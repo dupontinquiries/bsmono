@@ -14,7 +14,30 @@ pub enum Turn { User, Assistant }
 /// prompt + the keyframe's own keywords. All three are keyword bags to the matcher — retrieval never branches
 /// on kind. Pixels/clips live in a side-table keyed by [`Node::uuid`], not here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind { Text, Image, Shot }
+pub enum Kind { Text, Image, Shot, Patch, File }
+
+impl Kind {
+    /// Is this an ARTIFACT — something the conversation produced — rather than a turn of the conversation?
+    ///
+    /// The distinction is what the graph is for: a reader scanning it wants to see "here is where a patch
+    /// was applied" without reading every message. Artifacts and turns therefore render differently
+    /// (shape, colour, edge style) rather than being one undifferentiated stream of boxes.
+    pub fn is_artifact(self) -> bool { matches!(self, Kind::Patch | Kind::File | Kind::Image | Kind::Shot) }
+
+    /// Short glyph for the node badge.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Kind::Text => "", Kind::Image => "🖼", Kind::Shot => "🎬", Kind::Patch => "⑂", Kind::File => "🗎",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Text => "message", Kind::Image => "image", Kind::Shot => "shot",
+            Kind::Patch => "patch", Kind::File => "file",
+        }
+    }
+}
 
 /// Stable, session-independent identity — what the chat refers to a node by ("that galaxy image") and what
 /// an image's pixel payload is keyed on. Distinct from `id`, a positional index into this graph. Derived
@@ -42,6 +65,15 @@ pub struct Node {
     pub keywords: Vec<String>, // content words (topic signal for relevance/segmentation)
     pub looks_back: bool,      // this turn references something earlier ("undo", "the first version"…)
     pub pruned: bool,          // human-pruned: kept in the log but removed from the model's context
+}
+
+/// Bytes in the shortest form that stays unambiguous.
+fn human_bytes(b: u64) -> String {
+    const K: u64 = 1024;
+    if b < K { format!("{b} B") }
+    else if b < K * K { format!("{:.1} KiB", b as f64 / K as f64) }
+    else if b < K * K * K { format!("{:.1} MiB", b as f64 / (K * K) as f64) }
+    else { format!("{:.2} GiB", b as f64 / (K * K * K) as f64) }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -131,6 +163,49 @@ impl Graph {
     }
 
     /// Resolve a stable uuid back to its node (how a named/referenced image is looked up).
+    /// A PATCH node: a diff the assistant produced, attached to the turn that produced it.
+    ///
+    /// `applied` distinguishes a proposed patch from a landed one, because "the model suggested a change"
+    /// and "the file on disk changed" are very different facts to see in a history.
+    pub fn push_patch(&mut self, path: &str, hunks: usize, applied: bool, parent: Option<usize>,
+                      est: impl Fn(&str) -> usize) -> u128 {
+        let preview = format!("{}{} · {} hunk{}", if applied { "" } else { "proposed " },
+            path, hunks, if hunks == 1 { "" } else { "s" });
+        self.push_artifact(Kind::Patch, &preview, path, parent, est)
+    }
+
+    /// A FILE node: something written to the workspace.
+    pub fn push_file(&mut self, path: &str, bytes: u64, parent: Option<usize>,
+                     est: impl Fn(&str) -> usize) -> u128 {
+        let preview = format!("{path} · {}", human_bytes(bytes));
+        self.push_artifact(Kind::File, &preview, path, parent, est)
+    }
+
+    /// Shared construction for artifact nodes.
+    ///
+    /// Artifacts are ASSISTANT-side and start OUT of context: a produced file is not automatically part of
+    /// what the model is looking at, and marking it in-context would overstate the window. Keywords come
+    /// from the path so retrieval can find "that patch to backend.rs" the same way it finds a message.
+    fn push_artifact(&mut self, kind: Kind, preview: &str, path: &str, parent: Option<usize>,
+                     est: impl Fn(&str) -> usize) -> u128 {
+        let id = self.nodes.len();
+        let uuid = gen_uuid(preview, path, id as u64);
+        let keywords = path.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2).map(|w| w.to_ascii_lowercase()).collect();
+        self.nodes.push(Node {
+            id, uuid, kind, refers: None, parent: parent.or(self.head), turn: Turn::Assistant,
+            preview: preview.to_string(), tokens: est(preview), in_context: false,
+            keywords, looks_back: false, pruned: false,
+        });
+        self.head = Some(id);
+        uuid
+    }
+
+    /// Artifact nodes in order, for a filtered view ("show me what this conversation produced").
+    pub fn artifacts(&self) -> Vec<&Node> {
+        self.nodes.iter().filter(|n| n.kind.is_artifact()).collect()
+    }
+
     pub fn node_by_uuid(&self, uuid: u128) -> Option<&Node> { self.nodes.iter().find(|n| n.uuid == uuid) }
 
     /// Every image node's (uuid, name), newest last — for the payload side-table / a picker.
@@ -325,6 +400,91 @@ pub fn cue(text: &str) -> Option<Cue> {
         "like before","as before","restore","that earlier","the old","initial version",
     ];
     if BACK.iter().any(|k| t.contains(k)) { Some(Cue::LookBack) } else { None }
+}
+
+
+#[cfg(test)]
+mod artifact_tests {
+    use super::*;
+    fn est(s: &str) -> usize { s.len() / 4 + 1 }
+
+    #[test]
+    fn artifacts_attach_to_the_turn_that_produced_them() {
+        let mut g = Graph::default();
+        g.push_turn(Turn::User, "fix the loader", None, est);
+        let a = g.push_turn(Turn::Assistant, "here is a patch", None, est);
+        let ai = g.node_by_uuid(a).unwrap().id;
+        g.push_patch("src/lib.rs", 3, true, None, est);
+        let p = g.nodes.last().unwrap();
+        assert_eq!(p.kind, Kind::Patch);
+        assert_eq!(p.parent, Some(ai), "a patch hangs off the turn that produced it");
+        assert_eq!(p.turn, Turn::Assistant);
+        assert!(p.preview.contains("3 hunks") && p.preview.contains("src/lib.rs"));
+    }
+
+    #[test]
+    fn a_proposed_patch_reads_differently_from_an_applied_one() {
+        // "the model suggested a change" and "the file on disk changed" are different facts, and a
+        // history that renders them identically is misleading about what actually happened.
+        let mut g = Graph::default();
+        g.push_patch("a.rs", 1, true, None, est);
+        g.push_patch("b.rs", 1, false, None, est);
+        assert!(!g.nodes[0].preview.starts_with("proposed"));
+        assert!(g.nodes[1].preview.starts_with("proposed"));
+        assert!(g.nodes[0].preview.contains("1 hunk") && !g.nodes[0].preview.contains("hunks"));
+    }
+
+    #[test]
+    fn artifacts_start_out_of_context() {
+        // A produced file is not automatically in the model's window; marking it in-context would
+        // overstate what the model is looking at.
+        let mut g = Graph::default();
+        g.push_file("out/report.md", 4096, None, est);
+        assert!(!g.nodes[0].in_context);
+        assert!(g.nodes[0].preview.contains("4.0 KiB"));
+    }
+
+    #[test]
+    fn artifact_kinds_are_distinguishable_from_turns() {
+        assert!(!Kind::Text.is_artifact());
+        for k in [Kind::Patch, Kind::File, Kind::Image, Kind::Shot] {
+            assert!(k.is_artifact(), "{k:?} is an artifact");
+            assert!(!k.glyph().is_empty(), "{k:?} needs a badge glyph");
+        }
+        assert!(Kind::Text.glyph().is_empty(), "a plain message carries no badge");
+    }
+
+    #[test]
+    fn artifacts_are_retrievable_by_path_words() {
+        // Retrieval treats every node as a keyword bag; an artifact whose path contributed nothing would
+        // be unfindable by the name the user actually refers to it by.
+        let mut g = Graph::default();
+        g.push_patch("crates/logscope-egui/src/backend.rs", 2, true, None, est);
+        let kw = &g.nodes[0].keywords;
+        assert!(kw.iter().any(|w| w == "backend"), "{kw:?}");
+        assert!(kw.iter().any(|w| w == "logscope"), "{kw:?}");
+        assert!(!kw.iter().any(|w| w == "rs"), "two-letter noise is dropped: {kw:?}");
+    }
+
+    #[test]
+    fn the_artifact_filter_returns_only_produced_things() {
+        let mut g = Graph::default();
+        g.push_turn(Turn::User, "hello", None, est);
+        g.push_turn(Turn::Assistant, "hi", None, est);
+        g.push_patch("x.rs", 1, true, None, est);
+        g.push_file("y.md", 10, None, est);
+        let a = g.artifacts();
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|n| n.kind.is_artifact()));
+    }
+
+    #[test]
+    fn byte_sizes_stay_readable_across_magnitudes() {
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(4096), "4.0 KiB");
+        assert!(human_bytes(5 << 20).starts_with("5.0 MiB"));
+        assert!(human_bytes(3 << 30).starts_with("3.00 GiB"));
+    }
 }
 
 #[cfg(test)]
