@@ -110,10 +110,9 @@ pub(crate) mod engine {
         if std::env::var("LOGSCOPE_PREFILL_CHUNK").is_ok() || std::env::var("PREFILL_CHUNK").is_ok() {
             return prefill_chunk();
         }
-        const REF_WORK: usize = 3072 * 8192; // the shape the 256 default was tuned on
-        let work = d.max(1).saturating_mul(ff.max(1));
-        let scaled = PREFILL_CHUNK.saturating_mul(REF_WORK) / work.max(1);
-        scaled.clamp(16, PREFILL_CHUNK)
+        // One definition, in logscope::tuneprofile, so the engine and the profile cannot disagree about
+        // what the chunk should be — two copies of a tuning rule is how they drift.
+        logscope::tuneprofile::Defaults::default().prefill_chunk(d, ff) as usize
     }
     /// Hard ceiling on the context window regardless of the n_ctx slider — the KV cache is O(window)
     /// memory (~hundreds of KB per token), so this is the backstop against OOMing the device.
@@ -604,7 +603,27 @@ pub(crate) mod engine {
             // ON wins only if it beats OFF by ≥5% (margin guards against noise flipping it on).
             let decision = on < off * 0.95;
             gpu_kernels::ab_set_decided(decision);
-            gpu_kernels::store::fast_ab_put(&format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class()), decision);
+            // CACHE ONLY A DECISIVE RESULT. The margin above picks a side for THIS run, but an
+            // inconclusive measurement must not be written down: run-to-run variance here is easily a few
+            // percent, and a cached coin flip persists for every later load while nobody knows why it is
+            // there. Within the margin, decline to record and let the next load measure again.
+            let v = logscope::tuneprofile::Verdict {
+                option: "fast_decode".into(), chosen: decision,
+                on_ms: on * 1000.0, off_ms: off * 1000.0,
+                note: format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class()),
+            };
+            let key = format!("{} [{}]", self.gpu.adapter_name, self.model.decode_class());
+            if v.is_decisive(logscope::tuneprofile::Defaults::default().min_verdict_margin) {
+                gpu_kernels::store::fast_ab_put(&key, decision);
+                eprintln!("wgpu-engine: fast-decode A/B — {} by {:+.0}% ({:.1} vs {:.1} ms/tok), cached for [{}]",
+                    if decision { "ON" } else { "off" }, v.margin() * 100.0,
+                    v.on_ms, v.off_ms, self.model.decode_class());
+            } else {
+                eprintln!("wgpu-engine: fast-decode A/B INCONCLUSIVE ({:+.1}%, {:.1} vs {:.1} ms/tok) — \
+using {} for this run but NOT caching it; a difference this small is run-to-run noise and caching it \
+would mislead every later load",
+                    v.margin() * 100.0, v.on_ms, v.off_ms, if decision { "ON" } else { "off" });
+            }
             eprintln!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
                 if decision { "ON" } else { "OFF" }, self.gpu.adapter_name);
         }
