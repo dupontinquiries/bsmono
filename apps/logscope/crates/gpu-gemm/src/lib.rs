@@ -772,6 +772,19 @@ impl SubmitTuner {
     pub fn results(&self) -> &[(u32, f64, f64)] { &self.results }
 }
 
+/// Is this adapter name a SOFTWARE rasterizer rather than real silicon? The recognizers are the
+/// three CPU implementations a Vulkan/GL loader actually hands out — Mesa llvmpipe ("llvmpipe
+/// (LLVM 17.0.6, 256 bits)"), SwiftShader, and Microsoft's WARP/"Basic Render Driver" — plus
+/// softpipe and the word "software" itself. Matching is on the raw adapter name,
+/// case-insensitive, because that string is the only portable signal wgpu exposes; wgpu's own
+/// DeviceType::Cpu would also work for Vulkan but GL adapters frequently report Other, and
+/// llvmpipe-behind-GL is exactly the CI case that must stay recognizable.
+pub fn adapter_is_software(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n.contains("llvmpipe") || n.contains("swiftshader") || n.contains("softpipe")
+        || n.contains("software") || n.contains("basic render driver")
+}
+
 impl Gpu {
     pub fn new() -> Self {
         let instance = wgpu::Instance::default();
@@ -780,6 +793,23 @@ impl Gpu {
         })).expect("no GPU adapter");
         let info = adapter.get_info();
         let adapter_name = format!("{} [{:?}]", info.name, info.backend);
+        // Never run on a software rasterizer SILENTLY (ramalama's per-accelerator-image lesson,
+        // transcribed in maintenance/ASAHI_VULKAN_LESSONS.md: the failure mode on an Asahi kit is a
+        // missing/old mesa-vulkan-drivers → the Vulkan loader offers only llvmpipe → wgpu happily
+        // returns it as "HighPerformance" → decode runs 100× slow and nothing says why). CI runs
+        // llvmpipe DELIBERATELY, so the default is a loud warning, not a refusal; a real deployment
+        // sets LOGSCOPE_REQUIRE_HW_GPU=1 (serve/fleet paths) to turn the warning into a hard stop
+        // with the fix spelled out.
+        if adapter_is_software(&info.name) {
+            let msg = format!(
+                "wgpu-engine: SOFTWARE rasterizer adapter '{adapter_name}' — no hardware GPU was \
+                 offered. On an Asahi kit this almost always means mesa-vulkan-drivers (Honeykrisp) \
+                 is missing or shadowed: install from asahi-repos and check `vulkaninfo --summary`.");
+            if std::env::var("LOGSCOPE_REQUIRE_HW_GPU").is_ok_and(|v| v == "1") {
+                panic!("{msg} (LOGSCOPE_REQUIRE_HW_GPU=1 → refusing to start on software)");
+            }
+            eprintln!("{msg} (continuing — CI/dev mode; set LOGSCOPE_REQUIRE_HW_GPU=1 to refuse)");
+        }
         // Use the adapter's actual maximum limits, not the conservative downlevel
         // defaults (which cap buffers at 256 MiB / storage bindings at 128 MiB —
         // far too small for a real model's large vocab projections, e.g. a 128k×2048
@@ -7053,7 +7083,16 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     } else { None };
                     drop(gsrc); drop(usrc);
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
-                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
+                        // Routing semantics come from the checkpoint, not the arch tag: `deepseek2` spans
+                        // softmax-gated V2 and sigmoid-gated V3/GLM-4.7 (expert_gating_func = 2), and the
+                        // routed scaling factor is a trained constant the file carries. Absent keys keep
+                        // the per-arch defaults (see archcfg::MoeMeta).
+                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0,
+                            crate::archcfg::MoeMeta {
+                                gating_func: g.get_u32(&format!("{pfx}.expert_gating_func")),
+                                weights_scale: g.get_f32(&format!("{pfx}.expert_weights_scale")),
+                                weights_norm: g.get_bool(&format!("{pfx}.expert_weights_norm")),
+                            }) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
                 q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
@@ -10899,6 +10938,25 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
         if let Some((b, _)) = self.warm.iter().find(|(b, _)| b.id == id) { return Some(&b.emitted); }
         if let Some(b) = self.done.iter().find(|b| b.id == id) { return Some(&b.emitted); }
         None
+    }
+}
+
+#[cfg(test)]
+mod adapter_policy_tests {
+    use super::*;
+
+    #[test]
+    fn software_rasterizers_are_recognized_and_real_silicon_is_not() {
+        // the actual strings these stacks report (llvmpipe's includes its LLVM version)
+        for sw in ["llvmpipe (LLVM 17.0.6, 256 bits)", "SwiftShader Device (LLVM 10.0.0)",
+                   "softpipe", "Apple Software Renderer", "Microsoft Basic Render Driver"] {
+            assert!(adapter_is_software(sw), "{sw} must be classified software");
+        }
+        // the fleet's real adapters — and names that CONTAIN risky substrings must stay hardware
+        for hw in ["Apple M2 Max (G14C B1)", "AMD Radeon RX 7900 XTX", "NVIDIA GeForce RTX 4090",
+                   "Intel(R) Arc(tm) A770 Graphics", "Adreno (TM) 740"] {
+            assert!(!adapter_is_software(hw), "{hw} must NOT be classified software");
+        }
     }
 }
 

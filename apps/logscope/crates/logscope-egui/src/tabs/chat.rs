@@ -1026,6 +1026,24 @@ impl Default for Chat {
     }
 }
 impl Chat {
+    /// Seed the sampling sliders from the model's recommended defaults (`GenParams::for_model`) on a
+    /// successful load. Only the sampling trio moves (temperature / repeat penalty / min-p); the memory
+    /// knobs (n_ctx, max_tokens) stay the user's. Slider tweaks made AFTER a load are respected until
+    /// the next load — the preset is a starting point per model, not a lock. Concretely this exists
+    /// because GLM-4.7's card says repetition penalty must be OFF, and our 1.15 default would quietly
+    /// degrade it for anyone who didn't read that card.
+    pub fn apply_model_sampling_preset(&mut self, model_name: &str) {
+        let p = logscope::llm_backend::GenParams::for_model(model_name);
+        let d = logscope::llm_backend::GenParams::default();
+        // Only act when the model actually has a preset (differs from the global default): a load of a
+        // no-preset model must NOT stomp sliders back to defaults.
+        if (p.temperature, p.repeat_penalty, p.min_p) != (d.temperature, d.repeat_penalty, d.min_p) {
+            self.ctx.temperature = p.temperature;
+            self.ctx.repeat_penalty = p.repeat_penalty;
+            self.ctx.min_p = p.min_p;
+        }
+    }
+
     /// Prefill the composer (used when another tab routes a prompt to Chat).
     pub fn set_input(&mut self, s: String) { self.input = s; }
 
