@@ -4,7 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "autodiff"] }
+# Performance feature flags (all three were previously OFF, which is why the
+# Asahi/Mesa runs were paying full per-dispatch cost on every kernel):
+#   fusion   - kernel fusion: merges elementwise/reduction chains into single
+#              dispatches. Directly attacks the ~1241ms/iter FIXED overhead
+#              measured on the M2 Ultra (fewer submits = less driver overhead).
+#              With this flag Burn's `Wgpu` alias becomes `Fusion<CubeBackend>`
+#              automatically -- no code change needed.
+#   autotune - benchmarks kernel variants per-device and caches the winner in
+#              target/autotune/. Matters most on non-NVIDIA stacks like
+#              Honeykrisp where the default kernel choice is rarely tuned.
+#   vulkan   - the alternative SPIR-V compiler backend. Burn's docs: SPIR-V
+#              "performs significantly better than WGSL", especially matmul.
+burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "autodiff", "fusion", "autotune"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 flate2 = "1"
 bytemuck = "1"
@@ -18,3 +30,17 @@ rustfft = "6.4.1"
 
 [profile.release]
 opt-level = 3
+
+[features]
+# Opt-in SPIR-V / native-Vulkan compiler backend. Burn's docs state SPIR-V
+# "performs significantly better than WGSL", especially for matmul, and it's
+# the only path that can reach f16/TensorCore-class matmul. It is NOT on by
+# default because it requires a real Vulkan adapter advertising SPIR-V
+# passthrough: on a software rasterizer (lavapipe) adapter selection fails
+# outright with "No possible adapter available for backend", so a default-on
+# flag would break CPU-only/CI environments.
+#
+# On the M2 Ultra / Asahi (Honeykrisp is a real Vulkan 1.3 driver) this should
+# work and is the single most promising remaining speed lever:
+#     cargo build --release --features spirv
+spirv = ["burn/vulkan"]
