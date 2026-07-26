@@ -75,7 +75,10 @@ impl Feature {
             Feature::InterleavedMoe => true, // per-block expert-set detection in the loader
             Feature::PostNorm => true,       // Gemma2 support carries attn/ffn post-norms
             Feature::ChunkedSwa => true,     // same paths as StandardSwa; the rule differs, the wiring does not
-            Feature::Mla => false,           // compute paths validated but NOT wired into decode
+            // Forward, compressed cache, per-layer projections, decode block and per-layer routing are
+            // all in place and checked (--gate-mla-block + the kernel-validation suite). Not yet exercised
+            // on a real GLM/DeepSeek checkpoint — see the note.
+            Feature::Mla => true,
             // Wired end to end: f32 decode (windowed KV view), q8 decode (kernel start bound) and
             // prefill (per-row window in the parallel kernel), each checked against an independent
             // reference by --gate-swa. The one hole is the serial prefill fallback used when
@@ -92,9 +95,8 @@ impl Feature {
 
             Feature::PerLayerRopeFreqs => Some("full-attention layers get the windowed layers' rope base; \
 matters most on long contexts"),
-            Feature::Mla => Some("the compute kernels, the compressed-KV cache and the per-layer \
-projection weights are all in place and validated; only the decode plumbing that routes MLA layers \
-through them is missing"),
+            Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
+real DeepSeek/GLM checkpoint — the first such load is the test"),
             _ => None,
         }
     }
@@ -175,14 +177,16 @@ mod tests {
     }
 
     #[test]
-    fn glm_reports_mla_as_the_blocker() {
-        let g = gaps("glm4moe", 0);
-        assert!(g.contains(&Feature::Mla));
-        assert!(!g.contains(&Feature::SharedExpert), "shared expert IS implemented");
-        // the note must say what remains, not just that something does — the compute and weights are in
-        // place, only the decode plumbing is missing, and that distinction tells the next person where to start
-        let r = gap_report("glm4moe", 0);
-        assert!(r.iter().any(|s| s.contains("only the decode plumbing")), "{r:?}");
+    fn glm_no_longer_reports_mla_as_a_blocker() {
+        // It DID, through most of this project: the kernels existed but nothing called them. Forward,
+        // compressed cache, projections, decode block and per-layer routing are now all in place.
+        assert!(Feature::Mla.implemented());
+        assert!(gaps("glm4moe", 0).is_empty(), "{:?}", gaps("glm4moe", 0));
+        assert!(gaps("deepseek3", 0).is_empty());
+        // but the note must still say it has never run on a real checkpoint — validated against a CPU
+        // reference is not the same as having loaded a 200 GB model, and pretending otherwise is how a
+        // "supported" architecture surprises someone
+        assert!(Feature::Mla.note().unwrap().contains("never yet run on a real"));
     }
 
     #[test]
