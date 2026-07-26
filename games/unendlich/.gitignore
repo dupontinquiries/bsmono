@@ -1,0 +1,14 @@
+/target
+Cargo.lock.bak
+*.swp
+.DS_Store
+
+# Engine binary writes these to cwd during interactive play.
+# Spec-driven runs (--test-spec) write them to ~/.unendlich/runs/<uuid>/
+# instead, so these only appear from manual `cargo run` invocations.
+/worlds/
+run_summaries.txt
+
+# Python bytecode (lint tools)
+__pycache__/
+*.pyc

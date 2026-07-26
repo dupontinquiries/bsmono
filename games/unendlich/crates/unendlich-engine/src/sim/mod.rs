@@ -201,7 +201,8 @@ pub mod portal_graph; // r594: dimension/portal data model + linking/traversal
 pub mod block_placement; // r594: general block-placement validation (building)
 pub mod item_category; // r594: item->filter category classifier (feeds inventory_sort)
 pub mod inventory_transfer; // r594: cross-grid stack transfer (quick-move/deposit-all) atop inventory_grid
-pub mod infusion; // r594: infusion slot economy + sway-mark dominance (crafting genome)
+pub mod infusion;
+pub mod infusion_catalog; // r594: infusion slot economy + sway-mark dominance (crafting genome)
 pub mod armor_set; // r594: armour-set aggregator (piece modifiers + proportional set bonuses)
 pub mod object_permanence; // r595: target ghost record + uncertainty growth + give-up (mob brain)
 pub mod refresh_snap; // r604: autotune 500Hz target + fps snap ladder
@@ -259,6 +260,8 @@ pub mod strafe_face;
 // re-exported here; unifying on a shared item type is a follow-up.
 pub mod command_parse;
 pub mod craft_sway;
+pub mod item_genome;
+pub mod forge_types;
 pub mod collections;
 pub mod companion_roster;
 pub mod game_mode; // r335-gamemode: gamemode switch model + caps

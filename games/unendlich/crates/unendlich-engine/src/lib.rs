@@ -7,7 +7,6 @@
 //! * `player`      - player physics & input handling
 //! * `constants`   - tunable game-wide values
 
-pub mod pngutil;
 pub mod constants;
 pub mod runtime_flags;
 pub mod thread_probe;
