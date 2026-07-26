@@ -76,7 +76,10 @@ impl Feature {
             Feature::PostNorm => true,       // Gemma2 support carries attn/ffn post-norms
             Feature::ChunkedSwa => false,    // not implemented; full attention is used instead
             Feature::Mla => false,           // compute paths validated but NOT wired into decode
-            Feature::StandardSwa => false,   // not implemented; every layer attends fully
+            // Wired into the f32 DECODE path (windowed KV view, --gate-swa) but NOT into prefill, where
+            // every query row has its own window and needs a mask. Reported as not-implemented because
+            // partial coverage is what made Llama-4 hard to find: a long prompt still attends fully.
+            Feature::StandardSwa => false,
             Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
         }
     }
@@ -85,8 +88,9 @@ impl Feature {
     pub fn note(self) -> Option<&'static str> {
         match self {
             Feature::ChunkedSwa => Some("affects long contexts only; short prompts behave normally"),
-            Feature::StandardSwa => Some("windowed layers attend to the whole context instead — correct \
-below the window (Gemma 2: 4096 tokens), increasingly wrong beyond it"),
+            Feature::StandardSwa => Some("decode is windowed, but PREFILL still attends fully — so a \
+prompt longer than the window (Gemma 2: 4096) is processed wrongly even though generation after it is \
+correct"),
             Feature::PerLayerRopeFreqs => Some("full-attention layers get the windowed layers' rope base; \
 matters most on long contexts"),
             Feature::Mla => Some("the compute kernels exist and are validated, but are not wired into live decode"),
@@ -183,8 +187,10 @@ mod tests {
         let g2 = gaps("gemma2", 0);
         assert!(g2.contains(&Feature::StandardSwa), "Gemma2 needs SWA and we do not implement it");
         assert!(!g2.contains(&Feature::PostNorm), "post-norms ARE implemented");
-        // and the consequence is bounded, not total: correct below the window
-        assert!(gap_report("gemma2", 0).iter().any(|s| s.contains("below the window")));
+        // and the consequence is bounded AND specific: decode is windowed, prefill is not, so the note
+        // must say which half works rather than a blanket "output will be wrong"
+        let r = gap_report("gemma2", 0);
+        assert!(r.iter().any(|s| s.contains("PREFILL still attends fully")), "{r:?}");
     }
 
     #[test]
