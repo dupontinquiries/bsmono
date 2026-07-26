@@ -45,6 +45,12 @@ pub enum Feature {
     /// Per-layer rope frequency tensors, so full-attention layers scale rope differently from windowed
     /// ones (Gemma 4 `rope_freqs`).
     PerLayerRopeFreqs,
+    /// A per-layer HEAD DIMENSION: windowed and full-attention layers use different head sizes
+    /// (Gemma 4 `attention.key_length_swa` vs `key_length`). Everything here assumes one head_dim for the
+    /// whole model, so this is structural rather than a knob.
+    PerLayerHeadDim,
+    /// A learned scalar multiplying each layer's output (Gemma 4 `layer_output_scale`).
+    LayerOutputScale,
 }
 
 impl Feature {
@@ -61,6 +67,8 @@ impl Feature {
             Feature::StandardSwa => "sliding-window attention (with a separate rope base)",
             Feature::PostNorm => "post-attention / post-FFN normalization",
             Feature::PerLayerRopeFreqs => "per-layer rope frequency tensors",
+            Feature::PerLayerHeadDim => "per-layer head dimension (SWA layers differ from full-attention ones)",
+            Feature::LayerOutputScale => "per-layer learned output scale",
         }
     }
 
@@ -86,6 +94,8 @@ impl Feature {
             // ignoring the window.
             Feature::StandardSwa => true,
             Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
+            Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
+            Feature::LayerOutputScale => false,  // the tensor is not read
         }
     }
 
@@ -95,6 +105,10 @@ impl Feature {
 
             Feature::PerLayerRopeFreqs => Some("full-attention layers get the windowed layers' rope base; \
 matters most on long contexts"),
+            Feature::PerLayerHeadDim => Some("STRUCTURAL: head_dim is model-wide here, so a checkpoint \
+whose windowed and full layers differ cannot be laid out correctly at all"),
+            Feature::LayerOutputScale => Some("layer outputs are unscaled; the tensor is present in the \
+file and ignored"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
             _ => None,
@@ -124,8 +138,10 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         // learned Q/K norms before rope, and 4 adds per-layer rope frequency tensors.
         "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm],
         "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope],
+        // Gemma 4 (src/models/gemma4.cpp): everything gemma3 needs, plus per-layer rope freqs, a
+        // per-layer HEAD DIM (key_length_swa vs key_length) and a learned per-layer output scale.
         "gemma4" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
-                         Feature::PerLayerRopeFreqs],
+                         Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale],
         "glm4moe" | "glm-dsa" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
         _ => Vec::new(),
     }
@@ -201,12 +217,25 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_adds_per_layer_rope_on_top_of_gemma3() {
+    fn gemma4_needs_three_things_gemma3_does_not() {
         let g3 = required("gemma3", 0);
         let g4 = required("gemma4", 0);
         assert!(g3.contains(&Feature::QkNormPreRope) && g4.contains(&Feature::QkNormPreRope));
-        assert!(!g3.contains(&Feature::PerLayerRopeFreqs), "gemma3 has no per-layer rope freqs");
-        assert!(g4.contains(&Feature::PerLayerRopeFreqs), "gemma4 does (rope_freqs per layer)");
+        for f in [Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale] {
+            assert!(!g3.contains(&f), "gemma3 does not need {f:?}");
+            assert!(g4.contains(&f), "gemma4 does need {f:?}");
+        }
+    }
+
+    #[test]
+    fn gemma4_names_a_structural_blocker_not_a_missing_knob() {
+        // Per-layer head_dim is not something to bolt on: head_dim is a single model-wide value
+        // everywhere here. The report must distinguish that from a merely unimplemented option, because
+        // the two imply completely different amounts of work.
+        let r = gap_report("gemma4", 0);
+        assert!(r.iter().any(|s| s.contains("STRUCTURAL")), "{r:?}");
+        assert!(r.iter().any(|s| s.contains("present in the file and ignored")),
+                "an ignored tensor should say so: {r:?}");
     }
 
     #[test]
