@@ -222,6 +222,58 @@ impl Timeline {
     }
 }
 
+/// What is the MOST a change to CPU-side work could win?
+///
+/// Amdahl, applied to the engine's own profile line. Exists because optimisation effort is routinely
+/// spent on the wrong half: caching, batching and dispatch-count work can only ever recover the time the
+/// CPU actually holds, and on a compute-bound run that is a rounding error. Measuring the ceiling first
+/// costs one division and can save a week.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Headroom {
+    /// Best achievable speedup if ALL CPU setup and ALL sync stalls vanished.
+    pub ceiling: f32,
+    pub cpu_share: f32,
+    pub sync_share: f32,
+    pub submits_per_token: u64,
+}
+
+impl Headroom {
+    /// Below this, a change is not worth making: run-to-run variance on this class of hardware is a few
+    /// percent, so a 1.05x ceiling cannot be distinguished from noise even if perfectly realised.
+    pub const WORTH_DOING: f32 = 1.15;
+
+    pub fn is_worth_optimising(&self) -> bool { self.ceiling >= Self::WORTH_DOING }
+
+    /// Where the recoverable time actually is — which decides WHICH change to make.
+    pub fn verdict(&self) -> String {
+        if !self.is_worth_optimising() {
+            return format!("compute-bound: CPU holds {:.1}% and sync {:.1}%, so removing ALL of it gives {:.2}x. Caching, batching and submit-count work cannot help here — the GPU is the wall.",
+                self.cpu_share * 100.0, self.sync_share * 100.0, self.ceiling);
+        }
+        if self.sync_share > self.cpu_share * 4.0 {
+            format!("sync-bound: {:.0}% of the step is the CPU WAITING on the GPU ({} submits/token). The win is removing readbacks, not caching — a bind-group cache does not shorten a stall. Ceiling {:.2}x.",
+                self.sync_share * 100.0, self.submits_per_token, self.ceiling)
+        } else {
+            format!("dispatch-bound: {:.0}% is CPU setup at {} submits/token. Caching and batching are the right tools here. Ceiling {:.2}x.", self.cpu_share * 100.0, self.submits_per_token, self.ceiling)
+        }
+    }
+}
+
+/// Compute the headroom from one generation's measurements.
+pub fn headroom(wall_ns: u64, setup_ns: u64, sync_ns: u64, tokens: u64, submits: u64) -> Option<Headroom> {
+    if wall_ns == 0 { return None; }
+    let overhead = setup_ns.saturating_add(sync_ns).min(wall_ns);
+    let remaining = wall_ns - overhead;
+    // All overhead removed and the GPU work unchanged: that is the bound, and it is not reachable.
+    let ceiling = if remaining == 0 { f32::INFINITY } else { wall_ns as f32 / remaining as f32 };
+    Some(Headroom {
+        ceiling,
+        cpu_share: setup_ns as f32 / wall_ns as f32,
+        sync_share: sync_ns as f32 / wall_ns as f32,
+        submits_per_token: submits / tokens.max(1),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +370,50 @@ mod tests {
         assert_eq!(t.spans().len(), 2);
         assert_eq!(t.dropped(), 3);
         assert!(t.summary().iter().any(|s| s.contains("3 spans dropped")));
+    }
+
+    // The three cases below use REAL measurements from hardware runs, not invented numbers, so the
+    // thresholds are calibrated against workloads that actually occur.
+
+    #[test]
+    fn a_compute_bound_run_has_no_headroom_and_says_so_plainly() {
+        // DeepSeek-R1-Distill-8B: 369 tokens in 75.627 s, setup 179 ms, sync 0 ms, 5395 submits.
+        // 99.8% of the step is GPU execution. This is the case where caching work is wasted effort.
+        let h = headroom(75_627_000_000, 179_000_000, 0, 369, 5395).unwrap();
+        assert!(h.ceiling < 1.01, "ceiling {:.3}", h.ceiling);
+        assert!(!h.is_worth_optimising());
+        let v = h.verdict();
+        assert!(v.contains("compute-bound") && v.contains("cannot help here"), "{v}");
+    }
+
+    #[test]
+    fn a_sync_bound_run_points_at_readbacks_not_caching() {
+        // Llama-4 Scout: 4 tokens in 3.792 s, setup 7 ms, sync 3.025 s, 4604 submits.
+        let h = headroom(3_792_000_000, 7_000_000, 3_025_000_000, 4, 4604).unwrap();
+        assert!(h.ceiling > 4.0, "5x on the table: {:.2}", h.ceiling);
+        assert!(h.is_worth_optimising());
+        let v = h.verdict();
+        assert!(v.contains("sync-bound"), "{v}");
+        assert!(v.contains("does not shorten a stall"),
+            "the point is that the OBVIOUS fix is the wrong one here");
+        assert_eq!(h.submits_per_token, 1151);
+    }
+
+    #[test]
+    fn a_marginal_run_is_left_alone() {
+        // Qwen3-30B: 10 tokens in 3.106 s, setup 12 ms, sync 340 ms. 1.13x is below the threshold —
+        // run-to-run variance on this hardware is a few percent, so even a perfect fix is unmeasurable.
+        let h = headroom(3_106_000_000, 12_000_000, 340_000_000, 10, 310).unwrap();
+        assert!(h.ceiling < Headroom::WORTH_DOING, "ceiling {:.2}", h.ceiling);
+        assert!(!h.is_worth_optimising());
+    }
+
+    #[test]
+    fn zero_wall_time_yields_no_verdict_rather_than_infinity() {
+        assert!(headroom(0, 0, 0, 1, 1).is_none());
+        // and overhead exceeding the wall clock (clock skew between counters) must not go negative
+        let h = headroom(1_000_000, 900_000, 900_000, 1, 1).unwrap();
+        assert!(h.ceiling.is_infinite() || h.ceiling > 1.0);
     }
 
     #[test]
