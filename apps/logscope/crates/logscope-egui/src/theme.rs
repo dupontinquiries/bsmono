@@ -650,6 +650,17 @@ pub fn day_night_adjust_at(p: Palette, day: f32) -> Palette {
     q.faint = on_panel(q.faint, 3.0, false);
     q.cyan  = on_panel(q.cyan,  4.5, true);
     q.amber = on_panel(q.amber, 4.5, true);
+    // STATUS COLOURS at 3.0, not 4.5. These are graphical objects under WCAG 1.4.11 rather than body
+    // text: green and red usually appear as a dot, a bar or a border, and pushing them to a text-grade
+    // ratio over-saturates them into something that shouts. 3:1 is the level at which a reader can tell
+    // them apart from the surface and from each other, which is all they need to do.
+    //
+    // Measured before this: 11 palettes had a status colour under 3:1, the worst being Cloudscape's
+    // green at 1.37 — a success indicator very nearly invisible on its own panel.
+    q.green = on_panel(q.green, 3.0, true);
+    q.red   = on_panel(q.red,   3.0, true);
+
+
     q
 }
 
@@ -675,6 +686,24 @@ pub fn tick_day_night(ctx: &Context) {
 // can actually reach the target ratio against the current background) just far enough to hit a
 // WCAG-style ratio. Palettes keep their identity; text keeps its legibility. Pure + tested
 // across every palette in `PALETTES`.
+
+/// A mark that carries status WITHOUT colour.
+///
+/// Nudging the palette to separate red from green was tried and reverted: lightening a status colour and
+/// then re-establishing its 3:1 contrast against the panel are opposing moves, and they cancel — the
+/// same two-passes-fighting failure as the earlier text-contrast attempt. Colour cannot solve this on
+/// every palette.
+///
+/// So status is never encoded in colour ALONE. A caller pairs the colour with this mark, and a reader
+/// who cannot distinguish the hues reads the glyph instead. This is also simply better for everyone:
+/// a ✓ is legible at a glance in a way a green dot is not.
+pub fn status_mark(ok: bool) -> &'static str { if ok { "✓" } else { "✗" } }
+
+/// As above for a three-state indicator, where "in progress" is its own thing rather than a dimmer
+/// version of success — a spinner that looks like a faded tick reads as "done, weakly".
+pub fn status_mark3(state: Option<bool>) -> &'static str {
+    match state { Some(true) => "✓", Some(false) => "✗", None => "…" }
+}
 
 /// WCAG relative luminance of an sRGB color.
 pub fn rel_luminance(c: Color32) -> f32 {
@@ -1965,6 +1994,60 @@ mod day_night_tests {
         let shown: Vec<String> = worst.iter().take(8).map(|(k, r)| format!("{k} = {r:.2}")).collect();
         assert!(worst.is_empty(), "{} palette/role pairs are illegible on their panel:\n  {}",
             worst.len(), shown.join("\n  "));
+    }
+
+    #[test]
+    fn status_is_never_colour_alone() {
+        // Red/green is the most common colour-vision deficiency, and several palettes render success and
+        // failure at nearly identical luminance — Reading Room had them EXACTLY equal, so a deuteranope
+        // sees two identical grey dots.
+        //
+        // Separating the luminances in the palette was tried and reverted: lightening a status colour and
+        // then restoring its 3:1 panel contrast are opposing moves that cancel. Colour cannot fix this
+        // everywhere, so the answer is a mark that does not depend on hue at all.
+        assert_ne!(status_mark(true), status_mark(false));
+        // and the in-progress state is its own glyph, not a faded tick, which would read as "done, weakly"
+        assert_eq!(status_mark3(None), "…");
+        assert_eq!(status_mark3(Some(true)), status_mark(true));
+        assert_ne!(status_mark3(None), status_mark3(Some(false)));
+
+        // Record how many palettes actually need it, so the reason this helper exists stays visible.
+        let mut close = 0;
+        for p in PALETTES {
+            let q = day_night_adjust_at(*p, 0.5);
+            let (lg, lr) = (rel_luminance(q.green), rel_luminance(q.red));
+            if (lg.max(lr) + 0.05) / (lg.min(lr) + 0.05) < 1.2 { close += 1; }
+        }
+        assert!(close > 0,
+            "if no palette needed this any more, the helper could be reconsidered — currently {close} do");
+    }
+
+
+    #[test]
+    fn measure_meaning_carrying_contrast() {
+        // WCAG 2.1 SC 1.4.11 asks 3:1 for UI components and graphical objects — but it applies to things
+        // you must PERCEIVE TO OPERATE or that CARRY MEANING, not to decorative layering.
+        //
+        // A first pass measured every non-text pair and found 86 of 114 under 3:1. Most of those should
+        // NOT be changed: `panel2` against `panel` is a nested surface, and forcing 3:1 between them
+        // would turn calm hierarchy into a checkerboard. Applying a rule where it does not belong is how
+        // you damage a design while believing you are fixing it.
+        //
+        // So this measures only the pairs where the colour IS the information: a status indicator the
+        // reader must distinguish, and the accent used for a focused/selected control.
+        let mut bad: Vec<(String, f32)> = Vec::new();
+        for p in PALETTES {
+            let q = day_night_adjust_at(*p, 0.5);
+            for (name, fg) in [("green", q.green), ("red", q.red), ("amber", q.amber), ("cyan", q.cyan)] {
+                let r = contrast_ratio(fg, q.panel);
+                if r < 3.0 { bad.push((format!("{} {name}/panel", p.name), r)); }
+            }
+        }
+        bad.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let shown: Vec<String> = bad.iter().take(8).map(|(k, r)| format!("{k} = {r:.2}")).collect();
+        assert!(bad.is_empty(),
+            "{} status colours are indistinguishable from the surface they sit on:\n  {}",
+            bad.len(), shown.join("\n  "));
     }
 }
 
