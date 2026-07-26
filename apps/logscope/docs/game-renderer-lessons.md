@@ -99,3 +99,33 @@ Both are worth taking, and neither is done yet:
 a correctness harness and the wrong one for a frame budget. The equivalent mistake in inference was two
 `end_frame()` calls per expert fill (_181), which was correct for the same reason and wrong for the same
 reason — and cost 1152 submits/token until a ring replaced it.
+
+## Measured: the per-token arena did NOT do what it was built for
+
+The arena (`scratch_begin`/`scratch_end`) was built on the theory that the buffer pool's free-list order
+made bind groups differ between tokens, and that stabilising buffer identity would lift the 18% reuse the
+profile reported.
+
+**That theory is wrong, and `--gate-scratch` now measures it.** On a fair test — several interleaved shapes,
+inputs pre-uploaded so a freshly created input buffer cannot mask the effect — bind-group reuse is
+identical with the arena on and off:
+
+```
+bind-group reuse: arena off 83% (60/72) → arena on 83% (60/72)
+```
+
+The pool is already deterministic when the alloc/free pattern repeats, which is exactly what decode does.
+
+So the real cause of 18% reuse was **not** buffer identity. It was sub-buffer **views** bypassing the cache
+entirely (the old key skipped any input with a view, and streaming expert weights are all views). Keying on
+the view span fixed that. The arena addressed a problem that was not there.
+
+It is kept because it is bit-exact, off-switchable (`LOGSCOPE_NO_SCRATCH`) and does bound allocation during
+decode — but the gate now asserts only that it does not make reuse *worse*, and the claim that it improves
+the cache has been removed. Two lessons:
+
+* The game comparison correctly identified *submits per unit of work* as the variable, and the staging ring
+  (1152 → 72 submits/token) came out of it. That part held up.
+* "Games pre-create bind groups, so buffer churn must be our problem too" was an inference from a working
+  system to a broken one, and it did not survive measurement. Adopting a pattern is not the same as having
+  the problem the pattern solves.
