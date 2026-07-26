@@ -63,3 +63,11 @@ cuda  = ["candle-core/cuda",  "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 # Batched generator inference on the GPU via wgpu (Vulkan on Asahi/Linux).
 gpu = ["dep:wgpu", "dep:pollster", "dep:bytemuck"]
+
+# Compile-speed policy (monorepo-wide, dev only): full DWARF is the single biggest
+# artifact + link cost in these workspaces, and the sandbox/CI boxes are disk-starved.
+# line-tables-only keeps file:line in backtraces (the part actually read) while
+# cutting debuginfo ~10x. Release profiles are untouched. Override locally with
+# CARGO_PROFILE_DEV_DEBUG=2 when a debugger session needs full types.
+[profile.dev]
+debug = "line-tables-only"
