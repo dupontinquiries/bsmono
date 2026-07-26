@@ -908,6 +908,17 @@ pub struct Chat {
     hit_cap: bool,                          // last finished reply ran the full budget (offer manual Continue)
     checkpoints: Vec<Checkpoint>,           // restorable conversation snapshots (rollback)
     show_checkpoints: bool,                 // checkpoints panel open
+    /// GPU phase-breakdown subpanel open (📊 in the composer bar).
+    show_metrics: bool,
+    /// Counter snapshot taken when the last generation STARTED, so the panel shows that generation
+    /// rather than everything since process start.
+    metrics_base: crate::metricspanel::Counters,
+    /// Wall time of the last completed generation.
+    metrics_wall_ns: u64,
+    /// Tokens produced by the last generation, so per-token figures are that generation's.
+    metrics_tokens: u64,
+    /// When the current generation started, for measuring its wall time.
+    metrics_start: Option<std::time::Instant>,
     checked_restore: bool,                  // ran the startup autosave check
     recover: Option<usize>,                 // autosave found at startup with N msgs (offer recovery)
     vault: Option<crate::vault::Vault>,     // project-history store (content-addressed tree); None if unavailable
@@ -991,6 +1002,7 @@ impl Default for Chat {
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
             head: None, show_history: false, file_hist: None,
@@ -1261,6 +1273,12 @@ impl Chat {
                 }
             }
             Evt::Done { tokens, secs } => {
+                // Close the metrics window: prefer the worker's own timing over our wall clock, since it
+                // excludes UI frame time, and fall back to the clock if it reports nothing.
+                self.metrics_tokens = tokens as u64;
+                self.metrics_wall_ns = if secs > 0.0 { (secs as f64 * 1e9) as u64 }
+                    else { self.metrics_start.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0) };
+                self.metrics_start = None;
                 let idx = self.stream.as_ref().map(|s| s.idx);
                 if let Some(i) = idx {
                     if let Some(m) = self.msgs.get_mut(i) {
@@ -1599,6 +1617,10 @@ impl Chat {
         self.hit_cap = false;
         self.stream = Some(Stream { idx: aid, started: Instant::now(), tokens: 0, progress: None });
         self.last = None;
+        // Baseline the counters as the generation is submitted, so the panel reports this generation
+        // rather than everything since process start.
+        self.metrics_base = crate::metricspanel::snapshot(0);
+        self.metrics_start = Some(std::time::Instant::now());
         infer.generate(prompt);
     }
 
@@ -2019,6 +2041,10 @@ impl Chat {
         self.active_leaf = Some(aid);
         self.stream = Some(Stream { idx: aid, started: Instant::now(), tokens: 0, progress: None });
         self.last = None;
+        // Baseline the counters as the generation is submitted, so the panel reports this generation
+        // rather than everything since process start.
+        self.metrics_base = crate::metricspanel::snapshot(0);
+        self.metrics_start = Some(std::time::Instant::now());
         infer.generate(prompt);
     }
 
@@ -2047,7 +2073,11 @@ impl Chat {
                 self.pruned.retain(|&p| p < self.msgs.len());
                 self.stream = Some(Stream { idx, started: Instant::now(), tokens: 0, progress: None });
                 self.last = None;
-                infer.generate(prompt);
+                // Baseline the counters as the generation is submitted, so the panel reports this generation
+        // rather than everything since process start.
+        self.metrics_base = crate::metricspanel::snapshot(0);
+        self.metrics_start = Some(std::time::Instant::now());
+        infer.generate(prompt);
             }
             MsgAction::Regenerate(i) => {
                 if self.stream.is_some() || i >= self.msgs.len() || self.msgs[i].role != Role::Assistant { return; }
@@ -2058,7 +2088,11 @@ impl Chat {
                 self.active_leaf = Some(i);
                 self.stream = Some(Stream { idx: i, started: Instant::now(), tokens: 0, progress: None });
                 self.last = None;
-                infer.generate(prompt);
+                // Baseline the counters as the generation is submitted, so the panel reports this generation
+        // rather than everything since process start.
+        self.metrics_base = crate::metricspanel::snapshot(0);
+        self.metrics_start = Some(std::time::Instant::now());
+        infer.generate(prompt);
             }
         }
     }
@@ -6138,6 +6172,28 @@ impl Chat {
                     });
                 });
             }
+            if self.show_metrics {
+                egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
+                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                .show(ui, |ui| {
+                    ui.label(RichText::new("GPU phase breakdown — last generation").color(theme::CYAN()).strong().small());
+                    let now = crate::metricspanel::snapshot(self.metrics_tokens);
+                    let lines = now.since(&self.metrics_base).report(self.metrics_wall_ns);
+                    if lines.is_empty() {
+                        ui.label(RichText::new("nothing measured yet — send a message").color(theme::DIM()).small());
+                    } else {
+                        for l in &lines {
+                            // the dominant/remedy line is the actionable one, so it gets the accent
+                            let c = if l.starts_with("dominant:") { theme::AMBER() } else { theme::DIM() };
+                            ui.label(RichText::new(l).color(c).monospace().small());
+                        }
+                    }
+                    if let Some(why) = now.heatmap_unavailable() {
+                        ui.add_space(theme::PAD_XS as f32);
+                        ui.label(RichText::new(format!("heatmap: {why}")).color(theme::FAINT()).small());
+                    }
+                });
+            }
             if self.show_checkpoints && !self.checkpoints.is_empty() {
                 egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
                     outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
@@ -6387,6 +6443,9 @@ impl Chat {
                             if ui.button(RichText::new(format!("🕘 {}", self.checkpoints.len())).small())
                                 .on_hover_text("Checkpoint history (rollback)").clicked() { self.show_checkpoints = !self.show_checkpoints; }
                         }
+                        if ui.button(RichText::new("📊").small())
+                            .on_hover_text("GPU phase breakdown: where the last generation's time went")
+                            .clicked() { self.show_metrics = !self.show_metrics; }
                         if ui.add_enabled(!self.msgs.is_empty(), egui::Button::new(RichText::new("📌").small()))
                             .on_hover_text("Save a restore point for this conversation").clicked() { do_checkpoint = true; }
                     });
