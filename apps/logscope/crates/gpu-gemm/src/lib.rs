@@ -340,6 +340,8 @@ pub struct Gpu {
     moe_stage: Mutex<Option<Tensor>>,
     /// Stable per-token scratch: (sequence position, shape) -> buffer. See `scratch_begin`.
     decode_scratch: Mutex<(bool, usize, Vec<(usize, usize, wgpu::Buffer)>)>,
+    /// Monotonic fill counter selecting the staging ring slot. See `STAGE_RING`.
+    stage_cursor: Mutex<usize>,
     subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
     unified: bool,   // unified-memory GPU (Apple/Asahi): host==device RAM, so weight uploads go zero-copy
                      // (map-at-creation) instead of through the staging belt — see zerocopy::upload_path
@@ -857,7 +859,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), decode_scratch: Mutex::new((false, 0, Vec::new())), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), decode_scratch: Mutex::new((false, 0, Vec::new())), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1057,6 +1059,20 @@ impl Gpu {
         let dims = [nblk as u32, qs_base_words as u32, qw_base_words as u32, gx];
         self.dispatch(Q4K_TO_Q4, &[src], out, bytemuck::cast_slice(&dims), (gx, gy, 1));
     }
+
+    /// How many fills the staging ring holds before it must wrap.
+    ///
+    /// This is the renderer's answer to the problem _181 solved with a submit per fill. A single staging
+    /// buffer forces `end_frame()` before and after every fill — because queued writes all land before any
+    /// command buffer in a submit, so the next fill's bytes would overwrite this fill's source. That cost
+    /// TWO submits per fill: at 12 cold experts across 48 layers it is 1152 submits/token, which is
+    /// exactly what the profile measured.
+    ///
+    /// A RING removes the conflict instead of serialising around it: consecutive fills write to different
+    /// regions, so many fills ride in one submit and `end_frame` is needed only when the ring wraps.
+    /// Games do this for every streaming upload; it is the same reason a renderer keeps N frames of
+    /// uniform storage rather than one.
+    pub const STAGE_RING: usize = 8;
 
     /// The shared, persistent upload staging buffer for expert fills: allocated once, grown only if some
     /// layer needs more, and reused for every fill thereafter. Decode is sequential over layers, so one
@@ -2841,21 +2857,27 @@ impl Gpu {
                     // ONE persistent staging buffer, written and converted three times. Allocating a source
                     // buffer per fill (what this used to do) exhausts the driver's VMA within a few
                     // thousand fills and kills the run mid-generation.
-                    // THREE REGIONS of one buffer, not one region written three times: queued writes are
-                    // all applied BEFORE the command buffers in a submit, so re-writing the same range
-                    // would leave every dispatch reading the last write. Regions are 256-aligned so each
-                    // can be bound as its own storage view.
+                    // THREE REGIONS per fill, in a RING of STAGE_RING fills. Queued writes all land
+                    // before any command buffer in a submit, so a fill must not reuse a region another
+                    // fill in the same submit is still reading. _181 solved that with end_frame() before
+                    // and after every fill — correct, but two submits per fill, which is where
+                    // 1152 submits/token came from. The ring gives each fill its own regions, so many
+                    // fills share one submit and we only close the frame when the ring WRAPS.
                     let al = |x: usize| x.div_ceil(256) * 256;
-                    let (o0, o1) = (0usize, al(g.len()));
+                    let per_fill = al(g.len()) + al(u.len()) + al(dw.len());
+                    let slot = {
+                        let mut c = self.stage_cursor.lock().unwrap();
+                        let s = *c % Self::STAGE_RING;
+                        *c += 1;
+                        // Wrapping means slot 0 is about to be rewritten while an earlier fill may still
+                        // be queued against it — that is the one point where the frame must close.
+                        if s == 0 { self.end_frame(); }
+                        s
+                    };
+                    let base = slot * per_fill;
+                    let (o0, o1) = (base, base + al(g.len()));
                     let o2 = o1 + al(u.len());
-                    let stage = self.moe_stage(o2 + al(dw.len()));
-                    // ORDERING, and this is the subtle one: Queue::write_buffer data is applied at the
-                    // START of a submit, before every command buffer in it. With passes batched into a
-                    // frame, the NEXT expert's staging writes would land before THIS expert's conversion
-                    // dispatches ran — every fill would read the last-written expert's bytes. Closing the
-                    // open frame first, and again after the dispatches, makes a fill atomic with respect
-                    // to submits. Symptom when this is wrong is not a crash but fluent garbage.
-                    self.end_frame();
+                    let stage = self.moe_stage(Self::STAGE_RING * per_fill);
                     self.queue.write_buffer(&stage.buf, o0 as u64, g);
                     self.queue.write_buffer(&stage.buf, o1 as u64, u);
                     self.queue.write_buffer(&stage.buf, o2 as u64, dw);
@@ -2865,9 +2887,6 @@ impl Gpu {
                     self.q4k_convert_from(&view(o0, g.len()), &gu_buf, ff, d, 0, gu_qs_off / 4);
                     self.q4k_convert_from(&view(o1, u.len()), &gu_buf, ff, d, half_qw_words, gu_qs_off / 4 + half_qs_vals);
                     self.q4k_convert_from(&view(o2, dw.len()), &dn_buf, d, ff, 0, dn_qs_off / 4);
-                    // close the frame again so these conversions are submitted before the staging buffer
-                    // can be rewritten by the next fill
-                    self.end_frame();
                 }
             } else {
                 let gu_bytes = std::mem::take(&mut s.host_gu[e as usize]);
