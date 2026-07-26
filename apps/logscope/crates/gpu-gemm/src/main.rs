@@ -3659,6 +3659,49 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-gemma") {
+        // Gemma's three arithmetic differences from a Llama block, each checked against a CPU reference.
+        let gpu = Gpu::new();
+        eprintln!("gate-gemma: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let n = 256usize; let eps = 1e-6f32;
+        let x: Vec<f32> = (0..n).map(|i| ((i * 37 % 41) as f32) - 20.0).collect();
+        // Gemma ships norm weights centred near ZERO, so the "1 +" is the difference between scaling by
+        // ~w and by ~1: getting it wrong is a large error, not a rounding one.
+        let wv: Vec<f32> = (0..n).map(|i| ((i % 7) as f32 - 3.0) * 0.02).collect();
+        let folded: Vec<f32> = wv.iter().map(|v| 1.0 + v).collect();
+        let rms = (x.iter().map(|v| v * v).sum::<f32>() / n as f32 + eps).sqrt();
+        let want: Vec<f32> = x.iter().zip(&wv).map(|(v, w)| (v / rms) * (1.0 + w)).collect();
+        let got = gpu.download(&gpu.rmsnorm_t(&gpu.upload(&x, 1, n), &gpu.upload(&folded, 1, n), 1, n, eps));
+        let md = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("(1+w) folded at load == Gemma RMS norm: max|diff|={md:.3e}"), md < 1e-4);
+        // and it must DIFFER from the plain form, or the fold is doing nothing
+        let plain = gpu.download(&gpu.rmsnorm_t(&gpu.upload(&x, 1, n), &gpu.upload(&wv, 1, n), 1, n, eps));
+        let dp = plain.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("differs from the plain w form (max|diff|={dp:.3e})"), dp > 1.0);
+
+        // GELU-gated vs SiLU-gated: same packed input, genuinely different outputs
+        let ff = 64usize;
+        let gu: Vec<f32> = (0..2 * ff).map(|i| ((i as f32) * 0.031).sin() * 3.0).collect();
+        let gut = gpu.upload(&gu, 1, 2 * ff);
+        let ge = gpu.download(&gpu.geglu_packed(&gut));
+        let si = gpu.download(&gpu.swiglu_packed(&gut));
+        let gref: Vec<f32> = (0..ff).map(|i| {
+            let g = gu[i]; let u = gu[ff + i];
+            // tanh-approximate GELU, as ggml uses
+            let c = (2.0f32 / std::f32::consts::PI).sqrt();
+            let t = (c * (g + 0.044715 * g * g * g)).tanh();
+            0.5 * g * (1.0 + t) * u
+        }).collect();
+        let gd = ge.iter().zip(&gref).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("geglu matches the tanh-GELU reference: max|diff|={gd:.3e}"), gd < 2e-3);
+        let sd = ge.iter().zip(&si).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("geglu differs from swiglu (max|diff|={sd:.3e}) — selecting it matters"), sd > 1e-3);
+        println!("gate-gemma: {}", if ok {
+            "Gemma norm and activation are correct \u{2713}"
+        } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-mla-block") {
         // The MLA math is already checked against mla.rs by --validate. What is NOT checked is the BLOCK:
         // norm -> compress-and-append -> attend -> residual. The ordering matters — the token must be in
@@ -4181,7 +4224,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -4199,7 +4242,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -4210,7 +4253,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step

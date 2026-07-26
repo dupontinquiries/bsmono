@@ -1521,6 +1521,12 @@ pub struct BlockWeights {
     /// means the compressed-latent attention path can run for this layer; the GPU forward it feeds is
     /// already validated against the CPU reference by --gate-mla.
     pub mla: Option<crate::mla::MlaWeightsT>,
+    /// GELU-gated FFN instead of SiLU-gated (Gemma). Per block so a mixed model would still work.
+    pub geglu: bool,
+    /// Gemma applies a norm to each sublayer's OUTPUT, before the residual add — distinct from the
+    /// pre-norms `g1`/`g2`. `post_attn` follows attention, `post_ffn` follows the FFN.
+    pub post_attn: Option<Tensor>,
+    pub post_ffn: Option<Tensor>,
     /// Sliding-window attention for this layer: (window, rule). None = attend to the whole context.
     /// Set per layer because these architectures alternate windowed and full-attention layers.
     pub swa: Option<(u32, crate::swa::SwaType)>,
@@ -3480,8 +3486,19 @@ impl Gpu {
         // Dense SwiGLU FFN. norm_apply fuses norm2→wgate_up in the m=1 decode case (one dispatch),
         // and falls back to explicit rmsnorm_t+apply for prefill (t>1) — identical output either way.
         let gu = w.wgate_up.norm_apply(self, x2, &w.g2, d, eps, t);
-        let hmid = self.swiglu_packed(&gu);
-        w.wdown.apply_add(self, &hmid, t, x2)
+        // Gemma gates with GELU rather than SiLU. The kernel has always existed; selecting it per block
+        // is what turns it from dead code into support.
+        let hmid = if w.geglu { self.geglu_packed(&gu) } else { self.swiglu_packed(&gu) };
+        match &w.post_ffn {
+            // Gemma: normalize the FFN's OUTPUT before adding the residual — not the same as the pre-FFN
+            // norm already applied above, and skipping it changes every layer's contribution.
+            Some(pn) => {
+                let h = w.wdown.apply(self, &hmid, t);
+                let hn = self.rmsnorm_t(&h, pn, t, d, eps);
+                self.add_t(x2, &hn)
+            }
+            None => w.wdown.apply_add(self, &hmid, t, x2),
+        }
     }
 
     /// MoE FFN over `t` tokens (t=1 decode or t=thousands prefill — same path via expert grouping):
@@ -6666,14 +6683,14 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                 } else { fused }
             };
             layers.push(BlockWeights {
-                g1: self.upload(&fetch(&format!("blk.{i}.attn_norm.weight"))?, 1, d),
+                g1: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.attn_norm.weight"))?, &acfg), 1, d),
                 wqkv,
                 wq: lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq),
                 wk: lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk),
                 wv: lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv),
                 wo: lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)?,
-                g2: self.upload(&fetch(&format!("blk.{i}.ffn_norm.weight"))
-                    .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, 1, d),
+                g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
+                    .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, &acfg), 1, d),
                 // gate and up fused into one [2h, d] projection: a single matmul emits
                 // [t, 2h] = [gate(h) | up(h)] per row, which SWIGLU_PACKED then consumes.
                 // Halves the FFN projection dispatches/weight-binds; per-row int8 quant of
@@ -6928,6 +6945,15 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // weightless Llama4TextL2Norm. ON for every Llama-4 except the 128-expert Maverick, which
                 // is exactly how llama.cpp gates it (use_kq_norm = type != LLM_TYPE_17B_128E). Applied
                 // after rope by `kq_post`; rope layers only.
+                // Gemma gates with GELU. Selected from the arch config rather than sniffed from tensors.
+                geglu: matches!(acfg.act, crate::archcfg::Act::GeGlu),
+                // Gemma's post-attention / post-FFN norms. Absent on every other architecture, so None
+                // leaves those paths untouched. Loaded through gemma_norm so the (1+w) form is applied
+                // here too — a post-norm with the wrong scaling is as wrong as a missing one.
+                post_attn: fetch(&format!("blk.{i}.post_attention_norm.weight")).ok()
+                    .map(|v| self.upload(&gemma_norm(&v, &acfg), 1, d)),
+                post_ffn: fetch(&format!("blk.{i}.post_ffw_norm.weight")).ok()
+                    .map(|v| self.upload(&gemma_norm(&v, &acfg), 1, d)),
                 // MLA projections, when present. Loaded as f32 (not quantized): these are the small
                 // low-rank factors, and quantizing them is a separate question from quantizing the big
                 // weight matrices. GLM-5.2 (glm-dsa) names the reconstructed dims *_mla; both spellings
@@ -7157,7 +7183,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -8917,7 +8943,16 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             Some((k2, v2, l2)) => self.decode_attention_mh(&q, &k2, &v2, l2, ad, n_heads, n_kv_heads),
             None => self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads),
         };
-        let x2 = w.wo.apply_add(self, &attn, 1, x);
+        // Gemma normalizes the attention OUTPUT before the residual add (post_attention_norm), which is
+        // a different operation from the pre-attention norm already applied to the input.
+        let x2 = match &w.post_attn {
+            Some(pn) => {
+                let o = w.wo.apply(self, &attn, 1);
+                let on = self.rmsnorm_t(&o, pn, 1, d, eps);
+                self.add_t(x, &on)
+            }
+            None => w.wo.apply_add(self, &attn, 1, x),
+        };
         self.ffn_apply(w, &x2, 1, d, eps)
     }
     /// Staged-KV block decode: K/V for the current token go into the HOT f32 cache at its hot-relative
@@ -10901,6 +10936,21 @@ mod decode_cfg_tests {
         let qt2 = gpu.upload(&q, t, d);
         let pass = gpu.download(&gpu.qk_norm(qt2, &None, t, d, hd, eps));
         assert_eq!(pass, q, "no norm weight ⇒ unchanged");
+    }
+}
+
+/// Gemma's RMS norm is `x/rms(x) · (1 + w)` where every other architecture uses `x/rms(x) · w`.
+///
+/// Rather than a second kernel, the `1 +` is folded into the WEIGHT at load: `(1+w) · x/rms(x)` is
+/// exactly what the existing norm computes given `1+w`. One arithmetic change at load, no new shader, no
+/// per-call branch in the hot path — and nothing to keep in sync between two implementations.
+///
+/// The `1 +` is not cosmetic: Gemma ships norm weights centred near ZERO, so omitting it scales every
+/// normalized value by roughly w instead of 1+w, which is not a small error.
+fn gemma_norm(w: &[f32], acfg: &crate::archcfg::ArchConfig) -> Vec<f32> {
+    match acfg.norm {
+        crate::archcfg::Norm::RmsGemma => w.iter().map(|v| 1.0 + v).collect(),
+        crate::archcfg::Norm::Rms => w.to_vec(),
     }
 }
 
