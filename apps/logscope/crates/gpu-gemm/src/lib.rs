@@ -6079,6 +6079,15 @@ impl Model {
 
     /// Resident weight format, as a tuning-key component. A lever can pay at one precision and not
     /// another, so a verdict measured at q4 must not be reused for an int8-resident load.
+    /// (n_expert, n_used) when this model routes, for prefill chunk sizing. None for dense models.
+    ///
+    /// Read from the first MoE layer: every routed layer in a checkpoint shares the same counts, and a
+    /// model that mixed them would need per-layer chunking, which nothing supports.
+    pub fn moe_counts(&self) -> Option<(usize, usize)> {
+        self.layers.iter().find_map(|b| b.moe.as_ref())
+            .map(|m| (m.cfg.n_routed as usize, m.cfg.n_used as usize))
+    }
+
     /// Does any layer stream its experts from host memory? Changes what the prefill chunk should optimise
     /// for: refill traffic rather than dispatch duration.
     pub fn streams_experts(&self) -> bool {
