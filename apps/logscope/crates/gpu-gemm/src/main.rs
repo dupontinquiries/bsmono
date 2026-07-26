@@ -2488,9 +2488,16 @@ fn main() {
         let key = b"general.architecture";
         let kpos = patched.windows(key.len()).position(|w| w == key).expect("arch key present");
         let rel = patched[kpos..].windows(5).position(|w| w == b"llama").expect("arch value present");
-        patched[kpos + rel..kpos + rel + 5].copy_from_slice(b"qwen2"); // same length, in-place
+        // Patch to a genuinely UNSUPPORTED architecture. This used to write "qwen2", which was correct
+        // when qwen2 was unsupported and became a false expectation once it was implemented — the test
+        // then failed for years-of-commits reasons rather than a real defect. "gemma" is the same five
+        // bytes, maps to the Gemma2 config, and is unsupported (it still needs logit soft-capping).
+        patched[kpos + rel..kpos + rel + 5].copy_from_slice(b"gemma"); // same length, in-place
         match gpu.load_gguf_quantized(&patched) {
-            Err(e) => { ck("non-llama arch refused with guidance", e.contains("qwen2") && e.contains("llama.cpp")); if !(e.contains("qwen2")) { eprintln!("    got: {e}"); } }
+            Err(e) => {
+                ck("non-llama arch refused with guidance", e.contains("gemma") && e.contains("llama.cpp"));
+                if !e.contains("gemma") { eprintln!("    got: {e}"); }
+            }
             Ok(_) => ck("non-llama arch refused with guidance", false),
         }
         println!("gate-arch: {}", if ok { "architecture guard checks \u{2713}" } else { "FAIL \u{2717}" });
