@@ -328,6 +328,24 @@ mod tests {
     }
 
     #[test]
+    fn llama4_was_verified_at_graph_level_and_its_routing_is_sigmoid() {
+        // The graph-level read of llama4.cpp found no gaps. The single most load-bearing thing it
+        // confirmed is the expert gating: Llama-4 uses SIGMOID with the weight applied to the expert's
+        // INPUT and no normalization, where nearly every other MoE uses softmax over normalized weights.
+        // Getting that wrong would degrade output without any error, so it is worth a standing assertion
+        // rather than a note in a commit.
+        let c = crate::archcfg::for_arch("llama4");
+        let mc = crate::archcfg::moe_config(&c, 16, 1, 1);
+        assert_eq!(mc.norm, crate::moe::RouteNorm::Sigmoid, "llama.cpp: EXPERT_GATING_FUNC_TYPE_SIGMOID");
+        assert!(mc.weight_before, "the gate multiplies the expert INPUT");
+        assert!(!mc.normalize, "llama.cpp passes norm_w = false");
+        // and the contrast: qwen3moe is the ordinary softmax-over-normalized-weights case
+        let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
+        assert_eq!(q.norm, crate::moe::RouteNorm::Softmax);
+        assert!(!q.weight_before && q.normalize);
+    }
+
+    #[test]
     fn an_unknown_architecture_claims_nothing() {
         // Silence is honest: we have not transcribed requirements, which differs from knowing it needs
         // none. The loader's tensor-level wiring check is the backstop.
