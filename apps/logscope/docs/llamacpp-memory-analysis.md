@@ -159,3 +159,69 @@ in order of payoff:
 3. **Batch the syncs**: read back several layers' routing in one poll where the dependency allows.
 
 None of these is an upload optimization. The upload is already as fast as this hardware offers.
+
+## 7. Where our ceiling actually comes from — it is a Mesa policy, not hardware
+
+Read from `mesa-main/src/asahi/lib/agx_device.c`. The advertised limit is not the constraint:
+
+```c
+// hk_physical_device.c
+.maxMemoryAllocationSize = (1ull << 37),      // 128 GiB advertised
+```
+
+The real cut happens when Honeykrisp sets up the user VA window:
+
+```c
+// agx_device.c, agx_open_device()
+uint64_t kernel_size = MAX2(dev->params.vm_kernel_min_size, 32ull << 30);   // 32 GiB for the kernel
+uint64_t user_size   = vm_create.kernel_start - user_start;
+
+/* Round the user VA window to powers-of-two... */
+user_start = util_next_power_of_two64(user_start);
+user_size  = util_next_power_of_two64(user_size + 1) >> 1;
+
+/* ...so when we cut user size in half to emulate sparse buffers... */
+user_size /= 2;
+
+/* ...or maybe in quarters if necessary to disambiguate */
+if (user_size == user_start) {
+    user_size /= 2;
+}
+
+dev->sparse_ro_offset = user_size;
+util_vma_heap_init(&dev->main_heap, user_start, user_size);
+```
+
+Three reductions in a row, before a single byte is allocated:
+
+1. **32 GiB** off the top for the kernel heap.
+2. **Round DOWN to a power of two** — worst case loses almost half of what remains.
+3. **Halve it** (and possibly halve again) so one address bit can distinguish a read-only sparse alias of
+   every address. This is how Honeykrisp emulates sparse buffers without hardware support for them.
+
+`util_vma_heap_init(&dev->main_heap, user_start, user_size)` is the heap that "Failed to allocate BO VMA"
+comes from (agx_device.c:211). So our ~24 GiB ceiling is **address space Mesa reserved for a feature we do
+not use**, not a limit of the M2 or of the kernel.
+
+### What this means
+
+* **The ceiling is soft.** A local Mesa build with the sparse halving removed would roughly double the
+  usable VA window. The cost is that sparse buffer support breaks — which we do not use, and which is
+  ironic given `gpu-gemm` has a `sparse` feature: on this driver, sparse residency is *paid for* out of
+  exactly the address space it would then manage.
+* **This is worth confirming before acting on.** The numbers should be checked against the real device:
+  `dev->params.vm_end`, `vm_kernel_min_size`, and the resulting `main_heap` size. If the machine's user VA
+  is, say, 64 GiB before the halving, the arithmetic above lands close to the ~24 GiB we observe, which
+  would confirm the reading.
+* **Shipping a patched driver is a real option but a heavy one** — it means a forked Mesa on the user's
+  machine, rebuilt against each upstream release. Upstreaming a flag (`ASAHI_NO_SPARSE=1` skipping the
+  halving) would be the durable version, and is a small, well-motivated patch: the code already comments
+  exactly why the halving exists.
+* **A kernel change is NOT needed.** Everything above is userspace Mesa. That is a much lower bar than the
+  question assumed.
+
+### Honest caveat
+
+This is read from source, not measured. The next step is a small probe that prints the actual heap bounds
+on the M2 (the values are in `dev->params`), which would turn "the arithmetic suggests ~24 GiB" into a
+measured fact — the same discipline that settled the external-memory-host question.
