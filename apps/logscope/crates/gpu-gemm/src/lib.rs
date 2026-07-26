@@ -850,6 +850,9 @@ impl Gpu {
                 } else {
                     // non-OOM validation/internal errors: log loudly (these were the old default-panic set)
                     eprintln!("wgpu-engine: device error (non-fatal, logged): {msg}");
+                    if std::env::var("LOGSCOPE_DEVICE_ERROR_FATAL").is_ok() {
+                        panic!("LOGSCOPE_DEVICE_ERROR_FATAL: {msg}");
+                    }
                 }
             }));
         }
@@ -1444,6 +1447,9 @@ impl Gpu {
         // treats empty as "step failed, back off" rather than crashing.
         if self.oom_backoff() { return Vec::new(); }
         let bytes = (t.len() * 4) as u64;
+        debug_assert!(t.buf.size() >= bytes,
+            "download: tensor claims {}x{} ({} B) but its buffer holds {} B — shape/buffer mismatch at the enqueue site",
+            t.rows, t.cols, bytes, t.buf.size());
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
@@ -2135,6 +2141,7 @@ impl Gpu {
         // error, so bail early with an empty result once the device has signalled OOM this step.
         if self.oom_backoff() { return Vec::new(); }
         let bytes = (t.len() * 4) as u64;
+        debug_assert!(t.buf.size() >= bytes, "download-site: {}x{} needs {} B, buffer {} B", t.rows, t.cols, bytes, t.buf.size());
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         // If a frame is open, append the readback copy to it and flush the whole frame in one
@@ -4837,7 +4844,8 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
         // remainder. Only trust the MTP count if those trailing blocks genuinely lack attention tensors.
         let mtp = g.get_u32(&format!("{pfx}.nextn_predict_layers")).unwrap_or(0) as usize;
         let n = if mtp > 0 && mtp < n_blocks
-            && g.tensor(&format!("blk.{}.attn_q.weight", n_blocks - 1)).is_none() {
+            && g.tensor(&format!("blk.{}.attn_q.weight", n_blocks - 1)).is_none()
+            && g.tensor(&format!("blk.{}.attn_q_a.weight", n_blocks - 1)).is_none() {
             eprintln!("loader: {mtp} nextn-predict (MTP draft head) block(s) present, not loaded as layers — {} transformer layers", n_blocks - mtp);
             n_blocks - mtp
         } else { n_blocks };
@@ -5117,7 +5125,17 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             }
             // Qwen2 carries a bias on Q/K/V (llama doesn't). Fetch the f32 bias once so it can both
             // attach to the separate projections AND concatenate for the fused wqkv bias.
-            let has_qkv_bias = g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
+            // MLA q-compressed blocks (GLM-4.7-Flash, DeepSeek-V3: q_lora_rank > 0) ship NO
+            // attn_q/k/v — the low-rank factors loaded into `mla` below ARE the whole QKV.
+            // Same placeholder pattern as MoE's dense-FFN fields: tiny F32s, never bound
+            // (the forward matches `mla` first). Sniffed per BLOCK from the tensors, not
+            // from the config, so MTP draft blocks and mixed checkpoints stay honest.
+            // DeepSeek-V2-Lite (q_lora_rank == 0) keeps a real attn_q and takes the
+            // standard fetches below — its q is full-rank even though its KV is latent.
+            let mla_q = g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
+                && (g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
+                    || g.tensor(&format!("blk.{i}.attn_q_a_proj.weight")).is_some());
+            let has_qkv_bias = !mla_q && g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
             let (fbq, fbk, fbv) = if has_qkv_bias {
                 (fetch(&format!("blk.{i}.attn_q.bias"))?, fetch(&format!("blk.{i}.attn_k.bias"))?, fetch(&format!("blk.{i}.attn_v.bias"))?)
             } else { (Vec::new(), Vec::new(), Vec::new()) };
@@ -5127,7 +5145,7 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // Fused Q||K||V projection [d+2kv, d] (mirrors the wgate_up fusion): concatenate the q/k/v
             // weight ROWS then quantize — per-row quant of the concatenation is identical to quantizing
             // each separately (proven bit-exact by --gate-qkv). The bias concatenates the same way.
-            let wqkv = {
+            let wqkv = if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
                 let mut qkv = fetch(&format!("blk.{i}.attn_q.weight"))?;
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
@@ -5138,12 +5156,43 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
                     fused.with_bias(Some(self.upload(&b, 1, attn_dim + 2 * kv)))
                 } else { fused }
             };
+            let mla_w = {
+                let t = |a: &str, b: &str| -> Option<String> {
+                    let na = format!("blk.{i}.{a}.weight");
+                    if g.tensor(&na).is_some() { return Some(na); }
+                    let nb = format!("blk.{i}.{b}.weight");
+                    if g.tensor(&nb).is_some() { return Some(nb); }
+                    None
+                };
+                (|| -> Option<crate::mla::MlaWeightsT> {
+                    let (qa, qaln, qb) = (t("attn_q_a", "attn_q_a_proj")?, t("attn_q_a_norm", "attn_q_a_layernorm")?, t("attn_q_b", "attn_q_b_proj")?);
+                    let (kva, kvaln, kvb) = (t("attn_kv_a_mqa", "attn_kv_a")?, t("attn_kv_a_norm", "attn_kv_a_layernorm")?, t("attn_kv_b", "attn_kv_b_proj")?);
+                    let o = t("attn_output", "attn_out")?;
+                    let g1 = |n: &str| fetch(n).ok();
+                    Some(crate::mla::MlaWeightsT {
+                        q_a: self.upload_flat(&g1(&qa)?), q_a_ln: self.upload_flat(&g1(&qaln)?),
+                        q_b: self.upload_flat(&g1(&qb)?),
+                        kv_a: self.upload_flat(&g1(&kva)?), kv_a_ln: self.upload_flat(&g1(&kvaln)?),
+                        kv_b: self.upload_flat(&g1(&kvb)?),
+                        o: self.upload_flat(&g1(&o)?),
+                    })
+                })()
+            };
+            if mla_q && mla_w.is_none() {
+                return Err(format!(
+                    "blk.{i}: q-compressed MLA block (attn_q absent, attn_q_a present) but the MLA \
+tensor set is incomplete — need attn_q_a(+_norm)/attn_q_b, attn_kv_a_mqa(+_norm)/attn_kv_b, \
+attn_output (DeepSeek-V3 or *_proj GLM spellings)"));
+            }
             layers.push(BlockWeights {
                 g1: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.attn_norm.weight"))?, &acfg), 1, d),
                 wqkv,
-                wq: lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq),
-                wk: lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk),
-                wv: lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv),
+                wq: if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else { lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq) },
+                wk: if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else { lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk) },
+                wv: if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else { lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv) },
                 wo: lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)?,
                 g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
                     .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, &acfg), 1, d),
@@ -5433,28 +5482,7 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // low-rank factors, and quantizing them is a separate question from quantizing the big
                 // weight matrices. GLM-5.2 (glm-dsa) names the reconstructed dims *_mla; both spellings
                 // of the tensor names are accepted so one loader covers DeepSeek-V3 and GLM.
-                mla: {
-                    let t = |a: &str, b: &str| -> Option<String> {
-                        let na = format!("blk.{i}.{a}.weight");
-                        if g.tensor(&na).is_some() { return Some(na); }
-                        let nb = format!("blk.{i}.{b}.weight");
-                        if g.tensor(&nb).is_some() { return Some(nb); }
-                        None
-                    };
-                    (|| -> Option<crate::mla::MlaWeightsT> {
-                        let (qa, qaln, qb) = (t("attn_q_a", "attn_q_a_proj")?, t("attn_q_a_norm", "attn_q_a_layernorm")?, t("attn_q_b", "attn_q_b_proj")?);
-                        let (kva, kvaln, kvb) = (t("attn_kv_a_mqa", "attn_kv_a")?, t("attn_kv_a_norm", "attn_kv_a_layernorm")?, t("attn_kv_b", "attn_kv_b_proj")?);
-                        let o = t("attn_output", "attn_out")?;
-                        let g1 = |n: &str| fetch(n).ok();
-                        Some(crate::mla::MlaWeightsT {
-                            q_a: self.upload_flat(&g1(&qa)?), q_a_ln: self.upload_flat(&g1(&qaln)?),
-                            q_b: self.upload_flat(&g1(&qb)?),
-                            kv_a: self.upload_flat(&g1(&kva)?), kv_a_ln: self.upload_flat(&g1(&kvaln)?),
-                            kv_b: self.upload_flat(&g1(&kvb)?),
-                            o: self.upload_flat(&g1(&o)?),
-                        })
-                    })()
-                },
+                mla: mla_w,
                 // Sliding window, per layer. Read from metadata rather than assumed: the window size is
                 // `<arch>.attention.sliding_window`, and the layer pattern decides which layers use it.
                 // Llama-4 is CHUNKED (aligned blocks); Gemma is STANDARD (last n positions) — different

@@ -327,6 +327,78 @@ fn enc_q8_0(w: &[f32]) -> Vec<u8> {
 
 /// Serialize a HostModel as a q8_0 GGUF (weights as q8_0 type-8; norms/embed/biases f32). For
 /// --gate-q8direct, to exercise the loader's direct q8_0 → resident path end-to-end.
+/// Synthetic 1-layer deepseek2 checkpoint with q-compressed MLA (q_lora_rank > 0):
+/// attn_q_a(+norm)/attn_q_b + attn_kv_a_mqa(+norm)/attn_kv_b + attn_output, and NO
+/// attn_q/k/v — exactly the tensor shape of GLM-4.7-Flash, which the loader once
+/// refused with "missing tensor blk.0.attn_q.weight". Dims mirror --gate-mla-block
+/// (d=64, 2 heads, kv_lora=16, q_lora=32, nope=16, rope=8, v_head=16).
+fn write_gguf_deepseek2_mla() -> Vec<u8> {
+    let (d, heads, vocab, h) = (64usize, 2usize, 32usize, 128usize);
+    let (q_lora, kv_lora, nope, rope, v_head) = (32usize, 16usize, 16usize, 8usize, 16usize);
+    let qk_head = nope + rope;
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.05); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        let (t, by) = f32t(&w); ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    push("blk.0.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.attn_q_a.weight".into(), mat(q_lora, d), mk(21, q_lora * d));
+    push("blk.0.attn_q_a_norm.weight".into(), v1(q_lora), vec![1.0; q_lora]);
+    push("blk.0.attn_q_b.weight".into(), mat(heads * qk_head, q_lora), mk(22, heads * qk_head * q_lora));
+    push("blk.0.attn_kv_a_mqa.weight".into(), mat(kv_lora + rope, d), mk(23, (kv_lora + rope) * d));
+    push("blk.0.attn_kv_a_norm.weight".into(), v1(kv_lora), vec![1.0; kv_lora]);
+    push("blk.0.attn_kv_b.weight".into(), mat(heads * (nope + v_head), kv_lora), mk(24, heads * (nope + v_head) * kv_lora));
+    push("blk.0.attn_output.weight".into(), mat(d, heads * v_head), mk(25, d * heads * v_head));
+    push("blk.0.ffn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.ffn_gate.weight".into(), mat(h, d), mk(31, h * d));
+    push("blk.0.ffn_up.weight".into(), mat(h, d), mk(32, h * d));
+    push("blk.0.ffn_down.weight".into(), mat(d, h), mk(33, d * h));
+    push("output_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("output.weight".into(), mat(vocab, d), mk(41, vocab * d));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let s = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 13);
+    s(&mut b, "general.architecture"); u32b(&mut b, 8); s(&mut b, "deepseek2");
+    s(&mut b, "deepseek2.block_count"); u32b(&mut b, 4); u32b(&mut b, 1);
+    s(&mut b, "deepseek2.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    s(&mut b, "deepseek2.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    s(&mut b, "deepseek2.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    s(&mut b, "deepseek2.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    s(&mut b, "deepseek2.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    s(&mut b, "deepseek2.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 10000.0);
+    s(&mut b, "deepseek2.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    s(&mut b, "deepseek2.attention.kv_lora_rank"); u32b(&mut b, 4); u32b(&mut b, kv_lora as u32);
+    s(&mut b, "deepseek2.attention.q_lora_rank"); u32b(&mut b, 4); u32b(&mut b, q_lora as u32);
+    s(&mut b, "deepseek2.rope.dimension_count"); u32b(&mut b, 4); u32b(&mut b, rope as u32);
+    s(&mut b, "deepseek2.attention.key_length"); u32b(&mut b, 4); u32b(&mut b, qk_head as u32);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        s(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
@@ -3725,6 +3797,34 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         println!("gate-gemma: {}", if ok {
             "Gemma norm and activation are correct \u{2713}"
         } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-mla-load") {
+        // Regression for the GLM-4.7-Flash load failure: a q-compressed MLA checkpoint
+        // (q_lora_rank > 0) has NO blk.N.attn_q/k/v — the loader must take the MLA
+        // tensor set instead of failing with "missing tensor blk.0.attn_q.weight".
+        // The math is covered by --gate-mla-block; THIS gate is about the loader's
+        // per-block routing and that a loaded q-compressed model actually decodes.
+        let gpu = Gpu::new();
+        eprintln!("gate-mla-load: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let bytes = write_gguf_deepseek2_mla();
+        match gpu.load_gguf_quantized(&bytes) {
+            Err(e) => ck(&format!("q-compressed MLA gguf loads (was: 'missing tensor attn_q') — {e}"), false),
+            Ok(m) => {
+                ck("q-compressed MLA gguf loads", true);
+                ck("MLA config detected (q_lora=32, kv_lora=16)",
+                   m.mla.as_ref().map(|c| c.q_lora == 32 && c.kv_lora == 16).unwrap_or(false));
+                let c = gpu.new_cache_for(&m, 4);   // model-aware: attaches the MLA latent cache
+                let mut finite = true;
+                for (p, t) in [1u32, 5, 9].iter().enumerate() {
+                    let logits = gpu.decode_step(&m, &c, *t, p);
+                    finite &= logits.iter().all(|x| x.is_finite());
+                }
+                ck("3-token decode through the MLA path is finite", finite);
+            }
+        }
+        println!("gate-mla-load: {}", if ok { "q-compressed MLA loads + decodes \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-mla-block") {
