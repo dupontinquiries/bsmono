@@ -28,6 +28,10 @@ int ex_detail_generate(ex_greeble_t *out, int max,
   for (int p = 0; p < n_parts && n < level; p++) {
     const ex_detail_part_t *bp = &parts[p];
     float area = bp->sx*bp->sy + bp->sy*bp->sz + bp->sx*bp->sz;
+    if (area < 1e-5f) continue;   // a zeroed/collapsed part (e.g. BACK when the
+                                  // signature draws it separately): greebling it
+                                  // would yield 0-size boxes that render at full
+                                  // native size (the "default cube" bug).
     int quota = (int)((area / total_area) * level + 0.5f);
     if (quota < 1) quota = 1;
 
@@ -58,12 +62,12 @@ int ex_detail_generate(ex_greeble_t *out, int max,
       ex_greeble_shape shape;
       float gx, gy, gz, out_amt;
       float unit = fminf(fminf(bp->sx,bp->sy),bp->sz);
-      if (roll < 0.50f)      { shape=EX_GREEBLE_PLATE;  gx=unit*0.38f; gy=unit*0.06f; gz=unit*0.38f; out_amt=unit*0.04f; }
-      else if (roll < 0.74f) { shape=EX_GREEBLE_RIVET;  gx=gy=gz=unit*0.10f;          out_amt=unit*0.05f; }
-      else if (roll < 0.88f) { shape=EX_GREEBLE_VENT;   gx=unit*0.32f; gy=unit*0.04f; gz=unit*0.09f; out_amt=unit*0.03f; }
-      else if (roll < 0.96f) { shape=EX_GREEBLE_RIDGE;  gx=unit*0.55f; gy=unit*0.09f; gz=unit*0.08f; out_amt=unit*0.05f; }
-      else if (roll < 0.99f) { shape=EX_GREEBLE_SPIKE;  gx=gy=unit*0.07f; gz=unit*0.22f;             out_amt=unit*0.12f; }
-      else                   { shape=EX_GREEBLE_ANTENNA;gx=gz=unit*0.03f; gy=unit*0.42f;             out_amt=unit*0.24f; }
+      if (roll < 0.50f)      { shape=EX_GREEBLE_PLATE;  gx=unit*0.24f; gy=unit*0.04f; gz=unit*0.24f; out_amt=unit*0.03f; }
+      else if (roll < 0.74f) { shape=EX_GREEBLE_RIVET;  gx=gy=gz=unit*0.065f;          out_amt=unit*0.03f; }
+      else if (roll < 0.88f) { shape=EX_GREEBLE_VENT;   gx=unit*0.20f; gy=unit*0.03f; gz=unit*0.06f; out_amt=unit*0.02f; }
+      else if (roll < 0.96f) { shape=EX_GREEBLE_RIDGE;  gx=unit*0.34f; gy=unit*0.06f; gz=unit*0.05f; out_amt=unit*0.03f; }
+      else if (roll < 0.99f) { shape=EX_GREEBLE_SPIKE;  gx=gy=unit*0.05f; gz=unit*0.14f;             out_amt=unit*0.08f; }
+      else                   { shape=EX_GREEBLE_ANTENNA;gx=gz=unit*0.02f; gy=unit*0.26f;             out_amt=unit*0.15f; }
 
       // push the greeble slightly out along the face normal
       float nx = (face==0)?1:(face==1)?-1:0;

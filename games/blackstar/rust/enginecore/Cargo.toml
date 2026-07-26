@@ -1,0 +1,8 @@
+[package]
+name = "enginecore"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of the engine's PURE-LOGIC subsystems, differentially tested against the C they replace. Graphics, input and the game.c state machine deliberately stay in C."
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,3 @@
+imported_soldier_part0.iqm soldier_wep_assaultrifle_matinst.jpg body -1 0 0.00000 0.00000 0.00000
+imported_soldier_part1.iqm soldier_rb_soldiermultiaut_robo_.jpg body -1 0 0.00000 0.00000 0.00000
+imported_soldier_part2.iqm soldier_rb_soldieraut_cust_mat_i.jpg body -1 0 0.00000 0.00000 0.00000

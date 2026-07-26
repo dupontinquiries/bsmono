@@ -59,6 +59,7 @@ typedef struct {
   float blend_timer;      // counts down during TRANSFORMING
   float lock_timer;       // counts down during LOCKED
   float since_last_xform; // for EX_XFORM_MIN_INTERVAL_SEC guard
+  float dur_mul;          // transform-duration scale (chassis xform_dur_mul; 1.0 = default)
 
   // size class scales collider + profile at spawn time, see transform.c
   int size_class; // 0=Mini 1=Standard 2=Heavy 3=Titan, matches design doc order

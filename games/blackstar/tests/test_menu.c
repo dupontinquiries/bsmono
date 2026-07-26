@@ -11,7 +11,8 @@
 int main(void) {
   ex_campaign_t camp; ex_campaign_init(&camp);
   printf("campaign: %d missions, unlocked=%d\n", camp.count, camp.unlocked);
-  assert(camp.count == 4 && camp.missions[0].intro_slides > 0 && camp.missions[0].outro_slides > 0);
+  assert(camp.count > 0 && camp.count <= EX_MAX_MISSIONS &&
+         camp.missions[0].intro_slides > 0 && camp.missions[0].outro_slides > 0);
 
   ex_menu_t m; ex_menu_init(&m, &camp, 2);
   assert(m.state == EX_GS_TITLE);

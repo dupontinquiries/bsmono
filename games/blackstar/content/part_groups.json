@@ -1,0 +1,24 @@
+{
+  "_doc": "Exposes the raw IQM meshes as logical PART GROUPS. Every other content file references meshes by group + index, never by raw filename, so swapping the underlying art is a one-line change here. 'origin' tells the assembler how a mesh is anchored (center = pivot at mesh centre; base = pivot at the feet/mount; grip = weapon grip point).",
+  "groups": {
+    "torso":    { "slot": "chest",    "origin": "center", "meshes": ["pchest.iqm"] },
+    "head":     { "slot": "head",     "origin": "center", "meshes": ["phead.iqm"] },
+    "hand":     { "slot": "hand",     "origin": "center", "meshes": ["phand.iqm"] },
+    "limb":     { "slot": "limb",     "origin": "center", "meshes": ["plimb.iqm"] },
+    "joint":    { "slot": "joint",    "origin": "center", "meshes": ["psphere.iqm"] },
+    "bevel":    { "slot": "aux",      "origin": "center", "meshes": ["pbevel.iqm"] },
+    "cannon":   { "slot": "weapon",   "origin": "grip",   "meshes": [
+                    "weapon.iqm", "weapon_burst.iqm", "weapon_beam.iqm", "weapon_wave.iqm",
+                    "weapon_lob.iqm", "weapon_pierce.iqm", "weapon_flak.iqm", "weapon_plasma.iqm",
+                    "weapon_ricochet.iqm", "weapon_suppress.iqm" ] },
+    "backpiece":{ "slot": "back",     "origin": "base",   "meshes": [
+                    "spine_wing_cannon.iqm", "spine_heavy_cannon.iqm", "spine_crest.iqm",
+                    "spine_cable.iqm", "spine_harpoon.iqm", "spine_halo.iqm", "spine_solar.iqm",
+                    "spine_aegis.iqm", "spine_recon.iqm", "spine_mortar.iqm" ] },
+    "structure":{ "slot": "world",    "origin": "base",   "meshes": [
+                    "rock.iqm", "boulder.iqm", "spire.iqm", "column.iqm", "dome.iqm",
+                    "arch.iqm", "tower.iqm", "pillar.iqm" ] },
+    "prop":     { "slot": "world",    "origin": "base",   "meshes": [
+                    "deco_slab.iqm", "deco_pipe.iqm", "deco_antenna.iqm", "deco_crystal.iqm" ] }
+  }
+}

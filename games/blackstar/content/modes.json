@@ -1,0 +1,9 @@
+{
+  "_doc": "Skirmish/activity modes. 'waves' 0 = endless. 'rules' are the special flags each mode flips.",
+  "modes": {
+    "arena_fight": { "enum": "EX_MODE_ARENA_FIGHT", "waves": 8, "rules": [] },
+    "survival":    { "enum": "EX_MODE_SURVIVAL",    "waves": 0, "rules": ["endless"] },
+    "stalkers":    { "enum": "EX_MODE_STALKERS",    "waves": 0, "rules": ["endless", "horror_fog", "freeze_when_watched"] },
+    "defense":     { "enum": "EX_MODE_DEFEND",      "waves": 0, "rules": ["endless", "protect_core"] }
+  }
+}

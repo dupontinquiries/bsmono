@@ -7,6 +7,13 @@ mat4x4 projection_90deg;
 // shaders
 GLuint pointfbo_shader    = 0;
 GLuint forward_shader     = 0;
+/* SUN SHADOW MAP: one orthographic cascade following the camera, rendered along the
+   live planetary sun direction each frame (quality high+). */
+GLuint sunshadow_shader   = 0;
+GLuint sun_shadow_fbo = 0, sun_shadow_tex = 0;
+GLuint canvas_depth_tex = 0;   /* the canvas depth as a TEXTURE: SSAO + depth-aware post */
+#define SUN_SHADOW_RES 2048
+mat4x4 sun_light_mat;
 GLuint framebuffer_shader = 0;
 
 // buffers
@@ -31,6 +38,23 @@ void ex_render_init()
   /* -- SHADERS -- */
   pointfbo_shader  = ex_shader("pointfbo.glsl");
   framebuffer_shader = ex_shader("fboshader.glsl");
+  sunshadow_shader   = ex_shader("sunshadow.glsl");
+  { /* the sun's depth target: outside the map reads as depth 1.0 (fully lit) */
+    glGenFramebuffers(1, &sun_shadow_fbo);
+    glGenTextures(1, &sun_shadow_tex);
+    glBindTexture(GL_TEXTURE_2D, sun_shadow_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, SUN_SHADOW_RES, SUN_SHADOW_RES, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    float bcol[4] = {1.0f,1.0f,1.0f,1.0f};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, bcol);
+    glBindFramebuffer(GL_FRAMEBUFFER, sun_shadow_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, sun_shadow_tex, 0);
+    glDrawBuffer(GL_NONE); glReadBuffer(GL_NONE);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+  }
 
   // set up a 90 degree projection
   // mostly for omni-directional lights
@@ -131,6 +155,37 @@ void ex_render(ex_renderer_e renderer, ex_renderable_t *renderables)
   }
   /* ---------------------- */
 
+  /* -- SUN SHADOW PASS (high+): one ortho cascade centred ahead of the camera -- */
+  if (ex_gfx_quality >= 1.5f && ex_sun_strength > 0.03f && renderables->camera) {
+    {
+      ex_camera_matrices_t *scam = renderables->camera;
+      /* camera world position = inverse_view translation; forward = -Z axis of it */
+      float cpx = scam->inverse_view[3][0], cpy = scam->inverse_view[3][1], cpz = scam->inverse_view[3][2];
+      float cfx = -scam->inverse_view[2][0], cfz = -scam->inverse_view[2][2];
+      vec3 sd = { ex_sun_dir[0], ex_sun_dir[1], ex_sun_dir[2] };
+      float sl = sqrtf(sd[0]*sd[0]+sd[1]*sd[1]+sd[2]*sd[2]); if (sl < 0.001f){ sd[0]=0.35f; sd[1]=0.9f; sd[2]=0.35f; sl=1.0f; }
+      vec3 center = { cpx + cfx*45.0f, cpy, cpz + cfz*45.0f };
+      vec3 eye = { center[0] + sd[0]/sl*320.0f, center[1] + sd[1]/sl*320.0f, center[2] + sd[2]/sl*320.0f };
+      vec3 up = {0.0f, 1.0f, 0.0f};
+      mat4x4 lview, lproj;
+      mat4x4_look_at(lview, eye, center, up);
+      mat4x4_ortho(lproj, -150.0f, 150.0f, -150.0f, 150.0f, 1.0f, 800.0f);
+      mat4x4_mul(sun_light_mat, lproj, lview);
+      glViewport(0, 0, SUN_SHADOW_RES, SUN_SHADOW_RES);
+      glBindFramebuffer(GL_FRAMEBUFFER, sun_shadow_fbo);
+      glClear(GL_DEPTH_BUFFER_BIT);
+      glEnable(GL_CULL_FACE); glCullFace(GL_FRONT);   /* front-culling fights acne */
+      ex_shader_use(sunshadow_shader);
+      glUniformMatrix4fv(ex_uniform(sunshadow_shader, "u_light_mat"), 1, GL_FALSE, sun_light_mat[0]);
+      for (int j=0; j<models->count; j++) {
+        ex_model_t *model = (ex_model_t*)models->nodes[j].obj;
+        if (model->is_shadow) ex_render_model(model, sunshadow_shader);
+      }
+      glCullFace(GL_BACK);
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+  }
+  /* ----------------------------------------------------------------------- */
 
   /* -- RENDER PASS -- */
   switch (renderer) {
@@ -148,6 +203,22 @@ void ex_render(ex_renderer_e renderer, ex_renderable_t *renderables)
 float ex_clear_color[3] = {0.0f,0.0f,0.0f};
 float ex_fog_color[3] = {0.02f,0.02f,0.04f};
 float ex_fog_density = 0.010f;
+float ex_gfx_quality = 2.0f;   /* 0 mobile .. 3 ultra; scales shader effect cost */
+float ex_render_time = 0.0f;   /* seconds; drives animated procedural ground */
+/* PLANETARY SUN: direction/strength/colour driven by the game's day-cycle system.
+   Defaults reproduce the old hardcoded look exactly. */
+float ex_sun_dir[3]    = { 0.35f, 0.9f, 0.35f };
+float ex_sun_strength  = 0.62f;
+float ex_sun_color[3]  = { 1.0f, 1.0f, 1.0f };
+float ex_wetness       = 0.0f;   /* 0 dry .. 1 soaked: boosts env-reflection + glint */
+float ex_sun_uv[2]     = { 0.5f, 0.5f };   /* the sun's screen position (0..1), for the post lens flare */
+float ex_sun_vis       = 0.0f;             /* 0 offscreen/below .. 1 full flare */
+float ex_grade_warm[3] = { 1.0f, 0.92f, 0.80f };  /* highlight tint (per-world cinematography) */
+float ex_grade_cool[3] = { 0.78f, 0.86f, 1.0f };  /* shadow tint */
+float ex_cloud_amt     = 0.0f;   /* 0 clear/interior .. 1 heavy drifting cloud shadow */
+float ex_exposure      = 1.0f;   /* eye ADAPTATION: >1 = pupils open (night), lags behind the light */
+float ex_render_scale = 1.0f;  /* internal render resolution factor (0.5 .. 1.0) */
+int   ex_shadow_map_size = SHADOW_MAP_SIZE;  /* runtime shadow cubemap res (perf lever) */
 void ex_render_forward(ex_renderable_t *renderables)
 {
   /* INIT SOME STUFF */
@@ -178,9 +249,40 @@ void ex_render_forward(ex_renderable_t *renderables)
   ex_camera_matrices_t *camera = renderables->camera;
   glUniformMatrix4fv(ex_uniform(forward_shader, "u_projection"), 1, GL_FALSE, camera->projection[0]);
   glUniformMatrix4fv(ex_uniform(forward_shader, "u_view"), 1, GL_FALSE, camera->view[0]);
+  { /* project the planetary sun for the post-pass LENS FLARE: a far point along the
+       sun direction through view+projection -> screen uv + a visibility factor that
+       fades at the screen edges and dies when the sun is behind or below. */
+    float sd[3]={ex_sun_dir[0],ex_sun_dir[1],ex_sun_dir[2]};
+    float sl=sqrtf(sd[0]*sd[0]+sd[1]*sd[1]+sd[2]*sd[2]); if(sl<0.001f){sd[0]=0.35f;sd[1]=0.9f;sd[2]=0.35f;sl=1.0f;}
+    float cpx2=camera->inverse_view[3][0], cpy2=camera->inverse_view[3][1], cpz2=camera->inverse_view[3][2];
+    float wp[4]={cpx2+sd[0]/sl*2000.0f, cpy2+sd[1]/sl*2000.0f, cpz2+sd[2]/sl*2000.0f, 1.0f};
+    float vp4[4], cp4[4];
+    for(int r4=0;r4<4;r4++) vp4[r4]=camera->view[0][r4]*wp[0]+camera->view[1][r4]*wp[1]+camera->view[2][r4]*wp[2]+camera->view[3][r4]*wp[3];
+    for(int r4=0;r4<4;r4++) cp4[r4]=camera->projection[0][r4]*vp4[0]+camera->projection[1][r4]*vp4[1]+camera->projection[2][r4]*vp4[2]+camera->projection[3][r4]*vp4[3];
+    if (cp4[3] > 0.001f){
+      float sx=cp4[0]/cp4[3]*0.5f+0.5f, sy2=cp4[1]/cp4[3]*0.5f+0.5f;
+      ex_sun_uv[0]=sx; ex_sun_uv[1]=sy2;
+      float edge = fminf(fminf(sx,1.0f-sx), fminf(sy2,1.0f-sy2));         /* 0 at edge */
+      float ev = fmaxf(0.0f, fminf(1.0f, edge*4.0f));
+      float elv = fmaxf(0.0f, fminf(1.0f, (sd[1]/sl)*6.0f));              /* dies below horizon */
+      ex_sun_vis = ev*elv*fminf(1.0f, ex_sun_strength/0.35f);
+    } else ex_sun_vis = 0.0f;
+  }
   glUniformMatrix4fv(ex_uniform(forward_shader, "u_inverse_view"), 1, GL_FALSE, camera->inverse_view[0]);
   glUniform3fv(ex_uniform(forward_shader, "u_fog_color"), 1, ex_fog_color);
   glUniform1f(ex_uniform(forward_shader, "u_fog_density"), ex_fog_density);
+  glUniform1f(ex_uniform(forward_shader, "u_gfx_quality"), ex_gfx_quality);
+  glUniform1f(ex_uniform(forward_shader, "u_time"), ex_render_time);
+  glUniform3fv(ex_uniform(forward_shader, "u_sun_dir"), 1, ex_sun_dir);
+  glUniform1f(ex_uniform(forward_shader, "u_sun_strength"), ex_sun_strength);
+  glUniformMatrix4fv(ex_uniform(forward_shader, "u_sun_light_mat"), 1, GL_FALSE, sun_light_mat[0]);
+  glUniform1i(ex_uniform(forward_shader, "u_sun_shadow_on"), (ex_gfx_quality >= 1.5f && ex_sun_strength > 0.03f) ? 1 : 0);
+  glActiveTexture(GL_TEXTURE9);
+  glBindTexture(GL_TEXTURE_2D, sun_shadow_tex);
+  glUniform1i(ex_uniform(forward_shader, "u_sun_shadow"), 9);
+  glUniform3fv(ex_uniform(forward_shader, "u_sun_color"), 1, ex_sun_color);
+  glUniform1f(ex_uniform(forward_shader, "u_wetness"), ex_wetness);
+  glUniform1f(ex_uniform(forward_shader, "u_cloud_amt"), ex_cloud_amt);
 
   // first pass is ambient
   glDisable(GL_BLEND);
@@ -246,6 +348,18 @@ void ex_render_forward(ex_renderable_t *renderables)
   glBindVertexArray(framebuffer.vao);
   glActiveTexture(GL_TEXTURE0);
   glUniform1i(ex_uniform(framebuffer_shader, "u_texture"), 0);
+  glActiveTexture(GL_TEXTURE1);
+  glBindTexture(GL_TEXTURE_2D, canvas_depth_tex);
+  glUniform1i(ex_uniform(framebuffer_shader, "u_depth"), 1);
+  glActiveTexture(GL_TEXTURE0);
+  glUniform1f(ex_uniform(framebuffer_shader, "u_gfx_quality"), ex_gfx_quality);
+  glUniform2fv(ex_uniform(framebuffer_shader, "u_sun_uv"), 1, ex_sun_uv);
+  glUniform1f(ex_uniform(framebuffer_shader, "u_sun_vis"), ex_sun_vis);
+  glUniform3fv(ex_uniform(framebuffer_shader, "u_grade_warm"), 1, ex_grade_warm);
+  glUniform3fv(ex_uniform(framebuffer_shader, "u_grade_cool"), 1, ex_grade_cool);
+  glUniform1f(ex_uniform(framebuffer_shader, "u_time"), ex_render_time);
+  glUniform1f(ex_uniform(framebuffer_shader, "u_exposure"), ex_exposure);
+  glUniform1f(ex_uniform(framebuffer_shader, "u_upscale"), (ex_render_scale > 0.05f) ? 1.0f/ex_render_scale : 1.0f);
   glBindTexture(GL_TEXTURE_2D, framebuffer.cbo);
   glDrawArrays(GL_TRIANGLES, 0, 6);
   glBindVertexArray(0);
@@ -303,6 +417,7 @@ void ex_render_model(ex_model_t *model, GLuint shader)
     glUniform1i(ex_uniform(shader, "u_emissive_solid"), model->emissive_solid);
     glUniform3fv(ex_uniform(shader, "u_tint"), 1, model->tint);
     glUniform1f(ex_uniform(shader, "u_emission_strength"), model->emission_strength>0.0001f?model->emission_strength:1.0f);
+    glUniform1f(ex_uniform(shader, "u_mat_boost"), model->mat_boost>0.0001f?model->mat_boost:1.0f);
     ex_render_mesh(model->meshes[i], shader, model->instance_count);
   }
 }
@@ -382,7 +497,7 @@ void ex_render_point_light_begin(ex_point_light_t *light, GLuint shader)
   mat4x4_mul(light->transform[5], projection_90deg, light->transform[5]);
 
   // render to depth cube map
-  glViewport(0, 0, SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+  glViewport(0, 0, ex_shadow_map_size, ex_shadow_map_size);
   glBindFramebuffer(GL_FRAMEBUFFER, light->depth_map_fbo);
 
   glClear(GL_DEPTH_BUFFER_BIT);
@@ -436,14 +551,16 @@ void ex_render_resize(size_t width, size_t height)
   /* -- resze framebuffer -- */
   glBindFramebuffer(GL_FRAMEBUFFER, framebuffer.fbo);
 
-  framebuffer.width = display.width;
-  framebuffer.height = display.height;
+  framebuffer.width  = (size_t)((float)display.width  * ex_render_scale);
+  framebuffer.height = (size_t)((float)display.height * ex_render_scale);
+  if (framebuffer.width  < 16) framebuffer.width  = 16;
+  if (framebuffer.height < 16) framebuffer.height = 16;
 
   glBindTexture(GL_TEXTURE_2D, framebuffer.cbo);
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB10_A2, framebuffer.width, framebuffer.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
 
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_BORDER);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
@@ -452,11 +569,16 @@ void ex_render_resize(size_t width, size_t height)
   glBindTexture(GL_TEXTURE_2D, 0);
   glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, framebuffer.cbo, 0);
 
-  // depth buffer
-  glBindRenderbuffer(GL_RENDERBUFFER, framebuffer.rbo);
-  glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, framebuffer.width, framebuffer.height);
-  glBindRenderbuffer(GL_RENDERBUFFER, 0);
-  glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, framebuffer.rbo);
+  // depth buffer -- as a TEXTURE now, so the post pass can sample it (SSAO)
+  if (!canvas_depth_tex) glGenTextures(1, &canvas_depth_tex);
+  glBindTexture(GL_TEXTURE_2D, canvas_depth_tex);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, framebuffer.width, framebuffer.height, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_TEXTURE_2D, canvas_depth_tex, 0);
 
   // test framebuffer
   if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)

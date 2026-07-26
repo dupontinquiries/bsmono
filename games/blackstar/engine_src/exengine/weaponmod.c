@@ -10,6 +10,8 @@ const char* ex_weapon_mod_name(ex_weapon_mod_id id){
     case EX_MOD_ENERGON_CELL: return "energon cell"; case EX_MOD_RAPID_COIL: return "rapid coil";
     case EX_MOD_PIERCE_CORE: return "pierce core"; case EX_MOD_SCATTER_BARREL: return "scatter barrel";
     case EX_MOD_RIPPLE_COIL: return "ripple coil"; case EX_MOD_CRYO_ROUNDS: return "cryo rounds";
+    case EX_MOD_FLAK_CORE: return "flak core"; case EX_MOD_PLASMA_CORE: return "plasma core";
+    case EX_MOD_SUPPRESS_CORE: return "suppress core";
     default: return "none";
   }
 }
@@ -39,6 +41,10 @@ ex_weapon_profile_t ex_weapon_apply_mods(ex_watch_form_t form, const ex_weapon_m
       case EX_MOD_SCATTER_BARREL:p.pellets+=2; p.spread_deg+=8.0f; if(p.mode==EX_FIRE_BOLT)p.mode=EX_FIRE_BURST; break; // scatter
       case EX_MOD_RIPPLE_COIL:  p.mode=EX_FIRE_RICOCHET; p.cooldown*=1.05f; break;                    // ricochet conversion
       case EX_MOD_CRYO_ROUNDS:  p.slow = (p.slow<0.5f?0.5f:p.slow)+0.2f; break;                       // chilling slow
+      case EX_MOD_FLAK_CORE:    p.mode=EX_FIRE_FLAK;    p.cooldown*=1.15f; p.damage*=0.90f; break;     // airburst
+      case EX_MOD_PLASMA_CORE:  p.mode=EX_FIRE_PLASMA;  p.cooldown*=1.35f; p.damage*=1.15f; p.chains+=1; break; // heavy blast
+      case EX_MOD_SUPPRESS_CORE:p.mode=EX_FIRE_SUPPRESS;p.range*=1.30f; p.damage*=0.70f;
+                                p.slow=(p.slow<0.7f?0.7f:p.slow); break;                              // freeze beam
       default: break;
     }
   }

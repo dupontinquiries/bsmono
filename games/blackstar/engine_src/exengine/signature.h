@@ -24,6 +24,8 @@ typedef enum {
   EX_SIG_SOLAR,            // Pyre: a held star -- radiant core with corona spikes
   EX_SIG_AEGIS,            // Prime: a broad guardian arch over the shoulders
   EX_SIG_RECON,            // Scout: light swept sensor fins
+  EX_SIG_MORTAR,           // Siege: heavy shoulder mortar (gear breech + flared mouth)
+  EX_SIG_RAZOR,            // Executioner: twin swept dorsal blade fans
   EX_SIG_COUNT
 } ex_signature_t;
 

@@ -1,0 +1,33 @@
+{
+  "_doc": "Fire modes index the part_groups.cannon mesh list (so the gun model tracks the mode). Addons are loadout modifiers; a *_core addon converts the weapon to the named fire mode. element_affinity is the elemental form that naturally fires this mode.",
+  "fire_modes": {
+    "bolt":     { "enum": "EX_FIRE_BOLT",     "cannon": 0, "element_affinity": "any" },
+    "burst":    { "enum": "EX_FIRE_BURST",    "cannon": 1, "element_affinity": "wind" },
+    "beam":     { "enum": "EX_FIRE_BEAM",     "cannon": 2, "element_affinity": "light" },
+    "wave":     { "enum": "EX_FIRE_WAVE",     "cannon": 3, "element_affinity": "tsunami" },
+    "lob":      { "enum": "EX_FIRE_LOB",      "cannon": 4, "element_affinity": "magma" },
+    "pierce":   { "enum": "EX_FIRE_PIERCE",   "cannon": 5, "element_affinity": "titanium" },
+    "flak":     { "enum": "EX_FIRE_FLAK",     "cannon": 6, "element_affinity": "fire" },
+    "plasma":   { "enum": "EX_FIRE_PLASMA",   "cannon": 7, "element_affinity": "electricity" },
+    "ricochet": { "enum": "EX_FIRE_RICOCHET", "cannon": 8, "element_affinity": "metal" },
+    "suppress": { "enum": "EX_FIRE_SUPPRESS", "cannon": 9, "element_affinity": "ice" }
+  },
+  "addons": {
+    "long_barrel":  { "enum": "EX_MOD_LONG_BARREL",  "range_mul": 1.25 },
+    "scope":        { "enum": "EX_MOD_SCOPE",        "range_mul": 1.15, "spread_mul": 0.7 },
+    "ext_mag":      { "enum": "EX_MOD_EXT_MAG",      "cooldown_mul": 0.9 },
+    "underbarrel":  { "enum": "EX_MOD_UNDERBARREL",  "splash_add": 3 },
+    "stabilizer":   { "enum": "EX_MOD_STABILIZER",   "spread_mul": 0.6 },
+    "amplifier":    { "enum": "EX_MOD_AMPLIFIER",    "dmg_mul": 1.2 },
+    "chain_coil":   { "enum": "EX_MOD_CHAIN_COIL",   "chains_add": 1 },
+    "energon_cell": { "enum": "EX_MOD_ENERGON_CELL", "dmg_mul": 1.1, "cooldown_mul": 0.95 },
+    "rapid_coil":   { "enum": "EX_MOD_RAPID_COIL",   "cooldown_mul": 0.75 },
+    "pierce_core":  { "enum": "EX_MOD_PIERCE_CORE",   "converts_to": "pierce" },
+    "scatter_barrel":{"enum": "EX_MOD_SCATTER_BARREL","converts_to": "burst" },
+    "ripple_coil":  { "enum": "EX_MOD_RIPPLE_COIL",   "converts_to": "ricochet" },
+    "cryo_rounds":  { "enum": "EX_MOD_CRYO_ROUNDS",   "slow_add": 0.4 },
+    "flak_core":    { "enum": "EX_MOD_FLAK_CORE",     "converts_to": "flak" },
+    "plasma_core":  { "enum": "EX_MOD_PLASMA_CORE",   "converts_to": "plasma" },
+    "suppress_core":{ "enum": "EX_MOD_SUPPRESS_CORE", "converts_to": "suppress" }
+  }
+}

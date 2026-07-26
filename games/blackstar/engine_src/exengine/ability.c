@@ -63,6 +63,10 @@ int ex_ability_active_any(const ex_ability_loadout_t *l, ex_ability_id id){
     if (l->slots[i].id==id && l->slots[i].active_timer>0.0f) return 1;
   return 0;
 }
+int ex_loadout_has(const ex_ability_loadout_t *l, ex_ability_id id){
+  for (int i=0;i<l->count;i++) if (l->slots[i].id==id) return 1;
+  return 0;
+}
 void ex_loadout_update(ex_ability_loadout_t *l, float dt){
   for (int i=0;i<l->count;i++){
     ex_ability_t *a=&l->slots[i];

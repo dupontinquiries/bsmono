@@ -49,6 +49,7 @@ typedef struct {
   vec3 tint;                 // emissive/diffuse tint (default 1,1,1)
   int  emissive_solid;       // 1 = unlit models output PURE tint (bolts/fx)
   float emission_strength;   // per-model emission-map multiplier (0 = default 1.0)
+  float mat_boost;           // per-model material intensity: normal/spec/reflection amp (0/1 = default 1.0)
   uint8_t is_lit, is_shadow;
 
   ex_anim_t *current_anim;

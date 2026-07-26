@@ -31,6 +31,9 @@ static const ex_class_info_t CLASSES[EX_CLASS_COUNT] = {
   /* SCOUT     */ { "SCOUT", "recon -- fast and light, fragile, high mobility",
                     { 0 /*CAR*/, 10 /*CYCLE*/, 14 /*HAWK*/, 2 /*JET*/ },
                     0.72f, 1.35f, 55, 95, 75, 108 },
+  /* SIEGE     */ { "SIEGE", "artillery bombard -- long-range shells, slow but sturdy",
+                    { 1 /*TANK*/, 11 /*GUNSHIP*/, 15 /*CRAB*/, 9 /*MECH*/ },
+                    1.25f, 0.75f, 105, 155, 135, 106 },
 };
 
 const ex_class_info_t *ex_class_info(ex_class_t c)

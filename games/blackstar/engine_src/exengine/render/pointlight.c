@@ -1,3 +1,4 @@
+#include "render/renderer.h"
 #include <stdlib.h>
 #include <string.h>
 #include "render/pointlight.h"
@@ -16,7 +17,7 @@ ex_point_light_t *ex_point_light_new(vec3 pos, vec3 color, int dynamic)
   glBindTexture(GL_TEXTURE_CUBE_MAP, l->depth_map);
   for (int i=0; i<6; i++)
     glTexImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, GL_DEPTH_COMPONENT16,
-      SHADOW_MAP_SIZE, SHADOW_MAP_SIZE, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+      ex_shadow_map_size, ex_shadow_map_size, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
 
   glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_CUBE_MAP, GL_TEXTURE_MIN_FILTER, GL_NEAREST);

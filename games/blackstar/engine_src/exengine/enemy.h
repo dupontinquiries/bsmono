@@ -52,6 +52,14 @@ typedef struct {
 
   int   wants_to_fire;  // set true on the frame a shot should be spawned
 
+  // --- Destiny "owned space": which line this enemy holds and how far it
+  //     stands off. Front (0) pushes close, middle (1) holds mid, back (2)
+  //     holds far (anchors/snipers). Enemies HOLD their zone at standoff
+  //     range rather than all swarming, and advance a line when their zone
+  //     collapses (enough of that line has been cleared). ---
+  int   zone;           // 0 front, 1 middle, 2 back
+  float standoff;       // preferred distance from the player to hold at
+
   // --- Corrupted infection (from the Jhiaxus/Corrupted design) ---
   int   stage;          // 0 (n/a) or 1..3: wrong-geometry -> mid -> full
   float stage_timer;    // time in current stage; escalates over time
@@ -64,6 +72,16 @@ typedef struct {
   float summon_timer;   // counts down to summoning adds
   int   wants_slam;     // set the frame a slam should resolve
   int   wants_summon;   // set the frame adds should spawn
+
+  // --- commander / squad cohesion ---
+  //   A COMMANDER coordinates a squad: while it lives its troops hold their
+  //   zones with discipline. Kill it and the squad SCATTERS -- they break
+  //   formation, panic-flee for scatter_t seconds, then fight on demoralized
+  //   (wider standoff, worse cadence) unless another commander rallies them.
+  int   is_commander;   // 1 if this enemy leads a squad
+  int   squad;          // leader id this troop answers to (-1 = independent)
+  float scatter_t;      // >0: leaderless panic countdown (breaks zone discipline)
+  int   demoralized;    // 1 after scattering with no commander left
 } ex_enemy_t;
 
 /**

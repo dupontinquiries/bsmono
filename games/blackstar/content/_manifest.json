@@ -1,0 +1,309 @@
+{
+  "counts": {
+    "part_groups": 0,
+    "chassis": 0,
+    "signatures": 0,
+    "weapons": 0,
+    "abilities": 0,
+    "troops": 0,
+    "maps": 0,
+    "modes": 0,
+    "missions": 0,
+    "animations": 0,
+    "styling": 0,
+    "bots": 0
+  },
+  "summary": {
+    "part_groups": 10,
+    "chassis": 7,
+    "signatures": 10,
+    "fire_modes": 10,
+    "addons": 16,
+    "abilities": 9,
+    "troops": 17,
+    "maps": 16,
+    "modes": 4,
+    "missions": 8
+  },
+  "troops": {
+    "vanguard": {
+      "kind": "player_class",
+      "chassis": "standard",
+      "signature": "wing_cannon",
+      "backpiece_mesh": "spine_wing_cannon.iqm",
+      "fire_mode": "bolt",
+      "cannon_mesh": "weapon.iqm",
+      "abilities": [
+        "dash",
+        "overclock"
+      ],
+      "tint": [
+        150,
+        170,
+        200
+      ]
+    },
+    "interceptor": {
+      "kind": "player_class",
+      "chassis": "angular",
+      "signature": "recon",
+      "backpiece_mesh": "spine_recon.iqm",
+      "fire_mode": "burst",
+      "cannon_mesh": "weapon_burst.iqm",
+      "abilities": [
+        "dash",
+        "cloak"
+      ],
+      "tint": [
+        120,
+        200,
+        180
+      ]
+    },
+    "titan": {
+      "kind": "player_class",
+      "chassis": "juggernaut",
+      "signature": "heavy_cannon",
+      "backpiece_mesh": "spine_heavy_cannon.iqm",
+      "fire_mode": "plasma",
+      "cannon_mesh": "weapon_plasma.iqm",
+      "abilities": [
+        "shield",
+        "hover"
+      ],
+      "tint": [
+        200,
+        150,
+        90
+      ]
+    },
+    "specialist": {
+      "kind": "player_class",
+      "chassis": "strider",
+      "signature": "cable",
+      "backpiece_mesh": "spine_cable.iqm",
+      "fire_mode": "beam",
+      "cannon_mesh": "weapon_beam.iqm",
+      "abilities": [
+        "turret",
+        "overclock"
+      ],
+      "tint": [
+        160,
+        140,
+        200
+      ]
+    },
+    "reaver": {
+      "kind": "player_class",
+      "chassis": "raptor",
+      "signature": "harpoon",
+      "backpiece_mesh": "spine_harpoon.iqm",
+      "fire_mode": "ricochet",
+      "cannon_mesh": "weapon_ricochet.iqm",
+      "abilities": [
+        "dash",
+        "blink"
+      ],
+      "tint": [
+        200,
+        100,
+        110
+      ]
+    },
+    "warden": {
+      "kind": "player_class",
+      "chassis": "bruiser",
+      "signature": "aegis",
+      "backpiece_mesh": "spine_aegis.iqm",
+      "fire_mode": "suppress",
+      "cannon_mesh": "weapon_suppress.iqm",
+      "abilities": [
+        "shield",
+        "turret"
+      ],
+      "tint": [
+        120,
+        160,
+        210
+      ]
+    },
+    "pyre": {
+      "kind": "player_class",
+      "chassis": "angular",
+      "signature": "solar",
+      "backpiece_mesh": "spine_solar.iqm",
+      "fire_mode": "flak",
+      "cannon_mesh": "weapon_flak.iqm",
+      "abilities": [
+        "overclock",
+        "dash"
+      ],
+      "tint": [
+        230,
+        130,
+        60
+      ]
+    },
+    "prime": {
+      "kind": "player_class",
+      "chassis": "sentinel",
+      "signature": "halo",
+      "backpiece_mesh": "spine_halo.iqm",
+      "fire_mode": "wave",
+      "cannon_mesh": "weapon_wave.iqm",
+      "abilities": [
+        "shield",
+        "resonance"
+      ],
+      "tint": [
+        210,
+        60,
+        60
+      ]
+    },
+    "scout": {
+      "kind": "player_class",
+      "chassis": "raptor",
+      "signature": "recon",
+      "backpiece_mesh": "spine_recon.iqm",
+      "fire_mode": "lob",
+      "cannon_mesh": "weapon_lob.iqm",
+      "abilities": [
+        "cloak",
+        "hover"
+      ],
+      "tint": [
+        140,
+        200,
+        120
+      ]
+    },
+    "siege": {
+      "kind": "player_class",
+      "chassis": "juggernaut",
+      "signature": "mortar",
+      "backpiece_mesh": "spine_mortar.iqm",
+      "fire_mode": "lob",
+      "cannon_mesh": "weapon_lob.iqm",
+      "abilities": [
+        "shield",
+        "turret"
+      ],
+      "tint": [
+        170,
+        150,
+        120
+      ]
+    },
+    "grunt": {
+      "kind": "enemy",
+      "chassis": "standard",
+      "signature": "wing_cannon",
+      "backpiece_mesh": "spine_wing_cannon.iqm",
+      "fire_mode": "bolt",
+      "cannon_mesh": "weapon.iqm",
+      "abilities": [],
+      "tint": [
+        130,
+        130,
+        140
+      ]
+    },
+    "blackstar_raider": {
+      "kind": "enemy",
+      "chassis": "angular",
+      "signature": "harpoon",
+      "backpiece_mesh": "spine_harpoon.iqm",
+      "fire_mode": "pierce",
+      "cannon_mesh": "weapon_pierce.iqm",
+      "abilities": [
+        "dash"
+      ],
+      "tint": [
+        180,
+        90,
+        200
+      ]
+    },
+    "ravager": {
+      "kind": "enemy",
+      "chassis": "bruiser",
+      "signature": "heavy_cannon",
+      "backpiece_mesh": "spine_heavy_cannon.iqm",
+      "fire_mode": "flak",
+      "cannon_mesh": "weapon_flak.iqm",
+      "abilities": [],
+      "tint": [
+        200,
+        110,
+        70
+      ]
+    },
+    "slipstream": {
+      "kind": "enemy",
+      "chassis": "raptor",
+      "signature": "recon",
+      "backpiece_mesh": "spine_recon.iqm",
+      "fire_mode": "burst",
+      "cannon_mesh": "weapon_burst.iqm",
+      "abilities": [
+        "dash"
+      ],
+      "tint": [
+        110,
+        190,
+        210
+      ]
+    },
+    "ashfall_lancer": {
+      "kind": "variant",
+      "chassis": "raptor",
+      "signature": "solar",
+      "backpiece_mesh": "spine_solar.iqm",
+      "fire_mode": "flak",
+      "cannon_mesh": "weapon_flak.iqm",
+      "abilities": [
+        "dash",
+        "overclock"
+      ],
+      "tint": [
+        255,
+        120,
+        60
+      ]
+    },
+    "hoarfrost_sentinel": {
+      "kind": "variant",
+      "chassis": "sentinel",
+      "signature": "aegis",
+      "backpiece_mesh": "spine_aegis.iqm",
+      "fire_mode": "suppress",
+      "cannon_mesh": "weapon_suppress.iqm",
+      "abilities": [
+        "shield"
+      ],
+      "tint": [
+        150,
+        200,
+        255
+      ]
+    },
+    "magma_breaker": {
+      "kind": "variant",
+      "chassis": "bruiser",
+      "signature": "mortar",
+      "backpiece_mesh": "spine_mortar.iqm",
+      "fire_mode": "lob",
+      "cannon_mesh": "weapon_lob.iqm",
+      "abilities": [
+        "shield"
+      ],
+      "tint": [
+        230,
+        90,
+        40
+      ]
+    }
+  }
+}

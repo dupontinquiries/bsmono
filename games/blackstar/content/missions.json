@@ -1,0 +1,14 @@
+{
+  "_doc": "The campaign as a data chain. Each mission references a map, an objective, and (optionally) a champion troop. 'order' is the sequence. This mirrors campaign.c so the arc can be re-planned in JSON before touching C.",
+  "objectives": ["eliminate", "survive", "breach", "control", "protect"],
+  "missions": [
+    { "order": 1, "id": "the_pluto_line",      "map": "pluto",     "objective": "eliminate", "champion": "hoarfrost_sentinel", "beat": "hold the outer containment line; Cryotek attacks" },
+    { "order": 2, "id": "the_scavenger_king",  "map": "outer_rim", "objective": "eliminate", "champion": "blackstar_raider",   "beat": "Blackstar the Kuiper warlord" },
+    { "order": 3, "id": "the_red_extraction",  "map": "mars",      "objective": "breach",    "champion": null,                 "beat": "tear the Mars extraction rig apart; the shard is already gone" },
+    { "order": 4, "id": "the_beach_opens",     "map": "beach",     "objective": "protect",   "champion": null,                 "beat": "Earth's shore tears open; get the civilians clear" },
+    { "order": 5, "id": "what_jhiaxus_grew",   "map": "vault",     "objective": "eliminate", "champion": null,                 "beat": "the architect of the Corrupted" },
+    { "order": 6, "id": "the_mantle_dive",     "map": "foundry",   "objective": "control",   "champion": null,                 "beat": "Hot Rod becomes Rodimus" },
+    { "order": 7, "id": "the_drowned_approach","map": "trench",    "objective": "survive",   "champion": null,                 "beat": "hold the descent as the Corrupted converge on the wound" },
+    { "order": 8, "id": "beneath_the_pacific", "map": "cybertron", "objective": "eliminate", "champion": null,                 "beat": "Unicron; the truce; the gravity well" }
+  ]
+}

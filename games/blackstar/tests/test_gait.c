@@ -43,7 +43,8 @@ int main(void){
     bob_still += fabsf(s2[EX_PART_CHEST].offset[1]-1.35f);
   }
   printf("torso bob: moving=%.3f still=%.3f\n", bob_move, bob_still);
-  assert(bob_move > 0.1f && bob_still < 1e-4f);
+  // idle has a small breath/sway; moving must bob substantially MORE (not zero-idle)
+  assert(bob_move > 0.5f && bob_move > bob_still * 2.0f);
 
   // element tints differ (ice vs fire)
   ex_part_pose_t ice[EX_ROBOT_PARTS], fire[EX_ROBOT_PARTS];

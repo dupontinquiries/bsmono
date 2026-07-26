@@ -25,6 +25,9 @@ typedef enum {
   EX_MOD_SCATTER_BARREL,// scatter conversion: +pellets, +spread (a spread shot)
   EX_MOD_RIPPLE_COIL,   // ricochet conversion: rounds bounce off walls
   EX_MOD_CRYO_ROUNDS,   // adds a chilling slow to whatever it hits
+  EX_MOD_FLAK_CORE,     // airburst conversion: shots detonate for splash
+  EX_MOD_PLASMA_CORE,   // heavy-blast conversion: a big electric ball, +chains
+  EX_MOD_SUPPRESS_CORE, // freeze-beam conversion: long reach, heavy slow, low dmg
   EX_MOD_COUNT
 } ex_weapon_mod_id;
 

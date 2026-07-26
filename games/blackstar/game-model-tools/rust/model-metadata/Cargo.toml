@@ -1,0 +1,9 @@
+[package]
+name = "model-metadata"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "model-metadata"
+path = "src/main.rs"

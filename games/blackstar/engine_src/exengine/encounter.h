@@ -39,6 +39,15 @@ int ex_encounter_spawn(ex_encounter_t *e, ex_enemy_kind kind, ex_element_t el,
                        vec3 pos, float hp);
 
 /**
+ * [ex_encounter_spawn_squad spawn a commander + a ring of troops bound to it;
+ *  killing the commander scatters exactly this squad. Returns commander index]
+ */
+int ex_encounter_spawn_squad(ex_encounter_t *e, ex_enemy_kind cmd_kind,
+                             ex_enemy_kind troop_kind, ex_element_t el,
+                             vec3 center, float cmd_hp, float troop_hp,
+                             int n_troops, float ring_r);
+
+/**
  * [ex_encounter_spawn_makeup scatter `grunts` + `corrupted` enemies around a
  *  ring inside the arena bounds, deterministic per seed]
  */
@@ -52,6 +61,20 @@ void ex_encounter_spawn_makeup(ex_encounter_t *e, int grunts, int corrupted, int
  */
 void ex_encounter_update(ex_encounter_t *e, ex_chunk_world_t *chunks,
                          vec3 player_pos, float dt);
+
+/**
+ * [ex_encounter_update_zones collapse a cleared front line, advancing the
+ *  survivors forward (Destiny owned-space progression). Called by
+ *  ex_encounter_update; exposed for testing.]
+ */
+void ex_encounter_update_zones(ex_encounter_t *e);
+
+/**
+ * [ex_encounter_update_command commander cohesion: when a squad's commander
+ *  dies its surviving troops scatter (panic-flee, then fight on demoralized);
+ *  a squad that still has a live commander stays disciplined]
+ */
+void ex_encounter_update_command(ex_encounter_t *e, float dt);
 
 /**
  * [ex_encounter_targets fill a target array with live enemies; returns count]

@@ -1,0 +1,217 @@
+{
+  "model": {
+    "name": "arena_bot_parts",
+    "type": "shared_part_templates",
+    "comment": "CAD-style layered spec for the game's shared bot part meshes (docs/ART_BIBLE.md rungs 1-5). gen_props.py compiles each assembly below into an IQM. Layer order follows the reference pipeline: frame -> actuator -> armor -> detail. Engine articulation, per-part color, weathering, and alt-mode reshaping all live in robot_parts.c and operate on these templates per slot.",
+    "coordinate_system": { "up": "Y", "forward": "Z", "origin": "part_center", "units": "part-local half-extents (engine scales per slot)" }
+  },
+
+  "materials": {
+    "comment": "Meshes carry a base texture; final color is engine-side per-part tint (element tint + two-tone + rung-5 weathering + accent pass in robot_parts.c).",
+    "plate": { "texture": "plate_blue.png", "role": "armor + frame default" }
+  },
+
+  "proportions_reference": {
+    "comment": "Mirrors robot_parts.c body archetypes (do not edit here; documentation of the live values).",
+    "racer_beast":  { "calf": 1.55, "thigh": 0.82, "torso": 0.78, "torso_w": 1.18, "arm": 0.92, "stance": 1.05 },
+    "siege":        { "calf": 0.85, "thigh": 0.80, "torso": 0.85, "torso_w": 1.55, "arm": 1.10, "stance": 1.35 },
+    "flyer":        { "calf": 1.25, "thigh": 1.15, "torso": 0.95, "torso_w": 0.86, "arm": 1.05, "stance": 0.92 },
+    "balanced":     { "calf": 1.30, "thigh": 0.88, "torso": 0.86, "torso_w": 1.06 }
+  },
+
+  "joints_reference": {
+    "comment": "Engine-side articulation (robot_parts.c gait/pose system).",
+    "elbows_knees": { "type": "hinge", "mechanism": "pose-driven swing" },
+    "shoulders_hips": { "type": "ball", "mechanism": "pose-driven" },
+    "neck": { "type": "limited_rotation" }
+  },
+
+  "transform_map_reference": {
+    "comment": "Robot<->vehicle identity map (mirrors robot_parts.c vehicle branch): every part has two lives.",
+    "chest": "hull wedge", "head": "cab", "visor": "windshield",
+    "shoulders": "fenders", "arms": "front wheels", "thighs": "rear wheels",
+    "shins": "exhausts", "back": "turret hump", "hands_feet": "hull nubs"
+  },
+
+  "variants": {
+    "comment": "Named frames compiled from the SAME assemblies (the reference doc's 'Optimus G1 / Movie / Heavy Armor from one generator'). Each variant = base components + adds - drops, emitted as p<part>_<variant>.iqm. Engine routes: player wears prime; warlord champions swap to corsair on promotion.",
+    "watch": {
+      "style": "elemental god-form (film: the Watch, 'the 12+1') -- a body of pure element, grander and stranger than any warlord",
+      "overrides": {
+        "phead": {
+          "drop": ["crest_fin", "helmet_crown_plate", "antenna"],
+          "add": [
+            { "name": "halo_spike_c", "layer": "armor",  "type": "cyl", "r0": 0.20, "r1": 0.02, "h": 1.35, "segs": 6, "rings": 2, "pos": [0, 1.15, -0.05] },
+            { "name": "halo_spike_s", "layer": "armor",  "type": "cyl", "r0": 0.16, "r1": 0.02, "h": 1.05, "segs": 6, "rings": 2, "pos": [0.42, 1.02, -0.05], "mirror_x": true },
+            { "name": "halo_spike_o", "layer": "armor",  "type": "cyl", "r0": 0.13, "r1": 0.02, "h": 0.80, "segs": 6, "rings": 2, "pos": [0.76, 0.82, -0.05], "mirror_x": true },
+            { "name": "third_eye",    "layer": "detail", "type": "bevel_box", "dims": [0.14, 0.14, 0.10], "bevel": 0.04, "pos": [0, 0.42, 0.78] }
+          ]
+        },
+        "pchest": {
+          "add": [
+            { "name": "core_ring",    "layer": "detail",   "type": "cyl", "r0": 0.30, "r1": 0.30, "h": 0.14, "segs": 12, "rings": 2, "pos": [0, 0.10, 0.74] },
+            { "name": "core_gem",     "layer": "detail",   "type": "bevel_box", "dims": [0.18, 0.18, 0.16], "bevel": 0.05, "pos": [0, 0.10, 0.82] },
+            { "name": "mantle_wing",  "layer": "armor",    "type": "bevel_box", "dims": [0.14, 0.75, 0.40], "bevel": 0.06, "pos": [0.95, 0.55, -0.30], "mirror_x": true }
+          ]
+        },
+        "ppauldron": {
+          "add": [
+            { "name": "antler_main",  "layer": "armor",  "type": "cyl", "r0": 0.13, "r1": 0.015, "h": 0.90, "segs": 6, "rings": 2, "pos": [0.32, 0.95, 0.0] },
+            { "name": "antler_fork1", "layer": "armor",  "type": "cyl", "r0": 0.08, "r1": 0.01, "h": 0.50, "segs": 5, "rings": 2, "pos": [0.10, 1.05, 0.20] },
+            { "name": "antler_fork2", "layer": "armor",  "type": "cyl", "r0": 0.08, "r1": 0.01, "h": 0.50, "segs": 5, "rings": 2, "pos": [0.52, 1.05, -0.20] }
+          ]
+        }
+      }
+    },
+
+    "prime": {
+      "style": "heroic hero frame (reference doc: helmet_crown, chest windows, truck identity worn proudly)",
+      "overrides": {
+        "phead": {
+          "add": [
+            { "name": "crown_fin_tall", "layer": "armor", "type": "bevel_box", "dims": [0.07, 0.62, 0.44], "bevel": 0.05, "pos": [0, 0.98, 0.02] },
+            { "name": "helm_side_fin",  "layer": "armor", "type": "bevel_box", "dims": [0.06, 0.34, 0.30], "bevel": 0.04, "pos": [0.52, 0.88, -0.02], "mirror_x": true },
+            { "name": "face_mask",      "layer": "armor", "type": "bevel_box", "dims": [0.50, 0.26, 0.10], "bevel": 0.05, "pos": [0, -0.36, 0.82] }
+          ]
+        },
+        "pchest": {
+          "add": [
+            { "name": "chest_window",   "layer": "detail", "type": "bevel_box", "dims": [0.30, 0.26, 0.06], "bevel": 0.02, "pos": [0.40, 0.42, 0.80], "mirror_x": true },
+            { "name": "bumper_band",    "layer": "armor",  "type": "bevel_box", "dims": [0.82, 0.10, 0.10], "bevel": 0.03, "pos": [0, -0.94, 0.42] }
+          ]
+        },
+        "ppauldron": {
+          "add": [
+            { "name": "smokestack",     "layer": "actuator", "type": "cyl", "r0": 0.10, "r1": 0.085, "h": 0.9, "segs": 8, "rings": 2, "pos": [0.30, 0.85, -0.28] }
+          ]
+        }
+      }
+    },
+    "corsair": {
+      "style": "Blackstar warlord frame ('a body of welded wreckage, every plate torn from a rival's hull')",
+      "overrides": {
+        "phead": {
+          "drop": ["crest_fin", "helmet_crown_plate"],
+          "add": [
+            { "name": "horn_spike",     "layer": "armor",  "type": "cyl", "r0": 0.17, "r1": 0.02, "h": 0.85, "segs": 6, "rings": 2, "pos": [0.42, 1.05, -0.06], "mirror_x": true },
+            { "name": "visor_slit_wide","layer": "detail", "type": "bevel_box", "dims": [0.66, 0.06, 0.11], "bevel": 0.02, "pos": [0, 0.04, 0.81] }
+          ]
+        },
+        "pchest": {
+          "add": [
+            { "name": "naval_band_hi",  "layer": "armor",  "type": "bevel_box", "dims": [1.04, 0.09, 0.10], "bevel": 0.02, "pos": [0, 0.52, 0.62] },
+            { "name": "naval_band_lo",  "layer": "armor",  "type": "bevel_box", "dims": [1.04, 0.09, 0.10], "bevel": 0.02, "pos": [0, -0.48, 0.64] },
+            { "name": "collar_spike",   "layer": "detail", "type": "cyl", "r0": 0.06, "r1": 0.01, "h": 0.30, "segs": 5, "rings": 2, "pos": [0.55, 1.02, 0.28], "mirror_x": true }
+          ]
+        },
+        "ppauldron": {
+          "add": [
+            { "name": "pauldron_spike", "layer": "armor",  "type": "cyl", "r0": 0.14, "r1": 0.02, "h": 0.72, "segs": 6, "rings": 2, "pos": [0.34, 0.95, 0.0] },
+            { "name": "pauldron_spike2","layer": "armor",  "type": "cyl", "r0": 0.11, "r1": 0.02, "h": 0.55, "segs": 6, "rings": 2, "pos": [-0.28, 0.90, 0.22] }
+          ]
+        }
+      }
+    }
+  },
+
+  "assemblies": {
+
+    "phead": {
+      "output": "phead.iqm", "texture": "plate_blue.png",
+      "components": [
+        { "name": "cranium",        "layer": "armor",    "type": "bevel_box", "dims": [0.85, 0.80, 0.82], "bevel": 0.28, "pos": [0, 0, 0] },
+        { "name": "cheek_panel",    "layer": "armor",    "type": "bevel_box", "dims": [0.16, 0.50, 0.40], "bevel": 0.10, "pos": [0.72, -0.16, 0.34], "mirror_x": true },
+        { "name": "faceplate",      "layer": "armor",    "type": "bevel_box", "dims": [0.60, 0.42, 0.20], "bevel": 0.14, "pos": [0, -0.28, 0.70] },
+        { "name": "visor_band",     "layer": "detail",   "type": "bevel_box", "dims": [0.52, 0.10, 0.10], "bevel": 0.03, "pos": [0, 0.02, 0.80] },
+        { "name": "brow_ridge",     "layer": "armor",    "type": "bevel_box", "dims": [0.70, 0.12, 0.18], "bevel": 0.10, "pos": [0, 0.20, 0.72] },
+        { "name": "cheek_vent_hi",  "layer": "detail",   "type": "bevel_box", "dims": [0.12, 0.05, 0.14], "bevel": 0.02, "pos": [0.42, -0.18, 0.66], "mirror_x": true },
+        { "name": "cheek_vent_lo",  "layer": "detail",   "type": "bevel_box", "dims": [0.12, 0.05, 0.14], "bevel": 0.02, "pos": [0.42, -0.34, 0.66], "mirror_x": true },
+        { "name": "crest_fin",      "layer": "armor",    "type": "bevel_box", "dims": [0.08, 0.42, 0.50], "bevel": 0.06, "pos": [0, 0.85, 0.0] },
+        { "name": "crown_ridge",    "layer": "armor",    "type": "bevel_box", "dims": [0.05, 0.24, 0.34], "bevel": 0.04, "pos": [0.34, 0.80, -0.05], "mirror_x": true },
+        { "name": "antenna",        "layer": "detail",   "type": "cyl", "r0": 0.07, "r1": 0.03, "h": 0.5, "segs": 6, "rings": 2, "pos": [0.70, 0.60, 0], "mirror_x": true },
+        { "name": "chin_jaw",       "layer": "armor",    "type": "bevel_box", "dims": [0.42, 0.16, 0.42], "bevel": 0.12, "pos": [0, -0.62, 0.32] },
+
+        { "name": "helmet_crown_plate", "layer": "armor",  "type": "bevel_box", "dims": [0.55, 0.10, 0.55], "bevel": 0.06, "pos": [0, 0.72, 0.18],
+          "added": "animation-studio pass: crown plate over the brow, the helmet read" },
+        { "name": "jaw_hinge_bolt", "layer": "detail",   "type": "bevel_box", "dims": [0.06, 0.06, 0.06], "bevel": 0.02, "pos": [0.56, -0.50, 0.38], "mirror_x": true,
+          "added": "visible jaw articulation hardware" },
+        { "name": "neck_ring",      "layer": "frame",    "type": "cyl", "r0": 0.34, "r1": 0.30, "h": 0.16, "segs": 10, "rings": 2, "pos": [0, -0.86, 0.0],
+          "added": "the load-bearing neck bearing under the skull" }
+      ]
+    },
+
+    "pchest": {
+      "output": "pchest.iqm", "texture": "plate_blue.png",
+      "components": [
+        { "name": "core_torso",     "layer": "frame",    "type": "bevel_box", "dims": [1.00, 0.95, 0.62], "bevel": 0.20, "pos": [0, 0, 0] },
+        { "name": "pectoral",       "layer": "armor",    "type": "bevel_box", "dims": [0.42, 0.50, 0.18], "bevel": 0.10, "pos": [0.42, 0.18, 0.60], "mirror_x": true },
+        { "name": "cockpit_plate",  "layer": "armor",    "type": "bevel_box", "dims": [0.34, 0.46, 0.22], "bevel": 0.08, "pos": [0, -0.02, 0.66] },
+        { "name": "collar_ridge",   "layer": "armor",    "type": "bevel_box", "dims": [0.90, 0.14, 0.30], "bevel": 0.08, "pos": [0, 0.82, 0.30] },
+        { "name": "intake_hi",      "layer": "detail",   "type": "bevel_box", "dims": [0.10, 0.06, 0.30], "bevel": 0.02, "pos": [0.92, 0.30, 0.20], "mirror_x": true },
+        { "name": "intake_mid",     "layer": "detail",   "type": "bevel_box", "dims": [0.10, 0.06, 0.30], "bevel": 0.02, "pos": [0.92, 0.08, 0.20], "mirror_x": true },
+        { "name": "intake_lo",      "layer": "detail",   "type": "bevel_box", "dims": [0.10, 0.06, 0.30], "bevel": 0.02, "pos": [0.92, -0.14, 0.20], "mirror_x": true },
+        { "name": "abdominal_band", "layer": "armor",    "type": "bevel_box", "dims": [0.70, 0.18, 0.50], "bevel": 0.10, "pos": [0, -0.78, 0.10] },
+
+        { "name": "grille_bar",     "layer": "detail",   "type": "bevel_box", "dims": [0.30, 0.035, 0.06], "bevel": 0.01, "pos": [0, -0.38, 0.72],
+          "rows_y": [0.0, -0.10, -0.20], "added": "truck-grille chest homage (reference doc: truck_grille_chest)" },
+        { "name": "headlight_nub",  "layer": "detail",   "type": "bevel_box", "dims": [0.09, 0.07, 0.06], "bevel": 0.02, "pos": [0.62, -0.44, 0.62], "mirror_x": true,
+          "added": "vehicle-identity headlights carried into robot mode" },
+        { "name": "spine_strip",    "layer": "frame",    "type": "bevel_box", "dims": [0.10, 0.80, 0.08], "bevel": 0.03, "pos": [0, 0.0, -0.62],
+          "added": "the central spine beam surfacing on the back" },
+        { "name": "exhaust_stack",  "layer": "actuator", "type": "cyl", "r0": 0.09, "r1": 0.075, "h": 0.85, "segs": 8, "rings": 2, "pos": [0.78, 0.55, -0.42], "mirror_x": true,
+          "added": "twin exhaust stacks aft of the shoulders (reference doc: exhaust_pipes)" },
+        { "name": "waist_piston",   "layer": "actuator", "type": "cyl", "r0": 0.055, "r1": 0.055, "h": 0.45, "segs": 6, "rings": 2, "pos": [0.48, -0.72, -0.30], "mirror_x": true,
+          "added": "visible hip hydraulics in the waist gap" }
+      ]
+    },
+
+    "ppauldron": {
+      "output": "ppauldron.iqm", "texture": "plate_blue.png",
+      "components": [
+        { "name": "dome_core",      "layer": "frame",    "type": "sphere", "r": 0.8, "segs": 14, "rings": 10, "pos": [0, 0, 0] },
+        { "name": "top_plate",      "layer": "armor",    "type": "bevel_box", "dims": [0.72, 0.22, 0.62], "bevel": 0.10, "pos": [0, 0.62, 0] },
+        { "name": "second_plate",   "layer": "armor",    "type": "bevel_box", "dims": [0.60, 0.18, 0.52], "bevel": 0.08, "pos": [0, 0.30, 0.34] },
+        { "name": "rim_ridge",      "layer": "detail",   "type": "bevel_box", "dims": [0.85, 0.10, 0.10], "bevel": 0.03, "pos": [0, 0.74, 0.30] },
+        { "name": "vent_slat",      "layer": "detail",   "type": "bevel_box", "dims": [0.10, 0.05, 0.14], "bevel": 0.02, "pos": [0.78, -0.10, 0.02],
+          "rows_z": [-0.18, 0.0, 0.18] },
+
+        { "name": "bolt_stud",      "layer": "detail",   "type": "bevel_box", "dims": [0.05, 0.05, 0.05], "bevel": 0.015, "pos": [0.52, 0.62, 0.40],
+          "quad_corners_xz": true, "added": "four bolt studs pinning the crown plate" },
+        { "name": "under_actuator", "layer": "actuator", "type": "cyl", "r0": 0.10, "r1": 0.08, "h": 0.55, "segs": 7, "rings": 2, "pos": [0, -0.55, -0.15],
+          "added": "the shoulder servo visible under the armor skirt" }
+      ]
+    },
+
+    "phand": {
+      "output": "phand.iqm", "texture": "plate_blue.png",
+      "components": [
+        { "name": "palm",           "layer": "frame",    "type": "bevel_box", "dims": [0.60, 0.70, 0.50], "bevel": 0.20, "pos": [0, 0, 0] },
+        { "name": "knuckle",        "layer": "armor",    "type": "bevel_box", "dims": [0.13, 0.34, 0.16], "bevel": 0.08, "pos": [0, -0.70, 0.18],
+          "cols_x": [-0.34, -0.11, 0.11, 0.34] },
+        { "name": "thumb",          "layer": "armor",    "type": "bevel_box", "dims": [0.16, 0.30, 0.16], "bevel": 0.08, "pos": [0.55, -0.10, 0.10] },
+
+        { "name": "wrist_servo",    "layer": "actuator", "type": "cyl", "r0": 0.34, "r1": 0.30, "h": 0.20, "segs": 10, "rings": 2, "pos": [0, 0.72, 0],
+          "added": "the wrist bearing ring where the gauntlet meets the arm" },
+        { "name": "knuckle_guard",  "layer": "armor",    "type": "bevel_box", "dims": [0.50, 0.08, 0.10], "bevel": 0.03, "pos": [0, -0.48, 0.30],
+          "added": "a guard plate across the knuckle row" }
+      ]
+    },
+
+    "plimb": {
+      "output": "plimb.iqm", "texture": "plate_blue.png",
+      "comment": "limb_core + rings keep the Update-204 radius-relative construction (the greeble-filter lesson: attach relative to local taper, never absolute).",
+      "components": [
+        { "name": "tapered_core",   "layer": "frame",    "type": "limb_core", "r0": 1.0, "r1": 0.8, "h": 2.0, "segs": 14 },
+        { "name": "upper_cuff",     "layer": "armor",    "type": "ring", "at_y": 0.80, "r_scale": 1.16, "band_h": 0.22, "taper": 0.94 },
+        { "name": "lower_cuff",     "layer": "armor",    "type": "ring", "at_y": -0.82, "r_scale": 1.14, "band_h": 0.20, "taper": 0.94 },
+        { "name": "hinge_knob",     "layer": "detail",   "type": "bevel_box_local", "dims_rel": [0.50, null, 0.42], "dim_y": 0.14, "bevel": 0.10, "at_y": 0.0, "z_rel": 0.95 },
+        { "name": "armor_strip",    "layer": "armor",    "type": "bevel_box_local", "dims_rel": [0.30, null, null], "dim_y": 0.62, "dim_z": 0.06, "bevel": 0.06, "at_y": -0.05, "z_rel": 1.02 },
+
+        { "name": "hydraulic_piston", "layer": "actuator", "type": "cyl", "r0": 0.06, "r1": 0.06, "h": 1.1, "segs": 6, "rings": 2, "pos": [0.0, 0.05, -0.98], "mirror_x_offset": 0.30,
+          "added": "twin rear hydraulic pistons running the limb's length (reference doc: hydraulic_system, stroke pair)" },
+        { "name": "calf_vent",      "layer": "detail",   "type": "bevel_box", "dims": [0.28, 0.04, 0.08], "bevel": 0.01, "pos": [0, -0.52, 0.88],
+          "rows_y": [0.0, -0.12], "added": "twin vent slats low on the front face" }
+      ]
+    }
+  }
+}
