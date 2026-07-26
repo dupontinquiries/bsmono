@@ -709,6 +709,10 @@ const LONG_HORIZON: &str = include_str!("../../prompts/long_horizon.md");
 const PERSONAS: &[(&str, &str, &str)] = &[
     ("longhorizon", "Long-horizon engineer", LONG_HORIZON),
     ("logscope", "Logscope · quick log fix", BASE_SYSTEM),
+    // The LIAISON runs in FRONT of the big model: a small fast model that reports what the backend is
+    // doing while the large one works. Its rules live in logscope::liaison_prompt so the same wording
+    // governs the HUD strip and any direct chat with it — one prompt, not two that drift.
+    ("liaison", "Liaison · reports backend state", logscope::liaison_prompt::LIAISON_SYSTEM),
 ];
 /// Look up a persona's full system prompt by key (the status-bar persona popup switches with this).
 fn persona_by_key(key: &str) -> Option<&'static str> { PERSONAS.iter().find(|p| p.0 == key).map(|p| p.2) }
@@ -910,6 +914,11 @@ pub struct Chat {
     show_checkpoints: bool,                 // checkpoints panel open
     /// GPU phase-breakdown subpanel open (📊 in the composer bar).
     show_metrics: bool,
+    /// Running backend account shown under the newest message while a reply is generating.
+    hud: crate::liaisonhud::Hud,
+    /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
+    /// observation instead, which cannot be wrong because it is copied from the engine.
+    hud_narration: String,
     /// Counter snapshot taken when the last generation STARTED, so the panel shows that generation
     /// rather than everything since process start.
     metrics_base: crate::metricspanel::Counters,
@@ -1002,6 +1011,7 @@ impl Default for Chat {
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
@@ -2162,6 +2172,24 @@ impl Chat {
         // default and silently builds Llama-3 prompts for a ChatML model — the markers byte-split
         // (prompt diag: "0 special tokens"), the turn structure never reaches the model, and output
         // degrades to word salad (seen on every Qwen3 while Llama models worked).
+        // Feed the HUD from the engine's own counters while a reply is generating. These are
+        // observations, not narration: each is a measured fact the engine reported, phrased minimally and
+        // tagged with where it came from. The liaison model, when configured, rephrases them; until then
+        // the raw line shows, which cannot be wrong.
+        if self.stream.is_some() {
+            let c = crate::metricspanel::snapshot(self.metrics_tokens.max(1))
+                .since(&self.metrics_base);
+            if c.moe_fills > 0 {
+                self.hud.observe(format!("streaming experts — {} fills, {:.1} GiB moved",
+                    c.moe_fills, c.moe_bytes as f64 / (1u64 << 30) as f64), "moe-stream");
+            } else if c.submits > 0 {
+                self.hud.observe(format!("{} GPU submits so far", c.submits), "engine");
+            }
+        } else if !self.hud.is_empty() {
+            // a finished reply should not sit under a stale status line
+            self.hud.clear();
+            self.hud_narration.clear();
+        }
         if let Some(t) = infer.detected_template() {
             if self.template != t { self.template = t; }
             // Also record it separately, so build_prompt can use the worker's value even if a generate is
@@ -6666,6 +6694,34 @@ impl Chat {
                                 }
                             });
                         });
+                    }
+                    // ── LIAISON HUD: the running backend account, under the newest message ──
+                    //
+                    // Only while generating: after a reply lands, a status strip is stale and competes
+                    // with the answer for attention. Every line originates in an engine observation and
+                    // carries its source; when there is nothing observed the strip is absent entirely,
+                    // because a fabricated status looks mechanical and is therefore believed.
+                    if cur.is_some() {
+                        if let Some((line, narrated)) = self.hud.display(Some(&self.hud_narration)) {
+                            ui.add_space(theme::PAD_XS as f32);
+                            egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6),
+                                inner_margin: egui::Margin::symmetric(theme::PAD_SM, theme::PAD_XS),
+                                stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                            .show(ui, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    // the dot distinguishes a liaison SENTENCE from a raw engine line, so
+                                    // a reader always knows whether a model phrased it
+                                    ui.label(RichText::new(if narrated { "◈" } else { "·" })
+                                        .color(if narrated { theme::CYAN() } else { theme::FAINT() }).small());
+                                    ui.label(RichText::new(&line).color(theme::DIM()).small());
+                                });
+                                if let Some(src) = self.hud.latest().filter(|s| s.is_grounded()) {
+                                    ui.label(RichText::new(format!("via {}", src.grounds.join(", ")))
+                                        .color(theme::FAINT()).small());
+                                }
+                            });
+                            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+                        }
                     }
                 });
         });
