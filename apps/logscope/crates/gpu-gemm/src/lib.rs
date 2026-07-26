@@ -1434,6 +1434,12 @@ pub struct BlockWeights {
     /// factor (grows logarithmically past floor_scale) to keep long-context attention sharp. `None` =
     /// disabled (all non-Llama4 archs, and Llama4 RoPE layers). See llama4::AttnTemp.
     pub attn_temp: Option<crate::llama4::AttnTemp>,
+    /// Llama-4 `use_kq_norm` (Llama4TextL2Norm): a WEIGHTLESS RMS norm applied to Q and K *after* rope,
+    /// on rope layers only. Stored as an all-ones weight so it reuses the existing per-head rmsnorm.
+    /// llama.cpp sets this for every Llama-4 except the 128-expert Maverick (src/models/llama4.cpp).
+    /// Distinct from `q_norm`/`k_norm`, which are LEARNED weights applied BEFORE rope (the Qwen3 shape) —
+    /// both the weight and the ordering differ, which is why this could not reuse them.
+    pub kq_norm: Option<Tensor>,
     /// Mixture-of-experts FFN (qwen3moe): replaces wgate_up/wdown (which hold 1-row placeholders when this
     /// is Some). Router is a small F32 Lin [n_expert, d]; experts are per-expert quantized Lins so the
     /// existing matvec/SwiGLU kernels apply unchanged at an expert's rows (no weight slicing needed).
@@ -3945,8 +3951,8 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd; // ad = attention width (== d for plain MHA)
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd);
-        let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
+        let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd), w, t, kv, hd, eps);
         let v = w.wv.apply(self, &n1, t);
         let attn = self.attention_mh_t(&q, &k, &v, t, ad, n_heads, n_kv_heads);
         let o = w.wo.apply(self, &attn, t); // wo: [d, ad] projects the attention width back to d
@@ -3962,12 +3968,12 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
         let q = match w.attn_temp {
             Some(at) if w.nope && at.active_at(t.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, 0, t, ad),
             _ => q,
         };
-        let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd);
+        let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd), w, t, kv, hd, eps);
         let v = w.wv.apply(self, &n1, t);
         self.write_rows(kc, &k, 0, t, kv);
         self.write_rows(vc, &v, 0, t, kv);
@@ -3985,12 +3991,12 @@ impl Gpu {
         let base_freq = if w.nope { 0.0 } else { base_freq }; // Llama4 iRoPE NoPE switch
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, s, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, s), &w.q_norm, s, ad, hd, eps), ff, s, ad, base_freq, base, hd), w, s, ad, hd, eps);
         let q = match w.attn_temp {
             Some(at) if w.nope && at.active_at(base + s.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, base, s, ad),
             _ => q,
         };
-        let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, s), &w.k_norm, s, kv, hd, eps), ff, s, kv, base_freq, base, hd);
+        let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, s), &w.k_norm, s, kv, hd, eps), ff, s, kv, base_freq, base, hd), w, s, kv, hd, eps);
         let v = w.wv.apply(self, &n1, s);
         self.write_rows(kc, &k, base, s, kv);
         self.write_rows(vc, &v, base, s, kv);
@@ -6793,6 +6799,13 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // Scout (17B_16E) and OFF for Maverick. We do not implement it: our qk_norm is driven by a
                 // learned weight (None here) and runs BEFORE rope, which is the Qwen3 arrangement, not this
                 // one. Missing it produces coherent-looking garbage rather than an error.
+                // Llama-4 use_kq_norm: an all-ones weight so the existing per-head rmsnorm becomes the
+                // weightless Llama4TextL2Norm. ON for every Llama-4 except the 128-expert Maverick, which
+                // is exactly how llama.cpp gates it (use_kq_norm = type != LLM_TYPE_17B_128E). Applied
+                // after rope by `kq_post`; rope layers only.
+                kq_norm: if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
+                    Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim))
+                } else { None },
                 attn_temp: if is_llama4 && nope_step > 0 && (i + 1) % nope_step == 0 {
                     Some(crate::llama4::AttnTemp::default())
                 } else { None },
@@ -6983,7 +6996,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -7088,8 +7101,8 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         for (li, w) in m.layers.iter().enumerate() {
             // inline of block_forward, measuring each contribution's last-token RMS
             let n1 = self.rmsnorm_t(&x, &w.g1, t, m.d, m.eps);
-            let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, m.eps), ff, t, ad, m.base, 0, hd);
-            let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, m.eps), ff, t, kv, m.base, 0, hd);
+            let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, m.eps), ff, t, ad, m.base, 0, hd), w, t, ad, hd, m.eps);
+            let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, m.eps), ff, t, kv, m.base, 0, hd), w, t, kv, hd, m.eps);
             let v = w.wv.apply(self, &n1, t);
             let attn = self.attention_mh_t(&q, &k, &v, t, ad, m.n_heads, m.n_kv_heads);
             let o = w.wo.apply(self, &attn, t);
@@ -8232,6 +8245,14 @@ impl Gpu {
     /// (width = heads·head_dim) BEFORE RoPE. `norm` is the [head_dim] weight; `None` → pass-through (llama/
     /// qwen2). Since head_dim is contiguous per head, the [t, width] buffer viewed as [t·heads, head_dim]
     /// rows makes this a plain rmsnorm_t — no new kernel — then we restore the [t, width] shape for RoPE.
+    /// Llama-4's post-rope Q/K normalization. No-op unless the layer carries `kq_norm`, and skipped on
+    /// NoPE layers — those take the attention-temperature path instead, exactly as llama.cpp gates it with
+    /// `if (use_rope && hparams.use_kq_norm)`.
+    fn kq_post(&self, x: Tensor, w: &BlockWeights, t: usize, width: usize, head_dim: usize, eps: f32) -> Tensor {
+        if w.nope || w.kq_norm.is_none() { return x; }
+        self.qk_norm(x, &w.kq_norm, t, width, head_dim, eps)
+    }
+
     fn qk_norm(&self, x: Tensor, norm: &Option<Tensor>, t: usize, width: usize, head_dim: usize, eps: f32) -> Tensor {
         match norm {
             Some(w) => {
@@ -8474,8 +8495,8 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
-        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
+        let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd), w, 1, kv, hd, eps);
         let vr = w.wv.apply(self, &n1, 1);
         let (kqr, ksr) = self.quantize_rows(&kr, 1, kv);
         let (vqr, vsr) = self.quantize_rows(&vr, 1, kv);
@@ -8561,7 +8582,7 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
         // Llama 4 iRoPE: on NoPE layers past floor_scale, scale the query by the attention temperature so
         // long-context softmax stays sharp (the length-generalization mechanism). Skipped below the floor
         // (active_at == false) so short contexts pay nothing; RoPE layers carry attn_temp None.
@@ -8569,7 +8590,7 @@ impl Gpu {
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
             _ => q,
         };
-        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
+        let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd), w, 1, kv, hd, eps);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, pos, kv);
         self.write_row(vc, &vr, pos, kv);
@@ -8590,12 +8611,12 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
         let q = match w.attn_temp {
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
             _ => q,
         };
-        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
+        let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd), w, 1, kv, hd, eps);
         let vr = w.wv.apply(self, &n1, 1);
         // hot-relative write position: the token at absolute `pos` is row `pos - hot_start` of the hot cache
         let hrow = pos - hot_start;
@@ -8621,12 +8642,12 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base };
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, pos, hd), w, 1, ad, hd, eps);
         let q = match w.attn_temp {
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
             _ => q,
         };
-        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd);
+        let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, pos, hd), w, 1, kv, hd, eps);
         let vr = w.wv.apply(self, &n1, 1);
         // Write at the ABSOLUTE position (like the normal cache), NOT hot-relative: demotion reads old
         // rows [from,from+len) by absolute index, so the hot cache must be absolutely-indexed too. The hot
@@ -8747,8 +8768,8 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
         let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let q = self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, rope_pos, hd);
-        let kr = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, rope_pos, hd);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, 1), &w.q_norm, 1, ad, hd, eps), ff, 1, ad, base, rope_pos, hd), w, 1, ad, hd, eps);
+        let kr = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, hd, eps), ff, 1, kv, base, rope_pos, hd), w, 1, kv, hd, eps);
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, slot, kv);
         self.write_row(vc, &vr, slot, kv);
