@@ -121,6 +121,27 @@ impl App {
             });
         }
 
+        // ── Global task strip ──────────────────────────────────────────────────────────────
+        // A build/deploy started on Fleet keeps running when the user wanders to Files — before
+        // this, nothing anywhere said so, and the finished result could silently land on a page
+        // they'd left. One slim strip above the nav (bottom of the window on desktop, above the
+        // bottom bar on the phone) shows the spinner + the newest log line on EVERY tab while a
+        // task runs. It also owns the request_repaint for polling. NOTE: added before the
+        // CentralPanel — egui panels claim space in declaration order and the central panel must
+        // come last, or the strip would overlap the page content instead of shrinking it.
+        #[allow(deprecated)]
+        if self.task.is_running() {
+            egui::Panel::bottom("task_strip").show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    let tail = self.task.log();
+                    let last = tail.lines().last().unwrap_or("working…");
+                    ui.label(egui::RichText::new(last).monospace().small().weak());
+                });
+            });
+            ctx.request_repaint();
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let surface = ui.max_rect();
             match self.tab {
@@ -140,6 +161,23 @@ impl App {
             if let Some(dir) = frame.page_jump {
                 self.switch_tab(dir.sign());
             }
+        });
+
+        // ── Desktop keyboard nav ───────────────────────────────────────────────────────────
+        // Ctrl+1…9 jumps straight to a tab (the sidebar order); PgUp/PgDn cycle like the phone
+        // swipe. Checked AFTER page ui so a focused TextEdit's own key handling wins first.
+        ctx.input(|i| {
+            if i.modifiers.ctrl {
+                for (n, t) in Tab::ALL.iter().enumerate() {
+                    let key = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5,
+                               egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9][n];
+                    if i.key_pressed(key) {
+                        self.tab = *t;
+                    }
+                }
+            }
+            if i.key_pressed(egui::Key::PageDown) { self.switch_tab(1); }
+            if i.key_pressed(egui::Key::PageUp) { self.switch_tab(-1); }
         });
     }
 

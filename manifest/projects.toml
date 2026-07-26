@@ -126,6 +126,36 @@ runtime = "none"
 targets = ["desktop", "alpine"]
 notes = "LLM frontend + multiple backends; 10-100 instance hosting"
 
+[apps.logscope-egui]
+path = "apps/logscope/crates/logscope-egui"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop"]
+notes = "the egui/eframe LLM chat app over the vendored headless logscope core — the egui-primary frontend (GTK stays behind the core's optional `gui` feature and isn't built). `cargo build --release -p logscope-egui` from apps/logscope produces the deployable bin (`gui` + `gpu-scene` are default-on). Local llama.cpp inference: `--features llamacpp` (Vulkan) or `llamacpp-cpu`; the pure-Rust wgpu engine: `--features wgpu-engine` (pulls crates/gpu-gemm, excluded otherwise). GLM-4.7-Flash (arch deepseek2, MLA+MoE) is supported on both paths — see apps/logscope/GLM47_FLASH_SUPPORT.md."
+
+[apps.gitmind-egui]
+path = "apps/gitmind/crates/gui-egui"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop"]
+notes = "the egui-primary port of gitmind's Qt/QML touch GUI (Fleet/Push/Network/Apps/Import/Branches/Files/Timeline/Settings + dupes roll-up — see apps/gitmind/GITMIND_EGUI_PORT.md). Calls cockpit directly (both Rust; no JSON bridge). `cargo build --release -p gitmind-egui` produces the deployable bin (the `app` feature is default-on); headless lib for CI: `--no-default-features`. The Qt `gui` crate stays the untouched fallback and still needs Qt6."
+
+[apps.tomescope]
+path = "apps/tomescope"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = []              # REGISTERED BUT NOT BUILDABLE YET — see notes
+notes = "ebook reader drop (2026-07-26): 7 source files landed verbatim, but the archive lacked src/main.rs, src/util.rs and src/bin/shelfctl.rs, so the crate does not compile — no stubs were fabricated (apps/tomescope/DROP_STATUS.md has the exact gap). targets=[] keeps it out of every build plan until the three files arrive; flip to [\"desktop\"] then."
+
 [system.snapclone]
 path = "system/snapclone"
 kind = "hybrid"
@@ -288,6 +318,16 @@ notes = "whisper post-proc: hallucination filter + model resolution; zero-dep; c
 
 
 # --- games (new tier; consolidated from apps/ duplicates — keeping the larger games/ trees) ---
+[games.clawbound]
+path = "games/clawbound"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "papercraft stalk/hide/chase game (Rust + wgpu22; Vulkan/Metal/WebGPU). Deterministic logic lives in lib.rs; the default bin renders offscreen→PNG headless (CI-safe: `cargo run --release -- out.png MODE TOD`), the live window is `--features app -- --play`. Modes: world/map/goals/poses/seq/senses/wildlife/game/prowl/capture + the open-world clan-founding sim (openworld.rs, season-tick deterministic). IN-SANDBOX BUILD (cargo 1.75): sed the lockfile `version = 4`→`3`, then pin `image 0.25.1`, `proc-macro-crate 3.1.0`, `indexmap 2.2.6` to drop the edition-2024 chains — full test suite then runs (206+ green)."
+
 [games.unendlich]
 path = "games/unendlich"
 kind = "cargo"
