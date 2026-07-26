@@ -1868,6 +1868,24 @@ impl Chat {
                 m.parent.or(if i > 0 { Some(i - 1) } else { None }))),
             est, head);
         if !self.pruned.is_empty() { for nd in &mut g.nodes { nd.pruned = self.pruned.contains(&nd.id); } }
+        // ARTIFACTS produced by this conversation, hung off the last turn. They are appended AFTER the
+        // pruned marking so a pruned turn does not accidentally prune the file it produced — the file
+        // still exists on disk regardless of whether its turn is still in context.
+        //
+        // Deduplicated by path, keeping the LAST event: a file written three times is one artifact with
+        // its final size, not three nodes, and a graph that showed three would misrepresent the workspace.
+        if !self.agent_files.is_empty() {
+            let mut seen: std::collections::HashMap<&str, u64> = std::collections::HashMap::new();
+            let mut order: Vec<&str> = Vec::new();
+            for f in &self.agent_files {
+                if seen.insert(f.path.as_str(), f.bytes).is_none() { order.push(f.path.as_str()); }
+                else { seen.insert(f.path.as_str(), f.bytes); }
+            }
+            for path in order {
+                let bytes = seen.get(path).copied().unwrap_or(0);
+                g.push_file(path, bytes, None, est);
+            }
+        }
         g
     }
 
@@ -2935,6 +2953,24 @@ impl Chat {
             self.orbit.target.y += eased - self.walk_bob;
             self.walk_bob = eased;
             if walking { ui.ctx().request_repaint(); }
+        }
+        // AUTOSCROLL WHILE STREAMING. A reply being generated grows the newest node, and without this the
+        // camera sits wherever it was left and the user watches an empty region while the interesting
+        // thing happens off-screen. Only engages when the user has NOT taken manual control
+        // (`spatial_auto`) — following the tip is helpful during generation and infuriating if it fights
+        // someone who is deliberately looking somewhere else.
+        if self.stream.is_some() && self.spatial_auto && self.cam_pan_t0.is_none() {
+            let tip = self.active_leaf.or_else(|| self.msgs.len().checked_sub(1));
+            if let Some(id) = tip {
+                if self.walk_focus != Some(id) && id < pos.len() {
+                    let from = self.walk_focus.unwrap_or(id);
+                    let path = graph_path(&g, from, id);
+                    if path.len() > 1 { self.cam_pan_path = path; self.cam_pan_t0 = Some(std::time::Instant::now()); }
+                    else { self.orbit.target = pos[id]; }
+                    self.walk_focus = Some(id);
+                    ui.ctx().request_repaint();
+                }
+            }
         }
         // path (parent links via LCA) — Catmull-Rom through the node positions — instead of jumping straight there.
         if let Some(t0) = self.cam_pan_t0 {
@@ -4425,6 +4461,21 @@ impl Chat {
                 // outline only — let the 3D glossy pearl behind it show through
                 p.circle_stroke(pt, radius, egui::Stroke::new(1.0, col.linear_multiply(0.7)));
                 if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.5, egui::Stroke::new(1.0, theme::CYAN().linear_multiply(0.6))); }
+            } else if nd.kind.is_artifact() {
+                // ARTIFACTS ARE SQUARES; conversation turns are circles. Shape is the fastest visual
+                // channel for "the conversation PRODUCED this" vs "someone SAID this", and unlike a hue
+                // difference it survives greyscale, projection and colour-blindness. The glyph badge
+                // (⑂ patch, 🗎 file, 🖼 image, 🎬 shot) then says which kind without a legend.
+                let h = radius * 0.9;
+                let r = egui::Rect::from_center_size(pt, egui::vec2(h * 2.0, h * 2.0));
+                p.rect_filled(r, theme::r(2), col);
+                p.rect_stroke(r, theme::r(2), egui::Stroke::new(1.0, theme::INK().linear_multiply(0.6)),
+                    egui::StrokeKind::Middle);
+                let gl = nd.kind.glyph();
+                if !gl.is_empty() && radius > 5.0 {
+                    p.text(pt, egui::Align2::CENTER_CENTER, gl,
+                        egui::FontId::proportional((radius * 1.1).min(14.0)), theme::INK());
+                }
             } else {
                 p.circle_filled(pt, radius, col);
                 if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.0, egui::Stroke::new(1.0, theme::INK().linear_multiply(0.5))); }
