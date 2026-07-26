@@ -33,3 +33,29 @@ gin export-native /tmp/check && diff <(git rev-parse main^{tree}) \
 ```
 
 The snapshot in step 1 means a bad merge is always recoverable via gitmind.
+
+## Receiving a zip drop (not a bundle)
+
+The recipe above assumes the incoming history is a **descendant** — it either
+fast-forwards or you rebase onto it. Project drops that arrive as zip archives
+usually are not: they come from a line that branched at some earlier import
+point and moved on independently, so they carry neither your later commits nor
+any record of what they chose not to have.
+
+Unpacking one over its directory therefore **deletes** whatever the monorepo
+added since that branch point. Merge it as a sibling instead:
+
+```sh
+gin snapshot "before <drop>"                # checkpoint first, as always
+git checkout -b drop/<project> <import-point>
+rm -rf <path> && cp -a <unzipped>/. <path>/ # then commit
+git checkout main && git merge --no-ff drop/<project>
+```
+
+Finding `<import-point>` is the real work: measure divergence against each
+candidate commit rather than assuming the latest one. A file the drop lacks is
+then correctly read as "they never had it" rather than "they deleted it" — and
+if the archive genuinely lacks something the monorepo added, restore it on the
+drop branch before committing, or the merge will silently drop it.
+
+See `maintenance/MERGE_C4_245.md` for a worked example across three drops.
