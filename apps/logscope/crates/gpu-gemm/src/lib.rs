@@ -214,6 +214,7 @@ pub static DIMS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BG_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Max retained (submitted-but-not-freed) keep-buffers before a mid-window flush forces a poll+free.
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
 /// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
@@ -1242,68 +1243,6 @@ impl Gpu {
     ///
     /// No allocation and no host round-trip — with the file mapped for the process lifetime, the `raw`
     /// slice is a view into the GGUF itself, which is the whole point of Colibri's arrangement.
-    /// Begin a token's decode: hand out scratch buffers deterministically from here until `scratch_end`.
-    ///
-    /// This is a game renderer's per-frame arena, applied to decode. `games/soldier` creates its bind
-    /// groups ONCE and submits a frame with zero allocations, which it can do because its per-frame
-    /// resources never change shape. Decode has the same property and did not exploit it: every token
-    /// runs identical work at identical shapes (t=1; d, kv, ff are model constants), so the tenth token
-    /// requests exactly the same sizes in exactly the same order as the first.
-    ///
-    /// The buffer POOL recycles, but which buffer you get depends on free-list order, so bind groups
-    /// differed between tokens and the cache missed. Here the Nth allocation of a token always returns
-    /// the same buffer as the Nth allocation of the previous token, so every bind group is identical
-    /// across tokens and the cache hits.
-    ///
-    /// Correctness rests on decode being deterministic in its allocation ORDER, which it is — the same
-    /// code path runs per layer. If a shape ever fails to match at a given position the arena falls back
-    /// to a fresh allocation for that slot rather than handing back a wrongly-sized buffer.
-    pub fn scratch_begin(&self) {
-        SCRATCH.with(|c| { let mut g = c.borrow_mut(); g.0 = true; g.1 = 0; });
-    }
-
-    /// End a token's decode. Subsequent allocations go back to the ordinary pool.
-    pub fn scratch_end(&self) { SCRATCH.with(|c| c.borrow_mut().0 = false); }
-
-    /// RAII arena scope for one token. Ends on drop, so an early return or a `?` cannot leave the arena
-    /// active — which would hand decode buffers to whatever ran next and is exactly the class of lifetime
-    /// bug that corrupted weights earlier in this project.
-    ///
-    /// LOGSCOPE_NO_SCRATCH=1 disables it, so the arena can be bisected against without a rebuild.
-    pub fn scratch_scope(&self) -> ScratchScope<'_> {
-        let on = std::env::var_os("LOGSCOPE_NO_SCRATCH").is_none();
-        if on { self.scratch_begin(); }
-        ScratchScope { gpu: self, on }
-    }
-
-    /// How many distinct scratch slots a token uses — the arena's steady-state size.
-    pub fn scratch_slots(&self) -> usize { SCRATCH.with(|c| c.borrow().2.len()) }
-
-    /// Take the next scratch buffer for this shape, or None when the arena is inactive or the recorded
-    /// slot has a different shape (a divergent path — fall back rather than return the wrong size).
-    fn scratch_take(&self, rows: usize, cols: usize) -> Option<wgpu::Buffer> {
-        SCRATCH.with(|c| {
-            let mut g = c.borrow_mut();
-            if !g.0 { return None; }
-            let i = g.1;
-            g.1 += 1;
-            match g.2.get(i) {
-                Some((r, cc, b)) if *r == rows && *cc == cols => Some(b.clone()),
-                Some(_) => None,                   // shape drift at this slot: do not reuse
-                None => {
-                    let size = (rows * cols * 4) as u64;
-                    if size == 0 { return None; }
-                    let b = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("decode-scratch"), size,
-                        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false });
-                    g.2.push((rows, cols, b.clone()));
-                    Some(b)
-                }
-            }
-        })
-    }
-
     /// A raw word-addressed SCRATCH buffer. Pooled: it returns to the free list when dropped.
     pub fn alloc_words(&self, words: usize) -> Tensor { self.alloc(1, words) }
 
@@ -1557,25 +1496,8 @@ impl Drop for ArenaGuard<'_> {
     }
 }
 
-thread_local! {
-    /// The per-token scratch arena, PER THREAD.
-    ///
-    /// It was briefly a single shared arena, and the threaded-workers check in `--validate` caught it
-    /// immediately: lanes share one `Gpu`, so every thread's Nth allocation resolved to the SAME buffer
-    /// and concurrent decodes overwrote each other's intermediates (max|gpu-cpu| = 1.0).
-    ///
-    /// That is the part of the game-renderer pattern that does not transfer unexamined: soldier is a
-    /// single-threaded renderer with one frame in flight, while this engine runs N concurrent lanes over
-    /// one device. A per-frame arena is only safe if "the frame" is per-thread.
-    static SCRATCH: std::cell::RefCell<(bool, usize, Vec<(usize, usize, wgpu::Buffer)>)>
-        = std::cell::RefCell::new((false, 0, Vec::new()));
-}
 
 /// Holds the per-token scratch arena open; releases it on drop. See `Gpu::scratch_scope`.
-pub struct ScratchScope<'a> { gpu: &'a Gpu, on: bool }
-impl Drop for ScratchScope<'_> {
-    fn drop(&mut self) { if self.on { self.gpu.scratch_end(); } }
-}
 
 pub struct Tensor { buf: wgpu::Buffer, pub rows: usize, pub cols: usize, pool: Option<std::sync::Arc<BufferPool>>, view: Option<(u64, u64)> }
 impl Drop for Tensor {
@@ -2163,13 +2085,6 @@ impl Gpu {
         }
     }
     fn alloc(&self, rows: usize, cols: usize) -> Tensor {
-        // Stable per-token scratch first (see scratch_begin): the Nth allocation of a token always gets
-        // the same buffer as the Nth allocation of the previous token, so bind groups repeat and the
-        // cache hits. `pool: None` because the arena owns these — returning them to the free list would
-        // reintroduce exactly the nondeterminism this avoids.
-        if let Some(buf) = self.scratch_take(rows, cols) {
-            return Tensor { buf, rows, cols, pool: None, view: None };
-        }
         let size = (rows * cols * 4) as u64;
         // Recycle a same-size buffer freed by a dropped Tensor, else allocate. Kills per-op alloc churn.
         let recycled = if size > 0 { self.pool.free.lock().unwrap().get_mut(&size).and_then(|v| v.pop()) } else { None };
@@ -9042,7 +8957,6 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
     /// One token through all layers using the int8 KV cache; returns logits [vocab].
     pub fn decode_step_q8(&self, m: &Model, c: &QKvCache, token: u32, pos: usize) -> Vec<f32> {
-        let _scratch = self.scratch_scope();
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
@@ -9443,7 +9357,6 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// no matter how long the stream runs. Identical to full decode until the cap is hit,
     /// then each new token overwrites the oldest window slot (O(1), see `stream_slot`).
     pub fn decode_step_stream(&self, m: &Model, c: &KvCache, token: u32, pos: usize, sink: usize, window: usize) -> Vec<f32> {
-        let _scratch = self.scratch_scope();
         self.begin_frame();
         let (slot, attend_len) = stream_slot(pos, sink, window);
         let s = token as usize * m.d;
@@ -9459,9 +9372,6 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     pub fn decode_step(&self, m: &Model, c: &KvCache, token: u32, pos: usize) -> Vec<f32> {
-        // Per-token arena (the games/soldier pattern): every token allocates the same shapes in the same
-        // order, so handing out the same buffers makes every bind group repeat and the cache hit.
-        let _scratch = self.scratch_scope();
         self.begin_frame();
         let s = token as usize * m.d;
         let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
