@@ -1249,6 +1249,9 @@ fn normalize_prompt_template(prompt: &str, t: TemplateKind) -> Option<String> {
     }
 }
 
+/// One-shot latch so the EXPECTED Llama-4 rewrite is announced once per process, not once per turn.
+static TEMPLATE_NOTE_DONE: AtomicBool = AtomicBool::new(false);
+
 fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, template_out: Arc<std::sync::atomic::AtomicU8>) {
     // Default to the backend that's actually compiled in (llama.cpp if available),
     // so the header Load and the chat tab operate on the same, working backend.
@@ -1279,7 +1282,25 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
                 // the loaded model's template; if the UI built the prompt with the other family's markers,
                 // translate and say so loudly — this is the bug that garbled every ChatML model.
                 let prompt = match normalize_prompt_template(&prompt, backend.template()) {
-                    Some(fixed) => { eprintln!("worker: PROMPT TEMPLATE MISMATCH — UI sent {} markers to a {:?} model; translated (UI template state is stale — report this)", if fixed.contains("<|im_start|>") { "Llama-3" } else { "ChatML" }, backend.template()); fixed }
+                    Some(fixed) => {
+                        // TWO DIFFERENT SITUATIONS, previously reported identically as a mismatch to
+                        // "report this". For Llama-4 the UI builds Llama-3 markers ON PURPOSE and this
+                        // rewrite is the documented handoff (see chat.rs's TemplateKind::Llama4 arm) —
+                        // calling that a bug trained the user to ignore a message that also fires for a
+                        // real one. Anything else IS stale UI state and still says so.
+                        let sent = if fixed.contains("<|im_start|>") { "Llama-3" } else { "ChatML" };
+                        if backend.template() == TemplateKind::Llama4 && sent == "Llama-3" {
+                            if !TEMPLATE_NOTE_DONE.swap(true, Ordering::Relaxed) {
+                                eprintln!("worker: prompt rewritten to Llama-4 markers (expected: the UI \
+builds Llama-3 markers and the worker translates them authoritatively)");
+                            }
+                        } else {
+                            eprintln!("worker: PROMPT TEMPLATE MISMATCH — UI sent {sent} markers to a {:?} \
+model; translated. This is stale UI template state, not the Llama-4 handoff — please report it.",
+                                backend.template());
+                        }
+                        fixed
+                    }
                     None => prompt,
                 };
                 // NOTE: cancel is cleared by the SENDER (Inference::generate) on the UI thread, ordered
