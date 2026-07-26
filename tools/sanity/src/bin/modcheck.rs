@@ -33,8 +33,10 @@ struct ModDecl {
 }
 
 /// Scan one file's code for `mod NAME;` declarations (bodyless only) and any
-/// `#[path]` attribute bound to each.
-fn scan_mods(code: &str, pos: &[(u32, u32)]) -> Vec<ModDecl> {
+/// `#[path]` attribute bound to each. `raw` is the ORIGINAL source: the lexer strips
+/// string contents, so the attribute's value must be recovered from the raw line the
+/// position map points at (multi-line `#[path =\n"…"]` also checks the next line).
+fn scan_mods(code: &str, pos: &[(u32, u32)], raw: &str) -> Vec<ModDecl> {
     let cb = code.as_bytes();
     let mut out = Vec::new();
     let mut from = 0usize;
@@ -70,16 +72,25 @@ fn scan_mods(code: &str, pos: &[(u32, u32)]) -> Vec<ModDecl> {
         let window = &code[win_start..at];
         let path_attr = window.rfind("#[path").and_then(|p| {
             let seg = &window[p..];
-            let q1 = seg.find('"')?;
-            let q2 = seg[q1 + 1..].find('"')?;
             // the attribute must be the LAST thing before the mod (only ws/`pub` between)
             let after_attr = &seg[seg.find(']')? + 1..];
             let clean = after_attr.trim().trim_start_matches("pub").trim();
-            if clean.is_empty() || clean == "pub" {
-                Some(seg[q1 + 1..q1 + 1 + q2].to_string())
-            } else {
-                None
+            if !(clean.is_empty() || clean == "pub") {
+                return None;
             }
+            // recover the value from the RAW source: the lexer emptied the string, but
+            // pos maps the attr's code index to its raw line
+            let attr_line = pos[win_start + p].0 as usize;
+            for l in [attr_line, attr_line + 1] {
+                if let Some(rl) = raw.lines().nth(l.saturating_sub(1)) {
+                    if let Some(q1) = rl.find('"') {
+                        if let Some(q2) = rl[q1 + 1..].find('"') {
+                            return Some(rl[q1 + 1..q1 + 1 + q2].to_string());
+                        }
+                    }
+                }
+            }
+            None
         });
         let (line, col) = pos[ns];
         out.push(ModDecl { name, line, col, path_attr });
@@ -120,6 +131,7 @@ fn main() {
             Ok(s) => s,
             Err(_) => continue,
         };
+        let raw = String::from_utf8_lossy(&src).into_owned();
         let mut code = String::with_capacity(src.len());
         let mut pos = Vec::with_capacity(src.len());
         lex::walk_code(&src, |b, l, c| {
@@ -133,7 +145,7 @@ fn main() {
         let fname = f.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let base: PathBuf = if is_root_name(fname) { dir.to_path_buf() } else { dir.join(stem) };
 
-        for m in scan_mods(&code, &pos) {
+        for m in scan_mods(&code, &pos, &raw) {
             if let Some(rel) = &m.path_attr {
                 let target = dir.join(rel);
                 if target.is_file() {
@@ -194,7 +206,7 @@ mod tests {
             code.push(b as char);
             pos.push((l, c));
         });
-        scan_mods(&code, &pos)
+        scan_mods(&code, &pos, src)
     }
 
     #[test]
