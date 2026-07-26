@@ -10,6 +10,7 @@ use std::collections::HashMap;
 pub mod gguf;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
+pub mod enginelevers;
 pub mod archfeat;
 
 /// Engine tuning knobs a host application may set before the first `Gpu::new()`.
@@ -923,19 +924,37 @@ impl Gpu {
 
     /// Run the subgroup decode kernel against the plain (byte-per-thread) reference on a tiny random shape;
     /// true iff they agree within f32-reassociation tolerance. Gates whether the autotuner may pick sg.
+    /// Does the subgroup matvec agree with the reference kernel on THIS driver?
+    ///
+    /// Checked at MODEL SCALE, not at a token size. The original check used k=256, n=128 and passed on a
+    /// driver whose subgroup kernel is wrong by rel 2.5 at k=2048 — because a small k fits in one
+    /// subgroup-reduction step and never exercises the cross-wave accumulation where the bug lives. A
+    /// self-check that cannot fail on a broken driver is worse than none: it converts "unknown" into a
+    /// false "verified", and the engine then enables a kernel that silently corrupts every projection.
+    ///
+    /// The sizes below are a real attention projection and a real FFN width, so a driver that passes has
+    /// been asked the question that matters. Two shapes rather than one: the failure observed was
+    /// size-dependent, so a single shape could still be lucky.
     fn self_check_sg(&self) -> bool {
-        let (k, n) = (256usize, 128usize);
-        let mut rng = 0x00C0_FFEE_1234_5678u64;
-        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
-        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
-        let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
-        let qw = self.quantize_q8_resident(&w, n, k);
-        let a = self.upload(&act, 1, k);
-        let base = self.download(&self.matvec_decode_v1(&a, &qw, 1));
-        let sg = self.download(&self.matvec_decode_v2sg(&a, &qw, 4));
-        let scale = base.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
-        let worst = base.iter().zip(&sg).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        worst / scale < 1e-3
+        for (k, n) in [(2048usize, 2048usize), (8192, 1024)] {
+            let mut rng = 0x00C0_FFEE_1234_5678u64;
+            let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+            let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+            let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+            let qw = self.quantize_q8_resident(&w, n, k);
+            let a = self.upload(&act, 1, k);
+            let base = self.download(&self.matvec_decode_v1(&a, &qw, 1));
+            let sg = self.download(&self.matvec_decode_v2sg(&a, &qw, 4));
+            if base.len() != sg.len() || base.is_empty() { return false; }
+            let scale = base.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+            let worst = base.iter().zip(&sg).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            if !(worst / scale < 1e-3) {
+                eprintln!("wgpu-engine: subgroup matvec self-check FAILED at k={k} n={n} \
+(rel {:.2e}) — using the barrier-reduction kernel instead", worst / scale);
+                return false;
+            }
+        }
+        true
     }
 
     /// Generic compute dispatch. Convention: storage inputs at bindings 0..n
@@ -6420,6 +6439,17 @@ per-layer routing active");
         let swa_pattern: Vec<bool> = if swa_period > 0 {
             crate::swa::swa_layers(n_swa_layers, swa_period, false)
         } else { vec![true; n_swa_layers] };
+        // One line naming any optimization that is NOT in its default state, so a run is reproducible
+        // from its own log. Printing all twelve every load would be noise nobody reads; printing the
+        // deviations makes an unusual result traceable to the lever that caused it.
+        {
+            let overridden: Vec<String> = crate::enginelevers::LEVERS.iter().filter_map(|l| {
+                std::env::var(l.var).ok().map(|v| format!("{}={v}", l.var))
+            }).collect();
+            if !overridden.is_empty() {
+                eprintln!("wgpu-engine: non-default levers set — {}", overridden.join(" "));
+            }
+        }
         // Newly enabled architectures say so. Every Gemma-3 requirement is implemented and unit-gated,
         // but no Gemma checkpoint has ever been loaded end to end here — and this project has repeatedly
         // shown that "validated in isolation" and "works on a real file" are different claims. Saying it
