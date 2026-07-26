@@ -915,6 +915,9 @@ pub struct Chat {
     show_history: bool,                     // history/tree panel open
     file_hist: Option<usize>,               // generated-file index whose version history is expanded
     template: TemplateKind,                 // chat-template family of the loaded model (set on load)
+    /// The worker's live template, refreshed every frame. Preferred over `template` at prompt-build
+    /// time so a generate submitted in the same frame as a model load cannot use the previous model's.
+    live_template: Option<TemplateKind>,
     phys: crate::physui::Panel,             // in-scene physical control dock (Overview/Tour/Freecam as 3D buttons)
     phys_anim: Vec<crate::physui::ControlAnim>, // per-dock-control eased press/hover/lit feel (indexed by DOCK_IDS)
     phys_t: Option<std::time::Instant>,     // last dock-anim tick (for dt); None until the first frame
@@ -992,6 +995,7 @@ impl Default for Chat {
                 .and_then(|d| crate::vault::Vault::open(d).ok()),
             head: None, show_history: false, file_hist: None,
             template: TemplateKind::Llama3,
+            live_template: None,
             phys: phys_dock(),
             phys_anim: vec![crate::physui::ControlAnim::default(); DOCK_IDS.len()],
             phys_t: None,
@@ -1356,6 +1360,9 @@ impl Chat {
             temperature: self.ctx.temperature, repeat_penalty: self.ctx.repeat_penalty, min_p: self.ctx.min_p, n_threads: 4, n_gpu_layers: -1 }
     }
 
+    /// The loaded model's template, preferring the worker's live value over the per-frame copy.
+    fn live_template(&self) -> TemplateKind { self.live_template.unwrap_or(self.template) }
+
     fn build_prompt(&self, doc: &crate::analysis::Doc) -> String { self.build_prompt_upto(self.msgs.len(), doc) }
 
     /// Every branch tip: a message id that is no other message's (effective) parent. The effective parent
@@ -1602,7 +1609,10 @@ impl Chat {
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         match self.backend {
-            BackendKind::Wgpu => match self.template {
+            // Read the template LIVE rather than trusting the per-frame copy. The copy is refreshed in
+            // the update loop, so a generate submitted in the same frame as a model load still carried
+            // the PREVIOUS model's template — which is the "stale UI state" the worker kept reporting.
+            BackendKind::Wgpu => match self.live_template() {
                 TemplateKind::ChatML => self.build_prompt_chatml(&sys, upto),
                 TemplateKind::Llama3 => self.build_prompt_llama3(&sys, upto),
                 // Llama4: build with Llama-3 markers — the worker's normalize_prompt_template
@@ -2102,6 +2112,9 @@ impl Chat {
         // degrades to word salad (seen on every Qwen3 while Llama models worked).
         if let Some(t) = infer.detected_template() {
             if self.template != t { self.template = t; }
+            // Also record it separately, so build_prompt can use the worker's value even if a generate is
+            // submitted in the same frame as the load that changed it.
+            self.live_template = Some(t);
         }
         let key = (self.ctx.n_ctx, self.ctx.max_tokens, (self.ctx.temperature * 100.0) as i32, self.ctx.history_turns);
         if self.sent_params != Some(key) { infer.set_params(self.params()); self.sent_params = Some(key); }
