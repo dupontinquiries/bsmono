@@ -57,9 +57,14 @@ by assuming the latest:
 - `game.c` region 1 (wave delay) — drop is a superset, took it.
 - `game.c` region 2 — see below.
 
-Verified: all 54 module sources pass `gcc -fsyntax-only`, all 54 ctest targets
-resolve to real sources. No cmake in the authoring sandbox, so configure +
-ctest stay a hardware step.
+Verified: **cmake configure + full build + `ctest` all green — 64/64 tests
+pass**, from a fresh clone of the output bundle. That covers `test_gates` and
+`test_handoff` (ours) alongside `test_behavior`, `test_combat_json`,
+`test_commander_ai`, `test_hive_ai`, `test_bodykind` and the drop's six
+Python-driven tests (`content_validate`, `lint_dead_fields`, `silhouette`,
+`map_score`, `openworld`, `gltf_roundtrip`). The `game` binary links. Six
+compiler warnings, all in code neither side touched (`msdf.c`, `save_config`,
+`test_arena_iqm`) and all present before the merge.
 
 ### OPEN: two escalation systems now coexist
 
@@ -95,7 +100,12 @@ Landed from the drop: RpGAN relativistic pairing loss (Rust and Python), R1/R2
 zero-centered gradient penalties with lazy regularization on the Python side,
 and Burn `fusion`/`autotune` feature flags plus an opt-in `spirv` backend.
 
-Not verified: no Rust toolchain in the sandbox, so `cargo check` is a hardware
+Not verified: `cargo check` could not run. Ubuntu 24.04 ships cargo/rustc
+1.75, and the dependency graph needs ≥1.85 — `zeroize v1.9.0`, pinned in the
+existing lockfile, is itself edition-2024. `rustup` is unavailable and
+`static.rust-lang.org` is outside the sandbox allowlist, so no newer toolchain
+can be fetched. This gap is pre-existing and unrelated to the merge — the
+monorepo already notes (`89f3c41`) that unendlich needs rust 1.96. Hardware
 step.
 
 ## unendlich
@@ -122,6 +132,28 @@ the merge rather than during it.
 `Cargo.toml` auto-merged: our `netcode` path dependency alongside the drop's
 r742 → r746 version bump.
 
+### MANIFEST.sha256 is a baseline, and it is stale
+
+`RETURN_KIT.sh finish` uses `MANIFEST.sha256` to report which files a worker
+changed relative to the drop they were handed (`+` new, `~` changed). It is a
+record of the shipped state, not an integrity gate on the current tree.
+
+It was already stale when it arrived: checked against the **raw archive**, 288
+entries FAIL and 12 are missing, out of 1624. The merge adds exactly 15 more,
+and all 15 are correct outcomes:
+
+- 14 `assets/shaders/*.spv` — we kept ours, per the decision above; the
+  manifest records the drop's bytes. Equivalent shaders, different bytes.
+- `crates/unendlich-engine/src/sim/spawn.rs` — monorepo-side change the drop
+  predates; the merge correctly kept ours.
+
+**Left as-is deliberately.** Regenerating would make it a truthful baseline for
+the merged tree, but it is the external line's worker-workflow artifact and
+whether to re-baseline is their call, not the merge's. To do it:
+
+    cd games/unendlich && find . -type f -not -path './.git/*' \
+      -not -name MANIFEST.sha256 | sort | xargs sha256sum > MANIFEST.sha256
+
 ## gitmind
 
 Nothing to commit. `.gitmind/store.redb` is gitignored and regenerated from the
@@ -139,10 +171,27 @@ not bundles of descendant history, so the sibling-branch merge above is the
 shape to reuse for that case. Take the `gin snapshot` checkpoint first either
 way.
 
+## Whole-tree verification
+
+`./verify.sh` on the merged tree reports `projects-with-real-problems=1`
+(`rusty-board`). Running it on the **pre-merge bundle** gives byte-identical
+output — that problem predates this work, and these merges introduce no new
+findings. Note `verify.sh` covers `apps/`, `system/` and `tools/{peek,drift}`
+only; it does not reach `games/`, which is why the blackstar ctest run above
+carries the weight for that project.
+
+`git fsck` clean. The output bundle verifies as complete history and
+round-trips through a fresh clone, from which the blackstar build and 64/64
+ctest were run.
+
 ## Still open
 
 - `TODO(design)` in `games/blackstar/engine_src/game.c` — pick one escalation
-  mechanic and retire the other.
-- cmake configure + ctest for blackstar (needs a cmake host).
-- `cargo check` for kbm3 and unendlich (needs a Rust toolchain).
-- `maintenance/gitmind-sync.sh` on hardware.
+  mechanic and retire the other. Also check anything persisting a mode index:
+  `EX_MODE_ESCALATION` moved from ordinal 2 to 4.
+- `cargo check` for kbm3 and unendlich, and `apps/gitmind`'s `gin` — all need
+  a rust ≥1.85 host (see above).
+- `maintenance/gitmind-sync.sh` on hardware, once `gin` builds. `.gitmind`
+  needs nothing committed; `store.redb` is gitignored and regenerates from the
+  git graph these merges just changed.
+- Optionally re-baseline `games/unendlich/MANIFEST.sha256` (see above).
