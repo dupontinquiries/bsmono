@@ -1,0 +1,13 @@
+[package]
+name = "contentlint"
+version = "0.1.0"
+edition = "2021"
+
+# std-only ON PURPOSE: this is a build-gate tool — it must compile anywhere rustc exists,
+# with no lockfile, no network, no edition-2024 dependency surprises. See
+# maintenance/RUST_PORT_PLAN.md for the porting doctrine this is part of.
+[dependencies]
+
+[[bin]]
+name = "lint_dead_fields"
+path = "src/lint_dead_fields.rs"
