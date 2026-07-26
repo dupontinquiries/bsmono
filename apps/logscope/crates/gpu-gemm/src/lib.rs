@@ -6266,8 +6266,14 @@ per-layer routing active");
                 // Append layer-0's tensors so the exact expert stacking layout is visible right here — the
                 // one thing needed to wire the MoE forward, without a separate dump run.
                 let layout = g.dump_tensors("blk.0.");
-                return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {}. \
-                    Use the llama.cpp backend for this model.\n{layout}", acfg.note));
+                // If archfeat knows this architecture, say WHAT is missing. "unknown architecture" is an
+                // unhelpful answer for a model whose requirements have been transcribed from llama.cpp —
+                // the difference between "nobody has looked at this" and "three specific things are
+                // missing, one of them structural" is most of what a person needs to decide what to do.
+                let known = crate::archfeat::gap_report(&arch, expert_count);
+                let detail = if known.is_empty() { acfg.note.to_string() } else { known.join("; ") };
+                return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {detail}. \
+                    Use the llama.cpp backend for this model.\n{layout}"));
             }
             eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
         }
