@@ -302,6 +302,19 @@ if(Python3_FOUND)
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/lint_dead_fields.py
                    --root ${CMAKE_SOURCE_DIR})
 endif()
+# Rust twin of lint_dead_fields (rust/contentlint) — first port under
+# maintenance/RUST_PORT_PLAN.md. Byte-identical stdout + exit semantics, proven on both
+# the pass and fail paths against the Python. Runs wherever cargo exists — including
+# hosts with no Python3, which is the gap that motivated the port (these content gates
+# silently drop out of the suite there). The Python stays until the twin has run green
+# on every suite host; retire it by deleting the block above, nothing else.
+find_program(CARGO_EXECUTABLE cargo QUIET)
+if(CARGO_EXECUTABLE)
+  add_test(NAME lint_dead_fields_rs
+           COMMAND ${CARGO_EXECUTABLE} run --release --quiet
+                   --manifest-path ${CMAKE_SOURCE_DIR}/rust/contentlint/Cargo.toml
+                   --bin lint_dead_fields -- --root ${CMAKE_SOURCE_DIR})
+endif()
 if(Python3_FOUND)
   add_test(NAME silhouette
            COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/test_silhouette.py
