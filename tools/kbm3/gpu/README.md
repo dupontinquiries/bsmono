@@ -317,6 +317,122 @@ Ported and verified (each with a real Vulkan run, not just a read-through):
 - **CSV logging** — matches Python's `train_log.csv` format exactly (see
   above), so the existing `plot` tooling works unmodified on Rust runs.
 
+## Backend feature flags (the biggest speed lever found so far)
+
+Until now this crate built Burn with only `["std", "wgpu", "autodiff"]` — which
+means **kernel fusion and autotuning were both OFF**. On a stack where the
+measured bottleneck is per-iteration *dispatch overhead* (≈1241ms fixed per
+iteration on M2 Ultra/Asahi, independent of batch size), that was leaving the
+single most relevant optimization on the table.
+
+Now enabled by default:
+
+| feature | what it does | why it matters here |
+|---|---|---|
+| `fusion` | merges elementwise/reduction chains into single kernels | fewer dispatches = less driver overhead, which *is* the Asahi bottleneck |
+| `autotune` | benchmarks kernel variants per-device, caches the winner | default kernel choices are tuned for NVIDIA; Honeykrisp/Mesa needs its own |
+
+With `fusion` on, Burn's `Wgpu` alias automatically becomes
+`Fusion<CubeBackend<..>>` — no code change was needed.
+
+**Autotune has a large one-time cost.** Measured here: the first training
+iteration took **179s** (vs ~2s steady-state) while it benchmarked variants.
+Results cache in `target/autotune/`, so it's paid once per device/shape combo.
+To shrink it:
+
+```bash
+export CUBECL_AUTOTUNE_LEVEL=minimal   # fewer variants benchmarked
+```
+
+### Opt-in: the SPIR-V backend (`--features spirv`)
+
+Burn's own docs say the SPIR-V compiler backend *"performs significantly better
+than WGSL"*, especially for matmul, and it's the only path that can reach
+f16/TensorCore-class matmul. It is **opt-in**, not default:
+
+```bash
+cargo build --release --features spirv --bin beatspace-gpu
+```
+
+It's opt-in because it requires a real Vulkan adapter advertising SPIR-V
+passthrough. On a software rasterizer (lavapipe) adapter selection fails hard
+with `No possible adapter available for backend`, so defaulting it on would
+break CPU-only and CI environments. **Honeykrisp is a real Vulkan 1.3 driver,
+so this should work on the M2 Ultra — and it is the most promising untested
+speed lever remaining.** Worth benchmarking first thing:
+
+```bash
+# baseline (fusion+autotune, WGSL)
+cargo run --release --bin beatspace-gpu -- bench --batch 8 --warmup 10 --measure 50
+# SPIR-V
+cargo run --release --features spirv --bin beatspace-gpu -- bench --batch 8 --warmup 10 --measure 50
+```
+
+For reference, an unrelated Burn project (voxcpm-rs) measured **~2.6× from
+native-Vulkan + bf16 over plain wgpu** on AMD RDNA4 through Mesa, and ~5–7%
+from fusion+autotune alone. Different workload and hardware, so treat it as
+"worth testing", not a promise. That project also needed small patches for
+bf16 SPIR-V ops that Mesa's NIR translator mis-lowers — if SPIR-V misbehaves on
+Asahi, that's the class of bug to suspect.
+
+### Dispatch batching
+
+```bash
+export BURN_WGPU_MAX_TASKS=64   # how many compute tasks are batched per submit
+```
+Higher values mean fewer, larger submissions to the graphics API. Since the
+diagnosed problem is per-submit overhead, this is worth sweeping (try 16 / 32 /
+64 / 128) alongside the bench command.
+
+## SOTA training objective: RpGAN (R3GAN)
+
+`--loss rpgan` switches the adversarial objective from the classic BCE to the
+**relativistic pairing loss** from *"The GAN is dead; long live the GAN! A
+Modern Baseline GAN"* (Huang et al., NeurIPS 2024 — R3GAN).
+
+The classic loss asks D "is this sample real?" — an absolute decision boundary.
+RpGAN asks "is this real sample better than that fake one?", scoring a *pair*:
+
+```
+L_D = mean(softplus(-(D(real) - D(fake))))
+L_G = mean(softplus( (D(real) - D(fake))))
+```
+
+That one change is what fixes **mode dropping**. On the StackedMNIST
+1000-mode benchmark, the classic loss drops modes while RpGAN reaches full
+coverage, cutting reverse-KL from 0.9270 to 0.0781. For a trap-music generator
+— where the failure you'd actually hear is "every sample sounds like the same
+loop" — mode coverage is the metric that matters.
+
+Verification that the implementation is correct: at initialization D is
+untrained, so `D(real) ≈ D(fake)`, the difference is ~0, and **both losses must
+equal `softplus(0) = ln 2 = 0.6931`**. Observed: `lossD 0.6913, lossG 0.7068`.
+The classic BCE path, which has two terms, must equal `2·ln2 = 1.3863` —
+observed `1.4064`. Both match. The softplus uses the
+`max(x,0) + log(1+exp(-|x|))` identity, verified stable to x=700 where the
+naive form overflows.
+
+Default stays `bce`, so existing runs are unchanged.
+
+### Why R1/R2 are not in the Rust trainer
+
+R3GAN's full recipe is RpGAN **+ R1 + R2** (zero-centered gradient penalties on
+real *and* fake). The paper's central theoretical result is that RpGAN alone
+still diverges, and R1 alone is *not* sufficient — you need both for proven
+local convergence.
+
+Those penalties need **second-order gradients**, and Burn's autodiff does not
+provide them: `AutodiffBackend::grad()` returns an `InnerBackend` tensor, which
+carries no autodiff tracking, so there is nothing to backpropagate through. The
+type signature makes this unambiguous.
+
+The tractable stand-in is **instance noise**, which this trainer already applies
+(decaying sigma on D's inputs) — and that is not a hand-wave: Roth et al. (2017)
+showed instance noise is theoretically equivalent in effect to the R1/R2
+penalties, and R3GAN cites exactly that link. So the Rust path gets
+RpGAN + instance-noise-as-regularizer; the Python pipeline, which has PyTorch's
+double backward, gets the exact R1/R2 (see `--r1-gamma`, `--reg-every`).
+
 ## Performance: getting toward sub-1000ms/it
 
 **Use `--release`.** Directly measured on this dev box (lavapipe, so absolute

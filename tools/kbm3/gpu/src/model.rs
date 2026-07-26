@@ -285,3 +285,45 @@ pub fn bce_with_logits<B: Backend>(logits: Tensor<B, 1>, target: f32) -> Tensor<
     let softplus = logits.clone().abs().neg().exp().add_scalar(1.0).log();
     (max - logits.mul_scalar(target) + softplus).mean()
 }
+
+/// Numerically stable `softplus(x) = log(1 + exp(x))`, via the identity
+/// `softplus(x) = max(x,0) + log(1 + exp(-|x|))` (never overflows).
+fn softplus<B: Backend>(x: Tensor<B, 1>) -> Tensor<B, 1> {
+    let max = x.clone().clamp_min(0.0);
+    max + x.abs().neg().exp().add_scalar(1.0).log()
+}
+
+/// **RpGAN** — the relativistic pairing loss from "The GAN is dead; long live
+/// the GAN! A Modern Baseline GAN" (Huang et al., NeurIPS 2024 — R3GAN).
+///
+/// Where the classic GAN asks D "is this sample real?" (an absolute decision
+/// boundary), RpGAN asks "is this real sample better than that fake one?" —
+/// the critic scores a *pair*. That single change is what fixes mode dropping:
+/// on the StackedMNIST 1000-mode benchmark the classic loss drops modes while
+/// RpGAN reaches full coverage, cutting reverse-KL from 0.9270 to 0.0781.
+///
+///   L_D = mean( softplus( -(D(real) - D(fake)) ) )
+///   L_G = mean( softplus(  (D(real) - D(fake)) ) )
+///
+/// The pairing is elementwise over the batch (sample i of real vs sample i of
+/// fake), which is the standard cheap approximation to the full pairing
+/// expectation. Note both losses need BOTH logit sets, so unlike the BCE path
+/// the generator step must see D(real) too.
+///
+/// CAVEAT worth knowing: the R3GAN paper's full recipe is RpGAN + R1 + R2
+/// (zero-centered gradient penalties on real AND fake). R1/R2 require
+/// second-order gradients, which Burn's autodiff does not provide -- `grad()`
+/// returns an InnerBackend tensor with no autodiff tracking, so there's
+/// nothing to backprop through. The tractable stand-in is instance noise,
+/// which Roth et al. (2017) showed is theoretically equivalent in effect to
+/// the R1/R2 penalties -- and which this trainer already applies (decaying
+/// sigma on D's inputs). The Python pipeline, which has PyTorch's double
+/// backward, gets the exact R1/R2 with lazy regularization.
+pub fn rp_gan_d<B: Backend>(d_real: Tensor<B, 1>, d_fake: Tensor<B, 1>) -> Tensor<B, 1> {
+    softplus((d_real - d_fake).neg()).mean()
+}
+
+/// Generator side of the RpGAN objective (see [`rp_gan_d`]).
+pub fn rp_gan_g<B: Backend>(d_real: Tensor<B, 1>, d_fake: Tensor<B, 1>) -> Tensor<B, 1> {
+    softplus(d_real - d_fake).mean()
+}

@@ -3,6 +3,36 @@ kBM3 - AI Trap Music Generation (PyTorch / Asahi Linux)  -- v5.3
 ================================================================
 Single-file successor to gan-zai-v4--r3_r2_fixed.py.
 
+SOTA OBJECTIVE ADDED (R3GAN, Huang et al., NeurIPS 2024)
+--------------------------------------------------------------------------
+  * `--loss rpgan` -- the RELATIVISTIC PAIRING loss. Classic GAN asks D "is
+    this real?" (absolute boundary); RpGAN asks "is this real one better than
+    that fake one?", scoring a pair:
+        L_D = mean(softplus(-(D(real) - D(fake))))
+        L_G = mean(softplus( (D(real) - D(fake))))
+    This is the change that fixes MODE DROPPING: on StackedMNIST's 1000-mode
+    benchmark the classic loss drops modes while RpGAN gets full coverage
+    (reverse-KL 0.9270 -> 0.0781). For trap loops the audible failure is "every
+    sample is the same loop", so mode coverage is the metric that matters.
+    Sanity check: at init D(real) ~= D(fake), so both losses must equal
+    softplus(0) = ln2 = 0.6931 (the Rust port measures 0.6913 / 0.7068).
+
+  * `--r1-gamma G` -- ZERO-CENTERED GRADIENT PENALTIES R1 (on real) + R2 (on
+    fake). R3GAN's central theoretical result: RpGAN alone still diverges, and
+    R1 *alone* is not sufficient -- you need BOTH R1 and R2 for proven local
+    convergence. 0 = off (default). Typical 0.1-10, dataset dependent
+    (StyleGAN2 used 10 at 1024px; DiffAugment used 0.1 on CIFAR).
+
+  * `--reg-every N` -- LAZY REGULARIZATION (StyleGAN2's trick, default 16).
+    The penalties need a second backward pass, so applying them every step is
+    expensive; instead apply every N steps and scale by N to keep the effective
+    strength. Standard practice, negligible quality cost, large speedup.
+
+    NOTE: the Rust/Burn port cannot do R1/R2 -- Burn's autodiff has no
+    second-order gradients (grad() returns an InnerBackend tensor with no
+    tracking). It uses instance noise instead, which Roth et al. (2017) showed
+    is theoretically equivalent in effect to R1/R2 (and which R3GAN cites).
+
 WHAT CHANGED vs v5.2 (fixes the "5535 mels built but only 740 valid" bug)
 --------------------------------------------------------------------------
   * STABLE HASH-BASED SHARDING. v5.2 (and v4/v5 before it) assigned a file to
@@ -174,6 +204,21 @@ class Config:
     lr: float = 2e-4
     beta_1: float = 0.5
     label_smooth: float = 0.9
+    # --- SOTA objective (R3GAN, Huang et al., NeurIPS 2024) ---
+    # loss: "bce" (classic, default -- existing runs unchanged) or "rpgan"
+    #   (relativistic pairing: D scores real-vs-fake pairs instead of an
+    #   absolute boundary; fixes mode dropping).
+    loss: str = "bce"
+    # r1_gamma: weight of the zero-centered gradient penalties R1 (on real) and
+    #   R2 (on fake). R3GAN's result is that RpGAN needs BOTH to converge --
+    #   R1 alone still diverges. 0 disables. Typical: 0.1-10 (dataset-dependent;
+    #   StyleGAN2 used 10 at 1024px, DiffAugment used 0.1 on CIFAR).
+    r1_gamma: float = 0.0
+    # reg_every: "lazy regularization" (StyleGAN2) -- apply the penalties every
+    #   N steps instead of every step, scaling by N to keep effective strength.
+    #   The penalty needs a second backward pass, so this is a large speedup at
+    #   negligible quality cost. 16 is the standard value.
+    reg_every: int = 16
     griffinlim_iters: int = 64
 
     data_dir: str = "./music"
@@ -676,18 +721,58 @@ def train(cfg: Config, batch_size: int, device: torch.device,
 
         # --- Discriminator: real-as-real, fake-as-fake ---
         netD.zero_grad()
-        d_real_logits = netD(noised(real_imgs))
-        lossD_real = criterion(d_real_logits, real_label)
+        real_in = noised(real_imgs)
+        # R1/R2 need d(D)/d(input), so the inputs must be leaves that track grad.
+        do_reg = cfg.r1_gamma > 0.0 and (step % cfg.reg_every == 0)
+        if do_reg:
+            real_in.requires_grad_(True)
+        d_real_logits = netD(real_in)
         fake = netG(torch.randn(b_size, cfg.latent, device=device))
-        d_fake_logits = netD(noised(fake.detach()))
-        lossD_fake = criterion(d_fake_logits, fake_label)
-        lossD = lossD_real + lossD_fake
+        fake_in = noised(fake.detach())
+        if do_reg:
+            fake_in.requires_grad_(True)
+        d_fake_logits = netD(fake_in)
+
+        if cfg.loss == "rpgan":
+            # RpGAN (R3GAN, NeurIPS 2024): score real-vs-fake PAIRS rather than
+            # an absolute boundary. Fixes mode dropping (StackedMNIST: full
+            # 1000-mode coverage vs the classic loss's mode collapse).
+            lossD = F.softplus(-(d_real_logits - d_fake_logits)).mean()
+        else:
+            lossD_real = criterion(d_real_logits, real_label)
+            lossD_fake = criterion(d_fake_logits, fake_label)
+            lossD = lossD_real + lossD_fake
+
+        # --- Zero-centered gradient penalties R1 (real) + R2 (fake) ---
+        # R3GAN's key theoretical result: RpGAN alone still diverges; RpGAN
+        # WITH BOTH R1 and R2 has proven local convergence. R1 alone is NOT
+        # sufficient. Applied "lazily" every `reg_every` steps (StyleGAN2's
+        # trick) with the penalty scaled by reg_every to keep the effective
+        # strength unchanged -- the gradient penalty needs a second backward
+        # pass, so doing it every step would cost far more than it's worth.
+        if do_reg:
+            gp = 0.0
+            for logits, inp in ((d_real_logits, real_in), (d_fake_logits, fake_in)):
+                grad = torch.autograd.grad(
+                    outputs=logits.sum(), inputs=inp, create_graph=True
+                )[0]
+                gp = gp + grad.pow(2).flatten(1).sum(1).mean()
+            lossD = lossD + (cfg.r1_gamma / 2.0) * gp * cfg.reg_every
+
         lossD.backward()
         optD.step()
 
         # --- Generator: fool D ---
         netG.zero_grad()
-        lossG = criterion(netD(noised(fake)), real_label)
+        g_fake_logits = netD(noised(fake))
+        if cfg.loss == "rpgan":
+            # the pairing loss needs both sides; reals are detached constants
+            # from G's point of view
+            with torch.no_grad():
+                g_real_logits = netD(noised(real_imgs))
+            lossG = F.softplus(g_real_logits - g_fake_logits).mean()
+        else:
+            lossG = criterion(g_fake_logits, real_label)
         lossG.backward()
         optG.step()
 
@@ -817,6 +902,12 @@ def main():
     pt.add_argument("--no-instance-noise", action="store_true")
     pt.add_argument("--no-ema", action="store_true")
     pt.add_argument("--ema-decay", type=float, default=Config.ema_decay)
+    pt.add_argument("--loss", choices=["bce", "rpgan"], default=Config.loss,
+                    help="rpgan = R3GAN relativistic pairing loss (better mode coverage)")
+    pt.add_argument("--r1-gamma", type=float, default=Config.r1_gamma,
+                    help="weight for zero-centered gradient penalties R1+R2 (0=off)")
+    pt.add_argument("--reg-every", type=int, default=Config.reg_every,
+                    help="apply R1/R2 every N steps (lazy regularization)")
     pt.add_argument("--no-opus", action="store_true")
     pt.add_argument("--seed", type=int, default=None)
 
@@ -852,6 +943,7 @@ def main():
             ckpt_every=args.ckpt_every,
             instance_noise_sigma=0.0 if args.no_instance_noise else Config.instance_noise_sigma,
             use_ema=not args.no_ema, ema_decay=args.ema_decay,
+            loss=args.loss, r1_gamma=args.r1_gamma, reg_every=args.reg_every,
         )
         train(cfg, args.batch, device, workers=args.workers, resume=args.resume)
 
