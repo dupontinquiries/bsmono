@@ -225,3 +225,40 @@ not use**, not a limit of the M2 or of the kernel.
 This is read from source, not measured. The next step is a small probe that prints the actual heap bounds
 on the M2 (the values are in `dev->params`), which would turn "the arithmetic suggests ~24 GiB" into a
 measured fact — the same discipline that settled the external-memory-host question.
+
+## 8. Should Mesa be a subproject? No — and the Rust angle does not apply here
+
+Checked the current state rather than assuming:
+
+* **The Asahi Mesa fork is retired.** As of the 6.16 progress report (Aug 2025): *"our DRM Native Context
+  implementation has now been merged into the upstream virglrenderer project... This completes our
+  transition to a fully upstream graphics stack, and as such we are retiring our Mesa fork completely."*
+  So `agx_device.c` as read here IS the shipping driver — no fork to track.
+
+* **The Rust is in the KERNEL driver, not the Vulkan userspace.** `drm/asahi` is Rust (~21,000 lines,
+  upstreaming began early 2026). Honeykrisp — `src/asahi/vulkan/hk_*.c` and `src/asahi/lib/agx_device.c`,
+  which is where the VA halving lives — is **C**. So there is no Rust framework that applies to the change
+  we care about, and no Rust crate to depend on. The crossover the question was reaching for is real but
+  sits one layer below our problem.
+
+* **A kernel change is still not needed.** The 32 GiB kernel reservation and the sparse halving are both
+  chosen by *userspace* Mesa before `DRM_IOCTL_ASAHI_VM_CREATE`.
+
+### So the practical path is not vendoring
+
+Vendoring ~100 MB of Mesa into this monorepo to change three lines would be a maintenance burden with no
+upside. Instead:
+
+1. **Measure first** (still not done): print the real `main_heap` bounds on the M2. If the arithmetic does
+   not predict the observed ceiling, everything below is moot.
+2. **Build patched Mesa out-of-tree**, install to a prefix, and A/B it with
+   `VK_ICD_FILENAMES=/path/to/patched/asahi_icd.aarch64.json` — the same mechanism this container already
+   uses to select lavapipe. No system install, no risk to the working driver, trivially reversible.
+3. **If it works, upstream a flag** rather than carry a patch. The halving is well-commented and clearly
+   deliberate; a `sparse=false`-style option that skips it is a small, defensible MR.
+
+One adjacent thing worth knowing: Mesa 25.2 added **`VK_EXT_map_memory_placed`** for Asahi (letting an app
+request GPU memory be mapped at a specific address). Not a solution to our ceiling — it places mappings,
+it does not create address space — but it is evidence the driver's memory-mapping surface is actively
+being extended, which makes an upstream conversation about the VA split more likely to land than it would
+have been a year ago.
