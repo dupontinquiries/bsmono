@@ -60,6 +60,13 @@ pub enum Feature {
     LogitSoftcap,
     /// The token embedding is multiplied by sqrt(d) before the first block (all Gemma).
     EmbeddingScale,
+    /// Windowed layers rotate at a DIFFERENT rope frequency base than full-attention ones
+    /// (Gemma `rope.freq_base_swa`). Distinct from `PerLayerRopeFreqs`, which is per-layer rope
+    /// frequency TENSORS in Gemma 4.
+    PerLayerRopeBase,
+    /// The attention scale is a hyperparameter rather than 1/sqrt(head_dim). Equal to the default on
+    /// most Gemma 3, but NOT on the 27B, which uses 1/sqrt(n_embd/n_head).
+    AttentionScaleHparam,
 }
 
 impl Feature {
@@ -82,6 +89,8 @@ impl Feature {
             Feature::GemmaRmsNorm => "Gemma (1+w) RMS norm",
             Feature::LogitSoftcap => "tanh soft-cap on attention and final logits",
             Feature::EmbeddingScale => "token embedding scaled by sqrt(d)",
+            Feature::PerLayerRopeBase => "separate rope base for windowed layers",
+            Feature::AttentionScaleHparam => "attention scale from hparams, not 1/sqrt(head_dim)",
         }
     }
 
@@ -119,6 +128,8 @@ impl Feature {
             Feature::GemmaRmsNorm => true,       // (1+w) folded into the weight at load (--gate-gemma)
             Feature::LogitSoftcap => false,      // not implemented anywhere
             Feature::EmbeddingScale => true,     // Model::embed_scale, set from the arch at load
+            Feature::PerLayerRopeBase => true,   // BlockWeights::rope_base, from rope.freq_base_swa
+            Feature::AttentionScaleHparam => false, // 1/sqrt(head_dim) is hardcoded in the kernels
         }
     }
 
@@ -133,6 +144,8 @@ whose windowed and full layers differ cannot be laid out correctly at all"),
             Feature::LayerOutputScale => Some("layer outputs are unscaled; the tensor is present in the \
 file and ignored"),
             Feature::LogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
+            Feature::AttentionScaleHparam => Some("matches the 1/sqrt(head_dim) default on Gemma 3 12B \
+and below; differs only on the 27B, which uses 1/sqrt(n_embd/n_head)"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
             _ => None,
@@ -161,15 +174,15 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         // Gemma 2/3/4 all use standard SWA on a layer pattern with a separate rope base; 3 and 4 add
         // learned Q/K norms before rope, and 4 adds per-layer rope frequency tensors.
         "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::GeGluActivation,
-                         Feature::GemmaRmsNorm, Feature::LogitSoftcap, Feature::EmbeddingScale],
+                         Feature::GemmaRmsNorm, Feature::LogitSoftcap, Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
         "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
-                                     Feature::GeGluActivation, Feature::GemmaRmsNorm, Feature::EmbeddingScale],
+                                     Feature::GeGluActivation, Feature::GemmaRmsNorm, Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
         // Gemma 4 (src/models/gemma4.cpp): everything gemma3 needs, plus per-layer rope freqs, a
         // per-layer HEAD DIM (key_length_swa vs key_length) and a learned per-layer output scale.
         "gemma4" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
                          Feature::GeGluActivation, Feature::GemmaRmsNorm,
                          Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
-                         Feature::EmbeddingScale],
+                         Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
         "glm4moe" | "glm-dsa" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
         _ => Vec::new(),
     }
@@ -299,11 +312,15 @@ mod tests {
 
     #[test]
     fn gemma3_is_down_to_no_gaps_and_gemma2_only_needs_the_softcap() {
-        // Gemma 3 needed five things: SWA, post-norms, learned Q/K norm before rope, GELU gating and the
-        // (1+w) norm. All five are now in.
-        assert!(gaps("gemma3", 0).is_empty(), "{:?}", gaps("gemma3", 0));
+        // A LINE-BY-LINE read of gemma3.cpp's graph found two more things after this test first passed:
+        // the sqrt(d) embedding scale and a separate rope base for windowed layers. Both are now
+        // implemented. The third finding, the hparam attention scale, matches our 1/sqrt(head_dim)
+        // default on every Gemma 3 except the 27B — so it is listed as a requirement and NOT implemented,
+        // which is what keeps a 27B from silently loading wrong.
+        assert_eq!(gaps("gemma3", 0), vec![Feature::AttentionScaleHparam]);
+        assert!(Feature::PerLayerRopeBase.implemented() && Feature::EmbeddingScale.implemented());
         // Gemma 2 shares those but also soft-caps its attention and final logits, which is unimplemented.
-        assert_eq!(gaps("gemma2", 0), vec![Feature::LogitSoftcap]);
+        assert_eq!(gaps("gemma2", 0), vec![Feature::LogitSoftcap, Feature::AttentionScaleHparam]);
         // Gemma 4's remaining gaps are the structural ones, unchanged by this work.
         let g4 = gaps("gemma4", 0);
         assert!(g4.contains(&Feature::PerLayerHeadDim) && g4.contains(&Feature::LayerOutputScale));
