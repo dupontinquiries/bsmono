@@ -142,3 +142,24 @@ Three lessons:
   handles: their destructors run during thread teardown, where a panic cannot unwind. The existing
   `ArenaGuard` already carried a comment about not touching the GPU during teardown — the same trap, one
   layer down, and it was not read carefully enough before adding a second one.
+
+## CORRECTION: the staging ring did not reduce Scout's submits, and my attribution was wrong
+
+Measured on hardware after the ring landed: **1151 submits/token, unchanged.**
+
+The arithmetic that produced the ring — `1152 / 48 layers = 24 = 12 fills x 2 end_frame()` — was a
+coincidence. Scout does not take the path those `end_frame()` calls live in. Its expert tensors are Q6_K,
+so `MoE file-views unavailable` fires and it uses the **host-copy** fill path, where `StreamSlots::fill` is
+a bare `queue.write_buffer` with no submit at all. The ring optimised a path this model never executes.
+
+Two things follow, and the second matters more than the first:
+
+* The ring is still correct and still helps the file-view path (any all-Q4_K MoE checkpoint), so it stays —
+  but it is not the fix for the number in the profile.
+* **A plausible arithmetic match is not evidence.** 1152/48 = 24 and 12x2 = 24 was too neat, and I did not
+  check that the model in question reaches that code before acting on it. The check would have been one
+  grep: does Scout hit the `raw` branch? It does not, and the loader says so in its own log line, three
+  lines above the profile I was reading.
+
+The real source of ~24 submits/layer on Scout is still unidentified. `fill` does not submit; the router
+readback accounts for one per layer.
