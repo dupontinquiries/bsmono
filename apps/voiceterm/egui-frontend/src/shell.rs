@@ -606,6 +606,119 @@ impl Workspace {
             .map(|(id, _)| id)
             .next_back()
     }
+
+    /// The draggable dividers of the active tab, derived from the pane rects: two panes that
+    /// share an edge and overlap along it have a seam between them. Pure.
+    pub fn pane_seams(&self, w: f32, h: f32) -> Vec<PaneSeam> {
+        const EPS: f32 = 0.5;
+        let rects = self.model.pane_rects(w, h);
+        let mut out = Vec::new();
+        for (ai, ar) in rects.iter() {
+            for (bi, br) in rects.iter() {
+                if ai == bi {
+                    continue;
+                }
+                // vertical seam: a's right edge meets b's left edge, with rows in common
+                if ((ar.x + ar.w) - br.x).abs() < EPS {
+                    let from = ar.y.max(br.y);
+                    let to = (ar.y + ar.h).min(br.y + br.h);
+                    if to - from > EPS {
+                        out.push(PaneSeam {
+                            vertical: true,
+                            pos: br.x,
+                            from,
+                            to,
+                            a: *ai,
+                            b: *bi,
+                            extent: (br.x + br.w) - ar.x,
+                        });
+                    }
+                }
+                // horizontal seam: a's bottom edge meets b's top edge, with columns in common
+                if ((ar.y + ar.h) - br.y).abs() < EPS {
+                    let from = ar.x.max(br.x);
+                    let to = (ar.x + ar.w).min(br.x + br.w);
+                    if to - from > EPS {
+                        out.push(PaneSeam {
+                            vertical: false,
+                            pos: br.y,
+                            from,
+                            to,
+                            a: *ai,
+                            b: *bi,
+                            extent: (br.y + br.h) - ar.y,
+                        });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The seam within `tol` of `(x, y)`, nearest first — what a drag grabs, and what turns
+    /// the cursor into a resize arrow on hover.
+    pub fn seam_at(&self, w: f32, h: f32, x: f32, y: f32, tol: f32) -> Option<PaneSeam> {
+        let mut best: Option<(f32, PaneSeam)> = None;
+        for s in self.pane_seams(w, h) {
+            let (along, across) = if s.vertical { (y, x) } else { (x, y) };
+            if along < s.from || along > s.to {
+                continue;
+            }
+            let d = (across - s.pos).abs();
+            if d <= tol && best.as_ref().map_or(true, |(bd, _)| d < *bd) {
+                best = Some((d, s));
+            }
+        }
+        best.map(|(_, s)| s)
+    }
+
+    /// Drag a divider by `d` pixels (right for a vertical seam, down for a horizontal one).
+    ///
+    /// `d` becomes a ratio delta over the seam's own extent, so a 40px drag moves the divider
+    /// 40px regardless of how deep the split sits. The model only resizes a split where the
+    /// target is a DIRECT child, and the low-side pane isn't always one (in `H{V{A,B}, C}` the
+    /// A|C seam is the root's, but A hangs off the inner V) — so this tries the low-side pane
+    /// and falls back to the high-side one. The ratio change is identical either way; only
+    /// reachability differs.
+    ///
+    /// Focus is saved and restored: grabbing a divider should not move the keyboard focus.
+    pub fn drag_seam(&mut self, seam: &PaneSeam, d: f32) -> bool {
+        if seam.extent.abs() < f32::EPSILON {
+            return false;
+        }
+        let delta = d / seam.extent;
+        let dir = if seam.vertical { Dir::Right } else { Dir::Down };
+        let saved = self.focused_pane();
+        self.model.active_mut().focused_pane = seam.a;
+        let mut ok = self.model.resize(dir, delta);
+        if !ok {
+            self.model.active_mut().focused_pane = seam.b;
+            ok = self.model.resize(dir, delta);
+        }
+        self.model.active_mut().focused_pane = saved;
+        ok
+    }
+}
+
+/// A draggable divider between two panes. Plain `f32`, like [`PaneBox`], so seam maths is
+/// testable without a windowing stack.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneSeam {
+    /// A vertical divider (drag horizontally). `false` = horizontal divider (drag vertically).
+    pub vertical: bool,
+    /// x of a vertical seam, y of a horizontal one.
+    pub pos: f32,
+    /// Start of the seam along its other axis.
+    pub from: f32,
+    /// End of the seam along its other axis.
+    pub to: f32,
+    /// Pane on the low side (left / top).
+    pub a: u64,
+    /// Pane on the high side (right / bottom).
+    pub b: u64,
+    /// Combined extent of the two panes along the drag axis — the denominator that turns a
+    /// pixel drag into a ratio delta.
+    pub extent: f32,
 }
 
 /// One laid-out pane, ready to draw. Deliberately plain `f32` rather than `egui::Rect` so
@@ -933,6 +1046,87 @@ mod tests {
         // the terminal keeps focus; the web pane is not focused
         assert!(b.iter().any(|p| p.focused && !p.web));
         assert!(b.iter().all(|p| !(p.web && p.focused)));
+    }
+
+    /// f32 ratio maths lands a hair off exact pixels (240.00002); compare with a tolerance
+    /// rather than pinning bit-exact values.
+    fn near(a: f32, b: f32) -> bool {
+        (a - b).abs() < 0.01
+    }
+
+    #[test]
+    fn seams_sit_between_adjacent_panes_and_drag_moves_them() {
+        let mut ws = Workspace::new(&["main"]);
+        assert!(ws.pane_seams(400.0, 300.0).is_empty()); // one pane, nothing to drag
+
+        ws.apply(&WsCall::Command("split right".into()));
+        let seams = ws.pane_seams(400.0, 300.0);
+        // exactly one edge, reported once — a seam is an ordered (low, high) pair, so the
+        // reversed pair is a different edge and never matches
+        assert_eq!(seams.len(), 1);
+        let s = ws.seam_at(400.0, 300.0, 200.0, 150.0, 6.0).expect("seam at the midline");
+        assert!(s.vertical);
+        assert_eq!(s.pos, 200.0);
+        assert_eq!((s.from, s.to), (0.0, 300.0));
+        assert_eq!(s.extent, 400.0);
+
+        // away from the divider, and off the end of its span, there is nothing to grab
+        assert!(ws.seam_at(400.0, 300.0, 100.0, 150.0, 6.0).is_none());
+
+        // drag right 40px => the left pane gains exactly 40px
+        assert!(ws.drag_seam(&s, 40.0));
+        let b = ws.pane_boxes(400.0, 300.0, 0.0);
+        assert!(near(b[0].w, 240.0));
+        assert!(near(b[1].x, 240.0) && near(b[1].w, 160.0));
+
+        // and back the other way
+        assert!(ws.drag_seam(&s, -40.0));
+        assert!(near(ws.pane_boxes(400.0, 300.0, 0.0)[0].w, 200.0));
+    }
+
+    #[test]
+    fn dragging_a_divider_does_not_steal_focus() {
+        let mut ws = Workspace::new(&["main"]);
+        ws.apply(&WsCall::Command("split right".into()));
+        let focused = ws.focused_pane();
+        let s = ws.seam_at(400.0, 300.0, 200.0, 150.0, 6.0).unwrap();
+        ws.drag_seam(&s, 25.0);
+        assert_eq!(ws.focused_pane(), focused);
+    }
+
+    #[test]
+    fn nested_split_seam_falls_back_to_the_reachable_side() {
+        // H{ V{P0,P2}, P1 } — the P2|P1 seam belongs to the ROOT split, but P2 hangs off the
+        // inner V, so resizing via the low-side pane alone would silently fail.
+        let mut ws = Workspace::new(&["main"]);
+        ws.apply(&WsCall::Command("split right".into())); // H{P0,P1}, focus P1
+        let left = ws.pane_at(400.0, 300.0, 10.0, 10.0).unwrap();
+        assert!(ws.focus_pane(left));
+        ws.apply(&WsCall::Command("split down".into())); // left becomes V{P0,P2}
+        assert_eq!(ws.pane_boxes(400.0, 300.0, 0.0).len(), 3);
+
+        // grab the root divider low down, where the nested bottom-left pane meets the right one
+        let s = ws.seam_at(400.0, 300.0, 200.0, 225.0, 6.0).expect("root seam");
+        assert!(s.vertical);
+        assert!(ws.drag_seam(&s, 40.0)); // the fallback is what makes this true
+        let b = ws.pane_boxes(400.0, 300.0, 0.0);
+        let right: Vec<_> = b.iter().filter(|p| p.x >= 200.0).collect();
+        assert_eq!(right.len(), 1);
+        assert!(near(right[0].x, 240.0) && near(right[0].w, 160.0));
+    }
+
+    #[test]
+    fn horizontal_seam_drags_vertically() {
+        let mut ws = Workspace::new(&["main"]);
+        ws.apply(&WsCall::Command("split down".into()));
+        let s = ws.seam_at(400.0, 300.0, 200.0, 150.0, 6.0).expect("horizontal seam");
+        assert!(!s.vertical);
+        assert_eq!(s.pos, 150.0);
+        assert_eq!(s.extent, 300.0);
+        assert!(ws.drag_seam(&s, 30.0));
+        let b = ws.pane_boxes(400.0, 300.0, 0.0);
+        assert!(near(b[0].h, 180.0));
+        assert!(near(b[1].y, 180.0) && near(b[1].h, 120.0));
     }
 
     #[test]
