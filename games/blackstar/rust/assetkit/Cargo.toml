@@ -5,12 +5,23 @@ edition = "2021"
 description = "Cybertron asset library manager: browse/score the model library, preview meshes, drive exports, and monitor GAN training. Built on the monorepo's shared uikit-egui."
 
 [dependencies]
-# Point these at the monorepo checkout. Versions follow shared/uikit, which pins
-# egui 0.29 -- that needs rustc >= 1.76.
+# Repathed on the c4-245 merge. The drop authored these against a SIBLING
+# checkout ("../../../logscope-monorepo/shared/uikit/..."), which resolves to
+# games/logscope-monorepo/ inside this tree and does not exist -- so the crate
+# could not resolve at all. Both crates live in this monorepo at
+# shared/uikit/crates/, four levels up from games/blackstar/rust/assetkit.
+#
+# TODO(hardware): VERSION MISMATCH, deliberately NOT fixed here. This crate pins
+# egui/eframe 0.29, but shared/uikit/crates/uikit-egui now pins 0.34. Cargo will
+# admit both into the graph (semver-incompatible, so they coexist), and then
+# assetkit's own code handing egui types across the uikit-egui boundary will
+# fail to typecheck. Bumping to 0.34 is the likely fix but spans five minor
+# versions of egui API churn, so it needs a real compile to land -- which this
+# sandbox cannot do (egui 0.29 already needs rustc >= 1.76; available: 1.75).
 egui = "0.29"
 eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
-uikit-egui = { path = "../../../logscope-monorepo/shared/uikit/crates/uikit-egui" }
-snapclone-theme = { path = "../../../logscope-monorepo/shared/uikit/crates/snapclone-theme" }
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 
 [[bin]]
 name = "assetkit"
