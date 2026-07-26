@@ -3507,19 +3507,29 @@ impl Gpu {
     /// then weighted SCATTER-ADD into the output. Correctness-first v1: the per-layer router readback is a
     /// GPU sync (~1-3 ms) — the known perf ceiling (~5-10 tok/s decode) until GPU-side top-k lands.
     fn moe_ffn(&self, m: &MoeLayer, n2: &Tensor, t: usize, d: usize, x2: &Tensor) -> Tensor {
+        // Shared expert (GLM / DeepSeek / Llama-4 / Qwen2-MoE): a dense SwiGLU FFN added on top of the
+        // routed sum for EVERY token — the standard shared+routed decomposition. qwen3moe: None.
+        //
+        // ISSUED FIRST, DELIBERATELY. It depends only on `n2`, not on routing, so it is the one piece of
+        // this layer that does not wait for the router. `moe_ffn_routed` downloads the router logits to
+        // route on the CPU, and that download drains the queue — 48 of them per token on a 48-layer
+        // model, measured as 3030 ms of a 4399 ms step (GPU-sync-bound). Recording the shared expert's
+        // dispatches BEFORE that download means they are in the same submit and execute while the CPU is
+        // blocked, instead of starting after it returns. Same math, same final add order: bit-identical.
+        //
+        // This is the cheap half of the sync problem. The expensive half is that the routing readback
+        // exists at all — llama.cpp keeps top-k in the graph and never leaves the GPU mid-forward, which
+        // is what our v2 path does too, but streaming forces v1 because the CPU must know which expert to
+        // upload before it can upload it.
+        let shared = m.shared.as_ref().map(|(sgu, sdn)| {
+            let gu = sgu.apply(self, n2, t);
+            let hmid = self.swiglu_packed(&gu);
+            sdn.apply(self, &hmid, t)
+        });
         let routed = self.moe_ffn_routed(m, n2, t, d, x2);
-        // Shared expert (GLM / DeepSeek / Qwen2-MoE): a dense SwiGLU FFN added on top of the routed
-        // sum for EVERY token — the standard shared+routed MoE decomposition. qwen3moe: None →
-        // byte-identical to before. Runs batched over t on the existing dense kernels (+3
-        // dispatches per MoE layer); a fused MOE_WSUM variant can absorb the add later.
-        match &m.shared {
+        match shared {
             None => routed,
-            Some((sgu, sdn)) => {
-                let gu = sgu.apply(self, n2, t);
-                let hmid = self.swiglu_packed(&gu);
-                let sh = sdn.apply(self, &hmid, t);
-                self.add_t(&routed, &sh)
-            }
+            Some(sh) => self.add_t(&routed, &sh),
         }
     }
     /// Validation-facing entry for the whole MoE FFN (routing + experts + shared + residual).
