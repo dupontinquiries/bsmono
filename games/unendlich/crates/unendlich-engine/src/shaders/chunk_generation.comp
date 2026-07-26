@@ -1163,9 +1163,14 @@ void write_block(uint chunk_index, int local_idx, uint block_id) {
     uint global_idx = chunk_index * uint(BLOCKS_PER_CHUNK) + uint(local_idx);
     uint word_idx = global_idx / 4u;
     uint byte_in_word = global_idx & 3u;
-    uint shift = byte_in_word * 8u;
-    uint mask = 0xFFu << shift;
-    uint val = (block_id & 0xFFu) << shift;
+    // K2 (logscope RULESET, validated on the M2's AGX/Honeykrisp): dynamic PLAIN shifts are the
+    // one bit-op class the driver has miscompiled on real silicon; the safe idiom is the
+    // bitfield builtins (OpBitFieldInsert/-UExtract in SPIR-V). Same semantics for byte lanes
+    // 0/8/16/24 — this is a hazard-class removal, not a behaviour change. See
+    // maintenance/ASAHI_VULKAN_LESSONS.md; on-device verify remains the proof.
+    int bit_off = int(byte_in_word) * 8;
+    uint mask = bitfieldInsert(0u, 0xFFu, bit_off, 8);
+    uint val = bitfieldInsert(0u, block_id & 0xFFu, bit_off, 8);
     // Atomic OR is safe because a fresh batch zeros the buffer beforehand
     // and each invocation writes a unique byte. But OR isn't enough if
     // we ever overwrite — and surface decoration overwrites stone with
@@ -1213,8 +1218,8 @@ uint read_block_local(uint chunk_index, int lx, int ly, int lz) {
     uint global_idx = chunk_index * uint(BLOCKS_PER_CHUNK) + uint(local_idx);
     uint word_idx = global_idx / 4u;
     uint byte_in_word = global_idx & 3u;
-    uint shift = byte_in_word * 8u;
-    return (blocks_packed[word_idx] >> shift) & 0xFFu;
+    // K2-safe byte extract (see write_block): bitfieldExtract, not a dynamic plain shift.
+    return bitfieldExtract(blocks_packed[word_idx], int(byte_in_word) * 8, 8);
 }
 
 // Physical Celsius temperature. Used by the freezing rule.
