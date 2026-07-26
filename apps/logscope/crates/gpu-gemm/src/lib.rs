@@ -5998,6 +5998,12 @@ impl Model {
 
     /// Resident weight format, as a tuning-key component. A lever can pay at one precision and not
     /// another, so a verdict measured at q4 must not be reused for an int8-resident load.
+    /// Does any layer stream its experts from host memory? Changes what the prefill chunk should optimise
+    /// for: refill traffic rather than dispatch duration.
+    pub fn streams_experts(&self) -> bool {
+        self.layers.iter().any(|b| b.moe.as_ref().is_some_and(|m| m.stream.is_some()))
+    }
+
     pub fn residency_class(&self) -> &'static str {
         if self.layers.iter().any(|b| b.wq.is_q4()) { "q4" } else { "int8" }
     }

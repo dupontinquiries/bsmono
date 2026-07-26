@@ -106,13 +106,13 @@ pub(crate) mod engine {
     /// chunk x d x ff roughly constant keeps dispatch duration roughly constant instead.
     ///
     /// Only ever lowers: models at or below the reference shape keep 256. An explicit override always wins.
-    fn prefill_chunk_for(d: usize, ff: usize) -> usize {
+    fn prefill_chunk_for_streaming(d: usize, ff: usize, streams: bool) -> usize {
         if std::env::var("LOGSCOPE_PREFILL_CHUNK").is_ok() || std::env::var("PREFILL_CHUNK").is_ok() {
             return prefill_chunk();
         }
         // One definition, in logscope::tuneprofile, so the engine and the profile cannot disagree about
         // what the chunk should be — two copies of a tuning rule is how they drift.
-        logscope::tuneprofile::Defaults::default().prefill_chunk(d, ff) as usize
+        logscope::tuneprofile::Defaults::default().prefill_chunk_for_model(d, ff, streams) as usize
     }
     /// Hard ceiling on the context window regardless of the n_ctx slider — the KV cache is O(window)
     /// memory (~hundreds of KB per token), so this is the backstop against OOMing the device.
@@ -764,7 +764,7 @@ would mislead every later load",
                 // O(1)-bandwidth batched prefill of the whole prompt (one [T,d] pass).
                 // O(chunk·T) chunked prefill — NOT one O(T²) batched pass — so a long pasted
                 // context can't balloon attention scratch to tens of GB and OOM the device.
-                let pc = prefill_chunk_for(self.model.d, self.model.h);
+                let pc = prefill_chunk_for_streaming(self.model.d, self.model.h, self.model.streams_experts());
                 {
                     static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -772,6 +772,9 @@ would mislead every later load",
                             " (overridden)".to_string()
                         } else if pc < PREFILL_CHUNK {
                             format!(" (auto-lowered from {PREFILL_CHUNK} for this model's d={}/ff={} — a fixed token count means a bigger model gets a longer dispatch, which is what trips the GPU watchdog)", self.model.d, self.model.h)
+                        } else if self.model.streams_experts() {
+                            " (kept at full size: this model STREAMS experts, so refill traffic dominates \
+and a smaller chunk would re-pull every cold expert more often)".to_string()
                         } else {
                             " (default; set LOGSCOPE_PREFILL_CHUNK to lower for GPU-watchdog hangs)".to_string()
                         };
@@ -867,7 +870,7 @@ would mislead every later load",
             if reuse && produced == 0 && !cancel() {
                 eprintln!("wgpu-engine: reuse produced 0 tokens — retrying with a clean full prefill…");
                 let mut s2 = self.gpu.session_new(&self.model, cap, self.rng);
-                s2.logits = self.gpu.prefill_chunked(&self.model, &s2.cache, &prompt_ids, prefill_chunk_for(self.model.d, self.model.h));
+                s2.logits = self.gpu.prefill_chunked(&self.model, &s2.cache, &prompt_ids, prefill_chunk_for_streaming(self.model.d, self.model.h, self.model.streams_experts()));
                 s2.pos = prompt_ids.len();
                 produced = stream_from(&mut s2, &mut rng);
                 s = s2;
@@ -981,7 +984,7 @@ would mislead every later load",
             let reply = p.reply_ceiling.max(p.max_tokens).max(1);
             let max_seq = window;
             let mut pc = self.gpu.session_new(&self.model, max_seq, self.rng);
-            if !shared.is_empty() { let _ = self.gpu.prefill_chunked(&self.model, &pc.cache, &shared, prefill_chunk_for(self.model.d, self.model.h)); pc.pos = shared.len(); }
+            if !shared.is_empty() { let _ = self.gpu.prefill_chunked(&self.model, &pc.cache, &shared, prefill_chunk_for_streaming(self.model.d, self.model.h, self.model.streams_experts())); pc.pos = shared.len(); }
             let sp = SamplerParams { temperature: p.temperature, top_k: 40, top_p: 0.95, repeat_penalty: p.repeat_penalty, repeat_last_n: 64, min_p: p.min_p };
             let queue: Vec<(usize, Vec<u32>, usize)> = enc.iter().enumerate()
                 .map(|(i, e)| (i, e[shared.len().min(e.len())..].to_vec(), reply.min(window.saturating_sub(e.len())).max(1)))
