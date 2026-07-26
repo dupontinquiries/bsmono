@@ -1,6 +1,6 @@
 [package]
 name = "unendlich-engine"
-version = "0.99.9999992-r742-occlusion-wired"
+version = "0.99.9999996-r746-recipe-build-itemid-fix"
 edition = "2021"
 build = "build.rs"
 

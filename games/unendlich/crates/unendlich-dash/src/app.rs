@@ -250,7 +250,7 @@ impl DashApp {
                     ui.label(RichText::new(self.pick_dir.display().to_string()).color(INK));
                 });
                 ui.separator();
-                egui::ScrollArea::vertical().id_salt("dash-picker").show(ui, |ui| match std::fs::read_dir(&self.pick_dir) {
+                egui::ScrollArea::vertical().show(ui, |ui| match std::fs::read_dir(&self.pick_dir) {
                     Ok(rd) => {
                         let (mut dirs, mut files): (Vec<PathBuf>, Vec<PathBuf>) = rd.flatten().map(|e| e.path()).partition(|p| p.is_dir());
                         dirs.sort();
@@ -385,7 +385,7 @@ impl DashApp {
         }
 
         let mut clicked: Option<usize> = None;
-        egui::ScrollArea::vertical().id_salt("dash-main").max_height(ui.available_height() - 64.0).show(ui, |ui| {
+        egui::ScrollArea::vertical().max_height(ui.available_height() - 64.0).show(ui, |ui| {
             for i in idxs {
                 let run = &self.tel.runs[i];
                 let ts = run.start.clone().or_else(|| run.end.clone()).unwrap_or_else(|| format!("v{}", run.version.as_deref().unwrap_or("?")));
@@ -863,7 +863,7 @@ impl eframe::App for DashApp {
             .show_inside(ui, |ui| {
                 self.topbar(ui);
                 ui.add_space(14.0);
-                egui::ScrollArea::vertical().id_salt("dash-list").auto_shrink([false, false]).show(ui, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
                     self.render_view(ui);
                 });
             });
