@@ -3599,6 +3599,40 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         }
         return;
     }
+    if args.iter().any(|a| a == "--gate-llama4-kqnorm") {
+        // Llama-4 use_kq_norm (Llama4TextL2Norm). llama.cpp gates it exactly:
+        //     if (use_rope && hparams.use_kq_norm) { Qcur = rms_norm(Qcur); Kcur = rms_norm(Kcur); }
+        // so it applies on ROPE layers and NOT on NoPE layers (which take attention temperature instead).
+        // Getting the gate wrong in either direction produces fluent garbage, not an error — which is
+        // exactly how this went unnoticed. So both directions are asserted.
+        let gpu = Gpu::new();
+        eprintln!("gate-llama4-kqnorm: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (hd, heads) = (8usize, 2usize);
+        let width = hd * heads;
+        let x: Vec<f32> = (0..width).map(|i| ((i * 37 % 23) as f32) - 11.0).collect();
+        let xt = gpu.upload(&x, 1, width);
+        let ones = gpu.upload(&vec![1.0f32; hd], 1, hd);
+        let eps = 1e-5f32;
+
+        // Reference: per-head RMS norm with unit weight, on the CPU.
+        let mut want = x.clone();
+        for h in 0..heads {
+            let s: f32 = x[h * hd..(h + 1) * hd].iter().map(|v| v * v).sum::<f32>() / hd as f32;
+            let inv = 1.0 / (s + eps).sqrt();
+            for j in 0..hd { want[h * hd + j] = x[h * hd + j] * inv; }
+        }
+        let got = { let mut n = gpu.rmsnorm_t(&xt, &ones, heads, hd, eps); n.rows = 1; n.cols = width; gpu.download(&n) };
+        let md = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("unit-weight rmsnorm == per-head L2 reference: max|diff|={md:.3e}"), md < 1e-5);
+        // and it must actually CHANGE the vector — a no-op would silently look like "applied"
+        let unchanged = got.iter().zip(&x).all(|(a, b)| (a - b).abs() < 1e-9);
+        ck("the norm is not a no-op (it genuinely rescales)", !unchanged);
+        println!("gate-llama4-kqnorm: {}", if ok {
+            "post-rope Q/K norm matches the reference \u{2713} (placement gated on rope layers in kq_post)"
+        } else { "FAIL \u{2717}" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
@@ -3969,7 +4003,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None,
+        nope: false, attn_temp: None, kq_norm: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -3987,7 +4021,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -3998,7 +4032,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step
