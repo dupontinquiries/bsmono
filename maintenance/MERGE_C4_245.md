@@ -161,8 +161,13 @@ git graph, which these merges have just changed. On hardware:
 
     maintenance/gitmind-sync.sh
 
-`gin` cannot be built in the authoring sandbox (no Rust toolchain), as
-`LAYOUT.md` anticipates.
+`gin` cannot be built in the authoring sandbox. A toolchain *is* installable
+here (Ubuntu's rustc/cargo 1.75), but it is too old twice over:
+`apps/gitmind/Cargo.lock` is lockfile v4, which needs cargo ≥1.78, and
+regenerating the lock instead pulls `zeroize 1.9.0`, which is edition-2024 and
+needs ≥1.85. No `rustup`, and `static.rust-lang.org` is outside the allowlist,
+so no newer toolchain can be fetched. Confirmed by attempting it; the lockfile
+was restored and `target/` removed afterwards, so the tree is unchanged.
 
 One process note for `.gitmind/README.md`'s "Receiving a new bundle" recipe:
 it assumes the new history either fast-forwards or that you rebase onto it.
@@ -217,6 +222,73 @@ determine whether declaring the module builds clean or merely surfaces further
 errors in a file that has been dead through two drops. One line in
 `sim/mod.rs` if it turns out to be the former.
 
+## Post-merge fixes (found by auditing the merged tree)
+
+Three defects surfaced *after* the merges were committed, by running the
+repo's own tooling over the result rather than by inspecting the diffs.
+
+**`rustcheck` had a real bug** (`99d63bb`). `resolve_mod_files` inspected only
+`lines[n-2]` — the single line directly above a `mod x;` — when looking for a
+`#[path]` attribute. Attributes stack, so
+
+    #[path = "../audio.rs"]
+    #[allow(dead_code)]
+    mod audio;
+
+put `#[allow]` in that slot and hid the `#[path]` two lines up. The checker
+then looked for the module at its default location and emitted a bogus
+`missing-mod-file` — on the exact line `b3bc791` added and this merge worked to
+preserve. Now walks the whole contiguous attribute/comment run. Repo-wide
+effect is exactly one warning removed (14 static → 13); still flags genuinely
+absent modules.
+
+The 12 remaining are a *different* false positive, left alone: assetkit's
+`src/cli.rs` is a `[[bin]]` path target, so it is a crate root and its
+`mod json;` correctly resolves to `src/json.rs` — but `resolve_mod_files`
+derives the base directory from the filename alone (`main`/`lib`/`mod`) and
+never reads Cargo.toml's target tables. Fixing that is a larger change.
+
+**`assetkit` could not resolve at all** (`3bf7f21`). The drop authored it
+against a *sibling* checkout — `../../../logscope-monorepo/shared/uikit/…` —
+which from `games/blackstar/rust/assetkit` lands on `games/logscope-monorepo/`,
+a directory that does not exist here. Both crates are already in this tree at
+`shared/uikit/crates/`, four levels up rather than three. Same shape as the
+opendht repath `LAYOUT.md` records for snapclone. Path dependencies repo-wide
+now resolve **178/178** (was 176 with 2 broken).
+
+Not fixed, flagged in-file as `TODO(hardware)`: assetkit pins egui/eframe 0.29
+while `shared/uikit/crates/uikit-egui` now pins 0.34. Cargo admits both (they
+are semver-incompatible, so they coexist), and then assetkit's code handing
+egui types across the boundary fails to typecheck. The bump spans five minor
+versions of egui API churn and needs a real compile to land.
+
+**Neither project was known to the orchestrator** (`92beb2b`).
+`games/blackstar` and `tools/kbm3` were absent from `manifest/projects.toml`,
+so `build/build.sh` could not see them. Pre-existing — the merges left
+`manifest/` untouched and neither was ever registered — but wiring them now
+because the merge is what produced the evidence. blackstar is filed
+`kind = "cmake"` on the strength of the 64/64 ctest run above; kbm3 is filed
+`python+rust` *deliberately not* `cargo`, because there is no `Cargo.toml` at
+`tools/kbm3` (the crate is at `tools/kbm3/gpu`) and a cargo-kind entry would
+send `build.sh --run` to a directory with no manifest. Neither entry executes
+anything: the `--run` path is gated to `kind = cargo` on the host triple.
+
+### The audit that mattered: file-set checks are not enough
+
+The `pngutil` loss (`9925b22`) is the one to learn from. A check that compares
+*file sets* between pre- and post-merge reports zero loss here — the file was
+never missing. What went missing was the `pub mod pngutil;` line *inside* a
+file both sides had, so the loss was invisible to any inventory-level check and
+only showed up by diffing declarations.
+
+Re-run after the fix, across all three merged projects — every `mod`/`pub mod`
+declaration, every `[[bin]]` target and every package name in every `.rs` and
+`Cargo.toml` present both before and after:
+
+    games/blackstar   0 declaration losses
+    tools/kbm3        0 declaration losses
+    games/unendlich   0 declaration losses
+
 ## Whole-tree verification
 
 `./verify.sh` on the merged tree reports `projects-with-real-problems=1`
@@ -239,6 +311,12 @@ ctest were run.
   `EX_MODE_ESCALATION` moved from ordinal 2 to 4.
 - `cargo check` for kbm3 and unendlich, and `apps/gitmind`'s `gin` — all need
   a rust ≥1.85 host (see above).
+- `games/blackstar/rust/assetkit`: egui 0.29 → 0.34 to match
+  `shared/uikit/crates/uikit-egui`. Path deps now resolve, but the version skew
+  will not typecheck. Needs a rust host; `TODO(hardware)` in its Cargo.toml.
+- `tools/rustcheck`: 12 residual false positives on `assetkit/src/cli.rs`,
+  because the static tier does not read Cargo.toml `[[bin]]` path targets when
+  deciding a module's base directory.
 - `maintenance/gitmind-sync.sh` on hardware, once `gin` builds. `.gitmind`
   needs nothing committed; `store.redb` is gitignored and regenerates from the
   git graph these merges just changed.
