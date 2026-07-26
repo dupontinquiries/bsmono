@@ -12,6 +12,7 @@ pub mod tuneprofile;
 pub mod modelorg;
 pub mod residency;
 pub mod liaison;
+pub mod liaison_prompt;
 pub mod exploration;
 pub mod blackboard;
 pub mod budget;
