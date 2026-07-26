@@ -11,7 +11,7 @@
 //! Gemma2 (geglu + dual soft-cap + a norm tweak), then Phi-3 (fused QKV / partial-rotary).
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Phi3, Glm4Moe, DeepseekV3, Unknown }
+pub enum Arch { Llama, Qwen2, Qwen3, Qwen35, Qwen3Moe, Qwen4, Llama4, Gemma2, Gemma3, Phi3, Glm4Moe, DeepseekV3, Unknown }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Norm { /// x/rms(x) · w
@@ -116,6 +116,16 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: Some(30.0), attn_softcap: Some(50.0), tied_embed_default: true,
             supported: false, dense_supported: false,
             note: "needs geglu activation, (1+w) rms norm, and tanh soft-cap on attn + final logits",
+        },
+        // Gemma 3: everything Gemma 2 has EXCEPT the soft-caps (gemma3.cpp defaults
+        // f_final_logit_softcapping to 0), plus learned per-head Q/K norms applied BEFORE rope — the same
+        // shape Qwen3 uses, which is why attn_qk_norm carries it. Sliding window, (1+w) norm, GELU gating
+        // and the post-norms are all implemented and gated (--gate-swa, --gate-gemma).
+        "gemma3" | "gemma3n" => ArchConfig {
+            arch: Arch::Gemma3, prefix: "gemma3", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::RmsGemma, act: Act::GeGlu,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            supported: true, dense_supported: true,
+            note: "gemma3: (1+w) rms norm, geglu, post-norms and sliding-window attention",
         },
         "phi3" => ArchConfig {
             arch: Arch::Phi3, prefix: "phi3", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
@@ -321,7 +331,7 @@ mod tests {
         // llama rotates adjacent pairs (ggml NORM); qwen/gemma/phi rotate split halves (NEOX).
         // Wrong pairing = real words, scrambled meaning (the dense-Qwen salad, root-caused on M2 Ultra).
         assert!(for_arch("llama").rope_interleaved);
-        for a in ["qwen2", "qwen3", "qwen3moe", "gemma2", "phi3"] {
+        for a in ["qwen2", "qwen3", "qwen3moe", "gemma2", "gemma3", "phi3"] {
             assert!(!for_arch(a).rope_interleaved, "{a} must be NEOX");
         }
     }
@@ -378,6 +388,22 @@ mod tests {
         assert_eq!(dim_keys(&c).embedding_length, "qwen3_5.embedding_length");
         // the "qwen35" spelling maps to the same config
         assert_eq!(for_arch("qwen35").arch, Arch::Qwen35);
+    }
+
+    #[test]
+    fn gemma3_is_enabled_and_differs_from_gemma2_where_llamacpp_says() {
+        let c = for_arch("gemma3");
+        assert!(c.supported && c.dense_supported, "gemma3's requirements are implemented and gated");
+        // shared with gemma2
+        assert_eq!(c.norm, Norm::RmsGemma, "x/rms(x)·(1+w)");
+        assert_eq!(c.act, Act::GeGlu);
+        assert!(!c.rope_interleaved, "NEOX split-half, like qwen/gemma/phi");
+        // NOT shared: gemma3.cpp defaults the soft-caps off, and adds learned Q/K norms before rope
+        assert!(c.logit_softcap.is_none() && c.attn_softcap.is_none(), "gemma3 has no soft-caps");
+        assert!(c.attn_qk_norm, "gemma3 adds learned per-head Q/K norms before rope");
+        let g2 = for_arch("gemma2");
+        assert!(g2.logit_softcap.is_some() && !g2.attn_qk_norm, "gemma2 is the other way round");
+        assert!(!g2.supported, "gemma2 still needs soft-capping");
     }
 
     #[test]
