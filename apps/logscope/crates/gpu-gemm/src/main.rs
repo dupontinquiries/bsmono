@@ -3633,6 +3633,54 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-swa") {
+        // A windowed KV view must give exactly the answer attention would give over a cache containing
+        // only those rows. If it does not, the view offset or length is wrong — and the symptom would be
+        // subtly wrong attention, not an error.
+        let gpu = Gpu::new();
+        eprintln!("gate-swa: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (hd, n_heads, n_kv_heads) = (64usize, 2usize, 2usize);
+        let (ad, kvd) = (n_heads * hd, n_kv_heads * hd);
+        let total = 40usize;          // cache rows
+        let window = 8u32;
+        let pos = total - 1;
+        let mk = |seed: u32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                             ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect()
+        };
+        let kdata = mk(11, total * kvd);
+        let vdata = mk(22, total * kvd);
+        let qv = mk(33, ad);
+        let qt = gpu.upload(&qv, 1, ad);
+        let kc = gpu.upload(&kdata, total, kvd);
+        let vc = gpu.upload(&vdata, total, kvd);
+
+        // Reference: a cache holding ONLY the window's rows, attended in full.
+        let start = gpu_kernels::swa::window_start(window, gpu_kernels::swa::SwaType::Standard, pos as i64) as usize;
+        let len = pos + 1 - start;
+        let kc2 = gpu.upload(&kdata[start * kvd..(pos + 1) * kvd], len, kvd);
+        let vc2 = gpu.upload(&vdata[start * kvd..(pos + 1) * kvd], len, kvd);
+        let want = gpu.download(&gpu.decode_attention_mh_pub(&qt, &kc2, &vc2, len, ad, n_heads, n_kv_heads));
+
+        // Under test: a VIEW into the full cache at the same window.
+        let off = (start * kvd * 4) as u64;
+        let size = (len * kvd * 4) as u64;
+        let kv_view = |t: &gpu_kernels::Tensor| gpu.tensor_view(t, off, size, len, kvd);
+        let got = gpu.download(&gpu.decode_attention_mh_pub(&qt, &kv_view(&kc), &kv_view(&vc), len, ad, n_heads, n_kv_heads));
+
+        ck(&format!("window starts where swa says ({start}, len {len} of {total})"), start == total - window as usize);
+        let md = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("windowed VIEW == truncated cache: max|diff|={md:.3e}"), md == 0.0);
+        // and it must differ from full attention, or the window is doing nothing
+        let full = gpu.download(&gpu.decode_attention_mh_pub(&qt, &kc, &vc, total, ad, n_heads, n_kv_heads));
+        let dfull = full.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        ck(&format!("windowed differs from full attention (max|diff|={dfull:.3e})"), dfull > 1e-6);
+        println!("gate-swa: {}", if ok {
+            "windowed KV view is exact \u{2713} (decode attends only within the window)"
+        } else { "FAIL \u{2717}" });
+        return;
+    }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
         eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
@@ -4003,7 +4051,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None,
+        nope: false, attn_temp: None, kq_norm: None, swa: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -4021,7 +4069,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, moe: None,
+            q_norm: None, k_norm: None, nope: true, attn_temp: None, kq_norm: None, swa: None, moe: None,
         };
         let got = gpu.download(&gpu.block_forward(&bw_nope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // Roped baseline at the SAME (consistent) shape — the sanity term: nope must actually differ.
@@ -4032,7 +4080,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step

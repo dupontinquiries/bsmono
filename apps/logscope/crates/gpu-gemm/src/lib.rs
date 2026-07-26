@@ -1442,6 +1442,9 @@ pub struct BlockWeights {
     /// Distinct from `q_norm`/`k_norm`, which are LEARNED weights applied BEFORE rope (the Qwen3 shape) —
     /// both the weight and the ordering differ, which is why this could not reuse them.
     pub kq_norm: Option<Tensor>,
+    /// Sliding-window attention for this layer: (window, rule). None = attend to the whole context.
+    /// Set per layer because these architectures alternate windowed and full-attention layers.
+    pub swa: Option<(u32, crate::swa::SwaType)>,
     /// Mixture-of-experts FFN (qwen3moe): replaces wgate_up/wdown (which hold 1-row placeholders when this
     /// is Some). Router is a small F32 Lin [n_expert, d]; experts are per-expert quantized Lins so the
     /// existing matvec/SwiGLU kernels apply unchanged at an expert's rows (no weight slicing needed).
@@ -6188,6 +6191,14 @@ impl Gpu {
         // Llama4 iRoPE: every 4th layer uses NO positional encoding (llama.cpp hardcodes the same
         // step). NoPE layers also skip the weightless QK-Norm (it applies with RoPE only).
         let nope_step = if is_llama4 { 4usize } else { 0 };
+        // Which layers are windowed. llama.cpp's default pattern puts the FULL-attention layer last in
+        // each group (dense_first = false), so a period of 4 gives [swa, swa, swa, dense].
+        let swa_period = g.get_u32(&format!("{}.attention.sliding_window_pattern", acfg.prefix))
+            .unwrap_or(if is_llama4 { 4 } else { 0 });
+        let n_swa_layers = g.get_u32(&format!("{}.block_count", acfg.prefix)).unwrap_or(0) as usize;
+        let swa_pattern: Vec<bool> = if swa_period > 0 {
+            crate::swa::swa_layers(n_swa_layers, swa_period, false)
+        } else { vec![true; n_swa_layers] };
         // Declare any architecture requirement we do not implement, BEFORE the first token. Llama-4 cost
         // three rounds because partial support is indistinguishable from a quantization, streaming, or
         // conversion bug once the output is merely wrong rather than absent. The requirements come from
@@ -6805,6 +6816,16 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // weightless Llama4TextL2Norm. ON for every Llama-4 except the 128-expert Maverick, which
                 // is exactly how llama.cpp gates it (use_kq_norm = type != LLM_TYPE_17B_128E). Applied
                 // after rope by `kq_post`; rope layers only.
+                // Sliding window, per layer. Read from metadata rather than assumed: the window size is
+                // `<arch>.attention.sliding_window`, and the layer pattern decides which layers use it.
+                // Llama-4 is CHUNKED (aligned blocks); Gemma is STANDARD (last n positions) — different
+                // rules, so the type comes from the architecture, not from the presence of a window.
+                swa: {
+                    let n_swa = g.get_u32(&format!("{}.attention.sliding_window", acfg.prefix)).unwrap_or(0);
+                    let ty = if is_llama4 { crate::swa::SwaType::Chunked } else { crate::swa::SwaType::Standard };
+                    let windowed = swa_pattern.get(i).copied().unwrap_or(false);
+                    if n_swa > 0 && windowed { Some((n_swa, ty)) } else { None }
+                },
                 kq_norm: if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
                     Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim))
                 } else { None },
@@ -6998,7 +7019,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -8291,6 +8312,17 @@ impl Gpu {
         out
     }
     /// Multi-head/GQA decode attention: single query row over a cache of `l` rows.
+    /// Test hook: the same decode attention, callable from a gate.
+    pub fn decode_attention_mh_pub(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize,
+                                   n_heads: usize, n_kv_heads: usize) -> Tensor {
+        self.decode_attention_mh(q, kc, vc, l, dm, n_heads, n_kv_heads)
+    }
+
+    /// Test hook: a sub-range view of a tensor, for exercising windowed reads from a gate.
+    pub fn tensor_view(&self, t: &Tensor, off: u64, size: u64, rows: usize, cols: usize) -> Tensor {
+        Tensor { buf: t.buf.clone(), rows, cols, pool: None, view: Some((off, size)) }
+    }
+
     fn decode_attention_mh(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
         let out = self.alloc(1, dm); let hd = dm / n_heads;
         let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32];
@@ -8580,6 +8612,34 @@ impl Gpu {
         logits
     }
     /// One block for a single token at absolute `pos`, attending to its KV cache.
+    /// Restrict a KV cache to this layer's sliding window for a query at `pos`.
+    ///
+    /// A single query position sees a CONTIGUOUS window under both rules — the last `n_swa` positions
+    /// (Gemma) or the current aligned chunk (Llama-4) — so decode needs a range restriction, not a mask.
+    /// Prefill is different (every query row has its own window) and still needs the mask path.
+    ///
+    /// Returns None, meaning "attend to everything", when: the layer is not windowed; the window already
+    /// covers the whole context; the cache is itself a view (composing offsets is not worth the risk); or
+    /// the row stride would put the view off a 256-byte boundary, which a storage binding requires. The
+    /// last case degrades to full attention rather than binding something misaligned.
+    fn swa_view(&self, w: &BlockWeights, kc: &Tensor, vc: &Tensor, pos: usize, cols: usize)
+        -> Option<(Tensor, Tensor, usize)> {
+        let (n_swa, ty) = w.swa?;
+        if kc.view.is_some() || vc.view.is_some() { return None; }
+        let start = crate::swa::window_start(n_swa, ty, pos as i64) as usize;
+        if start == 0 { return None; }
+        let row_bytes = cols * 4;
+        let off = start * row_bytes;
+        if off % 256 != 0 { return None; }
+        let len = pos + 1 - start;
+        let size = (len * row_bytes) as u64;
+        Some((
+            Tensor { buf: kc.buf.clone(), rows: len, cols, pool: None, view: Some((off as u64, size)) },
+            Tensor { buf: vc.buf.clone(), rows: len, cols, pool: None, view: Some((off as u64, size)) },
+            len,
+        ))
+    }
+
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
@@ -8596,7 +8656,11 @@ impl Gpu {
         let vr = w.wv.apply(self, &n1, 1);
         self.write_row(kc, &kr, pos, kv);
         self.write_row(vc, &vr, pos, kv);
-        let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
+        // Sliding window, when this layer has one: attend to the window instead of the whole context.
+        let attn = match self.swa_view(w, kc, vc, pos, kv) {
+            Some((k2, v2, l2)) => self.decode_attention_mh(&q, &k2, &v2, l2, ad, n_heads, n_kv_heads),
+            None => self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads),
+        };
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
@@ -8747,7 +8811,11 @@ impl Gpu {
             Some(t) if w.nope && t.active_at(pos) => self.scale_query_temp(&q, t.scale(pos), ad),
             _ => q,
         };
-        let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
+        // Sliding window, when this layer has one: attend to the window instead of the whole context.
+        let attn = match self.swa_view(w, kc, vc, pos, kv) {
+            Some((k2, v2, l2)) => self.decode_attention_mh(&q, &k2, &v2, l2, ad, n_heads, n_kv_heads),
+            None => self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads),
+        };
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
