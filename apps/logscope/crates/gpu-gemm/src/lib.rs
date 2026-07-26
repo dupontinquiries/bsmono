@@ -4072,7 +4072,8 @@ impl Gpu {
         let v = w.wv.apply(self, &n1, s);
         self.write_rows(kc, &k, base, s, kv);
         self.write_rows(vc, &v, base, s, kv);
-        let attn = self.attention_mh_ext(&q, kc, vc, base, s, ad, n_heads, n_kv_heads);
+        // per-row sliding window, from this layer's config (None = causal only)
+        let attn = self.attention_mh_ext_swa(&q, kc, vc, base, s, ad, n_heads, n_kv_heads, w.swa);
         let o = w.wo.apply(self, &attn, s);
         let x2 = self.add_t(x, &o);
         self.ffn_apply(w, &x2, s, d, eps)
@@ -7536,7 +7537,12 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // still covering causal rows up to 2048 in one workgroup; longer rows fall back to the serial kernel
 // (correct, slower) until a split-K causal prefill lands. `SCTILE` must match the array size below.
 const ATTENTION_MH_EXT_PAR: &str = r#"
-struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,_a:u32,_b:u32,_c:u32 };
+// `nswa`/`swaty` add sliding-window attention. Unlike decode — where a single query position gives one
+// contiguous range — every query ROW here has its own window, so the bound is computed per row from that
+// row's global position. It is still a range rather than a mask, because both windowing rules are
+// contiguous: the tile loop simply starts at the window instead of at 0. swaty: 0 none, 1 standard
+// (Gemma, last n positions), 2 chunked (Llama-4, current aligned chunk).
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kc: array<f32>;
 @group(0)@binding(2) var<storage,read> vc: array<f32>;
@@ -7560,7 +7566,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   var m=-3.4e38; var den=0.0;
   // per-thread partial accumulator over head_dim columns this thread owns (c = tid, tid+64, …)
   var acc0=0.0; var acc1=0.0; var acc2=0.0;           // hd<=192 for tid-strided (hd/64) cols; 128→2 cols
-  var t0=0u;
+  // sliding window: this row's earliest visible KV position (0 when unwindowed)
+  var lo=0u;
+  if(dd.nswa>0u){
+    if(dd.swaty==1u){ if(l>dd.nswa){ lo=l-dd.nswa; } }        // standard: keep the last nswa positions
+    else if(dd.swaty==2u){ lo=(qpos/dd.nswa)*dd.nswa; }        // chunked: start of qpos's aligned chunk
+  }
+  var t0=lo;
   loop {
     if(t0>=l){break;}
     let t1=min(l, t0+TILE);
@@ -8413,8 +8425,28 @@ impl Gpu {
     /// `[base, base+s)` attend over the cache `kc`/`vc` already holding `base+s` rows,
     /// causal by global position. Output is `[s, dm]`.
     fn attention_mh_ext(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        self.attention_mh_ext_swa(q, kc, vc, base, s, dm, n_heads, n_kv_heads, None)
+    }
+
+    /// As above, with an optional sliding window applied per query row.
+    ///
+    /// Only the PARALLEL kernel implements the window. The serial fallback (hd > 192) is left causal-only
+    /// and this refuses to pretend otherwise — silently ignoring the window there would give a model with
+    /// an unusual head_dim quietly wrong prefill, which is the failure mode this project keeps paying for.
+    pub fn attention_mh_ext_swa(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, dm: usize,
+                                n_heads: usize, n_kv_heads: usize,
+                                swa: Option<(u32, crate::swa::SwaType)>) -> Tensor {
         let out = self.alloc(s, dm); let hd = dm / n_heads;
-        let dims = [s as u32, hd as u32, n_heads as u32, n_kv_heads as u32, base as u32, 0, 0, 0];
+        let (nswa, swaty) = match swa {
+            Some((n, crate::swa::SwaType::Standard)) => (n, 1u32),
+            Some((n, crate::swa::SwaType::Chunked)) => (n, 2u32),
+            _ => (0, 0),
+        };
+        if nswa > 0 && hd > 192 {
+            eprintln!("wgpu-engine: sliding window NOT applied in prefill for head_dim={hd} (the serial \
+fallback kernel is causal-only) — long prompts on this model will attend outside the window");
+        }
+        let dims = [s as u32, hd as u32, n_heads as u32, n_kv_heads as u32, base as u32, nswa, swaty, 0];
         // The parallel kernel now TILES the KV loop (online softmax over 2048-row tiles at 8 KB shared
         // memory), so it handles ANY causal length at high occupancy — no length cliff. Its per-thread
         // register accumulator holds ceil(hd/64) head-dim cols, so it's valid for hd<=192 (head_dim=128
