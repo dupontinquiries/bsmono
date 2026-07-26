@@ -24,7 +24,7 @@ use burn::tensor::activation::sigmoid;
 use burn::tensor::{Distribution, Tensor};
 
 use data::MelCache;
-use model::{bce_with_logits, GanConfig, Generator};
+use model::{bce_with_logits, rp_gan_d, rp_gan_g, GanConfig, Generator};
 
 type BE = Wgpu<f32, i32>;
 type AB = Autodiff<BE>;
@@ -252,6 +252,10 @@ fn train(cfg: &GanConfig, device: &WgpuDevice, args: &[String]) {
     let resume: Option<usize> = arg(args, "--resume");
     let synthetic = args.iter().any(|a| a == "--synthetic");
     let no_ema = args.iter().any(|a| a == "--no-ema");
+    // Loss objective. `--loss rpgan` selects the R3GAN relativistic pairing
+    // loss (better mode coverage); default stays the classic BCE so existing
+    // runs are unchanged.
+    let rpgan = arg::<String>(args, "--loss").map(|s| s == "rpgan").unwrap_or(false);
     let ema_decay: f32 = arg(args, "--ema-decay").unwrap_or(0.999);
     // How often (in iters) to run the EMA blend. The blend touches ~8 tensors
     // (a handful of kernel dispatches) every time; on backends with high
@@ -368,17 +372,33 @@ fn train(cfg: &GanConfig, device: &WgpuDevice, args: &[String]) {
 
         // Discriminator
         let fake = g.forward(z);
-        let d_real_logits = d.forward(noised(real));
+        let real_in = noised(real);
+        let d_real_logits = d.forward(real_in.clone());
         let d_fake_logits = d.forward(noised(fake.clone().detach()));
-        let loss_d = bce_with_logits(d_real_logits.clone(), label_smooth)
-            + bce_with_logits(d_fake_logits.clone(), 0.0);
+        // Discriminator objective: classic BCE, or the RpGAN relativistic
+        // pairing loss (R3GAN, NeurIPS 2024) which scores real-vs-fake PAIRS
+        // instead of an absolute boundary -- the change that fixes mode
+        // dropping. See model::rp_gan_d.
+        let loss_d = if rpgan {
+            rp_gan_d(d_real_logits.clone(), d_fake_logits.clone())
+        } else {
+            bce_with_logits(d_real_logits.clone(), label_smooth)
+                + bce_with_logits(d_fake_logits.clone(), 0.0)
+        };
         let grads = loss_d.backward();
         let grads = GradientsParams::from_grads(grads, &d);
         d = opt_d.step(lr, d, grads);
 
-        // Generator
-        let g_logits = d.forward(noised(fake));
-        let loss_g = bce_with_logits(g_logits, label_smooth);
+        // Generator. RpGAN's generator loss needs BOTH logit sets (it's a
+        // pairing), so re-score the reals through the just-updated D; the BCE
+        // path only needs the fakes.
+        let loss_g = if rpgan {
+            let g_fake_logits = d.forward(noised(fake));
+            let g_real_logits = d.forward(real_in).detach();
+            rp_gan_g(g_real_logits, g_fake_logits)
+        } else {
+            bce_with_logits(d.forward(noised(fake)), label_smooth)
+        };
         let grads = loss_g.backward();
         let grads = GradientsParams::from_grads(grads, &g);
         g = opt_g.step(lr, g, grads);
