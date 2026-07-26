@@ -120,12 +120,25 @@ So the real cause of 18% reuse was **not** buffer identity. It was sub-buffer **
 entirely (the old key skipped any input with a view, and streaming expert weights are all views). Keying on
 the view span fixed that. The arena addressed a problem that was not there.
 
-It is kept because it is bit-exact, off-switchable (`LOGSCOPE_NO_SCRATCH`) and does bound allocation during
-decode — but the gate now asserts only that it does not make reuse *worse*, and the claim that it improves
-the cache has been removed. Two lessons:
+**It has since been REMOVED**, for a second reason that only appeared under the full kernel suite: the arena
+stored its buffers in a `thread_local`, and the "threaded workers (shared Gpu/Model)" check spawns threads.
+When a spawned thread ends, TLS destruction drops **wgpu buffers**, which panics inside a destructor — a
+non-unwinding panic, so the process aborts. Validation died at check 112 with *"panic in a destructor during
+cleanup"*.
+
+Guarding the *access* with `try_with` did not help, because the problem is the destructor of the
+thread-local's *contents*, not reads of it. The alternatives were to move the storage into `Gpu` behind a
+mutex (wrong: two threads sharing one arena would interleave allocations and hand out each other's buffers)
+or to key it by thread id (complexity for a thing already measured as worthless). So it was deleted.
+
+Three lessons:
 
 * The game comparison correctly identified *submits per unit of work* as the variable, and the staging ring
   (1152 → 72 submits/token) came out of it. That part held up.
 * "Games pre-create bind groups, so buffer churn must be our problem too" was an inference from a working
   system to a broken one, and it did not survive measurement. Adopting a pattern is not the same as having
   the problem the pattern solves.
+* A thread-local is the obvious way to make per-thread state, and it is the wrong container for GPU
+  handles: their destructors run during thread teardown, where a panic cannot unwind. The existing
+  `ArenaGuard` already carried a comment about not touching the GPU during teardown — the same trap, one
+  layer down, and it was not read carefully enough before adding a second one.
