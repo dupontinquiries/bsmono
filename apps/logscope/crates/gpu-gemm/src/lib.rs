@@ -353,6 +353,9 @@ pub struct Gpu {
     /// false = llama-style adjacent pairs. Set at model load from the arch config; lives on Gpu to avoid
     /// threading one flag through ~20 rope call sites. (Single-resident-model assumption, like the arena.)
     pub rope_neox: std::sync::atomic::AtomicBool,
+    /// Partial-rotary width (phi3 family): rope only the first `rot` dims of each head.
+    /// 0 = full head_dim (every other architecture). Stored per load like `rope_neox`.
+    pub rope_rot: std::sync::atomic::AtomicU32,
     /// YaRN attention scale (f32 bits; 1.0 = off), set by the loader when the GGUF declares
     /// rope.scaling.type = "yarn". Applied inside every rope host fn (multiplies the rotated
     /// output — the ggml formulation: both q and k scaled, so scores scale by mscale²). Gpu-level
@@ -893,7 +896,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_rot: std::sync::atomic::AtomicU32::new(0), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -5132,20 +5135,43 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // from the config, so MTP draft blocks and mixed checkpoints stay honest.
             // DeepSeek-V2-Lite (q_lora_rank == 0) keeps a real attn_q and takes the
             // standard fetches below — its q is full-rank even though its KV is latent.
+            // Phi-3 family: ONE fused attn_qkv tensor, rows stacked [Q | K | V] — exactly the
+            // engine's own wqkv fusion layout, so the fused weight loads directly and the
+            // separate wq/wk/wv (the unfused/debug path) are row-slices of the same fetch.
+            let fused_qkv = g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
+                && g.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some();
+            let qkv_f: Option<Vec<f32>> = if fused_qkv {
+                let f = fetch(&format!("blk.{i}.attn_qkv.weight"))?;
+                if f.len() != (attn_dim + 2 * kv) * d {
+                    return Err(format!("blk.{i}.attn_qkv.weight has {} values, expected ({attn_dim}+2*{kv})*{d} — \
+head_count/head_count_kv metadata disagrees with the tensor", f.len()));
+                }
+                Some(f)
+            } else { None };
             let mla_q = g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
                 && (g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
                     || g.tensor(&format!("blk.{i}.attn_q_a_proj.weight")).is_some());
-            let has_qkv_bias = !mla_q && g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
+            let has_qkv_bias = !mla_q && !fused_qkv && g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
+            let fused_bias: Option<Vec<f32>> = if fused_qkv && g.tensor(&format!("blk.{i}.attn_qkv.bias")).is_some() {
+                Some(fetch(&format!("blk.{i}.attn_qkv.bias"))?)
+            } else { None };
             let (fbq, fbk, fbv) = if has_qkv_bias {
                 (fetch(&format!("blk.{i}.attn_q.bias"))?, fetch(&format!("blk.{i}.attn_k.bias"))?, fetch(&format!("blk.{i}.attn_v.bias"))?)
             } else { (Vec::new(), Vec::new(), Vec::new()) };
-            let bq = if has_qkv_bias { Some(self.upload(&fbq, 1, d)) } else { None };
-            let bk = if has_qkv_bias { Some(self.upload(&fbk, 1, kv)) } else { None };
-            let bv = if has_qkv_bias { Some(self.upload(&fbv, 1, kv)) } else { None };
+            let bq = if has_qkv_bias { Some(self.upload(&fbq, 1, d)) }
+                else { fused_bias.as_ref().map(|b| self.upload(&b[..attn_dim], 1, attn_dim)) };
+            let bk = if has_qkv_bias { Some(self.upload(&fbk, 1, kv)) }
+                else { fused_bias.as_ref().map(|b| self.upload(&b[attn_dim..attn_dim + kv], 1, kv)) };
+            let bv = if has_qkv_bias { Some(self.upload(&fbv, 1, kv)) }
+                else { fused_bias.as_ref().map(|b| self.upload(&b[attn_dim + kv..], 1, kv)) };
             // Fused Q||K||V projection [d+2kv, d] (mirrors the wgate_up fusion): concatenate the q/k/v
             // weight ROWS then quantize — per-row quant of the concatenation is identical to quantizing
             // each separately (proven bit-exact by --gate-qkv). The bias concatenates the same way.
-            let wqkv = if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
+            let wqkv = if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+            else if let Some(f) = &qkv_f {
+                let l = self.make_lin(f, attn_dim + 2 * kv, d, q, q4_mode);
+                if let Some(b) = &fused_bias { l.with_bias(Some(self.upload(b, 1, attn_dim + 2 * kv))) } else { l }
+            } else {
                 let mut qkv = fetch(&format!("blk.{i}.attn_q.weight"))?;
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
@@ -5188,10 +5214,13 @@ attn_output (DeepSeek-V3 or *_proj GLM spellings)"));
                 g1: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.attn_norm.weight"))?, &acfg), 1, d),
                 wqkv,
                 wq: if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else if let Some(f) = &qkv_f { self.make_lin(&f[0..attn_dim * d], attn_dim, d, q, q4_mode).with_bias(bq) }
                     else { lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq) },
                 wk: if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else if let Some(f) = &qkv_f { self.make_lin(&f[attn_dim * d..(attn_dim + kv) * d], kv, d, q, q4_mode).with_bias(bk) }
                     else { lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk) },
                 wv: if mla_q { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                    else if let Some(f) = &qkv_f { self.make_lin(&f[(attn_dim + kv) * d..(attn_dim + 2 * kv) * d], kv, d, q, q4_mode).with_bias(bv) }
                     else { lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv) },
                 wo: lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)?,
                 g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
@@ -5202,7 +5231,18 @@ attn_output (DeepSeek-V3 or *_proj GLM spellings)"));
                 // the concatenation is identical to quantizing the two weights separately.
                 // MoE layers have no dense FFN tensors — tiny F32 placeholders, never applied
                 // (ffn_apply branches to the moe field first).
-                wgate_up: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
+                wgate_up: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
+                else if g.tensor(&format!("blk.{i}.ffn_gate.weight")).is_none() {
+                    // Phi-3: no ffn_gate tensor — ffn_up rows are [gate | up] stacked, llama.cpp's
+                    // LLM_FFN_SWIGLU split (first half gets SiLU). That is EXACTLY this engine's
+                    // wgate_up layout, so the tensor loads as the fusion directly.
+                    let gu = fetch(&format!("blk.{i}.ffn_up.weight"))?;
+                    if gu.len() != 2 * h * d {
+                        return Err(format!("blk.{i}.ffn_up.weight has {} values — no ffn_gate present, so \
+expected the phi3 fused [gate|up] shape 2*{h}*{d}", gu.len()));
+                    }
+                    self.make_lin(&gu, 2 * h, d, q, q4_mode)
+                } else {
                     let gt = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
                     let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
                     let mut gu = Vec::with_capacity(gt.len() + u.len());
@@ -5509,6 +5549,19 @@ host-copy path (dequantize + requantize every expert into RAM)");
         } else {
             self.make_lin(&embed, vocab, d, q, q4_mode)
         };
+        // Partial rotary (phi3 family): `rope.dimension_count` < head_dim ropes only the
+        // leading dims of each head. Absent/full → 0 → kernels use head_dim (bit-identical
+        // to the pre-partial kernels). Odd values are rejected: the pairing needs rot/2.
+        let rot = {
+            let r = g.get_u32(&format!("{pfx}.rope.dimension_count")).unwrap_or(0) as usize;
+            if r == 0 || r >= head_dim { 0 } else if r % 2 == 1 {
+                return Err(format!("rope.dimension_count = {r} is odd — split-half rope needs an even width"));
+            } else {
+                eprintln!("loader: partial rotary — rope on the first {r} of {head_dim} head dims");
+                r
+            }
+        };
+        self.rope_rot.store(rot as u32, std::sync::atomic::Ordering::Relaxed);
         // RoPE frequency factors (llama3 long-context scaling). GGUF ships them as
         // `rope_freqs.weight` (length head_dim/2); absent → all 1.0 (plain RoPE).
         let hd_half = head_dim / 2;
@@ -5531,6 +5584,25 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 let (ffv, ms) = yarn_factors(head_dim, base, sf, orig, 32.0, 1.0, attnf);
                 rope_vals = ffv; mscale = ms;
                 eprintln!("wgpu-engine: YaRN rope scaling ON — {sf}× over {orig} native ctx (mscale {mscale:.4})");
+            }
+        }
+        // Phi-3 LongRoPE: per-dim factor TENSORS at the root (long + short), selected by
+        // context. llama.cpp picks per-run n_ctx; this engine serves up to the shipped max,
+        // so the shipped `context_length` vs `rope.scaling.original_context_length` decides.
+        // The factors divide the frequency exactly like ggml's freq_factors — they fold into
+        // the same ff buffer, padded with 1.0 above the rotated width.
+        if g.tensor("rope_factors_long.weight").is_some() && g.tensor("rope_factors_short.weight").is_some() {
+            let ctx = g.get_u32(&format!("{pfx}.context_length")).unwrap_or(0);
+            let orig = g.get_u32(&format!("{pfx}.rope.scaling.original_context_length")).unwrap_or(ctx);
+            let which = if ctx > orig { "rope_factors_long.weight" } else { "rope_factors_short.weight" };
+            let v = fetch(which)?;
+            let want = (if rot > 0 { rot } else { head_dim }) / 2;
+            if v.len() == want {
+                for (dst, src) in rope_vals.iter_mut().zip(&v) { *dst = *src; }
+                mscale = g.get_f32(&format!("{pfx}.rope.scaling.attn_factor")).unwrap_or(1.0);
+                eprintln!("wgpu-engine: LongRoPE factors ON ({which}, ctx {ctx} vs {orig} native; mscale {mscale:.4})");
+            } else {
+                eprintln!("wgpu-engine: LongRoPE factor tensor len {} != rot/2 {} — ignoring factors", v.len(), want);
             }
         }
         self.rope_mscale.store(mscale.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -5696,6 +5768,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.rope_rot.store(0, std::sync::atomic::Ordering::Relaxed);
         Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None, mtp_layers: 0 })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
@@ -6338,7 +6411,8 @@ impl Gpu {
         if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; }
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
-        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, 0];
+        let rot = match self.rope_rot.load(std::sync::atomic::Ordering::Relaxed) { 0 => head_dim as u32, r => r };
+        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, rot];
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
 
@@ -7028,7 +7102,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; } // NoPE sentinel
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
-        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, msc, 0];
+        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, msc, match self.rope_rot.load(std::sync::atomic::Ordering::Relaxed) { 0 => head_dim as u32, r => r }];
         self.dispatch(ROPE_MH_ROWS, &[x, ff, pos], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
     /// Process one token through all layers using the cache; returns logits [vocab].
