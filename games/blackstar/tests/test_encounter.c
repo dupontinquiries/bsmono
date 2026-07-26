@@ -65,6 +65,84 @@ int main(void){
   printf("boss spawn/kill ok\n");
 
   ex_chunk_world_free(w);
+
+  // --- Destiny owned-space zones -------------------------------------------
+  // hand-place enemies at known distances and verify sticky zones + the
+  // collapse-advance that the fix makes actually take effect.
+  ex_chunk_world_t *zw = ex_chunk_world_new();
+  vec3 pz = {0,1,0};
+  ex_encounter_t z; ex_encounter_init(&z, EX_WIN_ELIMINATE, 0);
+  // front (~6u), middle (~18u), back (~34u) -- three grunts per line
+  for (int i=0;i<3;i++) ex_encounter_spawn(&z, EX_ENEMY_GRUNT, EX_ELEM_FIRE, (vec3){6.0f, 0, i*1.0f}, 100.0f);
+  for (int i=0;i<3;i++) ex_encounter_spawn(&z, EX_ENEMY_GRUNT, EX_ELEM_FIRE, (vec3){18.0f,0, i*1.0f}, 100.0f);
+  for (int i=0;i<3;i++) ex_encounter_spawn(&z, EX_ENEMY_GRUNT, EX_ELEM_FIRE, (vec3){34.0f,0, i*1.0f}, 100.0f);
+  // first update assigns zones from spawn distance
+  ex_encounter_update(&z, zw, pz, 1.0f/60.0f);
+  int zc[3]={0,0,0};
+  for (int i=0;i<z.count;i++) if (z.enemies[i].zone>=0 && z.enemies[i].zone<3) zc[z.enemies[i].zone]++;
+  printf("zones after assign: front=%d mid=%d back=%d\n", zc[0],zc[1],zc[2]);
+  assert(zc[0]==3 && zc[1]==3 && zc[2]==3);        // one line each
+
+  // STICKY: a back-line enemy's zone must NOT be reshuffled just because a
+  // later frame sees it at a slightly different distance.
+  int back_zone_before = -1;
+  for (int i=0;i<z.count;i++) if (z.enemies[i].position[0]>30.0f){ back_zone_before=z.enemies[i].zone; break; }
+  z.enemies[8].position[0] = 5.0f;                  // yank one back enemy forward in space
+  ex_encounter_update(&z, zw, pz, 1.0f/60.0f);
+  assert(z.enemies[8].zone == back_zone_before);    // still tagged back -- sticky
+  printf("sticky zone held under position change\n");
+
+  // COLLAPSE-ADVANCE: wipe the front line -> the lines behind advance forward.
+  for (int i=0;i<z.count;i++) if (z.enemies[i].zone==0) ex_enemy_damage(&z.enemies[i], 9999.0f);
+  ex_encounter_update(&z, zw, pz, 1.0f/60.0f);      // update_zones collapses front
+  int adv=0;
+  for (int i=0;i<z.count;i++)
+    if (z.enemies[i].state!=EX_ENEMY_DEAD && z.enemies[i].zone==0) adv++;  // survivors now in front
+  printf("survivors advanced into front zone: %d\n", adv);
+  assert(adv > 0);                                  // the advance actually STUCK (was the bug)
+  ex_chunk_world_free(zw);
+
+  // --- commander cohesion: killing a leader scatters its squad ---------------
+  ex_chunk_world_t *cw = ex_chunk_world_new();
+  vec3 pc = {0,1,0};
+  ex_encounter_t cmd; ex_encounter_init(&cmd, EX_WIN_ELIMINATE, 0);
+  // a commander at 20u with 5 troops ringed around it
+  int ci = ex_encounter_spawn_squad(&cmd, EX_ENEMY_APEX, EX_ENEMY_GRUNT, EX_ELEM_FIRE,
+                                    (vec3){20,0,0}, 400.0f, 100.0f, 5, 3.0f);
+  assert(ci >= 0);
+  assert(cmd.enemies[ci].is_commander == 1);
+  int cmd_id = cmd.enemies[ci].id;
+  // count troops bound to this commander
+  int bound = 0;
+  for (int i=0;i<cmd.count;i++) if (cmd.enemies[i].squad == cmd_id) bound++;
+  printf("squad: commander + %d troops bound\n", bound);
+  assert(bound == 5);
+
+  // while the commander lives, troops are disciplined (no scatter)
+  ex_encounter_update(&cmd, cw, pc, 1.0f/60.0f);
+  int scattering = 0;
+  for (int i=0;i<cmd.count;i++) if (cmd.enemies[i].scatter_t > 0.0f) scattering++;
+  assert(scattering == 0);
+
+  // KILL THE COMMANDER -> its squad scatters
+  ex_enemy_damage(&cmd.enemies[ci], 99999.0f);
+  ex_encounter_update(&cmd, cw, pc, 1.0f/60.0f);
+  scattering = 0;
+  for (int i=0;i<cmd.count;i++)
+    if (cmd.enemies[i].squad == cmd_id && cmd.enemies[i].scatter_t > 0.0f) scattering++;
+  printf("after commander death: %d troops scattering\n", scattering);
+  assert(scattering == 5);            // the whole squad breaks
+
+  // after the panic window they become demoralized (fight on, shaken)
+  for (int t=0; t<5*60+10; t++) ex_encounter_update(&cmd, cw, pc, 1.0f/60.0f);
+  int demoralized = 0;
+  for (int i=0;i<cmd.count;i++)
+    if (cmd.enemies[i].squad == cmd_id && cmd.enemies[i].state != EX_ENEMY_DEAD
+        && cmd.enemies[i].demoralized) demoralized++;
+  printf("after panic window: %d demoralized survivors\n", demoralized);
+  assert(demoralized > 0);
+  ex_chunk_world_free(cw);
+
   printf("\nALL ASSERTIONS PASSED\n");
   return 0;
 }

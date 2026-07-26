@@ -14,6 +14,8 @@ const char *ex_signature_mesh(ex_signature_t s)
     case EX_SIG_SOLAR:        return "data/spine_solar.iqm";
     case EX_SIG_AEGIS:        return "data/spine_aegis.iqm";
     case EX_SIG_RECON:        return "data/spine_recon.iqm";
+    case EX_SIG_MORTAR:       return "data/spine_mortar.iqm";
+    case EX_SIG_RAZOR:        return "data/spine_razor.iqm";
     default:                  return "data/spine_wing_cannon.iqm";
   }
 }
@@ -30,6 +32,7 @@ ex_signature_t ex_signature_for_class(int player_class)
     case 6: return EX_SIG_SOLAR;        // EX_CLASS_PYRE     -- fire clone
     case 7: return EX_SIG_AEGIS;        // EX_CLASS_PRIME    -- the steward
     case 8: return EX_SIG_RECON;        // EX_CLASS_SCOUT    -- bumblebee
+    case 9: return EX_SIG_MORTAR;       // EX_CLASS_SIEGE    -- artillery bombard
     default:return EX_SIG_WING_CANNON;
   }
 }
@@ -48,6 +51,8 @@ const char *ex_signature_name(ex_signature_t s)
     case EX_SIG_SOLAR:        return "solar core";
     case EX_SIG_AEGIS:        return "aegis";
     case EX_SIG_RECON:        return "recon fins";
+    case EX_SIG_MORTAR:       return "siege mortar";
+    case EX_SIG_RAZOR:        return "razor fans";
     default:                  return "wing-cannon";
   }
 }
@@ -75,6 +80,9 @@ ex_sig_stats_t ex_signature_stats(ex_signature_t s)
     case EX_SIG_AEGIS:        return (ex_sig_stats_t){ 1.10f, 1.00f, 0.70f, 0.90f };
     // Scout: recon harasser -- quickest refire + fastest, but fragile + low damage.
     case EX_SIG_RECON:        return (ex_sig_stats_t){ 0.85f, 0.78f, 1.12f, 1.18f };
+    // Siege: hits hard but reloads slow; sturdy but ponderous.
+    case EX_SIG_MORTAR:       return (ex_sig_stats_t){ 1.45f, 1.35f, 0.82f, 0.80f };
+    case EX_SIG_RAZOR:        return (ex_sig_stats_t){ 1.15f, 0.90f, 1.18f, 1.12f };   // cutter: hits harder, moves quicker, thinner armour
     default:                  return (ex_sig_stats_t){ 1.00f, 1.00f, 1.00f, 1.00f };
   }
 }
@@ -100,6 +108,9 @@ ex_sig_combat_t ex_signature_combat(ex_signature_t s)
     case EX_SIG_AEGIS:        return (ex_sig_combat_t){ 0, 8.0f,  0.0f, 5.0f };
     // Scout: recon -- an extra bolt + a light sensor-tag slow.
     case EX_SIG_RECON:        return (ex_sig_combat_t){ 1, 0.0f,  0.6f, 0.0f };
+    // Siege: artillery -- a hard shove and a wide airburst on every shell.
+    case EX_SIG_MORTAR:       return (ex_sig_combat_t){ 0, 14.0f, 0.0f, 11.0f };
+    case EX_SIG_RAZOR:        return (ex_sig_combat_t){ 0, 0.0f, 0.30f, 0.0f };   // melee bite: bonus close damage
     default:                  return (ex_sig_combat_t){ 0, 0.0f,  0.0f, 0.0f };
   }
 }
@@ -161,6 +172,8 @@ void ex_signature_pose(ex_part_pose_t *robot_out, ex_part_pose_t *veh_out,
     case EX_SIG_SOLAR:        SET(&r, 0, 1.70f, -0.30f, 0.42f, 0.42f, 0.42f); break; // held core
     case EX_SIG_AEGIS:        SET(&r, 0, 1.80f, -0.20f, 0.66f, 0.50f, 0.34f); break; // broad guardian arch
     case EX_SIG_RECON:        SET(&r, 0, 1.58f, -0.35f, 0.55f, 0.28f, 0.40f); break; // swept fins
+    case EX_SIG_MORTAR:       SET(&r, 0, 1.60f, -0.42f, 0.54f, 0.58f, 0.54f); break; // heavy dorsal mortar
+    case EX_SIG_RAZOR:        SET(&r, 0, 1.30f, -0.50f, 0.62f, 0.50f, 0.46f); break; // swept blade fans
     default:                  SET(&r, 0, 1.50f, -0.40f, 0.55f, 0.50f, 0.35f); break;
   }
 

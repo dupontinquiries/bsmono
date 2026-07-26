@@ -28,6 +28,28 @@
 
 #define EX_CHUNK_NAME_MAX 48
 
+// MATERIAL CLASS + STRENGTH: gates how much a hit bites. Strength tiers follow
+// the design spec: human/terrain 0-100, cybertronian 100-500, clone 1000-10000.
+// A hit far below a material's strength is mostly shrugged off (you can scratch
+// clone hull with a blaster, but not shred it), giving tiered destructibility.
+typedef enum {
+  EX_MATCLASS_HUMAN = 0,     // concrete, glass, cars, rebar
+  EX_MATCLASS_TERRAIN,       // rock, ice, sand berms
+  EX_MATCLASS_CYBERTRONIAN,  // Autobot/Decepticon armour, energon structures
+  EX_MATCLASS_CLONE,         // clone-forged / Watch material -- near-indestructible
+  EX_MATCLASS_COUNT
+} ex_matclass;
+
+static inline float ex_matclass_default_strength(ex_matclass m) {
+  switch (m) {
+    case EX_MATCLASS_HUMAN:        return 60.0f;
+    case EX_MATCLASS_TERRAIN:      return 80.0f;
+    case EX_MATCLASS_CYBERTRONIAN: return 280.0f;
+    case EX_MATCLASS_CLONE:        return 4000.0f;
+    default:                  return 60.0f;
+  }
+}
+
 // bitmask -- which classes/damage sources can affect this chunk
 typedef enum {
   EX_CHUNK_HIT_MINI      = 1 << 0,
@@ -60,6 +82,9 @@ typedef struct {
 
   float hp, max_hp;               // hp <= 0 with DESTROYED-eligible -> destroyed
   int destructible;                // 0 = event-gated only, ignores hp/hit_mask
+
+  ex_matclass material;      // what this chunk is made of (gates hit penetration)
+  float strength;                  // damage-per-hit threshold to bite fully (see tiers above)
 
   // optional: event name that flips this chunk (open/seal/destroy)
   // empty string if purely damage-driven
@@ -113,6 +138,19 @@ ex_coll_chunk_t* ex_chunk_find(ex_chunk_world_t *world, const char *name);
  * @return           [1 if the chunk transitioned to DESTROYED this call]
  */
 int ex_chunk_apply_damage(ex_coll_chunk_t *chunk, float amount, uint32_t source_mask);
+
+/**
+ * [ex_chunk_set_material tag a chunk's material class + strength. If strength
+ *  <= 0, the class default is used. Governs how much each hit penetrates.]
+ */
+void ex_chunk_set_material(ex_coll_chunk_t *chunk, ex_matclass m, float strength);
+
+/**
+ * [ex_matclass_effective_damage how much of `amount` actually bites a material
+ *  of the given strength. At/above strength -> full; below -> falls off
+ *  sharply, with a hard floor so a pea-shooter can't chip clone armour.]
+ */
+float ex_matclass_effective_damage(float amount, float strength);
 
 /**
  * [ex_chunk_set_state force a state change, e.g. from an event trigger]

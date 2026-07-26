@@ -99,6 +99,9 @@ void ex_sound_restart(ex_source_t *s);
  */
 void ex_sound_play(ex_source_t *s);
 void ex_sound_gain(ex_source_t *s, float gain);
+
+/** [ex_sound_pitch playback rate: 1.0 = normal; the engine RPM knob] */
+void ex_sound_pitch(ex_source_t *s, float pitch);
 ex_source_t* ex_sound_pcm(const short *pcm, int nsamples, int rate);
 void ex_sound_free(ex_source_t *s);
 

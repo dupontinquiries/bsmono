@@ -61,6 +61,7 @@ in vec2 uv;
 in mat3 TBN;
 uniform sampler2D u_emission;
 uniform float u_emission_strength;
+uniform float u_mat_boost;   // per-model: amplifies normal detail, spec, reflection (1=default)
 
 uniform sampler2D u_texture;
 uniform sampler2D u_spec;
@@ -71,6 +72,16 @@ uniform mat4 u_view;
 uniform mat4 u_inverse_view;
 
 uniform bool u_ambient_pass;
+uniform float u_gfx_quality;   // 0 mobile .. 3 ultra
+uniform float u_time;          // seconds, for animated procedural ground
+uniform vec3  u_sun_dir;       // planetary sun direction (world), arcs across the day
+uniform float u_sun_strength;  // 0 night .. ~0.62 noon (per-world, event-dimmable)
+uniform vec3  u_sun_color;     // dawn amber .. noon white .. dying ember
+uniform float u_wetness;       // rain/immersion: surfaces go glossier
+uniform float u_cloud_amt;     // drifting cloud-shadow strength (0 indoors/space)
+uniform sampler2D u_sun_shadow;   // the sun's orthographic depth map (high+)
+uniform mat4  u_sun_light_mat;    // world -> sun clip
+uniform int   u_sun_shadow_on;
 uniform bool u_is_lit;
 uniform vec3 u_tint;
 uniform bool u_emissive_solid;
@@ -201,11 +212,41 @@ vec3 calc_point_light(point_light light)
   return vec3((1.0 - shadow) * (diffuse + specular));
 }
 
+// ---- procedural noise for the dynamic ground (value noise + fBm, cheap + seamless) ----
+float ex_hash(vec2 p){ p = fract(p*vec2(123.34, 456.21)); p += dot(p, p+45.32); return fract(p.x*p.y); }
+float ex_vnoise(vec2 p){
+  vec2 i = floor(p), f = fract(p); f = f*f*(3.0-2.0*f);
+  float a = ex_hash(i), b = ex_hash(i+vec2(1,0)), c = ex_hash(i+vec2(0,1)), d = ex_hash(i+vec2(1,1));
+  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);
+}
+float ex_fbm2(vec2 p){ float s=0.0, a=0.5; for(int i=0;i<4;i++){ s+=a*ex_vnoise(p); p*=2.0; a*=0.5; } return s; }
+float ex_fbm2c(vec2 p){ return ex_vnoise(p)*0.65 + ex_vnoise(p*2.3)*0.35; }   // 2-tap: cheap cloud octaves
+// cellular / Voronoi: nearest-feature distance + a per-cell random id, for cracked plates
+vec2 ex_cell(vec2 p){
+  vec2 ip = floor(p), fp = fract(p);
+  float f1 = 8.0; vec2 cid = vec2(0.0);
+  for (int j=-1;j<=1;j++){
+    for (int i=-1;i<=1;i++){
+      vec2 g = vec2(float(i), float(j));
+      vec2 o = vec2(ex_hash(ip+g), ex_hash(ip+g+17.1));
+      vec2 r = g + o - fp;
+      float d = dot(r,r);
+      if (d < f1){ f1 = d; cid = ip+g; }
+    }
+  }
+  return vec2(sqrt(f1), ex_hash(cid));
+}
+
 void main()
 {
   // guard: an unset tint uniform reads as 0 -> treat near-zero as white so a
   // model never renders black just because tint wasn't provided.
   vec3 tint = (dot(u_tint, u_tint) < 0.001) ? vec3(1.0) : u_tint;
+  // planetary sun state, hoisted to function scope so the lit block, the procedural
+  // ground, AND the atmosphere (god rays / height fog) can all read it.
+  float sunS = (u_sun_strength <= 0.0001) ? 0.62 : u_sun_strength;
+  vec3  sunCg = (dot(u_sun_color,u_sun_color) < 0.001) ? vec3(1.0) : u_sun_color;
+  vec3  sdirg = (dot(u_sun_dir,u_sun_dir) < 0.001) ? vec3(0.35, 0.9, 0.35) : u_sun_dir;
 
   // Emissive/unlit path: effects glow in their PURE tint colour (no texture
   // sample -- the muddy textures were washing bolts toward grey/white).
@@ -227,10 +268,73 @@ void main()
     // the arena centre, which left distant characters lit only by the specular
     // floor -> washed white). The sun has no attenuation, so form reads anywhere.
     vec3 base_diff = texture(u_texture, uv).rgb;
-    vec3 Nvs = normalize(TBN * normalize(texture(u_norm, uv).rgb * 2.0 - 1.0));
-    vec3 sun_vs = normalize(mat3(u_view) * normalize(vec3(0.35, 0.9, 0.35)));
+    vec3 nrm_ts = texture(u_norm, uv).rgb * 2.0 - 1.0;
+    nrm_ts.xy *= u_mat_boost;                     // amp bump strength (more relief on tires/face)
+    vec3 Nvs = normalize(TBN * normalize(nrm_ts));
+    // DISTANCE NORMAL FADE: far surfaces relax toward the smooth vertex normal so
+    // normal-map detail can't SHIMMER at distance -- a clean, stable far image.
+    {
+      float nf = clamp((length(frag) - 45.0) / 130.0, 0.0, 0.85);
+      Nvs = normalize(mix(Nvs, normalize(TBN * vec3(0.0, 0.0, 1.0)), nf));
+    }
+    vec3 sun_vs = normalize(mat3(u_view) * normalize(sdirg));
     float ndl = max(dot(Nvs, sun_vs), 0.0);
-    diffuse += base_diff * (0.12 + 0.62 * ndl);   // ambient floor + directional shaping
+    // SUN SHADOW (high+): project this fragment into the sun's depth map; 3x3 PCF with
+    // a slope-scaled bias. Everything the sun contributes -- direct, glint, in stack --
+    // is multiplied by the result: REAL cast shadows from the planetary star.
+    float sunSh = 1.0;
+    if (u_sun_shadow_on == 1) {
+      vec3 wps = (u_inverse_view * vec4(frag, 1.0)).xyz;
+      vec4 lp = u_sun_light_mat * vec4(wps, 1.0);
+      vec3 lpn = lp.xyz / lp.w * 0.5 + 0.5;
+      if (lpn.z <= 1.0) {
+        float bias = max(0.0022 * (1.0 - ndl), 0.0007);
+        float acc = 0.0;
+        vec2 stex = 1.0 / vec2(textureSize(u_sun_shadow, 0));
+        for (int sy = -1; sy <= 1; sy++)
+          for (int sx = -1; sx <= 1; sx++) {
+            float d2 = texture(u_sun_shadow, lpn.xy + vec2(sx, sy) * stex).r;
+            acc += (lpn.z - bias > d2) ? 0.0 : 1.0;
+          }
+        sunSh = mix(0.28, 1.0, acc / 9.0);   /* shadows stay readable, never pure black */
+      }
+    }
+    // CLOUD SHADOWS (balanced+): broad soft light-patches drift across the world --
+    // the sun through a moving cloud deck. World-space fbm, slow diagonal drift,
+    // never darker than 0.55 so it reads as weather, not failure. Off indoors/space.
+    if (u_cloud_amt > 0.001 && u_gfx_quality >= 0.5) {
+      vec3 wpc = (u_inverse_view * vec4(frag, 1.0)).xyz;
+      float cl = ex_fbm2c(wpc.xz * 0.0045 + vec2(u_time * 0.016, u_time * 0.011));
+      float cs2 = mix(1.0, 0.55 + 0.45 * smoothstep(0.35, 0.65, cl), u_cloud_amt);
+      sunSh *= cs2;
+    }
+    vec3  sunC = sunCg;
+    // ambient floor: flat on mobile; on balanced+ a HEMISPHERE fill (cool sky from
+    // above graduating to a warm-dark ground bounce below) for far more form.
+    vec3 up_vs = normalize(mat3(u_view) * vec3(0.0, 1.0, 0.0));
+    float hemi_t = dot(Nvs, up_vs) * 0.5 + 0.5;
+    vec3 hemi = mix(vec3(0.08, 0.07, 0.06), vec3(0.16, 0.19, 0.24), hemi_t);
+    vec3 amb_floor = mix(vec3(0.12), hemi, step(0.5, u_gfx_quality));
+    amb_floor *= 0.55 + 0.45 * clamp(sunS / 0.62, 0.0, 1.0);   // the sky's light dies with the sun
+    diffuse += base_diff * (amb_floor + sunS * ndl * sunC * sunSh);   // the PLANETARY sun shapes the world (shadowed)
+    // ENVIRONMENT REFLECTION (fake IBL, balanced+): the reflection vector samples the same
+    // sky/ground hemisphere, weighted by FRESNEL -- armour catches the sky at grazing
+    // angles and a warm bounce underneath, scaled by daylight so night stays matte-dark.
+    if (u_gfx_quality >= 0.5) {
+      vec3 vdir = normalize(-frag);
+      vec3 R = reflect(-vdir, Nvs);
+      float rt = dot(R, up_vs) * 0.5 + 0.5;
+      vec3 env = mix(vec3(0.10, 0.08, 0.06), mix(vec3(0.18,0.22,0.30), sunCg, 0.35), rt);
+      float fresE = pow(1.0 - max(dot(vdir, Nvs), 0.0), 3.0);
+      diffuse += env * fresE * (0.30 + 0.35*clamp(sunS/0.62, 0.0, 1.0)) * (1.0 + u_wetness*0.9) * u_mat_boost;
+      // sun GLINT: a tight specular from the planetary sun itself (the key reflection)
+      vec3 hgl = normalize(sun_vs + vdir);
+      diffuse += sunC * pow(max(dot(Nvs, hgl), 0.0), 64.0) * sunS * (0.8 + u_wetness*0.7) * sunSh * sqrt(u_mat_boost);
+      // BACK-LIGHT rim (the film kicker): a cool edge light from opposite the sun lifts
+      // silhouettes off dark backgrounds -- the third point of three-point lighting.
+      float rimK = pow(1.0 - max(dot(vdir, Nvs), 0.0), 2.5) * max(dot(Nvs, -sun_vs), 0.0);
+      diffuse += vec3(0.55, 0.72, 1.0) * rimK * sunS * 0.55;
+    }
     diffuse += texture(u_emission, uv).rgb * 2.2 * u_emission_strength;  // texture-based emission
   } else {
     if (u_point_active && u_point_count <= 0)
@@ -253,9 +357,62 @@ void main()
   float rim = pow(1.0 - max(dot(rim_n, rim_v), 0.0), 4.0);
   c += rim * (0.085 * mix(vec3(0.32,0.38,0.52), tint, 0.35));
   c = (c * (2.51*c + 0.03)) / (c * (2.43*c + 0.59) + 0.14);
-  // distance fog: frag is in view space, so its length is the camera distance.
-  float fog = 1.0 - exp(-u_fog_density * length(frag));
-  c = mix(c, u_fog_color, clamp(fog, 0.0, 1.0));
+  // ---- PROCEDURAL DYNAMIC GROUND: a full seamless material on up-facing ground --
+  //      cracked energy-PLATES (Voronoi cells with glowing pulsing seams), flowing energon
+  //      VEINS threading across them, fine mottling, and a slow breathing sheen. All in
+  //      world-space (via inverse-view) so it's connected map-wide with no UV seams, all
+  //      animated off u_time, and biased toward the map's element tint. Mobile skips it. ----
+  if (u_gfx_quality >= 1.0) {
+    vec3 wpos  = (u_inverse_view * vec4(frag, 1.0)).xyz;
+    vec3 wnorm = normalize(mat3(u_inverse_view) * normal);
+    if (wnorm.y > 0.6) {
+      vec2  gp   = wpos.xz;
+      float flow = u_time * 0.05;
+      vec2  warp = vec2(ex_fbm2(gp*0.03 + flow), ex_fbm2(gp*0.03 - flow + 5.2));   // domain warp
+      vec3  vcol = mix(vec3(0.20, 0.70, 1.0), tint, 0.5);                          // energon, element-biased
+      // 1) cracked energy PLATES: warped Voronoi cells are plates, the seams glow + pulse
+      vec2  cell = ex_cell(gp*0.09 + warp*0.5);
+      float seam = smoothstep(0.07, 0.0, cell.x);
+      float plate = 0.88 + 0.22*ex_hash(vec2(cell.y, 1.7));                        // plate-to-plate shade
+      float seamPulse = 0.5 + 0.5*sin(u_time*1.5 + cell.y*30.0);                   // each plate breathes its own seam
+      // 2) flowing VEINS threading across the plates
+      float v     = ex_fbm2(gp*0.06 + warp*1.5);
+      float veins = smoothstep(0.045, 0.0, abs(v - 0.5));
+      float vpulse= 0.5 + 0.5*sin(u_time*2.0 - gp.x*0.05 - gp.y*0.05 + v*12.0);
+      // 3) fine mottling + a slow breathing sheen
+      float grain = ex_fbm2(gp*0.25)*0.12;
+      float breath= 0.5 + 0.5*sin(u_time*0.7 + ex_fbm2(gp*0.02)*6.2831);
+      c *= plate * (0.94 + grain);
+      // NIGHT HUNT-LIGHT: as the planetary sun dies, the energon burns BRIGHTER --
+      // at night the seams + veins become the light you navigate by.
+      float nightGlow = 1.0 + 0.9 * (1.0 - clamp(sunS / 0.62, 0.0, 1.0));
+      c += vcol * seam  * (0.22 + 0.40*seamPulse) * nightGlow;
+      c += vcol * veins * (0.28 + 0.50*vpulse)   * nightGlow;
+      c += vcol * 0.02  * breath * nightGlow;
+    }
+  }
+  // ---- ATMOSPHERE: distance fog + HEIGHT FOG (ground mist) + GOD RAYS (sun in-scatter).
+  float fdist = length(frag);
+  float hfog = 0.0;
+  if (u_gfx_quality >= 0.5) {
+    // ground mist: fog thickens toward low world height, breathing slowly -- valleys pool.
+    vec3 wpf = (u_inverse_view * vec4(frag, 1.0)).xyz;
+    float mistband = exp(-max(wpf.y, 0.0) * 0.030);
+    hfog = mistband * (0.85 + 0.15 * sin(u_time * 0.23 + wpf.x * 0.01)) * 1.1;
+  }
+  float fog = 1.0 - exp(-u_fog_density * fdist * (1.0 + hfog));
+  // god rays: looking TOWARD the sun, the fog itself catches light -- a broad in-scatter
+  // halo plus a tighter core, strongest at dawn/dusk when the sun sits low (long shafts).
+  vec3 fogC = u_fog_color;
+  {
+    vec3 vd = normalize(frag);
+    vec3 sun_vs3 = normalize(mat3(u_view) * normalize(sdirg));
+    float toSun = max(dot(vd, sun_vs3), 0.0);
+    float lowSun = 1.0 - clamp(sdirg.y * 2.2, 0.0, 1.0);          // shafts live at the horizons
+    float shaft = pow(toSun, 24.0) * 1.6 + pow(toSun, 6.0) * 0.35;
+    fogC += sunCg * sunS * shaft * (0.8 + 1.6 * lowSun);
+  }
+  c = mix(c, fogC, clamp(fog, 0.0, 1.0));
   // atmospheric haze for SCALE: distant geometry desaturates and cools slightly,
   // so a large map reads as VAST distance rather than a blurred miniature. Ramps
   // in from ~250u out to ~1350u and tops out gently, so nearby detail is untouched.

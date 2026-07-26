@@ -18,7 +18,7 @@
 #include "element.h"
 
 #define EX_MAX_SLIDES   6
-#define EX_MAX_MISSIONS 6
+#define EX_MAX_MISSIONS 16
 #define EX_SLIDE_LEN    120
 
 typedef enum {

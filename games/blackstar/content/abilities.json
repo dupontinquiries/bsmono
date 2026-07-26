@@ -1,0 +1,14 @@
+{
+  "_doc": "Loadout abilities. 'kind' distinguishes an equipped PASSIVE perk (always-on while equipped) from an ACTIVE ability (a keyed trigger). effect is the gameplay hook that reads it.",
+  "abilities": {
+    "hover":     { "enum": "EX_ABIL_HOVER",     "kind": "perk",   "effect": "jump_mul", "value": 1.25 },
+    "turret":    { "enum": "EX_ABIL_TURRET",    "kind": "active", "effect": "deploy_sentry", "value": 12.0 },
+    "shield":    { "enum": "EX_ABIL_SHIELD",    "kind": "perk",   "effect": "deploy_armor", "value": 40.0 },
+    "dash":      { "enum": "EX_ABIL_DASH",      "kind": "perk",   "effect": "move_mul", "value": 1.12 },
+    "cloak":     { "enum": "EX_ABIL_CLOAK",     "kind": "perk",   "effect": "detect_mul", "value": 0.6 },
+    "overclock": { "enum": "EX_ABIL_OVERCLOCK", "kind": "perk",   "effect": "fire_mul", "value": 0.8 },
+    "resonance": { "enum": "EX_ABIL_RESONANCE", "kind": "active", "effect": "shock_pulse", "value": 1.0 },
+    "pulse":     { "enum": "EX_ABIL_PULSE",     "kind": "active", "effect": "cone_blast", "value": 1.0 },
+    "blink":     { "enum": "EX_ABIL_BLINK",     "kind": "active", "effect": "teleport", "value": 1.0 }
+  }
+}

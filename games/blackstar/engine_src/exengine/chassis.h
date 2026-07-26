@@ -22,6 +22,9 @@ typedef enum {
   EX_CHASSIS_ANGULAR,     /* sharp, lean, snappy fast fold */
   EX_CHASSIS_JUGGERNAUT,  /* broad, heavy, slow ponderous fold */
   EX_CHASSIS_STRIDER,     /* tall, slim, fluid fold */
+  EX_CHASSIS_RAPTOR,      /* lean, long-legged predator: fast fold */
+  EX_CHASSIS_BRUISER,     /* short, wide, huge arms: heavy fold */
+  EX_CHASSIS_SENTINEL,    /* very tall, spindly watcher */
   EX_CHASSIS_COUNT
 } ex_chassis_t;
 

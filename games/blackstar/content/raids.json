@@ -1,0 +1,518 @@
+{
+ "_doc": "Raid content generated from raids-and-relics.md by assetkit raids. 'mech' is the engine's raid_enc_t.mech (0 purge, 1 ground, 2 air, 3 sync) chosen from each boss's fiction, not assigned at random -- see 'premise'.",
+ "raids": {
+  "astro_armor_titan_speakerman": {
+   "name": "Astro Armor Titan Speakerman",
+   "title": "The Last Resonance",
+   "arena": "resonance",
+   "premise": "sings across half a galaxy; fractures planets by matching tectonic resonance",
+   "mech": 3,
+   "phases": [
+    { "name": "The Approach", "map": "frostline", "encounters": [
+     { "x": -6.8, "z": 7.7, "kind": 1, "mech": 3, "min_units": 3 },
+     { "x": -93.7, "z": 23.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -5.2, "z": -54.6, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -48.7, "z": 87.6, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Gauntlet", "map": "mining", "encounters": [
+     { "x": 12.2, "z": 59.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 26.6, "z": 88.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 31.1, "z": -53.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -34.8, "z": 30.4, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Resonance", "map": "unicron", "encounters": [
+     { "x": -6.3, "z": 8.5, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 30.1, "z": 60.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -47.9, "z": -84.2, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -12.1, "z": -79.3, "kind": 0, "mech": 3, "min_units": 3 }
+    ] }
+   ]
+  },
+  "devastator_jhiaxus": {
+   "name": "Devastator Jhiaxus",
+   "title": "Prototype Omega",
+   "arena": "rebuild",
+   "premise": "destroying one only caused it to rebuild itself",
+   "mech": 0,
+   "phases": [
+    { "name": "The Approach", "map": "shield_edge", "encounters": [
+     { "x": -43.3, "z": -11.5, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -40.3, "z": 49.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 29.3, "z": 8.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -64.5, "z": -17.5, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "trench", "encounters": [
+     { "x": -11.5, "z": 6.7, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -15.5, "z": -14.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -12.9, "z": -76.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -45.6, "z": -0.4, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Omega", "map": "wastes", "encounters": [
+     { "x": -23.6, "z": 58.5, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 37.7, "z": 59.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -68.9, "z": -86.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 72.2, "z": 23.2, "kind": 0, "mech": 0, "min_units": 1 }
+    ] }
+   ]
+  },
+  "plasma_s_mechagodzilla": {
+   "name": "Plasma's Mechagodzilla",
+   "title": "The Planet Burner",
+   "arena": "burn",
+   "premise": "its spinal plasma spine could ignite gas giants",
+   "mech": 1,
+   "phases": [
+    { "name": "The Approach", "map": "kuiper", "encounters": [
+     { "x": -13.5, "z": 66.0, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -54.2, "z": 53.3, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": 0.8, "z": 48.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -7.1, "z": 14.6, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "vault", "encounters": [
+     { "x": 11.4, "z": -31.5, "kind": 1, "mech": 1, "min_units": 1 },
+     { "x": 36.0, "z": -38.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 2.3, "z": -38.6, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": 93.1, "z": 89.7, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Burner", "map": "unicron", "encounters": [
+     { "x": -84.7, "z": -91.4, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 64.0, "z": 38.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -59.3, "z": 48.4, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": -36.5, "z": 42.2, "kind": 0, "mech": 1, "min_units": 1 }
+    ] }
+   ]
+  },
+  "cherno_alpha": {
+   "name": "Cherno Alpha",
+   "title": "The Walking Reactor",
+   "arena": "march",
+   "premise": "if it ever stops walking, the reactor reaches criticality",
+   "mech": 1,
+   "phases": [
+    { "name": "The Approach", "map": "mars", "encounters": [
+     { "x": -72.1, "z": -68.5, "kind": 1, "mech": 1, "min_units": 1 },
+     { "x": 92.2, "z": 68.9, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 61.2, "z": -59.6, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": -23.5, "z": -70.5, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "emberpit", "encounters": [
+     { "x": 16.3, "z": 65.7, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -20.9, "z": 80.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 91.6, "z": 52.9, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -41.3, "z": 45.2, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Reactor", "map": "outer_rim", "encounters": [
+     { "x": 53.0, "z": -75.4, "kind": 1, "mech": 1, "min_units": 1 },
+     { "x": 12.6, "z": 78.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 61.4, "z": -10.6, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -42.4, "z": 27.6, "kind": 0, "mech": 1, "min_units": 1 }
+    ] }
+   ]
+  },
+  "gigadrill": {
+   "name": "Gigadrill",
+   "title": "The Core Piercer",
+   "arena": "undercut",
+   "premise": "it drilled through moons, worlds, dwarf planets",
+   "mech": 2,
+   "phases": [
+    { "name": "The Approach", "map": "outer_rim", "encounters": [
+     { "x": 29.8, "z": 57.1, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -45.7, "z": 93.5, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": -26.3, "z": 20.1, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": -81.0, "z": -33.3, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "emberpit", "encounters": [
+     { "x": 79.5, "z": -21.2, "kind": 1, "mech": 2, "min_units": 1 },
+     { "x": -80.1, "z": 4.9, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 11.7, "z": 9.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 11.5, "z": 77.1, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Piercer", "map": "unicron", "encounters": [
+     { "x": -21.2, "z": 66.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 32.3, "z": 57.6, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": 86.6, "z": -91.6, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": -68.9, "z": -50.7, "kind": 0, "mech": 2, "min_units": 1 }
+    ] }
+   ]
+  },
+  "hardboil": {
+   "name": "Hardboil",
+   "title": "The Pressure King",
+   "arena": "pressure",
+   "premise": "built for depths that crush ordinary alloys",
+   "mech": 0,
+   "phases": [
+    { "name": "The Approach", "map": "emberpit", "encounters": [
+     { "x": -39.9, "z": 85.8, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -8.1, "z": 20.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -10.5, "z": -75.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 0.8, "z": 73.2, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "trench", "encounters": [
+     { "x": 28.6, "z": -72.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 63.2, "z": 31.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -70.2, "z": -68.2, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -57.5, "z": -85.5, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The King", "map": "wastes", "encounters": [
+     { "x": 19.1, "z": -9.3, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 7.0, "z": 38.2, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -72.7, "z": 74.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 67.7, "z": -5.6, "kind": 0, "mech": 0, "min_units": 1 }
+    ] }
+   ]
+  },
+  "hussar_tank": {
+   "name": "Hussar Tank",
+   "title": "The Charge",
+   "arena": "charge",
+   "premise": "it does not manoeuvre; it commits",
+   "mech": 1,
+   "phases": [
+    { "name": "The Approach", "map": "wastes", "encounters": [
+     { "x": 68.9, "z": -30.8, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -19.0, "z": 56.6, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": -94.9, "z": -30.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -24.2, "z": -38.5, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "trench", "encounters": [
+     { "x": -17.8, "z": -81.1, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 30.3, "z": -26.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -12.6, "z": 80.5, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": -42.9, "z": -21.2, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Charge", "map": "emberpit", "encounters": [
+     { "x": 56.1, "z": -4.8, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -80.1, "z": -63.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -82.2, "z": 19.0, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": -0.1, "z": 1.8, "kind": 0, "mech": 1, "min_units": 1 }
+    ] }
+   ]
+  },
+  "judgementor": {
+   "name": "Judgementor",
+   "title": "Executor of Empires",
+   "arena": "sentence",
+   "premise": "it did not fight wars, it ended them",
+   "mech": 3,
+   "phases": [
+    { "name": "The Approach", "map": "shield_edge", "encounters": [
+     { "x": -90.1, "z": -54.1, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 8.8, "z": 53.7, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -63.5, "z": 33.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -59.0, "z": -55.4, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Gauntlet", "map": "pluto", "encounters": [
+     { "x": 50.0, "z": 10.3, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 34.5, "z": 67.6, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 40.3, "z": -58.5, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -75.5, "z": 41.4, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Empires", "map": "unicron", "encounters": [
+     { "x": -91.5, "z": 18.3, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 60.0, "z": 93.3, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": 78.3, "z": -46.6, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -81.8, "z": -62.3, "kind": 0, "mech": 3, "min_units": 3 }
+    ] }
+   ]
+  },
+  "primitive_mantis_mech": {
+   "name": "Primitive Mantis Mech",
+   "title": "The First Hunter",
+   "arena": "ambush",
+   "premise": "the oldest predator pattern Cybertron ever built",
+   "mech": 0,
+   "phases": [
+    { "name": "The Approach", "map": "kuiper", "encounters": [
+     { "x": -6.1, "z": 79.3, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 63.0, "z": -47.2, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 37.1, "z": -13.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 12.0, "z": 71.1, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "unicron", "encounters": [
+     { "x": -92.3, "z": -27.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 5.5, "z": 84.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 45.8, "z": 17.9, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -72.0, "z": 8.6, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Hunter", "map": "foundry", "encounters": [
+     { "x": 34.9, "z": -58.0, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -65.1, "z": 12.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 11.4, "z": 42.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 80.2, "z": 49.6, "kind": 0, "mech": 0, "min_units": 1 }
+    ] }
+   ]
+  },
+  "pyrachnid": {
+   "name": "Pyrachnid",
+   "title": "Forge Widow",
+   "arena": "web",
+   "premise": "it spins its own foundry around its prey",
+   "mech": 3,
+   "phases": [
+    { "name": "The Approach", "map": "mining", "encounters": [
+     { "x": -73.9, "z": -72.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -88.5, "z": 57.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -33.5, "z": 81.3, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -45.8, "z": -5.6, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Gauntlet", "map": "emberpit", "encounters": [
+     { "x": -52.6, "z": 42.1, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -44.5, "z": -16.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 67.5, "z": -31.9, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 43.6, "z": 17.9, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Widow", "map": "unicron", "encounters": [
+     { "x": -2.5, "z": 87.7, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 36.2, "z": 20.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 82.7, "z": 26.2, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -19.8, "z": -0.2, "kind": 0, "mech": 3, "min_units": 3 }
+    ] }
+   ]
+  },
+  "scorpion_commander": {
+   "name": "Scorpion Commander",
+   "title": "The Frontier Marshal",
+   "arena": "frontier",
+   "premise": "held a border that no longer exists",
+   "mech": 1,
+   "phases": [
+    { "name": "The Approach", "map": "vault", "encounters": [
+     { "x": 70.5, "z": 65.7, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -19.4, "z": -29.6, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 17.5, "z": 2.9, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -64.5, "z": -44.4, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "reclaim", "encounters": [
+     { "x": -16.6, "z": 33.8, "kind": 1, "mech": 1, "min_units": 1 },
+     { "x": 22.5, "z": 67.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 55.5, "z": -31.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -33.5, "z": 38.0, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Marshal", "map": "foundry", "encounters": [
+     { "x": 3.3, "z": -60.8, "kind": 1, "mech": 1, "min_units": 1 },
+     { "x": 15.0, "z": -19.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -66.7, "z": 25.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -11.1, "z": 4.2, "kind": 0, "mech": 1, "min_units": 1 }
+    ] }
+   ]
+  },
+  "starlord": {
+   "name": "Starlord",
+   "title": "Twin Hammers",
+   "arena": "sentry",
+   "premise": "two hammers that are sentry guns",
+   "mech": 2,
+   "phases": [
+    { "name": "The Approach", "map": "mars", "encounters": [
+     { "x": -75.2, "z": -40.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -53.1, "z": -87.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 45.6, "z": 80.4, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": 51.5, "z": 49.7, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "foundry", "encounters": [
+     { "x": 5.4, "z": 90.5, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -3.9, "z": -9.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -43.0, "z": 7.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 88.6, "z": 39.8, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Hammers", "map": "pluto", "encounters": [
+     { "x": 37.7, "z": 7.6, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 43.0, "z": 76.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -2.1, "z": -11.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 33.4, "z": -44.3, "kind": 0, "mech": 2, "min_units": 1 }
+    ] }
+   ]
+  },
+  "strider_tank": {
+   "name": "Strider Tank",
+   "title": "The Horizon Walker",
+   "arena": "horizon",
+   "premise": "it walks toward the horizon and the horizon moves",
+   "mech": 2,
+   "phases": [
+    { "name": "The Approach", "map": "unicron", "encounters": [
+     { "x": -49.2, "z": 36.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -11.2, "z": 36.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 61.0, "z": -39.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -85.3, "z": -5.8, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "outer_rim", "encounters": [
+     { "x": 83.5, "z": 18.3, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -84.1, "z": 37.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 94.9, "z": -84.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -62.4, "z": -11.4, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Walker", "map": "pluto", "encounters": [
+     { "x": -17.0, "z": 89.0, "kind": 1, "mech": 2, "min_units": 1 },
+     { "x": -55.2, "z": -64.0, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": 59.5, "z": 13.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -57.2, "z": 43.2, "kind": 0, "mech": 2, "min_units": 1 }
+    ] }
+   ]
+  },
+  "tremor": {
+   "name": "Tremor",
+   "title": "Planetbreaker",
+   "arena": "quake",
+   "premise": "the ground is its weapon",
+   "mech": 1,
+   "phases": [
+    { "name": "The Approach", "map": "pluto", "encounters": [
+     { "x": -42.7, "z": -45.2, "kind": 1, "mech": 1, "min_units": 1 },
+     { "x": -32.6, "z": -30.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 36.1, "z": 90.9, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -10.7, "z": 31.2, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "unicron", "encounters": [
+     { "x": 74.3, "z": 38.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 83.0, "z": -11.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -66.1, "z": -42.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 5.1, "z": -5.5, "kind": 0, "mech": 1, "min_units": 1 }
+    ] },
+    { "name": "The Planetbreaker", "map": "cybertron", "encounters": [
+     { "x": 14.7, "z": -81.4, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -24.7, "z": 37.7, "kind": 0, "mech": 1, "min_units": 1 },
+     { "x": 90.3, "z": 54.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 56.4, "z": -10.4, "kind": 0, "mech": 1, "min_units": 1 }
+    ] }
+   ]
+  },
+  "trenchmaster": {
+   "name": "Trenchmaster",
+   "title": "The Ocean King",
+   "arena": "flood",
+   "premise": "the ocean king; the water rises to meet it",
+   "mech": 3,
+   "phases": [
+    { "name": "The Approach", "map": "cybertron", "encounters": [
+     { "x": 74.7, "z": 85.2, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 33.1, "z": 52.8, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -10.9, "z": -59.9, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": 77.9, "z": -81.6, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Gauntlet", "map": "vault", "encounters": [
+     { "x": -14.5, "z": 38.2, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 40.7, "z": 70.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 30.6, "z": 60.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 65.1, "z": -4.3, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The King", "map": "unicron", "encounters": [
+     { "x": -0.9, "z": -39.3, "kind": 1, "mech": 3, "min_units": 3 },
+     { "x": -88.0, "z": 6.0, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -4.3, "z": -42.2, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 86.9, "z": 32.1, "kind": 0, "mech": 3, "min_units": 3 }
+    ] }
+   ]
+  },
+  "wuthering_waves_sigillum": {
+   "name": "Wuthering Waves Sigillum",
+   "title": "The Seal",
+   "arena": "seal",
+   "premise": "a seal is only a door that has not been opened",
+   "mech": 0,
+   "phases": [
+    { "name": "The Approach", "map": "emberpit", "encounters": [
+     { "x": 71.7, "z": -26.2, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -24.6, "z": -14.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 86.7, "z": 89.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -87.7, "z": -9.5, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "outer_rim", "encounters": [
+     { "x": -53.7, "z": -43.9, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -68.8, "z": 87.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 12.7, "z": 55.0, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 37.1, "z": -57.4, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Seal", "map": "foundry", "encounters": [
+     { "x": -3.3, "z": 0.0, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -19.9, "z": -86.6, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -15.4, "z": -15.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 78.2, "z": 58.5, "kind": 0, "mech": 0, "min_units": 1 }
+    ] }
+   ]
+  },
+  "titan_cameraman_3_0_armor": {
+   "name": "Titan Cameraman 3.0 Armor",
+   "title": "Archivist",
+   "arena": "archive",
+   "premise": "it records everything; it has never stopped",
+   "mech": 2,
+   "phases": [
+    { "name": "The Approach", "map": "pluto", "encounters": [
+     { "x": -1.3, "z": -12.8, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 18.8, "z": 63.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -67.6, "z": 31.4, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": -1.5, "z": 59.6, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "vault", "encounters": [
+     { "x": 84.4, "z": -29.6, "kind": 1, "mech": 2, "min_units": 1 },
+     { "x": -1.3, "z": -7.3, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -16.9, "z": 44.1, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": 30.7, "z": -24.3, "kind": 0, "mech": 2, "min_units": 1 }
+    ] },
+    { "name": "The Archivist", "map": "frostline", "encounters": [
+     { "x": -12.5, "z": -73.8, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 19.2, "z": -85.1, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": -17.6, "z": 25.2, "kind": 0, "mech": 2, "min_units": 1 },
+     { "x": 38.8, "z": -87.8, "kind": 0, "mech": 2, "min_units": 1 }
+    ] }
+   ]
+  },
+  "sphere_robot": {
+   "name": "Sphere Robot",
+   "title": "The Observer",
+   "arena": "observe",
+   "premise": "it watches, and being watched changes what you do",
+   "mech": 0,
+   "phases": [
+    { "name": "The Approach", "map": "mining", "encounters": [
+     { "x": -77.0, "z": -20.5, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": 74.8, "z": -20.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 42.5, "z": -93.4, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -81.2, "z": -50.9, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Gauntlet", "map": "kuiper", "encounters": [
+     { "x": 11.0, "z": -27.3, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -43.6, "z": -70.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -58.5, "z": 58.6, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -55.0, "z": -31.0, "kind": 0, "mech": 0, "min_units": 1 }
+    ] },
+    { "name": "The Observer", "map": "unicron", "encounters": [
+     { "x": 92.1, "z": -46.4, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -91.6, "z": 52.1, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 22.9, "z": -16.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -52.5, "z": -63.9, "kind": 0, "mech": 0, "min_units": 1 }
+    ] }
+   ]
+  },
+  "titan_cameraman_3_0_what_if": {
+   "name": "Titan Cameraman 3.0 (What If...)",
+   "title": "The Divergence",
+   "arena": "diverge",
+   "premise": "the recording and the event no longer agree",
+   "mech": 3,
+   "phases": [
+    { "name": "The Approach", "map": "cybertron", "encounters": [
+     { "x": 86.0, "z": 8.8, "kind": 1, "mech": 0, "min_units": 1 },
+     { "x": -11.2, "z": 13.7, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 25.9, "z": 82.6, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": 82.7, "z": -16.3, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Gauntlet", "map": "foundry", "encounters": [
+     { "x": -17.7, "z": -4.6, "kind": 1, "mech": 3, "min_units": 3 },
+     { "x": 85.0, "z": 19.5, "kind": 0, "mech": 3, "min_units": 3 },
+     { "x": -3.2, "z": 49.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 36.6, "z": 7.8, "kind": 0, "mech": 3, "min_units": 3 }
+    ] },
+    { "name": "The Divergence", "map": "unicron", "encounters": [
+     { "x": 84.8, "z": 79.2, "kind": 1, "mech": 3, "min_units": 3 },
+     { "x": -18.8, "z": -84.5, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": -9.8, "z": 77.8, "kind": 0, "mech": 0, "min_units": 1 },
+     { "x": 35.8, "z": -1.5, "kind": 0, "mech": 3, "min_units": 3 }
+    ] }
+   ]
+  }
+ }
+}

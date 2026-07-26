@@ -1,6 +1,7 @@
 #include "coll_chunk.h"
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 #define EX_CHUNK_WORLD_INITIAL_CAP 32
 
@@ -51,6 +52,8 @@ ex_coll_chunk_t* ex_chunk_add(ex_chunk_world_t *world, const char *name,
   chunk->hp = hp;
   chunk->max_hp = hp;
   chunk->destructible = destructible;
+  chunk->material = EX_MATCLASS_HUMAN;                     // default tier; override via ex_chunk_set_material
+  chunk->strength = ex_matclass_default_strength(EX_MATCLASS_HUMAN);
   chunk->dirty = 0;
 
   world->chunks[world->count++] = chunk;
@@ -66,6 +69,22 @@ ex_coll_chunk_t* ex_chunk_find(ex_chunk_world_t *world, const char *name)
   return NULL;
 }
 
+void ex_chunk_set_material(ex_coll_chunk_t *chunk, ex_matclass m, float strength)
+{
+  chunk->material = m;
+  chunk->strength = (strength > 0.0f) ? strength : ex_matclass_default_strength(m);
+}
+
+float ex_matclass_effective_damage(float amount, float strength)
+{
+  if (strength <= 0.0f) return amount;         // no material gating
+  if (amount >= strength) return amount;       // overmatch: full bite
+  float r = amount / strength;                 // 0..1, how close to threshold
+  if (r < 0.125f) return 0.0f;                 // hard floor: too weak to mark it at all
+  // smooth falloff: r^1.5 keeps near-threshold hits meaningful, weak hits tiny
+  return amount * (r * sqrtf(r));
+}
+
 int ex_chunk_apply_damage(ex_coll_chunk_t *chunk, float amount, uint32_t source_mask)
 {
   if (!chunk->destructible)
@@ -79,7 +98,13 @@ int ex_chunk_apply_damage(ex_coll_chunk_t *chunk, float amount, uint32_t source_
   if (!(chunk->hit_mask & source_mask))
     return 0;
 
-  chunk->hp -= amount;
+  // MATERIAL PENETRATION: scale the incoming damage by how much this hit can
+  // actually bite the chunk's material. Clone hull shrugs off small-arms.
+  float bite = ex_matclass_effective_damage(amount, chunk->strength);
+  if (bite <= 0.0f)
+    return 0;
+
+  chunk->hp -= bite;
   chunk->dirty = 1;
 
   if (chunk->hp <= 0.0f) {

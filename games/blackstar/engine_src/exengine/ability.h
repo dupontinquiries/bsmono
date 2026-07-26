@@ -54,6 +54,8 @@ int  ex_ability_trigger(ex_ability_loadout_t *l, int slot);
 int  ex_ability_active(const ex_ability_loadout_t *l, int slot);
 /* [ex_ability_active_any is any slot with this id active?] */
 int  ex_ability_active_any(const ex_ability_loadout_t *l, ex_ability_id id);
+/* [is this ability equipped in any slot? -- for passive/gated perks] */
+int  ex_loadout_has(const ex_ability_loadout_t *l, ex_ability_id id);
 void ex_loadout_update(ex_ability_loadout_t *l, float dt);
 
 #endif // EX_ABILITY_H
