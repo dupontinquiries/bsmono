@@ -1442,6 +1442,10 @@ pub struct BlockWeights {
     /// Distinct from `q_norm`/`k_norm`, which are LEARNED weights applied BEFORE rope (the Qwen3 shape) —
     /// both the weight and the ordering differ, which is why this could not reuse them.
     pub kq_norm: Option<Tensor>,
+    /// MLA projections for this layer, when the checkpoint ships them (DeepSeek-V3 / GLM-MoE). Present
+    /// means the compressed-latent attention path can run for this layer; the GPU forward it feeds is
+    /// already validated against the CPU reference by --gate-mla.
+    pub mla: Option<crate::mla::MlaWeightsT>,
     /// Sliding-window attention for this layer: (window, rule). None = attend to the whole context.
     /// Set per layer because these architectures alternate windowed and full-attention layers.
     pub swa: Option<(u32, crate::swa::SwaType)>,
@@ -6144,9 +6148,21 @@ impl Gpu {
         // If an MLA-family checkpoint actually ships MLA projection tensors, we can't run it yet (MLA
         // forward unwired) — refuse clearly. If it has standard attention tensors instead, proceed.
         if arch_is_mla_family && has_mla_tensors {
+            // Be specific about WHAT is missing, because "MLA isn't wired" hides how much actually works.
+            // The GPU forward (MLA_QROPE / MLA_PACK_K / MLA_PACK_V / MLA_ATTN, the compressed-latent cache
+            // and mla_compress_append) is implemented AND validated against the CPU reference by
+            // the kernel-validation suite (--validate),
+            // including building the cache on-GPU. The per-layer projection weights now load
+            // too (BlockWeights::mla). What remains is the decode plumbing: a block_decode that routes
+            // MLA layers through mla_attention_step_gpu against an MlaCache instead of the standard K/V
+            // cache. Saying that plainly is more useful than a blanket refusal, and it means the next
+            // person picking this up knows the compute is trustworthy.
             let layout = g.dump_tensors("blk.0.");
-            return Err(format!("architecture '{arch}' uses Multi-head Latent Attention (attn_kv_a/kv_b present) \
-                which isn't wired in the wgpu engine yet — use the llama.cpp backend for this model.\n{layout}"));
+            return Err(format!("architecture '{arch}' uses Multi-head Latent Attention. The MLA forward and \
+compressed-KV cache ARE implemented and validated by the kernel-validation suite, and this \
+checkpoint's projection weights \
+load; what is missing is the decode plumbing that routes MLA layers through them instead of the standard \
+K/V cache. Until that lands, use the llama.cpp backend for this model.\n{layout}"));
         }
         let treat_unsupported = !acfg.supported;
         if treat_unsupported {
@@ -6816,6 +6832,32 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // weightless Llama4TextL2Norm. ON for every Llama-4 except the 128-expert Maverick, which
                 // is exactly how llama.cpp gates it (use_kq_norm = type != LLM_TYPE_17B_128E). Applied
                 // after rope by `kq_post`; rope layers only.
+                // MLA projections, when present. Loaded as f32 (not quantized): these are the small
+                // low-rank factors, and quantizing them is a separate question from quantizing the big
+                // weight matrices. GLM-5.2 (glm-dsa) names the reconstructed dims *_mla; both spellings
+                // of the tensor names are accepted so one loader covers DeepSeek-V3 and GLM.
+                mla: {
+                    let t = |a: &str, b: &str| -> Option<String> {
+                        let na = format!("blk.{i}.{a}.weight");
+                        if g.tensor(&na).is_some() { return Some(na); }
+                        let nb = format!("blk.{i}.{b}.weight");
+                        if g.tensor(&nb).is_some() { return Some(nb); }
+                        None
+                    };
+                    (|| -> Option<crate::mla::MlaWeightsT> {
+                        let (qa, qaln, qb) = (t("attn_q_a", "attn_q_a_proj")?, t("attn_q_a_norm", "attn_q_a_layernorm")?, t("attn_q_b", "attn_q_b_proj")?);
+                        let (kva, kvaln, kvb) = (t("attn_kv_a_mqa", "attn_kv_a")?, t("attn_kv_a_norm", "attn_kv_a_layernorm")?, t("attn_kv_b", "attn_kv_b_proj")?);
+                        let o = t("attn_output", "attn_out")?;
+                        let g1 = |n: &str| fetch(n).ok();
+                        Some(crate::mla::MlaWeightsT {
+                            q_a: self.upload_flat(&g1(&qa)?), q_a_ln: self.upload_flat(&g1(&qaln)?),
+                            q_b: self.upload_flat(&g1(&qb)?),
+                            kv_a: self.upload_flat(&g1(&kva)?), kv_a_ln: self.upload_flat(&g1(&kvaln)?),
+                            kv_b: self.upload_flat(&g1(&kvb)?),
+                            o: self.upload_flat(&g1(&o)?),
+                        })
+                    })()
+                },
                 // Sliding window, per layer. Read from metadata rather than assumed: the window size is
                 // `<arch>.attention.sliding_window`, and the layer pattern decides which layers use it.
                 // Llama-4 is CHUNKED (aligned blocks); Gemma is STANDARD (last n positions) — different
@@ -7019,7 +7061,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -8321,6 +8363,10 @@ impl Gpu {
                                    n_heads: usize, n_kv_heads: usize) -> Tensor {
         self.decode_attention_mh(q, kc, vc, l, dm, n_heads, n_kv_heads)
     }
+
+    /// Upload a flat f32 slice as a [1, n] tensor — for weights whose 2-D shape is carried in MlaDims
+    /// rather than in the tensor itself.
+    pub fn upload_flat(&self, v: &[f32]) -> Tensor { self.upload(v, 1, v.len()) }
 
     /// Test hook: a sub-range view of a tensor, for exercising windowed reads from a gate.
     pub fn tensor_view(&self, t: &Tensor, off: u64, size: u64, rows: usize, cols: usize) -> Tensor {
