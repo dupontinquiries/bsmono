@@ -1093,6 +1093,20 @@ impl App {
     /// Draw the terminal into the current UI region.
     pub fn render(&mut self, ui: &mut egui::Ui, colors: &uikit_egui::PaletteColors) {
         let origin = ui.min_rect().min;
+        self.render_at(ui, colors, origin);
+    }
+
+    /// Draw the terminal with its top-left at `origin` instead of at the UI cursor.
+    ///
+    /// A tiling frontend places several panes inside ONE ui region, so the origin has to be
+    /// caller-supplied — `ui.min_rect().min` is the whole region for every pane. `render` is
+    /// exactly this with the region's own corner, so existing callers are unchanged.
+    pub fn render_at(
+        &mut self,
+        ui: &mut egui::Ui,
+        colors: &uikit_egui::PaletteColors,
+        origin: egui::Pos2,
+    ) {
         let dt = ui.input(|i| i.stable_dt).min(0.1); // clamp a stalled first frame's huge dt
         let highlights = self.viewport_highlights();
         render_grid(ui, &self.terminal.grid, colors, &self.prefs.display, origin, self.cell.0, self.cell.1, self.font_size, self.cursor_mode, &mut self.cursor_anim, dt, &highlights);
