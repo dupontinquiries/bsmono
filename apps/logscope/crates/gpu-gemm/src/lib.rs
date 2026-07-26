@@ -11,6 +11,61 @@ pub mod gguf;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
 pub mod archfeat;
+
+/// Engine tuning knobs a host application may set before the first `Gpu::new()`.
+///
+/// Defined HERE rather than taken from `logscope::tuneprofile` so gpu-gemm stays independent of the app
+/// layer — the dependency runs app -> engine, and reversing it to share a config struct would be the
+/// wrong trade. The app maps its profile onto this at startup.
+///
+/// Environment variables still win over anything set here: a knob exists to be turned during a
+/// bisection, and a config file that silently overrode `LOGSCOPE_MATVEC_SG=1` would make that impossible.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EngineConfig {
+    /// Allow the subgroup matvec kernel. Off on drivers where it can hang large matmuls.
+    pub subgroup_matvec: bool,
+    /// Q4_K super-blocks converted per dispatch — bounds GPU work per submit against a firmware watchdog.
+    pub convert_chunk_blocks: usize,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self { EngineConfig { subgroup_matvec: true, convert_chunk_blocks: 16384 } }
+}
+
+static ENGINE_CONFIG: std::sync::OnceLock<EngineConfig> = std::sync::OnceLock::new();
+
+/// Set the engine configuration. Only the FIRST call takes effect — the values are read during device
+/// setup, so a later change would apply to some decisions and not others, which is worse than ignoring
+/// it. Returns whether this call was the one that set it.
+pub fn set_engine_config(c: EngineConfig) -> bool { ENGINE_CONFIG.set(c).is_ok() }
+
+/// The active configuration, defaults if never set.
+pub fn engine_config() -> EngineConfig { *ENGINE_CONFIG.get().unwrap_or(&EngineConfig::default()) }
+
+#[cfg(test)]
+mod engine_config_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_permissive_and_only_the_first_set_wins() {
+        // An unset config must not disable anything: a host that never configures the engine should get
+        // the same behaviour as before this existed.
+        let d = EngineConfig::default();
+        assert!(d.subgroup_matvec, "default must not disable a kernel the driver supports");
+        assert!(d.convert_chunk_blocks > 0);
+
+        // Only the first set takes effect — the values are read during device setup, so a later change
+        // would apply to some decisions and not others, which is worse than ignoring it.
+        let first = set_engine_config(EngineConfig { subgroup_matvec: false, convert_chunk_blocks: 99 });
+        let second = set_engine_config(EngineConfig { subgroup_matvec: true, convert_chunk_blocks: 1 });
+        if first {
+            assert!(!second, "a second set must be rejected, not silently applied");
+            assert_eq!(engine_config().convert_chunk_blocks, 99);
+            assert!(!engine_config().subgroup_matvec);
+        }
+    }
+}
+
 pub mod swa;
 #[allow(dead_code)] pub mod zerocopy; // scoped experiment: UMA zero-copy weight import (gated `zerocopy`)
 #[allow(dead_code)] pub mod oom; // detect GPU allocation OOM → downgrade residency instead of crashing
@@ -815,8 +870,14 @@ impl Gpu {
             // which is robust here. LOGSCOPE_MATVEC_SG=1 forces it back on for experimentation.
             let asahi_vulkan = conservative_vma; // set above iff Vulkan + adapter name contains "Apple"
             let force_sg = std::env::var_os("LOGSCOPE_MATVEC_SG").is_some();
-            if asahi_vulkan && !force_sg {
-                eprintln!("wgpu-engine: subgroup decode kernel DISABLED on {} (Asahi/Honeykrisp subgroup support can hang large matmuls; LOGSCOPE_MATVEC_SG=1 re-enables)", gpu.adapter_name);
+            // The host may also disable it via EngineConfig (from a tuning profile). The env var still
+            // wins: a knob exists to be turned during a bisection, and a config file that silently
+            // overrode it would make that impossible.
+            let cfg_off = !engine_config().subgroup_matvec;
+            if (asahi_vulkan || cfg_off) && !force_sg {
+                let why = if asahi_vulkan { "Asahi/Honeykrisp subgroup support can hang large matmuls" }
+                          else { "disabled by engine config" };
+                eprintln!("wgpu-engine: subgroup decode kernel DISABLED on {} ({why}; LOGSCOPE_MATVEC_SG=1 re-enables)", gpu.adapter_name);
                 gpu.sg_ok.store(false, std::sync::atomic::Ordering::Relaxed);
             } else {
                 let ok = gpu.self_check_sg();
@@ -1042,7 +1103,7 @@ impl Gpu {
         // 202048x5120, over 4 MILLION super-blocks — and one dispatch that large trips the GPU watchdog.
         // The driver kills the job and the log fills with timeouts. Super-blocks are independent and map
         // linearly onto the output, so a chunk is just an offset into src plus shifted qw/qs bases.
-        const CHUNK_BLOCKS: usize = 16384;   // ~4M weights per dispatch
+        let chunk_blocks: usize = engine_config().convert_chunk_blocks.max(1);
         const CHUNKS_PER_SUBMIT: usize = 8;  // bound how much work rides on one submit
         let mut done = 0usize;
         let mut since_submit = 0usize;
@@ -1051,7 +1112,7 @@ impl Gpu {
             let nblk = total / 256;
             let mut b0 = 0usize;
             while b0 < nblk {
-                let cnt = CHUNK_BLOCKS.min(nblk - b0);
+                let cnt = chunk_blocks.min(nblk - b0);
                 let byte0 = b0 * 144;
                 let need = cnt * 144;
                 let avail = p.raw.len().saturating_sub(byte0);
