@@ -3472,7 +3472,20 @@ impl Gpu {
                 (s.visits % REPIN_EVERY == 0, s.n_expert as u32)
             };
             if do_check && std::env::var("LOGSCOPE_MOE_NOREPIN").is_err() {
-                let pick = sm.lock().unwrap().policy.pick_repin(n_expert);
+                // Steer the pin set with the coupling predictor as well as observed heat. This is the one
+                // place the predictor pays on a capacity-bound model: it cannot speculate into ring slots
+                // (no spare slots — measured), but the pin set has to hold SOMETHING, and pinning what is
+                // about to be hot beats pinning what was hot. The hint only breaks ties; observed heat
+                // still wins outright.
+                let predicted: Vec<u32> = {
+                    let h = moe_route_hist().lock().unwrap();
+                    if h.prev_experts.is_empty() { Vec::new() } else {
+                        let layer = sm.lock().unwrap().layer as i32;
+                        h.map.predict(crate::expert_predict::CtxSig::unigram(0), layer,
+                                      &h.prev_experts, m.cfg.n_used as usize)
+                    }
+                };
+                let pick = sm.lock().unwrap().policy.pick_repin_hinted(n_expert, &predicted);
                 if let Some((evict, admit)) = pick {
                     if self.stream_repin(sm, evict, admit) {
                         MOE_REPINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
