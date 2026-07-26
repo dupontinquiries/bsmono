@@ -171,6 +171,52 @@ not bundles of descendant history, so the sibling-branch merge above is the
 shape to reuse for that case. Take the `gin snapshot` checkpoint first either
 way.
 
+### Restoring files is not enough — the DECLARATIONS go too
+
+Caught on a post-merge audit, after the merge had already been committed.
+
+Restoring the 4 missing files was necessary but insufficient. The drop's
+`lib.rs` also lacks the *module declarations* for them, for the same reason it
+lacks the files. Taking the drop's `lib.rs` therefore deleted
+`pub mod pngutil;` (added by `d59cf94`) and orphaned a file that is present and
+is public API — `unendlich_engine::pngutil::write_png`. Fixed in `9925b22`.
+
+The general lesson, and the reason the `.gitmind` note above matters: when a
+drop lacks something the monorepo has, the loss shows up in **two** places —
+the file, and every place that wires it in. Restoring only the first leaves a
+tree that looks complete and is not.
+
+Audited the whole class rather than the one symptom — diffed every `mod X;`
+declaration, every `[[bin]]` target and every `[features]` entry between the
+pre-merge bundle and the merged tree:
+
+- `pub mod pngutil;` — real loss, restored.
+- `pub mod infusion;` — false positive. The drop moved the r594 comment onto a
+  new adjacent `infusion_catalog` module; `infusion` is still declared.
+- No `[[bin]]` targets or features lost.
+- kbm3: no declarations lost or gained.
+- blackstar: the equivalent surface is the CMake source list, already proven by
+  the 64/64 ctest run.
+
+### PRE-EXISTING: sim/netview.rs is wired to nothing
+
+Found while auditing the above; **not** caused by this merge and not fixed
+here. `crates/unendlich-engine/src/sim/netview.rs` is present, and the
+auto-discovered `src/bin/unendlich-netview.rs` does
+`use unendlich_engine::sim::netview::snapshot;` — but `pub mod netview;`
+appears nowhere in `sim/mod.rs`, on the pre-merge bundle or after. The bin has
+no `[[bin]]` entry, so cargo auto-discovers and builds it, which means
+`cargo check --all-targets` should already have been failing.
+
+The likely cause is this exact failure mode one drop earlier, at `000e92d`
+(the r742 adoption) — which is why it is worth writing the pattern down rather
+than just patching it.
+
+Left alone deliberately: there is no rust toolchain here (see above) to
+determine whether declaring the module builds clean or merely surfaces further
+errors in a file that has been dead through two drops. One line in
+`sim/mod.rs` if it turns out to be the former.
+
 ## Whole-tree verification
 
 `./verify.sh` on the merged tree reports `projects-with-real-problems=1`
@@ -186,6 +232,8 @@ ctest were run.
 
 ## Still open
 
+- `sim::netview` is wired to nothing (pre-existing, see above) — one line in
+  `sim/mod.rs`, once a rust host can confirm it builds clean.
 - `TODO(design)` in `games/blackstar/engine_src/game.c` — pick one escalation
   mechanic and retire the other. Also check anything persisting a mode index:
   `EX_MODE_ESCALATION` moved from ordinal 2 to 4.

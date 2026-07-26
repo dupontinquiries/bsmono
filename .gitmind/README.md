@@ -54,8 +54,20 @@ git checkout main && git merge --no-ff drop/<project>
 
 Finding `<import-point>` is the real work: measure divergence against each
 candidate commit rather than assuming the latest one. A file the drop lacks is
-then correctly read as "they never had it" rather than "they deleted it" — and
-if the archive genuinely lacks something the monorepo added, restore it on the
-drop branch before committing, or the merge will silently drop it.
+then correctly read as "they never had it" rather than "they deleted it".
+
+If the archive genuinely lacks something the monorepo added, restore it on the
+drop branch before committing — **and restore what wires it in**. The loss
+lands in two places: the file, and its `mod` declaration / `[[bin]]` entry /
+CMake source line. Restoring only the file leaves a tree that looks complete
+and is not. After merging, diff those declaration sets against the pre-merge
+state — the cheapest way to catch the whole class:
+
+```sh
+git diff <pre-merge>..HEAD -- '*lib.rs' '*mod.rs' '*Cargo.toml' '*CMakeLists.txt'
+```
+
+This has bitten twice now: `pub mod pngutil;` at r746 (fixed), and
+`sim::netview` at r742 (still unwired).
 
 See `maintenance/MERGE_C4_245.md` for a worked example across three drops.
