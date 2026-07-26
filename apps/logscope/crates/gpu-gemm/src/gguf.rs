@@ -278,6 +278,94 @@ pub fn shard_siblings(first: &std::path::Path) -> Option<Vec<std::path::PathBuf>
 }
 
 #[cfg(test)]
+mod iq1s_tests {
+    use super::*;
+
+    /// Build one IQ1_S block with chosen scale bits, sign and codebook indices.
+    fn block(d: f32, scale3: u16, negative: bool, idx: [u16; 32]) -> Vec<u8> {
+        let mut b = Vec::with_capacity(50);
+        // f16 of d, via the round-trip the reader will use
+        let h = {
+            let bits = d.to_bits();
+            let s = ((bits >> 16) & 0x8000) as u16;
+            let e = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+            let m = ((bits >> 13) & 0x3FF) as u16;
+            s | ((e as u16) << 10) | m
+        };
+        b.extend_from_slice(&h.to_le_bytes());
+        let mut qs = [0u8; 32];
+        let mut qh = [0u16; 8];
+        for ib in 0..8 {
+            qh[ib] = (scale3 & 7) << 12 | if negative { 0x8000 } else { 0 };
+            for l in 0..4 {
+                let i = idx[ib * 4 + l];
+                qs[ib * 4 + l] = (i & 0xFF) as u8;
+                qh[ib] |= ((i >> 8) & 7) << (3 * l);
+            }
+        }
+        b.extend_from_slice(&qs);
+        for h in qh { b.extend_from_slice(&h.to_le_bytes()); }
+        b
+    }
+
+    #[test]
+    fn a_block_decodes_to_the_documented_formula() {
+        // dl = d·(2·s+1); each weight = dl·(grid_value + delta), delta = ±0.125
+        let d = 0.5f32;
+        let idx = [1u16; 32];                     // entry 1 = [1,-1,-1,-1,-1,-1,-1,-1]
+        let raw = block(d, 3, false, idx);
+        assert_eq!(raw.len(), 50, "IQ1_S block is 50 bytes per 256 weights");
+        let out = dequantize(19, &raw, 256).expect("iq1_s");
+        assert_eq!(out.len(), 256);
+        let dl = d * (2.0 * 3.0 + 1.0);           // 3.5
+        let e = crate::iq1s_grid::entry(1);
+        for j in 0..8 {
+            let want = dl * (e[j] as f32 + 0.125);
+            assert!((out[j] - want).abs() < 1e-5, "pos {j}: {} vs {want}", out[j]);
+        }
+    }
+
+    #[test]
+    fn the_sign_bit_flips_the_delta_not_the_weights() {
+        let idx = [1u16; 32];
+        let pos = dequantize(19, &block(0.5, 3, false, idx), 256).unwrap();
+        let neg = dequantize(19, &block(0.5, 3, true, idx), 256).unwrap();
+        let e = crate::iq1s_grid::entry(1);
+        let dl = 0.5 * 7.0;
+        for j in 0..8 {
+            assert!((pos[j] - dl * (e[j] as f32 + 0.125)).abs() < 1e-5);
+            assert!((neg[j] - dl * (e[j] as f32 - 0.125)).abs() < 1e-5, "delta must negate, not the grid");
+        }
+        // the two differ everywhere the grid is non-zero-sensitive — i.e. everywhere
+        assert!(pos.iter().zip(&neg).any(|(a, b)| (a - b).abs() > 1e-6));
+    }
+
+    #[test]
+    fn the_eleven_bit_index_really_uses_the_high_bits_from_qh() {
+        // Index 0x105 needs 8 bits from qs and 1 more from qh. If the qh contribution were dropped the
+        // decoder would read entry 5 instead — a wrong codebook row, and silently wrong weights.
+        let mut idx = [0u16; 32];
+        idx[0] = 0x105;
+        let out = dequantize(19, &block(1.0, 0, false, idx), 256).unwrap();
+        let want = crate::iq1s_grid::entry(0x105);
+        let wrong = crate::iq1s_grid::entry(0x005);
+        assert_ne!(want, wrong, "the test is only meaningful if the two rows differ");
+        for j in 0..8 {
+            assert!((out[j] - (want[j] as f32 + 0.125)).abs() < 1e-5, "used the wrong codebook row");
+        }
+    }
+
+    #[test]
+    fn the_declared_size_matches_the_block() {
+        assert_eq!(type_nbytes(19, 256), Some(50));
+        assert_eq!(type_nbytes(19, 2560), Some(500));
+        assert_eq!(type_nbytes(19, 100), None, "not a multiple of 256");
+        // 50 bytes / 256 weights = 1.5625 bits per weight
+        assert!(((50.0f64 * 8.0 / 256.0) - 1.5625).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
 mod shard_tests {
     use super::*;
 
@@ -406,6 +494,7 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         7 => if n % 32 == 0 { Some(n / 32 * 24) } else { None }, // Q5_1: f16 d + f16 m + 4B qh + 16B nibbles
         8 => if n % 32 == 0 { Some(n / 32 * 34) } else { None }, // Q8_0: f16 scale + 32×i8
         12 => if n % 256 == 0 { Some(n / 256 * 144) } else { None }, // Q4_K super-block
+        19 => if n % 256 == 0 { Some(n / 256 * 50) } else { None },  // IQ1_S: 50 B per 256 → 1.5625 bits/wt
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block
         20 => if n % 32 == 0 { Some(n / 32 * 18) } else { None }, // IQ4_NL: f16 d + 16B 4-bit codebook idx
@@ -567,6 +656,37 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
                         y[yoff + 32 + l] = d2 * (qs[qoff + l] >> 4) as f32 - mm2;
                     }
                     qoff += 32; yoff += 64; is += 2;
+                }
+            });
+            Ok(out)
+        }
+        19 => {
+            // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
+            // 8 u16 `qh`. Each group of 8 weights takes an 11-BIT codebook index: 8 bits from qs plus 3
+            // more from qh, indexing iq1s_grid's 2048 ternary entries. Per 32-weight sub-block, qh also
+            // carries a 3-bit scale (dl = d·(2·s+1)) and a sign bit selecting ±IQ1S_DELTA.
+            //
+            // Ported from llama.cpp dequantize_row_iq1_s (ggml/src/ggml-quants.c). The codebook is
+            // transcribed, not derived — see iq1s_grid.rs.
+            if n % 256 != 0 { return Err("iq1_s element count not a multiple of 256".into()); }
+            let nblk = n / 256;
+            if data.len() < nblk * 50 { return Err("iq1_s data truncated".into()); }
+            let mut out = vec![0f32; n];
+            par_blocks(&mut out, &data[..nblk * 50], 256, 50, |y, blk| {
+                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+                let qs = &blk[2..34];
+                let qh: Vec<u16> = (0..8).map(|i| u16::from_le_bytes([blk[34 + 2 * i], blk[35 + 2 * i]])).collect();
+                for ib in 0..8 {
+                    let h = qh[ib];
+                    let dl = d * (2 * ((h >> 12) & 7) + 1) as f32;
+                    let delta = if h & 0x8000 != 0 { -crate::iq1s_grid::IQ1S_DELTA } else { crate::iq1s_grid::IQ1S_DELTA };
+                    for l in 0..4 {
+                        let idx = qs[ib * 4 + l] as usize | ((((h >> (3 * l)) & 7) as usize) << 8);
+                        let g = crate::iq1s_grid::entry(idx);
+                        for j in 0..8 {
+                            y[ib * 32 + l * 8 + j] = dl * (g[j] as f32 + delta);
+                        }
+                    }
                 }
             });
             Ok(out)
