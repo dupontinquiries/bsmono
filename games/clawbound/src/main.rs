@@ -491,6 +491,45 @@ fn build_ancestor(m: &mut Mesh, x: f32, z: f32, gy: f32, sway: f32, ready: bool,
     m.set_op(1.0);
 }
 
+/// Place one First Spirit model on the terrain, feet planted at ground height. Loads,
+/// normalizes to the roster height (× `scale`), tints, and emits papercraft facets.
+/// A missing/corrupt asset prints and skips — a render mode must never crash over a
+/// statue, but tests (iqm::tests) fail loudly so the gap can't hide.
+fn build_spirit(m: &mut Mesh, idx: usize, x: f32, z: f32, yaw: f32, scale: f32, stone: f32) {
+    let (name, _title, tint, h) = clawbound_rs::iqm::FELINE_SPIRITS[idx % clawbound_rs::iqm::FELINE_SPIRITS.len()];
+    match clawbound_rs::iqm::Model::load(name) {
+        Ok(mut model) => {
+            model.normalize(h * scale);
+            let c = rgb(tint);
+            let st = rgb(0x9a958c);
+            // stone=0 → living pelt tint; stone=1 → full statue grey (ancestor shrines)
+            let col = [c[0] + (st[0] - c[0]) * stone, c[1] + (st[1] - c[1]) * stone, c[2] + (st[2] - c[2]) * stone];
+            let y = world::height_at(x, z);
+            model.build(m, v3(x, y, z), yaw, col);
+        }
+        Err(e) => eprintln!("spirit {name}: {e} (skipped)"),
+    }
+}
+
+/// The First Spirits gallery (SPIRITS_PLAN.md): every feline ancestor stood in an arc on
+/// open ground, living tints, names to stderr — the mode that proves the models load,
+/// orient, and scale before they haunt the real modes.
+fn build_spirits() -> (Mesh, Vec3) {
+    world::init_world();
+    let mut m = world::build_terrain(150);
+    m.extend(&world::build_grass(1200));
+    let n = clawbound_rs::iqm::FELINE_SPIRITS.len();
+    eprintln!("FIRST SPIRITS — {} ancestors", n);
+    for (i, (name, title, _, h)) in clawbound_rs::iqm::FELINE_SPIRITS.iter().enumerate() {
+        // an arc facing the camera, tallest in the middle
+        let t = i as f32 / (n - 1) as f32 - 0.5;
+        let (x, z) = (t * 34.0, 8.0 + t.abs() * t.abs() * 26.0);
+        eprintln!("  {:<26} {} ({:.1}u)", name, title, h);
+        build_spirit(&mut m, i, x, z, t * -0.9, 1.0, 0.0);
+    }
+    (m, v3(0.0, 2.2, 10.0))
+}
+
 fn build_prowl() -> (Mesh, Vec3) {
     use clawbound_rs::prowl::{Prowl, ProwlObj};
     use clawbound_rs::class::Class;
@@ -555,9 +594,13 @@ fn build_prowl() -> (Mesh, Vec3) {
     }
 
     // ancestor trees — grand swaying staging grounds
-    for a in &g.ancestors {
+    for (ai, a) in g.ancestors.iter().enumerate() {
         let gy = world::height_at(a.x, a.z);
         build_ancestor(&mut m, a.x, a.z, gy, g.time * 1.1 + a.x * 0.05, a.ready(), a.claimed_by);
+        // the First Spirit of this staging ground (SPIRITS_PLAN.md): a stone ancestor
+        // statue at the foot of the tree, facing the clearing. Which spirit is stable
+        // per tree (index order), so a claimed tree keeps its ancestor across frames.
+        build_spirit(&mut m, ai, a.x + 3.1, a.z + 1.4, 2.4 + ai as f32 * 0.7, 0.85, 0.8);
     }
 
     // power-up pickups
@@ -951,6 +994,18 @@ fn build_open() -> (Mesh, Vec3) {
         m.set_op(0.55);
         m.segment(v3(sx, sy, sz), v3(sx, sy + 18.0, sz), 0.8, 0.2, 8, rgb(0xd9ecff));
         m.set_op(1.0);
+        // the clan's First Spirit stands beneath the pillar — which ancestor answered is
+        // the doctrine's (SPIRITS_PLAN.md: philosophies, not gods): Shadow for hunters,
+        // Winter for guardians, Canopy for explorers, Mountain for isolationists, the
+        // Hearth Spirit for diplomats. Living tint — this one is not a statue.
+        let spirit = match w.doctrine {
+            clawbound_rs::openworld::Doctrine::Hunter => 2,        // black panther
+            clawbound_rs::openworld::Doctrine::Guardian => 1,      // white tiger
+            clawbound_rs::openworld::Doctrine::Explorer => 4,      // clouded leopard
+            clawbound_rs::openworld::Doctrine::Isolationist => 3,  // puma
+            clawbound_rs::openworld::Doctrine::Diplomatic => 7,    // persian
+        };
+        build_spirit(&mut m, spirit, sx + 2.2, sz + 1.0, 3.9, 1.0, 0.0);
     }
     // discoveries as POI pillars, prowl-style
     for (_, dx, dz) in &w.discoveries {
@@ -989,6 +1044,37 @@ fn build_open() -> (Mesh, Vec3) {
         cat::build(&mut m, v3(wd.x, wy, wd.z), 0.92, &cat::taste_air(wd.x), clawbound_rs::class::Class::Cat);
     }
 
+    // Where the founding ground touches water (mangrove/lake or good fishing), the
+    // drop's exotics surface: a shark under the shallows, the tiny blue octopus on the
+    // flats, a toucan at the treeline. Habitat-gated on the real biome — a moor clan
+    // never sees a shark. One wet spot only: set dressing, not a shoal.
+    {
+        let b = world::biome_at(cx, cz);
+        let watery = b.name == "Mangrove Shallows" || b.name == "Lake Shore" || w.site.fishing > 0.4;
+        if watery {
+            'wet: for k in 0..40 {
+                let a = k as f32 / 40.0 * std::f32::consts::TAU;
+                let (wx, wz) = (cx + a.cos() * (14.0 + k as f32), cz + a.sin() * (14.0 + k as f32));
+                if world::height_at(wx, wz) < world::WATER_Y - 0.4 {
+                    if let Ok(mut shark) = clawbound_rs::iqm::Model::load("great_white_shark") {
+                        shark.normalize(2.6);
+                        shark.build(&mut m, v3(wx, world::WATER_Y - 1.1, wz), a + 1.6, rgb(0x7d8fa0));
+                    }
+                    if let Ok(mut octo) = clawbound_rs::iqm::Model::load("galapagos_tiny_blue_octopus") {
+                        octo.normalize(0.7);
+                        octo.build(&mut m, v3(wx + 3.0, world::WATER_Y - 0.35, wz - 2.0), a, rgb(0x4f7fc0));
+                    }
+                    if let Ok(mut toucan) = clawbound_rs::iqm::Model::load("keel_billed_toucan") {
+                        let (tx, tz) = (wx * 0.6 + cx * 0.4, wz * 0.6 + cz * 0.4);
+                        let ty = world::height_at(tx, tz);
+                        toucan.normalize(0.9);
+                        toucan.build(&mut m, v3(tx, ty + 2.6, tz), a - 0.8, rgb(0x2c2c30));
+                    }
+                    break 'wet;
+                }
+            }
+        }
+    }
     (m, v3(cx, cy, cz))
 }
 
@@ -1006,6 +1092,7 @@ async fn run() {
         "goals" => build_goals(),
         "game" => build_game(),
         "prowl" => build_prowl(),
+        "spirits" => build_spirits(),
         "capture" => build_capture(),
         "open" => build_open(),
         "wildlife" => build_wildlife(),
@@ -1048,6 +1135,7 @@ async fn run() {
         "prowl" => (focus.add(v3(20.0, 34.0, -20.0)), focus.add(v3(0.0, -3.0, 8.0))),
         "capture" => (v3(92.0, 104.0, -30.0), v3(-6.0, -10.0, 6.0)),
         "open" => (focus.add(v3(17.0, 23.0, -19.0)), focus.add(v3(0.0, -2.0, 6.0))),
+        "spirits" => (focus.add(v3(0.0, 4.5, -26.0)), focus.add(v3(0.0, 1.2, 8.0))),
         "wildlife" => (focus.add(v3(0.5, 2.3, -7.5)), focus.add(v3(0.0, 0.9, 3.2))),
         _ => (focus.add(v3(-13.0, 8.0, -15.0)), focus.add(v3(3.0, -3.5, 7.0))),
     };

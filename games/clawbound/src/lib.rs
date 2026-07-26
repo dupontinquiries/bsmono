@@ -22,6 +22,7 @@ pub mod class;
 pub mod capture;
 pub mod ecology;
 pub mod hunter;
+pub mod iqm;
 pub mod mapeval;
 pub mod menu;
 pub mod net;
