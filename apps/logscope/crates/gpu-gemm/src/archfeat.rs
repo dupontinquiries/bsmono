@@ -74,12 +74,14 @@ impl Feature {
             Feature::SharedExpert => true,   // MoeLayer::shared
             Feature::InterleavedMoe => true, // per-block expert-set detection in the loader
             Feature::PostNorm => true,       // Gemma2 support carries attn/ffn post-norms
-            Feature::ChunkedSwa => false,    // not implemented; full attention is used instead
+            Feature::ChunkedSwa => true,     // same paths as StandardSwa; the rule differs, the wiring does not
             Feature::Mla => false,           // compute paths validated but NOT wired into decode
-            // Wired into the f32 DECODE path (windowed KV view, --gate-swa) but NOT into prefill, where
-            // every query row has its own window and needs a mask. Reported as not-implemented because
-            // partial coverage is what made Llama-4 hard to find: a long prompt still attends fully.
-            Feature::StandardSwa => false,
+            // Wired end to end: f32 decode (windowed KV view), q8 decode (kernel start bound) and
+            // prefill (per-row window in the parallel kernel), each checked against an independent
+            // reference by --gate-swa. The one hole is the serial prefill fallback used when
+            // head_dim > 192, which stays causal-only and SAYS SO at dispatch rather than silently
+            // ignoring the window.
+            Feature::StandardSwa => true,
             Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
         }
     }
@@ -87,10 +89,7 @@ impl Feature {
     /// What a user can do about a missing feature, when there is something.
     pub fn note(self) -> Option<&'static str> {
         match self {
-            Feature::ChunkedSwa => Some("affects long contexts only; short prompts behave normally"),
-            Feature::StandardSwa => Some("decode is windowed, but PREFILL still attends fully — so a \
-prompt longer than the window (Gemma 2: 4096) is processed wrongly even though generation after it is \
-correct"),
+
             Feature::PerLayerRopeFreqs => Some("full-attention layers get the windowed layers' rope base; \
 matters most on long contexts"),
             Feature::Mla => Some("the compute kernels, the compressed-KV cache and the per-layer \
@@ -166,12 +165,13 @@ mod tests {
     }
 
     #[test]
-    fn scout_reports_only_its_real_remaining_gap() {
+    fn scout_has_no_remaining_declared_gaps() {
+        // Llama-4 needed NoPE, attention temperature, chunked SWA, a shared expert, interleaved MoE and
+        // use_kq_norm. Every one is now implemented; the last two landed this session.
         let g = gaps("llama4", 16);
-        assert_eq!(g, vec![Feature::ChunkedSwa], "unexpected gaps: {g:?}");
-        let r = gap_report("llama4", 16);
-        assert_eq!(r.len(), 1);
-        assert!(r[0].contains("long contexts only"), "{}", r[0]);
+        assert!(g.is_empty(), "unexpected gaps: {g:?}");
+        // Maverick (128 experts) differs only in skipping use_kq_norm, and is likewise clear
+        assert!(gaps("llama4", 128).is_empty());
     }
 
     #[test]
@@ -186,16 +186,14 @@ mod tests {
     }
 
     #[test]
-    fn gemma_support_is_partial_and_says_so() {
-        // We claim Gemma2 support, but llama.cpp's gemma2.cpp sets swa_type = STANDARD with n_swa = 4096
-        // and a layer pattern — the same shape of undeclared gap Llama-4 had. It must be reported.
-        let g2 = gaps("gemma2", 0);
-        assert!(g2.contains(&Feature::StandardSwa), "Gemma2 needs SWA and we do not implement it");
-        assert!(!g2.contains(&Feature::PostNorm), "post-norms ARE implemented");
-        // and the consequence is bounded AND specific: decode is windowed, prefill is not, so the note
-        // must say which half works rather than a blanket "output will be wrong"
-        let r = gap_report("gemma2", 0);
-        assert!(r.iter().any(|s| s.contains("PREFILL still attends fully")), "{r:?}");
+    fn gemma2_is_now_fully_supported() {
+        // It was NOT, and this test previously asserted the gap: gemma2.cpp sets swa_type = STANDARD with
+        // n_swa = 4096 on a layer pattern, and we attended fully. With SWA wired through decode and
+        // prefill, both of Gemma2's requirements are met.
+        assert!(Feature::StandardSwa.implemented(), "SWA is wired end to end");
+        assert!(Feature::PostNorm.implemented());
+        assert!(gaps("gemma2", 0).is_empty(), "{:?}", gaps("gemma2", 0));
+        assert!(gap_report("gemma2", 0).is_empty(), "nothing left to declare");
     }
 
     #[test]
