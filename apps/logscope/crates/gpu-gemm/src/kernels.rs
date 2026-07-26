@@ -326,3 +326,11 @@ pub const Q4K_DEQUANT: &str = include_str!("kernels/q4k_dequant.wgsl");
 /// block, computing that block's absmax scale and packing 8 nibbles per word exactly as the CPU
 /// `quantize_q4_resident_cpu` does (scale = amax/7, nibble = round(w/scale) + 8).
 pub const Q4K_TO_Q4: &str = include_str!("kernels/q4k_to_q4.wgsl");
+
+// ── Qwen3.5 Gated DeltaNet + gated attention (see GLM47-style notes in QWEN35_SUPPORT.md) ──
+pub const DELTA_CONV_STEP: &str = include_str!("kernels/delta_conv_step.wgsl");
+pub const DELTA_STEP: &str = include_str!("kernels/delta_step.wgsl");
+pub const L2NORM_ROWS: &str = include_str!("kernels/l2norm_rows.wgsl");
+pub const MUL_GATE: &str = include_str!("kernels/mul_gate.wgsl");
+pub const DEINTERLEAVE2: &str = include_str!("kernels/deinterleave2.wgsl");
+pub const DELTA_GB: &str = include_str!("kernels/delta_gb.wgsl");

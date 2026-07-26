@@ -581,6 +581,98 @@ fn write_gguf_gemma3(m: &HostModel, swa_base: Option<f32>) -> Vec<u8> {
     b
 }
 
+/// Synthetic 2-layer Qwen3.5 hybrid: layer 0 = Gated DeltaNet (attn_qkv/attn_gate/ssm_*),
+/// layer 1 = gated attention (fused [q|gate] wq, per-head q/k norms). full_attention_interval=2
+/// drives the layer routing; ssm.* keys carry the DeltaNet dims. Small: d=32, S=8, Hk=2, Hv=4.
+fn write_gguf_qwen35(seed_shift: u32) -> Vec<u8> {
+    let (d, vocab, h) = (32usize, 48usize, 64usize);
+    let (st, hk, hv, dcv) = (8usize, 2usize, 4usize, 4usize);
+    let (kdim, vdim) = (hk * st, hv * st);
+    let conv_dim = 2 * kdim + vdim;
+    let (heads, hd) = (2usize, 16usize);          // attention layer: ad = 32 = d
+    let ad = heads * hd;
+    let mk = |seed: u32, n: usize| -> Vec<f32> {
+        let mut v = Vec::with_capacity(n); let mut x = (seed + seed_shift) | 1;
+        for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.15); }
+        v };
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
+        let (t, by) = f32t(&w); ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
+    // layer 0: DeltaNet
+    push("blk.0.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.attn_post_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.attn_qkv.weight".into(), mat(2 * kdim + vdim, d), mk(21, (2 * kdim + vdim) * d));
+    push("blk.0.attn_gate.weight".into(), mat(vdim, d), mk(22, vdim * d));
+    push("blk.0.ssm_conv1d.weight".into(), vec![dcv as u64, conv_dim as u64], mk(23, conv_dim * dcv));
+    push("blk.0.ssm_dt.bias".into(), v1(hv), mk(24, hv));
+    push("blk.0.ssm_a".into(), v1(hv), (0..hv).map(|i| -0.5 - 0.1 * i as f32).collect()); // -exp(A_log) < 0
+    push("blk.0.ssm_beta.weight".into(), mat(hv, d), mk(25, hv * d));
+    push("blk.0.ssm_alpha.weight".into(), mat(hv, d), mk(26, hv * d));
+    push("blk.0.ssm_norm.weight".into(), v1(st), vec![1.0; st]);
+    push("blk.0.ssm_out.weight".into(), mat(d, vdim), mk(27, d * vdim));
+    push("blk.0.ffn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.0.ffn_gate.weight".into(), mat(h, d), mk(31, h * d));
+    push("blk.0.ffn_up.weight".into(), mat(h, d), mk(32, h * d));
+    push("blk.0.ffn_down.weight".into(), mat(d, h), mk(33, d * h));
+    // layer 1: gated attention (wq rows DOUBLED: per-head [q|gate])
+    push("blk.1.attn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.1.attn_post_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.1.attn_q.weight".into(), mat(2 * ad, d), mk(41, 2 * ad * d));
+    push("blk.1.attn_k.weight".into(), mat(ad, d), mk(42, ad * d));
+    push("blk.1.attn_v.weight".into(), mat(ad, d), mk(43, ad * d));
+    push("blk.1.attn_q_norm.weight".into(), v1(hd), vec![1.0; hd]);
+    push("blk.1.attn_k_norm.weight".into(), v1(hd), vec![1.0; hd]);
+    push("blk.1.attn_output.weight".into(), mat(d, ad), mk(44, d * ad));
+    push("blk.1.ffn_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("blk.1.ffn_gate.weight".into(), mat(h, d), mk(45, h * d));
+    push("blk.1.ffn_up.weight".into(), mat(h, d), mk(46, h * d));
+    push("blk.1.ffn_down.weight".into(), mat(d, h), mk(47, d * h));
+    push("output_norm.weight".into(), v1(d), vec![1.0; d]);
+    push("output.weight".into(), mat(vocab, d), mk(51, vocab * d));
+
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let sst = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, 15);
+    sst(&mut b, "general.architecture"); u32b(&mut b, 8); sst(&mut b, "qwen35");
+    sst(&mut b, "qwen35.block_count"); u32b(&mut b, 4); u32b(&mut b, 2);
+    sst(&mut b, "qwen35.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    sst(&mut b, "qwen35.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, heads as u32);
+    sst(&mut b, "qwen35.embedding_length"); u32b(&mut b, 4); u32b(&mut b, d as u32);
+    sst(&mut b, "qwen35.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, h as u32);
+    sst(&mut b, "qwen35.vocab_size"); u32b(&mut b, 4); u32b(&mut b, vocab as u32);
+    sst(&mut b, "qwen35.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 10000.0);
+    sst(&mut b, "qwen35.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, 1e-5);
+    sst(&mut b, "qwen35.rope.dimension_count"); u32b(&mut b, 4); u32b(&mut b, 8);   // partial rot
+    sst(&mut b, "qwen35.full_attention_interval"); u32b(&mut b, 4); u32b(&mut b, 2);
+    sst(&mut b, "qwen35.ssm.conv_kernel"); u32b(&mut b, 4); u32b(&mut b, dcv as u32);
+    sst(&mut b, "qwen35.ssm.state_size"); u32b(&mut b, 4); u32b(&mut b, st as u32);
+    sst(&mut b, "qwen35.ssm.group_count"); u32b(&mut b, 4); u32b(&mut b, hk as u32);
+    sst(&mut b, "qwen35.ssm.time_step_rank"); u32b(&mut b, 4); u32b(&mut b, hv as u32);
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        sst(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
@@ -3981,6 +4073,114 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-qwen35") {
+        // Qwen3.5 / Ornith: Gated DeltaNet + gated attention. Two proof layers:
+        // (1) KERNEL vs CPU: the conv step and the delta rule, CHAINED across 3 tokens so
+        //     the in-place conv history and state must carry correctly step to step.
+        // (2) MODEL: the synthetic hybrid loads, decodes finite and deterministic, and the
+        //     recurrent state provably carries information (token 0 changes logits at
+        //     step 2 even though only DeltaNet links them at layer 0).
+        let gpu = Gpu::new();
+        eprintln!("gate-qwen35: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let mk = |seed: u32, n: usize| -> Vec<f32> {
+            let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+            for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.4); }
+            v };
+        // ── (1) kernels vs CPU, chained ──
+        let (st, hk, hv, dcv) = (8usize, 2usize, 4usize, 4usize);
+        let (kdim, vdim) = (hk * st, hv * st);
+        let ch = 2 * kdim + vdim;
+        let w = mk(2, ch * dcv);
+        let wt = gpu.upload(&w, 1, ch * dcv);
+        let conv_gpu = gpu.upload(&vec![0.0f32; ch * dcv], 1, ch * dcv);   // [y | history]
+        let mut hist = vec![0.0f32; ch * (dcv - 1)];
+        let state_gpu = gpu.upload(&vec![0.0f32; vdim * (1 + st)], 1, vdim * (1 + st)); // [out | M]
+        let mut m_cpu = vec![0.0f32; hv * st * st];
+        let mut worst_conv = 0.0f32; let mut worst_out = 0.0f32;
+        for step in 0..3u32 {
+            let x = mk(10 + step, ch);
+            let xt = gpu.upload(&x, 1, ch);
+            gpu.delta_conv_step_pub(&xt, &wt, &conv_gpu, ch, dcv);
+            // CPU conv + silu + history shift
+            let mut y = vec![0.0f32; ch];
+            for c in 0..ch {
+                let mut acc = 0.0f32;
+                for t in 0..dcv - 1 { acc += w[c * dcv + t] * hist[c * (dcv - 1) + t]; }
+                acc += w[c * dcv + dcv - 1] * x[c];
+                y[c] = acc / (1.0 + (-acc).exp());
+                for t in 0..dcv - 2 { hist[c * (dcv - 1) + t] = hist[c * (dcv - 1) + t + 1]; }
+                hist[c * (dcv - 1) + dcv - 2] = x[c];
+            }
+            let gy = gpu.download(&gpu.view_prefix(&conv_gpu, 1, ch));
+            worst_conv = worst_conv.max(y.iter().zip(&gy).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max));
+            // l2 norm q,k on CPU from y; v raw
+            let l2 = |seg: &[f32]| -> Vec<f32> {
+                seg.chunks(st).flat_map(|h| {
+                    let n = (h.iter().map(|v| v * v).sum::<f32>() + 1e-5).sqrt();
+                    h.iter().map(move |v| v / n).collect::<Vec<_>>()
+                }).collect() };
+            let (qn, kn) = (l2(&y[..kdim]), l2(&y[kdim..2 * kdim]));
+            let vv = &y[2 * kdim..];
+            let (al, be_r) = (mk(20 + step, hv), mk(30 + step, hv));
+            let (dtb, av) = (mk(3, hv), vec![-0.6f32; hv]);
+            let mut gb = vec![0.0f32; 2 * hv];
+            for h in 0..hv {
+                let sp = ((al[h] + dtb[h]).exp() + 1.0).ln();
+                gb[2 * h] = (av[h] * sp).exp();
+                gb[2 * h + 1] = 1.0 / (1.0 + (-be_r[h]).exp());
+            }
+            let (qt, kt2, vt2, gbt) = (gpu.upload(&qn, 1, kdim), gpu.upload(&kn, 1, kdim),
+                                       gpu.upload(&vv.to_vec(), 1, vdim), gpu.upload(&gb, 1, 2 * hv));
+            gpu.delta_step_pub(&qt, &kt2, &vt2, &gbt, &state_gpu, st, hv, hk);
+            // CPU delta rule
+            let mut o_cpu = vec![0.0f32; vdim];
+            let scale = 1.0 / (st as f32).sqrt();
+            for h in 0..hv {
+                let khh = h / (hv / hk);
+                let (eg, bb) = (gb[2 * h], gb[2 * h + 1]);
+                for j in 0..st {
+                    let row = &mut m_cpu[h * st * st + j * st..h * st * st + (j + 1) * st];
+                    let mut mkk = 0.0f32;
+                    for i in 0..st { mkk += row[i] * eg * kn[khh * st + i]; }
+                    let err = bb * (vv[h * st + j] - mkk);
+                    let mut oj = 0.0f32;
+                    for i in 0..st {
+                        row[i] = row[i] * eg + err * kn[khh * st + i];
+                        oj += row[i] * qn[khh * st + i] * scale;
+                    }
+                    o_cpu[h * st + j] = oj;
+                }
+            }
+            let go = gpu.download(&gpu.view_prefix(&state_gpu, 1, vdim));
+            worst_out = worst_out.max(o_cpu.iter().zip(&go).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max));
+        }
+        ck(&format!("conv step matches CPU across 3 chained tokens (max|\u{394}|={worst_conv:.2e})"), worst_conv < 1e-4);
+        ck(&format!("delta rule matches CPU across 3 chained tokens — state carries (max|\u{394}|={worst_out:.2e})"), worst_out < 1e-4);
+        // ── (2) model level ──
+        let bytes = write_gguf_qwen35(0);
+        match gpu.load_gguf_quantized(&bytes) {
+            Err(e) => ck(&format!("hybrid qwen35 gguf loads — {e}"), false),
+            Ok(m) => {
+                ck("hybrid qwen35 gguf loads (was: 'missing tensor blk.0.attn_q.weight')", true);
+                let run = |toks: &[u32]| -> Vec<Vec<f32>> {
+                    let c = gpu.new_cache_for(&m, 8);
+                    toks.iter().enumerate().map(|(p, &t)| gpu.decode_step(&m, &c, t, p)).collect()
+                };
+                let a = run(&[3, 17, 29, 11]);
+                let b = run(&[3, 17, 29, 11]);
+                let fin = a.iter().flatten().all(|x| x.is_finite());
+                let det = a.iter().flatten().zip(b.iter().flatten()).all(|(x, y)| x == y);
+                ck(&format!("4-token decode finite + deterministic across fresh caches"), fin && det);
+                let c2 = run(&[5, 17, 29, 11]);
+                let dmem = a[2].iter().zip(&c2[2]).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+                ck(&format!("recurrent state carries token-0 information to step 2 (max|\u{394}|={dmem:.2e})"), dmem > 1e-4);
+            }
+        }
+        println!("gate-qwen35: {}", if ok { "Gated DeltaNet + gated attention correct \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-swa-serial") {
         // The serial prefill attention kernel (hd > 192 — gemma3's head_dim=256) was
         // causal-only: on a 3840-token prompt every windowed layer attended the FULL
@@ -4698,7 +4898,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)), wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
         g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
         q_norm: None, k_norm: None, // llama-shape test block (no QK-Norm)
-        nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
+        nope: false, delta: None, qgate: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None,
         moe: None, // dense test block — the MoE path has its own validation
     };
     let xt = gpu.upload(&x, bt, bd);
@@ -4709,7 +4909,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
     // NoPE block (Llama4 iRoPE): the SAME weights with nope=true must match a CPU reference with
     // rope REMOVED — proving the per-layer switch reaches every projection and nothing else moves.
     {
-        let bw_nope = gpu_kernels::BlockWeights {
+        let bw_nope = gpu_kernels::BlockWeights { delta: None, qgate: false,
             wq: Lin::f32(gpu.upload(&blk.wq, bd, bd)), wk: Lin::f32(gpu.upload(&blk.wk, bd, bd)),
             wv: Lin::f32(gpu.upload(&blk.wv, bd, bd)), wo: Lin::f32(gpu.upload(&blk.wo, bd, bd)),
             wqkv: Lin::f32(gpu.upload(&[&blk.wq[..], &blk.wk[..], &blk.wv[..]].concat(), 3 * bd, bd)),
@@ -4727,7 +4927,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             wgate_up: Lin::f32(gpu.upload(&[&blk.wgate[..], &blk.wup[..]].concat(), 2 * bh, bd)),
             wdown: Lin::f32(gpu.upload(&blk.wdown, bd, bh)),
             g1: gpu.upload(&blk.g1, 1, bd), g2: gpu.upload(&blk.g2, 1, bd),
-            q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
+            q_norm: None, k_norm: None, nope: false, delta: None, qgate: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None,
         };
         let roped = gpu.download(&gpu.block_forward(&bw_rope, &xt, &ones, bt, bd, bd, 1, 1, BASE, EPS));
         // CPU: cpu_block minus the rope step
