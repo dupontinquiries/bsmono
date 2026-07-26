@@ -60,7 +60,7 @@ pub struct Statement {
 }
 
 impl Statement {
-    fn new(text: impl Into<String>, grounds: Vec<String>) -> Self { Statement { text: text.into(), grounds } }
+    pub fn new(text: impl Into<String>, grounds: Vec<String>) -> Self { Statement { text: text.into(), grounds } }
     /// A statement about having nothing to report — the honest alternative to inventing a summary.
     fn nothing(text: impl Into<String>) -> Self { Statement { text: text.into(), grounds: Vec::new() } }
     pub fn is_grounded(&self) -> bool { !self.grounds.is_empty() }
