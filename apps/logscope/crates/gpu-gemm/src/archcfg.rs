@@ -130,8 +130,8 @@ pub fn for_arch(arch: &str) -> ArchConfig {
         "phi3" => ArchConfig {
             arch: Arch::Phi3, prefix: "phi3", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
-            supported: false, dense_supported: false,
-            note: "fused qkv tensor + partial-rotary RoPE; needs a split + partial-dim rope kernel",
+            supported: true, dense_supported: true,
+            note: "fused attn_qkv ([Q|K|V] rows) and fused ffn_up ([gate|up]) split at load; NEOX rope over rope.dimension_count dims (partial-rot kernels); LongRoPE factor tensors honored",
         },
         // GLM-4-MoE (general.architecture = "glm4moe"). Two sub-forms exist; this registry entry is the
         // STANDARD-attention one (GQA + per-head QK-Norm + qkv bias, like Qwen3, plus shared-expert MoE).
