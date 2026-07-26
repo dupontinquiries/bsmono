@@ -114,6 +114,15 @@ impl Gguf {
     pub fn get_f32(&self, key: &str) -> Option<f32> {
         match self.metadata.get(key) { Some(Value::F32(v)) => Some(*v), _ => None }
     }
+    /// Tolerant bool: some converters write flags (`expert_weights_norm`, …) as integers.
+    pub fn get_bool(&self, key: &str) -> Option<bool> {
+        match self.metadata.get(key)? {
+            Value::Bool(v) => Some(*v),
+            Value::U32(v) => Some(*v != 0),
+            Value::I32(v) => Some(*v != 0),
+            _ => None,
+        }
+    }
 
     /// The model architecture, resolved robustly for the metadata-key prefix used by the hyperparameters.
     /// GGUF stores those under `<arch>.embedding_length` etc., and `<arch>` should equal

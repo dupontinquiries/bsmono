@@ -257,7 +257,13 @@ impl LogscopeApp {
         let mut repaint = false;
         for e in evts {
             match e {
-                Evt::Loaded(Ok(info)) => { self.model_loaded = true; self.local_status = format!("loaded {}", info.path); self.toaster.push(ctx, "Model loaded", theme::GREEN()); }
+                Evt::Loaded(Ok(info)) => {
+                    self.model_loaded = true;
+                    // Sampling presets keyed off the model name (e.g. GLM-4.7: penalty OFF per its card).
+                    self.tabs.chat.apply_model_sampling_preset(&info.path);
+                    self.local_status = format!("loaded {}", info.path);
+                    self.toaster.push(ctx, "Model loaded", theme::GREEN());
+                }
                 Evt::Loaded(Err(e)) => {
                     self.model_loaded = false;
                     // A backend switch drops the loaded model and reports "…reload the model". Clear the

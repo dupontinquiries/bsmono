@@ -56,8 +56,54 @@ impl Default for GenParams {
     }
 }
 
+impl GenParams {
+    /// Defaults adjusted for what the model actually wants, keyed off its file/display name. The global
+    /// default (`temp 0.7, repeat_penalty 1.15`) is a small-model coherence compromise, and some model
+    /// families are actively degraded by it:
+    ///
+    /// * **GLM-4.7 family** (GLM-4.7-Flash etc.): Z.ai/unsloth guidance is `temp 1.0, top-p 0.95,
+    ///   min-p 0.01` and **repetition penalty OFF** — the checkpoint loops under penalties (the
+    ///   Jan-2026 llama.cpp fix removed the looping, and penalties on top of the fixed sampler distort
+    ///   outputs; unsloth's model card says disable explicitly). Our 1.15-first chain is exactly the
+    ///   wrong thing for it.
+    ///
+    /// Names are matched loosely (case-insensitive, separators ignored) because the same model arrives
+    /// as `GLM-4.7-Flash-UD-Q4_K_XL.gguf`, `glm-4.7-flash:latest`, or a pretty display string.
+    pub fn for_model(name: &str) -> Self {
+        let n: String = name.to_ascii_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+        let mut p = Self::default();
+        if n.contains("glm47") {
+            p.temperature = 1.0;
+            p.repeat_penalty = 1.0; // OFF — see above; not a tuning preference, a correctness requirement
+            p.min_p = 0.01;
+        }
+        p
+    }
+}
+
 /// Compile-time capability flag the UI reads to show/hide the local path.
 pub const fn is_available() -> bool { cfg!(feature = "llama-ffi") }
+
+// ── Platform detection: Asahi Linux (Apple Silicon) ──────────────────────────
+
+/// Does a `/proc/device-tree/compatible` blob identify an Apple-Silicon (Asahi) platform?
+/// The file is a NUL-separated list of compatible strings; `apple,arm-platform` is the marker
+/// ramalama's accelerator autodetection keys on (see maintenance/ASAHI_VULKAN_LESSONS.md).
+/// Pure over the bytes so the parse is testable off-device.
+pub fn compatible_says_asahi(blob: &[u8]) -> bool {
+    blob.split(|b| *b == 0).any(|s| s == b"apple,arm-platform")
+}
+
+/// Runtime check: are we on an Asahi (Linux-on-Apple-Silicon) kit? Used to label backend
+/// diagnostics — on these boxes the ONLY working GPU path is Vulkan through Honeykrisp
+/// (mesa-vulkan-drivers from asahi-repos), so "asahi + no Vulkan adapter" is a driver-install
+/// problem, never a reason to fall back to CPU quietly. Returns false anywhere the device-tree
+/// path doesn't exist (x86, macOS, containers without /proc bind).
+pub fn is_asahi() -> bool {
+    std::fs::read("/proc/device-tree/compatible")
+        .map(|b| compatible_says_asahi(&b))
+        .unwrap_or(false)
+}
 
 // ── Process-global active-model registry (feature-independent) ───────────────
 static ACTIVE: OnceLock<Mutex<Option<Arc<LoadedModel>>>> = OnceLock::new();
@@ -296,6 +342,39 @@ mod tests {
     #[test]
     fn availability_matches_feature() {
         assert_eq!(is_available(), cfg!(feature = "llama-ffi"));
+    }
+    #[test]
+    fn asahi_detection_parses_the_device_tree_blob() {
+        // a real M2 kit's compatible list shape: model-specific first, platform marker after,
+        // NUL-separated with a trailing NUL
+        let m2 = b"apple,j414\0apple,t8112\0apple,arm-platform\0";
+        assert!(compatible_says_asahi(m2));
+        // marker must match a whole entry, not a substring of one
+        let tricky = b"vendor,apple-arm-platformish\0other,soc\0";
+        assert!(!compatible_says_asahi(tricky));
+        let pi = b"raspberrypi,4-model-b\0brcm,bcm2711\0";
+        assert!(!compatible_says_asahi(pi));
+        assert!(!compatible_says_asahi(b""));
+    }
+    #[test]
+    fn glm47_preset_kills_the_repeat_penalty_in_every_spelling() {
+        // The one non-negotiable: repetition penalty OFF for GLM-4.7 (its card says so; our 1.15-first
+        // sampler chain is exactly the wrong default for it). Match every spelling the file arrives as.
+        for name in ["GLM-4.7-Flash-UD-Q4_K_XL.gguf", "glm-4.7-flash:latest",
+                     "unsloth/GLM-4.7-Flash-GGUF", "Glm_4.7_flash_Q8_0"] {
+            let p = GenParams::for_model(name);
+            assert_eq!(p.repeat_penalty, 1.0, "{name}: penalty must be OFF");
+            assert_eq!(p.temperature, 1.0, "{name}: Z.ai general-use temp");
+            assert_eq!(p.min_p, 0.01, "{name}: llama.cpp default 0.05 is too high for this model");
+        }
+    }
+    #[test]
+    fn models_without_a_preset_keep_the_global_defaults() {
+        let (d, q) = (GenParams::default(), GenParams::for_model("qwen2.5-7b-instruct.gguf"));
+        assert_eq!((q.temperature, q.repeat_penalty, q.min_p), (d.temperature, d.repeat_penalty, d.min_p));
+        // GLM-4.6 and a hypothetical 4.70-lookalike must NOT match the 4.7 family by accident
+        let g46 = GenParams::for_model("glm-4.6-9b.gguf");
+        assert_eq!(g46.repeat_penalty, d.repeat_penalty, "glm-4.6 is not the 4.7 family");
     }
     #[cfg(feature = "llama-ffi")]
     #[test]

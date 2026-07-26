@@ -142,13 +142,19 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: true, dense_supported: true,
             note: "",
         },
-        // DeepSeek-V2/V3 (+ GLM-MoE with MLA): Multi-head Latent Attention. Detected here with the right
+        // DeepSeek-V2/V3 (+ GLM-MoE with MLA, incl. GLM-4.7-Flash which converts as `deepseek2`):
+        // Multi-head Latent Attention. The MLA forward, the compressed-latent cache, the per-layer
+        // projections and the routing are wired and gate-validated (--gate-mla-block); the loader still
+        // refuses any checkpoint whose kv_lora_rank metadata is absent, because then the latents can't
+        // be sized. Gating (softmax vs sigmoid), routed scaling and gate renormalization come from the
+        // checkpoint's expert_* metadata via MoeMeta — `deepseek2` spans V2 (softmax) and V3/GLM
+        // (sigmoid + routed_scaling_factor), so the arch alone cannot decide them.
         "deepseek2" | "deepseek3" | "deepseekv3" | "glm-dsa" | "glm_dsa" => ArchConfig {
             arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
-            supported: false, dense_supported: false,
-            note: "Multi-head Latent Attention (MLA): compressed-KV latent cache + low-rank q/kv projections. \
-                   Detected but the MLA forward isn't wired yet — use the llama.cpp backend for now.",
+            supported: true, dense_supported: true,
+            note: "MLA validated against the CPU reference but not yet exercised on a real \
+                   DeepSeek/GLM checkpoint — the first such load is the test (see GLM47_FLASH_SUPPORT.md)",
         },
         _ => ArchConfig {
             arch: Arch::Unknown, prefix: "", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
@@ -214,18 +220,39 @@ pub fn route_norm(cfg: &ArchConfig) -> crate::moe::RouteNorm {
     }
 }
 
-/// Build the MoE routing config from an arch + the checkpoint's expert counts (from `dim_keys`). `n_used`
-/// falls back to a sensible default when the metadata omits it.
-pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -> crate::moe::MoeConfig {
+/// Checkpoint-level MoE routing metadata (llama.cpp's `{arch}.expert_*` keys). These OVERRIDE the
+/// per-arch defaults, because one GGUF arch tag spans models that route differently: `deepseek2` covers
+/// DeepSeek-V2 (softmax gating) and V3/GLM-4.7 (sigmoid, `expert_gating_func = 2`), and only the file
+/// itself knows which it is. `None` = key absent = keep the arch default.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MoeMeta {
+    /// `{pfx}.expert_gating_func`: 1 = softmax, 2 = sigmoid (llama.cpp `llama_expert_gating_func_type`).
+    pub gating_func: Option<u32>,
+    /// `{pfx}.expert_weights_scale`: routed_scaling_factor (DeepSeek-V3: 2.5). Routed weights only.
+    pub weights_scale: Option<f32>,
+    /// `{pfx}.expert_weights_norm`: renormalize the selected gates to sum to 1 before scaling.
+    pub weights_norm: Option<bool>,
+}
+
+/// Build the MoE routing config from an arch + the checkpoint's expert counts (from `dim_keys`) + the
+/// routing metadata. `n_used` falls back to a sensible default when the metadata omits it.
+pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32, meta: MoeMeta) -> crate::moe::MoeConfig {
+    let norm = match meta.gating_func {
+        Some(2) => crate::moe::RouteNorm::Sigmoid,
+        Some(_) => crate::moe::RouteNorm::Softmax, // 1 (or any unknown value) = the pre-V3 default
+        None => route_norm(cfg),
+    };
     crate::moe::MoeConfig {
         n_routed,
         n_used: if n_used == 0 { 8.min(n_routed.max(1)) } else { n_used },
         n_shared: if cfg.moe_shared_expert { n_shared.max(1) } else { n_shared },
-        norm: route_norm(cfg),
+        norm,
         // Llama4: raw-sigmoid top-1 gate applied to the expert's INPUT (weight-before-FFN);
-        // everything else: normalized weights combined on the output.
-        normalize: !matches!(cfg.arch, Arch::Llama4),
+        // everything else: normalized weights combined on the output. A checkpoint-level
+        // expert_weights_norm wins over the arch rule when present.
+        normalize: meta.weights_norm.unwrap_or(!matches!(cfg.arch, Arch::Llama4)),
         weight_before: matches!(cfg.arch, Arch::Llama4),
+        scale: meta.weights_scale.unwrap_or(1.0),
     }
 }
 
@@ -254,21 +281,49 @@ mod tests {
         assert_eq!(for_arch(""), c, "missing arch string falls back to llama");    }
 
     #[test]
-    fn deepseek_and_glmdsa_are_mla_but_glm4moe_is_standard() {
-        // Corrected against real checkpoints: the MLA family (DeepSeek-V3, GLM-5.2 'glm-dsa') is detected
-        // but unwired; GLM4-MoE ('glm4moe') uses STANDARD GQA attention + shared-expert MoE and IS supported.
+    fn the_mla_family_is_supported_and_glm4moe_stays_standard() {
+        // History: this test once pinned `supported: false` ("MLA forward isn't wired yet"). The wiring
+        // then landed (--gate-mla-block + the kernel-validation suite) but the registry flag was never
+        // flipped, so the loader printed "MLA attention — validated; per-layer routing active" and then
+        // refused the very checkpoint it had just accepted, one branch later. This test now pins the
+        // CONSISTENT state: the MLA family loads; what remains checkpoint-gated is kv_lora_rank presence
+        // (checked in the loader, not here).
         for name in ["deepseek2", "deepseek3", "deepseekv3", "glm-dsa", "glm_dsa"] {
             let c = for_arch(name);
             assert_eq!(c.arch, Arch::DeepseekV3, "{name} should map to the MLA arch");
             assert!(c.moe && c.moe_shared_expert, "DeepSeek/GLM-DSA has routed + shared experts");
-            assert!(!c.supported, "MLA forward isn't wired yet → refuse cleanly");
-            assert!(c.note.contains("MLA") || c.note.contains("Latent"), "note must explain the MLA gap");
+            assert!(c.supported, "MLA is wired and gate-validated → {name} loads");
+            assert!(c.note.contains("not yet exercised"), "the note must keep the honest caveat: \
+                no real MLA checkpoint has run yet");
         }
-        // glm4moe: standard attention (QK-norm + bias) + shared-expert MoE — supported.
+        // glm4moe: standard attention (QK-norm + bias) + shared-expert MoE — supported, unchanged.
         let g = for_arch("glm4moe");
         assert_eq!(g.arch, Arch::Glm4Moe);
         assert!(g.supported && g.moe && g.moe_shared_expert && g.attn_qk_norm && g.attn_qkv_bias,
             "glm4moe is a supported standard-attention shared-expert MoE with QK-norm + bias");
+    }
+
+    #[test]
+    fn glm47_flash_routing_comes_from_the_checkpoint_not_the_arch() {
+        // GLM-4.7-Flash converts as `deepseek2` with expert_gating_func = 2 (sigmoid), top-4 routing and
+        // a routed scaling factor — while true DeepSeek-V2 files under the SAME arch tag gate by softmax
+        // with no scale. The metadata must decide, and its absence must reproduce the V2 behaviour.
+        let c = for_arch("deepseek2");
+        let glm = moe_config(&c, 64, 4, 1, MoeMeta {
+            gating_func: Some(2), weights_scale: Some(1.8), weights_norm: Some(true) });
+        assert_eq!(glm.norm, crate::moe::RouteNorm::Sigmoid, "gating_func=2 → sigmoid");
+        assert!(glm.normalize, "expert_weights_norm=true → renormalize the selected gates");
+        assert_eq!(glm.scale, 1.8, "expert_weights_scale is the routed scaling factor");
+        assert_eq!(glm.n_used, 4);
+        assert!(glm.n_shared >= 1, "the DeepSeek/GLM shared expert is always on");
+
+        let v2 = moe_config(&c, 64, 6, 1, MoeMeta::default());
+        assert_eq!(v2.norm, crate::moe::RouteNorm::Softmax, "no gating_func key → the pre-V3 default");
+        assert_eq!(v2.scale, 1.0, "no expert_weights_scale key → unscaled");
+
+        // an unknown future gating_func value must not silently become sigmoid
+        let odd = moe_config(&c, 64, 4, 1, MoeMeta { gating_func: Some(7), ..MoeMeta::default() });
+        assert_eq!(odd.norm, crate::moe::RouteNorm::Softmax);
     }
 
     #[test]
@@ -344,7 +399,7 @@ mod tests {
         assert!(c.moe && !c.moe_shared_expert, "MoE with NO shared expert (unlike Qwen2-MoE)");
         assert_eq!(route_norm(&c), crate::moe::RouteNorm::Softmax);
         // Qwen3-30B-A3B: 128 experts, 8 active, no shared
-        let mc = moe_config(&c, 128, 8, 0);
+        let mc = moe_config(&c, 128, 8, 0, MoeMeta::default());
         assert_eq!(mc.n_routed, 128);
         assert_eq!(mc.n_used, 8);
         assert_eq!(mc.n_shared, 0);
@@ -359,17 +414,17 @@ mod tests {
     fn moe_config_maps_arch_to_router() {
         // Qwen4: softmax gating, no shared expert
         let q = for_arch("qwen4");
-        let qc = moe_config(&q, 128, 8, 0);
+        let qc = moe_config(&q, 128, 8, 0, MoeMeta::default());
         assert_eq!(qc.norm, crate::moe::RouteNorm::Softmax);
         assert_eq!(qc.n_used, 8);
         assert_eq!(qc.n_shared, 0);
         // Llama4: sigmoid gating, at least one shared expert
         let l = for_arch("llama4");
-        let lc = moe_config(&l, 128, 1, 1);
+        let lc = moe_config(&l, 128, 1, 1, MoeMeta::default());
         assert_eq!(lc.norm, crate::moe::RouteNorm::Sigmoid);
         assert!(lc.n_shared >= 1, "llama4 forces a shared expert");
         // n_used defaults when metadata omits it
-        assert_eq!(moe_config(&q, 64, 0, 0).n_used, 8);
+        assert_eq!(moe_config(&q, 64, 0, 0, MoeMeta::default()).n_used, 8);
     }
 
     #[test]
