@@ -184,6 +184,17 @@ pub(crate) mod engine {
             // the file cannot borrow a mapping the loader drops on return. Reused by path, so reloading
             // the same model does not map it twice.
             let bytes: &'static [u8] = gpu_kernels::retain_map(path).map_err(|e| format!("open {path}: {e}"))?;
+            // Configure the engine from the tuning profile BEFORE the device is created — these values are
+            // read during setup. Adapter-specific defaults need the adapter name, which we do not have
+            // yet, so this applies the portable ones; the driver-detected fallbacks (Honeykrisp subgroup
+            // hang, conservative VMA) still apply on top inside Gpu::new().
+            {
+                let d = logscope::tuneprofile::Defaults::default();
+                gpu_kernels::set_engine_config(gpu_kernels::EngineConfig {
+                    subgroup_matvec: d.subgroup_matvec,
+                    convert_chunk_blocks: d.convert_chunk_blocks as usize,
+                });
+            }
             // SPLIT CHECKPOINT: if this is `-00001-of-0000N.gguf`, map the siblings too. A split model's
             // shard 1 carries metadata for the WHOLE model but only its own share of the tensors, so
             // loading it alone fails on a missing tensor with everything looking healthy. Unifying the
