@@ -11,6 +11,7 @@ pub mod gguf;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
 pub mod archfeat;
+pub mod swa;
 #[allow(dead_code)] pub mod zerocopy; // scoped experiment: UMA zero-copy weight import (gated `zerocopy`)
 #[allow(dead_code)] pub mod oom; // detect GPU allocation OOM → downgrade residency instead of crashing
 pub mod governor; // backend-agnostic GPU resource governor: per-device budget + adaptive window k
