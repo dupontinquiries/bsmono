@@ -214,7 +214,11 @@ def main():
         rec = {"name": n, "single": None, "parts": []}
         if m["single"]:
             dst = os.path.join(data_dir, f"imported_{n}.iqm")
-            if not a.dry_run: shutil.copy2(m["single"], dst)
+            # re-installing FROM the data dir (or a staging dir that links into it) is the
+            # idempotent case the collect() prefix-strip promises; copy2 raises
+            # SameFileError on it, which broke the promise. Same file → nothing to copy.
+            if not a.dry_run and not (os.path.exists(dst) and os.path.samefile(m["single"], dst)):
+                shutil.copy2(m["single"], dst)
             rec["single"] = f"data/imported_{n}.iqm"
         for (pf, tex, tag, axis, off, par, dsp) in m["parts"]:
             src = os.path.join(a.parts_dir, pf)
