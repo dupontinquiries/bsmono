@@ -338,6 +338,8 @@ pub struct Gpu {
     pending_q4k: Mutex<Vec<PendingQ4k>>,
     /// Persistent staging buffer for expert-slot fills, so decode never allocates.
     moe_stage: Mutex<Option<Tensor>>,
+    /// Stable per-token scratch: (sequence position, shape) -> buffer. See `scratch_begin`.
+    decode_scratch: Mutex<(bool, usize, Vec<(usize, usize, wgpu::Buffer)>)>,
     subgroups: bool, // adapter supports subgroup arithmetic (subgroupAdd) — enables the sg reduction kernel
     unified: bool,   // unified-memory GPU (Apple/Asahi): host==device RAM, so weight uploads go zero-copy
                      // (map-at-creation) instead of through the staging belt — see zerocopy::upload_path
@@ -855,7 +857,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), decode_scratch: Mutex::new((false, 0, Vec::new())), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -1226,6 +1228,57 @@ impl Gpu {
     ///
     /// No allocation and no host round-trip — with the file mapped for the process lifetime, the `raw`
     /// slice is a view into the GGUF itself, which is the whole point of Colibri's arrangement.
+    /// Begin a token's decode: hand out scratch buffers deterministically from here until `scratch_end`.
+    ///
+    /// This is a game renderer's per-frame arena, applied to decode. `games/soldier` creates its bind
+    /// groups ONCE and submits a frame with zero allocations, which it can do because its per-frame
+    /// resources never change shape. Decode has the same property and did not exploit it: every token
+    /// runs identical work at identical shapes (t=1; d, kv, ff are model constants), so the tenth token
+    /// requests exactly the same sizes in exactly the same order as the first.
+    ///
+    /// The buffer POOL recycles, but which buffer you get depends on free-list order, so bind groups
+    /// differed between tokens and the cache missed. Here the Nth allocation of a token always returns
+    /// the same buffer as the Nth allocation of the previous token, so every bind group is identical
+    /// across tokens and the cache hits.
+    ///
+    /// Correctness rests on decode being deterministic in its allocation ORDER, which it is — the same
+    /// code path runs per layer. If a shape ever fails to match at a given position the arena falls back
+    /// to a fresh allocation for that slot rather than handing back a wrongly-sized buffer.
+    pub fn scratch_begin(&self) {
+        let mut g = self.decode_scratch.lock().unwrap();
+        g.0 = true;   // active
+        g.1 = 0;      // rewind to the first slot
+    }
+
+    /// End a token's decode. Subsequent allocations go back to the ordinary pool.
+    pub fn scratch_end(&self) { self.decode_scratch.lock().unwrap().0 = false; }
+
+    /// How many distinct scratch slots a token uses — the arena's steady-state size.
+    pub fn scratch_slots(&self) -> usize { self.decode_scratch.lock().unwrap().2.len() }
+
+    /// Take the next scratch buffer for this shape, or None when the arena is inactive or the recorded
+    /// slot has a different shape (a divergent path — fall back rather than return the wrong size).
+    fn scratch_take(&self, rows: usize, cols: usize) -> Option<wgpu::Buffer> {
+        let mut g = self.decode_scratch.lock().unwrap();
+        if !g.0 { return None; }
+        let i = g.1;
+        g.1 += 1;
+        match g.2.get(i) {
+            Some((r, c, b)) if *r == rows && *c == cols => Some(b.clone()),
+            Some(_) => None,                       // shape drift at this slot: do not reuse
+            None => {
+                let size = (rows * cols * 4) as u64;
+                if size == 0 { return None; }
+                let b = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("decode-scratch"), size,
+                    usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false });
+                g.2.push((rows, cols, b.clone()));
+                Some(b)
+            }
+        }
+    }
+
     /// A raw word-addressed SCRATCH buffer. Pooled: it returns to the free list when dropped.
     pub fn alloc_words(&self, words: usize) -> Tensor { self.alloc(1, words) }
 
@@ -2065,6 +2118,13 @@ impl Gpu {
         }
     }
     fn alloc(&self, rows: usize, cols: usize) -> Tensor {
+        // Stable per-token scratch first (see scratch_begin): the Nth allocation of a token always gets
+        // the same buffer as the Nth allocation of the previous token, so bind groups repeat and the
+        // cache hits. `pool: None` because the arena owns these — returning them to the free list would
+        // reintroduce exactly the nondeterminism this avoids.
+        if let Some(buf) = self.scratch_take(rows, cols) {
+            return Tensor { buf, rows, cols, pool: None, view: None };
+        }
         let size = (rows * cols * 4) as u64;
         // Recycle a same-size buffer freed by a dropped Tensor, else allocate. Kills per-op alloc churn.
         let recycled = if size > 0 { self.pool.free.lock().unwrap().get_mut(&size).and_then(|v| v.pop()) } else { None };
