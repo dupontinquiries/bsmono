@@ -93,7 +93,9 @@ prompt longer than the window (Gemma 2: 4096) is processed wrongly even though g
 correct"),
             Feature::PerLayerRopeFreqs => Some("full-attention layers get the windowed layers' rope base; \
 matters most on long contexts"),
-            Feature::Mla => Some("the compute kernels exist and are validated, but are not wired into live decode"),
+            Feature::Mla => Some("the compute kernels, the compressed-KV cache and the per-layer \
+projection weights are all in place and validated; only the decode plumbing that routes MLA layers \
+through them is missing"),
             _ => None,
         }
     }
@@ -177,7 +179,10 @@ mod tests {
         let g = gaps("glm4moe", 0);
         assert!(g.contains(&Feature::Mla));
         assert!(!g.contains(&Feature::SharedExpert), "shared expert IS implemented");
-        assert!(gap_report("glm4moe", 0).iter().any(|s| s.contains("not wired into live decode")));
+        // the note must say what remains, not just that something does — the compute and weights are in
+        // place, only the decode plumbing is missing, and that distinction tells the next person where to start
+        let r = gap_report("glm4moe", 0);
+        assert!(r.iter().any(|s| s.contains("only the decode plumbing")), "{r:?}");
     }
 
     #[test]
