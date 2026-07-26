@@ -7746,7 +7746,11 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
 }"#;
 // GQA decode attention reading int8-packed K/V + per-row scales (dequant on the fly).
 const DECODE_ATTN_MH_Q8: &str = r#"
-struct D { l:u32,hd:u32,nh:u32,nkv:u32 };
+// `start` is the first KV row to attend to — sliding-window attention for a single query position is a
+// contiguous range, so it is a loop bound rather than a mask. Passed as an offset instead of binding a
+// sub-view because the q8 cache keeps ONE SCALE PER ROW in a separate tensor, and a view into that would
+// need 64-row alignment which a sliding window almost never has. start = 0 is the unwindowed case.
+struct D { l:u32,hd:u32,nh:u32,nkv:u32,start:u32 };
 @group(0)@binding(0) var<storage,read> q: array<f32>;
 @group(0)@binding(1) var<storage,read> kq: array<u32>;
 @group(0)@binding(2) var<storage,read> ks: array<f32>;
@@ -7761,7 +7765,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;
   let scale=1.0/sqrt(f32(dd.hd));
   var mx=-3.4e38;
-  for(var j=0u;j<dd.l;j=j+1u){
+  for(var j=dd.start;j<dd.l;j=j+1u){
     let ksc=ks[j]; var dot=0.0;
     for(var c=0u;c<dd.hd;c=c+1u){
       let idx=kb+c; let word=kq[j*kvw + idx/4u];
@@ -7772,7 +7776,7 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   }
   for(var c=0u;c<dd.hd;c=c+1u){o[b+c]=0.0;}
   var sum=0.0;
-  for(var j=0u;j<dd.l;j=j+1u){
+  for(var j=dd.start;j<dd.l;j=j+1u){
     let ksc=ks[j]; let vsc=vs[j]; var dot=0.0;
     for(var c=0u;c<dd.hd;c=c+1u){
       let idx=kb+c; let word=kq[j*kvw + idx/4u];
@@ -8511,8 +8515,14 @@ impl Gpu {
 
     /// int8-KV decode attention: single query row over `l` packed int8 rows + scales.
     fn decode_attention_mh_q8(&self, q: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        self.decode_attention_mh_q8_from(q, kq, ks, vq, vs, 0, l, dm, n_heads, n_kv_heads)
+    }
+
+    /// As above, attending only to KV rows `start..l` — the sliding window for this query position.
+    pub fn decode_attention_mh_q8_from(&self, q: &Tensor, kq: &Tensor, ks: &Tensor, vq: &Tensor, vs: &Tensor,
+                                       start: usize, l: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
         let out = self.alloc(1, dm); let hd = dm / n_heads;
-        let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32];
+        let dims = [l as u32, hd as u32, n_heads as u32, n_kv_heads as u32, start as u32, 0, 0, 0];
         self.dispatch(DECODE_ATTN_MH_Q8, &[q, kq, ks, vq, vs], &out, bytemuck::cast_slice(&dims), ((n_heads as u32).div_ceil(64), 1, 1)); out
     }
     pub fn new_qcache(&self, n_layers: usize, max_seq: usize, kv_dim: usize) -> QKvCache {
@@ -8536,7 +8546,8 @@ impl Gpu {
         let (vqr, vsr) = self.quantize_rows(&vr, 1, kv);
         self.copy_row(kq, pos, &kqr, 0, kv / 4); self.copy_row(ks, pos, &ksr, 0, 1);
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
-        let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, ad, n_heads, n_kv_heads);
+        // sliding window as a loop bound (see decode_attention_mh_q8_from on why not a view here)
+        let attn = self.decode_attention_mh_q8_from(&q, kq, ks, vq, vs, self.swa_start(w, pos), pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
@@ -8568,7 +8579,8 @@ impl Gpu {
         let (vqr, vsr) = self.quantize_rows(&vr, 1, kv);
         self.copy_row(kq, pos, &kqr, 0, kv / 4); self.copy_row(ks, pos, &ksr, 0, 1);
         self.copy_row(vq, pos, &vqr, 0, kv / 4); self.copy_row(vs, pos, &vsr, 0, 1);
-        let attn = self.decode_attention_mh_q8(&q, kq, ks, vq, vs, pos + 1, ad, n_heads, n_kv_heads);
+        // sliding window as a loop bound (see decode_attention_mh_q8_from on why not a view here)
+        let attn = self.decode_attention_mh_q8_from(&q, kq, ks, vq, vs, self.swa_start(w, pos), pos + 1, ad, n_heads, n_kv_heads);
         let x2 = w.wo.apply_add(self, &attn, 1, x);
         self.ffn_apply(w, &x2, 1, d, eps)
     }
@@ -8612,6 +8624,17 @@ impl Gpu {
         logits
     }
     /// One block for a single token at absolute `pos`, attending to its KV cache.
+    /// First KV row this layer may attend to for a query at `pos`. 0 when the layer is unwindowed.
+    ///
+    /// One definition used by BOTH decode paths, so the f32 view and the q8 loop bound cannot drift apart
+    /// — two implementations of one window is how an off-by-one hides.
+    pub fn swa_start(&self, w: &BlockWeights, pos: usize) -> usize {
+        match w.swa {
+            Some((n_swa, ty)) => crate::swa::window_start(n_swa, ty, pos as i64) as usize,
+            None => 0,
+        }
+    }
+
     /// Restrict a KV cache to this layer's sliding window for a query at `pos`.
     ///
     /// A single query position sees a CONTIGUOUS window under both rules — the last `n_swa` positions
@@ -8624,9 +8647,9 @@ impl Gpu {
     /// last case degrades to full attention rather than binding something misaligned.
     fn swa_view(&self, w: &BlockWeights, kc: &Tensor, vc: &Tensor, pos: usize, cols: usize)
         -> Option<(Tensor, Tensor, usize)> {
-        let (n_swa, ty) = w.swa?;
+        w.swa?;
         if kc.view.is_some() || vc.view.is_some() { return None; }
-        let start = crate::swa::window_start(n_swa, ty, pos as i64) as usize;
+        let start = self.swa_start(w, pos);
         if start == 0 { return None; }
         let row_bytes = cols * 4;
         let off = start * row_bytes;
