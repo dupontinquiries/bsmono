@@ -8810,6 +8810,39 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         ))
     }
 
+    /// MlaDims for a layer, from the model's MlaConfig. One conversion point, so the loader's metadata
+    /// and the kernels' expectations cannot drift.
+    pub fn mla_dims(&self, c: &MlaConfig, d: usize, n_heads: usize, base: f32, eps: f32) -> crate::mla::MlaDims {
+        crate::mla::MlaDims {
+            d, n_heads,
+            q_lora: c.q_lora, kv_lora: c.kv_lora,
+            qk_nope: c.qk_nope, qk_rope: c.qk_rope, v_head: c.v_head,
+            base, eps,
+        }
+    }
+
+    /// One decode step for a Multi-head Latent Attention layer.
+    ///
+    /// Structurally identical to `block_decode` — norm, attention, residual, FFN — but the attention half
+    /// is MLA: the token is COMPRESSED into the cache (a [kv_lora] latent plus a shared [qk_rope] rotary
+    /// key) and attention reconstructs per-head K/V from it, instead of caching K and V per head. That is
+    /// the memory win: `MlaCache::compression_vs_standard` is ~7x on DeepSeek-V3 shapes.
+    ///
+    /// Every piece it calls — mla_compress_append and mla_attention_step_gpu, including the output
+    /// projection — is already checked against the mla.rs CPU reference by the kernel-validation suite.
+    /// This is the plumbing that was missing, not new math.
+    pub fn block_decode_mla(&self, w: &BlockWeights, mw: &crate::mla::MlaWeightsT, dm: &crate::mla::MlaDims,
+                            x: &Tensor, cache: &crate::mla::MlaCache, layer: usize, pos: usize,
+                            d: usize, eps: f32) -> Tensor {
+        let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
+        // append THIS token's compressed row before attending, so the query sees itself — the same
+        // ordering as the standard path's write_row before decode_attention.
+        self.mla_compress_append(&n1, mw, dm, cache, layer, pos);
+        let attn = self.mla_attention_step_gpu(&n1, mw, dm, &cache.latent[layer], &cache.rot[layer], pos);
+        let x2 = self.add_t(x, &attn);
+        self.ffn_apply(w, &x2, 1, d, eps)
+    }
+
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
