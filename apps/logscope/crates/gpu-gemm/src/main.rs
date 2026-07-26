@@ -3775,6 +3775,46 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-scratch") {
+        // The game-renderer pattern: a per-token arena that hands out the SAME buffer for the Nth
+        // allocation of every token, so bind groups repeat instead of depending on free-list order.
+        // Two things must hold, and the second is the one that would silently corrupt: the buffers must
+        // actually repeat, and results must be unchanged.
+        let gpu = Gpu::new();
+        eprintln!("gate-scratch: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let n = 512usize;
+        let x: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.017).sin()).collect();
+        let w: Vec<f32> = (0..n).map(|i| 1.0 + (i % 5) as f32 * 0.01).collect();
+        let (xt, wt) = (gpu.upload(&x, 1, n), gpu.upload(&w, 1, n));
+
+        // reference: no arena
+        let plain = gpu.download(&gpu.rmsnorm_t(&xt, &wt, 1, n, 1e-5));
+
+        // same work, twice, inside the arena — and the second token must reuse the first's buffers
+        gpu.scratch_begin();
+        let a = gpu.download(&gpu.rmsnorm_t(&xt, &wt, 1, n, 1e-5));
+        let after_first = gpu.scratch_slots();
+        gpu.scratch_begin();
+        let b = gpu.download(&gpu.rmsnorm_t(&xt, &wt, 1, n, 1e-5));
+        let after_second = gpu.scratch_slots();
+        gpu.scratch_end();
+
+        ck(&format!("second token allocates NO new slots ({after_first} then {after_second})"),
+           after_first > 0 && after_second == after_first);
+        let d1 = a.iter().zip(&plain).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+        let d2 = b.iter().zip(&plain).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+        ck(&format!("arena results == pooled results (max|diff|={:.3e})", d1.max(d2)), d1 == 0.0 && d2 == 0.0);
+
+        // after scratch_end the ordinary pool is back in use, so behaviour outside decode is unchanged
+        let c = gpu.download(&gpu.rmsnorm_t(&xt, &wt, 1, n, 1e-5));
+        let d3 = c.iter().zip(&plain).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+        ck(&format!("pooled path still correct after scratch_end (max|diff|={d3:.3e})"), d3 == 0.0);
+        println!("gate-scratch: {}", if ok {
+            "per-token arena is stable and bit-identical \u{2713}"
+        } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-swa") {
         // A windowed KV view must give exactly the answer attention would give over a cache containing
         // only those rows. If it does not, the view offset or length is wrong — and the symptom would be
