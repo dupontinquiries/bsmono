@@ -261,8 +261,48 @@ impl eframe::App for VoicetermApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             self.app.handle_input(ui);
-            let term_rect = ui.available_rect_before_wrap();
-            self.app.fit_to(term_rect.size()); // keep the grid matching the actual pane size
+            let area = ui.available_rect_before_wrap();
+
+            // THE PANE GRID. A tab can hold several panes now, so the terminal no longer owns
+            // the whole region: geometry comes from the model (shell::Workspace::pane_boxes,
+            // backed by TermWorkspace) so it matches what QML lays out from ws_command.
+            // The focused pane hosts the live terminal; the rest draw their frame and take a
+            // click to focus. Per-pane ptys are on-device work — one App is live today.
+            const PANE_GUTTER: f32 = 6.0;
+            let boxes = self.workspace.pane_boxes(area.width(), area.height(), PANE_GUTTER);
+            let to_rect = |p: &voiceterm_egui::shell::PaneBox| {
+                egui::Rect::from_min_size(egui::pos2(area.min.x + p.x, area.min.y + p.y), egui::vec2(p.w, p.h))
+            };
+            let term_rect = boxes.iter().find(|p| p.focused).map(|p| to_rect(p)).unwrap_or(area);
+
+            // Painted before the terminal so the live pane and its detached menus sit on top.
+            let mut focus_to: Option<u64> = None;
+            for p in boxes.iter().filter(|p| !p.focused) {
+                let r = to_rect(p);
+                let resp = ui.interact(r, ui.id().with(("pane", p.id)), egui::Sense::click());
+                ui.painter().rect_filled(r, egui::CornerRadius::same(4), self.colors.bg_card);
+                ui.painter().rect_stroke(
+                    r,
+                    egui::CornerRadius::same(4),
+                    egui::Stroke::new(1.0, if resp.hovered() { self.colors.accent } else { self.colors.border }),
+                    egui::StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    r.center(),
+                    egui::Align2::CENTER_CENTER,
+                    if p.web { "web pane" } else { "pane" },
+                    egui::FontId::proportional(12.0),
+                    self.colors.text_weak,
+                );
+                if resp.clicked() {
+                    focus_to = Some(p.id);
+                }
+            }
+            if let Some(id) = focus_to {
+                self.workspace.focus_pane(id);
+            }
+
+            self.app.fit_to(term_rect.size()); // the grid matches the FOCUSED pane, not the region
             if self.app.handle_gestures(ctx, term_rect.min) {
                 ctx.request_repaint(); // fling momentum still gliding
             }
@@ -318,7 +358,7 @@ impl eframe::App for VoicetermApp {
                     None => {}
                 }
             }
-            self.app.render(ui, &self.colors);
+            self.app.render_at(ui, &self.colors, term_rect.min);
             paint_terminal_border(ui, term_rect, &self.colors);
 
             // the mic FAB docks at the terminal's bottom-right corner; press-hold opens the

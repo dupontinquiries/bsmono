@@ -22,7 +22,7 @@
 //! vibes") is a real, separate feature visible in the settings screenshot — not ported here.
 
 use crate::gesture_menus::WsCall;
-use crate::terminal_workspace::{Dir, TermWorkspace};
+use crate::terminal_workspace::{Dir, PaneKind, TermWorkspace};
 use egui::{Rect, Response, Ui};
 use uikit_egui::dock::{self, Chip, Corner};
 use uikit_egui::PaletteColors;
@@ -541,6 +541,86 @@ impl Workspace {
         }
         all
     }
+
+    /// The focused pane of the active tab.
+    pub fn focused_pane(&self) -> u64 {
+        self.model.active().focused_pane
+    }
+
+    /// Focus a pane by id (click-to-focus). Ignores ids not in the active tab.
+    pub fn focus_pane(&mut self, id: u64) -> bool {
+        if self.model.active().root.pane_ids().contains(&id) {
+            self.model.active_mut().focused_pane = id;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move focus geometrically, like a tiling WM (delegates to the model).
+    pub fn focus_dir(&mut self, dir: Dir) {
+        self.model.focus(dir);
+    }
+
+    /// Resize the focused pane along `dir` by a fraction of its parent split.
+    pub fn resize(&mut self, dir: Dir, delta: f32) -> bool {
+        self.model.resize(dir, delta)
+    }
+
+    /// Lay the active tab's panes out inside a `w`×`h` area, insetting each side by
+    /// `gutter / 2` so neighbours show a seam. Pure (plain f32 — no egui), so the split
+    /// geometry is testable without a windowing stack; the caller maps to `egui::Rect`.
+    ///
+    /// The inset is clamped to a third of each axis, so a pane never inverts when the
+    /// area is tiny or the tree is deep.
+    pub fn pane_boxes(&self, w: f32, h: f32, gutter: f32) -> Vec<PaneBox> {
+        let focused = self.focused_pane();
+        self.model
+            .pane_rects(w, h)
+            .into_iter()
+            .map(|(id, r)| {
+                let ix = (gutter * 0.5).min(r.w / 3.0).max(0.0);
+                let iy = (gutter * 0.5).min(r.h / 3.0).max(0.0);
+                PaneBox {
+                    id,
+                    x: r.x + ix,
+                    y: r.y + iy,
+                    w: (r.w - ix * 2.0).max(0.0),
+                    h: (r.h - iy * 2.0).max(0.0),
+                    focused: id == focused,
+                    web: matches!(self.model.pane_kind(id), Some(PaneKind::Web { .. })),
+                }
+            })
+            .collect()
+    }
+
+    /// Which pane covers `(x, y)` in pane-area coordinates? Hit-tests the UNGAPPED rects,
+    /// so a click that lands in a seam still selects a pane rather than falling through.
+    /// The last match wins, which matches the model's left-to-right / top-to-bottom order
+    /// on shared edges.
+    pub fn pane_at(&self, w: f32, h: f32, x: f32, y: f32) -> Option<u64> {
+        self.model
+            .pane_rects(w, h)
+            .into_iter()
+            .filter(|(_, r)| x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h)
+            .map(|(id, _)| id)
+            .next_back()
+    }
+}
+
+/// One laid-out pane, ready to draw. Deliberately plain `f32` rather than `egui::Rect` so
+/// the layout maths stays unit-testable without a windowing stack.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaneBox {
+    pub id: u64,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    /// The pane that owns keyboard input and hosts the live terminal grid.
+    pub focused: bool,
+    /// A web pane (renders a page, has no pty).
+    pub web: bool,
 }
 
 /// v0.1.803's "N more" pill math: how many whole rows are hidden above and below a scrolled
@@ -777,6 +857,82 @@ mod tests {
         ws.apply(&WsCall::Command("new tab".into()));
         assert_eq!(ws.active, ws.model().active_tab);
         assert_eq!(ws.tabs.last().unwrap().name, "shell 4");
+    }
+
+    #[test]
+    fn pane_boxes_tile_the_area_and_mark_focus() {
+        let mut ws = Workspace::new(&["main"]);
+        // one pane fills the area (minus the gutter inset)
+        let b = ws.pane_boxes(400.0, 300.0, 0.0);
+        assert_eq!(b.len(), 1);
+        assert!(b[0].focused && !b[0].web);
+        assert_eq!((b[0].x, b[0].y, b[0].w, b[0].h), (0.0, 0.0, 400.0, 300.0));
+
+        // split right => side by side, halving the width
+        ws.apply(&WsCall::Command("split right".into()));
+        let b = ws.pane_boxes(400.0, 300.0, 0.0);
+        assert_eq!(b.len(), 2);
+        assert_eq!((b[0].x, b[0].w), (0.0, 200.0));
+        assert_eq!((b[1].x, b[1].w), (200.0, 200.0));
+        assert_eq!((b[0].h, b[1].h), (300.0, 300.0));
+        // the new pane took focus (Workspace::split sets it)
+        assert!(!b[0].focused && b[1].focused);
+
+        // split down on the focused (right) pane => it halves vertically
+        ws.apply(&WsCall::Command("split down".into()));
+        let b = ws.pane_boxes(400.0, 300.0, 0.0);
+        assert_eq!(b.len(), 3);
+        let right: Vec<_> = b.iter().filter(|p| p.x >= 200.0).collect();
+        assert_eq!(right.len(), 2);
+        assert_eq!((right[0].y, right[0].h), (0.0, 150.0));
+        assert_eq!((right[1].y, right[1].h), (150.0, 150.0));
+    }
+
+    #[test]
+    fn gutter_insets_every_side_and_never_inverts() {
+        let mut ws = Workspace::new(&["main"]);
+        ws.apply(&WsCall::Command("split right".into()));
+        let b = ws.pane_boxes(400.0, 300.0, 8.0);
+        assert_eq!((b[0].x, b[0].w), (4.0, 192.0)); // inset 4 each side of a 200-wide half
+        assert_eq!((b[1].x, b[1].w), (204.0, 192.0));
+        assert_eq!((b[0].y, b[0].h), (4.0, 292.0));
+        // a gutter larger than the pane clamps instead of producing negative extents
+        let tiny = ws.pane_boxes(6.0, 6.0, 100.0);
+        assert!(tiny.iter().all(|p| p.w >= 0.0 && p.h >= 0.0));
+    }
+
+    #[test]
+    fn hit_testing_and_directional_focus_agree_with_the_layout() {
+        let mut ws = Workspace::new(&["main"]);
+        ws.apply(&WsCall::Command("split right".into()));
+        let left = ws.pane_at(400.0, 300.0, 10.0, 10.0).unwrap();
+        let right = ws.pane_at(400.0, 300.0, 390.0, 10.0).unwrap();
+        assert_ne!(left, right);
+        // outside the area hits nothing
+        assert!(ws.pane_at(400.0, 300.0, 500.0, 10.0).is_none());
+
+        // click-to-focus, then move focus geometrically back to the right
+        assert!(ws.focus_pane(left));
+        assert_eq!(ws.focused_pane(), left);
+        ws.focus_dir(Dir::Right);
+        assert_eq!(ws.focused_pane(), right);
+        // nothing further right: a no-op, not a wrap
+        ws.focus_dir(Dir::Right);
+        assert_eq!(ws.focused_pane(), right);
+        // an id from another tab is refused
+        assert!(!ws.focus_pane(9999));
+    }
+
+    #[test]
+    fn web_panes_are_flagged_for_the_renderer() {
+        let mut ws = Workspace::new(&["main"]);
+        ws.apply(&WsCall::OpenWebPane);
+        let b = ws.pane_boxes(400.0, 300.0, 0.0);
+        assert_eq!(b.len(), 2);
+        assert_eq!(b.iter().filter(|p| p.web).count(), 1);
+        // the terminal keeps focus; the web pane is not focused
+        assert!(b.iter().any(|p| p.focused && !p.web));
+        assert!(b.iter().all(|p| !(p.web && p.focused)));
     }
 
     #[test]
