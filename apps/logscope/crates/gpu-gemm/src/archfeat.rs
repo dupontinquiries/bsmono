@@ -58,6 +58,8 @@ pub enum Feature {
     GemmaRmsNorm,
     /// tanh soft-capping on attention logits and final logits (Gemma 2; Gemma 3+ default it off).
     LogitSoftcap,
+    /// The token embedding is multiplied by sqrt(d) before the first block (all Gemma).
+    EmbeddingScale,
 }
 
 impl Feature {
@@ -79,6 +81,7 @@ impl Feature {
             Feature::GeGluActivation => "GELU-gated FFN",
             Feature::GemmaRmsNorm => "Gemma (1+w) RMS norm",
             Feature::LogitSoftcap => "tanh soft-cap on attention and final logits",
+            Feature::EmbeddingScale => "token embedding scaled by sqrt(d)",
         }
     }
 
@@ -115,6 +118,7 @@ impl Feature {
             Feature::GeGluActivation => true,    // selected per block from ArchConfig::act (--gate-gemma)
             Feature::GemmaRmsNorm => true,       // (1+w) folded into the weight at load (--gate-gemma)
             Feature::LogitSoftcap => false,      // not implemented anywhere
+            Feature::EmbeddingScale => true,     // Model::embed_scale, set from the arch at load
         }
     }
 
@@ -157,14 +161,15 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         // Gemma 2/3/4 all use standard SWA on a layer pattern with a separate rope base; 3 and 4 add
         // learned Q/K norms before rope, and 4 adds per-layer rope frequency tensors.
         "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::GeGluActivation,
-                         Feature::GemmaRmsNorm, Feature::LogitSoftcap],
+                         Feature::GemmaRmsNorm, Feature::LogitSoftcap, Feature::EmbeddingScale],
         "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
-                                     Feature::GeGluActivation, Feature::GemmaRmsNorm],
+                                     Feature::GeGluActivation, Feature::GemmaRmsNorm, Feature::EmbeddingScale],
         // Gemma 4 (src/models/gemma4.cpp): everything gemma3 needs, plus per-layer rope freqs, a
         // per-layer HEAD DIM (key_length_swa vs key_length) and a learned per-layer output scale.
         "gemma4" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
                          Feature::GeGluActivation, Feature::GemmaRmsNorm,
-                         Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale],
+                         Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
+                         Feature::EmbeddingScale],
         "glm4moe" | "glm-dsa" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
         _ => Vec::new(),
     }
@@ -276,6 +281,20 @@ mod tests {
         assert!(!required("llama4", 16).contains(&Feature::StandardSwa));
         assert!(required("gemma3", 0).contains(&Feature::StandardSwa));
         assert!(!required("gemma3", 0).contains(&Feature::ChunkedSwa));
+    }
+
+    #[test]
+    fn every_gemma_needs_the_embedding_scale_and_it_is_implemented() {
+        // Found by reading the FORWARD PASS rather than the tensor list: every gemma*.cpp starts with
+        // `inpL = ggml_scale(inpL, sqrtf(n_embd))`. It is not a tensor, so nothing about the checkpoint
+        // hints at it — and at d=3840 the factor is ~62, so a model missing it produces nonsense rather
+        // than slightly-off output. Gemma 3 was declared supported WITHOUT it, which is the bug this
+        // entry exists to stop recurring.
+        for a in ["gemma2", "gemma3", "gemma4"] {
+            assert!(required(a, 0).contains(&Feature::EmbeddingScale), "{a} needs it");
+        }
+        assert!(Feature::EmbeddingScale.implemented());
+        assert!(!required("llama", 0).contains(&Feature::EmbeddingScale), "llama does not scale");
     }
 
     #[test]

@@ -5966,6 +5966,12 @@ pub struct Model {
     /// MLA (Multi-head Latent Attention) rank config, present only for DeepSeek-V3/GLM-MoE checkpoints.
     /// When set, the KV cache stores the compressed latent instead of per-head K/V. `None` = standard MHA/GQA.
     pub mla: Option<MlaConfig>,
+    /// Multiplier applied to the token embedding before the first block.
+    ///
+    /// Gemma scales by sqrt(d) (`inpL = ggml_scale(inpL, sqrtf(n_embd))` in every gemma*.cpp). At
+    /// d=3840 that is a factor of ~62 at the input, and it cascades — a model missing it does not
+    /// produce slightly-off output, it produces nonsense. 1.0 everywhere else, so no other model changes.
+    pub embed_scale: f32,
     /// DSA (DeepSeek Sparse Attention) lightning-indexer config, present only when the indexer weights ship.
     /// When set (and seq > index_topk) attention is sparse; `None` = dense attention.
     pub dsa: Option<DsaConfig>,
@@ -7156,7 +7162,13 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         if converted > 0 {
             eprintln!("wgpu-engine: Q4_K → q4 on GPU — {converted} tensors converted in batch (no host copy, no f32 round-trip)");
         }
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa, mtp_layers: mtp })
+        // Gemma multiplies the token embedding by sqrt(d) before the first block (every gemma*.cpp:
+        // `inpL = ggml_scale(inpL, sqrtf(n_embd))`). Everything else uses 1.0.
+        let embed_scale = if matches!(acfg.norm, crate::archcfg::Norm::RmsGemma) { (d as f32).sqrt() } else { 1.0 };
+        if embed_scale != 1.0 {
+            eprintln!("loader: embedding scaled by sqrt(d) = {embed_scale:.2} (Gemma)");
+        }
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa, mtp_layers: mtp })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -7236,7 +7248,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None, mtp_layers: 0 })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None, mtp_layers: 0 })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
@@ -8863,7 +8875,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     pub fn decode_step_q8(&self, m: &Model, c: &QKvCache, token: u32, pos: usize) -> Vec<f32> {
         self.begin_frame();
         let s = token as usize * m.d;
-        let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
+        let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
         if tracing { self.trace_tok.store(token as i64, std::sync::atomic::Ordering::Relaxed); }
@@ -8891,7 +8903,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         for (pos, &t) in tokens.iter().enumerate() {
             self.begin_frame();
             let s = t as usize * m.d;
-            let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
+            let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
             for li in 0..m.n_layers { x = self.block_decode_q8_fused(&m.layers[li], &x, &m.rope_factors, &c.kq[li], &c.ks[li], &c.vq[li], &c.vs[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
             logits = self.download(&m.output.apply(self, &xn, 1));
@@ -8969,6 +8981,25 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let attn = self.mla_attention_step_gpu(&n1, mw, dm, &cache.latent[layer], &cache.rot[layer], pos);
         let x2 = self.add_t(x, &attn);
         self.ffn_apply(w, &x2, 1, d, eps)
+    }
+
+    /// Upload an embedding row, applying the architecture's embedding scale.
+    fn embed_scaled(&self, m: &Model, row: &[f32]) -> Tensor {
+        if (m.embed_scale - 1.0).abs() < f32::EPSILON { return self.upload(row, 1, m.d); }
+        let scaled: Vec<f32> = row.iter().map(|v| v * m.embed_scale).collect();
+        self.upload(&scaled, 1, m.d)
+    }
+
+    /// Apply the embedding scale to an already-resident gathered row.
+    fn scale_embed_t(&self, m: &Model, x: Tensor) -> Tensor {
+        if (m.embed_scale - 1.0).abs() < f32::EPSILON { return x; }
+        // one row scaled by a constant: ROW_SCALE takes a per-row weight vector, so a 1-element weight
+        // is exactly the scalar case and avoids a second kernel for one multiply
+        let w = self.upload(&[m.embed_scale], 1, 1);
+        let out = self.alloc(1, m.d);
+        let dims = [1u32, m.d as u32, 0, 0];
+        self.dispatch(ROW_SCALE, &[&x, &w], &out, bytemuck::cast_slice(&dims), wg1(m.d as u32));
+        out
     }
 
     fn block_decode(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, kc: &Tensor, vc: &Tensor, pos: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
@@ -9229,7 +9260,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         self.begin_frame();
         let (slot, attend_len) = stream_slot(pos, sink, window);
         let s = token as usize * m.d;
-        let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
+        let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
         let fused = fused_qkv_enabled();
         for li in 0..m.n_layers {
             let (l, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
@@ -9243,7 +9274,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     pub fn decode_step(&self, m: &Model, c: &KvCache, token: u32, pos: usize) -> Vec<f32> {
         self.begin_frame();
         let s = token as usize * m.d;
-        let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
+        let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
         let fused = fused_qkv_enabled();
         let tracing = route_trace_armed();
         if tracing { self.trace_tok.store(token as i64, std::sync::atomic::Ordering::Relaxed); }
@@ -9829,7 +9860,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             out.push(id);
             if step + 1 == n_new { break; }
             self.begin_frame();
-            let x = embed_t.gather_row(self, &id_t, 0, m.d);  // next input gathered on-device from id_t
+            let x = self.scale_embed_t(m, embed_t.gather_row(self, &id_t, 0, m.d));  // gathered on-device
             logits_t = self.decode_layers_t(m, &c, x, prompt.len() + step);
         }
         out
@@ -9857,7 +9888,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             for j in 0..w {
                 self.argmax_at(&logits_t, &ids_buf, j as u32);            // token (step+j) → ids_buf[j]
                 if step + j + 1 < n_new {                                  // skip the final unneeded decode
-                    let x = embed_t.gather_row(self, &ids_buf, j as u32, m.d);
+                    let x = self.scale_embed_t(m, embed_t.gather_row(self, &ids_buf, j as u32, m.d));
                     logits_t = self.decode_layers_t(m, &c, x, l + step + j);
                 }
             }
@@ -10071,7 +10102,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         for (pos, &t) in tokens.iter().enumerate() {
             self.begin_frame();
             let s = t as usize * m.d;
-            let mut x = self.upload(&m.embed[s..s + m.d], 1, m.d);
+            let mut x = self.embed_scaled(m, &m.embed[s..s + m.d]);
             for li in 0..m.n_layers { x = self.block_decode_fused(&m.layers[li], &x, &m.rope_factors, &c.k[li], &c.v[li], pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps); }
             let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
             logits = self.download(&m.output.apply(self, &xn, 1));
