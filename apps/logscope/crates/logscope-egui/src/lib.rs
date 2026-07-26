@@ -67,6 +67,7 @@ pub mod voice_intent_fr;
 pub mod voice_intent_de;
 pub mod voice_lang;
 #[allow(dead_code)] pub mod explain;
+#[allow(dead_code)] pub mod bracecheck;
 #[allow(dead_code)] pub mod contextsrc;
 #[allow(dead_code)] pub mod ctxplan;
 pub use logscope_fan::quest;
