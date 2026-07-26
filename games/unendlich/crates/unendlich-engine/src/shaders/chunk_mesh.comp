@@ -122,8 +122,9 @@ uint block_at(int x, int y, int z) {
     int global_idx = int(pc.slot_index) * CHUNK_VOLUME + local_idx;
     int word_idx = global_idx >> 2;
     int byte_in_word = global_idx & 3;
-    uint word = blocks_packed[word_idx];
-    return (word >> uint(byte_in_word * 8)) & 0xFFu;
+    // K2-safe byte extract (see chunk_generation.comp / maintenance/ASAHI_VULKAN_LESSONS.md):
+    // bitfieldExtract instead of a dynamic plain shift — the idiom validated on AGX/Honeykrisp.
+    return bitfieldExtract(blocks_packed[word_idx], byte_in_word * 8, 8);
 }
 
 // `is_meshable` per CPU mesher: a block emits faces if it's NOT air. The
