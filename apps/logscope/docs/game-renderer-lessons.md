@@ -64,3 +64,38 @@ verified. llama.cpp avoids the whole issue by keeping top-k in the graph — it 
 1. Stable decode scratch (this document's main point) — pure CPU-side win, bit-identical, bounded work.
 2. Enough pinned experts to make the common layer fill-free, which then permits the sync-free path.
 3. Everything else in the profile is smaller than these two.
+
+## Comparing four codebases in this repo — the variable is submits per unit of work
+
+| codebase | submit pattern | outcome |
+|---|---|---|
+| `games/soldier` | 1 `queue.submit` in the whole renderer, once per frame | smooth |
+| `games/clawbound` | 4 submit sites total | smooth |
+| `games/unendlich` | 58 sites; `neural_gemm_pipeline.rs` does submit-then-wait-for-fence **per dispatch** (its own comment calls it "harness pattern") | **stutters** |
+| `logscope` decode | 1152 submits/token (before the staging ring) | slow |
+
+Unendlich is the useful data point precisely *because* it stutters. It is the game doing the most GPU work
+**and** the only one submitting per dispatch — it fails the same way inference did, for the same reason.
+That makes the diagnosis an observation rather than a theory: the three smooth programs batch, the two slow
+ones don't.
+
+### What unendlich does well and inference still does not
+
+Both are worth taking, and neither is done yet:
+
+* **Push constants** (`cmd_push_constants`) for per-dispatch parameters, instead of a uniform buffer.
+  logscope passes `dims` through a uniform buffer, which means a buffer per distinct dims value and a
+  dims-buffer handle inside the bind-group cache key. Push constants would remove both. Needs
+  `wgpu::Features::PUSH_CONSTANTS`, which is not universally available — so it is an opt-in path, not a
+  replacement.
+* **One persistent descriptor set per layer**, updated once at setup ("the descriptor set must already be
+  updated" — its dispatch precondition). Our equivalent is the bind-group cache, which is reactive:
+  it caches what was asked for. Building the layer's bind groups once at load would make the hit rate
+  100% by construction rather than by luck.
+
+### What unendlich does badly, and the lesson
+
+`submit → wait_for_fences(u64::MAX)` per dispatch drains the pipeline every time. It is the right shape for
+a correctness harness and the wrong one for a frame budget. The equivalent mistake in inference was two
+`end_frame()` calls per expert fill (_181), which was correct for the same reason and wrong for the same
+reason — and cost 1152 submits/token until a ring replaced it.
