@@ -698,6 +698,48 @@ impl Workspace {
         self.model.active_mut().focused_pane = saved;
         ok
     }
+
+    /// Reconcile the terminals currently hosted (`live`) against every pane in the workspace.
+    ///
+    /// Deliberately spans ALL tabs, not just the active one — `pane_ids_all` exists in the
+    /// model for exactly this ("spawn a PTY each"). Scoping it to the active tab would tear
+    /// down and respawn the shells on every tab switch, losing their scrollback and, on
+    /// device, killing running processes.
+    ///
+    /// Pure: the caller creates and drops the actual terminals (and their ptys).
+    ///
+    /// Web panes are excluded — they render a page and have no pty, so spawning a shell for
+    /// one would be wrong on device, not merely wasteful.
+    pub fn host_diff(&self, live: &[u64]) -> PaneHostDiff {
+        let mut all: Vec<u64> = self
+            .model
+            .pane_ids_all()
+            .into_iter()
+            .filter(|id| !matches!(self.model.pane_kind(*id), Some(PaneKind::Web { .. })))
+            .collect();
+        all.sort_unstable();
+        let mut spawn: Vec<u64> = all.iter().copied().filter(|id| !live.contains(id)).collect();
+        let mut retire: Vec<u64> = live.iter().copied().filter(|id| !all.contains(id)).collect();
+        spawn.sort_unstable();
+        retire.sort_unstable();
+        PaneHostDiff { spawn, retire }
+    }
+}
+
+/// The terminals to create and drop so the hosted set matches the model's panes.
+/// See [`Workspace::host_diff`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PaneHostDiff {
+    /// Panes that exist in the model but have no terminal yet.
+    pub spawn: Vec<u64>,
+    /// Terminals whose pane is gone — drop them (and their pty).
+    pub retire: Vec<u64>,
+}
+
+impl PaneHostDiff {
+    pub fn is_empty(&self) -> bool {
+        self.spawn.is_empty() && self.retire.is_empty()
+    }
 }
 
 /// A draggable divider between two panes. Plain `f32`, like [`PaneBox`], so seam maths is
@@ -1127,6 +1169,71 @@ mod tests {
         let b = ws.pane_boxes(400.0, 300.0, 0.0);
         assert!(near(b[0].h, 180.0));
         assert!(near(b[1].y, 180.0) && near(b[1].h, 120.0));
+    }
+
+    #[test]
+    fn host_diff_spawns_and_retires_terminals_to_match_the_panes() {
+        let mut ws = Workspace::new(&["main"]);
+        // nothing hosted yet: the one pane needs a terminal
+        let d = ws.host_diff(&[]);
+        assert_eq!(d.spawn.len(), 1);
+        assert!(d.retire.is_empty());
+        let mut live = d.spawn.clone();
+        assert!(ws.host_diff(&live).is_empty()); // steady state
+
+        // a split asks for exactly one more, not a rebuild
+        ws.apply(&WsCall::Command("split right".into()));
+        let d = ws.host_diff(&live);
+        assert_eq!(d.spawn.len(), 1);
+        assert!(d.retire.is_empty());
+        live.extend(d.spawn);
+        assert!(ws.host_diff(&live).is_empty());
+
+        // closing a pane retires exactly its terminal
+        let closing = ws.focused_pane();
+        ws.apply(&WsCall::Command("close pane".into()));
+        let d = ws.host_diff(&live);
+        assert_eq!(d.retire, vec![closing]);
+        assert!(d.spawn.is_empty());
+    }
+
+    #[test]
+    fn switching_tabs_keeps_the_other_tabs_shells_alive() {
+        let mut ws = Workspace::new(&["main"]);
+        let mut live = ws.host_diff(&[]).spawn;
+        // a second tab, split twice, so it has panes worth keeping
+        ws.apply(&WsCall::Command("new tab".into()));
+        ws.apply(&WsCall::Command("split right".into()));
+        live.extend(ws.host_diff(&live).spawn);
+        assert_eq!(live.len(), 3);
+
+        // switching away and back must not tear anything down or respawn it — this is why
+        // host_diff spans ALL tabs rather than just the active one
+        ws.apply(&WsCall::Command("go to tab 1".into()));
+        assert!(ws.host_diff(&live).is_empty());
+        ws.apply(&WsCall::Command("go to tab 2".into()));
+        assert!(ws.host_diff(&live).is_empty());
+
+        // but closing a whole tab retires every terminal that lived in it
+        let doomed: Vec<u64> = ws.active_pane_ids();
+        assert_eq!(doomed.len(), 2);
+        ws.apply(&WsCall::Command("close tab".into()));
+        let d = ws.host_diff(&live);
+        let mut expect = doomed.clone();
+        expect.sort_unstable();
+        assert_eq!(d.retire, expect);
+        assert!(d.spawn.is_empty());
+    }
+
+    #[test]
+    fn web_panes_never_get_a_terminal() {
+        let mut ws = Workspace::new(&["main"]);
+        let live = ws.host_diff(&[]).spawn;
+        assert_eq!(live.len(), 1);
+        // a web pane adds a pane to the model but NOT a shell — it renders a page, no pty
+        ws.apply(&WsCall::OpenWebPane);
+        assert_eq!(ws.active_pane_ids().len(), 2);
+        assert!(ws.host_diff(&live).is_empty());
     }
 
     #[test]

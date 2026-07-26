@@ -54,6 +54,12 @@ struct VoicetermApp {
     /// The settings screen (QML settings page): sidebar ⚙ toggles the right panel; edits apply
     /// live (App::apply_settings + palette each frame) and persist to prefs.kv on change.
     settings_open: bool,
+    /// Terminals for the panes that are NOT focused. `self.app` is always the focused pane's
+    /// terminal; on a focus change the two are swapped, so each pane keeps its own scrollback
+    /// and every existing `self.app` call site stays as it was.
+    pane_apps: std::collections::HashMap<u64, uikit_term::App>,
+    /// Which pane `self.app` currently belongs to — the swap's other half.
+    pane_focus: u64,
 }
 
 impl eframe::App for VoicetermApp {
@@ -262,6 +268,35 @@ impl eframe::App for VoicetermApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             self.app.handle_input(ui);
             let area = ui.available_rect_before_wrap();
+            let colors = self.colors; // PaletteColors is Copy — keeps the borrows below simple
+
+            // PER-PANE TERMINALS. `self.app` is always the focused pane's terminal; the rest
+            // are parked in `pane_apps`. When focus moves, the two are SWAPPED rather than the
+            // whole app being reworked around a map — so each pane keeps its own scrollback
+            // and selection, and every existing `self.app` call site is untouched.
+            let focus_now = self.workspace.focused_pane();
+            if focus_now != self.pane_focus {
+                if let Some(next) = self.pane_apps.remove(&focus_now) {
+                    let prev = std::mem::replace(&mut self.app, next);
+                    self.pane_apps.insert(self.pane_focus, prev);
+                }
+                self.pane_focus = focus_now;
+            }
+            // Reconcile hosts against the model: a split wants one more terminal, a closed
+            // pane's terminal is dropped (and with it its pty, on device).
+            let hosted: Vec<u64> = self
+                .pane_apps
+                .keys()
+                .copied()
+                .chain(std::iter::once(self.pane_focus))
+                .collect();
+            let diff = self.workspace.host_diff(&hosted);
+            for id in &diff.spawn {
+                self.pane_apps.insert(*id, uikit_term::App::new(80, 24));
+            }
+            for id in &diff.retire {
+                self.pane_apps.remove(id);
+            }
 
             // THE PANE GRID. A tab can hold several panes now, so the terminal no longer owns
             // the whole region: geometry comes from the model (shell::Workspace::pane_boxes,
@@ -280,20 +315,30 @@ impl eframe::App for VoicetermApp {
             for p in boxes.iter().filter(|p| !p.focused) {
                 let r = to_rect(p);
                 let resp = ui.interact(r, ui.id().with(("pane", p.id)), egui::Sense::click());
-                ui.painter().rect_filled(r, egui::CornerRadius::same(4), self.colors.bg_card);
+                ui.painter().rect_filled(r, egui::CornerRadius::same(4), colors.bg_card);
                 ui.painter().rect_stroke(
                     r,
                     egui::CornerRadius::same(4),
-                    egui::Stroke::new(1.0, if resp.hovered() { self.colors.accent } else { self.colors.border }),
+                    egui::Stroke::new(1.0, if resp.hovered() { colors.accent } else { colors.border }),
                     egui::StrokeKind::Inside,
                 );
-                ui.painter().text(
-                    r.center(),
-                    egui::Align2::CENTER_CENTER,
-                    if p.web { "web pane" } else { "pane" },
-                    egui::FontId::proportional(12.0),
-                    self.colors.text_weak,
-                );
+                // its own terminal, dimmed by the unfocused frame around it; web panes have no
+                // pty and stay a label until the reader is wired in.
+                match self.pane_apps.get_mut(&p.id) {
+                    Some(a) if !p.web => {
+                        a.fit_to(r.size());
+                        a.render_at(ui, &colors, r.min);
+                    }
+                    _ => {
+                        ui.painter().text(
+                            r.center(),
+                            egui::Align2::CENTER_CENTER,
+                            if p.web { "web pane" } else { "pane" },
+                            egui::FontId::proportional(12.0),
+                            colors.text_weak,
+                        );
+                    }
+                }
                 if resp.clicked() {
                     focus_to = Some(p.id);
                 }
@@ -334,7 +379,7 @@ impl eframe::App for VoicetermApp {
                     } else {
                         egui::vec2(0.0, SEAM_GRAB - 1.0)
                     };
-                    uikit_egui::split_pane::paint_divider(ui, band.shrink2(hair), self.colors.accent);
+                    uikit_egui::split_pane::paint_divider(ui, band.shrink2(hair), colors.accent);
                 }
                 if resp.dragged() {
                     let d = if s.vertical { resp.drag_delta().x } else { resp.drag_delta().y };
@@ -467,6 +512,9 @@ fn main() -> eframe::Result<()> {
                 link_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-link-menu").columns(2),
                 link_url: None,
                 workspace: Workspace::new(&["main", "logs"]),
+                pane_apps: std::collections::HashMap::new(),
+                pane_focus: 0, // TermWorkspace's first pane is id 0
+
                 theme: boot_theme,
                 theme_menu: voiceterm_egui::slide_menu::SlideMenu::new("voiceterm-theme-menu").columns(3).hold(0.35).item_size(64.0),
                 blocks: blocks,
