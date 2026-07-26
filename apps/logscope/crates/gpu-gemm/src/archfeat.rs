@@ -95,7 +95,9 @@ impl Feature {
             // implied it. The loader only accepts `post_attention_norm` as an alternate NAME for
             // ffn_norm — a pre-FFN norm — which is a different operation from Gemma's post-attention and
             // post-FFN norms. Neither is applied.
-            Feature::PostNorm => false,
+            // Now applied: post_attn after attention and post_ffn after the FFN, both before the
+            // residual add, loaded through the same (1+w) fold as the pre-norms.
+            Feature::PostNorm => true,
             Feature::ChunkedSwa => true,     // same paths as StandardSwa; the rule differs, the wiring does not
             // Forward, compressed cache, per-layer projections, decode block and per-layer routing are
             // all in place and checked (--gate-mla-block + the kernel-validation suite). Not yet exercised
@@ -110,8 +112,8 @@ impl Feature {
             Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
             Feature::LayerOutputScale => false,  // the tensor is not read
-            Feature::GeGluActivation => false,   // geglu_packed EXISTS as a kernel but no arch selects it
-            Feature::GemmaRmsNorm => false,      // only the plain x/rms(x)·w norm is implemented
+            Feature::GeGluActivation => true,    // selected per block from ArchConfig::act (--gate-gemma)
+            Feature::GemmaRmsNorm => true,       // (1+w) folded into the weight at load (--gate-gemma)
             Feature::LogitSoftcap => false,      // not implemented anywhere
         }
     }
@@ -126,10 +128,6 @@ matters most on long contexts"),
 whose windowed and full layers differ cannot be laid out correctly at all"),
             Feature::LayerOutputScale => Some("layer outputs are unscaled; the tensor is present in the \
 file and ignored"),
-            Feature::PostNorm => Some("the loader accepts post_attention_norm as an alias for ffn_norm, \
-which is a PRE-FFN norm — Gemma's post-attention and post-FFN norms are not applied"),
-            Feature::GeGluActivation => Some("the geglu kernel exists but no architecture selects it; \
-SiLU-gated is used instead"),
             Feature::LogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
@@ -231,18 +229,20 @@ mod tests {
     }
 
     #[test]
-    fn gemma_is_still_unsupported_and_the_table_says_so_honestly() {
-        // This test previously asserted Gemma2 was fully supported. It was WRONG, and the table was
-        // overstating support in the one direction the module documents as dangerous: PostNorm was marked
-        // implemented on the assumption that "we support Gemma2" implied it, when archcfg has always said
-        // supported: false and the loader only uses post_attention_norm as an alias for ffn_norm.
-        assert!(Feature::StandardSwa.implemented(), "SWA genuinely is wired end to end");
-        assert!(!Feature::PostNorm.implemented(), "post-norms are NOT applied");
-        assert!(!Feature::GeGluActivation.implemented(), "the kernel exists; no arch selects it");
-        assert!(!Feature::GemmaRmsNorm.implemented(), "(1+w) norm is not implemented");
-        let g2 = gaps("gemma2", 0);
-        assert!(g2.contains(&Feature::GeGluActivation) && g2.contains(&Feature::GemmaRmsNorm));
-        assert!(!g2.contains(&Feature::StandardSwa), "SWA is the one Gemma requirement now met");
+    fn every_gemma_feature_promoted_here_has_a_caller_not_just_a_kernel() {
+        // This test has now said three different things, and the history is the point. It first claimed
+        // Gemma2 was fully supported (wrong — the table was overstating). It was then corrected to assert
+        // nothing was implemented. Each of these is now promoted because something CALLS it, not because
+        // a kernel exists:
+        //   PostNorm        block_decode applies post_attn; ffn_apply applies post_ffn
+        //   GeGluActivation ffn_apply selects it from BlockWeights::geglu, set from ArchConfig::act
+        //   GemmaRmsNorm    gemma_norm() folds (1+w) into every norm weight at load
+        // all three checked by --gate-gemma.
+        for f in [Feature::PostNorm, Feature::GeGluActivation, Feature::GemmaRmsNorm, Feature::StandardSwa] {
+            assert!(f.implemented(), "{f:?} should be implemented");
+        }
+        // and the one thing still genuinely missing is not quietly promoted with them
+        assert!(!Feature::LogitSoftcap.implemented(), "soft-capping is still not implemented");
     }
 
     #[test]
@@ -279,14 +279,16 @@ mod tests {
     }
 
     #[test]
-    fn a_feature_is_only_implemented_if_something_actually_calls_it() {
-        // The lesson from the PostNorm correction, written as a test so it is not just a comment. A
-        // kernel existing is not support: geglu_packed has been in the engine the whole time and no
-        // architecture selects it, so GeGluActivation must read as NOT implemented. The same standard
-        // applied to MLA for most of this project, correctly.
-        assert!(!Feature::GeGluActivation.implemented());
-        let note = Feature::GeGluActivation.note().unwrap();
-        assert!(note.contains("kernel exists but no architecture selects it"), "{note}");
+    fn gemma3_is_down_to_no_gaps_and_gemma2_only_needs_the_softcap() {
+        // Gemma 3 needed five things: SWA, post-norms, learned Q/K norm before rope, GELU gating and the
+        // (1+w) norm. All five are now in.
+        assert!(gaps("gemma3", 0).is_empty(), "{:?}", gaps("gemma3", 0));
+        // Gemma 2 shares those but also soft-caps its attention and final logits, which is unimplemented.
+        assert_eq!(gaps("gemma2", 0), vec![Feature::LogitSoftcap]);
+        // Gemma 4's remaining gaps are the structural ones, unchanged by this work.
+        let g4 = gaps("gemma4", 0);
+        assert!(g4.contains(&Feature::PerLayerHeadDim) && g4.contains(&Feature::LayerOutputScale));
+        assert!(!g4.contains(&Feature::GeGluActivation), "the activation is no longer a gap for any Gemma");
     }
 
     #[test]
