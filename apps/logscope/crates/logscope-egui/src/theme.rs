@@ -613,6 +613,43 @@ pub fn day_night_adjust_at(p: Palette, day: f32) -> Palette {
     surf(p.line, &mut q.line, f, p.dark);
     // night also cools/warms the lamp a touch, matching the canopy sun's mood
     q.light = if p.dark { p.light } else { lerp_col(p.light, cool_tint(p.light, 0.5), (1.0 - day) * 0.6) };
+
+    // ── RAW-PAIR LEGIBILITY ──────────────────────────────────────────────────────────────────────
+    //
+    // The markdown layer asks for contrast-ensured colours, but most of the app does not: it calls
+    // theme::INK()/DIM()/FAINT()/CYAN() straight against a panel. Measured across all 19 palettes,
+    // 87 of 190 such pairs were under 4.5:1, several catastrophically — Yellow Brick Road's INK on
+    // PANEL was 1.24:1, which is body text you cannot read.
+    //
+    // So the palette itself is repaired here, once, rather than at thousands of call sites. Text roles
+    // are nudged toward legibility against BOTH surfaces they appear on (bg and panel), because a fix
+    // that satisfies one can break the other. Accents go through the HUE-PRESERVING adjuster so a
+    // palette keeps its identity — Cloudscape's cyan stays cyan, it just stops being invisible.
+    //
+    // Targets follow WCAG's own tiering rather than one blanket number: body text 4.5, secondary 4.0,
+    // and hints 3.0 (the large-text/UI-component level). Demanding 4.5 of a deliberately-faint hint
+    // would flatten the visual hierarchy into a wall of equally-loud text, which is its own
+    // readability problem.
+    // ENSURE AGAINST THE PANEL, not against both surfaces.
+    //
+    // Satisfying bg AND panel simultaneously was tried and is impossible on several palettes: when the
+    // two surfaces sit on opposite sides of mid-grey, the best achievable worst-case contrast is ~2.4:1
+    // no matter what colour is chosen (measured — every failing pair collapsed to the same pole value).
+    // No single text colour can be readable on both, which is a property of those palettes, not a bug
+    // to code around.
+    //
+    // The panel is the surface that matters: message frames, side panels and every subpanel draw their
+    // text on it. `bg` is the window backdrop, which carries chrome and very little reading text. So the
+    // repair targets the panel and the bg case is left to `ensure_contrast` at the few call sites that
+    // paint text directly on the backdrop.
+    let on_panel = |fg: Color32, target: f32, accent: bool| -> Color32 {
+        if accent { ensure_contrast_accent(fg, q.panel, target) } else { ensure_contrast(fg, q.panel, target) }
+    };
+    q.ink   = on_panel(q.ink,   4.5, false);
+    q.dim   = on_panel(q.dim,   4.0, false);
+    q.faint = on_panel(q.faint, 3.0, false);
+    q.cyan  = on_panel(q.cyan,  4.5, true);
+    q.amber = on_panel(q.amber, 4.5, true);
     q
 }
 
@@ -1901,6 +1938,33 @@ mod day_night_tests {
         let fixed = ensure_contrast(neon, bg, 4.5);
         assert!(contrast_ratio(fixed, bg) >= 4.5);
         assert!(rel_luminance(fixed) < rel_luminance(neon), "on paper the fix darkens");
+    }
+
+    #[test]
+    fn raw_palette_colours_are_legible_on_the_panel() {
+        // Most of the app uses theme::INK()/DIM()/FAINT()/CYAN() straight against a panel, WITHOUT the
+        // ensure_contrast adjuster the markdown layer goes through — so these raw pairs are what a reader
+        // actually sees nearly everywhere. Measured before the fix: 87 of 190 under 4.5:1, the worst
+        // being Yellow Brick Road INK on PANEL at 1.24:1, which is body text you cannot read.
+        //
+        // Tiered targets rather than one number: demanding 4.5 of a deliberately-faint hint would flatten
+        // the hierarchy into a wall of equally-loud text, which is its own readability problem.
+        let mut worst: Vec<(String, f32)> = Vec::new();
+        for p in PALETTES {
+            let q = day_night_adjust_at(*p, 0.5);
+            for (name, fg) in [("ink", q.ink), ("dim", q.dim), ("faint", q.faint),
+                               ("cyan", q.cyan), ("amber", q.amber)] {
+                // PANEL only: bg is the window backdrop and carries almost no reading text, and several
+                // palettes cannot satisfy both surfaces with one colour (see day_night_adjust_at).
+                let target = match name { "faint" => 3.0, "dim" => 4.0, _ => 4.5 };
+                let r = contrast_ratio(fg, q.panel);
+                if r < target - 0.05 { worst.push((format!("{} {}/panel (want {target})", p.name, name), r)); }
+            }
+        }
+        worst.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let shown: Vec<String> = worst.iter().take(8).map(|(k, r)| format!("{k} = {r:.2}")).collect();
+        assert!(worst.is_empty(), "{} palette/role pairs are illegible on their panel:\n  {}",
+            worst.len(), shown.join("\n  "));
     }
 }
 
