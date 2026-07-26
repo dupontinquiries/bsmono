@@ -23,6 +23,9 @@ snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
 serde_json = "1"
 
 [features]
-# the runnable eframe app; off by default so the lib (App + pages) builds + tests headless.
-default = []
+# the runnable eframe app, DEFAULT-ON per the house convention for every -egui port
+# (`cargo build --release` must produce the deployable bin — see manifest/projects.toml).
+# Headless lib for CI / sandbox verification: `--no-default-features` (App + pages + tests
+# compile without eframe or a display).
+default = ["app"]
 app = ["dep:eframe"]

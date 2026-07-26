@@ -24,6 +24,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     }
     for name in app.apps.apps.clone() {
         ui.horizontal(|ui| {
+            // the same per-app glyph the Fleet store rows use — recognisable at a glance
+            ui.label(crate::app::app_icon(&name));
             ui.label(&name);
             if ui.add_enabled(!app.task.is_running(), egui::Button::new("run").small()).clicked() {
                 let n = name.clone();
