@@ -136,6 +136,16 @@ runtime = "none"          # pure egui/glow (wayland/x11), same convention as the
 targets = ["desktop"]
 notes = "the egui/eframe LLM chat app over the vendored headless logscope core — the egui-primary frontend (GTK stays behind the core's optional `gui` feature and isn't built). `cargo build --release -p logscope-egui` from apps/logscope produces the deployable bin (`gui` + `gpu-scene` are default-on). Local llama.cpp inference: `--features llamacpp` (Vulkan) or `llamacpp-cpu`; the pure-Rust wgpu engine: `--features wgpu-engine` (pulls crates/gpu-gemm, excluded otherwise). GLM-4.7-Flash (arch deepseek2, MLA+MoE) is supported on both paths — see apps/logscope/GLM47_FLASH_SUPPORT.md."
 
+[apps.fao-codec-egui]
+path = "apps/fao-codec/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
+targets = ["desktop"]
+notes = "the egui-primary port of fao_app (GTK4/libadwaita video-codec workbench) — begun per UI_STRATEGY.md with the shell + the Encode Lab page driving the REAL fao-codec-lib encoder (encode_iframe_recon on a deterministic torture pattern; size/bpp/PSNR report, headless-tested). `cargo build --release -p fao-codec-egui` produces the deployable bin (app feature default-on); `--no-default-features` is the CI lib. The GTK original (fao_app, ~13K lines) stays the parity reference; sequence encode, block-match viz and v1/v2 comparison are the next pages. FIRST crate in the tree verified with the offline Rust 1.96 toolchain (rustup drop 2026-07-26) — the cargo-1.75/edition-2024 wall no longer applies in-sandbox."
+
 [apps.gitmind-egui]
 path = "apps/gitmind/crates/gui-egui"
 kind = "cargo"
