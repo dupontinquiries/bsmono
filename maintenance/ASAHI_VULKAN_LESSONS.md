@@ -86,6 +86,26 @@ source. Regeneration: the python block lives in the session transcript; the shap
 "concatenate moe.rs, archcfg.rs, the classifier fn+tests, and the llm_backend pure blocks into
 one `--test` file".
 
+### 5. eframe/wgpu apps: request the ADAPTER's limits, never wgpu's defaults — SHIPPED (beatspace)
+Reported from a kit: `beatspace gui` died before its first frame with
+`WGPU error: Limit 'max_color_attachments' value 8 is better than allowed 5`.
+Root cause is a request, not a capability: **eframe 0.35 renders through wgpu by
+default** (its default feature list carries `wgpu`, not `glow` — verified in the
+published 0.35 Cargo.toml), and its stock `device_descriptor` asks for
+`wgpu::Limits::default()` on every non-GL backend. That default sets
+`max_color_attachments: 8` (wgpu-types 27, verified), so any adapter allowing fewer
+refuses device creation — even though egui draws into exactly ONE color attachment.
+Fix in `apps/beatspace/src/gui.rs`: override `device_descriptor` to
+`required_limits: adapter.limits()`, which is supported by definition — the same rule
+gpu-gemm already states in `Gpu::new` ("Requesting the adapter's own limits is always
+valid"). The override also prints the chosen adapter name/backend/driver, per lesson 4
+(never-silent device selection): the report gave no way to tell WHICH GPU was picked,
+and that one line would have answered it.
+**Fleet note**: beatspace is the tree's only eframe-0.35 app (`tools/health/depdrift`
+shows eframe at 0.28/0.29/0.34/0.35), which is why nothing else hit this. Anything
+moving to 0.35+ inherits the wgpu-by-default renderer and needs the same override —
+this is the pattern, not a one-off patch.
+
 ## Deferred / not applicable — with reasons
 
 * **`--ncmoe` (n-cpu-moe) plumbing into GenParams**: the llama-cpp-2 Rust binding isn't vendored
