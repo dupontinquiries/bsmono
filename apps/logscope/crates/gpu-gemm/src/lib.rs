@@ -6327,6 +6327,15 @@ per-layer routing active");
         let swa_pattern: Vec<bool> = if swa_period > 0 {
             crate::swa::swa_layers(n_swa_layers, swa_period, false)
         } else { vec![true; n_swa_layers] };
+        // Newly enabled architectures say so. Every Gemma-3 requirement is implemented and unit-gated,
+        // but no Gemma checkpoint has ever been loaded end to end here — and this project has repeatedly
+        // shown that "validated in isolation" and "works on a real file" are different claims. Saying it
+        // costs one line and sets the right expectation for the first person to try it.
+        if matches!(acfg.arch, crate::archcfg::Arch::Gemma3) {
+            eprintln!("wgpu-engine: gemma3 support is NEW — (1+w) norm, GELU gating, post-norms and \
+sliding-window attention are each unit-gated, but no Gemma model has been run end to end. Report anything \
+that looks wrong.");
+        }
         // Declare any architecture requirement we do not implement, BEFORE the first token. Llama-4 cost
         // three rounds because partial support is indistinguishable from a quantization, streaming, or
         // conversion bug once the output is merely wrong rather than absent. The requirements come from
