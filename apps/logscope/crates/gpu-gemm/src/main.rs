@@ -517,6 +517,70 @@ fn write_gguf_llama_linear(m: &HostModel, factor: f32) -> Vec<u8> {
     b
 }
 
+/// Synthetic gemma3 checkpoint: (1+w) norms, GeGlu, per-head QK-norm tensors, sliding
+/// window, global rope base 1e6 — and OPTIONALLY `rope.freq_base_swa`. Three of these,
+/// differing only in that one key, prove the format-default logic black-box.
+fn write_gguf_gemma3(m: &HostModel, swa_base: Option<f32>) -> Vec<u8> {
+    let hd = m.d / m.n_heads;
+    let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
+    let v1 = |n: usize| vec![n as u64];
+    let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
+    let mut push = |name: String, dims: Vec<u64>, w: &[f32]| {
+        let (t, by) = f32t(w); ts.push((name, dims, t, by)); };
+    push("token_embd.weight".into(), mat(m.vocab, m.d), &m.embed);
+    let ones = vec![1.0f32; hd];
+    for (i, b) in m.layers.iter().enumerate() {
+        push(format!("blk.{i}.attn_norm.weight"), v1(m.d), &b.g1);
+        push(format!("blk.{i}.attn_q.weight"), mat(m.d, m.d), &b.wq);
+        push(format!("blk.{i}.attn_k.weight"), mat(m.d, m.d), &b.wk);
+        push(format!("blk.{i}.attn_v.weight"), mat(m.d, m.d), &b.wv);
+        push(format!("blk.{i}.attn_q_norm.weight"), v1(hd), &ones);
+        push(format!("blk.{i}.attn_k_norm.weight"), v1(hd), &ones);
+        push(format!("blk.{i}.attn_output.weight"), mat(m.d, m.d), &b.wo);
+        push(format!("blk.{i}.ffn_norm.weight"), v1(m.d), &b.g2);
+        push(format!("blk.{i}.ffn_gate.weight"), mat(m.h, m.d), &b.wgate);
+        push(format!("blk.{i}.ffn_up.weight"), mat(m.h, m.d), &b.wup);
+        push(format!("blk.{i}.ffn_down.weight"), mat(m.d, m.h), &b.wdown);
+    }
+    push("output_norm.weight".into(), v1(m.d), &m.out_norm);
+    push("output.weight".into(), mat(m.vocab, m.d), &m.output);
+    let mut offs = Vec::with_capacity(ts.len());
+    let mut off = 0u64;
+    for (_, _, _, by) in &ts { offs.push(off); off = align32(off + by.len() as u64); }
+    let mut b = Vec::new();
+    let sst = |b: &mut Vec<u8>, x: &str| { b.extend_from_slice(&(x.len() as u64).to_le_bytes()); b.extend_from_slice(x.as_bytes()); };
+    let u32b = |b: &mut Vec<u8>, v: u32| b.extend_from_slice(&v.to_le_bytes());
+    let u64b = |b: &mut Vec<u8>, v: u64| b.extend_from_slice(&v.to_le_bytes());
+    let f32b = |b: &mut Vec<u8>, v: f32| b.extend_from_slice(&v.to_le_bytes());
+    let nkv = 9 + if swa_base.is_some() { 1 } else { 0 };
+    b.extend_from_slice(b"GGUF"); u32b(&mut b, 3); u64b(&mut b, ts.len() as u64); u64b(&mut b, nkv);
+    sst(&mut b, "general.architecture"); u32b(&mut b, 8); sst(&mut b, "gemma3");
+    sst(&mut b, "gemma3.block_count"); u32b(&mut b, 4); u32b(&mut b, m.n_layers as u32);
+    sst(&mut b, "gemma3.attention.head_count"); u32b(&mut b, 4); u32b(&mut b, m.n_heads as u32);
+    sst(&mut b, "gemma3.attention.head_count_kv"); u32b(&mut b, 4); u32b(&mut b, m.n_kv_heads as u32);
+    sst(&mut b, "gemma3.embedding_length"); u32b(&mut b, 4); u32b(&mut b, m.d as u32);
+    sst(&mut b, "gemma3.feed_forward_length"); u32b(&mut b, 4); u32b(&mut b, m.h as u32);
+    sst(&mut b, "gemma3.rope.freq_base"); u32b(&mut b, 6); f32b(&mut b, 1_000_000.0);
+    sst(&mut b, "gemma3.attention.layer_norm_rms_epsilon"); u32b(&mut b, 6); f32b(&mut b, m.eps);
+    sst(&mut b, "gemma3.attention.sliding_window"); u32b(&mut b, 4); u32b(&mut b, 4);
+    if let Some(fb) = swa_base {
+        sst(&mut b, "gemma3.rope.freq_base_swa"); u32b(&mut b, 6); f32b(&mut b, fb);
+    }
+    for (i, (name, dims, ty, _)) in ts.iter().enumerate() {
+        sst(&mut b, name); u32b(&mut b, dims.len() as u32);
+        for &dd in dims { u64b(&mut b, dd); }
+        u32b(&mut b, *ty); u64b(&mut b, offs[i]);
+    }
+    while b.len() % 32 != 0 { b.push(0); }
+    let data_off = b.len() as u64;
+    for (i, (_, _, _, by)) in ts.iter().enumerate() {
+        while (b.len() as u64) < data_off + offs[i] { b.push(0); }
+        b.extend_from_slice(by);
+    }
+    b
+}
+
 fn write_gguf_q8_0(m: &HostModel) -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
@@ -3915,6 +3979,89 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         println!("gate-gemma: {}", if ok {
             "Gemma norm and activation are correct \u{2713}"
         } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-swa-serial") {
+        // The serial prefill attention kernel (hd > 192 — gemma3's head_dim=256) was
+        // causal-only: on a 3840-token prompt every windowed layer attended the FULL
+        // context, which is out of the trained distribution — first-hand gibberish.
+        // One CPU reference, both kernels, both window types, plus windows OFF.
+        let gpu = Gpu::new();
+        eprintln!("gate-swa-serial: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let cpu_ref = |q: &[f32], k: &[f32], v: &[f32], s: usize, base: usize, hd: usize,
+                       nh: usize, nkv: usize, swa: Option<(u32, gpu_kernels::swa::SwaType)>| -> Vec<f32> {
+            let (dm, kvdm) = (nh * hd, nkv * hd);
+            let mut out = vec![0.0f32; s * dm];
+            for i in 0..s { for h in 0..nh {
+                let qpos = base + i;
+                let lo = match swa {
+                    Some((n, gpu_kernels::swa::SwaType::Standard)) if qpos + 1 > n as usize => qpos + 1 - n as usize,
+                    Some((n, gpu_kernels::swa::SwaType::Chunked)) => (qpos / n as usize) * n as usize,
+                    _ => 0,
+                };
+                let kb = (h / (nh / nkv)) * hd;
+                let sc = 1.0 / (hd as f32).sqrt();
+                let dots: Vec<f32> = (lo..=qpos).map(|j|
+                    (0..hd).map(|c| q[i * dm + h * hd + c] * k[j * kvdm + kb + c]).sum::<f32>() * sc).collect();
+                let mx = dots.iter().fold(f32::MIN, |a, &b| a.max(b));
+                let ex: Vec<f32> = dots.iter().map(|d| (d - mx).exp()).collect();
+                let sum: f32 = ex.iter().sum();
+                for (jj, j) in (lo..=qpos).enumerate() {
+                    for c in 0..hd { out[i * dm + h * hd + c] += ex[jj] / sum * v[j * kvdm + kb + c]; }
+                }
+            }}
+            out
+        };
+        let mk = |seed: u32, n: usize| -> Vec<f32> {
+            let mut v = Vec::with_capacity(n); let mut x = seed | 1;
+            for _ in 0..n { x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+                v.push(((x >> 9) as f32 / (1u32 << 23) as f32 - 1.0) * 0.5); }
+            v };
+        for (hd, which) in [(96usize, "parallel (hd<=192)"), (256, "SERIAL (hd>192)")] {
+            let (s, base, nh, nkv) = (6usize, 5usize, 2usize, 1usize);
+            let (dm, kvdm, total) = (nh * hd, nkv * hd, base + s);
+            let (qv, kv_, vv) = (mk(3, s * dm), mk(5, total * kvdm), mk(7, total * kvdm));
+            let (qt, kt, vt) = (gpu.upload(&qv, s, dm), gpu.upload(&kv_, total, kvdm), gpu.upload(&vv, total, kvdm));
+            for (swa, nm) in [(None, "no window"),
+                              (Some((4u32, gpu_kernels::swa::SwaType::Standard)), "standard w=4"),
+                              (Some((4u32, gpu_kernels::swa::SwaType::Chunked)), "chunked w=4")] {
+                let got = gpu.download(&gpu.attention_mh_ext_swa(&qt, &kt, &vt, base, s, dm, nh, nkv, swa));
+                let want = cpu_ref(&qv, &kv_, &vv, s, base, hd, nh, nkv, swa);
+                let dmax = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                ck(&format!("{which}, {nm}: matches CPU reference (max|\u{394}|={dmax:.2e})"), dmax < 1e-3);
+            }
+        }
+        println!("gate-swa-serial: {}", if ok { "windowed prefill correct on both kernels \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
+    if args.iter().any(|a| a == "--gate-gemma3-swa-base") {
+        // llama.cpp HARDCODES 10000 as the gemma SWA-layer rope base when the GGUF omits
+        // rope.freq_base_swa (most do). Black-box proof of the default: three checkpoints
+        // identical except that one key — NO KEY must decode exactly like key=10000, and
+        // key=777 must decode differently (so the key is honored, not ignored).
+        let gpu = Gpu::new();
+        eprintln!("gate-gemma3-swa-base: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let hm = gen_model(64, 128, 2, 48, 4, 4);
+        let run = |bytes: &[u8]| -> Vec<f32> {
+            let m = gpu.load_gguf_quantized(bytes).unwrap();
+            let c = gpu.new_cache_for(&m, 8);
+            let mut out = Vec::new();
+            for (t, p) in [(7u32, 0usize), (19, 1), (31, 2), (11, 3), (5, 4), (23, 5)] {
+                out.extend(gpu.decode_step(&m, &c, t, p));
+            }
+            out
+        };
+        let (l_none, l_10k, l_777) = (run(&write_gguf_gemma3(&hm, None)),
+                                      run(&write_gguf_gemma3(&hm, Some(10000.0))),
+                                      run(&write_gguf_gemma3(&hm, Some(777.0))));
+        let d_eq = l_none.iter().zip(&l_10k).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        ck(&format!("no key == explicit 10000 (the llama.cpp default; max|\u{394}|={d_eq:.2e})"), d_eq < 1e-5);
+        let d_ne = l_none.iter().zip(&l_777).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        let fin = l_none.iter().all(|x| x.is_finite());
+        ck(&format!("explicit 777 diverges (key honored; max|\u{394}|={d_ne:.2e})"), fin && d_ne > 1e-3);
+        println!("gate-gemma3-swa-base: {}", if ok { "gemma SWA rope-base default correct \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-rope-linear") {
