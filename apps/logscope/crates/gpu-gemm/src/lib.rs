@@ -232,7 +232,14 @@ const DIMS_CACHE_CAP: usize = 4096;
 const BG_CACHE_CAP: usize = 8192;
 /// Bind-group cache key: pipeline identity + the ordered buffer handles (inputs, then output) + the dims
 /// buffer handle. wgpu::Buffer is Eq/Hash on its inner handle, so equal keys ⇒ identical bindings.
-type BgKey = (usize, Vec<wgpu::Buffer>, wgpu::Buffer);
+/// (pipeline, [(input buffer, view offset, view size)…], output buffer, dims buffer).
+///
+/// The view span is PART OF THE KEY rather than a reason to skip the cache. A bind group binds a buffer
+/// range, so two calls with the same buffers and the same ranges produce the same bind group — and
+/// streaming MoE weights are all views into slot buffers, which is precisely the workload that was
+/// bypassing the cache. A view whose offset is not in the key would be a correctness bug (one range's
+/// bind group reused for another); including it makes the reuse sound.
+type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, wgpu::Buffer, wgpu::Buffer);
 /// Reusable dims-ring size: how many uniform buffers the cache-full path rotates through. Bounds the
 /// TOTAL live dims buffer count (cache cap + ring) so Metal's buffer-object ceiling is never hit no
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
@@ -2377,14 +2384,16 @@ impl Gpu {
         let n = inputs.len() as u32;
         let (bgl, pipeline) = (&pipe.0, &pipe.1);
         // Opt-in bind-group cache: reuse the bind group for this exact (pipeline, buffers, dims) instead of
-        // recreating it every dispatch (the Asahi dispatch-bound hotspot). Only viable when no input uses a
-        // sub-buffer VIEW (those carry per-call offsets/sizes that aren't in the key); views fall through to
-        // the create path. Bit-identical: the key pins the same buffers to the same slots.
+        // recreating it every dispatch (the Asahi dispatch-bound hotspot). Views are now CACHEABLE: their
+        // (offset, size) is part of the key, so the same buffer bound at the same range hits, and a
+        // different range misses instead of silently reusing the wrong binding. This matters because
+        // streaming MoE weights are all views into slot buffers — the exact traffic that used to bypass
+        // the cache and left it at 18% reuse. Bit-identical: the key pins the same ranges to the same slots.
         let bg_cache_on = bind_group_cache_enabled();
-        let cache_key: Option<BgKey> = if bg_cache_on && inputs.iter().all(|t| t.view.is_none()) {
-            let mut bufs: Vec<wgpu::Buffer> = inputs.iter().map(|t| t.buf.clone()).collect();
-            bufs.push(out.buf.clone());
-            Some((pipe_ptr, bufs, (*dbuf).clone()))
+        let cache_key: Option<BgKey> = if bg_cache_on {
+            let bufs: Vec<(wgpu::Buffer, u64, u64)> = inputs.iter()
+                .map(|t| { let (o, l) = t.view.unwrap_or((0, 0)); (t.buf.clone(), o, l) }).collect();
+            Some((pipe_ptr, bufs, out.buf.clone(), (*dbuf).clone()))
         } else { None };
         if let Some(key) = &cache_key {
             if let Some(bg) = self.bg_cache.lock().unwrap().get(key).cloned() {
