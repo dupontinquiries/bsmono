@@ -61,6 +61,33 @@ pub fn mic_shape(scene: &str, material: theme::Material) -> MicShape {
 /// ACCESSIBLE: the 3D slab is the visual, and an egui widget placed over this rect is the hit-test +
 /// AccessKit overlay, so pointer clicks and screen-reader focus both target the physical object in the
 /// scene. Returns None if any corner is behind the camera (don't interact with an off-screen slab).
+/// Resolve a screen-anchored HUD slab against everything already placed this frame.
+/// Projects the desired (world-centre, w×h world) rect, packs it via hud_pack::place
+/// (never overlapping an earlier slab, clamped to the stage), then UN-projects the
+/// resolved centre so the 3D meshes and the egui overlay move together. Returns the
+/// possibly-moved world centre plus a size scale (<1 only on the packed-stage
+/// fallback, where the slab shrinks into the largest free band instead of stacking
+/// on a neighbour). Sites multiply their primary world size by the scale once, and
+/// every derived offset follows.
+#[allow(clippy::too_many_arguments)]
+fn hud_resolve(placed: &mut Vec<crate::hud_pack::Placed>, stage: egui::Rect,
+               cam: &crate::spatial::OrbitCam, cen: crate::spatial::Vec3,
+               right: crate::spatial::Vec3, up: crate::spatial::Vec3,
+               cx: f32, cy: f32, scale: f32,
+               want: crate::spatial::Vec3, w: f32, h: f32) -> (crate::spatial::Vec3, f32) {
+    let Some(desired) = project_slab_rect(cam, want, right, up, w, h, cx, cy, scale) else {
+        return (want, 1.0);
+    };
+    let resolved = crate::hud_pack::place(placed, stage, desired, 6.0);
+    let sz = if desired.width() > 0.5 && desired.height() > 0.5 {
+        (resolved.width() / desired.width()).min(resolved.height() / desired.height()).min(1.0)
+    } else { 1.0 };
+    if (resolved.center() - desired.center()).length() < 0.5 && sz >= 0.999 {
+        return (want, 1.0);
+    }
+    (screen_to_world(cam, cen, right, up, cx, cy, scale, resolved.center().x, resolved.center().y), sz)
+}
+
 pub fn project_slab_rect(cam: &crate::spatial::OrbitCam, center: crate::spatial::Vec3,
                          right: crate::spatial::Vec3, up: crate::spatial::Vec3, w: f32, h: f32,
                          cx: f32, cy: f32, scale: f32) -> Option<egui::Rect> {
@@ -3605,6 +3632,10 @@ impl Chat {
                 let (ppw_x, ppw_y) = px_per_world(&view_cam, cen, right, up, cx, cy, scale);
                 let ppw = ppw_x.min(ppw_y).max(1.0);
                 let anchor = |ax: f32, ay: f32| screen_to_world(&view_cam, cen, right, up, cx, cy, scale, rect.left() + ax * win_w, rect.top() + ay * win_h);
+                // Screen-space registry of this frame's HUD slabs: every screen-anchored
+                // component resolves through it, so the bottom dock/composer/action-row
+                // family (and the corner panels) can NEVER overlap — they restack instead.
+                let mut hud_placed: Vec<crate::hud_pack::Placed> = Vec::new();
                 // IN-SCENE PANEL BOX removed by default: the app is moving to a separate message box + text-entry
                 // box, so this third boxy plaque is redundant (and some of its layers weren't rendering cleanly).
                 // LOGSCOPE_PANEL=1 restores it. The MIC pearl (voice state) + node/voice highlights stay — they're
@@ -3797,6 +3828,9 @@ impl Chat {
                     // bottom of the canvas (the panel origin already sits low-centre).
                     let dock_c = anchor(0.5, 0.87); // bottom-centre, adapts to window size
                     let dock_radius = (0.42 * win_w / ppw / 1.36).clamp(0.55, 1.7); // arc spans ~42% of width
+                    let (dock_c, dock_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
+                                                        dock_c, dock_radius * 2.9, dock_radius * 1.2);
+                    let dock_radius = dock_radius * dock_hs;
                     let ds = dock_radius / 0.95; // scale buttons with the arc
                     let pos = crate::physui::dock_arc(
                         DOCK_IDS.len(),
@@ -3954,6 +3988,9 @@ impl Chat {
                     if std::env::var("LOGSCOPE_PHYS_PARAMS").map(|v| v != "0").unwrap_or(true) {
                         let panel_c = anchor(0.15, 0.60); // lower-left corner, adapts to window size
                         let plaque_w = (0.24 * win_w / ppw).clamp(0.9, 2.6);
+                        let (panel_c, panel_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
+                                                              panel_c, plaque_w, plaque_w * 1.60 / 1.42);
+                        let plaque_w = plaque_w * panel_hs;
                         let ps = plaque_w / 1.42; // scale the tuned layout by the window-derived plaque width
                         let back = |o: f32| V3::new(panel_c.x - toward.x * o, panel_c.y - toward.y * o, panel_c.z - toward.z * o);
                         // backing plaque (set back so the sliders sit proud of it)
@@ -4075,6 +4112,9 @@ impl Chat {
                     let comp_c = anchor(0.5, 0.90); // bottom-centre, adapts to window size
                     let comp_w = (0.62 * win_w / ppw).clamp(2.2, 6.5);
                     let comp_h = (0.20 * win_h / ppw).clamp(0.55, 1.3);
+                    let (comp_c, comp_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
+                                                        comp_c, comp_w, comp_h);
+                    let (comp_w, comp_h) = (comp_w * comp_hs, comp_h * comp_hs);
                     if let Some(rect) = project_slab_rect(&view_cam, comp_c, right, up, comp_w, comp_h, cx, cy, scale) {
                         let pearl_t = ui.input(|i| i.time) as f32;
                         let vpartial = self.voice.as_ref().map(|v| v.partial().to_string()).unwrap_or_default();
@@ -4113,6 +4153,9 @@ impl Chat {
                         ];
                         let arow_c = anchor(0.5, 0.985); // just below the composer
                         let btn_w = (0.08 * win_w / ppw).clamp(0.35, 0.9);
+                        let (arow_c, arow_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
+                                                            arow_c, btn_w * 3.7, btn_w * 0.9);
+                        let btn_w = btn_w * arow_hs;
                         let gap = btn_w * 1.35;
                         for (i, (glyph, hint)) in acts.iter().enumerate() {
                             let dx = (i as f32 - 1.0) * gap; // centre the middle button
@@ -4158,6 +4201,13 @@ impl Chat {
                 if !self.backdrop && !self.agent_plan.is_empty() {
                     let pc0 = anchor(0.86, 0.13);
                     let pw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
+                    let (pc0, pw) = {
+                        let ph = 0.15 * (pw / 1.3) * 9.5;   // title + up to 8 rows
+                        let cc0 = crate::spatial::Vec3::new(pc0.x - up.x * ph * 0.45, pc0.y - up.y * ph * 0.45, pc0.z - up.z * ph * 0.45);
+                        let (cc1, hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale, cc0, pw, ph);
+                        let ph2 = ph * hs;
+                        (crate::spatial::Vec3::new(cc1.x + up.x * ph2 * 0.45, cc1.y + up.y * ph2 * 0.45, cc1.z + up.z * ph2 * 0.45), pw * hs)
+                    };
                     let pscale = pw / 1.3;
                     let title_c = V3::new(pc0.x - toward.x * 0.30, pc0.y - toward.y * 0.30, pc0.z - toward.z * 0.30);
                     for cell in m3::label_cells(title_c, right, up, toward, "PLAN", 0.010 * pscale, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
@@ -4177,6 +4227,9 @@ impl Chat {
                 if !self.backdrop && !self.agent_files.is_empty() {
                     let fc = anchor(0.86, 0.42);
                     let fw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
+                    let (fc, fc_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
+                                                  fc, fw, fw * 1.7 / 1.3);
+                    let fw = fw * fc_hs;
                     let fs = fw / 1.3;
                     let back = |o: f32| V3::new(fc.x - toward.x * o, fc.y - toward.y * o, fc.z - toward.z * o);
                     let mut plaque = m3::panel(back(-0.06 * fs), right, up, 1.3 * fs, 1.7 * fs, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
@@ -4208,6 +4261,13 @@ impl Chat {
                 if !self.backdrop && !self.agent_candidates.is_empty() {
                     let cc = anchor(0.17, 0.22);
                     let cw = (0.30 * win_w / ppw).clamp(1.4, 3.6);
+                    let (cc, cw) = {
+                        let ch = 0.30 * (cw / 2.0) * 6.0 + 0.6 * (cw / 2.0);  // title + rows
+                        let cc0 = crate::spatial::Vec3::new(cc.x - up.x * ch * 0.4, cc.y - up.y * ch * 0.4, cc.z - up.z * ch * 0.4);
+                        let (cc1, hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale, cc0, cw, ch);
+                        let ch2 = ch * hs;
+                        (crate::spatial::Vec3::new(cc1.x + up.x * ch2 * 0.4, cc1.y + up.y * ch2 * 0.4, cc1.z + up.z * ch2 * 0.4), cw * hs)
+                    };
                     let cs = cw / 2.0;
                     let best = self.agent_candidates.iter().max_by_key(|b| (b.approved == Some(true), b.verified, b.files)).map(|b| b.index);
                     let title_c = V3::new(cc.x - toward.x * 0.30 + up.x * 0.5 * cs, cc.y - toward.y * 0.30 + up.y * 0.5 * cs, cc.z - toward.z * 0.30 + up.z * 0.5 * cs);
@@ -4282,6 +4342,9 @@ impl Chat {
                     let rc = anchor(0.5, 0.17); // top-centre, adapts to window size
                     let pw = (0.44 * win_w / ppw).clamp(1.6, 5.2);
                     let ph = (pw * 0.42).min(0.30 * win_h / ppw); // cap by height so it fits short windows
+                    let (rc, rc_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
+                                                  rc, pw, ph);
+                    let (pw, ph) = (pw * rc_hs, ph * rc_hs);
                     let bscale = (pw / (24.0 * 6.0) * 0.90).clamp(0.006, 0.03); // body fits ~24 cols
                     let hscale = bscale * 0.82;
                     // drop shadow (offset down-right, set back) for real depth
