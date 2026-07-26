@@ -3700,6 +3700,38 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             ck(&format!("q8 windowed differs from full attention (max|diff|={df8:.3e})"), df8 > 1e-6);
         }
 
+        // PREFILL: every query row has its own window, so this is where an off-by-one hides — a wrong
+        // bound on one row is invisible in aggregate. Each row is checked against attention computed over
+        // exactly that row's visible range.
+        {
+            let (sq, base) = (12usize, 20usize);       // 12 query rows starting at global position 20
+            let n_swa = 8u32;
+            let kvrows = base + sq;
+            let kd = mk(41, kvrows * kvd);
+            let vd = mk(42, kvrows * kvd);
+            let qd = mk(43, sq * ad);
+            let (kt, vt, qtp) = (gpu.upload(&kd, kvrows, kvd), gpu.upload(&vd, kvrows, kvd), gpu.upload(&qd, sq, ad));
+            let got = gpu.download(&gpu.attention_mh_ext_swa(&qtp, &kt, &vt, base, sq, ad, n_heads, n_kv_heads,
+                                                             Some((n_swa, gpu_kernels::swa::SwaType::Standard))));
+            // reference: row by row, decode attention over just that row's window
+            let mut worst = 0f32;
+            for r in 0..sq {
+                let qpos = base + r;
+                let lo = gpu_kernels::swa::window_start(n_swa, gpu_kernels::swa::SwaType::Standard, qpos as i64) as usize;
+                let len = qpos + 1 - lo;
+                let k1 = gpu.upload(&kd[lo * kvd..(qpos + 1) * kvd], len, kvd);
+                let v1 = gpu.upload(&vd[lo * kvd..(qpos + 1) * kvd], len, kvd);
+                let q1 = gpu.upload(&qd[r * ad..(r + 1) * ad], 1, ad);
+                let want_r = gpu.download(&gpu.decode_attention_mh_pub(&q1, &k1, &v1, len, ad, n_heads, n_kv_heads));
+                for c in 0..ad { worst = worst.max((got[r * ad + c] - want_r[c]).abs()); }
+            }
+            ck(&format!("prefill: every row windowed correctly (worst max|diff|={worst:.3e})"), worst < 2e-5);
+            // and it must differ from unwindowed prefill, or the bound did nothing
+            let full = gpu.download(&gpu.attention_mh_ext_swa(&qtp, &kt, &vt, base, sq, ad, n_heads, n_kv_heads, None));
+            let dl = full.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("prefill windowed differs from causal-only (max|diff|={dl:.3e})"), dl > 1e-6);
+        }
+
         println!("gate-swa: {}", if ok {
             "windowed KV view is exact \u{2713} (decode attends only within the window)"
         } else { "FAIL \u{2717}" });
