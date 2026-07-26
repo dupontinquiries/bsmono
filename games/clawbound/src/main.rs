@@ -877,6 +877,121 @@ fn main() {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// Open-world clan founding (openworld.rs): run a few years of the season sim,
+/// print the chronicle the way `goals` prints its fairness report, then stage the
+/// survivors at their camp. args: [4] origin `wander|survivors|exiled|ancient`,
+/// [5] doctrine `isolationist|explorer|guardian|hunter|diplomatic`.
+fn build_open() -> (Mesh, Vec3) {
+    use clawbound_rs::openworld::{Doctrine, OpenWorld, Origin, Site};
+    world::init_world();
+    let origin = Origin::parse(std::env::args().nth(4).as_deref().unwrap_or("wander"));
+    let doctrine = Doctrine::parse(std::env::args().nth(5).as_deref().unwrap_or("hunter"));
+    // found on good ground: coarse-scan the map for the best mix the way a real
+    // founder would pace the territory before settling
+    let mut best = (30.0f32, 40.0f32, f32::MIN);
+    for gx in -6..=6i32 {
+        for gz in -6..=6i32 {
+            let (x, z) = (gx as f32 * 34.0, gz as f32 * 34.0);
+            if world::height_at(x, z) < world::WATER_Y + 0.3 { continue; }
+            let s = Site::assess(x, z);
+            let score = s.prey_richness + s.defensibility * 0.5 + s.fishing * 0.4 + s.herbs * 0.3;
+            if score > best.2 { best = (x, z, score); }
+        }
+    }
+    let mut w = OpenWorld::new(2026, origin, doctrine, best.0, best.1);
+    for _ in 0..14 { w.season_tick(); }   // three and a half years
+    eprintln!("OPEN WORLD — {}", w.clan_name);
+    for line in &w.chronicle { eprintln!("  {}", line); }
+    eprintln!("  members {}  prey {:.2}  predators {:.2}  camp {}/6",
+        w.members.len(), w.prey_level, w.predator_pressure, w.camp.built_count());
+    eprintln!("  {}", w.describe());
+
+    let mut m = world::build_terrain(150);
+    m.extend(&world::build_water());
+    m.extend(&world::build_trees(140));
+    m.extend(&world::build_grass(2400));
+    m.extend(&world::build_reeds(450));
+    // wildlife thinned or thickened by how the clan hunted — §9 made visible
+    let critters = ecology::populate((26.0 * w.prey_level) as usize + 4, false);
+    m.extend(&build_critters(&critters));
+
+    let (cx, cz) = (w.site.x, w.site.z);
+    let cy = world::height_at(cx, cz);
+    // the gathering circle: a ring of stubby stones
+    for k in 0..10 {
+        let a = k as f32 / 10.0 * std::f32::consts::TAU;
+        let (sx, sz) = (cx + a.cos() * 3.2, cz + a.sin() * 3.2);
+        let sy = world::height_at(sx, sz);
+        m.segment(v3(sx, sy - 0.2, sz), v3(sx, sy + 0.55, sz), 0.34, 0.22, 5, rgb(0x9a958c));
+    }
+    // one lean-to tripod per built structure, ringed around the circle
+    let structs: [(bool, u32); 6] = [
+        (w.camp.warrior_den, 0x8a6a48), (w.camp.prey_store, 0x7c705a),
+        (w.camp.nursery, 0xa8895f), (w.camp.medicine_den, 0x6f8a58),
+        (w.camp.lookout, 0x9a958c), (w.camp.training_ground, 0xb59a6a),
+    ];
+    for (i, (built, col)) in structs.iter().enumerate() {
+        if !built { continue; }
+        let a = i as f32 / 6.0 * std::f32::consts::TAU + 0.31;
+        let (bx, bz) = (cx + a.cos() * 7.5, cz + a.sin() * 7.5);
+        let by = world::height_at(bx, bz);
+        for leg in 0..3 {
+            let la = leg as f32 / 3.0 * std::f32::consts::TAU + a;
+            m.segment(v3(bx + la.cos() * 1.1, by, bz + la.sin() * 1.1), v3(bx, by + 2.1, bz), 0.14, 0.06, 4, rgb(*col));
+        }
+    }
+    // the lookout earns its name: a tall post above the camp
+    if w.camp.lookout {
+        let ly = world::height_at(cx - 9.0, cz - 2.0);
+        m.segment(v3(cx - 9.0, ly, cz - 2.0), v3(cx - 9.0, ly + 6.5, cz - 2.0), 0.3, 0.1, 5, rgb(0x8a7a5f));
+    }
+    // sacred site: a translucent star-pillar (ancient bloodlines begin with one)
+    if let Some((sx, sz)) = w.sacred_site {
+        let sy = world::height_at(sx, sz);
+        m.set_op(0.55);
+        m.segment(v3(sx, sy, sz), v3(sx, sy + 18.0, sz), 0.8, 0.2, 8, rgb(0xd9ecff));
+        m.set_op(1.0);
+    }
+    // discoveries as POI pillars, prowl-style
+    for (_, dx, dz) in &w.discoveries {
+        let dy = world::height_at(*dx, *dz);
+        m.set_op(0.5);
+        m.segment(v3(*dx, dy, *dz), v3(*dx, dy + 9.0, *dz), 0.4, 0.1, 5, rgb(0x8fd0ff));
+        m.set_op(1.0);
+    }
+    // the clan, gathered: leader on a rock, members ringed, kits close in
+    let n = w.members.len().max(2) as f32;
+    let mut ring_i = 0.0f32;
+    for mem in &w.members {
+        use clawbound_rs::lore::Rank;
+        if mem.rank == Rank::Leader {
+            let (lx, lz) = (cx, cz - 4.6);
+            let ly = world::height_at(lx, lz);
+            m.segment(v3(lx, ly - 0.3, lz), v3(lx, ly + 1.0, lz), 0.9, 0.75, 6, rgb(0x8b8d92));
+            cat::build(&mut m, v3(lx, ly + 1.0, lz), 1.12, &cat::stand(), clawbound_rs::class::Class::Cat);
+            continue;
+        }
+        let a = ring_i / n * std::f32::consts::TAU;
+        let r = if mem.rank == Rank::Kit { 2.0 } else { 5.0 };
+        let (mx, mz) = (cx + a.cos() * r, cz + a.sin() * r);
+        let my = world::height_at(mx, mz);
+        let pose = if mem.rank == Rank::Kit { cat::idle(ring_i) }
+            else if mem.personality.bold > 0.66 { cat::stand() }
+            else if mem.personality.curious > 0.66 { cat::taste_air(ring_i) }
+            else { cat::idle(ring_i * 1.7) };
+        let s = if mem.rank == Rank::Kit { 0.55 } else { 0.95 };
+        cat::build(&mut m, v3(mx, my, mz), s, &pose, clawbound_rs::class::Class::Cat);
+        ring_i += 1.0;
+    }
+    // wanderers still deciding, out where their goodwill left them
+    for wd in &w.wanderers {
+        let wy = world::height_at(wd.x, wd.z);
+        cat::build(&mut m, v3(wd.x, wy, wd.z), 0.92, &cat::taste_air(wd.x), clawbound_rs::class::Class::Cat);
+    }
+
+    (m, v3(cx, cy, cz))
+}
+
 async fn run() {
     let scale: f32 = if hires() { 1.85 } else { 1.0 };   // supersample for AAA mode (fits a 2048 texture cap)
     #[allow(non_snake_case)]
@@ -892,6 +1007,7 @@ async fn run() {
         "game" => build_game(),
         "prowl" => build_prowl(),
         "capture" => build_capture(),
+        "open" => build_open(),
         "wildlife" => build_wildlife(),
         _ => build_scene(),
     };
@@ -931,6 +1047,7 @@ async fn run() {
         "game" => (focus.add(v3(22.0, 40.0, -22.0)), focus.add(v3(0.0, -3.0, 9.0))),
         "prowl" => (focus.add(v3(20.0, 34.0, -20.0)), focus.add(v3(0.0, -3.0, 8.0))),
         "capture" => (v3(92.0, 104.0, -30.0), v3(-6.0, -10.0, 6.0)),
+        "open" => (focus.add(v3(17.0, 23.0, -19.0)), focus.add(v3(0.0, -2.0, 6.0))),
         "wildlife" => (focus.add(v3(0.5, 2.3, -7.5)), focus.add(v3(0.0, 0.9, 3.2))),
         _ => (focus.add(v3(-13.0, 8.0, -15.0)), focus.add(v3(3.0, -3.5, 7.0))),
     };
