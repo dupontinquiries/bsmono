@@ -1825,6 +1825,8 @@ impl Lin {
     pub fn q8(q: QWeight) -> Self { Lin { kind: LinKind::Q8(q), bias: None } }
     pub fn q4(q: Q4Weight) -> Self { Lin { kind: LinKind::Q4(q), bias: None } }
     pub fn with_bias(mut self, b: Option<Tensor>) -> Self { self.bias = b; self }
+    /// Is this weight held as resident q4? Used to key tuning verdicts by precision.
+    pub fn is_q4(&self) -> bool { matches!(self.kind, LinKind::Q4(_)) }
     fn has_bias(&self) -> bool { self.bias.is_some() }
     pub fn apply(&self, gpu: &Gpu, a: &Tensor, m: usize) -> Tensor {
         let out = match &self.kind {
@@ -5917,6 +5919,12 @@ impl Model {
     /// anything tuned per-GPU must also be keyed on this — a verdict measured on a dense model does not
     /// transfer to a MoE one.
     pub fn decode_class(&self) -> &'static str { if self.is_moe() { "moe" } else { "dense" } }
+
+    /// Resident weight format, as a tuning-key component. A lever can pay at one precision and not
+    /// another, so a verdict measured at q4 must not be reused for an int8-resident load.
+    pub fn residency_class(&self) -> &'static str {
+        if self.layers.iter().any(|b| b.wq.is_q4()) { "q4" } else { "int8" }
+    }
     /// True if any block is a routed-MoE layer — the dispatch levers (bind-group cache, MoE fusions) only
     /// bear on MoE decode, so the magical A/B autotune skips the probe entirely on dense models.
     pub fn is_moe(&self) -> bool { self.layers.iter().any(|b| b.moe.is_some()) }
