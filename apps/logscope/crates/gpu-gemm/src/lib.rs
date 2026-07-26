@@ -10,6 +10,7 @@ use std::collections::HashMap;
 pub mod gguf;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
+pub mod archfeat;
 #[allow(dead_code)] pub mod zerocopy; // scoped experiment: UMA zero-copy weight import (gated `zerocopy`)
 #[allow(dead_code)] pub mod oom; // detect GPU allocation OOM → downgrade residency instead of crashing
 pub mod governor; // backend-agnostic GPU resource governor: per-device budget + adaptive window k
@@ -6186,15 +6187,15 @@ impl Gpu {
         // Llama4 iRoPE: every 4th layer uses NO positional encoding (llama.cpp hardcodes the same
         // step). NoPE layers also skip the weightless QK-Norm (it applies with RoPE only).
         let nope_step = if is_llama4 { 4usize } else { 0 };
-        // Warn LOUDLY rather than generate nonsense. Verified against llama.cpp
-        // (src/models/llama4.cpp): Llama-4 applies a weightless RMS norm to Q and K after rope on rope
-        // layers whenever use_kq_norm is set, and llama.cpp sets it for every Llama-4 EXCEPT the 128-expert
-        // Maverick. Scout is 16-expert, so it needs it and we do not do it. The symptom is fluent garbage,
-        // which is indistinguishable from a dozen other bugs unless the engine says so itself.
-        if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
-            eprintln!("wgpu-engine: ⚠ Llama-4 use_kq_norm is NOT implemented — this checkpoint ({} experts) \
-needs a weightless RMS norm on Q/K after rope (llama.cpp Llama4TextL2Norm). Output will be incoherent. \
-This is an architecture gap, not a quantization or streaming problem.", g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0));
+        // Declare any architecture requirement we do not implement, BEFORE the first token. Llama-4 cost
+        // three rounds because partial support is indistinguishable from a quantization, streaming, or
+        // conversion bug once the output is merely wrong rather than absent. The requirements come from
+        // llama.cpp's per-architecture files; see archfeat.rs.
+        {
+            let variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
+            for line in crate::archfeat::gap_report(&g.arch(), variant) {
+                eprintln!("wgpu-engine: ⚠ {line}");
+            }
         }
         // RoPE pairing style is per-FAMILY: llama rotates adjacent pairs (NORM); qwen/gemma/phi rotate
         // split halves (NEOX). Angles are identical — only the pairing differs — so the wrong style yields
