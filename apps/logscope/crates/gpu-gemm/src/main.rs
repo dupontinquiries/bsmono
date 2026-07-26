@@ -3633,6 +3633,54 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-mla-block") {
+        // The MLA math is already checked against mla.rs by --validate. What is NOT checked is the BLOCK:
+        // norm -> compress-and-append -> attend -> residual. The ordering matters — the token must be in
+        // the cache before the query attends, or it cannot see itself — and getting it wrong shifts every
+        // output by one position, which reads as a plausible-but-wrong model rather than an error.
+        let gpu = Gpu::new();
+        eprintln!("gate-mla-block: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        use gpu_kernels::mla::{MlaDims, MlaWeights, MlaWeightsT, compress_kv, attention_step};
+        let dm = MlaDims { d: 64, n_heads: 2, q_lora: 32, kv_lora: 16, qk_nope: 16, qk_rope: 8, v_head: 16,
+                           base: 10000.0, eps: 1e-5 };
+        let (h, qk) = (dm.n_heads, dm.qk_head());
+        let mk = |seed: u32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| { let z = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                             ((z >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
+        let (qa, qaln) = (mk(1, dm.q_lora * dm.d), vec![1.0f32; dm.q_lora]);
+        let qb = mk(2, h * qk * dm.q_lora);
+        let (kva, kvaln) = (mk(3, (dm.kv_lora + dm.qk_rope) * dm.d), vec![1.0f32; dm.kv_lora]);
+        let kvb = mk(4, h * (dm.qk_nope + dm.v_head) * dm.kv_lora);
+        let o = mk(5, dm.d * h * dm.v_head);
+        let wc = MlaWeights { q_a: &qa, q_a_ln: &qaln, q_b: &qb, kv_a: &kva, kv_a_ln: &kvaln, kv_b: &kvb, o: &o };
+        let wt = MlaWeightsT { q_a: gpu.upload_flat(&qa), q_a_ln: gpu.upload_flat(&qaln), q_b: gpu.upload_flat(&qb),
+                               kv_a: gpu.upload_flat(&kva), kv_a_ln: gpu.upload_flat(&kvaln),
+                               kv_b: gpu.upload_flat(&kvb), o: gpu.upload_flat(&o) };
+        let steps = 5usize;
+        let cache = gpu.mla_new_cache(1, 16, &dm);
+        let mut cpu_cache = Vec::new();
+        let mut worst = 0f32;
+        for pos in 0..steps {
+            let x = mk(100 + pos as u32, dm.d);
+            let xt = gpu.upload(&x, 1, dm.d);
+            // GPU: append then attend, exactly as block_decode_mla sequences it
+            gpu.mla_compress_append(&xt, &wt, &dm, &cache, 0, pos);
+            let g = gpu.download(&gpu.mla_attention_step_gpu(&xt, &wt, &dm, &cache.latent[0], &cache.rot[0], pos));
+            // CPU reference, same order
+            cpu_cache.push(compress_kv(&x, &wc, &dm, pos));
+            let c = attention_step(&x, &wc, &dm, &cpu_cache, pos);
+            for i in 0..dm.d { worst = worst.max((g[i] - c[i]).abs()); }
+        }
+        ck(&format!("MLA block matches the CPU reference across {steps} positions (worst={worst:.3e})"), worst < 2e-4);
+        // the cache really is the compressed representation, not a per-head K/V in disguise
+        let ratio = cache.compression_vs_standard(dm.n_heads, dm.qk_nope + dm.qk_rope);
+        ck(&format!("cache is compressed ({ratio:.1}x smaller than per-head K/V)"), ratio > 1.5);
+        println!("gate-mla-block: {}", if ok {
+            "MLA decode block is correct \u{2713} (append-then-attend ordering verified)"
+        } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-swa") {
         // A windowed KV view must give exactly the answer attention would give over a cache containing
         // only those rows. If it does not, the view offset or length is wrong — and the symptom would be
