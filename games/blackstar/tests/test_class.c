@@ -19,7 +19,7 @@ int main(void){
   assert(ex_class_clamp_bulk(EX_CLASS_INTERCEPTOR, 200) == ex_class_info(EX_CLASS_INTERCEPTOR)->bulk_max);
   for (int i=0;i<EX_CHASSIS_COUNT;i++){ const ex_chassis_info_t *ci=ex_chassis_info(i);
     assert(ci->name && ci->bulk_mul>0.5f && ci->fold_stagger>0.2f && ci->xform_dur_mul>0.5f); }
-  printf("chassis: 4 frame variants OK\n");
+  printf("chassis: %d frame variants OK\n", EX_CHASSIS_COUNT);
   printf("class system: %d profiles, gated vehicles + builds OK\n", EX_CLASS_COUNT);
   printf("ALL ASSERTIONS PASSED\n");
   return 0;

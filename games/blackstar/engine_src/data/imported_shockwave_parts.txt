@@ -1,0 +1,4 @@
+imported_shockwave_part0.iqm shockwave_body.jpg body -1 0 0.00000 0.00000 0.00000
+imported_shockwave_part1.iqm shockwave_hand.jpg body -1 0 0.00000 0.00000 0.00000
+imported_shockwave_part2.iqm shockwave_legs.jpg body -1 0 0.00000 0.00000 0.00000
+imported_shockwave_part3.iqm shockwave_body_alt.jpg body -1 0 0.00000 0.00000 0.00000

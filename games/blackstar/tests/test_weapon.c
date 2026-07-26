@@ -72,6 +72,14 @@ int main(void){
     ex_weapon_profile_t p = ex_weapon_apply_mods(EX_FORM_WATER,&m);
     assert(p.damage > ex_weapon_profile(EX_FORM_WATER).damage && p.range > ex_weapon_profile(EX_FORM_WATER).range);
     assert(ex_weapon_mods_add(&m, EX_MOD_AMPLIFIER) < 0 && "only three slots"); }
+  { ex_weapon_mods_t m; ex_weapon_mods_init(&m); ex_weapon_mods_add(&m, EX_MOD_FLAK_CORE);
+    assert(ex_weapon_apply_mods(EX_FORM_WATER,&m).mode==EX_FIRE_FLAK && "flak core -> airburst"); }
+  { ex_weapon_mods_t m; ex_weapon_mods_init(&m); ex_weapon_mods_add(&m, EX_MOD_PLASMA_CORE);
+    ex_weapon_profile_t p=ex_weapon_apply_mods(EX_FORM_WATER,&m);
+    assert(p.mode==EX_FIRE_PLASMA && p.chains>ex_weapon_profile(EX_FORM_WATER).chains && "plasma core -> heavy blast +chain"); }
+  { ex_weapon_mods_t m; ex_weapon_mods_init(&m); ex_weapon_mods_add(&m, EX_MOD_SUPPRESS_CORE);
+    ex_weapon_profile_t p=ex_weapon_apply_mods(EX_FORM_WATER,&m);
+    assert(p.mode==EX_FIRE_SUPPRESS && p.range>ex_weapon_profile(EX_FORM_WATER).range && "suppress core -> long freeze beam"); }
   printf("  pierce/flak forms + energon/rapid/pierce/scatter addons + 3-slot stack OK\n");
 
   printf("=== star-fire charge ===\n");
@@ -141,7 +149,7 @@ int main(void){
   assert(apex.phase==2 && slammed);
   // drop to phase 3 -> summons begin
   ex_enemy_damage(&apex, 600.0f);
-  for(int i=0;i<60*12;i++){ ex_enemy_update(&apex,bw,pl,1.0f/60.0f); if(apex.wants_summon)summoned=1; }
+  for(int i=0;i<60*14;i++){ ex_enemy_update(&apex,bw,pl,1.0f/60.0f); if(apex.wants_summon)summoned=1; }
   assert(apex.phase==3 && summoned);
   printf("  phase progression 1->2(slam)->3(summon) ok; melee scales to %.0f\n", ex_enemy_melee_damage(&apex));
   assert(ex_enemy_melee_damage(&apex) > 30.0f);

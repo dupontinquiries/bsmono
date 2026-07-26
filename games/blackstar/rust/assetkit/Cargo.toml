@@ -1,0 +1,22 @@
+[package]
+name = "assetkit"
+version = "0.1.0"
+edition = "2021"
+description = "Cybertron asset library manager: browse/score the model library, preview meshes, drive exports, and monitor GAN training. Built on the monorepo's shared uikit-egui."
+
+[dependencies]
+# Point these at the monorepo checkout. Versions follow shared/uikit, which pins
+# egui 0.29 -- that needs rustc >= 1.76.
+egui = "0.29"
+eframe = { version = "0.29", default-features = false, features = ["glow", "default_fonts"] }
+uikit-egui = { path = "../../../logscope-monorepo/shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../logscope-monorepo/shared/uikit/crates/snapclone-theme" }
+
+[[bin]]
+name = "assetkit"
+path = "src/main.rs"
+
+# CLI: no egui, so it builds on any rustc and is the verified half
+[[bin]]
+name = "assetkit-cli"
+path = "src/cli.rs"

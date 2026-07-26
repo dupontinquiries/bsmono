@@ -1,0 +1,251 @@
+{
+  "name": "Beneath the Pacific -- Raid",
+  "phases": [
+    {
+      "name": "The Descent",
+      "palette": "void",
+      "size": 110,
+      "score": 80.8,
+      "grade": "A",
+      "encounters": [
+        {
+          "x": -10.2,
+          "y": -91.5,
+          "kind": "objective",
+          "weight": 0.719,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": 45.5,
+          "y": -69.9,
+          "kind": "objective",
+          "weight": 0.717,
+          "mech": 3,
+          "min_units": 3
+        },
+        {
+          "x": 59.0,
+          "y": -31.9,
+          "kind": "objective",
+          "weight": 0.715,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": 61.2,
+          "y": 57.9,
+          "kind": "objective",
+          "weight": 0.717,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": 95.7,
+          "y": 83.6,
+          "kind": "objective",
+          "weight": 0.719,
+          "mech": 3,
+          "min_units": 3
+        },
+        {
+          "x": -0.3,
+          "y": 74.4,
+          "kind": "objective",
+          "weight": 0.722,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": -6.5,
+          "y": 32.4,
+          "kind": "objective",
+          "weight": 0.722,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": -41.9,
+          "y": 38.1,
+          "kind": "objective",
+          "weight": 0.715,
+          "mech": 3,
+          "min_units": 3
+        },
+        {
+          "x": -110.0,
+          "y": 2.3,
+          "kind": "landmark",
+          "weight": 1.0,
+          "mech": 2,
+          "min_units": 1
+        }
+      ],
+      "approach_waypoints": 98
+    },
+    {
+      "name": "The Gauntlet",
+      "palette": "frost",
+      "size": 120,
+      "score": 82.6,
+      "grade": "A",
+      "encounters": [
+        {
+          "x": 32.4,
+          "y": -66.6,
+          "kind": "objective",
+          "weight": 0.722,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": 32.4,
+          "y": -7.4,
+          "kind": "objective",
+          "weight": 0.717,
+          "mech": 3,
+          "min_units": 3
+        },
+        {
+          "x": 46.7,
+          "y": 22.7,
+          "kind": "objective",
+          "weight": 0.718,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": 4.6,
+          "y": 15.7,
+          "kind": "objective",
+          "weight": 0.711,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": -18.9,
+          "y": 44.1,
+          "kind": "objective",
+          "weight": 0.721,
+          "mech": 3,
+          "min_units": 3
+        },
+        {
+          "x": -15.6,
+          "y": 75.8,
+          "kind": "objective",
+          "weight": 0.713,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": -68.0,
+          "y": 12.3,
+          "kind": "objective",
+          "weight": 0.718,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": -54.3,
+          "y": -53.1,
+          "kind": "objective",
+          "weight": 0.721,
+          "mech": 2,
+          "min_units": 1
+        },
+        {
+          "x": -120.0,
+          "y": -120.0,
+          "kind": "landmark",
+          "weight": 1.0,
+          "mech": 2,
+          "min_units": 1
+        },
+        {
+          "x": 96.9,
+          "y": -93.7,
+          "kind": "objective",
+          "weight": 0.718,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": 73.6,
+          "y": 97.4,
+          "kind": "objective",
+          "weight": 0.718,
+          "mech": 3,
+          "min_units": 3
+        }
+      ],
+      "approach_waypoints": 155
+    },
+    {
+      "name": "Unicron's Heart",
+      "palette": "ember",
+      "size": 95,
+      "score": 73.9,
+      "grade": "B",
+      "encounters": [
+        {
+          "x": -15.2,
+          "y": -49.3,
+          "kind": "objective",
+          "weight": 0.719,
+          "mech": 2,
+          "min_units": 1
+        },
+        {
+          "x": -70.7,
+          "y": 2.0,
+          "kind": "landmark",
+          "weight": 1.0,
+          "mech": 2,
+          "min_units": 1
+        },
+        {
+          "x": -41.7,
+          "y": 54.7,
+          "kind": "objective",
+          "weight": 0.718,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": -42.5,
+          "y": 78.4,
+          "kind": "objective",
+          "weight": 0.719,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": -18.8,
+          "y": 81.0,
+          "kind": "objective",
+          "weight": 0.719,
+          "mech": 3,
+          "min_units": 3
+        },
+        {
+          "x": 84.4,
+          "y": 69.7,
+          "kind": "objective",
+          "weight": 0.72,
+          "mech": 0,
+          "min_units": 1
+        },
+        {
+          "x": 61.6,
+          "y": -78.3,
+          "kind": "boss",
+          "weight": 0.723,
+          "mech": 0,
+          "min_units": 1
+        }
+      ],
+      "approach_waypoints": 104
+    }
+  ]
+}

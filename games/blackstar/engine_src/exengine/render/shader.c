@@ -3,8 +3,10 @@
 
 #define EX_MAX_SHADERS 512
 
-GLint ex_uniform_map[256][256] = {{0}};
-GLint ex_uniform_locations[256][256] = {{0}};
+#define EX_UNIFORM_ROWS 256
+#define EX_UNIFORM_COLS 512
+GLint ex_uniform_map[EX_UNIFORM_ROWS][EX_UNIFORM_COLS] = {{0}};
+GLint ex_uniform_locations[EX_UNIFORM_ROWS][EX_UNIFORM_COLS] = {{0}};
 
 ex_shader_t shader_list[EX_MAX_SHADERS];
 size_t shader_count = 0;
@@ -21,9 +23,16 @@ inline GLint ex_uniform(GLuint shader, const char *str)
   while ((c = *str++))
     key = ((key << 5) + key) + c;
 
+  // CRASH FIX: the cache is FIXED-SIZE -- a shader handle past the row count, or a
+  // 257th+ distinct uniform name (indexed light/effect names mint new entries every
+  // index) used to write OUT OF BOUNDS and segfault inside this function. Out-of-range
+  // requests now just bypass the cache: a slower lookup, never a crash.
+  if (shader >= EX_UNIFORM_ROWS)
+    return glGetUniformLocation(shader, string);
+
   // check if location cached already
   int i=0;
-  for (i=0; i<256; i++) {
+  for (i=0; i<EX_UNIFORM_COLS; i++) {
     // end of array
     if (!ex_uniform_map[shader][i])
       break;
@@ -32,6 +41,10 @@ inline GLint ex_uniform(GLuint shader, const char *str)
     if (ex_uniform_map[shader][i] == key)
       return ex_uniform_locations[shader][i];
   }
+
+  // cache full: uncached lookup (correct, just not accelerated)
+  if (i >= EX_UNIFORM_COLS)
+    return glGetUniformLocation(shader, string);
 
   // store and return it
   GLint value = glGetUniformLocation(shader, string);

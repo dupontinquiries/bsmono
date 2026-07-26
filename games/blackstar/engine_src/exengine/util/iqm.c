@@ -1,7 +1,28 @@
+#include <math.h>
+#include "util/tangents.h"
 #include "util/iqm.h"
 #include "util/io.h"
 #include "util/cache.h"
 #include <string.h>
+
+// Look up a texture, falling back to the other common extension. Colour maps are
+// stored as .jpg (much smaller) while normal/spec maps stay .png (JPEG artifacts
+// wreck normals), but companion names are derived from the diffuse name -- so a
+// derived "norm_foo.jpg" must still find the real "norm_foo.png".
+static GLuint ex_cache_texture_alt(const char *name)
+{
+  GLuint id = ex_cache_texture(name);
+  if (id) return id;
+  size_t n = strlen(name);
+  if (n < 5) return 0;
+  char alt[512];
+  if (n >= sizeof(alt)) return 0;
+  strcpy(alt, name);
+  if (strcmp(alt + n - 4, ".jpg") == 0)      strcpy(alt + n - 4, ".png");
+  else if (strcmp(alt + n - 4, ".png") == 0) strcpy(alt + n - 4, ".jpg");
+  else return 0;
+  return ex_cache_texture(alt);
+}
 
 ex_model_t *ex_iqm_load_model(ex_scene_t *scene, const char *path, uint8_t flags)
 {
@@ -41,6 +62,7 @@ ex_model_t *ex_iqm_load_model(ex_scene_t *scene, const char *path, uint8_t flags
   // set the vertices
   ex_vertex_t *vertices  = malloc(sizeof(ex_vertex_t)*(header.num_vertexes));
   float *position, *uv, *normal, *tangent;
+  int has_tangent = 0;
   uint8_t *blend_indexes, *blend_weights, *color;
   ex_iqmvertexarray_t *vas = (ex_iqmvertexarray_t *)&data[header.ofs_vertexarrays];
   for (int i=0; i<header.num_vertexarrays; i++) {
@@ -67,6 +89,7 @@ ex_model_t *ex_iqm_load_model(ex_scene_t *scene, const char *path, uint8_t flags
       }
       case IQM_TANGENT: {
         tangent = (float *)&data[va.offset];
+        has_tangent = 1;
         for (int x=0; x<header.num_vertexes; x++)
           memcpy(&vertices[x].tangent, &tangent[x*va.size], va.size*sizeof(float));
         break;
@@ -183,6 +206,27 @@ ex_model_t *ex_iqm_load_model(ex_scene_t *scene, const char *path, uint8_t flags
     indices[i+2] = a;
   }
 
+  // If the mesh shipped without tangents (most of our procedurally-generated IQMs
+  // do), derive them from the UV gradient so normal mapping actually has a valid
+  // tangent basis. Without this the TBN is degenerate and only survives because a
+  // flat normal map collapses TBN*(0,0,1) back to the geometric normal.
+  if (!has_tangent && header.num_vertexes > 0 && header.num_triangles > 0) {
+    int nv = header.num_vertexes;
+    float *pos = malloc(sizeof(float)*nv*3), *uvp = malloc(sizeof(float)*nv*2);
+    float *nrm = malloc(sizeof(float)*nv*3), *tn4 = malloc(sizeof(float)*nv*4);
+    if (pos && uvp && nrm && tn4) {
+      for (int x=0; x<nv; x++) {
+        pos[x*3]=vertices[x].position[0]; pos[x*3+1]=vertices[x].position[1]; pos[x*3+2]=vertices[x].position[2];
+        uvp[x*2]=vertices[x].uv[0];       uvp[x*2+1]=vertices[x].uv[1];
+        nrm[x*3]=vertices[x].normal[0];   nrm[x*3+1]=vertices[x].normal[1];   nrm[x*3+2]=vertices[x].normal[2];
+      }
+      ex_compute_tangents(pos, uvp, nrm, tn4, nv, indices, header.num_triangles);
+      for (int x=0; x<nv; x++)
+        for (int k=0;k<4;k++) vertices[x].tangent[k] = tn4[x*4+k];
+    }
+    free(pos); free(uvp); free(nrm); free(tn4);
+  }
+
   // create the model
   ex_model_t *model = ex_model_new();
   model->bones       = bones;
@@ -276,19 +320,19 @@ ex_model_t *ex_iqm_load_model(ex_scene_t *scene, const char *path, uint8_t flags
         char spec[strlen(tex_name)+strlen(tex_types[0])+1];
         strcpy(spec, tex_types[0]);
         strcpy(&spec[strlen(tex_types[0])], tex_name);
-        m->texture_spec = ex_cache_texture(spec);
+        m->texture_spec = ex_cache_texture_alt(spec);
 
         // norm
         char norm[strlen(tex_name)+strlen(tex_types[1])+1];
         strcpy(norm, tex_types[1]);
         strcpy(&norm[strlen(tex_types[1])], tex_name);
-        m->texture_norm = ex_cache_texture(norm);
+        m->texture_norm = ex_cache_texture_alt(norm);
 
         // emission (emit_<tex>): additive self-lit detail; absent -> 0 (no glow)
         char emit[strlen(tex_name)+6];
         strcpy(emit, "emit_");
         strcpy(&emit[5], tex_name);
-        m->texture_emission = ex_cache_texture(emit);
+        m->texture_emission = ex_cache_texture_alt(emit);
       }
     }
 

@@ -180,5 +180,19 @@ void ex_render_destroy();
 extern float ex_clear_color[3];
 extern float ex_fog_color[3];
 extern float ex_fog_density;
+extern float ex_gfx_quality;
+extern float ex_render_time;
+extern float ex_sun_dir[3];
+extern float ex_sun_strength;
+extern float ex_sun_color[3];
+extern float ex_wetness;
+extern float ex_sun_uv[2];
+extern float ex_sun_vis;
+extern float ex_grade_warm[3];
+extern float ex_grade_cool[3];
+extern float ex_cloud_amt;
+extern float ex_exposure;
+extern float ex_render_scale;
+extern int   ex_shadow_map_size;
 
 #endif // EX_RENDERER_H

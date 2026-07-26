@@ -15,6 +15,7 @@ ex_enemy_t ex_enemy_new_kind(int id, vec3 pos, float hp, ex_enemy_kind kind, ex_
   ex_enemy_t e;
   memset(&e, 0, sizeof(e));
   e.id = id;
+  e.squad = -1;         // independent until a commander claims it
   e.kind = kind;
   e.element = element;
   e.position[0] = pos[0]; e.position[1] = pos[1]; e.position[2] = pos[2];
@@ -44,8 +45,8 @@ ex_enemy_t ex_enemy_new_kind(int id, vec3 pos, float hp, ex_enemy_kind kind, ex_
     e.radius = 0.8f;
     e.hp = e.max_hp = 45.0f;
     e.move_speed = 8.5f;
-    e.sight_range = 90.0f;
-    e.attack_range = 26.0f;   // erratic ranged pot-shots while closing
+    e.sight_range = 130.0f;
+    e.attack_range = 70.0f;   // erratic ranged pot-shots while closing, from range
     e.fire_cooldown = 0.5f;
     e.fire_timer = 0.0f;
   }
@@ -67,13 +68,18 @@ ex_enemy_t ex_enemy_new_kind(int id, vec3 pos, float hp, ex_enemy_kind kind, ex_
     e.phase = 1;
     e.slam_timer = 6.0f;
     e.summon_timer = 12.0f;
-  } else {
+  } else if (kind == EX_ENEMY_GRUNT) {
+    // standard ranged trooper: the default enemy. Long sight + range so it
+    // engages from real distance instead of being a free target up close.
     e.move_speed = 4.0f;
-    e.sight_range = 40.0f;   // long-range design: enemies notice from far
-    e.attack_range = 22.0f;  // and open fire at range, not point blank
-    e.fire_cooldown = 1.4f;
+    e.sight_range = 140.0f;  // long-range design: notice + engage from real distance
+    e.attack_range = 90.0f;  // open fire at range (was 22 -- you could poke them freely from outside it)
+    e.fire_cooldown = 1.1f;
     e.fire_timer = 0.0f;
   }
+  // NOTE: CORRUPTED and HIJACK set their own stats in their if-blocks above and
+  // must NOT be caught by a catch-all else here (that was a bug: it clobbered
+  // the melee-hunter + swarm profiles with grunt ranges).
   e.wants_to_fire = 0;
   return e;
 }
@@ -189,12 +195,38 @@ void ex_enemy_update(ex_enemy_t *e, ex_chunk_world_t *chunks, vec3 player_pos, f
       break;
 
     case EX_ENEMY_CHASE: {
-      if (dist <= e->attack_range && has_los) {
+      // COMMANDER DOWN -> SCATTER: with its leader dead, this troop panics and
+      // flees the player erratically, abandoning its zone. This is the payoff
+      // for decapitating a squad -- it visibly breaks apart.
+      if (e->scatter_t > 0.0f) {
+        if (dist > 1e-3f) {
+          float inv = 1.0f / dist;
+          float ax = -to_player[0] * inv, az = -to_player[2] * inv;  // away from player
+          e->stage_timer += dt;
+          float w = sinf(e->stage_timer * 5.0f + (float)e->id) * 0.9f; // erratic veer
+          float px = -az, pz = ax;
+          ax += px * w; az += pz * w;
+          float l = sqrtf(ax*ax+az*az); if (l>1e-3f){ ax/=l; az/=l; }
+          e->position[0] += ax * e->move_speed * 1.2f * dt;   // flee a touch faster
+          e->position[2] += az * e->move_speed * 1.2f * dt;
+        }
+        break;   // no firing while panicking
+      }
+      // Destiny owned-space: hold at the zone's standoff distance rather than
+      // crowding the player. Front line stands off close, back line far.
+      // DEMORALIZED squads (leader dead, panic over) hold much wider + shyer.
+      float hold = e->standoff;
+      if (e->demoralized) hold = (hold > 0.0f ? hold : 8.0f) + 18.0f;
+      // fire whenever in weapon range AND we've reached our hold line (or have
+      // no hold). standoff governs WALK distance; attack_range governs SHOOT
+      // distance -- so a back-line unit holds far but still opens fire at range.
+      int at_hold = (hold <= 0.0f) || (dist <= hold + 1.0f);
+      if (dist <= e->attack_range && has_los && at_hold) {
         e->state = EX_ENEMY_ATTACK;
         break;
       }
-      // walk toward the player on XZ
-      if (dist > 1e-3f) {
+      // walk toward the player on XZ, but stop advancing once at standoff
+      if (dist > 1e-3f && (hold <= 0.0f || dist > hold)) {
         float inv = 1.0f / dist;
         float mx = to_player[0] * inv, mz = to_player[2] * inv;
         // Hijacks move erratically -- a wobbling strafe layered on the approach,

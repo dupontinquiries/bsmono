@@ -3,6 +3,7 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "render/stb_image.h"
+#include "render/ctex.h"   /* CTEX compressed textures unpack on load (uses engine miniz) */
 
 ex_texture_t* ex_texture_load(const char *file_name, int get_data)
 {
@@ -33,7 +34,15 @@ ex_texture_t* ex_texture_load(const char *file_name, int get_data)
 
   // attempt to load image
   int w,h,n;
-  uint8_t *data = stbi_load_from_memory((uint8_t*)buff, size, &w, &h, &n, 4);
+  // CTEX compressed textures unpack to RGBA here (no new dep -- uses engine miniz).
+  // Falls through to stb_image for ordinary .png/.jpg.
+  uint8_t *data = NULL;
+  int ctex_ok = ex_ctex_decode((uint8_t*)buff, size, &data, &w, &h);
+  if (ctex_ok == 1) {
+    n = 4;   // CTEX always yields RGBA
+  } else {
+    data = stbi_load_from_memory((uint8_t*)buff, size, &w, &h, &n, 4);
+  }
   if (data == NULL) {
     printf("Could not load texture %s\n", file_dir);
     return NULL;

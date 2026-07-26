@@ -283,6 +283,14 @@ void ex_sound_gain(ex_source_t *s, float gain)
   if (s) alSourcef(s->id, AL_GAIN, gain);
 }
 
+void ex_sound_pitch(ex_source_t *s, float pitch)
+{
+  if (!s) return;
+  if (pitch < 0.5f) pitch = 0.5f;
+  if (pitch > 2.0f) pitch = 2.0f;
+  alSourcef(s->id, AL_PITCH, pitch);
+}
+
 void ex_sound_play(ex_source_t *s)
 {
   // dont continue stopped stream until restarted

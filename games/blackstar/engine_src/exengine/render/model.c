@@ -16,6 +16,7 @@ ex_model_t* ex_model_new()
   m->is_lit    = 1;
   m->emissive_solid = 0;        // MUST default off -- garbage here renders the model
   m->emission_strength = 0.0f;  // as a flat pure-tint block on EVERY model
+  m->mat_boost = 0.0f;          // 0 -> shader treats as 1.0 (no boost); imported models raise it
   m->use_transform  = 0;
 
   m->current_anim  = NULL;

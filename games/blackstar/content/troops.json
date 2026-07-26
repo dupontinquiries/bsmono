@@ -1,0 +1,273 @@
+{
+ "_doc": "A TROOP composes a body (chassis + signature backpiece) with a weapon fire-mode and abilities. This is the rearrangement layer: new troop variants are authored here by referencing existing chassis/signatures/weapons/abilities -- no new art or C code needed. 'kind' = player_class | enemy | variant. References are validated against the other content files by content_build.py.",
+ "troops": {
+  "vanguard": {
+   "kind": "player_class",
+   "class": "EX_CLASS_VANGUARD",
+   "chassis": "standard",
+   "signature": "wing_cannon",
+   "fire_mode": "bolt",
+   "abilities": [
+    "dash",
+    "overclock"
+   ],
+   "tint": [
+    150,
+    170,
+    200
+   ]
+  },
+  "interceptor": {
+   "kind": "player_class",
+   "class": "EX_CLASS_INTERCEPTOR",
+   "chassis": "angular",
+   "signature": "recon",
+   "fire_mode": "burst",
+   "abilities": [
+    "dash",
+    "cloak"
+   ],
+   "tint": [
+    120,
+    200,
+    180
+   ]
+  },
+  "titan": {
+   "kind": "player_class",
+   "class": "EX_CLASS_TITAN",
+   "chassis": "juggernaut",
+   "signature": "heavy_cannon",
+   "fire_mode": "plasma",
+   "abilities": [
+    "shield",
+    "hover"
+   ],
+   "tint": [
+    200,
+    150,
+    90
+   ]
+  },
+  "specialist": {
+   "kind": "player_class",
+   "class": "EX_CLASS_SPECIALIST",
+   "chassis": "strider",
+   "signature": "cable",
+   "fire_mode": "beam",
+   "abilities": [
+    "turret",
+    "overclock"
+   ],
+   "tint": [
+    160,
+    140,
+    200
+   ]
+  },
+  "reaver": {
+   "kind": "player_class",
+   "class": "EX_CLASS_REAVER",
+   "chassis": "raptor",
+   "signature": "harpoon",
+   "fire_mode": "ricochet",
+   "abilities": [
+    "dash",
+    "blink"
+   ],
+   "tint": [
+    200,
+    100,
+    110
+   ]
+  },
+  "warden": {
+   "kind": "player_class",
+   "class": "EX_CLASS_WARDEN",
+   "chassis": "bruiser",
+   "signature": "aegis",
+   "fire_mode": "suppress",
+   "abilities": [
+    "shield",
+    "turret"
+   ],
+   "tint": [
+    120,
+    160,
+    210
+   ]
+  },
+  "pyre": {
+   "kind": "player_class",
+   "class": "EX_CLASS_PYRE",
+   "chassis": "angular",
+   "signature": "solar",
+   "fire_mode": "flak",
+   "abilities": [
+    "overclock",
+    "dash"
+   ],
+   "tint": [
+    230,
+    130,
+    60
+   ]
+  },
+  "prime": {
+   "kind": "player_class",
+   "class": "EX_CLASS_PRIME",
+   "chassis": "sentinel",
+   "signature": "halo",
+   "fire_mode": "wave",
+   "abilities": [
+    "shield",
+    "resonance"
+   ],
+   "tint": [
+    210,
+    60,
+    60
+   ],
+   "frame": "prime"
+  },
+  "scout": {
+   "kind": "player_class",
+   "class": "EX_CLASS_SCOUT",
+   "chassis": "raptor",
+   "signature": "recon",
+   "fire_mode": "lob",
+   "abilities": [
+    "cloak",
+    "hover"
+   ],
+   "tint": [
+    140,
+    200,
+    120
+   ]
+  },
+  "siege": {
+   "kind": "player_class",
+   "class": "EX_CLASS_SIEGE",
+   "chassis": "juggernaut",
+   "signature": "mortar",
+   "fire_mode": "lob",
+   "abilities": [
+    "shield",
+    "turret"
+   ],
+   "tint": [
+    170,
+    150,
+    120
+   ]
+  },
+  "grunt": {
+   "kind": "enemy",
+   "chassis": "standard",
+   "signature": "wing_cannon",
+   "fire_mode": "bolt",
+   "abilities": [],
+   "tint": [
+    130,
+    130,
+    140
+   ]
+  },
+  "blackstar_raider": {
+   "kind": "enemy",
+   "chassis": "angular",
+   "signature": "harpoon",
+   "fire_mode": "pierce",
+   "abilities": [
+    "dash"
+   ],
+   "tint": [
+    180,
+    90,
+    200
+   ],
+   "frame": "corsair"
+  },
+  "ravager": {
+   "kind": "enemy",
+   "chassis": "bruiser",
+   "signature": "heavy_cannon",
+   "fire_mode": "flak",
+   "abilities": [],
+   "tint": [
+    200,
+    110,
+    70
+   ],
+   "frame": "corsair"
+  },
+  "slipstream": {
+   "kind": "enemy",
+   "chassis": "raptor",
+   "signature": "recon",
+   "fire_mode": "burst",
+   "abilities": [
+    "dash"
+   ],
+   "tint": [
+    110,
+    190,
+    210
+   ],
+   "frame": "corsair"
+  },
+  "ashfall_lancer": {
+   "kind": "variant",
+   "of": "blackstar_raider",
+   "chassis": "raptor",
+   "signature": "solar",
+   "fire_mode": "flak",
+   "abilities": [
+    "dash",
+    "overclock"
+   ],
+   "tint": [
+    255,
+    120,
+    60
+   ],
+   "_note": "NEW: an ember-scorched Kuiper skirmisher -- raider profile rebuilt on a fast raptor frame with a solar backpiece and airburst flak.",
+   "frame": "corsair"
+  },
+  "hoarfrost_sentinel": {
+   "kind": "variant",
+   "of": "grunt",
+   "chassis": "sentinel",
+   "signature": "aegis",
+   "fire_mode": "suppress",
+   "abilities": [
+    "shield"
+   ],
+   "tint": [
+    150,
+    200,
+    255
+   ],
+   "_note": "NEW: a tall spindly Pluto-line guardian -- freeze-beam and a shield, holds ground on the containment ring.",
+   "frame": "corsair"
+  },
+  "magma_breaker": {
+   "kind": "variant",
+   "of": "ravager",
+   "chassis": "bruiser",
+   "signature": "mortar",
+   "fire_mode": "lob",
+   "abilities": [
+    "shield"
+   ],
+   "tint": [
+    230,
+    90,
+    40
+   ],
+   "_note": "NEW: a mantle-dive heavy -- bruiser frame, mortar backpiece, lobbed magma. Pairs with the emberpit / foundry energon surges.",
+   "frame": "corsair"
+  }
+ }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "raid-content"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "raid-content"
+path = "src/main.rs"
