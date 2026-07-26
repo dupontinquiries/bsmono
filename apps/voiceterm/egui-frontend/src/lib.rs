@@ -21,6 +21,15 @@ pub mod setup_wizard;
 pub mod action_compass;
 pub mod shell;
 pub mod gesture_menus;
+
+/// voiceterm's tab + pane model, shared with the QML frontend rather than
+/// reimplemented here. It is pure `std` (no Qt, no `crate::`) and carries 28
+/// tests in the app crate, so `#[path]` costs nothing and guarantees the two
+/// frontends cannot drift. Lifting it into `uikit-term` alongside the block
+/// tracking (8e93585) is the natural follow-up once a host that can build
+/// egui 0.34 is available to validate the move.
+#[path = "../../src/terminal_workspace.rs"]
+pub mod terminal_workspace;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;
