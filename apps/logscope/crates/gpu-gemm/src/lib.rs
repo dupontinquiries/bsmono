@@ -6448,7 +6448,23 @@ that looks wrong.");
         // tensors to actually be present so a mislabeled dense file falls through to the dense path.
         let n_expert = g.get_u32(&format!("{pfx}.expert_count")).unwrap_or(0) as usize;
         let n_expert_used = g.get_u32(&format!("{pfx}.expert_used_count")).unwrap_or(8) as usize;
-        let expert_ff = g.get_u32(&format!("{pfx}.expert_feed_forward_length")).unwrap_or(0) as usize;
+        // Expert FFN width. llama.cpp falls back to n_ff / n_expert_used when the key is absent
+        // (qwen3moe.cpp:50), and that fallback matters: without it expert_ff is 0, `is_moe` goes false,
+        // and a MoE checkpoint loads as DENSE — reading expert tensors as if they were a single FFN.
+        // That is a silent structural misread, not a clean failure.
+        let expert_ff = {
+            let declared = g.get_u32(&format!("{pfx}.expert_feed_forward_length")).unwrap_or(0) as usize;
+            if declared > 0 { declared } else {
+                let n_used_meta = g.get_u32(&format!("{pfx}.expert_used_count")).unwrap_or(0) as usize;
+                let ff_meta = g.get_u32(&format!("{pfx}.feed_forward_length")).unwrap_or(0) as usize;
+                if n_used_meta > 0 && ff_meta > 0 {
+                    let derived = ff_meta / n_used_meta;
+                    eprintln!("loader: {pfx}.expert_feed_forward_length absent — deriving {derived} from \
+feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
+                    derived
+                } else { 0 }
+            }
+        };
         let is_moe = acfg.moe && n_expert > 0 && expert_ff > 0
             && (0..g.get_u32(&format!("{pfx}.block_count")).unwrap_or(0)).any(|b| g.tensor(&format!("blk.{b}.ffn_gate_exps.weight")).is_some());
         let h = match g.get_u32(&format!("{pfx}.feed_forward_length")) {

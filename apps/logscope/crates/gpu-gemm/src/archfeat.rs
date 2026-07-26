@@ -328,6 +328,22 @@ mod tests {
     }
 
     #[test]
+    fn the_three_moe_gating_shapes_stay_distinct() {
+        // Graph-level reads confirmed two DIFFERENT MoE conventions, and a third architecture family
+        // uses a third. Collapsing them is the same class of mistake as the two Q/K norms.
+        let l4 = crate::archcfg::moe_config(&crate::archcfg::for_arch("llama4"), 16, 1, 1);
+        let q3 = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
+        // llama4: sigmoid, weight on the expert INPUT, no normalization
+        assert_eq!(l4.norm, crate::moe::RouteNorm::Sigmoid);
+        assert!(l4.weight_before && !l4.normalize);
+        // qwen3moe: softmax over NORMALIZED weights, applied on the output
+        assert_eq!(q3.norm, crate::moe::RouteNorm::Softmax);
+        assert!(!q3.weight_before && q3.normalize);
+        // and they must not be the same config by accident
+        assert_ne!((l4.norm, l4.weight_before, l4.normalize), (q3.norm, q3.weight_before, q3.normalize));
+    }
+
+    #[test]
     fn llama4_was_verified_at_graph_level_and_its_routing_is_sigmoid() {
         // The graph-level read of llama4.cpp found no gaps. The single most load-bearing thing it
         // confirmed is the expert gating: Llama-4 uses SIGMOID with the weight applied to the expert's
