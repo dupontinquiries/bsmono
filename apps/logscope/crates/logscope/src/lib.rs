@@ -13,6 +13,7 @@ pub mod modelorg;
 pub mod residency;
 pub mod liaison;
 pub mod liaison_prompt;
+pub mod codecompare;
 pub mod exploration;
 pub mod blackboard;
 pub mod budget;
