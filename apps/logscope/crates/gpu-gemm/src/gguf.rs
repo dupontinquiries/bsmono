@@ -127,6 +127,18 @@ impl Gguf {
     ///   3. else the declared arch as-is, else "llama".
     /// The caller still gates on the result, so a recovered unsupported arch (e.g. gemma2) is refused
     /// clearly and safely instead of loading with the wrong forward path.
+    /// The DECLARED architecture, exactly as the file states it — no recovery, no inference.
+    ///
+    /// `arch()` falls back to the metadata-key prefix when the declared name has no matching keys, which
+    /// rescues a converter's mislabel. But the two answers disagreeing is itself information: a file
+    /// saying "gemma2" while carrying `llama.*` keys is either mislabeled OR a real Gemma the converter
+    /// wrote oddly, and silently choosing "llama" for the second case loads the wrong forward pass and
+    /// produces fluent garbage. Callers that care about refusing unsupported architectures should consult
+    /// this as well as `arch()`.
+    pub fn declared_arch(&self) -> Option<String> {
+        self.get_str("general.architecture").map(str::to_string)
+    }
+
     pub fn arch(&self) -> String {
         if let Some(a) = self.get_str("general.architecture") {
             if self.metadata.contains_key(&format!("{a}.embedding_length")) { return a.to_string(); }

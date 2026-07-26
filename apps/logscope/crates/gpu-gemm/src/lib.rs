@@ -6242,6 +6242,26 @@ impl Gpu {
         // converter's mislabel, e.g. an Ornith GGUF missing general.architecture), else "llama". So a
         // mislabeled-but-supported model loads, and a genuinely unsupported one is named correctly below.
         let arch = g.arch();
+        // If the file DECLARES an architecture we recognise and cannot run, refuse on that name — do not
+        // let the key-prefix fallback rescue it into something else. The fallback exists to recover a
+        // converter's mislabel, and it is right for an UNKNOWN declaration; but when a file plainly says
+        // "gemma2" and we know gemma2 is unsupported, resolving it to "llama" because it happens to carry
+        // llama.* keys means running the wrong forward pass and emitting fluent garbage. An explicit,
+        // recognised declaration is stronger evidence than an inferred prefix.
+        if let Some(declared) = g.declared_arch() {
+            if declared != arch {
+                let dcfg = crate::archcfg::for_arch(&declared);
+                if !matches!(dcfg.arch, crate::archcfg::Arch::Unknown) && !dcfg.supported && !dcfg.dense_supported {
+                    return Err(format!("this file DECLARES architecture '{declared}', which the wgpu engine \
+does not support ({}). Its metadata keys use the '{arch}' prefix, so the loader could have treated it as \
+'{arch}' — but running the wrong forward pass produces plausible-looking nonsense rather than an error, so \
+it refuses instead. Use the llama.cpp backend for this model.", dcfg.note));
+                }
+                eprintln!("wgpu-engine: file declares architecture '{declared}' but its metadata keys use \
+the '{arch}' prefix — proceeding as '{arch}' (a converter mislabel); report this if the model is really \
+a '{declared}'");
+            }
+        }
         let acfg = crate::archcfg::for_arch(&arch);
         // MLA is detected by TENSOR PRESENCE, not arch name. The glm4moe family ships in two forms: some
         // use Multi-head Latent Attention (attn_kv_a/kv_b down/up projections — not wired yet), but others
