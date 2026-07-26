@@ -1195,7 +1195,9 @@ impl Gpu {
         let qs_words = total / 32;
         // round the qw region up to 256 bytes (64 words) so the qs view is bindable
         let qs_off_words = (qw_words * 4).div_ceil(256) * 256 / 4;
-        let out = self.alloc(1, qs_off_words + qs_words);
+        // resident weights, NOT scratch: qw/qs views below outlive this handle, so the buffer must
+        // never return to the pool (see alloc_resident_words)
+        let out = self.alloc_resident_words(qs_off_words + qs_words);
         let (gx, gy) = wrapped_grid(nblk);
         let dims = [nblk as u32, qs_off_words as u32, 0u32, gx]; // qw_base = 0
         self.dispatch(Q4K_TO_Q4, &[&src], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
@@ -1216,9 +1218,21 @@ impl Gpu {
     ///
     /// No allocation and no host round-trip — with the file mapped for the process lifetime, the `raw`
     /// slice is a view into the GGUF itself, which is the whole point of Colibri's arrangement.
-    /// A raw word-addressed scratch buffer (one row of `words` f32-sized slots), for kernels that write
-    /// packed data rather than numbers.
+    /// A raw word-addressed SCRATCH buffer. Pooled: it returns to the free list when dropped.
     pub fn alloc_words(&self, words: usize) -> Tensor { self.alloc(1, words) }
+
+    /// A word-addressed buffer that will be held by RESIDENT WEIGHTS, and must never return to the pool.
+    ///
+    /// This distinction is not cosmetic. `Tensor::drop` puts a pooled buffer back on the free list, so if
+    /// a conversion allocates its output from the pool, hands out `qw`/`qs` VIEWS of it, and then drops
+    /// the owning handle, the weight buffer is recycled into the next allocation and the weights are
+    /// silently overwritten. The views keep working — they just read whatever was written there next.
+    /// That produced fluent garbage on every model taking the GPU Q4_K path.
+    pub fn alloc_resident_words(&self, words: usize) -> Tensor {
+        let mut t = self.alloc(1, words);
+        t.pool = None; // detach from the pool: the weights outlive this handle
+        t
+    }
 
     /// Read a word-addressed buffer back as u32s.
     pub fn download_words(&self, t: &Tensor) -> Vec<u32> {
@@ -6582,7 +6596,7 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
                             let total = n * k;
                             let (qw_words, qs_words) = (total / 8, total / 32);
                             let qs_off_words = (qw_words * 4).div_ceil(256) * 256 / 4;
-                            let out = self.alloc_words(qs_off_words + qs_words);
+                            let out = self.alloc_resident_words(qs_off_words + qs_words);
                             self.q4k_defer(&out, raw, n, k, 0, qs_off_words);
                             let qw = Tensor { buf: out.buf.clone(), rows: n, cols: k, pool: None,
                                               view: Some((0, (qw_words * 4) as u64)) };
@@ -6779,8 +6793,9 @@ host-copy path (dequantize + requantize every expert into RAM)");
                             // repin re-converts in place, so correcting the pin set costs a GPU pass.
                             let mut pinned_raw = std::collections::HashMap::new();
                             for e in 0..pin {
-                                let gb = self.alloc_words(gu_total / 4);
-                                let db = self.alloc_words(dn_total / 4);
+                                // pinned expert blobs are resident weights, not scratch
+                                let gb = self.alloc_resident_words(gu_total / 4);
+                                let db = self.alloc_resident_words(dn_total / 4);
                                 if let (Some(gt), Some(ut), Some(dt)) = (r.gate_of(e), r.up_of(e), r.down_of(e)) {
                                     // deferred, like the dense weights, so the arena can stay mapped
                                     self.q4k_defer(&gb, gt, expert_ff, d, 0, gu_qs / 4);
@@ -8489,6 +8504,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Upload a flat f32 slice as a [1, n] tensor — for weights whose 2-D shape is carried in MlaDims
     /// rather than in the tensor itself.
     pub fn upload_flat(&self, v: &[f32]) -> Tensor { self.upload(v, 1, v.len()) }
+
+    /// Test hook: copy rows between tensors, for exercising allocator reuse from a gate.
+    pub fn copy_rows_pub(&self, src: &Tensor, dst: &Tensor, dst_row: usize, n: usize, cols: usize) {
+        self.write_rows(dst, src, dst_row, n, cols);
+    }
 
     /// Test hook: a sub-range view of a tensor, for exercising windowed reads from a gate.
     pub fn tensor_view(&self, t: &Tensor, off: u64, size: u64, rows: usize, cols: usize) -> Tensor {

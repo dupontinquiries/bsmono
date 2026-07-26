@@ -3392,6 +3392,32 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
                got.len() == want.len() && got == want);
         }
 
+        // BUFFER LIFETIME. Every check above converts and reads back immediately, so none of them could
+        // see the bug that actually shipped: the conversion allocated its output from the POOL, handed out
+        // qw/qs views, then dropped the owning handle — returning the weight buffer to the free list,
+        // where the next allocation reused it and overwrote the weights. Here we convert, then allocate
+        // and WRITE a pile of scratch, then read the weights back.
+        {
+            let (rows, k) = (8usize, 512usize);
+            let total = rows * k;
+            let nb = total / 256;
+            let raw: Vec<u8> = (0..nb * 144).map(|i| ((i * 13 + 5) % 249) as u8).collect();
+            let lin = gpu_kernels::Lin::q4(gpu.q4k_to_q4_resident(&raw, rows, k));
+            let xv: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.011).cos()).collect();
+            let xt = gpu.upload(&xv, 1, k);
+            let before = gpu.download(&lin.apply(&gpu, &xt, 1));
+            // churn the allocator: if the weight buffer went back to the pool, one of these reclaims it
+            for i in 0..24 {
+                let scratch = gpu.alloc_words(total / 8 + total / 32);
+                let fill: Vec<f32> = vec![(i as f32) + 7.0; 64];
+                let ft = gpu.upload(&fill, 1, 64);
+                gpu.copy_rows_pub(&ft, &scratch, 0, 1, 64);
+            }
+            let after = gpu.download(&lin.apply(&gpu, &xt, 1));
+            let d = before.iter().zip(&after).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("converted weights survive allocator churn (max|diff|={d:.3e})"), d == 0.0);
+        }
+
         // LARGE TENSOR: every previous check used a few dozen super-blocks, so all of them fit in a 1-D
         // dispatch and none exercised the 65535 per-dimension limit. A real weight matrix does not — this
         // one needs 70000+ workgroups, and before the grid wrapped it produced a validation error that the
