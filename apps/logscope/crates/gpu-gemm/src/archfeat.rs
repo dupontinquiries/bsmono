@@ -37,6 +37,14 @@ pub enum Feature {
     SharedExpert,
     /// Expert tensors present on only some blocks (interleave_moe_layer_step).
     InterleavedMoe,
+    /// Standard sliding-window attention on a repeating layer pattern, with a SEPARATE rope frequency
+    /// base on the windowed layers (Gemma 2/3/4). Distinct from Llama-4's `ChunkedSwa`.
+    StandardSwa,
+    /// Post-normalization after attention and after the FFN, on top of the usual pre-norms (Gemma family).
+    PostNorm,
+    /// Per-layer rope frequency tensors, so full-attention layers scale rope differently from windowed
+    /// ones (Gemma 4 `rope_freqs`).
+    PerLayerRopeFreqs,
 }
 
 impl Feature {
@@ -50,6 +58,9 @@ impl Feature {
             Feature::Mla => "multi-head latent attention",
             Feature::SharedExpert => "shared expert",
             Feature::InterleavedMoe => "interleaved MoE layers",
+            Feature::StandardSwa => "sliding-window attention (with a separate rope base)",
+            Feature::PostNorm => "post-attention / post-FFN normalization",
+            Feature::PerLayerRopeFreqs => "per-layer rope frequency tensors",
         }
     }
 
@@ -62,8 +73,11 @@ impl Feature {
             Feature::QkNormPreRope => true,  // qk_norm with learned weights (Qwen3)
             Feature::SharedExpert => true,   // MoeLayer::shared
             Feature::InterleavedMoe => true, // per-block expert-set detection in the loader
+            Feature::PostNorm => true,       // Gemma2 support carries attn/ffn post-norms
             Feature::ChunkedSwa => false,    // not implemented; full attention is used instead
             Feature::Mla => false,           // compute paths validated but NOT wired into decode
+            Feature::StandardSwa => false,   // not implemented; every layer attends fully
+            Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
         }
     }
 
@@ -71,6 +85,10 @@ impl Feature {
     pub fn note(self) -> Option<&'static str> {
         match self {
             Feature::ChunkedSwa => Some("affects long contexts only; short prompts behave normally"),
+            Feature::StandardSwa => Some("windowed layers attend to the whole context instead — correct \
+below the window (Gemma 2: 4096 tokens), increasingly wrong beyond it"),
+            Feature::PerLayerRopeFreqs => Some("full-attention layers get the windowed layers' rope base; \
+matters most on long contexts"),
             Feature::Mla => Some("the compute kernels exist and are validated, but are not wired into live decode"),
             _ => None,
         }
@@ -95,6 +113,12 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
             v
         }
         "qwen3moe" | "qwen3" | "qwen35" => vec![Feature::QkNormPreRope],
+        // Gemma 2/3/4 all use standard SWA on a layer pattern with a separate rope base; 3 and 4 add
+        // learned Q/K norms before rope, and 4 adds per-layer rope frequency tensors.
+        "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm],
+        "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope],
+        "gemma4" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
+                         Feature::PerLayerRopeFreqs],
         "glm4moe" | "glm-dsa" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
         _ => Vec::new(),
     }
@@ -150,6 +174,37 @@ mod tests {
         assert!(g.contains(&Feature::Mla));
         assert!(!g.contains(&Feature::SharedExpert), "shared expert IS implemented");
         assert!(gap_report("glm4moe", 0).iter().any(|s| s.contains("not wired into live decode")));
+    }
+
+    #[test]
+    fn gemma_support_is_partial_and_says_so() {
+        // We claim Gemma2 support, but llama.cpp's gemma2.cpp sets swa_type = STANDARD with n_swa = 4096
+        // and a layer pattern — the same shape of undeclared gap Llama-4 had. It must be reported.
+        let g2 = gaps("gemma2", 0);
+        assert!(g2.contains(&Feature::StandardSwa), "Gemma2 needs SWA and we do not implement it");
+        assert!(!g2.contains(&Feature::PostNorm), "post-norms ARE implemented");
+        // and the consequence is bounded, not total: correct below the window
+        assert!(gap_report("gemma2", 0).iter().any(|s| s.contains("below the window")));
+    }
+
+    #[test]
+    fn gemma4_adds_per_layer_rope_on_top_of_gemma3() {
+        let g3 = required("gemma3", 0);
+        let g4 = required("gemma4", 0);
+        assert!(g3.contains(&Feature::QkNormPreRope) && g4.contains(&Feature::QkNormPreRope));
+        assert!(!g3.contains(&Feature::PerLayerRopeFreqs), "gemma3 has no per-layer rope freqs");
+        assert!(g4.contains(&Feature::PerLayerRopeFreqs), "gemma4 does (rope_freqs per layer)");
+    }
+
+    #[test]
+    fn the_two_sliding_windows_are_distinct_features() {
+        // Llama-4 uses CHUNKED SWA; Gemma uses STANDARD SWA with a separate rope base. Implementing one
+        // does not give the other, so they must not collapse — the same trap as the two Q/K norms.
+        assert_ne!(Feature::ChunkedSwa, Feature::StandardSwa);
+        assert!(required("llama4", 16).contains(&Feature::ChunkedSwa));
+        assert!(!required("llama4", 16).contains(&Feature::StandardSwa));
+        assert!(required("gemma3", 0).contains(&Feature::StandardSwa));
+        assert!(!required("gemma3", 0).contains(&Feature::ChunkedSwa));
     }
 
     #[test]
