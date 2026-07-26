@@ -4751,7 +4751,17 @@ per-layer routing active");
         // Which layers are windowed. llama.cpp's default pattern puts the FULL-attention layer last in
         // each group (dense_first = false), so a period of 4 gives [swa, swa, swa, dense].
         let swa_period = g.get_u32(&format!("{}.attention.sliding_window_pattern", acfg.prefix))
-            .unwrap_or(if is_llama4 { 4 } else { 0 });
+            // Format defaults when the key is absent, exactly as llama.cpp hardcodes them:
+            // llama4 = 4 (3 chunked : 1 rope-full), gemma3 = 6 (5 local : 1 global),
+            // gemma2 = 2 (alternating). Treating absence as "no pattern" made every gemma
+            // layer windowed — including the global ones, which then also took the SWA rope
+            // base. Absence of a key with a format-defined default is not zero.
+            .unwrap_or(match acfg.arch {
+                _ if is_llama4 => 4,
+                crate::archcfg::Arch::Gemma3 => 6,
+                crate::archcfg::Arch::Gemma2 => 2,
+                _ => 0,
+            });
         let n_swa_layers = g.get_u32(&format!("{}.block_count", acfg.prefix)).unwrap_or(0) as usize;
         let swa_pattern: Vec<bool> = if swa_period > 0 {
             crate::swa::swa_layers(n_swa_layers, swa_period, false)
@@ -5500,10 +5510,18 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // is exactly how llama.cpp gates it (use_kq_norm = type != LLM_TYPE_17B_128E). Applied
                 // after rope by `kq_post`; rope layers only.
                 // Per-layer rope base: Gemma rotates its WINDOWED layers at rope.freq_base_swa and its
-                // full-attention layers at the model base. Only set when the file actually carries the
-                // key AND this layer is windowed — otherwise None, and every other model is untouched.
+                // full-attention layers at the model base. llama.cpp HARDCODES 10000 as the SWA-layer
+                // default for gemma2/gemma3 — most GGUFs don't write the key at all — so absence of the
+                // key on a Gemma is not "no override", it's "use the format's default". Without this,
+                // 5 of every 6 gemma3 layers roped at the GLOBAL base (1e6): 100x-wrong frequencies on
+                // almost the whole stack, which decoded as multilingual token soup on the first real
+                // gemma3 checkpoint this engine ever saw. Non-Gemma archs: key-only, untouched.
                 rope_base: {
-                    let swa_base = g.get_f32(&format!("{}.rope.freq_base_swa", acfg.prefix));
+                    let swa_base = g.get_f32(&format!("{}.rope.freq_base_swa", acfg.prefix))
+                        .or(match acfg.arch {
+                            crate::archcfg::Arch::Gemma2 | crate::archcfg::Arch::Gemma3 => Some(10000.0),
+                            _ => None,
+                        });
                     match (swa_base, swa_pattern.get(i).copied().unwrap_or(false)) {
                         (Some(b), true) if b > 0.0 => Some(b),
                         _ => None,
@@ -6468,9 +6486,9 @@ impl Gpu {
 
     /// As above, with an optional sliding window applied per query row.
     ///
-    /// Only the PARALLEL kernel implements the window. The serial fallback (hd > 192) is left causal-only
-    /// and this refuses to pretend otherwise — silently ignoring the window there would give a model with
-    /// an unusual head_dim quietly wrong prefill, which is the failure mode this project keeps paying for.
+    /// BOTH kernels implement the window: the parallel tiled kernel (hd <= 192) and the serial
+    /// fallback (hd > 192 — gemma3-270m's head_dim=256 lands here). They share the same window
+    /// semantics and are gated against one CPU reference (--gate-swa-serial).
     pub fn attention_mh_ext_swa(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, dm: usize,
                                 n_heads: usize, n_kv_heads: usize,
                                 swa: Option<(u32, crate::swa::SwaType)>) -> Tensor {
@@ -6480,10 +6498,6 @@ impl Gpu {
             Some((n, crate::swa::SwaType::Chunked)) => (n, 2u32),
             _ => (0, 0),
         };
-        if nswa > 0 && hd > 192 {
-            eprintln!("wgpu-engine: sliding window NOT applied in prefill for head_dim={hd} (the serial \
-fallback kernel is causal-only) — long prompts on this model will attend outside the window");
-        }
         let dims = [s as u32, hd as u32, n_heads as u32, n_kv_heads as u32, base as u32, nswa, swaty, 0];
         // The parallel kernel now TILES the KV loop (online softmax over 2048-row tiles at 8 KB shared
         // memory), so it handles ANY causal length at high occupancy — no length cliff. Its per-thread

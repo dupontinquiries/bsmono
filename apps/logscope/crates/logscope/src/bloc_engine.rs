@@ -354,100 +354,171 @@ fn which_exists(cmd: &str) -> bool {
 }
 
 /// Get completion candidates from an LSP server for the current context.
-/// Spawns the server, sends initialize + textDocument/completion, reads response.
-/// This is a simplified single-shot approach; a full impl would keep the server alive.
+///
+/// Sessions are PERSISTENT and POOLED, one per server binary. The old code spawned a fresh
+/// server per call and killed it (without reaping) after one request — with pylsp that means
+/// a new ~100 MB python process per suggestion pass, several alive at once, plus a zombie
+/// left behind each time. That was the "many memory-hungry python processes" bug. Now:
+///   - one live server per language, initialized once, reused across requests;
+///   - every kill is followed by wait() (no zombies), including in Drop;
+///   - a failed/timed-out server is torn down and put on a 30s cooldown, so a broken
+///     install can't respawn-storm either.
 pub fn lsp_completions(ctx: &ScoringCtx) -> Vec<Suggestion> {
-    let lang     = detect_ts_language(ctx);
-    let server   = match detect_lsp_server(lang) { Some(s) => s, None => return vec![] };
-    let file     = match &ctx.file { Some(f) => f, None => return vec![] };
-    let root     = ctx.project_root.clone()
+    let lang   = detect_ts_language(ctx);
+    let server = match detect_lsp_server(lang) { Some(s) => s, None => return vec![] };
+    let file   = match &ctx.file { Some(f) => f, None => return vec![] };
+    let root   = ctx.project_root.clone()
         .or_else(|| file.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // Build minimal LSP JSON-RPC session
     let cursor = ctx.cursor.min(ctx.text.len());
     let before = &ctx.text[..cursor];
     let line   = before.matches('\n').count();
-    let col    = cursor - before.rfind('\n').map(|i| i+1).unwrap_or(0);
-
+    let col    = cursor - before.rfind('\n').map(|i| i + 1).unwrap_or(0);
     let file_uri = format!("file://{}", file.to_string_lossy());
     let root_uri = format!("file://{}", root.to_string_lossy());
 
-    // Three messages: initialize, initialized notification, completion request
-    let msgs = [
-        lsp_msg(1, "initialize", serde_json::json!({
+    let pool = lsp_pool();
+    let mut pool = match pool.lock() { Ok(p) => p, Err(_) => return vec![] };
+    // Cooldown: a server that just failed doesn't get respawned for 30s.
+    if let Some(t) = pool.cooldown.get(server) {
+        if t.elapsed() < std::time::Duration::from_secs(30) { return vec![]; }
+    }
+    let sess = match pool.sessions.remove(server) {
+        Some(s) => s,
+        None => match LspSession::spawn(server, &root_uri) {
+            Some(s) => s,
+            None => { pool.cooldown.insert(server, std::time::Instant::now()); return vec![]; }
+        }
+    };
+    let (sess, out) = sess.completion(&file_uri, lang.unwrap_or("text"), &ctx.text, line, col);
+    match sess {
+        Some(s) => { pool.sessions.insert(server, s); }              // healthy: keep for reuse
+        None => { pool.cooldown.insert(server, std::time::Instant::now()); } // torn down inside
+    }
+    out.map(|raw| parse_lsp_completions(&raw)).unwrap_or_default()
+}
+
+struct LspPool {
+    sessions: std::collections::HashMap<&'static str, LspSession>,
+    cooldown: std::collections::HashMap<&'static str, std::time::Instant>,
+}
+fn lsp_pool() -> &'static std::sync::Mutex<LspPool> {
+    static P: std::sync::OnceLock<std::sync::Mutex<LspPool>> = std::sync::OnceLock::new();
+    P.get_or_init(|| std::sync::Mutex::new(LspPool {
+        sessions: std::collections::HashMap::new(),
+        cooldown: std::collections::HashMap::new(),
+    }))
+}
+
+/// One live LSP server: child + writer handle + a reader thread that frames stdout by
+/// Content-Length and forwards each message body over a channel.
+struct LspSession {
+    child: std::process::Child,
+    stdin: std::process::ChildStdin,
+    rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    next_id: u32,
+}
+
+impl LspSession {
+    fn spawn(server: &str, root_uri: &str) -> Option<Self> {
+        let mut child = std::process::Command::new(server)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn().ok()?;
+        let stdin = child.stdin.take()?;
+        let mut stdout = child.stdout.take()?;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf: Vec<u8> = Vec::new();
+            let mut tmp = [0u8; 8192];
+            loop {
+                // frame out complete Content-Length messages
+                loop {
+                    let Some(hdr_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { break };
+                    let hdr = String::from_utf8_lossy(&buf[..hdr_end]);
+                    let len: usize = hdr.lines()
+                        .find_map(|l| l.strip_prefix("Content-Length:"))
+                        .and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+                    if buf.len() < hdr_end + 4 + len { break; }
+                    let body = buf[hdr_end + 4..hdr_end + 4 + len].to_vec();
+                    buf.drain(..hdr_end + 4 + len);
+                    if tx.send(body).is_err() { return; }
+                }
+                match stdout.read(&mut tmp) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                }
+            }
+        });
+        let mut s = LspSession { child, stdin, rx, next_id: 1 };
+        // initialize handshake, once per session lifetime
+        let id = s.send_req("initialize", serde_json::json!({
             "processId": std::process::id(),
             "rootUri": root_uri,
             "capabilities": {
                 "textDocument": { "completion": { "completionItem": { "snippetSupport": false } } }
             }
-        })),
-        lsp_notif("initialized", serde_json::json!({})),
-        lsp_notif("textDocument/didOpen", serde_json::json!({
-            "textDocument": {
-                "uri": file_uri,
-                "languageId": lang.unwrap_or("text"),
-                "version": 1,
-                "text": ctx.text
-            }
-        })),
-        lsp_msg(2, "textDocument/completion", serde_json::json!({
-            "textDocument": { "uri": file_uri },
-            "position": { "line": line, "character": col }
-        })),
-    ];
+        }))?;
+        s.wait_for(id, std::time::Duration::from_secs(3))?;
+        s.send_notif("initialized", serde_json::json!({}))?;
+        Some(s)
+    }
 
-    let mut child = match std::process::Command::new(server)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
-
-    use std::io::Write;
-    if let Some(stdin) = child.stdin.as_mut() {
-        for m in &msgs {
-            let _ = stdin.write_all(m.as_bytes());
+    fn send(&mut self, msg: &str) -> Option<()> {
+        use std::io::Write;
+        self.stdin.write_all(msg.as_bytes()).ok()
+    }
+    fn send_req(&mut self, method: &str, params: serde_json::Value) -> Option<u32> {
+        let id = self.next_id; self.next_id += 1;
+        self.send(&lsp_msg(id, method, params))?; Some(id)
+    }
+    fn send_notif(&mut self, method: &str, params: serde_json::Value) -> Option<()> {
+        self.send(&lsp_notif(method, params))
+    }
+    /// Drain frames until the response with `id` arrives (notifications are discarded).
+    fn wait_for(&mut self, id: u32, dl: std::time::Duration) -> Option<Vec<u8>> {
+        let needle = format!("\"id\":{id}");
+        let end = std::time::Instant::now() + dl;
+        loop {
+            let left = end.checked_duration_since(std::time::Instant::now())?;
+            let body = self.rx.recv_timeout(left).ok()?;
+            if String::from_utf8_lossy(&body).contains(&needle) { return Some(body); }
         }
     }
 
-    // Run the LSP read loop in a std::thread with a 3s hard timeout.
-    // This keeps the calling rayon thread free to do other work immediately
-    // while waiting — avoiding pool starvation.
-    let output = {
-        use std::io::Read;
-        let mut stdout = match child.stdout.take() { Some(s) => s, None => return vec![] };
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut tmp = [0u8; 4096];
-            loop {
-                match stdout.read(&mut tmp) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        buf.extend_from_slice(&tmp[..n]);
-                        if let Ok(s) = std::str::from_utf8(&buf) {
-                            if s.contains("\"id\":2") { break; }
-                        }
-                        if buf.len() > 256_000 { break; }
-                    }
-                }
-            }
-            let _ = tx.send(buf);
-        });
-        // 3 second hard deadline — LSP must respond quickly or we skip it
-        match rx.recv_timeout(std::time::Duration::from_secs(3)) {
-            Ok(b) => b,
-            Err(_) => { let _ = child.kill(); return vec![]; }
+    /// One completion round-trip. Consumes self; returns it only if the session stayed
+    /// healthy — a failure tears the child down (kill + WAIT) and returns None instead,
+    /// so a wedged server can never be reused or leak.
+    fn completion(mut self, uri: &str, lang: &str, text: &str, line: usize, col: usize)
+        -> (Option<Self>, Option<Vec<u8>>)
+    {
+        let r = (|| -> Option<Vec<u8>> {
+            // didClose + didOpen: spec-clean full-document sync without tracking versions
+            self.send_notif("textDocument/didClose", serde_json::json!({
+                "textDocument": { "uri": uri } }))?;
+            self.send_notif("textDocument/didOpen", serde_json::json!({
+                "textDocument": { "uri": uri, "languageId": lang, "version": 1, "text": text } }))?;
+            let id = self.send_req("textDocument/completion", serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": col } }))?;
+            self.wait_for(id, std::time::Duration::from_secs(3))
+        })();
+        match r {
+            Some(body) => (Some(self), Some(body)),
+            None => { self.teardown(); (None, None) }
         }
-    };
-    let _ = child.kill();
+    }
 
-    // Parse completion items from the response
-    parse_lsp_completions(&output)
+    fn teardown(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait(); // REAP — kill without wait is where the zombies came from
+    }
+}
+impl Drop for LspSession {
+    fn drop(&mut self) { self.teardown(); }
 }
 
 fn lsp_msg(id: u32, method: &str, params: serde_json::Value) -> String {
