@@ -1,0 +1,33 @@
+[package]
+name = "sanity"
+version = "0.1.0"
+edition = "2021"
+# std-only ON PURPOSE (RUST_PORT_PLAN doctrine rule 3): these are edit-time gates —
+# they must build with bare rustc under EITHER in-sandbox toolchain (1.75 or 1.96),
+# no lockfile, no network, no deps. Code stays 1.75-compatible for the same reason.
+
+[dependencies]
+
+[[bin]]
+name = "bracecheck"
+path = "src/bin/bracecheck.rs"
+
+[[bin]]
+name = "tomlstrings"
+path = "src/bin/tomlstrings.rs"
+
+[[bin]]
+name = "aritycheck"
+path = "src/bin/aritycheck.rs"
+
+[[bin]]
+name = "msrvcheck"
+path = "src/bin/msrvcheck.rs"
+
+[[bin]]
+name = "derivecheck"
+path = "src/bin/derivecheck.rs"
+
+[[bin]]
+name = "modcheck"
+path = "src/bin/modcheck.rs"

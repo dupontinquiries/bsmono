@@ -206,6 +206,16 @@ runtime = "none"
 targets = ["desktop"]
 notes = "cargo plugin + macros; makes cross-boundary assumptions explicit"
 
+[tools.sanity]
+path = "tools/sanity"
+kind = "cargo"
+role = "tool"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "no-compile edit gates: six std-only static primitives (bracecheck, tomlstrings, aritycheck, msrvcheck, derivecheck, modcheck) for the mistake classes that actually shipped during no-compile sessions — each README entry names its motivating incident. The layer UNDER tools/rustcheck: rustcheck answers 'did my change break the build' with the compiler as final tier; sanity answers 'is this edit even well-formed' with zero compilation, no deps, either in-sandbox toolchain. Silence is necessary, not sufficient."
+
 [tools.rustcheck]
 path = "tools/rustcheck"
 kind = "python+rust"
