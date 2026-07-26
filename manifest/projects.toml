@@ -388,6 +388,16 @@ runtime = "none"
 targets = ["desktop"]    # cross to phone/x86 unverified — desktop is what has actually been built
 notes = "Cybertron arena/campaign game: C on the exengine core, SDL2 + OpenGL, with an optional Vulkan probe and an optional Rust FSM behind -DUSE_RUST_FSM. Registered on the c4-245 merge because it is now EVIDENCED host-buildable, not merely planned: cmake Release configure + full build + `ctest` are green 64/64 under gcc 13.3 with libsdl2-dev + libGL. Six of the 64 are Python content tests (content_validate, lint_dead_fields, silhouette, map_score, openworld, gltf_roundtrip), gated behind find_package(Python3) so they simply drop out where Python is absent. Two Rust side-crates live here and are NOT part of the cmake build: rust_fsm/ (the FFI state machine) and rust/assetkit (egui asset browser — see its Cargo.toml TODO(hardware): it pins egui 0.29 against shared/uikit's 0.34). Open design item from the merge: game.c carries two escalation-perimeter systems (the drop's station/zone box and the monorepo's gates.c chain), composed rather than deduplicated — see TODO(design) at the site and maintenance/MERGE_C4_245.md."
 
+[tools.health]
+path = "tools/health"
+kind = "cargo"
+role = "tool"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "repo-health scanners (depdrift, hotspots, debtscan, testmap): std-only, no deps, reports over gates (exit 0 unless --fail-on-* asked). Shares tools/sanity's lexer via #[path] — one lexer, one set of lexer bugs. First run's findings are in the commit that added it: egui/eframe at FOUR versions (0.28/0.29/0.34/0.35), wgpu at four (0.19/22/27/29), a 14,816-line function, zero committed dbg! sites, and three orphan .rs files in unendlich (incl. the known netview case, found independently)."
+
 [tools.kbm3]
 path = "tools/kbm3"
 kind = "python+rust"

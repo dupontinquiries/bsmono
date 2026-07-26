@@ -1,0 +1,24 @@
+[package]
+name = "health"
+version = "0.1.0"
+edition = "2021"
+# std-only, 1.75-compatible, no deps — same doctrine as tools/sanity. The shared Rust
+# lexer is sanity's, referenced by #[path]: one lexer, one set of lexer bugs.
+
+[dependencies]
+
+[[bin]]
+name = "depdrift"
+path = "src/bin/depdrift.rs"
+
+[[bin]]
+name = "hotspots"
+path = "src/bin/hotspots.rs"
+
+[[bin]]
+name = "debtscan"
+path = "src/bin/debtscan.rs"
+
+[[bin]]
+name = "testmap"
+path = "src/bin/testmap.rs"
