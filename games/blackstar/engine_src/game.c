@@ -1,4 +1,5 @@
 #include <string.h>
+#include "drift.h"
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -1304,6 +1305,7 @@ static void end_wave_run(int victory){
   g_menu.state = EX_GS_RESULTS; g_menu.cursor = 0;
 }
 static void apply_theme_lighting(const char *mid, float brightness);
+static void realize_sector_cover(const char *mid, uint32_t seed);
 static ex_map_blueprint_t g_blueprint;
 // 2D segment vs AABB (slab test) -- used for line-of-sight through cover
 static int seg_aabb2d(float ax,float az,float bx,float bz,float mnx,float mnz,float mxx,float mxz){
@@ -2364,12 +2366,88 @@ static void escalation_update(float px, float pz) {
   }
 }
 
+/* SECTOR COVER REALIZER -- regenerate the procedural cover for arena `mid` from
+   `seed`: flow-first graph -> best-of-N -> collidable blueprint -> theme materials ->
+   the vol/rock/spire model pool -> greeble surface detail. Extracted from match setup
+   so the space bridge can call it too: every patrol jump now lays its OWN cover
+   (per-sector seed), and drift sectors re-dress an authored terrain entirely. The AI
+   reads g_blueprint live (LOS, cover queries), so sightlines follow automatically. */
+static void realize_sector_cover(const char *mid, uint32_t seed) {
+  ex_map_graph_t bg;
+  uint32_t bseed = ex_mapgraph_select_best(seed, 160, 1300.0f, &bg);
+  ex_mapgraph_to_blueprint(&bg, &g_blueprint, bseed);
+    int theme_mat = 0; // wall
+    if (!strcmp(mid,"foundry")||!strcmp(mid,"mining")||!strcmp(mid,"shield_edge")) theme_mat=2; // plate
+    else if (!strcmp(mid,"wastes")||!strcmp(mid,"emberpit")) theme_mat=1; // rock
+    for (int i = 0; i < g_blueprint.n_vols; i++)
+      if (g_blueprint.vols[i].material==0) g_blueprint.vols[i].material = theme_mat;
+    for (int i = 0; i < EX_MAP_MAX_VOLS; i++) {
+      // hide all three pool slots, then show the one matching the role
+      g_vol_models[i]->position[1] = -1000.0f;
+      g_rock_models[i]->position[1] = -1000.0f;
+      g_spire_models[i]->position[1] = -1000.0f;
+      if (i < g_blueprint.n_vols) {
+        ex_map_vol_t *v = &g_blueprint.vols[i];
+        // material tint
+        float tr,tg,tb;
+        if (v->material==2){ tr=0.45f; tg=0.55f; tb=0.75f; }
+        else if (v->material==1){ tr=0.62f; tg=0.5f; tb=0.38f; }
+        else { tr=0.5f; tg=0.52f; tb=0.56f; }
+        // pick the mesh: smooth rock for blocks/cover, tapered spire for
+        // vantage, box for walls/platforms/channels.
+        ex_model_t *m;
+        if (v->role==EX_VOL_EXPOSE) m = g_spire_models[i];
+        else if (v->role==EX_VOL_BLOCK || v->role==EX_VOL_LOWCOVER || v->role==EX_VOL_HIGHCOVER || v->role==EX_VOL_CONCEAL) m = g_rock_models[i];
+        else m = g_vol_models[i];
+        m->position[0]=v->center[0]; m->position[1]=v->center[1]; m->position[2]=v->center[2];
+        if (m==g_vol_models[i]) {
+          m->scale3[0]=v->half[0]; m->scale3[1]=v->half[1]; m->scale3[2]=v->half[2];
+        } else {
+          // rock/spire meshes are unit-ish; scale to the volume extents
+          m->scale3[0]=v->half[0]; m->scale3[1]=v->half[1]; m->scale3[2]=v->half[2];
+          // The rock mesh is centre-origin, so it must stay CENTERED on the
+          // collider -- previously it was dropped by half its height, which left
+          // the collider top (where you land) floating a half-height ABOVE the
+          // visible rock. Only the tall spire (vantage) keeps the ground offset.
+          if (m==g_spire_models[i]) m->position[1]=v->center[1]-v->half[1];
+        }
+        m->tint[0]=tr; m->tint[1]=tg; m->tint[2]=tb;
+      }
+    }
+    { ex_detail_part_t dparts[EX_MAP_MAX_VOLS]; int ndp=0;
+      for (int i=0;i<g_blueprint.n_vols && ndp<EX_MAP_MAX_VOLS;i++){
+        ex_map_vol_t *v=&g_blueprint.vols[i];
+        // detail only the large structures (towers, platforms, megastructure)
+        if (v->half[0] < 3.0f && v->half[1] < 3.0f) continue;
+        ex_detail_part_t *dp=&dparts[ndp++];
+        dp->offset[0]=v->center[0]; dp->offset[1]=v->center[1]; dp->offset[2]=v->center[2];
+        dp->sx=v->half[0]; dp->sy=v->half[1]; dp->sz=v->half[2];
+        uint8_t mc[3]; if(v->material==2){mc[0]=115;mc[1]=140;mc[2]=190;}else if(v->material==1){mc[0]=160;mc[1]=128;mc[2]=97;}else{mc[0]=128;mc[1]=133;mc[2]=143;}
+        dp->color[0]=mc[0]; dp->color[1]=mc[1]; dp->color[2]=mc[2];
+      }
+      static ex_greeble_t mg[MAP_DETAIL];
+      uint8_t macc[3]={200,180,90};
+      int ng = ex_detail_generate(mg, MAP_DETAIL, dparts, ndp, 0x5EED ^ (g_menu.map_index*13+1), MAP_DETAIL, macc);
+      for (int i=0;i<ng;i++){ ex_model_t *gm=g_map_detail[i];
+        gm->position[0]=mg[i].offset[0]; gm->position[1]=mg[i].offset[1]; gm->position[2]=mg[i].offset[2];
+        gm->scale3[0]=mg[i].sx; gm->scale3[1]=mg[i].sy; gm->scale3[2]=mg[i].sz;
+        gm->tint[0]=mg[i].color[0]/255.0f; gm->tint[1]=mg[i].color[1]/255.0f; gm->tint[2]=mg[i].color[2]/255.0f; }
+      for (int i=ng;i<MAP_DETAIL;i++) g_map_detail[i]->position[1]=-100000.0f;
+    }
+}
+
 /* Space-bridge jump: swap the whole arena to the next moon / outer-rim location,
    keeping the run's energon + perks + forged stats. The world literally opens up. */
 static void escalation_do_travel(float *ppos) {
   static const char *arenas[] = { "kuiper", "outer_rim", "europa", "io", "pluto", "titan",
                                   "mars", "glaciem", "carrion", "trench", "helix", "unicron" };
-  const char *dest = arenas[g_esc_arena % 12];
+  /* DRIFT SECTORS: every 3rd bridge tears somewhere uncharted -- an authored arena's
+     terrain re-dressed with freshly generated cover and a chart-annotation name. The
+     base theme rotates on the DRIFT index with a stride coprime to 12, so a long
+     patrol walks every theme (rules + arithmetic pinned by test_drift). */
+  int jump = g_esc_arena;
+  int is_drift = ex_drift_is(jump);
+  const char *dest = is_drift ? arenas[ex_drift_base(jump / 3, 12)] : arenas[jump % 12];
   g_esc_arena++;
   for (int i=0;i<NUM_THEMES;i++)
     g_theme_models[i]->position[1] = (strcmp(dest,g_theme_ids[i])==0) ? 0.0f : -10000.0f;
@@ -2381,8 +2459,16 @@ static void escalation_do_travel(float *ppos) {
   escalation_setup_stations();     // fresh zones + stations for the new arena
   g_champion_spawned = 0; g_champion_slot = -1; g_champion_kind = 0;  // new sector, new warlord
   g_esc_boss_down = map_has_warlord(dest) ? 0 : 1;
+  /* every sector lays its OWN cover: fresh graph -> blueprint on this arena's
+     terrain, seeded per (jump, mission) so a run's sector 6 is the same sector 6. */
+  realize_sector_cover(dest, ex_drift_seed(jump, g_menu.mission_index));
   ppos[0]=0.0f; ppos[1]=3.0f; ppos[2]=-14.0f;   // arrive at the new spawn
-  snprintf(g_shot_msg,sizeof(g_shot_msg),"SPACE BRIDGE -- arrived: %s", dest); g_shot_timer=3.2f;
+  if (is_drift)
+    snprintf(g_shot_msg,sizeof(g_shot_msg),"SPACE BRIDGE -- DRIFT SECTOR %s-%s (uncharted)",
+             ex_drift_greek(jump / 3), dest);
+  else
+    snprintf(g_shot_msg,sizeof(g_shot_msg),"SPACE BRIDGE -- arrived: %s", dest);
+  g_shot_timer=3.2f;
 }
 
 /* ---- RAID: the endgame. 3 gated phases from raid_plan.h (authored by the openworld
@@ -3134,9 +3220,7 @@ static void start_match(void)
     }
   } else hide_body(g_ally_parts);
   // procedural cover: flow-first graph -> best-of-N -> collidable blueprint
-  { ex_map_graph_t bg;
-    uint32_t bseed = ex_mapgraph_select_best(0xC0FFEE ^ (g_menu.mission_index*101+7), 160, 1300.0f, &bg);
-    ex_mapgraph_to_blueprint(&bg, &g_blueprint, bseed);
+  { // procedural cover now realized below (after `mid` resolves) via realize_sector_cover
     g_deco_col_n = 0;
     for (int i=0;i<NUM_PLANETS;i++) if(g_planets[i]) g_planets[i]->position[1]=-100000.0f;
     // human-scale cover clutter: drop the per-match colliders back to the fixed
@@ -3329,65 +3413,10 @@ static void start_match(void)
         if (g_haz_type[i]==HAZ_TOXIC){ hm->tint[0]=0.25f; hm->tint[1]=0.95f; hm->tint[2]=0.20f; }
         else { hm->tint[0]=0.5f; hm->tint[1]=0.45f; hm->tint[2]=0.4f; hm->scale3[1]=0.05f; } }
       else hm->position[1]=-1000.0f; }
-    int theme_mat = 0; // wall
-    if (!strcmp(mid,"foundry")||!strcmp(mid,"mining")||!strcmp(mid,"shield_edge")) theme_mat=2; // plate
-    else if (!strcmp(mid,"wastes")||!strcmp(mid,"emberpit")) theme_mat=1; // rock
-    for (int i = 0; i < g_blueprint.n_vols; i++)
-      if (g_blueprint.vols[i].material==0) g_blueprint.vols[i].material = theme_mat;
-    for (int i = 0; i < EX_MAP_MAX_VOLS; i++) {
-      // hide all three pool slots, then show the one matching the role
-      g_vol_models[i]->position[1] = -1000.0f;
-      g_rock_models[i]->position[1] = -1000.0f;
-      g_spire_models[i]->position[1] = -1000.0f;
-      if (i < g_blueprint.n_vols) {
-        ex_map_vol_t *v = &g_blueprint.vols[i];
-        // material tint
-        float tr,tg,tb;
-        if (v->material==2){ tr=0.45f; tg=0.55f; tb=0.75f; }
-        else if (v->material==1){ tr=0.62f; tg=0.5f; tb=0.38f; }
-        else { tr=0.5f; tg=0.52f; tb=0.56f; }
-        // pick the mesh: smooth rock for blocks/cover, tapered spire for
-        // vantage, box for walls/platforms/channels.
-        ex_model_t *m;
-        if (v->role==EX_VOL_EXPOSE) m = g_spire_models[i];
-        else if (v->role==EX_VOL_BLOCK || v->role==EX_VOL_LOWCOVER || v->role==EX_VOL_HIGHCOVER || v->role==EX_VOL_CONCEAL) m = g_rock_models[i];
-        else m = g_vol_models[i];
-        m->position[0]=v->center[0]; m->position[1]=v->center[1]; m->position[2]=v->center[2];
-        if (m==g_vol_models[i]) {
-          m->scale3[0]=v->half[0]; m->scale3[1]=v->half[1]; m->scale3[2]=v->half[2];
-        } else {
-          // rock/spire meshes are unit-ish; scale to the volume extents
-          m->scale3[0]=v->half[0]; m->scale3[1]=v->half[1]; m->scale3[2]=v->half[2];
-          // The rock mesh is centre-origin, so it must stay CENTERED on the
-          // collider -- previously it was dropped by half its height, which left
-          // the collider top (where you land) floating a half-height ABOVE the
-          // visible rock. Only the tall spire (vantage) keeps the ground offset.
-          if (m==g_spire_models[i]) m->position[1]=v->center[1]-v->half[1];
-        }
-        m->tint[0]=tr; m->tint[1]=tg; m->tint[2]=tb;
-      }
-    }
+    // procedural cover: flow-first graph -> best-of-N -> collidable blueprint,
+    // through the shared realizer so space-bridge jumps can lay their own.
+    realize_sector_cover(mid, 0xC0FFEE ^ (g_menu.mission_index*101+7));
     // --- FSM structures get procedural greeble subcomponents (surface detail) ---
-    { ex_detail_part_t dparts[EX_MAP_MAX_VOLS]; int ndp=0;
-      for (int i=0;i<g_blueprint.n_vols && ndp<EX_MAP_MAX_VOLS;i++){
-        ex_map_vol_t *v=&g_blueprint.vols[i];
-        // detail only the large structures (towers, platforms, megastructure)
-        if (v->half[0] < 3.0f && v->half[1] < 3.0f) continue;
-        ex_detail_part_t *dp=&dparts[ndp++];
-        dp->offset[0]=v->center[0]; dp->offset[1]=v->center[1]; dp->offset[2]=v->center[2];
-        dp->sx=v->half[0]; dp->sy=v->half[1]; dp->sz=v->half[2];
-        uint8_t mc[3]; if(v->material==2){mc[0]=115;mc[1]=140;mc[2]=190;}else if(v->material==1){mc[0]=160;mc[1]=128;mc[2]=97;}else{mc[0]=128;mc[1]=133;mc[2]=143;}
-        dp->color[0]=mc[0]; dp->color[1]=mc[1]; dp->color[2]=mc[2];
-      }
-      static ex_greeble_t mg[MAP_DETAIL];
-      uint8_t macc[3]={200,180,90};
-      int ng = ex_detail_generate(mg, MAP_DETAIL, dparts, ndp, 0x5EED ^ (g_menu.map_index*13+1), MAP_DETAIL, macc);
-      for (int i=0;i<ng;i++){ ex_model_t *gm=g_map_detail[i];
-        gm->position[0]=mg[i].offset[0]; gm->position[1]=mg[i].offset[1]; gm->position[2]=mg[i].offset[2];
-        gm->scale3[0]=mg[i].sx; gm->scale3[1]=mg[i].sy; gm->scale3[2]=mg[i].sz;
-        gm->tint[0]=mg[i].color[0]/255.0f; gm->tint[1]=mg[i].color[1]/255.0f; gm->tint[2]=mg[i].color[2]/255.0f; }
-      for (int i=ng;i<MAP_DETAIL;i++) g_map_detail[i]->position[1]=-100000.0f;
-    }
     // --- periphery decoration: themed smooth props ringing the arena ---
     const char *dmid = g_menu.in_campaign ? g_campaign.missions[g_menu.mission_index].map
                                           : g_theme_ids[g_menu.map_index % NUM_THEMES];
