@@ -51,6 +51,13 @@ pub enum Feature {
     PerLayerHeadDim,
     /// A learned scalar multiplying each layer's output (Gemma 4 `layer_output_scale`).
     LayerOutputScale,
+    /// GELU-gated FFN instead of SiLU-gated (all Gemma).
+    GeGluActivation,
+    /// Gemma's RMS norm: `x/rms(x) · (1 + w)`, computed in f32 — the `1 +` is not a detail, it changes
+    /// every normalized value.
+    GemmaRmsNorm,
+    /// tanh soft-capping on attention logits and final logits (Gemma 2; Gemma 3+ default it off).
+    LogitSoftcap,
 }
 
 impl Feature {
@@ -69,6 +76,9 @@ impl Feature {
             Feature::PerLayerRopeFreqs => "per-layer rope frequency tensors",
             Feature::PerLayerHeadDim => "per-layer head dimension (SWA layers differ from full-attention ones)",
             Feature::LayerOutputScale => "per-layer learned output scale",
+            Feature::GeGluActivation => "GELU-gated FFN",
+            Feature::GemmaRmsNorm => "Gemma (1+w) RMS norm",
+            Feature::LogitSoftcap => "tanh soft-cap on attention and final logits",
         }
     }
 
@@ -81,7 +91,11 @@ impl Feature {
             Feature::QkNormPreRope => true,  // qk_norm with learned weights (Qwen3)
             Feature::SharedExpert => true,   // MoeLayer::shared
             Feature::InterleavedMoe => true, // per-block expert-set detection in the loader
-            Feature::PostNorm => true,       // Gemma2 support carries attn/ffn post-norms
+            // CORRECTED. This was claimed as implemented on the assumption that "we support Gemma2"
+            // implied it. The loader only accepts `post_attention_norm` as an alternate NAME for
+            // ffn_norm — a pre-FFN norm — which is a different operation from Gemma's post-attention and
+            // post-FFN norms. Neither is applied.
+            Feature::PostNorm => false,
             Feature::ChunkedSwa => true,     // same paths as StandardSwa; the rule differs, the wiring does not
             // Forward, compressed cache, per-layer projections, decode block and per-layer routing are
             // all in place and checked (--gate-mla-block + the kernel-validation suite). Not yet exercised
@@ -96,6 +110,9 @@ impl Feature {
             Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
             Feature::LayerOutputScale => false,  // the tensor is not read
+            Feature::GeGluActivation => false,   // geglu_packed EXISTS as a kernel but no arch selects it
+            Feature::GemmaRmsNorm => false,      // only the plain x/rms(x)·w norm is implemented
+            Feature::LogitSoftcap => false,      // not implemented anywhere
         }
     }
 
@@ -109,6 +126,11 @@ matters most on long contexts"),
 whose windowed and full layers differ cannot be laid out correctly at all"),
             Feature::LayerOutputScale => Some("layer outputs are unscaled; the tensor is present in the \
 file and ignored"),
+            Feature::PostNorm => Some("the loader accepts post_attention_norm as an alias for ffn_norm, \
+which is a PRE-FFN norm — Gemma's post-attention and post-FFN norms are not applied"),
+            Feature::GeGluActivation => Some("the geglu kernel exists but no architecture selects it; \
+SiLU-gated is used instead"),
+            Feature::LogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
             _ => None,
@@ -136,11 +158,14 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
         "qwen3moe" | "qwen3" | "qwen35" => vec![Feature::QkNormPreRope],
         // Gemma 2/3/4 all use standard SWA on a layer pattern with a separate rope base; 3 and 4 add
         // learned Q/K norms before rope, and 4 adds per-layer rope frequency tensors.
-        "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm],
-        "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope],
+        "gemma2" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::GeGluActivation,
+                         Feature::GemmaRmsNorm, Feature::LogitSoftcap],
+        "gemma3" | "gemma3n" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
+                                     Feature::GeGluActivation, Feature::GemmaRmsNorm],
         // Gemma 4 (src/models/gemma4.cpp): everything gemma3 needs, plus per-layer rope freqs, a
         // per-layer HEAD DIM (key_length_swa vs key_length) and a learned per-layer output scale.
         "gemma4" => vec![Feature::StandardSwa, Feature::PostNorm, Feature::QkNormPreRope,
+                         Feature::GeGluActivation, Feature::GemmaRmsNorm,
                          Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale],
         "glm4moe" | "glm-dsa" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
         _ => Vec::new(),
@@ -206,14 +231,18 @@ mod tests {
     }
 
     #[test]
-    fn gemma2_is_now_fully_supported() {
-        // It was NOT, and this test previously asserted the gap: gemma2.cpp sets swa_type = STANDARD with
-        // n_swa = 4096 on a layer pattern, and we attended fully. With SWA wired through decode and
-        // prefill, both of Gemma2's requirements are met.
-        assert!(Feature::StandardSwa.implemented(), "SWA is wired end to end");
-        assert!(Feature::PostNorm.implemented());
-        assert!(gaps("gemma2", 0).is_empty(), "{:?}", gaps("gemma2", 0));
-        assert!(gap_report("gemma2", 0).is_empty(), "nothing left to declare");
+    fn gemma_is_still_unsupported_and_the_table_says_so_honestly() {
+        // This test previously asserted Gemma2 was fully supported. It was WRONG, and the table was
+        // overstating support in the one direction the module documents as dangerous: PostNorm was marked
+        // implemented on the assumption that "we support Gemma2" implied it, when archcfg has always said
+        // supported: false and the loader only uses post_attention_norm as an alias for ffn_norm.
+        assert!(Feature::StandardSwa.implemented(), "SWA genuinely is wired end to end");
+        assert!(!Feature::PostNorm.implemented(), "post-norms are NOT applied");
+        assert!(!Feature::GeGluActivation.implemented(), "the kernel exists; no arch selects it");
+        assert!(!Feature::GemmaRmsNorm.implemented(), "(1+w) norm is not implemented");
+        let g2 = gaps("gemma2", 0);
+        assert!(g2.contains(&Feature::GeGluActivation) && g2.contains(&Feature::GemmaRmsNorm));
+        assert!(!g2.contains(&Feature::StandardSwa), "SWA is the one Gemma requirement now met");
     }
 
     #[test]
@@ -247,6 +276,17 @@ mod tests {
         assert!(!required("llama4", 16).contains(&Feature::StandardSwa));
         assert!(required("gemma3", 0).contains(&Feature::StandardSwa));
         assert!(!required("gemma3", 0).contains(&Feature::ChunkedSwa));
+    }
+
+    #[test]
+    fn a_feature_is_only_implemented_if_something_actually_calls_it() {
+        // The lesson from the PostNorm correction, written as a test so it is not just a comment. A
+        // kernel existing is not support: geglu_packed has been in the engine the whole time and no
+        // architecture selects it, so GeGluActivation must read as NOT implemented. The same standard
+        // applied to MLA for most of this project, correctly.
+        assert!(!Feature::GeGluActivation.implemented());
+        let note = Feature::GeGluActivation.note().unwrap();
+        assert!(note.contains("kernel exists but no architecture selects it"), "{note}");
     }
 
     #[test]
