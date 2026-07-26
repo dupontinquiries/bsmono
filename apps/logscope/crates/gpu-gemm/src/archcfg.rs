@@ -74,7 +74,7 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             arch: Arch::Qwen35, prefix: "qwen3_5", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
             supported: true, dense_supported: true,
-            note: "Qwen3.5 dense (Ornith): QK-Norm before RoPE, qwen3_5.* metadata; correctness via --gate-qwen3. M2-gated for bit-exactness.",
+            note: "Qwen3.5 hybrid (Ornith): Gated-DeltaNet recurrent layers (ssm.* keys, attn_qkv+attn_gate) interleaved with gated attention (fused [q|gate] wq, sigmoid output gate), per-head QK-Norm, partial-rot NEOX rope; correctness via --gate-qwen35.",
         },
         // Qwen3-MoE (general.architecture = "qwen3moe"): the Qwen3 QK-Norm attention base + mixture-of-
         // experts — a router (ffn_gate_inp) selecting top-k of N experts (ffn_{gate,up,down}_exps), NO shared
