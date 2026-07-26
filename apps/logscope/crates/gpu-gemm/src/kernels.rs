@@ -334,3 +334,5 @@ pub const L2NORM_ROWS: &str = include_str!("kernels/l2norm_rows.wgsl");
 pub const MUL_GATE: &str = include_str!("kernels/mul_gate.wgsl");
 pub const DEINTERLEAVE2: &str = include_str!("kernels/deinterleave2.wgsl");
 pub const DELTA_GB: &str = include_str!("kernels/delta_gb.wgsl");
+pub const SWIGLU_MATVEC_Q8_0_ADD: &str = include_str!("kernels/swiglu_matvec_q8_0_add.wgsl");
+pub const SWIGLU_MATVEC_Q4_ADD: &str = include_str!("kernels/swiglu_matvec_q4_add.wgsl");
