@@ -3586,6 +3586,24 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             ck(&format!("{label}: fused == unfused (max|diff|={md:.3e}, rel={rel:.2e})"), md == 0.0);
         }
         gpu_kernels::ab_set_decided(false);
+        // SHARED-EXPERT ORDERING. The shared expert is now issued BEFORE the router readback so its
+        // dispatches occupy the GPU during that stall. Reordering independent work must not change a
+        // single value — if it does, the "independent" claim is false. Checked with a shared expert
+        // present, since that is the only case the reorder touches.
+        {
+            let layer = build(true);
+            gpu_kernels::ab_set_decided(false);
+            let a = gpu.download(&gpu.moe_ffn_t(&layer, &n2t, 1, d, &x2t));
+            let b = gpu.download(&gpu.moe_ffn_t(&layer, &n2t, 1, d, &x2t));
+            let md = a.iter().zip(&b).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            ck(&format!("shared+routed is deterministic across calls (max|diff|={md:.3e})"), md == 0.0);
+            // and the shared expert genuinely contributes — otherwise the ordering question is moot
+            let routed_only = build(false);
+            let r = gpu.download(&gpu.moe_ffn_t(&routed_only, &n2t, 1, d, &x2t));
+            let dsh = a.iter().zip(&r).map(|(p, q)| (p - q).abs()).fold(0f32, f32::max);
+            ck(&format!("the shared expert changes the result (max|diff|={dsh:.3e})"), dsh > 1e-6);
+        }
+
         println!("gate-moe-fusion: {}", if ok {
             "the dispatch levers really are bit-identical \u{2713}"
         } else { "FAIL \u{2717} — the levers CHANGE RESULTS; 'bit-identical, decode-speed only' is wrong" });
