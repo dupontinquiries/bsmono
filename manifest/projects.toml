@@ -318,3 +318,22 @@ runtime = "none"
 targets = ["desktop", "x86"]
 notes = "Rust port of paperbound's gamemodes and tooling: data/tech/economy (sim), live RTS matches with the four faction mechanics (match_sim), the clawbound-facet papercraft renderer with std-only PNG out (render), self-playing skirmishes (skirmish + bin), the base lane-battler mode with the shipped MODES table (battler), single-elim tournaments where every match is actually fought (tournament + bin), and a headless data editor whose validator encodes every match-start crash the project has shipped and fixed (editor + pbedit bin). Kit integration: cli-kit (all binaries), config-kit (pbedit XDG config/backups), net-kit (lan_skirmish: token-authenticated TCP lockstep with desync-detecting state hashes). Bins: skirmish, tournament, pbedit (incl. interactive shell — the UI seam an egui front drives later per UI_STRATEGY.md), lan_skirmish. Origami slice: units render as their actual folded card models from cards.json/parts.json (full builtin+JSON part vocabulary incl. the wizard outfit rack). GPU bridge (gpu.rs): scenes export as engine-ready interleaved vertex/index buffers (per-face normals — the facet IS the style) with a vk-harness-style libvulkan probe; the unendlich-engine render-core dependency lands on a GPU host (their lockfile v4 needs a newer cargo — see TODO.md). 44 tests, all against the real game data at games/paperbound."
 
+[games.blackstar]
+path = "games/blackstar"
+kind = "cmake"
+role = "app"
+daemon = false
+flatpak = false          # not packaged yet; SDL2 + GL, so freedesktop would be the runtime when it is
+runtime = "none"
+targets = ["desktop"]    # cross to phone/x86 unverified — desktop is what has actually been built
+notes = "Cybertron arena/campaign game: C on the exengine core, SDL2 + OpenGL, with an optional Vulkan probe and an optional Rust FSM behind -DUSE_RUST_FSM. Registered on the c4-245 merge because it is now EVIDENCED host-buildable, not merely planned: cmake Release configure + full build + `ctest` are green 64/64 under gcc 13.3 with libsdl2-dev + libGL. Six of the 64 are Python content tests (content_validate, lint_dead_fields, silhouette, map_score, openworld, gltf_roundtrip), gated behind find_package(Python3) so they simply drop out where Python is absent. Two Rust side-crates live here and are NOT part of the cmake build: rust_fsm/ (the FFI state machine) and rust/assetkit (egui asset browser — see its Cargo.toml TODO(hardware): it pins egui 0.29 against shared/uikit's 0.34). Open design item from the merge: game.c carries two escalation-perimeter systems (the drop's station/zone box and the monorepo's gates.c chain), composed rather than deduplicated — see TODO(design) at the site and maintenance/MERGE_C4_245.md."
+
+[tools.kbm3]
+path = "tools/kbm3"
+kind = "python+rust"
+role = "tool"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "kBM3 GAN/vocoder audio-model project. NOTE the layout: there is no Cargo.toml at the project root — the cargo crate is at gpu/ (burn 0.21 + wgpu, bins: main/vocoder/population), so build with `cd tools/kbm3/gpu && cargo build --release`, which is why this is filed python+rust rather than cargo (a cargo-kind entry would make build.sh --run cd to the wrong directory). Python side: pipeline/ (gan-zai v5.x trainers), vocoder/, explorer/ (spectrogram browser + server.py). The 2026-07-26 drop added the RpGAN relativistic pairing loss (--loss rpgan) on both the Rust and Python sides, R1/R2 penalties with lazy regularization on the Python side only (Burn has no second-order gradients), and turned on Burn's fusion + autotune with an opt-in `spirv` feature. `rustcheck --fast` passes. NOT compiled in-sandbox: burn's dependency graph pulls edition-2024 crates, which need a newer cargo than Ubuntu's 1.75."
