@@ -13,6 +13,55 @@ use crate::multimodal::{VisionConfig, ImagePlan, TileBox, plan_image};
 pub const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
 pub const CLIP_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
 
+/// Per-channel normalization applied after scaling to [0,1].
+///
+/// THIS IS NOT A CONSTANT, and treating it as one is a silent correctness bug. llama.cpp reads
+/// `clip.vision.image_mean` / `image_std` from the mmproj GGUF and THROWS if they are absent
+/// (`clip.cpp`, KEY_IMAGE_MEAN/KEY_IMAGE_STD) — because the values differ by encoder family:
+///
+///   CLIP   mean 0.481 0.458 0.408   std 0.269 0.261 0.276   (LLaVA and most early VLMs)
+///   SigLIP mean 0.5   0.5   0.5     std 0.5   0.5   0.5     (Gemma 3 vision, many recent models)
+///
+/// Applying CLIP's numbers to a SigLIP model shifts and rescales every pixel. The image still encodes
+/// to *something*, so there is no error — just captions that are plausibly wrong, which is the hardest
+/// failure to notice and the most expensive to chase.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Normalization { pub mean: [f32; 3], pub std: [f32; 3] }
+
+impl Normalization {
+    pub const CLIP: Self = Normalization { mean: CLIP_MEAN, std: CLIP_STD };
+    /// SigLIP and friends: symmetric, mapping [0,1] to [-1,1].
+    pub const SIGLIP: Self = Normalization { mean: [0.5; 3], std: [0.5; 3] };
+
+    /// Build from mmproj metadata.
+    ///
+    /// Refuses rather than defaulting. A default here would be applied to every model whose metadata we
+    /// failed to read, and the result is not a crash but subtly wrong embeddings — so the caller is made
+    /// to decide, exactly as llama.cpp does by throwing.
+    pub fn from_metadata(mean: Option<&[f32]>, std: Option<&[f32]>) -> Result<Self, String> {
+        let (Some(m), Some(sd)) = (mean, std) else {
+            return Err("mmproj metadata has no image_mean/image_std. These differ by encoder family (CLIP vs SigLIP) and guessing produces plausible-but-wrong embeddings rather than an error — pass the values explicitly or use Normalization::CLIP / ::SIGLIP deliberately.".into());
+        };
+        if m.len() < 3 || sd.len() < 3 {
+            return Err(format!("image_mean/image_std need 3 elements, got {} and {}", m.len(), sd.len()));
+        }
+        // A zero std would divide every channel by zero; llama.cpp assumes well-formed metadata, but a
+        // NaN tensor is a worse debugging experience than a message.
+        if sd[..3].iter().any(|v| *v == 0.0 || !v.is_finite()) {
+            return Err(format!("image_std must be non-zero and finite, got {:?}", &sd[..3]));
+        }
+        Ok(Normalization { mean: [m[0], m[1], m[2]], std: [sd[0], sd[1], sd[2]] })
+    }
+
+    /// Which known family these values match, for a loader log line.
+    pub fn family(&self) -> &'static str {
+        let close = |a: [f32; 3], b: [f32; 3]| a.iter().zip(b).all(|(x, y)| (x - y).abs() < 1e-4);
+        if close(self.mean, Self::CLIP.mean) && close(self.std, Self::CLIP.std) { "CLIP" }
+        else if close(self.mean, Self::SIGLIP.mean) && close(self.std, Self::SIGLIP.std) { "SigLIP" }
+        else { "custom" }
+    }
+}
+
 /// Bilinear-sample an RGB8 image (HWC, row-major, 3 bytes/pixel) at fractional `(fx, fy)`, clamped to the
 /// edges. Returns raw [r,g,b] in [0,255] as f32.
 pub fn sample(rgb: &[u8], w: u32, h: u32, fx: f32, fy: f32) -> [f32; 3] {
@@ -39,6 +88,13 @@ pub fn sample(rgb: &[u8], w: u32, h: u32, fx: f32, fy: f32) -> [f32; 3] {
 /// (a crop box in RESIZE space of `resize_to`). Uses half-pixel-centered mapping so the sampling is
 /// centered, matching standard vision-preprocessing.
 pub fn tile_chw(rgb: &[u8], w: u32, h: u32, resize_to: (u32, u32), bx: &TileBox, edge: u32) -> Vec<f32> {
+    tile_chw_norm(rgb, w, h, resize_to, bx, edge, Normalization::CLIP)
+}
+
+/// As `tile_chw`, with the model's own normalization.
+#[allow(clippy::too_many_arguments)]
+pub fn tile_chw_norm(rgb: &[u8], w: u32, h: u32, resize_to: (u32, u32), bx: &TileBox, edge: u32,
+                     norm: Normalization) -> Vec<f32> {
     let edge = edge.max(1);
     let (rw, rh) = (resize_to.0.max(1) as f32, resize_to.1.max(1) as f32);
     let sx = w as f32 / rw; // resize-space → source-space scale
@@ -56,7 +112,7 @@ pub fn tile_chw(rgb: &[u8], w: u32, h: u32, resize_to: (u32, u32), bx: &TileBox,
             let idx = (oy * edge + ox) as usize;
             for c in 0..3 {
                 let v = s[c] / 255.0;
-                out[c * n + idx] = (v - CLIP_MEAN[c]) / CLIP_STD[c];
+                out[c * n + idx] = (v - norm.mean[c]) / norm.std[c];
             }
         }
     }
@@ -123,6 +179,71 @@ pub fn preprocess(rgb: &[u8], w: u32, h: u32, cfg: &VisionConfig) -> VisionInput
         let _ = whole;
     }
     VisionInput { edge, tiles, has_thumbnail: plan.thumbnail }
+}
+
+
+#[cfg(test)]
+mod normalization_tests {
+    use super::*;
+
+    #[test]
+    fn siglip_and_clip_diverge_in_SCALE_not_just_offset() {
+        // Written after the first version of this test failed usefully. Mid-grey is a POOR discriminator:
+        // both families centre near zero there (CLIP 0.076, SigLIP 0.004), so a check at that point makes
+        // the difference look like rounding. The families actually differ in the DENOMINATOR — std 0.269
+        // vs 0.5, nearly 2x — so the gap opens at the extremes, which is where a real image lives.
+        let at = |v: f32, n: Normalization| (v - n.mean[0]) / n.std[0];
+        let (mid_c, mid_s) = (at(128.0 / 255.0, Normalization::CLIP), at(128.0 / 255.0, Normalization::SIGLIP));
+        assert!(mid_c.abs() < 0.1 && mid_s.abs() < 0.01, "both are near zero mid-range: {mid_c} {mid_s}");
+
+        let (white_c, white_s) = (at(1.0, Normalization::CLIP), at(1.0, Normalization::SIGLIP));
+        assert!((white_c - white_s).abs() > 0.8,
+            "a white pixel lands at {white_c} under CLIP and {white_s} under SigLIP — nearly double");
+        let (black_c, black_s) = (at(0.0, Normalization::CLIP), at(0.0, Normalization::SIGLIP));
+        assert!((black_c - black_s).abs() > 0.7, "and black diverges too: {black_c} vs {black_s}");
+    }
+
+    #[test]
+    fn missing_metadata_refuses_rather_than_defaulting() {
+        // A default would be applied to every model whose metadata we failed to read, and the result is
+        // not a crash but subtly wrong embeddings — the caller has to decide.
+        let e = Normalization::from_metadata(None, None).unwrap_err();
+        assert!(e.contains("plausible-but-wrong"), "{e}");
+        assert!(e.contains("CLIP") && e.contains("SIGLIP"), "the message must name the way out: {e}");
+        assert!(Normalization::from_metadata(Some(&[0.5, 0.5, 0.5]), None).is_err(), "half is not enough");
+    }
+
+    #[test]
+    fn short_or_degenerate_metadata_is_rejected() {
+        assert!(Normalization::from_metadata(Some(&[0.5, 0.5]), Some(&[0.5, 0.5, 0.5])).is_err());
+        // a zero std divides every channel by zero; a NaN tensor debugs far worse than a message
+        let e = Normalization::from_metadata(Some(&[0.5; 3]), Some(&[0.5, 0.0, 0.5])).unwrap_err();
+        assert!(e.contains("non-zero"), "{e}");
+    }
+
+    #[test]
+    fn well_formed_metadata_is_accepted_and_named() {
+        let n = Normalization::from_metadata(Some(&[0.5, 0.5, 0.5]), Some(&[0.5, 0.5, 0.5])).unwrap();
+        assert_eq!(n, Normalization::SIGLIP);
+        assert_eq!(n.family(), "SigLIP");
+        assert_eq!(Normalization::CLIP.family(), "CLIP");
+        // anything else is honestly labelled rather than forced into a bucket
+        let odd = Normalization::from_metadata(Some(&[0.1, 0.2, 0.3]), Some(&[1.0, 1.0, 1.0])).unwrap();
+        assert_eq!(odd.family(), "custom");
+    }
+
+    #[test]
+    fn the_default_path_is_unchanged_for_existing_callers() {
+        // tile_chw keeps CLIP so nothing that worked stops working; the norm-aware entry point is
+        // additive.
+        let rgb = vec![128u8; 4 * 4 * 3];
+        let bx = TileBox { x: 0, y: 0, w: 4, h: 4 };
+        let a = tile_chw(&rgb, 4, 4, (4, 4), &bx, 4);
+        let b = tile_chw_norm(&rgb, 4, 4, (4, 4), &bx, 4, Normalization::CLIP);
+        assert_eq!(a, b);
+        let c = tile_chw_norm(&rgb, 4, 4, (4, 4), &bx, 4, Normalization::SIGLIP);
+        assert_ne!(a, c, "and choosing SigLIP actually changes the tensor");
+    }
 }
 
 #[cfg(test)]
