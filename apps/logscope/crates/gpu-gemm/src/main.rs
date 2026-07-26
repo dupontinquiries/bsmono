@@ -3676,6 +3676,30 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         let full = gpu.download(&gpu.decode_attention_mh_pub(&qt, &kc, &vc, total, ad, n_heads, n_kv_heads));
         let dfull = full.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         ck(&format!("windowed differs from full attention (max|diff|={dfull:.3e})"), dfull > 1e-6);
+        // The q8 path uses a different mechanism — a kernel loop bound, not a view — because its cache
+        // keeps one scale per row in a separate tensor. Different mechanism, same required answer.
+        {
+            let kqd: Vec<f32> = (0..total * kvd / 4).map(|i| ((i * 7 % 251) as f32) - 125.0).collect();
+            let ksd: Vec<f32> = (0..total).map(|i| 0.01 + (i % 5) as f32 * 0.001).collect();
+            let vqd: Vec<f32> = (0..total * kvd / 4).map(|i| ((i * 11 % 241) as f32) - 120.0).collect();
+            let vsd: Vec<f32> = (0..total).map(|i| 0.02 + (i % 3) as f32 * 0.002).collect();
+            let (kqt, kst) = (gpu.upload(&kqd, total, kvd / 4), gpu.upload(&ksd, total, 1));
+            let (vqt, vst) = (gpu.upload(&vqd, total, kvd / 4), gpu.upload(&vsd, total, 1));
+            // windowed via the kernel's start bound
+            let w8 = gpu.download(&gpu.decode_attention_mh_q8_from(&qt, &kqt, &kst, &vqt, &vst, start, pos + 1, ad, n_heads, n_kv_heads));
+            // reference: caches holding only the window's rows, attended from 0
+            let (kq2, ks2) = (gpu.upload(&kqd[start * kvd / 4..(pos + 1) * kvd / 4], len, kvd / 4),
+                              gpu.upload(&ksd[start..pos + 1], len, 1));
+            let (vq2, vs2) = (gpu.upload(&vqd[start * kvd / 4..(pos + 1) * kvd / 4], len, kvd / 4),
+                              gpu.upload(&vsd[start..pos + 1], len, 1));
+            let r8 = gpu.download(&gpu.decode_attention_mh_q8_from(&qt, &kq2, &ks2, &vq2, &vs2, 0, len, ad, n_heads, n_kv_heads));
+            let d8 = w8.iter().zip(&r8).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("q8 start-bound == truncated cache: max|diff|={d8:.3e}"), d8 == 0.0);
+            let f8 = gpu.download(&gpu.decode_attention_mh_q8_from(&qt, &kqt, &kst, &vqt, &vst, 0, total, ad, n_heads, n_kv_heads));
+            let df8 = f8.iter().zip(&w8).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("q8 windowed differs from full attention (max|diff|={df8:.3e})"), df8 > 1e-6);
+        }
+
         println!("gate-swa: {}", if ok {
             "windowed KV view is exact \u{2713} (decode attends only within the window)"
         } else { "FAIL \u{2717}" });
