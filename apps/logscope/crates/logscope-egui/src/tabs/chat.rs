@@ -6711,6 +6711,8 @@ impl Chat {
                                 ui.horizontal_wrapped(|ui| {
                                     // the dot distinguishes a liaison SENTENCE from a raw engine line, so
                                     // a reader always knows whether a model phrased it
+                                    // shape AND colour: the glyph already distinguishes narrated from
+                                    // raw, so a reader who cannot separate the hues still can
                                     ui.label(RichText::new(if narrated { "◈" } else { "·" })
                                         .color(if narrated { theme::CYAN() } else { theme::FAINT() }).small());
                                     ui.label(RichText::new(&line).color(theme::DIM()).small());
