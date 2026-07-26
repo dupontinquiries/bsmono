@@ -22,6 +22,7 @@
 //! vibes") is a real, separate feature visible in the settings screenshot — not ported here.
 
 use crate::gesture_menus::WsCall;
+use crate::terminal_workspace::{Dir, TermWorkspace};
 use egui::{Rect, Response, Ui};
 use uikit_egui::dock::{self, Chip, Corner};
 use uikit_egui::PaletteColors;
@@ -403,56 +404,132 @@ impl WsTab {
 }
 
 /// The tab-strip model the per-tab action menu drives — the egui side of what QML kept in
-/// `termTabStrip._tabs` behind `backend.ws_command`. Single-pane for now: pane-level calls
-/// (split / close pane / web pane) report unhandled so the caller can surface or stub them.
-#[derive(Clone, Debug, Default)]
+/// `termTabStrip._tabs` behind `backend.ws_command`.
+///
+/// The authoritative state is a [`TermWorkspace`] — voiceterm's own tab+pane model, the same
+/// one the QML backend drives — so pane-level calls (split / close pane / web pane) are now
+/// really handled instead of reported unhandled. `tabs` and `active` remain public as a
+/// one-way PROJECTION of that model, rebuilt after every mutation: the UI keeps reading them
+/// exactly as before, and there is no second copy of tab state to drift.
+#[derive(Clone, Debug)]
 pub struct Workspace {
+    /// UI-facing projection of `model`. Rebuilt by `sync`; write through [`Workspace::apply`].
     pub tabs: Vec<WsTab>,
+    /// Projection of `model.active_tab`.
     pub active: usize,
+    model: TermWorkspace,
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self::from_model(TermWorkspace::new())
+    }
 }
 
 impl Workspace {
     pub fn new(names: &[&str]) -> Self {
-        Self { tabs: names.iter().map(|n| WsTab::new(*n)).collect(), active: 0 }
+        let mut m = TermWorkspace::new(); // starts with one tab, one pane
+        if let Some(first) = names.first() {
+            m.tabs[0].name = (*first).to_string();
+        }
+        for n in names.iter().skip(1) {
+            m.new_tab();
+            m.active_mut().name = (*n).to_string();
+        }
+        m.active_tab = 0;
+        Self::from_model(m)
+    }
+
+    fn from_model(model: TermWorkspace) -> Self {
+        let mut w = Workspace { tabs: Vec::new(), active: 0, model };
+        w.sync();
+        w
+    }
+
+    /// Rebuild the projection from the model. One direction only, so the two cannot disagree.
+    /// A fence boundary `b` sits between tab `b-1` and tab `b`, hence `fence_after(i) == b(i+1)`.
+    fn sync(&mut self) {
+        let fences = &self.model.fences;
+        self.tabs = self
+            .model
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, t)| WsTab { name: t.name.clone(), pinned: t.pinned, fence_after: fences.contains(&(i + 1)) })
+            .collect();
+        self.active = self.model.active_tab;
+    }
+
+    /// The authoritative model — pane trees, focus, fences.
+    pub fn model(&self) -> &TermWorkspace {
+        &self.model
+    }
+
+    /// Pane ids of the active tab, left-to-right / top-to-bottom. The renderer walks these
+    /// once the split layout lands; until then it tells you how many panes a tab holds.
+    pub fn active_pane_ids(&self) -> Vec<u64> {
+        self.model.active().root.pane_ids()
     }
 
     /// Apply one typed backend call (see `gesture_menus::tab_dispatch`). Returns `true` when the
-    /// call is handled by this model; pane-level calls return `false` (single-pane model).
-    /// Semantics mirror the QML backend: "new tab" appends AND activates; "go to tab N" is
-    /// 1-based and clamps; "close tab" keeps at least one tab and clamps `active`.
+    /// call is recognised. Semantics mirror the QML backend: "new tab" appends AND activates;
+    /// "go to tab N" is 1-based and clamps; "close tab" keeps at least one tab and clamps
+    /// `active`; "close pane" keeps at least one pane.
     pub fn apply(&mut self, call: &WsCall) -> bool {
-        match call {
+        let handled = match call {
             WsCall::ToggleFence(i) => {
-                if let Some(t) = self.tabs.get_mut(*i) {
-                    t.fence_after = !t.fence_after;
-                }
+                self.model.toggle_fence_after(*i);
                 true
             }
             WsCall::TogglePin(i) => {
-                if let Some(t) = self.tabs.get_mut(*i) {
-                    t.pinned = !t.pinned;
-                }
+                self.model.toggle_pin(*i);
                 true
             }
-            WsCall::Command(c) => {
-                if c == "new tab" {
-                    self.tabs.push(WsTab::new(format!("shell {}", self.tabs.len() + 1)));
-                    self.active = self.tabs.len() - 1;
-                    true
-                } else if let Some(n) = c.strip_prefix("go to tab ").and_then(|n| n.parse::<usize>().ok()) {
-                    self.active = n.saturating_sub(1).min(self.tabs.len().saturating_sub(1));
-                    true
-                } else if c == "close tab" {
-                    if self.tabs.len() > 1 {
-                        self.tabs.remove(self.active);
-                        self.active = self.active.min(self.tabs.len() - 1);
-                    }
-                    true
-                } else {
-                    false // split down/right, close pane, … — pane-level, not modeled yet
-                }
+            // The web pane opens beside the current one and does NOT steal focus (split_web
+            // keeps the terminal focused, so the pty stays addressable). The URL is filled in
+            // by the reader; the model only needs the pane to exist.
+            WsCall::OpenWebPane => {
+                self.model.split_web(Dir::Right, "");
+                true
             }
-            WsCall::OpenWebPane => false,
+            WsCall::Command(c) => self.command(c),
+        };
+        self.sync();
+        handled
+    }
+
+    fn command(&mut self, c: &str) -> bool {
+        if c == "new tab" {
+            self.model.new_tab();
+            // Keep the egui strip's naming ("shell 4"), not TermWorkspace's bare ordinal.
+            let n = self.model.tabs.len();
+            self.model.active_mut().name = format!("shell {n}");
+            true
+        } else if let Some(n) = c.strip_prefix("go to tab ").and_then(|n| n.parse::<usize>().ok()) {
+            // goto_tab rejects out-of-range rather than clamping, so clamp here to keep the
+            // QML behaviour the strip relies on ("go to tab 99" lands on the last tab).
+            let one_based = n.max(1).min(self.model.tabs.len());
+            self.model.goto_tab(one_based);
+            true
+        } else if c == "close tab" {
+            self.model.close_tab(); // self-guards the last tab and clamps active_tab
+            true
+        } else if c == "split down" {
+            self.model.split(Dir::Down); // stacked — QML's horizontal divider
+            true
+        } else if c == "split right" {
+            self.model.split(Dir::Right); // side by side — QML's vertical divider
+            true
+        } else if c == "close pane" {
+            // close_pane (not close_pane_id) is the focus-aware primitive: it re-focuses a
+            // surviving pane, and on the LAST pane of a tab it closes the tab instead — the
+            // QML behaviour. It returns None only when that would close the last tab too.
+            // close_pane_id is for web panes, which are never focused, and would leave
+            // focused_pane dangling here.
+            self.model.close_pane();
+            true
+        } else {
+            false
         }
     }
 
@@ -629,10 +706,11 @@ mod tests {
     #[test]
     fn tab_menu_dispatch_flows_end_to_end_into_the_workspace() {
         let mut ws = Workspace::new(&["main", "logs", "build"]);
-        // hold tab 3, drag up on the split cell: goto happens, the split itself is (honestly) unhandled
+        // hold tab 3, drag up on the split cell: goto happens, and the split now really lands
         let calls = tab_dispatch("split", Variant::Vertical, 2);
-        assert!(!ws.apply_all(&calls));
+        assert!(ws.apply_all(&calls));
         assert_eq!(ws.active, 2);
+        assert_eq!(ws.active_pane_ids().len(), 2); // the held tab gained a stacked pane
         // hold tab 1, close with the default (tab) variant: fully handled
         let calls = tab_dispatch("close", Variant::Tab, 0);
         assert!(ws.apply_all(&calls));
@@ -641,6 +719,64 @@ mod tests {
         // fence via the menu on the (new) first tab
         assert!(ws.apply_all(&tab_dispatch("fence", Variant::Single, 0)));
         assert!(ws.tabs[0].fence_after);
+    }
+
+    #[test]
+    fn pane_level_calls_are_handled_by_the_real_model() {
+        let mut ws = Workspace::new(&["main", "logs"]);
+        assert_eq!(ws.active_pane_ids().len(), 1);
+
+        // split right = side by side (QML's vertical divider); split down = stacked.
+        assert!(ws.apply(&WsCall::Command("split right".into())));
+        assert_eq!(ws.active_pane_ids().len(), 2);
+        assert!(ws.apply(&WsCall::Command("split down".into())));
+        assert_eq!(ws.active_pane_ids().len(), 3);
+
+        // panes are per-tab: the other tab is untouched
+        assert!(ws.apply(&WsCall::Command("go to tab 2".into())));
+        assert_eq!(ws.active_pane_ids().len(), 1);
+        assert!(ws.apply(&WsCall::Command("go to tab 1".into())));
+        assert_eq!(ws.active_pane_ids().len(), 3);
+
+        // close pane removes the focused one and re-focuses a survivor
+        assert!(ws.apply(&WsCall::Command("close pane".into())));
+        assert_eq!(ws.active_pane_ids().len(), 2);
+        assert!(ws.apply(&WsCall::Command("close pane".into())));
+        assert_eq!(ws.active_pane_ids().len(), 1);
+        // closing the LAST pane of a tab closes the TAB instead — QML's semantics
+        assert_eq!(ws.tabs.len(), 2);
+        assert!(ws.apply(&WsCall::Command("close pane".into())));
+        assert_eq!(ws.tabs.len(), 1);
+        // ...and on the last pane of the last tab it is a no-op, still handled
+        assert!(ws.apply(&WsCall::Command("close pane".into())));
+        assert_eq!((ws.tabs.len(), ws.active_pane_ids().len()), (1, 1));
+
+        // an unknown command is still honestly unhandled
+        assert!(!ws.apply(&WsCall::Command("teleport".into())));
+    }
+
+    #[test]
+    fn web_pane_opens_beside_without_stealing_focus() {
+        let mut ws = Workspace::new(&["main"]);
+        let focus_before = ws.model().active().focused_pane;
+        assert!(ws.apply(&WsCall::OpenWebPane));
+        assert_eq!(ws.active_pane_ids().len(), 2);
+        // split_web deliberately keeps the terminal focused so the pty stays addressable
+        assert_eq!(ws.model().active().focused_pane, focus_before);
+    }
+
+    #[test]
+    fn projection_tracks_the_model_after_every_call() {
+        let mut ws = Workspace::new(&["main", "logs", "build"]);
+        ws.apply(&WsCall::TogglePin(2));
+        ws.apply(&WsCall::ToggleFence(1));
+        // the projection is rebuilt from the model, not maintained separately
+        assert_eq!(ws.tabs.len(), ws.model().tabs.len());
+        assert!(ws.tabs[2].pinned && ws.model().tabs[2].pinned);
+        assert!(ws.tabs[1].fence_after && ws.model().fences.contains(&2));
+        ws.apply(&WsCall::Command("new tab".into()));
+        assert_eq!(ws.active, ws.model().active_tab);
+        assert_eq!(ws.tabs.last().unwrap().name, "shell 4");
     }
 
     #[test]

@@ -234,8 +234,9 @@ impl eframe::App for VoicetermApp {
             }
             let now = ctx.input(|i| i.time);
             for call in &apply {
-                // pane-level calls (split / close pane / web pane) are unhandled by the
-                // single-pane model — same on-device status as the other workspace stubs
+                // Pane-level calls (split / close pane / web pane) are handled for real now —
+                // shell::Workspace is backed by voiceterm's TermWorkspace — so these report
+                // what happened instead of the old "needs the workspace backend" stub.
                 let handled = self.workspace.apply(call);
                 use voiceterm_egui::gesture_menus::WsCall;
                 match call {
@@ -245,8 +246,13 @@ impl eframe::App for VoicetermApp {
                         self.toasts.info(if pinned { "Pinned" } else { "Unpinned" }, now);
                     }
                     WsCall::Command(c) if c == "close tab" => self.toasts.info("Closed tab", now),
-                    WsCall::Command(c) if !handled && (c.starts_with("split") || c == "close pane") => {
-                        self.toasts.warning(format!("{c}: needs the workspace backend"), now);
+                    WsCall::OpenWebPane => self.toasts.info("Web pane opened", now),
+                    WsCall::Command(c) if c.starts_with("split") => {
+                        self.toasts.info(format!("{} panes", self.workspace.active_pane_ids().len()), now);
+                    }
+                    WsCall::Command(c) if c == "close pane" => self.toasts.info("Closed pane", now),
+                    WsCall::Command(c) if !handled => {
+                        self.toasts.warning(format!("{c}: unrecognised"), now);
                     }
                     _ => {}
                 }
