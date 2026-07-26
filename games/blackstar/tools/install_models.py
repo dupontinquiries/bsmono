@@ -290,6 +290,23 @@ def main():
     lines.append(arr("g_imp_rz_def",  "rz",    "%.0f"))
     lines.append(arr("g_imp_scl_def", "scale", "%.3ff"))
     lines.append("")
+    # kind + transform-pair tables (gen_tuning.py writes "kind"/"pair" per name).
+    # EXACT name lookup on purpose: inherit_tuning's substring matching is right for
+    # orientation (a derived LMB wants its parent's fix) but wrong for identity —
+    # kind and pair are identity.
+    KIND_ID = {"prop": 0, "robot": 1, "vehicle": 2, "weapon": 3, "env": 4, "ship": 5}
+    name_to_idx = {r["name"]: i for i, r in enumerate(installed)}
+    kinds_out, pairs_out = [], []
+    for r in installed:
+        t = tuning.get(r["name"], {})
+        kinds_out.append(str(KIND_ID.get(t.get("kind", "prop"), 0)))
+        p = t.get("pair")
+        pairs_out.append(str(name_to_idx.get(p, -1) if p else -1))
+    lines.append("// model kind: 0 prop, 1 robot, 2 vehicle, 3 weapon, 4 env, 5 ship")
+    lines.append("static const unsigned char g_imp_kind[EX_N_IMPORTED] = { " + ", ".join(kinds_out) + " };")
+    lines.append("// vehicle<->robot transform partner (index into these tables), -1 = none")
+    lines.append("static const short g_imp_pair[EX_N_IMPORTED] = { " + ", ".join(pairs_out) + " };")
+    lines.append("")
 
     textured = [r for r in installed if len(r["parts"]) > 0]
     lines.append(f"// textured multi-part models ({len(textured)})")

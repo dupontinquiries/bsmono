@@ -6,6 +6,12 @@
 #include <stdio.h>
 #include <string.h>
 
+/* Imported-weapon hooks: game.c provides the real tables; these WEAK defaults keep
+ * standalone links (test_menu) working with an empty list — the row shows < none >
+ * and cycling clamps to it. gcc/clang weak symbols are the project's baseline. */
+__attribute__((weak)) int ex_imported_weapon_count(void){ return 0; }
+__attribute__((weak)) const char *ex_imported_weapon_name(int i){ (void)i; return "?"; }
+
 static const char *MAP_IDS[]  = { "wastes", "frostline", "emberpit", "vault", "foundry", "shield_edge", "mining", "outer_rim", "cybertron", "reclaim", "trench", "pluto", "beach", "mars", "core", "kuiper", "unicron", "europa", "io", "titan", "glaciem", "carrion", "helix", "enceladus" };
 static const char *MAP_NAMES[] = { "rusted wastes", "frostline", "ember pit", "crystal vault", "the foundry", "shield boundary", "mining station", "the outer rim", "cybertron", "the reclaim", "the trench", "pluto station", "the beach", "mars dig", "the core", "kuiper belt", "unicron", "europa", "io", "titan", "glaciem", "carrion drift", "helix", "enceladus geysers" };
 static const char *MAP_DESC[] = {
@@ -83,6 +89,7 @@ void ex_menu_init(ex_menu_t *m, ex_campaign_t *campaign, int map_count)
   m->loadout.size_class = 1;
   m->loadout.element = EX_ELEM_ICE;
   m->loadout.layout = EX_LAYOUT_QWERTY;
+  m->loadout.weapon_prop=0;
   m->loadout.height=100; m->loadout.bulk=100; m->loadout.head=100;
   m->loadout.shoulders=100; m->loadout.arm=100; m->loadout.leg=100;
   m->loadout.accent = EX_ELEM_ELECTRIC; m->loadout.paint = 0; m->loadout.finish = 1;
@@ -198,6 +205,8 @@ static void customize_option(ex_menu_t *m, int dir){
   else if(m->cursor==20){ int v=m->loadout.spoiler+dir; if(v<0)v=3; if(v>3)v=0; m->loadout.spoiler=v; }
   else if(m->cursor==21){ int v=m->loadout.exhaust+dir; if(v<0)v=3; if(v>3)v=0; m->loadout.exhaust=v; }
   else if(m->cursor==22){ m->loadout.stance=clampi(m->loadout.stance+dir*10,0,100); }
+  else if(m->cursor==24){ int n=ex_imported_weapon_count(); int v=m->loadout.weapon_prop+dir;
+    if(v<0)v=n; if(v>n)v=0; m->loadout.weapon_prop=v; }  // 0=none, 1..n = imported weapon
   else if(m->cursor==23){ m->loadout.rimglow=!m->loadout.rimglow; }
 }
 
@@ -416,7 +425,10 @@ int ex_menu_line(const ex_menu_t *m, int i, char *buf, int buflen)
                   snprintf(buf,buflen,"%sexhaust  < %s >",sel,EXN[m->loadout.exhaust&3]); break; }
         case 22:snprintf(buf,buflen,"%sstance   < %d%% >",sel,m->loadout.stance); break;
         case 23:snprintf(buf,buflen,"%srim glow < %s >",sel,m->loadout.rimglow?"accent-lit":"off"); break;
-        case 24:snprintf(buf,buflen,"%sdone",sel); break;
+        case 24:{ int wp=m->loadout.weapon_prop;
+                  if(wp<=0||wp>ex_imported_weapon_count()) snprintf(buf,buflen,"%sheld weapon < none >",sel);
+                  else snprintf(buf,buflen,"%sheld weapon < %s >",sel,ex_imported_weapon_name(wp-1)); break; }
+        case 25:snprintf(buf,buflen,"%sdone",sel); break;
       }
       return EX_CUSTOMIZE_ROWS;
     }

@@ -54,7 +54,13 @@ typedef struct {
   int stance;                 // vehicle ride height 0 slammed .. 100 raised (50 stock)
   int rimglow;                // vehicle: 0 off, 1 accent-lit running trim
   int hero_donor;             // 0 = none, else a campaign character whose parts you wear
+  int weapon_prop;            // 0 = none, else 1+index into the imported weapon list (cosmetic held prop)
 } ex_loadout_t;
+
+/* imported weapon-prop list (kind==weapon models): provided by game.c, consumed by the
+ * customize menu label. Count can be 0 on data-less builds; names are display labels. */
+int         ex_imported_weapon_count(void);
+const char *ex_imported_weapon_name(int i);
 
 // graphics settings the game applies
 typedef struct {
@@ -72,7 +78,7 @@ typedef struct {
 
 #define EX_BUILDER_ROWS 5
 #define EX_SETTINGS_ROWS 12
-#define EX_CUSTOMIZE_ROWS 25
+#define EX_CUSTOMIZE_ROWS 26
 #define EX_RES_PRESETS 4
 
 typedef struct {
