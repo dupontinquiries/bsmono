@@ -18,6 +18,24 @@
 use crate::exploration::{Audience, Branch, Event, ExplorationTree, Interrupt, Status, should_interrupt};
 use crate::residency::{Residency, gib};
 
+/// What the engine reports about the loaded model, as FACTS for the Liaison to render.
+///
+/// Deliberately plain strings rather than a dependency on the engine's `archfeat`: the Liaison presents
+/// observable state and does not compute it, and keeping the crates decoupled is what stops presentation
+/// logic leaking into the loader. The engine knows which architecture features it is missing; this is how
+/// it says so.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelStatus {
+    pub name: String,
+    pub arch: String,
+    /// One line per declared architecture gap, already phrased by the engine.
+    pub gaps: Vec<String>,
+}
+
+impl ModelStatus {
+    pub fn is_fully_supported(&self) -> bool { self.gaps.is_empty() }
+}
+
 /// Presents system state to the operator. Holds no state of its own beyond the audience — it is a pure
 /// function of the observable world, so it cannot drift from what actually happened.
 #[derive(Clone, Copy, Debug)]
@@ -90,13 +108,29 @@ impl Liaison {
     /// "What is blocked?" — deferred branches together with the condition that would release them, so the
     /// operator can tell which blockers are theirs to clear.
     pub fn what_is_blocked(&self, t: &ExplorationTree) -> Vec<Statement> {
-        let blocked: Vec<&Branch> = t.branches.iter()
-            .filter(|b| matches!(b.status, Status::Deferred { .. })).collect();
-        if blocked.is_empty() { return vec![Statement::nothing("Nothing is blocked.")]; }
-        blocked.iter().map(|b| {
-            let cond = match &b.status { Status::Deferred { retry_when } => retry_when.clone(), _ => String::new() };
-            Statement::new(format!("{} — waiting on: {}", b.objective, cond), vec![b.id.clone()])
-        }).collect()
+        self.what_is_blocked_with(t, None)
+    }
+
+    /// As above, plus the loaded model's declared architecture gaps.
+    ///
+    /// A model gap belongs here rather than in a log line nobody reads: "the engine does not implement
+    /// sliding-window attention for this architecture" is a blocker on getting correct output, and it is
+    /// the operator's decision whether that matters for their context length. Reporting it as *blocked*
+    /// rather than as a warning is the difference between an informed choice and a surprise.
+    pub fn what_is_blocked_with(&self, t: &ExplorationTree, model: Option<&ModelStatus>) -> Vec<Statement> {
+        let mut out: Vec<Statement> = t.branches.iter()
+            .filter(|b| matches!(b.status, Status::Deferred { .. }))
+            .map(|b| {
+                let cond = match &b.status { Status::Deferred { retry_when } => retry_when.clone(), _ => String::new() };
+                Statement::new(format!("{} — waiting on: {}", b.objective, cond), vec![b.id.clone()])
+            }).collect();
+        if let Some(m) = model {
+            for g in &m.gaps {
+                out.push(Statement::new(format!("{}: {g}", m.name), vec![m.arch.clone()]));
+            }
+        }
+        if out.is_empty() { return vec![Statement::nothing("Nothing is blocked.")]; }
+        out
     }
 
     /// "What should I review?" — only the things that genuinely need a human: irreversible actions and
@@ -184,13 +218,19 @@ impl Liaison {
     /// A single status pass — what an operator returning after a break should read first. Ordered by what
     /// costs them most to not know: things needing a decision, then blockers, then progress.
     pub fn briefing(&self, t: &ExplorationTree, r: &Residency, irreversible: &[&str]) -> Vec<String> {
+        self.briefing_with(t, r, irreversible, None)
+    }
+
+    /// As `briefing`, including the loaded model's declared gaps.
+    pub fn briefing_with(&self, t: &ExplorationTree, r: &Residency, irreversible: &[&str],
+                         model: Option<&ModelStatus>) -> Vec<String> {
         let mut out = Vec::new();
         let review = self.what_should_i_review(t, irreversible);
         if !review.is_empty() {
             out.push(format!("Needs you ({}):", review.len()));
             for (id, i) in &review { out.push(format!("  • [{id}] {}", describe_interrupt(i))); }
         }
-        let blocked = self.what_is_blocked(t);
+        let blocked = self.what_is_blocked_with(t, model);
         if blocked.iter().any(|s| s.is_grounded()) {
             out.push("Blocked:".into());
             for s in blocked.iter().filter(|s| s.is_grounded()) { out.push(format!("  • {}", s.text)); }
@@ -320,6 +360,40 @@ mod tests {
         let b = l.what_is_blocked(&t);
         assert_eq!(b.len(), 1);
         assert!(b[0].text.contains("ring headroom"), "{}", b[0].text);
+    }
+
+    #[test]
+    fn a_model_gap_is_reported_as_blocked_not_buried_in_a_log() {
+        let t = tree();
+        let l = Liaison::new(Audience::Developer);
+        let m = ModelStatus {
+            name: "gemma-4-12b-it".into(), arch: "gemma4".into(),
+            gaps: vec!["gemma4 needs sliding-window attention — NOT implemented (windowed layers attend \
+to the whole context instead)".into()],
+        };
+        assert!(!m.is_fully_supported());
+        let b = l.what_is_blocked_with(&t, Some(&m));
+        // both the deferred branch AND the model gap appear
+        assert!(b.iter().any(|s| s.text.contains("ring headroom")), "branch blocker still listed");
+        let gap = b.iter().find(|s| s.text.contains("sliding-window")).expect("model gap listed as blocked");
+        assert!(gap.text.starts_with("gemma-4-12b-it:"), "named by model: {}", gap.text);
+        assert!(gap.is_grounded(), "a model gap carries its arch as provenance");
+        // and it reaches the briefing, which is what an operator actually reads
+        let brief = l.briefing_with(&t, &Residency::new(), &[], Some(&m)).join("\n");
+        assert!(brief.contains("sliding-window"), "gap must survive into the briefing:\n{brief}");
+    }
+
+    #[test]
+    fn a_fully_supported_model_adds_no_blockers() {
+        let empty = ExplorationTree::new();
+        let l = Liaison::new(Audience::Developer);
+        let m = ModelStatus { name: "Qwen3-Coder".into(), arch: "qwen3moe".into(), gaps: Vec::new() };
+        assert!(m.is_fully_supported());
+        let b = l.what_is_blocked_with(&empty, Some(&m));
+        // with no branches and no gaps this must still be the honest empty answer, not a fabricated one
+        assert_eq!(b.len(), 1);
+        assert!(!b[0].is_grounded());
+        assert!(b[0].text.contains("Nothing is blocked"));
     }
 
     #[test]
