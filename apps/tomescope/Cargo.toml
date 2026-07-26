@@ -1,0 +1,53 @@
+# apps/tomescope — the overkill ebook / PDF / textbook reader for the egui-kit fleet.
+#
+# Drop this directory into the monorepo at `apps/tomescope` so the relative
+# path-deps onto shared/uikit + shared/settings-kit resolve. Everything UI is
+# built on uikit-egui (carved widgets, gesture layer, palettes, adaptive), the
+# same shared layer the rest of the portfolio ports onto.
+
+[package]
+name = "tomescope"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Overkill ebook/PDF/textbook reader: EPUB, PDF, CBZ/CBT, FB2, MD, HTML, TXT; library shelves + covers; pagination engine with typography controls; highlights, margin notes, flashcards (SRS), citations, per-book glossary, reading stats + heatmap, OPDS import, TTS hook — all on uikit-egui."
+
+[[bin]]
+name = "tomescope"
+path = "src/main.rs"
+
+[[bin]]
+name = "shelfctl"
+path = "src/bin/shelfctl.rs"
+
+[features]
+default = []
+# Rasterize PDF pages by shelling out to poppler's pdftoppm (if installed).
+# Text-layer extraction via lopdf works without this; this adds page images.
+poppler-cli = []
+# Speak selections/pages via a local `espeak-ng` binary (if installed).
+espeak = []
+
+[dependencies]
+egui = "0.34"
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"] }
+
+# The gui kit (from the reference tree). uikit-egui re-exports uikit-gesture.
+uikit-egui = { path = "../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../shared/uikit/crates/snapclone-theme" }
+settings-kit = { path = "../../shared/settings-kit" }
+
+# Formats
+zip = { version = "2", default-features = false, features = ["deflate"] }
+quick-xml = "0.36"
+lopdf = "0.34"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+
+# State
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+anyhow = "1"
+
+[profile.dev]
+opt-level = 1
