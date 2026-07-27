@@ -53,6 +53,7 @@ pub mod app;
 
 #[cfg(feature = "gpu")]
 pub mod gpu;
+pub mod map_preview;
 
 #[cfg(feature = "gpu")]
 pub mod gpu_egui;
