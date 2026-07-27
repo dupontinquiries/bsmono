@@ -67,6 +67,7 @@ pub mod voice_intent_fr;
 pub mod voice_intent_de;
 pub mod voice_lang;
 #[allow(dead_code)] pub mod explain;
+#[allow(dead_code)] pub mod diag;
 #[allow(dead_code)] pub mod prechecks;
 #[allow(dead_code)] pub mod liaisonhud;
 #[allow(dead_code)] pub mod metricspanel;
