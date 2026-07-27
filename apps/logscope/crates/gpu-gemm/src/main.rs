@@ -2858,6 +2858,12 @@ fn main() {
             ck(&format!("streamed decode == resident decode (pin={pin}/{ne}): max|diff|={e:.2e}"), e == 0.0);
         }
         std::env::remove_var("LOGSCOPE_MOE_V1");
+        // KNOWN BLIND SPOT, stated because a green gate that cannot see a class of bug is worse than no
+        // gate: this fills FEWER experts than Gpu::STAGE_RING has slots, so it never forces a ring wrap.
+        // A change that reopened the frame after the wrap kept this gate green and CHANGED the model's
+        // output on hardware. Catching that needs > STAGE_RING back-to-back fills compared against a
+        // resident reference, which this harness does not currently construct.
+        println!("  [!] blind spot: fewer fills than STAGE_RING — a wrap-ordering bug would pass here");
         println!("gate-moe-stream: {}", if ok { "live streaming decode is BIT-EXACT to resident \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
