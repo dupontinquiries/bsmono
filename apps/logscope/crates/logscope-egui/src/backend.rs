@@ -901,6 +901,10 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                         else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
             eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
                 self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
+            // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
+            // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
+            // said which mechanism was responsible.
+            eprintln!("wgpu-engine: [{}] {}", self.name, gpu_kernels::submit_attribution());
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
             if bgh + bgm > 0 {
                 eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} lookups ({:.0}% reused, {:.0}/tok saved) [LOGSCOPE_BG_CACHE]",
