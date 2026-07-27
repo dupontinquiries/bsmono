@@ -2058,9 +2058,17 @@ fn main() {
                 let lin = gpu_kernels::Lin::q8(gpu.quantize_q8_resident(&w, n, k));
                 let a = gpu.upload(&act, 1, k);
                 let _ = gpu.download(&lin.apply(&gpu, &a, 1));   // warm: do not time compilation
+                // BATCH THE APPLIES INTO ONE FRAME, download ONCE. The first version downloaded inside
+                // the loop, which measures a submit+poll+map ROUND TRIP per iteration, not the matvec —
+                // and a round trip is ~1 ms on Metal regardless of matrix size, so every shape came back
+                // at the same time and the GiB/s figure was really "bytes / round-trip latency". That is
+                // exactly the mistake this gate exists to catch, made by the gate.
                 let iters = 20usize;
+                gpu.begin_frame();
                 let t0 = std::time::Instant::now();
-                for _ in 0..iters { let _ = gpu.download(&lin.apply(&gpu, &a, 1)); }
+                let mut last = None;
+                for _ in 0..iters { last = Some(lin.apply(&gpu, &a, 1)); }
+                let _ = gpu.download(last.as_ref().unwrap());   // one sync, after all the work
                 let per = t0.elapsed().as_secs_f64() / iters as f64;
                 let bytes = (n * k) as f64 + (n * 4) as f64;   // q8: one byte/weight + a scale per row
                 println!("     {label:22} {:8.2} ms/call  {:7.1} GiB/s",
