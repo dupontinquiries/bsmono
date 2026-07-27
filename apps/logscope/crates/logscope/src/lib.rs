@@ -16,6 +16,7 @@ pub mod liaison_prompt;
 pub mod codecompare;
 pub mod buildpolicy;
 pub mod fanassemble;
+pub mod fanplan;
 pub mod exploration;
 pub mod blackboard;
 pub mod budget;
