@@ -139,9 +139,13 @@ impl LogscopeApp {
         let mut items: Vec<PickerItem> =
             self.ollama_entries.iter().cloned().map(PickerItem::Ollama).collect();
         items.extend(self.local_models.iter().cloned().map(PickerItem::Local));
-        let n = items.len();
-        self.model.items = items;
-        if self.model.selected >= n { self.model.selected = 0; }
+        // Restore the selection BY IDENTITY, not by index. A rescan reorders the list — adding one file
+        // to the models folder shifts every index after it — and the old index is still in range, just
+        // pointing at a different model. The picker then shows one name while the engine loads another.
+        if !self.model.replace_items(items) && !self.model.items.is_empty() {
+            self.local_status = format!("{} — previously selected model is gone; reset to {}",
+                self.local_status, self.model.current());
+        }
     }
     fn scan_local(&mut self) {
         let entered = Path::new(&self.models_dir).to_path_buf(); // owned: no borrow of self held
