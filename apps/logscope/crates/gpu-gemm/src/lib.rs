@@ -4258,6 +4258,15 @@ impl Gpu {
     pub fn prefill_chunked(&self, m: &Model, c: &KvCache, prompt: &[u32], chunk: usize) -> Vec<f32> {
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
+        // BATCH PREFILL INTO A FRAME. Prefill never opened one, so every dispatch took `dispatch`'s
+        // no-frame branch and became its own command buffer — the same defect just fixed in decode, in
+        // the path that dominates wall time for every MoE model measured (Qwen3-30B: 71 s of 75 s;
+        // Scout: 196 s of a 200 s turn). A MoE prefill issues one dispatch group per EXPERT per layer
+        // per chunk, so the count is large and the per-submit cost is paid on all of it.
+        //
+        // The router readbacks inside still flush, but `download` now reopens the frame, so each one
+        // ends a batch instead of ending batching.
+        self.begin_frame();
         let chunk = chunk.max(1);
         let mut logits = Vec::new();
         let mut start = 0;
@@ -4280,6 +4289,9 @@ impl Gpu {
             }
             start = end;
         }
+        // Close the frame we opened: leaving it open would hand a live encoder to whatever runs next,
+        // and `begin_frame` would then flush it at an arbitrary point rather than here.
+        self.end_frame();
         logits
     }
 }
