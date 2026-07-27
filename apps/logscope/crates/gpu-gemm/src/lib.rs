@@ -1918,7 +1918,7 @@ impl StreamSlots {
         let Some(buf) = self.slots.get(idx) else { return };
         let n = (bytes.len() as u64).min(self.slot_bytes) as usize;
         if n == 0 { return; }
-        gpu.queue.write_buffer(buf, 0, &bytes[..n]);
+        gpu.write_chunked(buf, 0, &bytes[..n]);   // expert slot fills are ~68 MiB
     }
 
     /// The whole slot as a word-addressed Tensor, for a kernel that writes packed data into it.
@@ -2618,7 +2618,7 @@ impl Gpu {
             let mut view = slab.slice(off..off + len).get_mapped_range_mut();
             view.copy_from_slice(bytes);
         } else {
-            self.queue.write_buffer(&slab, off, bytes);
+            self.write_chunked(&slab, off, bytes);   // arena slabs are up to 2 GiB
         }
         a.used = off + len;
         Tensor { buf: slab, rows, cols, pool: None, view: Some((off, len)) }
@@ -2884,9 +2884,9 @@ impl Gpu {
                     let (o0, o1) = (base, base + al(g.len()));
                     let o2 = o1 + al(u.len());
                     let stage = self.moe_stage(Self::STAGE_RING * per_fill);
-                    self.queue.write_buffer(&stage.buf, o0 as u64, g);
-                    self.queue.write_buffer(&stage.buf, o1 as u64, u);
-                    self.queue.write_buffer(&stage.buf, o2 as u64, dw);
+                    self.write_chunked(&stage.buf, o0 as u64, g);
+                    self.write_chunked(&stage.buf, o1 as u64, u);
+                    self.write_chunked(&stage.buf, o2 as u64, dw);
                     let view = |off: usize, len: usize| Tensor {
                         buf: stage.buf.clone(), rows: 1, cols: len / 4, pool: None,
                         view: Some((off as u64, al(len) as u64)) };
@@ -8788,9 +8788,43 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// rather than in the tensor itself.
     pub fn upload_flat(&self, v: &[f32]) -> Tensor { self.upload(v, 1, v.len()) }
 
+    /// Largest single `write_buffer` that stays on wgpu's fast staging path.
+    ///
+    /// MEASURED on Apple M2 Ultra / Honeykrisp, and the curve is backwards from what you would expect:
+    ///     16 MiB  21.1 GiB/s
+    ///     64 MiB   6.1 GiB/s
+    ///    256 MiB   5.9 GiB/s
+    /// Bigger transfers are 3.5x SLOWER, because a write that does not fit the staging belt falls off to
+    /// a slower path. Every large upload in this engine — expert fills at ~68 MiB, arena slabs at up to
+    /// 2 GiB — was landing in the slow band.
+    pub const UPLOAD_CHUNK: usize = 16 << 20;
+
+    /// `write_buffer`, split so each piece stays on the fast path.
+    ///
+    /// Semantically identical to one large write: `write_buffer` writes are applied in submission order,
+    /// so N sequential chunks land exactly as one call would. What changes is only which internal path
+    /// wgpu takes.
+    pub fn write_chunked(&self, buf: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        if bytes.len() <= Self::UPLOAD_CHUNK {
+            self.queue.write_buffer(buf, offset, bytes);
+            return;
+        }
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let end = (off + Self::UPLOAD_CHUNK).min(bytes.len());
+            self.queue.write_buffer(buf, offset + off as u64, &bytes[off..end]);
+            off = end;
+        }
+    }
+
     /// Test hook: raw host->device write, for measuring upload bandwidth.
     pub fn queue_write_pub(&self, dst: &Tensor, src: &[f32]) {
         self.queue.write_buffer(&dst.buf, 0, bytemuck::cast_slice(src));
+    }
+
+    /// Test hook: chunked host->device write, to compare against the single-shot path.
+    pub fn write_chunked_pub(&self, dst: &Tensor, src: &[f32]) {
+        self.write_chunked(&dst.buf, 0, bytemuck::cast_slice(src));
     }
 
     /// Test hook: a small view of a tensor, to force a sync without downloading all of it.
