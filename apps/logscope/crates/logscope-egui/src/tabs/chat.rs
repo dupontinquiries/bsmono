@@ -111,6 +111,8 @@ const PARAM_DIALS: [(usize, &str, f32, f32, bool); 5] = [
 const BACKEND_SEL: usize = 620; // LlamaCpp / Wgpu
 const PERSONA_SEL: usize = 621; // PERSONAS table
 const MODEL_SEL: usize = 622;   // ModelState::items — dynamic count
+/// Which job the selected model does: Liaison / Disciple / Thinker (see logscope::modelroles).
+const ROLE_SEL: usize = 623;
 
 /// Read a `Ctx` field as an f32 by its physical-dial id (for syncing the dial handle to the live value).
 fn ctx_get(ctx: &Ctx, id: usize) -> f32 {
@@ -150,6 +152,7 @@ fn phys_dock() -> crate::physui::Panel {
     p.add_selector(BACKEND_SEL, BackendKind::ALL.len(), 0);
     p.add_selector(PERSONA_SEL, PERSONAS.len(), 0);
     p.add_selector(MODEL_SEL, 1, 0); // real count set each frame via set_selector_count once known
+    p.add_selector(ROLE_SEL, 3, 2);  // default Thinker: the safe assumption is that a model is authoritative
     p
 }
 
@@ -4004,7 +4007,13 @@ impl Chat {
                             self.phys.set_selector_count(MODEL_SEL, m.items.len());
                             self.phys.set_index(MODEL_SEL, m.selected);
                         }
-                        let sel_rows: &[(usize, &str)] = &[(BACKEND_SEL, "BACKEND"), (PERSONA_SEL, "PERSONA"), (MODEL_SEL, "MODEL")];
+                        // ROLE row: which job the selected model is doing. Uses the Liaison/Disciple/
+                        // Thinker vocabulary rather than draft/target, because "target" reads as a
+                        // destination when it is the model doing the actual thinking, and a reader has
+                        // to be able to tell that a Disciple's output is PROVISIONAL.
+                        self.phys.set_selector_count(ROLE_SEL, 3);
+                        let sel_rows: &[(usize, &str)] = &[(BACKEND_SEL, "BACKEND"), (PERSONA_SEL, "PERSONA"),
+                                                           (MODEL_SEL, "MODEL"), (ROLE_SEL, "ROLE")];
                         for (row, &(id, label)) in sel_rows.iter().enumerate() {
                             if id == MODEL_SEL && model.is_none() { continue; } // no model context (headless/backdrop scene)
                             let off = (0.42 - (PARAM_DIALS.len() + row) as f32 * 0.26) * ps;
@@ -4014,6 +4023,12 @@ impl Chat {
                                 BACKEND_SEL => BackendKind::ALL[self.phys.index_of(id).min(1)].label().to_string(),
                                 PERSONA_SEL => PERSONAS.get(self.phys.index_of(id)).map(|(_, title, _)| title.to_string()).unwrap_or_default(),
                                 MODEL_SEL => model.as_deref().and_then(|m| m.items.get(m.selected)).map(|it| it.name().to_string()).unwrap_or_else(|| "—".into()),
+                                ROLE_SEL => {
+                                    use logscope::modelroles::Role;
+                                    [Role::Liaison, Role::Disciple, Role::Thinker]
+                                        .get(self.phys.index_of(ROLE_SEL)).copied()
+                                        .unwrap_or(Role::Thinker).label().to_string()
+                                }
                                 _ => String::new(),
                             };
                             let mut trk = m3::panel(rc, right, up, tw, th, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
