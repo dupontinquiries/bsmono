@@ -6456,6 +6456,10 @@ per-layer routing active");
                 // missing, one of them structural" is most of what a person needs to decide what to do.
                 let known = crate::archfeat::gap_report(&arch, expert_count);
                 let detail = if known.is_empty() { acfg.note.to_string() } else { known.join("; ") };
+                // trim a trailing period on `detail` before adding our own: notes end with one about half
+                // the time and "for now.. Use the" is the kind of sloppiness that makes a reader trust
+                // the rest of the message less
+                let detail = detail.trim_end_matches('.').to_string();
                 return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {detail}. \
                     Use the llama.cpp backend for this model.\n{layout}"));
             }
