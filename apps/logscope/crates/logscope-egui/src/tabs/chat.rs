@@ -1746,10 +1746,12 @@ impl Chat {
                 // rewrites them to <|header_start|>/<|eot|> authoritatively at generate time.
                 TemplateKind::Llama4 => self.build_prompt_llama3(&sys, upto),
                 TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
+                TemplateKind::Gemma3 => self.build_prompt_gemma3(&sys, upto),
                 TemplateKind::Plain => self.build_prompt_plain(&sys, upto),
             },
             // llama.cpp path is otherwise Plain, but Gemma needs its own turn markers to stop correctly.
             _ if self.template == TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
+            _ if self.template == TemplateKind::Gemma3 => self.build_prompt_gemma3(&sys, upto),
             _ => self.build_prompt_plain(&sys, upto),
         }
     }
@@ -2032,7 +2034,8 @@ impl Chat {
         match self.live_template() {
             TemplateKind::ChatML => format!("<|im_start|>system\n{sysline}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"),
             TemplateKind::Llama3 | TemplateKind::Llama4 => format!("<|start_header_id|>system<|end_header_id|>\n{sysline}<|eot_id|><|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"),
-            TemplateKind::Gemma => format!("<start_of_turn>user\n{sysline}\n{user}<end_of_turn>\n<start_of_turn>model\n"),
+            TemplateKind::Gemma3 => format!("<start_of_turn>user\n{sysline}\n{user}<end_of_turn>\n<start_of_turn>model\n"),
+            TemplateKind::Gemma => format!("<|turn>system\n{sysline}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n"),
             TemplateKind::Plain => format!("System: {sysline}\nUser: {user}\nAssistant:"),
         }
     }
@@ -2086,6 +2089,29 @@ impl Chat {
             s.push_str(&format!("<|turn>{role}\n{}<turn|>\n", neutralize_markers(m.text())));
         }
         s.push_str("<|turn>model\n");
+        s
+    }
+
+    /// Gemma 2/3 chat template: <start_of_turn>ROLE\n ... <end_of_turn>\n, roles user/model.
+    /// There is NO system role in this family — the system text folds into the FIRST user turn
+    /// (llama.cpp's convention), which matters doubly here: emitting a fake system turn makes the
+    /// model imitate turn markers, and gemma3 previously fell through to Plain entirely (the
+    /// uploaded log's `template=Plain`), so it never saw this format at all.
+    fn build_prompt_gemma3(&self, sys: &str, upto: usize) -> String {
+        let mut s = String::new();
+        let mut sys_pending = if sys.trim().is_empty() { None } else { Some(sys.to_string()) };
+        for m in self.chosen_msgs(8, sys, upto) {
+            let role = if m.role == Role::User { "user" } else { "model" };
+            let text = neutralize_markers(m.text());
+            let body = if m.role == Role::User {
+                match sys_pending.take() {
+                    Some(sy) => format!("{sy}\n\n{text}"),
+                    None => text,
+                }
+            } else { text };
+            s.push_str(&format!("<start_of_turn>{role}\n{body}<end_of_turn>\n"));
+        }
+        s.push_str("<start_of_turn>model\n");
         s
     }
 

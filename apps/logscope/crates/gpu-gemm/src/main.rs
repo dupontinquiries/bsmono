@@ -332,7 +332,10 @@ fn enc_q8_0(w: &[f32]) -> Vec<u8> {
 /// attn_q/k/v — exactly the tensor shape of GLM-4.7-Flash, which the loader once
 /// refused with "missing tensor blk.0.attn_q.weight". Dims mirror --gate-mla-block
 /// (d=64, 2 heads, kv_lora=16, q_lora=32, nope=16, rope=8, v_head=16).
-fn write_gguf_deepseek2_mla() -> Vec<u8> {
+fn write_gguf_deepseek2_mla() -> Vec<u8> { write_gguf_deepseek2_mla_ex(false) }
+/// `bf16_norms`: emit every *_norm tensor as BF16 (ggml type 30) — the GLM-4.x-era convert
+/// habit that broke Q4_K_S loads until the dequantizer grew a BF16 arm.
+fn write_gguf_deepseek2_mla_ex(bf16_norms: bool) -> Vec<u8> {
     let (d, heads, vocab, h) = (64usize, 2usize, 32usize, 128usize);
     let (q_lora, kv_lora, nope, rope, v_head) = (32usize, 16usize, 16usize, 8usize, 16usize);
     let qk_head = nope + rope;
@@ -344,9 +347,11 @@ fn write_gguf_deepseek2_mla() -> Vec<u8> {
     let mat = |rows: usize, cols: usize| vec![cols as u64, rows as u64];
     let v1 = |n: usize| vec![n as u64];
     let f32t = |w: &[f32]| (0u32, bytemuck::cast_slice::<f32, u8>(w).to_vec());
+    let bf16t = |w: &[f32]| (30u32, w.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect::<Vec<u8>>());
     let mut ts: Vec<(String, Vec<u64>, u32, Vec<u8>)> = Vec::new();
     let mut push = |name: String, dims: Vec<u64>, w: Vec<f32>| {
-        let (t, by) = f32t(&w); ts.push((name, dims, t, by)); };
+        let (t, by) = if bf16_norms && name.contains("_norm") { bf16t(&w) } else { f32t(&w) };
+        ts.push((name, dims, t, by)); };
     push("token_embd.weight".into(), mat(vocab, d), mk(11, vocab * d));
     push("blk.0.attn_norm.weight".into(), v1(d), vec![1.0; d]);
     push("blk.0.attn_q_a.weight".into(), mat(q_lora, d), mk(21, q_lora * d));
@@ -4073,6 +4078,56 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-win-scale") {
+        // The windowed sampled decode (sample→embed→decode on-device, k tokens per readback)
+        // gathered the next token's embedding WITHOUT applying m.embed_scale — a no-op for
+        // llama-family models (scale 1.0) but sqrt(d) on Gemma, so every windowed token fed a
+        // hidden state 8-25x too small: the "gemma3 gibberish while llama is fine" report,
+        // invisible to per-token gates because the chat backend routes through the windowed path.
+        // Proof: per-token stream_session vs stream_session_window must produce IDENTICAL token
+        // sequences at near-greedy sampling (exact-math F32 embed source, same rng seed) — on a
+        // gemma-normed model (the fix) AND a llama control (the fix must stay a no-op at scale 1).
+        let gpu = Gpu::new();
+        eprintln!("gate-win-scale: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let hm = gen_model(64, 128, 3, 48, 4, 2);
+        for (name, bytes, want_scale) in [
+            ("gemma3 (embed_scale=8)", write_gguf_gemma3(&hm, None), 8.0f32),
+            ("llama control (scale=1)", write_gguf_q8_0(&hm), 1.0f32),
+        ] {
+            match gpu.load_gguf_quantized(&bytes) {
+                Err(e) => ck(&format!("{name} loads — {e}"), false),
+                Ok(m) => {
+                    ck(&format!("{name}: embed_scale = {:.1}", m.embed_scale), (m.embed_scale - want_scale).abs() < 1e-3);
+                    let et = gpu.embed_table_t(&m);
+                    let prompt = [3u32, 9, 17];
+                    let sp = gpu_kernels::SamplerParams { temperature: 0.01, top_k: 2, top_p: 1.0,
+                                             repeat_penalty: 1.0, repeat_last_n: 0, min_p: 0.0 };
+                    let run = |windowed: bool| -> Vec<u32> {
+                        let mut s = gpu.session_new(&m, 32, 7);
+                        gpu.session_prefill(&m, &mut s, &prompt);
+                        let mut seen = prompt.to_vec();
+                        let mut rng = 0xC0FFEEu64;
+                        let mut ids: Vec<u32> = Vec::new();
+                        if windowed {
+                            gpu.stream_session_window(&m, &mut s, &mut seen, 6, None, &sp, &mut rng, 3,
+                                &gpu_kernels::EmbedT::F32(&et), &|| false, |t| { ids.push(t); true });
+                        } else {
+                            gpu.stream_session(&m, &mut s, &mut seen, 6, None, &sp, &mut rng,
+                                &|| false, |t| { ids.push(t); true });
+                        }
+                        ids
+                    };
+                    let pt = run(false);
+                    let win = run(true);
+                    ck(&format!("{name}: windowed ids == per-token ids ({pt:?} vs {win:?})"),
+                       !pt.is_empty() && pt == win);
+                }
+            }
+        }
+        println!("gate-win-scale: {}", if ok { "windowed decode applies the embed scale \u{2713}" } else { "FAIL \u{2717}" });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-ffn-fuse") {
         // Dense-decode pass-count optimization: silu(gate)*up fused into the down matvec
         // (+ residual), and out_norm folded into the logits matvec. Two guarantees:
@@ -4391,6 +4446,16 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         // per-block routing and that a loaded q-compressed model actually decodes.
         let gpu = Gpu::new();
         eprintln!("gate-mla-load: adapter = {}", gpu.adapter_name);
+        {
+            // BF16-normed variant (the GLM-4.7-Flash Q4_K_S failure): norms as ggml type 30 must
+            // load — and before the dequant arm existed, this exact file shape produced the opaque
+            // "MLA tensor set is incomplete" with no tensor named.
+            let bytes = write_gguf_deepseek2_mla_ex(true);
+            match gpu.load_gguf_quantized(&bytes) {
+                Ok(_) => println!("  [\u{2713}] BF16-normed MLA gguf loads (GLM-4.x convert habit)"),
+                Err(e) => { println!("  [\u{2717} FAIL] BF16-normed MLA gguf loads — {e}"); std::process::exit(1); }
+            }
+        }
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
         let bytes = write_gguf_deepseek2_mla();
         match gpu.load_gguf_quantized(&bytes) {

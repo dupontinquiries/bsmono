@@ -2660,6 +2660,9 @@ impl Gpu {
     /// decode's GPU-side row gather (`gather_q8_at`). ~4× smaller than an f32 embed copy — a
     /// 151k×2048 table costs ~350 MB instead of ~1.2 GB of Asahi's VMA budget.
     pub fn embed_q8(&self, m: &Model) -> QWeight { self.quantize_q8_resident(&m.embed, m.vocab, m.d) }
+    /// The full embedding table as a resident f32 tensor — the EmbedT::F32 source for windowed
+    /// decode and for gates that need the exact-math embed path (Model.embed stays private).
+    pub fn embed_table_t(&self, m: &Model) -> Tensor { self.upload(&m.embed, m.vocab, m.d) }
 
     /// The GPU-resident embedding table for windowed decode. Under MoE streaming (tight VMA budget) the
     /// table is q8 — ~4× smaller than f32, saving ~2.9 GiB on a Scout-class vocab, at ~0.5% RMSE (the
@@ -5349,33 +5352,45 @@ head_count/head_count_kv metadata disagrees with the tensor", f.len()));
                     fused.with_bias(Some(self.upload(&b, 1, attn_dim + 2 * kv)))
                 } else { fused }
             };
+            // MLA weight set with DIAGNOSTIC collection: the old closure collapsed every failure —
+            // a missing name OR a fetch/dequant error (e.g. an unsupported tensor type) — into one
+            // generic "incomplete" message via `.ok()?`. Now each tensor either resolves or records
+            // WHY it didn't, and the error names the exact tensors, their underlying errors, and
+            // dumps the block's attn tensors so the next unknown spelling/type self-diagnoses.
+            let mut mla_missing: Vec<String> = Vec::new();
             let mla_w = {
-                let t = |a: &str, b: &str| -> Option<String> {
+                let mut need = |a: &str, b: &str| -> Option<Vec<f32>> {
                     let na = format!("blk.{i}.{a}.weight");
-                    if g.tensor(&na).is_some() { return Some(na); }
                     let nb = format!("blk.{i}.{b}.weight");
-                    if g.tensor(&nb).is_some() { return Some(nb); }
-                    None
+                    let name = if g.tensor(&na).is_some() { na }
+                               else if g.tensor(&nb).is_some() { nb }
+                               else { mla_missing.push(format!("{a}|{b}: neither name present")); return None; };
+                    match fetch(&name) {
+                        Ok(v) => Some(v),
+                        Err(e) => { mla_missing.push(format!("{name}: {e}")); None }
+                    }
                 };
-                (|| -> Option<crate::mla::MlaWeightsT> {
-                    let (qa, qaln, qb) = (t("attn_q_a", "attn_q_a_proj")?, t("attn_q_a_norm", "attn_q_a_layernorm")?, t("attn_q_b", "attn_q_b_proj")?);
-                    let (kva, kvaln, kvb) = (t("attn_kv_a_mqa", "attn_kv_a")?, t("attn_kv_a_norm", "attn_kv_a_layernorm")?, t("attn_kv_b", "attn_kv_b_proj")?);
-                    let o = t("attn_output", "attn_out")?;
-                    let g1 = |n: &str| fetch(n).ok();
-                    Some(crate::mla::MlaWeightsT {
-                        q_a: self.upload_flat(&g1(&qa)?), q_a_ln: self.upload_flat(&g1(&qaln)?),
-                        q_b: self.upload_flat(&g1(&qb)?),
-                        kv_a: self.upload_flat(&g1(&kva)?), kv_a_ln: self.upload_flat(&g1(&kvaln)?),
-                        kv_b: self.upload_flat(&g1(&kvb)?),
-                        o: self.upload_flat(&g1(&o)?),
-                    })
-                })()
+                let parts = (need("attn_q_a", "attn_q_a_proj"), need("attn_q_a_norm", "attn_q_a_layernorm"),
+                             need("attn_q_b", "attn_q_b_proj"), need("attn_kv_a_mqa", "attn_kv_a"),
+                             need("attn_kv_a_norm", "attn_kv_a_layernorm"), need("attn_kv_b", "attn_kv_b_proj"),
+                             need("attn_output", "attn_out"));
+                match parts {
+                    (Some(qa), Some(qaln), Some(qb), Some(kva), Some(kvaln), Some(kvb), Some(o)) =>
+                        Some(crate::mla::MlaWeightsT {
+                            q_a: self.upload_flat(&qa), q_a_ln: self.upload_flat(&qaln),
+                            q_b: self.upload_flat(&qb),
+                            kv_a: self.upload_flat(&kva), kv_a_ln: self.upload_flat(&kvaln),
+                            kv_b: self.upload_flat(&kvb),
+                            o: self.upload_flat(&o),
+                        }),
+                    _ => None,
+                }
             };
             if mla_q && mla_w.is_none() {
                 return Err(format!(
                     "blk.{i}: q-compressed MLA block (attn_q absent, attn_q_a present) but the MLA \
-tensor set is incomplete — need attn_q_a(+_norm)/attn_q_b, attn_kv_a_mqa(+_norm)/attn_kv_b, \
-attn_output (DeepSeek-V3 or *_proj GLM spellings)"));
+tensor set is incomplete:\n  {}\nblock tensors:\n{}",
+                    mla_missing.join("\n  "), g.dump_tensors(&format!("blk.{i}.attn"))));
             }
             let delta_w: Option<Box<DeltaWeights>> = if is_recurrent {
                 let dd = delta_dims.as_ref().unwrap();
@@ -8565,6 +8580,12 @@ impl Gpu {
                     EmbedT::F32(t) => self.gather_at(t, &o, j as u32, m.d),
                     EmbedT::Q8(q) => self.gather_q8_at(q, &o, j as u32),
                 };
+                // Gemma scales input embeddings by sqrt(d) (25.3 on the 270m!). Every per-token
+                // path goes through embed_scaled; this on-device gather MUST apply the same scale
+                // or every windowed token feeds a 25x-too-small hidden state — the "gemma3
+                // gibberish while llama is fine" report, invisible to per-token gates because the
+                // chat backend routes through THIS path. scale_embed_t is a no-op at scale 1.0.
+                let x = self.scale_embed_t(m, x);
                 pre.push(self.decode_layers_t(m, &s.cache, x, s.pos + j));
                 // If a dims uniform allocation was rejected by the device (buffer-object/VMA ceiling —
                 // the M4 windowed crash surfaces at the FIRST sample_at, slot 0), the frame is poisoned:
