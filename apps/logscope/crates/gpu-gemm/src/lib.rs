@@ -6434,8 +6434,18 @@ a '{declared}'");
 metadata, so the latent dimensions are unknown. The MLA path is implemented and validated; this \
 particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layout}"));
             }
-            eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache (validated); \
+            // Only claim the path is ACTIVE if the weights actually loaded. Saying "per-layer routing
+            // active" and then failing two lines later with "the MLA forward isn't wired yet" is a log
+            // that contradicts itself, and the reader cannot tell which half to believe.
+            let split_kv_b = g.tensor("blk.0.attn_k_b.weight").is_some()
+                          && g.tensor("blk.0.attn_kv_b.weight").is_none();
+            if split_kv_b {
+                eprintln!("wgpu-engine: MLA detected, but this checkpoint splits kv_b into attn_k_b + \
+attn_v_b (3-D per-head); the loader reads a single combined attn_kv_b, so the MLA path will NOT engage");
+            } else {
+                eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache (validated); \
 per-layer routing active");
+            }
         }
         let treat_unsupported = !acfg.supported;
         if treat_unsupported {
