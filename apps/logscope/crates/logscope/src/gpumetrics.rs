@@ -244,14 +244,36 @@ impl Headroom {
 
     pub fn is_worth_optimising(&self) -> bool { self.ceiling >= Self::WORTH_DOING }
 
+    /// Is the sync time plausibly RECOVERABLE, or is it the GPU doing real work?
+    ///
+    /// `sync_ns` is "CPU blocked on the GPU", which conflates two opposite situations:
+    ///   - a pipeline STALL, where the GPU is idle and the block is pure waste, and
+    ///   - the GPU EXECUTING, where the block is just the CPU correctly waiting for real work.
+    /// Only the first is recoverable, and nothing in the counter distinguishes them.
+    ///
+    /// Submits per token is the usable proxy. A run doing hundreds of submits per token is draining the
+    /// pipeline constantly and its sync time is mostly stalls; a run doing a few dozen is waiting on
+    /// genuine compute. Measured the hard way: a Metal run at 1119 submits/token was cut to the low
+    /// hundreds and got NO faster, which is only possible if the sync time was execution all along.
+    pub fn sync_is_probably_stall(&self) -> bool { self.submits_per_token > 200 }
+
     /// Where the recoverable time actually is — which decides WHICH change to make.
     pub fn verdict(&self) -> String {
         if !self.is_worth_optimising() {
             return format!("compute-bound: CPU holds {:.1}% and sync {:.1}%, so removing ALL of it gives {:.2}x. Caching, batching and submit-count work cannot help here — the GPU is the wall.",
                 self.cpu_share * 100.0, self.sync_share * 100.0, self.ceiling);
         }
+        // GPU EXECUTION vs a STALL. sync_ns is "CPU blocked on the GPU" and cannot tell them apart:
+        // a drained pipeline (recoverable) and a busy GPU (not) look identical. submits/token is the
+        // proxy — thousands means the frame is being drained; tens means each submit carries real work.
+        if self.sync_share > self.cpu_share * 4.0 && !self.sync_is_probably_stall() {
+            return format!("GPU EXECUTION, not stalling: {:.0}% of the step is the CPU waiting, but at \
+only {} submits/token each one carries real work — the wait IS the compute. The nominal {:.2}x ceiling \
+is not real. Look at kernel throughput (--gate-perf) and at bytes moved per token.",
+                self.sync_share * 100.0, self.submits_per_token, self.ceiling);
+        }
         if self.sync_share > self.cpu_share * 4.0 {
-            format!("sync-bound: {:.0}% of the step is the CPU WAITING on the GPU ({} submits/token). The win is removing readbacks, not caching — a bind-group cache does not shorten a stall. Ceiling {:.2}x.",
+            format!("sync-bound: {:.0}% of the step is the CPU WAITING at {} submits/token — the frame is being drained constantly and the GPU starved. The win is removing readbacks, not caching — a bind-group cache does not shorten a stall. Ceiling {:.2}x.",
                 self.sync_share * 100.0, self.submits_per_token, self.ceiling)
         } else {
             format!("dispatch-bound: {:.0}% is CPU setup at {} submits/token. Caching and batching are the right tools here. Ceiling {:.2}x.", self.cpu_share * 100.0, self.submits_per_token, self.ceiling)
@@ -397,6 +419,23 @@ mod tests {
         assert!(v.contains("does not shorten a stall"),
             "the point is that the OBVIOUS fix is the wrong one here");
         assert_eq!(h.submits_per_token, 1151);
+    }
+
+    #[test]
+    fn high_sync_with_FEW_submits_is_execution_not_stalling() {
+        // The correction that cost a real experiment. Scout on Metal showed sync at 97% and a nominal
+        // 36x ceiling; cutting submits from 1119/token to the low hundreds made it NO faster, which is
+        // only possible if the sync time was the GPU executing rather than the pipeline draining.
+        // sync_ns cannot tell those apart, so submits/token is the proxy.
+        let stally = headroom(1_620_399_000_000, 1_812_000_000, 1_573_726_000_000, 726, 812_631).unwrap();
+        assert!(stally.sync_is_probably_stall(), "1119 submits/token is a draining pipeline");
+
+        let busy = headroom(1_620_399_000_000, 1_812_000_000, 1_573_726_000_000, 726, 36_000).unwrap();
+        assert!(!busy.sync_is_probably_stall(), "50 submits/token is genuine compute");
+        let v = busy.verdict();
+        assert!(v.contains("EXECUTION, not stalling"), "{v}");
+        assert!(v.contains("not real"), "the nominal ceiling must be disowned, not quoted: {v}");
+        assert!(v.contains("bytes moved per token"), "and it must redirect somewhere useful");
     }
 
     #[test]
