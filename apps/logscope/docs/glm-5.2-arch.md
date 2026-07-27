@@ -39,6 +39,31 @@ skipping, and both `*_mla` dim spellings.
    runs only over its top 2048. There is no dense fallback that is merely slower: attending to a 1M
    context in full is not something the engine can do.
 
+## Confirmed by an actual load attempt
+
+The engine unified all 6 shards (1809 tensors, **201.8 GiB**) before refusing, so the shard handling and
+the tensor index are fine. The block-0 dump confirms the metadata and adds shapes the KV pairs did not:
+
+```
+blk.0.attn_k_b.weight        [192x512x64]  Q8_0   <- 3-D: per-head MLA reconstruction
+blk.0.attn_v_b.weight        [512x256x64]  Q8_0   <- 3-D
+blk.0.attn_kv_a_mqa.weight   [6144x576]    Q8_0
+blk.0.attn_q_a.weight        [6144x2048]   Q5_K
+blk.0.indexer.attn_k.weight  [6144x128]    Q8_0   <- the sparse-attention indexer
+blk.0.indexer.attn_q_b.weight[2048x4096]   Q8_0
+blk.0.indexer.k_norm.weight  [128]         F32
+blk.0.indexer.proj.weight    [6144x32]     F32
+```
+
+Two things that were not visible from the KV metadata alone:
+
+* **`attn_k_b` and `attn_v_b` are 3-D** (`[head_dim x lora x n_head]`). Our MLA loader expects 2-D
+  projections, so even the implemented MLA path needs a shape change to read these.
+* The **indexer is four tensors per block**, all present and all currently unread.
+
+Quant mix is Q8_0 / Q5_K / Q6_K — no IQ1_S in block 0 despite the file name, so the 1-bit quantization is
+applied selectively to the expert tensors.
+
 ## Practical note
 
 It does not fit an M2 Ultra. The 1-bit quant is ~223 GB against a 192 GB ceiling. This document exists so
