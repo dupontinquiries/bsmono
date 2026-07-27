@@ -18,6 +18,7 @@ pub mod buildpolicy;
 pub mod fanassemble;
 pub mod fanplan;
 pub mod reflex;
+pub mod traceval;
 pub mod exploration;
 pub mod blackboard;
 pub mod budget;
