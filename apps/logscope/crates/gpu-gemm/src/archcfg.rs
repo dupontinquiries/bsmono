@@ -162,8 +162,10 @@ docs/glm-5.2-arch.md",
             arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
-            note: "Multi-head Latent Attention (MLA): compressed-KV latent cache + low-rank q/kv projections. \
-                   Detected but the MLA forward isn't wired yet — use the llama.cpp backend for now.",
+            note: "the MLA forward IS wired and validated (--gate-mla-block). What blocks this checkpoint \
+is tensor LAYOUT: it ships attn_k_b and attn_v_b as separate THREE-dimensional tensors \
+[head_dim x lora x n_head], while the loader expects one fused 2-D attn_kv_b. Splitting and reshaping \
+them at load is the remaining work",
         },
         _ => ArchConfig {
             arch: Arch::Unknown, prefix: "", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
@@ -403,6 +405,26 @@ mod tests {
         assert_eq!(dim_keys(&c).embedding_length, "qwen3_5.embedding_length");
         // the "qwen35" spelling maps to the same config
         assert_eq!(for_arch("qwen35").arch, Arch::Qwen35);
+    }
+
+    #[test]
+    fn a_note_must_not_claim_something_is_UNWIRED_that_archfeat_says_is_implemented() {
+        // Third instance of the same drift this session (gemma4's missing entry, glm-dsa's prefix, now
+        // this). GLM-4.7-Flash printed BOTH of these in one load:
+        //     "MLA attention — compressed-latent KV cache (validated); per-layer routing active"
+        //     "load failed: ... the MLA forward isn't wired yet"
+        // The engine and its own error message disagreed, because the note was written before MLA
+        // landed and nothing forced it to be revisited.
+        for a in ["deepseek2", "deepseek3", "glm-dsa", "glm4moe"] {
+            let n = for_arch(a).note.to_ascii_lowercase();
+            let claims_unwired = n.contains("isn't wired") || n.contains("is not wired")
+                || n.contains("not implemented");
+            let mla_done = crate::archfeat::Feature::Mla.implemented();
+            assert!(!(claims_unwired && mla_done),
+                "{a}'s note says MLA is unwired but archfeat reports it implemented: {n}");
+        }
+        // and the deepseek note now names the ACTUAL blocker, which is tensor layout
+        assert!(for_arch("deepseek2").note.contains("THREE-dimensional"));
     }
 
     #[test]
