@@ -183,7 +183,9 @@ pub(crate) mod engine {
             // Retained for the process lifetime (Colibri's g_maps): weights that want to be VIEWS into
             // the file cannot borrow a mapping the loader drops on return. Reused by path, so reloading
             // the same model does not map it twice.
+            crate::diag::note(&format!("wgpu-engine: STAGE begin mmap+retain {path}"));
             let bytes: &'static [u8] = gpu_kernels::retain_map(path).map_err(|e| format!("open {path}: {e}"))?;
+            crate::diag::note("wgpu-engine: STAGE end mmap+retain");
             // Configure the engine from the tuning profile BEFORE the device is created — these values are
             // read during setup. Adapter-specific defaults need the adapter name, which we do not have
             // yet, so this applies the portable ones; the driver-detected fallbacks (Honeykrisp subgroup
@@ -904,7 +906,9 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
             // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
             // said which mechanism was responsible.
-            eprintln!("wgpu-engine: [{}] {}", self.name, gpu_kernels::submit_attribution());
+            let attr = format!("wgpu-engine: [{}] {}", self.name, gpu_kernels::submit_attribution());
+            eprintln!("{attr}");
+            crate::diag::note(&attr);
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
             if bgh + bgm > 0 {
                 eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} lookups ({:.0}% reused, {:.0}/tok saved) [LOGSCOPE_BG_CACHE]",
