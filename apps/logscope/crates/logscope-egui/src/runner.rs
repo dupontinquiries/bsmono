@@ -679,6 +679,22 @@ fn build_prompt(tmpl: TemplateKind, system: &str, turns: &[(Role, &str)]) -> Str
             }
             s.push_str("<|im_start|>assistant\n");
         }
+        TemplateKind::Gemma3 => {
+            // Gemma 2/3: <start_of_turn>/<end_of_turn>, roles user/model, NO system role —
+            // the system text folds into the first user turn (llama.cpp's convention).
+            let mut sys_pending = if system.is_empty() { None } else { Some(neutralize(system)) };
+            for (role, text) in turns {
+                let r = if *role == Role::User { "user" } else { "model" };
+                let body = if *role == Role::User {
+                    match sys_pending.take() {
+                        Some(sy) => format!("{sy}\n\n{}", neutralize(text)),
+                        None => neutralize(text),
+                    }
+                } else { neutralize(text) };
+                s.push_str(&format!("<start_of_turn>{r}\n{body}<end_of_turn>\n"));
+            }
+            s.push_str("<start_of_turn>model\n");
+        }
         TemplateKind::Llama3 => {
             s.push_str("<|begin_of_text|>");
             if !system.is_empty() { s.push_str(&format!("<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>", neutralize(system))); }

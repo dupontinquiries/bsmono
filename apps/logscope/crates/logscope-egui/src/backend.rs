@@ -306,7 +306,11 @@ pub(crate) mod engine {
             } else if tok.special_id("<|eot_id|>").is_some() || tok.special_id("<|start_header_id|>").is_some() {
                 TemplateKind::Llama3
             } else if tok.special_id("<|turn>").is_some() || tok.special_id("<turn|>").is_some() {
-                TemplateKind::Gemma // Gemma 4 turn markers (changed from Gemma 3's <start_of_turn>/<end_of_turn>)
+                TemplateKind::Gemma // Gemma 4 turn markers
+            } else if tok.special_id("<end_of_turn>").is_some() {
+                TemplateKind::Gemma3 // Gemma 2/3 <start_of_turn>/<end_of_turn> — previously fell through to
+                                     // Plain (the log's "template=Plain"), so the model never saw its own
+                                     // chat format AND its turn markers were never emitted or stopped on
             } else {
                 TemplateKind::Plain
             };
@@ -367,7 +371,15 @@ pub(crate) mod engine {
             // output is bit-identical for any tile (--gate-matvec), so this can never change results.
             if !gpu.profile_forced() && std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_none() {
                 let (k, n) = (model.d, 2 * model.h); // wgate_up: the largest decode mat-vec
-                if let Some(t) = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n) {
+                let cached_raw = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n);
+                // Validate BEFORE applying: a cached tile of 2147549188 was seen in the field
+                // (poisoned/corrupt cache entry) and the old code called set_matvec_tile with it
+                // first and asked questions never. An insane tile is discarded and retuned.
+                let cached = cached_raw.filter(|t| (1..=64).contains(t));
+                if let (Some(raw), None) = (cached_raw, cached) {
+                    eprintln!("wgpu-engine: cached decode tile {raw} is out of range — discarding the cache entry, retuning");
+                }
+                if let Some(t) = cached {
                     gpu.set_matvec_tile(t);
                     eprintln!("wgpu-engine: decode tile = {t} (cached autotune for this GPU)");
                 } else {
@@ -644,8 +656,8 @@ using {} for this run but NOT caching it; a difference this small is run-to-run 
 would mislead every later load",
                     v.margin() * 100.0, v.on_ms, v.off_ms, if decision { "ON" } else { "off" });
             }
-            eprintln!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
-                if decision { "ON" } else { "OFF" }, self.gpu.adapter_name);
+            // (The conclusive branch above already logs its caching; a second unconditional
+            // "cached for <adapter>" here printed even on the INCONCLUSIVE path — a lying log line.)
         }
         pub fn generate(&mut self, prompt: &str, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
             let toks = self.tok.encode(prompt);
@@ -1180,10 +1192,18 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
 /// must match the model: a ChatML model (smollm2, `<|im_end|>`) fed Llama-3 markers drifts into
 /// byte-level marker text and never hits its real stop. Detected from the tokenizer at load.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TemplateKind { Llama3, ChatML, Plain, Gemma, Llama4 }
+pub enum TemplateKind {
+    Llama3, ChatML, Plain,
+    /// Gemma 4: <|turn>ROLE ... <turn|>, native system role.
+    Gemma,
+    Llama4,
+    /// Gemma 2/3: <start_of_turn>/<end_of_turn>, roles user/model, NO system role
+    /// (system text folds into the first user turn).
+    Gemma3,
+}
 impl TemplateKind {
-    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3, Self::Llama4 => 4 } }
-    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, 4 => Self::Llama4, _ => return None }) }
+    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3, Self::Llama4 => 4, Self::Gemma3 => 5 } }
+    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, 4 => Self::Llama4, 5 => Self::Gemma3, _ => return None }) }
 }
 
 /// What a successful load reports back to the UI.

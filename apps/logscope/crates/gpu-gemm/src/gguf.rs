@@ -466,7 +466,7 @@ pub fn ggml_type_name(t: u32) -> &'static str {
     match t {
         0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
         8 => "Q8_0", 9 => "Q8_1", 10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
-        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 20 => "IQ4_NL", 21 => "IQ3_S",
+        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 20 => "IQ4_NL", 21 => "IQ3_S", 30 => "BF16",
         _ => "?",
     }
 }
@@ -506,6 +506,7 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         19 => if n % 256 == 0 { Some(n / 256 * 50) } else { None },  // IQ1_S: 50 B per 256 → 1.5625 bits/wt
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block
+        30 => Some(n * 2),                                           // BF16: 2 bytes/value
         20 => if n % 32 == 0 { Some(n / 32 * 18) } else { None }, // IQ4_NL: f16 d + 16B 4-bit codebook idx
         _ => None,
     }
@@ -761,6 +762,15 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
                 }
             });
             Ok(out)
+        }
+        30 => {
+            // BF16: each value is the top 16 bits of an f32 — widen by shifting into the high half.
+            // Newer HF->GGUF converts (GLM-4.x era) store norms/biases as BF16 even in K-quant files,
+            // so a missing arm here silently failed whole MLA tensor sets.
+            Ok((0..n).map(|i| {
+                let b = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+                f32::from_bits((b as u32) << 16)
+            }).collect())
         }
         20 => {
             // IQ4_NL: 18-byte blocks of 32 — f16 scale `d`, then 16 bytes of packed 4-bit indices into a

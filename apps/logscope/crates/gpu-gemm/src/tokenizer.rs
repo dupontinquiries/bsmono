@@ -263,6 +263,20 @@ impl Tokenizer {
                 specials.push((s.into_owned(), i as u32));
             }
         }
+        // Gemma-3 GGUFs type ~6.4k tokens as CONTROL/USER_DEFINED — including plain
+        // formatting tokens ("\n" is id 108!) and thousands of <unusedN> placeholder slots.
+        // Registering those as specials had three visible failures at once (the gemma3.log
+        // report): the stop set inherited them (every reply died at its FIRST NEWLINE — "stop:
+        // model emitted stop token 108"), the specials-swallow ate newlines out of any output
+        // that survived, and encode split on "\n". A special here means "matched verbatim and
+        // handled out of band"; pure-whitespace text and <unusedN> placeholders are neither
+        // turn markers nor content markers, so they don't belong in the set at all.
+        specials.retain(|(text, _)| {
+            let is_ws = !text.is_empty() && text.chars().all(|c| c.is_whitespace());
+            let is_unused = text.starts_with("<unused") && text.ends_with('>')
+                && text[7..text.len() - 1].chars().all(|c| c.is_ascii_digit());
+            !is_ws && !is_unused
+        });
         tk.set_specials(specials);
         // Diagnostic: did the ChatML/Llama markers actually register? If these are None, the vocab doesn't
         // store them as literal "<|...|>" strings (so the <|...|> scan can't see them); if they're Some but
@@ -312,5 +326,34 @@ mod control_stop_tests {
     fn control_stop_ids_empty_when_no_specials() {
         let t = tok_with_specials(&[]);
         assert!(t.control_stop_ids().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod gemma3_specials_tests {
+    use super::*;
+    #[test]
+    fn whitespace_and_unused_slots_are_not_specials_or_stops() {
+        // The gemma3.log failure in miniature: "\n" (108) and <unusedN> typed as control.
+        let mut tk = Tokenizer::build(
+            (0..8).map(|i| format!("t{i}").into_bytes()).collect(), vec![], true);
+        let mut sp = vec![
+            ("\n".to_string(), 1u32), ("<unused0>".to_string(), 2), ("<unused123>".to_string(), 3),
+            ("<end_of_turn>".to_string(), 4), ("<start_of_turn>".to_string(), 5),
+        ];
+        sp.retain(|(text, _)| {
+            let is_ws = !text.is_empty() && text.chars().all(|c| c.is_whitespace());
+            let is_unused = text.starts_with("<unused") && text.ends_with('>')
+                && text[7..text.len() - 1].chars().all(|c| c.is_ascii_digit());
+            !is_ws && !is_unused
+        });
+        let mut t2 = Tokenizer::build((0..8).map(|i| format!("t{i}").into_bytes()).collect(), vec![], true);
+        t2.set_specials(sp);
+        assert!(!t2.is_special(1), "newline must not be special (it was stop token 108)");
+        assert!(!t2.is_special(2) && !t2.is_special(3), "<unusedN> slots are placeholders");
+        assert!(t2.is_special(4) && t2.is_special(5), "real turn markers stay special");
+        let stops: std::collections::HashSet<u32> = t2.control_stop_ids().into_iter().collect();
+        assert!(stops.contains(&4) && !stops.contains(&1) && !stops.contains(&2));
+        let _ = tk; let _ = &mut tk;
     }
 }

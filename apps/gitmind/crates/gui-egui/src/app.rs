@@ -134,8 +134,8 @@ impl App {
             egui::Panel::bottom("task_strip").show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    let tail = self.task.log();
-                    let last = tail.lines().last().unwrap_or("working…");
+                    let tail = self.task.log();   // Vec<String>, one entry per log line
+                    let last = tail.last().map(String::as_str).unwrap_or("working…");
                     ui.label(egui::RichText::new(last).monospace().small().weak());
                 });
             });
