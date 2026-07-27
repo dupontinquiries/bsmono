@@ -254,11 +254,16 @@ impl MapPreset {
         if matches!(self.name, "Triad Foundry" | "Vanguard Reach" | "Pinnacle") {
             c.triplane = true;
         }
+        // Learned sites: blueprints derived from 3D scans of real architecture (mapstudy tool).
+        // They live in the authored index space (8..) — authored-from-scans, same idiom.
+        if let Some(i) = Level::LEARNED_SITES.iter().position(|(n, ..)| *n == self.name) {
+            c.authored = Some(8 + i as u8);
+        }
         c
     }
 }
 
-pub const PRESETS: [MapPreset; 91] = [
+pub const PRESETS: [MapPreset; 104] = [
     MapPreset { name: "Copper District", theme: MapTheme::Industrial, size: 152, rooms: 34, cover: 2.8, pit: 0.16, lanes: 0 },
     MapPreset { name: "Foundry Night", theme: MapTheme::Industrial, size: 120, rooms: 26, cover: 3.2, pit: 0.10, lanes: 0 },
     MapPreset { name: "Iron Works", theme: MapTheme::Industrial, size: 168, rooms: 40, cover: 2.4, pit: 0.20, lanes: 0 },
@@ -358,6 +363,19 @@ pub const PRESETS: [MapPreset; 91] = [
     MapPreset { name: "Redwood Canyon", theme: MapTheme::Redwood, size: 116, rooms: 8, cover: 2.0, pit: 0.0, lanes: 0 },
     MapPreset { name: "Malecon Breakwater", theme: MapTheme::Urban, size: 120, rooms: 8, cover: 2.0, pit: 0.0, lanes: 2 },
     MapPreset { name: "Spire Foundry", theme: MapTheme::Industrial, size: 108, rooms: 8, cover: 2.0, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Naranco Sanctuary", theme: MapTheme::Military, size: 120, rooms: 8, cover: 2.2, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Haunted Parish", theme: MapTheme::Canopy, size: 120, rooms: 8, cover: 2.4, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Colossus Fountain", theme: MapTheme::Urban, size: 120, rooms: 8, cover: 2.4, pit: 0.0, lanes: 0 },
+    MapPreset { name: "San Pellegrino Piazza", theme: MapTheme::Urban, size: 128, rooms: 8, cover: 2.6, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Castillo de Pioz", theme: MapTheme::Military, size: 128, rooms: 8, cover: 2.4, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Barcience Keep", theme: MapTheme::Military, size: 120, rooms: 8, cover: 2.2, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Amman Cistern", theme: MapTheme::Military, size: 120, rooms: 8, cover: 2.2, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Morton Castle", theme: MapTheme::Military, size: 120, rooms: 8, cover: 2.2, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Pambre Bastion", theme: MapTheme::Military, size: 120, rooms: 8, cover: 2.2, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Perarrua Crag", theme: MapTheme::Military, size: 120, rooms: 8, cover: 2.2, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Lost Palace", theme: MapTheme::Canopy, size: 128, rooms: 8, cover: 2.6, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Thian Hock Keng", theme: MapTheme::Urban, size: 128, rooms: 8, cover: 2.6, pit: 0.0, lanes: 0 },
+    MapPreset { name: "Sky Palace Corridor", theme: MapTheme::Bunker, size: 112, rooms: 8, cover: 2.2, pit: 0.0, lanes: 0 },
 ];
 
 /// Per-theme low-poly palette (no textures — just tinted vertex colour, the reference's approach).
@@ -2418,6 +2436,7 @@ impl Level {
             Some(5) => Self::build_redwood_canyon(cfg),
             Some(6) => Self::build_malecon(cfg),
             Some(7) => Self::build_spire_foundry(cfg),
+            Some(a) if (8..8 + Self::LEARNED_SITES.len() as u8).contains(&a) => Self::build_learned_site(cfg, (a - 8) as usize),
             _ => Self::build_flood_zone(cfg),
         }
     }
@@ -2729,6 +2748,474 @@ impl Level {
         lvl.dress_boundary_margin(&mut Rng::new(seed_u ^ 0xB0DE));
         lvl.chunk_meshes(40.0); // whole-chunk frustum culling on the town's dense building geometry
 
+        lvl
+    }
+
+    /// **Learned sites** — blueprints LEARNED from 3D scans of real architecture (IQM models →
+    /// `tools`' sibling `src/bin/mapstudy.rs` → height-tiered char grids in `blueprints/learned/`).
+    /// The reference town proved the thesis (stamp real spatial design, not procedural guesswork);
+    /// these extend it to castles, temples and piazzas scanned from the real world: massing keeps
+    /// its height tiers (curtain wall vs keep vs spire), courtyards become THE open play spaces,
+    /// gates stay walk-under. Display name, blueprint text, skin kind (0 stone, 1 temple, 2 warm
+    /// town, 3 haunted, 4 steel), wall height. Beyond massing/courts/gates the blueprints now
+    /// carry two deeper learnings from the scans: 'c' columns (hypostyle rhythm — the cistern,
+    /// the churches: slender cover that preserves sightlines) and 'r' ramparts (the castles'
+    /// wall-walks: the massing edge ringing a courtyard becomes a walkable elevated line with
+    /// a parapet lip and stepped stairs down into the bailey).
+    pub const LEARNED_SITES: [(&'static str, &'static str, u8, f32); 13] = [
+        ("Naranco Sanctuary", include_str!("blueprints/learned/church_of_st.txt"), 0, 4.2),
+        ("Haunted Parish", include_str!("blueprints/learned/haunted_parish_ps1.txt"), 3, 3.8),
+        ("Colossus Fountain", include_str!("blueprints/learned/hercules_colossus_fountain.txt"), 2, 3.6),
+        ("San Pellegrino Piazza", include_str!("blueprints/learned/piazza_san_pellegrino.txt"), 2, 3.9),
+        ("Castillo de Pioz", include_str!("blueprints/learned/castillo_de_pioz.txt"), 0, 4.6),
+        ("Barcience Keep", include_str!("blueprints/learned/castillo_barcience_castilla.txt"), 0, 4.6),
+        ("Amman Cistern", include_str!("blueprints/learned/cistern_citadel_of.txt"), 0, 4.0),
+        ("Morton Castle", include_str!("blueprints/learned/morton_castle_scotland.txt"), 0, 4.4),
+        ("Pambre Bastion", include_str!("blueprints/learned/castillo_de_pambre.txt"), 0, 4.6),
+        ("Perarrua Crag", include_str!("blueprints/learned/castillo_de_perarrua.txt"), 0, 4.4),
+        ("Lost Palace", include_str!("blueprints/learned/lost_palace_church.txt"), 3, 4.2),
+        ("Thian Hock Keng", include_str!("blueprints/learned/thian_hock_keng.txt"), 1, 3.6),
+        ("Sky Palace Corridor", include_str!("blueprints/learned/scifi_corridor_sky.txt"), 4, 3.4),
+    ];
+
+    fn build_learned_site(cfg: MapConfig, site: usize) -> Level {
+        let (name, bp, kind, wall_h) = Self::LEARNED_SITES[site.min(Self::LEARNED_SITES.len() - 1)];
+        let rows: Vec<&str> = bp.lines().filter(|l| !l.is_empty() && !l.starts_with(';')).collect();
+        let gh = rows.len() as i32;
+        let gw = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0) as i32;
+        let border = 3;
+        let (w, h) = (gw + border * 2, gh + border * 2);
+        let pal = match kind {
+            1 => Palette { floor: rgb(126, 104, 92), wall: rgb(150, 60, 52), trim: rgb(206, 168, 92),
+                           ceil: rgb(56, 40, 38), cover: rgb(140, 96, 70), sky: rgb(216, 196, 168),
+                           fog: rgb(198, 176, 150), accent: rgb(226, 178, 84), rock: rgb(122, 104, 96) },
+            2 => Palette { floor: rgb(158, 140, 116), wall: rgb(184, 158, 122), trim: rgb(206, 186, 152),
+                           ceil: rgb(72, 66, 60), cover: rgb(168, 152, 124), sky: rgb(210, 196, 166),
+                           fog: rgb(200, 184, 156), accent: rgb(120, 148, 152), rock: rgb(150, 136, 116) },
+            3 => Palette { floor: rgb(92, 98, 88), wall: rgb(108, 112, 100), trim: rgb(128, 132, 116),
+                           ceil: rgb(44, 48, 46), cover: rgb(100, 106, 94), sky: rgb(140, 148, 142),
+                           fog: rgb(122, 130, 126), accent: rgb(110, 150, 120), rock: rgb(96, 102, 94) },
+            4 => Palette { floor: rgb(96, 102, 112), wall: rgb(122, 130, 142), trim: rgb(160, 170, 184),
+                           ceil: rgb(52, 56, 64), cover: rgb(112, 120, 132), sky: rgb(160, 172, 190),
+                           fog: rgb(140, 150, 166), accent: rgb(96, 190, 210), rock: rgb(104, 110, 122) },
+            _ => Palette { floor: rgb(138, 132, 120), wall: rgb(148, 142, 130), trim: rgb(176, 168, 152),
+                           ceil: rgb(60, 58, 54), cover: rgb(150, 144, 130), sky: rgb(196, 200, 206),
+                           fog: rgb(178, 182, 188), accent: rgb(150, 128, 96), rock: rgb(132, 126, 116) },
+        };
+        let seed_u = cfg.seed;
+        let mut acfg = cfg;
+        acfg.theme = match kind { 1 => MapTheme::Urban, 2 => MapTheme::Urban, 3 => MapTheme::Canopy,
+                                  4 => MapTheme::Bunker, _ => MapTheme::Military };
+        acfg.wall_height = wall_h;
+        let mut lvl = Self::authored_blank(acfg, w, h, pal, wall_h + 6.0);
+        let ts = lvl.ts();
+
+        // ── stamp the learned grid ──
+        let mut courts: Vec<(i32, i32)> = Vec::new();
+        let mut paving: Vec<(i32, i32)> = Vec::new();
+        let mut ramparts: Vec<(i32, i32)> = Vec::new();
+        let mut interior: Vec<(i32, i32)> = Vec::new();
+        let shell_obs = lvl.obstacles.len();
+        for (gz, row) in rows.iter().enumerate() {
+            for (gx, c) in row.chars().enumerate() {
+                let (x, z) = (gx as i32 + border, gz as i32 + border);
+                match c {
+                    d @ '1'..='9' => {
+                        lvl.set(x, z, Cell::Wall);
+                        let tier = d.to_digit(10).unwrap() as f32;
+                        if tier >= 6.0 {
+                            // keeps/spires: silhouette above the curtain-wall height, so the scan's
+                            // vertical drama survives the stamp (the whole point of the height tiers)
+                            let extra = (tier - 5.0) * 1.35;
+                            let cy = wall_h + extra * 0.5;
+                            let ctr = Vec3::new(x as f32 * ts, cy, z as f32 * ts);
+                            let half = Vec3::new(ts * 0.5, extra * 0.5, ts * 0.5);
+                            let mut mesh = boxx(ctr, half, dither(pal.trim, x * 7 + z, 0.07), FACE_ALL);
+                            mesh.material = Some(crate::mesh::Material::StoneBlock);
+                            lvl.meshes.push(mesh);
+                            lvl.obstacles.push(Obstacle { center: ctr, half });
+                        }
+                    }
+                    'a' => {
+                        // gate: walk-under lintel — the scan's arches stay arches
+                        lvl.set(x, z, Cell::Floor);
+                        let ctr = Vec3::new(x as f32 * ts, 2.9, z as f32 * ts);
+                        let half = Vec3::new(ts * 0.5, 0.45, ts * 0.5);
+                        let mut mesh = boxx(ctr, half, dither(pal.wall, x * 3 + z, 0.06), FACE_ALL);
+                        mesh.material = Some(crate::mesh::Material::StoneBlock);
+                        lvl.meshes.push(mesh);
+                        lvl.obstacles.push(Obstacle { center: ctr, half });
+                    }
+                    'c' => {
+                        // Column — the scan's hypostyle rhythm: cover that holds space open
+                        // instead of closing it. Slender, full height, registered as cover so
+                        // the evaluators see what the architecture is doing.
+                        lvl.set(x, z, Cell::Floor);
+                        let cy = wall_h * 0.48;
+                        let ctr = Vec3::new(x as f32 * ts, cy, z as f32 * ts);
+                        let half = Vec3::new(ts * 0.30, cy, ts * 0.30);
+                        let mut mesh = boxx(ctr, half, dither(pal.trim, x * 11 + z, 0.08), FACE_ALL);
+                        mesh.material = Some(crate::mesh::Material::StoneBlock);
+                        lvl.meshes.push(mesh);
+                        lvl.obstacles.push(Obstacle { center: ctr, half });
+                        lvl.cover_obstacles.push(Obstacle { center: ctr, half });
+                    }
+                    'r' => {
+                        // Rampart mass: solid below (the curtain wall), wall-walk added after
+                        // the loop once all rampart cells are known.
+                        lvl.set(x, z, Cell::Wall);
+                        ramparts.push((x, z));
+                    }
+                    'o' => { lvl.set(x, z, Cell::Floor); courts.push((x, z)); }
+                    '+' => { lvl.set(x, z, Cell::Floor); paving.push((x, z)); }
+                    '.' => { lvl.set(x, z, Cell::Floor); interior.push((x, z)); }
+                    _ => { lvl.set(x, z, Cell::Floor); }
+                }
+            }
+        }
+
+        // ── the wall-walk: ramparts become an elevated play line, not just an obstacle ──
+        // The castles' defensive circulation, learned from the scans: every 'r' cell gets a
+        // standable deck at wall-top, a parapet lip on its outward sides (crenellation cover
+        // for whoever holds the wall), and each rampart RUN gets stepped stairs down to the
+        // bailey at up to two of its floor-adjacent ends (STEP=0.65 makes ≤0.6 risers walkable).
+        if !ramparts.is_empty() {
+            let rset: std::collections::HashSet<(i32, i32)> = ramparts.iter().copied().collect();
+            let top = wall_h + 0.06;
+            for &(x, z) in &ramparts {
+                let (wx, wz) = (x as f32 * ts, z as f32 * ts);
+                lvl.platforms.push(Platform { x0: wx - ts * 0.5, z0: wz - ts * 0.5,
+                                              x1: wx + ts * 0.5, z1: wz + ts * 0.5, top });
+                for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let (nx, nz) = (x + dx, z + dz);
+                    let nb = lvl.cell(nx, nz);
+                    // parapet toward anything that ISN'T the walk itself or the courtyard it guards
+                    if !rset.contains(&(nx, nz)) && nb != Cell::Floor {
+                        let ctr = Vec3::new(wx + dx as f32 * ts * 0.42, top + 0.42,
+                                            wz + dz as f32 * ts * 0.42);
+                        let half = Vec3::new(if dx != 0 { 0.08 * ts } else { 0.5 * ts }, 0.42,
+                                             if dz != 0 { 0.08 * ts } else { 0.5 * ts });
+                        let mut mesh = boxx(ctr, half, dither(pal.trim, x * 5 + z * 3, 0.07), FACE_ALL);
+                        mesh.material = Some(crate::mesh::Material::StoneBlock);
+                        lvl.meshes.push(mesh);
+                        lvl.obstacles.push(Obstacle { center: ctr, half });
+                    }
+                }
+            }
+            // stairs: flood rampart runs; at ≤2 floor-adjacent cells per run, step down 2 tiles
+            let mut seen: std::collections::HashSet<(i32, i32)> = Default::default();
+            for &(sx, sz) in &ramparts {
+                if seen.contains(&(sx, sz)) { continue; }
+                let mut run = Vec::new(); let mut st = vec![(sx, sz)];
+                while let Some(p) = st.pop() {
+                    if !rset.contains(&p) || !seen.insert(p) { continue; }
+                    run.push(p);
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] { st.push((p.0 + dx, p.1 + dz)); }
+                }
+                let mut stairs = 0;
+                'run: for &(x, z) in &run {
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        if stairs >= 2 { break 'run; }
+                        let (f1, f2) = ((x + dx, z + dz), (x + 2 * dx, z + 2 * dz));
+                        if lvl.cell(f1.0, f1.1) != Cell::Floor || lvl.cell(f2.0, f2.1) != Cell::Floor { continue; }
+                        // eight steps across two floor tiles, risers ≤0.6
+                        let n = 8;
+                        for i in 0..n {
+                            let t0 = i as f32 / n as f32;
+                            let sy = 0.35 + (top - 0.35) * (1.0 - t0);
+                            let along = 0.5 + 2.0 * t0; // tiles out from the wall face
+                            let (cx, cz) = (x as f32 * ts + dx as f32 * ts * along,
+                                            z as f32 * ts + dz as f32 * ts * along);
+                            let (hx, hz) = (if dx != 0 { ts * (1.0 / n as f32) } else { ts * 0.45 },
+                                            if dz != 0 { ts * (1.0 / n as f32) } else { ts * 0.45 });
+                            lvl.platforms.push(Platform { x0: cx - hx, z0: cz - hz,
+                                                          x1: cx + hx, z1: cz + hz, top: sy });
+                            let mut mesh = boxx(Vec3::new(cx, sy * 0.5, cz),
+                                                Vec3::new(hx, sy * 0.5, hz),
+                                                dither(pal.wall, x * 13 + z * 7 + i as i32, 0.06), FACE_ALL);
+                            mesh.material = Some(crate::mesh::Material::StoneBlock);
+                            lvl.meshes.push(mesh);
+                        }
+                        stairs += 1;
+                    }
+                }
+            }
+        }
+
+        // ── rooms from the courtyard clusters (they ARE the play spaces the scan taught us) ──
+        {
+            let mut seen: std::collections::HashSet<(i32, i32)> = Default::default();
+            // Rooms come from the scan's open PLAY SPACES. Originally that meant courtyards
+            // only — but the hypostyle-hall learning opens interiors as '.' and those halls
+            // CONNECT former court pockets to the outside, so they flood as reachable and
+            // stop being 'o'. The halls are play spaces too (that was the point), so they
+            // room like courts do: cluster over courts + interior floor together. Without
+            // this, Castillo de Pioz regenerated to ONE room and populated ZERO enemies.
+            let court_set: std::collections::HashSet<(i32, i32)> =
+                courts.iter().chain(interior.iter()).copied().collect();
+            let courts: Vec<(i32, i32)> = court_set.iter().copied().collect();
+            let mut clusters: Vec<(usize, i32, i32, i32, i32)> = Vec::new();
+            for &(sx, sz) in &courts {
+                if seen.contains(&(sx, sz)) { continue; }
+                let mut st = vec![(sx, sz)];
+                let (mut n, mut x0, mut z0, mut x1, mut z1) = (0usize, sx, sz, sx, sz);
+                while let Some((x, z)) = st.pop() {
+                    if !seen.insert((x, z)) { continue; }
+                    n += 1; x0 = x0.min(x); z0 = z0.min(z); x1 = x1.max(x); z1 = z1.max(z);
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let p = (x + dx, z + dz);
+                        if court_set.contains(&p) && !seen.contains(&p) { st.push(p); }
+                    }
+                }
+                clusters.push((n, x0, z0, x1, z1));
+            }
+            clusters.sort_by(|a, b| b.0.cmp(&a.0));
+            for (i, &(n, x0, z0, x1, z1)) in clusters.iter().take(8).enumerate() {
+                if n < 4 { break; }
+                // The evaluator floods from and to ROOM RECT CENTERS. A ring-shaped court (the
+                // Colossus Fountain: walkable ring around a monument) has its bbox center ON the
+                // massing — an unwalkable room center reads as "disconnected" no matter how open
+                // the ring is. Keep the bbox when its center is floor; otherwise anchor a tight
+                // rect on the cluster cell NEAREST the center — a truthful gameplay anchor.
+                let (bcx, bcz) = ((x0 + x1) / 2, (z0 + z1) / 2);
+                let rect = if lvl.cell(bcx, bcz) == Cell::Floor {
+                    Rect::new(x0, z0, x1, z1)
+                } else {
+                    let &(nx, nz) = courts.iter()
+                        .filter(|&&(cx, cz)| cx >= x0 && cx <= x1 && cz >= z0 && cz <= z1)
+                        .min_by_key(|&&(cx, cz)| (cx - bcx).abs() + (cz - bcz).abs())
+                        .unwrap_or(&(bcx, bcz));
+                    Rect::new((nx - 1).max(x0), (nz - 1).max(z0), (nx + 1).min(x1), (nz + 1).min(z1))
+                };
+                let (rcx, rcz) = rect.center();
+                lvl.rooms.push(Room {
+                    rect, id: i,
+                    center: Vec3::new(rcx as f32 * ts, 0.0, rcz as f32 * ts),
+                    floor_y: 0.0, ceil_y: lvl.ceil_y,
+                });
+            }
+        }
+
+        // A ruin (Morton) or a plaza can scan as ONE huge open field → one cluster → one
+        // room → populate() refuses (it needs a non-spawn room). A big open space still has
+        // gameplay quarters; when clustering yields <2 rooms and the space is large, anchor
+        // quadrant rooms on its bbox — floor-anchored like the ring-court fix above.
+        if lvl.rooms.len() < 2 {
+            // The one room's rect can be the TIGHT floor-anchored rect (its cluster's bbox
+            // center hit a wall stub — Morton's exact case), so quarter the actual open-floor
+            // extent, not the room rect.
+            let mut bb: Option<Rect> = None;
+            for z in border..(h - border) { for x in border..(w - border) {
+                if lvl.cell(x, z) == Cell::Floor {
+                    bb = Some(match bb { None => Rect::new(x, z, x, z),
+                        Some(r) => Rect::new(r.x0.min(x), r.z0.min(z), r.x1.max(x), r.z1.max(z)) });
+                }
+            }}
+            if let Some(big) = bb {
+                let (mx, mz) = big.center();
+                let quads = [Rect::new(big.x0, big.z0, mx, mz), Rect::new(mx, big.z0, big.x1, mz),
+                             Rect::new(big.x0, mz, mx, big.z1), Rect::new(mx, mz, big.x1, big.z1)];
+                for q in quads {
+                    let qc = q.center();
+                    if (q.x1 - q.x0) >= 5 && (q.z1 - q.z0) >= 5 && lvl.cell(qc.0, qc.1) == Cell::Floor
+                        && lvl.rooms.len() < 5 {
+                        let id = lvl.rooms.len();
+                        lvl.rooms.push(Room {
+                            rect: q, id,
+                            center: Vec3::new(qc.0 as f32 * ts, 0.0, qc.1 as f32 * ts),
+                            floor_y: 0.0, ceil_y: lvl.ceil_y,
+                        });
+                    }
+                }
+            }
+        }
+
+        // ── restoration pass: every roomed space gets a doorway ──
+        // Rasterizing a scan to a 56-cell grid sometimes seals a real doorway (one thin
+        // opening quantizes into massing). A sealed hall fails the connectivity gate — and
+        // in the building it learns from, that hall HAS a door. So restore one: for each
+        // room center unreachable from room 0 over floor, probe the 4 cardinals for the
+        // shortest run of wall cells (≤4) that reaches reachable floor, carve it, and hang
+        // a lintel so it reads as the doorway it stands in for. Carves are counted in the
+        // level name-plate comment stream (eprintln) for authoring review.
+        {
+            let flood_from = |lvl: &Level, sx: i32, sz: i32| -> std::collections::HashSet<(i32, i32)> {
+                let mut seen = std::collections::HashSet::new();
+                let mut st = vec![(sx, sz)];
+                while let Some((x, z)) = st.pop() {
+                    if lvl.cell(x, z) != Cell::Floor || !seen.insert((x, z)) { continue; }
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] { st.push((x + dx, z + dz)); }
+                }
+                seen
+            };
+            if !lvl.rooms.is_empty() {
+                let r0 = lvl.rooms[0].rect.center();
+                for ri in 1..lvl.rooms.len() {
+                    let reach = flood_from(&lvl, r0.0, r0.1);
+                    let rc = lvl.rooms[ri].rect.center();
+                    if reach.contains(&rc) { continue; }
+                    if lvl.cell(rc.0, rc.1) == Cell::Wall {
+                        // the cluster's anchored rect can still center on massing when the
+                        // hall is a thin L; the anchor cell stands for the room, so it opens
+                        lvl.set(rc.0, rc.1, Cell::Floor);
+                    }
+                    let mut best: Option<(usize, i32, i32, Vec<(i32, i32)>)> = None;
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let (mut x, mut z) = rc;
+                        let mut walls = Vec::new();
+                        for _ in 0..24 {
+                            x += dx; z += dz;
+                            match lvl.cell(x, z) {
+                                Cell::Wall => walls.push((x, z)),
+                                Cell::Floor if reach.contains(&(x, z)) => {
+                                    if walls.len() <= 4
+                                        && best.as_ref().map_or(true, |b| walls.len() < b.0) {
+                                        best = Some((walls.len(), dx, dz, walls.clone()));
+                                    }
+                                    break;
+                                }
+                                Cell::Floor => { /* unreachable floor pocket: keep probing */ }
+                                _ => break,
+                            }
+                        }
+                    }
+                    if let Some((_, _, _, walls)) = best {
+                        for &(x, z) in &walls {
+                            lvl.set(x, z, Cell::Floor);
+                            let ctr = Vec3::new(x as f32 * ts, 2.9, z as f32 * ts);
+                            let half = Vec3::new(ts * 0.5, 0.45, ts * 0.5);
+                            let mut mesh = boxx(ctr, half, dither(pal.wall, x * 3 + z, 0.06), FACE_ALL);
+                            mesh.material = Some(crate::mesh::Material::StoneBlock);
+                            lvl.meshes.push(mesh);
+                            lvl.obstacles.push(Obstacle { center: ctr, half });
+                        }
+                        eprintln!("learned-site restoration: carved a {}-cell doorway for room {ri} of {name}", walls.len());
+                    }
+                }
+            }
+        }
+
+        if lvl.rooms.is_empty() {
+            // sites with no enclosed courtyards (open piazzas already reachable from the border):
+            // the approach ground is the arena
+            // same center-must-be-floor rule for the whole-field fallback
+            let (mut fx, mut fz) = (w / 2, h / 2);
+            if lvl.cell(fx, fz) != Cell::Floor {
+                'find: for r in 1..(w.max(h)) {
+                    for z in (fz - r).max(border)..=(fz + r).min(h - border - 1) {
+                        for x in (fx - r).max(border)..=(fx + r).min(w - border - 1) {
+                            if lvl.cell(x, z) == Cell::Floor { fx = x; fz = z; break 'find; }
+                        }
+                    }
+                }
+            }
+            lvl.rooms.push(Room { rect: Rect::new(fx - 1, fz - 1, fx + 1, fz + 1), id: 0,
+                center: Vec3::new(fx as f32 * ts, 0.0, fz as f32 * ts), floor_y: 0.0, ceil_y: lvl.ceil_y });
+        }
+
+        // ── connectivity restoration ──
+        // The scan's coarse grid loses doorways (a 1-cell gate rounds into wall), and some
+        // monuments genuinely split the field. The evaluator's bar is CONNECTED, so restore
+        // passage the way a conservator would: find every walkable component stranded from the
+        // main field and breach the THINNEST run of wall between them — a doorway, not a
+        // demolition. Deterministic; capped; each breach is 1 cell wide.
+        {
+            let idx = |x: i32, z: i32| (z * w + x) as usize;
+            let mut breaches = 0;
+            loop {
+                // label components of Floor
+                let mut comp = vec![u32::MAX; (w * h) as usize];
+                let mut sizes: Vec<(u32, usize, (i32, i32))> = Vec::new();
+                let mut next = 0u32;
+                for z0 in border..h - border { for x0 in border..w - border {
+                    if lvl.cell(x0, z0) != Cell::Floor || comp[idx(x0, z0)] != u32::MAX { continue; }
+                    let mut st = vec![(x0, z0)]; let mut n = 0usize;
+                    while let Some((x, z)) = st.pop() {
+                        if comp[idx(x, z)] != u32::MAX || lvl.cell(x, z) != Cell::Floor { continue; }
+                        comp[idx(x, z)] = next; n += 1;
+                        if x > border { st.push((x - 1, z)); } if x + 1 < w - border { st.push((x + 1, z)); }
+                        if z > border { st.push((x, z - 1)); } if z + 1 < h - border { st.push((x, z + 1)); }
+                    }
+                    sizes.push((next, n, (x0, z0))); next += 1;
+                }}
+                if sizes.len() <= 1 || breaches >= 64 { break; }
+                sizes.sort_by(|a, b| b.1.cmp(&a.1));
+                let main = sizes[0].0;
+                // A statue-class scan fragments into MANY tiny floor pockets (the Colossus:
+                // 130 islands — crevices between limbs and basin lips). A crevice is not play
+                // space and does not deserve a doorway: stranded components under 4 cells are
+                // FILLED to massing; only meaningful pockets get breached. (The old flat
+                // 12-breach cap quit with 118 islands stranded — the cap now bounds doors,
+                // not healing.)
+                let mut filled_any = false;
+                for &(cid, n, _) in &sizes[1..] {
+                    if n < 4 {
+                        for z in border..h - border { for x in border..w - border {
+                            if comp[idx(x, z)] == cid { lvl.cells[idx(x, z)] = Cell::Wall; filled_any = true; }
+                        }}
+                    }
+                }
+                if filled_any { continue; }
+                // BFS from the main component THROUGH walls, cost = walls crossed; the first
+                // stranded Floor reached names the thinnest breach; carve the wall path.
+                let mut dist = vec![u32::MAX; (w * h) as usize];
+                let mut prev = vec![u32::MAX; (w * h) as usize];
+                let mut dq: std::collections::VecDeque<(i32, i32)> = Default::default();
+                for z in border..h - border { for x in border..w - border {
+                    if comp[idx(x, z)] == main { dist[idx(x, z)] = 0; dq.push_back((x, z)); }
+                }}
+                let mut hit: Option<(i32, i32)> = None;
+                'bfs: while let Some((x, z)) = dq.pop_front() {
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let (nx, nz) = (x + dx, z + dz);
+                        if nx < border || nz < border || nx >= w - border || nz >= h - border { continue; }
+                        let ni = idx(nx, nz);
+                        if dist[ni] != u32::MAX { continue; }
+                        match lvl.cell(nx, nz) {
+                            Cell::Floor if comp[ni] != main => { prev[ni] = idx(x, z) as u32; hit = Some((nx, nz)); break 'bfs; }
+                            Cell::Wall => { dist[ni] = dist[idx(x, z)] + 1; prev[ni] = idx(x, z) as u32; dq.push_back((nx, nz)); }
+                            _ => {}
+                        }
+                    }
+                }
+                let Some((hx, hz)) = hit else { break };
+                // carve back along prev through the wall cells
+                let mut cur = prev[idx(hx, hz)] as usize;
+                while cur != u32::MAX as usize && lvl.cells[cur] == Cell::Wall {
+                    lvl.cells[cur] = Cell::Floor;
+                    cur = prev[cur] as usize;
+                    breaches += 1;
+                }
+            }
+        }
+
+        // paving props: benches/planters along the learned streets, like the reference town
+        {
+            let mut rng = Rng::new(seed_u ^ 0x51E7);
+            let mut rnd = move || rng.f32();
+            let mut placed = 0;
+            let mut tries = 0;
+            while placed < 22 && tries < 400 && !paving.is_empty() {
+                tries += 1;
+                let (cx, cz) = paving[(rnd() * paving.len() as f32) as usize % paving.len()];
+                let (wx, wz) = (cx as f32 * ts, cz as f32 * ts);
+                if lvl.obstacles[shell_obs..].iter().any(|o| (o.center.x - wx).abs() < 1.6 && (o.center.z - wz).abs() < 1.6) { continue; }
+                let half = Vec3::new(0.65, 0.5, 0.5);
+                let c = Vec3::new(wx, 0.5, wz);
+                let mut mesh = boxx(c, half, dither(pal.cover, cx * 5 + cz, 0.08), FACE_ALL);
+                mesh.material = Some(crate::mesh::Material::StoneBlock);
+                lvl.meshes.push(mesh);
+                lvl.obstacles.push(Obstacle { center: c, half });
+                placed += 1;
+            }
+        }
+        let _ = name;
+        lvl.cover_obstacles = lvl.obstacles[shell_obs..].to_vec();
+        lvl.open_air = true;
+        lvl.build_cliffs();
+        lvl.dissolve_boundary();
+        lvl.dress_boundary_margin(&mut Rng::new(seed_u ^ 0xB0DE));
+        lvl.chunk_meshes(40.0);
         lvl
     }
 
@@ -11128,6 +11615,23 @@ fn station_map_generates() {
 }
 
 #[test]
+fn learned_sites_stamp_courtyards_and_play() {
+    use crate::level::{Level, PRESETS};
+    for (i, (name, ..)) in Level::LEARNED_SITES.iter().enumerate() {
+        let p = PRESETS.iter().find(|p| p.name == *name)
+            .unwrap_or_else(|| panic!("{name} missing from PRESETS"));
+        let cfg = p.config(7 + i as u64);
+        assert_eq!(cfg.authored, Some(8 + i as u8), "{name} routes to its learned blueprint");
+        let lvl = Level::generate(cfg);
+        assert!(!lvl.rooms.is_empty(), "{name}: courtyards/open ground must yield rooms");
+        let walls = lvl.cells.iter().filter(|c| matches!(c, crate::level::Cell::Wall)).count();
+        assert!(walls > 60, "{name}: the scan's massing must actually stamp ({walls} walls)");
+        let s = lvl.spawn(0);
+        assert!(s.x.is_finite() && s.z.is_finite(), "{name} bad spawn");
+    }
+}
+
+#[test]
 fn all_presets_generate() {
     use crate::level::{Level, PRESETS};
     for (i, p) in PRESETS.iter().enumerate() {
@@ -12069,6 +12573,38 @@ fn sandstorm_rises_during_play() {
 }
 
 #[test]
+fn learned_sites_stamp_their_learning() {
+    // The 13 learned sites (IQM scans → mapstudy blueprints) must each be playable AND must
+    // actually STAMP what was learned: every 'c' in a blueprint is a registered cover column,
+    // and any map with 'r' cells exposes a wall-walk — standable platforms at wall-top height.
+    // Counting from the blueprint text itself keeps the test honest across regenerations: the
+    // assertion tightens or relaxes exactly as the learning does.
+    use crate::mapeval::score;
+    for (i, (name, bp, _kind, wall_h)) in Level::LEARNED_SITES.iter().enumerate() {
+        let cols = bp.lines().filter(|l| !l.starts_with(';'))
+            .flat_map(|l| l.chars()).filter(|&c| c == 'c').count();
+        let ramps = bp.lines().filter(|l| !l.starts_with(';'))
+            .flat_map(|l| l.chars()).filter(|&c| c == 'r').count();
+        let p = PRESETS.iter().find(|p| p.name == *name)
+            .unwrap_or_else(|| panic!("learned site {name} must be in PRESETS"));
+        let l = Level::generate(p.config(42));
+        let sc = score(&l);
+        assert!(sc.connected, "{name} must be fully connected (site {i})");
+        let wave = crate::enemy::populate(&l, 13, 7);
+        assert!(wave.len() >= 10, "{name} must populate a full wave (got {})", wave.len());
+        if cols > 0 {
+            assert!(l.cover_obstacles.len() >= cols,
+                "{name}: {cols} learned columns must register as cover (got {})", l.cover_obstacles.len());
+        }
+        if ramps > 0 {
+            let walk = l.platforms.iter().filter(|p| p.top >= *wall_h).count();
+            assert!(walk >= ramps,
+                "{name}: {ramps} rampart cells must expose a wall-walk (got {walk} wall-top platforms)");
+        }
+    }
+}
+
+#[test]
 fn authored_showcase_maps_score_well() {
     // Locks in the map-quality work: all three hand-authored showcase maps must grade at least C (>=60),
     // stay connected, and expose real vertical interest (rooftops/platforms) and freestanding cover so the
@@ -12161,4 +12697,37 @@ fn authored_showcase_maps_score_well() {
     }
 }
 
+}
+
+#[test]
+fn diag_colossus() {
+    use crate::level::{Level, PRESETS, Cell};
+    let p = PRESETS.iter().find(|p| p.name == "Colossus Fountain").unwrap();
+    let lvl = Level::generate(p.config(7 + 2));
+    println!("rooms={} w={} h={}", lvl.rooms.len(), lvl.w, lvl.h);
+    let (sx, sz) = lvl.rooms[0].rect.center();
+    let mut seen = vec![false; (lvl.w * lvl.h) as usize];
+    let mut st = vec![(sx, sz)];
+    while let Some((x, z)) = st.pop() {
+        if !lvl.in_bounds(x, z) { continue; }
+        let i = (z * lvl.w + x) as usize;
+        if seen[i] || !lvl.cell(x, z).walkable() { continue; }
+        seen[i] = true;
+        st.extend_from_slice(&[(x + 1, z), (x - 1, z), (x, z + 1), (x, z - 1)]);
+    }
+    for (ri, r) in lvl.rooms.iter().enumerate() {
+        let (cx, cz) = r.rect.center();
+        let ok = lvl.in_bounds(cx, cz) && seen[(cz * lvl.w + cx) as usize];
+        println!("room {ri}: center=({cx},{cz}) cell={:?} walk={} reached={ok} rect={:?}",
+                 lvl.cell(cx, cz), lvl.cell(cx, cz).walkable(), r.rect);
+        if !ok {
+            for z in (cz - 4).max(0)..=(cz + 4).min(lvl.h - 1) {
+                let row: String = ((cx - 8).max(0)..=(cx + 8).min(lvl.w - 1)).map(|x| {
+                    if (x, z) == (cx, cz) { '@' }
+                    else { match lvl.cell(x, z) { Cell::Wall => '#', Cell::Floor => '.', Cell::Solid => 'S', Cell::Void => 'V', _ => '?' } }
+                }).collect();
+                println!("   {row}");
+            }
+        }
+    }
 }

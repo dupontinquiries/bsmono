@@ -1,0 +1,26 @@
+; learned from "SciFi-Corridor (Sky Palace)" — 56x24 grid, up-axis Z, 655 massing cells, 262 courtyard cells, 5 columns, 263 rampart cells
+; legend: ^ outside  . open  + paving  o courtyard  a arch/gate  c column  r rampart(wall-walk)  1-9 massing height tier
+a99a^a9999999aa9999999a^a999999a^a9999999^a9999999a^a99.
+999999999999999o999999999999999999999999999999o999999999
+99rrrrr9999r9rrrr99999rrrr99999rrrr99999rrrrr99999rrrr99
+9rooooor9ororooooro89rooooro98roooor9o9roooooro89roooor^
+^roroooor9rooocoor99oocoror999oroooor9roooooor98oocoror^
+99rroorr9o9rroorr9o99roorr99999rorrr999rroorr9o99roorr99
+999roor99o99roor99o99roor999999ror999999roor99o99roor999
+7999rr9987899rr9987999rr99877999r99987999rr9987999rr9987
+997777799r99rrrr99r99rrrr999997777799999rrrr99r99rrrr999
+99^^^^^9rorroooorrorroooor9999^^^^^9999roooorrorroooor99
+99^^^^^9rorroooorrorroooor9999^^^^^9999roooorrorroooor99
+99^.^^.9rorroooorrorroooor9999^^^^^9999roooorrorroooor99
+99.^^^^9rorroooorrorroooor9oo9^^^^^9829roooorrorrooooor9
+a9^^^^^9rorroooorrorroooor9929^^^^^99o9roooorrorroooor99
+a9^^c^^roorroooorrorroooor91o9^^^^^9819rocoorrorroooor9a
+a999a^99ror9rror9ror9roor9998999a1999o99roor9ror9roor999
+7999^199ror99rr998r89roor9998999^9998999roor9ror9roor999
+8889^8888r99ror9998888rr89988898^9988899ror999r898ror888
+8888^2888888roor8888882o88988888a8888889ror8888888ror888
+^888^^887o88ror888o888oo88888888^8888888roor88o88roor888
+7888^^886388ror788o8883388887887a^787788ror787o887ror888
+377o7^477o7roor777o677^^3a777737a^37^3773r7o77o77^3ro777
+^6466^665466rr66666666^^a^aaaa^aa^aa^^676o6666666^^6o664
+^6455^56^^6^5^^5^6^^65^^a^a^^a^aa^aa^66666^66^^665^6545^
