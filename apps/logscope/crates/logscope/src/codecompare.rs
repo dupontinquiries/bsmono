@@ -183,7 +183,8 @@ directly comparable.";
 pub fn feedback(c: &Comparison) -> Option<String> {
     let q = c.review_queue();
     if q.is_empty() { return None; }
-    let mut s = String::from("Other models were asked for the same pieces. They diverged here:\n");
+    let mut s = String::from(crate::promptframe::Frame::ToolStatus.banner());
+    s.push_str("\nOther models were asked for the same pieces. They diverged here:\n");
     for p in q.iter().take(6) {
         s.push_str(&format!("- {} — {}", p.path, p.agreement.label()));
         if !p.missing.is_empty() { s.push_str(&format!("; not produced by {}", p.missing.join(", "))); }
