@@ -89,7 +89,12 @@ pub fn build(facts: &[Statement], ask: Option<&str>, audience: Audience) -> Opti
     let grounded: Vec<&Statement> = facts.iter().filter(|s| !s.text.trim().is_empty()).collect();
     if grounded.is_empty() { return None; }
 
-    let mut obs = String::from("OBSERVATIONS\n");
+    // FRAMED as tool status. The liaison reports on the inference ENGINE, and this codebase debugs the
+    // user's logs at the same time — so "the build failed" is ambiguous between three builds unless the
+    // block says which. Telling someone their program crashed when it was our kernel is the worst
+    // version of that mistake.
+    let mut obs = String::from(crate::promptframe::Frame::ToolStatus.banner());
+    obs.push_str("\nOBSERVATIONS\n");
     for (i, s) in grounded.iter().enumerate() {
         obs.push_str(&format!("{}. {}", i + 1, s.text));
         // Provenance travels with the fact. A statement that cannot name its source is exactly the one a
@@ -101,7 +106,8 @@ pub fn build(facts: &[Statement], ask: Option<&str>, audience: Audience) -> Opti
 
     let question = ask.map(str::trim).filter(|q| !q.is_empty()).unwrap_or("What is it doing right now?");
     let turns = vec![
-        (Role::System, format!("{LIAISON_SYSTEM}\n\n{}", audience_note(audience))),
+        (Role::System, format!("{LIAISON_SYSTEM}\n\n{}\n\n{}", audience_note(audience),
+            crate::promptframe::DISAMBIGUATION_RULE)),
         (Role::User, format!("{obs}\nQUESTION: {question}")),
     ];
     Some(LiaisonPrompt { turns })
@@ -170,6 +176,21 @@ mod tests {
             .contains("QUESTION: is it stuck?"));
         assert!(build(&f, Some("   "), Audience::Operator).unwrap().turns[1].1
             .contains("QUESTION: What is it doing right now?"), "blank asks get the default");
+    }
+
+    #[test]
+    fn the_observations_are_framed_as_TOOL_status_not_user_data() {
+        // This codebase reports on its own inference engine WHILE debugging someone's log files, so
+        // "the build failed" is ambiguous between three builds. Without the frame, a liaison can tell
+        // the user their program crashed when it was our kernel.
+        let p = build(&[st("the build failed: error[E0308]", &["build"])], None, Audience::Operator).unwrap();
+        let user = &p.turns[1].1;
+        assert!(user.contains("TOOL STATUS"), "{user}");
+        assert!(user.contains("NOT the user's program"));
+        // and the system turn carries the standing rule for telling the three apart
+        let sys = p.system().unwrap();
+        assert!(sys.contains("TOOL STATUS is the engine running you"));
+        assert!(sys.contains("USER DATA is what the person asked about"));
     }
 
     #[test]
