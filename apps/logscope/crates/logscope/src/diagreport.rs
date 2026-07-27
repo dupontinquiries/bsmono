@@ -19,7 +19,7 @@
 
 /// Sections, in the order they are written. The order is stable so a diff between two reports lines up.
 pub const SECTIONS: &[&str] = &[
-    "ENV", "ADAPTER", "LEVERS", "MODEL", "LOAD", "PROFILE", "SUBMITS", "GATES", "ERRORS", "TAIL",
+    "ENV", "ADAPTER", "LEVERS", "MODEL", "STAGES", "LOAD", "PROFILE", "SUBMITS", "GATES", "ERRORS", "TAIL",
 ];
 
 /// Longest a single value may be before it is elided. The stop-token sets run past 8000 characters.
@@ -43,13 +43,37 @@ pub struct Report { sections: Vec<(String, Vec<String>)> }
 impl Report {
     pub fn new() -> Self { Self::default() }
 
+    /// Append a line WITH a timestamp, so entries can be correlated against journalctl.
+    ///
+    /// Both clocks, deliberately. The wall clock is what journalctl stamps, so it is the only way to line
+    /// a GPU watchdog entry up with what this process was doing; the monotonic offset is what survives an
+    /// NTP step and makes durations between our own lines trustworthy. Either alone leaves a gap.
+    pub fn push_at(&mut self, section: &str, line: impl Into<String>, wall_secs: u64, mono_ms: u64) {
+        let stamped = format!("[{:>8}.{:03}s +{:>7}ms] {}",
+            wall_secs, 0, mono_ms, elide(line.into().trim_end()));
+        self.push_raw(section, stamped);
+    }
+
     /// Append a line to a section, creating it if needed. Lines past the cap are counted, not stored.
     pub fn push(&mut self, section: &str, line: impl Into<String>) {
         let line = elide(line.into().trim_end());
+        self.push_raw(section, line)
+    }
+
+    fn push_raw(&mut self, section: &str, line: String) {
         match self.sections.iter_mut().find(|(s, _)| s == section) {
             Some((_, v)) => v.push(line),
             None => self.sections.push((section.to_string(), vec![line])),
         }
+    }
+
+    /// A STAGE marker: a named phase with the time it took.
+    ///
+    /// Load is the phase most worth correlating — a watchdog entry during shard unification means
+    /// something different from one during expert quantization, and a flat list of lines cannot tell you
+    /// which was running.
+    pub fn stage(&mut self, name: &str, ms: u64, detail: &str) {
+        self.push_raw("STAGES", format!("{:>8} ms  {name:<28} {}", ms, elide(detail)));
     }
 
     /// Route a raw engine log line into whichever section it belongs to.
