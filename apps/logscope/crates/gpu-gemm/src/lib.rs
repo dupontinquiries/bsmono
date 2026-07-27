@@ -8788,6 +8788,17 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// rather than in the tensor itself.
     pub fn upload_flat(&self, v: &[f32]) -> Tensor { self.upload(v, 1, v.len()) }
 
+    /// Test hook: raw host->device write, for measuring upload bandwidth.
+    pub fn queue_write_pub(&self, dst: &Tensor, src: &[f32]) {
+        self.queue.write_buffer(&dst.buf, 0, bytemuck::cast_slice(src));
+    }
+
+    /// Test hook: a small view of a tensor, to force a sync without downloading all of it.
+    pub fn view_pub(&self, t: &Tensor, off: usize, len: usize) -> Tensor {
+        Tensor { buf: t.buf.clone(), rows: 1, cols: len, pool: None,
+                 view: Some(((off * 4) as u64, (len * 4) as u64)) }
+    }
+
     /// Test hook: copy rows between tensors, for exercising allocator reuse from a gate.
     pub fn copy_rows_pub(&self, src: &Tensor, dst: &Tensor, dst_row: usize, n: usize, cols: usize) {
         self.write_rows(dst, src, dst_row, n, cols);
