@@ -108,6 +108,10 @@ pub fn verdict_prompt(code: &str, question: &str) -> String {
 pub enum Rung {
     /// Deterministic checks. Microseconds, no model.
     Prechecks,
+    /// Execution evidence: counters from actually running the code. Nanoseconds per span, and
+    /// categorically better than an opinion for the questions it can answer — a span that FAULTED is a
+    /// known defect, not a guess.
+    Trace,
     /// The Disciple reads a verdict from one distribution.
     DiscipleVerdict,
     /// A second Disciple, differently prompted or a different model. Disagreement between two cheap
@@ -120,7 +124,7 @@ pub enum Rung {
 impl Rung {
     /// Rough cost in "Disciple forward passes", for reasoning about the ladder's economics.
     pub fn cost(self) -> f32 {
-        match self { Rung::Prechecks => 0.0, Rung::DiscipleVerdict => 1.0,
+        match self { Rung::Prechecks => 0.0, Rung::Trace => 0.0, Rung::DiscipleVerdict => 1.0,
                      Rung::SecondOpinion => 2.0, Rung::Thinker => 30.0 }
     }
 }
@@ -137,6 +141,30 @@ pub struct Ruling { pub rung: Rung, pub pass: Option<bool>, pub why: String }
 ///   knows it does not, spends a forward pass to be told what was free.
 /// - Two cheap judges DISAGREEING escalates, even though each was individually confident. That
 ///   disagreement is exactly the ambiguity the Thinker exists for, and averaging them would hide it.
+/// As `walk`, with execution evidence consulted before any model.
+///
+/// A fault is decisive: the code demonstrably raised, and no model opinion improves on that. But a clean
+/// trace is NOT a pass — coverage proves execution, not correctness — so it only *lowers* the priority
+/// and the ladder continues. That asymmetry is the whole point: evidence of failure is conclusive,
+/// evidence of success is not.
+pub fn walk_traced(
+    trace_fault: bool,
+    precheck_blocking: usize,
+    first: impl FnOnce() -> Verdict,
+    second: impl FnOnce() -> Verdict,
+    thinker: impl FnOnce() -> bool,
+) -> Ruling {
+    if precheck_blocking > 0 {
+        return Ruling { rung: Rung::Prechecks, pass: Some(false),
+            why: format!("{precheck_blocking} deterministic finding(s) — no model needed") };
+    }
+    if trace_fault {
+        return Ruling { rung: Rung::Trace, pass: Some(false),
+            why: "the code raised when run — direct evidence, and no model opinion improves on it".into() };
+    }
+    walk(0, first, second, thinker)
+}
+
 pub fn walk(
     precheck_blocking: usize,
     first: impl FnOnce() -> Verdict,
@@ -261,6 +289,29 @@ mod tests {
         assert_eq!(r.rung, Rung::Prechecks);
         assert_eq!(r.pass, Some(false));
         assert!(r.why.contains("no model needed"));
+    }
+
+    #[test]
+    fn a_fault_in_the_trace_settles_it_without_any_model() {
+        // Running the code is nanoseconds and a fault is a KNOWN defect. Asking a model whether code is
+        // good, when it has already been observed to raise, spends 30x the cost to be told what running
+        // it proved.
+        let r = walk_traced(true, 0, || panic!("no model"), || panic!("no model"), || panic!("no model"));
+        assert_eq!(r.rung, Rung::Trace);
+        assert_eq!(r.pass, Some(false));
+        assert_eq!(Rung::Trace.cost(), 0.0);
+    }
+
+    #[test]
+    fn a_CLEAN_trace_is_not_a_pass_and_the_ladder_continues() {
+        // The asymmetry that matters: evidence of failure is conclusive, evidence of success is not.
+        // Code can run without faulting and still compute the wrong answer, so a clean trace must not
+        // short-circuit the way a fault does.
+        let mut asked = false;
+        let r = walk_traced(false, 0, || { asked = true; v(0.95, 0.9) },
+                            || panic!("second not needed"), || panic!("thinker not needed"));
+        assert!(asked, "a clean trace still asks a model");
+        assert_eq!(r.rung, Rung::DiscipleVerdict);
     }
 
     #[test]
