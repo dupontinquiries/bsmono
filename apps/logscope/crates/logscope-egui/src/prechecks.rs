@@ -135,6 +135,106 @@ pub fn scan_rust(src: &str) -> Vec<Finding> {
     out
 }
 
+/// Crate names common enough that a near-miss is almost certainly a typo or a hallucination.
+///
+/// Deliberately small. This is not a registry and must not pretend to be one — an unknown name here
+/// means "not on the short list", never "does not exist", because being wrong in that direction would
+/// reject every legitimate niche dependency.
+const WELL_KNOWN: &[&str] = &[
+    "ratatui", "crossterm", "termion", "serde", "serde_json", "tokio", "anyhow", "thiserror",
+    "clap", "regex", "rayon", "reqwest", "itertools", "chrono", "tracing", "wgpu", "egui",
+];
+
+/// Levenshtein distance, capped — only used to ask "did you mean".
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
+    for i in 1..=a.len() {
+        cur[0] = i;
+        for j in 1..=b.len() {
+            let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// Crates a file `use`s, from its `use` statements.
+fn used_crates(src: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in src.lines() {
+        let l = code_only(raw);
+        let l = l.trim();
+        let Some(rest) = l.strip_prefix("use ") else { continue };
+        let root = rest.split(|c: char| c == ':' || c == '{' || c == ';' || c.is_whitespace())
+            .next().unwrap_or("").trim();
+        if root.is_empty() || matches!(root, "std" | "core" | "alloc" | "crate" | "self" | "super") { continue; }
+        let root = root.to_string();
+        if !out.contains(&root) { out.push(root); }
+    }
+    out
+}
+
+/// Check a file's `use` statements against the manifest and against near-miss crate names.
+///
+/// The `use`-without-a-dependency check is the strong one: it is mechanical, needs no registry, and
+/// catches an invented crate regardless of whether anyone has heard of it. The did-you-mean check is a
+/// weaker supplement for the case where the manifest is not available.
+pub fn scan_dependencies(src: &str, manifest: Option<&str>) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for c in used_crates(src) {
+        let declared = manifest.is_some_and(|m| m.lines().any(|l| {
+            let t = l.trim_start();
+            !t.starts_with('#') && t.starts_with(&c) &&
+                t[c.len()..].trim_start().starts_with(['=', '.', '{'])
+        }));
+        if manifest.is_some() && !declared {
+            out.push(Finding { line: 0, confidence: Confidence::Certain,
+                what: format!("`use {c}` but `{c}` is not a dependency in the manifest"),
+                fix: format!("add {c} to [dependencies], or remove the import if it was invented") });
+        }
+        // near-miss, whether or not a manifest was supplied
+        if !WELL_KNOWN.contains(&c.as_str()) {
+            // Distance alone is the wrong test. `ratatouille` is FOUR edits from `ratatui`, so a
+            // distance<=3 rule misses the exact case this exists for — while distance<=4 alone would
+            // match unrelated short names. Requiring a shared PREFIX as well is tighter than either:
+            // a hallucinated crate name is almost always a real one with the tail embellished.
+            let shared_prefix = |a: &str, b: &str| a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count();
+            if let Some(near) = WELL_KNOWN.iter()
+                .map(|k| (*k, edit_distance(&c, k), shared_prefix(&c, k)))
+                .filter(|(k, d, p)| *d > 0 && *d <= 4 && *p >= 4 && k.len() >= 4)
+                .min_by_key(|(_, d, _)| *d)
+                .map(|(k, d, _)| (k, d)) {
+                out.push(Finding { line: 0, confidence: Confidence::Likely,
+                    what: format!("`{c}` is not a crate I know of, and is {} edits from `{}`", near.1, near.0),
+                    fix: format!("did you mean `{}`?", near.0) });
+            }
+        }
+    }
+    out
+}
+
+/// Did a reply ignore an explicit correction?
+///
+/// The failure worth catching separately, because no amount of crate-checking prevents it: a user says
+/// "use ratatui, not that made up thing", and the next reply uses the made-up thing again. That is not a
+/// knowledge gap — the right answer was supplied — it is the correction not landing, and it needs a
+/// different response (re-anchor the context) than a wrong fact does.
+///
+/// `rejected` are terms the user explicitly ruled out.
+pub fn scan_ignored_correction(reply: &str, rejected: &[String]) -> Vec<Finding> {
+    let code = reply.lines().map(code_only).collect::<Vec<_>>().join("\n");
+    rejected.iter().filter(|r| !r.trim().is_empty())
+        .filter(|r| code.to_lowercase().contains(&r.to_lowercase()))
+        .map(|r| Finding { line: 0, confidence: Confidence::Certain,
+            what: format!("the reply still uses `{r}` after it was explicitly rejected"),
+            fix: "the correction did not land — restate it at the END of the prompt, where it is least \
+likely to be lost, rather than repeating the whole request".into() })
+        .collect()
+}
+
 /// Two crates in one manifest that solve the same problem.
 ///
 /// Not a compile error, and occasionally deliberate — hence Suspicion. Worth raising because pulling in
@@ -266,6 +366,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 // note: `std::x ::y` is wrong
 "#;
         assert!(scan_rust(s).is_empty(), "{:?}", scan_rust(s));
+    }
+
+    #[test]
+    fn an_invented_crate_is_caught_by_the_manifest_not_by_knowing_it() {
+        // The strong check, and the one that needs no registry: a `use` with no matching dependency
+        // cannot compile, whether the crate is famous, obscure or entirely made up.
+        let src = "use ratatouille::Tui;\nuse std::fs;\n";
+        let manifest = "[dependencies]\ncrossterm = \"0.27\"\n";
+        let f = scan_dependencies(src, Some(manifest));
+        assert!(f.iter().any(|x| x.confidence == Confidence::Certain
+            && x.what.contains("`ratatouille` is not a dependency")), "{f:?}");
+        // std is not a dependency and must not be flagged
+        assert!(!f.iter().any(|x| x.what.contains("std")));
+    }
+
+    #[test]
+    fn a_near_miss_offers_the_real_name() {
+        // ratatouille -> ratatui is three edits. Suggesting it turns "unknown crate" into a fix.
+        let f = scan_dependencies("use ratatouille::Tui;", None);
+        let n = f.iter().find(|x| x.fix.contains("did you mean")).expect("suggestion");
+        assert!(n.fix.contains("ratatui"), "{}", n.fix);
+        assert_eq!(n.confidence, Confidence::Likely, "a near-miss is a guess, not a certainty");
+    }
+
+    #[test]
+    fn a_legitimate_obscure_crate_is_not_rejected() {
+        // WELL_KNOWN is a short list, not a registry. Treating absence from it as "does not exist" would
+        // reject every niche dependency, and a checker that cries wolf stops being read.
+        let f = scan_dependencies("use zerocopy::AsBytes;", None);
+        assert!(f.is_empty(), "far from every known name, so no claim is made: {f:?}");
+    }
+
+    #[test]
+    fn a_reply_that_ignores_an_explicit_correction_is_flagged() {
+        // The failure worth catching on its own: the user said "use ratatui, not that made up thing",
+        // and the next reply used the made-up thing again. The right answer was SUPPLIED, so this is not
+        // a knowledge gap — it is the correction not landing, and it needs a different response.
+        let reply = "use ratatouille::Tui;\nfn main() {}";
+        let f = scan_ignored_correction(reply, &["ratatouille".into()]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].confidence, Confidence::Certain);
+        assert!(f[0].fix.contains("restate it at the END"),
+            "the remedy is re-anchoring, not repeating the request");
+    }
+
+    #[test]
+    fn a_rejected_term_in_PROSE_only_is_not_a_violation() {
+        // "I previously suggested ratatouille, which was wrong" is the model acknowledging the
+        // correction — flagging it would punish exactly the behaviour we want.
+        let reply = "// I previously used ratatouille, which does not exist.\nuse ratatui::Terminal;";
+        assert!(scan_ignored_correction(reply, &["ratatouille".into()]).is_empty());
     }
 
     #[test]
