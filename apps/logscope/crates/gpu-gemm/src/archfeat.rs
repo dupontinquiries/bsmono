@@ -64,6 +64,19 @@ pub enum Feature {
     /// (Gemma `rope.freq_base_swa`). Distinct from `PerLayerRopeFreqs`, which is per-layer rope
     /// frequency TENSORS in Gemma 4.
     PerLayerRopeBase,
+    /// Routed-expert weights are multiplied by a constant from metadata (`expert_weights_scale`).
+    ///
+    /// Llama-4 and Qwen3 leave it unset, so it defaulted harmlessly to 1. GLM-5.2 sets **2.5** — ignoring
+    /// it makes every MoE layer's contribution 2.5x too small, which does not error and does not produce
+    /// noise: it produces a model that is quietly worse than it should be.
+    ExpertWeightsScale,
+    /// Top-k routed weights are renormalized to sum to 1 (`expert_weights_norm`).
+    ExpertWeightsNorm,
+    /// DeepSeek-style SPARSE ATTENTION: a separate small indexer scores keys, and full attention runs
+    /// only over its top-k. GLM-5.2 uses 32 indexer heads of key_length 128 selecting top_k 2048 out of a
+    /// 1M context. Structural — there is no dense fallback that is merely slower, because attending to
+    /// everything at 1M context is not a thing the engine can do.
+    SparseAttentionIndexer,
     /// The attention scale is a hyperparameter rather than 1/sqrt(head_dim). Equal to the default on
     /// most Gemma 3, but NOT on the 27B, which uses 1/sqrt(n_embd/n_head).
     AttentionScaleHparam,
@@ -91,6 +104,9 @@ impl Feature {
             Feature::EmbeddingScale => "token embedding scaled by sqrt(d)",
             Feature::PerLayerRopeBase => "separate rope base for windowed layers",
             Feature::AttentionScaleHparam => "attention scale from hparams, not 1/sqrt(head_dim)",
+            Feature::ExpertWeightsScale => "routed-expert weights scaled by a metadata constant",
+            Feature::ExpertWeightsNorm => "routed-expert weights renormalized to sum to 1",
+            Feature::SparseAttentionIndexer => "sparse attention: an indexer selects top-k keys",
         }
     }
 
@@ -130,6 +146,9 @@ impl Feature {
             Feature::EmbeddingScale => true,     // Model::embed_scale, set from the arch at load
             Feature::PerLayerRopeBase => true,   // BlockWeights::rope_base, from rope.freq_base_swa
             Feature::AttentionScaleHparam => false, // 1/sqrt(head_dim) is hardcoded in the kernels
+            Feature::ExpertWeightsScale => false,   // the key is never read; effectively hardcoded to 1
+            Feature::ExpertWeightsNorm => false,    // moe::route normalizes for softmax only
+            Feature::SparseAttentionIndexer => false, // no indexer exists
         }
     }
 
@@ -146,6 +165,10 @@ file and ignored"),
             Feature::LogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
             Feature::AttentionScaleHparam => Some("matches the 1/sqrt(head_dim) default on Gemma 3 12B \
 and below; differs only on the 27B, which uses 1/sqrt(n_embd/n_head)"),
+            Feature::ExpertWeightsScale => Some("GLM-5.2 sets 2.5; ignoring it scales every MoE layer's \
+output down by that factor — a quietly worse model, not a broken one"),
+            Feature::SparseAttentionIndexer => Some("STRUCTURAL: without the indexer there is no dense \
+fallback, because attending to a 1M context in full is not something the engine can do"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
             _ => None,
@@ -183,7 +206,13 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
                          Feature::GeGluActivation, Feature::GemmaRmsNorm,
                          Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
                          Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
-        "glm4moe" | "glm-dsa" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
+        "glm4moe" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
+        // GLM-5.2. Transcribed from the shipped first shard's metadata rather than guessed:
+        //   expert_gating_func 2 (sigmoid), expert_weights_norm true, expert_weights_scale 2.5,
+        //   kv_lora_rank 512 / q_lora_rank 2048 (MLA), expert_shared_count 1,
+        //   attention.indexer.{head_count 32, key_length 128, top_k 2048} over a 1048576 context.
+        "glm-dsa" => vec![Feature::Mla, Feature::SharedExpert, Feature::ExpertWeightsScale,
+                          Feature::ExpertWeightsNorm, Feature::SparseAttentionIndexer],
         _ => Vec::new(),
     }
 }
@@ -359,6 +388,27 @@ mod tests {
         let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
         assert_eq!(q.norm, crate::moe::RouteNorm::Softmax);
         assert!(!q.weight_before && q.normalize);
+    }
+
+    #[test]
+    fn glm52_requirements_come_from_its_shipped_metadata() {
+        // Transcribed from GLM-5_2-UD-IQ1_S-00001-of-00006.gguf, not inferred from the family name.
+        // glm-dsa is NOT glm4moe: it adds a sparse-attention indexer and two expert-weighting knobs that
+        // the GLM-4 line does not have, and treating them as one architecture would silently apply the
+        // wrong forward pass.
+        let g = gaps("glm-dsa", 0);
+        for f in [Feature::SparseAttentionIndexer, Feature::ExpertWeightsScale, Feature::ExpertWeightsNorm] {
+            assert!(g.contains(&f), "glm-dsa needs {f:?}");
+            assert!(!required("glm4moe", 0).contains(&f), "glm4moe does NOT — they are different archs");
+        }
+        // MLA is shared and already implemented, so it must not appear as a gap for either
+        assert!(!g.contains(&Feature::Mla));
+
+        // The scale is the dangerous one: it fails QUIETLY. 2.5 ignored means every MoE layer contributes
+        // 40% of what it should, which reads as a mediocre model rather than a broken one.
+        assert!(Feature::ExpertWeightsScale.note().unwrap().contains("quietly worse"));
+        // The indexer is the blocking one, and the report must say why there is no degraded mode.
+        assert!(gap_report("glm-dsa", 0).iter().any(|s| s.contains("STRUCTURAL")));
     }
 
     #[test]
