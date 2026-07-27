@@ -129,6 +129,91 @@ impl Report {
     }
 }
 
+/// A kernel-side GPU fault, parsed from journalctl.
+#[derive(Clone, PartialEq, Debug)]
+pub struct GpuFault {
+    /// `MMM DD HH:MM:SS` as it appears in the journal, kept verbatim — reformatting it would make it
+    /// harder to grep back against the original.
+    pub stamp: String,
+    /// Seconds past midnight, for ordering and for lining up against our own clock.
+    pub secs_of_day: u32,
+    /// The driver's cumulative counter, which is what shows whether a run made things worse.
+    pub timeout_count: Option<u64>,
+}
+
+/// Parse Asahi GPU timeouts out of a journalctl dump.
+///
+/// The real signature, from a live run:
+/// ```text
+/// Jul 27 17:54:11 host kernel: asahi 406400000.gpu: ** GPU timeout nya~!!!!! **
+/// Jul 27 17:54:11 host kernel: asahi 406400000.gpu:   Timeout count: 1032
+/// Jul 27 17:54:11 host kernel: asahi 406400000.gpu:   Halted: 1
+/// ```
+/// Matched on "GPU timeout" rather than the full banner: the driver's message is decorated with ASCII
+/// art and an emoticon, and anchoring on decoration would break the moment someone tidies it.
+pub fn parse_gpu_faults(journal: &str) -> Vec<GpuFault> {
+    let mut out: Vec<GpuFault> = Vec::new();
+    for line in journal.lines() {
+        if line.contains("GPU timeout") {
+            let stamp = line.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+            let secs = stamp.split_whitespace().nth(2).and_then(parse_hms).unwrap_or(0);
+            out.push(GpuFault { stamp, secs_of_day: secs, timeout_count: None });
+        } else if let Some(v) = line.split("Timeout count:").nth(1) {
+            // attach to the most recent fault; the counter is printed just after the banner
+            if let (Some(last), Ok(n)) = (out.last_mut(), v.trim().parse::<u64>()) {
+                if last.timeout_count.is_none() { last.timeout_count = Some(n); }
+            }
+        }
+    }
+    out
+}
+
+fn parse_hms(t: &str) -> Option<u32> {
+    let p: Vec<&str> = t.split(':').collect();
+    if p.len() != 3 { return None; }
+    Some(p[0].parse::<u32>().ok()? * 3600 + p[1].parse::<u32>().ok()? * 60 + p[2].parse::<u32>().ok()?)
+}
+
+/// Group faults into bursts separated by more than `gap_secs` of quiet.
+///
+/// Bursts are the unit worth reporting. Fifty-three scattered timeouts and fifty-three in two clusters
+/// mean different things: the first suggests a chronic condition, the second points at two specific
+/// things that were running. Reporting only a total hides which one you have.
+pub fn burst(faults: &[GpuFault], gap_secs: u32) -> Vec<(String, String, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < faults.len() {
+        let start = i;
+        while i + 1 < faults.len()
+            && faults[i + 1].secs_of_day.saturating_sub(faults[i].secs_of_day) <= gap_secs { i += 1; }
+        out.push((faults[start].stamp.clone(), faults[i].stamp.clone(), i - start + 1));
+        i += 1;
+    }
+    out
+}
+
+impl Report {
+    /// Fold a journalctl dump into the report's ERRORS section, as bursts rather than raw lines.
+    ///
+    /// Also reports the counter DELTA across the capture, because the driver's count is cumulative: 1032
+    /// at the start and 1084 at the end says this session caused 52, which is the number that matters.
+    /// The absolute figure says only that the machine has had a hard life.
+    pub fn absorb_journal(&mut self, journal: &str) {
+        let f = parse_gpu_faults(journal);
+        if f.is_empty() { return; }
+        let counts: Vec<u64> = f.iter().filter_map(|x| x.timeout_count).collect();
+        let delta = match (counts.first(), counts.last()) {
+            (Some(a), Some(b)) => format!(" — driver counter {a} → {b}, this capture caused {}", b - a),
+            _ => String::new(),
+        };
+        self.push("ERRORS", format!("{} GPU timeouts in {} burst(s){delta}",
+            f.len(), burst(&f, 120).len()));
+        for (from, to, n) in burst(&f, 120) {
+            self.push("ERRORS", format!("  burst: {n:>3} timeouts  {from} .. {to}"));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,6 +286,58 @@ mod tests {
         // stylistic.
         assert!(ra.find("\n@@ADAPTER\n") < ra.find("\n@@PROFILE\n"));
         assert_eq!(ra, rb, "insertion order must not change the report");
+    }
+
+    // The real signature, taken verbatim from a live Asahi run.
+    const JOURNAL: &str = "\
+Jul 27 17:54:11 ultra-fed kernel: asahi 406400000.gpu: ** GPU timeout nya~!!!!! **
+Jul 27 17:54:11 ultra-fed kernel: asahi 406400000.gpu:   Timeout count: 1032
+Jul 27 17:54:11 ultra-fed kernel: asahi 406400000.gpu:   Halted: 1
+Jul 27 17:54:24 ultra-fed kernel: asahi 406400000.gpu: ** GPU timeout nya~!!!!! **
+Jul 27 17:54:24 ultra-fed kernel: asahi 406400000.gpu:   Timeout count: 1033
+Jul 27 18:55:41 ultra-fed kernel: asahi 406400000.gpu: ** GPU timeout nya~!!!!! **
+Jul 27 18:55:41 ultra-fed kernel: asahi 406400000.gpu:   Timeout count: 1084
+Jul 27 17:55:00 ultra-fed pipewire[1849]: mod.raop-sink: unrelated noise
+";
+
+    #[test]
+    fn the_real_asahi_signature_parses_and_ignores_unrelated_noise() {
+        let f = parse_gpu_faults(JOURNAL);
+        assert_eq!(f.len(), 3, "three timeouts, and pipewire is not one of them");
+        assert_eq!(f[0].timeout_count, Some(1032));
+        assert_eq!(f[2].timeout_count, Some(1084));
+        assert_eq!(f[0].stamp, "Jul 27 17:54:11");
+    }
+
+    #[test]
+    fn the_counter_DELTA_is_reported_not_just_the_absolute() {
+        // The driver's count is cumulative. 1032 says the machine has had a hard life; 1032 -> 1084 says
+        // THIS capture caused 52, which is the number that tells you whether a change helped.
+        let mut r = Report::new();
+        r.absorb_journal(JOURNAL);
+        let out = r.render();
+        assert!(out.contains("this capture caused 52"), "{out}");
+        assert!(out.contains("1032 → 1084"));
+    }
+
+    #[test]
+    fn faults_are_grouped_into_BURSTS_not_listed_flat() {
+        // Fifty-three scattered timeouts and fifty-three in two clusters mean different things: chronic
+        // versus two specific things that were running. A total alone hides which you have.
+        let f = parse_gpu_faults(JOURNAL);
+        let b = burst(&f, 120);
+        assert_eq!(b.len(), 2, "17:54 twice is one burst; 18:55 is another");
+        assert_eq!(b[0].2, 2);
+        assert_eq!(b[1].2, 1);
+    }
+
+    #[test]
+    fn a_journal_with_no_gpu_faults_adds_nothing() {
+        // A report that said "0 GPU timeouts" for every clean run would train the reader to skip the
+        // ERRORS section, which is where the one that matters will eventually appear.
+        let mut r = Report::new();
+        r.absorb_journal("Jul 27 17:55:00 host pipewire[1]: nothing to see\n");
+        assert!(!r.render().contains("@@ERRORS"));
     }
 
     #[test]
