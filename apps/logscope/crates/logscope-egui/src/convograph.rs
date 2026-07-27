@@ -14,7 +14,18 @@ pub enum Turn { User, Assistant }
 /// prompt + the keyframe's own keywords. All three are keyword bags to the matcher — retrieval never branches
 /// on kind. Pixels/clips live in a side-table keyed by [`Node::uuid`], not here.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind { Text, Image, Shot, Patch, File }
+pub enum Kind {
+    Text, Image, Shot, Patch, File,
+    /// A liaison line: the backend narrating itself. Not a turn (nobody said it) and not an artifact
+    /// (nothing was produced) — a third category, which is why it was invisible when the graph only had
+    /// two.
+    Liaison,
+    /// A FAN-OUT zone: one task sent to several models at once. Marks where the timeline stops being a
+    /// line, so a reader can see that three sibling nodes are alternatives rather than a sequence.
+    FanOut,
+    /// Where a fan-out was resolved back to one answer.
+    Merge,
+}
 
 impl Kind {
     /// Is this an ARTIFACT — something the conversation produced — rather than a turn of the conversation?
@@ -24,10 +35,21 @@ impl Kind {
     /// (shape, colour, edge style) rather than being one undifferentiated stream of boxes.
     pub fn is_artifact(self) -> bool { matches!(self, Kind::Patch | Kind::File | Kind::Image | Kind::Shot) }
 
+    /// Does this node mark a change in the timeline's SHAPE rather than carrying content?
+    ///
+    /// Fan-out and merge are structural: they say "the next three nodes are alternatives" and "they came
+    /// back together here". Rendering them like content nodes is what made a fan look identical to three
+    /// consecutive replies.
+    pub fn is_structural(self) -> bool { matches!(self, Kind::FanOut | Kind::Merge) }
+
+    /// Backend narration — neither a turn nor an artifact.
+    pub fn is_narration(self) -> bool { matches!(self, Kind::Liaison) }
+
     /// Short glyph for the node badge.
     pub fn glyph(self) -> &'static str {
         match self {
             Kind::Text => "", Kind::Image => "🖼", Kind::Shot => "🎬", Kind::Patch => "⑂", Kind::File => "🗎",
+            Kind::Liaison => "◈", Kind::FanOut => "⋔", Kind::Merge => "⋏",
         }
     }
 
@@ -35,6 +57,7 @@ impl Kind {
         match self {
             Kind::Text => "message", Kind::Image => "image", Kind::Shot => "shot",
             Kind::Patch => "patch", Kind::File => "file",
+            Kind::Liaison => "backend", Kind::FanOut => "fan-out", Kind::Merge => "merge",
         }
     }
 }
@@ -442,6 +465,26 @@ mod artifact_tests {
         g.push_file("out/report.md", 4096, None, est);
         assert!(!g.nodes[0].in_context);
         assert!(g.nodes[0].preview.contains("4.0 KiB"));
+    }
+
+    #[test]
+    fn the_graph_has_THREE_categories_not_two() {
+        // Liaison narration is neither a turn (nobody said it) nor an artifact (nothing was produced),
+        // and fan/merge are neither — they mark a change in the timeline's SHAPE. With only
+        // turn-vs-artifact, all three rendered as ordinary nodes and a fan-out looked exactly like three
+        // consecutive replies.
+        assert!(Kind::Liaison.is_narration());
+        assert!(!Kind::Liaison.is_artifact() && !Kind::Liaison.is_structural());
+        for k in [Kind::FanOut, Kind::Merge] {
+            assert!(k.is_structural(), "{k:?} marks shape, not content");
+            assert!(!k.is_artifact() && !k.is_narration());
+        }
+        assert!(!Kind::Text.is_narration() && !Kind::Text.is_structural());
+        // every non-text kind carries a distinct badge, so they are separable without colour
+        let g: Vec<&str> = [Kind::Image, Kind::Shot, Kind::Patch, Kind::File, Kind::Liaison,
+                            Kind::FanOut, Kind::Merge].iter().map(|k| k.glyph()).collect();
+        let mut u = g.clone(); u.sort(); u.dedup();
+        assert_eq!(u.len(), g.len(), "badges must be distinct: {g:?}");
     }
 
     #[test]
