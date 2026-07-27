@@ -2120,6 +2120,24 @@ fn main() {
                 println!("     {mb:4} MiB chunked: {:7.2} ms  {:7.1} GiB/s", per * 1e3,
                     mb as f64 / 1024.0 / per);
             }
+            // Chunked AND flushed between chunks. Plain chunking recovered only ~1.6x on hardware, not
+            // the full fast-path rate, which suggests the staging belt is a per-SUBMISSION budget that
+            // several queued chunks still exhaust. If this row matches the lone-16-MiB rate the belt is
+            // the limit; if it matches plain chunking, the ceiling is elsewhere and the extra submits
+            // buy nothing.
+            println!("  -- same sizes, chunked AND flushed between chunks --");
+            for mb in [64usize, 256] {
+                let words = mb * (1 << 20) / 4;
+                let src: Vec<f32> = vec![1.0; words];
+                let dst = gpu.alloc_resident_words(words);
+                let iters = 5usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters { gpu.write_chunked_flushed_pub(&dst, &src); }
+                let _ = gpu.download(&gpu.view_pub(&dst, 0, 1024));
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                println!("     {mb:4} MiB flushed: {:7.2} ms  {:7.1} GiB/s", per * 1e3,
+                    mb as f64 / 1024.0 / per);
+            }
             println!("     (planner assumes 100 GiB/s; a 70B Q4 streams ~42 blocks/token)");
         }
 
