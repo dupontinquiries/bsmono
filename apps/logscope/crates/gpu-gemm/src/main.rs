@@ -2077,6 +2077,32 @@ fn main() {
             println!("     (M2 Ultra peak ~800 GB/s = ~745 GiB/s; a decode matvec should approach it)");
         }
 
+        // HOST -> DEVICE UPLOAD BANDWIDTH. Layer streaming's whole viability rests on this number, and
+        // the planner currently ASSUMES 100 GiB/s: at that rate a 70B Q4 streams 42 blocks per token in
+        // ~188 ms (5.3 tok/s), which is worth building. At 20 GiB/s it is ~940 ms/tok and is not.
+        // Measuring first is the cheap half-hour that decides whether to spend the week.
+        {
+            println!("  -- host->device upload bandwidth (the layer-streaming assumption) --");
+            for mb in [16usize, 64, 256] {
+                let words = mb * (1 << 20) / 4;
+                let src: Vec<f32> = vec![1.0; words];
+                let dst = gpu.alloc_resident_words(words);
+                let _ = gpu.download(&gpu.upload(&src[..1024], 1, 1024));   // warm
+                let iters = 5usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    gpu.queue_write_pub(&dst, &src);
+                    gpu.end_frame();
+                }
+                // one sync at the end so the timing covers submitted work, not just queueing
+                let _ = gpu.download(&gpu.view_pub(&dst, 0, 1024));
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                println!("     {mb:4} MiB block: {:7.2} ms  {:7.1} GiB/s", per * 1e3,
+                    mb as f64 / 1024.0 / per);
+            }
+            println!("     (planner assumes 100 GiB/s; a 70B Q4 streams ~42 blocks/token)");
+        }
+
         println!("gate-perf: {} — and throughput is now MEASURED above, not deferred to the device", if ok { "speed levers validated \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
