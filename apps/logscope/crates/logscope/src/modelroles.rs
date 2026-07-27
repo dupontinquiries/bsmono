@@ -112,14 +112,93 @@ pub fn auto_assign(models: &[String], budget_gib: f32) -> [(Role, Option<String>
     scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let thinker = scored.iter().rev().find(|(g, _)| *g > 0.0 && *g <= budget_gib).map(|(_, m)| (*m).clone());
-    let liaison = scored.first().filter(|(g, _)| *g > 0.0).map(|(_, m)| (*m).clone());
+    // The liaison must FIT too. Picking "the smallest present" without a budget check makes a 109B model
+    // the liaison when it is the only one available — which then reports chat_ready long before anything
+    // can actually load. Smallest-that-fits, or none.
+    let liaison = scored.iter().find(|(g, _)| *g > 0.0 && *g <= budget_gib).map(|(_, m)| (*m).clone());
     // The Disciple must be STRICTLY smaller than the Thinker: a speculative pair where both are the same
     // size costs more than running the Thinker alone, since every draft is as expensive as verifying it.
-    let t_gib = thinker.as_ref().map(|t| score_from_name(t).gib_q4).unwrap_or(f32::MAX);
-    let disciple = scored.iter().rev()
-        .find(|(g, _)| *g > 0.0 && *g < t_gib * 0.5)
-        .map(|(_, m)| (*m).clone());
+    // No Thinker means no Disciple: a disciple with nothing to draft FOR is pointless, and using
+    // f32::MAX as the bound made every model — including ones that do not fit — pass the size test.
+    let disciple = match thinker.as_ref() {
+        None => None,
+        Some(t) => {
+            let t_gib = score_from_name(t).gib_q4;
+            scored.iter().rev()
+                .find(|(g, _)| *g > 0.0 && *g <= budget_gib && *g < t_gib * 0.5)
+                .map(|(_, m)| (*m).clone())
+        }
+    };
     [(Role::Liaison, liaison), (Role::Disciple, disciple), (Role::Thinker, thinker)]
+}
+
+/// The GPU-memory reality a role plan has to fit inside.
+///
+/// Not RAM. On Asahi/Honeykrisp the binding limit is the BO-VMA ceiling — roughly 24 GiB regardless of
+/// how much memory the machine has — while Metal's unified budget is RAM-derived and far larger. A plan
+/// built from system RAM would put Scout on both and OOM on one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Budget {
+    pub gpu_gib: f32,
+    /// True on drivers whose allocator caps far below system RAM (Asahi Vulkan).
+    pub constrained: bool,
+}
+
+impl Budget {
+    /// Honeykrisp: the ceiling is a Mesa policy, not the machine's memory.
+    pub fn asahi() -> Self { Budget { gpu_gib: 24.0, constrained: true } }
+    /// Metal-class unified memory: governed by RAM.
+    pub fn unified(ram_gib: f32) -> Self { Budget { gpu_gib: ram_gib * 0.5, constrained: false } }
+}
+
+/// Which model fills which role, and in what ORDER to load them.
+#[derive(Clone, PartialEq, Debug)]
+pub struct RolePlan {
+    pub liaison: Option<String>,
+    pub disciple: Option<String>,
+    pub thinker: Option<String>,
+    /// Why these, for the startup line.
+    pub why: String,
+}
+
+impl RolePlan {
+    /// Load order: the LIAISON first, always.
+    ///
+    /// It is the smallest model and the only one usable before the others arrive — so loading it first
+    /// means the operator can ask "what is it doing?" during the ninety seconds the Thinker takes, rather
+    /// than watching a progress bar. Loading the Thinker first optimises for the moment everything is
+    /// ready and ignores the entire interval before it.
+    pub fn load_order(&self) -> Vec<(Role, String)> {
+        let mut v = Vec::new();
+        if let Some(m) = &self.liaison { v.push((Role::Liaison, m.clone())); }
+        if let Some(m) = &self.disciple { v.push((Role::Disciple, m.clone())); }
+        if let Some(m) = &self.thinker { v.push((Role::Thinker, m.clone())); }
+        v
+    }
+
+    /// Can the operator hold a conversation yet?
+    ///
+    /// True as soon as the Liaison is up, regardless of the Thinker. This is what makes "chat while the
+    /// big model loads" possible at all — the coordinator does not need every role present to be useful,
+    /// only the one that talks.
+    pub fn chat_ready(&self, loaded: &[String]) -> bool {
+        self.liaison.as_ref().is_some_and(|l| loaded.iter().any(|m| m == l))
+    }
+}
+
+/// Build a plan for the platform actually present.
+pub fn plan_for_platform(models: &[String], budget: Budget) -> RolePlan {
+    let a = auto_assign(models, budget.gpu_gib);
+    let pick = |r: Role| a.iter().find(|(x, _)| *x == r).and_then(|(_, m)| m.clone());
+    let (liaison, disciple, thinker) = (pick(Role::Liaison), pick(Role::Disciple), pick(Role::Thinker));
+    let why = match (&thinker, budget.constrained) {
+        (Some(t), true) => format!(
+            "{t} as Thinker — the GPU allocator caps at {:.0} GiB here regardless of system RAM, so a \
+larger model would not fit however much memory the machine has", budget.gpu_gib),
+        (Some(t), false) => format!("{t} as Thinker, within a {:.0} GiB unified budget", budget.gpu_gib),
+        (None, _) => format!("no model fits the {:.0} GiB budget", budget.gpu_gib),
+    };
+    RolePlan { liaison, disciple, thinker, why }
 }
 
 #[cfg(test)]
@@ -184,6 +263,71 @@ mod tests {
         let good: Vec<String> = ["a-1b", "b-8b"].iter().map(|s| s.to_string()).collect();
         assert_eq!(auto_assign(&good, 100.0).iter().find(|(r, _)| *r == Role::Disciple).unwrap().1.as_deref(),
             Some("a-1b"));
+    }
+
+    fn ms(v: &[&str]) -> Vec<String> { v.iter().map(|s| s.to_string()).collect() }
+
+    #[test]
+    fn the_same_model_list_plans_DIFFERENTLY_on_asahi_and_metal() {
+        // The requirement, and the reason Budget is not just "RAM". On Honeykrisp the BO-VMA ceiling is
+        // ~24 GiB no matter how much memory the machine has, so Scout (~34 GiB at q4) cannot be the
+        // Thinker there even on a 192 GiB box — while the same list on Metal picks it happily.
+        let models = ms(&["llama3.2-3b", "qwen3-30b-a3b", "llama4-scout-109b"]);
+
+        let metal = plan_for_platform(&models, Budget::unified(192.0));   // 96 GiB budget
+        assert_eq!(metal.thinker.as_deref(), Some("llama4-scout-109b"));
+        assert_eq!(metal.liaison.as_deref(), Some("llama3.2-3b"), "smallest is the liaison");
+
+        let asahi = plan_for_platform(&models, Budget::asahi());          // 24 GiB ceiling
+        assert_eq!(asahi.thinker.as_deref(), Some("qwen3-30b-a3b"),
+            "Scout does not fit the allocator ceiling; the 30B does");
+        assert_eq!(asahi.liaison.as_deref(), Some("llama3.2-3b"));
+        assert!(asahi.why.contains("regardless of system RAM"),
+            "the message must say it is an ALLOCATOR limit, or someone buys more memory to fix it: {}",
+            asahi.why);
+    }
+
+    #[test]
+    fn the_liaison_loads_FIRST_so_chat_works_while_the_thinker_arrives() {
+        // Loading the Thinker first optimises for the moment everything is ready and ignores the ninety
+        // seconds before it. The Liaison is small, loads fast, and is the only role usable alone.
+        let p = plan_for_platform(&ms(&["llama3.2-3b", "llama4-scout-109b"]), Budget::unified(192.0));
+        let order = p.load_order();
+        assert_eq!(order[0].0, Role::Liaison);
+        assert_eq!(order.last().unwrap().0, Role::Thinker);
+
+        // and chat is live as soon as the liaison is up, with the thinker still loading
+        assert!(p.chat_ready(&ms(&["llama3.2-3b"])));
+        assert!(!p.chat_ready(&ms(&["llama4-scout-109b"])), "the thinker alone cannot hold the conversation");
+        assert!(!p.chat_ready(&[]));
+    }
+
+    #[test]
+    fn a_budget_nothing_fits_says_so_rather_than_planning_anyway() {
+        let p = plan_for_platform(&ms(&["llama4-scout-109b"]), Budget::asahi());
+        assert!(p.thinker.is_none());
+        assert!(p.why.contains("no model fits"));
+        assert!(p.load_order().is_empty(), "an unfittable plan loads nothing rather than trying");
+    }
+
+    #[test]
+    fn EVERY_role_must_fit_the_budget_not_just_the_thinker() {
+        // Three separate holes, all found by one test asserting an unfittable plan loads nothing:
+        //   - the liaison was "smallest present" with no budget check, so a 109B model became the
+        //     liaison when it was the only one — and chat_ready then went true for something that
+        //     could never load;
+        //   - the disciple had no budget check either;
+        //   - with no thinker, the disciple's size bound was f32::MAX * 0.5, which every model passes.
+        // "The thinker fits" is not the same claim as "the plan fits".
+        let big = ms(&["llama4-scout-109b"]);
+        let p = plan_for_platform(&big, Budget::asahi());
+        assert!(p.thinker.is_none() && p.liaison.is_none() && p.disciple.is_none(), "{p:?}");
+        assert!(!p.chat_ready(&big), "nothing loadable means no conversation, however it is spelled");
+
+        // and a disciple is never assigned without a thinker to draft FOR
+        let solo = plan_for_platform(&ms(&["tiny-1b"]), Budget::asahi());
+        assert_eq!(solo.thinker.as_deref(), Some("tiny-1b"), "it fits, so it is the thinker");
+        assert!(solo.disciple.is_none(), "nothing smaller to draft with");
     }
 
     #[test]
