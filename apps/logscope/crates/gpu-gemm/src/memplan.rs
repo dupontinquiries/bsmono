@@ -553,6 +553,18 @@ pub fn rss_split() -> (u64, u64, u64) {
     };
     let anon = kb("Anonymous:");
     let total = kb("Rss:");
+    // macOS: no smaps_rollup, so the anon/file SPLIT is unavailable — but the TOTAL is one ps
+    // call away, and "total known, split unknown" beats the old "resident memory: unavailable"
+    // (the report can say which part it can't see instead of going silent).
+    #[cfg(target_os = "macos")]
+    if total == 0 {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &std::process::id().to_string()]).output() {
+            if let Ok(kb_rss) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                return (0, 0, kb_rss * 1024);
+            }
+        }
+    }
     (anon, total.saturating_sub(anon), total)
 }
 
@@ -560,6 +572,12 @@ pub fn rss_split() -> (u64, u64, u64) {
 pub fn rss_report() -> String {
     let (anon, file, total) = rss_split();
     if total == 0 { return "resident memory: unavailable on this platform".into(); }
+    if anon == 0 && file == 0 {
+        // macOS path: ps gives the total; the anon/file split needs smaps_rollup (Linux-only).
+        // Say WHICH part is unknown instead of going silent (field-report ask).
+        return format!("resident memory: {:.1} GiB total (anon/file split unavailable on this platform)",
+                       total as f64 / (1u64 << 30) as f64);
+    }
     format!("resident memory: {:.1} GiB total = {:.1} GiB anonymous (our allocations) + {:.1} GiB file-backed \
 (mmap'd model; reclaimable by the kernel under pressure)",
         gib(total), gib(anon), gib(file))

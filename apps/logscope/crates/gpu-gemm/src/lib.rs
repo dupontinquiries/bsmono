@@ -265,7 +265,19 @@ pub fn gpu_submits() -> u64 { GPU_SUBMITS.load(std::sync::atomic::Ordering::Rela
 pub fn gpu_polls() -> u64 { GPU_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_setup_ns() -> u64 { GPU_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Relaxed) }
-pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES] { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
+pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES] { c.store(0, std::sync::atomic::Ordering::Relaxed); } for c in &SUBMIT_CAUSES { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
+/// WHY each submit happened — the diagnosis the Scout/Metal field report had to instrument mid-hunt
+/// (1119 submits/tok at 2.0 ms each with flush_every=128; three wrong guesses before tagging every
+/// flush site named the mechanism). Indices: 0 passes-cadence, 1 download, 2 end_frame, 3 dims-wrap,
+/// 4 frameless dispatch (no open frame — should be ~0 during decode after the reopen fix), 5 other.
+pub static SUBMIT_CAUSES: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
+#[inline] fn submit_cause(i: usize) { SUBMIT_CAUSES[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+pub fn gpu_submit_causes() -> [u64; 6] {
+    [0, 1, 2, 3, 4, 5].map(|i| SUBMIT_CAUSES[i].load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Cached per-shader GPU objects: the bind-group layout and compiled compute
 /// pipeline. Building these is expensive (shader compilation), so they're created
@@ -1455,12 +1467,22 @@ impl Gpu {
             t.rows, t.cols, bytes, t.buf.size());
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
+        // Explicit guard (NOT an if-let scrutinee): the scrutinee temporary would hold the frame
+        // lock for the whole block, and the reopen below re-locks it — a self-deadlock that hung
+        // the windowed-sampler path on its very first readback.
+        let mut fr = self.frame.lock().unwrap();
+        let _keep = if let Some(mut frame) = fr.take() {
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            submit_cause(1);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
+            // Reopen — same rule and same field evidence as download(); the windowed sampler calls
+            // THIS between windows, so without the reopen every windowed decode degraded too.
+            *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
+            drop(fr);
             None::<()>
         } else {
+            drop(fr);
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             self.submit(enc);
@@ -2202,14 +2224,27 @@ impl Gpu {
         // submit. frame.keep (dims uniforms + bind groups) is RETAINED past the submit — it's async,
         // and dropping it before the poll below recycles buffers the GPU is still reading → "Buffer
         // 'dims' is invalid" on Metal. clear_retained() after the poll frees them safely.
-        if let Some(mut frame) = self.frame.lock().unwrap().take() {
-            frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
-            self.submit(frame.enc);
-            self.retain_keep(frame.keep);
-        } else {
-            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
-            self.submit(enc);
+        {
+            let mut fr = self.frame.lock().unwrap();
+            if let Some(mut frame) = fr.take() {
+                frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+                submit_cause(1);
+                self.submit(frame.enc);
+                self.retain_keep(frame.keep);
+                // REOPEN the frame. A mid-decode readback (MoE router pick, windowed-sampler ids,
+                // logits) used to TAKE the frame and never put one back, so every dispatch after it
+                // fell into the frameless one-submit-per-dispatch branch — the Scout/Metal field
+                // report measured exactly this: 1119 submits/tok (~23/layer for 48 layers) with
+                // flush_every=128, at 2.0 ms of Metal command-buffer overhead each. The cadence
+                // flush three lines up already reopens; downloads now follow the same rule. This
+                // changes WHEN work is submitted, never what it computes.
+                *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
+            } else {
+                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+                enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+                submit_cause(5);
+                self.submit(enc);
+            }
         }
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -2384,6 +2419,7 @@ impl Gpu {
     }
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
     fn flush_and_wait(&self) {
+        submit_cause(3); // dims-ring wrap (its only caller)
         if let Some(frame) = self.frame.lock().unwrap().take() {
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
@@ -2464,7 +2500,13 @@ impl Gpu {
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     pub fn end_frame(&self) {
-        if let Some(frame) = self.frame.lock().unwrap().take() { self.submit(frame.enc); self.retain_keep(frame.keep); }
+        if let Some(frame) = self.frame.lock().unwrap().take() {
+            // The download-reopen can leave a frame with zero recorded passes at the decode tail;
+            // submitting an empty encoder is a pure submit-overhead tax, so skip it.
+            if frame.passes == 0 && frame.keep.is_empty() { return; }
+            submit_cause(2);
+            self.submit(frame.enc); self.retain_keep(frame.keep);
+        }
     }
 
     /// Dispatch over resident tensors: inputs at 0..n (read-only), out at n (read_write),
@@ -2565,6 +2607,7 @@ impl Gpu {
             let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
             if over_flush || over_retain {
                 let old = fr.take().unwrap();
+                submit_cause(0); // passes cadence (flush_every / retain cap)
                 self.submit(old.enc);
                 self.retain_keep(old.keep);
                 *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
@@ -2577,6 +2620,8 @@ impl Gpu {
             }
         } else {
             drop(fr);
+            submit_cause(4); // FRAMELESS: one submit per dispatch — during decode this is the
+                             // 20x Metal catastrophe; the download() frame-reopen keeps it ~0
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
