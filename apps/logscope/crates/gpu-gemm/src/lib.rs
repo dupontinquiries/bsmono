@@ -2914,12 +2914,19 @@ impl Gpu {
                         *c += 1;
                         // Wrapping means slot 0 is about to be rewritten while an earlier fill may still
                         // be queued against it — that is the one point where the frame must close.
-                        // Reopen after closing. end_frame() leaves the frame CLOSED, and every dispatch
-                        // after it takes the one-submit-per-dispatch branch — measured at 49751 of 54161
-                        // submits (99%) on a Scout run, because a 12-fill layer wraps this ring several
-                        // times per token and nothing put a frame back. Same defect as download(), in a
-                        // second place; closing without reopening is the shape to watch for.
-                        if s == 0 { self.end_frame(); self.begin_frame(); }
+                        // DO NOT REOPEN HERE. Reopening was tried in _274 and CHANGED THE MODEL'S OUTPUT
+                        // on hardware, which a submission-structure change must never do.
+                        //
+                        // This end_frame is a FENCE, not a flush. `queue.write_buffer` data is applied at
+                        // the START of a submit, before every command buffer in it — so if the frame stays
+                        // open, a later fill's staging writes join the same submit as an earlier fill's
+                        // dispatches and land BEFORE them. The earlier fill then reads the later expert's
+                        // bytes. That is the hazard _181 fixed, and reopening reintroduced it.
+                        //
+                        // The cost is real: this is most of the 99% no-frame submits. The fix is to make
+                        // the fence cheaper (fewer fills, or converting Q6_K so experts can be file VIEWS
+                        // and need no staging at all), not to remove it.
+                        if s == 0 { self.end_frame(); }
                         s
                     };
                     let base = slot * per_fill;
