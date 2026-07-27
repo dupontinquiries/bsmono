@@ -579,7 +579,7 @@ impl State {
         up(&self.device, &self.queue, &mut self.vbuf_trans, &mut self.vcap_trans, &mut self.vcount_trans, trans, "vt");
     }
 
-    fn render(&mut self, u: &U, game: &crate::game::Game, menu: &mut Option<MenuScreen>, loadout: &mut Loadout, menu_events: Vec<egui::Event>) -> MenuAction {
+    fn render(&mut self, u: &U, game: &crate::game::Game, menu: &mut Option<MenuScreen>, loadout: &mut Loadout, mstate: &mut gpu_menu::MenuState, menu_events: Vec<egui::Event>) -> MenuAction {
         let mut action = MenuAction::None;
         self.queue.write_buffer(&self.ubuf, 0, bytemuck::bytes_of(u));
         let frame = match self.surface.get_current_texture() {
@@ -660,7 +660,7 @@ impl State {
             let scale = self.scale;
             self.egui.prepare(&self.device, &self.queue, w, h, scale, menu_events, |ctx| {
                 if let Some(screen) = menu {
-                    action = gpu_menu::ui(ctx, screen, loadout);
+                    action = gpu_menu::ui(ctx, screen, loadout, mstate);
                     return;
                 }
                 let painter = ctx.layer_painter(egui::LayerId::new(
@@ -761,6 +761,7 @@ pub fn run() {
     // real pointer/keyboard events for the menu's egui widgets to actually be clickable — the HUD
     // never needed this (paint-only), so EguiOverlay::prepare previously had no events path at all.
     let mut menu_events: Vec<egui::Event> = Vec::new();
+    let mut menu_state = gpu_menu::MenuState::default();
 
     event_loop
         .run(move |event, elwt| match event {
@@ -781,6 +782,16 @@ pub fn run() {
                         cursor_pos = egui::pos2(position.x as f32 / scale.max(0.01), position.y as f32 / scale.max(0.01));
                         menu_events.push(egui::Event::PointerMoved(cursor_pos));
                     }
+                }
+                WindowEvent::MouseWheel { delta, .. } => {
+                    // The gpu bin synthesizes its own egui events (custom winit loop) and NEVER
+                    // forwarded the wheel — the map-select list could not scroll here at all.
+                    let d = match delta {
+                        winit::event::MouseScrollDelta::LineDelta(x, y) => egui::vec2(x * 24.0, y * 24.0),
+                        winit::event::MouseScrollDelta::PixelDelta(p) => egui::vec2(p.x as f32, p.y as f32),
+                    };
+                    menu_events.push(egui::Event::MouseWheel {
+                        unit: egui::MouseWheelUnit::Point, delta: d, modifiers: egui::Modifiers::default(), phase: egui::TouchPhase::Move });
                 }
                 WindowEvent::MouseInput { state: st, button, .. } => {
                     let down = st == ElementState::Pressed;
@@ -804,6 +815,20 @@ pub fn run() {
                 WindowEvent::KeyboardInput { event: ke, .. } => {
                     let down = ke.state == ElementState::Pressed;
                     if let PhysicalKey::Code(code) = ke.physical_key {
+                        // Menu navigation keys reach egui too (the map list pages with them).
+                        if menu.is_some() {
+                            let ek = match code {
+                                KeyCode::PageUp => Some(egui::Key::PageUp),
+                                KeyCode::PageDown => Some(egui::Key::PageDown),
+                                KeyCode::ArrowUp => Some(egui::Key::ArrowUp),
+                                KeyCode::ArrowDown => Some(egui::Key::ArrowDown),
+                                _ => None,
+                            };
+                            if let Some(k) = ek {
+                                menu_events.push(egui::Event::Key { key: k, physical_key: None,
+                                    pressed: down, repeat: false, modifiers: egui::Modifiers::default() });
+                            }
+                        }
                         if code == KeyCode::Escape {
                             if down {
                                 menu = match menu {
@@ -891,17 +916,25 @@ pub fn run() {
                         plights,
                     };
                     let events = std::mem::take(&mut menu_events);
-                    match state.render(&u, &game, &mut menu, &mut loadout, events) {
+                    match state.render(&u, &game, &mut menu, &mut loadout, &mut menu_state, events) {
                         MenuAction::None => {}
                         MenuAction::Resume => {
                             menu = None;
                             last = Instant::now(); // don't let time spent in the menu count as a dt jump
                             set_cursor_state(&window, false);
                         }
-                        MenuAction::StartGame(theme) => {
+                        MenuAction::StartGame(preset) => {
                             let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
                             let seed = (nanos as u64) ^ 0x9E3779B97F4A7C15;
-                            game = Game::new_with(seed, Some(theme), loadout);
+                            // Preset-ACCURATE start (parity with the app shell's deploy): the old
+                            // path passed only preset.theme, so every hand-tuned variation and all
+                            // 13 learned-site maps collapsed into a generic biome map — the learned
+                            // maps were listed but unreachable in this bin. None = Random.
+                            game = Game::new_match_tuned(seed, preset, loadout,
+                                crate::cosmetics::Cosmetics::default(), 0,
+                                crate::enemy::Difficulty::Regular, None,
+                                crate::creatures::HuntRole::Survivor,
+                                crate::enhance::CinematicTuning(0.0));
                             menu = None;
                             last = Instant::now();
                             set_cursor_state(&window, false);
