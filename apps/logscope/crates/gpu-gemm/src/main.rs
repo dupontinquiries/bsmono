@@ -2041,7 +2041,35 @@ fn main() {
         // The tiled GEMM is bit-exact to naive (above), and model prefill dispatches it via
         // linear_q8_0_t when LOGSCOPE_PREFILL_TILED=1 — so a tiled-prefill forward is bit-identical to
         // the naive forward by construction; no separate (env-cached) end-to-end check needed.
-        println!("gate-perf: {} (correctness only — speed is measured on the M2)", if ok { "speed levers validated \u{2713}" } else { "FAIL \u{2717}" });
+        // ACHIEVED THROUGHPUT at model shapes. This gate validated that the speed levers do not change
+        // results and then reported nothing about SPEED — which made it useless for the question it
+        // exists to answer, and I asked for it on a run where it could not help. A decode matvec is
+        // bandwidth-bound: it reads the whole weight matrix once per token, so GiB/s against device peak
+        // says immediately whether the kernel is near the wall or nowhere near it.
+        {
+            println!("  -- achieved decode-matvec throughput (q8 resident) --");
+            for &(k, n, label) in &[(5120usize, 5120usize, "attn-q 5120x5120"),
+                                    (5120, 16384, "ffn-gateup 5120x16384"),
+                                    (16384, 5120, "ffn-down 16384x5120")] {
+                let mut rng = 0x1234_5678_9ABC_DEF0u64;
+                let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+                let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+                let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+                let lin = gpu_kernels::Lin::q8(gpu.quantize_q8_resident(&w, n, k));
+                let a = gpu.upload(&act, 1, k);
+                let _ = gpu.download(&lin.apply(&gpu, &a, 1));   // warm: do not time compilation
+                let iters = 20usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters { let _ = gpu.download(&lin.apply(&gpu, &a, 1)); }
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                let bytes = (n * k) as f64 + (n * 4) as f64;   // q8: one byte/weight + a scale per row
+                println!("     {label:22} {:8.2} ms/call  {:7.1} GiB/s",
+                    per * 1e3, bytes / per / (1u64 << 30) as f64);
+            }
+            println!("     (M2 Ultra peak ~800 GB/s = ~745 GiB/s; a decode matvec should approach it)");
+        }
+
+        println!("gate-perf: {} — and throughput is now MEASURED above, not deferred to the device", if ok { "speed levers validated \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-qkv") {
