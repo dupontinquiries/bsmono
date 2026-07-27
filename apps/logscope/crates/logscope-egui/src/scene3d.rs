@@ -104,17 +104,58 @@ impl Float {
 }
 
 /// A baked environment: parallel meshes + their float motions.
-pub struct Scene { pub meshes: Vec<Mesh3>, floats: Vec<Float>, anchors: Vec<Vec3> }
+/// How wind (and the idle float) deform one mesh. The old model applied BOTH as whole-mesh offsets,
+/// which reads as a rigid unibody: kelp levitating off the seabed, creatures rocking like statues.
+/// The modes restore what each thing IS:
+///   * Bend    — grounded vegetation (kelp, tentacles, tall fronds): every displacement — wind AND the
+///               idle bob — is applied PER VERTEX, weighted 0 at the root to 1 at the tip, so the base
+///               stays planted exactly where it grew and the tip traces the gust.
+///   * Ripple  — creatures: the body keeps only its slow drift (locomotion), while the old bob energy
+///               becomes a traveling surface wave along the vertex NORMALS — fur/fin/scale ripple with
+///               ~zero net displacement, not a rigid rock.
+///   * Unibody — detached foliage (floating leaf puffs, canopy domes): whole-mesh motion is CORRECT for
+///               things that aren't attached to anything; the original path, kept for exactly those.
+#[derive(Clone, Copy, PartialEq)]
+enum WindMode { None, Unibody, Bend { root_y: f32, inv_h: f32 }, Ripple { amp: f32, speed: f32 } }
+
+pub struct Scene { pub meshes: Vec<Mesh3>, floats: Vec<Float>, anchors: Vec<Vec3>,
+                   modes: Vec<WindMode>, rests: Vec<Option<Vec<Vec3>>> }
 impl Scene {
-    fn new() -> Self { Scene { meshes: Vec::new(), floats: Vec::new(), anchors: Vec::new() } }
+    fn new() -> Self { Scene { meshes: Vec::new(), floats: Vec::new(), anchors: Vec::new(),
+                               modes: Vec::new(), rests: Vec::new() } }
     fn add(&mut self, m: Mesh3, f: Float) {
-        // wind only sways FOLIAGE (MOSS) that already floats; for those we cache a centroid anchor so the gust
-        // wave can sweep across the scene. Everything else stores a zero anchor (skipped at animate time).
-        let anchor = if m.mat == M::MOSS && (f.amp != 0.0 || f.drift != 0.0) && !m.verts.is_empty() {
-            let s = m.verts.iter().fold(v(0.0, 0.0, 0.0), |a, &p| addv(a, p));
-            mulv(s, 1.0 / m.verts.len() as f32)
-        } else { v(0.0, 0.0, 0.0) };
+        // Classify: MOSS that floats is wind-susceptible. TALL slender moss (height clearly dominant
+        // over footprint) is GROUNDED vegetation → Bend; the rest (puffs, domes) is detached foliage
+        // → Unibody. The centroid anchor still drives the gust wave's spatial phase in both cases.
+        let (anchor, mode, rest) = if m.mat == M::MOSS && (f.amp != 0.0 || f.drift != 0.0) && !m.verts.is_empty() {
+            let sum = m.verts.iter().fold(v(0.0, 0.0, 0.0), |a, &p| addv(a, p));
+            let anchor = mulv(sum, 1.0 / m.verts.len() as f32);
+            let (mut lo, mut hi) = (m.verts[0], m.verts[0]);
+            for &p in &m.verts {
+                lo = v(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                hi = v(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+            }
+            let (h, foot) = (hi.y - lo.y, (hi.x - lo.x).max(hi.z - lo.z));
+            if h > 1.2 * foot && h > 0.4 {
+                (anchor, WindMode::Bend { root_y: lo.y, inv_h: 1.0 / h.max(1e-4) }, Some(m.verts.clone()))
+            } else {
+                (anchor, WindMode::Unibody, None)
+            }
+        } else { (v(0.0, 0.0, 0.0), WindMode::None, None) };
         self.meshes.push(m); self.floats.push(f); self.anchors.push(anchor);
+        self.modes.push(mode); self.rests.push(rest);
+    }
+    /// Add a CREATURE: keeps its drift (locomotion) but converts the bob amplitude into a traveling
+    /// surface ripple along the normals — fur/fin/scale shimmer instead of a rigid rocking body.
+    fn add_creature(&mut self, m: Mesh3, f: Float) {
+        let sum = if m.verts.is_empty() { v(0.0, 0.0, 0.0) }
+                  else { mulv(m.verts.iter().fold(v(0.0, 0.0, 0.0), |a, &p| addv(a, p)), 1.0 / m.verts.len() as f32) };
+        let mode = WindMode::Ripple { amp: (f.amp * 0.12).clamp(0.015, 0.09), speed: (f.speed * 2.2).max(0.8) };
+        let rest = Some(m.verts.clone());
+        self.meshes.push(m);
+        // the body keeps only a softened bob (a third) + its drift — the rest of the energy is in the ripple
+        self.floats.push(Float { amp: f.amp * 0.3, ..f });
+        self.anchors.push(sum); self.modes.push(mode); self.rests.push(rest);
     }
     fn add_all(&mut self, ms: Vec<Mesh3>, f: Float) { for m in ms { self.add(m, f); } }
     /// A brief BUILD-IN when the world is freshly (re)built — which happens on a conversation STATE STEP, since
@@ -132,15 +173,51 @@ impl Scene {
     /// gets a WIND sway on top of its idle bob.
     pub fn animate(&mut self, t: f32) {
         let (wdir, wstr) = (wind_dir(), wind_strength(t));
-        for ((m, f), &anchor) in self.meshes.iter_mut().zip(&self.floats).zip(self.anchors.iter()) {
+        for i in 0..self.meshes.len() {
+            let (f, anchor, mode) = (self.floats[i], self.anchors[i], self.modes[i]);
             let base = f.offset(t);
-            // sway susceptibility derived from the object's own idle motion → leaves sway most, twigs least,
-            // rigid wood/stone (STILL) not at all. anchor==0 marks a non-foliage object (no wind).
-            if (anchor.x != 0.0 || anchor.y != 0.0 || anchor.z != 0.0) && wstr > 1e-3 {
-                let sway = (f.amp + f.drift) * 3.0;
-                m.offset = addv(base, wind_offset(wdir, wstr, anchor, t, sway));
-            } else {
-                m.offset = base;
+            let m = &mut self.meshes[i];
+            match mode {
+                WindMode::None => { m.offset = base; }
+                // Detached foliage: whole-mesh wind is CORRECT here (leaf puffs really do travel).
+                WindMode::Unibody => {
+                    let sway = (f.amp + f.drift) * 3.0;
+                    m.offset = if wstr > 1e-3 { addv(base, wind_offset(wdir, wstr, anchor, t, sway)) } else { base };
+                }
+                // Grounded vegetation: EVERYTHING — idle bob included — moves per vertex, weighted from
+                // 0 at the root to 1 at the tip (stiff base, free tip: w = h^1.5). The root row lands
+                // EXACTLY on its rest position every frame: planted, not levitating.
+                WindMode::Bend { root_y, inv_h } => {
+                    let sway = (f.amp + f.drift) * 3.0;
+                    let rest = self.rests[i].as_ref().expect("bend mesh has a rest pose");
+                    m.offset = v(0.0, 0.0, 0.0);
+                    for (vtx, &r) in m.verts.iter_mut().zip(rest.iter()) {
+                        let w = ((r.y - root_y) * inv_h).clamp(0.0, 1.0);
+                        // ^2.5, not ^1.5: "planted" is an INVARIANT (the test pins root motion
+                        // < 1e-4), not a vibe. At ^1.5 the bottom 5% band still moved ~4e-4 in a
+                        // full gust; ^2.5 puts the same band at ~2e-5 while the tip (w=1) is
+                        // untouched — and real kelp bends in its upper half anyway.
+                        let w = w * w * w.sqrt(); // ^2.5
+                        // the gust wave's phase advances along the PLANT (its own extent rides the
+                        // sweep), not just per object — tips lead, bases lag
+                        let wo = if wstr > 1e-3 { wind_offset(wdir, wstr, addv(anchor, mulv(r, 0.35)), t, sway) }
+                                 else { v(0.0, 0.0, 0.0) };
+                        *vtx = addv(r, mulv(addv(base, wo), w));
+                    }
+                }
+                // Creatures: drift/soft-bob as a body; the surface ripples along the normals with a wave
+                // traveling down the body axis — near-zero net displacement, so it reads as fur/fin
+                // shimmer + swimming undulation, never a rocking statue.
+                WindMode::Ripple { amp, speed } => {
+                    m.offset = base;
+                    let rest = self.rests[i].as_ref().expect("ripple mesh has a rest pose");
+                    let a = amp * (0.6 + 0.4 * wstr.min(1.5));
+                    for ((vtx, &r), n) in m.verts.iter_mut().zip(rest.iter()).zip(m.norms.iter()) {
+                        let along = (r.x - anchor.x) * 1.7 + (r.z - anchor.z) * 1.1 + (r.y - anchor.y) * 0.6;
+                        let ph = along * 2.6 - t * speed;
+                        *vtx = addv(r, mulv(*n, ph.sin() * a));
+                    }
+                }
             }
         }
     }
@@ -2135,7 +2212,8 @@ fn fish_species() -> [FishSpecies; 8] {
 /// Build ONE fish/whale of `sp` at `pos`, facing `fwd`, scaled by `sc`. Built in a LOCAL frame (+x forward,
 /// +y up, +z lateral): a chain of laterally-compressed, tapering ellipsoid body segments + a forked (or, for
 /// a whale, horizontal) caudal fin + dorsal/anal/pectoral fins + eyes — then transformed into world. All
-/// parts share one `Float` so the creature sways/bobs as a rigid body.
+/// parts share one `Float` for locomotion; each part registers as a CREATURE so its surface ripples
+/// (fin/scale shimmer + swimming undulation) instead of the whole fish rocking as a rigid body.
 fn add_fish(s: &mut Scene, pos: Vec3, fwd: Vec3, up_hint: Vec3, sp: &FishSpecies, sc: f32, fl: Float) {
     let fwd = normv(fwd);
     let side = { let cx = crossv(up_hint, fwd); if cx.x * cx.x + cx.y * cx.y + cx.z * cx.z < 1e-6 { v(0.0, 0.0, 1.0) } else { normv(cx) } };
@@ -2143,7 +2221,7 @@ fn add_fish(s: &mut Scene, pos: Vec3, fwd: Vec3, up_hint: Vec3, sp: &FishSpecies
     let mut emit = |mut m: m3::Mesh3, emis: f32| {
         for p in &mut m.verts { let l = *p; *p = addv(pos, addv(mulv(fwd, l.x), addv(mulv(up, l.y), mulv(side, l.z)))); }
         for nn in &mut m.norms { let l = *nn; *nn = addv(mulv(fwd, l.x), addv(mulv(up, l.y), mulv(side, l.z))); }
-        m.mat = M::WATER; m.emissive = emis; s.add(m, fl);
+        m.mat = M::WATER; m.emissive = emis; s.add_creature(m, fl);
     };
     let (len, h, w) = (sp.len * sc, sp.h * sc, sp.w * sc);
     let nseg = 5;
@@ -6118,6 +6196,70 @@ pub fn render_env(painter: &egui::Painter, cam: &OrbitCam, cx: f32, cy: f32, sca
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn grounded_kelp_bends_from_a_planted_root() {
+        std::env::set_var("LOGSCOPE_WIND", "1.5");
+        let mut sc = Scene::new();
+        let strand = m3::strand(v(2.0, -3.0, 1.0), v(2.0, 0.5, 1.0), 0.06, 5, 9, 0.0, 0.4, c(0x30, 0x80, 0x40));
+        let mut k = strand; k.mat = M::MOSS;
+        let rest = k.verts.clone();
+        sc.add(k, Float { amp: 0.5, speed: 0.5, phase: 0.3, drift: 0.35 });
+        assert!(matches!(sc.modes[0], WindMode::Bend { .. }), "tall moss classifies as grounded vegetation");
+        sc.animate(1.7);
+        let m = &sc.meshes[0];
+        assert_eq!((m.offset.x, m.offset.y, m.offset.z), (0.0, 0.0, 0.0), "bend meshes carry no unibody offset");
+        let (mut root_d, mut tip_d) = (0.0f32, 0.0f32);
+        let (lo, hi) = rest.iter().fold((f32::MAX, f32::MIN), |(a, b), p| (a.min(p.y), b.max(p.y)));
+        for (p, r) in m.verts.iter().zip(rest.iter()) {
+            let d = ((p.x - r.x).powi(2) + (p.y - r.y).powi(2) + (p.z - r.z).powi(2)).sqrt();
+            if r.y < lo + 0.05 { root_d = root_d.max(d); }
+            if r.y > hi - 0.05 { tip_d = tip_d.max(d); }
+        }
+        assert!(root_d < 1e-4, "the root stays planted exactly (moved {root_d})");
+        assert!(tip_d > 0.02, "the tip actually sways (moved {tip_d})");
+        std::env::remove_var("LOGSCOPE_WIND");
+    }
+    #[test]
+    fn creatures_ripple_without_rocking() {
+        std::env::set_var("LOGSCOPE_WIND", "1.0");
+        let mut sc = Scene::new();
+        let mut body = m3::uv_sphere(v(0.0, 0.0, 0.0), 0.6, 14, 10, c(0x60, 0x80, 0xa0));
+        body.mat = M::WATER;
+        let rest = body.verts.clone();
+        sc.add_creature(body, Float { amp: 0.4, speed: 1.0, phase: 0.0, drift: 0.2 });
+        sc.animate(2.3);
+        let m = &sc.meshes[0];
+        // per-vertex ripple present…
+        let maxd = m.verts.iter().zip(rest.iter())
+            .map(|(p, r)| ((p.x - r.x).powi(2) + (p.y - r.y).powi(2) + (p.z - r.z).powi(2)).sqrt())
+            .fold(0.0f32, f32::max);
+        assert!(maxd > 0.005, "surface ripples ({maxd})");
+        // …with near-zero NET displacement (shimmer, not a rigid rock of the whole body)
+        let net = m.verts.iter().zip(rest.iter())
+            .fold(v(0.0, 0.0, 0.0), |a, (p, r)| addv(a, v(p.x - r.x, p.y - r.y, p.z - r.z)));
+        let n = m.verts.len() as f32;
+        let net_mag = ((net.x / n).powi(2) + (net.y / n).powi(2) + (net.z / n).powi(2)).sqrt();
+        assert!(net_mag < maxd * 0.25, "ripple is balanced: net {net_mag} vs max {maxd}");
+        std::env::remove_var("LOGSCOPE_WIND");
+    }
+    #[test]
+    fn leaf_puffs_keep_their_unibody_drift_and_stone_stays_still() {
+        std::env::set_var("LOGSCOPE_WIND", "1.5");
+        let mut sc = Scene::new();
+        let mut puff = m3::uv_sphere(v(4.0, 2.0, -3.0), 0.8, 10, 8, c(0x40, 0x70, 0x30));
+        puff.mat = M::MOSS; // wide, not tall → detached foliage
+        sc.add(puff, Float { amp: 0.2, speed: 0.7, phase: 0.1, drift: 0.3 });
+        let mut rock = m3::uv_sphere(v(-2.0, -3.0, 0.0), 0.5, 8, 6, c(0x50, 0x50, 0x50));
+        rock.mat = M::STONE;
+        sc.add(rock, Float::STILL);
+        assert!(matches!(sc.modes[0], WindMode::Unibody), "wide moss = detached foliage keeps unibody wind");
+        sc.animate(3.1);
+        let puff_off = sc.meshes[0].offset;
+        assert!(puff_off.x.abs() + puff_off.y.abs() + puff_off.z.abs() > 1e-3, "the puff still travels as a body");
+        let rock_off = sc.meshes[1].offset;
+        assert!(rock_off.x.abs() + rock_off.y.abs() + rock_off.z.abs() < 1e-6, "stone does not feel wind");
+        std::env::remove_var("LOGSCOPE_WIND");
+    }
     use super::*;
 
     #[test]
