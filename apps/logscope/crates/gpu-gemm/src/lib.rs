@@ -215,6 +215,29 @@ pub static DIMS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BG_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// SUBMIT ATTRIBUTION — which cause drained the frame. `GPU_SUBMITS` says how many; these say WHY,
+/// which is the question that actually leads to a fix. Added because a Metal run showed 1119
+/// submits/token at 2.0 ms each while `flush_every` was 128 — meaning ~5 passes per submit, so
+/// something other than the pass counter was doing the flushing and no amount of reasoning from the
+/// outside could tell which.
+pub static SUBMIT_BY_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_RETAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_DOWNLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_DIMS_WRAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One line attributing every submit to its cause, for the profile report.
+pub fn submit_attribution() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (p, r, d, w, e) = (SUBMIT_BY_PASSES.load(Relaxed), SUBMIT_BY_RETAIN.load(Relaxed),
+        SUBMIT_BY_DOWNLOAD.load(Relaxed), SUBMIT_BY_DIMS_WRAP.load(Relaxed), SUBMIT_BY_END_FRAME.load(Relaxed));
+    let total = (p + r + d + w + e).max(1);
+    format!("submit causes — passes {} ({:.0}%), download {} ({:.0}%), end_frame {} ({:.0}%), \
+dims-wrap {} ({:.0}%), retain {} ({:.0}%)",
+        p, p as f64 * 100.0 / total as f64, d, d as f64 * 100.0 / total as f64,
+        e, e as f64 * 100.0 / total as f64, w, w as f64 * 100.0 / total as f64,
+        r, r as f64 * 100.0 / total as f64)
+}
 
 /// Max retained (submitted-but-not-freed) keep-buffers before a mid-window flush forces a poll+free.
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
@@ -2129,6 +2152,7 @@ impl Gpu {
         // and dropping it before the poll below recycles buffers the GPU is still reading → "Buffer
         // 'dims' is invalid" on Metal. clear_retained() after the poll frees them safely.
         if let Some(mut frame) = self.frame.lock().unwrap().take() {
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
@@ -2286,6 +2310,7 @@ impl Gpu {
         let idx = *next;
         if idx == 0 {
             drop(ring); // release the ring lock before touching the frame/queue
+            SUBMIT_BY_DIMS_WRAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.flush_and_wait();
             ring = self.dims_ring.lock().unwrap();
         }
@@ -2390,7 +2415,10 @@ impl Gpu {
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     pub fn end_frame(&self) {
-        if let Some(frame) = self.frame.lock().unwrap().take() { self.submit(frame.enc); self.retain_keep(frame.keep); }
+        if let Some(frame) = self.frame.lock().unwrap().take() {
+            SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.submit(frame.enc); self.retain_keep(frame.keep);
+        }
     }
 
     /// Dispatch over resident tensors: inputs at 0..n (read-only), out at n (read_write),
@@ -2490,6 +2518,8 @@ impl Gpu {
             let over_flush = frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
             let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
             if over_flush || over_retain {
+                if over_flush { SUBMIT_BY_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                else { SUBMIT_BY_RETAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                 let old = fr.take().unwrap();
                 self.submit(old.enc);
                 self.retain_keep(old.keep);
