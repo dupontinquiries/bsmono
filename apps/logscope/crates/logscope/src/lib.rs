@@ -36,6 +36,7 @@ pub mod shorten;
 pub mod conversation_db;
 pub mod model_selector;
 pub mod modelroles;
+pub mod activemodel;
 pub mod providers;
 pub mod llm_backend;
 #[cfg(feature = "bloc")]

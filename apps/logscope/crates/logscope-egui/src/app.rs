@@ -161,14 +161,21 @@ impl LogscopeApp {
             }
         }
     }
-    /// The model generation should run: the deployment's Target when the plan is valid, else the dropdown
-    /// pick. This is the routing switch — the tile deployment now drives which model loads.
-    fn active_target_name(&self) -> Option<String> {
-        if self.deployment.is_valid() {
-            if let Some(t) = self.deployment.target() { return Some(t.model.clone()); }
-        }
-        Some(self.model.current()).filter(|s| s != "—")
+    /// The ONE resolution of "what am I talking to", with its source.
+    ///
+    /// This used to be a silent precedence rule: the deployment won when its plan was valid, and nothing
+    /// said so. Changing the picker then did nothing at all, with no indication why — every control
+    /// looked live and one of them was not. `Resolution` carries the loser too, so the UI can say which
+    /// control is currently inert instead of leaving someone to conclude the app is broken.
+    fn active_model(&self) -> logscope::activemodel::Resolution {
+        let dep = if self.deployment.is_valid() {
+            self.deployment.target().map(|t| t.model.clone())
+        } else { None };
+        logscope::activemodel::resolve(dep.as_deref(), Some(&self.model.current()))
     }
+
+    /// The model generation should run.
+    fn active_target_name(&self) -> Option<String> { self.active_model().name }
 
     /// The deployment's Draft model name, if one is configured (for speculative/tree decoding).
     fn active_draft_name(&self) -> Option<String> {
@@ -381,6 +388,20 @@ impl eframe::App for LogscopeApp {
                             .default_width(480.0)
                             .show(ui.ctx(), |ui| {
                                 ui.label(RichText::new("pick the model for each stage").color(theme::DIM()).small());
+                                // WHAT YOU ARE ACTUALLY TALKING TO, resolved once and stated here. This
+                                // window and the picker can disagree, and the deployment wins — which is
+                                // fine, but it has to be VISIBLE or the picker reads as broken.
+                                let act = self.active_model();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("active:").color(theme::DIM()).small());
+                                    ui.label(RichText::new(act.name.as_deref().unwrap_or("—"))
+                                        .color(theme::CYAN()).strong().small());
+                                    ui.label(RichText::new(format!("(from {})", act.source.label()))
+                                        .color(theme::FAINT()).small());
+                                });
+                                if let Some(note) = act.note() {
+                                    ui.label(RichText::new(note).color(theme::AMBER()).small());
+                                }
                                 ui.add_space(4.0);
                                 crate::model::pipeline_selectors(ui, &mut self.deployment, &available, &est);
                                 ui.add_space(6.0);
@@ -424,11 +445,24 @@ impl eframe::App for LogscopeApp {
                 ui.label(RichText::new(txt).color(col).small());
                 // routing: show which model actually runs (deployment Target, else dropdown) + a draft note.
                 // No Load button — autoload_if_changed() loads the active target automatically.
-                if let Some(t) = self.active_target_name() {
+                let act = self.active_model();
+                if let Some(t) = act.name.clone() {
                     let loaded = self.model_loaded && self.autoloaded.as_deref() == Some(t.as_str());
                     let mark = if loaded { "●" } else { "○" };
-                    ui.label(RichText::new(format!("{mark} → {t}")).color(if loaded { theme::GREEN() } else { theme::DIM() }).small())
-                        .on_hover_text("The model generation runs (deployment Target if set, else the picker). Loads automatically when it changes.");
+                    // The top bar is where someone looks to answer "what am I talking to", so it names
+                    // the SOURCE too. An amber dot means a visible control is currently inert — the
+                    // picker says one thing and the deployment is doing another.
+                    let inert = act.picker_is_inert();
+                    let col = if inert { theme::AMBER() } else if loaded { theme::GREEN() } else { theme::DIM() };
+                    let hover = act.note().unwrap_or_else(|| format!(
+                        "Talking to {t}, chosen by the {}. Loads automatically when it changes.",
+                        act.source.label()));
+                    ui.label(RichText::new(format!("{mark} → {t}")).color(col).small())
+                        .on_hover_text(hover);
+                    if inert {
+                        ui.label(RichText::new("⚠").color(theme::AMBER()).small())
+                            .on_hover_text(act.note().unwrap_or_default());
+                    }
                     if let Some(d) = self.active_draft_name() {
                         ui.label(RichText::new(format!("+draft {d}")).color(theme::FAINT()).small());
                     }
