@@ -909,6 +909,11 @@ pub struct Level {
     pub space_plan: Vec<(Rect, crate::spaces::SpaceFunction)>,
     /// Destructible objects (breakable barriers, crates, glass) — queried by collision, raycast and render.
     pub destructibles: Vec<crate::destructible::Destructible>,
+    /// Scan-learned per-cell appearance (the IQM pipeline): fine wall heights, roof slope,
+    /// weathering roughness, and a palette learned from the model's own texture set with a
+    /// per-cell tint index into it. Consumed by build_meshes' wall pass — walls take the
+    /// scan's real silhouette and colors instead of one uniform slab in the skin palette.
+    pub learned_facade: Option<FacadeDetail>,
     /// Timed flood channels (authored Flood Zone map) — trenches that surge and drain on a cycle.
     pub flood: Vec<FloodChannel>,
     /// Optional sweeping sandstorm (authored Desert Town map).
@@ -1095,6 +1100,20 @@ impl AirCurrent {
 }
 
 /// A walkable raised surface: a world-space AABB footprint at height `top`.
+/// Per-cell appearance learned from a scanned model (see `bin/mapstudy.rs` for the geometry
+/// layers and `tools/texlearn.py` for the palette): all vecs are w*h, indexed z*w+x.
+/// `h` fine height 0-15 (fraction of `max_h`), `slope` roof pitch 0-3, `rough` weathering 0-15,
+/// `tint` palette index (255 = unset -> skin palette), `palette` the model's learned colors.
+#[derive(Clone, Default)]
+pub struct FacadeDetail {
+    pub h: Vec<u8>,
+    pub slope: Vec<u8>,
+    pub rough: Vec<u8>,
+    pub tint: Vec<u8>,
+    pub palette: Vec<Color32>,
+    pub max_h: f32,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Platform {
     pub x0: f32,
@@ -1468,6 +1487,7 @@ impl Level {
             agent_height: Vec::new(),
             space_plan: Vec::new(),
             destructibles: Vec::new(),
+            learned_facade: None,
             flood: Vec::new(),
             sandstorm: None,
             cover_obstacles: Vec::new(),
@@ -2384,6 +2404,7 @@ impl Level {
             agent_height: Vec::new(),
             space_plan: Vec::new(),
             destructibles: Vec::new(),
+            learned_facade: None,
             flood: Vec::new(),
             sandstorm: None,
             cover_obstacles: Vec::new(),
@@ -2809,6 +2830,60 @@ impl Level {
         acfg.wall_height = wall_h;
         let mut lvl = Self::authored_blank(acfg, w, h, pal, wall_h + 6.0);
         let ts = lvl.ts();
+
+        // ── scan-learned appearance sidecar (';;H/S/R' from mapstudy's normals pass,
+        //    ';;P/C' palette+tints from tools/texlearn.py — the model's OWN texture colors) ──
+        {
+            let mut lh: Vec<String> = Vec::new(); let mut ls: Vec<String> = Vec::new();
+            let mut lr: Vec<String> = Vec::new(); let mut lc: Vec<String> = Vec::new();
+            let mut palette: Vec<Color32> = Vec::new();
+            for line in bp.lines() {
+                if let Some(r) = line.strip_prefix(";;H ") { lh.push(r.to_string()); }
+                else if let Some(r) = line.strip_prefix(";;S ") { ls.push(r.to_string()); }
+                else if let Some(r) = line.strip_prefix(";;R ") { lr.push(r.to_string()); }
+                else if let Some(r) = line.strip_prefix(";;C ") { lc.push(r.to_string()); }
+                else if let Some(r) = line.strip_prefix(";;P ") {
+                    let p: Vec<&str> = r.split_whitespace().collect();
+                    if p.len() == 2 && p[1].len() == 6 {
+                        if let Ok(v) = u32::from_str_radix(p[1], 16) {
+                            palette.push(rgb(((v >> 16) & 255) as u8, ((v >> 8) & 255) as u8, (v & 255) as u8));
+                        }
+                    }
+                }
+            }
+            if !lh.is_empty() {
+                let n = (w * h) as usize;
+                let mut fd = FacadeDetail { h: vec![0; n], slope: vec![0; n], rough: vec![0; n],
+                                            tint: vec![255; n], palette, max_h: wall_h * 2.6 };
+                let hexv = |c: char| c.to_digit(16).map(|d| d as u8);
+                for (gz, row) in lh.iter().enumerate() {
+                    for (gx, c) in row.chars().enumerate() {
+                        let (x, z) = (gx as i32 + border, gz as i32 + border);
+                        if x < w && z < h { if let Some(v) = hexv(c) { fd.h[(z * w + x) as usize] = v; } }
+                    }
+                }
+                for (layer, dst) in [(&ls, 1u8), (&lr, 2)] {
+                    for (gz, row) in layer.iter().enumerate() {
+                        for (gx, c) in row.chars().enumerate() {
+                            let (x, z) = (gx as i32 + border, gz as i32 + border);
+                            if x < w && z < h { if let Some(v) = hexv(c) {
+                                let i = (z * w + x) as usize;
+                                if dst == 1 { fd.slope[i] = v; } else { fd.rough[i] = v; }
+                            } }
+                        }
+                    }
+                }
+                for (gz, row) in lc.iter().enumerate() {
+                    for (gx, c) in row.chars().enumerate() {
+                        let (x, z) = (gx as i32 + border, gz as i32 + border);
+                        if x < w && z < h && c != 'g' {
+                            if let Some(v) = hexv(c) { fd.tint[(z * w + x) as usize] = v; }
+                        }
+                    }
+                }
+                lvl.learned_facade = Some(fd);
+            }
+        }
 
         // ── stamp the learned grid ──
         let mut courts: Vec<(i32, i32)> = Vec::new();
@@ -5037,6 +5112,7 @@ impl Level {
             agent_height: Vec::new(),
             space_plan: Vec::new(),
             destructibles: Vec::new(),
+            learned_facade: None,
             flood: Vec::new(),
             sandstorm: None,
             cover_obstacles: Vec::new(),
@@ -6958,6 +7034,19 @@ impl Level {
                     ((0, -1), Vec3::new(0.0, 0.0, 1.0), [Vec3::new(wx + ts, wall_base_y, wz), Vec3::new(wx, wall_base_y, wz)]),
                     ((0, 1), Vec3::new(0.0, 0.0, -1.0), [Vec3::new(wx, wall_base_y, wz + ts), Vec3::new(wx + ts, wall_base_y, wz + ts)]),
                 ];
+                // Scan-learned facade override for THIS cell: real silhouette height (the keep is
+                // taller than the curtain; the ruin is a stub) and the model's OWN colors driven
+                // by the learned per-cell tint, with dither strength scaled by learned weathering
+                // (dressed stone stays calm, rubble shimmers). None → the skin palette as before.
+                let fac_cell = self.learned_facade.as_ref().and_then(|f| {
+                    let i = (z * self.w + x) as usize;
+                    if i < f.tint.len() && f.tint[i] != 255 && !f.palette.is_empty() {
+                        let top = (self.floor_y + (f.h[i] as f32 / 15.0) * f.max_h).max(self.floor_y + 1.2);
+                        let base_c = f.palette[(f.tint[i] as usize).min(f.palette.len() - 1)];
+                        let dstr = 0.05 + (f.rough[i] as f32 / 15.0) * 0.11;
+                        Some((top.min(y1), base_c, dstr))
+                    } else { None }
+                });
                 for ((dx, dz), n, base) in edges {
                     let nb = self.cell(x + dx, z + dz);
                     if nb == Cell::Floor || nb == Cell::Void {
@@ -6970,7 +7059,11 @@ impl Level {
                     let b1 = base[1];
                     // Per-zone tone: a coarse regional hash so the map isn't one flat grey field. Adjacent
                     // areas read as different bays/wings.
-                    let zone = dither(pal.wall, (x / 5) * 23 + (z / 5) * 41, 0.14);
+                    let zone = match fac_cell {
+                        Some((_, c, d)) => dither(c, x * 5 + z * 9, d),
+                        None => dither(pal.wall, (x / 5) * 23 + (z / 5) * 41, 0.14),
+                    };
+                    let y1 = fac_cell.map(|(t, _, _)| t).unwrap_or(y1);
                     // Dado split: a darker lower course (wainscot) under a lighter field, so the wall has a
                     // horizontal line instead of a single blank plane.
                     let dado = (wall_base_y + 1.05).min(y1 - 0.6);
@@ -12614,6 +12707,21 @@ fn learned_sites_stamp_their_learning() {
             let walk = l.platforms.iter().filter(|p| p.top >= *wall_h).count();
             assert!(walk >= ramps,
                 "{name}: {ramps} rampart cells must expose a wall-walk (got {walk} wall-top platforms)");
+        }
+        // Appearance learning: any blueprint carrying the sidecar layers must parse into a
+        // live FacadeDetail — with a non-uniform height field (the scan's real silhouette,
+        // not a slab) and, where texlearn bound a texture set, the model's own palette.
+        if bp.contains(";;H ") {
+            let f = l.learned_facade.as_ref()
+                .unwrap_or_else(|| panic!("{name}: appearance sidecar present but facade not parsed"));
+            let mut seen = [false; 16];
+            for &v in &f.h { seen[v as usize] = true; }
+            assert!(seen.iter().filter(|&&b| b).count() >= 3,
+                "{name}: learned heights should be non-uniform (a real silhouette)");
+            if bp.contains(";;P ") {
+                assert!(!f.palette.is_empty(), "{name}: palette lines present but not parsed");
+                assert!(f.tint.iter().any(|&t| t != 255), "{name}: palette bound but no cell tinted");
+            }
         }
     }
 }

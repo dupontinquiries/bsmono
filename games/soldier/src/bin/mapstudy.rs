@@ -22,7 +22,7 @@ use std::path::Path;
 fn u32le(b: &[u8], o: usize) -> u32 { u32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]) }
 fn f32le(b: &[u8], o: usize) -> f32 { f32::from_le_bytes([b[o], b[o+1], b[o+2], b[o+3]]) }
 
-struct Model { pos: Vec<[f32; 3]>, tris: Vec<[u32; 3]> }
+struct Model { pos: Vec<[f32; 3]>, nrm: Vec<[f32; 3]>, tris: Vec<[u32; 3]> }
 
 fn parse_iqm(b: &[u8]) -> Option<Model> {
     if b.len() < 124 || &b[..16] != b"INTERQUAKEMODEL\0" { return None; }
@@ -32,6 +32,7 @@ fn parse_iqm(b: &[u8]) -> Option<Model> {
     let num_triangles = u32le(b, 56) as usize;
     let ofs_triangles = u32le(b, 60) as usize;
     let mut pos = Vec::new();
+    let mut nrm = Vec::new();
     for i in 0..num_vertexarrays {
         let r = ofs_vertexarrays + i * 20;
         let (ty, fmt, size, off) = (u32le(b, r), u32le(b, r+8), u32le(b, r+12) as usize, u32le(b, r+16) as usize);
@@ -42,6 +43,13 @@ fn parse_iqm(b: &[u8]) -> Option<Model> {
                 pos.push([f32le(b, o), f32le(b, o+4), f32le(b, o+8)]);
             }
         }
+        if ty == 2 && fmt == 7 && size >= 3 {              // NORMAL, FLOAT — the appearance signal:
+            nrm.reserve(num_vertexes);                     // roof pitch + facade weathering live here
+            for v in 0..num_vertexes {
+                let o = off + v * size * 4;
+                nrm.push([f32le(b, o), f32le(b, o+4), f32le(b, o+8)]);
+            }
+        }
     }
     if pos.is_empty() { return None; }
     let mut tris = Vec::with_capacity(num_triangles);
@@ -49,7 +57,7 @@ fn parse_iqm(b: &[u8]) -> Option<Model> {
         let o = ofs_triangles + t * 12;
         tris.push([u32le(b, o), u32le(b, o+4), u32le(b, o+8)]);
     }
-    Some(Model { pos, tris })
+    Some(Model { pos, nrm, tris })
 }
 
 fn main() {
@@ -75,16 +83,18 @@ fn study(m: &Model, name: &str, slug: &str, out: &Path) {
     // two castles (up=X → solid blobs, courtyards lost). Instead rasterize under all three
     // candidates and keep the axis that yields the most PLAYABLE structure: ground cells +
     // courtyards + gates. The right orientation is the one that reads as a place to fight in.
-    let classify = |up: usize| -> (Vec<Vec<char>>, usize, usize, usize) {
+    let classify = |up: usize| -> (Vec<Vec<char>>, usize, usize, usize, (Vec<u8>, Vec<u8>, Vec<u8>)) {
         classify_axis(m, &lo, &hi, up)
     };
     let (mut up, mut best_rows, mut best_score) = (1usize, Vec::new(), -1i64);
+    let mut best_layers = (Vec::new(), Vec::new(), Vec::new());
     for a in 0..3 {
-        let (rows, ground, courts, gates) = classify(a);
+        let (rows, ground, courts, gates, layers) = classify(a);
         let score = ground as i64 + 3 * courts as i64 + 2 * gates as i64;
-        if score > best_score { best_score = score; up = a; best_rows = rows; }
+        if score > best_score { best_score = score; up = a; best_rows = rows; best_layers = layers; }
     }
     let rows = best_rows;
+    let (lay_h, lay_s, lay_r) = best_layers;
     let gh = rows.len(); let gw = rows[0].len();
     let mass: usize = rows.iter().flatten().filter(|c| c.is_ascii_digit()).count();
     let courts: usize = rows.iter().flatten().filter(|&&c| c == 'o').count();
@@ -93,19 +103,31 @@ fn study(m: &Model, name: &str, slug: &str, out: &Path) {
     let mut txt = format!("; learned from \"{name}\" — {}x{} grid, up-axis {}, {} massing cells, {} courtyard cells, {} columns, {} rampart cells\n; legend: ^ outside  . open  + paving  o courtyard  a arch/gate  c column  r rampart(wall-walk)  1-9 massing height tier\n",
         gw, gh, ["X", "Y", "Z"][up], mass, courts, cols, ramps);
     for r in &rows { txt.push_str(&r.iter().collect::<String>()); txt.push('\n'); }
+    // ── appearance sidecar (';'-prefixed: invisible to older parsers) ──
+    if !lay_h.is_empty() {
+        txt.push_str(";; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F (from vertex normals)\n");
+        let hex = |v: u8| char::from_digit(v as u32, 16).unwrap();
+        for z in 0..gh { txt.push_str(";;H "); for x in 0..gw { txt.push(hex(lay_h[z * gw + x])); } txt.push('\n'); }
+        for z in 0..gh { txt.push_str(";;S "); for x in 0..gw { txt.push(hex(lay_s[z * gw + x])); } txt.push('\n'); }
+        for z in 0..gh { txt.push_str(";;R "); for x in 0..gw { txt.push(hex(lay_r[z * gw + x])); } txt.push('\n'); }
+    }
     std::fs::write(out.join(format!("{slug}.txt")), &txt).unwrap();
     println!("── {name} ({gw}x{gh}, up={}, courts={courts}) → {slug}.txt", ["X","Y","Z"][up]);
     for r in rows.iter().step_by(2) { println!("  {}", r.iter().collect::<String>()); }
 }
 
-fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec<char>>, usize, usize, usize) {
+fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec<char>>, usize, usize, usize, (Vec<u8>, Vec<u8>, Vec<u8>)) {
     let (ax, az) = match up { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
     let (sw, sh) = (hi[ax] - lo[ax], hi[az] - lo[az]);
     let span_up = (hi[up] - lo[up]).max(1e-6);
     let long = 56.0f32; let scale = long / sw.max(sh);
     let (gw, gh) = (((sw * scale).round() as usize).clamp(24, 56), ((sh * scale).round() as usize).clamp(24, 56));
-    #[derive(Clone, Copy)] struct C { n: u32, minh: f32, maxh: f32, hist: [u16; 8] }
-    let mut g = vec![C { n: 0, minh: f32::MAX, maxh: f32::MIN, hist: [0; 8] }; gw * gh];
+    #[derive(Clone, Copy)] struct C { n: u32, minh: f32, maxh: f32, hist: [u16; 8],
+        // appearance accumulators (from vertex NORMALS): mean up-component of TOP-BAND faces
+        // (roof pitch) and angular spread of all faces (weathering/roughness)
+        top_up_sum: f32, top_n: u32, nx: f32, ny: f32, nz: f32, nn: u32 }
+    let mut g = vec![C { n: 0, minh: f32::MAX, maxh: f32::MIN, hist: [0; 8],
+        top_up_sum: 0.0, top_n: 0, nx: 0.0, ny: 0.0, nz: 0.0, nn: 0 }; gw * gh];
     for t in &m.tris {
         let c = |i: usize| m.pos[t[i] as usize];
         let cx = (c(0)[ax] + c(1)[ax] + c(2)[ax]) / 3.0;
@@ -117,6 +139,14 @@ fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec
         let cell = &mut g[gz * gw + gx];
         cell.n += 1; cell.minh = cell.minh.min(h01); cell.maxh = cell.maxh.max(h01);
         cell.hist[((h01 * 8.0) as usize).min(7)] += 1;
+        if !m.nrm.is_empty() {
+            let nm = |i: usize| m.nrm[t[i] as usize];
+            let (a, b2, c2) = (nm(0), nm(1), nm(2));
+            let n3 = [(a[0]+b2[0]+c2[0])/3.0, (a[1]+b2[1]+c2[1])/3.0, (a[2]+b2[2]+c2[2])/3.0];
+            let len = (n3[0]*n3[0]+n3[1]*n3[1]+n3[2]*n3[2]).sqrt().max(1e-6);
+            let n3 = [n3[0]/len, n3[1]/len, n3[2]/len];
+            cell.nx += n3[0]; cell.ny += n3[1]; cell.nz += n3[2]; cell.nn += 1;
+        }
     }
     let dense = { let mut ns: Vec<u32> = g.iter().map(|c| c.n).filter(|&n| n > 0).collect(); ns.sort_unstable();
                   if ns.is_empty() { 1 } else { ns[ns.len() / 2] } };
@@ -332,8 +362,51 @@ fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec
         }}
         for z in 0..gh { for x in 0..gw { if mark[z * gw + x] { rows[z][x] = 'r'; } } }
     }
+    // ── appearance layers, learned from the geometry the scan actually carries ──
+    // H: fine per-cell height (0-15 of the model's full height) — real silhouettes instead of
+    //    one uniform wall_h slab. S: roof pitch class 0-3 from the mean tilt of TOP-BAND face
+    //    normals (flat lids vs pitched tile roofs). R: weathering 0-15 as 1 − mean-resultant-
+    //    length of the cell's face normals (dressed stone ≈ few orientations ≈ smooth; rubble
+    //    and eroded masonry scatter their normals).
+    if !m.nrm.is_empty() {
+        for t in &m.tris {
+            let c = |i: usize| m.pos[t[i] as usize];
+            let cx = (c(0)[ax] + c(1)[ax] + c(2)[ax]) / 3.0;
+            let cz = (c(0)[az] + c(1)[az] + c(2)[az]) / 3.0;
+            let cy = (c(0)[up] + c(1)[up] + c(2)[up]) / 3.0;
+            let gx = (((cx - lo[ax]) / sw * gw as f32) as usize).min(gw - 1);
+            let gz = (((cz - lo[az]) / sh * gh as f32) as usize).min(gh - 1);
+            let h01 = (cy - lo[up]) / span_up;
+            let cell = &mut g[gz * gw + gx];
+            if cell.n > 0 && h01 > cell.maxh - 0.12 {
+                let nm = |i: usize| m.nrm[t[i] as usize];
+                let (a, b2, c2) = (nm(0), nm(1), nm(2));
+                let mut n3 = [(a[0]+b2[0]+c2[0])/3.0, (a[1]+b2[1]+c2[1])/3.0, (a[2]+b2[2]+c2[2])/3.0];
+                let len = (n3[0]*n3[0]+n3[1]*n3[1]+n3[2]*n3[2]).sqrt().max(1e-6);
+                n3 = [n3[0]/len, n3[1]/len, n3[2]/len];
+                cell.top_up_sum += n3[up].abs(); cell.top_n += 1;
+            }
+        }
+    }
+    let mut lay_h = vec![0u8; gw * gh];
+    let mut lay_s = vec![0u8; gw * gh];
+    let mut lay_r = vec![0u8; gw * gh];
+    for z in 0..gh { for x in 0..gw {
+        let c = g[z * gw + x];
+        if c.n == 0 { continue; }
+        lay_h[z * gw + x] = ((c.maxh * 15.0).round() as i32).clamp(0, 15) as u8;
+        if c.top_n > 0 {
+            let up_mean = c.top_up_sum / c.top_n as f32;      // 1.0 = flat lid, lower = pitched
+            lay_s[z * gw + x] = if up_mean > 0.92 { 0 } else if up_mean > 0.78 { 1 }
+                                else if up_mean > 0.60 { 2 } else { 3 };
+        }
+        if c.nn > 0 {
+            let rlen = (c.nx * c.nx + c.ny * c.ny + c.nz * c.nz).sqrt() / c.nn as f32;
+            lay_r[z * gw + x] = (((1.0 - rlen) * 15.0).round() as i32).clamp(0, 15) as u8;
+        }
+    }}
     let ground = rows.iter().flatten().filter(|&&c| c == '.' || c == '+').count();
     let courts = rows.iter().flatten().filter(|&&c| c == 'o').count();
     let gates = rows.iter().flatten().filter(|&&c| c == 'a').count();
-    (rows, ground, courts, gates)
+    (rows, ground, courts, gates, (lay_h, lay_s, lay_r))
 }

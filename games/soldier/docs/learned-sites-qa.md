@@ -40,7 +40,7 @@ Pambre Bastion              71  true   0.32     14     23    169     3    12
 Perarrua Crag               56  true   0.37      3      0      5     3     0
 Lost Palace                 55  true   0.50    124      0    536    40     0
 Thian Hock Keng             66  true   0.39      9      0    135     0     0
-Sky Palace Corridor         65  true   0.45     42    386    983     5   263
+Sky Palace Corridor         65  true   0.45     42    386    980     5   263
 ```
 
 Notes, honest ones: **Thian Hock Keng** yields 0/0 on the new learnings — its scan reads as a
@@ -49,3 +49,28 @@ walled temple court without a detected hypostyle band; its courts still carry th
 didn't survive scanning (ruins and shells); their columns and courts do the work instead. The
 three lowest structure scores (Pambre 0.32, Pioz/Perarrua 0.37) are dense keeps — the
 archetype-fair scorer expects that band for interiors.
+
+## Appearance learning (textures + normals)
+
+The scans' TEXCOORDs were zeroed by conversion (verified exhaustively), so exact UV sampling is
+impossible — but the uploaded texture archive still carries what each building LOOKS like. Two
+new sidecar layer families, both invisible to older parsers:
+
+* `;;H` / `;;S` / `;;R` (mapstudy, from vertex **normals**): fine per-cell height 0-F (real
+  silhouettes — Pioz's keep reads `d`/`e` against its curtain), roof-pitch class 0-3 from
+  top-band normal tilt, and weathering 0-F as 1 − mean-resultant-length of face normals
+  (dressed stone calm, rubble scattered).
+* `;;P` / `;;C` (tools/texlearn.py, from the model's **own texture set**): a median-cut palette
+  (binding by archive naming, confidence-tagged in each header — MORTON/PAMBRE/PERARRUA/
+  BARCIENCE/pellegrino/parish high; the 26-tile sandstone UDIM scan → Amman Cistern; the warm
+  ornate cluster → Thian; the grayscale metals → SciFi; Pioz gets a sibling-castle union;
+  church/lost-palace/colossus honestly keep the skin palette) and a per-cell tint index driven
+  by height band + roughness jitter, roofs taking the palette's most hue-distinct entry.
+
+`Level.learned_facade` consumes both in the wall pass: per-cell wall TOP from `;;H`
+(silhouettes instead of one slab — dado, pilasters, trim and sconces all scale with it), wall
+color from the learned palette with dither strength scaled by `;;R`. The lock-in test asserts
+the facade parses on every sidecar map, heights are non-uniform, and bound palettes tint cells.
+
+Still open from this pass, deliberately: '^' expansion-ring scatter (outside cells are bare
+floor), destructible columns/merlons, and slope-driven roof cap meshes.
