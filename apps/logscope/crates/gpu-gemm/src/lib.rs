@@ -225,18 +225,29 @@ pub static SUBMIT_BY_RETAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 pub static SUBMIT_BY_DOWNLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SUBMIT_BY_DIMS_WRAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Dispatches that ran with NO frame open, each becoming its own command buffer. This is the expensive
+/// one and it was the only path left untagged — a run showed 4256 submits against 729 attributed, and
+/// the missing 3500 had to be here.
+pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One line attributing every submit to its cause, for the profile report.
 pub fn submit_attribution() -> String {
     use std::sync::atomic::Ordering::Relaxed;
-    let (p, r, d, w, e) = (SUBMIT_BY_PASSES.load(Relaxed), SUBMIT_BY_RETAIN.load(Relaxed),
-        SUBMIT_BY_DOWNLOAD.load(Relaxed), SUBMIT_BY_DIMS_WRAP.load(Relaxed), SUBMIT_BY_END_FRAME.load(Relaxed));
-    let total = (p + r + d + w + e).max(1);
-    format!("submit causes — passes {} ({:.0}%), download {} ({:.0}%), end_frame {} ({:.0}%), \
-dims-wrap {} ({:.0}%), retain {} ({:.0}%)",
-        p, p as f64 * 100.0 / total as f64, d, d as f64 * 100.0 / total as f64,
-        e, e as f64 * 100.0 / total as f64, w, w as f64 * 100.0 / total as f64,
-        r, r as f64 * 100.0 / total as f64)
+    let (p, r, d, w, e, nf) = (SUBMIT_BY_PASSES.load(Relaxed), SUBMIT_BY_RETAIN.load(Relaxed),
+        SUBMIT_BY_DOWNLOAD.load(Relaxed), SUBMIT_BY_DIMS_WRAP.load(Relaxed),
+        SUBMIT_BY_END_FRAME.load(Relaxed), SUBMIT_BY_NO_FRAME.load(Relaxed));
+    let counted = p + r + d + w + e + nf;
+    let actual = GPU_SUBMITS.load(Relaxed);
+    let total = counted.max(1);
+    // Report the SHORTFALL too. The first version of this line accounted for 729 of 4256 submits and
+    // said nothing about the other 3527, which made a partial answer look like a complete one.
+    let gap = actual.saturating_sub(counted);
+    format!("submit causes — no-frame {} ({:.0}%), passes {} ({:.0}%), download {} ({:.0}%), \
+end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} attributed{}",
+        nf, nf as f64 * 100.0 / total as f64, p, p as f64 * 100.0 / total as f64,
+        d, d as f64 * 100.0 / total as f64, e, e as f64 * 100.0 / total as f64, w, r,
+        counted, actual,
+        if gap > 0 { format!(" — {gap} UNATTRIBUTED, a submit path is still untagged") } else { String::new() })
 }
 
 /// Max retained (submitted-but-not-freed) keep-buffers before a mid-window flush forces a poll+free.
@@ -2577,6 +2588,7 @@ impl Gpu {
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
+            SUBMIT_BY_NO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc); // queue order makes each op's writes visible to the next
         }
     }
