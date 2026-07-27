@@ -143,7 +143,22 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             note: "",
         },
         // DeepSeek-V2/V3 (+ GLM-MoE with MLA): Multi-head Latent Attention. Detected here with the right
-        "deepseek2" | "deepseek3" | "deepseekv3" | "glm-dsa" | "glm_dsa" => ArchConfig {
+        // GLM-5.2 (`glm-dsa`). SEPARATE from DeepSeek despite sharing MLA, because `prefix` selects the
+        // METADATA KEY namespace and a glm-dsa file spells its keys `glm-dsa.attention.*`. Folding it
+        // into the DeepSeek entry meant looking up `deepseek2.attention.kv_lora_rank` in a file that has
+        // `glm-dsa.attention.kv_lora_rank` — so the loader reported "no kv_lora_rank in its metadata"
+        // about a checkpoint that states it plainly. A wrong reason is worse than no reason: it sends
+        // the reader to the checkpoint when the fault is ours.
+        "glm-dsa" | "glm_dsa" => ArchConfig {
+            arch: Arch::DeepseekV3, prefix: "glm-dsa", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
+            supported: false, dense_supported: false,
+            note: "GLM-5.2: MLA plus a SPARSE-ATTENTION INDEXER (32 heads, key_length 128, top_k 2048 \
+over a 1M context) and expert_weights_scale 2.5. The indexer tensors are present per block \
+(indexer.attn_k, indexer.attn_q_b, indexer.k_norm, indexer.proj) and nothing reads them — see \
+docs/glm-5.2-arch.md",
+        },
+        "deepseek2" | "deepseek3" | "deepseekv3" => ArchConfig {
             arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
@@ -388,6 +403,21 @@ mod tests {
         assert_eq!(dim_keys(&c).embedding_length, "qwen3_5.embedding_length");
         // the "qwen35" spelling maps to the same config
         assert_eq!(for_arch("qwen35").arch, Arch::Qwen35);
+    }
+
+    #[test]
+    fn a_shared_config_entry_must_not_share_a_metadata_prefix() {
+        // `prefix` selects the metadata KEY namespace, and GGUF spells those keys with the file's own
+        // architecture string. GLM-5.2 was folded into the DeepSeek entry, so the loader looked up
+        // `deepseek2.attention.kv_lora_rank` in a file that carries `glm-dsa.attention.kv_lora_rank` and
+        // reported the metadata as MISSING. It was not missing; we asked the wrong question.
+        assert_eq!(for_arch("glm-dsa").prefix, "glm-dsa");
+        assert_eq!(for_arch("glm_dsa").prefix, "glm-dsa", "the underscore spelling resolves the same");
+        assert_eq!(for_arch("deepseek3").prefix, "deepseek2");
+        // they still SHARE the forward-pass shape — only the namespace differs
+        assert_eq!(for_arch("glm-dsa").arch, for_arch("deepseek3").arch);
+        // and glm-dsa's note must name the indexer, since that is the blocking gap rather than MLA
+        assert!(for_arch("glm-dsa").note.contains("INDEXER"));
     }
 
     #[test]
