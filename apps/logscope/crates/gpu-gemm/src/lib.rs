@@ -243,6 +243,13 @@ dims-wrap {} ({:.0}%), retain {} ({:.0}%)",
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
 /// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
 const DIMS_RETAIN_CAP: usize = 8192;
+/// Largest batch allowed after a readback on a driver whose submit governor cannot run.
+///
+/// The governor normally bounds queue depth so a display sharing the GPU is serviced between submits.
+/// On Honeykrisp it disables itself (completion callbacks are slow or absent), so nothing bounds it —
+/// and an unbounded batch produced watchdog timeouts and a stuttering desktop. 32 keeps most of the
+/// batching win while leaving the compositor gaps to run in.
+const POST_READBACK_FLUSH_CAP: u32 = 32;
 /// Windowed-decode mid-loop flush cadence: flush+poll every N sampler slots so a large window's
 /// per-slot buffers (bind groups, dims, decode intermediates) free instead of accumulating in one
 /// pinned frame until the device runs out of buffer objects. Small enough to bound live buffers on
@@ -2182,7 +2189,25 @@ impl Gpu {
         //
         // Only reopened if one was open on entry: a caller that downloads without a frame does not want
         // one opened behind its back.
-        if had_frame { self.begin_frame(); }
+        if had_frame {
+            self.begin_frame();
+            // PACING. Reopening restores batching, but it also removes the pacing that
+            // one-submit-per-dispatch accidentally provided: with the submit governor disabled — which it
+            // is on Honeykrisp, where completion callbacks are slow or absent — nothing else bounds how
+            // much work piles into a single submit. Measured consequence: GPU watchdog timeouts and a
+            // visibly stuttering desktop, because the compositor shares this GPU and never gets between
+            // the batches.
+            //
+            // So on a driver with no working governor, cap the batch after a readback. This gives back
+            // most of the submit reduction while leaving gaps the display can be serviced in. Drivers
+            // with a functioning governor keep the full batch, because there the governor already does
+            // this job properly.
+            if self.conservative_vma && self.inflight_cap.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                let cur = self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
+                let capped = cur.min(POST_READBACK_FLUSH_CAP);
+                self.flush_every.store(capped, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         v
     }
 
