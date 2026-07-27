@@ -49,7 +49,13 @@ pub struct Task {
 }
 
 #[derive(Clone, Debug)]
-pub struct WorkerPrompt { pub label: String, pub system: String, pub user: String }
+pub struct WorkerPrompt {
+    pub label: String, pub system: String, pub user: String,
+    /// Aggressive mode: one style per best-of run (len == best_of), so the K runs are K
+    /// genuinely different worker threads — distinct instructions AND sampling — instead of
+    /// K identical clones. Empty for other modes (uniform runs).
+    pub styles: Vec<crate::styles::Style>,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Aggregation { Single, StitchFiles }
@@ -88,7 +94,7 @@ fn sys_aggregate() -> String {
 /// Build the orchestration plan for a mode + task. Pure: assembles prompts, picks fan-out + best-of +
 /// aggregation. No model is called here.
 pub fn plan(mode: Mode, task: &Task) -> Plan {
-    let single = |sys: String| WorkerPrompt { label: "main".into(), system: sys, user: task.goal.clone() };
+    let single = |sys: String| WorkerPrompt { label: "main".into(), system: sys, user: task.goal.clone(), styles: Vec::new() };
     match mode {
         Mode::Barebones => Plan { mode_name: "barebones", workers: vec![single(sys_barebones())], best_of: 1, aggregate: Aggregation::Single },
         Mode::Coordinator | Mode::Aggressive => {
@@ -104,7 +110,7 @@ pub fn plan(mode: Mode, task: &Task) -> Plan {
                 if s.is_empty() { "(none)".into() } else { s }
             };
             let worker_sys = if mode == Mode::Aggressive { sys_worker_iterative() } else { sys_worker() };
-            let workers = task.subtasks.iter().map(|st| {
+            let workers = task.subtasks.iter().enumerate().map(|(ui, st)| {
                 let user = format!(
                     "Overall goal:\n{goal}\n\n\
                      Shared context (types, imports, the other file you must fit into):\n{ctx}\n\n\
@@ -113,7 +119,7 @@ pub fn plan(mode: Mode, task: &Task) -> Plan {
                      Sibling units being written in parallel — match these names/signatures, call them, do NOT redefine them:\n{sib}\n\n\
                      Output ONLY `{name}` as a complete, compilable definition.",
                     goal = task.goal, ctx = task.shared_context, name = st.name, spec = st.spec, sib = siblings(&st.name));
-                WorkerPrompt { label: st.name.clone(), system: worker_sys.clone(), user }
+                WorkerPrompt { styles: if mode == Mode::Aggressive { crate::styles::assign(best_of, ui as u64) } else { Vec::new() }, label: st.name.clone(), system: worker_sys.clone(), user }
             }).collect();
             Plan { mode_name, workers, best_of, aggregate: Aggregation::StitchFiles }
         }
@@ -196,5 +202,27 @@ mod tests {
             assert_eq!(p.workers.len(), 1, "{:?} with no subtasks is single-shot", m);
             assert_eq!(p.aggregate, Aggregation::Single);
         }
+    }
+}
+
+#[cfg(test)]
+mod styled_tests {
+    use super::*;
+    #[test]
+    fn aggressive_workers_carry_k_distinct_styles() {
+        let t = Task { goal: "g".into(), shared_context: "ctx".into(),
+                       subtasks: vec![Subtask { name: "a".into(), spec: "s".into() },
+                                      Subtask { name: "b".into(), spec: "s".into() }] };
+        let p = plan(Mode::Aggressive, &t);
+        assert_eq!(p.best_of, 3);
+        for w in &p.workers {
+            assert_eq!(w.styles.len(), 3, "one style per best-of run");
+            let names: std::collections::BTreeSet<_> = w.styles.iter().map(|s| s.name).collect();
+            assert_eq!(names.len(), 3, "styles distinct within a unit");
+        }
+        // different units rotate differently (seeded by unit index)
+        assert_ne!(p.workers[0].styles[0].name, p.workers[1].styles[0].name);
+        let pc = plan(Mode::Coordinator, &t);
+        assert!(pc.workers.iter().all(|w| w.styles.is_empty()), "non-aggressive is uniform");
     }
 }

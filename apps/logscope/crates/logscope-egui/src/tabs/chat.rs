@@ -385,6 +385,11 @@ impl Msg {
     fn text(&self) -> &str { &self.variants[self.cur] }
     fn cur_mut(&mut self) -> &mut String { &mut self.variants[self.cur] }
 }
+/// A message as the CONTEXT WINDOW sees it: role + cleaned text (see chosen_msgs). Drop-in for
+/// the builders' `m.role` / `m.text()` usage.
+struct CtxMsg { role: Role, text: String }
+impl CtxMsg { fn text(&self) -> &str { &self.text } }
+
 /// A structural edit requested from a message's controls, applied after the render pass (so the
 /// render can borrow `msgs` immutably-ish while the buttons just record intent).
 enum MsgAction { Copy(usize), EditStart(usize), EditSave(usize), EditCancel(usize), Regenerate(usize), Delete(usize), PrevVar(usize), NextVar(usize) }
@@ -871,7 +876,13 @@ pub struct Chat {
     branch_from: Option<usize>,    // if set, the next user message forks off this node instead of the tip
     gen_samples: Vec<crate::estimate::GenSample>, // completed generations → progress estimates
     last_prompt_tokens: usize,     // prompt size of the in-flight generation (for the live estimate)
-    queue: std::collections::VecDeque<(String, Option<usize>)>, // (text, parent) fired while busy → run when free
+    queue: std::collections::VecDeque<(String, Option<usize>, Option<logscope_fan::styles::Style>)>, // (text, parent, work style) fired while busy → run when free
+    /// Reflexes: automatic bounded reactions to a finished fan branch (compile error → one fix
+    /// follow-up; test failure → one; empty reply → one retry; near-duplicate → annotation only).
+    /// The coordinator's spinal cord — the brain (user / next turn) stays in charge of what they queue.
+    reflexes_on: bool,
+    /// Branch indices already reflex-scanned: at most one reaction per branch, ever.
+    reflexed: std::collections::HashSet<usize>,
     fold_pos: Vec<crate::spatial::Vec3>, // cached protein-fold layout (recomputed when the tree changes)
     flex_pos: Vec<crate::spatial::Vec3>, // cached obstacle-AVOIDED render positions (strand weaved around scenery)
     flex_key: Option<(usize, crate::scene3d::EnvParams)>, // (node count, env) the flex was computed for
@@ -915,6 +926,13 @@ pub struct Chat {
     lanes_ready: bool, // the pool's async model load completed (LaneEvt::Ready seen)
     local_model_path: Option<String>, // the picker's selected LOCAL .gguf, captured each frame for :lanes
     rep_monitor: crate::repetition::RepeatMonitor, // cuts a runaway repetition loop in the live reply (all backends)
+    /// Deduplicated CODE COMPONENTS harvested from the transcript (see components.rs): the UI
+    /// lists them, the context builder references them instead of repeating their code, and the
+    /// descriptor model names them when the worker is idle.
+    components: crate::components::ComponentRegistry,
+    naming_q: std::collections::VecDeque<usize>,   // components awaiting a model-written name
+    naming_live: Option<usize>,                    // a naming request currently streaming back
+    naming_buf: String,
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
     ctx: Ctx,
@@ -1000,6 +1018,7 @@ impl Default for Chat {
             active_leaf: None, branch_from: None,
             gen_samples: Vec::new(), last_prompt_tokens: 0,
             queue: std::collections::VecDeque::new(),
+            reflexes_on: true, reflexed: std::collections::HashSet::new(),
             fold_pos: Vec::new(),
             flex_pos: Vec::new(),
             flex_key: None,
@@ -1035,6 +1054,8 @@ impl Default for Chat {
             lanes: None, lane_jobs: std::collections::HashMap::new(), lanes_ready: false,
             local_model_path: None,
             rep_monitor: crate::repetition::RepeatMonitor::default(),
+            components: crate::components::ComponentRegistry::default(),
+            naming_q: std::collections::VecDeque::new(), naming_live: None, naming_buf: String::new(),
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
@@ -1224,6 +1245,19 @@ impl Chat {
                 Evt::Loaded(Err(_)) => { return; }
             }
         }
+        // A descriptor-model naming request in flight: its tokens belong to the component,
+        // not the transcript. Consumed here so the normal stream machinery never sees them.
+        if let Some(cid) = self.naming_live {
+            match e {
+                Evt::Token(t) => { self.naming_buf.push_str(&t); return; }
+                Evt::Done { .. } => {
+                    self.components.set_name(cid, std::mem::take(&mut self.naming_buf));
+                    self.naming_live = None;
+                    return;
+                }
+                _ => { self.naming_live = None; self.naming_buf.clear(); }
+            }
+        }
         match e {
             Evt::Token(t) => {
                 let mut stop = false;
@@ -1341,6 +1375,14 @@ impl Chat {
                 if let Some(i) = idx {
                     if let Some(m) = self.msgs.get_mut(i) {
                         if m.text().is_empty() { *m.cur_mut() = "[stopped]".into(); }
+                    }
+                }
+                // Post-hoc repetition read on the finished reply: a HUD-visible note now, and
+                // condensation of exactly this pattern when the context is next rebuilt.
+                if let Some(i) = idx {
+                    if let Some(rep) = self.msgs.get(i).and_then(|m| crate::repetition::analyze(m.text())) {
+                        self.hud.observe(format!("repetition in reply: {} ×{} (\"{}\") — will be condensed in context",
+                            rep.kind, rep.reps.max(2), rep.sample), "repetition");
                     }
                 }
                 self.last = Some((tokens, secs));
@@ -1506,7 +1548,7 @@ impl Chat {
             match &fan.kind {
                 FanKind::Continue => {
                     if self.queue.len() >= MAX_FAN_QUEUE { break 'outer; }
-                    self.queue.push_back((CONTINUE_ALL_TOK.to_string(), Some(l)));
+                    self.queue.push_back((CONTINUE_ALL_TOK.to_string(), Some(l), None));
                     added += 1;
                 }
                 FanKind::Fuzzy { width, template } => {
@@ -1515,7 +1557,7 @@ impl Chat {
                     if task.trim().is_empty() { continue; }
                     for v in crate::consensus::fuzz(&task, *width, now_unix().wrapping_add(l as u64)) {
                         if self.queue.len() >= MAX_FAN_QUEUE { break 'outer; }
-                        self.queue.push_back((v, Some(l)));
+                        self.queue.push_back((v, Some(l), None));
                         added += 1;
                     }
                 }
@@ -1524,6 +1566,11 @@ impl Chat {
         fan.rounds_left -= 1;
         let rounds = fan.rounds_left;
         if rounds > 0 && added > 0 { self.fan = Some(fan); } // more rounds → keep fanning as the queue drains
+        if added == 0 {
+            self.hud.observe(logscope_fan::liaison_fan::narrate(
+                &logscope_fan::liaison_fan::FanEvent::FanFinished {
+                    branches: self.msgs.iter().filter(|m| m.role == Role::Assistant).count() }), "liaison");
+        }
         self.note = if added == 0 { "fan finished — no more leaves to expand".into() }
                     else { format!("fan: +{added} queued · {rounds} rounds left · {} pending (:stop to cancel)", self.queue.len()) };
     }
@@ -1950,17 +1997,44 @@ impl Chat {
     /// Most-recent turns that fit the budget — the in-context slice of the conversation graph, i.e. the
     /// SAME selection the Graph sidebar paints. convograph is the single authority; this is what the
     /// model is actually fed. When threading is off, only the latest message is kept (context leads).
-    fn chosen_msgs(&self, per_msg_overhead: usize, sys: &str, upto: usize) -> Vec<&Msg> {
+    /// The context window's messages, CLEANED for the model: every historical message runs
+    /// through repetition::condense (fence-aware — code is never edited) and the component
+    /// registry's block dedup (an identical code block already in this context collapses to a
+    /// one-line reference). The NEWEST message stays verbatim — that's the live turn. The
+    /// user-visible transcript is untouched; only what the model re-reads changes.
+    fn chosen_msgs(&self, per_msg_overhead: usize, sys: &str, upto: usize) -> Vec<CtxMsg> {
         let budget = self.ctx.n_ctx.saturating_sub(self.ctx.max_tokens) as usize;
         let max_msgs = if self.threading { self.ctx.history_turns * 2 + 1 } else { 1 };
         let mut g = self.convo_graph(upto);
         g.mark_window_ex(budget, est(sys) + 8, per_msg_overhead, max_msgs);
-        g.context_ids().into_iter().map(|id| &self.msgs[id]).collect()
+        let ids = g.context_ids();
+        let n = ids.len();
+        let mut seen = std::collections::HashSet::new();
+        ids.into_iter().enumerate().map(|(i, id)| {
+            let m = &self.msgs[id];
+            let text = if i + 1 == n { m.text().to_string() } else {
+                let (condensed, _) = crate::repetition::condense(m.text());
+                self.components.dedup_for_context(&condensed, &mut seen)
+            };
+            CtxMsg { role: m.role, text }
+        }).collect()
     }
 
     fn sys(&self) -> &str {
         let s = self.context.trim();
         if s.is_empty() { LONG_HORIZON } else { s }
+    }
+
+    /// A one-off single-turn prompt in the LIVE template — the descriptor-model side channel
+    /// (component naming) uses this so its request stops correctly on every model family.
+    fn wrap_single_turn(&self, user: &str) -> String {
+        let sysline = "You are a terse code librarian.";
+        match self.live_template() {
+            TemplateKind::ChatML => format!("<|im_start|>system\n{sysline}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"),
+            TemplateKind::Llama3 | TemplateKind::Llama4 => format!("<|start_header_id|>system<|end_header_id|>\n{sysline}<|eot_id|><|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"),
+            TemplateKind::Gemma => format!("<start_of_turn>user\n{sysline}\n{user}<end_of_turn>\n<start_of_turn>model\n"),
+            TemplateKind::Plain => format!("System: {sysline}\nUser: {user}\nAssistant:"),
+        }
     }
 
     /// Plain transcript format (llama.cpp path; the model adds BOS).
@@ -2052,8 +2126,42 @@ impl Chat {
                 // Fire-and-queue: if the model is busy, don't stop it — enqueue this (branch) turn to run as
                 // soon as the current reply finishes. This is what makes branching non-blocking. An active
                 // agent run owns the model too, so queue behind it rather than colliding.
-                if self.stream.is_some() || self.agent_run.is_some() || self.agent_fan.is_some() { self.queue.push_back((qt, parent)); return; }
-                self.start_generation(qt, parent, infer, doc);
+                if self.stream.is_some() || self.agent_run.is_some() || self.agent_fan.is_some() { self.queue.push_back((qt, parent, None)); return; }
+                self.start_generation(qt, parent, None, infer, doc);
+            }
+        }
+    }
+
+    /// Reflex pass at queue-drain time: the previous queued branch just finished streaming, so scan
+    /// it against its earlier siblings and react — bounded to ONE reaction per branch and gated on
+    /// the toggle. Runs only while fan work is pending/active (a lone chat turn is not fanned work).
+    fn maybe_reflex(&mut self, _infer: &Inference, _doc: &crate::analysis::Doc) {
+        if !self.reflexes_on { return; }
+        if self.queue.is_empty() && self.fan.is_none() { return; }
+        let Some(idx) = self.msgs.len().checked_sub(1) else { return };
+        if self.msgs[idx].role != Role::Assistant || self.reflexed.contains(&idx) { return; }
+        let reply = self.msgs[idx].text().to_string();
+        if reply.is_empty() && self.stream.is_some() { return; } // still streaming, not finished
+        self.reflexed.insert(idx);
+        let parent = self.msgs[idx].parent;
+        let siblings: Vec<String> = self.msgs.iter().enumerate()
+            .filter(|(i, m)| *i != idx && m.role == Role::Assistant && m.parent == parent)
+            .map(|(_, m)| m.text().to_string()).collect();
+        let sib_refs: Vec<&str> = siblings.iter().map(|s| s.as_str()).collect();
+        for r in logscope_fan::reflex::scan(&reply, &sib_refs, logscope_fan::reflex::Config::default()) {
+            match logscope_fan::reflex::reaction(&r) {
+                logscope_fan::reflex::Reaction::FollowUp { prompt, why } => {
+                    if self.queue.len() < MAX_FAN_QUEUE {
+                        self.queue.push_back((prompt, parent, None));
+                        self.hud.observe(logscope_fan::liaison_fan::narrate(
+                            &logscope_fan::liaison_fan::FanEvent::ReflexFollowUp { why }), "liaison");
+                    }
+                    break; // one follow-up per branch
+                }
+                logscope_fan::reflex::Reaction::Annotate { note } => {
+                    self.hud.observe(format!("reflex: {note}"), "liaison");
+                    self.note = note;
+                }
             }
         }
     }
@@ -2097,7 +2205,22 @@ impl Chat {
         self.last_prompt_tokens = 0;
     }
 
-    fn start_generation(&mut self, qt: String, parent: Option<usize>, infer: &Inference, doc: &crate::analysis::Doc) {
+    fn start_generation(&mut self, qt: String, parent: Option<usize>, style: Option<logscope_fan::styles::Style>, infer: &Inference, doc: &crate::analysis::Doc) {
+        // A fan work style varies HOW this thread decodes, not just what it is told: apply the
+        // sampling half for this one generation and restore afterwards (the ctx is the user's).
+        let saved = (self.ctx.temperature, self.ctx.min_p);
+        if let Some(st) = &style {
+            self.ctx.temperature = (self.ctx.temperature + st.temp_delta).clamp(0.05, 1.5);
+            if let Some(mp) = st.min_p { self.ctx.min_p = mp; }
+        }
+        let restore = style.is_some();
+        let r = self.start_generation_inner(qt, parent, style, infer, doc);
+        if restore { self.ctx.temperature = saved.0; self.ctx.min_p = saved.1; }
+        r
+    }
+    fn start_generation_inner(&mut self, qt: String, parent: Option<usize>, style: Option<logscope_fan::styles::Style>, infer: &Inference, doc: &crate::analysis::Doc) {
+        // The instruction half of a work style rides the prompt itself.
+        let qt = match &style { Some(st) => format!("{}\n\n[work style: {}]", qt, st.system), None => qt };
         // fresh reply → fresh stepwise accounting
         self.step_last_paused = 0; self.step_continues = 0; self.step_pending_continue = false; self.step_arm_continue = false;
         if !self.msgs.is_empty() {
@@ -2214,6 +2337,32 @@ impl Chat {
     }
 
     fn sync_worker(&mut self, infer: &Inference) {
+        // COMPONENT REGISTRY: incrementally harvest fenced code blocks from the transcript.
+        // New components queue for a descriptor-model name; the request fires only when the
+        // worker is idle, and its reply is intercepted in apply_evt (never enters the chat).
+        {
+            let texts: Vec<String> = self.msgs.iter().map(|m| m.text().to_string()).collect();
+            for id in self.components.sync(texts.iter().map(|t| t.as_str())) {
+                self.naming_q.push_back(id);
+                let c = &self.components.items[id];
+                self.note = format!("component #{}: {} ({} lines, {})", c.id + 1, c.name, c.lines, c.lang);
+            }
+        }
+        if self.stream.is_none() && self.naming_live.is_none() {
+            if let Some(cid) = self.naming_q.pop_front() {
+                if let Some(c) = self.components.items.get(cid) {
+                    let head: String = c.text.lines().take(24).collect::<Vec<_>>().join("\n");
+                    let ask = format!("Describe what this {} code does in 3 to 6 lowercase words. Answer with ONLY those words.\n\n{}\n",
+                                      if c.lang.is_empty() { "code" } else { &c.lang }, head);
+                    let prompt = self.wrap_single_turn(&ask);
+                    self.naming_live = Some(cid);
+                    self.naming_buf.clear();
+                    infer.generate(prompt);
+                }
+            }
+        } else if self.naming_live.is_some() && self.naming_buf.len() >= 64 {
+            infer.cancel();   // the descriptor answered; don't let it ramble the budget away
+        }
         if self.sent_backend != Some(self.backend) { infer.set_backend(self.backend); self.sent_backend = Some(self.backend); }
         // Template: trust the worker's LIVE detected template over per-tab cached state. A tab created
         // after the model loaded (or whose Evt::Loaded another drain consumed) otherwise keeps a stale
@@ -4973,7 +5122,7 @@ impl Chat {
                 let base = self.base_for_fan();
                 if !base.is_empty() {
                     let parent = self.walk_focus.or(self.active_leaf);
-                    for v in crate::consensus::fuzz(&base, n, now_unix()) { self.queue.push_back((v, parent)); }
+                    for v in crate::consensus::fuzz(&base, n, now_unix()) { self.queue.push_back((v, parent, None)); }
                     self.input.clear();
                     self.note = format!("fuzz: fanned {n} retries (:stop to cancel)");
                 } else { self.note = ":fuzz — nothing to fan (type a prompt, or send one first)".into(); }
@@ -4985,10 +5134,35 @@ impl Chat {
                 let base = self.base_for_fan();
                 if !base.is_empty() {
                     let parent = self.walk_focus.or(self.active_leaf);
-                    for (v, _name) in crate::directives::fanout_user(&base, n, now_unix()) { self.queue.push_back((v, parent)); }
+                    let styles = logscope_fan::styles::assign(n, now_unix());
+                    for ((v, _name), st) in crate::directives::fanout_user(&base, n, now_unix()).into_iter().zip(styles) {
+                        self.queue.push_back((v, parent, Some(st)));
+                    }
                     self.input.clear();
-                    self.note = format!("fuzzd: fanned {n} directive-varied branches (:stop to cancel)");
+                    self.hud.observe(logscope_fan::liaison_fan::narrate(
+                        &logscope_fan::liaison_fan::FanEvent::RoundStarted { round: 1, width: n, styled: true }), "liaison");
+                    self.note = format!("fuzzd: fanned {n} branches — distinct directive + work style each (:stop to cancel)");
                 } else { self.note = ":fuzzd — nothing to fan (type a prompt, or send one first)".into(); }
+            }
+            // :paths N — fan N feature-CREATION paths for the composer's feature idea: each branch is
+            // anchored to a distinct build-path archetype (mvp/api/data/test/ux/risk) and ends in the
+            // same "## Path summary" block, so the branches compare side by side and :pick /
+            // :merge-docs apply unchanged. The planning sibling of :fuzzd.
+            Command::Paths(n) => {
+                let base = self.base_for_fan();
+                if !base.is_empty() {
+                    let parent = self.walk_focus.or(self.active_leaf);
+                    for (_name, p) in logscope_fan::pathfan::prompts(&base, n, now_unix()) {
+                        if self.queue.len() >= MAX_FAN_QUEUE { break; }
+                        self.queue.push_back((p, parent, None));
+                    }
+                    self.input.clear();
+                    self.fan_is_docs = true; // path plans are documents — suggest union over pick
+                    let preview: String = base.chars().take(40).collect();
+                    self.hud.observe(logscope_fan::liaison_fan::narrate(
+                        &logscope_fan::liaison_fan::FanEvent::PathsFanned { feature_preview: preview, n }), "liaison");
+                    self.note = format!("paths: exploring {n} feature-creation paths (:stop to cancel)");
+                } else { self.note = ":paths — describe the feature first (type it, or send it as a message)".into(); }
             }
             // :o / :open <path> — import a chat (markdown ## You / ## Assistant) and load it as the convo.
             Command::Open(p) => {
@@ -5090,7 +5264,7 @@ impl Chat {
                             let parent = self.walk_focus.or(self.active_leaf);
                             let tasks = crate::vimmode::map_tasks(&files, &template);
                             let n = tasks.len();
-                            for t in tasks { self.queue.push_back((t, parent)); }
+                            for t in tasks { self.queue.push_back((t, parent, None)); }
                             self.note = format!(":map — fanned {n} worker task(s), one per changed file (:stop to cancel)");
                         }
                     }
@@ -5121,7 +5295,7 @@ impl Chat {
                     if holes.is_empty() { self.note = ":fill — found no todo!()/unimplemented!() holes in the skeleton".into(); }
                     else {
                         let parent = self.walk_focus.or(self.active_leaf);
-                        for h in &holes { self.queue.push_back((crate::decompose::subtask_prompt(&skeleton, h), parent)); }
+                        for h in &holes { self.queue.push_back((crate::decompose::subtask_prompt(&skeleton, h), parent, None)); }
                         let n = holes.len();
                         self.fill_session = Some(FillSession { skeleton, holes });
                         if from_composer { self.input.clear(); }
@@ -5155,7 +5329,7 @@ impl Chat {
                 else {
                     let context: Vec<String> = self.msgs.iter().filter(|m| m.role == Role::Assistant).map(|m| m.text().to_string()).collect();
                     let parent = self.walk_focus.or(self.active_leaf);
-                    self.queue.push_back((crate::quest::quest_prompt(&task, n, &context), parent));
+                    self.queue.push_back((crate::quest::quest_prompt(&task, n, &context), parent, None));
                     self.note = format!("asking {n} clarifying questions — answer the A: lines, then :ans");
                 }
             }
@@ -6051,7 +6225,19 @@ impl Chat {
                                 ui.add_space(6.0);
                             }
                             ui.separator();
-                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. Task decomposition + execution wiring is in progress; selecting a mode here records the intent.").color(theme::FAINT()).small());
+                            ui.checkbox(&mut self.reflexes_on, "⚡ reflexes")
+                                .on_hover_text("Automatic bounded reactions to finished fan branches: a compile error or test failure queues ONE fix follow-up, an empty reply ONE retry; near-duplicates are annotated (consider :pick). The brain stays in charge — reflexes only add follow-ups, never cancel work.");
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button("🎐 fuzz ×6").on_hover_text("Fan 6 branches off the focus — each with a distinct behavioral directive AND its own work style (instruction + sampling). Same as :fuzzd 6.").clicked() {
+                                    self.run_command(crate::vimmode::Command::FuzzDirective(6), ui);
+                                }
+                                if ui.button("🛣 paths ×6").on_hover_text("Explore 6 feature-creation paths for the composer text (mvp/api/data/test/ux/risk archetypes), each ending in a comparable summary. Same as :paths 6.").clicked() {
+                                    self.run_command(crate::vimmode::Command::Paths(6), ui);
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. Aggressive best-of-K runs are now styled: K distinct work styles per unit. Reflexes + the liaison narrate under the newest message.").color(theme::FAINT()).small());
                         }
                         RightPage::Graph => {
                             ui.label(RichText::new("CONVERSATION GRAPH").color(theme::DIM()).small().strong());
@@ -6316,7 +6502,29 @@ impl Chat {
                             if ui.button("📂 Open folder").on_hover_text(format!("Reveal {}", dir.display())).clicked() { Self::reveal(&dir); }
                         }
                     });
-                    }); // close gen_files_drawer
+                    });
+                    // ── CODE COMPONENTS: the deduplicated blocks this conversation has produced.
+                    // Named by the descriptor model when it has spoken (•), by their own
+                    // declarations until then. Click a row to copy the component's code.
+                    if !self.components.items.is_empty() {
+                        egui::CollapsingHeader::new(RichText::new(format!("CODE COMPONENTS ({})", self.components.items.len()))
+                                .color(theme::CYAN()).strong().small())
+                            .default_open(false)
+                            .show(ui, |ui| {
+                                for c in &self.components.items {
+                                    let tag = if c.named_by_model { "•" } else { "·" };
+                                    let line = format!("#{} {} {}  — {} · {} lines · ×{}",
+                                        c.id + 1, tag, c.name,
+                                        if c.lang.is_empty() { "code" } else { &c.lang }, c.lines, c.uses);
+                                    if ui.add(egui::Label::new(RichText::new(line).small()).sense(egui::Sense::click()))
+                                        .on_hover_text("click to copy this component's code")
+                                        .clicked() {
+                                        ui.ctx().copy_text(c.text.clone());
+                                    }
+                                }
+                            });
+                    }
+ // close gen_files_drawer
                 });
             }
             if let Some((msg, at)) = &self.ws_note {
@@ -6830,11 +7038,12 @@ impl Chat {
             // Between rounds of a depth fan: once this round's generations have all finished and drained,
             // fire the next round on the NEW frontier (this is what makes :Nca / :Nfa go N deep).
             if self.queue.is_empty() && self.fan.is_some() { self.fan_step(); }
-            if let Some((qt, parent)) = self.queue.pop_front() {
+            self.maybe_reflex(infer, doc);
+            if let Some((qt, parent, style)) = self.queue.pop_front() {
                 if qt == CONTINUE_ALL_TOK {
                     if let Some(l) = parent { self.expand_leaf(l, infer, doc); }
                 } else {
-                    self.start_generation(qt, parent, infer, doc);
+                    self.start_generation(qt, parent, style, infer, doc);
                 }
                 ui.ctx().request_repaint();
             }
@@ -7141,8 +7350,8 @@ mod tests {
     fn activity_status_summarizes_inflight_work() {
         let mut c = Chat::default();
         assert_eq!(c.activity_status(), None, "idle → nothing to show");
-        c.queue.push_back(("x".into(), None));
-        c.queue.push_back(("y".into(), None));
+        c.queue.push_back(("x".into(), None, None));
+        c.queue.push_back(("y".into(), None, None));
         assert_eq!(c.activity_status().as_deref(), Some("2 queued"));
         // a running depth fan reads alongside the queued count
         c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 3, only: None });

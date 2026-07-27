@@ -60,6 +60,7 @@ pub enum Command {
     Overview,          // :overview / :fit    — refit the camera to the whole tree (the `o` key, too)
     Fuzz(usize),       // :fuzz <N>            — fan N fuzzed branches (default 10)
     FuzzDirective(usize), // :fuzzd <N> / :fd  — fan N branches, each with a different behavioral directive
+    Paths(usize),      // :paths [N] / :pf     — fan N feature-CREATION paths (mvp/api/data/test/ux/risk archetypes)
     Open(String),      // :o / :open <path>    — import a chat (markdown ## You / ## Assistant) from a file
     ContinueAll(usize),// :ca [N] / :Nca       — continuation on every leaf, fanned N rounds deep (depth-N)
     FuzzyAll { depth: usize, width: usize, template: String }, // :fa [W] ['tmpl'] / :Nfa W 'tmpl' — depth×width templated fan
@@ -272,6 +273,7 @@ static CATALOG: &[CmdSpec] = &[
     CmdSpec { name: "fa",        aliases: &["fuzzy-all"],           args: "[W] ['tmpl']",  help: "depth×width templated fan-out over the leaves" },
     CmdSpec { name: "fuzz",      aliases: &["f"],                   args: "[N]",           help: "fan N fuzzed variants of the prompt (default 10)" },
     CmdSpec { name: "fuzzd",     aliases: &["fd"],                  args: "[N]",           help: "fan N variants, each a different behavioral directive" },
+    CmdSpec { name: "paths",     aliases: &["pf"],                  args: "[N]",           help: "fan N feature-creation paths (mvp/api/data/test/ux/risk) to compare side by side" },
     CmdSpec { name: "mergectx",  aliases: &["mc"],                  args: "<ids> ['ask']", help: "flatten the referenced nodes into one context for a pick" },
     CmdSpec { name: "strategy",  aliases: &["strat", "bird", "birdseye"], args: "[ids] ['focus']", help: "condense the conversation into a unified bird's-eye synthesis" },
     CmdSpec { name: "segment",   aliases: &["blocks", "seg"],       args: "[ids] ['focus']", help: "map the chat into blocks + mark seams to split/branch the graph" },
@@ -433,6 +435,7 @@ pub fn parse_command(line: &str) -> Command {
         "unprune" | "up" => Command::Unprune,
         "overview" | "fit" => Command::Overview,
         "fuzz" | "f" => Command::Fuzz(arg.parse::<usize>().unwrap_or(10).clamp(2, 40)),
+        "paths" | "pf" => Command::Paths(arg.parse::<usize>().unwrap_or(6).clamp(2, 6)),
         "fuzzd" | "fd" => Command::FuzzDirective(arg.parse::<usize>().unwrap_or(10).clamp(2, 40)),
         "o" | "open" => Command::Open(arg.to_string()),
         "ca" | "continue-all" => {
