@@ -36,6 +36,8 @@ pub const SPECS: &[CmdSpec] = &[
         help: "fan n varied retries of the last prompt off the same parent", example: ":fuzz 8" },
     CmdSpec { name: "fuzzd", aliases: &["fd"], usage: ":fuzzd [n]", arg: ArgKind::Count,
         help: "fan n branches off the focus, each carrying a different behavioral directive", example: ":fd 6" },
+    CmdSpec { name: "paths", aliases: &["pf"], usage: ":paths [n]", arg: ArgKind::Count,
+        help: "fan n feature-CREATION paths (mvp/api/data/test/ux/risk archetypes) to compare side by side", example: ":paths 6" },
     CmdSpec { name: "fuzzy-all", aliases: &["fa"], usage: ":fuzzy-all [n]", arg: ArgKind::Count,
         help: "fan n varied continuations off every current leaf", example: ":fa 4" },
     CmdSpec { name: "continue-all", aliases: &["ca"], usage: ":continue-all", arg: ArgKind::None,

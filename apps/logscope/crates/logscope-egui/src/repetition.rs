@@ -293,6 +293,185 @@ fn jaccard(a: &std::collections::HashSet<u64>, b: &std::collections::HashSet<u64
 
 // ── tests ───────────────────────────────────────────────────────────────────────────────────────
 
+
+// ── improved recognition: line-, char-, and counter-normalized cycles ────────────────────────────
+//
+// tail_cycle is word-level, which misses three real failure modes seen in the wild:
+//   * STANZA loops — a multi-line code/JSON block repeating (long word period, but a SHORT line
+//     period), e.g. the same 4-line struct emitted forever;
+//   * GLYPH runs — whitespace-free character loops ("``````````", "————", "abcabc...") that
+//     word-splitting collapses into one token;
+//   * COUNTER loops — the same sentence with only a number ticking ("Step 3: retry the fetch."
+//     over and over with 3→4→5), which verbatim matching never sees.
+// Each has its own conservative thresholds; severity_of_v2 composes them.
+
+/// Trailing LINE cycle: the last `p` (trimmed) lines repeat `>= min_reps` times.
+/// Returns (period_in_lines, reps). Blank-only periods are ignored.
+pub fn line_tail_cycle(text: &str, min_reps: usize) -> Option<(usize, usize)> {
+    let min_reps = min_reps.max(2);
+    let lines: Vec<&str> = text.lines().map(|l| l.trim_end()).collect();
+    let n = lines.len();
+    if n < min_reps { return None; }
+    for p in 1..=(n / min_reps).min(12) {
+        let period = &lines[n - p..];
+        if period.iter().all(|l| l.trim().is_empty()) { continue; }
+        let mut reps = 1usize;
+        let mut i = n - p;
+        while i >= p && lines[i - p..i] == *period { reps += 1; i -= p; }
+        if reps >= min_reps { return Some((p, reps)); }
+    }
+    None
+}
+
+/// Trailing CHARACTER cycle over the raw tail (last 512 chars): a period of 1..=`max_period`
+/// chars repeated `>= min_reps` times. Catches glyph runs and separator spam that have no
+/// whitespace for the word detector to split on.
+pub fn char_tail_cycle(text: &str, min_reps: usize, max_period: usize) -> Option<(String, usize)> {
+    let min_reps = min_reps.max(2);
+    let tail: Vec<char> = text.chars().rev().take(512).collect::<Vec<_>>().into_iter().rev().collect();
+    let n = tail.len();
+    for p in 1..=max_period.min(n / min_reps.max(1)) {
+        let period = &tail[n - p..];
+        if period.iter().all(|c| c.is_whitespace()) { continue; }
+        let mut reps = 1usize;
+        let mut i = n - p;
+        while i >= p && tail[i - p..i] == *period { reps += 1; i -= p; }
+        if reps >= min_reps { return Some((period.iter().collect(), reps)); }
+    }
+    None
+}
+
+/// Counter-normalized word cycle: digits fold to '#' before the word-level scan, so a sentence
+/// repeating with only a number ticking is caught. Deliberately STRICT — period >= 4 words and
+/// reps >= 4 — so legitimate numbered lists (different words per item) never match.
+pub fn counter_tail_cycle(text: &str, min_reps: usize) -> Option<(Vec<String>, usize)> {
+    let norm: String = text.chars().map(|c| if c.is_ascii_digit() { '#' } else { c }).collect();
+    match tail_cycle(&norm, min_reps.max(4)) {
+        Some((period, reps)) if period.len() >= 4 => Some((period, reps)),
+        _ => None,
+    }
+}
+
+/// severity_of, composed over ALL detectors — the full read for realtime callers.
+pub fn severity_of_v2(recent: &str) -> Severity {
+    if tail_cycle(recent, 3).is_some() { return Severity::Looping; }
+    if line_tail_cycle(recent, 3).is_some() { return Severity::Looping; }
+    if char_tail_cycle(recent, 12, 8).is_some() { return Severity::Looping; }
+    if counter_tail_cycle(recent, 4).is_some() { return Severity::Looping; }
+    let r = ngram_repeat_ratio(recent, 4);
+    if r >= 0.5 { Severity::Looping } else if r >= 0.28 { Severity::Warming } else { Severity::Clean }
+}
+
+// ── post-hoc analysis + automatic context condensation ───────────────────────────────────────────
+
+/// What a finished message's repetition looked like — for a badge, a HUD note, and the
+/// context-cleanup marker.
+#[derive(Clone, Debug)]
+pub struct RepetitionReport {
+    pub kind: &'static str,   // "phrase" | "lines" | "glyphs" | "counter" | "paragraph"
+    pub sample: String,       // one instance of the repeating unit (clipped)
+    pub reps: usize,
+    pub saved_chars: usize,   // how much condensation removed
+}
+
+fn clip(s: &str, n: usize) -> String {
+    let mut out: String = s.chars().take(n).collect();
+    if s.chars().count() > n { out.push('…'); }
+    out
+}
+
+/// Is the END of `text` inside an unterminated ``` fence? Condensation never edits code.
+fn in_open_fence(text: &str) -> bool { text.matches("```").count() % 2 == 1 }
+
+/// Analyze a FINISHED message. Returns the strongest repetition found, if any.
+pub fn analyze(text: &str) -> Option<RepetitionReport> {
+    if !in_open_fence(text) {
+        if let Some((p, reps)) = line_tail_cycle(text, 3) {
+            if reps >= 3 {
+                let lines: Vec<&str> = text.lines().collect();
+                let sample = lines[lines.len() - p..].join("\n");
+                return Some(RepetitionReport { kind: "lines", sample: clip(&sample, 80), reps, saved_chars: 0 });
+            }
+        }
+    }
+    if let Some((period, reps)) = tail_cycle(text, 4) {
+        return Some(RepetitionReport { kind: "phrase", sample: clip(&period.join(" "), 60), reps, saved_chars: 0 });
+    }
+    if let Some((gl, reps)) = char_tail_cycle(text, 16, 8) {
+        return Some(RepetitionReport { kind: "glyphs", sample: clip(&gl, 16), reps, saved_chars: 0 });
+    }
+    if let Some((period, reps)) = counter_tail_cycle(text, 4) {
+        return Some(RepetitionReport { kind: "counter", sample: clip(&period.join(" "), 60), reps, saved_chars: 0 });
+    }
+    None
+}
+
+/// Condense a message for CONTEXT: collapse a trailing cycle to ONE instance plus a marker, and
+/// collapse runs of identical consecutive paragraphs. Fence-aware — anything touching ``` fences
+/// is left byte-for-byte (repeated lines are the fabric of code). The user-visible message is
+/// never touched; this only shapes what the model re-reads.
+pub fn condense(text: &str) -> (String, Option<RepetitionReport>) {
+    let mut out = text.to_string();
+    let mut report: Option<RepetitionReport> = None;
+    // 1) trailing LINE cycle (outside fences)
+    if !in_open_fence(&out) {
+        if let Some((p, reps)) = line_tail_cycle(&out, 3) {
+            let lines: Vec<String> = out.lines().map(|l| l.to_string()).collect();
+            let period = lines[lines.len() - p..].join("\n");
+            if !period.contains("```") {
+                let cut = lines.len() - p * (reps - 1);
+                let saved0 = out.len();
+                out = lines[..cut].join("\n");
+                out.push_str(&format!("\n⟲ the previous {} line(s) repeated ×{} — condensed for context\n", p, reps));
+                let saved = saved0.saturating_sub(out.len());
+                report = Some(RepetitionReport { kind: "lines", sample: clip(&period, 80), reps, saved_chars: saved });
+            }
+        }
+    }
+    // 2) trailing WORD cycle (only if nothing collapsed yet)
+    if report.is_none() && !in_open_fence(&out) {
+        if let Some((period, reps)) = tail_cycle(&out, 4) {
+            let pstr = period.join(" ");
+            if !pstr.contains("```") && pstr.len() >= 8 {
+                if let Some(first) = out.find(&pstr) {
+                    let saved = out.len().saturating_sub(first + pstr.len());
+                    let head = out[..first].trim_end().to_string();
+                    out = format!("{}\n{} ⟲ (this phrase repeated ×{} — condensed)\n", head, pstr, reps);
+                    report = Some(RepetitionReport { kind: "phrase", sample: clip(&pstr, 60), reps,
+                                                     saved_chars: saved });
+                }
+            }
+        }
+    }
+    // 3) identical consecutive PARAGRAPHS (only in fully fence-free text)
+    if !out.contains("```") {
+        let paras: Vec<String> = out.split("\n\n").map(|p| p.to_string()).collect();
+        if paras.len() >= 3 {
+            let mut kept: Vec<String> = Vec::new();
+            let (mut i, mut collapsed) = (0usize, 0usize);
+            let mut first_sample = String::new();
+            while i < paras.len() {
+                let mut j = i + 1;
+                while j < paras.len() && paras[j].trim() == paras[i].trim() && !paras[i].trim().is_empty() { j += 1; }
+                kept.push(paras[i].clone());
+                if j - i >= 2 {
+                    kept.push(format!("⟲ (paragraph repeated ×{} — condensed)", j - i));
+                    collapsed += (j - i - 1) * paras[i].len();
+                    if first_sample.is_empty() { first_sample = paras[i].clone(); }
+                }
+                i = j;
+            }
+            if collapsed > 0 {
+                out = kept.join("\n\n");
+                if report.is_none() {
+                    report = Some(RepetitionReport { kind: "paragraph", sample: clip(&first_sample, 60), reps: 0, saved_chars: collapsed });
+                }
+            }
+        }
+    }
+    (out, report)
+}
+
 #[cfg(test)]
 mod write_guard_tests {
     use super::*;
@@ -409,5 +588,39 @@ mod tests {
         assert!(matches!(g.observe(a, "noop"), LoopAction::Proceed));
         assert!(matches!(g.observe(b, "noop"), LoopAction::Proceed), "distinct turns must not strike");
         assert_eq!(g.strikes(), 0);
+    }
+
+    #[test]
+    fn line_cycle_catches_stanza_loops_words_miss() {
+        let stanza = "let x = 1;\nlet y = 2;\ncall(x, y);\n";
+        let text = format!("prelude\n{}{}{}{}", stanza, stanza, stanza, stanza);
+        assert!(line_tail_cycle(&text, 3).is_some());
+    }
+    #[test]
+    fn char_cycle_catches_glyph_runs() {
+        assert!(char_tail_cycle("done\n``````````````````````", 12, 8).is_some());
+        assert!(char_tail_cycle("normal prose without runs at all here", 12, 8).is_none());
+    }
+    #[test]
+    fn counter_cycle_ticks_but_lists_do_not() {
+        let loopy = "Step 3: retry the fetch now. Step 4: retry the fetch now. Step 5: retry the fetch now. Step 6: retry the fetch now. Step 7: retry the fetch now.";
+        assert!(counter_tail_cycle(loopy, 4).is_some());
+        let list = "1. bake the bread 2. cool the loaf 3. slice it thin 4. toast to taste";
+        assert!(counter_tail_cycle(list, 4).is_none());
+    }
+    #[test]
+    fn condense_collapses_and_reports_but_never_touches_code() {
+        let text = "answer below\n\nsame para\n\nsame para\n\nsame para\n\ntail";
+        let (out, rep) = condense(text);
+        assert_eq!(out.matches("same para").count(), 1, "{out}");
+        assert!(rep.is_some());
+        let code = "```rust\nlet a=1;\nlet a=1;\nlet a=1;\nlet a=1;\n```";
+        let (out2, _) = condense(code);
+        assert_eq!(out2, code, "fenced code must be untouched");
+    }
+    #[test]
+    fn analyze_reads_a_finished_runaway() {
+        let t = "the model said the value the value the value the value the value";
+        assert_eq!(analyze(t).expect("phrase loop").kind, "phrase");
     }
 }

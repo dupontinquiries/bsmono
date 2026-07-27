@@ -22,6 +22,10 @@
 #[allow(dead_code)] pub mod cmdpalette;
 #[allow(dead_code)] pub mod consensus;
 #[allow(dead_code)] pub mod coordinator;
+pub mod reflex;
+pub mod styles;
+pub mod pathfan;
+pub mod liaison_fan;
 #[allow(dead_code)] pub mod decompose;
 #[allow(dead_code)] pub mod dispatch;
 #[allow(dead_code)] pub mod enlist;
