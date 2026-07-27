@@ -2914,7 +2914,12 @@ impl Gpu {
                         *c += 1;
                         // Wrapping means slot 0 is about to be rewritten while an earlier fill may still
                         // be queued against it — that is the one point where the frame must close.
-                        if s == 0 { self.end_frame(); }
+                        // Reopen after closing. end_frame() leaves the frame CLOSED, and every dispatch
+                        // after it takes the one-submit-per-dispatch branch — measured at 49751 of 54161
+                        // submits (99%) on a Scout run, because a 12-fill layer wraps this ring several
+                        // times per token and nothing put a frame back. Same defect as download(), in a
+                        // second place; closing without reopening is the shape to watch for.
+                        if s == 0 { self.end_frame(); self.begin_frame(); }
                         s
                     };
                     let base = slot * per_fill;
