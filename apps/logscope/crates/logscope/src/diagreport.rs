@@ -49,8 +49,11 @@ impl Report {
     /// a GPU watchdog entry up with what this process was doing; the monotonic offset is what survives an
     /// NTP step and makes durations between our own lines trustworthy. Either alone leaves a gap.
     pub fn push_at(&mut self, section: &str, line: impl Into<String>, wall_secs: u64, mono_ms: u64) {
-        let stamped = format!("[{:>8}.{:03}s +{:>7}ms] {}",
-            wall_secs, 0, mono_ms, elide(line.into().trim_end()));
+        // Wall clock as an absolute epoch second (what journalctl stamps) plus the monotonic offset.
+        // The first version printed a hardcoded ".000" subsecond field, which looked like precision it
+        // did not have — a fake digit is worse than a missing one because it invites correlation at a
+        // resolution the data cannot support.
+        let stamped = format!("[{wall_secs} +{mono_ms:>7}ms] {}", elide(line.into().trim_end()));
         self.push_raw(section, stamped);
     }
 
