@@ -372,16 +372,24 @@ pub(crate) mod engine {
             if !gpu.profile_forced() && std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_none() {
                 let (k, n) = (model.d, 2 * model.h); // wgate_up: the largest decode mat-vec
                 let cached_raw = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n);
-                // Validate BEFORE applying: a cached tile of 2147549188 was seen in the field
-                // (poisoned/corrupt cache entry) and the old code called set_matvec_tile with it
-                // first and asked questions never. An insane tile is discarded and retuned.
-                let cached = cached_raw.filter(|t| (1..=64).contains(t));
+                // Validate BEFORE applying — but validate CORRECTLY. The field values 2147549188 and
+                // 2147680260 that looked like poison are 0x8001_0004 / 0x8003_0004: PACKED
+                // DecodeConfigs (high bit = packed, kernel id << 16, tile low) — the previous
+                // range check would have discarded every tuned config on every machine that had
+                // one, forcing a retune per load. Packed values are accepted and printed decoded;
+                // bare legacy tiles are accepted in 1..=64; everything else really is poison.
+                let cached = cached_raw.filter(|&t| t & 0x8000_0000 != 0 || (1..=64).contains(&t));
                 if let (Some(raw), None) = (cached_raw, cached) {
-                    eprintln!("wgpu-engine: cached decode tile {raw} is out of range — discarding the cache entry, retuning");
+                    eprintln!("wgpu-engine: cached decode tile {raw} is neither a packed config nor a sane bare tile — discarding, retuning");
                 }
                 if let Some(t) = cached {
                     gpu.set_matvec_tile(t);
-                    eprintln!("wgpu-engine: decode tile = {t} (cached autotune for this GPU)");
+                    if t & 0x8000_0000 != 0 {
+                        let c = gpu_kernels::DecodeConfig::unpack(t);
+                        eprintln!("wgpu-engine: decode cfg = {:?} tile {} (cached autotune for this GPU)", c.kernel, c.tile);
+                    } else {
+                        eprintln!("wgpu-engine: decode tile = {t} (cached autotune for this GPU)");
+                    }
                 } else {
                     let t0 = std::time::Instant::now();
                     let best = gpu.autotune_matvec(k, n);
@@ -825,6 +833,7 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
                 gpu_kernels::GPU_SETUP_NS.load(AOrd::Relaxed), gpu_kernels::GPU_SYNC_NS.load(AOrd::Relaxed));
+            let c0 = gpu_kernels::gpu_submit_causes();
             let (bgh0, bgm0) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed), gpu_kernels::BG_MISSES.load(AOrd::Relaxed));
             // Windowed SAMPLED decode: the whole sample→embed→decode cycle stays on-device for k
             // tokens per readback — no per-token full-vocab logits sync and no per-token O(v·log v)
@@ -921,6 +930,18 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             let accounted = setup_ms + sync_ms;
             let bound = if accounted < total_ms * 0.15 { "GPU-execution" }
                         else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
+            {
+                // WHY the submits happened — one run names the mechanism instead of three guesses
+                // (the Scout/Metal hunt). Printed only when a cause was recorded.
+                let c1 = gpu_kernels::gpu_submit_causes();
+                let d: Vec<u64> = c1.iter().zip(c0.iter()).map(|(a, b)| a.saturating_sub(*b)).collect();
+                let tot: u64 = d.iter().sum();
+                if tot > 0 {
+                    let pc = |v: u64| (v as f64 / tot as f64 * 100.0).round() as u64;
+                    eprintln!("wgpu-engine: [{}] submit causes — passes {} ({}%), download {} ({}%), end_frame {} ({}%), dims-wrap {} ({}%), frameless {} ({}%), other {} ({}%)",
+                        self.name, d[0], pc(d[0]), d[1], pc(d[1]), d[2], pc(d[2]), d[3], pc(d[3]), d[4], pc(d[4]), d[5], pc(d[5]));
+                }
+            }
             eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
                 self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
