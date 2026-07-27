@@ -16,6 +16,20 @@ pub fn enabled() -> bool {
         || std::env::args().any(|a| a == "--diag"))
 }
 
+/// Which section a raw engine line belongs to. Mirrors Report::absorb's rules, exposed here so a
+/// timestamped push can pick the same destination that absorb() would have.
+fn classify(l: &str) -> &'static str {
+    if l.contains("adapter =") || l.contains("preflight") { "ADAPTER" }
+    else if l.contains("levers") { "LEVERS" }
+    else if l.contains("profile —") { "PROFILE" }
+    else if l.contains("submit causes") || l.contains("submit batch") { "SUBMITS" }
+    else if l.contains("gate-") { "GATES" }
+    else if l.to_lowercase().contains("fail") || l.contains("panic") { "ERRORS" }
+    else if l.contains("loaded in") || l.contains("resident memory") || l.contains("quantiz") { "LOAD" }
+    else if l.contains("layers=") { "MODEL" }
+    else { "TAIL" }
+}
+
 /// Process start, for the monotonic offset every line carries.
 fn t0() -> std::time::Instant {
     static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -37,10 +51,12 @@ pub fn note(line: &str) {
     let mut g = CAPTURE.lock().unwrap();
     let r = g.get_or_insert_with(Report::new);
     // classify first, then stamp: absorb() picks the section from content
-    let before = r.populated().len();
-    r.absorb(line);
-    let _ = before;
-    r.push_at("TAIL", "", wall_secs(), mono);   // keeps the clock advancing even for quiet stretches
+    // Stamp the line ITSELF rather than emitting a separate clock entry. The first version pushed a
+    // blank timestamped line after every real one, which doubled the report's length with rows carrying
+    // no information — visible immediately in the first real run, and exactly the kind of noise that
+    // makes a diagnostic tiring to read.
+    let sec = if line.contains("STAGE ") { "STAGES" } else { classify(line) };
+    r.push_at(sec, line, wall_secs(), mono);
 }
 
 /// Time a named stage and record how long it took.
