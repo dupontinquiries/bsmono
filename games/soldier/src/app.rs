@@ -393,6 +393,11 @@ pub struct FpsApp {
     armory_slot: usize,
     /// Cached crossfading map preview shown in the map-select menu.
     map_preview: Option<MapPreview>,
+    /// Map-select list scroll offset, driven MANUALLY from global input (wheel anywhere over
+    /// the menu, drag, PgUp/PgDn). Field-report bug: the wheel did nothing over the list on at
+    /// least one platform — whatever eats hover-targeted wheel events there, a manual offset
+    /// fed to ScrollArea::vertical_scroll_offset cannot be eaten.
+    map_scroll: f32,
     /// Procedural sound engine (only with the `sound` feature; `None` if no audio device).
     #[cfg(feature = "sound")]
     audio: Option<crate::audio::play::Audio>,
@@ -473,6 +478,7 @@ impl FpsApp {
             armory_pitch: 0.1,
             armory_slot: 0,
             map_preview: None,
+            map_scroll: 0.0,
             #[cfg(feature = "sound")]
             audio: crate::audio::play::Audio::new(),
         };
@@ -1180,7 +1186,26 @@ impl FpsApp {
                             );
                         }
                         ui.add_space(6.0);
-                        uikit_egui::scroll::bounded(ui, 280.0, |ui| {
+                        // The list gets the REST of the window, not a fixed 280px (the old cap
+                        // wasted the bottom half of the screen and hid everything past the first
+                        // rows — including all 13 learned-site maps).
+                        let reserved = 150.0 + 130.0 + 120.0; // preview + header/labels + footer
+                        let list_h = (ctx.screen_rect().height() - reserved).clamp(240.0, 720.0);
+                        // Manual scroll: wheel ANYWHERE over the menu, PgUp/PgDn/arrows, plus the
+                        // scroll area's own drag — three independent paths to the same offset.
+                        let (wheel, pgup, pgdn, up, dn) = ui.input(|i| (
+                            i.smooth_scroll_delta.y,
+                            i.key_pressed(egui::Key::PageUp), i.key_pressed(egui::Key::PageDown),
+                            i.key_pressed(egui::Key::ArrowUp), i.key_pressed(egui::Key::ArrowDown)));
+                        self.map_scroll = (self.map_scroll - wheel
+                            + if pgdn { list_h * 0.85 } else { 0.0 } - if pgup { list_h * 0.85 } else { 0.0 }
+                            + if dn { 36.0 } else { 0.0 } - if up { 36.0 } else { 0.0 }).max(0.0);
+                        let out = egui::ScrollArea::vertical()
+                            .id_salt("map_select_list")
+                            .max_height(list_h)
+                            .auto_shrink([false, false])
+                            .vertical_scroll_offset(self.map_scroll)
+                            .show(ui, |ui| {
                             egui::Grid::new("maps").spacing([8.0, 8.0]).show(ui, |ui| {
                                 for (i, pr) in crate::level::PRESETS.iter().enumerate() {
                                     let sel = self.sel_preset == Some(i);
@@ -1199,6 +1224,9 @@ impl FpsApp {
                                 }
                             });
                         });
+                        // clamp to real content height + persist what the area actually applied
+                        let max_off = (out.content_size.y - out.inner_rect.height()).max(0.0);
+                        self.map_scroll = out.state.offset.y.min(max_off);
                         ui.add_space(6.0);
                         // preference toggle for the selected map
                         if let Some(i) = self.sel_preset {

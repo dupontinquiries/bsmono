@@ -12573,6 +12573,20 @@ fn sandstorm_rises_during_play() {
 }
 
 #[test]
+fn every_learned_site_is_selectable() {
+    // Field report: the map-select list hid everything past the first rows, so it LOOKED like
+    // the learned maps were missing. They must actually be in PRESETS (the list's data source),
+    // by exact display name — this pins the wiring so a rename or dropped entry fails loudly
+    // instead of silently vanishing from the menu.
+    for (name, ..) in Level::LEARNED_SITES.iter() {
+        assert!(PRESETS.iter().any(|p| p.name == *name),
+            "learned site '{name}' must be selectable (missing from PRESETS)");
+    }
+    assert!(PRESETS.len() >= 24 + Level::LEARNED_SITES.len(),
+        "PRESETS should carry the hand-tuned set plus every learned site (got {})", PRESETS.len());
+}
+
+#[test]
 fn learned_sites_stamp_their_learning() {
     // The 13 learned sites (IQM scans → mapstudy blueprints) must each be playable AND must
     // actually STAMP what was learned: every 'c' in a blueprint is a registered cover column,
