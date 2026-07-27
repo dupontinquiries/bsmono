@@ -38,6 +38,8 @@ pub mod model_selector;
 pub mod modelroles;
 pub mod activemodel;
 pub mod cratecheck;
+pub mod diagreport;
+pub mod correlate;
 pub mod providers;
 pub mod llm_backend;
 #[cfg(feature = "bloc")]
