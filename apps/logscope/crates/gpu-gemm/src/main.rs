@@ -2094,10 +2094,30 @@ fn main() {
                     gpu.queue_write_pub(&dst, &src);
                     gpu.end_frame();
                 }
+                let _ = &dst;
                 // one sync at the end so the timing covers submitted work, not just queueing
                 let _ = gpu.download(&gpu.view_pub(&dst, 0, 1024));
                 let per = t0.elapsed().as_secs_f64() / iters as f64;
                 println!("     {mb:4} MiB block: {:7.2} ms  {:7.1} GiB/s", per * 1e3,
+                    mb as f64 / 1024.0 / per);
+            }
+            // CHUNKED, for the same sizes. If splitting a large write into UPLOAD_CHUNK pieces recovers
+            // the small-block rate, then every big upload in the engine was on the slow path and the fix
+            // is free. If it does not, the ceiling is real and layer streaming is bounded by it.
+            println!("  -- same sizes, split into {} MiB chunks --", Gpu::UPLOAD_CHUNK >> 20);
+            for mb in [64usize, 256] {
+                let words = mb * (1 << 20) / 4;
+                let src: Vec<f32> = vec![1.0; words];
+                let dst = gpu.alloc_resident_words(words);
+                let iters = 5usize;
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    gpu.write_chunked_pub(&dst, &src);
+                    gpu.end_frame();
+                }
+                let _ = gpu.download(&gpu.view_pub(&dst, 0, 1024));
+                let per = t0.elapsed().as_secs_f64() / iters as f64;
+                println!("     {mb:4} MiB chunked: {:7.2} ms  {:7.1} GiB/s", per * 1e3,
                     mb as f64 / 1024.0 / per);
             }
             println!("     (planner assumes 100 GiB/s; a 70B Q4 streams ~42 blocks/token)");
