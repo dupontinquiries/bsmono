@@ -96,7 +96,11 @@ pub fn agreement(token_logprobs: &[f32], sigma: f32) -> Option<Agreement> {
 /// The prompt for a verdict. Short on purpose: it is read once per candidate and the answer is a single
 /// distribution, so every extra token is pure cost.
 pub fn verdict_prompt(code: &str, question: &str) -> String {
-    format!("{code}\n\n{question}\nAnswer with one word, yes or no:")
+    // FRAMED as candidate output: an error in this block means the CANDIDATE is wrong, not that the tool
+    // broke or that the user's program failed. A judge that mistakes the frame answers about the wrong
+    // artifact — fluently, because nothing in a stack trace says which of the three it came from.
+    format!("{}\n{code}\n\n{question}\nAnswer with one word, yes or no:",
+        crate::promptframe::Frame::CandidateOutput.banner())
 }
 
 /// A rung on the escalation ladder: who is asked, and what it costs.
