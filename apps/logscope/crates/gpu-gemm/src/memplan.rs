@@ -511,9 +511,15 @@ mod tests {
     }
 }
 
-/// Total system RAM in bytes, or 0 when it cannot be determined. Linux reads `MemTotal` from
-/// /proc/meminfo; other platforms return 0 so callers treat the check as unavailable rather than
-/// assuming a value and refusing a load that would have worked.
+/// Total system RAM in bytes, or 0 when it cannot be determined.
+///
+/// Linux reads `MemTotal`; macOS reads `hw.memsize` via sysctl. Everything else returns 0, and 0 means
+/// UNKNOWN rather than "none" — callers must disable the guard rather than refuse a load that would have
+/// worked.
+///
+/// The macOS path matters more than it looks: on unified memory this figure also drives the GPU buffer
+/// budget, so returning 0 there made a 192 GiB machine fall back to a conservative guess and pick q4
+/// where int8 would have fitted. A missing probe was silently costing model quality.
 pub fn system_ram_bytes() -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
         for line in s.lines() {
@@ -521,6 +527,38 @@ pub fn system_ram_bytes() -> u64 {
                 if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
                     return kb * 1024;
                 }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `sysctl -n hw.memsize` is the total physical RAM in bytes. Shelling out rather than linking
+        // libc's sysctl keeps this dependency-free, and it runs once at load where a few ms is nothing.
+        if let Ok(out) = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output() {
+            if let Ok(txt) = String::from_utf8(out.stdout) {
+                if let Ok(b) = txt.trim().parse::<u64>() { if b > 0 { return b; } }
+            }
+        }
+    }
+    0
+}
+
+/// Resident set size of this process in bytes, or 0 when unavailable.
+///
+/// macOS has no `smaps_rollup`, so the anonymous/file split is not available there — but the TOTAL is,
+/// via `ps`. Reporting a total with an honest "split unavailable" beats reporting nothing, because the
+/// total is what tells you whether you are about to swap.
+pub fn process_rss_bytes() -> u64 {
+    let (_, _, total) = rss_split();
+    if total > 0 { return total; }
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id();
+        if let Ok(out) = std::process::Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()]).output() {
+            if let Ok(txt) = String::from_utf8(out.stdout) {
+                // ps reports KiB
+                if let Ok(kb) = txt.trim().parse::<u64>() { return kb * 1024; }
             }
         }
     }
@@ -559,7 +597,17 @@ pub fn rss_split() -> (u64, u64, u64) {
 /// One line describing where this process's memory actually is.
 pub fn rss_report() -> String {
     let (anon, file, total) = rss_split();
-    if total == 0 { return "resident memory: unavailable on this platform".into(); }
+    if total == 0 {
+        // Fall back to the total-only probe before giving up: on macOS the anon/file SPLIT is
+        // unavailable but the total is not, and the total is the number that tells you whether you are
+        // about to swap.
+        let t = process_rss_bytes();
+        if t > 0 {
+            return format!("resident memory: {:.1} GiB total (anonymous/file split unavailable on this \
+platform — the total is what matters for swap pressure)", t as f64 / (1u64 << 30) as f64);
+        }
+        return "resident memory: unavailable on this platform".into();
+    }
     format!("resident memory: {:.1} GiB total = {:.1} GiB anonymous (our allocations) + {:.1} GiB file-backed \
 (mmap'd model; reclaimable by the kernel under pressure)",
         gib(total), gib(anon), gib(file))
