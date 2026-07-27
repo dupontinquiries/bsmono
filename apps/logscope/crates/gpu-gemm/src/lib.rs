@@ -2151,6 +2151,9 @@ impl Gpu {
         // submit. frame.keep (dims uniforms + bind groups) is RETAINED past the submit — it's async,
         // and dropping it before the poll below recycles buffers the GPU is still reading → "Buffer
         // 'dims' is invalid" on Metal. clear_retained() after the poll frees them safely.
+        // Remember whether a frame was OPEN, because taking it here is what silently ends batching for
+        // everything that follows. See the reopen at the end of this function.
+        let had_frame = self.frame.lock().unwrap().is_some();
         if let Some(mut frame) = self.frame.lock().unwrap().take() {
             SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
@@ -2170,6 +2173,16 @@ impl Gpu {
         let v = bytemuck::cast_slice(&data).to_vec();
         drop(data); staging.unmap();
         self.clear_retained(); // poll waited for completion → retained dims/bind-groups are safe to free
+        // REOPEN THE FRAME. Taking it above is necessary — the readback has to be submitted to be read —
+        // but leaving it closed meant every subsequent dispatch took `dispatch`'s no-frame branch, which
+        // submits ONE COMMAND BUFFER PER DISPATCH. In a MoE decode the router readback happens once per
+        // layer, so the frame died at the first layer and never came back: measured at 1119 submits/token
+        // on Metal (48 layers x ~23 dispatches after each readback) at 2.0 ms each, which was the entire
+        // step time. `flush_every` looked ignored because the code path it governs was not being used.
+        //
+        // Only reopened if one was open on entry: a caller that downloads without a frame does not want
+        // one opened behind its back.
+        if had_frame { self.begin_frame(); }
         v
     }
 
