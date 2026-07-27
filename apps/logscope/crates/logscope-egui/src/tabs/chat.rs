@@ -4489,6 +4489,22 @@ impl Chat {
                 // outline only — let the 3D glossy pearl behind it show through
                 p.circle_stroke(pt, radius, egui::Stroke::new(1.0, col.linear_multiply(0.7)));
                 if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.5, egui::Stroke::new(1.0, theme::CYAN().linear_multiply(0.6))); }
+            } else if nd.kind.is_structural() {
+                // FAN-OUT / MERGE: a wide, flat bar rather than a blob. It reads as a junction — the
+                // point where the timeline splits or rejoins — instead of as one more thing that
+                // happened, which is how three alternatives came to look like three replies.
+                let h = radius * 0.45;
+                let r = egui::Rect::from_center_size(pt, egui::vec2(radius * 3.0, h * 2.0));
+                p.rect_filled(r, theme::r(2), theme::VIOLET());
+                if radius > 5.0 {
+                    p.text(pt, egui::Align2::CENTER_CENTER, nd.kind.glyph(),
+                        egui::FontId::proportional((radius * 1.1).min(13.0)), theme::INK());
+                }
+            } else if nd.kind.is_narration() {
+                // LIAISON: a hollow ring. Nobody said it and nothing was produced, so it should not
+                // carry the visual weight of a turn — but it must remain findable, hence a ring rather
+                // than a fainter dot, which would read as a quiet message.
+                p.circle_stroke(pt, radius * 0.85, egui::Stroke::new(1.5, theme::CYAN()));
             } else if nd.kind.is_artifact() {
                 // ARTIFACTS ARE SQUARES; conversation turns are circles. Shape is the fastest visual
                 // channel for "the conversation PRODUCED this" vs "someone SAID this", and unlike a hue
