@@ -253,6 +253,23 @@ mod tests {
     }
 
     #[test]
+    fn maverick_differs_from_scout_only_where_llamacpp_says() {
+        // Llama-4 Maverick: 17B active, 400B total, 128 experts, 1M context — versus Scout's 16 experts
+        // and 10M. The ONLY architectural difference llama4.cpp encodes is use_kq_norm, which is
+        // `type != LLM_TYPE_17B_128E` — so Maverick skips the post-rope norm Scout needs.
+        let scout = required("llama4", 16);
+        let mav = required("llama4", 128);
+        assert!(scout.contains(&Feature::KqNormPostRope), "Scout applies it");
+        assert!(!mav.contains(&Feature::KqNormPostRope), "Maverick does NOT — the 128E branch");
+        // everything else is shared, and both are gap-free
+        for f in [Feature::NoPe, Feature::AttnTemp, Feature::ChunkedSwa, Feature::SharedExpert,
+                  Feature::InterleavedMoe] {
+            assert!(scout.contains(&f) && mav.contains(&f), "{f:?} is shared");
+        }
+        assert!(gaps("llama4", 128).is_empty(), "{:?}", gaps("llama4", 128));
+    }
+
+    #[test]
     fn scout_has_no_remaining_declared_gaps() {
         // Llama-4 needed NoPE, attention temperature, chunked SWA, a shared expert, interleaved MoE and
         // use_kq_norm. Every one is now implemented; the last two landed this session.
