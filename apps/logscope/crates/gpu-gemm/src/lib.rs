@@ -8791,13 +8791,43 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Largest single `write_buffer` that stays on wgpu's fast staging path.
     ///
     /// MEASURED on Apple M2 Ultra / Honeykrisp, and the curve is backwards from what you would expect:
-    ///     16 MiB  21.1 GiB/s
-    ///     64 MiB   6.1 GiB/s
-    ///    256 MiB   5.9 GiB/s
-    /// Bigger transfers are 3.5x SLOWER, because a write that does not fit the staging belt falls off to
-    /// a slower path. Every large upload in this engine — expert fills at ~68 MiB, arena slabs at up to
-    /// 2 GiB — was landing in the slow band.
+    ///     16 MiB  21.8 GiB/s
+    ///     64 MiB   6.2 GiB/s
+    ///    256 MiB   6.0 GiB/s
+    /// Bigger transfers are ~3.5x SLOWER, because a write that does not fit the staging belt falls off
+    /// to a slower path. Every large upload here — expert fills at ~68 MiB, arena slabs up to 2 GiB —
+    /// was landing in the slow band.
+    ///
+    /// CHUNKING RECOVERS ABOUT HALF OF IT, not all, which is not what I predicted:
+    ///     64 MiB chunked  10.3 GiB/s   (vs 6.2 unchunked, vs 21.8 for a lone 16 MiB write)
+    ///    256 MiB chunked   9.8 GiB/s
+    /// So four 16 MiB writes in one frame are not equivalent to one 16 MiB write. The belt is a fixed
+    /// budget per submission, and chunks queued together still exhaust it — just less abruptly than one
+    /// oversized write does. `write_chunked_flushed` tests whether closing the frame between chunks
+    /// recovers the rest; until that is measured on hardware, 1.6x is what this is worth and the claim
+    /// stops there.
     pub const UPLOAD_CHUNK: usize = 16 << 20;
+
+    /// As `write_chunked`, closing the frame between chunks so the staging belt can recycle.
+    ///
+    /// Costs a submit per chunk, which is only worth it if belt exhaustion is really the limit — hence a
+    /// separate function to be measured against the plain one rather than a change to it. If the numbers
+    /// come back equal, the ceiling is elsewhere and this should be deleted rather than kept "just in
+    /// case".
+    pub fn write_chunked_flushed(&self, buf: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let end = (off + Self::UPLOAD_CHUNK).min(bytes.len());
+            self.queue.write_buffer(buf, offset + off as u64, &bytes[off..end]);
+            self.end_frame();   // submit so the belt is released before the next chunk is staged
+            off = end;
+        }
+    }
+
+    /// Test hook for the flushed variant.
+    pub fn write_chunked_flushed_pub(&self, dst: &Tensor, src: &[f32]) {
+        self.write_chunked_flushed(&dst.buf, 0, bytemuck::cast_slice(src));
+    }
 
     /// `write_buffer`, split so each piece stays on the fast path.
     ///
