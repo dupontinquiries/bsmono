@@ -3451,6 +3451,28 @@ memplan's cap is measuring something that no longer applies (see docs/asahi-vram
             let scale = cpu.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
             ck(&format!("swiglu: CPU == GPU (rel={:.2e})", worst / scale), worst / scale < 1e-5);
         }
+        // Attention against the GPU's, which is the op most likely to disagree: the scale, the mask and
+        // the softmax all have to match, and each is individually easy to get right while producing a
+        // different answer together.
+        {
+            // Gpu::attention takes T QUERIES and returns t x d, causally masked — a prefill shape. The
+            // decode case is its LAST row: the final query attending to every key. Comparing a
+            // single-query CPU call against the whole t x d output was my error, and it produced a
+            // confident-looking rel=2.4 that said nothing about either implementation.
+            let (hd, n_past) = (64usize, 12usize);
+            let qall = mk(11, n_past * hd);
+            let k = mk(12, n_past * hd);
+            let v = mk(13, n_past * hd);
+            let q_last = &qall[(n_past - 1) * hd..];
+            let (mut sc, mut cpu) = (Vec::new(), vec![0f32; hd]);
+            gpu_kernels::cpuops::attend_head(q_last, &k, &v, hd, n_past, &mut sc, &mut cpu);
+            let gall = gpu.attention(&qall, &k, &v, n_past, hd);
+            let g = gall[(n_past - 1) * hd..].to_vec();
+            let worst = cpu.iter().zip(&g).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let scale = cpu.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
+            ck(&format!("attention: CPU == GPU (rel={:.2e})", worst / scale), worst / scale < 1e-4);
+        }
+
         println!("gate-cpuops: {}", if ok {
             "the CPU ops agree with the GPU kernels \u{2713}"
         } else {
