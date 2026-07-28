@@ -3396,6 +3396,17 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             let want = gpu_kernels::gguf::dequantize(14, &raw, nblk * 256).expect("cpu q6k");
             let got = gpu.download(&gpu.q6k_dequant(&raw, nblk * 256).expect("gpu q6k"));
             let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            if worst != 0.0 && nblk == 1 {
+                // First divergence, with its neighbours: the PATTERN names the fault. All-zero GPU means
+                // the scale read failed; every 16th wrong means the sub-block scales; scattered means the
+                // 6-bit assembly.
+                println!("      cpu[0..8] = {:?}", &want[..8.min(want.len())]);
+                println!("      gpu[0..8] = {:?}", &got[..8.min(got.len())]);
+                let first = want.iter().zip(&got).position(|(a, b)| (a - b).abs() > 0.0);
+                println!("      first divergence at index {first:?}");
+                let nz = got.iter().filter(|v| **v != 0.0).count();
+                println!("      gpu non-zero: {nz} of {}", got.len());
+            }
             ck(&format!("{label}: GPU == CPU (max|diff|={worst:.3e})"), worst == 0.0);
         }
         // A block whose scales are NEGATIVE: reading them as unsigned silently doubles half the weights,
