@@ -9174,8 +9174,14 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         if n_weights % 256 != 0 { return Err("q6_k: element count not a multiple of 256".into()); }
         let nblk = n_weights / 256;
         if raw.len() < nblk * 210 { return Err("q6_k: data truncated".into()); }
-        let srcbuf = self.upload_bytes(&raw[..nblk * 210], "q6k-src");
-        let src = Tensor { buf: srcbuf, rows: 1, cols: (nblk * 210).div_ceil(4), pool: None, view: None };
+        // PAD THE BUFFER to whole words as well as the view. Rounding the view up without padding the
+        // buffer asks for a range past its end — the view length is what the shader sees, but the
+        // buffer length is what bounds the view.
+        let src_bytes = (nblk * 210).div_ceil(4) * 4;
+        let mut padded = raw[..nblk * 210].to_vec();
+        padded.resize(src_bytes, 0);
+        let srcbuf = self.upload_bytes(&padded, "q6k-src");
+        let src = Tensor { buf: srcbuf, rows: 1, cols: src_bytes / 4, pool: None, view: None };
         let out = self.alloc_resident_words(n_weights);
         let chunk = engine_config().convert_chunk_blocks.max(1);
         let mut b0 = 0usize;
@@ -9188,7 +9194,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             // Every weight then came out zero and the gate reported max|diff| 3.3e5.
             //
             // Padding the BUFFER was not enough: the binding range is what the shader sees.
-            let vlen = ((n * 210).div_ceil(4) * 4).min(nblk * 210 - byte_off + 3 & !3);
+            let vlen = ((n * 210).div_ceil(4) * 4).min(src_bytes - byte_off);
             let view = Tensor { buf: src.buf.clone(), rows: 1, cols: vlen / 4,
                                 pool: None, view: Some((byte_off as u64, vlen as u64)) };
             let dstv = Tensor { buf: out.buf.clone(), rows: 1, cols: n * 256,

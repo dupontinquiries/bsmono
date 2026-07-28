@@ -3391,6 +3391,24 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
                 ((z >> 13) & 0xFF) as u8
             }).collect()
         };
+        // HAND-CHECKED BLOCK FIRST. A single block with known bytes isolates the arithmetic from the
+        // chunking, and prints the first few values from both paths so the divergence is visible rather
+        // than summarised as a max-diff.
+        {
+            let mut raw = vec![0u8; 210];
+            raw[208] = 0x00; raw[209] = 0x3C;          // d = 1.0 (f16)
+            for k in 192..208 { raw[k] = 1; }          // all sub-block scales = +1
+            // ql[0] low nibble = 5, qh[0] bits 0-1 = 0  -> q = 5 - 32 = -27, weight = 1*1*(-27)
+            raw[0] = 0x05;
+            let want = gpu_kernels::gguf::dequantize(14, &raw, 256).expect("cpu");
+            let got = gpu.download(&gpu.q6k_dequant(&raw, 256).expect("gpu"));
+            println!("     hand-checked block, first 4 weights:");
+            println!("       expected (d=1, sc=1, q0=5): {:.1} {:.1} {:.1} {:.1}", -27.0, -32.0, -32.0, -32.0);
+            println!("       cpu  {:.1} {:.1} {:.1} {:.1}", want[0], want[1], want[2], want[3]);
+            println!("       gpu  {:.1} {:.1} {:.1} {:.1}", got[0], got[1], got[2], got[3]);
+            ck("hand-checked block matches the CPU reference",
+               want.iter().take(4).zip(got.iter()).all(|(a, b)| (a - b).abs() == 0.0));
+        }
         for (nblk, label) in [(1usize, "one block"), (37, "37 blocks"), (5000, "5000 blocks (chunked)")] {
             let raw = mk(nblk, 0x51E7 + nblk as u32);
             let want = gpu_kernels::gguf::dequantize(14, &raw, nblk * 256).expect("cpu q6k");
