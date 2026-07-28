@@ -13,6 +13,24 @@
 use crate::gguf::{Gguf, Value};
 use std::collections::HashMap;
 
+/// Bytes dropped during encoding because their mapped char was not in the vocab.
+///
+/// Should be zero for a well-formed byte-level vocab. Non-zero means the prompt the model receives is
+/// not the text that was typed, and every later explanation is chasing a corruption that happened
+/// before inference started.
+pub static ENCODE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Characters dropped during decoding because they were not in the byte table.
+pub static DECODE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One line reporting any silent losses, or None when there were none.
+pub fn drop_report() -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (e, d) = (ENCODE_DROPS.load(Relaxed), DECODE_DROPS.load(Relaxed));
+    if e == 0 && d == 0 { return None; }
+    Some(format!("tokenizer: {e} byte(s) dropped while ENCODING and {d} char(s) while DECODING — the \
+text the model saw is not the text that was typed. A complete byte-level vocab drops nothing"))
+}
+
 pub struct Tokenizer {
     tokens: Vec<Vec<u8>>,
     vocab: HashMap<Vec<u8>, u32>,
@@ -194,7 +212,15 @@ impl Tokenizer {
             let mut syms = Vec::new();
             for &b in chunk.as_bytes() {
                 let key = self.byte_encoder[b as usize].to_string().into_bytes();
-                if let Some(&id) = self.vocab.get(&key) { syms.push(id); }
+                match self.vocab.get(&key) {
+                    Some(&id) => syms.push(id),
+                    // A byte whose mapped char is absent from the vocab was previously DROPPED here,
+                    // silently. The prompt then differs from what the user typed with nothing to say so,
+                    // and every downstream explanation — bad weights, bad sampler — is chasing a
+                    // corruption that happened before the model saw anything. Counted so a load can
+                    // report it; a complete byte-level vocab has all 256 and this stays zero.
+                    None => { ENCODE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                }
             }
             out.extend(self.bpe_merge(syms));
         }
@@ -219,7 +245,15 @@ impl Tokenizer {
                 bytes.extend_from_slice(t);
             } else {
                 let s = String::from_utf8_lossy(t);
-                for c in s.chars() { if let Some(&b) = self.byte_decoder.get(&c) { bytes.push(b); } }
+                for c in s.chars() {
+                    match self.byte_decoder.get(&c) {
+                        Some(&b) => bytes.push(b),
+                        // Same silent drop on the way out. A char that is not in the byte table is
+                        // usually U+FFFD from a lossy conversion above, which means the token bytes were
+                        // not valid in the mapped alphabet — worth counting rather than swallowing.
+                        None => { DECODE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    }
+                }
             }
         }
         bytes
@@ -316,3 +350,49 @@ mod control_stop_tests {
         assert!(t.control_stop_ids().is_empty());
     }
 }
+    #[test]
+    fn a_round_trip_through_byte_level_loses_NOTHING_and_says_so() {
+        // The complaint that prompted this: a model describing plain ASCII input as "Arabic and Persian
+        // letters". Whatever caused that, silent drops in either direction would produce exactly that
+        // class of confusion — the model genuinely receiving different text than was typed — and until
+        // now nothing would have reported it.
+        use std::sync::atomic::Ordering::Relaxed;
+        ENCODE_DROPS.store(0, Relaxed);
+        DECODE_DROPS.store(0, Relaxed);
+
+        // A byte-level vocab covering all 256 mapped chars, as a real one does.
+        let enc = byte_to_unicode();
+        let tokens: Vec<Vec<u8>> = enc.iter().map(|c| c.to_string().into_bytes()).collect();
+        let tk = Tokenizer::new_byte_level(tokens, Vec::new());
+
+        for text in ["hi there", "héllo wörld", "日本語", "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}", "emoji \u{1f600} ok"] {
+            let ids = tk.encode(text);
+            let back = tk.decode(&ids);
+            assert_eq!(back, text, "round trip changed {text:?} into {back:?}");
+        }
+        assert_eq!(ENCODE_DROPS.load(Relaxed), 0, "a complete vocab drops nothing");
+        assert_eq!(DECODE_DROPS.load(Relaxed), 0);
+        assert!(drop_report().is_none(), "and reports nothing when there is nothing to report");
+    }
+
+    #[test]
+    fn an_incomplete_vocab_is_COUNTED_rather_than_swallowed() {
+        // The failure this exists to surface. Drop one byte's mapping and the text silently changes;
+        // previously nothing anywhere would have said so.
+        use std::sync::atomic::Ordering::Relaxed;
+        ENCODE_DROPS.store(0, Relaxed);
+        DECODE_DROPS.store(0, Relaxed);
+        let enc = byte_to_unicode();
+        // omit the mapping for 'z' (0x7a)
+        let tokens: Vec<Vec<u8>> = enc.iter().enumerate()
+            .filter(|(b, _)| *b != 0x7a)
+            .map(|(_, c)| c.to_string().into_bytes()).collect();
+        let tk = Tokenizer::new_byte_level(tokens, Vec::new());
+        let ids = tk.encode("puzzle");
+        let back = tk.decode(&ids);
+        assert_ne!(back, "puzzle", "the text really did change");
+        assert!(ENCODE_DROPS.load(Relaxed) > 0, "and the loss is now counted");
+        let r = drop_report().expect("reported");
+        assert!(r.contains("not the text that was typed"));
+    }
+
