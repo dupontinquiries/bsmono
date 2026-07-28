@@ -883,6 +883,8 @@ impl Gpu {
         // (k·~36 dispatches) in ONE submit, since on Metal encoder setup — not GPU sync — is the
         // wall. A pinned FLUSH_EVERY=8192 used to be silently clamped to 1024 (≈28 tokens), so a
         // 128-window still flushed ~5×; the higher ceiling lets the window actually be one submit.
+        PROGRESS_EVERY.store(std::env::var("LOGSCOPE_PROGRESS_EVERY").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
@@ -1857,6 +1859,26 @@ const REPIN_EVERY: u64 = 16;
 /// probe put break-even at >43%), and `MOE_BYTES` is what that costs in bytes actually moved. Printed
 /// periodically under LOGSCOPE_MOE_STATS=1.
 pub static MOE_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A LOGICAL POSITION marker, printed periodically so a GPU watchdog entry can be placed in the sequence
+/// rather than only on the wall clock.
+///
+/// The distinction matters and I got it wrong once: a watchdog fires a second or two AFTER the GPU
+/// hangs, so the journal timestamp says when the fault was NOTICED, not where the offending work sat.
+/// "43% through the run" is compatible with "the first fill of a phase that starts at 43%" — and with
+/// only two faults, a boundary is at least as likely as a coincidence. Wall time alone cannot separate
+/// them; a periodic (layer, fill, phase) breadcrumb can.
+pub static PROGRESS_EVERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Emit a positional breadcrumb every `n` fills. 0 disables. Set from LOGSCOPE_PROGRESS_EVERY.
+pub fn progress_tick(phase: &str, layer: usize, extra: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let every = PROGRESS_EVERY.load(Relaxed);
+    if every == 0 { return; }
+    let f = MOE_FILLS.load(Relaxed);
+    if f % every != 0 { return; }
+    eprintln!("wgpu-engine: PROGRESS {phase} layer={layer} fills={f} bytes={:.1}GiB {extra}",
+        MOE_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64);
+}
 pub static MOE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_REPINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2944,6 +2966,10 @@ impl Gpu {
                         // LOGSCOPE_STAGE_FENCE=submit restores the old behaviour for A/B, because the wait
                         // costs real time and the hypothesis deserves a measurement rather than my word.
                         if s == 0 {
+                            // The ring wrap IS a candidate boundary, so it is where a breadcrumb is most
+                            // useful: if faults cluster on wrap ticks the ring is implicated, and if they
+                            // fall between them it is not.
+                            progress_tick("ring-wrap", 0, "fence");
                             if std::env::var("LOGSCOPE_STAGE_FENCE").as_deref() == Ok("submit") {
                                 self.end_frame();
                             } else {
