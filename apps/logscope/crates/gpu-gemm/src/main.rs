@@ -3377,6 +3377,44 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-vram") {
+        // Inflate until it pops, verifying each step. Reports the highest total the device actually
+        // HONOURS — which is not the same as the highest it will allocate, and the difference is the
+        // whole reason this is a probe rather than a constant.
+        let gpu = Gpu::new();
+        eprintln!("gate-vram: adapter = {}", gpu.adapter_name);
+        let slab_mb: u64 = std::env::var("LOGSCOPE_PROBE_SLAB_MB").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(1024);
+        let max_gb: u64 = std::env::var("LOGSCOPE_PROBE_MAX_GB").ok()
+            .and_then(|v| v.parse().ok()).unwrap_or(64);
+        println!("  probing in {slab_mb} MiB slabs up to {max_gb} GiB (writes and reads back each one)");
+        let t0 = std::time::Instant::now();
+        let got = gpu.probe_vram_ceiling(slab_mb * (1 << 20), max_gb * (1 << 30));
+        let gib = got as f64 / (1u64 << 30) as f64;
+        // Did it POP, or did it just reach the limit I imposed? Reporting my own ceiling as a discovered
+        // fact would be the same error as the 24 GiB constant this probe exists to question.
+        let popped = got < max_gb * (1 << 30);
+        println!("  {} {gib:.1} GiB in {:.1}s",
+            if popped { "VERIFIED CEILING (allocation failed above this):" }
+            else { "reached the probe's own limit WITHOUT failing — the device honours at least" },
+            t0.elapsed().as_secs_f64());
+        // The figure the engine currently assumes, for comparison.
+        let assumed = gpu_kernels::memplan::gpu_buffer_budget_uma(
+            (192.0 * (1u64 << 30) as f64) as u64, gpu.conservative_vma, true);
+        println!("  engine currently budgets: {:.1} GiB", assumed as f64 / (1u64 << 30) as f64);
+        if !popped {
+            println!("gate-vram: INCONCLUSIVE — raise LOGSCOPE_PROBE_MAX_GB until it fails. A run that \
+stops at the limit it was given has measured the limit, not the device.");
+        } else if gib * (1u64 << 30) as f64 > assumed as f64 * 1.25 {
+            println!("gate-vram: the device honours MORE than the engine budgets — \
+memplan's cap is measuring something that no longer applies (see docs/asahi-vram-ceiling.md)");
+        } else if got == 0 {
+            println!("gate-vram: nothing verified — the probe could not allocate even one slab");
+        } else {
+            println!("gate-vram: the budget is consistent with what the device honours \u{2713}");
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--gate-q6k") {
         // Q6_K on the GPU, against the CPU reference in gguf.rs. Bit-exactness is the bar, not "close":
         // this decides whether Scout's experts can be FILE VIEWS instead of 200 GiB of host copies, and a
