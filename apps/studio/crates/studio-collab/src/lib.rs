@@ -36,6 +36,8 @@
 //! Edits to *different* fields of the same clip (one peer trims, another
 //! changes gain) commute and both survive, because they are separate ops.
 
+pub mod wire;
+
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use studio_core::{ClipId, EditError, Op, Project, Ticks, TrackId};

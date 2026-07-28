@@ -47,7 +47,7 @@ edits exactly reversible, which floats are not.
 | crate | what it is | tests |
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
-| `studio-collab` | convergent op log (Lamport + site), per-peer presence | 6 |
+| `studio-collab` | convergent op log, presence, **the session wire** | 12 |
 | `studio-egui` | timeline on uikit-egui + touch gestures, theater/split modes, panels | 14 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, **transport** | 18 |
@@ -86,8 +86,9 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    `Effect` type is already opaque-by-design so hosts can register kinds.
 3. **Device I/O** — the transport clock and mixdown are done; nothing yet
    hands samples to a sound card or pulls them from a microphone.
-4. **Transport** — the op packets are plain serde; snapclone's `snapclone-dht`
-   already carries signed records between peers and is the obvious carrier.
+4. **A carrier** — the wire format and join protocol are done; something has
+   to actually move the bytes. `snapclone-dht` already carries signed records
+   between peers and is the intended one.
 5. **Block-backed sources** — Audacity's insight that samples live in chunks so
    an edit touches a few blocks, not a file.
 
@@ -263,3 +264,34 @@ only re-seeks past a threshold: correcting every packet stutters the audio,
 never correcting lets drift accumulate, so small offsets are left to the local
 clock and only a real scrub causes a jump. This is the transport-level half of
 theater mode, kept out of the UI because a clock is not a UI concern.
+
+## The wire
+
+`Doc` converges given the ops; `wire` is how a peer gets them. The transport
+underneath is deliberately unspecified — a DHT, a socket, a file and a websocket
+are all "somewhere bytes go".
+
+The codec is hand-rolled rather than a general format, because an op is small,
+fixed-shape and enormously frequent (every nudge of a clip is one) and a general
+encoding would spend more bytes on field names than on the edit. What that buys,
+beyond size:
+
+* **A version byte**, so a peer on an older build refuses the packet instead of
+  silently misreading a struct that gained a field. Unknown op kinds are refused
+  the same way.
+* **Truncation is loud.** Every read is checked, so a short packet returns
+  `None` rather than a half-decoded op. A test feeds every prefix of a valid
+  packet and requires all of them to fail — an edit applied from a corrupt
+  packet would diverge one replica silently, which is the one failure this
+  design exists to prevent.
+* **A stream stays aligned.** `drain` pulls whole packets and leaves the partial
+  tail for the next read, and a packet that fails to decode is *skipped* rather
+  than fatal: the frame length is still trustworthy, so one bad packet must not
+  cost the session every edit after it.
+
+Joining needs no coordination. A newcomer sends `Hello` with the highest Lamport
+clock it has (0 when cold); the peer answers with every op stamped after that.
+Because `integrate` is idempotent and order-independent, the joiner can be
+receiving live edits *while* the catch-up is still arriving — a test does
+exactly that, then replays the entire history again and requires nothing to
+change.
