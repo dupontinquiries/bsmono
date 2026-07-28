@@ -938,6 +938,13 @@ pub struct Chat {
     show_checkpoints: bool,                 // checkpoints panel open
     /// GPU phase-breakdown subpanel open (📊 in the composer bar).
     show_metrics: bool,
+    /// Rolling window of the Thinker's recent output, for the watch strip.
+    watch: logscope::thinkerwatch::ThinkerWindow,
+    /// The whole current reply: the forecast must count fences opened BEFORE the window, since a code
+    /// block started 300 words ago is still open and a window-local count would call it closed.
+    watch_full: String,
+    /// The Liaison's latest condensation, None until the first poll returns.
+    watch_gist: Option<String>,
     /// Messages the reader has explicitly opened, overriding the cliffsnotes collapse. Explicit rather
     /// than sticky-by-default: a reader who opens one long reply usually wants that one, not all of them.
     expanded_msgs: std::collections::HashSet<usize>,
@@ -1038,6 +1045,8 @@ impl Default for Chat {
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            watch: logscope::thinkerwatch::ThinkerWindow::new(),
+            watch_full: String::new(), watch_gist: None,
             expanded_msgs: Default::default(),
             hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
@@ -1206,6 +1215,8 @@ impl Chat {
         }
         match e {
             Evt::Token(t) => {
+                self.watch.push(&t);
+                self.watch_full.push_str(&t);
                 let mut stop = false;
                 let plain = self.backend != BackendKind::Wgpu; // template path stops on <|eot_id|>
                 let mut check_text: Option<String> = None;
@@ -6577,6 +6588,20 @@ impl Chat {
                         if !self.checkpoints.is_empty() {
                             if ui.button(RichText::new(format!("🕘 {}", self.checkpoints.len())).small())
                                 .on_hover_text("Checkpoint history (rollback)").clicked() { self.show_checkpoints = !self.show_checkpoints; }
+                        }
+                        // THINKER WATCH, LEFT of the metrics toggle: what the big model is writing now, condensed,
+                        // plus a forecast inferred from the text's STRUCTURE. Shown only while generating — a strip
+                        // left beside a finished reply reads as current.
+                        if self.stream.is_some() {
+                            let w = logscope::thinkerwatch::Watch {
+                                gist: self.watch_gist.clone(),
+                                forecast: logscope::thinkerwatch::forecast(&self.watch_full),
+                                words_so_far: self.watch.total_words(),
+                            };
+                            ui.label(RichText::new(w.line()).color(theme::DIM()).small())
+                                .on_hover_text("What the Thinker is writing now. The tilde clause is INFERRED from the \
+text's structure — an unclosed fence, an open brace — not predicted by a model.");
+                            ui.add_space(6.0);
                         }
                         if ui.button(RichText::new("📊").small())
                             .on_hover_text("GPU phase breakdown: where the last generation's time went")
