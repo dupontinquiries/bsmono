@@ -50,7 +50,8 @@ edits exactly reversible, which floats are not.
 | `studio-collab` | convergent op log, presence, wire, carrier, **project files** | 25 |
 | `studio-egui` | timeline, touch gestures, theater/split modes, **Helix keys** | 22 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
-| `studio-live` | pattern rack, synths (incl. beatspace), recording, **transport** | 18 |
+| `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
+| `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
 
 ## Realtime collaboration, concretely
 
@@ -396,3 +397,67 @@ press is how an editor feels haunted); and **insert mode must be literal**, so
 naming a track "wd" cannot step a cut and delete a clip. Motions stop at the
 ends instead of wrapping, because an editor that jumps from the last cut back to
 the head on one extra press has lost you.
+
+## Finding things by what was said
+
+Transcript search, voice commands and the command palette look like three
+features and are one: *type or say a phrase, get the thing you meant*. Built
+separately they become three half-good search boxes.
+
+**The insight that makes transcript search correct.** whisper.cpp transcribes a
+**source file**; an editor searches a **timeline**. Those are different
+coordinate spaces, and the difference is not cosmetic — a clip has an in-point
+and a length, so most of a take is usually *not on the timeline at all*. A
+search returning raw transcript offsets will happily send you to a line that was
+trimmed out, and the same line appears twice if the source is used in two clips.
+`TranscriptIndex::find` maps every hit through the clips that reference the
+source: trimmed-away dialogue does not appear, and a line inside two clips
+yields two results — one per place you could actually go. That is the whole
+difference between a search that helps and one you stop trusting after the third
+wrong jump.
+
+**Speakers** are a first-class filter rather than a post-filter, because on a
+two-hour multi-mic session that is the difference between a useful list and 400
+hits. "Where does the second singer come in", "only the interviewer".
+
+**Fast path**: the index is inverted (token → segments), built once, and a query
+is a posting intersection rather than a scan — the palette searches on every
+keystroke, and a palette that stutters is one nobody opens.
+
+**The repertoire** is voiceterm's idea applied to editing: the useful unit is not
+a command but the *sequence you keep repeating* — "split here, delete the left,
+snap the rest up". Recording it once turns a nine-key ritual into three words.
+Steps are ops, so a routine is undoable, shareable and replayable by the same
+machinery as everything else; nothing about voice is special-cased downstream.
+Phrase matching scores token overlap with a bonus for verbatim order and a
+**floor beneath which nothing fires**, because running the *wrong* workflow on
+someone's timeline is far worse than running none. Usage counts break ties, so
+the palette gets better the more you edit.
+
+## Designed, not yet built
+
+The rest of the request, specified rather than hand-waved so it can be picked up
+cleanly:
+
+**Touch feedback in `uikit-egui`.** The pieces worth having are a spring-damper
+`Anim<T>` (critically damped by default, so nothing overshoots into looking
+cheap), a `Ripple` bound to press position, `Squish` on press with the release
+carrying momentum, and a rubber-band overscroll — all frame-rate independent
+(integrate by `dt`, never per-frame constants) and all honouring
+`prefers-reduced-motion`. The reason to put them in the kit rather than in
+Studio: every fleet app then inherits them, and touch feedback that differs per
+app reads as breakage. Default-on for Studio via a `TouchFeel` in the shared
+theme.
+
+**Keyboard hinting for rusty-board.** The board already knows its layout and
+cardinal variants; hinting means surfacing the *next likely keys* — from the
+engine's own prediction — as a transient overlay on the keycaps, plus a
+"what can I swipe from here" ring on long-press. The honest hard part is
+choosing when NOT to hint, since a keyboard that redraws constantly is worse
+than one that never helps.
+
+**whisper.cpp integration.** `Segment` is already whisper's output shape
+(start/end/text/speaker/confidence), so the binding is a decode-and-feed job:
+run the model over a source once, cache the transcript beside the media, and
+`TranscriptIndex::add` it. Deliberately left at the boundary because it needs a
+model file and a machine, not because it is unclear.
