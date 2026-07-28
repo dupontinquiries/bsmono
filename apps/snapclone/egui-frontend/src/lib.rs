@@ -10,7 +10,13 @@
 use egui::Ui;
 use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteColors};
 
-pub const PAGES: [&str; 3] = ["Camera", "Peers", "Settings"];
+pub mod unified_nav;
+pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
+
+/// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
+/// skeleton ("Camera/Peers/Settings") predated the faithful-port pass; "Peers" was never a
+/// Qt page — the roster lives on the FRIENDS page, and Inbox/Wayfinder were missing entirely.
+pub const PAGES: [&str; 5] = unified_nav::PAGE_NAMES;
 
 /// A connected peer (mirrors snapclone-proto; on-device the real roster feeds this).
 #[derive(Debug, Clone)]
@@ -21,6 +27,13 @@ pub struct Peer {
 
 /// The snapclone view: page/subpage nav, a live background, the peer roster, and gesture/theme.
 pub struct Snapclone {
+    /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
+    /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
+    pub bar: UnifiedNav,
+    /// Login overlay visibility, with the Qt ordering rule (MainWindow.cpp): the overlay
+    /// STARTS HIDDEN; if auto-login already succeeded at construction we leave it hidden and
+    /// go straight to camera; otherwise we show it and hide on `login_succeeded`.
+    pub login_visible: bool,
     pub nav: Nav,
     pub bg: LiveBackground,
     pub peers: Vec<Peer>,
@@ -30,7 +43,14 @@ pub struct Snapclone {
 
 impl Snapclone {
     pub fn new(peers: Vec<Peer>) -> Snapclone {
+        Self::new_with_login(peers, true)
+    }
+
+    /// `auto_logged_in` mirrors Qt's construction-time auto-login check.
+    pub fn new_with_login(peers: Vec<Peer>, auto_logged_in: bool) -> Snapclone {
         Snapclone {
+            bar: UnifiedNav::new(),
+            login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
             bg: LiveBackground::new(BgStyle::Aurora),
             peers,
@@ -142,6 +162,11 @@ impl Snapclone {
     }
 }
 
+impl Snapclone {
+    /// Qt's `loginSucceeded` signal: hide the overlay (idempotent, per the ordering rule).
+    pub fn login_succeeded(&mut self) { self.login_visible = false; }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,12 +183,14 @@ mod tests {
         let mut s = app();
         assert_eq!(s.page_name(), "Camera");
         s.swipe_page(1);
-        assert_eq!(s.page_name(), "Peers");
+        assert_eq!(s.page_name(), "Inbox"); // page 1 in the faithful 5-page shell
         s.swipe_page(1);
-        s.swipe_page(1); // clamp at Settings
+        s.swipe_page(1);
+        s.swipe_page(1);
+        s.swipe_page(1); // clamp at Settings (page 4)
         assert_eq!(s.page_name(), "Settings");
         s.swipe_page(-1);
-        assert_eq!(s.page_name(), "Peers");
+        assert_eq!(s.page_name(), "Wayfinder");
     }
 
     #[test]
@@ -172,7 +199,7 @@ mod tests {
         s.nav.go_page(1); // Peers
         s.nav.push_subpage(0); // into a peer detail
         s.swipe_page(1); // should be ignored so content interaction wins
-        assert_eq!(s.page_name(), "Peers");
+        assert_eq!(s.page_name(), "Inbox"); // page 1 is Inbox in the faithful 5-page shell
         assert_eq!(s.nav.subpage(), Some(0));
     }
 
@@ -194,5 +221,82 @@ mod tests {
         prefs.gesture.animation = settings_kit::AnimationStyle::Heavy;
         s.apply_settings(&ctx, &prefs);
         assert_eq!(s.gesture.config_mut().takeover_lock_ms, 220.0);
+    }
+}
+
+#[cfg(test)]
+mod faithful_shell_tests {
+    use super::*;
+
+    #[test]
+    fn five_qt_pages_in_order() {
+        assert_eq!(PAGES, ["Camera", "Inbox", "Friends", "Wayfinder", "Settings"],
+            "the page set must match MainWindow.cpp kPage* exactly");
+    }
+
+    #[test]
+    fn sub_tab_tables_match_the_qt_switches() {
+        assert_eq!(sub_tabs(0), &[] as &[&str], "Camera is not SubTabbed");
+        assert_eq!(sub_tabs(1), &["All", "Unread", "Sent"], "InboxWidget::subTabLabel");
+        assert_eq!(sub_tabs(2), &["All", "Online", "Pending"], "ContactsPage::subTabLabel");
+        assert_eq!(sub_tabs(3), &[] as &[&str], "Wayfinder is not SubTabbed");
+        assert_eq!(sub_tabs(4), &["General", "Camera", "Network", "Storage", "About"],
+            "SettingsPage::subTabLabel");
+    }
+
+    #[test]
+    fn login_overlay_ordering_rule() {
+        // auto-login already succeeded at construction → overlay stays hidden (the Qt bug
+        // this rule exists to prevent: overlay flashing over the camera on first paint)
+        let s = Snapclone::new_with_login(vec![], true);
+        assert!(!s.login_visible);
+        // auto-login not yet fired → shown, then hidden on the signal
+        let mut s = Snapclone::new_with_login(vec![], false);
+        assert!(s.login_visible);
+        s.login_succeeded();
+        assert!(!s.login_visible);
+        s.login_succeeded(); // idempotent
+        assert!(!s.login_visible);
+    }
+
+    fn run_bar(bar: &mut UnifiedNav) {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(480.0, 800.0))),
+            ..Default::default()
+        };
+        #[allow(deprecated)]
+        let _ = ctx.run(raw, |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| { let _ = bar.ui(ui); });
+        });
+    }
+
+    #[test]
+    fn underline_morph_converges_on_the_active_segment() {
+        let mut bar = UnifiedNav::new();
+        bar.page = 1; // Inbox: segments exist
+        run_bar(&mut bar);
+        let start = bar.underline_span().expect("underline after first frame");
+        bar.sub[1] = 2; // jump to "Sent" — the morph should EASE, not snap
+        run_bar(&mut bar);
+        let mid = bar.underline_span().unwrap();
+        assert!(mid.0 > start.0, "morph must move toward the new segment");
+        for _ in 0..40 { run_bar(&mut bar); }
+        let done = bar.underline_span().unwrap();
+        assert!((done.0 - mid.0).abs() > 0.0 || done.0 > start.0);
+        // converged: two more frames barely move it
+        let before = bar.underline_span().unwrap();
+        run_bar(&mut bar);
+        let after = bar.underline_span().unwrap();
+        assert!((after.0 - before.0).abs() < 0.6, "underline must settle ({} -> {})", before.0, after.0);
+    }
+
+    #[test]
+    fn every_page_renders_headless_with_the_bar() {
+        for page in 0..PAGE_NAMES.len() {
+            let mut bar = UnifiedNav::new();
+            bar.page = page;
+            run_bar(&mut bar); // must not panic on any page form (centered vs segmented)
+        }
     }
 }
