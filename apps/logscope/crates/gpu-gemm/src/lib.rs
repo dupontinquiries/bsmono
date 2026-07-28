@@ -9174,28 +9174,31 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
 
     /// Dequantize raw Q6_K bytes to f32 on the GPU.
     ///
-    /// Chunked the same way the Q4_K path is, and for the same reason: one dispatch over a whole
-    /// expert tensor is long enough to trip the firmware watchdog, which on this hardware is not a
-    /// hypothetical — 56 timeouts in a four-minute window is what an oversized dispatch looks like.
-    /// STILL RED, but the fault is now localised to ONE function.
+    /// 210-byte super-block of 256 weights: 128 low-nibble bytes, 64 high-2-bit bytes, 16 SIGNED int8
+    /// sub-block scales, then an f16 `d`. A quant is `nib | (hi2 << 4)`, recentred by -32.
     ///
-    /// Progress by elimination, each step a measurement rather than a guess:
-    ///   1. GPU output was entirely 0.0 — so the scale `d` was reading as zero, not the quants being
-    ///      wrong. FIXED: the binding VIEW was 210 bytes, and a shader viewing it as `array<u32>` sees
-    ///      52 whole words; the f16 scale at bytes 208..209 lives in word 52, past the end. WGSL reads
-    ///      an out-of-range index as ZERO rather than faulting, so every weight scaled by nothing.
-    ///      Padding the BUFFER was not enough — the binding RANGE is what the shader sees.
-    ///   2. Output is now -0.0 uniformly. The sign bit is present, so `d` IS being read; the exponent
-    ///      and mantissa are contributing nothing. That puts the remaining fault inside `f16()` — its
-    ///      normal branch, not the byte extraction and not the 6-bit assembly.
+    /// Exists so Scout's experts can be FILE VIEWS: its `ffn_down_exps` is Q6_K, and one
+    /// non-convertible tensor forces the whole model onto the host-copy path — 200 GiB of traffic per
+    /// generation plus the staging fence that costs most of its submits.
     ///
-    /// The fixture's scale bytes are 0xDB 0xE8 = 0xE8DB: sign 1, exp 26, mant 219 — a normal value of
-    /// order -2^11, which should take `bits = sign<<31 | (exp+112)<<23 | mant<<13`. Getting -0.0 from
-    /// that means the branch is not executing or the shift is being folded away, which one print of
-    /// `exp` from inside the shader would settle.
+    /// STATE: `--gate-q6k` is RED and this is NOT wired into the loader. Two faults found and fixed,
+    /// two remaining:
     ///
-    /// NOT wired into the loader, and must not be until the gate is green: a conversion that is merely
-    /// close would degrade every expert silently.
+    ///   FIXED  `d` at bytes 208..209 fell outside the binding. A 210-byte `array<u32>` exposes 52
+    ///          whole words = 208 bytes, and WGSL reads an out-of-range index as ZERO rather than
+    ///          faulting — so every weight came out `0 * scale * q`. It produced NOTHING rather than
+    ///          something wrong, which is why the arithmetic looked correct on review: it was. Both the
+    ///          view length and the source buffer are now rounded up to whole words; padding the buffer
+    ///          alone was not enough, because the binding RANGE is what the shader sees.
+    ///   FIXED  `dispatch` bound the output with `as_entire_binding()`, ignoring its view, so every
+    ///          chunk wrote at offset 0. Fixed with the bind-group cache key extended to carry the
+    ///          output's offset — the binding alone would have been worse, since a cached group would
+    ///          then be reused with the wrong destination silently.
+    ///   LEFT   37 blocks differ by 5.4e-2 against values up to 3.3e5: a relative error of ~1.6e-7,
+    ///          which is one f32 ULP and therefore an ORDER-OF-OPERATIONS difference, not a logic
+    ///          error. Worth finding anyway — one ULP is harmless in isolation and compounds across 48
+    ///          layers, which is the exact shape of "close enough" this project keeps paying for.
+    ///   LEFT   5000 blocks differ grossly (2.4e8). Separate fault, in the chunked path only.
     pub fn q6k_dequant(&self, raw: &[u8], n_weights: usize) -> Result<Tensor, String> {
         if n_weights % 256 != 0 { return Err("q6_k: element count not a multiple of 256".into()); }
         let nblk = n_weights / 256;
