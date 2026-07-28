@@ -27,6 +27,14 @@ snapclone_add_test(test_AddressClassification test_AddressClassification.cpp)
 # PressFsm is the Qt-free decision core behind PressGesture; its simulation
 # harness replays synthetic novice-style input and needs neither Qt nor the
 # snapclone libraries, so it builds as a plain C++ executable.
+# Trace-channel policy: pure C++, no Qt link needed (that is the point of
+# keeping TraceChannels.cpp Qt-free — the debug policy stays unit-testable).
+add_executable(test_TraceChannels
+    test_TraceChannels.cpp
+    ${PROJECT_SOURCE_DIR}/src/debug/TraceChannels.cpp)
+target_include_directories(test_TraceChannels PRIVATE ${PROJECT_SOURCE_DIR}/include)
+add_test(NAME test_TraceChannels COMMAND test_TraceChannels)
+
 add_executable(test_PressFsm test_PressFsm.cpp)
 target_include_directories(test_PressFsm PRIVATE ${PROJECT_SOURCE_DIR}/include)
 target_link_libraries(test_PressFsm PRIVATE snapclone_warnings)

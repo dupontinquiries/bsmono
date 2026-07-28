@@ -1,4 +1,5 @@
 #include "ui/ModalSurface.hpp"
+#include "debug/Trace.hpp"   // per-event diagnostics: off unless the channel is on
 #include "ui/Theme.hpp"
 
 #include <QResizeEvent>
@@ -108,7 +109,7 @@ QWidget *ModalSurface::present(QWidget *widget, Layer layer,
     // now-null entry and update the container's opacity.
     connect(widget, &QObject::destroyed, this,
             [this, layer](QObject *obj) {
-        qCInfo(lcModal) << "widget destroyed in" << layerName(layer)
+        SC_TRACE_S(Layout, lcModal) << "widget destroyed in" << layerName(layer)
                         << "— calling removeFromStack";
         removeFromStack(static_cast<QWidget *>(obj), layer);
         emit stackChanged();
@@ -163,7 +164,7 @@ QWidget *ModalSurface::present(QWidget *widget, Layer layer,
     widget->raise();
     widget->show();
 
-    qCInfo(lcModal) << "presented" << widget->metaObject()->className()
+    SC_TRACE_S(Layout, lcModal) << "presented" << widget->metaObject()->className()
                     << "into" << layerName(layer)
                     << "stack-size" << ctx.stack.size();
 
@@ -299,7 +300,7 @@ bool ModalSurface::eventFilter(QObject *obj, QEvent *ev)
     // saying "inside=1" when the user thinks they tapped outside, the
     // widget's geometry is wrong. If "inside=0" and we say "dismissing"
     // but the user still sees the scrim, close() isn't destroying.
-    qCInfo(lcModal) << "filter HIT layer=" << layerName(hitLayer)
+    SC_TRACE_S(Layout, lcModal) << "filter HIT layer=" << layerName(hitLayer)
                     << "topmost=" << topmost->metaObject()->className()
                     << "topmost-geom=" << topmost->geometry()
                     << "click=" << localPt
@@ -311,14 +312,14 @@ bool ModalSurface::eventFilter(QObject *obj, QEvent *ev)
     }
     // Tap on the scrim/empty area.
     if (m_dismissOnTap.value(topmost, false)) {
-        qCInfo(lcModal) << "tap-outside dismiss"
+        SC_TRACE_S(Layout, lcModal) << "tap-outside dismiss"
                         << topmost->metaObject()->className()
                         << "from" << layerName(hitLayer)
                         << "deleteOnClose=" << (topmost->testAttribute(Qt::WA_DeleteOnClose) ? 1 : 0);
         topmost->close();
         return true; // consumed
     }
-    qCInfo(lcModal) << "tap-outside NO-DISMISS (dismissOnTap=false)"
+    SC_TRACE_S(Layout, lcModal) << "tap-outside NO-DISMISS (dismissOnTap=false)"
                     << "layer=" << layerName(hitLayer);
     // Non-dismissible — eat the event anyway so it doesn't fall through
     // to layers underneath (we already declared this widget modal).
@@ -337,7 +338,7 @@ void ModalSurface::removeFromStack(QWidget *widget, Layer layer)
     m_widgetLayer.remove(widget);
     m_dismissOnTap.remove(widget);
 
-    qCInfo(lcModal) << "removeFromStack layer=" << layerName(layer)
+    SC_TRACE_S(Layout, lcModal) << "removeFromStack layer=" << layerName(layer)
                     << "stack-size before=" << before
                     << "after=" << ctx.stack.size();
 
@@ -346,7 +347,7 @@ void ModalSurface::removeFromStack(QWidget *widget, Layer layer)
     if (ctx.stack.isEmpty()) {
         ctx.container->setAttribute(Qt::WA_TransparentForMouseEvents, true);
         if (ctx.scrim) ctx.scrim->hide();
-        qCInfo(lcModal) << "layer" << layerName(layer)
+        SC_TRACE_S(Layout, lcModal) << "layer" << layerName(layer)
                         << "now empty — container transparent, scrim hidden";
     }
 

@@ -1,4 +1,5 @@
 #include <QApplication>
+#include "debug/TraceControl.hpp"
 #include <QSettings>
 #include "ui/Theme.hpp"
 #include "ui/UiDebugFlags.hpp"
@@ -134,7 +135,18 @@ int main(int argc, char *argv[])
     // findable) and BEFORE any logging-category-using code runs. Reads
     // settings like "debug/mobileDisplay" and configures QLoggingCategory
     // filter rules accordingly.
-    SnapClone::UI::UiDebugFlags::apply();
+    // Diagnostic tracing: load the saved channel set, let SNAPCLONE_TRACE and
+    // --trace=... override it, print --trace-help if asked, and apply the
+    // logging-category rules. Must run AFTER the QSettings org/app names are
+    // set and BEFORE any category-using code logs.
+    //
+    // This replaces the old UiDebugFlags::apply() call. That function emitted
+    // filter rules for only the categories it knew about, and
+    // QLoggingCategory::setFilterRules REPLACES the whole rule set — so calling
+    // it here would have silently reset every channel a CLI flag had just
+    // enabled. UiDebugFlags now delegates to the same TraceControl, so the
+    // legacy "mobile display debug" checkbox still works.
+    SnapClone::Debug::TraceControl::instance().initFromLaunch(app.arguments());
 
     // ── CLI argument parsing ─────────────────────────────────────────────────
     QCommandLineParser parser;

@@ -1,4 +1,6 @@
 #include "ui/SettingsPage.hpp"
+#include <QSignalBlocker>
+#include "debug/TraceControl.hpp"
 #include "ui/AmbientPaletteDeriver.hpp"     // V32.29: ambient inbox theme
 #include "core/AppController.hpp"            // V32.29: storage access for ambient
 #include "core/AccountManager.hpp"           // reroll + multiple accounts
@@ -1677,6 +1679,92 @@ void SettingsPage::buildDebugFlagsSection(QVBoxLayout *root)
         UiDebugFlags::setMobileDisplayDebug(on);
     });
     layout->addWidget(m_dbgMobileDisplay);
+
+    // ── Diagnostic tracing (per-channel) ───────────────────────────────────
+    // Everything below is OFF in a normal session. These are the per-event
+    // diagnostics — wheel deltas, gesture classification, modal taps, camera
+    // pipeline chatter — that are indispensable while a feature is being built
+    // and pure noise afterwards. Rather than delete them (the next person to
+    // debug a hand-off bug needs exactly those lines, on an installed build,
+    // with no compiler in reach) they are compiled in but gated: a channel that
+    // is off costs one atomic read, and its arguments are never formatted.
+    {
+        using namespace SnapClone::Debug;
+        auto &tc = TraceControl::instance();
+
+        auto *traceBox = makeSection(tr("Diagnostic tracing"), this);
+        auto *tl = new QVBoxLayout(traceBox);
+        tl->setSpacing(Theme::SPACE_SM);
+
+        auto *tIntro = new QLabel(
+            tr("Extra logging for one area at a time. Off by default; turning a "
+               "channel on takes effect immediately and survives a restart, so you "
+               "can catch something that breaks during startup. Warnings and errors "
+               "are never suppressed."), traceBox);
+        tIntro->setWordWrap(true);
+        tIntro->setStyleSheet(QStringLiteral("color: %1; font-size: 12px;")
+                              .arg(QLatin1String(Theme::TEXT_SECONDARY())));
+        tl->addWidget(tIntro);
+
+        auto *status = new QLabel(tc.statusLine(), traceBox);
+        status->setStyleSheet(QStringLiteral("color: %1; font-size: 12px; font-weight: 600;")
+                              .arg(QLatin1String(Theme::TEXT_PRIMARY())));
+        tl->addWidget(status);
+
+        for (std::size_t i = 0; i < kChannelCount; ++i) {
+            const auto ch = static_cast<TraceChannel>(i);
+            auto *cb = new QCheckBox(
+                QStringLiteral("%1 — %2").arg(QString::fromLatin1(name(ch)),
+                                              QString::fromLatin1(help(ch))), traceBox);
+            cb->setChecked(tc.isOn(ch));
+            cb->setToolTip(tr("Also available at launch as --trace=%1 or "
+                              "SNAPCLONE_TRACE=%1").arg(QString::fromLatin1(name(ch))));
+            connect(cb, &QCheckBox::toggled, this, [ch, status](bool on) {
+                auto &t = TraceControl::instance();
+                t.setChannel(ch, on, QStringLiteral("settings page"));
+                status->setText(t.statusLine());
+            });
+            // Reflect changes made elsewhere (CLI at launch, auto-off, the legacy
+            // toggle) so the checkbox never lies about what is actually running.
+            connect(&tc, &TraceControl::changed, cb, [cb, ch, status]() {
+                QSignalBlocker block(cb);
+                cb->setChecked(TraceControl::instance().isOn(ch));
+                status->setText(TraceControl::instance().statusLine());
+            });
+            tl->addWidget(cb);
+        }
+
+        auto *offRow = new QHBoxLayout;
+        auto *offLbl = new QLabel(tr("Turn tracing off automatically after"), traceBox);
+        auto *offSpin = new QSpinBox(traceBox);
+        offSpin->setRange(0, 24 * 60);
+        offSpin->setSuffix(tr(" min"));
+        offSpin->setSpecialValueText(tr("never"));   // 0
+        offSpin->setValue(tc.autoOffMinutes());
+        offSpin->setToolTip(tr("A field build should never quietly fill the disk "
+                               "because a channel was left on. 0 means \"until I turn "
+                               "it off\". Also available as --trace-minutes=N."));
+        connect(offSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [status](int v) {
+            TraceControl::instance().setAutoOffMinutes(v);
+            status->setText(TraceControl::instance().statusLine());
+        });
+        offRow->addWidget(offLbl);
+        offRow->addWidget(offSpin);
+        offRow->addStretch(1);
+        tl->addLayout(offRow);
+
+        // The same words the terminal prints for --trace-help, so a bug reporter
+        // reads one set of instructions no matter where they look.
+        auto *cliHelp = new QLabel(TraceControl::helpTextQ(), traceBox);
+        cliHelp->setWordWrap(true);
+        cliHelp->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        cliHelp->setStyleSheet(QStringLiteral(
+            "color: %1; font-size: 11px; font-family: monospace;")
+            .arg(QLatin1String(Theme::TEXT_SECONDARY())));
+        tl->addWidget(cliHelp);
+
+        root->addWidget(traceBox);
+    }
 
     // ── Live-apply wiring ────────────────────────────────────────────────────
     // We connect each toggle to a lambda that both:

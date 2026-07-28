@@ -12,6 +12,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(SNAPCLONE_BUILD_TESTS       "Build unit tests"                        ON)
 option(SNAPCLONE_BUILD_TOOLS       "Build standalone dev tools (ringtone_workshop)" OFF)
 option(SNAPCLONE_ENABLE_SANITIZERS "Enable ASAN/UBSAN in Debug builds"       OFF)
+# Per-frame / per-sample trace sites (SC_TRACE_HOT) compile to nothing unless
+# this is ON, so a production build pays literally zero for them — not even the
+# atomic read the ordinary SC_TRACE sites cost. Turn it on when you need to
+# instrument a render or audio path in the field:
+#   cmake -B build -DSNAPCLONE_HOT_TRACE=ON
+option(SNAPCLONE_HOT_TRACE "Compile in the highest-volume (per-frame) trace sites" OFF)
+if(SNAPCLONE_HOT_TRACE)
+    add_compile_definitions(SNAPCLONE_HOT_TRACE=1)
+endif()
 option(SNAPCLONE_JAMI_BACKEND      "Enable Jami/dhtnet P2P backend"          OFF)
 # SNAPCLONE_OPENDHT_BACKEND is declared in the backend section below
 option(SNAPCLONE_RUST_CRYPTO       "Use Rust AES-256-GCM crypto backend"     ON)
@@ -680,6 +689,7 @@ endif()
 # silently disable it (camera falls back to the gst-launch / Qt backends) rather
 # than failing the build — so desktop builds without libcamera headers work.
 option(SNAPCLONE_LIBCAMERA "Use the direct libcamera C++ camera backend (preferred on mobile Linux)" ON)
+
 if(SNAPCLONE_LIBCAMERA)
     find_package(PkgConfig)
     if(PkgConfig_FOUND)
