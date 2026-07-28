@@ -510,3 +510,243 @@ mod tests {
         assert!(!draw_model(&mut f, &mb, "no_such_card", 0.0, 0.0, 10.0, 1.0, rgb(0xFFFFFF)));
     }
 }
+
+// ── 3D: folding a card model into a real mesh ───────────────────────────────
+//
+// Slice 10 taught the SOFTWARE renderer to draw card models, but only as a
+// screen-space pass: `render_scene` painted them over the 3D frame with
+// `draw_model`. That left the models stranded on the CPU — `build_scene`'s mesh
+// (and therefore `SceneBuffers`, and therefore the whole wgpu path) could only
+// ever contain the generic diamond stand-ins.
+//
+// `model_mesh` folds a recipe into actual geometry instead: every part becomes
+// an extruded papercraft solid — a front facet, a back facet, and the side walls
+// between them — so a unit is the same object whichever renderer draws it. The
+// extrusion depth is deliberately shallow (a fold has thickness, a sheet is not
+// a box) and every facet stays flat, because `SceneBuffers` derives one normal
+// per triangle and that is the whole look.
+
+/// Local 2D outline for a builtin part, in body units (×size). These mirror the
+/// polygons `draw_part` fills in 2D, so the folded mesh and the drawn card agree
+/// on silhouette; the third dimension is added by extrusion.
+fn builtin_outline(part: &str) -> Vec<(f64, f64)> {
+    match part {
+        "slab" => vec![(-1.0, -0.28), (0.9, -0.32), (1.0, 0.34), (-1.05, 0.36)],
+        "panel" => vec![(-1.0, -0.30), (1.0, -0.32), (1.0, 0.30), (-1.0, 0.30)],
+        "shell" => vec![(-1.0, 0.30), (-0.55, -0.50), (0.55, -0.50), (1.0, 0.30)],
+        "wedge" => vec![(-0.40, 0.10), (0.90, -0.50), (0.50, 0.20)],
+        "wing" => vec![(0.0, -0.40), (0.60, -1.00), (0.50, -0.10)],
+        "spine" => vec![(-0.30, 0.10), (0.0, -0.85), (0.30, 0.10)],
+        "leg" => vec![(-0.18, 0.0), (0.18, 0.0), (0.14, 0.85), (-0.14, 0.85)],
+        "crest" => vec![(-0.45, 0.15), (-0.10, -0.75), (0.20, -0.55), (0.45, 0.15)],
+        "tusk" => vec![(0.0, 0.0), (0.75, -0.35), (0.55, 0.10)],
+        "tail" => vec![(-0.10, 0.0), (0.95, -0.25), (0.85, 0.15), (0.05, 0.28)],
+        "orb" => vec![
+            (-0.35, 0.0), (-0.25, -0.25), (0.0, -0.35), (0.25, -0.25),
+            (0.35, 0.0), (0.25, 0.25), (0.0, 0.35), (-0.25, 0.25),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Extrude a local outline into a papercraft solid at world (x, e, y).
+///
+/// `fdir` mirrors the model to face the other way; `depth` is the sheet's
+/// thickness. Winding is kept consistent so face normals point outward, which
+/// matters to the GPU path even though the shader does not cull.
+#[allow(clippy::too_many_arguments)]
+fn extrude_outline(
+    mesh: &mut crate::render::Mesh,
+    outline: &[(f64, f64)],
+    x: f64,
+    e: f64,
+    y: f64,
+    s: f64,
+    fdir: f64,
+    depth: f64,
+    col: [f32; 3],
+) {
+    use crate::render::v3;
+    if outline.len() < 3 {
+        return;
+    }
+    // local (lx, ly) → world: lx runs across the model, ly runs UP (screen-y is
+    // inverted), and the sheet is offset ±depth along the view axis.
+    let p = |lx: f64, ly: f64, dz: f64| v3(x + lx * s * fdir, e - ly * s, y + dz);
+    let front = shade(col, 1.0);
+    let back = shade(col, 0.72); // the far facet reads darker — a fold, not a cutout
+    let wall = shade(col, 0.86);
+    let n = outline.len();
+    // fan-triangulate both facets (parts are small and convex enough for a fan)
+    for i in 1..n - 1 {
+        let (a, b, c) = (outline[0], outline[i], outline[i + 1]);
+        mesh.tri(
+            p(a.0, a.1, -depth),
+            p(b.0, b.1, -depth),
+            p(c.0, c.1, -depth),
+            front,
+        );
+        mesh.tri(
+            p(c.0, c.1, depth),
+            p(b.0, b.1, depth),
+            p(a.0, a.1, depth),
+            back,
+        );
+    }
+    // side walls close the fold
+    for i in 0..n {
+        let a = outline[i];
+        let b = outline[(i + 1) % n];
+        mesh.quad(
+            p(a.0, a.1, -depth),
+            p(b.0, b.1, -depth),
+            p(b.0, b.1, depth),
+            p(a.0, a.1, depth),
+            wall,
+        );
+    }
+}
+
+/// Fold a card model into 3D geometry at world (x, e, y).
+///
+/// `s` is the body scale in world units, `fdir` ±1 for facing, `team` tints the
+/// paper the way `draw_model` does. Returns false when the book has no such
+/// card, so a caller can fall back to the diamond stand-in.
+#[allow(clippy::too_many_arguments)]
+pub fn model_mesh(
+    mesh: &mut crate::render::Mesh,
+    book: &ModelBook,
+    card: &str,
+    x: f64,
+    e: f64,
+    y: f64,
+    s: f64,
+    fdir: f64,
+    team: [f32; 3],
+) -> bool {
+    let Some(model) = book.models.get(card) else {
+        return false;
+    };
+    let paper = mix(model.paper, team, 0.45);
+    // Parts are folded back-to-front so the painter's-order the 2D pass relies
+    // on still reads correctly when a renderer does not sort (the depth buffer
+    // handles it on the GPU; this keeps the software path honest too).
+    for part in &model.parts {
+        let ps = part.size.max(0.05) * s;
+        let col = shade(paper, part.tone);
+        let cx = x + part.at.0 * s * fdir;
+        let ce = e - part.at.1 * s;
+        let depth = (ps * 0.10).max(s * 0.03);
+        let outline = builtin_outline(&part.part);
+        if !outline.is_empty() {
+            // builtin: extrude its silhouette, raised by the part's height
+            extrude_outline(mesh, &outline, cx, ce - part.h * s * 0.9, y, ps, fdir, depth, col);
+            continue;
+        }
+        let Some(spec) = book.json_parts.get(&part.part) else {
+            continue;
+        };
+        let col2 = shade(paper, part.tone * spec.tone_mult);
+        let base_e = if spec.raised { ce - part.h * s * 1.4 } else { ce };
+        let mirrors: &[f64] = if spec.pair { &[1.0, -1.0] } else { &[1.0] };
+        for &mir in mirrors {
+            match spec.kind.as_str() {
+                "disc" => {
+                    let r = (spec.radius * ps).max(s * 0.05);
+                    mesh.disc(cx, base_e, y, r, 10, col2);
+                }
+                "lines" => {
+                    // a drawn line becomes a thin folded ribbon in 3D
+                    for w in spec.points.windows(2) {
+                        let ribbon = vec![
+                            (w[0].0 * mir, w[0].1 - 0.04),
+                            (w[1].0 * mir, w[1].1 - 0.04),
+                            (w[1].0 * mir, w[1].1 + 0.04),
+                            (w[0].0 * mir, w[0].1 + 0.04),
+                        ];
+                        extrude_outline(mesh, &ribbon, cx, base_e, y, ps, fdir, depth * 0.6, col2);
+                    }
+                }
+                _ => {
+                    // poly and prism both extrude; prism just stands taller
+                    let d = if spec.kind == "prism" { depth * 2.2 } else { depth };
+                    let pts: Vec<(f64, f64)> =
+                        spec.points.iter().map(|&(px, py)| (px * mir, py)).collect();
+                    extrude_outline(mesh, &pts, cx, base_e, y, ps, fdir, d, col2);
+                }
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod mesh_tests {
+    use super::*;
+    use crate::render::Mesh;
+
+    fn book() -> ModelBook {
+        ModelBook::load(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).expect("book")
+    }
+
+    #[test]
+    fn a_card_folds_into_real_3d_geometry() {
+        let b = book();
+        let mut m = Mesh::new();
+        assert!(model_mesh(&mut m, &b, "foldknight", 0.0, 0.0, 0.0, 10.0, 1.0, [0.5, 0.6, 0.9]));
+        assert!(m.tris.len() > 40, "a knight should fold into real geometry ({} tris)", m.tris.len());
+        // it must have DEPTH — a flat sheet in 3D would be a bug, not a fold
+        let (mut zmin, mut zmax) = (f64::MAX, f64::MIN);
+        let (mut ymin, mut ymax) = (f64::MAX, f64::MIN);
+        for t in &m.tris {
+            for p in &t.p {
+                zmin = zmin.min(p.y); zmax = zmax.max(p.y);
+                ymin = ymin.min(p.e); ymax = ymax.max(p.e);
+            }
+        }
+        assert!(zmax - zmin > 0.05, "the fold needs thickness (z span {:.3})", zmax - zmin);
+        assert!(ymax - ymin > 2.0, "the model needs height (y span {:.2})", ymax - ymin);
+    }
+
+    #[test]
+    fn unknown_cards_decline_so_the_caller_can_fall_back() {
+        let b = book();
+        let mut m = Mesh::new();
+        assert!(!model_mesh(&mut m, &b, "no_such_card", 0.0, 0.0, 0.0, 10.0, 1.0, [1.0; 3]));
+        assert!(m.tris.is_empty(), "a declined model must not leave geometry behind");
+    }
+
+    #[test]
+    fn different_cards_fold_into_different_meshes() {
+        let b = book();
+        let mut counts = std::collections::BTreeMap::new();
+        for card in ["foldknight", "mothmage", "inkwitch", "phoenix"] {
+            let mut m = Mesh::new();
+            if model_mesh(&mut m, &b, card, 0.0, 0.0, 0.0, 10.0, 1.0, [0.5, 0.6, 0.9]) {
+                counts.insert(card, m.tris.len());
+            }
+        }
+        assert!(counts.len() >= 3, "the sample cards should all exist");
+        let uniq: std::collections::BTreeSet<_> = counts.values().collect();
+        assert!(uniq.len() > 1, "different recipes must fold to different geometry: {counts:?}");
+    }
+
+    #[test]
+    fn folded_models_reach_the_gpu_buffers() {
+        // The point of the whole slice: a model must survive the trip into the
+        // interleaved buffers the GPU path uploads, with one normal per FACE.
+        let b = book();
+        let mut m = Mesh::new();
+        assert!(model_mesh(&mut m, &b, "foldknight", 0.0, 0.0, 0.0, 10.0, 1.0, [0.5, 0.6, 0.9]));
+        let bufs = crate::gpu::SceneBuffers::from_mesh(&m);
+        assert_eq!(bufs.indices.len(), m.tris.len() * 3, "every triangle indexed");
+        assert_eq!(bufs.vertices.len() % 9, 0, "interleaved pos/nrm/col");
+        // normals are unit-length and per-face: the three vertices of a triangle
+        // share one normal, which is what keeps a crease sharp
+        let v = &bufs.vertices;
+        let i0 = bufs.indices[0] as usize * 9;
+        let n = [v[i0 + 3], v[i0 + 4], v[i0 + 5]];
+        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+        assert!((len - 1.0).abs() < 1e-3, "face normal should be unit length (got {len})");
+    }
+}
