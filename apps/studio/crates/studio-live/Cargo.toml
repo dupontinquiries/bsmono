@@ -1,0 +1,9 @@
+[package]
+name = "studio-live"
+version = "0.1.0"
+edition = "2021"
+description = "Studio's performance half: an FL-style pattern rack with pluggable synths (including beatspace's latent-space beat generator), and punch-in recording that shares takes with collaborators as ops."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+studio-audio = { path = "../studio-audio" }
