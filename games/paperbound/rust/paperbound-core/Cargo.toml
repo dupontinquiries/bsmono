@@ -16,9 +16,22 @@ config-kit = { path = "../../../../shared/config-kit" }
 # the default build stays std-only and 1.75-compatible.
 unendlich-engine = { path = "../../../unendlich/crates/unendlich-engine", default-features = false, features = ["render-core"], optional = true }
 
+# wgpu: the portable GPU path. Chosen over wiring ash directly because the
+# fleet is Metal (M2 Ultra) AND Vulkan (Asahi M2) — wgpu covers both from one
+# source, and its shader front-end (naga) can VALIDATE the WGSL in a unit test
+# with no GPU present, which is what makes this path testable in CI.
+wgpu = { version = "22", optional = true, default-features = false, features = ["wgsl", "metal"] }
+naga = { version = "22", optional = true, features = ["wgsl-in"] }
+pollster = { version = "0.3", optional = true }
+bytemuck = { version = "1", optional = true, features = ["derive"] }
+
 [features]
 default = []
 gpu-engine = ["dep:unendlich-engine"]
+# The wgpu renderer. `wgpu-shader` is the CPU-only slice — WGSL validation and
+# uniform packing — so shader correctness is testable without a GPU or a window.
+wgpu-shader = ["dep:naga", "dep:bytemuck"]
+wgpu-render = ["wgpu-shader", "dep:wgpu", "dep:pollster"]
 
 # gpu_smoke links the unendlich engine — auto-discovery would compile it in
 # default (std-only) builds and fail on the feature-gated gpu::engine module.
