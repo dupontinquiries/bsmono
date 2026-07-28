@@ -883,6 +883,8 @@ impl Gpu {
         // (k·~36 dispatches) in ONE submit, since on Metal encoder setup — not GPU sync — is the
         // wall. A pinned FLUSH_EVERY=8192 used to be silently clamped to 1024 (≈28 tokens), so a
         // 128-window still flushed ~5×; the higher ceiling lets the window actually be one submit.
+        STALL_MS.store(std::env::var("LOGSCOPE_STALL_MS").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         PROGRESS_EVERY.store(std::env::var("LOGSCOPE_PROGRESS_EVERY").ok()
             .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         let flush_every = std::sync::atomic::AtomicU32::new(
@@ -1869,6 +1871,65 @@ pub static MOE_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// them; a periodic (layer, fill, phase) breadcrumb can.
 pub static PROGRESS_EVERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The last dispatch recorded, as (shader source pointer, workgroups, dims[0]).
+///
+/// Kept as raw atomics rather than a String because it is written on EVERY dispatch — tens of thousands
+/// per token — and anything allocating would change the timing of the thing being measured.
+pub static LAST_SHADER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static LAST_WG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LAST_DIM0: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Dispatches recorded so far, so a stall can be located in the sequence.
+pub static DISPATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Stalls observed (a poll that took longer than the threshold).
+pub static STALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds a device poll may take before it is reported as a stall. 0 disables the check.
+///
+/// A GPU hang shows up on our side as a poll that takes SECONDS instead of milliseconds — the kernel
+/// recovers the device and we carry on, so the only trace we normally keep is a journal line with no
+/// idea what was running. Timing the poll ourselves means the fault names the exact operation that
+/// caused it, and two runs answer "is it deterministic" without needing the journal at all.
+pub static STALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record the dispatch about to be submitted, so a stall can name it.
+#[inline]
+pub fn mark_dispatch(pipe_id: usize, wg: (u32, u32, u32), dim0: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if STALL_MS.load(Relaxed) == 0 { return; }
+    // The PIPELINE identity, not a name: pipelines are cached for the process lifetime so the value is
+    // stable and comparable across a run, and storing it is one atomic write on a path taken tens of
+    // thousands of times per token. A String here would allocate and change the timing of the thing
+    // being measured.
+    LAST_SHADER.store(pipe_id, Relaxed);
+    LAST_WG.store(((wg.0 as u64) << 32) | (wg.1 as u64) << 16 | wg.2 as u64, Relaxed);
+    LAST_DIM0.store(dim0, Relaxed);
+    DISPATCH_SEQ.fetch_add(1, Relaxed);
+}
+
+/// Check whether a poll stalled, and if so report exactly what was in flight.
+///
+/// NOT OBSERVED FIRING in the container: lavapipe's polls on the small gate workloads stay under any
+/// useful threshold, so there is nothing here to detect. The wiring is at both blocking polls
+/// (flush_and_wait and the download map) and is gated, but "it compiles and is in the right place" is a
+/// weaker claim than "it fired", and the difference is worth stating.
+///
+/// Reports the SEQUENCE NUMBER as well as the shape: "the 41,203rd dispatch" is what makes two runs
+/// comparable. If the same sequence number stalls twice, the hang is deterministic and can be bisected;
+/// if it moves, it is a race and bisection would waste a day.
+pub fn check_stall(started: std::time::Instant, _unused: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let thresh = STALL_MS.load(Relaxed);
+    if thresh == 0 { return; }
+    let ms = started.elapsed().as_millis() as u64;
+    if ms < thresh { return; }
+    STALLS.fetch_add(1, Relaxed);
+    let wg = LAST_WG.load(Relaxed);
+    eprintln!("wgpu-engine: STALL {ms} ms at dispatch #{} — wg=({},{},{}) dim0={} pipe={:#x} \
+(a poll this long is a GPU hang; the kernel recovers and we continue)",
+        DISPATCH_SEQ.load(Relaxed), (wg >> 32) as u32, ((wg >> 16) & 0xFFFF) as u32, (wg & 0xFFFF) as u32,
+        LAST_DIM0.load(Relaxed), LAST_SHADER.load(Relaxed));
+}
+
 /// Emit a positional breadcrumb every `n` fills. 0 disables. Set from LOGSCOPE_PROGRESS_EVERY.
 pub fn progress_tick(phase: &str, layer: usize, extra: &str) {
     use std::sync::atomic::Ordering::Relaxed;
@@ -2205,6 +2266,7 @@ impl Gpu {
             self.submit(enc);
         }
         let slice = staging.slice(..);
+        let t_dl_poll = std::time::Instant::now();
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let t_sync = std::time::Instant::now();
         GPU_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -2212,6 +2274,7 @@ impl Gpu {
         let data = slice.get_mapped_range();
         let v = bytemuck::cast_slice(&data).to_vec();
         drop(data); staging.unmap();
+        check_stall(t_dl_poll, 0);   // a readback that waited seconds is a hang, not a slow kernel
         self.clear_retained(); // poll waited for completion → retained dims/bind-groups are safe to free
         // REOPEN THE FRAME. Taking it above is necessary — the readback has to be submitted to be read —
         // but leaving it closed meant every subsequent dispatch took `dispatch`'s no-frame branch, which
@@ -2410,7 +2473,9 @@ impl Gpu {
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
         }
+        let t_poll = std::time::Instant::now();
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        check_stall(t_poll, 0);
         self.clear_retained();
     }
 
@@ -2566,6 +2631,7 @@ impl Gpu {
             if cache.len() < BG_CACHE_CAP { cache.insert(key, bg.clone()); }
         }
         GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        mark_dispatch(pipe_ptr, wg, dims.first().map(|b| *b as u32).unwrap_or(0));
         self.record_dispatch(pipeline, &bg, wg, Some(&dbuf));
     }
 
