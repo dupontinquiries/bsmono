@@ -130,6 +130,16 @@ impl Tokenizer {
     }
 
     pub fn vocab_size(&self) -> usize { self.tokens.len() }
+
+    /// Does this vocabulary carry a given special token?
+    ///
+    /// The capability check for model-specific wire formats — Gemma's `<|file_separator|>` being the
+    /// first. Sending such a token to a model that lacks it does NOT error: it tokenizes as a dozen
+    /// literal punctuation characters the model has never seen arranged that way, and the reply
+    /// degrades in a manner that looks like the model being bad at the task rather than like a
+    /// protocol mistake. Deciding from the vocab is exact; deciding from a model NAME is wrong at
+    /// every edge — a finetune, a requant, a renamed file.
+    pub fn has_special(&self, text: &str) -> bool { self.special_id(text).is_some() }
     pub fn is_byte_level(&self) -> bool { self.byte_level }
 
     /// Greedy lowest-rank merge over a symbol-id sequence.
