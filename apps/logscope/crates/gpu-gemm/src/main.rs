@@ -3443,7 +3443,7 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             "Q6_K converts on the GPU, bit-exact \u{2713} — expert file views are unblocked"
         } else {
             "FAIL \u{2717} — KNOWN RED, the kernel is not correct yet and is NOT wired into the loader. \
-See Gpu::q6k_dequant for the two candidate faults."
+See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
