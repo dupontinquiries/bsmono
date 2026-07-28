@@ -12,6 +12,8 @@
 //! collaborative editor whose collaboration is invisible is just an editor with
 //! a surprising undo history.
 
+pub mod touch;
+
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use studio_collab::Doc;
 use studio_core::{ClipId, Project, Ticks, TrackId, TrackKind, TICKS_PER_SECOND};

@@ -48,8 +48,9 @@ edits exactly reversible, which floats are not.
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
 | `studio-collab` | convergent op log (Lamport + site), per-peer presence | 6 |
-| `studio-egui` | timeline on uikit-egui: ruler, tracks, clips, waveforms, presence overlay | 7 |
+| `studio-egui` | timeline on uikit-egui + touch gestures, theater/split modes, panels | 14 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
+| `studio-live` | FL-style pattern rack, pluggable synths (incl. beatspace), punch-in recording | 9 |
 
 ## Realtime collaboration, concretely
 
@@ -152,3 +153,72 @@ are easy to get backwards: half gain is 6 dB down, a muted track is silent, and
 DAW shares and every reimplementation inverts once). Silence reports
 `-inf` dBFS rather than a magic `-100.0`, so a caller cannot mistake "very
 quiet" for "nothing".
+
+## The rack (the FL half)
+
+Audacity's model is a tape recorder; FL Studio's is a step rack. An editor with
+only one is annoying in a predictable way — you bounce a loop to audio just to
+place it, or draw a hundred identical clips because there is no pattern to
+repeat. Studio keeps the timeline as the arrangement and adds the rack as a
+**generator**: a pattern placed on the timeline is a clip whose source is
+synthesised rather than decoded, so collaboration, undo and mixdown do not care
+where the samples came from.
+
+Patterns are bitmasks per channel, not `Vec<bool>` — a rack is edited by
+toggling single steps thousands of times a session, and a pattern that fits in
+a word is trivially cheap to send to a collaborator.
+
+### beatspace as a synth type
+
+`apps/beatspace` is a mel-spectrogram GAN that walks a latent space and
+crossfades generated beats; its player already exposes `next_sample()`, which
+*is* the `Synth` interface. So it becomes a synth **kind** whose "note" is a
+position in latent space: `SynthKind::Beatspace { z, crossfade }`. A pattern
+step can move `z`, which turns latent drift into sequenced automation instead of
+a live-only thumb gesture.
+
+The model is **not linked here**. `SynthKind` is a description; a host with
+beatspace loaded registers a renderer, and a host without one still opens, edits
+and plays the project — the beatspace channel is simply silent. A test pins
+that, because a project that fails to open because a plugin is missing is the
+worst failure mode a DAW has.
+
+## Recording, and why takes are ops
+
+`Recorder` captures interleaved input while armed (audio before you hit record
+can never leak into a take), tracks a peak for the meter with reset-on-read so
+a transient is never missed between frames, and commits via **`commit_ops`** —
+returning `AddSource` + `AddClip` rather than mutating.
+
+That is the whole trick: a take reaches a collaborator's timeline by exactly the
+mechanism a drag does. Recording is not special-cased in the sync layer, which
+is why sharing it works at all.
+
+## Phones, and the two ways to watch a session
+
+Both source editors assume a mouse and a big screen. The useful touch set is
+small and must be unambiguous, because a misread gesture in an editor destroys
+work: one finger drags, two fingers pinch to zoom about their midpoint, two
+fingers slide to pan, long-press is the context action (there is no right
+button), double-tap zooms to fit.
+
+Telling pinch from pan is the whole problem, since fingers never move purely.
+The recognizer compares change-in-spread against change-in-midpoint, requires
+one to dominate by 1.6× *and* the gesture to have moved more than 12px before
+committing, then **holds that decision for the rest of the gesture** — which is
+what stops a timeline lurching between zooming and panning mid-drag. Tests pin
+all three: a clear pinch, a clear slide, jitter deciding nothing, and a
+committed pinch surviving pure translation.
+
+**Theater vs Split** is not cosmetic. In theater there is one program view and
+one playhead — the session's, not yours — for a director and an editor looking
+at the same cut. In split everyone keeps their own playhead and peers show as
+markers, which is divide-and-conquer and where a long-form edit spends most of
+its life. The mode decides whether your scrub is *broadcast*; getting that
+backwards is the most annoying thing a collaborative editor can do, so it is a
+mode and not a buried preference. Theater falls back to your own playhead if the
+host goes quiet, because a frozen picture is worse than a slightly wrong one.
+
+On a narrow screen the editor shows **one solid panel at a time** (Timeline,
+Rack, Mixer, Program). Translucent floating panels over a timeline are
+unreadable at six inches and impossible to hit accurately.
