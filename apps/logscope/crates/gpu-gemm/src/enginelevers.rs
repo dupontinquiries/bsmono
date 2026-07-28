@@ -109,11 +109,13 @@ slot overwritten under a running dispatch corrupts weights silently" },
         validated_by: Some("--gate-q4k"),
         why: "an ESCAPE HATCH, not an optimization: setting it restores the CPU conversion path. Named \
 negatively so the fast path is what you get by not thinking about it" },
-    Lever { var: "LOGSCOPE_ZEROCOPY", default: Default_::Off,
-        platform: Platform::NeedsFeature("VK_EXT_external_memory_host"),
-        validated_by: Some("--gate-zerocopy"),
-        why: "importing host memory directly. Measured ABSENT on Honeykrisp, so it stays off there by \
-detection rather than by default — llama.cpp cannot import on that device either" },
+    Lever { var: "LOGSCOPE_ZEROCOPY", default: Default_::Off, platform: Platform::Any,
+        validated_by: Some("--gate-zerocopy (measures the extension as ABSENT on Honeykrisp)"),
+        why: "IMPOSSIBLE ON ASAHI, not merely unavailable. `drm_asahi_gem_create` takes size, flags, \
+vm_id — and the flags are WRITEBACK and VM_PRIVATE. There is no userptr and no host-pointer import in \
+the UAPI at all, so VK_EXT_external_memory_host cannot be implemented by Mesa; it would need a kernel \
+ABI change and a matched kernel/Mesa pair thereafter. PARKED: do not spend more effort here. On Metal \
+the arena's map-at-creation path already achieves the same end without the extension" },
 ];
 
 /// Levers that are on by default without anything validating them. Must be empty.
