@@ -7697,6 +7697,10 @@ host-copy path (dequantize + requantize every expert into RAM)");
 file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             }
         }
+        // Report any silent tokenizer losses. Zero for a well-formed byte-level vocab; non-zero means
+        // the prompt differs from what was typed, and no amount of engine debugging downstream will
+        // explain it.
+        if let Some(r) = crate::tokenizer::drop_report() { eprintln!("wgpu-engine: {r}"); }
         let converted = self.flush_q4k();
         // The load pass read the whole file; hand that page cache back rather than holding ~61 GiB
         // resident for the life of the process.
