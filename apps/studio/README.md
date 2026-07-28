@@ -48,6 +48,7 @@ edits exactly reversible, which floats are not.
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
 | `studio-collab` | convergent op log (Lamport + site), per-peer presence | 6 |
+| `studio-egui` | timeline on uikit-egui: ruler, tracks, clips, presence overlay | 7 |
 
 ## Realtime collaboration, concretely
 
@@ -81,8 +82,8 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    decode, `ffmpeg` via CLI for video, keeping the core codec-free.
 2. **Audio render graph** — mix tracks, apply effects, produce samples. The
    `Effect` type is already opaque-by-design so hosts can register kinds.
-3. **egui frontend** on `uikit-egui`: timeline view, waveform, transport, and
-   peer playheads drawn from `Doc::peers` (the collaboration UI is the point).
+3. **Waveforms and transport** for the egui frontend — the timeline, ruler,
+   tracks, clips and the presence overlay exist; peak data and playback do not.
 4. **Transport** — the op packets are plain serde; snapclone's `snapclone-dht`
    already carries signed records between peers and is the obvious carrier.
 5. **Block-backed sources** — Audacity's insight that samples live in chunks so
@@ -91,3 +92,30 @@ the model, undo, and convergence. What does not exist yet, in rough order:
 A test found the one real bug in this pass: `rebuild()` originally replayed the
 op log from an empty project and erased every track and source that pre-dated
 the session. A `Doc` now remembers the project it opened.
+
+## The timeline view
+
+`studio-egui` keeps its arithmetic — time↔pixel, clip rectangles, hit testing,
+snapping — in plain functions with no `Ui` in sight, for the same reason
+snapclone's trace policy is Qt-free: that is the part which is easy to get
+subtly wrong, and it is only testable if nothing needs a window. The drawing
+code is then a thin pass over those results.
+
+Three behaviours are pinned by tests because they are the ones every
+reimplementation gets wrong:
+
+* **Zoom holds the frame under the cursor.** Every editor does this; almost
+  every rewrite forgets it and zooms about the viewport's left edge instead.
+* **Hit testing is row-aware.** The same x on a different track is a different
+  clip — a row-agnostic test produces exactly the confusion you would expect.
+* **Snapping ignores the clip being dragged.** Otherwise a clip snaps to itself
+  and will not move at all, which reads as the editor being broken.
+
+The presence overlay is why the whole thing exists: peer playheads are drawn
+above the clips in a per-site colour that is stable across machines, and any
+clip a peer is working in gets a warning edge. `peers_on` is track-aware —
+being inside a clip's time span is necessary but not sufficient, because a peer
+scrubbing the video track is not editing the audio clip under the same instant.
+A peer who declares no active track still matches on time alone, so the warning
+degrades to "someone is around here" rather than vanishing. (A test caught that:
+it originally flagged both clips under one playhead.)
