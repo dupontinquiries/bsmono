@@ -47,7 +47,7 @@ edits exactly reversible, which floats are not.
 | crate | what it is | tests |
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
-| `studio-collab` | convergent op log, presence, **the session wire** | 12 |
+| `studio-collab` | convergent op log, presence, wire, **carrier adapter** | 19 |
 | `studio-egui` | timeline on uikit-egui + touch gestures, theater/split modes, panels | 14 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, **transport** | 18 |
@@ -86,9 +86,9 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    `Effect` type is already opaque-by-design so hosts can register kinds.
 3. **Device I/O** — the transport clock and mixdown are done; nothing yet
    hands samples to a sound card or pulls them from a microphone.
-4. **A carrier** — the wire format and join protocol are done; something has
-   to actually move the bytes. `snapclone-dht` already carries signed records
-   between peers and is the intended one.
+4. **Publishing to a live DHT** — session keys, chunking and reassembly are
+   done and tested against the awkward carrier shape; what remains is calling
+   `snapclone-dht`'s put/get from a running node.
 5. **Block-backed sources** — Audacity's insight that samples live in chunks so
    an edit touches a few blocks, not a file.
 
@@ -295,3 +295,34 @@ Because `integrate` is idempotent and order-independent, the joiner can be
 receiving live edits *while* the catch-up is still arriving — a test does
 exactly that, then replays the entire history again and requires nothing to
 change.
+
+## Surviving a real carrier
+
+`wire` says what a packet looks like; `carrier` says how it survives something
+that actually moves bytes. `snapclone-dht` is the intended one, and its shape is
+the awkward case worth designing against: records have a **size cap**, delivery
+is **unordered and lossy**, and storage is **keyed rather than streamed** — there
+is no connection to carry framing.
+
+A single clip nudge fits a record easily. The catch-up that brings a joiner up
+to date does not: a few hundred ops is tens of kilobytes against a DHT value
+measured in low kilobytes. So packets are **chunked**, with enough header to
+rebuild them, and a packet that already fits still becomes one chunk so the
+receiving path has one shape to handle instead of two.
+
+The `Reassembler` tolerates duplicates and reordering because the carrier
+produces both as normal behaviour, not as edge cases. The subtle part is that a
+**duplicate must not be counted twice** — otherwise a message "completes" while
+still missing a piece, hands up a truncated packet, `Packet::decode` rejects it,
+and the edit is lost for good. A test feeds the same first chunk three times and
+requires that only the genuinely last piece completes the message.
+
+What this deliberately does **not** do is retransmission or ordering. `Doc` is
+already idempotent and order-independent, and a lost chunk is recovered by the
+joiner asking again — building a reliability layer on top of a CRDT is solving a
+problem the CRDT already solved.
+
+Session keys are derived from the session name by the same FNV-1a fold
+snapclone uses for sc-IDs, so every participant computes the same key without
+being told it, and a short name still fills all 20 bytes instead of clustering
+near zero.
