@@ -311,6 +311,26 @@ pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: b
     (ram_budget / 2).min((cap * GIB) as u64)
 }
 
+/// The budget, preferring a MEASURED ceiling over either constant.
+///
+/// Both 24.0 and 48.0 are guesses that have outlived their evidence. `--gate-vram` measures what the
+/// device actually honours — 63 GiB on an M2 Ultra where the constant said 24 — and a measurement
+/// should win over a number nobody has checked since it was written.
+///
+/// Worth recording what a read of the driver added, because it changes what the measurement MEANS: the
+/// GPU virtual address space is 512 GiB (`UAT_IAS = 39`), and a run mapping ~110 GiB across three
+/// models sits at 21% of it. So the "Failed to allocate BO VMA" the probe hits at 63 GiB is NOT address
+/// space exhaustion. Something else is bounded — and until that is identified, a measured number is the
+/// only trustworthy input, because no constant can encode a limit whose mechanism is unknown.
+pub fn gpu_budget_preferring_measurement(ram_budget: u64, conservative_vma: bool, unified: bool,
+                                         measured_gib: f32) -> u64 {
+    match budget_from_measurement(measured_gib) {
+        // Still bounded by RAM: honouring an allocation is not the same as it being wise to make.
+        Some(b) => b.min(ram_budget / 2),
+        None => gpu_buffer_budget_uma(ram_budget, conservative_vma, unified),
+    }
+}
+
 const GIB: f64 = (1u64 << 30) as f64;
 pub fn gib(bytes: u64) -> f64 { bytes as f64 / GIB }
 
@@ -637,6 +657,24 @@ mod rss_tests {
         else { assert_eq!(a + f, t, "the two halves must reconcile to the total"); }
     }
 }
+    #[test]
+    fn a_measurement_replaces_the_constant_but_RAM_still_bounds_it() {
+        let ram = (192.0 * GIB) as u64;
+        // measured: 63 GiB -> 75% = ~47, well under RAM/2, so the measurement governs
+        let m = gpu_budget_preferring_measurement(ram, true, true, 63.0);
+        let c = gpu_buffer_budget_uma(ram, true, true);
+        assert!(m > c, "measured {:.0} must beat the 24 GiB constant {:.0}", gib(m), gib(c));
+
+        // unprobed falls back to the constant rather than to nothing
+        assert_eq!(gpu_budget_preferring_measurement(ram, true, true, 0.0), c);
+
+        // and a huge measurement is still bounded by RAM: honouring an allocation is not the same as
+        // it being wise to make, and the probe deliberately allocates past what a real run should.
+        let small_ram = (8.0 * GIB) as u64;
+        let big = gpu_budget_preferring_measurement(small_ram, false, true, 500.0);
+        assert!(big <= small_ram / 2, "RAM still bounds it: {:.1} GiB", gib(big));
+    }
+
     #[test]
     fn a_measurement_outranks_the_constant_but_keeps_a_margin() {
         // The constant said 24 GiB; --gate-vram measured 63 on the same device. A measurement has to
