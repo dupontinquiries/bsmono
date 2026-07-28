@@ -94,6 +94,24 @@ pub fn threads_for(bytes: u64, available: usize) -> usize {
     want.min(available.max(1))
 }
 
+// ROW BLOCKING WAS TRIED AND IS SLOWER. Kept as a note rather than code.
+//
+// The idea: one row at a time re-walks the whole activation vector per row, so processing four rows
+// together should read it once for four and keep it in L1 while the weights stream past. The reasoning
+// is sound and the measurement disagrees:
+//
+//     per-row  : 19.97 ms   1.3 GiB/s
+//     blocked  : 26.10 ms   1.0 GiB/s   (-23.5%)
+//
+// The 2-D accumulator `[[f32; LANES]; ROW_BLOCK]` does not stay in registers. Per-row, the single
+// `[f32; LANES]` lives in registers for the whole loop; blocked, it spills, and the reload traffic
+// costs more than the saved activation reads win. The activation was already hot in L1 anyway — it is
+// 20 KiB and re-read immediately — so the term being optimized away was close to free to begin with.
+//
+// Recorded because the argument for it is good enough that someone will propose it again, and because
+// deleting a plausible optimization on the strength of a measurement is the same call as removing the
+// per-token arena in _231.
+
 /// Q8_0 matvec across threads, weights read straight from the mapped file.
 ///
 /// `raw` is the whole weight tensor as it sits on disk: `n_rows` rows of `k` weights, each row
