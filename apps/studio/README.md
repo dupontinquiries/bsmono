@@ -52,6 +52,7 @@ edits exactly reversible, which floats are not.
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
+| `studio-fx` | EQ, compressor, limiter, transform, colour, retiming | 12 |
 
 ## Realtime collaboration, concretely
 
@@ -461,3 +462,50 @@ than one that never helps.
 run the model over a source once, cache the transcript beside the media, and
 `TranscriptIndex::add` it. Deliberately left at the boundary because it needs a
 model file and a machine, not because it is unclear.
+
+## The plugins
+
+Nothing in `studio-fx` is novel, and that is exactly why it is worth having: EQ,
+dynamics, transform, colour and retiming are **settled**, with textbook-correct
+behaviour that can be asserted instead of eyeballed. Each is a plain struct with
+a `process` and no allocation in the hot path, so the same code runs in a render
+and in a realtime callback. `instantiate` turns a project's stored
+`Effect { kind, params }` into a running instance, or declines — so a project
+made with a plugin you lack still opens.
+
+**EQ** is RBJ-cookbook biquads in Direct Form I, which costs one extra state
+variable and behaves markedly better when coefficients change under a moving
+knob. Frequencies are clamped *before* the trig, because a user can drag a
+slider past Nyquist and NaN coefficients emit a burst of noise. The curve drawn
+in the UI is computed from the coefficients rather than measured, so the display
+cannot disagree with the filter.
+
+**Compressor**: dB-domain detection, separate attack and release, and a
+quadratic soft knee that is continuous in *slope* as well as value — a slope
+discontinuity is precisely what makes a compressor sound like it is grabbing. A
+test walks the curve and refuses a slope jump.
+
+**Limiter**: a compressor at infinite ratio with real lookahead. The first cut
+had the classic bug — gain computed from the incoming sample but applied to the
+delayed one, so a transient dropped the gain while an old quiet sample was
+passing and it had released again by the time the loud one emerged. The test
+caught it leaking 1.03 against a 0.91 ceiling. The gain now accounts for every
+sample still inside the window, which is O(window) per sample; a monotonic deque
+would make it O(1) and is the right optimisation later, but being audibly
+correct first is worth more than being fast at letting samples through.
+
+**Transform** stores normalised fractions rather than pixels, so a project
+survives a resolution change, and exposes `invert` because what a renderer
+actually needs is "for this output pixel, where do I sample?" — a test round-trips
+both directions, since `apply` and `invert` disagreeing shifts the picture.
+
+**Colour** applies lift → gamma → gain in that order (changing it silently
+changes the look of every existing project) and desaturates on Rec.709 luma, not
+a flat average — the classic error that turns skin tones grey-green.
+
+**Retiming** is where naive implementations break, because the useful question
+is not "how fast" but "given a timeline instant, which source instant do I
+read". For a ramp that is the **integral** of the speed curve, not the speed:
+ramping 1× → 3× over ten seconds consumes twenty seconds of source and the
+halfway point sits at 7.5s, not 10s. Getting it wrong drifts picture against
+sound across the ramp while both look individually correct.
