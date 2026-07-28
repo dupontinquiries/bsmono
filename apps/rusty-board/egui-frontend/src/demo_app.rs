@@ -9,7 +9,7 @@
 use eframe::egui;
 
 use crate::real_layout::{Press, RealBoard};
-use crate::swipe::{candidate_bar, draw_trail, SwipeState};
+use crate::swipe::{candidate_bar, draw_trail_styled, set_trail_debug_styling, trail_debug_styling, SwipeState, TrailStyle};
 use crate::{apply_theme, keyboard_ui, Board};
 use uikit_egui::Adaptive;
 
@@ -20,6 +20,9 @@ struct Feel {
     real: RealBoard,
     real_active: bool,
     typed: String,
+    /// Which gesture category the live trail is showing — only visible when trail debug
+    /// styling is on (see the Diagnostics toggle). Recomputed as the gesture is classified.
+    trail_style: TrailStyle,
     /// Swipe typing: the live path, the trail, and the ranked words (board-gestures does the
     /// recognition — the same decoder the GTK app runs).
     swipe: SwipeState,
@@ -28,6 +31,7 @@ struct Feel {
 impl Feel {
     pub fn new() -> Feel {
         Feel {
+            trail_style: TrailStyle::Solid,
             board: Board::new(),
             real: RealBoard::new(),
             real_active: false,
@@ -54,6 +58,19 @@ impl eframe::App for Feel {
         apply_theme(ctx);
 
         egui::Panel::top("out").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // A diagnostic that ships switched off and is reachable without a rebuild —
+                // the same bargain as snapclone's trace channels. On device this is what tells
+                // you whether a gesture was read as cardinal, swipe, or nothing at all.
+                let mut dbg = trail_debug_styling();
+                if ui.checkbox(&mut dbg, "trail shows gesture category").changed() {
+                    set_trail_debug_styling(dbg);
+                }
+                if dbg {
+                    ui.label(egui::RichText::new("dots = cardinal · stripes = swiped word · grey = ignored")
+                        .weak().small());
+                }
+            });
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("layout: {}", self.board.current().name)).strong());
                 ui.separator();
@@ -149,7 +166,11 @@ impl eframe::App for Feel {
                     }
                     if self.swipe.is_active() {
                         let colors = uikit_egui::palette_colors(self.board.palette());
-                        draw_trail(ui, self.swipe.path(), colors.accent);
+                        // The trail carries the gesture CATEGORY when debug styling is on:
+                        // dots = the cardinal grid claimed it, stripes = it decoded as a
+                        // swiped word, grey = nothing useful. Off by default, so the normal
+                        // case is one accent line and the style argument costs an atomic read.
+                        draw_trail_styled(ui, self.swipe.path(), colors.accent, self.trail_style);
                         ctx.request_repaint();
                     }
                 });
