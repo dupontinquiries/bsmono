@@ -12,11 +12,13 @@
 pub mod mesh;
 pub mod ray;
 pub mod sdf;
+pub mod spine;
 
 use glam::Vec3;
 pub use mesh::{dual_contour, MeshOpts, TriMesh};
 pub use ray::{Hit, Ray, raycast};
-pub use sdf::Sdf;
+pub use sdf::{Sdf, Section};
+pub use spine::{Grower, Node, Spine, Turtle};
 
 /// One named solid in the model. `id` is assigned by evaluation order (the forge document owns
 /// NAMES; ids are ephemeral render/pick handles — "names not IDs" per games/EDITORS.md).
