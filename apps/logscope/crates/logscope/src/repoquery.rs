@@ -183,6 +183,129 @@ pub fn parse_request(reply: &str) -> Option<Query> {
     }
 }
 
+// ── Two-step negotiation ────────────────────────────────────────────────────────────────────────
+//
+// The Thinker asks for context; the Liaison runs the fetch and sees the result FIRST, then offers a
+// PREVIEW — a truncated body plus how much was withheld. The Thinker answers "enough" or "send it all",
+// and only the second case spends its context on the full text.
+//
+// The obvious failure is a preview that hides the useful part, so the Thinker says "enough" and answers
+// from a slice it actively declined to complete. That is worse than no preview, because the Thinker has
+// now made a decision it believes was informed. Two things guard it: the preview always states how many
+// characters and lines were withheld, and `Preview::looks_sufficient` is advisory only — the Thinker
+// decides, never the Liaison.
+//
+// The subtler failure is the Thinker always saying "send it all", which makes the preview pure overhead
+// — a round trip and a small model's forward pass to learn nothing. `Negotiation::preview_is_paying`
+// tracks the accept rate so a caller can stop previewing when it stops helping.
+
+/// Where a context request has got to.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Stage {
+    /// The Thinker asked; nothing fetched yet.
+    Requested(Query),
+    /// Fetched, and a preview offered to the Thinker.
+    Previewed { evidence: Evidence, preview: Preview },
+    /// The Thinker accepted the preview. The full body was never sent.
+    SettledOnPreview,
+    /// The Thinker wanted everything, and got it.
+    DeliveredFull,
+    /// The fetch failed or was refused; the Thinker is told so rather than left waiting.
+    Failed(String),
+}
+
+/// The cheap first offer.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Preview {
+    pub head: String,
+    pub withheld_chars: usize,
+    pub withheld_lines: usize,
+}
+
+/// Characters shown in a preview before the rest is withheld.
+pub const PREVIEW_CHARS: usize = 600;
+
+impl Preview {
+    pub fn of(body: &str) -> Self {
+        if body.len() <= PREVIEW_CHARS {
+            return Preview { head: body.to_string(), withheld_chars: 0, withheld_lines: 0 };
+        }
+        // Cut on a line boundary: half a commit subject reads as a complete one and invites the Thinker
+        // to accept a preview it has misread.
+        let cut = body[..PREVIEW_CHARS].rfind('\n').unwrap_or(PREVIEW_CHARS);
+        let head = body[..cut].to_string();
+        Preview { head, withheld_chars: body.len() - cut,
+                  withheld_lines: body[cut..].lines().count().saturating_sub(1) }
+    }
+
+    pub fn is_complete(&self) -> bool { self.withheld_chars == 0 }
+
+    /// The message put to the Thinker. States the withholding in the same breath as the content.
+    pub fn ask(&self) -> String {
+        if self.is_complete() {
+            return format!("{}\n\n(That is the complete result.)", self.head);
+        }
+        format!("{}\n\n[{} more lines / {} characters withheld]\n\nIs this enough to answer, or should \
+I send the rest? Reply ENOUGH or SEND-ALL. Answering ENOUGH means you will not see the withheld part.",
+            self.head, self.withheld_lines, self.withheld_chars)
+    }
+
+    /// Advisory only: a hint that the withheld part is probably immaterial.
+    ///
+    /// Never used to decide — the Thinker decides. A Liaison that could settle this on its own would be
+    /// choosing what the Thinker knows, which is the thing this whole module exists to avoid.
+    pub fn looks_sufficient(&self) -> bool { self.withheld_lines <= 2 }
+}
+
+/// The Thinker's answer to a preview.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict { Enough, SendAll }
+
+pub fn parse_verdict(reply: &str) -> Option<Verdict> {
+    let up = reply.trim().to_ascii_uppercase();
+    // Checked in this order because a reply containing both ("not enough, send all") must resolve to
+    // SEND-ALL — the expensive, safe direction. Preferring ENOUGH there would silently drop context the
+    // Thinker asked for.
+    if up.contains("SEND-ALL") || up.contains("SEND ALL") { return Some(Verdict::SendAll); }
+    if up.contains("ENOUGH") { return Some(Verdict::Enough); }
+    None
+}
+
+/// Tracks a request through the two steps, and whether previewing is worth continuing.
+#[derive(Clone, Debug, Default)]
+pub struct Negotiation { accepted: u32, escalated: u32 }
+
+impl Negotiation {
+    pub fn new() -> Self { Self::default() }
+
+    /// Record a verdict.
+    pub fn record(&mut self, v: Verdict) {
+        match v { Verdict::Enough => self.accepted += 1, Verdict::SendAll => self.escalated += 1 }
+    }
+
+    /// Is previewing still saving anything?
+    ///
+    /// If the Thinker always escalates, the preview is a round trip and a small model's forward pass
+    /// spent to learn nothing, and the caller should send the full body directly. Requires a few samples
+    /// first: judging on one escalation would abandon the mechanism before it has been tried.
+    pub fn preview_is_paying(&self) -> bool {
+        let total = self.accepted + self.escalated;
+        if total < 4 { return true; }
+        self.accepted * 4 >= total     // paying if at least a quarter are accepted
+    }
+
+    pub fn stats(&self) -> String {
+        format!("{} previews accepted, {} escalated to full", self.accepted, self.escalated)
+    }
+}
+
+/// What the Thinker is told it may ask for.
+pub const NEGOTIATION_PROTOCOL: &str = "When you need repository context, say so and name what you want. A smaller model will run the fetch and show you a PREVIEW first: the beginning of the result, plus how much was withheld.
+
+Reply ENOUGH if the preview answers your question, or SEND-ALL to receive the whole result.
+
+ENOUGH means you will not see the withheld part, so do not use it to save effort — use it when the preview genuinely settles the question. If you answer from a preview that was missing what you needed, nothing will tell you afterwards.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,6 +386,90 @@ mod tests {
         assert!(parse_request("").is_none());
         assert!(FETCH_PROTOCOL.contains("Ask for NONE"));
         assert!(FETCH_PROTOCOL.contains("costs the main model context"));
+    }
+
+    fn long_body(lines: usize) -> String {
+        (0..lines).map(|i| format!("abc{i:04} 2026-07-28 commit subject number {i}"))
+            .collect::<Vec<_>>().join("\n")
+    }
+
+    #[test]
+    fn a_preview_states_what_it_WITHHELD_in_the_same_breath_as_the_content() {
+        // The dangerous direction is a preview that hides the useful part, so the Thinker answers
+        // ENOUGH from a slice it actively declined to complete — worse than no preview, because it has
+        // now made a decision it believes was informed.
+        let p = Preview::of(&long_body(60));
+        assert!(!p.is_complete());
+        let ask = p.ask();
+        assert!(ask.contains("withheld"), "{ask}");
+        assert!(ask.contains("you will not see the withheld part"),
+            "the consequence of ENOUGH must be stated where the choice is made");
+        assert!(p.withheld_lines > 0 && p.withheld_chars > 0);
+    }
+
+    #[test]
+    fn a_preview_cuts_on_a_LINE_boundary() {
+        // Half a commit subject reads as a whole one, and invites the Thinker to accept a preview it has
+        // misread. Truncating mid-line is how a preview becomes actively misleading rather than partial.
+        let p = Preview::of(&long_body(60));
+        assert!(!p.head.is_empty());
+        assert!(!p.head.ends_with(|c: char| c.is_ascii_digit() && p.head.len() == PREVIEW_CHARS),
+            "must not stop mid-token");
+        assert!(long_body(60).starts_with(&p.head));
+    }
+
+    #[test]
+    fn a_short_result_is_offered_COMPLETE_rather_than_previewed() {
+        // Previewing something that fits is a round trip to say "here is all of it, is that enough".
+        let p = Preview::of("abc123 2026-07-28 one commit");
+        assert!(p.is_complete());
+        assert!(p.ask().contains("complete result"));
+        assert_eq!(p.withheld_chars, 0);
+    }
+
+    #[test]
+    fn an_ambiguous_verdict_resolves_to_the_SAFE_direction() {
+        // "not enough, send all" contains both words. Preferring ENOUGH would silently drop context the
+        // Thinker explicitly asked for; preferring SEND-ALL costs tokens and nothing else.
+        assert_eq!(parse_verdict("not enough, SEND-ALL please"), Some(Verdict::SendAll));
+        assert_eq!(parse_verdict("ENOUGH"), Some(Verdict::Enough));
+        assert_eq!(parse_verdict("send all"), Some(Verdict::SendAll));
+        assert_eq!(parse_verdict("hmm"), None, "an unparseable reply is not a silent ENOUGH");
+    }
+
+    #[test]
+    fn the_liaison_never_DECIDES_sufficiency() {
+        // looks_sufficient is a hint. A Liaison that could settle this alone would be choosing what the
+        // Thinker knows, which is the thing this module exists to prevent.
+        let p = Preview::of(&long_body(60));
+        let _hint = p.looks_sufficient();
+        // the ask always offers the choice, whatever the hint says
+        assert!(p.ask().contains("ENOUGH or SEND-ALL"));
+    }
+
+    #[test]
+    fn previewing_stops_when_it_stops_paying() {
+        // If the Thinker always escalates, the preview is a round trip and a forward pass spent to learn
+        // nothing. But judging on one escalation would abandon the mechanism before it was tried.
+        let mut n = Negotiation::new();
+        n.record(Verdict::SendAll);
+        assert!(n.preview_is_paying(), "one sample is not evidence");
+        for _ in 0..4 { n.record(Verdict::SendAll); }
+        assert!(!n.preview_is_paying(), "5 escalations, 0 accepted: stop previewing");
+
+        let mut m = Negotiation::new();
+        for _ in 0..3 { m.record(Verdict::Enough); }
+        for _ in 0..3 { m.record(Verdict::SendAll); }
+        assert!(m.preview_is_paying(), "half accepted is clearly worth it");
+        assert!(m.stats().contains("3 previews accepted"));
+    }
+
+    #[test]
+    fn the_protocol_warns_against_using_ENOUGH_to_save_effort() {
+        // The instruction a model most needs, because ENOUGH is the cheap answer and its cost is
+        // invisible: nothing tells it afterwards that the withheld part mattered.
+        assert!(NEGOTIATION_PROTOCOL.contains("do not use it to save effort"));
+        assert!(NEGOTIATION_PROTOCOL.contains("nothing will tell you afterwards"));
     }
 
     #[test]
