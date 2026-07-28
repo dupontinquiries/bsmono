@@ -238,6 +238,43 @@ where F: FnMut(u32, Option<&[(String, usize)]>) -> Vec<Opinion> {
     Stop::BudgetSpent { positions: last_positions.unwrap_or_default() }
 }
 
+/// What to do after a deliberation ends, expressed so a caller cannot accidentally use a bad answer.
+///
+/// `Stop` says what happened; this says what it is worth. The separation matters because the tempting
+/// shortcut — take the majority whenever the panel fails to agree — is exactly the move that makes the
+/// whole design pointless, and it should not be one field access away.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Disposition {
+    /// Use this answer.
+    Use(String),
+    /// Ask a larger model, and give it what the panel produced as CONTEXT rather than as an answer.
+    Escalate { context: String },
+}
+
+impl Stop {
+    /// Turn an outcome into an instruction.
+    ///
+    /// Everything except a demonstrated agreement escalates, and the escalation carries the panel's
+    /// positions so the larger model can see the disagreement — which is genuinely useful input, unlike
+    /// the majority verdict, which is a conclusion drawn from correlated evidence.
+    pub fn disposition(&self) -> Disposition {
+        match self {
+            Stop::Agreed(a) => Disposition::Use(a.clone()),
+            Stop::NeverDisagreed(a) => Disposition::Escalate { context: format!(
+                "A panel of small models all answered {a:?} and never disagreed about anything. Treat \
+this as ONE opinion, not several — they share training data and therefore share mistakes. It may well \
+be right; it is simply not corroborated.") },
+            Stop::BudgetSpent { positions } | Stop::Stalled { positions } => {
+                let mut c = String::from("A panel of small models could not agree. Positions:\n");
+                for (p, n) in positions { c.push_str(&format!("  {n}x  {p}\n")); }
+                c.push_str("Use this as EVIDENCE OF DIFFICULTY, not as a vote. The split says the \
+question is genuinely ambiguous or under-specified; the counts do not say which side is right.");
+                Disposition::Escalate { context: c }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +446,46 @@ mod tests {
         }
         assert!(stop.escalate());
         assert!(stop.explain().contains("a majority among correlated models is not evidence"));
+    }
+
+    #[test]
+    fn an_escalation_carries_the_split_as_EVIDENCE_not_as_a_vote() {
+        // The tempting shortcut is to take the majority when the panel fails. That is exactly the move
+        // that makes the design pointless, so the escalation hands the larger model the DISAGREEMENT —
+        // which is real information — and says explicitly not to read the counts as a verdict.
+        let stop = Stop::BudgetSpent { positions: vec![("btreemap".into(), 2), ("hashmap".into(), 1)] };
+        match stop.disposition() {
+            Disposition::Escalate { context } => {
+                assert!(context.contains("2x  btreemap"), "the positions are visible");
+                assert!(context.contains("EVIDENCE OF DIFFICULTY, not as a vote"));
+                assert!(context.contains("the counts do not say which side is right"));
+            }
+            other => panic!("a split must escalate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_uncorroborated_agreement_escalates_saying_it_may_still_be_right() {
+        // The message has to be accurate in both directions. "Never disagreed" does not mean wrong — it
+        // means unsupported — and overstating it would train a reader to ignore the warning.
+        match Stop::NeverDisagreed("x".into()).disposition() {
+            Disposition::Escalate { context } => {
+                assert!(context.contains("ONE opinion, not several"));
+                assert!(context.contains("It may well be right"), "not an accusation of error");
+                assert!(context.contains("share training data"));
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_a_demonstrated_agreement_is_usable() {
+        assert_eq!(Stop::Agreed("x".into()).disposition(), Disposition::Use("x".into()));
+        for s in [Stop::NeverDisagreed("x".into()),
+                  Stop::Stalled { positions: vec![("a".into(), 1)] },
+                  Stop::BudgetSpent { positions: vec![] }] {
+            assert!(matches!(s.disposition(), Disposition::Escalate { .. }), "{s:?} must escalate");
+        }
     }
 
     #[test]
