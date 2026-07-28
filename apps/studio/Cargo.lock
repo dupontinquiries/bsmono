@@ -399,6 +399,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "studio-audio"
+version = "0.1.0"
+dependencies = [
+ "studio-core",
+]
+
+[[package]]
 name = "studio-collab"
 version = "0.1.0"
 dependencies = [
@@ -418,6 +425,7 @@ name = "studio-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "studio-audio",
  "studio-collab",
  "studio-core",
  "uikit-egui",
