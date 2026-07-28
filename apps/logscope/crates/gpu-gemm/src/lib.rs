@@ -4007,7 +4007,13 @@ impl Gpu {
         // the v2 kernels are wrong, not the weights. LOGSCOPE_MOE_V1=1 forces the v1 path for A/B.
         // Streaming (m.stream) MUST use v1: the stacked weights are placeholders under streaming; experts
         // are served per-expert from the stream store, which the v1 loop intercepts.
-        if t == 1 && m.stream.is_none() && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax) && !m.cfg.weight_before
+        // Sigmoid gating is now handled by MOE_TOPK's mode 1, so it no longer forces v1. `weight_before`
+        // still does, and that is the remaining piece for Llama-4: the weight must scale the expert's
+        // INPUT rather than its output, and SwiGLU is nonlinear so the two are genuinely different —
+        // `silu(w*g)*(w*u) != w*silu(g)*u`. Doing it needs the routed path to build per-slot scaled
+        // activations (xper=1 for gate_up) instead of broadcasting one row, which is a real change
+        // rather than a flag.
+        if t == 1 && m.stream.is_none() && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
             if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
@@ -4224,7 +4230,9 @@ impl Gpu {
         let logits = m.router.apply(self, n2, 1);
         // 2) top-k selection + combine weights → selw [k idx (u32) | k weights (f32 bitcast)]
         let selw = self.alloc(1, 2 * slots);
-        let tk = [ne as u32, slots as u32, 0, 0];
+        // mode 1 = sigmoid. Selection is unchanged either way; only the weighting differs.
+        let mode = match m.cfg.norm { crate::moe::RouteNorm::Sigmoid => 1u32, _ => 0 };
+        let tk = [ne as u32, slots as u32, mode, m.cfg.normalize as u32];
         self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (1, 1, 1));
         // 3) fused gate||up for each selected expert (broadcast activation)
         // one dispatch across ALL selected experts: wg.z = slot (was 8 dispatches — the dominant
@@ -5538,7 +5546,10 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
 // moe::route's Softmax path: global softmax renormalized to the top-k == softmax over the selected).
 // Output selw: [0..k) = expert index (u32), [k..2k) = combine weight (f32 bitcast to u32).
 const MOE_TOPK: &str = r#"
-struct D { n:u32,k:u32,_b:u32,_c:u32 };
+// `mode` selects the WEIGHTING, not the selection: 0 = softmax over the chosen k, 1 = sigmoid of each
+// logit. Selection is identical either way because sigmoid is monotonic, so top-k by raw logit picks the
+// same experts — which is why this is a small change rather than a second kernel.
+struct D { n:u32,k:u32,mode:u32,normalize:u32 };
 @group(0)@binding(0) var<storage,read> logits: array<f32>;
 @group(0)@binding(1) var<storage,read_write> selw: array<u32>;
 @group(0)@binding(2) var<uniform> d: D;
@@ -5559,8 +5570,17 @@ fn main(){
   // exp(max-1) after normalization — the exact wgtΔmax the differential checker caught)
   let mx=lg[0];
   var sum=0.0;
-  for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-mx); sum=sum+lg[s]; }
-  for(var s=0u;s<d.k;s=s+1u){ selw[s]=idx[s]; selw[d.k+s]=bitcast<u32>(lg[s]/sum); }
+  if (d.mode == 1u) {
+    // Sigmoid gating (Llama-4, GLM). Each weight is sigmoid(logit) INDEPENDENTLY — there is no shared
+    // denominator unless the model asks for one, so a softmax here would silently renormalize weights
+    // the reference leaves alone.
+    for(var s=0u;s<d.k;s=s+1u){ lg[s]=1.0/(1.0+exp(-lg[s])); sum=sum+lg[s]; }
+  } else {
+    for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-mx); sum=sum+lg[s]; }
+  }
+  // Softmax is normalized by construction; sigmoid only when the model says so.
+  let dnm = select(1.0, sum, d.mode == 0u || d.normalize == 1u);
+  for(var s=0u;s<d.k;s=s+1u){ selw[s]=idx[s]; selw[d.k+s]=bitcast<u32>(lg[s]/dnm); }
 }"#;
 
 // MOE_MATVEC_Q8 / MOE_MATVEC_Q4: the base MATVEC_Q8_0/MATVEC_Q4 kernels with the weight row indexed
