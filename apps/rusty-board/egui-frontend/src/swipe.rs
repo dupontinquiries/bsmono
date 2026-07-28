@@ -189,7 +189,107 @@ impl SwipeState {
 /// Paint the in-flight gesture. Port of `src/ui/swipe_trail.rs`: quadratic Bézier smoothing
 /// through the midpoints, stroke tapering 7px → 2px and alpha 0.85 → 0.05 from head to tail.
 /// The taper is what makes a swipe read as a direction rather than a scribble.
+
+// ── trail styling by gesture category (ported from src/ui/swipe_trail.rs) ────
+//
+// The GTK trail can render in one of four treatments so that, ON DEVICE, you can
+// SEE which branch a gesture fell into instead of guessing from behaviour: dots
+// mean the cardinal grid claimed it, stripes mean it was decoded as a swiped
+// word, a desaturated line means nothing useful happened. It is off by default
+// — ordinary users want one accent-coloured line — and toggled from settings
+// (`appearance.debug_trail_styling`).
+//
+// This is the same idea as snapclone's trace channels: a diagnostic that ships
+// switched off, costs nothing when off, and is reachable on an installed build
+// without a rebuild. Here the cost when off is one atomic load per trail draw.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static TRAIL_DEBUG_STYLING: AtomicBool = AtomicBool::new(false);
+
+/// Turn gesture-category trail styling on or off (process-wide).
+pub fn set_trail_debug_styling(on: bool) {
+    TRAIL_DEBUG_STYLING.store(on, Ordering::Relaxed);
+}
+
+pub fn trail_debug_styling() -> bool {
+    TRAIL_DEBUG_STYLING.load(Ordering::Relaxed)
+}
+
+/// Visual treatment for the swipe trail, matching the GTK enum one-for-one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum TrailStyle {
+    /// Normal accent line — the default, and what always renders with debug
+    /// styling off.
+    #[default]
+    Solid,
+    /// Muted grey: "nothing useful here" (normal-tap drag, off-key start).
+    Desaturated,
+    /// Round dots: the cardinal grid / steno cell swipes.
+    Dotted,
+    /// Dashed segments: a freeform swipe-typed word.
+    Striped,
+}
+
+impl TrailStyle {
+    /// Map a source-key behaviour label to a style, so the live trail reflects
+    /// the gesture category as the user draws. Labels match the GTK side
+    /// exactly — this is the seam where the two frontends must not drift.
+    pub fn for_behavior_label(label: &str) -> Self {
+        match label {
+            "cardinal" => TrailStyle::Dotted,
+            "swipe" => TrailStyle::Striped,
+            "normal" | "none" => TrailStyle::Desaturated,
+            _ => TrailStyle::Solid,
+        }
+    }
+
+    /// The colour this style paints in, given the configured accent. Only
+    /// `Desaturated` departs from the accent — the rest carry the accent and
+    /// differ in SHAPE, which stays legible on any palette.
+    pub fn color(self, accent: Color32) -> Color32 {
+        match self {
+            TrailStyle::Desaturated => {
+                // luminance-preserving grey, so the trail stays visible on both
+                // light and dark boards instead of vanishing into one of them
+                let l = (0.299 * accent.r() as f32
+                    + 0.587 * accent.g() as f32
+                    + 0.114 * accent.b() as f32) as u8;
+                Color32::from_rgb(l, l, l)
+            }
+            _ => accent,
+        }
+    }
+
+    /// Whether a segment at position `f` along the trail (0 = tail, 1 = head)
+    /// should be painted. Solid and desaturated draw everything; dotted and
+    /// striped punch periodic gaps, which is how they read as dots/dashes
+    /// without needing a dash-pattern API egui's painter does not have.
+    pub fn draws_segment(self, i: usize) -> bool {
+        match self {
+            TrailStyle::Solid | TrailStyle::Desaturated => true,
+            TrailStyle::Dotted => i % 3 == 0,
+            TrailStyle::Striped => i % 6 < 3,
+        }
+    }
+
+    /// The style actually used for painting: with debug styling off, every
+    /// gesture draws Solid regardless of category.
+    pub fn effective(self) -> TrailStyle {
+        if trail_debug_styling() { self } else { TrailStyle::Solid }
+    }
+}
+
+/// Draw the trail in the configured accent (the everyday path).
 pub fn draw_trail(ui: &Ui, path: &[SwipePoint], accent: Color32) {
+    draw_trail_styled(ui, path, accent, TrailStyle::Solid);
+}
+
+/// Draw the trail with a gesture-category style. The style only takes effect
+/// when debug styling is enabled; otherwise this is exactly `draw_trail`.
+pub fn draw_trail_styled(ui: &Ui, path: &[SwipePoint], accent: Color32, style: TrailStyle) {
+    let style = style.effective();
+    let accent = style.color(accent);
     if path.len() < 2 {
         return;
     }
@@ -206,6 +306,9 @@ pub fn draw_trail(ui: &Ui, path: &[SwipePoint], accent: Color32) {
             accent.b(),
             (alpha * 255.0) as u8,
         );
+        if !style.draws_segment(i) {
+            continue;
+        }
         let a = Pos2::new(path[i - 1].x as f32, path[i - 1].y as f32);
         let b = Pos2::new(path[i].x as f32, path[i].y as f32);
         if i + 1 < n {
@@ -390,5 +493,66 @@ mod tests {
                 }
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod trail_style_tests {
+    use super::*;
+
+    #[test]
+    fn behaviour_labels_map_to_the_same_styles_as_gtk() {
+        // This mapping is the seam between the two frontends: if the labels
+        // drift, the same gesture draws differently on GTK and egui and the
+        // diagnostic starts lying. Pinned against src/ui/swipe_trail.rs.
+        assert_eq!(TrailStyle::for_behavior_label("cardinal"), TrailStyle::Dotted);
+        assert_eq!(TrailStyle::for_behavior_label("swipe"), TrailStyle::Striped);
+        assert_eq!(TrailStyle::for_behavior_label("normal"), TrailStyle::Desaturated);
+        assert_eq!(TrailStyle::for_behavior_label("none"), TrailStyle::Desaturated);
+        assert_eq!(TrailStyle::for_behavior_label("anything else"), TrailStyle::Solid);
+        assert_eq!(TrailStyle::default(), TrailStyle::Solid);
+    }
+
+    #[test]
+    fn debug_styling_is_off_by_default_and_flattens_every_style() {
+        // Ordinary users get one accent line. Only with the toggle on does the
+        // category show through — same contract as the GTK side.
+        set_trail_debug_styling(false);
+        assert!(!trail_debug_styling());
+        for s in [TrailStyle::Dotted, TrailStyle::Striped, TrailStyle::Desaturated] {
+            assert_eq!(s.effective(), TrailStyle::Solid, "{s:?} must flatten when debug is off");
+        }
+        set_trail_debug_styling(true);
+        assert_eq!(TrailStyle::Dotted.effective(), TrailStyle::Dotted);
+        set_trail_debug_styling(false); // leave the process as we found it
+    }
+
+    #[test]
+    fn dotted_and_striped_actually_break_the_line_up() {
+        // The styles differ in SHAPE, not just colour, so they stay legible on
+        // any palette. Count what a 60-sample trail would paint.
+        let painted = |s: TrailStyle| (1..60).filter(|i| s.draws_segment(*i)).count();
+        let solid = painted(TrailStyle::Solid);
+        assert_eq!(solid, 59, "solid paints every segment");
+        assert_eq!(painted(TrailStyle::Desaturated), 59, "desaturated is solid but grey");
+        let dotted = painted(TrailStyle::Dotted);
+        let striped = painted(TrailStyle::Striped);
+        assert!(dotted < solid / 2, "dotted should be sparse ({dotted}/{solid})");
+        assert!(striped > dotted && striped < solid, "striped sits between ({striped})");
+    }
+
+    #[test]
+    fn desaturated_keeps_the_accents_luminance() {
+        // A grey that ignores luminance disappears on either a light or a dark
+        // board; this one is derived from the accent so it stays visible.
+        let bright = TrailStyle::Desaturated.color(Color32::from_rgb(255, 220, 40));
+        let dark = TrailStyle::Desaturated.color(Color32::from_rgb(30, 40, 60));
+        assert_eq!(bright.r(), bright.g());
+        assert_eq!(bright.g(), bright.b(), "must be grey");
+        assert!(bright.r() > dark.r(), "a bright accent yields a brighter grey");
+        // and the other styles keep the accent untouched
+        let acc = Color32::from_rgb(10, 200, 120);
+        assert_eq!(TrailStyle::Dotted.color(acc), acc);
+        assert_eq!(TrailStyle::Striped.color(acc), acc);
     }
 }
