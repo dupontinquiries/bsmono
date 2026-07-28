@@ -10,13 +10,36 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   arbitrary SDF trees, `cad-view` carries them as `MeshKind::Generated`, and the demo document now
   contains three CSG parts (a drilled bracket, a blended lamp, a patterned stud row) that draw.
 
+## Grow mode (M2)
+
+- **`ridge` is tracked but not yet geometry.** The `e` key toggles it, the turtle carries it and
+  the status bar shows it, but nothing in the swept solid responds. In the original grower, ridge
+  spikes the profile points whose local x is within 0.35 of the axis — an f-rep equivalent needs
+  the section SDF to take a ridge parameter. Until then `e` is an honest no-op on the shape, and
+  that is the one place where a key does less than the original.
+- **Preview is coarse and throttled.** While growing, the form is re-meshed at resolution 28 at
+  most every 120 ms; the committed part is meshed at 56. Expect the live shape to look chunkier
+  than what lands in the document. Both numbers are constants at the top of `main.rs`.
+- **The preview is not pickable.** It is drawn, not a `Part`, so tapping it does nothing until it
+  is committed with Esc.
+- **No undo inside a session.** Growth is append-only until you commit; there is no way to walk
+  stations back. Committing writes ops, so undo at the *document* level is the natural home for
+  this and it does not exist yet either.
+- **Growth does not see the rest of the model.** No snapping to an existing face, no collision, no
+  starting a spine from a picked point — a session always begins at the origin. Growing *onto*
+  existing geometry is the obvious next affordance.
+- **Polygon sections are underestimates near their vertices.** They are evaluated as the max over
+  edge half-planes, which is exact on a face and conservative at a corner. Safe for tracing and
+  meshing; it does mean a hex profile's corners mesh very slightly soft.
+
 ## Not verified in-sandbox
 
 - **The app has never been run.** The build environment had one core, 3 GB RAM, no GPU and no
   display. What *has* been observed: `cargo test` (47 tests), offline naga WGSL validation, and
   `cadscope --selftest`, which evaluates the document, meshes every CSG part and ray-probes the
   result headlessly — it passes, and its printed volumes agree with hand calculation to within
-  ~1.5%. What remains unobserved is everything downstream of the GPU: that the pass draws, that
+  ~1.5%, and which drives a scripted Grow session through branch, knuckle, section change and
+  mirror to a closed solid. What remains unobserved is everything downstream of the GPU: that the pass draws, that
   depth sorts, that a tap selects what is under the finger, that the selection tint breathes.
   Run `cargo run --release -p cadscope-egui` on hardware to close this.
 - **`depth_buffer: 32` runtime path.** The pipeline declares `Depth32Float` because

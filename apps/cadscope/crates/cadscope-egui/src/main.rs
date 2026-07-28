@@ -12,9 +12,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use cad_forge::{BoolMode, Doc, Op, OpWarning, ShapeSpec};
-use cad_kernel::{MeshOpts, Model, Sdf};
-use cad_motion::{Action, Mode};
+use cad_forge::{BoolMode, Doc, Op, OpWarning, ShapeSpec, SpineNode};
+use cad_kernel::{Grower, MeshOpts, Model, Sdf, Section};
+use cad_motion::{Action, GrowAction, Mode};
 use cad_view::camera::{ndc_of, OrbitCamera};
 use cad_view::meshgen::{from_trimesh, MeshData};
 use cad_view::renderer::{FrameDraw, Globals, MeshKind, ObjectRaw, ViewRenderer};
@@ -148,6 +148,76 @@ fn selftest() -> ! {
     // Same plate, off-axis: solid material, so it stops here.
     check("down beside the bore", probe(1.8, 3.2), "bracket");
 
+    // A scripted Grow session, driven through exactly the calls the keyboard produces, then
+    // committed the way Esc commits it. This is the only way to exercise the grammar without a
+    // keyboard, and it checks the part the eye would otherwise have to: that steering, branching,
+    // knuckles, section changes and the mirror all survive into a closed solid.
+    let mut g = Grower::new(0.12);
+    for i in 0..90 {
+        if i % 4 == 0 {
+            g.grow_turtle_yaw();
+        }
+        if i == 30 {
+            g.node_bulge();
+        }
+        if i == 45 {
+            g.branch();
+        }
+        if i == 60 {
+            g.turtle().set_section(Section::Hex);
+        }
+        if i % 12 == 0 {
+            g.turtle().thicken(1.0);
+        }
+        g.grow(1.0);
+    }
+    g.toggle_mirror();
+    let stations: usize = g.spines.iter().map(|s| s.nodes.len()).sum();
+    let grown = g.to_sdf().expect("a grown session must produce a solid");
+    let gm = cad_kernel::dual_contour(&grown, MeshOpts { resolution: 44 });
+    let gvol = gm.signed_volume();
+    let gok = !gm.is_empty() && gvol > 0.0 && g.spines.len() == 2;
+    if !gok {
+        fail += 1;
+    }
+    println!(
+        "  grow      {} spines, {} stations, mirrored -> {:6} tris   vol {:8.2}  {}",
+        g.spines.len(),
+        stations,
+        gm.tri_count(),
+        gvol,
+        if gok { "ok" } else { "FAIL" }
+    );
+
+    // ...and the same session as document history: every spine becomes a named op that rebuilds.
+    let mut doc2 = Doc { name: "grown".into(), ops: Vec::new() };
+    for (i, spine) in g.spines.iter().enumerate() {
+        doc2.ops.push(Op::Spine {
+            name: format!("grown{i}"),
+            nodes: spine
+                .nodes
+                .iter()
+                .map(|n| SpineNode { at: n.pos.to_array(), up: n.up.to_array(), r: n.radius, section: 1 })
+                .collect(),
+            blend: spine.blend,
+            mirror: g.mirror,
+            color: [0.72, 0.84, 0.62, 1.0],
+        });
+    }
+    let round_trips = Doc::from_json(&doc2.to_json()).map(|d| d == doc2).unwrap_or(false);
+    let (m2, w2) = doc2.apply();
+    let doc_ok = round_trips && w2.is_empty() && m2.parts.len() == g.spines.len();
+    if !doc_ok {
+        fail += 1;
+    }
+    println!(
+        "  commit    {} ops -> {} parts, json round-trip {}  {}",
+        doc2.ops.len(),
+        m2.parts.len(),
+        round_trips,
+        if doc_ok { "ok" } else { "FAIL" }
+    );
+
     println!(
         "selftest: {} ({:.1}s)",
         if fail == 0 { "PASS" } else { "FAIL" },
@@ -169,7 +239,24 @@ struct App {
     meshed: HashMap<u32, Arc<MeshData>>,
     /// Bumped on every re-evaluation so the renderer can drop stale generated buffers.
     epoch: u64,
+    /// Live Grow session, if any.
+    grower: Option<Grower>,
+    /// Seconds banked toward the next station, so growth rate is wall-clock and not frame-rate.
+    grow_accum: f32,
+    /// Coarse preview of the growing form, re-meshed on a throttle. Its key changes every rebuild
+    /// so the renderer evicts the previous one.
+    preview: Option<Arc<MeshData>>,
+    preview_key: u64,
+    preview_due: f32,
+    grown: u32,
 }
+
+/// One station every 33 ms of growth: fine enough that the swept chain reads as a smooth tube,
+/// coarse enough that a long session stays cheap to mesh.
+const STATION_DT: f32 = 1.0 / 30.0;
+/// Preview re-mesh interval. Coarse resolution while growing; the committed part gets full quality.
+const PREVIEW_EVERY: f32 = 0.12;
+const PREVIEW_RES: u32 = 28;
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -196,6 +283,12 @@ impl App {
             start: std::time::Instant::now(),
             meshed: HashMap::new(),
             epoch: 0,
+            grower: None,
+            grow_accum: 0.0,
+            preview: None,
+            preview_key: 1 << 40,
+            preview_due: 0.0,
+            grown: 0,
         };
         app.remesh();
         app.frame_all();
@@ -256,8 +349,126 @@ impl App {
                 self.selected = Some(ids[next]);
             }
             Action::ClearSelection => self.selected = None,
+            Action::EnterMode(Mode::Grow) => self.enter_grow(),
             Action::EnterMode(m) => self.mode = m,
         }
+    }
+
+    /// Start a Grow session at the origin, framed so the form has room to appear.
+    fn enter_grow(&mut self) {
+        self.mode = Mode::Grow;
+        self.grower = Some(Grower::new(0.12));
+        self.grow_accum = 0.0;
+        self.preview_due = 0.0;
+        self.preview = None;
+        self.selected = None;
+        self.cam.frame(Vec3::new(0.0, 1.6, 1.5), 6.0);
+    }
+
+    /// Advance the session by wall-clock time and refresh the preview on its throttle.
+    fn tick_grow(&mut self, dt: f32) {
+        let Some(g) = self.grower.as_mut() else { return };
+        self.grow_accum += dt;
+        let mut grew = false;
+        // Cap the catch-up so a stalled frame cannot dump a hundred stations at once.
+        let mut budget = 8;
+        while self.grow_accum >= STATION_DT && budget > 0 {
+            self.grow_accum -= STATION_DT;
+            budget -= 1;
+            g.grow(1.0);
+            grew = true;
+        }
+        self.preview_due -= dt;
+        if grew && self.preview_due <= 0.0 {
+            self.preview_due = PREVIEW_EVERY;
+            self.rebuild_preview();
+        }
+    }
+
+    fn rebuild_preview(&mut self) {
+        let Some(g) = self.grower.as_ref() else { return };
+        let Some(sdf) = g.to_sdf() else { return };
+        let t = cad_kernel::dual_contour(&sdf, MeshOpts { resolution: PREVIEW_RES });
+        if t.is_empty() {
+            return;
+        }
+        self.preview_key = self.preview_key.wrapping_add(1);
+        self.preview = Some(Arc::new(from_trimesh(&t)));
+    }
+
+    /// Apply one Grow keystroke. Steering is handled separately, per frame, while held.
+    fn grow_action(&mut self, a: GrowAction, dt: f32) {
+        let Some(g) = self.grower.as_mut() else { return };
+        match a {
+            GrowAction::Yaw(s) => g.turtle().yaw(s * dt),
+            GrowAction::Pitch(s) => g.turtle().pitch(s * dt),
+            GrowAction::Roll(s) => g.turtle().roll(s * dt),
+            GrowAction::Thicken(s) => g.turtle().thicken(s),
+            GrowAction::Flare(s) => g.turtle().flare(s),
+            GrowAction::Twist(s) => g.turtle().twist_by(s),
+            GrowAction::Straighten => g.turtle().straighten(),
+            GrowAction::ToggleRidge => g.turtle().toggle_ridge(),
+            GrowAction::ToggleWobble => g.turtle().toggle_wobble(),
+            GrowAction::Section(d) => {
+                if let Some(sec) = Section::from_digit(d) {
+                    g.turtle().set_section(sec);
+                }
+            }
+            GrowAction::Node => g.node_bulge(),
+            GrowAction::Branch => g.branch(),
+            GrowAction::Parent => g.parent(),
+            GrowAction::Mirror => g.toggle_mirror(),
+        }
+    }
+
+    /// Leave Grow mode, writing what was grown into the document as a real op — the session
+    /// becomes history, not a scratch mesh. A form too short to sweep is simply discarded.
+    fn commit_grow(&mut self) {
+        self.mode = Mode::Normal;
+        self.preview = None;
+        let Some(g) = self.grower.take() else { return };
+        let stations: usize = g.spines.iter().map(|s| s.nodes.len()).sum();
+        if g.to_sdf().is_none() || stations < 2 {
+            return;
+        }
+        self.grown += 1;
+        let name = format!("grown{}", self.grown);
+        // Every spine of the session becomes its own op, so the history stays legible and any one
+        // branch can be edited or removed later by name.
+        let mirror = g.mirror;
+        for (i, spine) in g.spines.iter().enumerate() {
+            if spine.nodes.len() < 2 {
+                continue;
+            }
+            let nodes: Vec<SpineNode> = spine
+                .nodes
+                .iter()
+                .map(|n| SpineNode {
+                    at: n.pos.to_array(),
+                    up: n.up.to_array(),
+                    r: n.radius,
+                    section: match n.section {
+                        Section::Circle => 1,
+                        Section::Square => 2,
+                        Section::Triangle => 3,
+                        Section::Star => 4,
+                        Section::Hex => 5,
+                    },
+                })
+                .collect();
+            self.doc.ops.push(Op::Spine {
+                name: if i == 0 { name.clone() } else { format!("{name}_{i}") },
+                nodes,
+                blend: spine.blend,
+                mirror,
+                color: [0.72, 0.84, 0.62, 1.0],
+            });
+        }
+        let (model, warns) = self.doc.apply();
+        self.model = model;
+        self.warns = warns;
+        self.remesh();
+        self.selected = self.model.parts.iter().find(|p| p.name == name).map(|p| p.id);
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
@@ -335,12 +546,22 @@ impl App {
             }
         }
 
+        if let Some(m) = self.preview.clone() {
+            draws.push(FrameDraw {
+                kind: MeshKind::Generated(self.preview_key),
+                object: object_raw(Mat4::IDENTITY, [0.72, 0.84, 0.62, 1.0], [0.0, 0.15, 0.30, 0.0]),
+                mesh: Some(m),
+            });
+        }
+
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
             cad_view::renderer::ViewportCallback { globals, draws, epoch: self.epoch },
         ));
-        if self.selected.is_some() {
-            ui.ctx().request_repaint(); // selection breathe; otherwise stay idle (phone battery)
+        // Repaint continuously while growing (the form is moving) or while something is selected
+        // (the tint breathes); otherwise stay idle, which is what keeps a phone's battery alive.
+        if self.selected.is_some() || self.mode == Mode::Grow {
+            ui.ctx().request_repaint();
         }
     }
 }
@@ -397,34 +618,75 @@ impl eframe::App for App {
         let ctx = root.ctx().clone();
         let ctx = &ctx;
         // keyboard → cad-motion actions (skip when a text widget wants the keys)
+        let dt = ctx.input(|i| i.stable_dt).clamp(0.001, 0.1);
         if ctx.memory(|m| m.focused().is_none()) {
-            let mut acts: Vec<Action> = Vec::new();
+            let mut chars: Vec<char> = Vec::new();
             let mut esc = false;
+            let mut held: Vec<GrowAction> = Vec::new();
             ctx.input(|i| {
                 for ev in &i.events {
                     match ev {
-                        egui::Event::Text(t) => {
-                            for ch in t.chars() {
-                                if let Some(a) = cad_motion::normal_key(ch) {
-                                    if self.mode == Mode::Normal {
-                                        acts.push(a);
-                                    }
-                                }
-                            }
-                        }
+                        egui::Event::Text(t) => chars.extend(t.chars()),
                         egui::Event::Key { key: egui::Key::Escape, pressed: true, .. } => esc = true,
                         _ => {}
                     }
                 }
+                // Steering is sampled from key state rather than text events, because it has to
+                // apply every frame the key is down — that is what makes the form turn smoothly
+                // instead of in keyboard-repeat jerks. Shift turns yaw into roll, matching H/L.
+                if self.mode == Mode::Grow {
+                    let shift = i.modifiers.shift;
+                    if i.key_down(egui::Key::H) {
+                        held.push(if shift { GrowAction::Roll(1.0) } else { GrowAction::Yaw(1.0) });
+                    }
+                    if i.key_down(egui::Key::L) {
+                        held.push(if shift { GrowAction::Roll(-1.0) } else { GrowAction::Yaw(-1.0) });
+                    }
+                    if i.key_down(egui::Key::J) {
+                        held.push(GrowAction::Pitch(-1.0));
+                    }
+                    if i.key_down(egui::Key::K) {
+                        held.push(GrowAction::Pitch(1.0));
+                    }
+                }
             });
-            for a in acts {
-                self.act(a);
-            }
-            if esc {
-                let (mode, action) = cad_motion::escape(self.mode);
-                self.mode = mode;
-                if let Some(a) = action {
-                    self.act(a);
+
+            match self.mode {
+                Mode::Normal => {
+                    for ch in chars {
+                        if let Some(a) = cad_motion::normal_key(ch) {
+                            self.act(a);
+                        }
+                    }
+                    if esc {
+                        let (mode, action) = cad_motion::escape(self.mode);
+                        self.mode = mode;
+                        if let Some(a) = action {
+                            self.act(a);
+                        }
+                    }
+                }
+                Mode::Grow => {
+                    for a in held {
+                        self.grow_action(a, dt);
+                    }
+                    for ch in chars {
+                        if let Some(a) = cad_motion::grow_key(ch) {
+                            if !a.is_continuous() {
+                                self.grow_action(a, dt);
+                            }
+                        }
+                    }
+                    if esc {
+                        self.commit_grow();
+                    } else {
+                        self.tick_grow(dt);
+                    }
+                }
+                Mode::Sketch => {
+                    if esc {
+                        self.mode = Mode::Normal;
+                    }
                 }
             }
         }
@@ -462,17 +724,47 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 let mode = match self.mode {
                     Mode::Normal => "NORMAL",
-                    Mode::Grow => "GROW (M2 stub — Esc to leave)",
+                    Mode::Grow => "GROW",
                     Mode::Sketch => "SKETCH (M2 stub — Esc to leave)",
                 };
                 ui.label(egui::RichText::new(mode).strong().monospace());
                 ui.separator();
-                match self.selected.and_then(|id| self.model.part(id)) {
-                    Some(p) => ui.label(format!("▸ {}", p.name)),
-                    None => ui.label("nothing selected"),
-                };
+                match (self.mode, self.grower.as_ref()) {
+                    (Mode::Grow, Some(g)) => {
+                        let t = g.turtles[g.active];
+                        let stations: usize = g.spines.iter().map(|s| s.nodes.len()).sum();
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "r {:.2}  taper {:.2}  twist {:+.1}  {:?}{}{}  ·  {} spine{}  {} stations",
+                                t.radius,
+                                t.taper,
+                                t.twist,
+                                t.section,
+                                if t.ridge > 0.0 { " ridge" } else { "" },
+                                if t.wobble { " wobble" } else { "" },
+                                g.spines.len(),
+                                if g.spines.len() == 1 { "" } else { "s" },
+                                stations,
+                            ))
+                            .monospace(),
+                        );
+                        if g.mirror {
+                            ui.label(egui::RichText::new("MIRROR").strong());
+                        }
+                    }
+                    _ => {
+                        match self.selected.and_then(|id| self.model.part(id)) {
+                            Some(p) => ui.label(format!("▸ {}", p.name)),
+                            None => ui.label("nothing selected"),
+                        };
+                    }
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label("drag orbit · right-drag pan · pinch/scroll dolly · tap pick · hjkl + - f n Esc");
+                    let help = match self.mode {
+                        Mode::Grow => "hjkl steer · HL roll · wb thick · fp flare · [] twist · 0 straight · e ridge · ` wobble · 1-5 section · space node · t branch · y parent · m mirror · Esc commit",
+                        _ => "drag orbit · right-drag pan · pinch/scroll dolly · tap pick · hjkl + - f n · g grow · Esc",
+                    };
+                    ui.label(egui::RichText::new(help).small());
                 });
             });
         });

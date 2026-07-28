@@ -260,6 +260,13 @@ impl Grower {
         }
     }
 
+    /// A single steering nudge at the grammar's yaw rate for one station's worth of time — what
+    /// holding `h` for one tick does.
+    pub fn grow_turtle_yaw(&mut self) {
+        let dt = 1.0 / 30.0;
+        self.turtle().yaw(dt);
+    }
+
     /// `m`.
     pub fn toggle_mirror(&mut self) {
         self.mirror = !self.mirror;
@@ -285,9 +292,10 @@ impl Grower {
     }
 }
 
-/// Reflect a tree across X = 0. Only the placement-bearing nodes need touching, since every
+/// Reflect a tree across X = 0. Public because committing a mirrored spine into a document has
+/// to bake the reflection, not carry a flag the rest of the kernel would have to honour. Only the placement-bearing nodes need touching, since every
 /// primitive here is symmetric about its own axes except through its stored geometry.
-fn mirror_x(s: &Sdf) -> Sdf {
+pub fn mirror_x(s: &Sdf) -> Sdf {
     let flip = |v: Vec3| Vec3::new(-v.x, v.y, v.z);
     match s {
         Sdf::Swept { a, b, ra, rb, section, up } => Sdf::Swept {

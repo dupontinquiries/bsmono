@@ -277,8 +277,12 @@ impl ViewRenderer {
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cb: &ViewportCallback) {
-        if cb.epoch != self.epoch {
-            self.meshes.retain(|k, _| !matches!(k, MeshKind::Generated(_)));
+        // Generated meshes live exactly as long as something draws them. That covers a document
+        // edit (old part keys vanish) and, more sharply, Grow mode's live preview, which hands over
+        // a fresh key every time it re-meshes.
+        if cb.epoch != self.epoch || cb.draws.iter().any(|d| matches!(d.kind, MeshKind::Generated(_))) {
+            let live: std::collections::HashSet<MeshKind> = cb.draws.iter().map(|d| d.kind).collect();
+            self.meshes.retain(|k, _| !matches!(k, MeshKind::Generated(_)) || live.contains(k));
             self.epoch = cb.epoch;
         }
         if cb.draws.len() as u32 > self.obj_capacity {

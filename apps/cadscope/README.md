@@ -5,7 +5,7 @@ export truth. The renderer is [`games/skydribble`](../../games/skydribble)'s obj
 transplanted into an `egui_wgpu` paint callback; the app patterns (liaison, fan-out, convograph,
 sanitization boundary) come from [`apps/logscope`](../logscope).
 
-**Status: M1 in progress** — the kernel meshes arbitrary CSG through dual contouring and the
+**Status: M2 in progress** — the kernel meshes arbitrary CSG through dual contouring and the
 viewport draws it. 47 tests green plus a headless `--selftest`; the interactive gate still needs
 hardware (this workspace was built in a sandbox with no GPU or display).
 
@@ -13,7 +13,7 @@ hardware (this workspace was built in a sandbox with no GPU or display).
 
 ```sh
 cd apps/cadscope
-cargo test                              # 47 tests, includes offline WGSL validation via naga
+cargo test                              # 59 tests, includes offline WGSL validation via naga
 cargo run -p cadscope-egui -- --selftest  # headless: evaluate, mesh and ray-probe the model
 cargo run --release -p cadscope-egui    # the app (bin name: cadscope)
 ```
@@ -43,7 +43,27 @@ single solid).
 | `g` | Grow mode (M2 stub) |
 | `Esc` | clear selection / leave mode |
 
-`z` and `space` are deliberately unmapped: they are the camera prefix and the leader key, reserved
+### Grow mode (`g`)
+
+Steer a form as it grows instead of placing primitives. The grammar is
+[`spine_grower.html`](../../games/blackstar/tools/spine_grower.html)'s, key for key, so muscle
+memory from that tool transfers directly.
+
+| key | effect | key | effect |
+|---|---|---|---|
+| `h` `l` | yaw | `[` `]` | twist −/+ |
+| `j` `k` | pitch | `0` | straighten |
+| `H` `L` | roll | `e` | ridge toggle |
+| `w` `b` | thicken / narrow | `` ` `` | wobble toggle |
+| `f` `p` | flare / pinch | `1`–`5` | section: ○ □ △ ✦ ⬡ |
+| `space` | knuckle (fat station) | `t` | branch |
+| `m` | mirror across X | `y` | back to parent |
+| `Esc` | commit into the document | | |
+
+The form grows continuously while the mode is active; steering keys apply while held. `Esc` writes
+each spine into the document as a `spine` op — the session becomes history, not a scratch mesh.
+
+In Normal mode, `z` and `space` are deliberately unmapped: they are the camera prefix and the leader key, reserved
 for the `logscope-fan::vimmode` integration at M2.
 
 ## Crates
@@ -53,10 +73,10 @@ which needs it for the paint callback.
 
 | crate | milestone | what it owns |
 |---|---|---|
-| `cad-kernel` | M0 ✅ M1 ✅ | SDF primitives, CSG, `Blend`, `Shell`, bounds, sphere-traced rays, `Part`/`Model`, picking, and dual-contour meshing. std + glam only. |
+| `cad-kernel` | M0 ✅ M1 ✅ | SDF primitives, CSG, `Blend`, `Shell`, bounds, sphere-traced rays, `Part`/`Model`, picking, and dual-contour meshing, and the spine/turtle grow model. std + glam only. |
 | `cad-forge` | M0 ✅ M1 ✅ | `.cadf` op documents — names not IDs, per-op error tolerance, byte-stable round-trip. Ops: add, nudge, color, combine (union/intersect/subtract/blend), shell, pattern, remove. |
 | `cad-view` | M0 ✅ | wgpu renderer, procedural meshes, orbit camera, the one lit WGSL pass. |
-| `cad-motion` | M0 ✅ | modal key → action mapping. Pure; no camera, no scene. |
+| `cad-motion` | M0 ✅ M2 ✅ | modal key → action mapping for Normal and Grow. Pure; no camera, no scene. |
 | `cadscope-egui` | M0 ✅ | the shell: window, viewport, panels, wiring. |
 | `cad-liaison` | M3 | PartSpec/OpScript sanitizers, `logscope-fan` adapters, genviz progress. |
 | `cad-tex` | M4 | the texturing system: material graphs, triplanar + auto-unwrap, bake, audit. |

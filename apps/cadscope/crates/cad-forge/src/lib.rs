@@ -47,6 +47,23 @@ impl ShapeSpec {
     }
 }
 
+/// One station of a grown spine, in the document's own vocabulary rather than the kernel's — the
+/// forge owns what is serialized, so the kernel stays free of serde (and of any obligation to keep
+/// its internal types stable across versions).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SpineNode {
+    pub at: [f32; 3],
+    #[serde(default = "up_default")]
+    pub up: [f32; 3],
+    pub r: f32,
+    /// The grower's 1-5: circle, square, triangle, star, hex.
+    #[serde(default = "section_default")]
+    pub section: u32,
+}
+
+fn up_default() -> [f32; 3] { [0.0, 1.0, 0.0] }
+fn section_default() -> u32 { 1 }
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Op {
@@ -80,6 +97,17 @@ pub enum Op {
     /// Repeat a part `count` times along `step`, unioned into one solid. The canonical CAD
     /// linear pattern; `count` includes the original.
     Pattern { name: String, count: u32, step: [f32; 3] },
+    /// A grown solid: the stations a Grow-mode session recorded, swept and blended into one part.
+    Spine {
+        name: String,
+        nodes: Vec<SpineNode>,
+        #[serde(default)]
+        blend: f32,
+        #[serde(default)]
+        mirror: bool,
+        #[serde(default = "default_color")]
+        color: [f32; 4],
+    },
     /// Remove a part by name.
     Remove { name: String },
 }
@@ -212,6 +240,37 @@ impl Doc {
                         None => warn(&mut warns, i, format!("pattern: no part named '{name}'")),
                     }
                 }
+                Op::Spine { name, nodes, blend, mirror, color } => {
+                    if model.parts.iter().any(|p| &p.name == name) {
+                        warn(&mut warns, i, format!("spine: name '{name}' already exists"));
+                        continue;
+                    }
+                    let mut spine = cad_kernel::Spine::new(blend.max(0.0));
+                    for n in nodes {
+                        spine.nodes.push(cad_kernel::Node {
+                            pos: Vec3::from(n.at),
+                            up: Vec3::from(n.up),
+                            radius: n.r.max(1e-3),
+                            section: cad_kernel::Section::from_digit(n.section).unwrap_or_default(),
+                        });
+                    }
+                    match spine.to_sdf() {
+                        Some(sdf) => {
+                            let sdf = if *mirror {
+                                cad_kernel::sdf::blend(
+                                    sdf.clone(),
+                                    cad_kernel::spine::mirror_x(&sdf),
+                                    blend.max(0.01),
+                                )
+                            } else {
+                                sdf
+                            };
+                            model.parts.push(Part { id: next_id, name: name.clone(), sdf, color: *color });
+                            next_id += 1;
+                        }
+                        None => warn(&mut warns, i, format!("spine '{name}': needs at least two stations")),
+                    }
+                }
                 Op::Remove { name } => {
                     let before = model.parts.len();
                     model.parts.retain(|p| &p.name != name);
@@ -266,6 +325,49 @@ mod tests {
         let (m, warns) = d.apply();
         assert_eq!(warns.len(), 2, "{warns:?}");
         assert_eq!(m.parts.len(), 1, "good ops still applied");
+    }
+
+    #[test]
+    fn a_spine_op_round_trips_and_builds_a_solid() {
+        let nodes: Vec<SpineNode> = (0..8)
+            .map(|i| SpineNode {
+                at: [0.0, 0.5, i as f32 * 0.3],
+                up: [0.0, 1.0, 0.0],
+                r: 0.3,
+                section: 1,
+            })
+            .collect();
+        let d = Doc {
+            name: "grown".into(),
+            ops: vec![Op::Spine {
+                name: "tendril".into(),
+                nodes,
+                blend: 0.1,
+                mirror: false,
+                color: default_color(),
+            }],
+        };
+        assert_eq!(Doc::from_json(&d.to_json()).unwrap(), d, "spine ops must round-trip");
+        let (m, warns) = d.apply();
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(m.parts.len(), 1);
+        // On the centreline it is solid; a long way off the axis it is not.
+        assert!(m.parts[0].sdf.eval(glam::Vec3::new(0.0, 0.5, 1.0)) < 0.0);
+        assert!(m.parts[0].sdf.eval(glam::Vec3::new(3.0, 0.5, 1.0)) > 0.0);
+    }
+
+    #[test]
+    fn a_one_station_spine_is_reported_not_fatal() {
+        let d = Doc {
+            name: "stub".into(),
+            ops: vec![
+                Op::Spine { name: "x".into(), nodes: vec![SpineNode { at: [0.0; 3], up: [0.0, 1.0, 0.0], r: 0.2, section: 1 }], blend: 0.0, mirror: false, color: default_color() },
+                Op::Add { name: "ok".into(), shape: ShapeSpec::Sphere { r: 1.0 }, at: [0.0; 3], rot_axis_deg: None, color: default_color() },
+            ],
+        };
+        let (m, warns) = d.apply();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(m.parts.len(), 1, "the later op still applies");
     }
 
     #[test]
