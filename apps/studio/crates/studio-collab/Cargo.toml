@@ -1,0 +1,9 @@
+[package]
+name = "studio-collab"
+version = "0.1.0"
+edition = "2021"
+description = "Realtime collaborative editing for Studio projects: a convergent op log with per-peer presence. Neither kdenlive nor Audacity can be edited by two people at once; this is the reason Studio exists as a port rather than a clone."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+serde = { version = "1", features = ["derive"] }
