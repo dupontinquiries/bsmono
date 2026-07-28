@@ -3770,6 +3770,88 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-moe-cpu") {
+        // THE MISSING REFERENCE. Every other MoE gate compares GPU against GPU — streaming vs resident,
+        // fused vs unfused, v1 vs v2. All of them pass if the SHARED forward is wrong, and that is
+        // exactly the shape of the evidence: DeepSeek-8B (dense) produces coherent text while Scout and
+        // Qwen3-30B (both MoE) produce garbage, with every MoE gate green.
+        //
+        // This computes a small MoE layer entirely on the CPU — route, top-k, per-expert SwiGLU,
+        // weighted sum — and compares. f32 weights throughout, so any difference is the FORWARD PASS
+        // and not quantization.
+        let gpu = Gpu::new();
+        eprintln!("gate-moe-cpu: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let (d, ff, ne, n_used) = (64usize, 128usize, 8usize, 2usize);
+        let mk = |seed: u32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| {
+                let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                ((x >> 9) as f32 / (1u32 << 23) as f32) - 0.5
+            }).collect()
+        };
+        let rw = mk(1, ne * d);
+        let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
+        let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
+        let xin = mk(8, d);
+
+        for (norm, wbefore, label) in [
+            (gpu_kernels::moe::RouteNorm::Softmax, false, "softmax, weight-after (Qwen3)"),
+            (gpu_kernels::moe::RouteNorm::Sigmoid, true,  "sigmoid, weight-before (Llama-4)"),
+        ] {
+            let cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32,
+                n_shared: 0, norm, normalize: true, weight_before: wbefore };
+            // ---- CPU reference ----
+            let mut logits = vec![0f32; ne];
+            for e in 0..ne { logits[e] = (0..d).map(|i| rw[e * d + i] * xin[i]).sum(); }
+            let sel = gpu_kernels::moe::route(&logits, &cfg);
+            let mut want = vec![0f32; d];
+            for s in &sel {
+                let e = s.expert as usize;
+                let xe: Vec<f32> = if wbefore { xin.iter().map(|v| v * s.weight).collect() } else { xin.clone() };
+                // gate_up is [2*ff, d]: rows 0..ff are gate, ff..2ff are up (packed SwiGLU)
+                let mut act = vec![0f32; ff];
+                for r in 0..ff {
+                    let g: f32 = (0..d).map(|i| gus[e][r * d + i] * xe[i]).sum();
+                    let u: f32 = (0..d).map(|i| gus[e][(ff + r) * d + i] * xe[i]).sum();
+                    act[r] = (g / (1.0 + (-g).exp())) * u;         // silu(g) * u
+                }
+                for r in 0..d {
+                    let v: f32 = (0..ff).map(|i| dns[e][r * ff + i] * act[i]).sum();
+                    want[r] += if wbefore { v } else { v * s.weight };
+                }
+            }
+            // moe_ffn_t takes (n2 = normed input, x2 = RESIDUAL) and returns the residual PLUS the MoE
+            // output. The first version of this reference omitted the residual and reported the engine
+            // as broken — element 0 was off by exactly -0.5, which is exactly xin[0]. A gate that is
+            // wrong in the accusing direction is the worst kind: it would have sent the next session
+            // hunting a bug in correct code.
+            for r in 0..d { want[r] += xin[r]; }
+            // ---- GPU ----
+            let layer = gpu_kernels::MoeLayer {
+                router: gpu_kernels::Lin::f32(gpu.upload(&rw, ne, d)),
+                gate_up: gus.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, 2 * ff, d))).collect(),
+                down: dns.iter().map(|w| gpu_kernels::Lin::f32(gpu.upload(w, d, ff))).collect(),
+                stacked_gu: gpu_kernels::Lin::f32(gpu.upload(&gus.concat(), ne * 2 * ff, d)),
+                stacked_down: gpu_kernels::Lin::f32(gpu.upload(&dns.concat(), ne * d, ff)),
+                cfg, shared: None, stream: None,
+            };
+            let n2t = gpu.upload(&xin, 1, d); let x2t = gpu.upload(&xin, 1, d);
+            let got = gpu.download(&gpu.moe_ffn_t(&layer, &n2t, 1, d, &x2t));
+            let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
+            println!("     routed experts: {:?}", sel.iter().map(|s| (s.expert, s.weight)).collect::<Vec<_>>());
+            println!("     cpu[0..4] = {:?}", &want[..4.min(want.len())]);
+            println!("     gpu[0..4] = {:?}", &got[..4.min(got.len())]);
+            ck(&format!("{label}: GPU == CPU (rel={:.2e})", worst / scale), worst / scale < 1e-4);
+        }
+        println!("gate-moe-cpu: {}", if ok {
+            "the MoE forward matches a CPU reference \u{2713}"
+        } else {
+            "FAIL \u{2717} — the MoE forward disagrees with the CPU. Every GPU-vs-GPU MoE gate would \
+still pass, which is why this one exists."
+        });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-moe-fusion") {
         // The dispatch levers advertise themselves as "bit-identical, decode-speed only". That is a claim,
         // and it has never been checked. It matters now because the A/B verdict is keyed by decode class,
