@@ -243,6 +243,23 @@ impl ActPrep {
     pub fn new(act: &[f32]) -> Self { ActPrep { q: quantize_act(act), sums: act_block_sums(act) } }
 }
 
+/// The byte range of one layer's weights, for prefetching the next while computing this one.
+///
+/// Colibri's `couple_prefetch` issued the NEXT layer's expert fills during the current layer's stall.
+/// The CPU analogue is first-touch page faults: weights read from an mmap are not resident until
+/// touched, and a 60 GiB model faults every page exactly once — during the first token, serialised
+/// against the arithmetic that needs them. Handing this range to `crate::prefetch_mapped` for layer
+/// N+1 while computing layer N overlaps the fault with useful work.
+///
+/// Returns None past the end rather than clamping: a clamped range would prefetch the last layer
+/// repeatedly, which is wasted syscalls that look like progress.
+pub fn layer_range(raw: &[u8], layer: usize, bytes_per_layer: usize) -> Option<&[u8]> {
+    let start = layer.checked_mul(bytes_per_layer)?;
+    if start >= raw.len() { return None; }
+    let end = (start + bytes_per_layer).min(raw.len());
+    Some(&raw[start..end])
+}
+
 /// Matvec over a mapped weight tensor, on a persistent pool.
 ///
 /// `raw` is the tensor exactly as it sits in the file. No copy, no dequantization pass, no staging.
@@ -512,6 +529,18 @@ mod tests {
             let rel = (want - out[r]).abs() / want.abs().max(1e-3);
             assert!(rel < 0.01, "row {r}: want {want}, got {}, rel {rel:.4}", out[r]);
         }
+    }
+
+    #[test]
+    fn a_layer_range_past_the_end_is_None_not_a_clamped_repeat() {
+        // A clamped range would prefetch the last layer over and over — wasted syscalls that look like
+        // progress, and the kind of thing that shows up as "the prefetch is enabled" while doing
+        // nothing useful.
+        let raw = vec![0u8; 1000];
+        assert_eq!(layer_range(&raw, 0, 300).map(|s| s.len()), Some(300));
+        assert_eq!(layer_range(&raw, 3, 300).map(|s| s.len()), Some(100), "last layer is short");
+        assert!(layer_range(&raw, 4, 300).is_none(), "past the end is None");
+        assert!(layer_range(&raw, usize::MAX, 300).is_none(), "and the multiply cannot overflow");
     }
 
     #[test]
