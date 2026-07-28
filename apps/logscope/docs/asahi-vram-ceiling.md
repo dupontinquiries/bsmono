@@ -118,3 +118,43 @@ could not report it honestly even if one existed.
 
 So reaching in the dark is, unusually, the correct approach here — but it should be done once and
 cached, not left to a person with an env var.
+
+
+## A third number, from llama.cpp's Vulkan backend: 97 GiB
+
+Running logscope's llama.cpp backend on the same machine:
+
+```
+llama_prepare_model_devices: using device Vulkan0 (Apple M2 Ultra (G14D B1)) - 97140 MiB free
+```
+
+So there are now three figures for the same device:
+
+| source | figure | what it is |
+|---|---|---|
+| `memplan` constant | 24 GiB | an empirical peak from the STAGING path, pre-arena |
+| `--gate-vram` | 63 GiB | the largest total this engine allocated AND verified |
+| llama.cpp / Vulkan | 97 GiB | what the driver REPORTS as available |
+
+These are not in conflict; they measure three different things, and the gap between the second and
+third is the interesting one. 97 GiB is the driver's own accounting — `VkPhysicalDeviceMemoryProperties`
+heap size less what is already committed. 63 GiB is where OUR allocation pattern stopped working. The
+difference is not the device refusing; it is something about how we ask.
+
+Candidates, in the order worth testing:
+
+* **Slab size.** The probe allocates 1 GiB slabs and the arena packs into ≤2047 MiB ones. llama.cpp's
+  Vulkan backend allocates far fewer, far larger blocks. If the BO VMA allocator fragments per
+  allocation rather than per byte, fewer-and-larger would reach closer to 97.
+* **Buffer count.** Sixty-three 1 GiB slabs is sixty-three buffer objects plus everything else the
+  engine holds. The governor already models a buffer-object budget for Metal; the Vulkan path may have
+  an equivalent limit we are hitting first.
+* **Our own overhead.** The probe runs inside a process that has already allocated pipelines, bind
+  groups and dims buffers. llama.cpp's 97 GiB is measured at startup with nothing committed.
+
+The cheap discriminator is to re-run `--gate-vram` with `LOGSCOPE_PROBE_SLAB_MB=4096`. If the verified
+ceiling rises toward 97, the limit is allocation SHAPE rather than total bytes — and the arena's
+2047 MiB slab size becomes a tuning parameter rather than a constant.
+
+That would matter beyond the ceiling: Scout at ~34 GiB resident already fits under 63, but a 70B at q4
+needs ~40 GiB and a 70B at int8 needs ~75, which is the difference between "streams" and "fits".
