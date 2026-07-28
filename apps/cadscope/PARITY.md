@@ -37,13 +37,23 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 - **Indexed, but nothing is cached.** A scan of the monorepo takes ~33 s for 4,894 entries and is
   redone from scratch every time. §17.4 calls for a content-hashed derived cache; until it exists,
   `--ref-index` is a diagnostic rather than something the app can afford at startup.
-- **Only IQM headers are parsed.** OBJ and glTF models index by *name* with empty facts, which is
-  honest but thin — 3,155 model entries, 2,150 of them with real facts. An OBJ reader is cheap and
-  should follow.
-- **Bounds are nearly always absent.** IQM stores them per animation frame, so a static export has
-  none: exactly 1 model in the whole tree reports bounds. This is the strongest argument for the
-  M5 plan of computing volume from vertex data rather than headers — the cheap proxy is unavailable
-  precisely where a designer would want it.
+- **glTF/GLB models index by name only.** IQM gives headers and OBJ gives measured geometry;
+  3,150 of 3,155 model entries now carry real facts, and the remainder are glTF. A reader for it is
+  the obvious next parser.
+- **Units are unknown, and that limits what `volume of` means.** Nothing in the corpus records
+  whether a file is in millimetres, metres or engine units — the measured volumes span twelve
+  orders of magnitude, and some of the largest are almost certainly a unit convention rather than a
+  large object. §17.1 lists unit scale and up-axis as derived facts; they are not implemented.
+  Until they are, "same volume as X" is only meaningful between files that share a convention, and
+  `ref.toml`'s per-root unit hint is the intended fix.
+- **A measured volume assumes a closed mesh.** The divergence-theorem sum is only a volume for a
+  closed, consistently wound surface. An open or non-manifold OBJ still produces a number, and that
+  number is meaningless. `obj_diagnose_v3` from the v2 lineage already knows how to detect this and
+  should gate the fact.
+- **IQM bounds are nearly always absent.** IQM stores them per animation frame, so a static export
+  has none: exactly 1 IQM in the tree reports bounds, against 1,000 OBJ files that now compute
+  theirs from vertices. This is what settled the design — reference volume comes from vertex data,
+  measured with the mesher's own sum.
 - **Names are ambiguous and that is deliberate.** `obsidian` resolves to three entries (its base,
   normal and specular maps, correctly grouped under one name); `puma` resolves to a top hit plus
   two weaker ones. `resolve` returns a ranked list and never collapses to one answer — a silent

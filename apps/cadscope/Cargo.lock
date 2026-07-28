@@ -306,6 +306,7 @@ version = "0.1.0"
 name = "cad-ref"
 version = "0.1.0"
 dependencies = [
+ "cad-kernel",
  "glam",
 ]
 

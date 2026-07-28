@@ -130,6 +130,10 @@ pub enum Sdf {
     /// Smooth union with blend radius `k` — the operator the UI sells as *Blend* (fillet-ish).
     /// Polynomial smooth-min; bounded by `min(a,b)` from above and `min(a,b) − k/4` from below.
     Blend { a: Box<Sdf>, b: Box<Sdf>, k: f32 },
+    /// Uniform scale by `s` about the origin. Uniform only, and deliberately so: a non-uniform
+    /// scale does not preserve distance in any direction, so it cannot be expressed as an exact
+    /// SDF without a Lipschitz correction that would make every child evaluation conservative.
+    Scale { s: f32, node: Box<Sdf> },
     /// Rounded shell of thickness `t` around the child's surface (|d| − t): hollowing in one node.
     Shell { t: f32, node: Box<Sdf> },
     /// A segment from `a` to `b` swept with `section`, its radius tapering `ra` → `rb`. `up`
@@ -172,6 +176,10 @@ impl Sdf {
                 }
                 let h = (0.5 + 0.5 * (db - da) / k).clamp(0.0, 1.0);
                 db + (da - db) * h - k * h * (1.0 - h)
+            }
+            Sdf::Scale { s, node } => {
+                let s = if s.abs() < 1e-6 { 1e-6 } else { *s };
+                node.eval(p / s) * s.abs()
             }
             Sdf::Shell { t, node } => node.eval(p).abs() - t,
             Sdf::Swept { a, b, ra, rb, section, up } => {
@@ -279,6 +287,11 @@ impl Sdf {
                 (al.max(bl), ah.min(bh))
             }
             Sdf::Subtract { a, .. } => a.aabb(),
+            Sdf::Scale { s, node } => {
+                let (lo, hi) = node.aabb();
+                let (a, b) = (lo * *s, hi * *s);
+                (a.min(b), a.max(b))
+            }
             Sdf::Shell { t, node } => {
                 let (lo, hi) = node.aabb();
                 (lo - Vec3::splat(*t), hi + Vec3::splat(*t))
@@ -304,6 +317,7 @@ impl Sdf {
             Sdf::Union { a, b } | Sdf::Blend { a, b, .. } => a.bound_radius().max(b.bound_radius()),
             Sdf::Intersect { a, b } => a.bound_radius().min(b.bound_radius()),
             Sdf::Subtract { a, .. } => a.bound_radius(),
+            Sdf::Scale { s, node } => node.bound_radius() * s.abs(),
             Sdf::Shell { t, node } => node.bound_radius() + t,
             Sdf::Swept { a, b, ra, rb, .. } => (a.length() + ra).max(b.length() + rb),
         }
@@ -323,6 +337,7 @@ pub fn intersect(a: Sdf, b: Sdf) -> Sdf { Sdf::Intersect { a: Box::new(a), b: Bo
 pub fn subtract(a: Sdf, b: Sdf) -> Sdf { Sdf::Subtract { a: Box::new(a), b: Box::new(b) } }
 pub fn blend(a: Sdf, b: Sdf, k: f32) -> Sdf { Sdf::Blend { a: Box::new(a), b: Box::new(b), k } }
 pub fn shell(t: f32, node: Sdf) -> Sdf { Sdf::Shell { t, node: Box::new(node) } }
+pub fn scale(s: f32, node: Sdf) -> Sdf { Sdf::Scale { s, node: Box::new(node) } }
 pub fn swept(a: Vec3, b: Vec3, ra: f32, rb: f32, section: Section, up: Vec3) -> Sdf {
     Sdf::Swept { a, b, ra, rb, section, up }
 }
@@ -399,6 +414,19 @@ mod tests {
             let p = Vec3::new(lo.x - 0.01, lo.y + (hi.y - lo.y) * t, 0.0);
             assert!(s.eval(p) > 0.0);
         }
+    }
+
+    #[test]
+    fn uniform_scale_is_exact_and_cubes_the_volume() {
+        let unit = sphere(1.0);
+        let big = scale(3.0, unit.clone());
+        // Distance scales with the shape: a point 6 units out is 3 from a radius-3 sphere.
+        assert!((big.eval(Vec3::new(6.0, 0.0, 0.0)) - 3.0).abs() < 1e-4);
+        assert!((big.eval(Vec3::ZERO) + 3.0).abs() < 1e-4);
+        // And the meshed volume follows s^3, which is what `volume of` relies on.
+        let v1 = crate::dual_contour(&unit, crate::MeshOpts { resolution: 32 }).signed_volume();
+        let v3 = crate::dual_contour(&big, crate::MeshOpts { resolution: 32 }).signed_volume();
+        assert!((v3 / v1 / 27.0 - 1.0).abs() < 0.02, "{v3} / {v1}");
     }
 
     #[test]

@@ -21,6 +21,7 @@ use glam::Vec3;
 
 pub mod doc;
 pub mod iqm;
+pub mod obj;
 pub mod png;
 
 /// What sort of reference an entry is. The four kinds of §17.1.
@@ -56,8 +57,14 @@ pub struct ModelFacts {
     pub mesh_names: Vec<String>,
     /// Material names referenced by the meshes; the bridge to the texture corpus.
     pub materials: Vec<String>,
-    /// Axis-aligned bounds, when the file carries them (IQM stores them per animation frame).
+    /// Axis-aligned bounds, when the file carries them (IQM stores them per animation frame) or
+    /// when we read enough geometry to compute them.
     pub bounds: Option<(Vec3, Vec3)>,
+    /// Enclosed volume, measured from vertex data with the same divergence-theorem sum the mesher
+    /// uses — so a reference volume and a modelled volume are the same quantity, not two things
+    /// that share a name. `None` when only a header was read.
+    pub volume: Option<f32>,
+    pub area: Option<f32>,
 }
 
 impl ModelFacts {
@@ -193,7 +200,11 @@ impl Index {
         let stem = path.file_stem()?.to_str()?.to_string();
         let bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let (name, facts) = match kind {
-            Kind::Model => (stem, Facts::Model(iqm::facts(path).unwrap_or_default())),
+            Kind::Model => {
+                // IQM gives headers; OBJ gives real geometry, and therefore a measured volume.
+                let facts = iqm::facts(path).or_else(|| obj::facts(path)).unwrap_or_default();
+                (stem, Facts::Model(facts))
+            }
             Kind::Texture => {
                 let (name, role) = split_texture_role(&stem);
                 let mut f = png::facts(path).unwrap_or_default();
@@ -316,6 +327,17 @@ mod tests {
         assert_eq!(Kind::of_path(Path::new("norm_x.PNG")), Some(Kind::Texture));
         assert_eq!(Kind::of_path(Path::new("spec.md")), Some(Kind::Doc));
         assert_eq!(Kind::of_path(Path::new("Cargo.lock")), None);
+    }
+
+    #[test]
+    fn measured_volume_is_distinct_from_the_box_proxy() {
+        let f = ModelFacts {
+            bounds: Some((Vec3::ZERO, Vec3::new(2.0, 2.0, 2.0))),
+            volume: Some(4.19), // a sphere inscribed in that box
+            ..Default::default()
+        };
+        assert_eq!(f.bounds_volume(), Some(8.0));
+        assert!(f.volume.unwrap() < f.bounds_volume().unwrap(), "the solid fills less than its box");
     }
 
     #[test]

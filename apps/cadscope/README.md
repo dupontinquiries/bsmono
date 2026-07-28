@@ -14,7 +14,7 @@ hardware (this workspace was built in a sandbox with no GPU or display).
 ```sh
 cd apps/cadscope
 cargo run -p cadscope-egui -- --ref-index ../..   # index the monorepo's models/textures/docs
-cargo test                              # 72 tests, includes offline WGSL validation via naga
+cargo test                              # 80 tests, includes offline WGSL validation via naga
 cargo run -p cadscope-egui -- --selftest  # headless: evaluate, mesh and ray-probe the model
 cargo run --release -p cadscope-egui    # the app (bin name: cadscope)
 ```

@@ -85,6 +85,7 @@ fn demo_doc() -> Doc {
 fn ref_index(root: &str) -> ! {
     use cad_ref::{Facts, Index, Kind, ScanOpts};
     let t0 = std::time::Instant::now();
+    let mut fail_ref = 0usize;
     let idx = Index::scan(std::path::Path::new(root), &ScanOpts::default());
     println!(
         "indexed {} entries from {root} in {:.2}s",
@@ -146,6 +147,66 @@ fn ref_index(root: &str) -> ! {
     }
     println!("  {joined} model->texture material joins resolved{}", if example.is_empty() { String::new() } else { format!("  (e.g. {example})") });
 
+    // Measured geometry, not just headers: OBJ files carry vertices, so they carry a volume.
+    let mut measured: Vec<(&str, f32, f32)> = Vec::new();
+    for e in &idx.entries {
+        if let Facts::Model(m) = &e.facts {
+            if let (Some(v), Some(a)) = (m.volume, m.area) {
+                if v > 0.0 {
+                    measured.push((e.name.as_str(), v, a));
+                }
+            }
+        }
+    }
+    measured.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    println!("  {} models measured from vertex data (volume + area)", measured.len());
+    for (n, v, a) in measured.iter().take(3) {
+        println!("    {:34} vol {:>12.1}  area {:>12.1}", n, v, a);
+    }
+
+    // The whole §17 chain, end to end on a real file: resolve a name, take its MEASURED volume,
+    // and build a part that is scaled to match — with the match verified rather than asserted.
+    if let Some((name, vol, _)) = measured.iter().find(|(_, v, _)| *v > 1.0 && *v < 1.0e6) {
+        let doc = Doc {
+            name: "volume-of".into(),
+            ops: vec![
+                Op::Add {
+                    name: "blank".into(),
+                    shape: ShapeSpec::Cuboid { half: [1.0, 1.0, 1.0] },
+                    at: [0.0, 0.0, 0.0],
+                    rot_axis_deg: None,
+                    color: [0.7, 0.7, 0.7, 1.0],
+                },
+                Op::MatchVolume { name: "blank".into(), volume: *vol, tol: 0.02, resolution: 40 },
+            ],
+        };
+        let (m, w) = doc.apply();
+        let got = m
+            .parts
+            .first()
+            .map(|p| {
+                cad_kernel::dual_contour(&p.sdf, MeshOpts { resolution: 48 })
+                    .signed_volume()
+                    .abs()
+            })
+            .unwrap_or(0.0);
+        let ok = w.is_empty() && (got - vol).abs() / vol < 0.02;
+        if !ok {
+            fail_ref += 1;
+        }
+        println!(
+            "  volume-of {:20} target {:.1} -> built {:.1} ({:+.2}%)  {}",
+            name,
+            vol,
+            got,
+            (got - vol) / vol * 100.0,
+            if ok { "ok" } else { "FAIL" }
+        );
+        for warning in &w {
+            println!("      warning: {}", warning.reason);
+        }
+    }
+
     // Name resolution, which is what a person actually uses.
     for q in ["puma", "shark", "obsidian", "nosuchmodelanywhere"] {
         let hits = idx.resolve(q, None, 3);
@@ -156,7 +217,10 @@ fn ref_index(root: &str) -> ! {
             println!("  resolve {:22} -> {}", q, names.join(", "));
         }
     }
-    std::process::exit(0);
+    if fail_ref > 0 {
+        println!("ref-index: FAIL");
+    }
+    std::process::exit(if fail_ref == 0 { 0 } else { 1 });
 }
 
 /// Headless verification of the whole model pipeline — evaluate the document, mesh every CSG

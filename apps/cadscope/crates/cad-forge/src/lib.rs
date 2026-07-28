@@ -108,6 +108,26 @@ pub enum Op {
         #[serde(default = "default_color")]
         color: [f32; 4],
     },
+    /// Scale a part uniformly about its own centre (not the origin, which would move it).
+    Scale { name: String, factor: f32 },
+    /// Resize a part until its measured volume matches `volume` — the op behind "make it the same
+    /// volume as <model>" (plan §17.2). The target is a number the *caller* resolved from the
+    /// reference corpus; this op's job is to hit it and to check that it did.
+    ///
+    /// The check is the point. Volume is measured by meshing the part, the scale factor is the
+    /// cube root of the ratio, and the result is re-measured: if it is not within `tol` the op
+    /// warns. A claim about geometry is verified on every rebuild, never trusted.
+    MatchVolume {
+        name: String,
+        volume: f32,
+        /// Fractional tolerance; 0.02 (2%) when omitted, which is comfortably above the mesher's
+        /// own error at the default resolution.
+        #[serde(default)]
+        tol: f32,
+        /// Mesh resolution used for measurement. Higher is slower and more accurate.
+        #[serde(default)]
+        resolution: u32,
+    },
     /// Remove a part by name.
     Remove { name: String },
 }
@@ -121,6 +141,14 @@ pub enum BoolMode {
     Union,
     Intersect,
     Subtract,
+}
+
+/// Scale about the part's own centre. Scaling about the origin would silently translate anything
+/// not modelled there, which is never what "make it bigger" means.
+fn scale_about_centre(sdf: &cad_kernel::Sdf, factor: f32) -> cad_kernel::Sdf {
+    let (lo, hi) = sdf.aabb();
+    let c = (lo + hi) * 0.5;
+    cad_kernel::sdf::translate(c, cad_kernel::sdf::scale(factor, cad_kernel::sdf::translate(-c, sdf.clone())))
 }
 
 /// The document. `name` titles the model; ops replay in order.
@@ -271,6 +299,49 @@ impl Doc {
                         None => warn(&mut warns, i, format!("spine '{name}': needs at least two stations")),
                     }
                 }
+                Op::Scale { name, factor } => match model.parts.iter_mut().find(|p| &p.name == name) {
+                    Some(p) if factor.is_finite() && *factor > 1e-4 => {
+                        p.sdf = scale_about_centre(&p.sdf, *factor)
+                    }
+                    Some(_) => warn(&mut warns, i, format!("scale '{name}': factor must be > 0")),
+                    None => warn(&mut warns, i, format!("scale: no part named '{name}'")),
+                },
+                Op::MatchVolume { name, volume, tol, resolution } => {
+                    let tol = if *tol > 0.0 { *tol } else { 0.02 };
+                    let res = if *resolution >= 8 { *resolution } else { 40 };
+                    let target = *volume;
+                    match model.parts.iter_mut().find(|p| &p.name == name) {
+                        Some(p) if target.is_finite() && target > 0.0 => {
+                            let measure = |sdf: &cad_kernel::Sdf| {
+                                cad_kernel::dual_contour(sdf, cad_kernel::MeshOpts { resolution: res })
+                                    .signed_volume()
+                                    .abs()
+                            };
+                            let current = measure(&p.sdf);
+                            if current <= 1e-9 {
+                                warn(&mut warns, i, format!("match_volume '{name}': part has no measurable volume"));
+                            } else {
+                                let factor = (target / current).cbrt();
+                                p.sdf = scale_about_centre(&p.sdf, factor);
+                                let got = measure(&p.sdf);
+                                let err = (got - target).abs() / target;
+                                if err > tol {
+                                    warn(
+                                        &mut warns,
+                                        i,
+                                        format!(
+                                            "match_volume '{name}': wanted {target:.3}, measured {got:.3} ({:.1}% off, tolerance {:.1}%)",
+                                            err * 100.0,
+                                            tol * 100.0
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        Some(_) => warn(&mut warns, i, format!("match_volume '{name}': target volume must be > 0")),
+                        None => warn(&mut warns, i, format!("match_volume: no part named '{name}'")),
+                    }
+                }
                 Op::Remove { name } => {
                     let before = model.parts.len();
                     model.parts.retain(|p| &p.name != name);
@@ -368,6 +439,43 @@ mod tests {
         let (m, warns) = d.apply();
         assert_eq!(warns.len(), 1);
         assert_eq!(m.parts.len(), 1, "the later op still applies");
+    }
+
+    #[test]
+    fn match_volume_hits_its_target_and_stays_put() {
+        // A sphere of radius 2 (volume 33.5) asked to become volume 8.
+        let d = Doc {
+            name: "resize".into(),
+            ops: vec![
+                Op::Add { name: "blob".into(), shape: ShapeSpec::Sphere { r: 2.0 }, at: [5.0, 0.0, 0.0], rot_axis_deg: None, color: default_color() },
+                Op::MatchVolume { name: "blob".into(), volume: 8.0, tol: 0.0, resolution: 40 },
+            ],
+        };
+        let (m, warns) = d.apply();
+        assert!(warns.is_empty(), "post-condition should hold: {warns:?}");
+        let (lo, hi) = m.parts[0].sdf.aabb();
+        let c = (lo + hi) * 0.5;
+        // Scaling must not have dragged the part toward the origin.
+        assert!((c.x - 5.0).abs() < 0.05, "part moved to {c:?}");
+        // And the radius should now be the one that gives volume 8: (3*8/4pi)^(1/3) = 1.241
+        let r = (hi.x - lo.x) * 0.5;
+        assert!((r - 1.241).abs() < 0.05, "radius {r}");
+    }
+
+    #[test]
+    fn match_volume_reports_a_target_it_cannot_verify() {
+        // Tolerance far tighter than the mesher's own error at a coarse resolution: the op must
+        // say so rather than quietly claim success.
+        let d = Doc {
+            name: "picky".into(),
+            ops: vec![
+                Op::Add { name: "blob".into(), shape: ShapeSpec::Sphere { r: 2.0 }, at: [0.0; 3], rot_axis_deg: None, color: default_color() },
+                Op::MatchVolume { name: "blob".into(), volume: 8.0, tol: 1e-6, resolution: 12 },
+            ],
+        };
+        let (_, warns) = d.apply();
+        assert_eq!(warns.len(), 1);
+        assert!(warns[0].reason.contains("measured"), "{}", warns[0].reason);
     }
 
     #[test]
