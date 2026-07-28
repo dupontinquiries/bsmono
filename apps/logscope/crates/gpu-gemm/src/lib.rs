@@ -148,7 +148,32 @@ pub fn retain_map(path: &str) -> std::io::Result<&'static [u8]> {
 /// reclaimable. Releasing it hands that decision back to the kernel immediately instead of leaving it to
 /// memory pressure. Nothing is lost: a later expert fill re-faults the pages it needs, which is precisely
 /// the streaming design ("the kernel page cache IS the cache").
+/// Set when any weight is held as a VIEW into a retained mapping, rather than copied out of it.
+///
+/// Releasing page residency under a live view turns every subsequent read of that weight into a disk
+/// fault. For a streamed MoE that is one fault storm per expert fill — the exact path the view mode
+/// exists to make cheap.
+pub static MAP_VIEWS_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that a retained mapping is being VIEWED, not just read during load.
+pub fn mark_map_views_live() {
+    MAP_VIEWS_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub fn release_map_residency() -> usize {
+    // GUARD. This was unconditional, and it is safe ONLY when the load pass has finished reading and
+    // nothing holds a view into the mapping. When experts are file VIEWS (`RawExpertSrc`), the mapping is
+    // live for the process lifetime and MADV_DONTNEED turns every fill into a page fault from disk —
+    // converting the view path's whole advantage into its opposite, and stalling the CPU inside the
+    // write_buffer that a GPU dispatch is waiting on.
+    //
+    // Scout does not hit this today because its Q6_K expert tensor forces the host-copy path. Any
+    // all-Q4_K MoE checkpoint would, which is precisely the case the view path was built for.
+    if MAP_VIEWS_LIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("wgpu-engine: keeping page cache — expert weights are VIEWS into the mapped file, so \
+dropping residency would fault every fill from disk");
+        return 0;
+    }
     let Some(reg) = RETAINED_MAPS.get() else { return 0 };
     let g = reg.lock().unwrap();
     let mut n = 0;
@@ -3123,6 +3148,14 @@ impl Gpu {
                                 n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize) -> MoeStream {
         let gu_expert_bytes = ff * d / 256 * 144;
         let dn_expert_bytes = d * ff / 256 * 144;
+        // These are VIEWS into a retained mapping, not copies — so the mapping must stay resident for the
+        // process lifetime. Declaring it here rather than at the release site keeps the fact next to the
+        // thing that makes it true.
+        mark_map_views_live();
+        // These slices point INTO the retained mapping and stay live for the process lifetime, so the
+        // page cache must not be dropped underneath them. Declaring it here rather than at the release
+        // site keeps the fact next to the thing that makes it true.
+        mark_map_views_live();
         let raw = RawExpertSrc { gate, up, down, gu_expert_bytes, dn_expert_bytes, ff, d };
         let (_, gu_total) = raw.gu_layout();
         let (_, dn_total) = raw.dn_layout();
