@@ -12,6 +12,7 @@
 //! something that runs, or `None` if this build does not know the kind.
 
 pub mod analysis;
+pub mod saturation;
 
 use std::collections::BTreeMap;
 use studio_core::Ticks;

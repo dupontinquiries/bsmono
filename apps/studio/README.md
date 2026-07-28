@@ -52,7 +52,7 @@ edits exactly reversible, which floats are not.
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, compressor, limiter, transform, colour, retiming, **analysis** | 18 |
+| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, **saturation** | 27 |
 
 ## Realtime collaboration, concretely
 
@@ -549,3 +549,53 @@ A test caught the definition being wrong on the first pass: a 9 kHz source was
 reported as "masked" by a bass at 100 Hz, where the target has no content at
 all. Masking requires something *of yours* to bury, so a band where the target
 is absent now scores zero — the correct definition rather than a threshold tweak.
+
+## Saturation: why these curves
+
+Every soft-clipper sounds *fine*; the classics sound **good**, and the whole
+difference is which harmonics they make — which is arithmetic, not mystique:
+
+* A **symmetric** curve (`f(-x) = -f(x)`) can only make ODD harmonics — 3rd,
+  5th. That is the console/transistor sound: present, a bit aggressive.
+* An **asymmetric** curve also makes EVEN harmonics. The 2nd is an octave up,
+  which the ear reads as warmth rather than distortion — the tube sound, and why
+  a tube stage flatters a vocal where a clipper just makes it loud.
+
+So the profiles differ in symmetry and knee shape, and the tests **measure the
+harmonic signature with an FFT** instead of trusting the comment. That caught
+two of my own claims being wrong: I had Tape in the even-harmonic group, but
+real tape is 3rd-harmonic dominant with only a trace of 2nd — it is warm because
+of its soft knee and compression, not because it is asymmetric. And Chebyshev
+blends T2/T4 (even) with T3 (odd), so it belongs in both.
+
+The classics — **Tube**, **Tape**, **Console**, **Diode** — are kept because
+they sound good. The funky four never existed in hardware: **Wavefolder**
+reflects instead of clipping so harmonics keep climbing with drive rather than
+settling; **Crush** makes drive select bit depth, so it gets grainier instead of
+louder; **Chebyshev** synthesises harmonics directly, so the knob literally
+picks *which* harmonic to add; **Rectify** rings an octave up on transients.
+
+### The performance decision
+
+Distortion makes harmonics above the signal, and any past Nyquist fold back as
+inharmonic tones — the metallic edge that makes cheap plugins sound cheap. The
+fix is oversampling, which costs 4× the work. So it runs **only when it is doing
+something**: below a drive floor the curve is near-linear, generates almost
+nothing to fold, and the stage collapses to a multiply. A mastering chain with
+eight modules where six sit near unity should not pay for eight oversamplers.
+
+A DC blocker follows every curve, because asymmetric shaping adds offset that is
+inaudible on its own and quietly eats headroom in everything downstream — the
+classic reason a "warm" chain runs out of room. Crush and Chebyshev take drive
+as a *parameter* rather than input gain; multiplying their input by eight first
+buries the effect entirely, which is what the harmonics test caught.
+
+## Visual direction: unendlich, not iZotope
+
+The interaction grammar comes from Ozone and Neutron — spectrum as the shared
+canvas, direct manipulation of nodes and crossovers on it, a visible reorderable
+module chain, gain-matched A/B, masking between tracks. The *look* comes from
+unendlich instead: atmospheric depth rather than flat panels — fog gradients
+behind the spectrum, sun/ambient colour grading the whole surface, modules
+sitting in a lit volume rather than boxed in chrome. Borrowing the grammar and
+not the skin is also what keeps this a spiritual successor rather than a clone.
