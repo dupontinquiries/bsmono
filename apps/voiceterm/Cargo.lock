@@ -299,6 +299,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "core-kit"
+version = "0.1.0"
+
+[[package]]
 name = "coreaudio-rs"
 version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1253,6 +1257,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ipc-kit"
+version = "0.1.0"
+dependencies = [
+ "net-kit",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1492,6 +1503,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "models-kit"
+version = "0.1.0"
+
+[[package]]
 name = "ndk"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1521,10 +1536,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "net-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+]
+
+[[package]]
 name = "new_debug_unreachable"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "650eef8c711430f1a879fdd01d4745a7deea475becfb90269c06775983bbf086"
+
+[[package]]
+name = "nifty-core"
+version = "0.1.0"
 
 [[package]]
 name = "nix"
@@ -2910,6 +2936,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "voice-kit"
+version = "0.1.0"
+dependencies = [
+ "models-kit",
+]
+
+[[package]]
+name = "voiced-core"
+version = "0.1.0"
+dependencies = [
+ "ipc-kit",
+ "voice-kit",
+]
+
+[[package]]
 name = "vte"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3041,11 +3082,13 @@ dependencies = [
  "flate2",
  "libc",
  "llama-cpp-2",
+ "nifty-core",
  "portable-pty",
  "qmetaobject",
  "scraper",
  "unicode-width 0.1.14",
  "ureq",
+ "voiced-core",
  "vte",
  "whisper-rs",
 ]

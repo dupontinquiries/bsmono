@@ -192,6 +192,11 @@ pub struct TermGrid {
     /// cell write) already routes through one of them. Indexed by visible
     /// row; `None` = needs recompute. Lazily (re)sized to `rows`.
     row_pack_cache: Vec<Option<String>>,
+    /// How many times a row has actually been re-packed (cache miss). Exposed
+    /// so tests can assert the SHAPE of the work, not just the output: a
+    /// streaming `cat` must cost O(lines), not O(lines × rows). Wraps
+    /// harmlessly; it is a diagnostic, not state.
+    packs_computed: u64,
     pub cursor_row: usize,
     pub cursor_col: usize,
     scroll_top: usize,
@@ -323,6 +328,7 @@ impl TermGrid {
             dirty: true,
             dirty_rows: None,
             row_pack_cache: Vec::new(),
+            packs_computed: 0,
             cursor_row: 0, cursor_col: 0,
             scroll_top: 0, scroll_bot: rows.saturating_sub(1),
             saved_row: 0, saved_col: 0,
@@ -399,17 +405,69 @@ impl TermGrid {
             self.cells.remove(self.scroll_top);
             self.cells.insert(self.scroll_bot, self.blank_line());
         }
-        // v0.1.494: a scroll shifts every row's content — conservative
-        // full mark. (A future cache could special-case this as a blit;
-        // for now correctness over cleverness.)
-        self.mark_all_dirty();
+        // A scroll SHIFTS rows; it does not change their content. The old code
+        // marked everything dirty and dropped the whole packed cache, so every
+        // newline at the bottom of the screen re-packed the entire screen —
+        // O(rows × cols) per line of streaming output, which is the classic
+        // terminal cliff (`cat` of a big file, a compile log). alacritty and
+        // cosmic-term avoid it structurally by keeping the grid in a ring
+        // buffer, where a scroll is an index bump and row identity survives.
+        //
+        // We get the same effect without changing the storage model: shift the
+        // cache in lockstep with the rows it describes. Entry i still describes
+        // whatever now sits at row i, so the cache stays CORRECT while the
+        // repack cost drops to the one newly exposed blank row. The renderer is
+        // still told every row is dirty — they all moved on screen — but being
+        // dirty now costs a memcpy of a cached string instead of re-formatting
+        // it from cells.
+        self.scroll_cache_up();
+        self.mark_all_dirty_keep_cache();
+    }
+
+    /// Shift the packed-row cache up one, mirroring `cells`: drop the entry for
+    /// the line that scrolled off, and leave the newly exposed row uncached.
+    fn scroll_cache_up(&mut self) {
+        if self.row_pack_cache.len() == self.rows
+            && self.scroll_top < self.row_pack_cache.len()
+            && self.scroll_bot < self.row_pack_cache.len()
+        {
+            self.row_pack_cache.remove(self.scroll_top);
+            self.row_pack_cache.insert(self.scroll_bot, None);
+        } else {
+            // shape mismatch (mid-resize): correctness first, drop it all
+            self.row_pack_cache.clear();
+        }
+    }
+
+    /// Shift the packed-row cache down one, mirroring `cells`.
+    fn scroll_cache_down(&mut self) {
+        if self.row_pack_cache.len() == self.rows
+            && self.scroll_top < self.row_pack_cache.len()
+            && self.scroll_bot < self.row_pack_cache.len()
+        {
+            self.row_pack_cache.remove(self.scroll_bot);
+            self.row_pack_cache.insert(self.scroll_top, None);
+        } else {
+            self.row_pack_cache.clear();
+        }
+    }
+
+    /// Mark every row dirty for the RENDERER without discarding the packed
+    /// cache. Only correct when the cache has been shifted to match the rows
+    /// (see the scroll paths); every other bulk mutation must keep using
+    /// `mark_all_dirty`, which drops the cache.
+    fn mark_all_dirty_keep_cache(&mut self) {
+        self.dirty = true;
+        let last = self.rows.saturating_sub(1);
+        self.dirty_rows = Some((0, last));
     }
     fn scroll_down(&mut self) {
         if self.scroll_bot < self.cells.len() && self.scroll_top < self.cells.len() {
             self.cells.remove(self.scroll_bot);
             self.cells.insert(self.scroll_top, self.blank_line());
         }
-        self.mark_all_dirty();
+        self.scroll_cache_down();
+        self.mark_all_dirty_keep_cache();
     }
 
     fn enter_alt(&mut self) {
@@ -540,6 +598,9 @@ impl TermGrid {
     /// v0.1.490: read-only dirty check (does NOT clear). Used by the
     /// UI to detect a main-thread mutation that needs republishing.
     pub fn is_dirty(&self) -> bool { self.dirty }
+
+    /// Diagnostic: how many row re-packs have happened. See `packs_computed`.
+    pub fn packs_computed(&self) -> u64 { self.packs_computed }
 
     /// v0.1.494: mark a single row changed (extends the dirty-row
     /// range). Called from the precise hot path (`print`). Also sets
@@ -795,6 +856,7 @@ impl TermGrid {
             return "";
         }
         if self.row_pack_cache[idx].is_none() {
+            self.packs_computed = self.packs_computed.wrapping_add(1);
             let packed = self.row_runs_packed(idx);
             self.row_pack_cache[idx] = Some(packed);
         }
@@ -2817,3 +2879,66 @@ mod search_tests {
     }
 }
 
+
+#[cfg(test)]
+mod scroll_blit_tests {
+    use super::*;
+
+    /// Stream `lines` of text through the parser, reading every visible row each
+    /// frame exactly as the renderer does, and report how many row re-packs it
+    /// cost.
+    fn stream(rows: usize, cols: usize, lines: usize) -> u64 {
+        let mut g = TermGrid::new(cols, rows);
+        let mut parser = vte::Parser::new();
+        for i in 0..lines {
+            let text = format!("line {i:5} the quick brown fox jumps over the lazy dog\r\n");
+            for b in text.as_bytes() {
+                parser.advance(&mut g, *b);
+            }
+            for r in 0..rows {
+                let _ = g.row_runs_packed_cached(r);
+            }
+        }
+        g.packs_computed()
+    }
+
+    #[test]
+    fn streaming_output_does_not_repack_the_whole_screen_per_line() {
+        // The property that matters: a scroll SHIFTS rows, so the cost of a line
+        // of streaming output must not scale with how tall the window is.
+        // Before the cache learned to shift with its rows, 500 lines cost 11,494
+        // repacks at 24 rows and 22,648 at 50 — i.e. O(lines × rows), the
+        // classic `cat a big file` cliff. After, both cost 1,000.
+        let short = stream(24, 80, 500);
+        let tall = stream(50, 80, 500);
+        assert!(short < 500 * 4, "24-row stream should be O(lines), got {short} repacks");
+        assert!(tall < 500 * 4, "50-row stream should be O(lines), got {tall} repacks");
+        // and the real invariant: doubling the rows must not double the work
+        assert!(tall <= short + 500,
+                "repacks must not scale with row count ({short} at 24 rows vs {tall} at 50)");
+    }
+
+    #[test]
+    fn the_shifted_cache_still_tells_the_truth() {
+        // Correctness guard for the blit: after scrolling, every cached row must
+        // still equal a freshly packed one. A cache that is fast and wrong is
+        // worse than the slow one it replaced.
+        let (rows, cols) = (12usize, 40usize);
+        let mut g = TermGrid::new(cols, rows);
+        let mut parser = vte::Parser::new();
+        for i in 0..60 {
+            let text = format!("row {i} abcdefghijklmnop\r\n");
+            for b in text.as_bytes() {
+                parser.advance(&mut g, *b);
+            }
+            for r in 0..rows {
+                let _ = g.row_runs_packed_cached(r);
+            }
+        }
+        for r in 0..rows {
+            let fresh = g.row_runs_packed(r);
+            let cached = g.row_runs_packed_cached(r).to_string();
+            assert_eq!(cached, fresh, "row {r}: cached form drifted from the truth");
+        }
+    }
+}
