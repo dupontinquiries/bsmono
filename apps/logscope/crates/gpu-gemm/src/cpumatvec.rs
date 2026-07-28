@@ -213,46 +213,64 @@ pub fn act_block_sums(act: &[f32]) -> Vec<f32> {
     act.chunks_exact(32).map(|c| c.iter().sum()).collect()
 }
 
-/// Q8_0 matvec across threads, weights read straight from the mapped file.
+/// Weight formats the CPU path can consume directly from the mapped file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Quant { Q8_0, Q4_K }
+
+impl Quant {
+    /// Bytes one row of `k` weights occupies.
+    pub fn row_bytes(self, k: usize) -> usize {
+        match self { Quant::Q8_0 => (k / 32) * 34, Quant::Q4_K => (k / 256) * 144 }
+    }
+    /// From a GGUF type id, or None for formats this path does not read.
+    ///
+    /// Returning None rather than a default matters: a wrong guess here would read a Q6_K tensor as
+    /// Q4_K and produce plausible-looking garbage, which is the failure mode this project keeps paying
+    /// for. Unsupported means fall back to the GPU, not improvise.
+    pub fn from_gguf(t: u32) -> Option<Self> {
+        match t { 8 => Some(Quant::Q8_0), 12 => Some(Quant::Q4_K), _ => None }
+    }
+}
+
+/// Everything about the activation that every row reuses, computed once.
 ///
-/// `raw` is the whole weight tensor as it sits on disk: `n_rows` rows of `k` weights, each row
-/// `k/32 * 34` bytes. No copy, no dequantization pass, no staging — the three things the GPU path
-/// spends most of its machinery on.
+/// llama.cpp hoists exactly this out of the row loop, and it is most of why its CPU path is fast: the
+/// quantization and the block sums are O(k) while the matvec is O(n_rows * k), so paying them per row
+/// would add a term that grows with the matrix.
+pub struct ActPrep { pub q: Vec<(f32, [i8; 32])>, pub sums: Vec<f32> }
+
+impl ActPrep {
+    pub fn new(act: &[f32]) -> Self { ActPrep { q: quantize_act(act), sums: act_block_sums(act) } }
+}
+
+/// Matvec over a mapped weight tensor, on a persistent pool.
 ///
-/// Rows are split into contiguous spans and each thread writes only its own slice of the output, so
-/// there is no sharing and no locking. Deterministic regardless of thread count: a row's arithmetic
-/// does not depend on which thread ran it, which matters because a result that varies with the thread
-/// pool is untestable.
-pub fn matvec_q8_0(raw: &[u8], n_rows: usize, k: usize, act: &[f32], threads: usize) -> Vec<f32> {
-    let row_bytes = (k / 32) * 34;
+/// `raw` is the tensor exactly as it sits in the file. No copy, no dequantization pass, no staging.
+///
+/// Rows split into contiguous spans, one per worker — contiguous so each worker walks a contiguous
+/// span of the file and the prefetcher can work. Every worker writes only its own rows, so there is no
+/// sharing to synchronise beyond the pool's own barrier.
+pub fn matvec(pool: &crate::cpupool::Pool, q: Quant, raw: &[u8], n_rows: usize, k: usize,
+              act: &ActPrep) -> Vec<f32> {
+    let row_bytes = q.row_bytes(k);
     let mut out = vec![0f32; n_rows];
+    let threads = pool.threads();
     let spans = split_rows(n_rows, threads);
-    if spans.len() <= 1 {
-        for r in 0..n_rows {
-            let o = r * row_bytes;
-            if o + row_bytes > raw.len() { break; }
-            out[r] = dot_q8_0(&raw[o..o + row_bytes], act);
-        }
-        return out;
-    }
-    // Hand each thread a disjoint output slice. `chunks_mut` gives non-overlapping borrows, so the
-    // compiler proves the absence of races rather than a comment asserting it.
-    let mut rest: &mut [f32] = &mut out;
-    let mut pieces: Vec<(usize, &mut [f32])> = Vec::new();
-    for (s, e) in &spans {
-        let (head, tail) = rest.split_at_mut(e - s);
-        pieces.push((*s, head));
-        rest = tail;
-    }
-    std::thread::scope(|sc| {
-        for (start, slice) in pieces {
-            sc.spawn(move || {
-                for (i, o) in slice.iter_mut().enumerate() {
-                    let off = (start + i) * row_bytes;
-                    if off + row_bytes > raw.len() { break; }
-                    *o = dot_q8_0(&raw[off..off + row_bytes], act);
-                }
-            });
+    // Raw pointer so each worker can write its disjoint slice; the spans are non-overlapping by
+    // construction and `run` joins before `out` is read.
+    let base = out.as_mut_ptr() as usize;
+    pool.run(|id, _| {
+        let Some(&(s, e)) = spans.get(id) else { return };
+        for r in s..e {
+            let off = r * row_bytes;
+            if off + row_bytes > raw.len() { break; }
+            let v = match q {
+                Quant::Q8_0 => dot_q8_0_iq(&raw[off..off + row_bytes], &act.q),
+                Quant::Q4_K => dot_q4_k(&raw[off..off + row_bytes], &act.q, &act.sums),
+            };
+            // SAFETY: spans are disjoint, so no two workers write the same index, and `run` does not
+            // return until every worker has finished.
+            unsafe { *(base as *mut f32).add(r) = v; }
         }
     });
     out
@@ -344,9 +362,10 @@ mod tests {
             }
         }
         let act: Vec<f32> = (0..k).map(|i| ((i % 9) as f32) - 4.0).collect();
-        let one = matvec_q8_0(&raw, rows, k, &act, 1);
+        let prep = ActPrep::new(&act);
+        let one = matvec(&crate::cpupool::Pool::new(1), Quant::Q8_0, &raw, rows, k, &prep);
         for t in [2usize, 3, 8, 24, 64] {
-            let many = matvec_q8_0(&raw, rows, k, &act, t);
+            let many = matvec(&crate::cpupool::Pool::new(t), Quant::Q8_0, &raw, rows, k, &prep);
             assert_eq!(one, many, "thread count {t} changed the result");
         }
         assert_eq!(one.len(), rows);
@@ -362,9 +381,12 @@ mod tests {
         let mut raw = Vec::new();
         for r in 0..rows { raw.extend(q8_block(0.1 * (r + 1) as f32, &q)); }
         let act: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
-        let out = matvec_q8_0(&raw, rows, k, &act, 4);
+        let prep = ActPrep::new(&act);
+        let out = matvec(&crate::cpupool::Pool::new(4), Quant::Q8_0, &raw, rows, k, &prep);
         for r in 0..rows {
-            let want = dot_q8_0(&raw[r * 34..(r + 1) * 34], &act);
+            // The driver must not be a second implementation: every row equals the single-row dot on
+            // that row's bytes, which is what lets the dot's own tests carry the correctness.
+            let want = dot_q8_0_iq(&raw[r * 34..(r + 1) * 34], &prep.q);
             assert_eq!(out[r], want, "row {r}");
         }
     }
@@ -463,6 +485,50 @@ mod tests {
         assert_eq!(split_rows(3, 24).len(), 3, "24 threads for 3 rows is 3 spans, not 24");
         assert_eq!(split_rows(0, 8).len(), 0);
         assert!(split_rows(1, 1).iter().all(|(a, b)| a < b));
+    }
+
+    #[test]
+    fn a_q4k_matvec_matches_row_by_row_dequantization() {
+        // End to end on the format every model here ships. If this is wrong the CPU path is useless
+        // however fast it is.
+        let (rows, k) = (9usize, 256usize);
+        let mut raw = Vec::new();
+        for r in 0..rows {
+            let mut b: Vec<u8> = (0..144).map(|i| ((i * 37 + r * 13 + 11) % 251) as u8).collect();
+            // Pin d and dmin to real f16 values. Arbitrary bytes there decode to NaN or Inf for some
+            // rows, and then BOTH paths agree at NaN while the comparison itself is NaN — a fixture
+            // that fails without either implementation being wrong.
+            let (d, dmin) = (f32_to_half(0.05 + r as f32 * 0.01), f32_to_half(0.02));
+            b[0..2].copy_from_slice(&d.to_le_bytes());
+            b[2..4].copy_from_slice(&dmin.to_le_bytes());
+            raw.extend(b);
+        }
+        let act: Vec<f32> = (0..k).map(|i| ((i * 7 % 23) as f32) - 11.0).collect();
+        let prep = ActPrep::new(&act);
+        let out = matvec(&crate::cpupool::Pool::new(3), Quant::Q4_K, &raw, rows, k, &prep);
+        for r in 0..rows {
+            let w = crate::gguf::dequantize(12, &raw[r * 144..(r + 1) * 144], 256).unwrap();
+            let want: f32 = w.iter().zip(&act).map(|(a, b)| a * b).sum();
+            let rel = (want - out[r]).abs() / want.abs().max(1e-3);
+            assert!(rel < 0.01, "row {r}: want {want}, got {}, rel {rel:.4}", out[r]);
+        }
+    }
+
+    #[test]
+    fn an_unsupported_quant_returns_None_rather_than_guessing() {
+        // A wrong guess would read a Q6_K tensor as Q4_K and produce plausible garbage — the exact
+        // failure this project keeps paying for. Unsupported means fall back to the GPU, not improvise.
+        assert_eq!(Quant::from_gguf(8), Some(Quant::Q8_0));
+        assert_eq!(Quant::from_gguf(12), Some(Quant::Q4_K));
+        for t in [14u32, 19, 0, 1, 99] { assert_eq!(Quant::from_gguf(t), None, "type {t}"); }
+    }
+
+    #[test]
+    fn row_bytes_matches_the_on_disk_layout() {
+        // Getting this wrong reads every row at the wrong offset — a silent misalignment rather than an
+        // error, so it is worth pinning against the format constants directly.
+        assert_eq!(Quant::Q8_0.row_bytes(4096), (4096 / 32) * 34);
+        assert_eq!(Quant::Q4_K.row_bytes(4096), (4096 / 256) * 144);
     }
 
     #[test]
