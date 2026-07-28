@@ -7171,6 +7171,16 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             // weight ROWS then quantize — per-row quant of the concatenation is identical to quantizing
             // each separately (proven bit-exact by --gate-qkv). The bias concatenates the same way.
             let wqkv = {
+                // REFUSE CLEANLY when this is an MLA checkpoint. MLA models have no `attn_q` — they
+                // have the low-rank pair attn_q_a/attn_q_b — so falling through to the dense path here
+                // reports "missing tensor blk.0.attn_q.weight", which sends the reader looking for a
+                // corrupt file. The tensor is not missing; the loader is reading the wrong architecture.
+                if g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
+                    || g.tensor(&format!("blk.{i}.attn_kv_a_mqa.weight")).is_some() {
+                    return Err(format!("blk.{i} is Multi-head Latent Attention (attn_q_a / attn_kv_a_mqa \
+present, attn_q absent) and the MLA path did not engage, so the dense loader ran instead. This is a \
+LOADER gap, not a bad checkpoint — see the MLA line earlier in this log for which part is missing"));
+                }
                 let mut qkv = fetch(&format!("blk.{i}.attn_q.weight"))?;
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
                 qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
