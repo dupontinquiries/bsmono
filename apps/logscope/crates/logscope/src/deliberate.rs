@@ -124,6 +124,43 @@ pub fn round_budget(panel_params_b: &[f32], single_params_b: f32) -> f64 {
     s / p
 }
 
+/// What each panellist is told on the FIRST round.
+///
+/// Deliberately does not mention the other models. A panellist that knows it is one of four will hedge
+/// toward what it expects the others to say, which is the correlation this whole design is trying to
+/// avoid — the independence guard measures disagreement, and priming for agreement would defeat it
+/// before it could measure anything.
+pub const ROUND_ONE: &str = "\
+Answer the question directly and concisely. State your answer, then one sentence of reasoning. If you \
+are unsure, say so rather than guessing — an admitted uncertainty is more useful than a confident wrong \
+answer, because it is what tells us to ask a larger model.";
+
+/// What panellists are told when the first round SPLIT.
+///
+/// Now they see each other, because the disagreement itself is the new information. Framed to invite
+/// changing position on evidence rather than on the vote count — a panellist that switches because it
+/// is outnumbered adds nothing except a larger majority for whatever the majority already believed.
+pub fn round_two(positions: &[(String, usize)], own: &str) -> String {
+    let mut s = String::from("The panel disagreed. Positions taken:\n");
+    for (p, n) in positions {
+        let mine = if normalize(own) == *p { "  (yours)" } else { "" };
+        s.push_str(&format!("  {n}x  {p}{mine}\n"));
+    }
+    s.push_str("\nIf another position is better supported than yours, say so and why. If yours still \
+holds, say why the others are wrong. Do NOT change your answer because it is outnumbered — a position \
+that only gains support by counting heads adds nothing the first round did not already have.");
+    s
+}
+
+/// Estimated bytes read for a full deliberation, against the single large model.
+///
+/// The thing to check before running one, since the panel's whole justification is that it reads less.
+pub fn cost_estimate(panel_params_b: &[f32], single_params_b: f32, rounds: u32) -> (f64, f64, bool) {
+    let (per_round, single) = bytes_per_token(panel_params_b, single_params_b);
+    let total = per_round * rounds.max(1) as f64;
+    (total, single, total <= single)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,6 +232,39 @@ mod tests {
         // has to be genuinely smaller to have anything to spend.
         let r = round_budget(&[3.0; 10], 30.0);
         assert!((r - 1.0).abs() < 0.01, "got {r:.2}");
+    }
+
+    #[test]
+    fn round_one_does_not_tell_a_panellist_it_is_on_a_panel() {
+        // A model that knows it is one of four hedges toward what it expects the others to say, which
+        // is exactly the correlation the independence guard exists to detect. Priming for agreement
+        // would defeat the measurement before it could take one.
+        let p = ROUND_ONE.to_lowercase();
+        for leak in ["panel", "other model", "others", "consensus", "vote"] {
+            assert!(!p.contains(leak), "round one must not mention {leak:?}");
+        }
+        assert!(p.contains("unsure"), "but it must make admitting uncertainty an available answer");
+    }
+
+    #[test]
+    fn round_two_shows_the_split_and_forbids_switching_on_headcount() {
+        // A panellist that switches because it is outnumbered adds nothing except a larger majority for
+        // what the majority already believed — which is precisely how an ensemble converges on its
+        // shared error.
+        let r = round_two(&[("use a btreemap".into(), 2), ("use a hashmap".into(), 1)], "use a HashMap");
+        assert!(r.contains("2x  use a btreemap"));
+        assert!(r.contains("(yours)"), "a panellist must be able to find its own position");
+        assert!(r.contains("Do NOT change your answer because it is outnumbered"));
+    }
+
+    #[test]
+    fn the_cost_estimate_says_when_deliberation_stops_being_cheaper() {
+        // The panel's entire justification is that it reads less. Two rounds of 4x3B is still under one
+        // 30B; three is not, and the caller should know that before running the third.
+        let (t2, s, ok2) = cost_estimate(&[3.0; 4], 30.0, 2);
+        assert!(ok2 && t2 < s, "two rounds: {t2:.1e} vs {s:.1e}");
+        let (t3, _, ok3) = cost_estimate(&[3.0; 4], 30.0, 3);
+        assert!(!ok3, "three rounds costs more than the single model: {t3:.1e}");
     }
 
     #[test]

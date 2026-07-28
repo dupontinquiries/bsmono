@@ -507,7 +507,7 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
 /// nibble is weight j and high nibble weight j+16; w = (nibble - 8) * d.
 /// Unpack the j-th 6-bit scale and min from a Q4_K/Q5_K 12-byte scale block
 /// (ggml `get_scale_min_k4`). Returns (scale6, min6), each 0..63.
-fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
