@@ -54,6 +54,7 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11) — no Qt runtime, same convention as rusty-board-egui
 targets = ["desktop"]
+primary = true            # THE default build of voiceterm: gitmind selects this, not the Qt shell
 notes = "the egui-primary port of voiceterm (Qt/QML terminal) — see UI_STRATEGY.md. Defaults to the Voice palette (terminal orange/green) matching the Qt surface. `cargo build --release` produces the deployable `voiceterm-egui` bin directly (the `app` feature is default-on); the Qt/QML original stays the parity reference."
 
 [apps.rusty-board-egui]

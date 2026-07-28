@@ -23,6 +23,13 @@ pub struct State {
     /// This app's registered egui port (manifest/projects.toml), if any — `None` also covers
     /// "the manifest wasn't readable," same as `appcatalog::AppEntry::egui_port`.
     egui_port: Option<appcatalog::ManifestEntry>,
+    /// Set once we have auto-selected a `primary = true` port for the current selection, so
+    /// the swap happens on discovery and not on every frame (which would fight the user the
+    /// instant they chose the original).
+    primary_swapped: bool,
+    /// The entry the primary port replaced, kept so "use the original instead" can put it
+    /// back. A default you cannot undo is a trap.
+    pub legacy: Option<SuiteApp>,
 }
 
 pub fn ui(app: &mut App, ui: &mut egui::Ui) {
@@ -53,6 +60,20 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     ui.separator();
     if let Some(sel) = app.fleet.selected.clone() {
         ui.label(format!("selected: {}  ({})", sel.name, sel.path));
+        // When the manifest's primary port replaced the selection, say so plainly and keep
+        // the original one click away — a default that cannot be undone is a trap, and the
+        // Qt shell is still the parity reference for the port.
+        if let Some(legacy) = app.fleet.legacy.clone() {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("★ egui build — the default for this app")
+                    .color(egui::Color32::from_rgb(122, 200, 140)).small());
+                if ui.small_button(format!("use the original ({}) instead", legacy.name)).clicked() {
+                    app.fleet.selected = Some(legacy);
+                    app.fleet.legacy = None;
+                    app.fleet.scanned_path = None;
+                }
+            });
+        }
 
         // re-scan the REAL Cargo.toml + manifest only when the selection actually changed —
         // matches Fleet.qml's local_build_options call on selection, not every frame.
@@ -79,9 +100,29 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 })
             });
             app.fleet.scanned_path = Some(sel.path.clone());
+            // a genuinely new selection may have its own primary port to honour
+            if app.fleet.legacy.as_ref().map(|l| l.path != sel.path).unwrap_or(true) {
+                app.fleet.primary_swapped = false;
+            }
         }
 
         if let Some(port) = app.fleet.egui_port.clone() {
+            // A port marked `primary = true` in the manifest IS the app: select it on the
+            // user's behalf the moment it is discovered, rather than showing the superseded
+            // build and asking them to opt in. voiceterm is the first of these — the Qt/QML
+            // shell stays available as the parity reference, but "voiceterm" now means the
+            // egui build, and the button below offers the original instead.
+            if port.primary && !app.fleet.primary_swapped {
+                let mut ported = sel.clone();
+                ported.name = format!("{}-egui", sel.name);
+                ported.path = port.path.clone();
+                app.fleet.legacy = Some(sel.clone());   // remember what we replaced
+                app.fleet.selected = Some(ported);
+                app.fleet.primary_swapped = true;
+                app.fleet.scanned_path = None;          // re-scan against the port's Cargo.toml
+                ui.ctx().request_repaint();
+                return;
+            }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new(format!("🔌 egui port registered: {}", port.path)).color(egui::Color32::from_rgb(122, 162, 247)).small());
                 if ui.small_button("build this port instead").clicked() {
