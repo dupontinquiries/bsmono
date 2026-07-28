@@ -99,6 +99,12 @@ that depends on the model and the device, so a fixed default would be wrong for 
         validated_by: Some("--gate-store"),
         why: "slab-packing resident weights. Auto-on for BO-VMA-constrained drivers, where buffer-object \
 count is the binding limit; unnecessary elsewhere" },
+    Lever { var: "LOGSCOPE_STAGE_FENCE", default: Default_::On, platform: Platform::Any,
+        validated_by: Some("--gate-moe-stream (bit-exact both ways; the hazard needs deep queues)"),
+        why: "the expert staging ring fences on COMPLETION by default. Setting it to `submit` restores \
+the weaker submission-only fence for A/B — the wait costs real time, and the claim that it stops the \
+Asahi GPU timeouts deserves a measurement rather than an argument. Default is the safe side because a \
+slot overwritten under a running dispatch corrupts weights silently" },
     Lever { var: "LOGSCOPE_NO_Q4K_GPU", default: Default_::Off, platform: Platform::Any,
         validated_by: Some("--gate-q4k"),
         why: "an ESCAPE HATCH, not an optimization: setting it restores the CPU conversion path. Named \
