@@ -3770,6 +3770,10 @@ impl Chat {
                     "Archive"      => ([0xe6, 0xd8, 0xbc], crate::texgen::mat::PAPER, 0.04, 188, [0x4a, 0x32, 0x1c], 0.45), // ink on parchment
                     "Reading Room" => ([0xf0, 0xe8, 0xd6], crate::texgen::mat::PAPER, 0.04, 190, [0x2e, 0x24, 0x18], 0.42), // typewriter ink
                     "Mansion Garden" => ([0xf0, 0xe6, 0xcc], crate::texgen::mat::STONE, 0.14, 150, [0xd8, 0xb4, 0x5c], 0.9), // cream marble + gold veins
+                    "Persian Garden"  => ([0xe4, 0xd2, 0xac], crate::texgen::mat::STONE, 0.12, 168, [0x1e, 0x82, 0x96], 0.8), // sun-warmed plaster, turquoise inlay
+                    "Garden Cloister" => ([0xd6, 0xd6, 0xc8], crate::texgen::mat::STONE, 0.10, 176, [0x46, 0x6e, 0x38], 0.7), // limestone plaque, moss-green cut
+                    "Madrassa Court"  => ([0xe8, 0xde, 0xc8], crate::texgen::mat::STONE, 0.16, 160, [0x1d, 0x5a, 0x8e], 0.95), // ivory plaster, cobalt zellij
+                    "Bamboo Grove"    => ([0x24, 0x32, 0x22], crate::texgen::mat::WOOD,  0.20, 140, [0x9a, 0xc4, 0x60], 1.0),  // dark board, lantern-lit green
                     // Every OTHER world derives a coherent idiom from its active palette (material + warm
                     // light + cool accent) instead of the old flat-grey quad, so the message panel and the
                     // mic pearl read as belonging to the scene. Dark worlds glow their accent on a dim tinted
@@ -4666,7 +4670,7 @@ impl Chat {
                     saturation: std::env::var("LOGSCOPE_SAT").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.18),
                     shoulder: std::env::var("LOGSCOPE_SHOULDER").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
                     // per-scene BLOOM trim — Old Library + Cloudscape were over-blooming (detail washed out)
-                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, _ => 1.0 }, texscale: dtexscale, bump: dbump,
+                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, "Persian Garden" => 0.34, "Madrassa Court" => 0.32, "Garden Cloister" => 0.45, "Bamboo Grove" => 0.70, _ => 1.0 }, texscale: dtexscale, bump: dbump,
                     caustic, godray_amt: gr_amt, godray_weight: gr_w, godray_decay: gr_dec,
                     pearl, pearl_variant, pearl_pos, pearl_r, aspect: rect.width() / rect.height().max(1.0),
                     nacre: std::env::var("LOGSCOPE_NACRE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.4),
@@ -7589,6 +7593,10 @@ fn scene_light(name: &str) -> (egui::Color32, egui::Color32, f32, f32) {
         "Forest"       => (c(0xd0, 0xe2, 0x8a), c(0x2e, 0x3c, 0x1e), 0.86, 1.06), // sunlit woodland green
         "Treehouse"    => (c(0xe2, 0xb0, 0x6e), c(0x1c, 0x26, 0x12), 0.58, 1.0),  // warm dusk canopy (fireflies pop)
         "Mansion Garden" => (c(0xd2, 0xc8, 0xb0), c(0x76, 0x6e, 0x58), 0.54, 0.70), // cream marble — toned further (still too bloomy)
+        "Persian Garden"  => (c(0xf0, 0xd8, 0x9a), c(0x8e, 0x74, 0x4e), 0.80, 0.95), // low golden-hour sun over dust
+        "Garden Cloister" => (c(0xdc, 0xdc, 0xd0), c(0x6e, 0x72, 0x68), 0.62, 0.78), // flat overcast; a north arcade is never bright
+        "Madrassa Court"  => (c(0xf6, 0xe2, 0xb0), c(0x86, 0x74, 0x54), 0.84, 0.92), // high sun into a white court, brass bounce
+        "Bamboo Grove"    => (c(0xbc, 0xdc, 0x86), c(0x24, 0x34, 0x20), 0.50, 0.66), // green-filtered light under a full canopy
         _              => (c(140, 168, 205),    c(96, 82, 66),       0.74, 1.00),
     }
 }
