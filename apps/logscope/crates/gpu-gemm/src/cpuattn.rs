@@ -80,6 +80,39 @@ pub fn write_kv(cache: &mut [f32], pos: usize, head_dim: usize, src: &[f32]) {
     cache[off..off + head_dim].copy_from_slice(&src[..head_dim]);
 }
 
+/// SwiGLU over a PACKED gate/up tensor: `silu(gate) * up`.
+///
+/// `gu` holds gate rows then up rows — `[2*ff, d]` — which is how llama.cpp and this loader both store
+/// it, and why the matvec above produces both halves in one call. Splitting them into two tensors would
+/// double the number of matvecs and halve the length of each, which is worse on every axis: more
+/// dispatch overhead, shorter runs for the prefetcher, and the same bytes read.
+///
+/// `silu(x) = x / (1 + e^-x)`. Written out rather than called through a generic activation, because the
+/// indirection would cost a call per element in a loop that runs ff times per layer.
+pub fn swiglu(gu: &[f32], ff: usize, out: &mut [f32]) {
+    for i in 0..ff {
+        let g = gu[i];
+        out[i] = (g / (1.0 + (-g).exp())) * gu[ff + i];
+    }
+}
+
+/// Rotary embedding applied in place to one head, NeoX (split-half) pairing.
+///
+/// The pairing is the thing to get right: NeoX pairs `i` with `i + head_dim/2`, while the interleaved
+/// variant pairs `2i` with `2i+1`. Both are "RoPE", both run without error, and the wrong one produces
+/// fluent text that degrades with position — which is exactly the failure this project has spent days
+/// chasing on the GPU side. `archcfg::rope_interleaved` already records which a model needs.
+pub fn rope_neox(x: &mut [f32], head_dim: usize, pos: usize, base: f32) {
+    let half = head_dim / 2;
+    for i in 0..half {
+        let freq = 1.0 / base.powf(2.0 * i as f32 / head_dim as f32);
+        let (s, c) = (pos as f32 * freq).sin_cos();
+        let (a, b) = (x[i], x[i + half]);
+        x[i] = a * c - b * s;
+        x[i + half] = a * s + b * c;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +196,62 @@ mod tests {
         let ms = x.iter().map(|v| v * v).sum::<f32>() / 4.0;
         let sc = 1.0 / (ms + 1e-6).sqrt();
         for i in 0..4 { assert!((out[i] - x[i] * sc * w[i]).abs() < 1e-6); }
+    }
+
+    #[test]
+    fn swiglu_reads_gate_and_up_from_the_packed_halves() {
+        // Reading the halves the wrong way round produces silu(up)*gate, which is finite, plausible,
+        // and wrong — no error anywhere.
+        let ff = 3usize;
+        let gu = vec![1.0f32, -2.0, 0.5,   10.0, 20.0, 30.0];   // gate, then up
+        let mut out = vec![0f32; ff];
+        swiglu(&gu, ff, &mut out);
+        for i in 0..ff {
+            let g = gu[i];
+            let want = (g / (1.0 + (-g).exp())) * gu[ff + i];
+            assert!((out[i] - want).abs() < 1e-6, "lane {i}: {} vs {want}", out[i]);
+        }
+        // silu is not the identity, so a swapped implementation would differ visibly
+        assert!((out[0] - gu[ff]).abs() > 0.1, "silu(1.0) != 1.0");
+    }
+
+    #[test]
+    fn rope_pairs_i_with_i_plus_half_not_adjacent_elements() {
+        // NeoX pairs i with i+head_dim/2; the interleaved variant pairs 2i with 2i+1. Both are "RoPE",
+        // both run without error, and the wrong one gives fluent text that decays with position — the
+        // exact failure this project has chased on the GPU side.
+        let hd = 4usize;
+        let mut x = vec![1.0f32, 0.0, 0.0, 0.0];
+        rope_neox(&mut x, hd, 1, 10000.0);
+        // element 0 rotates against element 2 (0 + hd/2), so both move and 1/3 stay put
+        assert!(x[0] != 1.0 && x[2] != 0.0, "0 and 2 are a pair: {x:?}");
+        assert_eq!(x[1], 0.0, "1 is untouched by the 0/2 rotation");
+        assert_eq!(x[3], 0.0);
+    }
+
+    #[test]
+    fn rope_at_position_zero_is_the_identity() {
+        // sin(0)=0, cos(0)=1. A version that got the sign or the pairing wrong usually fails here first,
+        // and it is the cheapest possible check.
+        let hd = 8usize;
+        let orig: Vec<f32> = (0..hd).map(|i| i as f32 + 1.0).collect();
+        let mut x = orig.clone();
+        rope_neox(&mut x, hd, 0, 10000.0);
+        for i in 0..hd { assert!((x[i] - orig[i]).abs() < 1e-6, "lane {i}"); }
+    }
+
+    #[test]
+    fn rope_preserves_the_norm_of_each_pair() {
+        // A rotation cannot change a magnitude. This catches a wrong frequency, a swapped sin/cos, and
+        // a sign error — none of which the identity test at position 0 would see.
+        let hd = 8usize;
+        let mut x: Vec<f32> = (0..hd).map(|i| (i as f32) * 0.7 - 2.0).collect();
+        let before: Vec<f32> = (0..hd / 2).map(|i| x[i] * x[i] + x[i + hd / 2] * x[i + hd / 2]).collect();
+        rope_neox(&mut x, hd, 37, 10000.0);
+        for i in 0..hd / 2 {
+            let after = x[i] * x[i] + x[i + hd / 2] * x[i + hd / 2];
+            assert!((before[i] - after).abs() < 1e-4, "pair {i}: {} vs {after}", before[i]);
+        }
     }
 
     #[test]

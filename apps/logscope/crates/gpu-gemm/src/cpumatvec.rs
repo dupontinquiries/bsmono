@@ -260,6 +260,17 @@ pub fn layer_range(raw: &[u8], layer: usize, bytes_per_layer: usize) -> Option<&
     Some(&raw[start..end])
 }
 
+// A SCRATCH BUFFER WAS CONSIDERED AND IS NOT WORTH IT. `matvec` allocates a fresh Vec per call and a
+// decode makes ~336 calls per token, which looks like it should matter. Measured:
+//
+//     full call     : 13.487 ms
+//     the Vec alone :  0.001 ms   (0.01% of the call)
+//     at 336 calls  :  0.24 ms per token spent allocating
+//
+// Below noise. Adding a reusable buffer would be the per-token arena from _227 repeated on a different
+// processor — built on a plausible argument, measured at zero, and deleted in _231. The measurement is
+// recorded so the argument does not get made a third time.
+
 /// Matvec over a mapped weight tensor, on a persistent pool.
 ///
 /// `raw` is the tensor exactly as it sits in the file. No copy, no dequantization pass, no staging.
