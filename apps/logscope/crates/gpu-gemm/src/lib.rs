@@ -1871,6 +1871,40 @@ pub static MOE_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 /// them; a periodic (layer, fill, phase) breadcrumb can.
 pub static PROGRESS_EVERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// `HH:MM:SS.mmm` local time, for prefixing engine log lines.
+///
+/// Every correlation in this project has been done by hand because the engine's own output carries no
+/// clock — the diagnostic report has stamps, but the terminal log that people actually paste does not.
+/// Local rather than UTC because journalctl is local, and a stamp you have to convert is a stamp you
+/// will convert wrongly at least once.
+pub fn stamp() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let (secs, ms) = (now.as_secs() as i64 + local_offset_secs(), now.subsec_millis());
+    let t = secs.rem_euclid(86400);
+    format!("{:02}:{:02}:{:02}.{:03}", t / 3600, (t % 3600) / 60, t % 60, ms)
+}
+
+/// Seconds to add to UTC for local time, read once from `date +%z`.
+fn local_offset_secs() -> i64 {
+    static OFF: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::process::Command::new("date").arg("+%z").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                let t = s.trim();
+                if t.len() < 5 { return None; }
+                let sign = if t.starts_with('-') { -1i64 } else { 1 };
+                Some(sign * (t[1..3].parse::<i64>().ok()? * 3600 + t[3..5].parse::<i64>().ok()? * 60))
+            }).unwrap_or(0)
+    })
+}
+
+/// Timestamped engine log line. Use for anything that may need correlating with a kernel log.
+#[macro_export]
+macro_rules! elog {
+    ($($a:tt)*) => { eprintln!("[{}] {}", $crate::stamp(), format!($($a)*)) };
+}
+
 /// The last dispatch recorded, as (shader source pointer, workgroups, dims[0]).
 ///
 /// Kept as raw atomics rather than a String because it is written on EVERY dispatch — tens of thousands
@@ -1924,7 +1958,7 @@ pub fn check_stall(started: std::time::Instant, _unused: usize) {
     if ms < thresh { return; }
     STALLS.fetch_add(1, Relaxed);
     let wg = LAST_WG.load(Relaxed);
-    eprintln!("wgpu-engine: STALL {ms} ms at dispatch #{} — wg=({},{},{}) dim0={} pipe={:#x} \
+    elog!("wgpu-engine: STALL {ms} ms at dispatch #{} — wg=({},{},{}) dim0={} pipe={:#x} \
 (a poll this long is a GPU hang; the kernel recovers and we continue)",
         DISPATCH_SEQ.load(Relaxed), (wg >> 32) as u32, ((wg >> 16) & 0xFFFF) as u32, (wg & 0xFFFF) as u32,
         LAST_DIM0.load(Relaxed), LAST_SHADER.load(Relaxed));
@@ -1937,7 +1971,7 @@ pub fn progress_tick(phase: &str, layer: usize, extra: &str) {
     if every == 0 { return; }
     let f = MOE_FILLS.load(Relaxed);
     if f % every != 0 { return; }
-    eprintln!("wgpu-engine: PROGRESS {phase} layer={layer} fills={f} bytes={:.1}GiB {extra}",
+    elog!("wgpu-engine: PROGRESS {phase} layer={layer} fills={f} bytes={:.1}GiB {extra}",
         MOE_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64);
 }
 pub static MOE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
