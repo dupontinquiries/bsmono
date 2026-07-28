@@ -11,6 +11,8 @@
 //! opens. [`instantiate`] is the bridge: it turns that description into
 //! something that runs, or `None` if this build does not know the kind.
 
+pub mod analysis;
+
 use std::collections::BTreeMap;
 use studio_core::Ticks;
 

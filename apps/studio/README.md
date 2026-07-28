@@ -52,7 +52,7 @@ edits exactly reversible, which floats are not.
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, compressor, limiter, transform, colour, retiming | 12 |
+| `studio-fx` | EQ, compressor, limiter, transform, colour, retiming, **analysis** | 18 |
 
 ## Realtime collaboration, concretely
 
@@ -509,3 +509,43 @@ read". For a ramp that is the **integral** of the speed curve, not the speed:
 ramping 1× → 3× over ten seconds consumes twenty seconds of source and the
 halfway point sits at 7.5s, not 10s. Getting it wrong drifts picture against
 sound across the ramp while both look individually correct.
+
+## Learning from Ozone and Neutron
+
+iZotope's Ozone 8 (mastering) and Neutron 3 (mixing) are the best-designed audio
+interfaces of their generation and have no Linux build, which makes them a
+reasonable thing to learn from. What is worth taking is **interaction design**,
+and the DSP underneath is textbook — none of the numbers here are anyone's
+secret. Their artwork, presets and branding are theirs and are not copied.
+
+The structural idea worth stealing: **the spectrum is the canvas**. Every Ozone
+module draws on one shared frequency axis, so an EQ curve, a multiband
+crossover, a compressor threshold and the live signal are legible together
+instead of requiring you to correlate four separate boxes. Everything else
+follows from that — direct manipulation of nodes and crossovers *on* the
+spectrum rather than knobs beside it, and a visible module chain you can
+reorder.
+
+`analysis` is the layer all of that is drawn from: an FFT (hand-rolled — thirty
+lines, no dependency in a realtime meter's hot path, and the most testable
+function in existence), calibrated spectra where a full-scale sine reads 0 dBFS
+so the display can actually be trusted, third-octave band energies averaged in
+the **power** domain (averaging dB under-reads a band with one strong partial,
+which is exactly the case you care about), true peak by oversampling (a sample
+peak of 0 dBFS can still reconstruct above full scale — the reason a "safe"
+master clips on a consumer DAC), stereo correlation and width, and
+**gain-matched A/B**, which is the single most important honesty feature in a
+mastering tool because louder always sounds better and an unmatched comparison
+lies every time.
+
+**Masking** is Neutron's standout idea and the one that maps best onto Studio:
+instances on different tracks compare spectra and show *where* two sources fight
+— not "your vocal is buried" but "your vocal is buried between 300 and 800 Hz",
+which is the difference between a meter you act on and one you ignore. Studio
+already has the multi-track model and a channel between collaborators, so this
+is the whole feature minus the drawing.
+
+A test caught the definition being wrong on the first pass: a 9 kHz source was
+reported as "masked" by a bass at 100 Hz, where the target has no content at
+all. Masking requires something *of yours* to bury, so a band where the target
+is absent now scores zero — the correct definition rather than a threshold tweak.
