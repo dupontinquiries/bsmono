@@ -280,6 +280,21 @@ pub fn gpu_buffer_budget(ram_budget: u64, conservative_vma: bool) -> u64 {
 /// a staging artifact, so it holds regardless of the 192 GiB of RAM behind it. Metal (macOS, unified but
 /// NOT conservative_vma) has no such ceiling and can go to RAM. So: conservative_vma keeps the hard cap
 /// even though it's unified; Metal-class unified lifts to a RAM fraction. LOGSCOPE_MAX_GPU_GB overrides.
+/// Budget from a MEASURED ceiling, when one exists.
+///
+/// A measurement outranks every constant here. `--gate-vram` found this device honouring 63 GiB where
+/// the constant assumed 24 — the constant was an empirical figure from the staging upload path, taken
+/// before the arena removed the staging, and nothing in the code distinguished "the driver refuses"
+/// from "we assumed it would". Models that fitted were being streamed for no reason.
+///
+/// Keeps a margin below the measurement rather than using it whole: the probe finds where allocation
+/// FAILS, and running at exactly that point leaves nothing for the KV cache, transients, or another
+/// process on the same GPU.
+pub fn budget_from_measurement(measured_gib: f32) -> Option<u64> {
+    if measured_gib <= 0.0 { return None; }        // 0 = never probed, not "no memory"
+    Some((measured_gib as f64 * 0.75 * GIB) as u64)
+}
+
 pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: bool) -> u64 {
     if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
         if let Ok(gb) = s.trim().parse::<f64>() { return (gb * GIB) as u64; }
@@ -622,3 +637,23 @@ mod rss_tests {
         else { assert_eq!(a + f, t, "the two halves must reconcile to the total"); }
     }
 }
+    #[test]
+    fn a_measurement_outranks_the_constant_but_keeps_a_margin() {
+        // The constant said 24 GiB; --gate-vram measured 63 on the same device. A measurement has to
+        // win, or the probe is decoration.
+        let b = budget_from_measurement(63.0).unwrap();
+        let gib = |n: f64| (n * GIB) as u64;
+        assert!(b > gib(40.0) && b < gib(63.0), "got {:.1} GiB", b as f64 / GIB);
+        // Not the whole measurement: the probe finds where allocation FAILS, and running at exactly
+        // that point leaves nothing for KV, transients, or another process on the same GPU.
+        assert!(b < gib(63.0));
+    }
+
+    #[test]
+    fn an_unprobed_device_returns_None_rather_than_zero_budget() {
+        // 0 means "never measured", not "no memory". Returning a zero budget would refuse every model
+        // on a machine that had simply not run the probe yet.
+        assert!(budget_from_measurement(0.0).is_none());
+        assert!(budget_from_measurement(-1.0).is_none());
+    }
+
