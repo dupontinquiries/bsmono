@@ -1,0 +1,8 @@
+[package]
+name = "studio-fx"
+version = "0.1.0"
+edition = "2021"
+description = "Studio's effect plugins: biquad EQ, compressor, brickwall limiter, 2D transform, lift/gamma/gain colour, and retiming — the settled DSP and geometry both editors need."
+
+[dependencies]
+studio-core = { path = "../studio-core" }

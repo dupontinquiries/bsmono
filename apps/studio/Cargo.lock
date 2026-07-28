@@ -432,6 +432,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "studio-fx"
+version = "0.1.0"
+dependencies = [
+ "studio-core",
+]
+
+[[package]]
 name = "studio-live"
 version = "0.1.0"
 dependencies = [

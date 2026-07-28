@@ -1,3 +1,3 @@
 [workspace]
-members = ["crates/studio-core", "crates/studio-collab", "crates/studio-egui", "crates/studio-audio", "crates/studio-live", "crates/studio-voice"]
+members = ["crates/studio-core", "crates/studio-collab", "crates/studio-egui", "crates/studio-audio", "crates/studio-live", "crates/studio-voice", "crates/studio-fx"]
 resolver = "2"
