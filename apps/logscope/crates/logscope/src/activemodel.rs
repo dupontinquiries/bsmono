@@ -72,6 +72,25 @@ pub fn resolve(deployment: Option<&str>, picker: Option<&str>) -> Resolution {
     }
 }
 
+/// What a caller should DO to make the picker agree with the resolved model.
+///
+/// The precedence rule made the override visible (a control that cannot take effect now says so), but
+/// visibility is not the fix — three things can still write the target, and during startup it passes
+/// through intermediate values, each of which triggered a full model load.
+///
+/// The structural fix is WRITE-THROUGH: when a deployment names a model, it sets the picker ONCE rather
+/// than shadowing it forever. After that there is a single source, the picker, and "what am I talking
+/// to" has one answer that everything reads and one path that writes it.
+///
+/// Returns the index the picker should move to, or None if it already agrees or the model is absent.
+pub fn write_through(resolution: &Resolution, picker_items: &[String]) -> Option<usize> {
+    let name = resolution.name.as_deref()?;
+    if resolution.source != Source::Deployment { return None; }
+    let idx = picker_items.iter().position(|i| i == name)?;
+    // Only move if it actually disagrees; a needless write would restart the autoload settle timer.
+    if resolution.shadowed.is_some() { Some(idx) } else { None }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +143,33 @@ mod tests {
         let r = resolve(Some("llama4-scout"), None);
         assert_eq!(r.name.as_deref(), Some("llama4-scout"));
         assert!(!r.picker_is_inert(), "nothing was displaced");
+    }
+
+    #[test]
+    fn write_through_collapses_the_deployment_into_the_picker() {
+        // The structural fix: instead of shadowing forever, the deployment moves the picker ONCE and
+        // then there is a single source. Making the override merely VISIBLE (_263) left three writers.
+        let items: Vec<String> = ["a", "llama4-scout", "qwen3-30b"].iter().map(|s| s.to_string()).collect();
+        let r = resolve(Some("llama4-scout"), Some("qwen3-30b"));
+        assert_eq!(write_through(&r, &items), Some(1), "move the picker to what is actually running");
+
+        // agreement writes nothing — a needless write would restart the autoload settle timer and
+        // reintroduce the very load-churn this is meant to stop
+        let agreed = resolve(Some("llama4-scout"), Some("llama4-scout"));
+        assert_eq!(write_through(&agreed, &items), None);
+
+        // and a picker-sourced resolution has nothing to write through
+        assert_eq!(write_through(&resolve(None, Some("qwen3-30b")), &items), None);
+    }
+
+    #[test]
+    fn write_through_does_nothing_when_the_model_is_not_in_the_list() {
+        // A deployment naming a model the picker has never seen must not panic or invent an index —
+        // it simply cannot be represented there, and the override stays visible instead.
+        let items: Vec<String> = vec!["a".to_string()];
+        let r = resolve(Some("not-in-list"), Some("a"));
+        assert_eq!(write_through(&r, &items), None);
+        assert!(r.picker_is_inert(), "and the user is still told why");
     }
 
     #[test]
