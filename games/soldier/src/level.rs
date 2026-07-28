@@ -1112,6 +1112,10 @@ pub struct FacadeDetail {
     pub slope: Vec<u8>,
     pub rough: Vec<u8>,
     pub tint: Vec<u8>,
+    /// Per-cell TERRAIN height 0-15 (the scan's `;;G` minh layer): the crag under Perarrua,
+    /// the mound under Morton — applied into `Level.heights` so the site sits on its real
+    /// ground instead of a flat slab.
+    pub ground: Vec<u8>,
     pub palette: Vec<Color32>,
     pub max_h: f32,
 }
@@ -1792,9 +1796,15 @@ impl Level {
                     };
                     let dado = (fy + 1.1).min(top_y - 0.4);
                     if tint != 255 && !f.palette.is_empty() {
+                        // The vertex colour MULTIPLIES the texel: a full-strength palette tint
+                        // muddied the photograph into "flat noisy panels" (field report). The
+                        // photo carries the colour now; the palette is only a 22% wash so
+                        // neighbouring cells still drift the way the scan does, and the dither
+                        // shrinks to weathering-only.
                         let base = f.palette[(tint as usize).min(f.palette.len() - 1)];
-                        let lower = dither(scale_rgb(base, 0.78), x * 5 + z * 9, 0.05 + rough * 0.10);
-                        let upper = dither(base, x * 9 + z * 5, 0.05 + rough * 0.10);
+                        let wash = lerp_c(rgb(244, 244, 240), base, 0.22);
+                        let lower = dither(scale_rgb(wash, 0.86), x * 5 + z * 9, 0.02 + rough * 0.05);
+                        let upper = dither(wash, x * 9 + z * 5, 0.02 + rough * 0.05);
                         tex.push_quad(b0, b1, b1.with_y(dado), b0.with_y(dado), n, lower);
                         tex.push_quad(b0.with_y(dado), b1.with_y(dado), b1.with_y(top_y), b0.with_y(top_y), n, upper);
                     } else {
@@ -2924,12 +2934,14 @@ impl Level {
         {
             let mut lh: Vec<String> = Vec::new(); let mut ls: Vec<String> = Vec::new();
             let mut lr: Vec<String> = Vec::new(); let mut lc: Vec<String> = Vec::new();
+            let mut lg: Vec<String> = Vec::new();
             let mut palette: Vec<Color32> = Vec::new();
             for line in bp.lines() {
                 if let Some(r) = line.strip_prefix(";;H ") { lh.push(r.to_string()); }
                 else if let Some(r) = line.strip_prefix(";;S ") { ls.push(r.to_string()); }
                 else if let Some(r) = line.strip_prefix(";;R ") { lr.push(r.to_string()); }
                 else if let Some(r) = line.strip_prefix(";;C ") { lc.push(r.to_string()); }
+                else if let Some(r) = line.strip_prefix(";;G ") { lg.push(r.to_string()); }
                 else if let Some(r) = line.strip_prefix(";;P ") {
                     let p: Vec<&str> = r.split_whitespace().collect();
                     if p.len() == 2 && p[1].len() == 6 {
@@ -2942,7 +2954,7 @@ impl Level {
             if !lh.is_empty() {
                 let n = (w * h) as usize;
                 let mut fd = FacadeDetail { site, h: vec![0; n], slope: vec![0; n], rough: vec![0; n],
-                                            tint: vec![255; n], palette, max_h: wall_h * 2.6 };
+                                            tint: vec![255; n], ground: vec![0; n], palette, max_h: wall_h * 2.6 };
                 let hexv = |c: char| c.to_digit(16).map(|d| d as u8);
                 for (gz, row) in lh.iter().enumerate() {
                     for (gx, c) in row.chars().enumerate() {
@@ -2968,6 +2980,33 @@ impl Level {
                             if let Some(v) = hexv(c) { fd.tint[(z * w + x) as usize] = v; }
                         }
                     }
+                }
+                for (gz, row) in lg.iter().enumerate() {
+                    for (gx, c) in row.chars().enumerate() {
+                        let (x, z) = (gx as i32 + border, gz as i32 + border);
+                        if x < w && z < h { if let Some(v) = c.to_digit(16) {
+                            fd.ground[(z * w + x) as usize] = v as u8;
+                        } }
+                    }
+                }
+                // ── THE TERRAIN: the site sits on its scanned ground ──
+                // Amplitude 0.7*max_h keeps a one-step gradient (~0.55 over a tile) walkable
+                // through the continuous bilinear surface, while 2+ steps read as the cliffs
+                // they are in the model (Perarrua's crag EDGES should stop you). One 3x3
+                // smooth softens rasterization spikes without flattening the hill.
+                if fd.ground.iter().any(|&g| g > 0) {
+                    let amp = fd.max_h * 0.7 / 15.0;
+                    let base: Vec<f32> = fd.ground.iter().map(|&g| g as f32 * amp).collect();
+                    for z in 0..h { for x in 0..w {
+                        let (mut sum, mut cnt) = (0.0f32, 0.0f32);
+                        for dz in -1..=1i32 { for dx in -1..=1i32 {
+                            let (nx, nz) = (x + dx, z + dz);
+                            if nx >= 0 && nz >= 0 && nx < w && nz < h {
+                                sum += base[(nz * w + nx) as usize]; cnt += 1.0;
+                            }
+                        }}
+                        lvl.heights[(z * w + x) as usize] = sum / cnt;
+                    }}
                 }
                 lvl.learned_facade = Some(fd);
             }
@@ -3044,8 +3083,22 @@ impl Level {
         // bailey at up to two of its floor-adjacent ends (STEP=0.65 makes ≤0.6 risers walkable).
         if !ramparts.is_empty() {
             let rset: std::collections::HashSet<(i32, i32)> = ramparts.iter().copied().collect();
-            let top = wall_h + 0.06;
+            let fac = lvl.learned_facade.clone();
+            let cell_top = |x: i32, z: i32| -> f32 {
+                fac.as_ref().and_then(|f| f.h.get((z * lvl.w + x) as usize).copied())
+                    .filter(|&h| h > 0)
+                    .map(|h| (h as f32 / 15.0) * fac.as_ref().unwrap().max_h)
+                    .unwrap_or(wall_h) + 0.06
+            };
+            let pal_tint = |x: i32, z: i32, base: Color32| -> Color32 {
+                fac.as_ref().and_then(|f| {
+                    let t = f.tint.get((z * lvl.w + x) as usize).copied()?;
+                    if t == 255 || f.palette.is_empty() { None }
+                    else { Some(f.palette[(t as usize).min(f.palette.len() - 1)]) }
+                }).unwrap_or(base)
+            };
             for &(x, z) in &ramparts {
+                let top = cell_top(x, z); // the wall-walk rides the SCAN's height, not one slab
                 let (wx, wz) = (x as f32 * ts, z as f32 * ts);
                 lvl.platforms.push(Platform { x0: wx - ts * 0.5, z0: wz - ts * 0.5,
                                               x1: wx + ts * 0.5, z1: wz + ts * 0.5, top });
@@ -3053,12 +3106,14 @@ impl Level {
                     let (nx, nz) = (x + dx, z + dz);
                     let nb = lvl.cell(nx, nz);
                     // parapet toward anything that ISN'T the walk itself or the courtyard it guards
-                    if !rset.contains(&(nx, nz)) && nb != Cell::Floor {
-                        let ctr = Vec3::new(wx + dx as f32 * ts * 0.42, top + 0.42,
+                    // Every-other-cell merlons at reduced height, in the model's own stone
+                    // colour — the continuous full-height trim lip read as "brick clutter".
+                    if !rset.contains(&(nx, nz)) && nb != Cell::Floor && (x + z) % 2 == 0 {
+                        let ctr = Vec3::new(wx + dx as f32 * ts * 0.42, top + 0.34,
                                             wz + dz as f32 * ts * 0.42);
-                        let half = Vec3::new(if dx != 0 { 0.08 * ts } else { 0.5 * ts }, 0.42,
-                                             if dz != 0 { 0.08 * ts } else { 0.5 * ts });
-                        let mut mesh = boxx(ctr, half, dither(pal.trim, x * 5 + z * 3, 0.07), FACE_ALL);
+                        let half = Vec3::new(if dx != 0 { 0.08 * ts } else { 0.42 * ts }, 0.34,
+                                             if dz != 0 { 0.08 * ts } else { 0.42 * ts });
+                        let mut mesh = boxx(ctr, half, dither(scale_rgb(pal_tint(x, z, pal.trim), 0.92), x * 5 + z * 3, 0.05), FACE_ALL);
                         mesh.material = Some(crate::mesh::Material::StoneBlock);
                         lvl.meshes.push(mesh);
                         lvl.obstacles.push(Obstacle { center: ctr, half });
@@ -3075,31 +3130,39 @@ impl Level {
                     run.push(p);
                     for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] { st.push((p.0 + dx, p.1 + dz)); }
                 }
-                let mut stairs = 0;
+                // ONE stair per run, and only for real wall-walks (>= 6 cells): the old
+                // two-per-run, eight-riser boxes were the "brick stairs everywhere" the field
+                // report called out — the reconstruction was out-shouting the model. Five
+                // fatter slabs in the model's own stone, rising to the run's actual scan
+                // height, read as a built stair instead of scattered masonry.
+                if run.len() < 6 { continue; }
+                let run_top = run.iter().map(|&(x, z)| cell_top(x, z)).fold(0.0f32, f32::max);
+                let mut placed = false;
                 'run: for &(x, z) in &run {
                     for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                        if stairs >= 2 { break 'run; }
+                        if placed { break 'run; }
                         let (f1, f2) = ((x + dx, z + dz), (x + 2 * dx, z + 2 * dz));
                         if lvl.cell(f1.0, f1.1) != Cell::Floor || lvl.cell(f2.0, f2.1) != Cell::Floor { continue; }
-                        // eight steps across two floor tiles, risers ≤0.6
-                        let n = 8;
+                        let n = ((run_top / 0.55).ceil() as usize).clamp(4, 9);
+                        let slab_c = scale_rgb(pal_tint(x, z, pal.wall), 0.9);
                         for i in 0..n {
                             let t0 = i as f32 / n as f32;
-                            let sy = 0.35 + (top - 0.35) * (1.0 - t0);
-                            let along = 0.5 + 2.0 * t0; // tiles out from the wall face
+                            let sy = 0.30 + (run_top - 0.30) * (1.0 - t0);
+                            let along = 0.5 + 2.0 * t0;
                             let (cx, cz) = (x as f32 * ts + dx as f32 * ts * along,
                                             z as f32 * ts + dz as f32 * ts * along);
-                            let (hx, hz) = (if dx != 0 { ts * (1.0 / n as f32) } else { ts * 0.45 },
-                                            if dz != 0 { ts * (1.0 / n as f32) } else { ts * 0.45 });
+                            let (hx, hz) = (if dx != 0 { ts * (1.1 / n as f32) } else { ts * 0.42 },
+                                            if dz != 0 { ts * (1.1 / n as f32) } else { ts * 0.42 });
                             lvl.platforms.push(Platform { x0: cx - hx, z0: cz - hz,
                                                           x1: cx + hx, z1: cz + hz, top: sy });
                             let mut mesh = boxx(Vec3::new(cx, sy * 0.5, cz),
                                                 Vec3::new(hx, sy * 0.5, hz),
-                                                dither(pal.wall, x * 13 + z * 7 + i as i32, 0.06), FACE_ALL);
-                            mesh.material = Some(crate::mesh::Material::StoneBlock);
+                                                dither(slab_c, x * 13 + z * 7 + i as i32, 0.04), FACE_NO_BOTTOM);
+                            mesh.material = Some(crate::mesh::Material::LearnedWall(
+                                fac.as_ref().map(|f| f.site as u8).unwrap_or(0)));
                             lvl.meshes.push(mesh);
                         }
-                        stairs += 1;
+                        placed = true;
                     }
                 }
             }
@@ -12815,9 +12878,14 @@ fn learned_sites_stamp_their_learning() {
                 "{name}: {cols} learned columns must register as cover (got {})", l.cover_obstacles.len());
         }
         if ramps > 0 {
-            let walk = l.platforms.iter().filter(|p| p.top >= *wall_h).count();
+            // Wall-walks now ride the SCAN's per-cell height (a ruin's low run sits below the
+            // skin wall_h — that's the model, not a bug), so the honest bar is "elevated,
+            // one platform per rampart cell", not one fixed height.
+            // a RUIN's rampart stub can sit under a metre — the model's truth. The invariant is
+            // one standable deck per rampart cell, at any real elevation.
+            let walk = l.platforms.iter().filter(|p| p.top >= 0.4).count();
             assert!(walk >= ramps,
-                "{name}: {ramps} rampart cells must expose a wall-walk (got {walk} wall-top platforms)");
+                "{name}: {ramps} rampart cells must expose a wall-walk (got {walk} elevated platforms)");
         }
         // Appearance learning: any blueprint carrying the sidecar layers must parse into a
         // live FacadeDetail — with a non-uniform height field (the scan's real silhouette,
@@ -12830,6 +12898,11 @@ fn learned_sites_stamp_their_learning() {
             assert!(seen.iter().filter(|&&b| b).count() >= 3,
                 "{name}: learned heights should be non-uniform (a real silhouette)");
             assert_eq!(f.site, i, "{name}: facade must know its site index (texture tile selection)");
+            if bp.contains(";;G ") && f.ground.iter().any(|&g| g > 3) {
+                let (mn, mx) = l.heights.iter().fold((f32::MAX, f32::MIN), |(a, b), &v| (a.min(v), b.max(v)));
+                assert!(mx - mn > 1.0,
+                    "{name}: the scan's terrain must shape the ground (height span {:.2})", mx - mn);
+            }
             if bp.contains(";;P ") {
                 assert!(!f.palette.is_empty(), "{name}: palette lines present but not parsed");
                 assert!(f.tint.iter().any(|&t| t != 255), "{name}: palette bound but no cell tinted");

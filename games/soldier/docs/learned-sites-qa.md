@@ -28,19 +28,19 @@ anchors over the floor bbox so waves populate.
 
 ```
 site                     grade  conn struct  choke  plats  cover  cols ramps
-Naranco Sanctuary           66  true   0.45     90     73    371    40    43
-Haunted Parish              66  true   0.46    214     48    999    40    26
-Colossus Fountain           59  true   0.57     50     75    432    29    43
-San Pellegrino Piazza       59  true   0.60     48    181    746    12    97
-Castillo de Pioz            73  true   0.37      5     44    149     0    27
-Barcience Keep              59  true   0.56     11      0     13     5     0
-Amman Cistern               64  true   0.53     30    217    204     3   125
-Morton Castle               59  true   0.50      7      0     27     8     0
-Pambre Bastion              71  true   0.32     14     23    169     3    12
-Perarrua Crag               56  true   0.37      3      0      5     3     0
-Lost Palace                 55  true   0.50    124      0    536    40     0
-Thian Hock Keng             66  true   0.39      9      0    135     0     0
-Sky Palace Corridor         65  true   0.45     42    386    980     5   263
+Naranco Sanctuary           76  true   0.45     90     40    357    40    43
+Haunted Parish              74  true   0.46    214     12    999    40    26
+Colossus Fountain           68  true   0.57     51     19    389    29    43
+San Pellegrino Piazza       68  true   0.61     49     46    679    12    97
+Castillo de Pioz            81  true   0.37      5     32    120     0    27
+Barcience Keep              71  true   0.56     11      0     13     5     0
+Amman Cistern               81  true   0.53     30    101    126     3   125
+Morton Castle               71  true   0.50      7      0     27     8     0
+Pambre Bastion              81  true   0.32     14      4    163     3    12
+Perarrua Crag               68  true   0.37      3      0      5     3     0
+Lost Palace                 68  true   0.50    124      0    536    40     0
+Thian Hock Keng             75  true   0.39      9      0    135     0     0
+Sky Palace Corridor         74  true   0.45     42    322    850     5   263
 ```
 
 Notes, honest ones: **Thian Hock Keng** yields 0/0 on the new learnings — its scan reads as a
@@ -82,5 +82,14 @@ maps, and the pass runs from `build_cliffs` as a choke point — the theme-metho
 silently skipped the Military-skinned castles is gone. **Learned fog** pulls the fog colour
 toward the palette's light tone and sits closer (aerial perspective at scale). The downhill
 GROUND_SNAP fix (46 airborne flickers -> 0 on the ramp test) makes walking the sites smooth.
+
+**Model-first pass** (field report: "brick stairs everywhere… the terrains and buildings and
+textures were way better"): the scans' `;;G` GROUND layer now shapes `Level.heights` — Perarrua
+sits on its crag, Morton on its mound, the ring relaxing outward — and grades jumped for it
+(Pioz 73→81, Naranco 66→76, Piazza 59→68: the evaluator agrees the model's terrain beats the
+flat slab). The photograph carries wall colour now (near-white verts with a 22% palette wash —
+full tints muddied the texel), wall-walks ride the per-cell scan height instead of one slab,
+stairs went from two-per-run eight-riser brick piles to ONE per real run (≥6 cells) of five
+photo-stone slabs, and merlons are every-other-cell, lower, in the model's own stone.
 
 Still open, deliberately: '^' expansion-ring scatter, destructible columns/merlons.

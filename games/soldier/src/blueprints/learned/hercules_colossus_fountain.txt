@@ -51,7 +51,7 @@ a5.^............^.^^.^a^^^^a^^^..^^^^..................^
 334...^....^.^aa^a^a^7777777^^a^77^7^a^^a^^^a^^^........
 334.....^^^^.^^^a^^^^^777^^7^^^^^^a^^a^^^^^^a^^^.^^^.^.^
 344.......^^^^^^^^^^a^^^^^^^^^^^a^^^^^^^^^a^^^^a^aa^^^^^
-;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F (from vertex normals)
+;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F, G ground/terrain 0-F
 ;;H 0300030303002200000000000ccd0020223034000005600070000000
 ;;H 300303000320220000000200cccdc000220000400500006000080800
 ;;H 30300030030022002000000bcccccb02000300400050000700008009
@@ -205,3 +205,54 @@ a5.^............^.^^.^a^^^^a^^^..^^^^..................^
 ;;R 00002200010000000000014200000000000000000000000000000000
 ;;R 13200310000000000000000000000000000000000000000000000000
 ;;R 12111321000000000000000000000000000000000000000000000000
+;;G 23222323232122100000123456554422223234323445655676676767
+;;G 32232322232122101001223452442543222223434544556666787878
+;;G 32321232232122112112322244345652112323434454456765678789
+;;G 22332332221212121122433764425221123333445445566656767899
+;;G 22233443311222121234545255456552000000000054355666778778
+;;G 22333434332222112345424454422242552222221005367677777788
+;;G 222334333221111234344232423422242432111211221cbaaababbaa
+;;G 23333343432210112434433344c334334322110112322cbbbababbba
+;;G 223344343211012234323333c323222323211212234225aaaabbbbaa
+;;G 333443233212112345644323332333233322232232552bbabbaaabba
+;;G 3344443442232223342424242224243244334433456526aaaababbaa
+;;G 334444344224444444445244543454445444554332722bbbbbbaaaaa
+;;G 3444433422222211101100000000012220122222222217ccbbababba
+;;G 344454323464444444344ccc2cc222c23434b43444ccc88cc7babaaa
+;;G 44454423444445433443cbbccdeedcbbc3b3c344554ca9aac8cbbaba
+;;G 44454233454554444334cbbccccccbbcc44344444555accaabccbaba
+;;G 2444323344554444443bcccfedcdeccccb3434d454574cbbaccbbbba
+;;G 245423444564c454434cecfedddefeccec434544554555ccabcbabba
+;;G 25453445556554444ccbcceddeddeddccbcc44454c56655ccbc8baba
+;;G 244334656554444ccbcccefeefedddefccbcdc455465765ccbbcbbaa
+;;G 35543456556544abccccededdeddeddefcccedc456655655bcbcbbba
+;;G 3664456666565bbcccdefedcdedefedeeeeccccb56566665ccbcbaaa
+;;G 3564467775665cccfeededcdefedefefefedcccb55657786cbbb9bba
+;;G 466556787976cccdeefedcdedeeefededeedcdcbc6778676ccbbbaaa
+;;G 4454566767c6cccdededcdefe44dedcddefedcccb676c996ccbbbbaa
+;;G 446446787d67bccefeddcdefe84dedcccdeddccbc67cc996cbbbbbba
+;;G 24644677a776bbcdefeededeeeeeeedcdeddedccb67dc676ccbbcba9
+;;G 446446687666cccedeefefeddddeefedefeefccbc776a6a6ccbb8bba
+;;G 4564566676a9abbcdddededccdeffeeefedddccc77876776ccbcbcbb
+;;G 44675688a9aaacccccedefedccdeeefeedcccbb77bdda776cbbbcbba
+;;G 547756899aa9abccbccceefedddedefeecccbb88877dcb7ccbbcccba
+;;G 545655799aaaabbbbcbccefeeeefedeccbbbbc89c8bb777ccbbcccba
+;;G 4457558899aabbbbbbcdecefffeedeececbccc98bd8787cbbbcacbbb
+;;G 44576667999abbbbbbbcccceeeddefccdcbbcdd888aa77cbbbccccbb
+;;G 15557666799abbbbbbbcbbccccccccccccbbbdcd8aa8cbcbbcbccbba
+;;G 135588668999aabbbbcccbccccccccbbbcbbbbbba88bcbbbbcbccba9
+;;G 125578668989aaaacccccbcbbbbbcbbcccccbbbbb8bccbbc8acbbbba
+;;G 1255786688999999cccccbbbcbaababcbcccba9c888abbcbccbccba9
+;;G 1355886789ab9999cccbbaaababaa9ababcbc8888888abcbcbccbbba
+;;G 35558669899cc999cbbaaabaabcba99abcbbb889c98ac9ccccbbbbbb
+;;G 365586698acbbba9cba9abcbaabaa99aabbcb89ccc98c8bcbbcbbbba
+;;G 36558668898cbccccbaa9abba9aabaabaabcbcbbcb89ccbbbcbbbbba
+;;G 2655877889cbcba9cbabaabcbaabcbbcbaababccbab8ccbabbaabbba
+;;G 2555877899acbb99babcbaabaababaabaaba988aca8bb8babbaaabaa
+;;G 3555987799999999aaababaabbcbba9aabcba8899b8abbbaabbbaaaa
+;;G 3455986699999999abaabcbbcccccba9abbaa8888888cbbbbbbabbba
+;;G 34557997bcccccbabcbbcbaabbabbcbabcbabbccbbbccccbcbabaaba
+;;G 3455698888acaaabbcbbbabbbbbbbbabbccbcbbbbccbbbbbbcbbbbaa
+;;G 3445678999aba9abababaaaabbbbaababbbbbbaabbbaaaaaababaaaa
+;;G 2445667a999aa99aba9aaabbbaaba9a9aabaaa99aaa9a999aa9aa9a9
+;;G 24456678aa999889a99abaaaa99a989abaa9998899a9989a9aa99898

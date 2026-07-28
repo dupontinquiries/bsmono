@@ -55,7 +55,7 @@ aa^............^^a^............^a^^^............^^^^^^^^
 ^^^^^^^^^^^^^^^^^^^a9999^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ^^^^^^^^^^^^^^^^^^^^95a^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 ^^^^^^^^^^^^^^^^^^^a^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F (from vertex normals)
+;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F, G ground/terrain 0-F
 ;;H 00000000000000000000000000000000000ee3000000000000000000
 ;;H 000000000000000000000000000000000be33e000000000000000000
 ;;H 0000000000000000000000000000000fdeeeee800000000000000000
@@ -221,6 +221,61 @@ aa^............^^a^............^a^^^............^^^^^^^^
 ;;R 0000000000000000000f8bac00000000000000000000000000000000
 ;;R 00000000000000000000aa0000000000000000000000000000000000
 ;;R 00000000000000000006000000000000000000000000000000000000
+;;G 0000000000000000000000000489abcdcba223210000000000000000
+;;G 000000000000000000000041489abcdedb2223321000000000000000
+;;G 00000000000000000000045489abcdef832223438100000000000000
+;;G 0000000000000000000645689abcdcbaa22248349810000000000000
+;;G 000000000000000003676689abcdedeaa9464445a991000000000000
+;;G 0000000000000008867877889aaeeeeabc345445baa9000000000000
+;;G 000000000000008998898898848accdcccecc46dcbba900000000000
+;;G 000000000000089aa99a99a7447edabceccdcceedccba90000000000
+;;G 00000000000089abbaabaab778eaaaaaeccebbdeeddcba9000000000
+;;G 0000000008089abccbbc7eeaa9aaaaaaeedcbbceededcba900000000
+;;G 000000008989abcdd9ab77ebaaa999aaaedebbbeeefedcba90000000
+;;G 000000989a9abcdeea6a67aaa9a9aabbcdcdcbaaddeedcba98000000
+;;G 000009a9ababcddee76687aaa9aaaaccdedcaa9aadedcba980000000
+;;G 08809ababcbcdeedd787aa999aabdcdcdeaa889aabeddcba98000000
+;;G 8999abcbcdcddddcaaaa99aaaabdededba9a9899aaeeedcba9800000
+;;G 9aaabcdcdedeecaaaaa99aaaaedcddebaaaa9a89aaaedcdcba980000
+;;G abbbcdedcdccda9aa99aaafeddcbbbbbaaaaa98899aeddedcba98000
+;;G bcccdefeddcaa99999aaaaedded99bbaaaaaaa889aaadedcba980000
+;;G cddccdedacaaa999aaaedcdedd999aaaabeaa9a899aaeedcba980000
+;;G deedcddaaaaa99aaaeddcbcaaa99aaabdefeaa99899aaeedcba98000
+;;G ddedcabbaa99aaaeadcdcaaaa987aaceddeddaa9889aaaeedcba9800
+;;G eed9aaaaa9aaaabddedeaaaa975699adedddeaa997899aeedcba9800
+;;G dddeaacbbaabdeedcdaaaa9755677aacdccdedaa9689aaaeddcba980
+;;G ccdebbbaaaaccdde99aa977355667aaaedcddcaa9a899aaeeedcba98
+;;G bcddebbbdeddcded999775533566799adddedccaa9989aaaddcba980
+;;G abcdeabdeddedcdcb99766655556677aaeddccdbaa9889aade349821
+;;G bcdeddbcedcdcbbbba99765654856799aadeddebaa9989aac6538432
+;;G abcddebbdedeabbbbba97766644576799acdebaaaa99aabb76436543
+;;G abcdedcbbda9aabbdeaaa7665d4556779aaeaaaaaaaaddbb66353432
+;;G 9abcdddbba99caadedcaa976654456677aaaaaaabbcdeebbb6243321
+;;G 9abcdeedbcaa89abdcdea97766535567799aabbbbabcddddec733212
+;;G abcdefededa999aaededaa77665544566799bbbdcbabcdeed5535223
+;;G 9abcdeddddaa999aaefeea977664345799a9bededcbbadecce432224
+;;G 09abcdcdeedaaaeaabeeda9a7655277aaaaeddcdbbaaaaeccd443645
+;;G 009abcbcddcbaa99aabded9a765799aaaadddedbaaba99edbcba6555
+;;G 0009ababcddbba99aabedca99679aaaaddedcbbaeaa9aaacbaa9a5a9
+;;G 00009aabcdeeaaa999abcbba9999aaededdcaaaa99aaabbdeaaadcba
+;;G 000089abcdedeba989aabbba99aadedcdcaaaa99aaaabaadecabcba9
+;;G 000009abcdeeddaa989abbbb9aaeddcbbaaa999aaba755aaedcbba98
+;;G 00009abcdefedde999babbededcdccbbaaa99aaaba75446cdcbaa987
+;;G 000009abcdededbaa9c9becbddccaaaa99aaaaabba5444abcba99870
+;;G 0000089abcdeddcba9edddcbdedaaaa999aaa67bda44989aba988700
+;;G 00000089abcdcddbaeddeddebaaaa9aaaaab6777ddcba989a9847000
+;;G 000000089abccddebdedddeeaaa9999aa9865677ccba987898400000
+;;G 000000089abcdedebbdedcaaaa99aaaab876787abba9871480000000
+;;G 0000000089abcdcdcbbddbaa99aaaabb8def8ba9aa98700000000000
+;;G 00000000089abccdcbabbaa9aaabbbbc989edcba9987000000000000
+;;G 00000000089abcdedcbbbccbabbba12cbbcdcba98870000000000000
+;;G 00000000089abcdedccbabbbdcc2001baabcba927700000000000000
+;;G 000000000089abcdccdbbbabb74cccba99aba9210000000000000000
+;;G 0000000000089abccdedc111133edcba989a92100000000000000000
+;;G 00000000000089abbcdc012118cdcba9865920000000000000000000
+;;G 000000000000089aabc90123babcba98653000000000000000000000
+;;G 00000000000000899aba04edcbaba986500000000000000000000000
+;;G 000000000000000889a5bcdcba9a9860000000000000000000000000
 ;; palette learned from 10 texture file(s) — binding medium — the warm ornate cluster; roof entry: None
 ;;P 0 503E27
 ;;P 1 574E36
