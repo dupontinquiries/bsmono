@@ -9194,11 +9194,21 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     ///          chunk wrote at offset 0. Fixed with the bind-group cache key extended to carry the
     ///          output's offset — the binding alone would have been worse, since a cached group would
     ///          then be reused with the wrong destination silently.
-    ///   LEFT   37 blocks differ by 5.4e-2 against values up to 3.3e5: a relative error of ~1.6e-7,
-    ///          which is one f32 ULP and therefore an ORDER-OF-OPERATIONS difference, not a logic
-    ///          error. Worth finding anyway — one ULP is harmless in isolation and compounds across 48
-    ///          layers, which is the exact shape of "close enough" this project keeps paying for.
-    ///   LEFT   5000 blocks differ grossly (2.4e8). Separate fault, in the chunked path only.
+    ///   FIXED  `wg1` takes an ELEMENT count and divides by 64 itself; it was called with an
+    ///          already-divided value. 65 blocks asked for wg1(2) = ONE workgroup = 64 threads, so
+    ///          block 64 onward was never dispatched and kept whatever the allocator left. A size sweep
+    ///          made it obvious — exact through 64 blocks, then rel=1.00 at 65 — and nothing about the
+    ///          arithmetic was involved. Everything that fitted one workgroup had looked perfect.
+    ///   LEFT   a uniform ~4.7e-10 relative difference at every size, i.e. 1-2 f32 ULPs. NOT the
+    ///          multiply chain: binding `d * scale` to a named value first, so the compiler cannot
+    ///          contract it into an FMA, changed nothing. That leaves `f16()` — the CPU reference and
+    ///          this shader must be rounding some inputs differently, and random test bytes will hit
+    ///          subnormals and edge exponents that a real checkpoint mostly would not.
+    ///
+    /// The remaining ULP is worth closing rather than tolerating. `--gate-q4k` achieves bit-exactness
+    /// on the same class of work, so it is achievable here; and a dequantizer that is a ULP off is
+    /// harmless in isolation and compounds across 48 layers — the exact shape of "close enough" that
+    /// produced the buffer-pool corruption and the ignored expert_weights_scale.
     pub fn q6k_dequant(&self, raw: &[u8], n_weights: usize) -> Result<Tensor, String> {
         if n_weights % 256 != 0 { return Err("q6_k: element count not a multiple of 256".into()); }
         let nblk = n_weights / 256;
@@ -9229,8 +9239,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             let dstv = Tensor { buf: out.buf.clone(), rows: 1, cols: n * 256,
                                 pool: None, view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)) };
             let dims = [n as u32, 0u32, 0u32, 0u32];
-            self.dispatch(Q6K_DEQUANT, &[&view], &dstv, bytemuck::cast_slice(&dims),
-                          wg1((n as u32).div_ceil(64)));
+            // wg1 takes the ELEMENT count and divides by 64 itself. Passing an already-divided value
+            // divides twice: 65 blocks asked for wg1(2) = ONE workgroup = 64 threads, so block 64 onward
+            // was never dispatched and kept whatever the allocator left. That is the 64->65 cliff in the
+            // size sweep — everything up to one workgroup looked perfect.
+            self.dispatch(Q6K_DEQUANT, &[&view], &dstv, bytemuck::cast_slice(&dims), wg1(n as u32));
             b0 += n;
         }
         Ok(out)
@@ -11790,10 +11803,19 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg
             let q2 = i32((b & 0xFu) | (((h >> 2u) & 3u) << 4u)) - 32;
             let q3 = i32((a >> 4u)  | (((h >> 4u) & 3u) << 4u)) - 32;
             let q4 = i32((b >> 4u)  | (((h >> 6u) & 3u) << 4u)) - 32;
-            dst[o + l]       = d * f32(i8_at(sc + is))      * f32(q1);
-            dst[o + l + 32u] = d * f32(i8_at(sc + is + 2u)) * f32(q2);
-            dst[o + l + 64u] = d * f32(i8_at(sc + is + 4u)) * f32(q3);
-            dst[o + l + 96u] = d * f32(i8_at(sc + is + 6u)) * f32(q4);
+            // Bind (d * scale) to a NAMED value before multiplying by the quant. The CPU reference
+            // computes `dsc = d * sc` once per sub-block and then `dsc * q`; writing it as a single
+            // expression lets the compiler contract the chain into an FMA, which rounds ONCE instead of
+            // twice and lands 1-2 ULPs away. More accurate, and not what the reference does — and a
+            // dequantizer that disagrees with the reference by a ULP compounds across 48 layers.
+            let d1 = d * f32(i8_at(sc + is));
+            let d2 = d * f32(i8_at(sc + is + 2u));
+            let d3 = d * f32(i8_at(sc + is + 4u));
+            let d4 = d * f32(i8_at(sc + is + 6u));
+            dst[o + l]       = d1 * f32(q1);
+            dst[o + l + 32u] = d2 * f32(q2);
+            dst[o + l + 64u] = d3 * f32(q3);
+            dst[o + l + 96u] = d4 * f32(q4);
         }
     }
 }
