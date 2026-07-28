@@ -50,7 +50,7 @@ edits exactly reversible, which floats are not.
 | `studio-collab` | convergent op log (Lamport + site), per-peer presence | 6 |
 | `studio-egui` | timeline on uikit-egui + touch gestures, theater/split modes, panels | 14 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
-| `studio-live` | FL-style pattern rack, pluggable synths (incl. beatspace), punch-in recording | 9 |
+| `studio-live` | pattern rack, synths (incl. beatspace), recording, **transport** | 18 |
 
 ## Realtime collaboration, concretely
 
@@ -84,8 +84,8 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    decode, `ffmpeg` via CLI for video, keeping the core codec-free.
 2. **Audio render graph** — mix tracks, apply effects, produce samples. The
    `Effect` type is already opaque-by-design so hosts can register kinds.
-3. **Transport and playback** — mixdown produces samples; nothing yet sends
-   them to a device or moves a playhead in real time.
+3. **Device I/O** — the transport clock and mixdown are done; nothing yet
+   hands samples to a sound card or pulls them from a microphone.
 4. **Transport** — the op packets are plain serde; snapclone's `snapclone-dht`
    already carries signed records between peers and is the obvious carrier.
 5. **Block-backed sources** — Audacity's insight that samples live in chunks so
@@ -222,3 +222,44 @@ host goes quiet, because a frozen picture is worse than a slightly wrong one.
 On a narrow screen the editor shows **one solid panel at a time** (Timeline,
 Rack, Mixer, Program). Translucent floating panels over a timeline are
 unreadable at six inches and impossible to hit accurately.
+
+## The transport, and three bugs it is designed around
+
+A playhead is easy to get approximately right and hard to get exactly right, and
+the errors read as "it feels wrong" without users being able to say why.
+
+**The clock counts samples, not seconds.** Advancing a float by `dt` each UI
+frame accumulates error and ties musical time to frame rate — a dropped frame
+moves the playhead. `advance(frames)` takes what the device actually consumed,
+so the playhead is wherever the samples say it is. Video follows audio, never
+the reverse. A test runs 10,000 awkward-sized buffers and demands the position
+be exact.
+
+**Recorded audio arrives late.** Input passes through the device buffer before
+your callback sees it, so a take stamped at the current playhead lands late by
+exactly the round-trip latency. The symptom is that everything you record drifts
+behind the click by a consistent few milliseconds — invisible until you layer
+two takes, and then maddening. `record_position()` subtracts it (clamped at zero
+so a large configured latency near the project start cannot go negative). This
+is the single most common bug in home-grown recorders.
+
+**Loops must not drop samples at the seam.** When the playhead crosses the loop
+end mid-buffer, the remainder belongs to the *start* of the loop. `Advance`
+reports the split and `spans()` hands the renderer both halves, because a
+renderer that assumes one contiguous span produces the click every naive looper
+has.
+
+A **count-in** rolls the clock back so the count happens before the punch point,
+keeps the recorder disarmed while it runs, and reports the exact buffer where it
+arms. The punch frame is stored rather than recomputed, so changing the tempo
+mid-count cannot move the target.
+
+### Following a shared transport
+
+`Sync::Follow` carries the host's position *and* the round-trip time, because
+the packet describes where the host **was** a hop ago — a naive follower is
+permanently behind. Adding half the RTT puts you where it is now. And a follower
+only re-seeks past a threshold: correcting every packet stutters the audio,
+never correcting lets drift accumulate, so small offsets are left to the local
+clock and only a real scrub causes a jump. This is the transport-level half of
+theater mode, kept out of the UI because a clock is not a UI concern.

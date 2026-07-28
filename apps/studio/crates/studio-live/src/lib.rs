@@ -31,6 +31,8 @@
 //! bargain the effect list makes in `studio-core`, for the same reason: a
 //! project must never fail to open because a plugin is missing.
 
+pub mod transport;
+
 use studio_audio::SourceAudio;
 use studio_core::Ticks;
 
