@@ -13,6 +13,7 @@
 //! a surprising undo history.
 
 pub mod touch;
+pub mod keys;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use studio_collab::Doc;
