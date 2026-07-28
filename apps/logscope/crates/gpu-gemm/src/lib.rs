@@ -8901,6 +8901,47 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         self.queue.write_buffer(&dst.buf, 0, bytemuck::cast_slice(src));
     }
 
+    /// Dequantize raw Q6_K bytes to f32 on the GPU.
+    ///
+    /// Chunked the same way the Q4_K path is, and for the same reason: one dispatch over a whole
+    /// expert tensor is long enough to trip the firmware watchdog, which on this hardware is not a
+    /// hypothetical — 56 timeouts in a four-minute window is what an oversized dispatch looks like.
+    /// NOT YET CORRECT — `--gate-q6k` is RED (max|diff| 3.3e5 on a single block against the CPU
+    /// reference). Kept in the tree because the structure is right and the fault is narrow, but it must
+    /// not be wired into the loader until the gate is green: a conversion that is merely close would
+    /// degrade every expert in the model, silently, which is the exact failure this project keeps paying
+    /// for.
+    ///
+    /// Two candidates for the fault, both testable:
+    ///   - `dispatch` binds the OUTPUT with as_entire_binding(), ignoring a view — so the per-chunk dst
+    ///     view is a no-op and every chunk writes at offset 0. That explains the multi-block cases but
+    ///     NOT the single-block one, which is also red.
+    ///   - the f16 subnormal branch or the 2-bit high-bit assembly differs from the CPU path in a way a
+    ///     single hand-checked block would expose immediately.
+    pub fn q6k_dequant(&self, raw: &[u8], n_weights: usize) -> Result<Tensor, String> {
+        if n_weights % 256 != 0 { return Err("q6_k: element count not a multiple of 256".into()); }
+        let nblk = n_weights / 256;
+        if raw.len() < nblk * 210 { return Err("q6_k: data truncated".into()); }
+        let srcbuf = self.upload_bytes(&raw[..nblk * 210], "q6k-src");
+        let src = Tensor { buf: srcbuf, rows: 1, cols: (nblk * 210).div_ceil(4), pool: None, view: None };
+        let out = self.alloc_resident_words(n_weights);
+        let chunk = engine_config().convert_chunk_blocks.max(1);
+        let mut b0 = 0usize;
+        while b0 < nblk {
+            let n = chunk.min(nblk - b0);
+            let byte_off = b0 * 210;
+            let view = Tensor { buf: src.buf.clone(), rows: 1, cols: (n * 210).div_ceil(4),
+                                pool: None, view: Some((byte_off as u64, (n * 210) as u64)) };
+            let dstv = Tensor { buf: out.buf.clone(), rows: 1, cols: n * 256,
+                                pool: None, view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)) };
+            let dims = [n as u32, 0u32, 0u32, 0u32];
+            self.dispatch(Q6K_DEQUANT, &[&view], &dstv, bytemuck::cast_slice(&dims),
+                          wg1((n as u32).div_ceil(64)));
+            b0 += n;
+        }
+        Ok(out)
+    }
+
     /// Test hook: chunked host->device write, to compare against the single-shot path.
     pub fn write_chunked_pub(&self, dst: &Tensor, src: &[f32]) {
         self.write_chunked(&dst.buf, 0, bytemuck::cast_slice(src));
@@ -11387,6 +11428,83 @@ pub fn wrapped_grid(units: usize) -> (u32, u32) {
 /// Bytes are read through a u32 view: super-block b starts at byte b*144, i.e. word b*36. The 6-bit
 /// scale/min packing (`get_scale_min_k4`) is reproduced exactly, including the j>=4 branch that stitches
 /// the high 2 bits from an earlier byte.
+
+/// Q6_K -> f32 on the GPU, mirroring `gguf::dequantize` type 14 exactly.
+///
+/// 210-byte super-block of 256 weights: 128 low-nibble bytes `ql`, 64 high-2-bit bytes `qh`, 16 int8
+/// sub-block scales, then an f16 `d`. A 6-bit quant is `nib | (hi2 << 4)`, recentred by -32, and the
+/// weight is `d * sc * (q - 32)`. Processed in two 128-wide halves, same as the CPU path.
+///
+/// This exists so Scout's experts can be FILE VIEWS. Its `ffn_down_exps` is Q6_K, and the view path
+/// requires every expert tensor to be GPU-convertible — one Q6_K tensor forced the whole model onto the
+/// host-copy path, which is 200 GiB of traffic per generation and the staging fence that costs 99% of
+/// submits. Converting Q6_K removes the copies rather than making them faster.
+pub const Q6K_DEQUANT: &str = r#"
+struct D { n:u32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<u32>;
+@group(0)@binding(1) var<storage,read_write> dst: array<f32>;
+@group(0)@binding(2) var<uniform> dims: D;
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+fn f16(h: u32) -> f32 {
+    let sign = (h >> 15u) & 1u;
+    let exp  = (h >> 10u) & 0x1Fu;
+    let mant = h & 0x3FFu;
+    var bits: u32;
+    if (exp == 0u) {
+        if (mant == 0u) { bits = sign << 31u; }
+        else {
+            var m = mant; var e: i32 = -1;
+            loop { if ((m & 0x400u) != 0u) { break; } m = m << 1u; e = e - 1; }
+            m = m & 0x3FFu;
+            bits = (sign << 31u) | (u32(127 - 15 + e + 1) << 23u) | (m << 13u);
+        }
+    } else if (exp == 31u) {
+        bits = (sign << 31u) | 0x7F800000u | (mant << 13u);
+    } else {
+        bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
+    }
+    return bitcast<f32>(bits);
+}
+
+// int8 from a byte: the scales are SIGNED, and reading them as unsigned silently doubles half of them.
+fn i8_at(i: u32) -> i32 {
+    let b = byte_at(i);
+    if (b >= 128u) { return i32(b) - 256; }
+    return i32(b);
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+    let blk = g.x + g.y * nwg.x * 64u;
+    if (blk >= dims.n) { return; }
+    let base = blk * 210u;
+    let d = f16(byte_at(base + 208u) | (byte_at(base + 209u) << 8u));
+    let out = blk * 256u;
+    for (var half: u32 = 0u; half < 2u; half = half + 1u) {
+        let ql = base + half * 64u;
+        let qh = base + 128u + half * 32u;
+        let sc = base + 192u + half * 8u;
+        let o  = out + half * 128u;
+        for (var l: u32 = 0u; l < 32u; l = l + 1u) {
+            let is = l / 16u;
+            let a = byte_at(ql + l);
+            let b = byte_at(ql + l + 32u);
+            let h = byte_at(qh + l);
+            let q1 = i32((a & 0xFu) | (((h >> 0u) & 3u) << 4u)) - 32;
+            let q2 = i32((b & 0xFu) | (((h >> 2u) & 3u) << 4u)) - 32;
+            let q3 = i32((a >> 4u)  | (((h >> 4u) & 3u) << 4u)) - 32;
+            let q4 = i32((b >> 4u)  | (((h >> 6u) & 3u) << 4u)) - 32;
+            dst[o + l]       = d * f32(i8_at(sc + is))      * f32(q1);
+            dst[o + l + 32u] = d * f32(i8_at(sc + is + 2u)) * f32(q2);
+            dst[o + l + 64u] = d * f32(i8_at(sc + is + 4u)) * f32(q3);
+            dst[o + l + 96u] = d * f32(i8_at(sc + is + 6u)) * f32(q4);
+        }
+    }
+}
+"#;
+
 pub const Q4K_DEQUANT: &str = r#"
 struct D { n:u32, grid_w:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;     // raw Q4_K bytes, viewed as words

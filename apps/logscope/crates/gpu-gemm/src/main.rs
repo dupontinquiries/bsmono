@@ -3377,6 +3377,47 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
         } else { "FAIL \u{2717}" });
         return;
     }
+    if args.iter().any(|a| a == "--gate-q6k") {
+        // Q6_K on the GPU, against the CPU reference in gguf.rs. Bit-exactness is the bar, not "close":
+        // this decides whether Scout's experts can be FILE VIEWS instead of 200 GiB of host copies, and a
+        // conversion that is merely close would degrade every expert in the model.
+        let gpu = Gpu::new();
+        eprintln!("gate-q6k: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        // Pseudo-random blocks, including bytes that exercise the sign of the scales and the high bits.
+        let mk = |nblk: usize, seed: u32| -> Vec<u8> {
+            (0..nblk * 210).map(|i| {
+                let z = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                ((z >> 13) & 0xFF) as u8
+            }).collect()
+        };
+        for (nblk, label) in [(1usize, "one block"), (37, "37 blocks"), (5000, "5000 blocks (chunked)")] {
+            let raw = mk(nblk, 0x51E7 + nblk as u32);
+            let want = gpu_kernels::gguf::dequantize(14, &raw, nblk * 256).expect("cpu q6k");
+            let got = gpu.download(&gpu.q6k_dequant(&raw, nblk * 256).expect("gpu q6k"));
+            let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("{label}: GPU == CPU (max|diff|={worst:.3e})"), worst == 0.0);
+        }
+        // A block whose scales are NEGATIVE: reading them as unsigned silently doubles half the weights,
+        // and random bytes alone may not make that visible.
+        {
+            let mut raw = mk(1, 7);
+            for k in 192..208 { raw[k] = 0xF0; }        // -16 as i8
+            raw[208] = 0x00; raw[209] = 0x3C;           // d = 1.0
+            let want = gpu_kernels::gguf::dequantize(14, &raw, 256).expect("cpu");
+            let got = gpu.download(&gpu.q6k_dequant(&raw, 256).expect("gpu"));
+            let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            ck(&format!("negative scales handled as SIGNED (max|diff|={worst:.3e})"), worst == 0.0);
+            assert!(want.iter().any(|v| *v < 0.0), "the fixture must actually produce negatives");
+        }
+        println!("gate-q6k: {}", if ok {
+            "Q6_K converts on the GPU, bit-exact \u{2713} — expert file views are unblocked"
+        } else {
+            "FAIL \u{2717} — KNOWN RED, the kernel is not correct yet and is NOT wired into the loader. \
+See Gpu::q6k_dequant for the two candidate faults."
+        });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-q4k") {
         // GPU Q4_K dequant vs the CPU implementation that every loading Q4_K model already depends on.
         // This is the enabling step for the Colibri approach — never convert on load, let the GPU read the
