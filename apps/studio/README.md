@@ -48,7 +48,7 @@ edits exactly reversible, which floats are not.
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
 | `studio-collab` | convergent op log, presence, wire, carrier, **project files** | 25 |
-| `studio-egui` | timeline on uikit-egui + touch gestures, theater/split modes, panels | 14 |
+| `studio-egui` | timeline, touch gestures, theater/split modes, **Helix keys** | 22 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, **transport** | 18 |
 
@@ -353,3 +353,46 @@ locked reloads empty; the snapshot adds tracks unlocked, places the clips, then
 restores the flags, and the loader never has to know. A damaged or foreign file
 is refused outright rather than half-read, because quietly loading an empty
 project over someone's work is the failure that actually loses it.
+
+## Helix keys, where they earn their place
+
+Helix is **selection-first**: select a thing, then act on it (`w` then `d`),
+where vim is verb-first (`dw`). In a text buffer that is a preference; on a
+timeline it is simply how editing already works — you click a clip and then do
+something to it. So the grammar maps on with almost no distortion, and brings
+two things a timeline badly wants:
+
+* **Multiple selections as a first-class idea.** `C` adds a cursor, so "trim the
+  head of these nine clips" is one operation rather than nine drags. Both source
+  editors make that awkward.
+* **Motions that mean something.** In text `w` is a word; on a timeline the
+  equivalent unit is the **edit point**, so `w`/`b` step cut to cut — exactly how
+  you navigate a rough assembly — and `3w` skips three.
+
+| key | timeline meaning |
+|---|---|
+| `w` `b` | next / previous cut (`3w` counts) |
+| `e` | end of this clip |
+| `g g` `g e` `g c` | timeline start / end / back to the playhead |
+| `x` | select the clip under the playhead |
+| `%` `;` | select everything / collapse to one |
+| `C` `alt-C` | add the clip below / above — multi-clip editing |
+| `d` `y` `p` | delete, yank, paste |
+| `s` | **split** at the playhead |
+| `u` `U` | undo / redo (already what `History` does) |
+| `v` `i` `Esc` | select mode / text entry / back out |
+| `space` `:` | play-pause / command palette |
+
+**What is deliberately not copied:** regex selection, tree-sitter objects, and
+`%`-as-whole-file have no timeline meaning, and inventing one produces keys
+nobody can guess. `s` is the single departure — split, because every video
+editor already binds it there. A key that surprises both audiences is worse than
+one that surprises half.
+
+Three traps the tests pin, all of them the ones modal editors actually hit: a
+count must **not stick** to the next motion; a half-typed sequence must clear on
+an unbound key rather than lingering (a pending prefix that survives a stray
+press is how an editor feels haunted); and **insert mode must be literal**, so
+naming a track "wd" cannot step a cut and delete a clip. Motions stop at the
+ends instead of wrapping, because an editor that jumps from the last cut back to
+the head on one extra press has lost you.
