@@ -48,7 +48,8 @@ edits exactly reversible, which floats are not.
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
 | `studio-collab` | convergent op log (Lamport + site), per-peer presence | 6 |
-| `studio-egui` | timeline on uikit-egui: ruler, tracks, clips, presence overlay | 7 |
+| `studio-egui` | timeline on uikit-egui: ruler, tracks, clips, waveforms, presence overlay | 7 |
+| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 
 ## Realtime collaboration, concretely
 
@@ -82,8 +83,8 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    decode, `ffmpeg` via CLI for video, keeping the core codec-free.
 2. **Audio render graph** — mix tracks, apply effects, produce samples. The
    `Effect` type is already opaque-by-design so hosts can register kinds.
-3. **Waveforms and transport** for the egui frontend — the timeline, ruler,
-   tracks, clips and the presence overlay exist; peak data and playback do not.
+3. **Transport and playback** — mixdown produces samples; nothing yet sends
+   them to a device or moves a playhead in real time.
 4. **Transport** — the op packets are plain serde; snapclone's `snapclone-dht`
    already carries signed records between peers and is the obvious carrier.
 5. **Block-backed sources** — Audacity's insight that samples live in chunks so
@@ -119,3 +120,35 @@ scrubbing the video track is not editing the audio clip under the same instant.
 A peer who declares no active track still matches on time alone, so the warning
 degrades to "someone is around here" rather than vanishing. (A test caught that:
 it originally flagged both clips under one playhead.)
+
+## The audio half
+
+The idea worth taking from Audacity is not any of its UI: it is that a
+`Sequence` carries **summary blocks** — min/max at 256 samples per point and
+again at 65,536 — so drawing a ten-hour recording zoomed out reads a few
+kilobytes instead of gigabytes. `studio-audio`'s `Peaks` is that in a few dozen
+lines: a pyramid where each level is built from the one below (O(n), not
+O(n log n)), and `for_px` picks the level whose buckets are closest to one
+screen pixel.
+
+Min **and** max are kept, never an average, because a waveform drawn from
+averages loses exactly the transients an editor is hunting for — a click, a
+clipped peak, a drum attack. A test plants one spike in a quiet file and
+requires it to still be visible at the coarsest level and in a 40-column
+zoomed-out draw. Another checks every bucket of every level against a
+brute-force scan, because a fast summary that lies is worse than no summary.
+
+The timeline draws waveforms from that pyramid at one column per pixel, so the
+cost of drawing a clip is its **width, not its duration** — a ten-minute clip
+and a ten-second one draw at the same speed. Sources with no pyramid yet render
+as plain blocks: analysis must never gate editing.
+
+`mixdown` is a pure function of (project, sources, window): it walks the clips
+intersecting the window, applies clip gain and fades, and sums to interleaved
+stereo. Same inputs, same samples, every time — no device, no callback, no
+clock, which is what makes a render testable at all. Tests pin the things that
+are easy to get backwards: half gain is 6 dB down, a muted track is silent, and
+**solo on any track silences every track that is not soloed** (the rule every
+DAW shares and every reimplementation inverts once). Silence reports
+`-inf` dBFS rather than a magic `-100.0`, so a caller cannot mistake "very
+quiet" for "nothing".

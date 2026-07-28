@@ -133,6 +133,10 @@ pub fn timeline(
     colors: &PaletteColors,
     playhead: Ticks,
     selection: &[ClipId],
+    // Peak pyramids per source. Sources without one draw as plain blocks, so a
+    // clip whose audio has not been scanned yet is still editable — analysis
+    // must never gate editing.
+    peaks: &std::collections::BTreeMap<studio_core::SourceId, studio_audio::Peaks>,
 ) -> Option<ClipId> {
     let rows = track_rows(&doc.project);
     let height = RULER_H + rows.len().max(1) as f32 * view.track_h;
@@ -191,6 +195,34 @@ pub fn timeline(
             // arbitrate it afterwards
             if !doc.peers_on(clip.id).is_empty() {
                 painter.rect_stroke(r.expand(1.5), 4.0, Stroke::new(2.0, colors.warning), egui::StrokeKind::Outside);
+            }
+            // waveform, from the peak pyramid — one column per pixel, so the
+            // cost of drawing a clip is its WIDTH, not its duration. This is
+            // the whole reason Audacity's summary blocks are worth copying:
+            // a ten-minute clip and a ten-second one draw at the same speed.
+            if let Some(peaks) = peaks.get(&clip.source) {
+                let vis = r.intersect(Rect::from_min_max(
+                    Pos2::new(origin.x + view.gutter, r.min.y), r.max));
+                let cols = vis.width().floor() as usize;
+                if cols > 1 && vis.width() > 0.0 {
+                    let rate = doc.project.sources.get(&clip.source).map(|s| s.sample_rate).unwrap_or(48_000);
+                    // sample range of the VISIBLE part of the clip
+                    let skip = Ticks(((vis.min.x - r.min.x) / view.px_per_sec
+                        * TICKS_PER_SECOND as f32) as i64);
+                    let s0 = clip.src_in.saturating_add(skip).to_samples(rate) as usize;
+                    let s1 = s0 + Ticks(((vis.width() / view.px_per_sec)
+                        * TICKS_PER_SECOND as f32) as i64).to_samples(rate) as usize;
+                    let mid = vis.center().y;
+                    let half = (vis.height() * 0.5 - 3.0).max(1.0);
+                    let wave = colors.text.gamma_multiply(0.55);
+                    for (i, mm) in peaks.window(s0, s1, cols).iter().enumerate() {
+                        let x = vis.min.x + i as f32;
+                        let (lo, hi) = (mm.min.clamp(-1.0, 1.0), mm.max.clamp(-1.0, 1.0));
+                        painter.line_segment(
+                            [Pos2::new(x, mid - hi * half), Pos2::new(x, mid - lo * half)],
+                            Stroke::new(1.0, wave));
+                    }
+                }
             }
             if r.width() > 34.0 {
                 let name = doc.project.sources.get(&clip.source)

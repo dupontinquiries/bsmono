@@ -1,0 +1,8 @@
+[package]
+name = "studio-audio"
+version = "0.1.0"
+edition = "2021"
+description = "Studio's audio half: Audacity-style multi-resolution peak pyramids for waveform drawing, and a mixdown that turns a timeline into samples."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
