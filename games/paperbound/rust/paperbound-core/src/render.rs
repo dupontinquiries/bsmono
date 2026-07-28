@@ -252,6 +252,55 @@ pub fn build_scene(world: &World, plateaus: &[Plateau], team_cols: [[f32; 3]; 2]
     build_scene_inner(world, plateaus, team_cols, true)
 }
 
+
+/// Build the scene with units folded as their REAL card models, in the mesh.
+///
+/// `build_scene` renders units as diamond stand-ins, and `render_scene` paints
+/// the real models over the frame in a screen-space pass — which meant the
+/// models never existed as geometry and so could never reach `SceneBuffers` or
+/// the GPU. This variant folds each unit's card into the mesh itself
+/// (`origami::model_mesh`), so ONE mesh describes the whole battlefield and
+/// every renderer — software, wgpu, or anything later — draws the same thing.
+///
+/// Units whose spec names no card keep the diamond, which is why the stand-in
+/// stays in the code: it is the honest fallback, not dead weight.
+pub fn build_scene_with_models(
+    world: &World,
+    plateaus: &[Plateau],
+    team_cols: [[f32; 3]; 2],
+    book: &crate::origami::ModelBook,
+    card_for: &dyn Fn(&crate::match_sim::MUnit) -> Option<String>,
+) -> Mesh {
+    // ground/buildings/wells as ever, but WITHOUT the diamond units
+    let mut m = build_scene_inner(world, plateaus, team_cols, false);
+    for u in &world.units {
+        if !u.alive() {
+            continue;
+        }
+        let e = lift_at(plateaus, u.x, u.y);
+        let s = if u.worker { 9.0 } else { 12.0 };
+        let tc = team_cols[u.team];
+        // face the way the unit is heading, so a marching line reads as one
+        let fdir = if u.team == 0 { 1.0 } else { -1.0 };
+        let folded = card_for(u)
+            .map(|card| crate::origami::model_mesh(&mut m, book, card.as_str(), u.x, e, u.y, s * 0.5, fdir, tc))
+            .unwrap_or(false);
+        if !folded {
+            // the stand-in: two lit facets and a darker rear fold
+            let body = mix(rgb(0xEDE4CC), tc, 0.6);
+            let tip = v3(u.x, e + s * 1.7, u.y);
+            let l = v3(u.x - s, e, u.y + s * 0.4);
+            let r = v3(u.x + s, e, u.y + s * 0.4);
+            let back = v3(u.x, e, u.y - s * 0.7);
+            m.tri(l, r, tip, body);
+            m.tri(r, back, tip, shade(body, 0.84));
+            m.tri(back, l, tip, shade(body, 0.72));
+        }
+        m.disc(u.x, e + 0.15, u.y + s * 0.35, s * 0.9, 8, shade(rgb(0x9A8B66), 0.78));
+    }
+    m
+}
+
 pub fn build_scene_inner(
     world: &World,
     plateaus: &[Plateau],
@@ -659,5 +708,82 @@ mod tests {
         // elevation lifts straight up the screen, unforeshortened
         let (_, sy2) = cam.project(v3(100.0, HG_LIFT, 100.0));
         assert!((sy - sy2 - HG_LIFT).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod model_scene_tests {
+    use super::*;
+
+    fn book() -> crate::origami::ModelBook {
+        crate::origami::ModelBook::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).expect("book")
+    }
+
+    #[test]
+    fn the_battlefield_mesh_carries_folded_models() {
+        // The whole point of build_scene_with_models: units become GEOMETRY, so
+        // the same battlefield reaches the software rasterizer and the GPU alike.
+        let book = crate::data::load_factbook(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).expect("factbook");
+        let mut w = World::new(&book["rootbound"], &book["swarm"]);
+        // Seed the world the way the PNG test does — without a scriptorium and a
+        // node there is nothing to train from, the sim produces no units, and the
+        // assertions below would pass vacuously.
+        w.add_building(0, "scriptorium", 320.0, 620.0, true);
+        w.add_building(1, "scriptorium", 1180.0, 380.0, true);
+        w.nodes.push(crate::match_sim::Node { x: 520.0, y: 560.0, amount: 1800.0 });
+        // place the fighters directly: training from scratch is the economy
+        // slice's business, and this test is about GEOMETRY, not build orders
+        for i in 0..4 {
+            w.add_unit(0, "soldier", 620.0 + i as f64 * 30.0, 560.0);
+            w.add_unit(1, "soldier", 860.0 + i as f64 * 30.0, 470.0);
+        }
+        for _ in 0..(4 * 30) { w.tick(1.0 / 30.0); }
+        assert!(!w.units.is_empty(), "the sim must produce units for this test to mean anything");
+
+        let mb = super::model_scene_tests::book();
+        let plateaus: Vec<Plateau> = Vec::new();
+        let cols = [rgb(0xD8B45A), rgb(0x8C7CC8)];
+        let diamonds = build_scene(&w, &plateaus, cols);
+        let folded = build_scene_with_models(&w, &plateaus, cols, &mb, &|_u| Some("foldknight".into()));
+        assert!(folded.tris.len() > diamonds.tris.len(),
+                "folded models must add real geometry ({} vs {} tris)",
+                folded.tris.len(), diamonds.tris.len());
+
+        // and it survives the trip to the GPU buffers
+        let bufs = crate::gpu::SceneBuffers::from_mesh(&folded);
+        assert_eq!(bufs.indices.len(), folded.tris.len() * 3);
+        assert!(bufs.vertices.len() > 9 * 100, "a battlefield of models is not tiny");
+    }
+
+    #[test]
+    fn a_unit_without_a_card_still_gets_its_stand_in() {
+        // The diamond is the honest fallback for a unit whose spec names no
+        // card — it must not vanish from the field.
+        let book = crate::data::load_factbook(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).expect("factbook");
+        let mut w = World::new(&book["rootbound"], &book["swarm"]);
+        // Seed the world the way the PNG test does — without a scriptorium and a
+        // node there is nothing to train from, the sim produces no units, and the
+        // assertions below would pass vacuously.
+        w.add_building(0, "scriptorium", 320.0, 620.0, true);
+        w.add_building(1, "scriptorium", 1180.0, 380.0, true);
+        w.nodes.push(crate::match_sim::Node { x: 520.0, y: 560.0, amount: 1800.0 });
+        // place the fighters directly: training from scratch is the economy
+        // slice's business, and this test is about GEOMETRY, not build orders
+        for i in 0..4 {
+            w.add_unit(0, "soldier", 620.0 + i as f64 * 30.0, 560.0);
+            w.add_unit(1, "soldier", 860.0 + i as f64 * 30.0, 470.0);
+        }
+        for _ in 0..(4 * 30) { w.tick(1.0 / 30.0); }
+        assert!(!w.units.is_empty(), "the sim must produce units for this test to mean anything");
+        let mb = super::model_scene_tests::book();
+        let plateaus: Vec<Plateau> = Vec::new();
+        let cols = [rgb(0xD8B45A), rgb(0x8C7CC8)];
+        let none = build_scene_with_models(&w, &plateaus, cols, &mb, &|_u| None);
+        let base = build_scene_inner(&w, &plateaus, cols, false);
+        assert!(none.tris.len() > base.tris.len(),
+                "unmatched units must still render as stand-ins");
     }
 }

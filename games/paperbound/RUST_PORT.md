@@ -10,6 +10,7 @@ game ships and reproduces facts the Python suites already proved.
 | 10 | `origami` | card models — builtin parts **and** the data-driven `parts.json` vocabulary |
 | 11 | `gpu` | `SceneBuffers`: interleaved pos/nrm/col + u32 indices, byte-deterministic |
 | 12 | `wgpu_paper` | **the portable GPU renderer** |
+| 13 | `origami::model_mesh` | card models folded into real **3D geometry** |
 | — | `editor` | data editor, now model- and part-aware |
 
 ## Why wgpu
@@ -77,3 +78,37 @@ The editor learned the same vocabulary: `parts` lists everything (builtin and
 data), `parts <name>` describes one, and `model <card>` prints a card's fold
 recipe part by part. All three read the same `ModelBook` the renderer uses, so
 the editor can never disagree with what will actually be drawn.
+
+
+## Slice 13 — the models become geometry
+
+Slice 10 taught the software renderer to draw card models, but only as a
+*screen-space* pass: `render_scene` painted them over the finished 3D frame.
+That left the models stranded on the CPU. `build_scene`'s mesh — and therefore
+`SceneBuffers`, and therefore everything wgpu could ever draw — contained only
+the generic diamond stand-ins. The prettiest part of the game could not reach
+the GPU path at all.
+
+`origami::model_mesh` folds a recipe into actual geometry: every part becomes an
+extruded papercraft solid — front facet, back facet, and the side walls that
+close the fold. Depth is deliberately shallow (a fold has thickness; a sheet is
+not a box), the far facet is shaded darker so it reads as a fold rather than a
+cutout, and every facet stays flat because `SceneBuffers` derives one normal per
+triangle and that is the entire look.
+
+`render::build_scene_with_models` uses it to build a battlefield where units ARE
+geometry, so one mesh describes the whole field and every renderer — software,
+wgpu, or whatever comes next — draws the same thing. Units whose spec names no
+card keep the diamond, which is why the stand-in stays in the code: it is the
+honest fallback, not dead weight, and a test asserts it still appears.
+
+Four tests pin the fold itself (real triangle count, genuine thickness and
+height, unknown cards declining cleanly without leaving geometry behind,
+different recipes producing different meshes) and two pin the scene — including
+the one that matters most: a folded battlefield survives the trip into the
+interleaved GPU buffers with unit-length per-face normals.
+
+A note on test honesty: the scene tests originally early-returned when the sim
+produced no units, which made them pass while asserting nothing. They now place
+fighters directly and assert the field is non-empty first — a test that cannot
+fail is worse than no test.
