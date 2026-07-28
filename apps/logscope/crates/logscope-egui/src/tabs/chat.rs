@@ -1878,7 +1878,10 @@ impl Chat {
     }
 
     fn log_block(&self, doc: &crate::analysis::Doc) -> Option<String> {
-        if !self.attach_log || doc.lines.is_empty() { return None; }
+        // Never attach the BUILT-IN demo document. Attaching it tells the model to answer from a file
+        // the user has never seen, with "use only this data" — which is why a greeting came back as an
+        // analysis of sample.log. A real load clears the flag.
+        if !self.attach_log || doc.lines.is_empty() || doc.placeholder { return None; }
         let name = if doc.name.is_empty() { "(unnamed)" } else { &doc.name };
         let mut s = format!("CURRENT LOG: {name} ({} lines). Use only this data; cite line patterns or lines from it.", doc.lines.len());
         let tops = crate::analysis::repeated_templates(&doc.lines, 5);
