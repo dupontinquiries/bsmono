@@ -1106,6 +1106,8 @@ impl AirCurrent {
 /// `tint` palette index (255 = unset -> skin palette), `palette` the model's learned colors.
 #[derive(Clone, Default)]
 pub struct FacadeDetail {
+    /// Which LEARNED_SITES entry this is — selects the learned wall-texture atlas tile.
+    pub site: usize,
     pub h: Vec<u8>,
     pub slope: Vec<u8>,
     pub rough: Vec<u8>,
@@ -1739,6 +1741,92 @@ impl Level {
             boulders.apply_material(crate::mesh::Material::StoneBlock, 0xB0D3);
             boulders.material = Some(crate::mesh::Material::StoneBlock);
             self.meshes.push(boulders);
+        }
+        // Every flow that dresses cliffs also renders learned interior walls — one choke point
+        // instead of chasing the four per-flow call sites (a no-op unless learned_facade is set).
+        self.build_learned_walls();
+    }
+
+    /// **Learned walls** — the interior open-air wall renderer for scanned sites. On open-sky
+    /// maps the indoor wall loop skips everything and `build_cliffs` only dresses the map
+    /// BOUNDARY, so a learned castle's curtain was collision with no geometry at all: the
+    /// visible "walls" were just keeps, columns and parapets. This pass gives every interior
+    /// Wall cell of a learned map its real face: base at the ground, top at the scan's
+    /// per-cell height (`;;H`), two stacked photo bands sampling the model's OWN texture crop
+    /// (`Material::LearnedWall`), vertex-tinted by the learned palette with weathering-scaled
+    /// dither, a solid cap, and a simple ridge where `;;S` says the roof pitches.
+    fn build_learned_walls(&mut self) {
+        let Some(f) = self.learned_facade.clone() else { return };
+        // No theme guard: theme.open_sky() said FALSE for the Military-skinned castles even
+        // though the sites are open-air, so Pioz and the Cistern emitted nothing while
+        // Haunted (Canopy) worked. Learned walls are owned by THIS pass on every learned map;
+        // the indoor loop stands down for them (see its skip), so nothing double-draws.
+        let ts = self.ts();
+        let pal = self.pal;
+        let mut tex = Mesh3::new(Color32::WHITE);
+        tex.material = Some(crate::mesh::Material::LearnedWall(f.site as u8));
+        let mut plain = Mesh3::new(pal.wall);
+        let mut caps = Mesh3::new(scale_rgb(pal.wall, 0.9));
+        let idx = |x: i32, z: i32| (z * self.w + x) as usize;
+        let roof_col = f.palette.iter().rev().nth(1).copied().unwrap_or(scale_rgb(pal.wall, 0.7));
+        for z in 1..(self.h - 1) {
+            for x in 1..(self.w - 1) {
+                if self.cell(x, z) != Cell::Wall || self.on_boundary(x, z) { continue; }
+                let i = idx(x, z);
+                let h15 = f.h.get(i).copied().unwrap_or(0);
+                let top_y = if h15 > 0 { self.floor_y + (h15 as f32 / 15.0) * f.max_h }
+                            else { self.floor_y + self.cfg.wall_height };
+                let top_y = top_y.max(self.floor_y + 1.2);
+                let tint = f.tint.get(i).copied().unwrap_or(255);
+                let rough = f.rough.get(i).copied().unwrap_or(4) as f32 / 15.0;
+                let (wx, wz) = (x as f32 * ts, z as f32 * ts);
+                for (dx, dz, n) in [(-1, 0, Vec3::new(-1.0, 0.0, 0.0)), (1, 0, Vec3::new(1.0, 0.0, 0.0)),
+                                    (0, -1, Vec3::new(0.0, 0.0, -1.0)), (0, 1, Vec3::new(0.0, 0.0, 1.0))] {
+                    if self.cell(x + dx, z + dz) != Cell::Floor { continue; } // faces you can SEE
+                    let fy = self.floor_h((x + dx) as f32 * ts + ts * 0.5, (z + dz) as f32 * ts + ts * 0.5) - 0.4;
+                    let (b0, b1) = match (dx, dz) {
+                        (-1, 0) => (Vec3::new(wx, fy, wz + ts), Vec3::new(wx, fy, wz)),
+                        (1, 0) => (Vec3::new(wx + ts, fy, wz), Vec3::new(wx + ts, fy, wz + ts)),
+                        (0, -1) => (Vec3::new(wx, fy, wz), Vec3::new(wx + ts, fy, wz)),
+                        _ => (Vec3::new(wx + ts, fy, wz + ts), Vec3::new(wx, fy, wz + ts)),
+                    };
+                    let dado = (fy + 1.1).min(top_y - 0.4);
+                    if tint != 255 && !f.palette.is_empty() {
+                        let base = f.palette[(tint as usize).min(f.palette.len() - 1)];
+                        let lower = dither(scale_rgb(base, 0.78), x * 5 + z * 9, 0.05 + rough * 0.10);
+                        let upper = dither(base, x * 9 + z * 5, 0.05 + rough * 0.10);
+                        tex.push_quad(b0, b1, b1.with_y(dado), b0.with_y(dado), n, lower);
+                        tex.push_quad(b0.with_y(dado), b1.with_y(dado), b1.with_y(top_y), b0.with_y(top_y), n, upper);
+                    } else {
+                        let c = dither(pal.wall, x * 7 + z * 11, 0.10);
+                        plain.push_quad(b0, b1, b1.with_y(dado), b0.with_y(dado), n, scale_rgb(c, 0.8));
+                        plain.push_quad(b0.with_y(dado), b1.with_y(dado), b1.with_y(top_y), b0.with_y(top_y), n, c);
+                    }
+                }
+                let any_face = [(-1, 0), (1, 0), (0, -1), (0, 1)].iter()
+                    .any(|&(dx, dz)| self.cell(x + dx, z + dz) == Cell::Floor);
+                if any_face {
+                    let cap_c = if tint != 255 && !f.palette.is_empty() {
+                        scale_rgb(f.palette[(tint as usize).min(f.palette.len() - 1)], 0.9)
+                    } else { scale_rgb(pal.wall, 0.9) };
+                    caps.push_quad(Vec3::new(wx, top_y, wz), Vec3::new(wx + ts, top_y, wz),
+                                   Vec3::new(wx + ts, top_y, wz + ts), Vec3::new(wx, top_y, wz + ts),
+                                   Vec3::new(0.0, 1.0, 0.0), cap_c);
+                    let sl = f.slope.get(i).copied().unwrap_or(0);
+                    if sl > 0 {
+                        let rh = 0.30 + sl as f32 * 0.28;
+                        caps.merge(&boxx(Vec3::new(wx + ts * 0.5, top_y + rh * 0.5, wz + ts * 0.5),
+                                         Vec3::new(ts * 0.36, rh * 0.5, ts * 0.36),
+                                         dither(roof_col, x * 3 + z * 17, 0.08), FACE_NO_BOTTOM));
+                    }
+                }
+            }
+        }
+        for mut m in [tex, plain, caps] {
+            if m.tri_count() > 0 {
+                shade_ao(&mut m, self.floor_y, self.floor_y + f.max_h, 0.55, 1.10);
+                self.meshes.push(m);
+            }
         }
     }
 
@@ -2853,7 +2941,7 @@ impl Level {
             }
             if !lh.is_empty() {
                 let n = (w * h) as usize;
-                let mut fd = FacadeDetail { h: vec![0; n], slope: vec![0; n], rough: vec![0; n],
+                let mut fd = FacadeDetail { site, h: vec![0; n], slope: vec![0; n], rough: vec![0; n],
                                             tint: vec![255; n], palette, max_h: wall_h * 2.6 };
                 let hexv = |c: char| c.to_digit(16).map(|d| d as u8);
                 for (gz, row) in lh.iter().enumerate() {
@@ -6946,6 +7034,12 @@ impl Level {
         }
         let ceil = Mesh3::new(pal.ceil); // always empty now — no overhead lid; kept as a stable meshes[1] slot
         let mut walls = Mesh3::new(pal.wall);
+        // Learned-site wall photograph: facade cells emit here so their quads sample the
+        // model's OWN texture crop (Material::LearnedWall tile), tinted by the learned palette
+        // via vertex colour. One mesh per level; empty (and skipped) on non-learned maps.
+        let mut learned_tex = Mesh3::new(Color32::WHITE);
+        learned_tex.material = self.learned_facade.as_ref()
+            .map(|f| crate::mesh::Material::LearnedWall(f.site as u8));
         let mut trim = Mesh3::new(pal.trim); // diffuse structural band near the wall top
         let mut arch_glow = Mesh3::new(pal.accent).emit(0.8); // ceiling lamps + skylights (practical light)
         let lamp_col = lerp_c(pal.accent, rgb(255, 250, 240), 0.65);
@@ -7055,6 +7149,9 @@ impl Level {
                     if open_sky || self.on_boundary(x + dx, z + dz) {
                         continue; // map edge terminates in cliffs/boundary assets, not a flat wall
                     }
+                    if self.learned_facade.is_some() {
+                        continue; // learned maps: build_learned_walls owns every wall face
+                    }
                     let b0 = base[0];
                     let b1 = base[1];
                     // Per-zone tone: a coarse regional hash so the map isn't one flat grey field. Adjacent
@@ -7074,11 +7171,20 @@ impl Level {
                     // 2m×3m panel — this is a big part of what makes flat-shaded surfaces read as "toaster
                     // Doom" instead of something with real material response. More vertices means the PBR
                     // terms in the renderer actually get evaluated at more points across the face.
+                    if fac_cell.is_some() {
+                        // Two stacked photo bands (each a unit-UV sample of the learned crop —
+                        // >1 UV would bleed into the next atlas tile). The dado seam reads as a
+                        // string course, which these buildings genuinely have.
+                        learned_tex.push_quad(b0, b1, b1.with_y(dado), b0.with_y(dado), n, lower);
+                        learned_tex.push_quad(b0.with_y(dado), b1.with_y(dado), b1.with_y(y1), b0.with_y(y1), n, zone);
+                    } else {
                     push_quad_grid(&mut walls, b0, b1, b1.with_y(dado), b0.with_y(dado), n, lower, 1, 1, key);
                     push_quad_grid(&mut walls, b0.with_y(dado), b1.with_y(dado), b1.with_y(y1), b0.with_y(y1), n, zone, 2, 1, key.wrapping_add(97));
+                    }
                     // Pilaster: a protruding vertical column at intervals, breaking the flat run. A wider
-                    // capital caps it near the top.
-                    if key % 3 == 0 {
+                    // capital caps it near the top. (Plain cells only — the learned photograph
+                    // carries its own relief, and a flat trim band would fight it.)
+                    if fac_cell.is_none() && key % 3 == 0 {
                         let m = (b0 + b1) * 0.5;
                         let colh = (y1 - wall_base_y) * 0.5;
                         let along = Vec3::new((b1.x - b0.x).abs() * 0.24, 0.0, (b1.z - b0.z).abs() * 0.24);
@@ -7091,6 +7197,7 @@ impl Level {
                         walls.merge(&boxx(cap, Vec3::new(half.x + 0.07, 0.12, half.z + 0.07), scale_rgb(pal.trim, 0.9), FACE_ALL));
                     }
                     // structural trim band near the top (diffuse, not glowing)
+                    if fac_cell.is_some() { continue; }
                     let ta = y1 - 0.55;
                     let tb = y1 - 0.32;
                     trim.push_quad(b0.with_y(ta), b1.with_y(ta), b1.with_y(tb), b0.with_y(tb), n, pal.trim);
@@ -7110,6 +7217,10 @@ impl Level {
         // Ambient occlusion by height — multiplicative so the per-zone wall tones and pilaster relief survive
         // (darker and grimier at the floor, brightening toward the ceiling light) instead of flattening to grey.
         shade_ao(&mut walls, wall_base_y, y1, 0.5, 1.12);
+        if learned_tex.material.is_some() && !learned_tex.verts.is_empty() {
+            shade_ao(&mut learned_tex, wall_base_y, y1, 0.6, 1.08);
+            self.meshes.push(std::mem::replace(&mut learned_tex, Mesh3::new(Color32::WHITE)));
+        }
         tint_up(&mut trim, lerp_c(pal.trim, rgb(255, 255, 255), 0.12), scale_rgb(pal.trim, 0.6));
 
         // Structural greebles — ceiling beams across each room and, on the open-sky biomes, a translucent
@@ -12718,9 +12829,12 @@ fn learned_sites_stamp_their_learning() {
             for &v in &f.h { seen[v as usize] = true; }
             assert!(seen.iter().filter(|&&b| b).count() >= 3,
                 "{name}: learned heights should be non-uniform (a real silhouette)");
+            assert_eq!(f.site, i, "{name}: facade must know its site index (texture tile selection)");
             if bp.contains(";;P ") {
                 assert!(!f.palette.is_empty(), "{name}: palette lines present but not parsed");
                 assert!(f.tint.iter().any(|&t| t != 255), "{name}: palette bound but no cell tinted");
+                let tex = l.meshes.iter().any(|m| m.material == Some(crate::mesh::Material::LearnedWall(i as u8)));
+                assert!(tex, "{name}: tinted facade cells must emit the learned wall-photo mesh");
             }
         }
     }

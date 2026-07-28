@@ -129,6 +129,11 @@ pub struct Player {
     pub underwater: bool,
 }
 
+/// How far below the feet the ground can drop in one frame and still count as "walking
+/// down the hill" rather than "stepped off a ledge". Slightly under the step-UP assist so
+/// the two never fight; at sprint speed on the steepest generated slopes the per-frame
+/// surface drop stays well inside this.
+const GROUND_SNAP: f32 = 0.55;
 const GRAVITY: f32 = 24.0;
 const JUMP_SPEED: f32 = 8.0;
 const WALK_SPEED: f32 = 7.2;
@@ -667,6 +672,20 @@ impl Player {
                 if self.was_air {
                     self.land_dip = (-self.vel.y * 0.045).clamp(0.0, 0.7);
                 }
+                self.vel.y = 0.0;
+                self.on_ground = true;
+            } else if self.on_ground && self.vel.y <= 0.1
+                && self.pos.y - surface <= GROUND_SNAP {
+                // ── Downhill ground-snap: the hilly-terrain stutter fix ──────────────
+                // Walking DOWN a slope, gravity alone drops the body slower than the
+                // bilinear terrain surface falls away, so every few frames the player
+                // went "airborne" for an instant, then landed — re-triggering land_dip
+                // (a camera dip per stutter!) and flickering on_ground, which also
+                // gates SPRINT, so speed oscillated too. If we were grounded, aren't
+                // moving upward (a jump/jet sets vel.y > 0 and is exempt), and the
+                // surface is within a step below the feet, glue the feet to it and
+                // stay grounded. Real ledges (> GROUND_SNAP) still become real falls.
+                self.pos.y = surface;
                 self.vel.y = 0.0;
                 self.on_ground = true;
             } else {
@@ -1265,6 +1284,47 @@ fn obstacles_block_by_vertical_span_not_just_footprint() {
     l.obstacles.clear();
     l.obstacles.push(Obstacle { center: Vec3::new(c.x, 2.4, c.z), half: Vec3::new(0.6, 0.3, 0.6) }); // beam at [2.1,2.7]
     assert!(!body_blocked(&l, p, 0.4, 0.0, 1.8), "standing body passes under a high beam");
+}
+
+#[test]
+fn walking_downhill_does_not_stutter_airborne() {
+    // The hilly-terrain stutter: descending a slope, gravity alone dropped the body slower
+    // than the bilinear surface fell away, so the player flickered airborne/landed every few
+    // frames — re-triggering the landing camera dip and gating sprint on and off. The
+    // GROUND_SNAP fix glues grounded feet to a surface within a step below. This test builds
+    // a literal downhill ramp in the height field and walks it: on_ground must never flicker,
+    // and the walk must actually descend (so the test can't pass vacuously on flat ground).
+    use crate::level::{Level, MapConfig};
+    let mut l = Level::generate(MapConfig::default());
+    let sc = l.rooms[0].center;
+    let ts = l.ts();
+    let (tx0, tz0) = ((sc.x / ts) as i32, (sc.z / ts) as i32);
+    // a straight descending ramp ahead of the spawn: ~0.28 per tile over 22 tiles (a real hill)
+    for i in 0..22 {
+        for dz in -3..=3 {
+            let (x, z) = (tx0 + i, tz0 + dz);
+            if x >= 0 && z >= 0 && x < l.w && z < l.h {
+                l.heights[(z * l.w + x) as usize] = 6.0 - i as f32 * 0.28;
+            }
+        }
+    }
+    let mut p = Player::new(&l);
+    p.pos = crate::math::Vec3::new((tx0 as f32 + 0.5) * ts, l.floor_h((tx0 as f32 + 0.5) * ts, sc.z) , sc.z);
+    p.cam.yaw = std::f32::consts::FRAC_PI_2; // face +x (down the ramp)
+    let mut input = Input::default();
+    input.fwd = 1.0;
+    let dt = 1.0 / 60.0;
+    let (start_x, start_y) = (p.pos.x, p.pos.y);
+    let mut air_flips = 0;
+    let mut was = p.on_ground;
+    for _ in 0..240 {
+        p.update(&l, &input, dt);
+        if was && !p.on_ground { air_flips += 1; }
+        was = p.on_ground;
+    }
+    assert!(p.pos.x - start_x > 6.0, "the walk must actually travel down the ramp (moved {:.2})", p.pos.x - start_x);
+    assert!(start_y - p.pos.y > 1.0, "the walk must actually descend (dropped {:.2})", start_y - p.pos.y);
+    assert_eq!(air_flips, 0, "grounded walk down a hill must never flicker airborne (flipped {air_flips}x)");
 }
 
 #[test]

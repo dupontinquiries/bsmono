@@ -1633,7 +1633,7 @@ impl eframe::App for FpsApp {
         // textures. Remember its id for the renderer.
         let want_tile = self.settings.graphics_preset.settings().atlas_tile;
         if self.atlas.is_none() || self.atlas_tile != want_tile {
-            let (rgba, w, h) = crate::mesh::build_material_atlas(want_tile, 5);
+            let (rgba, w, h) = crate::mesh::build_material_atlas(want_tile, crate::mesh::ATLAS_COLS);
             let img = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
             let opts = egui::TextureOptions {
                 magnification: egui::TextureFilter::Linear,

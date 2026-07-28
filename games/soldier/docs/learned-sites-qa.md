@@ -72,5 +72,15 @@ new sidecar layer families, both invisible to older parsers:
 color from the learned palette with dither strength scaled by `;;R`. The lock-in test asserts
 the facade parses on every sidecar map, heights are non-uniform, and bound palettes tint cells.
 
-Still open from this pass, deliberately: '^' expansion-ring scatter (outside cells are bare
-floor), destructible columns/merlons, and slope-driven roof cap meshes.
+Shipped since: **real photograph tiles** — `Material::LearnedWall(site)` slots in a 7x7 atlas,
+painted from 160px crops of each model's own texture set (`src/assets/learned/*.rgb`, ~1 MB,
+attribution commented); **`build_learned_walls`**, the interior open-air wall renderer (interior
+Wall cells previously emitted NO geometry — the curtains were invisible collision; now every
+face gets two photo bands at the scan's `;;H` height, palette-tinted with `;;R`-scaled dither, a
+cap, and `;;S` ridge boxes). Ownership is single: the indoor wall loop stands down on learned
+maps, and the pass runs from `build_cliffs` as a choke point — the theme-method guard that
+silently skipped the Military-skinned castles is gone. **Learned fog** pulls the fog colour
+toward the palette's light tone and sits closer (aerial perspective at scale). The downhill
+GROUND_SNAP fix (46 airborne flickers -> 0 on the ramp test) makes walking the sites smooth.
+
+Still open, deliberately: '^' expansion-ring scatter, destructible columns/merlons.

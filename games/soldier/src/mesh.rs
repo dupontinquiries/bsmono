@@ -402,6 +402,12 @@ pub enum Material {
     /// Moss / mossy forest floor — a soft mottled green with darker damp patches and a fine organic speckle.
     /// Matte. For forest ground, damp stone, and shaded north faces.
     Moss,
+    /// A wall tile learned from one of the scanned models' OWN texture sets (index = the
+    /// learned-site index in `level::LEARNED_SITES`). The atlas paints these slots from real
+    /// downsampled crops embedded at `assets/learned/*.rgb` — Morton's mossy Scottish rubble,
+    /// the cistern's Jordan sandstone — so learned walls carry the photograph, modulated by
+    /// the per-cell palette tint the vertex colours already learned.
+    LearnedWall(u8),
 }
 
 #[inline]
@@ -460,6 +466,8 @@ fn p_planks(x: f32, z: f32, scale: f32, seed: u32) -> f32 {
 fn material_mod(mat: Material, x: f32, y: f32, z: f32, seed: u32) -> f32 {
     let base = fbm2(x * 0.5 + 3.0, z * 0.5 - 5.0, 4, seed) - 0.5;
     match mat {
+        // learned tiles already carry photographic variation — keep the procedural mod gentle
+        Material::LearnedWall(_) => base * 0.35,
         Material::Concrete => base * 0.16 + p_speckle(x, z, 8.0, seed) * 0.03,
         Material::Brick => p_block(x, z, 0.7, 0.5, 0.10, seed) * 0.24 + base * 0.05,
         Material::Corrugated => p_ribs(x, 0.9) * 0.15 + p_ribs(z, 0.9) * 0.04,
@@ -594,6 +602,14 @@ pub const ATLAS_MATERIALS: [Material; 24] = [
 /// Base albedo for a material — the dominant colour the pattern modulates.
 pub fn material_base(mat: Material) -> Color32 {
     match mat {
+        Material::LearnedWall(li) => {
+            // mean of the embedded crop — a truthful "dominant colour" for distance shading
+            let raw = LEARNED_TILES[(li as usize).min(LEARNED_TILES.len() - 1)];
+            let (mut r, mut g, mut b, mut n) = (0u32, 0u32, 0u32, 0u32);
+            let mut o = 0;
+            while o + 2 < raw.len() { r += raw[o] as u32; g += raw[o + 1] as u32; b += raw[o + 2] as u32; n += 1; o += 33; }
+            Color32::from_rgb((r / n) as u8, (g / n) as u8, (b / n) as u8)
+        }
         Material::Concrete => Color32::from_rgb(150, 150, 154),
         Material::Brick => Color32::from_rgb(150, 84, 66),
         Material::Corrugated => Color32::from_rgb(140, 144, 150),
@@ -710,6 +726,7 @@ fn jitter_cell(base: Color32, amt: f32, h: f32, h2: f32) -> Color32 {
 /// workflow, expressed as three numbers a per-vertex Blinn-Phong-ish shader can actually use.
 pub fn material_pbr(mat: Material) -> (f32, f32, f32) {
     match mat {
+        Material::LearnedWall(_) => (0.05, 10.0, 0.0), // weathered masonry: near-matte
         Material::Concrete => (8.0, 0.14, 0.02),
         Material::Brick => (6.0, 0.10, 0.0),
         Material::Corrugated => (46.0, 0.55, 0.32),  // galvanized/rusted sheet metal — tight glint, real reflect
@@ -842,6 +859,26 @@ pub fn material_pixel(mat: Material, u: f32, v: f32) -> Color32 {
 /// Build the material atlas as RGBA bytes: a `cols`×`cols` grid of `tile`-px material swatches (the first
 /// tile is pure white so untextured geometry — water, glass, particles, glow — can sample a flat texel and
 /// keep its vertex colour). Returns (rgba, width, height). One upload, one draw call, crisp per-pixel texture.
+/// Learned wall crops (160x160 raw RGB), ORDER MATCHES `level::LEARNED_SITES`. Ambiguous
+/// models wear a masonry cousin's crop, stated here honestly: church <- Barcience stone,
+/// Lost Palace <- Morton, the Colossus <- Perarrua; Pioz (no set of its own) <- Pambre.
+pub const LEARNED_TILE_PX: usize = 160;
+pub static LEARNED_TILES: [&[u8]; 13] = [
+    include_bytes!("assets/learned/church_of_st.rgb"),
+    include_bytes!("assets/learned/haunted_parish_ps1.rgb"),
+    include_bytes!("assets/learned/hercules_colossus_fountain.rgb"),
+    include_bytes!("assets/learned/piazza_san_pellegrino.rgb"),
+    include_bytes!("assets/learned/castillo_de_pioz.rgb"),
+    include_bytes!("assets/learned/castillo_barcience_castilla.rgb"),
+    include_bytes!("assets/learned/cistern_citadel_of.rgb"),
+    include_bytes!("assets/learned/morton_castle_scotland.rgb"),
+    include_bytes!("assets/learned/castillo_de_pambre.rgb"),
+    include_bytes!("assets/learned/castillo_de_perarrua.rgb"),
+    include_bytes!("assets/learned/lost_palace_church.rgb"),
+    include_bytes!("assets/learned/thian_hock_keng.rgb"),
+    include_bytes!("assets/learned/scifi_corridor_sky.rgb"),
+];
+
 pub fn build_material_atlas(tile: usize, cols: usize) -> (Vec<u8>, usize, usize) {
     let size = tile * cols;
     let mut img = vec![255u8; size * size * 4];
@@ -866,23 +903,41 @@ pub fn build_material_atlas(tile: usize, cols: usize) -> (Vec<u8>, usize, usize)
             }
         }
     }
+    // learned-site wall tiles: real photographs from the scans' texture sets
+    for (i, raw) in LEARNED_TILES.iter().enumerate() {
+        let slot = 1 + ATLAS_MATERIALS.len() + i;
+        if slot >= cols * cols { break; }
+        let (tx, ty) = (slot % cols, slot / cols);
+        let n = LEARNED_TILE_PX;
+        for py in 0..tile {
+            for px in 0..tile {
+                let sx = (px * n / tile).min(n - 1);
+                let sy = (py * n / tile).min(n - 1);
+                let o = (sy * n + sx) * 3;
+                put(&mut img, tx * tile + px, ty * tile + py, Color32::from_rgb(raw[o], raw[o + 1], raw[o + 2]));
+            }
+        }
+    }
     // slot 0 white tile is already 255 from the fill
     (img, size, size)
 }
 
 /// Standard atlas column count used across the renderers (a cols×cols grid of material tiles).
-pub const ATLAS_COLS: usize = 5;
+pub const ATLAS_COLS: usize = 7; // 5 -> 7: room for the 13 learned-site wall tiles (24 materials + white + 13 = 38 of 49)
 
 /// The atlas slot index for a material (0 = white tile). Mirrors `atlas_rect`'s slot logic; used by the GPU
 /// renderer, which computes the cell in-shader from the slot.
 pub fn atlas_slot(mat: Material) -> usize {
+    if let Material::LearnedWall(i) = mat {
+        return 1 + ATLAS_MATERIALS.len() + (i as usize).min(LEARNED_TILES.len() - 1);
+    }
     ATLAS_MATERIALS.iter().position(|&m| m == mat).map(|i| i + 1).unwrap_or(0)
 }
 
 /// The atlas UV sub-rect (u0,v0,u1,v1) for a material in a `cols`×`cols` atlas. A small inset avoids bleeding
 /// into neighbouring tiles under bilinear sampling.
 pub fn atlas_rect(mat: Material, cols: usize) -> (f32, f32, f32, f32) {
-    let slot = ATLAS_MATERIALS.iter().position(|&m| m == mat).map(|i| i + 1).unwrap_or(0);
+    let slot = atlas_slot(mat);
     let (tx, ty) = (slot % cols, slot / cols);
     let s = 1.0 / cols as f32;
     // Bilinear sampling blends in neighbouring texels, so a UV right at a tile's edge can pick up a sliver
@@ -1861,5 +1916,32 @@ mod tests {
         assert_eq!(b.sway.len(), b.verts.len());
         assert!(b.sway[..rigid.verts.len()].iter().all(|&w| w == 0.0));
         assert!(*b.sway.last().unwrap() > 0.9);
+    }
+}
+
+#[cfg(test)]
+mod learned_atlas_tests {
+    use super::*;
+    #[test]
+    fn learned_wall_tiles_paint_real_photograph_pixels() {
+        // The 13 learned slots must carry the embedded crops, not white fill: sample each
+        // slot's center pixel and demand exact equality with the crop's own center pixel
+        // (nearest-neighbour scaling makes the mapping exact at tile centers).
+        let tile = 32usize;
+        let (img, size, _) = build_material_atlas(tile, ATLAS_COLS);
+        for (i, raw) in LEARNED_TILES.iter().enumerate() {
+            let slot = 1 + ATLAS_MATERIALS.len() + i;
+            let (tx, ty) = (slot % ATLAS_COLS, slot / ATLAS_COLS);
+            let (px, py) = (tx * tile + tile / 2, ty * tile + tile / 2);
+            let o = (py * size + px) * 4;
+            let n = LEARNED_TILE_PX;
+            let (sx, sy) = ((tile / 2) * n / tile, (tile / 2) * n / tile);
+            let so = (sy * n + sx) * 3;
+            assert_eq!((img[o], img[o + 1], img[o + 2]), (raw[so], raw[so + 1], raw[so + 2]),
+                "learned slot {i} must show its photograph");
+        }
+        // and the slots must FIT the atlas
+        assert!(1 + ATLAS_MATERIALS.len() + LEARNED_TILES.len() <= ATLAS_COLS * ATLAS_COLS,
+            "atlas grid too small for materials + learned tiles");
     }
 }
