@@ -122,3 +122,11 @@ Incidental in-tree fixes (the crate hadn't built since June): `snapclone-nat` ne
 `sync` feature, `snapclone-dht` was missing its `rand` dep, and an identity test called
 `.as_deref()` on a non-Deref newtype. All unrelated to the DHT design; fixed so the crate
 compiles and its tests run.
+
+## Diagnostic logging
+
+Per-event diagnostics in the Qt app are now gated on named trace channels that
+are off by default and switchable three ways (Settings, env var, CLI flag) —
+see `docs/DIAGNOSTIC_TRACING.md`. When porting a widget to egui, port its trace
+sites as trace sites: the egui side should grow the same channel names so one
+habit works across both halves.

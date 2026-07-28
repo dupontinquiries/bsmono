@@ -1,4 +1,5 @@
 #include "ui/SwipeNavigator.hpp"
+#include "debug/Trace.hpp"   // per-event diagnostics: off unless the channel is on
 #include "ui/SubTabbed.hpp"   // V32.34+: dynamic_cast target for two-level nav
 
 #include <QTouchEvent>
@@ -206,7 +207,7 @@ void SwipeNavigator::commitScrollDelta(QScrollBar *hbar, QScrollBar *vbar,
         // is self-consistent. Expected: dy>0 → delta<0 (value dropped).
         const int delta = actual - before;
         if (delta != 0 && ((dy > 0) == (delta > 0))) {
-            qCInfo(lcSwipeNav, "[SCROLL-INVERT?] dy=%d but value moved %+d "
+            SC_TRACE(Input, lcSwipeNav, "[SCROLL-INVERT?] dy=%d but value moved %+d "
                                "(same sign — expected opposite). Possible "
                                "competing native scroll handler.", dy, delta);
         }
@@ -524,7 +525,7 @@ void SwipeNavigator::applyOverscroll(qreal dx, qreal dy)
         // tap should produce NO overscroll, so if this logs with tiny dx/dy
         // right after a tap, the bounce is overscroll engaging on near-zero
         // motion (the thing to fix). Path tells us drag vs fling origin.
-        qCInfo(lcSwipeNav, "[OVERSCROLL] streak begin: d=(%.1f, %.1f) via %s",
+        SC_TRACE(Input, lcSwipeNav, "[OVERSCROLL] streak begin: d=(%.1f, %.1f) via %s",
                dx, dy, m_scrollTarget ? "drag" : "fling");
     }
 
@@ -1126,7 +1127,7 @@ int SwipeNavigator::cycleSubTab(int delta)
     st->setCurrentSubTab(next);
     emit subTabChanged(next);
     if (wrap != 0)
-        qCInfo(lcSwipeNav, "[HANDOFF] sub-tab scrub WRAPPED %s → breaks to page",
+        SC_TRACE(Input, lcSwipeNav, "[HANDOFF] sub-tab scrub WRAPPED %s → breaks to page",
                wrap > 0 ? "off end" : "off start");
     return wrap;
 }
@@ -1150,7 +1151,7 @@ bool SwipeNavigator::unifiedNavEnabled()
         // detent + scroll/gesture passthrough) is even active. Without this it's
         // impossible to tell from the log whether "handoff not working" means
         // "flag was off" vs "flag on but handoff misbehaving".
-        qCInfo(lcSwipeNav, "[UNIFIED-NAV] %s (source: %s)",
+        SC_TRACE(Input, lcSwipeNav, "[UNIFIED-NAV] %s (source: %s)",
                v ? "ENABLED" : "disabled", src);
         return v;
     }();
@@ -1251,7 +1252,7 @@ void SwipeNavigator::evaluateVerticalDetent(qreal rawY)
             engageScrollTakeoverLock();   // block further takeover briefly
             // V32.34+: visible in release logs so a device run confirms the
             // scroll→sub-tab handoff actually fired (rawY crossed threshold).
-            qCInfo(lcSwipeNav, "[HANDOFF] scroll→sub-tab: advanced %s "
+            SC_TRACE(Input, lcSwipeNav, "[HANDOFF] scroll→sub-tab: advanced %s "
                                "(rawY=%.0f >= %.0f, lock=%lldms)",
                    dir > 0 ? "NEXT" : "PREV", rawY, m_subPageDetent.config().commitPx,
                    static_cast<long long>(scrollTakeoverLockMs()));
@@ -1275,7 +1276,7 @@ void SwipeNavigator::evaluateVerticalDetent(qreal rawY)
             if (target >= 0 && target < pageCount()) {
                 m_vDetentFired = true;
                 engageScrollTakeoverLock();
-                qCInfo(lcSwipeNav, "[HANDOFF] scroll→page: at sub-tab edge, "
+                SC_TRACE(Input, lcSwipeNav, "[HANDOFF] scroll→page: at sub-tab edge, "
                                    "advancing to page %d (dir=%d, lock=%lldms)",
                        target, dir,
                        static_cast<long long>(scrollTakeoverLockMs()));
@@ -1484,7 +1485,7 @@ void SwipeNavigator::startCommitAnimation(bool toNext, qreal releaseVelocityPxMs
             engageScrollTakeoverLock();
             // V32.34+: visible in release logs — confirms a swipe committed a
             // page change ("menu swipe") and reset to the first sub-tab.
-            qCInfo(lcSwipeNav, "[HANDOFF] swipe→page: committed to page %d",
+            SC_TRACE(Input, lcSwipeNav, "[HANDOFF] swipe→page: committed to page %d",
                    destIndex);
         }
         notifyPageTransition(destIndex);
@@ -1886,7 +1887,7 @@ bool SwipeNavigator::gestureEnd(const QPointF &pos)
                 // Spill to the adjacent page if one exists; else resist+bounce.
                 const int target = m_currentIndex + dir;
                 if (target >= 0 && target < pageCount()) {
-                    qCInfo(lcSwipeNav, "[HANDOFF] sub-tab scrub at edge → page %d "
+                    SC_TRACE(Input, lcSwipeNav, "[HANDOFF] sub-tab scrub at edge → page %d "
                                        "(dir=%d)", target, dir);
                     m_hBrokeToPage = true;   // fall through to the page commit
                 } else {
@@ -2072,7 +2073,7 @@ SwipeNavigator::resolveAmbiguous(qreal dx, qreal dy)
         }
         // Carousel is at the edge in the drag direction → fall through to the
         // PageSwipe block, completing the passthrough to page navigation.
-        qCInfo(lcSwipeNav, "[HANDOFF] carousel at edge → passing through to "
+        SC_TRACE(Input, lcSwipeNav, "[HANDOFF] carousel at edge → passing through to "
                            "page swipe (dx=%.1f)", dx);
     }
 
@@ -2230,7 +2231,7 @@ bool SwipeNavigator::event(QEvent *e)
                 candidate == GestureIntent::TapCommit    ? "TapCommit"    :
                 candidate == GestureIntent::Ambiguous    ? "Ambiguous"    :
                                                            "None";
-            qCInfo(lcSwipeNav, "[GESTURE] touch classified as %s", name);
+            SC_TRACE(Input, lcSwipeNav, "[GESTURE] touch classified as %s", name);
         }
 
         // PassToChild: this touch is for a button/input/etc. Don't
@@ -3523,7 +3524,7 @@ bool SwipeNavigator::processWheelEvent(QWheelEvent *e)
     if (isBegin && unifiedNavEnabled() && qAbs(vPx) >= qAbs(hPx)) {
         const bool atLimit = currentSubTabbed()
             && wheelAtVerticalLimit(e->globalPosition().toPoint(), vPx);
-        qCInfo(lcSwipeNav, "[WHEEL] v=%.0f h=%.0f subTabbed=%d atVLimit=%d",
+        SC_TRACE(Input, lcSwipeNav, "[WHEEL] v=%.0f h=%.0f subTabbed=%d atVLimit=%d",
                vPx, hPx, currentSubTabbed() ? 1 : 0, atLimit ? 1 : 0);
     }
 

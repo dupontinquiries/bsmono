@@ -1,4 +1,5 @@
 #include "ui/VirtualKeyboardWatcher.hpp"
+#include "debug/Trace.hpp"   // per-event diagnostics: off unless the channel is on
 
 #include <QGuiApplication>
 #include <QInputMethod>
@@ -29,7 +30,7 @@ VirtualKeyboardWatcher::VirtualKeyboardWatcher()
         // when we wire up (unusual, but the singleton is lazy so we
         // could attach after focus is on a text input).
         m_lastRect = im->keyboardRectangle().toAlignedRect();
-        qCInfo(lcVkb) << "Watcher initialized; initial keyboard rect:" << m_lastRect;
+        SC_TRACE_S(Layout, lcVkb) << "Watcher initialized; initial keyboard rect:" << m_lastRect;
     } else {
         qCWarning(lcVkb) << "No QInputMethod available — keyboard tracking inactive";
     }
@@ -57,7 +58,7 @@ void VirtualKeyboardWatcher::onKeyboardRectangleChanged()
     const bool wasVisible = !m_lastRect.isEmpty();
     const bool isVisibleNow = !newRect.isEmpty();
     m_lastRect = newRect;
-    qCInfo(lcVkb) << "Keyboard rect changed:" << newRect
+    SC_TRACE_S(Layout, lcVkb) << "Keyboard rect changed:" << newRect
                   << "visible:" << isVisibleNow
                   << "(was" << wasVisible << ")";
     emit visibilityChanged(isVisibleNow, newRect);

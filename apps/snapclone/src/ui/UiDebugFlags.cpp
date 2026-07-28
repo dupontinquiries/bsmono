@@ -1,4 +1,5 @@
 #include "ui/UiDebugFlags.hpp"
+#include "debug/TraceControl.hpp"
 
 #include <QSettings>
 #include <QLoggingCategory>
@@ -40,34 +41,23 @@ void UiDebugFlags::setMobileDisplayDebug(bool on)
 
 void UiDebugFlags::apply()
 {
-    // Build a filter-rules string. QLoggingCategory takes a multi-line
-    // format like:
-    //   snapclone.ui.vkeyboard.info=true
-    //   snapclone.ui.vkeyboard.debug=true
+    // Delegates to the trace-channel system (debug/TraceChannels.hpp), which is
+    // now the single source of truth for which diagnostic categories are live.
     //
-    // When the flag is OFF, we set both info and debug to FALSE — that
-    // silences info() AND debug() level output. warning() and critical()
-    // stay on regardless (real problems still surface). When ON, we
-    // set them back to TRUE so the diagnostic chatter resumes.
+    // Two reasons this stopped owning its own rules:
+    //   1. QLoggingCategory::setFilterRules REPLACES the entire rule set, so this
+    //      function's partial string silently reset every category it didn't know
+    //      about back to Qt's defaults — including any channel enabled from the
+    //      CLI a moment earlier.
+    //   2. Filter rules alone still pay to FORMAT each dropped message; the
+    //      SC_TRACE macros skip the arguments entirely.
     //
-    // Why explicit booleans (not just commenting): Qt's default is
-    // "info+ enabled, debug disabled". Once we've EVER applied a rule
-    // for a category we have to explicitly state both info and debug,
-    // otherwise the previous run's setting leaks.
-    const bool mobOn = mobileDisplayDebug();
-    QString rules;
-    for (const char *cat : kMobileDisplayCategories) {
-        const QString c = QString::fromLatin1(cat);
-        // info default: ON when flag ON, OFF when flag OFF
-        rules += c + QStringLiteral(".info=")
-              + (mobOn ? QStringLiteral("true") : QStringLiteral("false"))
-              + QStringLiteral("\n");
-        // debug default: same.
-        rules += c + QStringLiteral(".debug=")
-              + (mobOn ? QStringLiteral("true") : QStringLiteral("false"))
-              + QStringLiteral("\n");
-    }
-    QLoggingCategory::setFilterRules(rules);
+    // The legacy "mobile display debug" switch maps onto the Layout channel,
+    // which owns exactly the categories it used to list (vkeyboard, modal,
+    // modaltest, dialog), so existing settings keep working.
+    using namespace SnapClone::Debug;
+    TraceControl::instance().setChannel(TraceChannel::Layout, mobileDisplayDebug(),
+                                        QStringLiteral("UiDebugFlags (legacy)"));
 }
 
 } // namespace SnapClone::UI

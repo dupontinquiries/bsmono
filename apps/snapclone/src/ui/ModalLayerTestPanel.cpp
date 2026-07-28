@@ -1,4 +1,5 @@
 #include "ui/ModalLayerTestPanel.hpp"
+#include "debug/Trace.hpp"   // per-event diagnostics: off unless the channel is on
 #include "ui/ModalSurface.hpp"
 #include "ui/Theme.hpp"
 
@@ -263,7 +264,7 @@ void ModalLayerTestPanel::presentTestWidget(int layerIndex, const QString &label
     }
 
     const auto layerEnum = static_cast<ModalSurface::Layer>(layerIndex + 1);
-    qCInfo(lcModalTest) << "presenting test widget into"
+    SC_TRACE_S(Layout, lcModalTest) << "presenting test widget into"
                         << ModalSurface::layerName(layerEnum)
                         << "geom=" << w->geometry();
     // V32.34+: also close on tap-INSIDE-widget for the test panel. The
@@ -315,7 +316,7 @@ bool ModalLayerTestPanel::eventFilter(QObject *obj, QEvent *ev)
     if (isTap) {
         if (auto *w = qobject_cast<QWidget *>(obj)) {
             if (m_clickToClose.contains(w)) {
-                qCInfo(lcModalTest) << "tap-to-close fired on"
+                SC_TRACE_S(Layout, lcModalTest) << "tap-to-close fired on"
                                     << w->metaObject()->className()
                                     << "event=" << static_cast<int>(t);
                 m_clickToClose.remove(w);
