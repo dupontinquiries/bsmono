@@ -31,6 +31,13 @@ fn glass_chrome_frame() -> egui::Frame {
 
 type HostBatch = (String, Vec<ModelInfo>);
 
+/// How long the resolved target must hold still before a load is kicked.
+///
+/// Long enough to cover a startup where the scan, the deployment plan and the role plan each move it;
+/// short enough that a deliberate model change still feels immediate. A user picking from a dropdown
+/// will not notice 400 ms; three abandoned 30 GiB loads take 45 seconds.
+const AUTOLOAD_SETTLE_MS: u64 = 400;
+
 pub struct LogscopeApp {
     tab: Tab,
     last_tab: Tab,
@@ -55,6 +62,8 @@ pub struct LogscopeApp {
     show_pipeline: bool, // Active-pipeline window (Large/Small/Voice/Image selectors) toggled by the ⚙ button
     deployment: logscope::deploy::Deployment, // multi-model/multi-device plan behind the tile picker
     autoloaded: Option<String>,               // name of the model we last auto-kicked a load for (debounce)
+    /// Target that wants loading, and when it was first seen. Cleared once loaded or abandoned.
+    pending_target: Option<(String, std::time::Instant)>,
 }
 
 impl Default for LogscopeApp {
@@ -89,6 +98,7 @@ impl Default for LogscopeApp {
                 mem_bytes: logscope::model_selector::read_free_bytes().max(1),
             }]),
             autoloaded: None,
+            pending_target: None,
         };
         app.rescan();
         app.boot_env();
@@ -205,11 +215,42 @@ impl LogscopeApp {
     /// AUTOLOAD: whenever the resolved active local target changes, kick a load automatically — no Load
     /// button. Debounced by name (only re-loads when the target actually changes) and skipped while scanning
     /// (models aren't settled yet). Ollama/remote targets need no local load, so they're left alone.
+    /// Load the resolved target, but only once it has STOPPED CHANGING.
+    ///
+    /// This used to fire on every change, and the resolved target passes through intermediate values
+    /// during startup — the scan completes and picks a default, then the deployment plan resolves, then
+    /// the role plan applies. Each intermediate value triggered a full load. Observed on a real run:
+    /// DeepSeek-8B, then GLM-4.7-Flash, then Qwen3-30B, three models mapped in 45 seconds for one
+    /// model's worth of work, with the first two abandoned immediately.
+    ///
+    /// A settle delay fixes it without needing to find and serialise every writer — which is the real
+    /// problem, and one this does not solve. It makes the symptom go away and buys time; the number of
+    /// things that can write the target is still three.
     fn autoload_if_changed(&mut self) {
         if self.scanning { return; }
-        let Some(name) = self.active_target_name() else { return };
+        // COLLAPSE THE SOURCES before resolving. If a deployment names a model the picker also has, move
+        // the picker to it once — after that there is a single source and the override stops being a
+        // standing disagreement. Done here rather than at render time so it happens whether or not the
+        // pipeline panel is open.
+        {
+            let items: Vec<String> = self.model.items.iter().map(|i| i.name().to_string()).collect();
+            if let Some(idx) = logscope::activemodel::write_through(&self.active_model(), &items) {
+                self.model.selected = idx;
+            }
+        }
+        let Some(name) = self.active_target_name() else { self.pending_target = None; return };
         if self.autoloaded.as_deref() == Some(name.as_str()) { return; } // already (auto)loaded this one
-        let Some(path) = self.local_path_for(&name) else { return };     // only local files are loaded here
+
+        // Restart the timer whenever the target moves; load only when it has held still.
+        match &self.pending_target {
+            Some((prev, _)) if *prev == name => {}
+            _ => { self.pending_target = Some((name.clone(), std::time::Instant::now())); return; }
+        }
+        let Some((_, since)) = &self.pending_target else { return };
+        if since.elapsed() < std::time::Duration::from_millis(AUTOLOAD_SETTLE_MS) { return; }
+
+        let Some(path) = self.local_path_for(&name) else { self.pending_target = None; return };
+        self.pending_target = None;
         self.autoloaded = Some(name.clone());
         self.local_status = format!("auto-loading {name}…");
         self.model_loaded = false;
