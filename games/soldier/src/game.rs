@@ -444,7 +444,22 @@ impl Game {
         // Fog hides the far clip and sells the era. Draw distance is generous but bounded so the far-cull
         // keeps very large maps affordable (otherwise fog.end would scale with the whole map diagonal).
         let reach = level.cfg.size as f32 * level.ts();
-        let fog = Fog::new(fogcol, (reach * 0.34 / fog_mul).min(120.0), (reach * 1.18 / fog_mul).min(260.0));
+        let mut fog = Fog::new(fogcol, (reach * 0.34 / fog_mul).min(120.0), (reach * 1.18 / fog_mul).min(260.0));
+        // Learned-site atmosphere: the fog takes the model's OWN light tone (the palette's
+        // brightest entry pulled toward the skin fog) and sits a little closer — aerial
+        // perspective that makes the scanned massing read at scale instead of floating in
+        // clear air. Sites without a bound palette keep the skin fog untouched.
+        if let Some(f) = &level.learned_facade {
+            if let Some(&light) = f.palette.last() {
+                let mix = |a: u8, b: u8| ((a as u16 * 11 + b as u16 * 5) / 16) as u8;
+                fog.color = Color32::from_rgb(mix(fog.color.r(), light.r()),
+                                              mix(fog.color.g(), light.g()),
+                                              mix(fog.color.b(), light.b()));
+                fog.start *= 0.78;
+                fog.end *= 0.88;
+            }
+        }
+        let fog = fog;
 
         let mut pickups = pickups::populate(&level, seed);
         // collectibles authored in a custom map (the floating item sits above its pad)
