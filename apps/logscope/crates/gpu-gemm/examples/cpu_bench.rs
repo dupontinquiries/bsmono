@@ -17,4 +17,5 @@ fn main() {
                  bytes as f64 / per / (1u64 << 30) as f64);
     }
     println!("  available_parallelism = {avail}; threads_for says {}", threads_for(bytes, avail));
+
 }
