@@ -428,6 +428,7 @@ dependencies = [
  "studio-audio",
  "studio-collab",
  "studio-core",
+ "studio-fx",
  "uikit-egui",
 ]
 

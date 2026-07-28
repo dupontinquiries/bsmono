@@ -8,5 +8,6 @@ description = "Studio's timeline UI on uikit-egui: tracks, clips, ruler, and the
 studio-core = { path = "../studio-core" }
 studio-collab = { path = "../studio-collab" }
 studio-audio = { path = "../studio-audio" }
+studio-fx = { path = "../studio-fx" }
 egui = "0.34"        # must match uikit-egui, or Color32 and Sense are different types
 uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }

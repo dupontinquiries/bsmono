@@ -14,6 +14,7 @@
 
 pub mod touch;
 pub mod keys;
+pub mod spectrum;
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use studio_collab::Doc;
