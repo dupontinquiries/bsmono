@@ -338,7 +338,14 @@ const BG_CACHE_CAP: usize = 8192;
 /// streaming MoE weights are all views into slot buffers, which is precisely the workload that was
 /// bypassing the cache. A view whose offset is not in the key would be a correctness bug (one range's
 /// bind group reused for another); including it makes the reuse sound.
-type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, wgpu::Buffer, wgpu::Buffer);
+/// (pipeline, inputs as (buffer, offset, size), OUTPUT as (buffer, offset, size), dims buffer).
+///
+/// The output carries its offset and size for the same reason the inputs do (_220): a cached bind group
+/// reused with a different view writes to the wrong place. This was missed when views were added to the
+/// inputs, and the output was bound with `as_entire_binding()` — so a chunked conversion wrote every
+/// chunk at offset 0. Fixing the binding without fixing the KEY would have been worse than leaving it:
+/// the first chunk's bind group would be reused for all of them, silently.
+type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, (wgpu::Buffer, u64, u64), wgpu::Buffer);
 /// Reusable dims-ring size: how many uniform buffers the cache-full path rotates through. Bounds the
 /// TOTAL live dims buffer count (cache cap + ring) so Metal's buffer-object ceiling is never hit no
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
@@ -2702,7 +2709,8 @@ impl Gpu {
         let cache_key: Option<BgKey> = if bg_cache_on {
             let bufs: Vec<(wgpu::Buffer, u64, u64)> = inputs.iter()
                 .map(|t| { let (o, l) = t.view.unwrap_or((0, 0)); (t.buf.clone(), o, l) }).collect();
-            Some((pipe_ptr, bufs, out.buf.clone(), (*dbuf).clone()))
+            let ov = out.view.unwrap_or((0, out.buf.size()));
+            Some((pipe_ptr, bufs, (out.buf.clone(), ov.0, ov.1), (*dbuf).clone()))
         } else { None };
         if let Some(key) = &cache_key {
             if let Some(bg) = self.bg_cache.lock().unwrap().get(key).cloned() {
@@ -2720,7 +2728,15 @@ impl Gpu {
             };
             bg_entries.push(wgpu::BindGroupEntry { binding: i as u32, resource });
         }
-        bg_entries.push(wgpu::BindGroupEntry { binding: n, resource: out.buf.as_entire_binding() });
+        // Honour the OUTPUT's view, exactly as the inputs above do. Without this a chunked dispatch
+        // writes every chunk at offset 0 — the Q6_K conversion produced a correct first chunk and then
+        // overwrote it 37 times.
+        let out_res = match out.view {
+            None => out.buf.as_entire_binding(),
+            Some((off, len)) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &out.buf, offset: off, size: std::num::NonZeroU64::new(len) }),
+        };
+        bg_entries.push(wgpu::BindGroupEntry { binding: n, resource: out_res });
         bg_entries.push(wgpu::BindGroupEntry { binding: n + 1, resource: dbuf.as_entire_binding() });
         let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: bgl, entries: &bg_entries });
         let bg = std::sync::Arc::new(bg);
