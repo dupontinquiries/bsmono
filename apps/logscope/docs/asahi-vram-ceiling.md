@@ -69,3 +69,52 @@ Three outcomes, all informative:
 
 Until one of those is observed, the conservative cap stays. Raising it on the strength of a comment is
 exactly the reasoning that this project has been repeatedly bitten by.
+
+
+## MEASURED: 63 GiB, against a 24 GiB assumption
+
+```
+gate-vram: adapter = Apple M2 Ultra (G14D B1) [Vulkan]
+  probing in 1024 MiB slabs up to 64 GiB (writes and reads back each one)
+Failed to allocate BO VMA
+  VERIFIED CEILING (allocation failed above this): 63.0 GiB in 4.5s
+  engine currently budgets: 24.0 GiB
+```
+
+The hypothesis held. The cap was measuring the **staging** upload path — the transient double-allocation
+that `queue.write_buffer` makes — and the map-at-creation arena removed it. The device honours **2.6x**
+what the engine was budgeting, and models that fitted were being streamed for no reason.
+
+The probe popped cleanly ("Failed to allocate BO VMA", caught by the OOM guard) rather than hanging or
+corrupting, which is the outcome that makes the number trustworthy.
+
+## And it did NOT fix the gibberish
+
+`LOGSCOPE_MAX_GPU_GB=32` loaded Scout fully resident, **with no GPU timeouts**, and still produced
+`2, of`. Qwen3-30B produced word soup.
+
+That is worth as much as the ceiling finding. It rules out, in one run:
+
+* memory pressure
+* expert streaming and the fills
+* the staging fence
+* the GPU timeouts
+
+None of them are the cause, because all of them are absent and the output is unchanged. Whatever
+produces `2, of` survives a completely different memory regime — which is the same conclusion the
+cross-platform run pointed at before the frame lifecycle bug muddied it.
+
+## On `/sys` — there is nothing to read
+
+There is no standard sysfs node for "largest GPU allocation this driver will honour". `/sys/class/drm/card*/`
+exposes device identity and connector state; DRM drivers that manage discrete VRAM may expose
+`mem_info_vram_total` under their own vendor path, but that is amdgpu's convention rather than a
+kernel-wide interface, and it reports physical VRAM rather than a VA-space policy.
+
+The Asahi ceiling is not a hardware quantity at all — it is where the driver's BO VMA allocator gives up,
+which depends on fragmentation, what else is mapped, and the allocation pattern. That is why probing
+finds 63 GiB on a 192 GiB machine and why the number would not be constant across runs. A sysfs file
+could not report it honestly even if one existed.
+
+So reaching in the dark is, unusually, the correct approach here — but it should be done once and
+cached, not left to a person with an env var.
