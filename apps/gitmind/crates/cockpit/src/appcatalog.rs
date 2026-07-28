@@ -41,6 +41,12 @@ pub struct ManifestEntry {
     pub app_id: String,
     pub path: String,
     pub notes: String,
+    /// `primary = true` — this entry is THE default build of the app it ports,
+    /// not an alternative to opt into. gitmind selects a primary port on behalf
+    /// of the user and offers the original as the alternative, which is the
+    /// right way round once a port has taken over: the thing you get by default
+    /// should be the thing the project actually ships.
+    pub primary: bool,
 }
 
 /// Parse `manifest/projects.toml`'s `[apps.*]` sections into a flat list. Minimal hand-rolled
@@ -49,11 +55,11 @@ pub struct ManifestEntry {
 /// doesn't need one. Pure — no filesystem access; the caller reads the file.
 pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
     let mut out = Vec::new();
-    let mut cur: Option<(String, String, String)> = None; // (app_id, path, notes)
-    let flush = |cur: &mut Option<(String, String, String)>, out: &mut Vec<ManifestEntry>| {
-        if let Some((id, path, notes)) = cur.take() {
+    let mut cur: Option<(String, String, String, bool)> = None; // (app_id, path, notes, primary)
+    let flush = |cur: &mut Option<(String, String, String, bool)>, out: &mut Vec<ManifestEntry>| {
+        if let Some((id, path, notes, primary)) = cur.take() {
             if !path.is_empty() {
-                out.push(ManifestEntry { app_id: id, path, notes });
+                out.push(ManifestEntry { app_id: id, path, notes, primary });
             }
         }
     };
@@ -61,16 +67,23 @@ pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
         let line = raw.trim();
         if let Some(rest) = line.strip_prefix("[apps.").and_then(|r| r.strip_suffix(']')) {
             flush(&mut cur, &mut out);
-            cur = Some((rest.to_string(), String::new(), String::new()));
+            cur = Some((rest.to_string(), String::new(), String::new(), false));
             continue;
         }
         if line.starts_with('[') {
             flush(&mut cur, &mut out); // a different table — this app's section ended
             continue;
         }
-        if let Some((_, path, notes)) = cur.as_mut() {
+        if let Some((_, path, notes, primary)) = cur.as_mut() {
             if let Some(v) = toml_string_value(line, "path") { *path = v; }
             if let Some(v) = toml_string_value(line, "notes") { *notes = v; }
+            // `primary = true` (bare boolean, not a quoted string)
+            if let Some(rest) = line.strip_prefix("primary") {
+                let rest = rest.trim_start().strip_prefix('=').map(|r| r.trim_start());
+                if let Some(r) = rest {
+                    *primary = r.starts_with("true");
+                }
+            }
         }
     }
     flush(&mut cur, &mut out);
@@ -332,6 +345,37 @@ notes = "the egui-primary port of bo-controller."
 path = "apps/logscope"
 kind = "cargo"
 "#;
+
+    #[test]
+    fn a_primary_port_is_marked_and_the_default_build_is_unambiguous() {
+        // `primary = true` is how the manifest says "this port IS the app now".
+        // gitmind selects such a port on the user's behalf instead of showing the
+        // superseded build and asking them to opt in, so the flag has to survive
+        // parsing — and NOT leak onto entries that never set it.
+        let text = std::fs::read_to_string(
+            crate::ops::repo_root().join("manifest/projects.toml")).expect("manifest");
+        let entries = parse_manifest(&text);
+        let egui = entries.iter().find(|e| e.app_id == "voiceterm-egui").expect("the egui port");
+        assert!(egui.primary, "voiceterm-egui must be marked the primary build");
+        let qt = entries.iter().find(|e| e.app_id == "voiceterm").expect("the Qt shell");
+        assert!(!qt.primary, "the superseded Qt shell must not claim primary");
+        // the port must still be discoverable as a port (path prefix rule)
+        assert!(egui.path.starts_with(&qt.path), "the port lives under the app it ports");
+        assert_ne!(egui.path, qt.path);
+        // and exactly one build of voiceterm claims to be primary
+        let claims = entries.iter()
+            .filter(|e| e.path.starts_with(&qt.path) && e.primary).count();
+        assert_eq!(claims, 1, "exactly one voiceterm build may be the default");
+    }
+
+    #[test]
+    fn primary_defaults_to_false_without_the_flag() {
+        let entries = parse_manifest("[apps.thing]\npath = \"apps/thing\"\n");
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].primary, "absent flag means not primary");
+        let entries = parse_manifest("[apps.thing]\npath = \"apps/thing\"\nprimary = true\n");
+        assert!(entries[0].primary, "a bare boolean true is honoured");
+    }
 
     #[test]
     fn parse_manifest_reads_path_and_notes_per_app_section() {
