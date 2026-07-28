@@ -2300,7 +2300,17 @@ impl Gpu {
     /// records a CATCHABLE OutOfMemory instead of the fatal get_mapped_range abort a failed map-on-create
     /// gives. The UMA map path is safe because weight loads memplan-preflight the fit before any upload.
     fn upload_bytes(&self, bytes: &[u8], label: &'static str) -> wgpu::Buffer {
-        let size = (bytes.len().max(4)) as u64;
+        // ROUND UP TO A WHOLE WORD. Shaders view these buffers as `array<u32>`, so the last partial word
+        // is unreadable if the buffer ends mid-word: a WGSL index past the array length yields zero, not
+        // an error.
+        //
+        // Found via Q6_K, whose super-block is 210 bytes — 52.5 words. Its f16 scale lives at bytes
+        // 208..209, inside word 52, which spans 208..211 and lies past a 210-byte buffer. The scale read
+        // as ZERO, so every weight in the block came out zero, and the gate reported max|diff| 3.3e5
+        // against the CPU path. Any quant whose block size is not a multiple of 4 has the same exposure;
+        // Q4_K (144) and Q8_0 (34→ padded) happen to be safe or already padded, which is why this
+        // survived until a 210-byte format arrived.
+        let size = (bytes.len().max(4).div_ceil(4) * 4) as u64;
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         if self.unified && !bytes.is_empty() {
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: true });
@@ -9141,18 +9151,25 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Chunked the same way the Q4_K path is, and for the same reason: one dispatch over a whole
     /// expert tensor is long enough to trip the firmware watchdog, which on this hardware is not a
     /// hypothetical — 56 timeouts in a four-minute window is what an oversized dispatch looks like.
-    /// NOT YET CORRECT — `--gate-q6k` is RED (max|diff| 3.3e5 on a single block against the CPU
-    /// reference). Kept in the tree because the structure is right and the fault is narrow, but it must
-    /// not be wired into the loader until the gate is green: a conversion that is merely close would
-    /// degrade every expert in the model, silently, which is the exact failure this project keeps paying
-    /// for.
+    /// STILL RED, but the fault is now localised to ONE function.
     ///
-    /// Two candidates for the fault, both testable:
-    ///   - `dispatch` binds the OUTPUT with as_entire_binding(), ignoring a view — so the per-chunk dst
-    ///     view is a no-op and every chunk writes at offset 0. That explains the multi-block cases but
-    ///     NOT the single-block one, which is also red.
-    ///   - the f16 subnormal branch or the 2-bit high-bit assembly differs from the CPU path in a way a
-    ///     single hand-checked block would expose immediately.
+    /// Progress by elimination, each step a measurement rather than a guess:
+    ///   1. GPU output was entirely 0.0 — so the scale `d` was reading as zero, not the quants being
+    ///      wrong. FIXED: the binding VIEW was 210 bytes, and a shader viewing it as `array<u32>` sees
+    ///      52 whole words; the f16 scale at bytes 208..209 lives in word 52, past the end. WGSL reads
+    ///      an out-of-range index as ZERO rather than faulting, so every weight scaled by nothing.
+    ///      Padding the BUFFER was not enough — the binding RANGE is what the shader sees.
+    ///   2. Output is now -0.0 uniformly. The sign bit is present, so `d` IS being read; the exponent
+    ///      and mantissa are contributing nothing. That puts the remaining fault inside `f16()` — its
+    ///      normal branch, not the byte extraction and not the 6-bit assembly.
+    ///
+    /// The fixture's scale bytes are 0xDB 0xE8 = 0xE8DB: sign 1, exp 26, mant 219 — a normal value of
+    /// order -2^11, which should take `bits = sign<<31 | (exp+112)<<23 | mant<<13`. Getting -0.0 from
+    /// that means the branch is not executing or the shift is being folded away, which one print of
+    /// `exp` from inside the shader would settle.
+    ///
+    /// NOT wired into the loader, and must not be until the gate is green: a conversion that is merely
+    /// close would degrade every expert silently.
     pub fn q6k_dequant(&self, raw: &[u8], n_weights: usize) -> Result<Tensor, String> {
         if n_weights % 256 != 0 { return Err("q6_k: element count not a multiple of 256".into()); }
         let nblk = n_weights / 256;
@@ -9165,8 +9182,15 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         while b0 < nblk {
             let n = chunk.min(nblk - b0);
             let byte_off = b0 * 210;
-            let view = Tensor { buf: src.buf.clone(), rows: 1, cols: (n * 210).div_ceil(4),
-                                pool: None, view: Some((byte_off as u64, (n * 210) as u64)) };
+            // The VIEW length bounds the shader's `array<u32>`, so it must cover whole words. A
+            // 210-byte block is 52.5 words; a 210-byte binding exposes 52, and the f16 scale at bytes
+            // 208..209 sits in word 52 — out of bounds, which WGSL reads as ZERO rather than faulting.
+            // Every weight then came out zero and the gate reported max|diff| 3.3e5.
+            //
+            // Padding the BUFFER was not enough: the binding range is what the shader sees.
+            let vlen = ((n * 210).div_ceil(4) * 4).min(nblk * 210 - byte_off + 3 & !3);
+            let view = Tensor { buf: src.buf.clone(), rows: 1, cols: vlen / 4,
+                                pool: None, view: Some((byte_off as u64, vlen as u64)) };
             let dstv = Tensor { buf: out.buf.clone(), rows: 1, cols: n * 256,
                                 pool: None, view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)) };
             let dims = [n as u32, 0u32, 0u32, 0u32];
