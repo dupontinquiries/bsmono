@@ -9388,6 +9388,12 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         Ok(out)
     }
 
+    /// The device's per-buffer ceiling. No single allocation may exceed it, whatever the total budget.
+    ///
+    /// Honeykrisp reports ~2047 MiB (2^31 - 1), which is why the arena packs into slabs of that size and
+    /// why a probe using larger ones measures the limit rather than the device.
+    pub fn max_buffer_bytes(&self) -> usize { self.device.limits().max_buffer_size as usize }
+
     /// Test hook: chunked host->device write, to compare against the single-shot path.
     pub fn write_chunked_pub(&self, dst: &Tensor, src: &[f32]) {
         self.write_chunked(&dst.buf, 0, bytemuck::cast_slice(src));
