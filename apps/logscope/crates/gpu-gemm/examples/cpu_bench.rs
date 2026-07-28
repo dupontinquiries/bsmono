@@ -1,3 +1,11 @@
+//! Standalone CPU measurement — creates no Gpu, needs no device.
+//!
+//! What the numbers mean on a 24-core M2 Ultra:
+//!   single-core GiB/s   is the inner loop vectorizing? ~4 GiB/s here on x86 with no NEON; if the M2
+//!                       single-core figure is similar or better the loop shape is fine, and if it is
+//!                       far lower the aarch64 codegen needs looking at.
+//!   scaling to 24       does the contiguous row split work? This container reports
+//!                       available_parallelism = 1, so every threading number here is meaningless.
 fn main() {
     use gpu_kernels::cpumatvec::*;
     let (rows, k) = (5120usize, 5120usize);
