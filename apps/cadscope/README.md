@@ -13,7 +13,8 @@ hardware (this workspace was built in a sandbox with no GPU or display).
 
 ```sh
 cd apps/cadscope
-cargo test                              # 59 tests, includes offline WGSL validation via naga
+cargo run -p cadscope-egui -- --ref-index ../..   # index the monorepo's models/textures/docs
+cargo test                              # 72 tests, includes offline WGSL validation via naga
 cargo run -p cadscope-egui -- --selftest  # headless: evaluate, mesh and ray-probe the model
 cargo run --release -p cadscope-egui    # the app (bin name: cadscope)
 ```
@@ -80,6 +81,7 @@ which needs it for the paint callback.
 | `cadscope-egui` | M0 ✅ | the shell: window, viewport, panels, wiring. |
 | `cad-liaison` | M3 | PartSpec/OpScript sanitizers, `logscope-fan` adapters, genviz progress. |
 | `cad-tex` | M4 | the texturing system: material graphs, triplanar + auto-unwrap, bake, audit. |
+| `cad-ref` | M4 ▸ | the reference corpus: index models, textures and specs by name so "same volume as `puma`" resolves to a measured fact. IQM/PNG/doc parsing works today; the verbs are M4–M7. |
 | `cad-pool` | M5 | asset pools: manifests, budgets, per-game injection. |
 | `cad-net` | M6 | forge-op replication over snapcore clusters. |
 | `cad-nifty` | M6 | niftyplot emit; the `%kind: hardware` implementation (upstreams to `shared/nifty-core`). |

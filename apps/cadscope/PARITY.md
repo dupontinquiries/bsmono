@@ -32,6 +32,28 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   edge half-planes, which is exact on a face and conservative at a corner. Safe for tracing and
   meshing; it does mean a hex profile's corners mesh very slightly soft.
 
+## The reference corpus (§17, v0)
+
+- **Indexed, but nothing is cached.** A scan of the monorepo takes ~33 s for 4,894 entries and is
+  redone from scratch every time. §17.4 calls for a content-hashed derived cache; until it exists,
+  `--ref-index` is a diagnostic rather than something the app can afford at startup.
+- **Only IQM headers are parsed.** OBJ and glTF models index by *name* with empty facts, which is
+  honest but thin — 3,155 model entries, 2,150 of them with real facts. An OBJ reader is cheap and
+  should follow.
+- **Bounds are nearly always absent.** IQM stores them per animation frame, so a static export has
+  none: exactly 1 model in the whole tree reports bounds. This is the strongest argument for the
+  M5 plan of computing volume from vertex data rather than headers — the cheap proxy is unavailable
+  precisely where a designer would want it.
+- **Names are ambiguous and that is deliberate.** `obsidian` resolves to three entries (its base,
+  normal and specular maps, correctly grouped under one name); `puma` resolves to a top hit plus
+  two weaker ones. `resolve` returns a ranked list and never collapses to one answer — a silent
+  pick is how you scale a part to the volume of the wrong model.
+- **No verbs yet.** The index answers "what is called this"; `volume of`, `texture from`, `fit` and
+  `like` are M4–M7. The model→texture join is proven (2,295 resolve against the real tree) but is
+  not yet wired to anything.
+- **Niftyplot entries parse to nothing.** No `.nifty` files exist in the tree yet, and the parser
+  arrives at M6 with the hardware-kind implementation.
+
 ## Not verified in-sandbox
 
 - **The app has never been run.** The build environment had one core, 3 GB RAM, no GPU and no

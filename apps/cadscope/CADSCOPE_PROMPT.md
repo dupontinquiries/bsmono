@@ -223,3 +223,103 @@ Stored: extracted at `/home/claude/fj-drop/fornjot-main`; original zip parked **
 State of the project (from the snapshot itself): the v0.49-era b-rep kernel (`fj-core`, `fj-math`, 2024-03) is **deprecated in place** — husk crates pointing at consolidated `crates/fj` — and the live work is the `experiments/` series (2024-10 → 2025-12-03). The author's own framing: mainline "reached a local maximum… mired in complexity"; the surviving concepts are *"approximated geometry as a uniform intermediate representation, and a simplified topological objects graph"*, with 2025-11-07 showing that keeping exact local geometry definitions costs ~600 lines of core data-structure code to define a cube, and 2025-12-03 asking whether that information is needed at all.
 
 Reading for CADscope §5: this **corroborates** the SDF-first course rather than challenging it — the strongest Rust b-rep attempt is independently migrating *toward* "approximate geometry as the uniform representation." It does **not** hand us a drop-in kernel. What it changes: **M1 must design persistent face/edge naming into forge ops** (the topological-naming problem is what b-rep is genuinely for), studying fj's object-graph/handle identity model — so the §5 seam stays open without rewriting documents later. Borrow candidates at M1: fj's validation-check architecture, fj-math predicates, the experiments' approx-geometry data model. Full mainline adoption: off the table (deprecated by its own author). Deep analysis scheduled at M1 kernel design, alongside the mesher.
+
+---
+
+## §17 — The reference corpus (`cad-ref`): design grounded in what already exists
+
+`apps/logscope` is useful because its liaison is *grounded*: it reads a real codebase and it never
+invents — an empty tree makes it say "nothing observed" rather than guess. CADscope's equivalent
+input is not source code. It is the accumulated prior art already sitting in this monorepo, and as
+of this writing that is not hypothetical: **2,150 `.iqm` models** (`games/clawbound/assets/`,
+`games/blackstar/`), **1,005 OBJ/glTF meshes**, **354 textures** already following the engine's
+`<name>.png` / `norm_<name>.png` / `spec_<name>.png` convention, the niftyplot diagrams
+(`shared/nifty-core`, spec in `apps/voiceterm/docs/niftyplot-spec.md`), and the design prose
+scattered through `DESIGN.md`, `EDITORS.md` and every project README.
+
+§17 makes that corpus a first-class, queryable index so a designer can say
+
+> *"add arms like `velgorn`"* · *"make it the same volume as `puma`"* ·
+> *"use the texture from `scorponok_body`"* · *"design this to fit `enclosure_spec.md`"*
+
+and have each reference resolve to a **measured fact**, not to a language model's recollection of
+a file it never opened.
+
+### 17.1 What the corpus holds
+
+Four entry kinds, each with facts *derived by Rust* and cached against a content hash:
+
+| kind | sources | derived facts |
+|---|---|---|
+| `model` | `.iqm`, `.glb`/`.gltf`, `.obj` | AABB, centroid, **volume** and surface area (closed-mesh divergence theorem — the same `signed_volume` the mesher already uses), triangle count, unit scale and up-axis, named sub-meshes (`arm_L`, `wing`), material slots, bilateral-symmetry test |
+| `texture` | `<name>.png` + `norm_`/`spec_` siblings | resolution, channel stats, dominant palette, tileability, content hash + perceptual dHash, which models reference it |
+| `niftyplot` | niftyplot documents | node/edge lists for `%kind: graph`; for `%kind: hardware`, the component/pin/trace/**clearance** tables — which is how "design a bracket that fits this board" becomes arithmetic |
+| `doc` | `.md`, `.txt` | title, heading tree, and **extracted dimensioned statements** — `120 mm × 80 mm`, `M3 clearance`, `wall ≥ 2mm`, `fits in a 40mm cube` |
+
+Names are the address, per `games/EDITORS.md` ("names not IDs"): `velgorn`, `puma`,
+`scorponok_body`, `enclosure_spec.md`. The name is what a person actually says out loud, so it is
+what the corpus is keyed on — with fuzzy resolution over the fzf-lite matcher already living in
+`logscope-fan`, and an explicit disambiguation prompt when a name is ambiguous rather than a silent
+pick.
+
+### 17.2 The verbs — reference resolves to a constraint, not to a vibe
+
+The point is that every one of these lowers to something **deterministic and checkable**:
+
+- **`volume of <model>`** → a scalar constraint. Solve the uniform scale that makes the current
+  part's meshed volume equal the reference's, apply it as an op. Verifiable to a tolerance by
+  re-measuring, and it is measured, not asserted.
+- **`texture from <model>`** → resolve that model's material set through the `norm_`/`spec_`
+  convention, register the maps in `cad-tex` (§8). No geometry involved; this is the cheapest verb
+  and should ship first.
+- **`fit <doc>`** → extract the dimensioned statements and raise them as a **checklist** the
+  current model is measured against, each line green or red with the actual number beside it. A
+  spec becomes a test, which is the whole idea.
+- **`fits <niftyplot>`** → for `%kind: hardware`, derive the board outline, mounting-hole pattern
+  and keep-out volumes, and offer them as sketch geometry to design *around*. CADscope is the first
+  hardware-kind implementer (§9), so this verb and that parser land together.
+- **`like <model>[.part]`** → the hard one, and deliberately last. It does **not** paste the
+  reference mesh (that is `import <model>`, a separate and honest verb). It extracts a *proportion
+  summary* — segment lengths, radii along a medial axis, attachment frames, symmetry — and hands
+  that to Grow (§6) as a target the turtle is steered toward or fitted against. "Arms like velgorn"
+  should produce *your* arms at velgorn's proportions, not velgorn's arms.
+
+### 17.3 The boundary, unchanged
+
+The sanitization rule from §7 holds exactly as it does everywhere else, and this is where it earns
+the most: **the model never emits geometry, code, or corpus facts.** It emits a constrained
+`RefQuery` (kind + name + verb) and an `OpScript` of ops that already exist. Rust performs the
+lookup, Rust computes the volume, Rust applies the scale. And the liaison never invents an entry:
+if `velgorn` is not indexed, the answer is that it is not indexed — logscope's "nothing observed",
+transplanted. A reference to a file nobody has is the single most likely hallucination in this
+whole application, so it is the one the architecture makes structurally impossible.
+
+Every grounded op carries its claim as a **post-condition** recorded in the document: "same volume
+as `puma`" becomes an assertion re-checked on every rebuild and displayed in history with the
+measured delta. If a later edit breaks it, the history says so. That is the CAD form of "never
+invents" — the claim is checked, not trusted.
+
+### 17.4 Shape and placement
+
+New crate `cad-ref`, sitting beside `cad-pool` and sharing its scanning layer but pointed the
+other way: `cad-pool` is **outbound** (budgets, injection into `games/`), `cad-ref` is **inbound**
+(grounding a design decision). Both inherit the v2 script lineage — `model_metadata_v1` for mesh
+facts, `texture_audit_v2` for content and perceptual hashing, `obj_diagnose_v3` for mesh sanity —
+rather than reinventing any of it. `cad-liaison` is the only consumer that speaks natural language;
+`cad-ref` itself has no LLM dependency at all and is testable headlessly against the real tree.
+
+Index lives in `ref.toml` (roots, include/exclude globs, unit hints per root) plus a content-hashed
+derived cache, so a 2,150-model scan is paid once.
+
+### 17.5 Milestones
+
+- **M4** — index + `texture from` (rides in with `cad-tex`).
+- **M5** — `volume of` and the measured post-conditions (rides in with `cad-pool`'s scanner).
+- **M6** — `fits <niftyplot>`, alongside the hardware-kind implementation upstreamed to
+  `shared/nifty-core`.
+- **M7** — `like <model>`, the proportion extractor, once Grow has a fitting target.
+
+Acceptance for the whole section: on a fresh checkout, `cadscope --ref-index` scans the real tree
+and reports counts matching a `find`; `volume of puma` on a grown form produces a part whose
+re-measured volume is within 1% and whose history shows the delta; and a request naming a model
+that does not exist produces a refusal that names what *was* searched, never a plausible invention.

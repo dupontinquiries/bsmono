@@ -303,6 +303,13 @@ name = "cad-pool"
 version = "0.1.0"
 
 [[package]]
+name = "cad-ref"
+version = "0.1.0"
+dependencies = [
+ "glam",
+]
+
+[[package]]
 name = "cad-tex"
 version = "0.1.0"
 
@@ -327,6 +334,7 @@ dependencies = [
  "cad-forge",
  "cad-kernel",
  "cad-motion",
+ "cad-ref",
  "cad-view",
  "eframe",
  "egui",

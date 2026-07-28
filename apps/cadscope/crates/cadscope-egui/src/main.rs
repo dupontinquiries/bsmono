@@ -23,8 +23,12 @@ use glam::{Mat4, Quat, Vec2, Vec3};
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
-    if std::env::args().any(|a| a == "--selftest") {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--selftest") {
         selftest();
+    }
+    if let Some(i) = args.iter().position(|a| a == "--ref-index") {
+        ref_index(args.get(i + 1).map(String::as_str).unwrap_or("."));
     }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
@@ -73,6 +77,86 @@ fn demo_doc() -> Doc {
             Op::Pattern { name: "studs".into(), count: 4, step: [3.0, 0.0, 0.0] },
         ],
     }
+}
+
+/// Scan a tree into the reference corpus (plan §17) and report what it found. This is the verb
+/// behind "same volume as `puma`" — before any of that can be trusted, the index has to be able to
+/// walk a real, messy asset tree and come back with facts rather than guesses.
+fn ref_index(root: &str) -> ! {
+    use cad_ref::{Facts, Index, Kind, ScanOpts};
+    let t0 = std::time::Instant::now();
+    let idx = Index::scan(std::path::Path::new(root), &ScanOpts::default());
+    println!(
+        "indexed {} entries from {root} in {:.2}s",
+        idx.len(),
+        t0.elapsed().as_secs_f32()
+    );
+    for (kind, label) in [
+        (Kind::Model, "models"),
+        (Kind::Texture, "textures"),
+        (Kind::Niftyplot, "niftyplot"),
+        (Kind::Doc, "docs"),
+    ] {
+        println!("  {:10} {}", label, idx.count(kind));
+    }
+
+    // What the corpus actually knows about the models it parsed.
+    let mut parsed = 0usize;
+    let mut with_bounds = 0usize;
+    let mut named_parts = 0usize;
+    let mut biggest: Vec<(&str, u32)> = Vec::new();
+    for e in &idx.entries {
+        if let Facts::Model(m) = &e.facts {
+            if m.triangles > 0 {
+                parsed += 1;
+                biggest.push((e.name.as_str(), m.triangles));
+            }
+            if m.bounds.is_some() {
+                with_bounds += 1;
+            }
+            named_parts += m.mesh_names.len();
+        }
+    }
+    biggest.sort_by(|a, b| b.1.cmp(&a.1));
+    biggest.truncate(5);
+    println!("  parsed {parsed} model headers, {with_bounds} with bounds, {named_parts} named sub-meshes");
+    for (n, t) in &biggest {
+        println!("    {:34} {:>8} tris", n, t);
+    }
+
+    // Materials are the bridge to the texture corpus: a model names them, and the index groups
+    // <name>.png / norm_ / spec_ under one entry name, so `texture from <model>` is a join.
+    let mut joined = 0usize;
+    let mut example = String::new();
+    for e in &idx.entries {
+        if let Facts::Model(m) = &e.facts {
+            for mat in &m.materials {
+                let stem = std::path::Path::new(mat)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(mat);
+                if !idx.material_set(stem).is_empty() {
+                    joined += 1;
+                    if example.is_empty() {
+                        example = format!("{} -> {}", e.name, stem);
+                    }
+                }
+            }
+        }
+    }
+    println!("  {joined} model->texture material joins resolved{}", if example.is_empty() { String::new() } else { format!("  (e.g. {example})") });
+
+    // Name resolution, which is what a person actually uses.
+    for q in ["puma", "shark", "obsidian", "nosuchmodelanywhere"] {
+        let hits = idx.resolve(q, None, 3);
+        if hits.is_empty() {
+            println!("  resolve {:22} -> nothing indexed under that name", q);
+        } else {
+            let names: Vec<String> = hits.iter().map(|(e, s)| format!("{}({})", e.name, s)).collect();
+            println!("  resolve {:22} -> {}", q, names.join(", "));
+        }
+    }
+    std::process::exit(0);
 }
 
 /// Headless verification of the whole model pipeline — evaluate the document, mesh every CSG

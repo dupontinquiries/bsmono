@@ -26,6 +26,7 @@ cad-kernel = { path = "crates/cad-kernel" }
 cad-forge = { path = "crates/cad-forge" }
 cad-view = { path = "crates/cad-view" }
 cad-motion = { path = "crates/cad-motion" }
+cad-ref = { path = "crates/cad-ref" }
 
 [profile.dev]
 opt-level = 2                 # skydribble's lesson: geometry at opt 0 is unusable
