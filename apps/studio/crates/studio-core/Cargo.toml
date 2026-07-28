@@ -1,0 +1,8 @@
+[package]
+name = "studio-core"
+version = "0.1.0"
+edition = "2021"
+description = "The editing model shared by Studio's video NLE and audio editor: a timebase, tracks of clips, and every edit expressed as a serializable, invertible operation — which is what makes undo and realtime collaboration the same mechanism."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
