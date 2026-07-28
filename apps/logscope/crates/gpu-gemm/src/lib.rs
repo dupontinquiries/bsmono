@@ -11738,6 +11738,26 @@ pub fn wrapped_grid(units: usize) -> (u32, u32) {
 /// requires every expert tensor to be GPU-convertible — one Q6_K tensor forced the whole model onto the
 /// host-copy path, which is 200 GiB of traffic per generation and the staging fence that costs 99% of
 /// submits. Converting Q6_K removes the copies rather than making them faster.
+/// Extract a WGSL function body from a shader constant, normalised for comparison.
+///
+/// Used by the drift test below. Strips comments and collapses whitespace, so two copies that differ
+/// only in commentary compare equal while a changed constant does not.
+#[cfg(test)]
+fn wgsl_fn_body(src: &str, sig: &str) -> Option<String> {
+    let i = src.find(sig)?;
+    let b = src[i..].find('{')? + i;
+    let (mut depth, mut j) = (0i32, b);
+    for c in src[b..].chars() {
+        if c == '{' { depth += 1; } else if c == '}' { depth -= 1; if depth == 0 { break; } }
+        j += c.len_utf8();
+    }
+    let body = &src[b..=j];
+    let no_comments: String = body.lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>().join(" ");
+    Some(no_comments.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
 pub const Q6K_DEQUANT: &str = r#"
 struct D { n:u32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;
@@ -11752,22 +11772,18 @@ fn f16(h: u32) -> f32 {
     let mant = h & 0x3FFu;
     var bits: u32;
     if (exp == 0u) {
-        if (mant == 0u) { bits = sign << 31u; }
-        else {
-            // Match gguf::f16_to_f32 EXACTLY: seed the unbiased exponent at -14 (a subnormal half is
-            // mant * 2^-24, and normalising until bit 10 is the implicit leading 1 leaves -14 - shifts),
-            // then bias by +127. Seeding at -1 and biasing by 113 lands one exponent LOW, halving every
-            // subnormal — and that same class of bug is recorded in the CPU helper's own comment, where
-            // an earlier version was two low and shrank K-quant scales fourfold. Rare in real weights,
-            // which is exactly why it survives review and shows up as a small max|diff| on random bytes.
-            var m = mant; var e: i32 = -14;
+        if (mant == 0u) {
+            bits = sign << 31u;
+        } else {
+            // subnormal: normalize until bit 10 is the implicit leading 1
+            var e: i32 = -14; var m: u32 = mant;
             loop { if ((m & 0x400u) != 0u) { break; } m = m << 1u; e = e - 1; }
             bits = (sign << 31u) | (u32(e + 127) << 23u) | ((m & 0x3FFu) << 13u);
         }
-    } else if (exp == 31u) {
-        bits = (sign << 31u) | 0x7F800000u | (mant << 13u);
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31u) | (0xFFu << 23u) | (mant << 13u);   // inf / nan, preserved
     } else {
-        bits = (sign << 31u) | ((exp + 112u) << 23u) | (mant << 13u);
+        bits = (sign << 31u) | (u32(i32(exp) + 127 - 15) << 23u) | (mant << 13u);
     }
     return bitcast<f32>(bits);
 }
@@ -11993,3 +12009,45 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
     }
 }
 "#;
+
+#[cfg(test)]
+mod shader_drift_tests {
+    /// The three shader copies of `f16()` must stay semantically identical.
+    ///
+    /// They are hand-copied into each quant kernel's source, and one of them carried a wrong subnormal
+    /// exponent — seeded at -1 and biased by 113 instead of -14 and +127, halving every subnormal — for
+    /// an unknown period. The other two were correct, so `--gate-q4k` stayed green throughout and gave
+    /// no hint at all. Duplication is what made that possible: three copies, one review each, no
+    /// coupling between them.
+    ///
+    /// Comparing bodies with comments stripped is the cheapest guard that actually holds.
+    /// Deduplicating into one shared constant would be better, but `concat!` does not work across const
+    /// items and the restructure would touch every kernel — this catches the same drift for a fraction
+    /// of the risk.
+    #[test]
+    fn the_three_shader_f16_helpers_do_not_drift() {
+        let srcs = [("Q6K", super::Q6K_DEQUANT), ("Q4K", super::Q4K_DEQUANT),
+                    ("Q4K_TO_Q4", super::Q4K_TO_Q4)];
+        let bodies: Vec<(&str, String)> = srcs.iter()
+            .filter_map(|(n, s)| super::wgsl_fn_body(s, "fn f16(h: u32)").map(|b| (*n, b)))
+            .collect();
+        assert_eq!(bodies.len(), 3, "expected three copies, found {}", bodies.len());
+        for (name, b) in &bodies[1..] {
+            assert_eq!(b, &bodies[0].1, "{}'s f16() has drifted from {}'s", name, bodies[0].0);
+        }
+        // and the subnormal seed must be the CPU's, not a plausible-looking alternative
+        assert!(bodies[0].1.contains("-14"), "subnormal exponent seeds at -14: {}", bodies[0].1);
+        assert!(bodies[0].1.contains("e + 127"), "and biases by +127");
+    }
+
+    /// `byte_at` is duplicated the same way and reads raw quant bytes — a wrong shift there would
+    /// misread every weight rather than a rare subnormal, so it is the more dangerous of the two.
+    #[test]
+    fn the_shader_byte_at_helpers_do_not_drift() {
+        let srcs = [super::Q6K_DEQUANT, super::Q4K_DEQUANT, super::Q4K_TO_Q4];
+        let bodies: Vec<String> = srcs.iter()
+            .filter_map(|s| super::wgsl_fn_body(s, "fn byte_at(i: u32)")).collect();
+        assert_eq!(bodies.len(), 3);
+        for b in &bodies[1..] { assert_eq!(b, &bodies[0], "byte_at has drifted"); }
+    }
+}
