@@ -17,6 +17,7 @@ pub mod liaison_relay;
 pub mod filesep;
 pub mod msgview;
 pub mod repoquery;
+pub mod workspace_access;
 pub mod thinkerwatch;
 pub mod promptframe;
 pub mod codecompare;
