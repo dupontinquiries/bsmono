@@ -3415,6 +3415,50 @@ memplan's cap is measuring something that no longer applies (see docs/asahi-vram
         }
         return;
     }
+    if args.iter().any(|a| a == "--gate-cpuops") {
+        // The CPU ops must agree with the GPU kernels, not merely with their own definitions. A CPU path
+        // that is internally consistent and disagrees with the shaders would produce a model that is
+        // fine on one backend and subtly wrong on the other — which is worse than one that is wrong
+        // everywhere, because it looks like a hardware problem.
+        let gpu = Gpu::new();
+        eprintln!("gate-cpuops: adapter = {}", gpu.adapter_name);
+        let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
+        let d = 256usize;
+        let mk = |seed: u32, n: usize| -> Vec<f32> {
+            (0..n).map(|i| {
+                let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
+                ((x >> 9) as f32 / (1u32 << 23) as f32) - 0.5
+            }).collect()
+        };
+        // RMS norm
+        {
+            let (x, w) = (mk(1, d), mk(2, d));
+            let mut cpu = vec![0f32; d];
+            gpu_kernels::cpuops::rmsnorm(&x, &w, 1e-5, &mut cpu);
+            let g = gpu.rmsnorm(&x, &w, 1, d, 1e-5);
+            let worst = cpu.iter().zip(&g).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let scale = cpu.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
+            ck(&format!("rmsnorm: CPU == GPU (rel={:.2e})", worst / scale), worst / scale < 1e-5);
+        }
+        // SwiGLU over a packed gate/up
+        {
+            let ff = d / 2;
+            let gu = mk(3, 2 * ff);
+            let mut cpu = vec![0f32; ff];
+            gpu_kernels::cpuops::swiglu(&gu, ff, &mut cpu);
+            let g = gpu.download(&gpu.swiglu_packed(&gpu.upload(&gu, 1, 2 * ff)));
+            let worst = cpu.iter().zip(&g).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            let scale = cpu.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1e-6);
+            ck(&format!("swiglu: CPU == GPU (rel={:.2e})", worst / scale), worst / scale < 1e-5);
+        }
+        println!("gate-cpuops: {}", if ok {
+            "the CPU ops agree with the GPU kernels \u{2713}"
+        } else {
+            "FAIL \u{2717} — a CPU path that disagrees with the shaders is worse than one that is wrong \
+everywhere: it looks like a hardware problem"
+        });
+        return;
+    }
     if args.iter().any(|a| a == "--gate-q6k") {
         // Q6_K on the GPU, against the CPU reference in gguf.rs. Bit-exactness is the bar, not "close":
         // this decides whether Scout's experts can be FILE VIEWS instead of 200 GiB of host copies, and a
