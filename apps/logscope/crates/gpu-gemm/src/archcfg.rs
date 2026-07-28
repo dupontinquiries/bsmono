@@ -162,10 +162,10 @@ docs/glm-5.2-arch.md",
             arch: Arch::DeepseekV3, prefix: "deepseek2", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
             supported: false, dense_supported: false,
-            note: "the MLA forward IS wired and validated (--gate-mla-block). What blocks this checkpoint \
-is tensor LAYOUT: it ships attn_k_b and attn_v_b as separate THREE-dimensional tensors \
-[head_dim x lora x n_head], while the loader expects one fused 2-D attn_kv_b. Splitting and reshaping \
-them at load is the remaining work",
+            note: "MLA is wired: compressed-latent cache, per-layer routing, the decode block \
+(--gate-mla-block), and BOTH kv_b layouts — the legacy fused attn_kv_b and the modern split \
+attn_k_b + attn_v_b, which GGUF stores 3-D but which are the same bytes as llama.cpp's 2-D declaration \
+(PR #12801). Still unverified end to end on a real checkpoint, so `supported` stays false until one runs",
         },
         _ => ArchConfig {
             arch: Arch::Unknown, prefix: "", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
@@ -423,8 +423,15 @@ mod tests {
             assert!(!(claims_unwired && mla_done),
                 "{a}'s note says MLA is unwired but archfeat reports it implemented: {n}");
         }
-        // and the deepseek note now names the ACTUAL blocker, which is tensor layout
-        assert!(for_arch("deepseek2").note.contains("THREE-dimensional"));
+        // The deepseek note has now said three different things across three commits, and the sequence is
+        // the point: "MLA isn't wired" (stale), then "the blocker is 3-D tensor layout" (true at the
+        // time), and now that BOTH layouts are read. Each revision followed a real change, and a note
+        // that lagged behind sent the reader to inspect their checkpoint for our bug.
+        let n = for_arch("deepseek2").note;
+        assert!(n.contains("attn_k_b") && n.contains("attn_kv_b"), "both layouts named: {n}");
+        // and it must still refuse, because reading the weights is not the same as having run them
+        assert!(!for_arch("deepseek2").supported);
+        assert!(n.contains("unverified end to end"), "the remaining gap has to stay stated: {n}");
     }
 
     #[test]

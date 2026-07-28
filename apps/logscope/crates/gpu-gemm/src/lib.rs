@@ -6698,15 +6698,14 @@ particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layou
             // Only claim the path is ACTIVE if the weights actually loaded. Saying "per-layer routing
             // active" and then failing two lines later with "the MLA forward isn't wired yet" is a log
             // that contradicts itself, and the reader cannot tell which half to believe.
-            let split_kv_b = g.tensor("blk.0.attn_k_b.weight").is_some()
-                          && g.tensor("blk.0.attn_kv_b.weight").is_none();
-            if split_kv_b {
-                eprintln!("wgpu-engine: MLA detected, but this checkpoint splits kv_b into attn_k_b + \
-attn_v_b (3-D per-head); the loader reads a single combined attn_kv_b, so the MLA path will NOT engage");
-            } else {
-                eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache (validated); \
-per-layer routing active");
-            }
+            // The split form is now READ (k_b + v_b concatenated), so it is no longer a blocker. What
+            // remains unverified is whether the concatenation order and the 3-D-as-2-D flattening match
+            // what mla.rs expects — the shapes line up and llama.cpp's declaration says they should, but
+            // no MLA checkpoint has run end to end here.
+            let split_kv_b = g.tensor("blk.0.attn_k_b.weight").is_some();
+            eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache, per-layer routing, \
+{} kv_b layout. UNVERIFIED on a real checkpoint: the decode block and cache are gated, the weight \
+layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
         }
         let treat_unsupported = !acfg.supported;
         if treat_unsupported {
@@ -7468,14 +7467,38 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     };
                     (|| -> Option<crate::mla::MlaWeightsT> {
                         let (qa, qaln, qb) = (t("attn_q_a", "attn_q_a_proj")?, t("attn_q_a_norm", "attn_q_a_layernorm")?, t("attn_q_b", "attn_q_b_proj")?);
-                        let (kva, kvaln, kvb) = (t("attn_kv_a_mqa", "attn_kv_a")?, t("attn_kv_a_norm", "attn_kv_a_layernorm")?, t("attn_kv_b", "attn_kv_b_proj")?);
+                        let (kva, kvaln) = (t("attn_kv_a_mqa", "attn_kv_a")?, t("attn_kv_a_norm", "attn_kv_a_layernorm")?);
+            // kv_b comes in TWO forms and only the legacy one is fused.
+            //
+            // llama.cpp PR #12801 declares the modern pair as 2-D:
+            //     wk_b = {qk_nope,  n_head * kv_lora}
+            //     wv_b = {kv_lora,  n_head * v_head_mla}
+            // and GGUF stores them 3-D — `attn_k_b [192, 512, 20]`, `attn_v_b [512, 256, 20]`. Those are
+            // THE SAME BYTES: ne0 varies fastest, so [a, b, c] is [a, b*c] without reshuffling. Reading
+            // the split form therefore needs a concatenation, not a transpose or a re-layout.
+            //
+            // "only old legacy GGUF files will have the unsplit wkv_b tensor" — so the fused name must
+            // stay supported, but it is the fallback, not the expectation.
+            let kvb_split = (t("attn_k_b", "attn_k_b_trans"), t("attn_v_b", "attn_v_b_proj"));
+            let kvb_fused = t("attn_kv_b", "attn_kv_b_proj");
                         let o = t("attn_output", "attn_out")?;
                         let g1 = |n: &str| fetch(n).ok();
                         Some(crate::mla::MlaWeightsT {
                             q_a: self.upload_flat(&g1(&qa)?), q_a_ln: self.upload_flat(&g1(&qaln)?),
                             q_b: self.upload_flat(&g1(&qb)?),
                             kv_a: self.upload_flat(&g1(&kva)?), kv_a_ln: self.upload_flat(&g1(&kvaln)?),
-                            kv_b: self.upload_flat(&g1(&kvb)?),
+                            kv_b: match (&kvb_split, &kvb_fused) {
+                    // Split form: concatenate k_b then v_b into the single [n_head*(qk_nope+v_head),
+                    // kv_lora] matrix mla.rs expects. Order matters and is k THEN v, matching the fused
+                    // layout llama.cpp splits FROM.
+                    ((Some(kb), Some(vb)), _) => {
+                        let (mut a, b) = (g1(kb)?, g1(vb)?);
+                        a.extend_from_slice(&b);
+                        self.upload_flat(&a)
+                    }
+                    (_, Some(f)) => self.upload_flat(&g1(f)?),
+                    _ => return None,
+                },
                             o: self.upload_flat(&g1(&o)?),
                         })
                     })()
