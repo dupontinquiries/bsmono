@@ -166,7 +166,21 @@ pub const BAMBOO_GROVE: Palette = Palette {
     maxmark: c(0x9c,0x7c,0x38), whisker: c(0xdc,0xe8,0xc8),
 };
 
-pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN, ALLEY, FRACTAL_SPIRES, RECURSIVE_CITADEL, HOLLOW_JUNGLE, YELLOW_BRICK_ROAD, BIFROST, TITAN_RIBCAGE, PERSIAN_GARDEN, GARDEN_CLOISTER, MADRASSA, BAMBOO_GROVE];
+
+/// Rural Commons: laterite earth, thatch, and dry olive scrub under a high hard sun, with one
+/// cooking fire for warmth. Ochres and browns pulled from the woodwork kit's own BaseColor maps
+/// and lifted; the single saturated note is the hearth, which is how the place actually reads.
+pub const RURAL_COMMONS: Palette = Palette {
+    name: "Rural Commons", dark: false, material: Material::Wood, lit: true, canopy: false, light: c(0xff,0xe4,0xb0),
+    bg: c(0xc4,0x9a,0x70), window: c(0xd2,0xac,0x82), panel: c(0xd2,0xac,0x82), panel2: c(0xba,0x92,0x68), line: c(0x94,0x6a,0x44),
+    ink: c(0x2e,0x22,0x18), dim: c(0x58,0x42,0x30), faint: c(0x7a,0x5e,0x44), track_bg: c(0xb2,0x8a,0x60),
+    amber: c(0xbe,0x7c,0x2c), amber_soft: c(0xe2,0xa8,0x58), amber_ink: c(0xf8,0xec,0xd8),
+    blue: c(0x38,0x6e,0x8c), cyan: c(0x2e,0x8c,0x8a), violet: c(0x6c,0x4a,0x6e), green: c(0x5c,0x6e,0x30),
+    yellow: c(0xc8,0x96,0x2a), red: c(0xb0,0x44,0x24), red_soft: c(0xc8,0x70,0x4e),
+    maxmark: c(0xa8,0x6c,0x2a), whisker: c(0x2e,0x22,0x18),
+};
+
+pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN, ALLEY, FRACTAL_SPIRES, RECURSIVE_CITADEL, HOLLOW_JUNGLE, YELLOW_BRICK_ROAD, BIFROST, TITAN_RIBCAGE, PERSIAN_GARDEN, GARDEN_CLOISTER, MADRASSA, BAMBOO_GROVE, RURAL_COMMONS];
 
 /// Frozen Bifrost Bunker: a tight circular arena — a raised basalt dais (Nordic knotwork packed with frost) ringed
 /// by sunken glacial-ice trenches, its heart a shattered hexagonal pane of iridescent prismatic glass whose

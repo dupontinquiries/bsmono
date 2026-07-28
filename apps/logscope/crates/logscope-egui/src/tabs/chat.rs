@@ -3774,6 +3774,7 @@ impl Chat {
                     "Garden Cloister" => ([0xd6, 0xd6, 0xc8], crate::texgen::mat::STONE, 0.10, 176, [0x46, 0x6e, 0x38], 0.7), // limestone plaque, moss-green cut
                     "Madrassa Court"  => ([0xe8, 0xde, 0xc8], crate::texgen::mat::STONE, 0.16, 160, [0x1d, 0x5a, 0x8e], 0.95), // ivory plaster, cobalt zellij
                     "Bamboo Grove"    => ([0x24, 0x32, 0x22], crate::texgen::mat::WOOD,  0.20, 140, [0x9a, 0xc4, 0x60], 1.0),  // dark board, lantern-lit green
+                    "Rural Commons"   => ([0xc8, 0xa0, 0x72], crate::texgen::mat::WOOD,  0.18, 158, [0xb0, 0x44, 0x24], 0.9),  // sun-bleached plank, hearth-red cut
                     // Every OTHER world derives a coherent idiom from its active palette (material + warm
                     // light + cool accent) instead of the old flat-grey quad, so the message panel and the
                     // mic pearl read as belonging to the scene. Dark worlds glow their accent on a dim tinted
@@ -4670,7 +4671,7 @@ impl Chat {
                     saturation: std::env::var("LOGSCOPE_SAT").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.18),
                     shoulder: std::env::var("LOGSCOPE_SHOULDER").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
                     // per-scene BLOOM trim — Old Library + Cloudscape were over-blooming (detail washed out)
-                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, "Persian Garden" => 0.34, "Madrassa Court" => 0.32, "Garden Cloister" => 0.45, "Bamboo Grove" => 0.70, _ => 1.0 }, texscale: dtexscale, bump: dbump,
+                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, "Persian Garden" => 0.34, "Madrassa Court" => 0.32, "Garden Cloister" => 0.45, "Bamboo Grove" => 0.70, "Rural Commons" => 0.40, _ => 1.0 }, texscale: dtexscale, bump: dbump,
                     caustic, godray_amt: gr_amt, godray_weight: gr_w, godray_decay: gr_dec,
                     pearl, pearl_variant, pearl_pos, pearl_r, aspect: rect.width() / rect.height().max(1.0),
                     nacre: std::env::var("LOGSCOPE_NACRE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.4),
@@ -7597,6 +7598,7 @@ fn scene_light(name: &str) -> (egui::Color32, egui::Color32, f32, f32) {
         "Garden Cloister" => (c(0xdc, 0xdc, 0xd0), c(0x6e, 0x72, 0x68), 0.62, 0.78), // flat overcast; a north arcade is never bright
         "Madrassa Court"  => (c(0xf6, 0xe2, 0xb0), c(0x86, 0x74, 0x54), 0.84, 0.92), // high sun into a white court, brass bounce
         "Bamboo Grove"    => (c(0xbc, 0xdc, 0x86), c(0x24, 0x34, 0x20), 0.50, 0.66), // green-filtered light under a full canopy
+        "Rural Commons"   => (c(0xff, 0xdc, 0x9e), c(0x8c, 0x66, 0x42), 0.88, 1.02), // high hard sun on dust — the brightest world in the set
         _              => (c(140, 168, 205),    c(96, 82, 66),       0.74, 1.00),
     }
 }

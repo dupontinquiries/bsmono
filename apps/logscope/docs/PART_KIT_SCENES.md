@@ -3,8 +3,8 @@
 Eight scanned models arrived as "map parts" — a Persian garden, a garden cloister,
 the Bou Inania madrassa in Fez, an Alcazar fountain, a bamboo garden, Rodin's
 *Burghers of Calais*, a Czech pylon monument, and a kit of African rural woodwork.
-They became a reusable **part kit** (twelve builders) and **four new worlds** built
-from it.
+They became a reusable **part kit** (twelve builders) and **five new worlds** built
+from it — one per part-family, so every one of the eight scans informs something.
 
 ## What actually transferred
 
@@ -41,6 +41,13 @@ other worlds live in. Said plainly here so nobody mistakes them for sampled colo
 All twelve are ordinary scene builders — any existing world can call them.
 
 ## The worlds
+
+**Rural Commons** — the village clearing the woodwork kit is a set of parts *for*: swept
+laterite earth ringed by thatch shelters, plank fences dividing it into plots, log stacks
+and drying racks at each homestead, a cooking hearth, one broad shade tree, and the Czech
+pylon standing in it as the commons' marker. The kit's mass sits in its lowest band — it is
+a set of GROUND things, not a building — so the composition is horizontal and the monument
+is the one vertical the eye lands on.
 
 **Persian Garden** — a chahar bagh: fourfold walled garden, water rills meeting at
 a central tank, cypress avenues, mud-brick wall with an iwan. **Garden Cloister** —
@@ -81,6 +88,7 @@ Persian Garden    1132 →  2013 meshes    55k →  105k tris
 Garden Cloister    579 →   973 meshes    21k →   38k tris
 Madrassa Court    2395 →  2704 meshes    54k →   64k tris
 Bamboo Grove      2033 →  4941 meshes   116k →  226k tris
+Rural Commons      590 →  1418 meshes    26k →   43k tris
 Mansion Garden    2841 →  3119 meshes   362k →  444k tris   (existing, for scale)
 ```
 
@@ -88,3 +96,16 @@ The grove's first cut hit 11.9k meshes / 512k tris at 220 nodes — four times t
 busiest existing world — because each culm is ~20 meshes of segments, collars and
 leaf sprays. Its density curve was tempered to a gentler slope with a ceiling,
 which is also truer to a managed grove: it fills in, it does not become impassable.
+
+## Two more things the reports caught
+
+The cost/collider report is worth reading after any change to these worlds, because it has
+already caught two faults that no rendering test would have:
+
+* **The Madrassa had zero colliders** — its whole arcade was geometry with no volume, so the
+  camera flew straight through the courtyard walls while every sibling world stopped it. The
+  arch JAMBS now collide and the bay centres stay open, because a bay is a doorway.
+* **Four kit builders had no caller.** `stone_pylon`, `log_stack`, `plank_fence` and
+  `thatch_shelter` were written for the woodwork and monument scans and then left unused —
+  dead code, and two of the eight parts with no world of their own. Rural Commons is what
+  closed that gap; the check is simply that every builder in the kit has a caller.
