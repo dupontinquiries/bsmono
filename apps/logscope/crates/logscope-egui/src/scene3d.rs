@@ -5890,6 +5890,7 @@ fn build(palette_name: &str) -> Scene {
         "Garden Cloister" => garden_cloister(),
         "Madrassa Court" => madrassa_court(),
         "Bamboo Grove" => bamboo_grove(),
+        "Rural Commons" => rural_commons(),
         _ => islands(),
     };
     // PHYSICAL UI — a scene-styled "context surface" set just outside the graph's footprint, facing it. The
@@ -5915,6 +5916,7 @@ fn build(palette_name: &str) -> Scene {
             "Garden Cloister" => (1, -3.4, false),  // limestone plaque, matching the arcade
             "Madrassa Court" => (1, -3.4, false),   // carved stone, set on the zellij
             "Bamboo Grove" => (0, -3.4, false),     // a wooden board, as a tea garden would have
+            "Rural Commons" => (0, -3.4, false),    // a plank board on posts, like the drying racks
             "Mistfall" => (2, -1.6, false),
             "Cloudscape" | "Folding@home" => (2, -0.6, true),
             _ => (1, -3.0, false),
@@ -5928,7 +5930,8 @@ fn build(palette_name: &str) -> Scene {
     // NOT get the generic outer room — that second shell was the "giant structure" dominating every overview.
     if palette_name != "Atlantis" && palette_name != "Cloudscape" && palette_name != "Forest" && palette_name != "Treehouse" && palette_name != "Canopy" && palette_name != "Mansion Garden" && palette_name != "Alley" && palette_name != "Fractal Spires" && palette_name != "Recursive Citadel" && palette_name != "Hollow Jungle" && palette_name != "Yellow Brick Road" && palette_name != "Frozen Bifrost" && palette_name != "Titan's Ribcage"
         && palette_name != "Persian Garden" && palette_name != "Garden Cloister"
-        && palette_name != "Madrassa Court" && palette_name != "Bamboo Grove" {
+        && palette_name != "Madrassa Court" && palette_name != "Bamboo Grove"
+        && palette_name != "Rural Commons" {
         let (mat, lo, hi, shelf) = match palette_name {
             "Canopy" | "Old Library" => (M::WOOD, c(0x2c, 0x20, 0x12), c(0x5a, 0x44, 0x28), true),
             "Archive" => (M::STONE, c(0x66, 0x5e, 0x4e), c(0xa8, 0x9e, 0x88), false), // cathedral: pale marble shell, no shelves
@@ -7034,6 +7037,14 @@ fn madrassa_court() -> Scene {
             let span = court * 1.9 / per_wall as f32 * 0.86;
             horseshoe_arch(&mut s, px, pz, yf, span, span * 0.55, a + std::f32::consts::FRAC_PI_2,
                            plaster_lo, plaster_hi, k % 2 == 0);
+            // The arcade needs VOLUME, not just geometry: without colliders the camera flew
+            // straight through the courtyard walls while every sibling world stopped it.
+            // Collide the jambs only — the bay's middle is a doorway and should stay walkable.
+            for js in [-1.0_f32, 1.0] {
+                push_collider(Collider::Pillar {
+                    x: px + tx * js * span * 0.46, z: pz + tz * js * span * 0.46,
+                    r: span * 0.10, y0: yf, y1: yf + span * 1.05 });
+            }
             // cedar screen (mashrabiya) filling some bays
             if screened_every > 0 && k % screened_every.max(1) == 0 {
                 let latt = ((4.0 * q) as i32).max(2);
@@ -7254,6 +7265,208 @@ fn bamboo_grove() -> Scene {
     s
 }
 
+
+/// RURAL COMMONS — the village clearing the African-woodwork kit is a set of parts for,
+/// with the pylon monument standing in it as the commons' marker. This is the world that
+/// completes the drop: every one of the eight scans now informs something.
+///
+/// The woodwork scan puts half its mass in the lowest band — it is a kit of GROUND things
+/// (log piles, boards, brush, a lean-to roof), not a building — so the composition is
+/// horizontal: a swept-earth commons ringed by shelters, divided by plank fences into
+/// plots, with the monument as the one vertical the eye lands on. The graph floats over the
+/// open middle, which is what a commons is for.
+///
+/// Conversation mapping: SHELTERS ring the commons and their count follows node count (the
+/// settlement grows with the talk); `branches` sets how many plots the fences divide it
+/// into; `seed` places everything and picks which hearths are lit; `prop_density` scales
+/// log stacks, brush and drying racks; `tree_size` shapes the one big shade tree.
+fn rural_commons() -> Scene {
+    use std::f32::consts::TAU;
+    let mut s = Scene::new();
+    let ep = env_params();
+    let q = render_quality();
+    let yf = -3.4_f32;
+    let sc = 1.5_f32 * (map_radius() / 64.0).clamp(1.0, 2.2);
+    let seed = ep.seed as i32;
+
+    // Laterite earth, swept hard around the commons and dustier further out. The kit's own
+    // ground map samples very dark (internal_ground_ao); this is that hue, lifted.
+    let earth_lo = c(0x7e, 0x4a, 0x2e);
+    let earth_hi = c(0xb8, 0x7e, 0x4e);
+    let mut ground = m3::disc(v(0.0, yf, 0.0), 32.0 * sc, 88, earth_lo);
+    m3::tint_up(&mut ground, earth_hi, earth_lo); ground.mat = M::STONE; s.add(ground, Float::STILL);
+    let commons_r = 10.0 * sc;
+    let mut swept = m3::disc(v(0.0, yf + 0.02, 0.0), commons_r, 64, earth_hi);
+    m3::tint_up(&mut swept, c(0xd0, 0x9c, 0x68), earth_lo); swept.mat = M::STONE; s.add(swept, Float::STILL);
+    // broom arcs — the daily sweeping is what makes a commons read as tended
+    for k in 0..((6.0 * q).max(3.0) as i32) {
+        let rr = commons_r * (0.35 + k as f32 / 9.0);
+        let mut arc = m3::torus(v(0.0, yf + 0.03, 0.0), rr, 0.05 * sc, 40, 5, c(0xc4, 0x90, 0x60));
+        arc.mat = M::STONE; s.add(arc, Float::STILL);
+    }
+
+    // THE MONUMENT — the pylon with its hat, off the crossing so the graph keeps the middle.
+    {
+        let a = hash(2, seed) * TAU;
+        let d = commons_r * 0.62;
+        stone_pylon(&mut s, a.cos() * d, a.sin() * d, yf + 0.03, 4.6 * sc, seed);
+        // a ring of laid stones around its foot, as village markers usually have
+        for k in 0..10 {
+            let ra = TAU * k as f32 / 10.0;
+            let (rx, rz) = (a.cos() * d + ra.cos() * 1.5 * sc, a.sin() * d + ra.sin() * 1.5 * sc);
+            let mut st = m3::rock(v(rx, yf + 0.05, rz), 0.28 * sc, (seed + k) as u32, c(0x8a, 0x82, 0x74));
+            m3::scale3(&mut st, 1.0, 0.5, 1.0); st.mat = M::STONE; s.add(st, Float::STILL);
+        }
+    }
+
+    // SHELTERS ringing the commons. Count follows the conversation and is NOT scaled by
+    // render_quality — the madrassa taught that lesson: LOD thins ornament, never buildings.
+    let huts = ((4.0 + ep.nodes as f32 / 9.0).clamp(4.0, 18.0)) as i32;
+    let ring = commons_r + 5.2 * sc;
+    for k in 0..huts {
+        let a = TAU * k as f32 / huts as f32 + hash(k, seed + 11) * 0.12;
+        let rr = ring + (hash(k, seed + 12) - 0.5) * 3.0 * sc;
+        let (px, pz) = (a.cos() * rr, a.sin() * rr);
+        thatch_shelter(&mut s, px, pz, yf, (2.0 + hash(k, seed + 13) * 0.8) * sc, seed + k * 7);
+
+        // each homestead gets its own ground story: a woodpile, a rack, a swept apron
+        let out = normv(v(px, 0.0, pz));
+        let (ox, oz) = (out.x, out.z);
+        let mut apron = m3::disc(v(px, yf + 0.03, pz), 3.0 * sc, 24, earth_hi);
+        m3::tint_up(&mut apron, c(0xc8, 0x94, 0x60), earth_lo); apron.mat = M::STONE; s.add(apron, Float::STILL);
+        if hash(k, seed + 14) < 0.7 * ep.prop_density.clamp(0.3, 2.0) {
+            log_stack(&mut s, px + ox * 2.2 * sc, pz + oz * 2.2 * sc, yf, 2.4 * sc,
+                      2 + (hash(k, seed + 15) * 2.0) as i32, seed + k);
+        }
+        // drying rack: two forked posts and a pole, with cloth or fish hung over it
+        if hash(k, seed + 16) < 0.55 * ep.prop_density.clamp(0.3, 2.0) {
+            let (rx, rz) = (px - oz * 2.4 * sc, pz + ox * 2.4 * sc);
+            let wood = c(0x6c, 0x4a, 0x2c);
+            for sgn in [-1.0_f32, 1.0] {
+                let (fx, fz) = (rx + ox * 0.0 + (-oz) * sgn * 1.1 * sc, rz + oz * 0.0 + ox * sgn * 1.1 * sc);
+                let mut post = m3::tube(v(fx, yf, fz), v(fx, yf + 1.6 * sc, fz), 0.07 * sc, 6, wood);
+                post.mat = M::WOOD; s.add(post, Float::STILL);
+            }
+            let a0 = v(rx - oz * 1.1 * sc, yf + 1.55 * sc, rz + ox * 1.1 * sc);
+            let a1 = v(rx + oz * 1.1 * sc, yf + 1.55 * sc, rz - ox * 1.1 * sc);
+            let mut pole = m3::tube(a0, a1, 0.05 * sc, 5, c(0x8e, 0x68, 0x3c));
+            pole.mat = M::WOOD; s.add(pole, Float::STILL);
+            for h in 0..((3.0 * q).max(1.0) as i32) {
+                let f = (h as f32 + 0.5) / 3.0;
+                let hx = a0.x + (a1.x - a0.x) * f;
+                let hz = a0.z + (a1.z - a0.z) * f;
+                let col = [c(0xc4, 0x6a, 0x3a), c(0xd8, 0xc0, 0x88), c(0x4a, 0x6e, 0x8c)][(hash(h + k, seed + 17) * 3.0) as usize % 3];
+                let mut cloth = m3::disc(v(hx, yf + 1.1 * sc, hz), 0.42 * sc, 4, col);
+                m3::scale3(&mut cloth, 1.0, 1.0, 0.15);
+                cloth.mat = M::WOOD;
+                s.add(cloth, Float { amp: 0.06, speed: 1.1, phase: hash(h, seed + 18) * 6.28, drift: 0.04 });
+            }
+        }
+    }
+
+    // PLOT FENCES — the commons is divided by plank runs between the homesteads. How many
+    // divisions follows the conversation's branchiness: a forked talk is a subdivided village.
+    let plots = (2 + ep.branches.min(6)) as i32;
+    for k in 0..plots {
+        let a = TAU * k as f32 / plots as f32 + hash(k, seed + 21) * 0.3;
+        let r0 = commons_r + 1.2 * sc;
+        let r1 = ring + 4.0 * sc;
+        plank_fence(&mut s, a.cos() * r0, a.sin() * r0, a.cos() * r1, a.sin() * r1, yf, 1.5 * sc, seed + k * 13);
+    }
+    // a low fence arc closing part of the commons itself (a livestock kraal)
+    {
+        let a0 = hash(7, seed) * TAU;
+        let steps = 7;
+        for i in 0..steps {
+            let f0 = i as f32 / steps as f32;
+            let f1 = (i + 1) as f32 / steps as f32;
+            let (b0, b1) = (a0 + f0 * 1.5, a0 + f1 * 1.5);
+            let rr = commons_r * 0.86;
+            plank_fence(&mut s, b0.cos() * rr, b0.sin() * rr, b1.cos() * rr, b1.sin() * rr, yf, 1.1 * sc, seed + i);
+        }
+    }
+
+    // THE HEARTH — a cooking fire at the commons' edge, the world's warm light
+    {
+        let a = hash(9, seed) * TAU;
+        let d = commons_r * 0.74;
+        let (hx, hz) = (a.cos() * d, a.sin() * d);
+        for k in 0..8 {
+            let ra = TAU * k as f32 / 8.0;
+            let mut st = m3::rock(v(hx + ra.cos() * 0.8 * sc, yf + 0.06, hz + ra.sin() * 0.8 * sc),
+                                  0.24 * sc, (seed + k * 3) as u32, c(0x5e, 0x56, 0x4c));
+            st.mat = M::STONE; s.add(st, Float::STILL);
+        }
+        let mut embers = m3::disc(v(hx, yf + 0.08, hz), 0.6 * sc, 14, c(0xd8, 0x5a, 0x22));
+        embers.mat = M::STONE; embers.emissive = 3.2; s.add(embers, Float::STILL);
+        for k in 0..((5.0 * q).max(2.0) as i32) {
+            let fa = hash(k, seed + 31) * TAU;
+            let fr = hash(k, seed + 32) * 0.4 * sc;
+            let fh = (0.5 + hash(k, seed + 33) * 0.9) * sc;
+            let mut flame = m3::tube(v(hx + fa.cos() * fr, yf + 0.08, hz + fa.sin() * fr),
+                                     v(hx + fa.cos() * fr * 0.4, yf + fh, hz + fa.sin() * fr * 0.4),
+                                     0.10 * sc, 5, c(0xff, 0xa8, 0x3c));
+            flame.mat = M::STONE; flame.emissive = 5.5;
+            s.add(flame, Float { amp: 0.10, speed: 3.0, phase: hash(k, seed + 34) * 6.28, drift: 0.05 });
+        }
+        // three cooking stones and a pot
+        let mut pot = m3::uv_sphere(v(hx, yf + 0.45 * sc, hz), 0.36 * sc, 10, 7, c(0x38, 0x30, 0x2a));
+        m3::scale3(&mut pot, 1.0, 0.8, 1.0); pot.mat = M::STONE; s.add(pot, Float::STILL);
+    }
+
+    // THE SHADE TREE — every commons has one, and it is where the graph's light comes from
+    // at the edges. Broad, low-branching, umbrella-crowned.
+    {
+        let a = hash(13, seed) * TAU;
+        let d = commons_r * 1.05;
+        let (tx, tz) = (a.cos() * d, a.sin() * d);
+        let h = 7.0 * sc * ep.tree_size.clamp(0.7, 1.5) * ep.tree_height.clamp(0.7, 1.4);
+        let girth = 0.55 * sc * ep.tree_girth.clamp(0.6, 1.6);
+        let mut trunk = m3::tube(v(tx, yf, tz), v(tx, yf + h * 0.45, tz), girth, 12, c(0x6e, 0x5a, 0x42));
+        m3::tint_height(&mut trunk, yf, yf + h, c(0x4e, 0x3e, 0x2c), c(0x9c, 0x86, 0x62));
+        trunk.mat = M::WOOD; s.add(trunk, Float::STILL);
+        let nb = 6;
+        for b in 0..nb {
+            let ba = TAU * b as f32 / nb as f32 + hash(b, seed + 41) * 0.4;
+            let reach = h * (0.42 + hash(b, seed + 42) * 0.22);
+            let tip = v(tx + ba.cos() * reach, yf + h * (0.62 + hash(b, seed + 43) * 0.16), tz + ba.sin() * reach);
+            let mut br = m3::tube(v(tx, yf + h * 0.45, tz), tip, girth * 0.38, 8, c(0x6e, 0x5a, 0x42));
+            br.mat = M::WOOD; s.add(br, Float::STILL);
+            let mut crown = m3::leaf_cluster_lod(tip, h * 0.30, (seed + b * 5) as u32, c(0x4a, 0x66, 0x2e), q);
+            crown.mat = M::WOOD;
+            s.add(crown, Float { amp: 0.05, speed: 0.6, phase: hash(b, seed + 44) * 6.28, drift: 0.03 });
+        }
+        contact_shadow(&mut s, tx, tz, h * 0.42, yf, 120);
+        push_collider(Collider::Pillar { x: tx, z: tz, r: girth * 1.4, y0: yf, y1: yf + h });
+    }
+
+    // BRUSH — the kit's bush texture is a dry olive scrub; scatter it beyond the homesteads
+    let nbush = ((10.0 + ep.nodes as f32 / 7.0) * ep.prop_density * q).clamp(6.0, 48.0) as i32;
+    for k in 0..nbush {
+        let a = hash(k, seed + 51) * TAU;
+        let r = ring + 2.0 * sc + hash(k, seed + 52).sqrt() * 12.0 * sc;
+        let (px, pz) = (a.cos() * r, a.sin() * r);
+        let mut bush = m3::leaf_cluster_lod(v(px, yf + 0.30 * sc, pz), (0.6 + hash(k, seed + 53) * 0.5) * sc,
+                                            (seed + k) as u32, c(0x5c, 0x5e, 0x30), q);
+        bush.mat = M::WOOD;
+        s.add(bush, Float { amp: 0.04, speed: 0.9, phase: hash(k, seed + 54) * 6.28, drift: 0.02 });
+    }
+    // loose boards and firewood on the swept ground (the kit's flattest parts)
+    let nboard = ((4.0 + ep.nodes as f32 / 20.0) * ep.prop_density * q).clamp(3.0, 14.0) as i32;
+    for k in 0..nboard {
+        let a = hash(k, seed + 61) * TAU;
+        let r = commons_r * (0.5 + hash(k, seed + 62) * 0.42);
+        let (px, pz) = (a.cos() * r, a.sin() * r);
+        let ang = hash(k, seed + 63) * TAU;
+        let l = (0.9 + hash(k, seed + 64) * 0.8) * sc;
+        let mut brd = m3::tube(v(px - ang.cos() * l, yf + 0.08, pz - ang.sin() * l),
+                               v(px + ang.cos() * l, yf + 0.08, pz + ang.sin() * l), 0.09 * sc, 5, c(0x8a, 0x66, 0x3e));
+        m3::tint_up(&mut brd, c(0xb0, 0x8a, 0x58), c(0x5c, 0x40, 0x26));
+        brd.mat = M::WOOD; s.add(brd, Float::STILL);
+    }
+    s
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -7329,7 +7542,7 @@ mod tests {
         // Not an assertion so much as a bench: print the geometry each new world builds at a
         // small and a large conversation, so the cost of a scene is visible when tuning it.
         // (`cargo test -p logscope-egui part_kit_scene_report -- --nocapture`)
-        for scene in ["Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove", "Mansion Garden"] {
+        for scene in ["Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove", "Rural Commons", "Mansion Garden"] {
             for (label, nodes) in [("small", 12u32), ("large", 220)] {
                 set_env_params(EnvParams { nodes, seed: 0xC0FF_EE00, ..Default::default() });
                 let sc = build(scene);
@@ -7352,7 +7565,7 @@ mod tests {
         // colourway, tree placement, path direction), and the tree/prop character has to
         // reach the geometry. Without this a scene silently degrades into a static model
         // and every conversation looks the same.
-        for scene in ["Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove"] {
+        for scene in ["Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove", "Rural Commons"] {
             let a = EnvParams { seed: 0x1111_1111, nodes: 60, ..Default::default() };
             let b = EnvParams { seed: 0x9999_9999, nodes: 60, ..Default::default() };
             set_env_params(a);
@@ -7382,7 +7595,7 @@ mod tests {
         // puts solid geometry where the nodes live, the conversation renders inside a
         // wall. Assert the centre column stays clear of colliders out to the graph's
         // own half-extent.
-        for scene in ["Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove"] {
+        for scene in ["Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove", "Rural Commons"] {
             set_env_params(EnvParams { nodes: 80, ext_x: 18, ext_z: 14, ..Default::default() });
             let _ = build(scene);
             let hits = env_colliders().iter().filter(|c| match c {
@@ -7414,7 +7627,7 @@ mod tests {
         let small = EnvParams { nodes: 10, ..Default::default() };
         let big = EnvParams { nodes: 220, ..Default::default() };
         for scene in ["Alley", "Canopy", "Titan's Ribcage",
-                      "Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove"] {
+                      "Persian Garden", "Garden Cloister", "Madrassa Court", "Bamboo Grove", "Rural Commons"] {
             set_env_params(small);
             let s = build(scene).meshes.len();
             set_env_params(big);
