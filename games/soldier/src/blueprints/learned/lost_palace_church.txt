@@ -56,7 +56,7 @@ a89a999.ca399a39^2^9.99.ca9a9^939^^c^c^.3a^^^^a^3^^a999a
 ^^^^^^^^^^^^^^^^^^^^^.....^776^.....^^^^^^^^^^^^^^^^^^^^
 ^^^^^^^^^^^^^^^^^^^^^^^..^^^66^.^^^^^^^^^^^^^^^^^^^^^^^^
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F (from vertex normals)
+;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F, G ground/terrain 0-F
 ;;H a000000002a00000000f004eeeeffffffffffffefeea30000fb0070a
 ;;H 200000000300000000000044eeeefeeffffeeffeeee4000000000000
 ;;H 200000c00000b00003000044eeefffeff0feeffeeee4000070300f00
@@ -225,3 +225,59 @@ a89a999.ca399a39^2^9.99.ca9a9^939^^c^c^.3a^^^^a^3^^a999a
 ;;R 000000000000000000000048050a8804980000000000000000000000
 ;;R 000000000000000000000000c0003700000000000000000000000000
 ;;R 00000000000000000000000000000000000000000000000000000000
+;;G 556789a9820899a998755303633555e0af0e50635333325675ba9765
+;;G 26789aba9189aabaa987653333355eeffffee6634333256789a98765
+;;G 2789abcba99abbcbb198763332355befbefee6b53332567818387265
+;;G 78989abaa99abcdccba9876333355eeffff9e66523336189a9878776
+;;G 89a989a999abcdeddcba987333bd9eefff9eeff66333789aba389387
+;;G 989889a9819abadccbaba98762defeeeffeeef662ba983333919a992
+;;G a98789aa9889aaccdcbba9833366eefffffffe6663387333333abaab
+;;G 98778899989a9abbcbaa987789abfeefbefecf666a9986556789a99a
+;;G 87789889a9aba9aab19987667266eefffffffedb2baa911156389883
+;;G 7789a99ababcba99a988966333defeeffffeef66633ba98235678776
+;;G 789aba99aabcba989a99a9765666feeffffeefe6bedcba9844567967
+;;G 1899a999a1aba989919aba933226feeeffeeeffe233ba18233159a93
+;;G 19a999aaa1aa999aa1abc1aab126e1eeee2eeef2122113223183ab1a
+;;G 789aaaaba99aaaaaaa9adcb33223eeeeeeeeee6623332212339abcdb
+;;G 2989a9aaaaaba9aaaa1fedc33321eeeee837e2e21332112333abcdef
+;;G 9a9abaababbcbaabbadedcbcde11dddd67656621633212343cbabcde
+;;G ababcbacaccdcbaccacdcbabcd621269876521243e3523453ba9abcd
+;;G 1abcdcadedbcbaeddabbba9ab66bb21111111155533654567a3893b7
+;;G a9abcbaadbabaabcdcbbba88cdedcba9aaa9996663376567793779a9
+;;G 9a9abaabcbaa99abcbbdc8bcde6cbaaabcbaaa666698765678766512
+;;G aba9aabcb299889abcdedcbbcdcbaabbcdcbbbc8bba9876567645443
+;;G bcbaabcdcba919abcdefedcb3bbb2bccdedcccdedcba915446234453
+;;G 1aaabcdeaa28679abadedcbcdcdeacdcdedddcbeddcba98332234567
+;;G 8999abcda988789abccdcbcdedddcdedcddeedcddedcba9833223456
+;;G 89aa9aaaa9998889abbcbab3eeeba3edcade3cdeee33a98233212345
+;;G 2a9aaaaa9aaa9989aaaba9a4abbba3dcbbcd4bcdbdc4981232101233
+;;G cba99abaabbbaa99abbcba99abbbabcbaabcbcbbbcba985232100122
+;;G ba9889a99aaa9989abcdcba9abbbbaba99abcdc8aba9851232101232
+;;G a98778989999889abcdedbbabcddcbbba9abbeddba98765122112343
+;;G aa987789aa987789aaefedcbbbee2abba9abbfeeeba9876533223452
+;;G 9a998889aa998789aadedcbabcddcbba99abdedddba9876534334565
+;;G 899a999aa99a9899abcdcbabccccbaa989abcdccccba985233445676
+;;G 98899aacba9989a9abbcbabcddddcba9879abccdddcba98236544565
+;;G a989abcdcbaa98989aababcdeeee2a98689abcdeeedcba9845433454
+;;G ba9abcdedcbba987899a9abcddddcba98589abcdddcba98234322343
+;;G cbababcdcbbcba98998989abccccbaa988999abcccba980123223232
+;;G 2a9a9abcaaaba989aa9889abcddcbaba99aaabcddcba981233212121
+;;G 9a999aabaa9a9a99aa989abcdeedcbcbaabbbcdeedcba98123211211
+;;G 899a999a999a9a99aba9abcdeeeedcdcbbccb2eeeedcba9833292322
+;;G 788998898889aba99a99aabcddeeddedccddccddddcba9a9229a9223
+;;G 2789a988779abcba999abbccdeddeddccdeedccdeedcbaba99ab3934
+;;G 789aba9989abcdcba9abccddeddcddedccddedccdedcbbcbaabcba95
+;;G 89abcbaa9abcdedcbabcddedededcdedccdeedcddedcbcdcbbcdcba9
+;;G 733adcab3aaaefa3a333eefe3efedc3cbbc3d3dededccded33ded547
+;;G 7448333e3e333f3393c3f43f3f3f3c333cd3c3ef3feddefe3def4447
+;;G 655545ded4ab4ed464dee44edede4dedcdedccdedededdedc8445656
+;;G 55678555874cb4c474cdd44dde4d5c44bcdedcded4dedcd655665545
+;;G 44567678555dcdc485cddd5d5dcddcdc5cddcdcdcdcdd65587654434
+;;G 33456567655655b596b5c5565cbc5b6cdcccbccdcd66665676543323
+;;G 2234545656786666abcccc66bcb66a6bcbccbcb67666876565432212
+;;G 102343454567789776bb6b66aba6696ababbbb777898765454321101
+;;G 000232343456789ab7a8bba7abab797babab77776787654343210000
+;;G 0000202323456789a99997aa7bab7abbaa8876665676543232000000
+;;G 0000000202345678988889999a9a8aa9889876554565432020000000
+;;G 00000000002335678777788999898a99878765443454320000000000
+;;G 00000000000203567666677888788988767654332343200000000000

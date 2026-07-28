@@ -83,18 +83,18 @@ fn study(m: &Model, name: &str, slug: &str, out: &Path) {
     // two castles (up=X → solid blobs, courtyards lost). Instead rasterize under all three
     // candidates and keep the axis that yields the most PLAYABLE structure: ground cells +
     // courtyards + gates. The right orientation is the one that reads as a place to fight in.
-    let classify = |up: usize| -> (Vec<Vec<char>>, usize, usize, usize, (Vec<u8>, Vec<u8>, Vec<u8>)) {
+    let classify = |up: usize| -> (Vec<Vec<char>>, usize, usize, usize, (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)) {
         classify_axis(m, &lo, &hi, up)
     };
     let (mut up, mut best_rows, mut best_score) = (1usize, Vec::new(), -1i64);
-    let mut best_layers = (Vec::new(), Vec::new(), Vec::new());
+    let mut best_layers = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for a in 0..3 {
         let (rows, ground, courts, gates, layers) = classify(a);
         let score = ground as i64 + 3 * courts as i64 + 2 * gates as i64;
         if score > best_score { best_score = score; up = a; best_rows = rows; best_layers = layers; }
     }
     let rows = best_rows;
-    let (lay_h, lay_s, lay_r) = best_layers;
+    let (lay_h, lay_s, lay_r, lay_g) = best_layers;
     let gh = rows.len(); let gw = rows[0].len();
     let mass: usize = rows.iter().flatten().filter(|c| c.is_ascii_digit()).count();
     let courts: usize = rows.iter().flatten().filter(|&&c| c == 'o').count();
@@ -105,18 +105,19 @@ fn study(m: &Model, name: &str, slug: &str, out: &Path) {
     for r in &rows { txt.push_str(&r.iter().collect::<String>()); txt.push('\n'); }
     // ── appearance sidecar (';'-prefixed: invisible to older parsers) ──
     if !lay_h.is_empty() {
-        txt.push_str(";; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F (from vertex normals)\n");
+        txt.push_str(";; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F, G ground/terrain 0-F\n");
         let hex = |v: u8| char::from_digit(v as u32, 16).unwrap();
         for z in 0..gh { txt.push_str(";;H "); for x in 0..gw { txt.push(hex(lay_h[z * gw + x])); } txt.push('\n'); }
         for z in 0..gh { txt.push_str(";;S "); for x in 0..gw { txt.push(hex(lay_s[z * gw + x])); } txt.push('\n'); }
         for z in 0..gh { txt.push_str(";;R "); for x in 0..gw { txt.push(hex(lay_r[z * gw + x])); } txt.push('\n'); }
+        for z in 0..gh { txt.push_str(";;G "); for x in 0..gw { txt.push(hex(lay_g[z * gw + x])); } txt.push('\n'); }
     }
     std::fs::write(out.join(format!("{slug}.txt")), &txt).unwrap();
     println!("── {name} ({gw}x{gh}, up={}, courts={courts}) → {slug}.txt", ["X","Y","Z"][up]);
     for r in rows.iter().step_by(2) { println!("  {}", r.iter().collect::<String>()); }
 }
 
-fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec<char>>, usize, usize, usize, (Vec<u8>, Vec<u8>, Vec<u8>)) {
+fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec<char>>, usize, usize, usize, (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>)) {
     let (ax, az) = match up { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
     let (sw, sh) = (hi[ax] - lo[ax], hi[az] - lo[az]);
     let span_up = (hi[up] - lo[up]).max(1e-6);
@@ -388,6 +389,7 @@ fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec
             }
         }
     }
+    let mut lay_g = vec![0u8; gw * gh];
     let mut lay_h = vec![0u8; gw * gh];
     let mut lay_s = vec![0u8; gw * gh];
     let mut lay_r = vec![0u8; gw * gh];
@@ -395,6 +397,10 @@ fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec
         let c = g[z * gw + x];
         if c.n == 0 { continue; }
         lay_h[z * gw + x] = ((c.maxh * 15.0).round() as i32).clamp(0, 15) as u8;
+        // GROUND: where the site actually SITS. minh is the lowest geometry in the cell — the
+        // terrain surface under open ground, the footing under massing. This is the crag under
+        // Perarrua and the mound under Morton: the scans' terrain, not a flat slab.
+        lay_g[z * gw + x] = ((c.minh * 15.0).round() as i32).clamp(0, 15) as u8;
         if c.top_n > 0 {
             let up_mean = c.top_up_sum / c.top_n as f32;      // 1.0 = flat lid, lower = pitched
             lay_s[z * gw + x] = if up_mean > 0.92 { 0 } else if up_mean > 0.78 { 1 }
@@ -405,8 +411,24 @@ fn classify_axis(m: &Model, lo: &[f32; 3], hi: &[f32; 3], up: usize) -> (Vec<Vec
             lay_r[z * gw + x] = (((1.0 - rlen) * 15.0).round() as i32).clamp(0, 15) as u8;
         }
     }}
+    // empty ('^') cells: relax ground toward the nearest filled cell so the site's hill
+    // continues into the surrounding ring instead of cliff-edging at the footprint
+    for _ in 0..6 {
+        let snap = lay_g.clone();
+        for z in 0..gh { for x in 0..gw {
+            if g[z * gw + x].n > 0 { continue; }
+            let mut best = 0u8; let mut got = false;
+            for (dx, dz) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                let (nx, nz) = (x as i32 + dx, z as i32 + dz);
+                if nx < 0 || nz < 0 || nx as usize >= gw || nz as usize >= gh { continue; }
+                let v = snap[nz as usize * gw + nx as usize];
+                if g[nz as usize * gw + nx as usize].n > 0 || v > 0 { best = best.max(v.saturating_sub(1)); got = true; }
+            }
+            if got { lay_g[z * gw + x] = lay_g[z * gw + x].max(best); }
+        }}
+    }
     let ground = rows.iter().flatten().filter(|&&c| c == '.' || c == '+').count();
     let courts = rows.iter().flatten().filter(|&&c| c == 'o').count();
     let gates = rows.iter().flatten().filter(|&&c| c == 'a').count();
-    (rows, ground, courts, gates, (lay_h, lay_s, lay_r))
+    (rows, ground, courts, gates, (lay_h, lay_s, lay_r, lay_g))
 }

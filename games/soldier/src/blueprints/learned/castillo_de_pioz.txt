@@ -56,7 +56,7 @@
 ^^^^^^^^^^^^^^^..........................^^^^^^^^^^^^^^^
 ^^^^^^^^^^^^^^^^^.....................^^^^^^^^^^^^^^^^^^
 ^^^^^^^^^^^^^^^^^^^^^..............^^^^^^^^^^^^^^^^^^^^^
-;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F (from vertex normals)
+;; appearance layers — H fine height 0-F, S roof-slope 0-3, R roughness 0-F, G ground/terrain 0-F
 ;;H 00000000000000000000000d0d000dd00d0000000000000000000000
 ;;H 0000000000000000000e0000d00000dddddd00000000000000000000
 ;;H 00000000000000000eedd0d00000dd0ddddd0dd00000000000000000
@@ -225,6 +225,62 @@
 ;;R 00000000000000001111020221000000340330000000000000000000
 ;;R 00000000000000000011040022011000210020000000000000000000
 ;;R 00000000000000000000010000002100010000000000000000000000
+;;G 0000000000889ababccdcbcdcdcbcddccdccbbbbbbba980000000000
+;;G 000000000899abcbcddedcccdcbbccddddddcccccccba98700000000
+;;G 0000000089aabcdcdeeddcdccbccddcdddddcddddddcba9870000000
+;;G 000000089abbcdedeedcddccccddcccdcddddddeeeedcba987000000
+;;G 00000889abccdeddeddccdcdddcddcdddddddddddeeedcba98700000
+;;G 0000899abcdcdeeddccddcdcdcababccbddddddddddddcbba9870000
+;;G 00089aabcdedcdedcddcddd9999aaacbacaaddaacdddddccba987000
+;;G 0089abbcdddedcddddddccca9999ccccbcaabcaaadddddddcba98700
+;;G 089abccdeeededdcddcccccccbbcccccccccccbabdddddddcba98700
+;;G 89abcddedddcdddcccccccccccccccccccccacca99bddddddcba9870
+;;G 9abcdeedccddcdcccbcbcbccccccbccccbccabca99adddddddcba987
+;;G 9abcdeeeddeddccbbbbbbbcccbcbcbccccbcbbba99dddddddddcba98
+;;G abcdeeedeeddcccbbbbbbbcbbbccccbcbcccccbccccddddddddcba98
+;;G abcdeeedddddcbbbbbbcccbccbbbccccbcccbccbbbccddddddcdcba9
+;;G bcdeedededdccbbbba7778bb99a99cbcc9ccccccccbccddddddcdcba
+;;G cdefedeedddcbbbbbb7778bb88b888bb88c988cccbccccdddddddcba
+;;G defeeeeedddbbbbbbb888ccc98c999cc98c888ccccbaacddddddddcb
+;;G defeeeedddcbbbbbbccdddcdccdbbcddcdcd88cccccbccddddddddcb
+;;G deeeeddddccbbb97bcdeeeeeddddddeeedddddccccbbccdddddddddc
+;;G deedeeeddcbbbb978cdeeeeeeeddeeeeeeeeedccbbabbccddddddddc
+;;G dedeeeeddcbbbab8bcde88999c98889999888ddcccbabccddddddddc
+;;G dedeecdddcbbbaabccde88999998888899888ccdcbababccdddddddd
+;;G edeeededdcbbbabbccec984229a999aa22a88bccccbabcccdddddddd
+;;G feddeeeddcbbbbabbddec922234444422229bbccccbabbbccdcddddd
+;;G feeeeedddcbbba89cddda922344444332229bccccbbbbbccccddddcc
+;;G edeeeeeddcbbeb778cccaab34bbaaabb23a9bddcbccbabbcccccdccd
+;;G eeeeeeddcbbbba778ccb99b45bbbba5b33a9cddcbdbdbbccccccdccd
+;;G ffeeeeeedcbbbbebbbbb99b44bbbbaab34aacdcccbdbedbcccccdcdd
+;;G ffeddeeddcbbbbdbcbbb99b44bbbbaa833a9cddccceebbbbcccccccc
+;;G efeddeeddcbbbbcbccdca9b44bbbbba944a88ddccdcdbdcbcccccccc
+;;G ffeeeeeddcbbcccccccdbab35bbbbb1000088cdcccbbbcbbcccccccd
+;;G ffeeeeeddccccccccdcdaa233444450000099bdccbccdcbbccccccdd
+;;G feedefeedcbbcccccdddaa2233444400010a9cdccbbbcbbbcccccccd
+;;G feedeeeedccbcccccddd99222aaaab20000aaddcbccbbcdbbccccccd
+;;G effeefeecccbcccccddd999aaaaaa992102aaddccbcbbcdbbbccccdd
+;;G deeddeeeddcacccccddd999aaaaaa999aaaabdccccbabbcdbccccccc
+;;G effeeeeeddcaccccccdccddddddddddcaccdddccababaabbbbccccdc
+;;G efeefeeeddcccccbcccccddccdddddcddddccccccbaaabaabcccccdc
+;;G deedeeeeddcccdccccccccccccccccccccccccccbbabaabbbccccccb
+;;G defefeeeedcccccbcccdcc98cccccccccccbbbcbccbbbbbcccccccba
+;;G cdefeeeeedcccdccccccbe988bbbbbbccbbbabbabbabbccccccccba9
+;;G bcdeeedeedccccecbbcbbbe9bbbbbbbbbbbbaabaaabbcccccccccba9
+;;G bcdefeeeedccbccccccccbbbbbbbbbbbbbbbbbbbaabcbccccccdcba9
+;;G abcdeeefeeccccccccccccbbbbbbbbbbbbcbcccbabccccccccccba98
+;;G 9abcdddeeedcccccccccccbabccbbccccccbcccbbbcccccccccba987
+;;G 09abccdeeedccccccccccccbcbbccccccccbcbbcbbcccccccccba987
+;;G 089abcdeeedccccccccbcbbcbcccccccccbabbba999accccccba9876
+;;G 0089abcdeedcccccccccbcccbccccccccccbcb888889abcccba98760
+;;G 00089abcdeddccccccccbcbcbccccccccbbba988999abcccba987600
+;;G 000089abcddccdccccccccbccccccccbcbba8889cbccccbba9876000
+;;G 0000089abccdcccccccccccccccccccccca888abcccccbaa98760000
+;;G 00000089abbcddddddcccccccccccbbbca988bcccccbba9987600000
+;;G 000000089aabcccddddccccbcccccbbb9889accc9cbaa98876000000
+;;G 00000000899abbcdcbabb899accccccc88899ccccba9987760000000
+;;G 000000000889aabcba8aa999abbbbccc98899cbbba98876600000000
+;;G 00000000007899aba9899899abbbbbbbc999abaaa987760000000000
 ;; palette learned from 12 texture file(s) — binding fallback — no set of its own; sibling-castle union palette; roof entry: 3
 ;;P 0 313B1F
 ;;P 1 42423A
