@@ -40,7 +40,7 @@ Pambre Bastion              81  true   0.32     14      4    163     3    12
 Perarrua Crag               68  true   0.37      3      0      5     3     0
 Lost Palace                 68  true   0.50    124      0    536    40     0
 Thian Hock Keng             75  true   0.39      9      0    135     0     0
-Sky Palace Corridor         74  true   0.45     42    322    850     5   263
+Sky Palace Corridor         74  true   0.45     42    322    847     5   263
 ```
 
 Notes, honest ones: **Thian Hock Keng** yields 0/0 on the new learnings — its scan reads as a
@@ -91,5 +91,18 @@ flat slab). The photograph carries wall colour now (near-white verts with a 22% 
 full tints muddied the texel), wall-walks ride the per-cell scan height instead of one slab,
 stairs went from two-per-run eight-riser brick piles to ONE per real run (≥6 cells) of five
 photo-stone slabs, and merlons are every-other-cell, lower, in the model's own stone.
+
+**Crop-set + set-piece pass** (field report: one tiny crop tiled everywhere is not the scan;
+the ground had no texture; the real value is DbD-style palette SETS): the atlas is 8x8 with
+THREE crops per site — two high-detail wall regions from different quadrants/files, picked
+between in coarse 3-cell patches so a curtain drifts across real surface regions, plus a
+low-variance GROUND crop the floor mesh now wears (`learned_slot(site, which)`). And the
+scans feed EVERY map now: `tools/extract_pieces.py` cuts 25 connected structures (towers,
+gatehouses, halls) from the final blueprints with their full appearance;
+`Level::stamp_learned_piece` drops one into any level (facade created/merged, palette and
+tints travelling along); the landmark pass places a piece on ~1/3 of Military/Urban/Canopy
+seeds — a photographed tower where a procedural monument used to be. Stamping can seal an
+existing corridor, so the doorway-restoration pass was extracted to `restore_room_access`
+and runs after every stamp (the same cure the site maps use).
 
 Still open, deliberately: '^' expansion-ring scatter, destructible columns/merlons.

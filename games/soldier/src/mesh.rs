@@ -863,20 +863,50 @@ pub fn material_pixel(mat: Material, u: f32, v: f32) -> Color32 {
 /// models wear a masonry cousin's crop, stated here honestly: church <- Barcience stone,
 /// Lost Palace <- Morton, the Colossus <- Perarrua; Pioz (no set of its own) <- Pambre.
 pub const LEARNED_TILE_PX: usize = 160;
-pub static LEARNED_TILES: [&[u8]; 13] = [
-    include_bytes!("assets/learned/church_of_st.rgb"),
-    include_bytes!("assets/learned/haunted_parish_ps1.rgb"),
-    include_bytes!("assets/learned/hercules_colossus_fountain.rgb"),
-    include_bytes!("assets/learned/piazza_san_pellegrino.rgb"),
-    include_bytes!("assets/learned/castillo_de_pioz.rgb"),
-    include_bytes!("assets/learned/castillo_barcience_castilla.rgb"),
-    include_bytes!("assets/learned/cistern_citadel_of.rgb"),
-    include_bytes!("assets/learned/morton_castle_scotland.rgb"),
-    include_bytes!("assets/learned/castillo_de_pambre.rgb"),
-    include_bytes!("assets/learned/castillo_de_perarrua.rgb"),
-    include_bytes!("assets/learned/lost_palace_church.rgb"),
-    include_bytes!("assets/learned/thian_hock_keng.rgb"),
-    include_bytes!("assets/learned/scifi_corridor_sky.rgb"),
+/// Atlas payload for a site's crop: `which` 0 = wall-A, 1 = wall-B, 2 = ground. Three crops
+/// per site — two high-detail wall regions from different quadrants/files so facades VARY,
+/// plus a low-variance ground crop for the floor.
+pub fn learned_slot(site: usize, which: usize) -> u8 { (site * 3 + which.min(2)) as u8 }
+pub static LEARNED_TILES: [&[u8]; 39] = [
+    include_bytes!("assets/learned/church_of_st.w0.rgb"),
+    include_bytes!("assets/learned/church_of_st.w1.rgb"),
+    include_bytes!("assets/learned/church_of_st.g.rgb"),
+    include_bytes!("assets/learned/haunted_parish_ps1.w0.rgb"),
+    include_bytes!("assets/learned/haunted_parish_ps1.w1.rgb"),
+    include_bytes!("assets/learned/haunted_parish_ps1.g.rgb"),
+    include_bytes!("assets/learned/hercules_colossus_fountain.w0.rgb"),
+    include_bytes!("assets/learned/hercules_colossus_fountain.w1.rgb"),
+    include_bytes!("assets/learned/hercules_colossus_fountain.g.rgb"),
+    include_bytes!("assets/learned/piazza_san_pellegrino.w0.rgb"),
+    include_bytes!("assets/learned/piazza_san_pellegrino.w1.rgb"),
+    include_bytes!("assets/learned/piazza_san_pellegrino.g.rgb"),
+    include_bytes!("assets/learned/castillo_de_pioz.w0.rgb"),
+    include_bytes!("assets/learned/castillo_de_pioz.w1.rgb"),
+    include_bytes!("assets/learned/castillo_de_pioz.g.rgb"),
+    include_bytes!("assets/learned/castillo_barcience_castilla.w0.rgb"),
+    include_bytes!("assets/learned/castillo_barcience_castilla.w1.rgb"),
+    include_bytes!("assets/learned/castillo_barcience_castilla.g.rgb"),
+    include_bytes!("assets/learned/cistern_citadel_of.w0.rgb"),
+    include_bytes!("assets/learned/cistern_citadel_of.w1.rgb"),
+    include_bytes!("assets/learned/cistern_citadel_of.g.rgb"),
+    include_bytes!("assets/learned/morton_castle_scotland.w0.rgb"),
+    include_bytes!("assets/learned/morton_castle_scotland.w1.rgb"),
+    include_bytes!("assets/learned/morton_castle_scotland.g.rgb"),
+    include_bytes!("assets/learned/castillo_de_pambre.w0.rgb"),
+    include_bytes!("assets/learned/castillo_de_pambre.w1.rgb"),
+    include_bytes!("assets/learned/castillo_de_pambre.g.rgb"),
+    include_bytes!("assets/learned/castillo_de_perarrua.w0.rgb"),
+    include_bytes!("assets/learned/castillo_de_perarrua.w1.rgb"),
+    include_bytes!("assets/learned/castillo_de_perarrua.g.rgb"),
+    include_bytes!("assets/learned/lost_palace_church.w0.rgb"),
+    include_bytes!("assets/learned/lost_palace_church.w1.rgb"),
+    include_bytes!("assets/learned/lost_palace_church.g.rgb"),
+    include_bytes!("assets/learned/thian_hock_keng.w0.rgb"),
+    include_bytes!("assets/learned/thian_hock_keng.w1.rgb"),
+    include_bytes!("assets/learned/thian_hock_keng.g.rgb"),
+    include_bytes!("assets/learned/scifi_corridor_sky.w0.rgb"),
+    include_bytes!("assets/learned/scifi_corridor_sky.w1.rgb"),
+    include_bytes!("assets/learned/scifi_corridor_sky.g.rgb"),
 ];
 
 pub fn build_material_atlas(tile: usize, cols: usize) -> (Vec<u8>, usize, usize) {
@@ -923,7 +953,7 @@ pub fn build_material_atlas(tile: usize, cols: usize) -> (Vec<u8>, usize, usize)
 }
 
 /// Standard atlas column count used across the renderers (a cols×cols grid of material tiles).
-pub const ATLAS_COLS: usize = 7; // 5 -> 7: room for the 13 learned-site wall tiles (24 materials + white + 13 = 38 of 49)
+pub const ATLAS_COLS: usize = 8; // 5 -> 7: room for the 13 learned-site wall tiles (24 materials + white + 13 = 38 of 49)
 
 /// The atlas slot index for a material (0 = white tile). Mirrors `atlas_rect`'s slot logic; used by the GPU
 /// renderer, which computes the cell in-shader from the slot.
