@@ -2454,6 +2454,51 @@ impl Gpu {
         }
         Some(r)
     }
+    /// Find the largest total GPU allocation this device will actually HONOUR.
+    ///
+    /// The Asahi budget of 24 GiB is an empirical figure from the staging upload path, measured before
+    /// the map-at-creation arena existed. Nobody has measured what the device really allows, and the
+    /// loader's own message says "raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling" — so this probes
+    /// it rather than leaving that to a person with a env var and an afternoon.
+    ///
+    /// ## Allocation succeeding is not the answer
+    ///
+    /// A driver can return a buffer it cannot back, and the failure then appears later as wrong results
+    /// rather than an error. So every step WRITES a pattern and READS IT BACK. A step counts only if the
+    /// data survives; anything else is treated as failure, because an overcommitted allocation that
+    /// reports success is worse than one that refuses.
+    ///
+    /// Allocates in `slab` chunks and keeps them all live, because the ceiling is on TOTAL resident
+    /// bytes rather than any single buffer — one 30 GiB buffer failing says nothing about thirty 1 GiB
+    /// ones, and the arena packs into ≤2047 MiB slabs anyway.
+    ///
+    /// Returns the highest verified total in bytes. Everything is dropped before returning.
+    pub fn probe_vram_ceiling(&self, slab_bytes: u64, max_bytes: u64) -> u64 {
+        let slab = slab_bytes.max(1 << 20);
+        let words = (slab / 4) as usize;
+        let mut held: Vec<Tensor> = Vec::new();
+        let mut verified = 0u64;
+        // A recognisable pattern: zeros would pass against a buffer that was never written.
+        let pattern: Vec<f32> = (0..1024).map(|i| (i as f32) * 3.5 + 1.0).collect();
+        while verified + slab <= max_bytes {
+            let step = self.run_guarded("vram-probe", || {
+                let t = self.alloc_resident_words(words);
+                self.queue.write_buffer(&t.buf, 0, bytemuck::cast_slice(&pattern));
+                t
+            });
+            let Some(t) = step else { break };
+            // Read it back. An allocation the driver cannot honour often accepts the write and returns
+            // garbage — which is the case this whole probe exists to catch.
+            let got = self.download(&self.view_pub(&t, 0, pattern.len()));
+            if got.len() < pattern.len() || got != pattern { break; }
+            held.push(t);
+            verified += slab;
+        }
+        drop(held);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        verified
+    }
+
     /// GPU keep-alive spin (cf. Colibri's COLI_METAL_SPIN). Decode is dispatch-bound: our own profile says
     /// "encoder setup, not GPU sync, is the wall", and on Apple Silicon the GPU ramps its clock DOWN
     /// between the short per-token bursts, so the next burst starts on a cold clock (Colibri measured this
