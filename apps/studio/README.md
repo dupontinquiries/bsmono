@@ -48,7 +48,7 @@ edits exactly reversible, which floats are not.
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
 | `studio-collab` | convergent op log, presence, wire, carrier, **project files** | 25 |
-| `studio-egui` | timeline, touch gestures, theater/split modes, **Helix keys** | 22 |
+| `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
@@ -593,9 +593,42 @@ buries the effect entirely, which is what the harmonics test caught.
 ## Visual direction: unendlich, not iZotope
 
 The interaction grammar comes from Ozone and Neutron — spectrum as the shared
-canvas, direct manipulation of nodes and crossovers on it, a visible reorderable
+canvas (now built: `studio_egui::spectrum`), direct manipulation of nodes and crossovers on it, a visible reorderable
 module chain, gain-matched A/B, masking between tracks. The *look* comes from
 unendlich instead: atmospheric depth rather than flat panels — fog gradients
 behind the spectrum, sun/ambient colour grading the whole surface, modules
 sitting in a lit volume rather than boxed in chrome. Borrowing the grammar and
 not the skin is also what keeps this a spiritual successor rather than a clone.
+
+## The shared canvas, built
+
+`spectrum` is the one structural idea from Ozone made real: an EQ curve, a
+multiband crossover, a compressor threshold and the live signal all share **one
+frequency axis**, drawn into one lit volume. Modules paint overlays into the
+returned rect rather than owning boxes of their own — which is the whole point,
+since you drag nodes and crossovers *on* the spectrum because they are already
+there.
+
+The look is unendlich's: a vertical fog gradient with the warmth low, so the
+spectrum sits *in* something rather than on top of a flat panel, and the signal
+is filled to the floor so it reads as a mass in that volume rather than a line
+floating in it.
+
+Four pieces of arithmetic are pure and tested, because an axis that is subtly
+wrong is the bug you never quite see — you just stop trusting the display, which
+defeats the entire point of putting everything on it:
+
+* **Log frequency.** Linear is the classic mistake: it hands half the display to
+  10–20 kHz, where almost nothing musical happens, and squashes the two octaves
+  that carry a mix into a few pixels. A test asserts equal octaves occupy equal
+  width.
+* **Node grabbing in screen space, not frequency space.** Two nodes an octave
+  apart are close on screen at 40 Hz and far at 10 kHz; picking by frequency
+  distance grabs the wrong one exactly where nodes are most crowded.
+* **Crossovers clamped in octaves.** They cannot pass each other — that produces
+  bands of negative width and a multiband which silently drops audio — and the
+  minimum gap is octaves rather than Hz, because 200 Hz is generous at 400 Hz
+  and invisible at 12 kHz.
+* **Column averaging in the power domain.** A pixel column spanning many bins up
+  high would otherwise under-read whenever one bin is hot, which is precisely
+  the partial you are looking at.
