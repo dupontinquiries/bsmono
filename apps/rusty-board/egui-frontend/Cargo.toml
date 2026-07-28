@@ -24,6 +24,8 @@ app = ["dep:eframe"]
 egui = "0.34"
 # the shared layout/input model (the gtk app and this frontend read ONE schema)
 board-layouts = { path = "../crates/board-layouts" }
+# the SHARED swipe recognizer (same code the GTK app uses — see crates/board-gestures)
+board-gestures = { path = "../crates/board-gestures" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
