@@ -3863,6 +3863,11 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         for (norm, wbefore, label) in [
             (gpu_kernels::moe::RouteNorm::Softmax, false, "softmax, weight-after (Qwen3)"),
             (gpu_kernels::moe::RouteNorm::Sigmoid, true,  "sigmoid, weight-before (Llama-4)"),
+            // This one newly takes the GPU-ROUTED v2 path: sigmoid gating no longer forces v1, so the
+            // weighting now comes from MOE_TOPK's mode 1 rather than from CPU routing. Adding a case
+            // for it because changing which path a configuration takes, without a test that exercises
+            // the new one, is how a working model quietly starts producing something else.
+            (gpu_kernels::moe::RouteNorm::Sigmoid, false, "sigmoid, weight-after (GPU-routed v2)"),
         ] {
             let cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32,
                 n_shared: 0, norm, normalize: true, weight_before: wbefore };
