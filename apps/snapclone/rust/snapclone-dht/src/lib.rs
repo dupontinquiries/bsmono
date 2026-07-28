@@ -14,6 +14,13 @@
 //! | GossipDiscovery peer records    | gossip::*         | scaffold |
 //! | DhtDiscovery announce           | announce::*       | scaffold |
 
+pub mod core;
+pub mod wire;
+pub mod engine;
+pub mod presence;
+#[cfg(test)]
+mod sim;
+
 pub mod identity;
 pub mod resolver;
 pub mod gossip;

@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn extract_from_display_string() {
         let id = ScId::extract_from_display("kesslerd@192.168.1.5 (sc-32a51661)");
-        assert_eq!(id.as_deref().map(|s| s.as_str()), Some("sc-32a51661"));
+        assert_eq!(id.as_ref().map(|s| s.as_str()), Some("sc-32a51661"));
     }
 
     #[test]
