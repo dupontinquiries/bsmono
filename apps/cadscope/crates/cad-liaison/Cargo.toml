@@ -1,0 +1,9 @@
+[package]
+name = "cad-liaison"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "STUB (M3): PartSpec/OpScript sanitizers + logscope-fan adapters + genviz progress model."
+
+[dependencies]
+

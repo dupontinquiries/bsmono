@@ -1,0 +1,9 @@
+[package]
+name = "cad-nifty"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "STUB (M6): niftyplot emit + the hardware-kind implementation (upstreams into shared/nifty-core)."
+
+[dependencies]
+

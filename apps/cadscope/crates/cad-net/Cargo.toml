@@ -1,0 +1,9 @@
+[package]
+name = "cad-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "STUB (M6): forge-op replication over netcode/snapcore clusters, presence, soft locks."
+
+[dependencies]
+

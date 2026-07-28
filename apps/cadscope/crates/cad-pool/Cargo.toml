@@ -1,0 +1,9 @@
+[package]
+name = "cad-pool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "STUB (M5): asset pools — manifests, audits, budgets, per-game injection adapters (v2-script lineage)."
+
+[dependencies]
+

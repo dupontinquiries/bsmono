@@ -1,0 +1,9 @@
+[package]
+name = "cad-tex"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "STUB (M4): the texturing system — material graphs, triplanar/UV, bake-to-convention, pool audit."
+
+[dependencies]
+
