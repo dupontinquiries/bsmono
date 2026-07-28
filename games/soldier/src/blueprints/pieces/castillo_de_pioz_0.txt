@@ -1,0 +1,101 @@
+; piece from castillo_de_pioz (site 4) — 15x15, 93 cells
+...............
+.777.......89..
+.7677777788889.
+.767rrrrrrr777.
+..7rooooooor8..
+..roooooooor7..
+..9rooooooor9..
+..9rooooooor9..
+..9rooooooor9..
+..roooooorr997.
+.99rrrrror9937.
+.7799999r99967.
+.999.....97769.
+..........7799.
+...............
+;;H aaaaa999abc9cee
+;;H abbbbbabacdceee
+;;H bb9abbbbacccdeb
+;;H bb9cbbcccccbaca
+;;H bbbccbccccccdbb
+;;H bb9dcbbbcccdaca
+;;H beeddbbcbcceecb
+;;H eeeccbbbbceeebb
+;;H eeeeebbbbbeeebb
+;;H ffeddeeebbbeeaa
+;;H befdeedeebee5ba
+;;H bbbefedeeeeeaab
+;;H deefffeeeebcaee
+;;H eeeeeeeeeebbeee
+;;H deeeddddddccdcd
+;;S 223311112331333
+;;S 322211111333323
+;;S 233312113333333
+;;S 223322113223322
+;;S 103110021212322
+;;S 203220002212222
+;;S 333210311223332
+;;S 313110000231303
+;;S 332230000132313
+;;S 323333330133312
+;;S 233332333332331
+;;S 132203213333331
+;;S 332323333333323
+;;S 332323333333332
+;;S 333333333333333
+;;R 132121001220235
+;;R 24140000169a565
+;;R 26c235433236456
+;;R 11b734333322265
+;;R 102300152312433
+;;R 103200004522352
+;;R 853200422417895
+;;R 585200001386a06
+;;R 454920001176515
+;;R a8763233032c651
+;;R 19d2126a8458440
+;;R 17cb995b7a8d4e1
+;;R 66b887835497792
+;;R 7bb9a8bba779887
+;;R 23681116555c942
+;;G 899999888889988
+;;G 84229a999aa22a8
+;;G 922234444422229
+;;G 922344444332229
+;;G ab34bbaaabb23a9
+;;G 9b45bbbba5b33a9
+;;G 9b44bbbbaab34aa
+;;G 9b44bbbbaa833a9
+;;G 9b44bbbbba944a8
+;;G ab35bbbbb100008
+;;G a23344445000009
+;;G a2233444400010a
+;;G 9222aaaab20000a
+;;G 99aaaaaa992102a
+;;G 99aaaaaa999aaaa
+;;C ggggggggggggggg
+;;C g333ggggggg33gg
+;;C g3533333333333g
+;;C g3533333333333g
+;;C gg33ggggggg33gg
+;;C gg5gggggggg33gg
+;;C gg33ggggggg33gg
+;;C gg33ggggggg33gg
+;;C gg33ggggggg33gg
+;;C gg3gggggg33333g
+;;C g3333333g33353g
+;;C g3337333333333g
+;;C g333ggggg33333g
+;;C gggggggggg3333g
+;;C ggggggggggggggg
+;;P 0 313B1F
+;;P 1 42423A
+;;P 2 3F5122
+;;P 3 524853
+;;P 4 4A6029
+;;P 5 566935
+;;P 6 6C6162
+;;P 7 727754
+;;P 8 807474
+;;P 9 998C87

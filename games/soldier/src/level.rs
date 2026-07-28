@@ -1751,6 +1751,77 @@ impl Level {
         self.build_learned_walls();
     }
 
+    /// Restoration: carve a small doorway (with lintel) for any roomed space unreachable from
+    /// room 0 — rasterized scans AND stamped set-pieces can seal a real opening; in the building
+    /// they learn from, that hall has a door. Shared by the site builder and piece consumers.
+    pub fn restore_room_access(&mut self, tag: &str) {
+        let ts = self.ts();
+        let pal = self.pal;
+        // Rasterizing a scan to a 56-cell grid sometimes seals a real doorway (one thin
+        // opening quantizes into massing). A sealed hall fails the connectivity gate — and
+        // in the building it learns from, that hall HAS a door. So restore one: for each
+        // room center unreachable from room 0 over floor, probe the 4 cardinals for the
+        // shortest run of wall cells (≤4) that reaches reachable floor, carve it, and hang
+        // a lintel so it reads as the doorway it stands in for. Carves are counted in the
+        // level name-plate comment stream (eprintln) for authoring review.
+        {
+            let flood_from = |lvl: &Level, sx: i32, sz: i32| -> std::collections::HashSet<(i32, i32)> {
+                let mut seen = std::collections::HashSet::new();
+                let mut st = vec![(sx, sz)];
+                while let Some((x, z)) = st.pop() {
+                    if lvl.cell(x, z) != Cell::Floor || !seen.insert((x, z)) { continue; }
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] { st.push((x + dx, z + dz)); }
+                }
+                seen
+            };
+            if !self.rooms.is_empty() {
+                let r0 = self.rooms[0].rect.center();
+                for ri in 1..self.rooms.len() {
+                    let reach = flood_from(&*self, r0.0, r0.1);
+                    let rc = self.rooms[ri].rect.center();
+                    if reach.contains(&rc) { continue; }
+                    if self.cell(rc.0, rc.1) == Cell::Wall {
+                        // the cluster's anchored rect can still center on massing when the
+                        // hall is a thin L; the anchor cell stands for the room, so it opens
+                        self.set(rc.0, rc.1, Cell::Floor);
+                    }
+                    let mut best: Option<(usize, i32, i32, Vec<(i32, i32)>)> = None;
+                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                        let (mut x, mut z) = rc;
+                        let mut walls = Vec::new();
+                        for _ in 0..24 {
+                            x += dx; z += dz;
+                            match self.cell(x, z) {
+                                Cell::Wall => walls.push((x, z)),
+                                Cell::Floor if reach.contains(&(x, z)) => {
+                                    if walls.len() <= 4
+                                        && best.as_ref().map_or(true, |b| walls.len() < b.0) {
+                                        best = Some((walls.len(), dx, dz, walls.clone()));
+                                    }
+                                    break;
+                                }
+                                Cell::Floor => { /* unreachable floor pocket: keep probing */ }
+                                _ => break,
+                            }
+                        }
+                    }
+                    if let Some((_, _, _, walls)) = best {
+                        for &(x, z) in &walls {
+                            self.set(x, z, Cell::Floor);
+                            let ctr = Vec3::new(x as f32 * ts, 2.9, z as f32 * ts);
+                            let half = Vec3::new(ts * 0.5, 0.45, ts * 0.5);
+                            let mut mesh = boxx(ctr, half, dither(pal.wall, x * 3 + z, 0.06), FACE_ALL);
+                            mesh.material = Some(crate::mesh::Material::StoneBlock);
+                            self.meshes.push(mesh);
+                            self.obstacles.push(Obstacle { center: ctr, half });
+                        }
+                        eprintln!("learned-site restoration: carved a {}-cell doorway for room {ri} of {tag}", walls.len());
+                    }
+                }
+            }
+        }
+    }
+
     /// **Learned walls** — the interior open-air wall renderer for scanned sites. On open-sky
     /// maps the indoor wall loop skips everything and `build_cliffs` only dresses the map
     /// BOUNDARY, so a learned castle's curtain was collision with no geometry at all: the
@@ -1767,8 +1838,14 @@ impl Level {
         // the indoor loop stands down for them (see its skip), so nothing double-draws.
         let ts = self.ts();
         let pal = self.pal;
-        let mut tex = Mesh3::new(Color32::WHITE);
-        tex.material = Some(crate::mesh::Material::LearnedWall(f.site as u8));
+        // TWO wall-crop buckets: the scan's texture set gives us two distinct high-detail
+        // regions (different quadrants/files), and coarse 3-cell patches pick between them —
+        // so a long curtain drifts between real surface regions the way the photographed
+        // building does, instead of one square tiled everywhere (field report).
+        let mut tex_a = Mesh3::new(Color32::WHITE);
+        tex_a.material = Some(crate::mesh::Material::LearnedWall(crate::mesh::learned_slot(f.site, 0)));
+        let mut tex_b = Mesh3::new(Color32::WHITE);
+        tex_b.material = Some(crate::mesh::Material::LearnedWall(crate::mesh::learned_slot(f.site, 1)));
         let mut plain = Mesh3::new(pal.wall);
         let mut caps = Mesh3::new(scale_rgb(pal.wall, 0.9));
         let idx = |x: i32, z: i32| (z * self.w + x) as usize;
@@ -1805,8 +1882,10 @@ impl Level {
                         let wash = lerp_c(rgb(244, 244, 240), base, 0.22);
                         let lower = dither(scale_rgb(wash, 0.86), x * 5 + z * 9, 0.02 + rough * 0.05);
                         let upper = dither(wash, x * 9 + z * 5, 0.02 + rough * 0.05);
-                        tex.push_quad(b0, b1, b1.with_y(dado), b0.with_y(dado), n, lower);
-                        tex.push_quad(b0.with_y(dado), b1.with_y(dado), b1.with_y(top_y), b0.with_y(top_y), n, upper);
+                        let which = ((x / 3).wrapping_mul(7) ^ (z / 3).wrapping_mul(13) ^ (h15 as i32 / 6)) & 1;
+                        let dst = if which == 0 { &mut tex_a } else { &mut tex_b };
+                        dst.push_quad(b0, b1, b1.with_y(dado), b0.with_y(dado), n, lower);
+                        dst.push_quad(b0.with_y(dado), b1.with_y(dado), b1.with_y(top_y), b0.with_y(top_y), n, upper);
                     } else {
                         let c = dither(pal.wall, x * 7 + z * 11, 0.10);
                         plain.push_quad(b0, b1, b1.with_y(dado), b0.with_y(dado), n, scale_rgb(c, 0.8));
@@ -1832,7 +1911,7 @@ impl Level {
                 }
             }
         }
-        for mut m in [tex, plain, caps] {
+        for mut m in [tex_a, tex_b, plain, caps] {
             if m.tri_count() > 0 {
                 shade_ao(&mut m, self.floor_y, self.floor_y + f.max_h, 0.55, 1.10);
                 self.meshes.push(m);
@@ -2897,6 +2976,112 @@ impl Level {
         ("Sky Palace Corridor", include_str!("blueprints/learned/scifi_corridor_sky.txt"), 4, 3.4),
     ];
 
+    /// **Learned set-pieces** — the Dead-by-Daylight "palette set" idea: connected structures
+    /// cut whole from the scans (a tower, a gatehouse, an arcade bay — `tools/extract_pieces.py`),
+    /// carrying their full appearance (massing + H/S/R/G layers + palette + tints). Any map can
+    /// stamp one and it wears its model's photograph and silhouette. (site, blueprint) pairs.
+    pub const LEARNED_PIECES: [(usize, &'static str); 25] = [
+        (5, include_str!("blueprints/pieces/castillo_barcience_castilla_0.txt")),
+        (8, include_str!("blueprints/pieces/castillo_de_pambre_0.txt")),
+        (8, include_str!("blueprints/pieces/castillo_de_pambre_1.txt")),
+        (9, include_str!("blueprints/pieces/castillo_de_perarrua_0.txt")),
+        (9, include_str!("blueprints/pieces/castillo_de_perarrua_1.txt")),
+        (4, include_str!("blueprints/pieces/castillo_de_pioz_0.txt")),
+        (0, include_str!("blueprints/pieces/church_of_st_0.txt")),
+        (0, include_str!("blueprints/pieces/church_of_st_1.txt")),
+        (6, include_str!("blueprints/pieces/cistern_citadel_of_0.txt")),
+        (1, include_str!("blueprints/pieces/haunted_parish_ps1_0.txt")),
+        (1, include_str!("blueprints/pieces/haunted_parish_ps1_1.txt")),
+        (1, include_str!("blueprints/pieces/haunted_parish_ps1_2.txt")),
+        (1, include_str!("blueprints/pieces/haunted_parish_ps1_3.txt")),
+        (2, include_str!("blueprints/pieces/hercules_colossus_fountain_0.txt")),
+        (2, include_str!("blueprints/pieces/hercules_colossus_fountain_1.txt")),
+        (10, include_str!("blueprints/pieces/lost_palace_church_0.txt")),
+        (10, include_str!("blueprints/pieces/lost_palace_church_1.txt")),
+        (10, include_str!("blueprints/pieces/lost_palace_church_2.txt")),
+        (7, include_str!("blueprints/pieces/morton_castle_scotland_0.txt")),
+        (7, include_str!("blueprints/pieces/morton_castle_scotland_1.txt")),
+        (3, include_str!("blueprints/pieces/piazza_san_pellegrino_0.txt")),
+        (3, include_str!("blueprints/pieces/piazza_san_pellegrino_1.txt")),
+        (12, include_str!("blueprints/pieces/scifi_corridor_sky_0.txt")),
+        (11, include_str!("blueprints/pieces/thian_hock_keng_0.txt")),
+        (11, include_str!("blueprints/pieces/thian_hock_keng_1.txt")),
+    ];
+
+    /// Stamp a learned set-piece into THIS level at grid offset (ox, oz): massing becomes
+    /// walls (with the piece's per-cell heights/tints merged into `learned_facade`, created if
+    /// absent), 'c' columns become slender cover, courts/paving become floor. The piece then
+    /// renders through the same `build_learned_walls` pass the site maps use — the photograph
+    /// and silhouette travel with it. Call BEFORE build_meshes/build_cliffs. Returns cells stamped.
+    pub fn stamp_learned_piece(&mut self, piece: usize, ox: i32, oz: i32) -> usize {
+        let (site, bp) = Self::LEARNED_PIECES[piece.min(Self::LEARNED_PIECES.len() - 1)];
+        let rows: Vec<&str> = bp.lines().filter(|l| !l.starts_with(';')).collect();
+        let gh = rows.len() as i32;
+        let gw = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0) as i32;
+        let mut lh: Vec<&str> = Vec::new(); let mut lr: Vec<&str> = Vec::new();
+        let mut lsl: Vec<&str> = Vec::new(); let mut lc: Vec<&str> = Vec::new();
+        let mut palette: Vec<Color32> = Vec::new();
+        for line in bp.lines() {
+            if let Some(r) = line.strip_prefix(";;H ") { lh.push(r); }
+            else if let Some(r) = line.strip_prefix(";;S ") { lsl.push(r); }
+            else if let Some(r) = line.strip_prefix(";;R ") { lr.push(r); }
+            else if let Some(r) = line.strip_prefix(";;C ") { lc.push(r); }
+            else if let Some(r) = line.strip_prefix(";;P ") {
+                let p: Vec<&str> = r.split_whitespace().collect();
+                if p.len() == 2 && p[1].len() == 6 {
+                    if let Ok(v) = u32::from_str_radix(p[1], 16) {
+                        palette.push(rgb(((v >> 16) & 255) as u8, ((v >> 8) & 255) as u8, (v & 255) as u8));
+                    }
+                }
+            }
+        }
+        let n = (self.w * self.h) as usize;
+        if self.learned_facade.is_none() {
+            self.learned_facade = Some(FacadeDetail { site, h: vec![0; n], slope: vec![0; n],
+                rough: vec![0; n], tint: vec![255; n], ground: vec![0; n],
+                palette: palette.clone(), max_h: self.cfg.wall_height * 2.6 });
+        }
+        let mut fd = self.learned_facade.take().unwrap();
+        if fd.palette.is_empty() { fd.palette = palette; }
+        let mut stamped = 0usize;
+        for (gz, row) in rows.iter().enumerate() {
+            for (gx, ch) in row.chars().enumerate() {
+                let (x, z) = (ox + gx as i32, oz + gz as i32);
+                if x < 1 || z < 1 || x >= self.w - 1 || z >= self.h - 1 { continue; }
+                let i = (z * self.w + x) as usize;
+                let hexat = |rows: &Vec<&str>| rows.get(gz).and_then(|r| r.chars().nth(gx))
+                    .and_then(|c| c.to_digit(16)).map(|v| v as u8);
+                match ch {
+                    d if d.is_ascii_digit() || d == 'r' => {
+                        self.set(x, z, Cell::Wall);
+                        if let Some(v) = hexat(&lh) { fd.h[i] = v; }
+                        if let Some(v) = hexat(&lr) { fd.rough[i] = v; }
+                        if let Some(v) = hexat(&lsl) { fd.slope[i] = v; }
+                        if let Some(c) = lc.get(gz).and_then(|r| r.chars().nth(gx)) {
+                            if let Some(v) = c.to_digit(16) { fd.tint[i] = v as u8; }
+                        }
+                        stamped += 1;
+                    }
+                    'c' => {
+                        self.set(x, z, Cell::Floor);
+                        let ts = self.ts();
+                        let cy = self.cfg.wall_height * 0.48;
+                        let ctr = Vec3::new(x as f32 * ts, cy, z as f32 * ts);
+                        let half = Vec3::new(ts * 0.30, cy, ts * 0.30);
+                        self.obstacles.push(Obstacle { center: ctr, half });
+                        self.cover_obstacles.push(Obstacle { center: ctr, half });
+                        stamped += 1;
+                    }
+                    'o' | '+' | '.' | 'a' => { self.set(x, z, Cell::Floor); }
+                    _ => {}
+                }
+            }
+        }
+        let _ = (gw, gh);
+        self.learned_facade = Some(fd);
+        stamped
+    }
+
     fn build_learned_site(cfg: MapConfig, site: usize) -> Level {
         let (name, bp, kind, wall_h) = Self::LEARNED_SITES[site.min(Self::LEARNED_SITES.len() - 1)];
         let rows: Vec<&str> = bp.lines().filter(|l| !l.is_empty() && !l.starts_with(';')).collect();
@@ -3159,7 +3344,7 @@ impl Level {
                                                 Vec3::new(hx, sy * 0.5, hz),
                                                 dither(slab_c, x * 13 + z * 7 + i as i32, 0.04), FACE_NO_BOTTOM);
                             mesh.material = Some(crate::mesh::Material::LearnedWall(
-                                fac.as_ref().map(|f| f.site as u8).unwrap_or(0)));
+                                crate::mesh::learned_slot(fac.as_ref().map(|f| f.site).unwrap_or(0), 0)));
                             lvl.meshes.push(mesh);
                         }
                         placed = true;
@@ -3256,70 +3441,7 @@ impl Level {
             }
         }
 
-        // ── restoration pass: every roomed space gets a doorway ──
-        // Rasterizing a scan to a 56-cell grid sometimes seals a real doorway (one thin
-        // opening quantizes into massing). A sealed hall fails the connectivity gate — and
-        // in the building it learns from, that hall HAS a door. So restore one: for each
-        // room center unreachable from room 0 over floor, probe the 4 cardinals for the
-        // shortest run of wall cells (≤4) that reaches reachable floor, carve it, and hang
-        // a lintel so it reads as the doorway it stands in for. Carves are counted in the
-        // level name-plate comment stream (eprintln) for authoring review.
-        {
-            let flood_from = |lvl: &Level, sx: i32, sz: i32| -> std::collections::HashSet<(i32, i32)> {
-                let mut seen = std::collections::HashSet::new();
-                let mut st = vec![(sx, sz)];
-                while let Some((x, z)) = st.pop() {
-                    if lvl.cell(x, z) != Cell::Floor || !seen.insert((x, z)) { continue; }
-                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] { st.push((x + dx, z + dz)); }
-                }
-                seen
-            };
-            if !lvl.rooms.is_empty() {
-                let r0 = lvl.rooms[0].rect.center();
-                for ri in 1..lvl.rooms.len() {
-                    let reach = flood_from(&lvl, r0.0, r0.1);
-                    let rc = lvl.rooms[ri].rect.center();
-                    if reach.contains(&rc) { continue; }
-                    if lvl.cell(rc.0, rc.1) == Cell::Wall {
-                        // the cluster's anchored rect can still center on massing when the
-                        // hall is a thin L; the anchor cell stands for the room, so it opens
-                        lvl.set(rc.0, rc.1, Cell::Floor);
-                    }
-                    let mut best: Option<(usize, i32, i32, Vec<(i32, i32)>)> = None;
-                    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                        let (mut x, mut z) = rc;
-                        let mut walls = Vec::new();
-                        for _ in 0..24 {
-                            x += dx; z += dz;
-                            match lvl.cell(x, z) {
-                                Cell::Wall => walls.push((x, z)),
-                                Cell::Floor if reach.contains(&(x, z)) => {
-                                    if walls.len() <= 4
-                                        && best.as_ref().map_or(true, |b| walls.len() < b.0) {
-                                        best = Some((walls.len(), dx, dz, walls.clone()));
-                                    }
-                                    break;
-                                }
-                                Cell::Floor => { /* unreachable floor pocket: keep probing */ }
-                                _ => break,
-                            }
-                        }
-                    }
-                    if let Some((_, _, _, walls)) = best {
-                        for &(x, z) in &walls {
-                            lvl.set(x, z, Cell::Floor);
-                            let ctr = Vec3::new(x as f32 * ts, 2.9, z as f32 * ts);
-                            let half = Vec3::new(ts * 0.5, 0.45, ts * 0.5);
-                            let mut mesh = boxx(ctr, half, dither(pal.wall, x * 3 + z, 0.06), FACE_ALL);
-                            mesh.material = Some(crate::mesh::Material::StoneBlock);
-                            lvl.meshes.push(mesh);
-                            lvl.obstacles.push(Obstacle { center: ctr, half });
-                        }
-                        eprintln!("learned-site restoration: carved a {}-cell doorway for room {ri} of {name}", walls.len());
-                    }
-                }
-            }
-        }
+        lvl.restore_room_access(name);
 
         if lvl.rooms.is_empty() {
             // sites with no enclosed courtyards (open piazzas already reachable from the border):
@@ -3438,6 +3560,12 @@ impl Level {
         let _ = name;
         lvl.cover_obstacles = lvl.obstacles[shell_obs..].to_vec();
         lvl.open_air = true;
+        // ── the GROUND wears the model too: the site's low-variance texture crop on the
+        // floor mesh (index 0 — authored_blank builds floor first), the same way the desert
+        // town skins its sand. Field report: "the ground is missing texture."
+        if let Some(f0) = lvl.meshes.get_mut(0) {
+            f0.material = Some(crate::mesh::Material::LearnedWall(crate::mesh::learned_slot(site, 2)));
+        }
         lvl.build_cliffs();
         lvl.dissolve_boundary();
         lvl.dress_boundary_margin(&mut Rng::new(seed_u ^ 0xB0DE));
@@ -6739,6 +6867,26 @@ impl Level {
     /// anchors sightlines, gives the map a recognisable heart, and — as a blocked footprint — splits the
     /// central room into lanes you flow around.
     fn build_landmark(&mut self) {
+        // ── learned set-piece as landmark: the scans feed EVERY map, not just the 13 sites ──
+        // On the open built/ruin-friendly biomes, roughly a third of seeds place a piece cut
+        // from one of the scanned models — a real tower or gatehouse with its photograph and
+        // silhouette — instead of a procedural monument. The piece stamps BEFORE meshing, so
+        // build_learned_walls renders it exactly as it renders the site maps.
+        if self.learned_facade.is_none()
+            && matches!(self.cfg.theme, MapTheme::Military | MapTheme::Urban | MapTheme::Canopy)
+            && self.cfg.seed % 3 == 0 {
+            let pick = (self.cfg.seed as usize / 3) % Self::LEARNED_PIECES.len();
+            let bp = Self::LEARNED_PIECES[pick].1;
+            let pw = bp.lines().filter(|l| !l.starts_with(';')).map(|l| l.chars().count()).max().unwrap_or(0) as i32;
+            let ph = bp.lines().filter(|l| !l.starts_with(';')).count() as i32;
+            let (ox, oz) = ((self.w - pw) / 2, (self.h - ph) / 2);
+            if pw > 0 && pw < self.w - 4 && ph < self.h - 4 {
+                self.stamp_learned_piece(pick, ox, oz);
+                // a stamped structure can seal an existing corridor — same cure as the sites
+                self.restore_room_access("stamped piece");
+                return; // the piece IS the landmark
+            }
+        }
         if self.rooms.len() < 2 {
             return;
         }
@@ -12840,6 +12988,32 @@ fn sandstorm_rises_during_play() {
 }
 
 #[test]
+fn learned_set_pieces_stamp_and_render_in_other_maps() {
+    // The Dead-by-Daylight loop: structures cut whole from the scans must (a) exist as a
+    // real library, (b) stamp into ANY level with their appearance travelling along, and
+    // (c) actually render in a procedural biome map via the landmark consumer.
+    assert!(Level::LEARNED_PIECES.len() >= 20,
+        "the piece library should hold the extracted set ({} found)", Level::LEARNED_PIECES.len());
+    // (b) direct stamp into a fresh level
+    let mut l = Level::generate(MapConfig::default());
+    let before_walls = (0..l.w * l.h).filter(|&i| l.cells[i as usize] == Cell::Wall).count();
+    let stamped = l.stamp_learned_piece(0, l.w / 2 - 8, l.h / 2 - 8);
+    assert!(stamped > 20, "a set-piece must stamp real structure (got {stamped} cells)");
+    let after_walls = (0..l.w * l.h).filter(|&i| l.cells[i as usize] == Cell::Wall).count();
+    assert!(after_walls > before_walls, "stamping must add massing");
+    let f = l.learned_facade.as_ref().expect("the piece must carry its facade");
+    assert!(!f.palette.is_empty(), "the piece must carry its site palette");
+    assert!(f.h.iter().any(|&h| h > 0), "the piece must carry its heights");
+    // (c) end-to-end: a Military-theme seed divisible by 3 places a piece as the landmark
+    let cfg = MapConfig { seed: 9, theme: MapTheme::Military, ..MapConfig::default() };
+    let lm = Level::generate(cfg);
+    use crate::mapeval::score;
+    assert!(score(&lm).connected, "a map with a stamped piece must stay connected");
+    let learned = lm.meshes.iter().any(|m| matches!(m.material, Some(crate::mesh::Material::LearnedWall(_))));
+    assert!(learned, "the stamped piece must RENDER with its photograph in a procedural map");
+}
+
+#[test]
 fn every_learned_site_is_selectable() {
     // Field report: the map-select list hid everything past the first rows, so it LOOKED like
     // the learned maps were missing. They must actually be in PRESETS (the list's data source),
@@ -12906,8 +13080,13 @@ fn learned_sites_stamp_their_learning() {
             if bp.contains(";;P ") {
                 assert!(!f.palette.is_empty(), "{name}: palette lines present but not parsed");
                 assert!(f.tint.iter().any(|&t| t != 255), "{name}: palette bound but no cell tinted");
-                let tex = l.meshes.iter().any(|m| m.material == Some(crate::mesh::Material::LearnedWall(i as u8)));
+                let want = [crate::mesh::learned_slot(i, 0), crate::mesh::learned_slot(i, 1)];
+                let tex = l.meshes.iter().any(|m| matches!(m.material,
+                    Some(crate::mesh::Material::LearnedWall(s)) if want.contains(&s)));
                 assert!(tex, "{name}: tinted facade cells must emit the learned wall-photo mesh");
+                let gslot = crate::mesh::learned_slot(i, 2);
+                assert!(l.meshes.iter().any(|m| m.material == Some(crate::mesh::Material::LearnedWall(gslot))),
+                    "{name}: the floor must wear the site's ground crop (chunked)");
             }
         }
     }
