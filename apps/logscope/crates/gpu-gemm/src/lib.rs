@@ -9181,34 +9181,26 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// non-convertible tensor forces the whole model onto the host-copy path — 200 GiB of traffic per
     /// generation plus the staging fence that costs most of its submits.
     ///
-    /// STATE: `--gate-q6k` is RED and this is NOT wired into the loader. Two faults found and fixed,
-    /// two remaining:
+    /// STATE: `--gate-q6k` is GREEN — bit-exact against the CPU reference at 1, 37 and 5000 blocks,
+    /// including the negative-scales case. Four faults, found in this order:
     ///
-    ///   FIXED  `d` at bytes 208..209 fell outside the binding. A 210-byte `array<u32>` exposes 52
-    ///          whole words = 208 bytes, and WGSL reads an out-of-range index as ZERO rather than
-    ///          faulting — so every weight came out `0 * scale * q`. It produced NOTHING rather than
-    ///          something wrong, which is why the arithmetic looked correct on review: it was. Both the
-    ///          view length and the source buffer are now rounded up to whole words; padding the buffer
-    ///          alone was not enough, because the binding RANGE is what the shader sees.
-    ///   FIXED  `dispatch` bound the output with `as_entire_binding()`, ignoring its view, so every
-    ///          chunk wrote at offset 0. Fixed with the bind-group cache key extended to carry the
-    ///          output's offset — the binding alone would have been worse, since a cached group would
-    ///          then be reused with the wrong destination silently.
-    ///   FIXED  `wg1` takes an ELEMENT count and divides by 64 itself; it was called with an
-    ///          already-divided value. 65 blocks asked for wg1(2) = ONE workgroup = 64 threads, so
-    ///          block 64 onward was never dispatched and kept whatever the allocator left. A size sweep
-    ///          made it obvious — exact through 64 blocks, then rel=1.00 at 65 — and nothing about the
-    ///          arithmetic was involved. Everything that fitted one workgroup had looked perfect.
-    ///   LEFT   a uniform ~4.7e-10 relative difference at every size, i.e. 1-2 f32 ULPs. NOT the
-    ///          multiply chain: binding `d * scale` to a named value first, so the compiler cannot
-    ///          contract it into an FMA, changed nothing. That leaves `f16()` — the CPU reference and
-    ///          this shader must be rounding some inputs differently, and random test bytes will hit
-    ///          subnormals and edge exponents that a real checkpoint mostly would not.
+    ///   1. `d` at bytes 208..209 fell outside the binding. A 210-byte `array<u32>` exposes 52 whole
+    ///      words = 208 bytes, and WGSL reads out of range as ZERO, so every weight was `0 * s * q`. It
+    ///      produced NOTHING rather than something wrong, which is why the arithmetic looked correct.
+    ///   2. `dispatch` ignored the OUTPUT's view, so chunks overwrote at offset 0. Fixed there, with the
+    ///      bind-group cache key extended to match — a latent bug for every chunked dispatch, not just
+    ///      this one.
+    ///   3. `wg1` takes an ELEMENT count and divides by 64 itself; it was called pre-divided, so 65
+    ///      blocks got ONE workgroup and block 64 onward was never dispatched. A size sweep found the
+    ///      64->65 cliff immediately after two commits of reasoning about arithmetic that was fine.
+    ///   4. The f16 SUBNORMAL path seeded the exponent at -1 and biased by 127-15, which is exactly the
+    ///      bug `gguf::f16_to_f32`'s own comment documents as previously fixed there — "landing 2 too
+    ///      low ... every subnormal came out 4x small". The wrong version was transcribed into the
+    ///      shader FROM the comment explaining why it was wrong.
     ///
-    /// The remaining ULP is worth closing rather than tolerating. `--gate-q4k` achieves bit-exactness
-    /// on the same class of work, so it is achievable here; and a dequantizer that is a ULP off is
-    /// harmless in isolation and compounds across 48 layers — the exact shape of "close enough" that
-    /// produced the buffer-pool corruption and the ignored expert_weights_scale.
+    /// The lesson worth keeping is (4): a reference implementation's comments describe bugs it no longer
+    /// has, and copying code that sits next to such a comment reintroduces them. The other three were
+    /// all size- or binding-related and invisible to a single-block test.
     pub fn q6k_dequant(&self, raw: &[u8], n_weights: usize) -> Result<Tensor, String> {
         if n_weights % 256 != 0 { return Err("q6_k: element count not a multiple of 256".into()); }
         let nblk = n_weights / 256;
