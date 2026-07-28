@@ -9,10 +9,12 @@
 //! zero-heavy-deps so editing kernel logic recompiles in seconds and headless consumers (tests,
 //! the liaison's verifiers, CI goldens) take just the logic.
 
+pub mod mesh;
 pub mod ray;
 pub mod sdf;
 
 use glam::Vec3;
+pub use mesh::{dual_contour, MeshOpts, TriMesh};
 pub use ray::{Hit, Ray, raycast};
 pub use sdf::Sdf;
 
@@ -58,6 +60,19 @@ impl Model {
     /// Loose world bound of everything — drives camera framing.
     pub fn bound_radius(&self) -> f32 {
         self.parts.iter().map(|p| p.sdf.bound_radius()).fold(1.0f32, f32::max)
+    }
+
+    /// Union of every part's bounds — what "frame everything" should use, since `bound_radius`
+    /// is measured from the origin and says nothing about where the model actually sits.
+    pub fn aabb(&self) -> (Vec3, Vec3) {
+        let mut lo = Vec3::splat(f32::INFINITY);
+        let mut hi = Vec3::splat(f32::NEG_INFINITY);
+        for p in &self.parts {
+            let (l, h) = p.sdf.aabb();
+            lo = lo.min(l);
+            hi = hi.max(h);
+        }
+        if lo.is_finite() && hi.is_finite() { (lo, hi) } else { (Vec3::ZERO, Vec3::ZERO) }
     }
 
     pub fn part(&self, id: u32) -> Option<&Part> {

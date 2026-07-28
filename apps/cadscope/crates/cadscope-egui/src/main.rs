@@ -9,16 +9,23 @@
 //! M2 — PARITY.md tracks it.) Keyboard: cad-motion Normal mode — hjkl orbit, +/- dolly, f frame,
 //! n/N cycle, g Grow (stub), Esc clear.
 
-use cad_forge::{Doc, Op, OpWarning, ShapeSpec};
-use cad_kernel::{Model, Sdf};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use cad_forge::{BoolMode, Doc, Op, OpWarning, ShapeSpec};
+use cad_kernel::{MeshOpts, Model, Sdf};
 use cad_motion::{Action, Mode};
 use cad_view::camera::{ndc_of, OrbitCamera};
+use cad_view::meshgen::{from_trimesh, MeshData};
 use cad_view::renderer::{FrameDraw, Globals, MeshKind, ObjectRaw, ViewRenderer};
 use eframe::egui;
 use glam::{Mat4, Quat, Vec2, Vec3};
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
+    if std::env::args().any(|a| a == "--selftest") {
+        selftest();
+    }
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         // 32 → Depth32Float on egui's pass (egui_wgpu::depth_format_from_bits) — the format the
@@ -30,8 +37,9 @@ fn main() -> eframe::Result<()> {
     eframe::run_native("CADscope", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
 
-/// The M0 demo document: primitives only (the viewport meshes primitives; CSG surfaces arrive
-/// with the M1 mesher — kernel CSG is already exercised by `cargo test -p cad-kernel`).
+/// The M1 demo document. Primitives exercise the cached parametric meshes; the last three parts
+/// are CSG and therefore go through the dual contourer — a drilled bracket (subtract), a fused
+/// lamp (blend, which is the operator the UI sells as a fillet), and a patterned row of studs.
 fn demo_doc() -> Doc {
     let add = |name: &str, shape: ShapeSpec, at: [f32; 3], rot: Option<([f32; 3], f32)>, color: [f32; 4]| Op::Add {
         name: name.into(),
@@ -40,16 +48,112 @@ fn demo_doc() -> Doc {
         rot_axis_deg: rot,
         color,
     };
+    let steel = [0.62, 0.66, 0.72, 1.0];
     Doc {
-        name: "m0-bench".into(),
+        name: "m1-bench".into(),
         ops: vec![
-            add("base", ShapeSpec::Cuboid { half: [7.0, 1.0, 5.0] }, [0.0, 1.0, 0.0], None, [0.62, 0.66, 0.72, 1.0]),
+            add("base", ShapeSpec::Cuboid { half: [7.0, 1.0, 5.0] }, [0.0, 1.0, 0.0], None, steel),
             add("pillar", ShapeSpec::Cylinder { r: 1.4, hh: 3.2 }, [-3.2, 5.2, 0.0], None, [0.82, 0.55, 0.28, 1.0]),
             add("knob", ShapeSpec::Sphere { r: 1.8 }, [-3.2, 10.1, 0.0], None, [0.85, 0.30, 0.30, 1.0]),
             add("ring", ShapeSpec::Torus { major: 2.6, minor: 0.7 }, [3.4, 4.6, 0.0], Some(([1.0, 0.0, 0.0], 90.0)), [0.32, 0.62, 0.85, 1.0]),
             add("handle", ShapeSpec::Capsule { r: 0.8, hh: 2.2 }, [3.4, 4.6, 0.0], Some(([0.0, 0.0, 1.0], 90.0)), [0.45, 0.78, 0.50, 1.0]),
+
+            // bracket: a plate with a bore through it — the subtract the M0 viewport could not draw
+            add("bracket", ShapeSpec::Cuboid { half: [2.4, 0.5, 1.6] }, [0.0, 3.4, 3.2], None, [0.70, 0.72, 0.76, 1.0]),
+            add("bore", ShapeSpec::Cylinder { r: 0.9, hh: 1.2 }, [0.0, 3.4, 3.2], None, steel),
+            Op::Combine { into: "bracket".into(), other: "bore".into(), mode: BoolMode::Subtract, k: 0.0 },
+
+            // lamp: sphere fused to a post with a blend radius, so the join reads as a fillet
+            add("lamp", ShapeSpec::Sphere { r: 1.5 }, [0.0, 5.4, -3.4], None, [0.90, 0.78, 0.42, 1.0]),
+            add("post", ShapeSpec::Cylinder { r: 0.5, hh: 1.8 }, [0.0, 3.2, -3.4], None, [0.90, 0.78, 0.42, 1.0]),
+            Op::Combine { into: "lamp".into(), other: "post".into(), mode: BoolMode::Union, k: 0.9 },
+
+            // studs: one cylinder, patterned — a union tree, meshed as a single solid
+            add("studs", ShapeSpec::Cylinder { r: 0.45, hh: 0.35 }, [-4.5, 2.35, 3.4], None, [0.55, 0.58, 0.64, 1.0]),
+            Op::Pattern { name: "studs".into(), count: 4, step: [3.0, 0.0, 0.0] },
         ],
     }
+}
+
+/// Headless verification of the whole model pipeline — evaluate the document, mesh every CSG
+/// part, probe it with rays — with no window and no GPU. This is the house `--selftest` convention
+/// (logscope), and it is precisely what CI, or a build box without a display, can actually run.
+fn selftest() -> ! {
+    let t0 = std::time::Instant::now();
+    let doc = demo_doc();
+    let (model, warns) = doc.apply();
+    let mut fail = 0usize;
+    println!("doc '{}': {} ops -> {} parts", doc.name, doc.ops.len(), model.parts.len());
+    for w in &warns {
+        println!("  FAIL  op #{}: {}", w.index, w.reason);
+        fail += 1;
+    }
+
+    for part in &model.parts {
+        match display_of(&part.sdf) {
+            Some((kind, _)) => println!("  {:9} primitive  {:?}", part.name, kind),
+            None => {
+                let (lo, hi) = part.sdf.aabb();
+                let cell = (hi - lo).max_element() / 56.0;
+                let t = cad_kernel::dual_contour(&part.sdf, MeshOpts { resolution: 56 });
+                let vol = t.signed_volume();
+                let err = t
+                    .positions
+                    .iter()
+                    .map(|p| part.sdf.eval(Vec3::from(*p)).abs())
+                    .fold(0.0f32, f32::max);
+                // A vertex further off the surface than half a cell means the QEF solve or the
+                // clamp misplaced it; negative volume means the winding is inverted.
+                let ok = !t.is_empty() && vol > 0.0 && err < cell * 0.5;
+                if !ok {
+                    fail += 1;
+                }
+                println!(
+                    "  {:9} meshed  {:6} tris   vol {:8.2}   max|d| {:.4} (cell {:.4})  {}",
+                    part.name,
+                    t.tri_count(),
+                    vol,
+                    err,
+                    cell,
+                    if ok { "ok" } else { "FAIL" }
+                );
+            }
+        }
+    }
+
+    // Ray probes: what the tap-picker will do, on geometry whose answer we know by hand.
+    let probe = |x: f32, z: f32| {
+        model.pick(&cad_kernel::Ray::new(Vec3::new(x, 60.0, z), Vec3::NEG_Y), 500.0)
+    };
+    let mut check = |label: &str, got: Option<cad_kernel::Pick>, want: &str| {
+        let name = got
+            .and_then(|p| model.part(p.part_id).map(|q| q.name.clone()))
+            .unwrap_or_else(|| "<miss>".into());
+        let ok = name == want;
+        if !ok {
+            fail += 1;
+        }
+        println!(
+            "  probe {:22} -> {:9} (want {:9}) {}",
+            label,
+            name,
+            want,
+            if ok { "ok" } else { "FAIL" }
+        );
+    };
+    check("down at origin", probe(0.0, 0.0), "base");
+    // Straight down the bracket's bore: the hole must be genuinely open, so the ray reaches the
+    // slab underneath rather than stopping on the plate.
+    check("down through the bore", probe(0.0, 3.2), "base");
+    // Same plate, off-axis: solid material, so it stops here.
+    check("down beside the bore", probe(1.8, 3.2), "bracket");
+
+    println!(
+        "selftest: {} ({:.1}s)",
+        if fail == 0 { "PASS" } else { "FAIL" },
+        t0.elapsed().as_secs_f32()
+    );
+    std::process::exit(if fail == 0 { 0 } else { 1 });
 }
 
 struct App {
@@ -60,6 +164,11 @@ struct App {
     selected: Option<u32>,
     mode: Mode,
     start: std::time::Instant,
+    /// Dual-contoured geometry for parts the parametric mesh path cannot express (any CSG tree),
+    /// keyed by part id. Rebuilt only when the document is re-evaluated, never per frame.
+    meshed: HashMap<u32, Arc<MeshData>>,
+    /// Bumped on every re-evaluation so the renderer can drop stale generated buffers.
+    epoch: u64,
 }
 
 impl App {
@@ -77,9 +186,45 @@ impl App {
 
         let doc = demo_doc();
         let (model, warns) = doc.apply();
-        let mut cam = OrbitCamera::default();
-        cam.frame(Vec3::new(0.0, 4.0, 0.0), model.bound_radius().min(60.0));
-        App { doc, model, warns, cam, selected: None, mode: Mode::Normal, start: std::time::Instant::now() }
+        let mut app = App {
+            doc,
+            model,
+            warns,
+            cam: OrbitCamera::default(),
+            selected: None,
+            mode: Mode::Normal,
+            start: std::time::Instant::now(),
+            meshed: HashMap::new(),
+            epoch: 0,
+        };
+        app.remesh();
+        app.frame_all();
+        app
+    }
+
+    /// Mesh every part the parametric path cannot draw. Cost is O(resolution³) per part, which is
+    /// why it happens here and not in the frame loop; adaptive octree refinement (PARITY) is what
+    /// eventually makes this cheap enough to run on every edit keystroke.
+    fn remesh(&mut self) {
+        self.meshed.clear();
+        self.epoch = self.epoch.wrapping_add(1);
+        for part in &self.model.parts {
+            if display_of(&part.sdf).is_some() {
+                continue;
+            }
+            let t = cad_kernel::dual_contour(&part.sdf, MeshOpts { resolution: 56 });
+            if t.is_empty() {
+                log::warn!("part '{}' produced no surface", part.name);
+                continue;
+            }
+            log::info!("meshed '{}': {} tris", part.name, t.tri_count());
+            self.meshed.insert(part.id, Arc::new(from_trimesh(&t)));
+        }
+    }
+
+    fn frame_all(&mut self) {
+        let (lo, hi) = self.model.aabb();
+        self.cam.frame((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(1.0));
     }
 
     fn act(&mut self, a: Action) {
@@ -92,10 +237,10 @@ impl App {
             Action::DollyOut => self.cam.dolly(1.18),
             Action::FrameSelection => match self.selected.and_then(|id| self.model.part(id)) {
                 Some(p) => {
-                    let (center, _, _) = unwrap_placement(&p.sdf);
-                    self.cam.frame(center, p.sdf.bound_radius() - center.length() + 2.0);
+                    let (lo, hi) = p.sdf.aabb();
+                    self.cam.frame((lo + hi) * 0.5, ((hi - lo).length() * 0.5).max(0.5));
                 }
-                None => self.cam.frame(Vec3::new(0.0, 4.0, 0.0), self.model.bound_radius().min(60.0)),
+                None => self.frame_all(),
             },
             Action::SelectNext | Action::SelectPrev => {
                 let ids: Vec<u32> = self.model.parts.iter().map(|p| p.id).collect();
@@ -166,19 +311,33 @@ impl App {
                 [0.52, 0.55, 0.58, 1.0],
                 [1.0, 0.0, 0.05, 0.0], // mode=ground, no pick id
             ),
+            mesh: None,
         });
         for part in &self.model.parts {
-            if let Some((kind, model)) = display_of(&part.sdf) {
-                draws.push(FrameDraw {
+            let params = [0.0, 0.0, 0.30, part.id as f32 + 1.0];
+            match display_of(&part.sdf) {
+                // A primitive: cached parametric mesh, placed by its model matrix.
+                Some((kind, model)) => draws.push(FrameDraw {
                     kind,
-                    object: object_raw(model, part.color, [0.0, 0.0, 0.30, part.id as f32 + 1.0]),
-                });
+                    object: object_raw(model, part.color, params),
+                    mesh: None,
+                }),
+                // CSG: dual-contoured in world space already, so the model matrix is identity.
+                None => {
+                    if let Some(m) = self.meshed.get(&part.id) {
+                        draws.push(FrameDraw {
+                            kind: MeshKind::Generated(part.id as u64),
+                            object: object_raw(Mat4::IDENTITY, part.color, params),
+                            mesh: Some(m.clone()),
+                        });
+                    }
+                }
             }
         }
 
         ui.painter().add(egui_wgpu::Callback::new_paint_callback(
             rect,
-            cad_view::renderer::ViewportCallback { globals, draws },
+            cad_view::renderer::ViewportCallback { globals, draws, epoch: self.epoch },
         ));
         if self.selected.is_some() {
             ui.ctx().request_repaint(); // selection breathe; otherwise stay idle (phone battery)
@@ -294,7 +453,9 @@ impl eframe::App for App {
                     }
                 }
                 ui.separator();
+                let tris: usize = self.meshed.values().map(|m| m.idx.len() / 3).sum();
                 ui.label(format!("{} ops → {} parts", self.doc.ops.len(), self.model.parts.len()));
+                ui.label(format!("{} meshed, {tris} tris", self.meshed.len()));
             });
 
         egui::Panel::bottom("status").show_inside(root, |ui| {

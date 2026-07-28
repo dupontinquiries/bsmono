@@ -95,6 +95,66 @@ impl Sdf {
         g.normalize_or(Vec3::Y)
     }
 
+    /// Conservative axis-aligned bounds. Unlike `bound_radius` this tracks placement, so the
+    /// mesher can grid only where the solid actually is — the difference between meshing a bracket
+    /// and meshing the empty cube of space it was translated into.
+    pub fn aabb(&self) -> (Vec3, Vec3) {
+        match self {
+            Sdf::Sphere { r } => (Vec3::splat(-r), Vec3::splat(*r)),
+            Sdf::Cuboid { half } => (-*half, *half),
+            Sdf::Cylinder { r, hh } => (Vec3::new(-r, -hh, -r), Vec3::new(*r, *hh, *r)),
+            Sdf::Capsule { r, hh } => (Vec3::new(-r, -(hh + r), -r), Vec3::new(*r, hh + r, *r)),
+            Sdf::Torus { major, minor } => {
+                let x = major + minor;
+                (Vec3::new(-x, -minor, -x), Vec3::new(x, *minor, x))
+            }
+            Sdf::Translate { off, node } => {
+                let (lo, hi) = node.aabb();
+                (lo + *off, hi + *off)
+            }
+            Sdf::Rotate { inv, node } => {
+                // Rotate the child's eight corners and re-bound. `inv` is stored inverted, so the
+                // forward rotation is its inverse.
+                let (lo, hi) = node.aabb();
+                let rot = inv.inverse();
+                let (mut nlo, mut nhi) = (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY));
+                for c in 0..8 {
+                    let p = Vec3::new(
+                        if c & 1 == 0 { lo.x } else { hi.x },
+                        if c & 2 == 0 { lo.y } else { hi.y },
+                        if c & 4 == 0 { lo.z } else { hi.z },
+                    );
+                    let q = rot * p;
+                    nlo = nlo.min(q);
+                    nhi = nhi.max(q);
+                }
+                (nlo, nhi)
+            }
+            Sdf::Union { a, b } => {
+                let (al, ah) = a.aabb();
+                let (bl, bh) = b.aabb();
+                (al.min(bl), ah.max(bh))
+            }
+            Sdf::Blend { a, b, k } => {
+                // Smooth-min pulls the surface outward by at most k/4, and the fillet fairing can
+                // reach a little further where the operands meet; k is the honest allowance.
+                let (al, ah) = a.aabb();
+                let (bl, bh) = b.aabb();
+                (al.min(bl) - Vec3::splat(*k), ah.max(bh) + Vec3::splat(*k))
+            }
+            Sdf::Intersect { a, b } => {
+                let (al, ah) = a.aabb();
+                let (bl, bh) = b.aabb();
+                (al.max(bl), ah.min(bh))
+            }
+            Sdf::Subtract { a, .. } => a.aabb(),
+            Sdf::Shell { t, node } => {
+                let (lo, hi) = node.aabb();
+                (lo - Vec3::splat(*t), hi + Vec3::splat(*t))
+            }
+        }
+    }
+
     /// Loose bounding radius from the origin — enough for the tracer's far clip and `frame`.
     /// Conservative by construction (sums where it must); tightness is not a promise.
     pub fn bound_radius(&self) -> f32 {
@@ -186,6 +246,19 @@ mod tests {
         // The long X axis rotated to +Y: a point far along Y should be near the surface now.
         assert!(s.eval(Vec3::new(0.0, 2.0, 0.0)).abs() < 1e-4);
         assert!(s.eval(Vec3::new(2.0, 0.0, 0.0)) > 1.0);
+    }
+
+    #[test]
+    fn aabb_tracks_placement_and_contains_the_surface() {
+        let s = translate(Vec3::new(10.0, 0.0, 0.0), sphere(2.0));
+        let (lo, hi) = s.aabb();
+        assert!((lo.x - 8.0).abs() < 1e-5 && (hi.x - 12.0).abs() < 1e-5, "{lo:?} {hi:?}");
+        // Sample the box faces: nothing outside the box may be inside the solid.
+        for i in 0..40 {
+            let t = i as f32 / 39.0;
+            let p = Vec3::new(lo.x - 0.01, lo.y + (hi.y - lo.y) * t, 0.0);
+            assert!(s.eval(p) > 0.0);
+        }
     }
 
     #[test]

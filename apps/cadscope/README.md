@@ -5,14 +5,16 @@ export truth. The renderer is [`games/skydribble`](../../games/skydribble)'s obj
 transplanted into an `egui_wgpu` paint callback; the app patterns (liaison, fan-out, convograph,
 sanitization boundary) come from [`apps/logscope`](../logscope).
 
-**Status: M0 complete** — the vertical slice compiles and tests green; the interactive gate needs
+**Status: M1 in progress** — the kernel meshes arbitrary CSG through dual contouring and the
+viewport draws it. 47 tests green plus a headless `--selftest`; the interactive gate still needs
 hardware (this workspace was built in a sandbox with no GPU or display).
 
 ## Build and run
 
 ```sh
 cd apps/cadscope
-cargo test                              # 36 tests, includes offline WGSL validation via naga
+cargo test                              # 47 tests, includes offline WGSL validation via naga
+cargo run -p cadscope-egui -- --selftest  # headless: evaluate, mesh and ray-probe the model
 cargo run --release -p cadscope-egui    # the app (bin name: cadscope)
 ```
 
@@ -20,10 +22,13 @@ Requires Rust 1.96+. The wgpu backend is mandatory — `NativeOptions.depth_buff
 `Depth32Float`, which is the format the `cad-view` pipeline declares. The glow backend will not
 work.
 
-## What M0 gives you
+## What the demo gives you
 
-A demo document (`m0-bench`: slab, pillar, knob, ring, handle) built from forge ops, evaluated to
-an SDF model, drawn as meshes on a gridded ground plane.
+A document (`m1-bench`) built from forge ops, evaluated to an SDF model, drawn on a gridded ground
+plane. Five parts are primitives on cached parametric meshes; three are CSG and go through the dual
+contourer — a **bracket** (a plate with a bore subtracted), a **lamp** (a sphere blended onto a
+post, so the join reads as a fillet), and **studs** (one cylinder patterned four times into a
+single solid).
 
 | input | action |
 |---|---|
@@ -48,8 +53,8 @@ which needs it for the paint callback.
 
 | crate | milestone | what it owns |
 |---|---|---|
-| `cad-kernel` | M0 ✅ | SDF primitives, CSG, `Blend`, `Shell`, sphere-traced rays, `Part`/`Model`, picking. std + glam only. |
-| `cad-forge` | M0 ✅ | `.cadf` op documents — names not IDs, per-op error tolerance, byte-stable round-trip. |
+| `cad-kernel` | M0 ✅ M1 ✅ | SDF primitives, CSG, `Blend`, `Shell`, bounds, sphere-traced rays, `Part`/`Model`, picking, and dual-contour meshing. std + glam only. |
+| `cad-forge` | M0 ✅ M1 ✅ | `.cadf` op documents — names not IDs, per-op error tolerance, byte-stable round-trip. Ops: add, nudge, color, combine (union/intersect/subtract/blend), shell, pattern, remove. |
 | `cad-view` | M0 ✅ | wgpu renderer, procedural meshes, orbit camera, the one lit WGSL pass. |
 | `cad-motion` | M0 ✅ | modal key → action mapping. Pure; no camera, no scene. |
 | `cadscope-egui` | M0 ✅ | the shell: window, viewport, panels, wiring. |
@@ -69,6 +74,9 @@ which needs it for the paint callback.
 - **`ObjectRaw` is exactly 256 bytes.** That is skydribble's layout, kept verbatim: a universally
   supported dynamic-offset alignment and the stride the WGSL `Obj` struct pads to. A test asserts
   it. Do not reorder the fields.
+- **The mesher trusts the distance bound.** Dual contouring reads crossings and gradients straight
+  out of the field; if `eval` ever overestimated, vertices would land off-surface. The selftest
+  measures exactly this (`max|d|` per part, against half a cell).
 - **Shaders are validated offline.** `cargo test -p cad-view` parses and validates `shader.wgsl`
   with naga, so WGSL errors are a test failure and not a black viewport on someone's phone.
 

@@ -13,6 +13,7 @@
 //! draws into egui's own render pass — no second surface, no texture round-trip.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use wgpu::util::DeviceExt;
 
@@ -69,6 +70,10 @@ pub enum MeshKind {
     /// cylindrical half-height / radius in thousandths.
     Capsule { hh_milli: u32 },
     GroundSlab,
+    /// A mesh built by the kernel's dual contourer rather than a parametric generator — the CSG
+    /// path. The key identifies it (part id today); the data rides along on the first
+    /// `FrameDraw` that names it and is cached until the epoch bumps.
+    Generated(u64),
 }
 
 fn build_mesh(kind: MeshKind) -> MeshData {
@@ -78,14 +83,18 @@ fn build_mesh(kind: MeshKind) -> MeshData {
         MeshKind::Cylinder => meshgen::cylinder(48),
         MeshKind::Torus { ratio_milli } => meshgen::torus(ratio_milli as f32 / 1000.0, 64, 28),
         MeshKind::Capsule { hh_milli } => meshgen::capsule(hh_milli as f32 / 1000.0, 12, 32),
+        // Never reached: generated meshes arrive as data on the draw, not built from a key.
+        MeshKind::Generated(_) => MeshData::new(),
     }
 }
 
-/// One instance to draw this frame.
-#[derive(Clone, Copy)]
+/// One instance to draw this frame. `mesh` is `Some` only for a `Generated` kind the renderer may
+/// not have cached yet; cloning an `Arc` per frame is the whole cost of carrying it.
+#[derive(Clone)]
 pub struct FrameDraw {
     pub kind: MeshKind,
     pub object: ObjectRaw,
+    pub mesh: Option<Arc<MeshData>>,
 }
 
 struct GpuMesh {
@@ -105,6 +114,9 @@ pub struct ViewRenderer {
     obj_bg: wgpu::BindGroup,
     obj_capacity: u32,
     meshes: HashMap<MeshKind, GpuMesh>,
+    /// Bumped by the app whenever the model is re-evaluated; generated meshes are dropped on
+    /// change so an edited document cannot leak GPU buffers for geometry that no longer exists.
+    epoch: u64,
 }
 
 impl ViewRenderer {
@@ -218,6 +230,23 @@ impl ViewRenderer {
             obj_bg,
             obj_capacity,
             meshes: HashMap::new(),
+            epoch: 0,
+        }
+    }
+
+    fn make_gpu_mesh(device: &wgpu::Device, m: &MeshData) -> GpuMesh {
+        GpuMesh {
+            vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cadscope-mesh-v"),
+                contents: bytemuck::cast_slice(&m.verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            }),
+            ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cadscope-mesh-i"),
+                contents: bytemuck::cast_slice(&m.idx),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+            index_count: m.idx.len() as u32,
         }
     }
 
@@ -248,6 +277,10 @@ impl ViewRenderer {
     }
 
     fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cb: &ViewportCallback) {
+        if cb.epoch != self.epoch {
+            self.meshes.retain(|k, _| !matches!(k, MeshKind::Generated(_)));
+            self.epoch = cb.epoch;
+        }
         if cb.draws.len() as u32 > self.obj_capacity {
             self.obj_capacity = (cb.draws.len() as u32).next_power_of_two();
             let (buf, bg) = Self::make_obj_buffer(device, &self.obj_layout, self.obj_capacity);
@@ -255,22 +288,16 @@ impl ViewRenderer {
             self.obj_bg = bg;
         }
         for d in &cb.draws {
-            self.meshes.entry(d.kind).or_insert_with(|| {
-                let m = build_mesh(d.kind);
-                GpuMesh {
-                    vbuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("cadscope-mesh-v"),
-                        contents: bytemuck::cast_slice(&m.verts),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    }),
-                    ibuf: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("cadscope-mesh-i"),
-                        contents: bytemuck::cast_slice(&m.idx),
-                        usage: wgpu::BufferUsages::INDEX,
-                    }),
-                    index_count: m.idx.len() as u32,
-                }
-            });
+            if self.meshes.contains_key(&d.kind) {
+                continue;
+            }
+            let gpu = match (&d.kind, &d.mesh) {
+                (MeshKind::Generated(_), Some(m)) => Self::make_gpu_mesh(device, m),
+                // A generated kind with no data yet: skip, and pick it up on a later frame.
+                (MeshKind::Generated(_), None) => continue,
+                (kind, _) => Self::make_gpu_mesh(device, &build_mesh(**&kind)),
+            };
+            self.meshes.insert(d.kind, gpu);
         }
         queue.write_buffer(&self.globals_buf, 0, bytemuck::bytes_of(&cb.globals));
         if !cb.draws.is_empty() {
@@ -298,6 +325,8 @@ impl ViewRenderer {
 pub struct ViewportCallback {
     pub globals: Globals,
     pub draws: Vec<FrameDraw>,
+    /// Increment when the model is re-evaluated; see `ViewRenderer::epoch`.
+    pub epoch: u64,
 }
 
 impl egui_wgpu::CallbackTrait for ViewportCallback {
@@ -352,9 +381,11 @@ mod tests {
             MeshKind::Torus { ratio_milli: 350 },
             MeshKind::Torus { ratio_milli: 200 },
             MeshKind::Capsule { hh_milli: 800 },
+            MeshKind::Generated(7),
+            MeshKind::Generated(8),
         ]
         .into_iter()
         .collect();
-        assert_eq!(keys.len(), 3);
+        assert_eq!(keys.len(), 5);
     }
 }

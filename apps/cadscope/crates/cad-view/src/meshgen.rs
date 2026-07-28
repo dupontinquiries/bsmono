@@ -220,6 +220,20 @@ pub fn boxx() -> MeshData {
     m
 }
 
+/// Adopt a kernel `TriMesh` (dual-contoured CSG geometry) as a renderable mesh. UVs are zeroed:
+/// the shader only reads them for the ground grid, and real parameterization is cad-tex's job (M4).
+pub fn from_trimesh(t: &cad_kernel::TriMesh) -> MeshData {
+    MeshData {
+        verts: t
+            .positions
+            .iter()
+            .zip(t.normals.iter())
+            .map(|(p, n)| Vertex { pos: *p, nrm: *n, uv: [0.0, 0.0] })
+            .collect(),
+        idx: t.indices.clone(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +261,19 @@ mod tests {
         for v in sphere(8, 12).verts {
             assert!((Vec3::from(v.pos).length() - 1.0).abs() < 1e-4);
         }
+    }
+
+    #[test]
+    fn trimesh_adoption_preserves_counts() {
+        let solid = cad_kernel::sdf::subtract(
+            cad_kernel::sdf::cuboid(Vec3::splat(2.0)),
+            cad_kernel::sdf::cylinder(0.8, 3.0),
+        );
+        let t = cad_kernel::dual_contour(&solid, cad_kernel::MeshOpts { resolution: 24 });
+        let m = from_trimesh(&t);
+        assert_eq!(m.verts.len(), t.positions.len());
+        assert_eq!(m.idx.len(), t.indices.len());
+        check(&m);
     }
 
     #[test]

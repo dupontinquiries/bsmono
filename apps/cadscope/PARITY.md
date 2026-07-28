@@ -4,17 +4,51 @@ House convention (`PARITY.md`, per-project): record what was *not* carried over,
 simplified, and what has not actually been observed working — so the next session inherits facts
 instead of assumptions. Nothing here is a bug report; these are known, chosen, or unverified.
 
+## Closed
+
+- ~~**The viewport draws primitives only.**~~ Closed at M1. `cad_kernel::mesh::dual_contour` meshes
+  arbitrary SDF trees, `cad-view` carries them as `MeshKind::Generated`, and the demo document now
+  contains three CSG parts (a drilled bracket, a blended lamp, a patterned stud row) that draw.
+
 ## Not verified in-sandbox
 
 - **The app has never been run.** The build environment had one core, 3 GB RAM, no GPU and no
-  display. M0's gate was met by compilation + 36 passing tests + offline naga WGSL validation. The
-  first person with hardware should run `cargo run --release -p cadscope-egui` and confirm: the
-  scene draws, depth sorts correctly, tap-picking selects the part under the finger, and the
-  selection tint breathes. Until then, treat "the viewport works" as *plausible*, not *observed*.
+  display. What *has* been observed: `cargo test` (47 tests), offline naga WGSL validation, and
+  `cadscope --selftest`, which evaluates the document, meshes every CSG part and ray-probes the
+  result headlessly — it passes, and its printed volumes agree with hand calculation to within
+  ~1.5%. What remains unobserved is everything downstream of the GPU: that the pass draws, that
+  depth sorts, that a tap selects what is under the finger, that the selection tint breathes.
+  Run `cargo run --release -p cadscope-egui` on hardware to close this.
 - **`depth_buffer: 32` runtime path.** The pipeline declares `Depth32Float` because
   `egui_wgpu::depth_format_from_bits(32, 0)` returns it and eframe passes `NativeOptions.depth_buffer`
   through. Read from the 0.34.3 source, not executed. If the pass and pipeline formats ever
   disagree, wgpu will say so loudly at startup.
+
+## The mesher (M1)
+
+- **Uniform grid, not adaptive.** One cell size over the whole part, so cost is O(resolution³) and
+  a large part with one small fillet pays for that fillet everywhere. Octree refinement driven by
+  QEF residual or curvature is the follow-on, and it is what eventually makes meshing cheap enough
+  to run on every keystroke instead of on document change.
+- **Meshing is synchronous on the UI thread.** `App::remesh` runs at startup and on any future
+  document edit. At M1's demo scale (~20k triangles total) that is imperceptible, but a heavy part
+  will stall the frame. The fix is the genviz-style worker + progress model already planned for the
+  liaison (M3) — meshing and AI generation should share one progress surface.
+- **No vertex clustering.** Dual contouring places exactly one vertex per cell, so a cell
+  containing two separate surface sheets (a wall thinner than the cell size, two parts nearly
+  touching) will weld them and produce a non-manifold junction. Manifold-preserving DC needs
+  per-cell surface-component clustering. Practical guard today: keep `resolution` fine enough that
+  a cell is smaller than the thinnest wall — for `Shell`, thinner than `t`.
+- **Sharp features are clamped to their cell.** The QEF solution is clamped into the owning cell
+  to guarantee vertices cannot cross into a neighbour and self-intersect. This is the standard
+  robustness trade and it very slightly rounds a corner whose ideal vertex lies outside its cell.
+- **Generated meshes have no UVs.** `from_trimesh` zeroes them. The shader only reads UVs for the
+  ground grid, so nothing is wrong today, but texturing CSG geometry needs real parameterization —
+  that is `cad-tex`'s auto-unwrap work (M4).
+- **No mesh caching across edits.** A document change re-meshes every CSG part from scratch and
+  bumps the renderer epoch, dropping all generated GPU buffers. Correct, and wasteful once
+  documents are large: incremental re-meshing of only the parts whose subtree changed wants a
+  content hash on the SDF tree.
 
 ## Simplified from skydribble
 
@@ -30,27 +64,24 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 
 ## Kernel and viewport gaps
 
-- **The viewport draws primitives only.** `display_of` maps a primitive leaf plus its
-  translate/rotate wrappers to a cached mesh. A part whose SDF is a CSG tree (`Union`, `Subtract`,
-  `Blend`, `Shell`) is skipped by the renderer — *it is still fully modeled, picked, and measured
-  correctly by the kernel*, it just has no triangles yet. The M1 adaptive dual-contouring mesher
-  closes this. Consequence today: a `Combine` op makes a part vanish from view while remaining in
-  the parts list and remaining pickable. This is expected, not a bug.
 - **Picking is SDF ray-marching, not an ID buffer.** O(parts) sphere traces per click. Correct and
   dependency-free, but it will not scale to large assemblies and it cannot pick a *feature* (face,
   edge, vertex) — only a part. The ID-buffer pass planned in §4 supersedes it when feature
   selection lands (M2).
-- **`Model::pick` has no BVH.** Every part is traced on every click. Fine at M0 scale; add a
+- **`Model::pick` has no BVH.** Every part is traced on every click. Fine at this scale; add a
   bounding-sphere BVH when assemblies grow.
 - **Not a B-rep kernel.** Exact analytic surfaces, no persistent topological naming. STEP export,
   exact fillet/chamfer semantics, and stable face references across edits are all consequences of
   this choice, not oversights. See the fornjot analysis note in the plan (§15 addendum) — the
-  decision to be revisited at M1 is *persistent face/edge naming in forge ops*, which must be
-  designed in before documents accumulate, not retrofitted.
+  decision to be revisited is *persistent face/edge naming in forge ops*, which must be designed in
+  before documents accumulate, not retrofitted.
 - **`Blend` is smooth-min, not a true fillet.** It reads as a fillet and is bounded
   (`min(a,b) - k/4 ≤ blend ≤ min(a,b)`, tested), but it is not a constant-radius rolling-ball
   fillet and will not measure as one. Whether that is acceptable for real parts is open question
   #2 in the plan.
+- **`Sdf::aabb` is conservative, not tight.** `Rotate` re-bounds eight rotated corners, and
+  `Blend` pads by the full `k`. A loose box costs mesher resolution (cells spent on empty space),
+  never correctness.
 
 ## UI stack
 
@@ -69,7 +100,7 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 - **gpu-gemm device sharing.** The whole point of unifying on wgpu 29 is that `apps/logscope`'s
   pure-Rust inference engine and this renderer can eventually share a device and queue. Nothing has
   been shared yet; they merely agree on a version. First real test is M3.
-- **The five stub crates are stubs.** `cad-tex`, `cad-liaison`, `cad-net`, `cad-nifty`, `cad-pool`
-  contain a milestone constant and a test asserting it. They exist to fix the dependency direction
-  early, and they are counted in the 36 tests — do not read that number as coverage of unwritten
-  features.
+- **The four remaining stub crates are stubs.** `cad-tex`, `cad-liaison`, `cad-net`, `cad-nifty`
+  and `cad-pool` contain a milestone constant and a test asserting it. They exist to fix the
+  dependency direction early, and they are counted in the 47 tests — do not read that number as
+  coverage of unwritten features.

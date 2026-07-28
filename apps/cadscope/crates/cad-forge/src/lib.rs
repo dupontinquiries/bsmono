@@ -75,6 +75,11 @@ pub enum Op {
         #[serde(default)]
         k: f32,
     },
+    /// Hollow a part: keep a wall of thickness `t` around its surface.
+    Shell { name: String, t: f32 },
+    /// Repeat a part `count` times along `step`, unioned into one solid. The canonical CAD
+    /// linear pattern; `count` includes the original.
+    Pattern { name: String, count: u32, step: [f32; 3] },
     /// Remove a part by name.
     Remove { name: String },
 }
@@ -177,6 +182,36 @@ impl Doc {
                         _ => warn(&mut warns, i, format!("combine: missing '{into}' or '{other}'")),
                     }
                 }
+                Op::Shell { name, t } => match model.parts.iter_mut().find(|p| &p.name == name) {
+                    Some(p) if t.is_finite() && *t > 0.0 => {
+                        p.sdf = cad_kernel::sdf::shell(*t, p.sdf.clone())
+                    }
+                    Some(_) => warn(&mut warns, i, format!("shell '{name}': thickness must be > 0")),
+                    None => warn(&mut warns, i, format!("shell: no part named '{name}'")),
+                },
+                Op::Pattern { name, count, step } => {
+                    let step_v = Vec3::from(*step);
+                    let ok = (2..=512).contains(count) && step_v.length_squared() > 1e-9;
+                    match model.parts.iter_mut().find(|p| &p.name == name) {
+                        Some(p) if ok => {
+                            let base = p.sdf.clone();
+                            let mut acc = base.clone();
+                            for n in 1..*count {
+                                acc = cad_kernel::sdf::union(
+                                    acc,
+                                    cad_kernel::sdf::translate(step_v * n as f32, base.clone()),
+                                );
+                            }
+                            p.sdf = acc;
+                        }
+                        Some(_) => warn(
+                            &mut warns,
+                            i,
+                            format!("pattern '{name}': count must be 2..=512 and step non-zero"),
+                        ),
+                        None => warn(&mut warns, i, format!("pattern: no part named '{name}'")),
+                    }
+                }
                 Op::Remove { name } => {
                     let before = model.parts.len();
                     model.parts.retain(|p| &p.name != name);
@@ -231,6 +266,44 @@ mod tests {
         let (m, warns) = d.apply();
         assert_eq!(warns.len(), 2, "{warns:?}");
         assert_eq!(m.parts.len(), 1, "good ops still applied");
+    }
+
+    #[test]
+    fn shell_hollows_and_pattern_repeats() {
+        let d = Doc {
+            name: "m1-ops".into(),
+            ops: vec![
+                Op::Add { name: "cup".into(), shape: ShapeSpec::Sphere { r: 3.0 }, at: [0.0; 3], rot_axis_deg: None, color: default_color() },
+                Op::Shell { name: "cup".into(), t: 0.2 },
+                Op::Add { name: "stud".into(), shape: ShapeSpec::Cylinder { r: 0.4, hh: 0.5 }, at: [20.0, 0.0, 0.0], rot_axis_deg: None, color: default_color() },
+                Op::Pattern { name: "stud".into(), count: 4, step: [2.0, 0.0, 0.0] },
+            ],
+        };
+        let (m, warns) = d.apply();
+        assert!(warns.is_empty(), "{warns:?}");
+        let cup = m.parts.iter().find(|p| p.name == "cup").unwrap();
+        assert!(cup.sdf.eval(glam::Vec3::ZERO) > 0.0, "shelled sphere is hollow at its centre");
+        assert!(cup.sdf.eval(glam::Vec3::new(3.0, 0.0, 0.0)) < 0.0, "the wall itself is solid");
+        let stud = m.parts.iter().find(|p| p.name == "stud").unwrap();
+        for n in 0..4 {
+            let x = 20.0 + 2.0 * n as f32;
+            assert!(stud.sdf.eval(glam::Vec3::new(x, 0.0, 0.0)) < 0.0, "copy {n} missing");
+        }
+        assert!(stud.sdf.eval(glam::Vec3::new(29.0, 0.0, 0.0)) > 0.0, "pattern must not run on");
+    }
+
+    #[test]
+    fn bad_pattern_is_reported_not_fatal() {
+        let d = Doc {
+            name: "guard".into(),
+            ops: vec![
+                Op::Add { name: "a".into(), shape: ShapeSpec::Sphere { r: 1.0 }, at: [0.0; 3], rot_axis_deg: None, color: default_color() },
+                Op::Pattern { name: "a".into(), count: 1, step: [0.0, 0.0, 0.0] },
+            ],
+        };
+        let (m, warns) = d.apply();
+        assert_eq!(warns.len(), 1);
+        assert_eq!(m.parts.len(), 1);
     }
 
     #[test]
