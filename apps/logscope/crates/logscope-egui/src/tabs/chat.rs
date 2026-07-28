@@ -382,6 +382,27 @@ struct VerifyJob {
 
 // ── Persistence: checkpoints, rollback, crash recovery ───────────────────────────────────────
 /// On-disk form of a turn (no UI/Instant state). Role 0 = user, 1 = assistant.
+/// The message list, as the view model sees it.
+///
+/// Implemented on a slice rather than on ChatTab so building rows borrows only the messages — the
+/// renderer no longer needs `&mut self` while it paints, which is what forced the collect-then-apply
+/// dance and the alternative of cloning every message to read it.
+struct MsgSlice<'a>(&'a [Msg]);
+
+impl logscope::msgview::MessageStore for MsgSlice<'_> {
+    fn len(&self) -> usize { self.0.len() }
+    fn is_user(&self, i: usize) -> bool { self.0[i].role == Role::User }
+    fn line_count(&self, i: usize) -> usize { self.0[i].text().lines().count() }
+    fn summary(&self, i: usize) -> String {
+        // Only called for rows that will actually collapse, so the parse cost is paid once per visible
+        // collapsed row rather than once per message per frame.
+        let t = self.0[i].text();
+        let edits = logscope::liaison_relay::parse_edits(t);
+        let cn = logscope::liaison_relay::cliffsnotes(t, &edits, None);
+        format!("\u{25b8} {}  ({} lines)", cn.label(), t.lines().count())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct MsgSave { role: u8, variants: Vec<String>, cur: usize }
 /// A named, restorable snapshot of the whole conversation.
@@ -6603,6 +6624,13 @@ impl Chat {
                     let nmsgs = self.msgs.len();
                     let scroll_to = self.scroll_chat_to.take(); // jump-scroll target from the graph
                     let msg_count = self.msgs.len();
+                    // ROW DESCRIPTORS, built once per frame from a borrow of the messages that ends
+                    // here. The paint reads these instead of deciding per-message, so the collapse
+                    // decision and its label are computed in one place and the renderer stops needing
+                    // to know the rules. Summaries are computed only for rows that actually collapse.
+                    let rows = logscope::msgview::build_rows(
+                        &MsgSlice(&self.msgs), 0..msg_count, &self.expanded_msgs,
+                        logscope::liaison_relay::COLLAPSE_ABOVE_LINES);
                     let expanded_now = self.expanded_msgs.clone();
                     let mut expand_msg: Option<usize> = None;
                     let mut collapse_msg: Option<usize> = None;
@@ -6653,18 +6681,16 @@ impl Chat {
                                     // afterwards, so it folds once it is no longer the latest message. Only when BOTH long and
                                     // not-latest: collapsing what someone is currently reading is hostile, and folding a
                                     // three-line answer saves nothing.
-                                    let body_lines = m.text().lines().count();
-                                    let is_latest = i + 1 == msg_count;
+                                    let row = rows.get(i);
+                                    let body_lines = row.map(|r| r.lines).unwrap_or(0);
                                     let collapsible = m.role == Role::Assistant
-                                        && logscope::liaison_relay::CliffsNotes::should_collapse(body_lines, is_latest);
+                                        && body_lines > logscope::liaison_relay::COLLAPSE_ABOVE_LINES
+                                        && i + 1 != msg_count;
                                     let expanded = expanded_now.contains(&i);
-                                    if collapsible && !expanded {
-                                        let edits = logscope::liaison_relay::parse_edits(m.text());
-                                        let cn = logscope::liaison_relay::cliffsnotes(m.text(), &edits, None);
-                                        // The label carries what the reply DID, so a reader can decide without opening it —
-                                        // a chevron saying "Assistant reply" costs a click and saves no attention.
-                                        let lbl = format!("\u{25b8} {}  ({body_lines} lines)", cn.label());
-                                        if ui.button(RichText::new(lbl).color(theme::DIM()).small()).clicked() {
+                                    if let Some(r) = row.filter(|r| r.collapsed) {
+                                        // The label was computed when the row was built; the paint just
+                                        // draws it. No parse, no summary, no clone at draw time.
+                                        if ui.button(RichText::new(r.label.clone()).color(theme::DIM()).small()).clicked() {
                                             expand_msg = Some(i);
                                         }
                                         return;
@@ -6761,8 +6787,14 @@ impl Chat {
                     }
                     // Apply the chevron clicks here: the render closure holds `self.msgs` mutably, so it
                     // records the intent and the mutation happens once the borrow ends.
-                    if let Some(i) = expand_msg { self.expanded_msgs.insert(i); }
-                    if let Some(i) = collapse_msg { self.expanded_msgs.remove(&i); }
+                    // Applied through the view model, so the expansion set has one mutation path and
+                    // the caller learns whether anything actually moved.
+                    let mut acts = Vec::new();
+                    if let Some(i) = expand_msg { acts.push(logscope::msgview::RowAction::Expand(i)); }
+                    if let Some(i) = collapse_msg { acts.push(logscope::msgview::RowAction::Collapse(i)); }
+                    if logscope::msgview::apply_actions(&mut self.expanded_msgs, &acts) {
+                        ui.ctx().request_repaint();
+                    }
                     // ── LIAISON HUD: the running backend account, under the newest message ──
                     //
                     // Only while generating: after a reply lands, a status strip is stale and competes
