@@ -37,6 +37,7 @@
 //! changes gain) commute and both survive, because they are separate ops.
 
 pub mod wire;
+pub mod carrier;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
