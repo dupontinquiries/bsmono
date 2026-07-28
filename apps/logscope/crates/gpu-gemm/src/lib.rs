@@ -160,6 +160,36 @@ pub fn mark_map_views_live() {
     MAP_VIEWS_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Drop page residency for every mapping EXCEPT the one currently in use.
+///
+/// The registry is deliberately leak-on-purpose — weights hold `&'static [u8]` into it, so a mapping can
+/// never be unmapped while a model that references it is alive. But nothing evicted a mapping when the
+/// model was REPLACED, and `autoload_if_changed` fires on every selection change: a session that touches
+/// three models ends up holding three models' worth of page cache, only one of which is live.
+///
+/// Observed: DeepSeek-8B, GLM-4.7-Flash and Qwen3-30B all mapped in one run, ~110 GiB of address space
+/// for one model's worth of work. The address space itself is cheap; the PAGE CACHE is not, and on a
+/// machine where the GPU budget is already the binding constraint it is competing for exactly the memory
+/// the live model needs.
+///
+/// This releases residency rather than unmapping, because unmapping would invalidate slices that a
+/// still-referenced model may hold. The pages come back on demand if anything does touch them.
+pub fn release_stale_map_residency(keep: &str) -> usize {
+    if MAP_VIEWS_LIVE.load(std::sync::atomic::Ordering::Relaxed) { return 0; }
+    let Some(reg) = RETAINED_MAPS.get() else { return 0 };
+    let g = reg.lock().unwrap();
+    let mut n = 0usize;
+    for (path, fb) in g.iter() {
+        if path == keep { continue; }
+        if let FileBytes::Mapped(m) = *fb {
+            // SAFETY: same argument as release_map_residency — read-only, file-backed, shared mapping of
+            // a file we never write, so discarding resident pages loses nothing but the cache.
+            if unsafe { m.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) }.is_ok() { n += 1; }
+        }
+    }
+    n
+}
+
 pub fn release_map_residency() -> usize {
     // GUARD. This was unconditional, and it is safe ONLY when the load pass has finished reading and
     // nothing holds a view into the mapping. When experts are file VIEWS (`RawExpertSrc`), the mapping is
