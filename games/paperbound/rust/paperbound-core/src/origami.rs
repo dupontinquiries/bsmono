@@ -411,6 +411,21 @@ pub fn draw_model(
 mod tests {
     use super::*;
 
+    /// How many pixels the frame actually painted (alpha > 0).
+    fn ink(f: &Frame) -> usize { f.px.chunks(4).filter(|p| p[3] > 0).count() }
+
+    /// A cheap shape fingerprint: which pixels were painted, order-sensitive.
+    fn ink_signature(f: &Frame) -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for (i, p) in f.px.chunks(4).enumerate() {
+            if p[3] > 0 {
+                h ^= i as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h
+    }
+
     fn game_dir() -> std::path::PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
@@ -426,6 +441,52 @@ mod tests {
         for (k, min_parts) in [("mothmage", 8), ("foldknight", 6), ("inkwitch", 5), ("phoenix", 6)] {
             let m = mb.models.get(k).unwrap_or_else(|| panic!("no model for {k}"));
             assert!(m.parts.len() >= min_parts, "{k}: {} parts", m.parts.len());
+        }
+    }
+
+    #[test]
+    fn every_data_part_folds_into_real_geometry() {
+        // parts.json is the extension point — packs add parts as DATA and both
+        // engines must fold them. Assert every registered part actually draws
+        // something: a typo'd `kind`, an empty `points`, or a name the renderer
+        // silently ignores would otherwise ship as an invisible unit.
+        let mb = ModelBook::load(&game_dir()).expect("model book");
+        let mut skipped = Vec::new();
+        for (name, spec) in &mb.json_parts {
+            let mut frame = Frame::new(96, 96);
+            let before = ink(&frame);
+            let part = ModelPart {
+                part: name.clone(),
+                at: (0.0, 0.0),
+                size: 1.0,
+                h: 0.4,
+                ang: 0.0,
+                tone: 1.0,
+            };
+            draw_part(&mut frame, &mb, &part, 48.0, 60.0, 26.0, 1.0, [0.9, 0.85, 0.7], 1.0);
+            if ink(&frame) == before {
+                skipped.push(format!("{name} (kind={}, {} points)", spec.kind, spec.points.len()));
+            }
+        }
+        assert!(skipped.is_empty(), "these data parts drew nothing: {skipped:?}");
+    }
+
+    #[test]
+    fn the_new_rts_parts_are_registered_and_distinct() {
+        // The siege/cavalry/naval/caster vocabulary added for the RTS: each must
+        // load, and each must fold to a DIFFERENT footprint — two parts that
+        // render identically are a spec bug, not a style choice.
+        let mb = ModelBook::load(&game_dir()).expect("model book");
+        let mut seen: std::collections::BTreeMap<u64, String> = Default::default();
+        for name in ["ram", "catapult", "hoof", "oar", "mast", "lantern", "scroll", "shieldwall", "antler", "ribcage"] {
+            assert!(mb.json_parts.contains_key(name), "new part {name} must be registered");
+            let mut frame = Frame::new(96, 96);
+            let part = ModelPart { part: name.into(), at: (0.0, 0.0), size: 1.0, h: 0.4, ang: 0.0, tone: 1.0 };
+            draw_part(&mut frame, &mb, &part, 48.0, 60.0, 26.0, 1.0, [0.9, 0.85, 0.7], 1.0);
+            let sig = ink_signature(&frame);
+            if let Some(prev) = seen.insert(sig, name.to_string()) {
+                panic!("{name} folds identically to {prev}");
+            }
         }
     }
 

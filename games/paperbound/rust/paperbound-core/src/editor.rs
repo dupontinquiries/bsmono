@@ -26,6 +26,9 @@ pub const PROJECTILE_STYLES: &[&str] =
 pub const DELIVERY_MODES: &[&str] = &["area", "bolt", "chain", "rain"];
 
 pub struct Editor {
+    /// Lazily-loaded card models + part vocabulary, shared with the renderer so
+    /// the editor's answers and the drawn model can never drift apart.
+    book: Option<crate::origami::ModelBook>,
     pub path: PathBuf,
     pub doc: serde_json::Value,
 }
@@ -34,7 +37,18 @@ impl Editor {
     pub fn open(path: &Path) -> Result<Self, String> {
         let raw = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let doc = serde_json::from_str(&raw).map_err(|e| format!("parse: {e}"))?;
-        Ok(Editor { path: path.into(), doc })
+        Ok(Editor { path: path.into(), doc, book: None })
+    }
+
+    /// The card models + part vocabulary, loaded on first use from the game
+    /// directory that holds this data file. Cached: the book is read-only here
+    /// and re-reading it per command would be a needless file round-trip.
+    pub fn model_book(&mut self) -> Result<&crate::origami::ModelBook, String> {
+        if self.book.is_none() {
+            let dir = self.path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            self.book = Some(crate::origami::ModelBook::load(dir)?);
+        }
+        Ok(self.book.as_ref().unwrap())
     }
 
     fn factions(&self) -> Option<&serde_json::Map<String, serde_json::Value>> {
@@ -241,11 +255,55 @@ pub fn shell_exec(ed: &mut Editor, line: &str) -> (String, bool) {
         [] => (String::new(), true),
         ["quit"] | ["exit"] | ["q"] => ("folded.".into(), false),
         ["help"] | ["?"] => (
-            "commands: list <factions|maps> · get <path> · set <path> <value>\n             validate · save [file] · help · quit"
+            "commands: list <factions|maps|parts|models> · get <path> · set <path> <value>\n             parts [name] · model <card> · validate · save [file] · help · quit"
                 .into(),
             true,
         ),
         ["list", what] => (ed.list(what).join("\n"), true),
+        // ── model vocabulary ────────────────────────────────────────────────
+        // The editor edits FACTIONS and MAPS, but a designer writing a fold
+        // recipe needs to know what parts exist and what a card currently
+        // folds into — otherwise the only way to find out is to read
+        // parts.json by hand and guess. Both answers come from the same
+        // ModelBook the renderer uses, so the editor can never disagree with
+        // what will actually be drawn.
+        ["parts"] => match ed.model_book() {
+            Ok(book) => {
+                let mut names: Vec<String> = crate::origami::BUILTIN_PARTS
+                    .iter().map(|s| format!("{s} (builtin)")).collect();
+                names.extend(book.json_parts.keys().map(|k| format!("{k} (data)")));
+                (format!("{} parts:\n{}", names.len(), names.join("\n")), true)
+            }
+            Err(e) => (format!("no model book: {e}"), true),
+        },
+        ["parts", name] => match ed.model_book() {
+            Ok(book) => match book.json_parts.get(*name) {
+                Some(spec) => (
+                    format!("{name}: kind={} points={} raised={} pair={} thick={} tone×{:.2}",
+                            spec.kind, spec.points.len(), spec.raised, spec.pair, spec.thick, spec.tone_mult),
+                    true),
+                None if crate::origami::BUILTIN_PARTS.contains(name) =>
+                    (format!("{name}: builtin part (folded by the renderer, not data-defined)"), true),
+                None => (format!("no part '{name}' — try `parts` for the list"), true),
+            },
+            Err(e) => (format!("no model book: {e}"), true),
+        },
+        ["model", card] => match ed.model_book() {
+            Ok(book) => match book.models.get(*card) {
+                Some(m) => {
+                    let mut out = format!("{card}: {} parts, paper #{:02x}{:02x}{:02x}\n",
+                        m.parts.len(), (m.paper[0] * 255.0) as u8, (m.paper[1] * 255.0) as u8,
+                        (m.paper[2] * 255.0) as u8);
+                    for p in &m.parts {
+                        out.push_str(&format!("  {:<11} at ({:+.2},{:+.2}) size {:.2} h {:.2} tone {:.2}\n",
+                            p.part, p.at.0, p.at.1, p.size, p.h, p.tone));
+                    }
+                    (out, true)
+                }
+                None => (format!("no model for '{card}'"), true),
+            },
+            Err(e) => (format!("no model book: {e}"), true),
+        },
         ["get", path] => match ed.get(path) {
             Some(v) => (v.to_string(), true),
             None => (format!("nothing at '{path}'"), true),
