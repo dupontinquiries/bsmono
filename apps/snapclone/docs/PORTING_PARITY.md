@@ -87,3 +87,38 @@ Nearby inline panel + pending flow) on the Friends page; InboxWidget + SnapFeedW
 Inbox; SnapViewerDialog (auto-close after durationSecs, save-any-time) + SnapComposerDialog;
 then the SettingsPage body. voiceterm: behavior-diff audit of each ported module against its
 QML for drift.
+
+
+## snapclone DHT — native port of OpenDHT (`thirdparty/opendht` reference)
+
+The `snapclone-dht` crate's presence/announce path was a "via OpenDHT FFI / JamiAdapter" stub;
+it is now a native sans-io DHT faithful to the OpenDHT reference, with constants and semantics
+cited per item:
+
+| OpenDHT reference | snapclone-dht | fidelity |
+|---|---|---|
+| `InfoHash` 160-bit + `commonBits` (infohash.h) | `core::InfoHash` XOR + `common_bits` | exact |
+| k-buckets, `TARGET_NODES=8`, split-own-bucket (routing_table.h) | `core::RoutingTable` | exact constants + split rule |
+| `SEARCH_NODES=14`, `MAX_REQUESTED_SEARCH_NODES=4` (dht.h) | `engine` search state | exact; iterative lookup ends when closest set stops improving |
+| `MessageType` ping/find/get/put/listen + reply/error (net.h) | `wire::Msg` / `Q` | full set incl. ValueData push |
+| msgpack maps keyed t/y/q/a/r (net.h KEY_*) | `wire` codec | subset codec, strict round-trip |
+| write token on announce (anti-spoof) | `engine` token_for + 401 on missing | enforced |
+| value expiry (storage.h) | `core::Storage::expire`, 10 min | matched |
+| `virtual_network_builder` sim testing (python/tools) | `sim::Sim` deterministic net | same strategy |
+
+Sans-io throughout: `Engine::handle_packet(from, bytes, now)` and `tick(now)` return packets to
+send; nothing touches a socket, so the whole DHT is a pure function under test. Seven simulation
+tests cover wire round-trips, XOR/common-bits, bucket split + K-cap, 30-node convergence, a
+put resolved by a distant get, token-less announce rejected with no store, listener push on a
+later put, and value expiry. Presence bridges sc-IDs to the DHT (`presence::key_for_scid` +
+`Presence` value); `announce::announce_record` is the pure (key,value) the socket loop feeds to
+`Engine::put`.
+
+Honest divergences (documented, not hidden): the msgpack codec is a hand-rolled subset (only
+the cases these messages use); crypto-signed values and the proxy/TCP transport paths are out
+of scope for this pass; ids in tests are deterministic seeds, not identity keys.
+
+Incidental in-tree fixes (the crate hadn't built since June): `snapclone-nat` needed tokio's
+`sync` feature, `snapclone-dht` was missing its `rand` dep, and an identity test called
+`.as_deref()` on a non-Deref newtype. All unrelated to the DHT design; fixed so the crate
+compiles and its tests run.
