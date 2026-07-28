@@ -147,7 +147,12 @@ impl Feature {
             Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
             Feature::LayerOutputScale => false,  // the tensor is not read
-            Feature::MlaSplit3dProjections => false, // the loader fetches a fused 2-D attn_kv_b only
+            // Implemented in _289: the loader now reads attn_k_b + attn_v_b and concatenates them, having
+            // established from llama.cpp PR #12801 that the 3-D GGUF form is byte-identical to the 2-D
+            // declaration. This flag stayed false for four commits after the code landed — the fifth
+            // instance of a registry disagreeing with the loader, and the one that made a fixed gap keep
+            // reporting itself as a gap.
+            Feature::MlaSplit3dProjections => true,
             Feature::GeGluActivation => true,    // selected per block from ArchConfig::act (--gate-gemma)
             Feature::GemmaRmsNorm => true,       // (1+w) folded into the weight at load (--gate-gemma)
             Feature::LogitSoftcap => false,      // not implemented anywhere
@@ -303,12 +308,13 @@ mod tests {
         assert!(Feature::Mla.implemented(), "the forward is wired and validated");
         assert!(!gaps("deepseek2", 0).contains(&Feature::Mla), "MLA is not what blocks it");
 
-        // What does block it is layout: attn_k_b [192x512x20] and attn_v_b [512x256x20] shipped
-        // separately and in 3-D, where the loader fetches one fused 2-D attn_kv_b.
-        assert!(gaps("deepseek2", 0).contains(&Feature::MlaSplit3dProjections));
-        assert!(gaps("glm-dsa", 0).contains(&Feature::MlaSplit3dProjections));
-        assert!(Feature::MlaSplit3dProjections.note().unwrap().contains("not a maths one"),
-            "the note must stop a reader concluding the forward is broken");
+        // FOURTH thing this test has said, and the reason the running commentary is kept: the layout gap
+        // is now CLOSED too (_289 reads attn_k_b + attn_v_b and concatenates). The flag stayed false for
+        // four commits after the code landed, so a fixed gap kept reporting itself as a gap in the
+        // loader's own warning — the fifth instance of a registry disagreeing with what the code does.
+        assert!(Feature::MlaSplit3dProjections.implemented(), "_289 reads the split form");
+        assert!(!gaps("deepseek2", 0).contains(&Feature::MlaSplit3dProjections));
+        assert!(!gaps("glm-dsa", 0).contains(&Feature::MlaSplit3dProjections));
 
         // glm4moe uses the fused form and is genuinely clear.
         assert!(gaps("glm4moe", 0).is_empty(), "{:?}", gaps("glm4moe", 0));
