@@ -38,6 +38,7 @@
 
 pub mod wire;
 pub mod carrier;
+pub mod file;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

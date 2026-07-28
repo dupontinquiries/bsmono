@@ -47,7 +47,7 @@ edits exactly reversible, which floats are not.
 | crate | what it is | tests |
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
-| `studio-collab` | convergent op log, presence, wire, **carrier adapter** | 19 |
+| `studio-collab` | convergent op log, presence, wire, carrier, **project files** | 25 |
 | `studio-egui` | timeline on uikit-egui + touch gestures, theater/split modes, panels | 14 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, **transport** | 18 |
@@ -326,3 +326,30 @@ Session keys are derived from the session name by the same FNV-1a fold
 snapclone uses for sc-IDs, so every participant computes the same key without
 being told it, and a short name still fills all 20 bytes instead of clustering
 near zero.
+
+## Saving: the file is the ops
+
+kdenlive saves an MLT XML tree; Audacity saves an AUP3 SQLite database. Both
+describe the project's *final state*, which makes the file format a second model
+that has to be kept in step with the first — and drift between them is where
+"this project opens wrong in the new version" comes from.
+
+Studio does not need a second model. Every edit is already an `Op`, so a project
+file is **the ops that build it**, and loading is replaying them through the same
+`apply` the editor uses. A file therefore cannot describe something the editor
+is unable to construct.
+
+Three things fall out: the wire codec *is* the file codec (one encoding to keep
+correct, already tested against truncation and version skew); a file is
+replayable straight into a live session, so opening a project while
+collaborating is the same path a joiner takes; and history is optional — keep it
+and undo survives a restart, omit it and nothing is lost.
+
+Two traps the tests pin. **Order matters**: sources before tracks before clips,
+because a clip validates against its source and needs somewhere to live —
+getting it wrong silently drops clips, the classic "half my project is missing".
+And **locked tracks refuse clips**, so a snapshot that adds a track already
+locked reloads empty; the snapshot adds tracks unlocked, places the clips, then
+restores the flags, and the loader never has to know. A damaged or foreign file
+is refused outright rather than half-read, because quietly loading an empty
+project over someone's work is the failure that actually loses it.
