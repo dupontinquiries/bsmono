@@ -71,7 +71,32 @@ after  (_279, completion fence):    2 timeouts
 That confirms the race. The CPU was lapping the 8-slot ring while earlier fills were still in flight, and
 waiting for completion at each wrap stops it.
 
-## The two survivors are NOT a boundary condition
+## CORRECTION: I cannot tell whether the survivors are a boundary
+
+The analysis below claimed the two remaining timeouts are "mid-run, therefore not boundaries". That
+claim is not supported by the data, and the reason is worth recording.
+
+**A watchdog fires a second or two AFTER the GPU hangs.** The journal timestamp says when the fault was
+NOTICED, not where the offending work sat in the sequence. "43% through the run" is entirely compatible
+with "the first fill of a phase that begins at 43%" — and with only two events, a boundary is at least
+as likely as a coincidence. Wall-clock position cannot separate those.
+
+What the timings below DO establish is narrower: they are not RUN-level boundaries (not the first or
+last thing that happened). They say nothing about per-layer, per-chunk or per-wrap position, because
+nothing in the log records those.
+
+`LOGSCOPE_PROGRESS_EVERY=N` now emits a positional breadcrumb every N fills, including one at each ring
+wrap:
+
+```
+wgpu-engine: PROGRESS ring-wrap layer=0 fills=800 bytes=53.1GiB fence
+```
+
+With those in the diag report, a journal timestamp lands between two known positions and the question
+becomes answerable instead of arguable. If faults cluster on wrap ticks, the ring is implicated; if they
+fall between them, it is not.
+
+## What the wall-clock timings show (run-level only)
 
 ```
 Scout mmap done   +  0s
