@@ -11,6 +11,7 @@ pub mod gguf;
 pub mod cpumatvec;
 pub mod cpupool;
 pub mod cpuattn;
+pub mod cpudecode;
 pub mod cpuops;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
