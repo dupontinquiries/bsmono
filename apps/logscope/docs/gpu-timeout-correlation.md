@@ -57,3 +57,41 @@ per-dispatch submit volume and not the fills.
 
 The counter delta in `@@ERRORS` is the measure to compare across runs: the driver's `Timeout count:` is
 cumulative, so only the delta says whether a change helped.
+
+
+## Result: the completion fence removed 96% of them
+
+Same model, same prompt, with the staging ring fencing on completion instead of submission:
+
+```
+before (_277, submit-only fence):  56 timeouts in a 3.5-minute burst
+after  (_279, completion fence):    2 timeouts
+```
+
+That confirms the race. The CPU was lapping the 8-slot ring while earlier fills were still in flight, and
+waiting for completion at each wrap stops it.
+
+## The two survivors are NOT a boundary condition
+
+```
+Scout mmap done   +  0s
+timeout #1        +141s   43% through the run
+timeout #2        +218s   67% through
+run ends          +327s
+```
+
+Neither is first nor last, and 109 seconds of clean running follow the second. An off-by-one on the
+first wrap, or a teardown race, would land at an edge — these do not.
+
+They fall in the **prefill** window (load completes around +60 s). This model prefills at **chunk 256**,
+kept large by the MoE sparsity rule in `tuneprofile::prefill_chunk_moe` because refill traffic dominated
+when each fill was cheap. A 256-token chunk through 48 layers makes each attention dispatch far longer
+than decode's, which is the classic watchdog trigger — and it is a different mechanism from the ring
+race, which is why fixing the ring did not remove these.
+
+Note the rule's justification has weakened: with a completion fence, fills now cost a poll each, so the
+"bigger chunk means fewer refills" argument is partly offset by the fence cost. The chunk size deserves
+re-measuring rather than inheriting a verdict from before the fence existed.
+
+**Cheap discriminator:** `LOGSCOPE_PREFILL_CHUNK=64`. If the last two disappear, it is dispatch
+duration; if they persist, it is neither the ring nor the chunk and the search moves elsewhere.
