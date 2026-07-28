@@ -3387,7 +3387,20 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             .and_then(|v| v.parse().ok()).unwrap_or(1024);
         let max_gb: u64 = std::env::var("LOGSCOPE_PROBE_MAX_GB").ok()
             .and_then(|v| v.parse().ok()).unwrap_or(64);
+        // A slab larger than the device's per-buffer limit fails on the FIRST allocation, and the probe
+        // then reported "nothing verified" — which reads as "the device has no memory" when the real
+        // cause is "your slab exceeds a hard limit". Measured on Honeykrisp: a 4096 MiB slab verified
+        // 0.0 GiB while 1024 MiB slabs reached 63.
+        let max_buf_mb = gpu.max_buffer_bytes() / (1 << 20);
+        if slab_mb > max_buf_mb as u64 {
+            println!("  slab of {slab_mb} MiB exceeds this device's max_buffer_size of {max_buf_mb} MiB \
+— a single allocation that large ALWAYS fails, so the probe would measure the limit rather than the \
+device. Clamping to {max_buf_mb} MiB.");
+        }
+        let slab_mb = slab_mb.min(max_buf_mb as u64).max(1);
         println!("  probing in {slab_mb} MiB slabs up to {max_gb} GiB (writes and reads back each one)");
+        println!("  device max_buffer_size = {max_buf_mb} MiB — no single allocation may exceed this, \
+which is why bigger slabs cannot raise the ceiling");
         let t0 = std::time::Instant::now();
         let got = gpu.probe_vram_ceiling(slab_mb * (1 << 20), max_gb * (1 << 30));
         let gib = got as f64 / (1u64 << 30) as f64;

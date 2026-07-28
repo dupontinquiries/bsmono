@@ -143,18 +143,33 @@ difference is not the device refusing; it is something about how we ask.
 
 Candidates, in the order worth testing:
 
-* **Slab size.** The probe allocates 1 GiB slabs and the arena packs into ≤2047 MiB ones. llama.cpp's
-  Vulkan backend allocates far fewer, far larger blocks. If the BO VMA allocator fragments per
-  allocation rather than per byte, fewer-and-larger would reach closer to 97.
+* ~~**Slab size.**~~ **TESTED AND RULED OUT.** `LOGSCOPE_PROBE_SLAB_MB=4096` verified **0.0 GiB** — the
+  first allocation failed outright. The cause is `max_buffer_size`, which this device reports as
+  **2047 MiB** (2³¹−1): no single allocation may exceed it, whatever the total budget. Bigger slabs
+  cannot raise the ceiling because they cannot be allocated at all. The arena already packs into slabs
+  of exactly that size for this reason.
+
+  The probe reported that failure badly — "nothing verified" reads as *the device has no memory* when
+  the real cause is *your slab exceeds a hard limit*. It now reads the limit, clamps to it, and says so.
 * **Buffer count.** Sixty-three 1 GiB slabs is sixty-three buffer objects plus everything else the
   engine holds. The governor already models a buffer-object budget for Metal; the Vulkan path may have
   an equivalent limit we are hitting first.
 * **Our own overhead.** The probe runs inside a process that has already allocated pipelines, bind
   groups and dims buffers. llama.cpp's 97 GiB is measured at startup with nothing committed.
 
-The cheap discriminator is to re-run `--gate-vram` with `LOGSCOPE_PROBE_SLAB_MB=4096`. If the verified
-ceiling rises toward 97, the limit is allocation SHAPE rather than total bytes — and the arena's
-2047 MiB slab size becomes a tuning parameter rather than a constant.
+With slab size eliminated, **buffer count is the remaining shape hypothesis**, and it is now the cheap
+one to test: 63 GiB in 1 GiB slabs is 63 buffer objects, while the same total in 2047 MiB slabs is 31.
+If the ceiling rises with fewer-but-maximal buffers, the limit is counted in OBJECTS rather than bytes —
+which is exactly the model the governor already uses for Metal, and would mean the Vulkan path needs the
+same treatment.
+
+```bash
+LOGSCOPE_PROBE_SLAB_MB=2047 kernel-validate --gate-vram    # 31 buffers for 63 GiB, not 63
+```
+
+If it stops at 63 GiB again, the count is not the limit either, and what remains is our own committed
+overhead — pipelines, bind groups and dims buffers already held when the probe runs, which llama.cpp's
+startup figure does not include.
 
 That would matter beyond the ceiling: Scout at ~34 GiB resident already fits under 63, but a 70B at q4
 needs ~40 GiB and a 70B at int8 needs ~75, which is the difference between "streams" and "fits".
