@@ -120,3 +120,47 @@ re-measuring rather than inheriting a verdict from before the fence existed.
 
 **Cheap discriminator:** `LOGSCOPE_PREFILL_CHUNK=64`. If the last two disappear, it is dispatch
 duration; if they persist, it is neither the ring nor the chunk and the search moves elsewhere.
+
+## The stall detector was in the wrong place, and that is itself the finding
+
+Run with `LOGSCOPE_STALL_MS=500`: **eight GPU timeouts in the kernel log, and not one STALL line from
+us.** No poll exceeded 500 ms while the device was demonstrably hanging.
+
+That is not a bug in the threshold. It means **the hang is on work we submitted and never waited for.**
+With ~99% of dispatches on the no-frame path, the engine fires thousands of independent command buffers
+and blocks on almost none of them; the GPU hangs on one, the kernel recovers it, and the CPU never
+observes anything because it was not waiting.
+
+A detector placed on the blocking polls can only ever see hangs that block us. Catching this one needs
+the opposite shape: **poll NON-blockingly and watch whether completions advance.** If submitted keeps
+climbing while completed does not for N milliseconds, that is a hang — observable without ever waiting
+on it.
+
+`wgpu::PollType::Poll` returns immediately and reports queue progress; sampling it on a timer, or every
+K dispatches, would give the sequence number of the last dispatch known to have COMPLETED rather than
+the last one submitted. The gap between those two numbers at fault time is the target.
+
+## Determinism: suggestive, not established
+
+```
+run A:  2 timeouts, first at +141 s after mmap
+run B:  8 timeouts, all within 10 s, first at +122 s
+```
+
+Same phase both times (~2 minutes in, during prefill), which is what determinism looks like at this
+resolution. But wall-clock position still cannot distinguish "the same operation" from "the same phase",
+and the counts differ by 4x. A dispatch sequence number would settle it; wall time will not.
+
+## New kernel-side detail worth keeping
+
+Two of the eight faults carry a real pending event rather than the usual `-1`:
+
+```
+Event slot: 118
+Pending events:
+  [0:118] flags=7 value=0x76633e00
+```
+
+A populated slot means the firmware was waiting on a specific event that never signalled, rather than
+losing track entirely. That is a stuck fence, and it is consistent with a hang inside submitted work
+rather than a driver-level lockup.
