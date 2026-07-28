@@ -3409,6 +3409,20 @@ so any proposed block layout must reproduce it exactly", gpu_kernels::gguf::ggml
             ck("hand-checked block matches the CPU reference",
                want.iter().take(4).zip(got.iter()).all(|(a, b)| (a - b).abs() == 0.0));
         }
+        // SIZE SWEEP. 1 block is exact, 37 is off by a ULP, 5000 is gross — so the fault is
+        // size-dependent and the threshold names the mechanism. Printed as a table rather than asserted,
+        // because the point is to see WHERE it changes, not to pass.
+        {
+            println!("     size sweep (max|diff| by block count):");
+            for nblk in [1usize, 2, 8, 16, 32, 37, 64, 65, 128, 256, 1024, 4096, 5000] {
+                let raw = mk(nblk, 0x51E7 + nblk as u32);
+                let want = gpu_kernels::gguf::dequantize(14, &raw, nblk * 256).expect("cpu");
+                let got = gpu.download(&gpu.q6k_dequant(&raw, nblk * 256).expect("gpu"));
+                let worst = want.iter().zip(&got).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+                let scale = want.iter().map(|v| v.abs()).fold(0f32, f32::max).max(1.0);
+                println!("       {nblk:>5} blocks: max|diff|={worst:.3e}  rel={:.2e}", worst / scale);
+            }
+        }
         for (nblk, label) in [(1usize, "one block"), (37, "37 blocks"), (5000, "5000 blocks (chunked)")] {
             let raw = mk(nblk, 0x51E7 + nblk as u32);
             let want = gpu_kernels::gguf::dequantize(14, &raw, nblk * 256).expect("cpu q6k");
