@@ -917,6 +917,9 @@ pub struct Chat {
     show_checkpoints: bool,                 // checkpoints panel open
     /// GPU phase-breakdown subpanel open (📊 in the composer bar).
     show_metrics: bool,
+    /// Messages the reader has explicitly opened, overriding the cliffsnotes collapse. Explicit rather
+    /// than sticky-by-default: a reader who opens one long reply usually wants that one, not all of them.
+    expanded_msgs: std::collections::HashSet<usize>,
     /// Running backend account shown under the newest message while a reply is generating.
     hud: crate::liaisonhud::Hud,
     /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
@@ -1014,6 +1017,7 @@ impl Default for Chat {
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            expanded_msgs: Default::default(),
             hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
@@ -6598,6 +6602,10 @@ impl Chat {
                     let streaming_any = cur.is_some();
                     let nmsgs = self.msgs.len();
                     let scroll_to = self.scroll_chat_to.take(); // jump-scroll target from the graph
+                    let msg_count = self.msgs.len();
+                    let expanded_now = self.expanded_msgs.clone();
+                    let mut expand_msg: Option<usize> = None;
+                    let mut collapse_msg: Option<usize> = None;
                     for (i, m) in self.msgs.iter_mut().enumerate() {
                         if Some(i) == scroll_to { ui.scroll_to_cursor(Some(egui::Align::Center)); }
                         let (who, c, fill) = match m.role {
@@ -6641,6 +6649,31 @@ impl Chat {
                                         if ui.button("Cancel").clicked() { action = Some(MsgAction::EditCancel(i)); }
                                     });
                                 } else {
+                                    // CLIFFSNOTES COLLAPSE. A long assistant reply is relevant for one turn and is scenery
+                                    // afterwards, so it folds once it is no longer the latest message. Only when BOTH long and
+                                    // not-latest: collapsing what someone is currently reading is hostile, and folding a
+                                    // three-line answer saves nothing.
+                                    let body_lines = m.text().lines().count();
+                                    let is_latest = i + 1 == msg_count;
+                                    let collapsible = m.role == Role::Assistant
+                                        && logscope::liaison_relay::CliffsNotes::should_collapse(body_lines, is_latest);
+                                    let expanded = expanded_now.contains(&i);
+                                    if collapsible && !expanded {
+                                        let edits = logscope::liaison_relay::parse_edits(m.text());
+                                        let cn = logscope::liaison_relay::cliffsnotes(m.text(), &edits, None);
+                                        // The label carries what the reply DID, so a reader can decide without opening it —
+                                        // a chevron saying "Assistant reply" costs a click and saves no attention.
+                                        let lbl = format!("\u{25b8} {}  ({body_lines} lines)", cn.label());
+                                        if ui.button(RichText::new(lbl).color(theme::DIM()).small()).clicked() {
+                                            expand_msg = Some(i);
+                                        }
+                                        return;
+                                    }
+                                    if collapsible && expanded {
+                                        if ui.button(RichText::new("\u{25be} collapse").color(theme::FAINT()).small()).clicked() {
+                                            collapse_msg = Some(i);
+                                        }
+                                    }
                                     let segs = segment_message(m.text());
                                     let last = segs.len().saturating_sub(1);
                                     let think_open = m.think_open;
@@ -6726,6 +6759,10 @@ impl Chat {
                             });
                         });
                     }
+                    // Apply the chevron clicks here: the render closure holds `self.msgs` mutably, so it
+                    // records the intent and the mutation happens once the borrow ends.
+                    if let Some(i) = expand_msg { self.expanded_msgs.insert(i); }
+                    if let Some(i) = collapse_msg { self.expanded_msgs.remove(&i); }
                     // ── LIAISON HUD: the running backend account, under the newest message ──
                     //
                     // Only while generating: after a reply lands, a status strip is stale and competes
