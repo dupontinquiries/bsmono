@@ -186,6 +186,14 @@ pub(crate) mod engine {
             crate::diag::note(&format!("wgpu-engine: STAGE begin mmap+retain {path}"));
             let bytes: &'static [u8] = gpu_kernels::retain_map(path).map_err(|e| format!("open {path}: {e}"))?;
             crate::diag::note("wgpu-engine: STAGE end mmap+retain");
+            // Hand back the page cache of any model we mapped earlier and are no longer using. The
+            // registry cannot unmap (weights hold 'static slices into it), but residency is reclaimable
+            // — and a session that switches models was otherwise holding every one of them resident.
+            let stale = gpu_kernels::release_stale_map_residency(path);
+            if stale > 0 {
+                eprintln!("wgpu-engine: released page cache from {stale} previously-loaded model file(s) \
+— only the active model stays resident");
+            }
             // Configure the engine from the tuning profile BEFORE the device is created — these values are
             // read during setup. Adapter-specific defaults need the adapter name, which we do not have
             // yet, so this applies the portable ones; the driver-detected fallbacks (Honeykrisp subgroup
