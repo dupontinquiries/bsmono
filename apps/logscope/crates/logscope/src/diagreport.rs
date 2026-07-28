@@ -53,7 +53,11 @@ impl Report {
         // The first version printed a hardcoded ".000" subsecond field, which looked like precision it
         // did not have — a fake digit is worse than a missing one because it invites correlation at a
         // resolution the data cannot support.
-        let stamped = format!("[{wall_secs} +{mono_ms:>7}ms] {}", elide(line.into().trim_end()));
+        // Epoch seconds AND a local wall clock. journalctl stamps local time with no year or zone, so an
+        // epoch alone forces the reader to convert by hand every time — which I did, four times, before
+        // deciding that was the tool's job. `hms_local` uses the offset captured at startup.
+        let stamped = format!("[{wall_secs} {} +{mono_ms:>7}ms] {}",
+            hms_local(wall_secs), elide(line.into().trim_end()));
         self.push_raw(section, stamped);
     }
 
@@ -127,6 +131,33 @@ impl Report {
     pub fn populated(&self) -> Vec<&str> {
         self.sections.iter().filter(|(_, v)| !v.is_empty()).map(|(s, _)| s.as_str()).collect()
     }
+}
+
+/// Seconds to add to UTC to get local time, captured once.
+///
+/// Determined by asking `date +%z` rather than assuming UTC, because the whole point is to line our
+/// stamps up with journalctl's local ones — and a report that is four hours off is worse than one with
+/// no clock at all, since it looks correlatable and is not.
+pub fn local_offset_secs() -> i64 {
+    static OFF: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::process::Command::new("date").arg("+%z").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                let t = s.trim();
+                if t.len() < 5 { return None; }
+                let sign = if t.starts_with('-') { -1i64 } else { 1 };
+                let h: i64 = t[1..3].parse().ok()?;
+                let m: i64 = t[3..5].parse().ok()?;
+                Some(sign * (h * 3600 + m * 60))
+            }).unwrap_or(0)
+    })
+}
+
+/// `HH:MM:SS` in local time, for direct comparison with a journalctl stamp.
+pub fn hms_local(epoch_secs: u64) -> String {
+    let t = (epoch_secs as i64 + local_offset_secs()).rem_euclid(86400);
+    format!("{:02}:{:02}:{:02}", t / 3600, (t % 3600) / 60, t % 60)
 }
 
 /// A kernel-side GPU fault, parsed from journalctl.
@@ -329,6 +360,23 @@ Jul 27 17:55:00 ultra-fed pipewire[1849]: mod.raop-sink: unrelated noise
         assert_eq!(b.len(), 2, "17:54 twice is one burst; 18:55 is another");
         assert_eq!(b[0].2, 2);
         assert_eq!(b[1].2, 1);
+    }
+
+    #[test]
+    fn stamps_render_in_LOCAL_time_for_direct_journal_comparison() {
+        // journalctl stamps local time with no year and no zone. An epoch alone makes every correlation
+        // a manual conversion — done by hand four times before this existed. A report that is four hours
+        // off is worse than one with no clock: it looks correlatable and is not.
+        let a = hms_local(0);
+        assert_eq!(a.len(), 8, "HH:MM:SS");
+        // one hour later is one hour later, whatever the zone
+        let t0 = hms_local(1785201113);
+        let t1 = hms_local(1785201113 + 3600);
+        let h0: u32 = t0[..2].parse().unwrap();
+        let h1: u32 = t1[..2].parse().unwrap();
+        assert_eq!((h0 + 1) % 24, h1, "{t0} -> {t1}");
+        // and midnight wraps rather than going negative
+        assert!(hms_local(0).starts_with(|c: char| c.is_ascii_digit()));
     }
 
     #[test]
