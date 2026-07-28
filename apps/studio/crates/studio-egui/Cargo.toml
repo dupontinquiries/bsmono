@@ -1,0 +1,11 @@
+[package]
+name = "studio-egui"
+version = "0.1.0"
+edition = "2021"
+description = "Studio's timeline UI on uikit-egui: tracks, clips, ruler, and the peer-presence overlay that makes collaborative editing legible."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+studio-collab = { path = "../studio-collab" }
+egui = "0.34"        # must match uikit-egui, or Color32 and Sense are different types
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }

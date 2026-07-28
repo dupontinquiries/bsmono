@@ -206,12 +206,22 @@ impl Doc {
         }
     }
 
-    /// Peers whose playhead is inside `clip`, for the "two people on the same
-    /// clip" warning that prevents most conflicts before they happen.
+    /// Peers who are working in `clip`, for the "two people on the same clip"
+    /// warning that prevents most conflicts before they happen.
+    ///
+    /// Being inside the clip's time span is necessary but NOT sufficient: a peer
+    /// scrubbing the video track is not editing the audio clip that happens to
+    /// sit under the same instant. When a peer declares an `active_track` we
+    /// require it to match, which is what that field is for; a peer who declares
+    /// none (a viewer, or a client that does not track focus) still matches on
+    /// time alone, so the warning degrades to "someone is around here" rather
+    /// than disappearing.
     pub fn peers_on(&self, id: ClipId) -> Vec<&Presence> {
         let Some(c) = self.project.clips.get(&id) else { return Vec::new() };
         self.peers.values()
-            .filter(|p| p.site != self.site && p.playhead >= c.pos && p.playhead < c.end())
+            .filter(|p| p.site != self.site)
+            .filter(|p| p.playhead >= c.pos && p.playhead < c.end())
+            .filter(|p| p.active_track.map(|t| t == c.track).unwrap_or(true))
             .collect()
     }
 }
