@@ -1,0 +1,8 @@
+[package]
+name = "studio-voice"
+version = "0.1.0"
+edition = "2021"
+description = "Studio's spoken layer: a whisper transcript index that maps dialogue and lyrics back onto the timeline, a repertoire of workflows bound to spoken phrases, and the unified command palette that searches all of it."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
