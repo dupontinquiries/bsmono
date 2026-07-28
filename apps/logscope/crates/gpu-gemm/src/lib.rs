@@ -7242,9 +7242,56 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
 present, attn_q absent) and the MLA path did not engage, so the dense loader ran instead. This is a \
 LOADER gap, not a bad checkpoint — see the MLA line earlier in this log for which part is missing"));
                 }
-                let mut qkv = fetch(&format!("blk.{i}.attn_q.weight"))?;
-                qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
-                qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
+                // DIAGNOSE rather than just report a name. "missing tensor blk.0.attn_q.weight" sends
+                // the reader to look for a corrupt file; the tensor is usually not missing at all, the
+                // model just names its attention weights differently — fused attn_qkv, MLA's low-rank
+                // pair, or a convention this loader has never seen. Listing what the block ACTUALLY has
+                // turns an hour of guessing into one line.
+                if g.tensor(&format!("blk.{i}.attn_q.weight")).is_none() {
+                    let mut found: Vec<String> = Vec::new();
+                    for suffix in ["attn_qkv", "attn_q_a", "attn_q_b", "attn_kv_a_mqa", "attn_k", "attn_v",
+                                   "attn_output", "attn_norm", "wqkv", "query_key_value"] {
+                        let n = format!("blk.{i}.{suffix}.weight");
+                        if let Some(t) = g.tensor(&n) {
+                            found.push(format!("{suffix} {:?}", t.dims));
+                        }
+                    }
+                    let hint = if found.iter().any(|f| f.starts_with("attn_qkv") || f.starts_with("wqkv")
+                                                   || f.starts_with("query_key_value")) {
+                        " — this looks like a FUSED qkv layout, which this loader does not split yet"
+                    } else if found.iter().any(|f| f.starts_with("attn_q_a")) {
+                        " — this is Multi-head Latent Attention"
+                    } else { "" };
+                    return Err(format!("blk.{i} has no `attn_q.weight`. What it DOES have: [{}]{hint}. \
+The file is not corrupt; this loader does not recognise its attention layout",
+                        if found.is_empty() { "nothing recognisable".into() } else { found.join(", ") }));
+                }
+                // The loader's internal layout IS q ++ k ++ v, so a checkpoint that ships them already
+                // fused needs no rearrangement — only a shape check. Guarded rather than assumed: some
+                // architectures interleave qkv PER HEAD instead of as three blocks, and those have the
+                // same total row count while being a completely different matrix. Matching rows is
+                // necessary, not sufficient, so this is accepted only when the split form is absent and
+                // the total is exactly right.
+                let want_rows = (attn_dim + 2 * kv) as u64;
+                let mut qkv = if g.tensor(&format!("blk.{i}.attn_q.weight")).is_none() {
+                    let name = format!("blk.{i}.attn_qkv.weight");
+                    let t = g.tensor(&name).ok_or_else(|| format!("blk.{i}: neither attn_q nor attn_qkv"))?;
+                    let rows = t.dims.last().copied().unwrap_or(0).max(t.dims.first().copied().unwrap_or(0));
+                    if rows != want_rows {
+                        return Err(format!("blk.{i}.attn_qkv has {rows} rows but this model needs \
+{want_rows} (attn_dim {attn_dim} + 2 x kv {kv}). A fused qkv with the wrong row count is a DIFFERENT \
+layout — probably per-head interleaved — and reading it as three blocks would produce fluent nonsense"));
+                    }
+                    eprintln!("wgpu-engine: blk.{i} ships a FUSED attn_qkv ({rows} rows, as expected) — \
+using it directly. UNVERIFIED against a real generation: the row count matching does not prove the \
+q/k/v block ORDER matches");
+                    fetch(&name)?
+                } else {
+                    let mut v = fetch(&format!("blk.{i}.attn_q.weight"))?;
+                    v.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
+                    v.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
+                    v
+                };
                 let fused = self.make_lin(&qkv, attn_dim + 2 * kv, d, q, q4_mode);
                 if has_qkv_bias {
                     let mut b = Vec::with_capacity(attn_dim + 2 * kv);
