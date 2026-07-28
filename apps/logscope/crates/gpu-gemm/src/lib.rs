@@ -11762,10 +11762,15 @@ fn f16(h: u32) -> f32 {
     if (exp == 0u) {
         if (mant == 0u) { bits = sign << 31u; }
         else {
-            var m = mant; var e: i32 = -1;
+            // Match gguf::f16_to_f32 EXACTLY: seed the unbiased exponent at -14 (a subnormal half is
+            // mant * 2^-24, and normalising until bit 10 is the implicit leading 1 leaves -14 - shifts),
+            // then bias by +127. Seeding at -1 and biasing by 113 lands one exponent LOW, halving every
+            // subnormal — and that same class of bug is recorded in the CPU helper's own comment, where
+            // an earlier version was two low and shrank K-quant scales fourfold. Rare in real weights,
+            // which is exactly why it survives review and shows up as a small max|diff| on random bytes.
+            var m = mant; var e: i32 = -14;
             loop { if ((m & 0x400u) != 0u) { break; } m = m << 1u; e = e - 1; }
-            m = m & 0x3FFu;
-            bits = (sign << 31u) | (u32(127 - 15 + e + 1) << 23u) | (m << 13u);
+            bits = (sign << 31u) | (u32(e + 127) << 23u) | ((m & 0x3FFu) << 13u);
         }
     } else if (exp == 31u) {
         bits = (sign << 31u) | 0x7F800000u | (mant << 13u);
