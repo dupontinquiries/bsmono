@@ -36,6 +36,7 @@ pub mod shorten;
 pub mod conversation_db;
 pub mod model_selector;
 pub mod modelroles;
+pub mod cpuplacement;
 pub mod activemodel;
 pub mod cratecheck;
 pub mod diagreport;
