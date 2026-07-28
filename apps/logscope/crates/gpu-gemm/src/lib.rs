@@ -2926,7 +2926,30 @@ impl Gpu {
                         // The cost is real: this is most of the 99% no-frame submits. The fix is to make
                         // the fence cheaper (fewer fills, or converting Q6_K so experts can be file VIEWS
                         // and need no staging at all), not to remove it.
-                        if s == 0 { self.end_frame(); }
+                        //
+                        // AND IT MUST FENCE ON COMPLETION, NOT SUBMISSION. end_frame() only submits, which
+                        // orders the commands but does not wait for them. Slot 0 can therefore be
+                        // rewritten while an earlier fill's dispatches are still IN FLIGHT — and on
+                        // Honeykrisp nothing throttles queue depth, because the submit governor disables
+                        // itself when completion callbacks are slow or absent. In-flight submits then
+                        // accumulate until more than STAGE_RING fills overlap and a slot is overwritten
+                        // underneath a running dispatch.
+                        //
+                        // That matches the observed failure shape better than resource accumulation does:
+                        // thousands of fills succeed, then timeouts begin and continue — which is what a
+                        // hazard that needs deep queues to manifest looks like, not what a leak looks
+                        // like. The dims ring already fences with flush_and_wait for exactly this reason;
+                        // the staging ring using the weaker primitive was an inconsistency, not a choice.
+                        //
+                        // LOGSCOPE_STAGE_FENCE=submit restores the old behaviour for A/B, because the wait
+                        // costs real time and the hypothesis deserves a measurement rather than my word.
+                        if s == 0 {
+                            if std::env::var("LOGSCOPE_STAGE_FENCE").as_deref() == Ok("submit") {
+                                self.end_frame();
+                            } else {
+                                self.flush_and_wait();
+                            }
+                        }
                         s
                     };
                     let base = slot * per_fill;

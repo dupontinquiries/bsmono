@@ -25,7 +25,22 @@ This rules out two explanations and leaves one:
   ones. The prefill chunk and conversion chunking were already sized against the watchdog and behave
   the same at fill 1 as at fill 1500.
 * **Not a cold-start driver problem.** The first 87 seconds of heavy GPU work complete cleanly.
-* **Consistent with ACCUMULATION** — something that grows with fill count until the device degrades.
+* **Consistent with a COMPLETION RACE in the staging ring** — the leading explanation, and better than
+  accumulation. `end_frame()` orders SUBMISSION; it does not wait for COMPLETION. A fill is cheap on the
+  CPU (one `write_buffer` plus a few recorded dispatches), so the CPU races ahead of the GPU — and on
+  Honeykrisp nothing throttles queue depth, because the submit governor disables itself when completion
+  callbacks are slow or absent. The CPU can be on fill 50 while the GPU still executes fill 10; slot
+  `50 % 8` then overwrites the bytes fill 10 is mid-read.
+
+  This fits the shape better than a leak does: **thousands of fills succeed, then faults begin and
+  continue.** A leak degrades gradually from the start. A hazard that needs deep queues to manifest is
+  clean until the CPU pulls far enough ahead, then fails constantly. The 87-second delay is the queue
+  filling.
+
+  Supporting detail: the **dims ring already fences with `flush_and_wait`**. The staging ring using the
+  weaker primitive was an inconsistency with no recorded justification.
+
+* **Also consistent with ACCUMULATION** — something that grows with fill count until the device degrades.
   Candidates, in the order worth testing:
   1. Retained bind groups and dims uniforms. `pending_keep` is only released on a poll, and with 99% of
      submits on the no-frame path the poll cadence is whatever `DIMS_RETAIN_CAP` forces.
