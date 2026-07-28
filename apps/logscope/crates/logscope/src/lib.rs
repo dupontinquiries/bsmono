@@ -16,6 +16,7 @@ pub mod liaison_prompt;
 pub mod liaison_relay;
 pub mod msgview;
 pub mod repoquery;
+pub mod thinkerwatch;
 pub mod promptframe;
 pub mod codecompare;
 pub mod buildpolicy;
