@@ -161,6 +161,58 @@ pub fn quantize_act(act: &[f32]) -> Vec<(f32, [i8; 32])> {
     act.chunks_exact(32).map(quantize_act_block).collect()
 }
 
+/// Dot a Q4_K weight row with a pre-quantized activation.
+///
+/// Q4_K is what every model here actually ships — `Q4_K_M` for Scout, Qwen3 and DeepSeek — so a CPU path
+/// that only handled Q8_0 could not run any of them.
+///
+/// 144-byte super-block of 256 weights: f16 `d`, f16 `dmin`, 12 bytes of packed 6-bit scales and mins,
+/// then 128 nibble bytes. A weight is `d*sc*nib - dmin*m`, and the MIN TERM is what makes this different
+/// from Q8_0: it does not vanish into a single scale, so the integer accumulation has to carry it
+/// separately. `sum(w*a) = d*sc*sum(nib*a) - dmin*m*sum(a)` — two integer sums per sub-block, one
+/// float combine. The second sum is over the activation alone and is the same for every row, so it is
+/// computed once in `quantize_act` and reused.
+pub fn dot_q4_k(raw: &[u8], act_q: &[(f32, [i8; 32])], act_sum: &[f32]) -> f32 {
+    let nblk = act_q.len() / 8;              // 8 sub-blocks of 32 per super-block
+    let mut total = 0f32;
+    for b in 0..nblk {
+        let off = b * 144;
+        if off + 144 > raw.len() { break; }
+        let blk = &raw[off..off + 144];
+        let d = half_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let dmin = half_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
+        let (scales, qs) = (&blk[4..16], &blk[16..144]);
+        let (mut is, mut qoff, mut sub) = (0usize, 0usize, 0usize);
+        for _ in 0..4 {
+            let (sc1, m1) = crate::gguf::get_scale_min_k4(is, scales);
+            let (sc2, m2) = crate::gguf::get_scale_min_k4(is + 1, scales);
+            for (half, sc, m) in [(0usize, sc1, m1), (1, sc2, m2)] {
+                let idx = b * 8 + sub + half;
+                let (da, qa) = &act_q[idx];
+                let mut acc = 0i32;
+                for l in 0..32 {
+                    let nib = if half == 0 { qs[qoff + l] & 0xF } else { qs[qoff + l] >> 4 };
+                    acc += (nib as i32) * (qa[l] as i32);
+                }
+                // d*sc*sum(nib*a) - dmin*m*sum(a): the min term uses the activation sum, which does not
+                // depend on the weights and is therefore hoisted out of every row.
+                total += d * sc as f32 * da * acc as f32 - dmin * m as f32 * act_sum[idx];
+            }
+            is += 2; qoff += 32; sub += 2;
+        }
+    }
+    total
+}
+
+/// Per-block sums of the raw activation, for Q4_K's min term.
+///
+/// Separate from `quantize_act` because it is the sum of the ORIGINAL floats, not the quantized ones —
+/// using the quantized sum would fold the activation's quantization error into the min term as well,
+/// where it does not belong.
+pub fn act_block_sums(act: &[f32]) -> Vec<f32> {
+    act.chunks_exact(32).map(|c| c.iter().sum()).collect()
+}
+
 /// Q8_0 matvec across threads, weights read straight from the mapped file.
 ///
 /// `raw` is the whole weight tensor as it sits on disk: `n_rows` rows of `k` weights, each row
@@ -351,6 +403,46 @@ mod tests {
         assert!(q.iter().all(|v| *v == 0));
         let raw = q8_block(1.0, &[1i8; 32]);
         assert_eq!(dot_q8_0_iq(&raw, &[(d, q)]), 0.0);
+    }
+
+    #[test]
+    fn the_q4k_dot_matches_dequantize_then_multiply() {
+        // Q4_K_M is what every model here ships, so this is the format that decides whether the CPU
+        // path can run anything at all. Correctness is defined against gguf::dequantize followed by a
+        // plain dot — anything else is a different function.
+        let raw: Vec<u8> = (0..144).map(|i| ((i * 37 + 11) % 251) as u8).collect();
+        let w = crate::gguf::dequantize(12, &raw, 256).expect("cpu q4_k");
+        let act: Vec<f32> = (0..256).map(|i| ((i * 13 % 29) as f32) - 14.0).collect();
+
+        let want: f32 = w.iter().zip(&act).map(|(a, b)| a * b).sum();
+        let got = dot_q4_k(&raw, &quantize_act(&act), &act_block_sums(&act));
+        let rel = (want - got).abs() / want.abs().max(1e-3);
+        assert!(rel < 0.01, "want {want}, got {got}, rel {rel:.4}");
+    }
+
+    #[test]
+    fn the_q4k_min_term_uses_the_UNQUANTIZED_activation_sum() {
+        // sum(w*a) = d*sc*sum(nib*a) - dmin*m*sum(a). The second sum is over the ORIGINAL floats:
+        // using the quantized ones would fold the activation's quantization error into the min term as
+        // well, where it does not belong, and the error would grow with dmin rather than staying bounded.
+        let act: Vec<f32> = (0..64).map(|i| (i as f32) * 0.37 - 11.0).collect();
+        let sums = act_block_sums(&act);
+        assert_eq!(sums.len(), 2);
+        let direct: f32 = act[..32].iter().sum();
+        assert_eq!(sums[0], direct, "the sum is of the raw activation, not a reconstruction");
+
+        // and it is genuinely different from summing the quantized values back
+        let (d, q) = quantize_act_block(&act[..32]);
+        let requant: f32 = q.iter().map(|v| *v as f32 * d).sum();
+        assert_ne!(sums[0], requant, "if these were equal the distinction would be untestable");
+    }
+
+    #[test]
+    fn a_truncated_q4k_block_stops_rather_than_reading_past_the_map() {
+        let mut raw: Vec<u8> = (0..144).map(|i| (i % 251) as u8).collect();
+        raw.truncate(100);
+        let act = vec![1.0f32; 256];
+        assert_eq!(dot_q4_k(&raw, &quantize_act(&act), &act_block_sums(&act)), 0.0);
     }
 
     #[test]
