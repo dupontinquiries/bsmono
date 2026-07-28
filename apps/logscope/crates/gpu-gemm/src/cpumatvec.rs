@@ -1,0 +1,282 @@
+//! cpumatvec.rs — quantized matvec on the CPU, straight out of the mapped file.
+//!
+//! The case for this got much stronger after reading the driver: M1/M2 AGX has **no matrix units**, so
+//! `VK_KHR_cooperative_matrix` would lower to the same FMAs the GPU already issues; the matrix hardware
+//! on the SoC is the ANE, behind a driver with no dma_buf import. Meanwhile the CPU side of an M2 Ultra
+//! is 24 cores against the same unified DRAM the GPU reads — no transfer, no dispatch, no watchdog.
+//!
+//! ## Three things this does differently from the GPU path
+//!
+//! 1. **No dequantization pass.** The dot product consumes the packed format directly. Dequantizing to
+//!    f32 first would triple the bytes touched, and this is bandwidth-bound — the arithmetic is free by
+//!    comparison.
+//! 2. **No copy.** Weights are read from the `&[u8]` the file is mapped at. The GPU path's entire
+//!    staging apparatus — the ring, the completion fence, the 200 GiB of traffic per generation —
+//!    exists to move bytes the CPU can simply read.
+//! 3. **Vectorized by construction, not by intrinsics.** The inner loop accumulates into a fixed-size
+//!    array so LLVM emits NEON on aarch64 and AVX on x86 from the same source. Hand-written intrinsics
+//!    would be faster on one target and untestable on the other — and untestable is how the shader's
+//!    f16 subnormal bug survived three copies.
+//!
+//! Correctness is defined against `gguf::dequantize` followed by a plain dot product. Anything else is
+//! a different function.
+
+/// Accumulator lanes. Chosen so the array fits a NEON `float32x4_t` pair and an AVX register, which is
+/// what lets one source vectorize on both.
+const LANES: usize = 8;
+
+/// Dot product of a Q8_0 weight row with an f32 activation, read straight from the file bytes.
+///
+/// Q8_0 block: f16 scale then 32 int8 quants, 34 bytes for 32 weights.
+pub fn dot_q8_0(raw: &[u8], act: &[f32]) -> f32 {
+    let nblk = act.len() / 32;
+    let mut acc = [0f32; LANES];
+    for b in 0..nblk {
+        let off = b * 34;
+        if off + 34 > raw.len() { break; }
+        let d = half_to_f32(u16::from_le_bytes([raw[off], raw[off + 1]]));
+        let a = &act[b * 32..b * 32 + 32];
+        // 32 quants over LANES accumulators: each lane sums every LANES-th element, so the adds are
+        // independent and the loop vectorizes. Lane assignment is FIXED, which keeps the summation
+        // order deterministic — a different order would change the last bits and the reference is
+        // bit-exact by design.
+        for i in 0..32 {
+            let q = raw[off + 2 + i] as i8 as f32;
+            acc[i % LANES] += d * q * a[i];
+        }
+    }
+    acc.iter().sum()
+}
+
+/// f16 -> f32. Same seeding as `gguf::f16_to_f32`: subnormals start at exponent -14 and bias by +127.
+///
+/// Written out rather than reused across a crate boundary, and therefore a fourth copy of a function
+/// that has already gone wrong once — so the test below asserts it against the reference for every
+/// subnormal, not a sample.
+fn half_to_f32(h: u16) -> f32 {
+    let (sign, exp, mant) = ((h >> 15) as u32, ((h >> 10) & 0x1F) as u32, (h & 0x3FF) as u32);
+    let bits = if exp == 0 {
+        if mant == 0 { sign << 31 } else {
+            let (mut m, mut e) = (mant, -14i32);
+            while (m & 0x400) == 0 { m <<= 1; e -= 1; }
+            (sign << 31) | (((e + 127) as u32) << 23) | ((m & 0x3FF) << 13)
+        }
+    } else if exp == 31 {
+        (sign << 31) | 0x7F80_0000 | (mant << 13)
+    } else {
+        (sign << 31) | ((exp + 112) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
+}
+
+/// How to split `n_rows` across `n_threads`.
+///
+/// Contiguous ranges, not interleaved: each thread then walks a contiguous span of the weight file,
+/// which is what the prefetcher is built for. Interleaving would give every thread the whole file's
+/// stride pattern and defeat it.
+pub fn split_rows(n_rows: usize, n_threads: usize) -> Vec<(usize, usize)> {
+    let t = n_threads.clamp(1, n_rows.max(1));
+    let per = n_rows.div_ceil(t);
+    (0..t).filter_map(|i| {
+        let (s, e) = (i * per, ((i + 1) * per).min(n_rows));
+        if s < e { Some((s, e)) } else { None }
+    }).collect()
+}
+
+/// Threads worth using for a matvec of this size.
+///
+/// Below a threshold the spawn cost exceeds the work. Measured in bytes touched rather than rows,
+/// because a short wide row and a tall narrow matrix cost differently and rows alone cannot tell them
+/// apart.
+pub fn threads_for(bytes: u64, available: usize) -> usize {
+    const MIN_BYTES_PER_THREAD: u64 = 1 << 20;    // 1 MiB
+    let want = (bytes / MIN_BYTES_PER_THREAD).max(1) as usize;
+    want.min(available.max(1))
+}
+
+/// Q8_0 matvec across threads, weights read straight from the mapped file.
+///
+/// `raw` is the whole weight tensor as it sits on disk: `n_rows` rows of `k` weights, each row
+/// `k/32 * 34` bytes. No copy, no dequantization pass, no staging — the three things the GPU path
+/// spends most of its machinery on.
+///
+/// Rows are split into contiguous spans and each thread writes only its own slice of the output, so
+/// there is no sharing and no locking. Deterministic regardless of thread count: a row's arithmetic
+/// does not depend on which thread ran it, which matters because a result that varies with the thread
+/// pool is untestable.
+pub fn matvec_q8_0(raw: &[u8], n_rows: usize, k: usize, act: &[f32], threads: usize) -> Vec<f32> {
+    let row_bytes = (k / 32) * 34;
+    let mut out = vec![0f32; n_rows];
+    let spans = split_rows(n_rows, threads);
+    if spans.len() <= 1 {
+        for r in 0..n_rows {
+            let o = r * row_bytes;
+            if o + row_bytes > raw.len() { break; }
+            out[r] = dot_q8_0(&raw[o..o + row_bytes], act);
+        }
+        return out;
+    }
+    // Hand each thread a disjoint output slice. `chunks_mut` gives non-overlapping borrows, so the
+    // compiler proves the absence of races rather than a comment asserting it.
+    let mut rest: &mut [f32] = &mut out;
+    let mut pieces: Vec<(usize, &mut [f32])> = Vec::new();
+    for (s, e) in &spans {
+        let (head, tail) = rest.split_at_mut(e - s);
+        pieces.push((*s, head));
+        rest = tail;
+    }
+    std::thread::scope(|sc| {
+        for (start, slice) in pieces {
+            sc.spawn(move || {
+                for (i, o) in slice.iter_mut().enumerate() {
+                    let off = (start + i) * row_bytes;
+                    if off + row_bytes > raw.len() { break; }
+                    *o = dot_q8_0(&raw[off..off + row_bytes], act);
+                }
+            });
+        }
+    });
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a Q8_0 block: f16 scale then 32 int8 quants.
+    fn q8_block(d: f32, q: &[i8; 32]) -> Vec<u8> {
+        let h = f32_to_half(d);
+        let mut v = h.to_le_bytes().to_vec();
+        v.extend(q.iter().map(|&x| x as u8));
+        v
+    }
+    fn f32_to_half(f: f32) -> u16 {
+        let b = f.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+        let mant = (b >> 13) & 0x3FF;
+        if exp <= 0 { return sign; }
+        sign | ((exp as u16) << 10) | mant as u16
+    }
+
+    #[test]
+    fn the_dot_matches_dequantize_then_multiply() {
+        // The definition of correct. Anything that disagrees with dequantize-then-dot is a different
+        // function, however fast it is.
+        let d = 0.125f32;
+        let q: [i8; 32] = std::array::from_fn(|i| (i as i8) - 16);
+        let raw = q8_block(d, &q);
+        let act: Vec<f32> = (0..32).map(|i| (i as f32) * 0.25 - 4.0).collect();
+
+        let want: f32 = (0..32).map(|i| d * q[i] as f32 * act[i]).sum();
+        let got = dot_q8_0(&raw, &act);
+        assert!((want - got).abs() < 1e-4, "want {want}, got {got}");
+    }
+
+    #[test]
+    fn multiple_blocks_accumulate() {
+        let q: [i8; 32] = std::array::from_fn(|i| ((i % 7) as i8) - 3);
+        let mut raw = q8_block(0.5, &q);
+        raw.extend(q8_block(0.25, &q));
+        let act: Vec<f32> = (0..64).map(|i| ((i % 5) as f32) - 2.0).collect();
+        let want: f32 = (0..32).map(|i| 0.5 * q[i] as f32 * act[i]).sum::<f32>()
+                      + (0..32).map(|i| 0.25 * q[i] as f32 * act[i + 32]).sum::<f32>();
+        assert!((want - dot_q8_0(&raw, &act)).abs() < 1e-3);
+    }
+
+    #[test]
+    fn a_truncated_block_stops_rather_than_reading_past_the_map() {
+        // The weights are a view into a mapped file. Reading past the end is a fault, not a wrong
+        // answer, so the bound check matters more here than in an owned buffer.
+        let q: [i8; 32] = [1; 32];
+        let mut raw = q8_block(1.0, &q);
+        raw.truncate(20);                       // half a block
+        let act = vec![1.0f32; 32];
+        assert_eq!(dot_q8_0(&raw, &act), 0.0, "an incomplete block contributes nothing");
+    }
+
+    #[test]
+    fn the_f16_helper_agrees_with_the_reference_on_EVERY_subnormal() {
+        // This is a fourth copy of a function that has already been wrong once: the shader's subnormal
+        // branch seeded its exponent at -1 instead of -14 and halved every subnormal, surviving review
+        // in two of three copies. Sampling would have missed it — subnormal scales are rare — so this
+        // checks all 1024 of them plus the boundaries.
+        for m in 0..0x400u16 {
+            let h = m;                                    // exp=0 => subnormal
+            let want = crate::gguf::f16_to_f32(h);
+            assert_eq!(half_to_f32(h).to_bits(), want.to_bits(), "subnormal mant={m}");
+        }
+        for h in [0u16, 0x8000, 0x3C00, 0xBC00, 0x7BFF, 0x0400, 0x7C00] {
+            assert_eq!(half_to_f32(h).to_bits(), crate::gguf::f16_to_f32(h).to_bits(), "h={h:#06x}");
+        }
+    }
+
+    #[test]
+    fn the_threaded_matvec_is_INDEPENDENT_of_thread_count() {
+        // A result that varies with the pool size is untestable, and would make every later comparison
+        // ambiguous. Each row's arithmetic must not depend on which thread ran it.
+        let q: [i8; 32] = std::array::from_fn(|i| ((i * 7 % 13) as i8) - 6);
+        let (rows, k) = (37usize, 64usize);
+        let mut raw = Vec::new();
+        for r in 0..rows {
+            for b in 0..k / 32 {
+                let d = 0.05 * (r + b + 1) as f32;
+                raw.extend(q8_block(d, &q));
+            }
+        }
+        let act: Vec<f32> = (0..k).map(|i| ((i % 9) as f32) - 4.0).collect();
+        let one = matvec_q8_0(&raw, rows, k, &act, 1);
+        for t in [2usize, 3, 8, 24, 64] {
+            let many = matvec_q8_0(&raw, rows, k, &act, t);
+            assert_eq!(one, many, "thread count {t} changed the result");
+        }
+        assert_eq!(one.len(), rows);
+        assert!(one.iter().any(|v| *v != 0.0), "and it computed something");
+    }
+
+    #[test]
+    fn each_row_matches_the_single_row_dot() {
+        // The threaded driver must not be a second implementation. Every row equals dot_q8_0 on that
+        // row's bytes, which is the property that lets the dot's own tests carry the correctness.
+        let q: [i8; 32] = std::array::from_fn(|i| (i as i8) - 16);
+        let (rows, k) = (5usize, 32usize);
+        let mut raw = Vec::new();
+        for r in 0..rows { raw.extend(q8_block(0.1 * (r + 1) as f32, &q)); }
+        let act: Vec<f32> = (0..k).map(|i| (i as f32) * 0.1).collect();
+        let out = matvec_q8_0(&raw, rows, k, &act, 4);
+        for r in 0..rows {
+            let want = dot_q8_0(&raw[r * 34..(r + 1) * 34], &act);
+            assert_eq!(out[r], want, "row {r}");
+        }
+    }
+
+    #[test]
+    fn rows_split_into_CONTIGUOUS_spans() {
+        // Contiguous, not interleaved: each thread walks a contiguous span of the weight file, which is
+        // what the hardware prefetcher is built for. Interleaving hands every thread the whole file's
+        // stride pattern and defeats it.
+        let s = split_rows(100, 8);
+        assert_eq!(s.first().unwrap().0, 0);
+        assert_eq!(s.last().unwrap().1, 100);
+        for w in s.windows(2) { assert_eq!(w[0].1, w[1].0, "spans must be contiguous and gapless"); }
+        // and every row is covered exactly once
+        assert_eq!(s.iter().map(|(a, b)| b - a).sum::<usize>(), 100);
+    }
+
+    #[test]
+    fn splitting_never_produces_empty_spans_or_more_threads_than_rows() {
+        assert_eq!(split_rows(3, 24).len(), 3, "24 threads for 3 rows is 3 spans, not 24");
+        assert_eq!(split_rows(0, 8).len(), 0);
+        assert!(split_rows(1, 1).iter().all(|(a, b)| a < b));
+    }
+
+    #[test]
+    fn thread_count_scales_with_BYTES_not_rows() {
+        // A short wide row and a tall narrow matrix cost differently, and a row count cannot tell them
+        // apart. Below a threshold the spawn cost exceeds the work.
+        assert_eq!(threads_for(1 << 10, 24), 1, "a kilobyte is not worth a thread pool");
+        assert_eq!(threads_for(64 << 20, 24), 24, "64 MiB uses all of them");
+        assert_eq!(threads_for(4 << 20, 24), 4);
+        assert_eq!(threads_for(1 << 30, 1), 1, "never more than are available");
+    }
+}
