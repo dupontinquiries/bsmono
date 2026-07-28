@@ -112,6 +112,55 @@ pub fn threads_for(bytes: u64, available: usize) -> usize {
 // deleting a plausible optimization on the strength of a measurement is the same call as removing the
 // per-token arena in _231.
 
+/// Quantize an activation block of 32 to int8 with one shared scale, llama.cpp's `quantize_row_q8_0`.
+///
+/// Scale is `max|x| / 127`, so the largest element maps to +/-127 and nothing clips.
+pub fn quantize_act_block(a: &[f32]) -> (f32, [i8; 32]) {
+    let amax = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+    if amax == 0.0 { return (0.0, [0; 32]); }
+    let d = amax / 127.0;
+    let inv = 1.0 / d;
+    let mut q = [0i8; 32];
+    for i in 0..32 { q[i] = (a[i] * inv).round().clamp(-127.0, 127.0) as i8; }
+    (d, q)
+}
+
+/// Dot with BOTH sides quantized: int8 x int8 accumulated in i32, scaled once per block.
+///
+/// This is the lesson from llama.cpp's CPU path, and it is not a micro-optimization — it changes what
+/// the inner loop IS. Ours multiplies floats: `d * q as f32 * a[i]`, so 32 float multiply-adds per
+/// block plus a f32 widening of every quant. llama.cpp accumulates `q_w * q_a` in i32 and applies
+/// `d_w * d_a` ONCE at the end of the block. On aarch64 that lowers to SDOT (four int8 MACs per
+/// instruction) where the float version lowers to FMLA over widened values.
+///
+/// ## It is NOT bit-exact, and that is the trade
+///
+/// Quantizing the activation loses precision the f32 path keeps. llama.cpp accepts this because the
+/// error is far below what the weights already introduce and the throughput is several times better.
+/// So the gate for this measures ERROR AGAINST A BOUND rather than demanding exactness — demanding
+/// exactness of an approximation would just mean never adopting it.
+///
+/// The activation is quantized once per block and reused across every row in a matvec, so its cost
+/// amortizes over `n_rows` — which is why llama.cpp quantizes the whole activation vector up front.
+pub fn dot_q8_0_iq(raw: &[u8], act_q: &[(f32, [i8; 32])]) -> f32 {
+    let mut total = 0f32;
+    for (b, (da, qa)) in act_q.iter().enumerate() {
+        let off = b * 34;
+        if off + 34 > raw.len() { break; }
+        let dw = half_to_f32(u16::from_le_bytes([raw[off], raw[off + 1]]));
+        // i32 accumulation: exact, no rounding until the single scale below.
+        let mut sum = 0i32;
+        for i in 0..32 { sum += (raw[off + 2 + i] as i8 as i32) * (qa[i] as i32); }
+        total += dw * da * sum as f32;
+    }
+    total
+}
+
+/// Quantize a whole activation vector once, for reuse across every row.
+pub fn quantize_act(act: &[f32]) -> Vec<(f32, [i8; 32])> {
+    act.chunks_exact(32).map(quantize_act_block).collect()
+}
+
 /// Q8_0 matvec across threads, weights read straight from the mapped file.
 ///
 /// `raw` is the whole weight tensor as it sits on disk: `n_rows` rows of `k` weights, each row
@@ -266,6 +315,42 @@ mod tests {
             let want = dot_q8_0(&raw[r * 34..(r + 1) * 34], &act);
             assert_eq!(out[r], want, "row {r}");
         }
+    }
+
+    #[test]
+    fn the_integer_dot_is_close_to_the_float_one_but_NOT_equal() {
+        // The trade llama.cpp makes. Quantizing the activation loses precision the f32 path keeps, and
+        // demanding exactness of an approximation would just mean never adopting it — so the bar is a
+        // BOUND, not equality. Anything under ~1% here is far below what Q8_0 weights already introduce.
+        let q: [i8; 32] = std::array::from_fn(|i| ((i * 5 % 61) as i8) - 30);
+        let raw = q8_block(0.07, &q);
+        let act: Vec<f32> = (0..32).map(|i| ((i * 13 % 29) as f32) - 14.0).collect();
+        let f = dot_q8_0(&raw, &act);
+        let i = dot_q8_0_iq(&raw, &quantize_act(&act));
+        let rel = (f - i).abs() / f.abs().max(1e-6);
+        assert!(rel < 0.01, "float {f}, integer {i}, rel {rel:.4}");
+        assert_ne!(f, i, "and it is genuinely a different computation, not a renamed one");
+    }
+
+    #[test]
+    fn activation_quantization_never_clips_the_largest_element() {
+        // Scale is max|x|/127, so the extreme maps to exactly +/-127. A scale that clipped would lose
+        // the largest contribution to every dot — the one that matters most.
+        let a: Vec<f32> = (0..32).map(|i| if i == 7 { -9.5 } else { (i as f32) * 0.1 }).collect();
+        let (d, q) = quantize_act_block(&a);
+        assert_eq!(q[7], -127, "the extreme maps to the limit, not past it");
+        assert!((d - 9.5 / 127.0).abs() < 1e-6);
+        assert!(q.iter().all(|v| *v != i8::MIN), "and nothing lands on -128, which has no positive twin");
+    }
+
+    #[test]
+    fn an_all_zero_activation_block_quantizes_to_zero_not_NaN() {
+        // max|x| = 0 makes the scale a division by zero. A NaN here would poison an entire row.
+        let (d, q) = quantize_act_block(&[0.0; 32]);
+        assert_eq!(d, 0.0);
+        assert!(q.iter().all(|v| *v == 0));
+        let raw = q8_block(1.0, &[1i8; 32]);
+        assert_eq!(dot_q8_0_iq(&raw, &[(d, q)]), 0.0);
     }
 
     #[test]
