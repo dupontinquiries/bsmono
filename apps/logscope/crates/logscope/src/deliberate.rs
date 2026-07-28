@@ -161,6 +161,83 @@ pub fn cost_estimate(panel_params_b: &[f32], single_params_b: f32, rounds: u32) 
     (total, single, total <= single)
 }
 
+/// Why a deliberation ended.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Stop {
+    /// The panel agreed, having shown it can disagree.
+    Agreed(String),
+    /// Out of rounds within the bandwidth budget. The split is handed up, not averaged.
+    BudgetSpent { positions: Vec<(String, usize)> },
+    /// The panel kept agreeing without ever disagreeing — its consensus carries no information.
+    NeverDisagreed(String),
+    /// Positions stopped moving. More rounds of the same is not deliberation.
+    Stalled { positions: Vec<(String, usize)> },
+}
+
+impl Stop {
+    /// Should a larger model be asked?
+    ///
+    /// Everything except a genuine agreement escalates. Notably `NeverDisagreed` does: a panel that
+    /// produced the same answer three times running has given one opinion, and passing it up as though
+    /// it were three is how a shared blind spot acquires false weight.
+    pub fn escalate(&self) -> bool { !matches!(self, Stop::Agreed(_)) }
+
+    pub fn explain(&self) -> String {
+        match self {
+            Stop::Agreed(a) => format!("panel agreed on {a:?} after demonstrating independence"),
+            Stop::BudgetSpent { positions } => format!(
+                "still split across {} positions with the round budget spent — escalating rather than \
+taking the majority, because a majority among correlated models is not evidence", positions.len()),
+            Stop::NeverDisagreed(a) => format!(
+                "agreed on {a:?} every round without ever disagreeing — one opinion repeated, not a \
+consensus"),
+            Stop::Stalled { positions } => format!(
+                "positions stopped moving across {} camps — more rounds of the same is not \
+deliberation", positions.len()),
+        }
+    }
+}
+
+/// Run a deliberation to a conclusion.
+///
+/// `ask(round, prior)` produces the panel's opinions for a round; `prior` is the previous split so a
+/// caller can build the round-two prompt. `max_rounds` should come from `round_budget` — the panel's
+/// justification is that it reads less than the single model, and a deliberation that outruns that has
+/// spent the argument for its own existence.
+pub fn deliberate<F>(panel: &mut Panel, max_rounds: u32, mut ask: F) -> Stop
+where F: FnMut(u32, Option<&[(String, usize)]>) -> Vec<Opinion> {
+    let mut prior: Option<Vec<(String, usize)>> = None;
+    let mut last_positions: Option<Vec<(String, usize)>> = None;
+    // Stall is judged on WHO SAID WHAT, not on the tally. A tally sorts, so two models swapping sides
+    // produces an identical one — and that swap is exactly the signal that deliberation is working.
+    // Comparing tallies would call a live argument stalled and stop a round too early.
+    let mut last_stances: Option<Vec<(String, String)>> = None;
+    for r in 0..max_rounds.max(1) {
+        let ops = ask(r, prior.as_deref());
+        match panel.round(&ops) {
+            Outcome::Consensus { answer, .. } => return Stop::Agreed(answer),
+            Outcome::UnearnedConsensus { answer, .. } => {
+                // Keep going: another round may reveal a disagreement, which would retroactively make
+                // this agreement mean something. If it never does, that is itself the finding.
+                if r + 1 == max_rounds.max(1) { return Stop::NeverDisagreed(answer); }
+                prior = None;
+            }
+            Outcome::Split { positions } => {
+                let stances: Vec<(String, String)> =
+                    ops.iter().map(|o| (o.model.clone(), normalize(&o.answer))).collect();
+                if last_stances.as_deref() == Some(stances.as_slice()) {
+                    return Stop::Stalled { positions };
+                }
+                last_stances = Some(stances);
+                last_positions = Some(positions.clone());
+                prior = Some(positions);
+            }
+            Outcome::Empty => break,
+        }
+    }
+    Stop::BudgetSpent { positions: last_positions.unwrap_or_default() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -265,6 +342,73 @@ mod tests {
         assert!(ok2 && t2 < s, "two rounds: {t2:.1e} vs {s:.1e}");
         let (t3, _, ok3) = cost_estimate(&[3.0; 4], 30.0, 3);
         assert!(!ok3, "three rounds costs more than the single model: {t3:.1e}");
+    }
+
+    #[test]
+    fn a_panel_that_disagrees_then_agrees_reaches_a_real_consensus() {
+        let mut p = Panel::new();
+        let stop = deliberate(&mut p, 3, |r, _| {
+            if r == 0 { vec![op("a", "HashMap"), op("b", "BTreeMap")] }
+            else { vec![op("a", "BTreeMap"), op("b", "BTreeMap")] }
+        });
+        assert_eq!(stop, Stop::Agreed("btreemap".into()));
+        assert!(!stop.escalate(), "a real consensus does not need a larger model");
+    }
+
+    #[test]
+    fn a_panel_that_never_disagrees_escalates_however_many_rounds_it_agrees_for() {
+        // The failure the whole design is built around. Three identical answers three times running is
+        // one opinion repeated, and passing it up as though it were nine is how a shared blind spot
+        // acquires false weight.
+        let mut p = Panel::new();
+        let stop = deliberate(&mut p, 3, |_, _| vec![op("a", "X"), op("b", "X"), op("c", "X")]);
+        assert_eq!(stop, Stop::NeverDisagreed("x".into()));
+        assert!(stop.escalate());
+        assert!(stop.explain().contains("one opinion repeated"));
+    }
+
+    #[test]
+    fn unchanged_positions_stop_the_deliberation_early() {
+        // More rounds of the same is not deliberation, and spending the budget to re-read it wastes the
+        // bandwidth the panel exists to save.
+        let mut p = Panel::new();
+        let mut calls = 0;
+        let stop = deliberate(&mut p, 10, |_, _| {
+            calls += 1;
+            vec![op("a", "X"), op("b", "Y")]
+        });
+        assert!(matches!(stop, Stop::Stalled { .. }), "{stop:?}");
+        assert_eq!(calls, 2, "stopped as soon as the positions repeated, not after 10 rounds");
+    }
+
+    #[test]
+    fn a_stall_is_judged_on_POSITIONS_not_on_the_count() {
+        // Two models swapping sides leaves the tally identical while the deliberation is genuinely
+        // still moving. Comparing counts would call that stalled and stop a round too early.
+        let mut p = Panel::new();
+        let mut calls = 0;
+        let _ = deliberate(&mut p, 4, |_, _| {
+            calls += 1;
+            if calls % 2 == 1 { vec![op("a", "X"), op("b", "Y")] } else { vec![op("a", "Y"), op("b", "X")] }
+        });
+        assert!(calls > 2, "swapping sides is not a stall; got {calls} rounds");
+    }
+
+    #[test]
+    fn a_split_that_survives_the_budget_escalates_rather_than_taking_the_majority() {
+        let mut p = Panel::new();
+        let mut n = 0;
+        let stop = deliberate(&mut p, 2, |_, _| {
+            n += 1;
+            if n == 1 { vec![op("a", "X"), op("b", "Y"), op("c", "Y")] }
+            else { vec![op("a", "Z"), op("b", "Y"), op("c", "Y")] }
+        });
+        match &stop {
+            Stop::BudgetSpent { positions } => assert!(positions.len() >= 2),
+            other => panic!("expected BudgetSpent, got {other:?}"),
+        }
+        assert!(stop.escalate());
+        assert!(stop.explain().contains("a majority among correlated models is not evidence"));
     }
 
     #[test]

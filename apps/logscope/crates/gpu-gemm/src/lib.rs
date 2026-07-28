@@ -176,6 +176,26 @@ pub fn mark_map_views_live() {
 ///
 /// This releases residency rather than unmapping, because unmapping would invalidate slices that a
 /// still-referenced model may hold. The pages come back on demand if anything does touch them.
+/// Ask the kernel to start faulting in part of a retained mapping, before it is needed.
+///
+/// The CPU analogue of Colibri's `couple_prefetch`: a 60 GiB model faults every page exactly once, and
+/// without this that happens during the first token, serialised against the arithmetic that wants them.
+/// `WillNeed` starts the work asynchronously.
+///
+/// Deliberately not a blocking populate — that would move the stall rather than hide it. Advisory, so
+/// this reports whether the call was made rather than pretending pages are resident afterwards.
+pub fn prefetch_mapped(path: &str, offset: usize, len: usize) -> bool {
+    let Some(reg) = RETAINED_MAPS.get() else { return false };
+    let g = reg.lock().unwrap();
+    let Some(fb) = g.get(path) else { return false };
+    if let FileBytes::Mapped(m) = *fb {
+        if offset >= m.len() || len == 0 { return false; }
+        let n = len.min(m.len() - offset);
+        return m.advise_range(memmap2::Advice::WillNeed, offset, n).is_ok();
+    }
+    false
+}
+
 pub fn release_stale_map_residency(keep: &str) -> usize {
     if MAP_VIEWS_LIVE.load(std::sync::atomic::Ordering::Relaxed) { return 0; }
     let Some(reg) = RETAINED_MAPS.get() else { return 0 };
