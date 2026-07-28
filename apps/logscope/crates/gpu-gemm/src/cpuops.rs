@@ -74,6 +74,50 @@ pub fn rope_neox(v: &mut [f32], pos: usize, base: f32) {
     }
 }
 
+/// Single-token attention against a KV cache, for one query head.
+///
+/// ## Layout
+///
+/// `k` and `v` are `[n_ctx][head_dim]`, so `K[t]` and `V[t]` are each contiguous. Both the score dot and
+/// the weighted sum then walk memory linearly, which is what the prefetcher wants — the alternative
+/// (`[head_dim][n_ctx]`) makes the score dot stride and is only worth it for batched prefill, which this
+/// path does not do.
+///
+/// ## GQA
+///
+/// Every model here uses grouped query attention — Scout 40/8, DeepSeek 32/8 — so several query heads
+/// share one KV head. The mapping is `kv_head = q_head / (n_q_heads / n_kv_heads)`, INTEGER division, so
+/// heads 0..4 share KV head 0 when the ratio is 5. Using `q_head % n_kv_heads` instead is the classic
+/// error: it also produces a valid index and a model that runs, with each head attending to the wrong
+/// neighbour's keys.
+pub fn attend_head(q: &[f32], k: &[f32], v: &[f32], head_dim: usize, n_past: usize,
+                   scores: &mut Vec<f32>, out: &mut [f32]) {
+    scores.clear();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    for t in 0..n_past {
+        let kt = &k[t * head_dim..(t + 1) * head_dim];
+        let dot: f32 = q.iter().zip(kt).map(|(a, b)| a * b).sum();
+        scores.push(dot * scale);
+    }
+    softmax(scores);
+    for o in out.iter_mut() { *o = 0.0; }
+    for t in 0..n_past {
+        let w = scores[t];
+        let vt = &v[t * head_dim..(t + 1) * head_dim];
+        for i in 0..head_dim { out[i] += w * vt[i]; }
+    }
+}
+
+/// Which KV head a query head reads.
+///
+/// Split out and tested on its own because it is one integer division that silently produces a working
+/// model when wrong.
+#[inline]
+pub fn kv_head_for(q_head: usize, n_q_heads: usize, n_kv_heads: usize) -> usize {
+    if n_kv_heads == 0 { return 0; }
+    q_head / (n_q_heads / n_kv_heads).max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +206,62 @@ mod tests {
         assert!(v[0] != 1.0 && v[2] != 0.0, "0 and 2 are a pair: {v:?}");
         assert_eq!(v[1], 0.0);
         assert_eq!(v[3], 0.0);
+    }
+
+    #[test]
+    fn gqa_maps_query_heads_to_kv_heads_by_DIVISION_not_modulo() {
+        // The classic error. `q % n_kv` also yields a valid index and a model that runs — each head
+        // simply attends to the wrong neighbour's keys, which reads as a slightly worse model rather
+        // than a broken one. Scout is 40/8, so heads 0..4 share KV head 0.
+        for q in 0..40 { assert_eq!(kv_head_for(q, 40, 8), q / 5, "q={q}"); }
+        assert_eq!(kv_head_for(4, 40, 8), 0);
+        assert_eq!(kv_head_for(5, 40, 8), 1, "the group boundary is at 5, not at 8");
+        // modulo would give 5 % 8 == 5 here, which is a different head entirely
+        assert_ne!(kv_head_for(5, 40, 8), 5 % 8);
+        // MHA (no grouping) is the identity
+        for q in 0..8 { assert_eq!(kv_head_for(q, 8, 8), q); }
+    }
+
+    #[test]
+    fn attention_over_one_position_returns_that_positions_value() {
+        // With a single past token, softmax over one score is 1.0 whatever the score is, so the output
+        // must be exactly V[0]. Any scale or masking bug shows up immediately here.
+        let hd = 4;
+        let q = vec![0.5f32; hd];
+        let k = vec![2.0f32; hd];
+        let v = vec![1.0f32, 2.0, 3.0, 4.0];
+        let (mut sc, mut out) = (Vec::new(), vec![0f32; hd]);
+        attend_head(&q, &k, &v, hd, 1, &mut sc, &mut out);
+        assert_eq!(out, v, "one position means the value passes through unchanged");
+        assert!((sc[0] - 1.0).abs() < 1e-6, "and its weight is 1");
+    }
+
+    #[test]
+    fn attention_weights_are_a_distribution_over_the_PAST_only() {
+        // n_past bounds the loop, which is the causal mask. If it read beyond, a decode would attend to
+        // KV slots not yet written — uninitialised memory that produces plausible garbage.
+        let hd = 2;
+        let q = vec![1.0f32, 0.0];
+        let k = vec![1.0, 0.0,  0.0, 1.0,  9.9, 9.9];   // slot 2 must not be read
+        let v = vec![1.0, 1.0,  2.0, 2.0,  99.0, 99.0];
+        let (mut sc, mut out) = (Vec::new(), vec![0f32; hd]);
+        attend_head(&q, &k, &v, hd, 2, &mut sc, &mut out);
+        assert_eq!(sc.len(), 2, "only the past is scored");
+        assert!((sc.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(out[0] < 3.0 && out[1] < 3.0, "the unwritten slot did not leak in: {out:?}");
+    }
+
+    #[test]
+    fn a_larger_score_gets_more_weight() {
+        // Sanity on the sign of the scale: a key aligned with the query must dominate one opposed to it.
+        let hd = 2;
+        let q = vec![1.0f32, 0.0];
+        let k = vec![1.0, 0.0,  -1.0, 0.0];
+        let v = vec![10.0, 0.0,  0.0, 10.0];
+        let (mut sc, mut out) = (Vec::new(), vec![0f32; hd]);
+        attend_head(&q, &k, &v, hd, 2, &mut sc, &mut out);
+        assert!(sc[0] > sc[1], "aligned key wins: {sc:?}");
+        assert!(out[0] > out[1], "so its value dominates: {out:?}");
     }
 
     #[test]
