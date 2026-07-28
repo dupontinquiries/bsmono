@@ -311,10 +311,12 @@ end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} attributed{}",
 const DIMS_RETAIN_CAP: usize = 8192;
 /// Largest batch allowed after a readback on a driver whose submit governor cannot run.
 ///
-/// The governor normally bounds queue depth so a display sharing the GPU is serviced between submits.
-/// On Honeykrisp it disables itself (completion callbacks are slow or absent), so nothing bounds it —
-/// and an unbounded batch produced watchdog timeouts and a stuttering desktop. 32 keeps most of the
-/// batching win while leaving the compositor gaps to run in.
+/// UNUSED. Kept with its history because the idea recurs and the implementation was worse than the
+/// problem: applied as a permanent `store` it ratcheted the tuner's 128 down to 32 on the first
+/// readback of the first token and never let it back up. If pacing is ever needed here again, it must
+/// bound a single batch and restore the tuner's value afterwards — `stream_session_window` already does
+/// exactly that with a `saved_flush`, and that is the pattern to copy.
+#[allow(dead_code)]
 const POST_READBACK_FLUSH_CAP: u32 = 32;
 /// Windowed-decode mid-loop flush cadence: flush+poll every N sampler slots so a large window's
 /// per-slot buffers (bind groups, dims, decode intermediates) free instead of accumulating in one
@@ -2404,11 +2406,15 @@ impl Gpu {
             // most of the submit reduction while leaving gaps the display can be serviced in. Drivers
             // with a functioning governor keep the full batch, because there the governor already does
             // this job properly.
-            if self.conservative_vma && self.inflight_cap.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                let cur = self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
-                let capped = cur.min(POST_READBACK_FLUSH_CAP);
-                self.flush_every.store(capped, std::sync::atomic::Ordering::Relaxed);
-            }
+            // NOTE: this used to STORE a reduced flush_every here, which was a one-way ratchet — the
+            // submit tuner picks 128, the first readback lowers it to 32, and nothing ever restores it,
+            // so every token after the first ran at four times the submit count the tuner chose. The
+            // pacing was meant to be per-batch and was implemented as a permanent mutation.
+            //
+            // Removed rather than repaired: the readback cadence already paces this path. A MoE decode
+            // reads the router back once per layer, so the frame is drained ~48 times per token no
+            // matter what flush_every says, and the compositor gets its gaps from that. Adding a second
+            // pacing mechanism on top only destroyed the tuner's measurement.
         }
         v
     }
@@ -12108,6 +12114,33 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// `flush_every` must not be mutated by anything other than the tuner or an explicit pin.
+    ///
+    /// A permanent `store` of a reduced value was added here as "pacing after a readback" and acted as a
+    /// one-way ratchet: the tuner picks 128, the first readback lowers it to 32, nothing restores it, and
+    /// every subsequent token runs at four times the submit count that was measured as best. The symptom
+    /// was submits "firing too quickly again" — an autotuned value silently overridden by a second
+    /// mechanism that had no way to give it back.
+    ///
+    /// This is a source check rather than a runtime one because the failure is structural: any `store`
+    /// into flush_every outside `set_flush_every` is the same mistake. `stream_session_window` shows the
+    /// correct shape — save, cap, restore.
+    #[test]
+    fn flush_every_is_not_ratcheted_by_a_second_mechanism() {
+        let src = include_str!("lib.rs");
+        let stores: Vec<&str> = src.lines()
+            .filter(|l| l.contains("flush_every.store("))
+            .map(|l| l.trim())
+            .filter(|l| !l.starts_with("//"))
+            // and not this test's own filter line, which contains the string it searches for
+            .filter(|l| !l.contains("l.contains("))
+            .collect();
+        // Exactly one: the setter. Anything else is a second writer with no restore path.
+        assert_eq!(stores.len(), 1,
+            "flush_every should be written only by set_flush_every; found {} writers:\n{}",
+            stores.len(), stores.join("\n"));
+    }
+
     /// The three shader copies of `f16()` must stay semantically identical.
     ///
     /// They are hand-copied into each quant kernel's source, and one of them carried a wrong subnormal
