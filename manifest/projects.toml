@@ -65,7 +65,15 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11) — no GTK/Qt runtime, same convention as logscope
 targets = ["desktop"]
-notes = "the egui-primary port of rusty-board (GTK4 keyboard) — see UI_STRATEGY.md. `cargo build --release` produces the deployable `rusty-board-egui` bin directly (the `app` feature is default-on); the GTK4 original stays the parity reference."
+# NOT yet `primary = true`. The port now shares rusty-board's REAL config type
+# (src/config/mod.rs by #[path], so settings cannot drift) and covers the
+# keyboard proper — layouts, gestures, swipe typing with trail diagnostics,
+# appearance and behaviour. What the GTK build still does and this does not:
+# voice dictation and the LLM assistant (settings::ready() reports both false),
+# the minimised tray, and the microterm. Making this the default before voice
+# lands would take dictation away from anyone who relies on it, so the flag
+# waits on those rather than on the flag being convenient.
+notes = "the egui port of rusty-board (GTK4 keyboard) — see UI_STRATEGY.md. Shares the engine's own Config via #[path] rather than reimplementing settings, so the two front ends cannot disagree about what a setting means. `cargo build --release` produces the deployable `rusty-board-egui` bin directly (the `app` feature is default-on). Not yet marked primary: voice dictation, the LLM assistant, the minimised tray and the microterm are still GTK-only — see settings::ready()."
 
 [apps.bo-suite]
 path = "apps/bo-suite"
