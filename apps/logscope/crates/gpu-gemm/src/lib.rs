@@ -379,6 +379,31 @@ type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, (wgpu::Buffer, u64, u64), wg
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
 /// a slot is never rewritten while an in-flight dispatch still reads it.
 const DIMS_RING_SIZE: usize = 2048;
+
+/// ## A structural difference from llama.cpp, measured in buffer objects
+///
+/// Every dispatch here needs four u32s of shape, and we pass them in a UNIFORM BUFFER — cached by
+/// content up to `DIMS_CACHE_CAP` with a `DIMS_RING_SIZE` ring behind it. **Up to 6144 buffer objects
+/// holding sixteen bytes each.** The governor's own model puts `baseline_objects` at 6400 against a
+/// `soft_object_cap` of 8192, so the engine starts at 78% of its object budget before allocating a
+/// single weight.
+///
+/// llama.cpp's Vulkan backend passes the same parameters as PUSH CONSTANTS: no buffer, no cache, no
+/// ring, no wrap fence, no retain list. Vulkan guarantees at least 128 bytes; our dims are 16.
+///
+/// Adopting that would DELETE rather than shrink:
+/// * the dims cache and its 4096 buffers,
+/// * the 2048-entry ring and the wrap that calls `flush_and_wait`,
+/// * `DIMS_RETAIN_CAP` and the retained-keep list,
+/// * the `dims_alloc_failed` path and the M4 "Buffer 'dims' invalid" crash it exists to survive,
+/// * the `SUBMIT_BY_DIMS_WRAP` attribution category, because it would not exist.
+///
+/// NOT ATTEMPTED HERE, and the capability is unverified: wgpu 29 does not expose `PUSH_CONSTANTS` or
+/// `max_push_constant_size` under the names this crate would need, so whether it is reachable through
+/// this abstraction is an open question rather than a known yes. Recorded because the object-count
+/// arithmetic is the strongest argument yet for why our memory behaviour differs from llama.cpp's, and
+/// it does not depend on the answer.
+pub const DIMS_PUSH_BYTES: u32 = 16;
 /// Fixed uniform-buffer size for every dims buffer (largest dims payload is 16 u32 = 64 bytes; round up).
 const DIMS_BUF_SIZE: u64 = 256;
 /// How many times the retain-cap forced a mid-window poll+free (test/telemetry).
