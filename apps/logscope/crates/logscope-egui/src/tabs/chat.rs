@@ -938,6 +938,9 @@ pub struct Chat {
     show_checkpoints: bool,                 // checkpoints panel open
     /// GPU phase-breakdown subpanel open (📊 in the composer bar).
     show_metrics: bool,
+    /// Steps the reader has opened, as (message, step). Per-step rather than per-message: opening one
+    /// long step usually means wanting that one, not every step of every later reply.
+    step_open: std::collections::HashSet<(usize, usize)>,
     /// Rolling window of the Thinker's recent output, for the watch strip.
     watch: logscope::thinkerwatch::ThinkerWindow,
     /// The whole current reply: the forecast must count fences opened BEFORE the window, since a code
@@ -1045,6 +1048,7 @@ impl Default for Chat {
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            step_open: Default::default(),
             watch: logscope::thinkerwatch::ThinkerWindow::new(),
             watch_full: String::new(), watch_gist: None,
             expanded_msgs: Default::default(),
@@ -6660,6 +6664,8 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                         &MsgSlice(&self.msgs), 0..msg_count, &self.expanded_msgs,
                         logscope::liaison_relay::COLLAPSE_ABOVE_LINES);
                     let expanded_now = self.expanded_msgs.clone();
+                    let step_open = self.step_open.clone();
+                    let mut toggle_step: Option<(usize, usize)> = None;
                     let mut expand_msg: Option<usize> = None;
                     let mut collapse_msg: Option<usize> = None;
                     for (i, m) in self.msgs.iter_mut().enumerate() {
@@ -6727,6 +6733,24 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                         if ui.button(RichText::new("\u{25be} collapse").color(theme::FAINT()).small()).clicked() {
                                             collapse_msg = Some(i);
                                         }
+                                    }
+                                    // STEPWISE OUTLINE. A coordinator reply carries "STEP k/n — summary" markers, which are a table
+                                    // of contents the reader was scrolling past. Rendered as headers with the long middles folded,
+                                    // the verbosity stops being a cost — which matters because these replies arrive FAST, so the
+                                    // problem was never the tokens, only having to scroll through them to find the one that counts.
+                                    let steps = logscope::stepview::split_steps(m.text());
+                                    if steps.len() > 1 {
+                                        for (si2, st) in steps.iter().enumerate() {
+                                            let folded = logscope::stepview::fold_by_default(&steps, si2)
+                                                && !step_open.contains(&(i, si2));
+                                            if !st.summary.is_empty() {
+                                                let mark = if folded { "\u{25b8}" } else { "\u{25be}" };
+                                                if ui.button(RichText::new(format!("{mark} {}", st.header()))
+                                                    .color(theme::DIM()).small()).clicked() { toggle_step = Some((i, si2)); }
+                                            }
+                                            if !folded { render_markdown(ui, &st.body, ""); }
+                                        }
+                                        return;
                                     }
                                     let segs = segment_message(m.text());
                                     let last = segs.len().saturating_sub(1);
