@@ -14,6 +14,7 @@ pub mod residency;
 pub mod liaison;
 pub mod liaison_prompt;
 pub mod liaison_relay;
+pub mod stepview;
 pub mod filesep;
 pub mod msgview;
 pub mod repoquery;
