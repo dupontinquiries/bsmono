@@ -52,7 +52,7 @@ edits exactly reversible, which floats are not.
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, **imager** | 40 |
+| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, **chain** | 46 |
 
 ## Realtime collaboration, concretely
 
@@ -692,3 +692,36 @@ horizontal one — what every hardware vectorscope does, and why an engineer can
 read it at a glance. Per-band correlation completes the picture: not "this mix
 has phase problems" but "your 200 Hz is out of phase", which is the difference
 between a meter you act on and one you learn to ignore.
+
+## The chain strip
+
+The third piece of the Ozone grammar, after the shared canvas and the meters: a
+strip showing what the signal actually passes through, in order, each stage
+bypassable and draggable. It exists because **order changes the sound** and most
+interfaces hide that — an EQ before a compressor makes the compressor react to
+the boosted band, while the same EQ after it does not, and those are audibly
+different masters. A test asserts the difference rather than the theory.
+
+Three things the strip has to get right beyond drawing:
+
+* **Bypass must be true bypass** — identical to the stage not being there, not
+  "nearly", because the button's whole job is to answer "is this helping?"
+  honestly.
+* **Latency must be reported.** A chain containing a lookahead limiter delays
+  the signal; a host that does not know by how much drifts this track against
+  every other one, and the error is a constant few milliseconds that sounds like
+  sloppy playing rather than a bug. Bypassing the limiter removes its delay too,
+  which is the subtle half — a host told the *wrong* latency is worse than one
+  told none.
+* **A drag that ends where it started must cost nothing**, since it is the most
+  common gesture on a strip.
+
+The strip also warns about the orders that undo themselves: a limiter that is
+not last (stages after it push the signal back over the ceiling), two limiters
+(the second cannot improve on the first, only squash it), and widening after
+limiting (which lifts peaks back above the ceiling). Advice, not enforcement —
+an unusual chain is sometimes exactly what a record needs.
+
+The end-to-end test is the one that matters: EQ → multiband → saturation →
+imager → +6 dB → limiter, everything built so far in the order it would actually
+be used, must still not let a sample past the ceiling.
