@@ -12,7 +12,47 @@ use std::path::Path;
 use crate::{Dimension, DocFacts};
 
 /// Units we recognise, longest first so `mm` is not mistaken for `m`.
-const UNITS: [&str; 8] = ["mm", "cm", "in", "thou", "m", "\"", "'", "deg"];
+///
+/// The inch and foot marks (`"` and `'`) are deliberately **absent**. They were here, and running
+/// the `fit` verb over the real corpus showed what that costs: prose like `"===1" meaning` parsed
+/// as one inch, because a closing quotation mark after a digit is indistinguishable from an inch
+/// mark without understanding the sentence. In a tree full of developer documentation, quotation
+/// marks outnumber inch marks by orders of magnitude, so the mark is dropped and `in` / `inch`
+/// carry the unit instead. A spec that writes 5" simply will not be picked up, which is the
+/// direction to err: a missed requirement is visible, a fabricated one is not.
+/// Recognised units, longest first so `inch` is matched before `in` and `mm` before `m`. The flag
+/// is `tight`: whether the unit must abut the number with no space.
+///
+/// `in` is tight-only, and that too came from running `fit` over the real corpus. "in" is an
+/// English preposition, so `level 1 in ~0.5` and `real git 2.43 in ` both parsed as inches. No
+/// amount of local scanning can tell a unit from a preposition — only the sentence can — so the
+/// abbreviation is accepted only when bound to its number (`5in`), while the spelled-out `inch`
+/// and `inches` are unambiguous and may be spaced. A spec writing `5 in` is therefore missed,
+/// which is the right way to be wrong: a missing requirement is visible in a checklist, an
+/// invented one silently becomes a constraint nobody wrote.
+const UNITS: [(&str, bool); 8] = [
+    ("inches", false),
+    ("inch", false),
+    ("thou", false),
+    ("deg", false),
+    ("mm", false),
+    ("cm", false),
+    ("in", true),
+    ("m", false),
+];
+
+/// Collapse spellings to one canonical unit, so a checklist does not report `inch` and `in` as
+/// two different things.
+fn canonical(u: &str) -> &'static str {
+    match u {
+        "inches" | "inch" | "in" => "in",
+        "mm" => "mm",
+        "cm" => "cm",
+        "m" => "m",
+        "thou" => "thou",
+        _ => "deg",
+    }
+}
 
 pub fn facts(path: &Path) -> Option<DocFacts> {
     // Cap the read: a corpus can contain a very large log, and nothing past the first stretch of a
@@ -60,18 +100,17 @@ fn scan_dimensions(line: &str, out: &mut Vec<Dimension>) {
         }
         let num: String = b[start..i].iter().collect();
         let Ok(value) = num.parse::<f32>() else { continue };
-        let mut j = i;
-        if j < b.len() && b[j] == ' ' {
-            j += 1;
-        }
+        let spaced = i < b.len() && b[i] == ' ';
+        let j = if spaced { i + 1 } else { i };
         let tail: String = b[j..].iter().collect::<String>().to_ascii_lowercase();
-        if let Some(unit) = UNITS.iter().find(|u| {
-            tail.starts_with(**u)
+        if let Some((unit, _)) = UNITS.iter().find(|(u, tight)| {
+            (!*tight || !spaced)
+                && tail.starts_with(u)
                 && !tail[u.len()..].starts_with(|c: char| c.is_alphanumeric())
         }) {
             out.push(Dimension {
                 value,
-                unit: (*unit).to_string(),
+                unit: canonical(unit).to_string(),
                 context: line.trim().to_string(),
             });
             i = j + unit.len();
@@ -98,6 +137,28 @@ mod tests {
     #[test]
     fn thread_callouts_are_not_lengths() {
         let f = parse("Use M3 and M4 fasteners throughout.");
+        assert!(f.dimensions.is_empty(), "{:?}", f.dimensions);
+    }
+
+    #[test]
+    fn quotation_marks_in_prose_are_not_inches() {
+        // Regression: found by running `fit` over the real corpus, where changelog prose full of
+        // quoted strings produced a checklist of phantom inch dimensions.
+        let f = parse("Tabs stop being \"1, 2, 3\". The `===1` stub keeps \"1\" meaning one.");
+        assert!(f.dimensions.is_empty(), "{:?}", f.dimensions);
+    }
+
+    #[test]
+    fn inches_need_either_tight_binding_or_the_spelled_out_word() {
+        let f = parse("The shaft is 2in across and the plate is 0.5 inch thick.");
+        assert_eq!(f.dimensions.len(), 2, "{:?}", f.dimensions);
+        assert!(f.dimensions.iter().all(|d| d.unit == "in"));
+    }
+
+    #[test]
+    fn in_as_a_preposition_is_not_a_measurement() {
+        // Regression from the real corpus: changelog prose measured in phantom inches.
+        let f = parse("Measured ~4.9x smaller at level 1 in ~0.5 seconds, with real git 2.43 in CI.");
         assert!(f.dimensions.is_empty(), "{:?}", f.dimensions);
     }
 

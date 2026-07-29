@@ -83,7 +83,7 @@ fn demo_doc() -> Doc {
 /// behind "same volume as `puma`" — before any of that can be trusted, the index has to be able to
 /// walk a real, messy asset tree and come back with facts rather than guesses.
 fn ref_index(root: &str) -> ! {
-    use cad_ref::{Facts, Index, Kind, RefError, ScanOpts, Units};
+    use cad_ref::{Facts, Index, Kind, ScanOpts, Units};
     let t0 = std::time::Instant::now();
     let mut fail_ref = 0usize;
     let root_path = std::path::Path::new(root);
@@ -297,7 +297,57 @@ fn ref_index(root: &str) -> ! {
             }
         }
     }
-    let _ = RefError::NotAModel { name: String::new() }; // keep the import honest if unused above
+
+    // The `fit <doc>` verb: a specification's dimensioned statements, measured against a part.
+    // The part here is the M0 bench's bracket, taken at its real bounding extents.
+    let (blo, bhi) = demo_doc()
+        .apply()
+        .0
+        .parts
+        .iter()
+        .find(|p| p.name == "bracket")
+        .map(|p| p.sdf.aabb())
+        .unwrap_or((Vec3::ZERO, Vec3::ZERO));
+    let extent = (bhi - blo).to_array();
+    let mut fit_docs: Vec<String> = idx
+        .entries
+        .iter()
+        .filter(|e| e.kind == cad_ref::Kind::Doc)
+        .filter(|e| matches!(&e.facts, Facts::Doc(d) if d.dimensions.len() >= 2))
+        .map(|e| e.name.clone())
+        .collect();
+    fit_docs.truncate(1);
+    fit_docs.push("no_such_spec".into());
+    for name in fit_docs {
+        match idx.fit_check(&name, Some(extent)) {
+            Ok(r) => {
+                println!(
+                    "  fit {:26} {} lines: {} within, {} exceed, {} not a length",
+                    r.doc,
+                    r.lines.len(),
+                    r.count(cad_ref::Verdict::Within),
+                    r.count(cad_ref::Verdict::Exceeds),
+                    r.count(cad_ref::Verdict::NotALength),
+                );
+                for l in r.lines.iter().take(3) {
+                    println!(
+                        "      {:>9.2} {:3} {:14?}  {}",
+                        l.required.value,
+                        l.required.unit,
+                        l.verdict,
+                        l.required.context.chars().take(52).collect::<String>()
+                    );
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains(&name) {
+                    fail_ref += 1;
+                }
+                println!("  fit {:26} declined: {msg}", name);
+            }
+        }
+    }
 
     // Name resolution, which is what a person actually uses.
     for q in ["puma", "shark", "obsidian", "nosuchmodelanywhere"] {

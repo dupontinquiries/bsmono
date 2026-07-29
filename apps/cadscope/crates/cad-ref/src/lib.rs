@@ -78,6 +78,7 @@ pub enum RefError {
     /// searched, and the nearest matches so the answer is useful rather than merely correct.
     NotIndexed { name: String, searched: usize, nearest: Vec<String> },
     NotAModel { name: String },
+    NotADoc { name: String },
     /// Indexed, but only a header was read — no vertices, so nothing to measure.
     NoGeometry { name: String },
     /// Measured, but the surface does not enclose anything.
@@ -100,6 +101,7 @@ impl std::fmt::Display for RefError {
                 Ok(())
             }
             RefError::NotAModel { name } => write!(f, "'{name}' is not a model"),
+            RefError::NotADoc { name } => write!(f, "'{name}' is not a document"),
             RefError::NoGeometry { name } => {
                 write!(f, "'{name}' was indexed from a header only; no vertices to measure")
             }
@@ -522,9 +524,98 @@ impl Index {
             .collect()
     }
 
+    /// The `fit <doc>` verb (plan §17.2): turn a specification's dimensioned statements into a
+    /// checklist measured against a part, each line carrying the number it came from.
+    ///
+    /// Scope, stated plainly because it would otherwise be overclaimed: this compares against the
+    /// part's **bounding box**, and it reads every dimension as a limit the part must sit inside.
+    /// A spec line like "wall >= 2.5mm" is a minimum, not a maximum, and this verb does not yet
+    /// parse comparator words — such a line is reported with its measured neighbour so a person
+    /// can judge, never silently marked satisfied. The checklist is an aid to reading a spec, not
+    /// a certificate that one has been met.
+    pub fn fit_check(&self, doc: &str, part_extent_mm: Option<[f32; 3]>) -> Result<FitReport, RefError> {
+        let Some(entry) = self.exact(doc).into_iter().find(|e| e.kind == Kind::Doc) else {
+            return Err(if self.exact(doc).is_empty() {
+                let nearest = self
+                    .resolve(doc, Some(Kind::Doc), 3)
+                    .into_iter()
+                    .map(|(e, _)| e.name.clone())
+                    .collect();
+                RefError::NotIndexed { name: doc.into(), searched: self.len(), nearest }
+            } else {
+                RefError::NotADoc { name: doc.into() }
+            });
+        };
+        let Facts::Doc(d) = &entry.facts else { return Err(RefError::NotADoc { name: doc.into() }) };
+
+        let largest = part_extent_mm.map(|e| e[0].max(e[1]).max(e[2]));
+        let mut report = FitReport { doc: entry.name.clone(), lines: Vec::new() };
+        for dim in &d.dimensions {
+            // Only length units are comparable; an angle or a bare inch mark is carried through
+            // as a statement the checklist shows but cannot test.
+            let required_mm = match dim.unit.as_str() {
+                "mm" => Some(dim.value),
+                "cm" => Some(dim.value * 10.0),
+                "m" => Some(dim.value * 1000.0),
+                "in" => Some(dim.value * 25.4),
+                _ => None,
+            };
+            let verdict = match (required_mm, largest) {
+                (Some(r), Some(a)) if a <= r => Verdict::Within,
+                (Some(_), Some(_)) => Verdict::Exceeds,
+                (None, _) => Verdict::NotALength,
+                (_, None) => Verdict::PartNotMeasured,
+            };
+            report.lines.push(FitLine {
+                required: dim.clone(),
+                required_mm,
+                part_largest_mm: largest,
+                verdict,
+            });
+        }
+        Ok(report)
+    }
+
     /// All maps belonging to one material name — the `texture from <model>` verb's payload.
     pub fn material_set(&self, name: &str) -> Vec<&Entry> {
         self.exact(name).into_iter().filter(|e| e.kind == Kind::Texture).collect()
+    }
+}
+
+/// One line of a `fit` checklist.
+#[derive(Clone, Debug)]
+pub struct FitLine {
+    pub required: Dimension,
+    /// The requirement normalised to millimetres, when it is a length at all.
+    pub required_mm: Option<f32>,
+    pub part_largest_mm: Option<f32>,
+    pub verdict: Verdict,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// The part's largest extent sits inside this dimension.
+    Within,
+    Exceeds,
+    /// An angle, a bare quote mark, or anything else that is not a length.
+    NotALength,
+    /// The part has no measured extent to compare against.
+    PartNotMeasured,
+}
+
+#[derive(Clone, Debug)]
+pub struct FitReport {
+    pub doc: String,
+    pub lines: Vec<FitLine>,
+}
+
+impl FitReport {
+    pub fn count(&self, v: Verdict) -> usize {
+        self.lines.iter().filter(|l| l.verdict == v).count()
+    }
+    /// True only when there is something testable and everything testable passed.
+    pub fn all_within(&self) -> bool {
+        self.count(Verdict::Within) > 0 && self.count(Verdict::Exceeds) == 0
     }
 }
 
@@ -678,6 +769,52 @@ mod tests {
             Err(RefError::Ambiguous { candidates, .. }) => assert_eq!(candidates.len(), 2),
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    fn spec_doc() -> Entry {
+        Entry {
+            name: "enclosure_spec".into(),
+            kind: Kind::Doc,
+            path: "enclosure_spec.md".into(),
+            bytes: 0,
+            facts: Facts::Doc(crate::doc::parse(
+                "# Enclosure\nThe cavity is 120 mm across.\nRotate the mount 45 deg.\n",
+            )),
+        }
+    }
+
+    #[test]
+    fn fit_check_measures_lengths_and_declines_the_rest() {
+        let idx = Index::from_entries(vec![spec_doc()]);
+        let r = idx.fit_check("enclosure_spec", Some([100.0, 40.0, 20.0])).unwrap();
+        assert_eq!(r.lines.len(), 2, "one length and one angle");
+        assert_eq!(r.lines[0].verdict, Verdict::Within, "100mm fits inside 120mm");
+        assert_eq!(r.lines[0].required_mm, Some(120.0));
+        assert_eq!(r.lines[1].verdict, Verdict::NotALength, "45 deg is not a size");
+        assert!(r.all_within());
+
+        // A part too big for the cavity fails the line rather than rounding in its favour.
+        let r2 = idx.fit_check("enclosure_spec", Some([130.0, 10.0, 10.0])).unwrap();
+        assert_eq!(r2.lines[0].verdict, Verdict::Exceeds);
+        assert!(!r2.all_within());
+    }
+
+    #[test]
+    fn fit_check_without_a_measured_part_says_so() {
+        let idx = Index::from_entries(vec![spec_doc()]);
+        let r = idx.fit_check("enclosure_spec", None).unwrap();
+        assert_eq!(r.lines[0].verdict, Verdict::PartNotMeasured);
+        assert!(!r.all_within(), "unmeasured must never read as passing");
+    }
+
+    #[test]
+    fn fit_check_refuses_an_unknown_or_wrong_kind_name() {
+        let idx = Index::from_entries(vec![spec_doc(), tex("plating.png")]);
+        assert!(matches!(
+            idx.fit_check("nothing_like_this", None),
+            Err(RefError::NotIndexed { .. })
+        ));
+        assert!(matches!(idx.fit_check("plating", None), Err(RefError::NotADoc { .. })));
     }
 
     #[test]

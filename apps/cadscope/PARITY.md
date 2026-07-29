@@ -72,11 +72,28 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   normal and specular maps, correctly grouped under one name); `puma` resolves to a top hit plus
   two weaker ones. `resolve` returns a ranked list and never collapses to one answer — a silent
   pick is how you scale a part to the volume of the wrong model.
-- **Two verbs live, three to go.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
-  and `texture from` (`Index::textures_of_model`, a join that reports unresolved materials rather
-  than dropping them) both work against the real tree. `fit <doc>`, `fits <niftyplot>` and
-  `like <model>` remain M6–M7. Neither live verb is wired into the UI yet — both are reachable only
-  from `--ref-index` and from the document format.
+- **`fit <doc>` is a bounding-box test, and reads every dimension as a limit.** A spec line like
+  "wall >= 2.5 mm" is a *minimum*, and the verb does not parse comparator words — such a line is
+  shown with its measured neighbour so a person can judge, never silently marked satisfied. The
+  checklist is an aid to reading a spec, not a certificate that one has been met.
+- **Dimension extraction deliberately misses some real dimensions.** Two false-positive classes
+  turned up when `fit` was first run over the real tree, and both were fixed by *narrowing*: the
+  inch mark `"` was removed entirely (prose like `"===1" meaning` parsed as one inch, and in a tree
+  of developer documentation quotation marks outnumber inch marks enormously), and the abbreviation
+  `in` now requires tight binding to its number (`5in`, not `5 in`) because "in" is also an English
+  preposition — `level 1 in ~0.5` and `git 2.43 in CI` both parsed as inches. A spec writing `5 in`
+  is therefore missed. That is the intended direction of error: a missing requirement is visible in
+  a checklist, an invented one silently becomes a constraint nobody wrote.
+- **No units are declared for the monorepo root.** `ref.toml` is read from the scan root, and the
+  one in `apps/cadscope` applies only when scanning there — so a whole-tree scan reports 0 models
+  with declared units and `volume of` correctly declines every one of them. That is the mechanism
+  working, not failing, but it means the verb is unusable tree-wide until someone who knows the
+  conventions writes the declarations.
+- **Three verbs live, two to go.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
+  `texture from` (`Index::textures_of_model`, a join that reports unresolved materials rather than
+  dropping them) and `fit <doc>` all work against the real tree. `fits <niftyplot>` and
+  `like <model>` remain M6–M7. **None of the live verbs is wired into the UI** — they are reachable
+  only from `--ref-index` and from the document format.
 - **Niftyplot entries parse to nothing.** No `.nifty` files exist in the tree yet, and the parser
   arrives at M6 with the hardware-kind implementation.
 
