@@ -45,6 +45,7 @@ pub mod model_selector;
 pub mod modelroles;
 pub mod cpuplacement;
 pub mod coreclass;
+pub mod constrain;
 pub mod hybridsplit;
 pub mod coresidency;
 pub mod loadadvice;
