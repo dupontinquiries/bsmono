@@ -4,11 +4,11 @@ total_car_rings 2
 total_goals 0
 best_combo 0
 best_air 3.25
-top_speed 24.21
+top_speed 221.41
 volume 0.80
 music 1
 minimap 0
-ball_cam 0
+ball_cam 1
 fullscreen 1
 car 2
 map 18
@@ -51,9 +51,9 @@ cfg ball_friction 2.425
 cfg ball_weight 0.800
 cfg car_size 1.051
 cfg car_grip 0.999
-cfg car_top 1.000
-cfg car_accel 1.000
-cfg car_boost 1.000
+cfg car_top 1.078
+cfg car_accel 1.004
+cfg car_boost 1.024
 cfg car_boost_regen 0.000
 cfg car_boost_max 1.000
 cfg car_boost_unl 1.000
