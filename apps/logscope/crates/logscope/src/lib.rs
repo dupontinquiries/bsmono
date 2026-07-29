@@ -46,6 +46,7 @@ pub mod modelroles;
 pub mod cpuplacement;
 pub mod coreclass;
 pub mod constrain;
+pub mod smallrole;
 pub mod hybridsplit;
 pub mod coresidency;
 pub mod loadadvice;
