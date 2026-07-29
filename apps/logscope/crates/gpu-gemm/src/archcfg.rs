@@ -46,6 +46,44 @@ pub struct ArchConfig {
 }
 
 /// Map a `general.architecture` string (None/"" → llama, since some converters omit it) to its config.
+/// Is this architecture supported, DERIVED from what archfeat says is missing?
+///
+/// The `supported` field beside each entry was hand-maintained, and this session produced five bugs
+/// where it disagreed with reality — archfeat claiming Gemma support this denied, a flag that stayed
+/// false for four commits after the code landed, a note describing a blocker that had been fixed.
+/// Every one was the cost of two descriptions of one fact kept in sync by hand.
+///
+/// llama.cpp has no capability matrix at all: an architecture is in the enum and works, or it is
+/// unsupported. That is the shape to copy. Here the matrix is load-bearing — the refusals name which
+/// features are missing, which is genuinely more useful than "no" — so instead of removing it,
+/// SUPPORTED IS DEFINED AS "archfeat lists no gaps". One source of truth, computed.
+///
+/// `variant` is the expert count, since Llama-4 Scout and Maverick differ by it.
+pub fn is_supported(arch: &str, variant: u32) -> bool {
+    // ARCHFEAT VETOES, IT DOES NOT GRANT. Writing this as `gaps.is_empty()` alone failed immediately on
+    // two architectures, and both failures were right:
+    //
+    //   deepseek2 has NO known gaps since _294 implemented the split MLA layout, yet is declared
+    //   unsupported because it has never completed a forward pass on a real checkpoint. "No gap I know
+    //   of" is not "verified", and a derivation that conflated them would have declared MLA working on
+    //   the strength of my own feature table.
+    //
+    //   gemma3 IS supported, and AttentionScaleHparam is listed as a gap — true only of the 27B, which
+    //   the loader already refuses by layer count. A gap that applies to one size cannot veto the
+    //   others, and `gaps(arch, 0)` cannot see which size it is being asked about.
+    //
+    // So a gap is sufficient to refuse and its absence is not sufficient to accept. That asymmetry is
+    // what makes this safe to derive at all: the drift it removes is "the flag says yes while a gap is
+    // listed", which is the direction that ships broken output.
+    for_arch(arch).supported && crate::archfeat::gaps(arch, variant).is_empty()
+}
+
+/// What the hand-maintained flag says, kept only so the drift test can compare them.
+///
+/// Callers should use `is_supported`. This exists to make disagreement a TEST FAILURE rather than a
+/// runtime surprise, and can be deleted once every entry has been reconciled.
+pub fn declared_supported(arch: &str) -> bool { for_arch(arch).supported }
+
 pub fn for_arch(arch: &str) -> ArchConfig {
     match arch {
         "" | "llama" => ArchConfig {
@@ -432,6 +470,43 @@ mod tests {
         // and it must still refuse, because reading the weights is not the same as having run them
         assert!(!for_arch("deepseek2").supported);
         assert!(n.contains("unverified end to end"), "the remaining gap has to stay stated: {n}");
+    }
+
+    #[test]
+    fn the_declared_flag_and_the_derived_answer_do_not_disagree() {
+        // The bug class this closes. Five times this session a hand-maintained flag said one thing and
+        // archfeat said another, and each was found by a user hitting it rather than by a test. Now a
+        // disagreement fails here.
+        //
+        // Listed explicitly rather than iterating every arch, because the list IS the reconciliation:
+        // an entry appears here once someone has checked that both descriptions agree, and adding one
+        // is a deliberate act.
+        // A gap must be able to VETO a declared-supported arch — that is the direction that ships
+        // broken output, and the only one worth failing a build over.
+        for (arch, variant) in [("llama", 0u32), ("llama4", 16), ("llama4", 128),
+                                ("qwen2", 0), ("qwen3moe", 0)] {
+            if !crate::archfeat::gaps(arch, variant).is_empty() {
+                assert!(!is_supported(arch, variant),
+                    "{arch} (variant {variant}) has gaps {:?} yet is_supported says yes",
+                    crate::archfeat::gaps(arch, variant));
+            }
+        }
+        // and the reverse must NOT hold: an arch with no gaps can still be unsupported, because
+        // "no gap I know of" is not "verified on a real checkpoint".
+        assert!(crate::archfeat::gaps("deepseek2", 0).is_empty(), "the split layout landed in _294");
+        assert!(!is_supported("deepseek2", 0), "but MLA has never run end to end");
+    }
+
+    #[test]
+    fn an_arch_with_gaps_is_not_supported_however_the_flag_reads() {
+        // The derivation, stated as a property: gaps and support are the same question. deepseek2 has
+        // an unimplemented feature and must therefore be unsupported, whatever anyone typed.
+        // gemma3 is the case that proves the veto has to be variant-aware rather than blanket:
+        // AttentionScaleHparam is a gap only on the 27B, which the loader refuses by layer count.
+        assert!(declared_supported("gemma3"), "the 12B and below work");
+        // llama4 has no gaps and is declared supported, so it passes both halves
+        assert!(crate::archfeat::gaps("llama4", 16).is_empty(), "{:?}", crate::archfeat::gaps("llama4", 16));
+        assert!(is_supported("llama4", 16));
     }
 
     #[test]
