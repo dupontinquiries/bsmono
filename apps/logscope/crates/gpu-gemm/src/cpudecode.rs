@@ -161,6 +161,46 @@ pub fn decode_step(pool: &Pool, raw: &[u8], norms: &[f32], layers: &[LayerRef], 
     true
 }
 
+/// Build layer references from a parsed GGUF, so the CPU path can read a real model.
+///
+/// The blocker this removes: `decode_step` took `LayerRef`s that only a fixture could produce. Every
+/// offset here comes from the file's own tensor table, and `data_off` is where the tensor data begins —
+/// GGUF offsets are relative to that, not to the file, and treating them as absolute reads the header
+/// as weights.
+///
+/// Returns an error naming the FIRST missing tensor rather than a count. "3 tensors missing" sends a
+/// reader to diff the whole list; "blk.0.attn_q.weight" says which convention the file uses.
+pub fn layers_from_gguf(g: &crate::gguf::Gguf, sh: &Shape, data_off: usize)
+    -> Result<Vec<LayerRef>, String> {
+    let mut out = Vec::with_capacity(sh.n_layers);
+    // Norms are f32 and small; they are gathered into one buffer by the caller, so a LayerRef holds an
+    // index into it rather than a file offset. Recorded as the running total.
+    let mut norm_at = 0usize;
+    for i in 0..sh.n_layers {
+        let t = |suffix: &str| -> Result<TensorRef, String> {
+            let name = format!("blk.{i}.{suffix}.weight");
+            let ti = g.tensor(&name).ok_or_else(|| format!("missing tensor {name}"))?;
+            let quant = Quant::from_gguf(ti.ggml_type).ok_or_else(|| format!(
+                "{name} is ggml type {} which the CPU path does not read — fall back to the GPU rather \
+than guessing a layout", ti.ggml_type))?;
+            // GGUF dims are [cols, rows]: ne0 varies fastest and is the reduction dimension.
+            let cols = *ti.dims.first().unwrap_or(&0) as usize;
+            let rows = ti.dims.get(1).copied().unwrap_or(1) as usize;
+            Ok(TensorRef { off: data_off + ti.offset as usize, rows, cols, quant })
+        };
+        let l = LayerRef {
+            attn_norm: norm_at,
+            q: t("attn_q")?, k: t("attn_k")?, v: t("attn_v")?, o: t("attn_output")?,
+            ffn_norm: norm_at + sh.d,
+            gate_up: t("ffn_gate_up").or_else(|_| t("ffn_up"))?,
+            down: t("ffn_down")?,
+        };
+        norm_at += 2 * sh.d;
+        out.push(l);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,6 +325,93 @@ mod tests {
         let mut x = vec![0.2f32; sh.d];
         assert!(decode_step(&pool, &raw, &norms, &layers, &sh, &mut kv, &mut x));
         assert!(x.iter().any(|v| *v != 0.0), "a first token that attends to nothing gives zeros");
+    }
+
+    /// A minimal GGUF header with the tensors one layer needs.
+    fn gguf_one_layer() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend(b"GGUF");
+        v.extend(3u32.to_le_bytes());
+        let names: Vec<(&str, u64, u64)> = vec![
+            ("blk.0.attn_q.weight", 64, 64), ("blk.0.attn_k.weight", 64, 32),
+            ("blk.0.attn_v.weight", 64, 32), ("blk.0.attn_output.weight", 64, 64),
+            ("blk.0.ffn_up.weight", 64, 256), ("blk.0.ffn_down.weight", 128, 64),
+        ];
+        v.extend((names.len() as u64).to_le_bytes());
+        v.extend(0u64.to_le_bytes());              // no kv pairs
+        let mut off = 0u64;
+        for (n, c, r) in &names {
+            v.extend((n.len() as u64).to_le_bytes());
+            v.extend(n.as_bytes());
+            v.extend(2u32.to_le_bytes());          // 2 dims
+            v.extend(c.to_le_bytes());
+            v.extend(r.to_le_bytes());
+            v.extend(8u32.to_le_bytes());          // ggml type 8 = Q8_0
+            v.extend(off.to_le_bytes());
+            off += r * (c / 32) * 34;
+        }
+        v
+    }
+
+    #[test]
+    fn layers_are_read_from_the_files_own_tensor_table() {
+        // The blocker this removes: decode_step took LayerRefs only a fixture could produce.
+        let raw = gguf_one_layer();
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let l = layers_from_gguf(&g, &sh, 4096).expect("layers");
+        assert_eq!(l.len(), 1);
+        // GGUF dims are [cols, rows] — ne0 varies fastest and is the reduction dimension. Reading them
+        // the other way round transposes every weight, which runs and produces garbage.
+        assert_eq!(l[0].q.cols, 64);
+        assert_eq!(l[0].q.rows, 64);
+        assert_eq!(l[0].k.rows, 32, "kv projections are narrower under GQA");
+        // Offsets are relative to the DATA section, not the file: treating them as absolute reads the
+        // header as weights.
+        assert_eq!(l[0].q.off, 4096);
+        assert!(l[0].down.off > 4096);
+    }
+
+    #[test]
+    fn a_missing_tensor_names_ITSELF_rather_than_a_count() {
+        // "3 tensors missing" sends a reader to diff the whole list; a name says which convention the
+        // file uses, which is usually the actual difference.
+        let raw = gguf_one_layer();
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 2,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let e = layers_from_gguf(&g, &sh, 0).unwrap_err();
+        assert!(e.contains("blk.1.attn_q.weight"), "got {e}");
+    }
+
+    #[test]
+    fn an_unsupported_quant_refuses_instead_of_guessing_a_layout() {
+        // Reading a Q6_K tensor as Q4_K produces plausible garbage. The message says to fall back to the
+        // GPU, because that is the actual remedy rather than a request to fix the file.
+        let mut raw = gguf_one_layer();
+        // rewrite the first tensor's ggml_type to 14 (Q6_K)
+        let pos = raw.windows(4).position(|w| w == 8u32.to_le_bytes()).unwrap();
+        raw[pos..pos + 4].copy_from_slice(&14u32.to_le_bytes());
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let e = layers_from_gguf(&g, &sh, 0).unwrap_err();
+        assert!(e.contains("ggml type 14"), "{e}");
+        assert!(e.contains("fall back to the GPU rather than guessing"), "{e}");
+    }
+
+    #[test]
+    fn norm_indices_advance_by_two_per_layer_and_do_not_overlap() {
+        // attn_norm and ffn_norm are d floats each in one shared buffer. Overlapping them would apply
+        // the attention norm's weights to the FFN — finite, plausible, and wrong at every layer.
+        let raw = gguf_one_layer();
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let l = layers_from_gguf(&g, &sh, 0).unwrap();
+        assert_eq!(l[0].attn_norm, 0);
+        assert_eq!(l[0].ffn_norm, sh.d, "the two norms must not share a slice");
     }
 
     #[test]
