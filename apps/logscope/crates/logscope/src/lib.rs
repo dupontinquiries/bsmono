@@ -46,6 +46,7 @@ pub mod modelroles;
 pub mod cpuplacement;
 pub mod coreclass;
 pub mod hybridsplit;
+pub mod coresidency;
 pub mod deliberate;
 pub mod activemodel;
 pub mod cratecheck;
