@@ -80,12 +80,15 @@ impl Section {
 /// marked ready must have every one of its fields reachable.
 pub fn ready(section: Section) -> bool {
     match section {
-        // Everything the keyboard itself needs is reachable now.
-        Section::Appearance | Section::Behavior | Section::Gestures | Section::Layout => true,
-        // These configure subsystems the port does not host yet — the fields
-        // exist and round-trip, but the port cannot exercise them, and offering
-        // a control that does nothing is worse than not offering it.
-        Section::Voice | Section::Llm => false,
+        // Everything the keyboard itself needs, plus dictation: the port mounts
+        // rusty-board's own voice stack by #[path] behind the `voice` feature
+        // and drives it through `dictation`, so these settings do what they say.
+        Section::Appearance | Section::Behavior | Section::Gestures
+        | Section::Layout | Section::Voice => true,
+        // The assistant configures a subsystem the port does not host yet. The
+        // fields exist and round-trip, but offering a control that does nothing
+        // is worse than not offering it.
+        Section::Llm => false,
     }
 }
 
@@ -151,8 +154,8 @@ mod tests {
         // offering a control that does nothing is worse than not offering it.
         assert!(ready(Section::Appearance) && ready(Section::Behavior));
         assert!(ready(Section::Gestures) && ready(Section::Layout));
-        assert!(!ready(Section::Voice), "not hosted yet — say so rather than pretend");
-        assert!(!ready(Section::Llm));
+        assert!(ready(Section::Voice), "dictation is hosted behind the `voice` feature");
+        assert!(!ready(Section::Llm), "the assistant is not — say so rather than pretend");
     }
 
     #[test]
