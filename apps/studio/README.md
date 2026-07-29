@@ -52,7 +52,7 @@ edits exactly reversible, which floats are not.
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, **chain** | 46 |
+| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 54 |
 
 ## Realtime collaboration, concretely
 
@@ -725,3 +725,47 @@ an unusual chain is sometimes exactly what a record needs.
 The end-to-end test is the one that matters: EQ → multiband → saturation →
 imager → +6 dB → limiter, everything built so far in the order it would actually
 be used, must still not let a sample past the ceiling.
+
+## The assistant: diagnosis first, and much less of it
+
+The iZotope assistants got the **critique** right — fed a mix they identified
+real, specific problems, reliably, across wildly different material. They got the
+**prescription** wrong: heavy-handed, especially on EQ and compression, to the
+point where the common workflow was to dial the result back to somewhere between
+15% and 50% and prefer that.
+
+So the two are separated. `analyze` produces **findings** — what was observed,
+where, how confident, and a plain sentence saying why it matters — and that half
+is worth having on its own; you can read it and fix things yourself. `propose`
+turns findings into moves scaled by a **strength** defaulting to 0.3, in the
+middle of the band people actually used.
+
+Four rules follow, all tested:
+
+* **Strength 0 proposes nothing**, so "apply" is fully undoable by turning the
+  dial down rather than being a one-way door.
+* **Even at full strength nothing is drastic** — 4 dB of EQ and 2.5:1 are the
+  caps. The failure being corrected is a tool that, given a big number, proposes
+  a big move.
+* **Some findings deliberately propose nothing.** An over-compressed master
+  cannot be fixed by more processing and a phase problem is a mix decision, not
+  a mastering one. The finding still shows, because knowing is the point.
+* **A balanced mix produces no findings at all.** This is the actual root of
+  heavy-handedness: a tool that always finds something will always do something,
+  and a mix that is already fine gets damaged by an assistant justifying itself.
+
+### Two bugs the tests caught, both mine
+
+The first cut compared a narrow band against a broadband average, which is
+biased on any sparse spectrum — and it duly diagnosed a low-mid build-up in a
+deliberately balanced mix. Exactly the heavy-handedness this module exists to
+avoid, caught by its own test.
+
+Fixing that surfaced a deeper one in `analysis`: `band_db` averages **per bin**,
+so it measures spectral *density*. Measuring a flat signal's octave levels
+showed them declining ~20 dB from 40 Hz to 5 kHz purely because higher octaves
+hold more bins — meaning every mix would read as bright-thin and real harshness
+would be missed. Comparing bands of different widths must **sum**, so
+`band_power_db` now does, and the findings compare octave totals against the
+median octave. The median rather than the mean, because it ignores one loud band
+instead of being dragged by it — which is what a tonal-balance judgement wants.

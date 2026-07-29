@@ -115,6 +115,21 @@ impl Spectrum {
         let p: f32 = slice.iter().map(|db| 10f32.powf(db / 10.0)).sum::<f32>() / slice.len() as f32;
         10.0 * p.max(1e-12).log10()
     }
+    /// TOTAL power in a frequency range, in dB.
+    ///
+    /// Distinct from [`Spectrum::band_db`], which averages per bin and so
+    /// measures spectral DENSITY. The distinction is not academic: a flat
+    /// spectrum read with the averaging version slopes downward by ~20 dB from
+    /// 40 Hz to 5 kHz, because higher octaves span far more bins. Comparing
+    /// bands of DIFFERENT widths — which is exactly what tonal balance does —
+    /// must sum, not average.
+    pub fn band_power_db(&self, lo: f32, hi: f32) -> f32 {
+        let n = self.bins_db.len() as f32;
+        let k0 = ((lo * n * 2.0 / self.rate) as usize).min(self.bins_db.len().saturating_sub(1));
+        let k1 = ((hi * n * 2.0 / self.rate) as usize).clamp(k0 + 1, self.bins_db.len());
+        let p: f32 = self.bins_db[k0..k1].iter().map(|db| 10f32.powf(db / 10.0)).sum();
+        10.0 * p.max(1e-12).log10()
+    }
 }
 
 /// Third-octave centres — the resolution a masking display wants. Finer and it
