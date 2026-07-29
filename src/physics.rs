@@ -1366,6 +1366,44 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // hit drives THROUGH it. Spin used to scale up with the impact,
         // which is what made shots knuckle off at odd angles.
         let spin_w = 0.30 * (1.0 - soft);
+        /*
+This is also backwards.
+
+rel is the car→ball relative velocity. The torque direction from a contact impulse is:
+
+torque = r × impulse
+
+where:
+
+r = -n * ball.r
+
+so:
+
+(-n * ball.r).cross(rel)
+
+simplifies to:
+
+-n.cross(rel)
+
+Meaning your current line:
+
+n.cross(rel)
+
+injects the opposite spin.
+
+Change:
+
+ball.ang += n.cross(rel) * spin_w / ball.r;
+
+to:
+
+ball.ang -= n.cross(rel) * spin_w / ball.r;
+
+or:
+
+ball.ang += rel.cross(n) * spin_w / ball.r;
+        */
+        // ball.ang += n.cross(rel) * spin_w / ball.r;
         ball.ang += n.cross(rel) * spin_w / ball.r;
         ball.ang += car.omega * 0.12 * (1.0 - soft);
     }
