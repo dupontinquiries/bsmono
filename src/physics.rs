@@ -1215,6 +1215,58 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 let roll = 1.5 * cfg.ball.friction * cfg.arena.friction;
                 ball.vel = vt * (1.0 - (roll * dt).min(1.0)); // rolling friction
             }
+
+
+            /*
+The biggest culprit is here:
+
+ball.ang = n.cross(ball.vel) / ball.r;
+
+inside the arena collision handling.
+
+This line runs every time the ball touches a surface and overwrites the accumulated angular velocity.
+
+Because your rotation integration is:
+
+ball.rot = (Quat::from_scaled_axis(ball.ang * dt) * ball.rot).normalize();
+
+your ang is world-space angular velocity. The formula:
+
+n.cross(ball.vel)
+
+creates a spin axis that is reversed relative to the contact point motion.
+
+For a floor:
+
+        ω
+        ↑
+        |
+      (ball)
+        |
+        v → velocity
+---------------- floor
+        n ↑
+
+The correct rolling axis is:
+
+ball.vel.cross(n)
+
+not:
+
+n.cross(ball.vel)
+
+because:
+
+a × b = -(b × a)
+
+So change:
+
+ball.ang = n.cross(ball.vel) / ball.r;
+
+to:
+
+ball.ang = ball.vel.cross(n) / ball.r;
+            */
             // TODO verify ball rotation is fixed now
             ball.ang = ball.vel.cross(n) / ball.r;
             // ball.ang = n.cross(ball.vel) / ball.r;
