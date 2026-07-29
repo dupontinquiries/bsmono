@@ -1268,7 +1268,12 @@ to:
 ball.ang = ball.vel.cross(n) / ball.r;
             */
             // TODO verify ball rotation is fixed now
-            ball.ang = ball.vel.cross(n) / ball.r;
+            // fix v1
+            // ball.ang = ball.vel.cross(n) / ball.r;
+            // fix v2
+            let target_ang = ball.vel.cross(n) / ball.r;
+            ball.ang += (target_ang - ball.ang) * 0.15;
+            // original impl
             // ball.ang = n.cross(ball.vel) / ball.r;
         }
     }

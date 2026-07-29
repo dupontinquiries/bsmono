@@ -11,7 +11,7 @@ minimap 0
 ball_cam 1
 fullscreen 1
 car 2
-map 18
+map 15
 seed 20260726
 bind forward k:.
 bind reverse k:e
@@ -57,9 +57,9 @@ cfg car_boost 1.024
 cfg car_boost_regen 0.000
 cfg car_boost_max 1.000
 cfg car_boost_unl 1.000
-cfg car_jump 1.000
+cfg car_jump 1.002
 cfg car_analog 1.000
-cfg car_analog_soft 0.450
+cfg car_analog_soft 0.650
 cfg flip_strength 1.200
 cfg flip_resets 1.000
 cfg flip_strict 1.000
