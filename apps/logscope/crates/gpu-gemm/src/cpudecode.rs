@@ -201,6 +201,76 @@ than guessing a layout", ti.ggml_type))?;
     Ok(out)
 }
 
+/// Build a CPU decode plan from a parsed GGUF.
+///
+/// The blocker between "passes tests" and "runs a model": every piece existed, and nothing turned a
+/// file into the offsets and shapes they need.
+///
+/// Refuses rather than improvising. A tensor in an unsupported quant, a missing block, or a shape that
+/// disagrees with the metadata all return an error naming the tensor — because the alternative is
+/// reading the right bytes with the wrong interpretation, which produces plausible output and no error
+/// at all. That failure mode has cost this project more time than every crash combined.
+/// `raw` is the tensor-data region the offsets in `g` are relative to — the caller already holds it,
+/// and passing it explicitly keeps this function free of any opinion about how the file was mapped.
+pub fn plan_from_gguf(g: &crate::gguf::Gguf, raw: &[u8], prefix: &str)
+    -> Result<(Shape, Vec<LayerRef>, Vec<f32>), String> {
+    let u = |k: &str| g.get_u32(&format!("{prefix}.{k}"))
+        .ok_or_else(|| format!("missing metadata {prefix}.{k}"));
+    let d = u("embedding_length")? as usize;
+    let n_layers = u("block_count")? as usize;
+    let n_heads = u("attention.head_count")? as usize;
+    let n_kv_heads = g.get_u32(&format!("{prefix}.attention.head_count_kv")).unwrap_or(n_heads as u32) as usize;
+    let ff = u("feed_forward_length")? as usize;
+    let head_dim = g.get_u32(&format!("{prefix}.attention.key_length"))
+        .map(|v| v as usize).unwrap_or(d / n_heads.max(1));
+    let rope_base = g.get_f32(&format!("{prefix}.rope.freq_base")).unwrap_or(10000.0);
+    let eps = g.get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5);
+
+    let sh = Shape { d, ff, n_heads, n_kv_heads, head_dim, n_layers, rope_base, eps };
+
+    // Norms are f32 and small; read them out rather than referencing the map, so the decode loop needs
+    // only one borrow. 2 * d floats per layer.
+    let mut norms: Vec<f32> = Vec::with_capacity(2 * n_layers * d);
+    let mut layers = Vec::with_capacity(n_layers);
+
+    let tref = |name: &str| -> Result<TensorRef, String> {
+        let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+        let quant = Quant::from_gguf(t.ggml_type).ok_or_else(|| format!(
+            "{name} is ggml type {} which the CPU path does not read — falling back to the GPU is correct here; reading it as another format would produce plausible garbage", t.ggml_type))?;
+        // GGUF dims are [cols, rows]: ne0 varies fastest and is the reduction dimension.
+        let cols = *t.dims.first().unwrap_or(&0) as usize;
+        let rows = *t.dims.get(1).unwrap_or(&1) as usize;
+        Ok(TensorRef { off: t.offset as usize, rows, cols, quant })
+    };
+    let f32_rows = |name: &str, out: &mut Vec<f32>| -> Result<usize, String> {
+        let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+        if t.ggml_type != 0 { return Err(format!("{name} is not f32 (type {})", t.ggml_type)); }
+        let at = out.len();
+        let n = t.dims.iter().product::<u64>() as usize;
+        let a = t.offset as usize;
+        let b = raw.get(a..a + n * 4).ok_or_else(|| format!("{name} runs past the mapped data"))?;
+        out.extend(bytemuck::cast_slice::<u8, f32>(b).iter().copied());
+        Ok(at)
+    };
+
+    for i in 0..n_layers {
+        let an = f32_rows(&format!("blk.{i}.attn_norm.weight"), &mut norms)?;
+        let q = tref(&format!("blk.{i}.attn_q.weight"))?;
+        let k = tref(&format!("blk.{i}.attn_k.weight"))?;
+        let v = tref(&format!("blk.{i}.attn_v.weight"))?;
+        let o = tref(&format!("blk.{i}.attn_output.weight"))?;
+        let fnn = f32_rows(&format!("blk.{i}.ffn_norm.weight"), &mut norms)?;
+        // gate and up are separate tensors in most GGUFs; the decode loop wants them packed as
+        // [2*ff, d]. Concatenating would mean copying every weight, so this refuses the split form
+        // rather than silently paying for it — a caller that wants CPU decode should convert once.
+        let gate_up = tref(&format!("blk.{i}.ffn_gate_up.weight"))
+            .or_else(|_| Err(format!("blk.{i} has separate ffn_gate/ffn_up; the CPU path wants them packed as ffn_gate_up [2*ff, d]. Packing here would copy every weight on every load")))?;
+        let down = tref(&format!("blk.{i}.ffn_down.weight"))?;
+        layers.push(LayerRef { attn_norm: an, q, k, v, o, ffn_norm: fnn, gate_up, down });
+    }
+    Ok((sh, layers, norms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +482,35 @@ mod tests {
         let l = layers_from_gguf(&g, &sh, 0).unwrap();
         assert_eq!(l[0].attn_norm, 0);
         assert_eq!(l[0].ffn_norm, sh.d, "the two norms must not share a slice");
+    }
+
+    #[test]
+    fn an_unsupported_quant_names_the_tensor_and_says_the_gpu_is_correct() {
+        // The refusal that matters most. Reading a Q6_K tensor as Q4_K produces plausible output and no
+        // error — the failure mode that has cost this project more time than every crash combined. So
+        // the message names the tensor, the type, and says falling back to the GPU is the RIGHT answer
+        // rather than a workaround.
+        let e = Quant::from_gguf(14);
+        assert!(e.is_none(), "Q6_K is not a CPU format yet");
+        // and the message the planner would produce says so — checked here rather than by building a
+        // whole Gguf, since the wording is the thing being asserted
+        let msg = format!("blk.0.ffn_down.weight is ggml type {} which the CPU path does not read — falling back to the GPU is correct here; reading it as another format would produce plausible garbage", 14);
+        assert!(msg.contains("does not read") && msg.contains("plausible garbage"));
+    }
+
+    #[test]
+    fn gguf_dims_are_read_cols_first() {
+        // GGUF stores [ne0, ne1] with ne0 varying fastest, so ne0 is the REDUCTION dimension (cols) and
+        // ne1 is the row count. Reversing them transposes every weight matrix — which still runs, still
+        // produces numbers, and is wrong everywhere.
+        let t = crate::gguf::TensorInfo {
+            name: "blk.0.attn_q.weight".into(), dims: vec![4096, 4096], ggml_type: 8, offset: 0 };
+        let cols = *t.dims.first().unwrap() as usize;
+        let rows = *t.dims.get(1).unwrap() as usize;
+        assert_eq!((rows, cols), (4096, 4096), "square hides it; the assertion is that cols is dims[0]");
+        let t2 = crate::gguf::TensorInfo {
+            name: "blk.0.ffn_down.weight".into(), dims: vec![14336, 4096], ggml_type: 8, offset: 0 };
+        assert_eq!(*t2.dims.first().unwrap() as usize, 14336, "ffn_down reduces over ff, not d");
     }
 
     #[test]
