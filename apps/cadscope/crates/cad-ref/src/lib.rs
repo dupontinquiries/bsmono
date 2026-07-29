@@ -62,9 +62,15 @@ pub struct ModelFacts {
     pub bounds: Option<(Vec3, Vec3)>,
     /// Enclosed volume, measured from vertex data with the same divergence-theorem sum the mesher
     /// uses — so a reference volume and a modelled volume are the same quantity, not two things
-    /// that share a name. `None` when only a header was read.
+    /// that share a name. `None` when only a header was read, **and `None` when the surface is not
+    /// closed**: the sum returns a confident number for an open shell, and that number is not a
+    /// volume. Withholding it is the whole difference between a fact and a plausible figure.
     pub volume: Option<f32>,
     pub area: Option<f32>,
+    /// Surface topology, when geometry was read. `closed` is the gate on `volume`.
+    pub closed: bool,
+    pub open_edges: u32,
+    pub non_manifold_edges: u32,
 }
 
 impl ModelFacts {
@@ -261,9 +267,76 @@ impl Index {
         hits
     }
 
+    /// Build an index directly from entries — for tests, and for loading a cache without a scan.
+    pub fn from_entries(entries: Vec<Entry>) -> Index {
+        let mut idx = Index { entries, by_name: HashMap::new() };
+        idx.entries.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
+        idx.reindex();
+        idx
+    }
+
+    /// The `texture from <model>` verb (plan §17.2): resolve a model's material names to the
+    /// texture entries that implement them, grouped by role.
+    ///
+    /// This is a *join*, not a guess. A material the corpus has no texture for is reported as
+    /// present-but-unresolved rather than dropped, because "this model references a map nobody has"
+    /// is exactly the kind of fact a designer needs to hear before relying on it.
+    pub fn textures_of_model(&self, model: &str) -> Vec<MaterialMaps<'_>> {
+        let Some(entry) = self.exact(model).into_iter().find(|e| e.kind == Kind::Model) else {
+            return Vec::new();
+        };
+        let Facts::Model(m) = &entry.facts else { return Vec::new() };
+        m.materials
+            .iter()
+            .map(|mat| {
+                // Materials are written as bare names, as paths, and with extensions; the corpus is
+                // keyed on the stem either way.
+                let stem = Path::new(mat)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(mat.as_str());
+                let (stem, _) = split_texture_role(stem);
+                let mut maps = MaterialMaps { material: mat.clone(), name: stem.clone(), base: None, normal: None, specular: None };
+                for e in self.material_set(&stem) {
+                    if let Facts::Texture(t) = &e.facts {
+                        match t.role {
+                            TextureRole::Base => maps.base = Some(e),
+                            TextureRole::Normal => maps.normal = Some(e),
+                            TextureRole::Specular => maps.specular = Some(e),
+                        }
+                    }
+                }
+                maps
+            })
+            .collect()
+    }
+
     /// All maps belonging to one material name — the `texture from <model>` verb's payload.
     pub fn material_set(&self, name: &str) -> Vec<&Entry> {
         self.exact(name).into_iter().filter(|e| e.kind == Kind::Texture).collect()
+    }
+}
+
+/// A material as the corpus can supply it: the name a model asked for, and whichever of the
+/// engine's three maps actually exist for it.
+#[derive(Clone, Debug)]
+pub struct MaterialMaps<'a> {
+    /// Exactly as the model file spelled it.
+    pub material: String,
+    /// The corpus key it resolved to.
+    pub name: String,
+    pub base: Option<&'a Entry>,
+    pub normal: Option<&'a Entry>,
+    pub specular: Option<&'a Entry>,
+}
+
+impl MaterialMaps<'_> {
+    /// True when nothing in the corpus implements this material.
+    pub fn unresolved(&self) -> bool {
+        self.base.is_none() && self.normal.is_none() && self.specular.is_none()
+    }
+    pub fn found(&self) -> usize {
+        self.base.is_some() as usize + self.normal.is_some() as usize + self.specular.is_some() as usize
     }
 }
 
@@ -305,6 +378,50 @@ pub fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tex(path: &str) -> Entry {
+        let stem = Path::new(path).file_stem().unwrap().to_str().unwrap();
+        let (name, role) = split_texture_role(stem);
+        Entry {
+            name,
+            kind: Kind::Texture,
+            path: path.into(),
+            bytes: 0,
+            facts: Facts::Texture(TextureFacts { width: 512, height: 512, role }),
+        }
+    }
+
+    #[test]
+    fn texture_from_model_is_a_join_and_reports_gaps() {
+        let model = Entry {
+            name: "velgorn".into(),
+            kind: Kind::Model,
+            path: "velgorn.iqm".into(),
+            bytes: 0,
+            facts: Facts::Model(ModelFacts {
+                materials: vec!["obsidian".into(), "textures/plating.png".into(), "ghost".into()],
+                ..Default::default()
+            }),
+        };
+        let idx = Index::from_entries(vec![
+            model,
+            tex("obsidian.png"),
+            tex("norm_obsidian.png"),
+            tex("spec_obsidian.png"),
+            tex("plating.png"),
+        ]);
+        let maps = idx.textures_of_model("velgorn");
+        assert_eq!(maps.len(), 3);
+        // A full set resolves all three roles.
+        assert_eq!(maps[0].name, "obsidian");
+        assert_eq!(maps[0].found(), 3);
+        // A material written as a path still resolves by stem, here with only a base map.
+        assert_eq!(maps[1].name, "plating");
+        assert_eq!(maps[1].found(), 1);
+        assert!(maps[1].normal.is_none());
+        // And a material nobody implements is reported, not silently dropped.
+        assert!(maps[2].unresolved(), "missing materials must stay visible");
+    }
 
     #[test]
     fn texture_roles_group_under_one_name() {

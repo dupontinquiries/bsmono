@@ -46,10 +46,16 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   large object. §17.1 lists unit scale and up-axis as derived facts; they are not implemented.
   Until they are, "same volume as X" is only meaningful between files that share a convention, and
   `ref.toml`'s per-root unit hint is the intended fix.
-- **A measured volume assumes a closed mesh.** The divergence-theorem sum is only a volume for a
-  closed, consistently wound surface. An open or non-manifold OBJ still produces a number, and that
-  number is meaningless. `obj_diagnose_v3` from the v2 lineage already knows how to detect this and
-  should gate the fact.
+- **Most of the corpus cannot be measured, and now says so.** The closed-manifold gate is
+  implemented: vertices are welded by quantized position (exporters duplicate coincident vertices
+  constantly), edges are censused, and `volume` is withheld unless every edge is shared by exactly
+  two triangles. Against the real tree that is **165 closed models out of 1,000 with geometry —
+  835 are open shells**. The previous, ungated run reported 998 volumes, so 833 of them were
+  confident numbers for surfaces that enclose nothing. Anything relying on `volume of` must expect
+  "not measurable" to be the common answer, and that is the honest state of the corpus rather than
+  a defect in the reader.
+- **Open shells still report area and bounds**, which are meaningful without closure, so an open
+  model is not useless as a reference — it just cannot answer a volume question.
 - **IQM bounds are nearly always absent.** IQM stores them per animation frame, so a static export
   has none: exactly 1 IQM in the tree reports bounds, against 1,000 OBJ files that now compute
   theirs from vertices. This is what settled the design — reference volume comes from vertex data,
@@ -58,9 +64,11 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   normal and specular maps, correctly grouped under one name); `puma` resolves to a top hit plus
   two weaker ones. `resolve` returns a ranked list and never collapses to one answer — a silent
   pick is how you scale a part to the volume of the wrong model.
-- **No verbs yet.** The index answers "what is called this"; `volume of`, `texture from`, `fit` and
-  `like` are M4–M7. The model→texture join is proven (2,295 resolve against the real tree) but is
-  not yet wired to anything.
+- **Two verbs live, three to go.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
+  and `texture from` (`Index::textures_of_model`, a join that reports unresolved materials rather
+  than dropping them) both work against the real tree. `fit <doc>`, `fits <niftyplot>` and
+  `like <model>` remain M6–M7. Neither live verb is wired into the UI yet — both are reachable only
+  from `--ref-index` and from the document format.
 - **Niftyplot entries parse to nothing.** No `.nifty` files exist in the tree yet, and the parser
   arrives at M6 with the hardware-kind implementation.
 

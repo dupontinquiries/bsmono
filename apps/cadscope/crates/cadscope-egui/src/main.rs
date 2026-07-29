@@ -159,6 +159,17 @@ fn ref_index(root: &str) -> ! {
         }
     }
     measured.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Topology census: how much of the corpus is actually closed enough to have a volume.
+    let (mut with_geom, mut closed, mut open_shells) = (0usize, 0usize, 0usize);
+    for e in &idx.entries {
+        if let Facts::Model(m) = &e.facts {
+            if m.area.is_some() {
+                with_geom += 1;
+                if m.closed { closed += 1 } else { open_shells += 1 }
+            }
+        }
+    }
+    println!("  {with_geom} models with geometry: {closed} closed, {open_shells} open (no volume reported)");
     println!("  {} models measured from vertex data (volume + area)", measured.len());
     for (n, v, a) in measured.iter().take(3) {
         println!("    {:34} vol {:>12.1}  area {:>12.1}", n, v, a);
@@ -205,6 +216,41 @@ fn ref_index(root: &str) -> ! {
         for warning in &w {
             println!("      warning: {}", warning.reason);
         }
+    }
+
+    // The `texture from <model>` verb, on whatever model in the corpus resolves the most maps.
+    let mut best: Option<(&str, Vec<cad_ref::MaterialMaps>)> = None;
+    for e in idx.entries.iter().filter(|e| e.kind == Kind::Model) {
+        let maps = idx.textures_of_model(&e.name);
+        let found: usize = maps.iter().map(|m| m.found()).sum();
+        if found > best.as_ref().map_or(0, |(_, m)| m.iter().map(|x| x.found()).sum()) {
+            best = Some((e.name.as_str(), maps));
+        }
+        if found >= 6 {
+            break;
+        }
+    }
+    match best {
+        Some((name, maps)) => {
+            let missing = maps.iter().filter(|m| m.unresolved()).count();
+            println!(
+                "  texture-from {:20} {} materials, {} maps resolved, {} unresolved",
+                name,
+                maps.len(),
+                maps.iter().map(|m| m.found()).sum::<usize>(),
+                missing
+            );
+            for m in maps.iter().filter(|m| !m.unresolved()).take(3) {
+                println!(
+                    "      {:24} base {} norm {} spec {}",
+                    m.name,
+                    m.base.is_some() as u8,
+                    m.normal.is_some() as u8,
+                    m.specular.is_some() as u8
+                );
+            }
+        }
+        None => println!("  texture-from: no model resolved any material"),
     }
 
     // Name resolution, which is what a person actually uses.
