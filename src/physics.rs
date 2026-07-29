@@ -1215,7 +1215,9 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 let roll = 1.5 * cfg.ball.friction * cfg.arena.friction;
                 ball.vel = vt * (1.0 - (roll * dt).min(1.0)); // rolling friction
             }
-            ball.ang = n.cross(ball.vel) / ball.r;
+            // TODO verify ball rotation is fixed now
+            ball.ang = ball.vel.cross(n) / ball.r;
+            // ball.ang = n.cross(ball.vel) / ball.r;
         }
     }
 
