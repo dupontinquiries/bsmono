@@ -21,6 +21,10 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+tracing = "0.1"
+anyhow = "1"
+directories = "5"
+toml = "0.8"
 egui = "0.34"
 # the shared layout/input model (the gtk app and this frontend read ONE schema)
 board-layouts = { path = "../crates/board-layouts" }
