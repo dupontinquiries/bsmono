@@ -323,8 +323,34 @@ void main()
     if (u_gfx_quality >= 0.5) {
       vec3 vdir = normalize(-frag);
       vec3 R = reflect(-vdir, Nvs);
-      float rt = dot(R, up_vs) * 0.5 + 0.5;
-      vec3 env = mix(vec3(0.10, 0.08, 0.06), mix(vec3(0.18,0.22,0.30), sunCg, 0.35), rt);
+      float rt = dot(R, up_vs);
+      // The old line was `rt*0.5+0.5` straight into a two-colour mix, i.e. the
+      // reflection was a smooth function of nothing but the normal's up-ness.
+      // That is EXACTLY how you shade a sphere, so every model wore the same
+      // soft chrome-ball gradient regardless of its actual shape -- a car came
+      // out looking like a bubble.
+      //
+      // Two changes make it read as a reflection OF SOMETHING instead:
+      //
+      // 1. A HORIZON. Real environments have a hard sky/ground edge, and it is
+      //    that edge sliding across a surface that tells you the surface is
+      //    curved *and* which way. A smooth gradient tells you nothing, so a
+      //    flat panel and a sphere look identical. `smoothstep` over a narrow
+      //    band puts the edge back while staying soft enough not to alias.
+      // 2. AZIMUTH. The gradient was rotationally symmetric about the up axis,
+      //    so turning the model changed nothing. Sampling the reflection's
+      //    horizontal direction breaks that symmetry, and a body panel now
+      //    shifts as it rotates the way a real one does.
+      float horizon = smoothstep(-0.12, 0.10, rt);
+      vec3 ground_c = vec3(0.10, 0.08, 0.06);
+      vec3 sky_c    = mix(vec3(0.18,0.22,0.30), sunCg, 0.35);
+      // sky is brighter toward the sun side, darker opposite: azimuthal variation
+      float azim = dot(normalize(R - up_vs*rt), normalize(sun_vs - up_vs*dot(sun_vs, up_vs)));
+      sky_c *= 0.72 + 0.45 * (azim * 0.5 + 0.5);
+      vec3 env = mix(ground_c, sky_c, horizon);
+      // a thin bright band right at the horizon line -- the giveaway that a
+      // surface is polished, and the thing a smooth gradient can never produce
+      env += sky_c * 0.5 * (1.0 - smoothstep(0.0, 0.07, abs(rt)));
       float fresE = pow(1.0 - max(dot(vdir, Nvs), 0.0), 3.0);
       diffuse += env * fresE * (0.30 + 0.35*clamp(sunS/0.62, 0.0, 1.0)) * (1.0 + u_wetness*0.9) * u_mat_boost;
       // sun GLINT: a tight specular from the planetary sun itself (the key reflection)

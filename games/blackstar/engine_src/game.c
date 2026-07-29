@@ -2060,9 +2060,28 @@ static void orb_update(ex_entity_t *e, float fx, float fz, int throw_edge, float
     if (g_orb_reset_t <= 0.0f) { g_orb_pos[0]=0; g_orb_pos[1]=1.2f; g_orb_pos[2]=0; g_orb_vel[0]=g_orb_vel[1]=g_orb_vel[2]=0; g_orb_carrier=-1; }
     else return;
   }
-  if (g_orb_carrier == 0) {                 // you are carrying it -- it rides in front
-    g_orb_pos[0]=e->position[0]+fx*2.4f; g_orb_pos[1]=1.6f; g_orb_pos[2]=e->position[2]+fz*2.4f;
-    g_orb_vel[0]=g_orb_vel[2]=0.0f;
+  if (g_orb_carrier == 0) {                 // DRIBBLING: it is nudged, not welded
+    // The orb used to be teleported to a fixed point in front of you with its
+    // velocity zeroed, which meant it could never fall away no matter how hard
+    // you turned or how fast you went -- the ball was effectively glued on.
+    // Now it is still a physical body: a spring pulls it toward the carry point,
+    // and the touch BREAKS if it falls behind. That is what makes dribbling a
+    // skill rather than a state you toggle.
+    float tx = e->position[0]+fx*2.6f, tz = e->position[2]+fz*2.6f;
+    float sx = tx-g_orb_pos[0], sz = tz-g_orb_pos[2];
+    float slip = sqrtf(sx*sx+sz*sz);
+    // accelerate toward the carry point, capped -- a hard turn outruns it
+    float k = 26.0f;
+    g_orb_vel[0] += sx*k*dt; g_orb_vel[2] += sz*k*dt;
+    float dfr = powf(0.35f, dt); g_orb_vel[0]*=dfr; g_orb_vel[2]*=dfr;
+    g_orb_pos[0]+=g_orb_vel[0]*dt; g_orb_pos[2]+=g_orb_vel[2]*dt;
+    g_orb_pos[1]=1.35f + sinf(g_anim_t*9.0f)*0.12f;              // it bobbles as it rolls
+    // LOST TOUCH: outrun it, or turn hard enough that it slides off the nose
+    float pv2 = sqrtf(e->velocity[0]*e->velocity[0]+e->velocity[2]*e->velocity[2]);
+    if (slip > 3.4f || (slip > 2.2f && pv2 > 26.0f)) {
+      g_orb_carrier = -1;
+      snprintf(g_shot_msg,sizeof(g_shot_msg),"lost the touch"); g_shot_timer=0.7f;
+    }
     if (throw_edge) { g_orb_carrier=-1; g_orb_vel[0]=fx*36.0f; g_orb_vel[2]=fz*36.0f; snprintf(g_shot_msg,sizeof(g_shot_msg),"ORB HURLED"); g_shot_timer=0.9f; }
   } else {                                   // loose: rolls, bounces, gets dribbled
     g_orb_pos[0]+=g_orb_vel[0]*dt; g_orb_pos[2]+=g_orb_vel[2]*dt; g_orb_pos[1]=1.2f;
@@ -2071,9 +2090,24 @@ static void orb_update(ex_entity_t *e, float fx, float fz, int throw_edge, float
     if (g_orb_pos[0]<-62.0f){ g_orb_pos[0]=-62.0f; g_orb_vel[0]= fabsf(g_orb_vel[0])*0.6f; }
     float dx=e->position[0]-g_orb_pos[0], dz=e->position[2]-g_orb_pos[2]; float d2=dx*dx+dz*dz;
     float pv=sqrtf(e->velocity[0]*e->velocity[0]+e->velocity[2]*e->velocity[2]);
-    if (d2 < 7.0f) { g_orb_carrier=0; }                                                 // GRAB: forgiving radius, any normal speed
-    else if (d2 < 14.0f && pv > 8.0f) {                                                 // only a real charge dribbles it
-      g_orb_vel[0]+=e->velocity[0]*0.8f; g_orb_vel[2]+=e->velocity[2]*0.8f;
+    // CONTACT: one sphere-vs-sphere test, and the impulse follows the CONTACT
+    // NORMAL. The old code added the car's whole velocity vector regardless of
+    // where the two actually touched, so a glancing pass sent the orb off at an
+    // angle unrelated to the geometry -- the "weird angles" and apparent spin.
+    // Along-the-normal is the standard model and, more importantly, the one a
+    // player can predict: hit it on the left, it goes right.
+    float dd = sqrtf(fmaxf(d2, 0.0001f));
+    float nx = -dx/dd, nz = -dz/dd;                       // car -> orb
+    if (d2 < 9.0f) {
+      float closing = e->velocity[0]*nx + e->velocity[2]*nz;   // speed INTO the orb
+      if (closing > 0.0f) {
+        float imp = closing * 1.35f + 4.0f;               // a nudge even at a crawl
+        g_orb_vel[0] += nx*imp; g_orb_vel[2] += nz*imp;
+      }
+      // never let the two interpenetrate: push the orb out to the touch radius
+      g_orb_pos[0] = e->position[0] - nx*3.0f; g_orb_pos[2] = e->position[2] - nz*3.0f;
+      // SOFT TOUCH at low closing speed = you have gathered it
+      if (pv < 14.0f && closing < 6.0f) g_orb_carrier = 0;
     }
     for (int q=0;q<g_enc.count;q++){ ex_enemy_t *o=&g_enc.enemies[q]; if(o->state==EX_ENEMY_DEAD) continue;
       float ex_=o->position[0]-g_orb_pos[0], ez=o->position[2]-g_orb_pos[2]; if(ex_*ex_+ez*ez < 9.0f){
@@ -11380,13 +11414,23 @@ void game_update(double dt, double ft)
       for (int gb3=0; gb3<g_gbody_count; gb3++){ const grav_body_t *B=&GRAV_BODIES[g_gbody_idx[gb3]];
         float gdx=g_gbody_pos[gb3][0]-e->position[0], gdy=g_gbody_pos[gb3][1]-e->position[1], gdz=g_gbody_pos[gb3][2]-e->position[2];
         float r2=gdx*gdx+gdy*gdy+gdz*gdz; float r=sqrtf(fmaxf(r2, 1.0f));
-        float pull = fminf(60.0f, B->mass*3200.0f / fmaxf(r2, B->rad*B->rad));
+        // Strength: 3200 with a 60 m/s^2 ceiling was roughly twice Earth surface
+        // gravity at the shell and dominated everything else on the map. 1100
+        // with a 22 ceiling leaves the bodies clearly felt without the arena
+        // flinging you about.
+        float pull = fminf(22.0f, B->mass*1100.0f / fmaxf(r2, B->rad*B->rad));
         ax += (gdx/r)*pull; ay += (gdy/r)*pull; az += (gdz/r)*pull;
         // SURFACE: land on the body -- clamp to the shell, kill inward radial speed
         float shell = B->rad + 0.9f;
         if (r < shell){
+          // These bodies ORBIT, so one can move INTO a player who is standing on
+          // it. Teleporting to the shell then threw you clear at the body's own
+          // speed, which reads as the planet shoving you away -- gravity that
+          // feels repulsive. Ease out instead, bounded per frame, and never add
+          // energy doing it.
           float ux2=-gdx/r, uy2=-gdy/r, uz2=-gdz/r;     // outward
-          e->position[0]=g_gbody_pos[gb3][0]+ux2*shell; e->position[1]=g_gbody_pos[gb3][1]+uy2*shell; e->position[2]=g_gbody_pos[gb3][2]+uz2*shell;
+          float need = shell - r, step = fminf(need, 24.0f*(float)dt);
+          e->position[0]+=ux2*step; e->position[1]+=uy2*step; e->position[2]+=uz2*step;
           float vr = e->velocity[0]*(-ux2)+e->velocity[1]*(-uy2)+e->velocity[2]*(-uz2);
           if (vr > 0.0f){ e->velocity[0]+=ux2*vr; e->velocity[1]+=uy2*vr; e->velocity[2]+=uz2*vr; }
           e->velocity[0]*=0.985f; e->velocity[2]*=0.985f;   // shell friction
