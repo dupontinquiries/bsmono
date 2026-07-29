@@ -7137,7 +7137,22 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                                 let per_expert_all_layers = (n as u64) * per_expert_layer;
                                 let ring = (n_expert_used as u64 + 1).max(2); // per-layer streaming ring
                                 let ring_cost = (n as u64) * ring * per_expert_layer; // ring resident across all layers
-                                if dense + ring_cost > gpu_budget {
+                                // WOULD IT SIMPLY FIT? This check did not exist: the branch was entered for ANY
+                    // MoE model, so Scout streamed 16 experts through a staging ring against a budget
+                    // that holds all of them. Streaming costs a host copy of every expert, the ring's
+                    // completion fence, and most of the run's submits — all to avoid an allocation
+                    // that succeeds.
+                    //
+                    // The budget rose from 24 to 48 GiB in _340 on llama.cpp's evidence, which is what
+                    // makes this reachable now; at 24 the answer was genuinely no.
+                    let full_resident = dense + (n_expert as u64) * per_expert_all_layers;
+                    if full_resident <= gpu_budget {
+                        eprintln!("wgpu-engine: MoE fits FULLY RESIDENT ({:.1} GiB of {:.1} GiB budget) \
+— no expert streaming, no host copy, no staging ring. Set LOGSCOPE_MOE_STREAM=1 to force streaming.",
+                            gib(full_resident), gib(gpu_budget));
+                        auto_q4 = true;
+                        // moe_stream_pin stays None, which is what selects the resident path below.
+                    } else if dense + ring_cost > gpu_budget {
                                     return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB. Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget)));
                                 }
                                 let pin_fit = ((gpu_budget - dense - ring_cost) / per_expert_all_layers) as usize;
