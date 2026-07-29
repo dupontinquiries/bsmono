@@ -6830,7 +6830,13 @@ particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layou
 {} kv_b layout. UNVERIFIED on a real checkpoint: the decode block and cache are gated, the weight \
 layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
         }
-        let treat_unsupported = !acfg.supported;
+        // DERIVED, not read off the entry. archfeat can veto a declared-supported architecture — the
+        // direction that ships broken output — while a declared-unsupported one stays refused whatever
+        // the feature table says, because "no gap I know of" is not "verified on a real checkpoint".
+        // Variant = expert count, which distinguishes Llama-4 Scout (16) from Maverick (128). Read
+        // from metadata here rather than threaded down, since this is the only place that needs it.
+        let variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
+        let treat_unsupported = !crate::archcfg::is_supported(&arch, variant);
         if treat_unsupported {
             // MoE-aware escape: some architectures (e.g. Qwen4) are only PARTIALLY unsupported — their MoE
             // routing kernel isn't wired, but a DENSE checkpoint of the same arch runs on the existing
