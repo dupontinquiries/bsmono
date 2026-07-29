@@ -363,6 +363,25 @@ pub(crate) mod engine {
             eprintln!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} head_dim={} rope_base={} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
                 t0.elapsed().as_secs_f32(), model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.head_dim, model.base, model.h, model.vocab,
                 model.output_is_quantized(), eos, stop_ids, template, tok.is_byte_level(), tok.vocab_size());
+            // LOAD ADVICE. Runs the planners against this model and says only what they DISAGREE with —
+            // an unprobed budget, a split that would beat streaming, a GPU the planner would skip. Every
+            // planner is otherwise tested logic with no caller, and a hypothesis that has never seen a
+            // real model is exactly what produced the 24 GiB constant and the thread-spawn figure.
+            {
+                // Bytes touched per layer per token: the dense weights, approximated from the model's
+                // own dimensions rather than a residency figure that may not be in scope here.
+                let per_layer = (4 * model.d * model.d + 3 * model.d * model.h) as u64 / 2;  // ~q4
+                let facts = logscope::loadadvice::LoadFacts {
+                    n_layers: model.n_layers, bytes_per_layer: per_layer,
+                    gpu_budget_bytes: gpu_kernels::memplan::gpu_buffer_budget_uma(
+                        gpu_kernels::memplan::system_ram_bytes(), gpu.conservative_vma, true),
+                    measured_vram_gib: 0.0,
+                    gpu_gib_s: 258.1, cpu_gib_s: 113.2, d: model.d,
+                };
+                for line in logscope::loadadvice::advise(&facts) {
+                    eprintln!("wgpu-engine: advice — {line}");
+                }
+            }
             if std::env::var("LOGSCOPE_DISPATCH_BENCH").is_ok() { gpu.dispatch_bench(); }
             if std::env::var("LOGSCOPE_WEIGHT_CHECK").is_ok() { eprintln!("wgpu-engine: {}", model.weight_probe(&gpu)); }
             // Prewarm: compile the prefill + decode pipelines now (in the load window) so the
