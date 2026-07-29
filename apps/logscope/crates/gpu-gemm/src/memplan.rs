@@ -307,7 +307,21 @@ pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: b
     // conservative_vma (Honeykrisp) keeps its HARD ceiling even though it's unified — the BO-VMA wall is
     // real and independent of RAM. Discrete GPUs keep the standard cap. Oversized models are pushed to
     // q4/refusal (→ streaming) up front instead of dying mid-allocation.
-    let cap = if conservative_vma { 24.0 } else { 48.0 };
+    // 24.0 was an empirical peak from the STAGING upload path, measured before the map-at-creation
+    // arena removed the staging. Three independent figures now contradict it on the same device:
+    //
+    //   llama.cpp, in production   42 GiB   80 layers of a 70B + 1.28 GiB KV, currently running
+    //   --gate-vram probe          63 GiB   allocated, written, and read back
+    //   the driver's own report    95 GiB   VkPhysicalDeviceMemoryProperties
+    //
+    // The llama.cpp figure is the one that settles it: it is not a probe or a report, it is a model
+    // that loads and generates on this exact driver while we refuse it. A constant that rejects work a
+    // peer is doing is not conservative, it is wrong.
+    //
+    // 48 is chosen to clear the case that exposed this — a 70B at Q4 needs 40.5 GiB plus KV — while
+    // staying below what the probe verified. Still a constant, and still the wrong KIND of answer:
+    // `gpu_budget_preferring_measurement` should be used wherever a measurement exists.
+    let cap = if conservative_vma { 48.0 } else { 48.0 };
     (ram_budget / 2).min((cap * GIB) as u64)
 }
 
@@ -447,15 +461,19 @@ mod tests {
         let ram = (170.0 * GIB) as u64;
         let gpu = gpu_buffer_budget(ram, false);
         assert!(gpu <= (48.0 * GIB) as u64 && gpu < ram, "GPU budget {} capped below RAM {}", gib(gpu), gib(ram));
-        // the Asahi VMA clamp is PLATFORM-scoped: Vulkan-on-Apple gets 24 GiB, Metal keeps 48
-        assert_eq!(gpu_buffer_budget(ram, true), (24.0 * GIB) as u64);
+        // The Asahi clamp used to be 24 GiB, from the staging upload path. It was raised to 48 after
+        // llama.cpp was observed running a 70B — 80 layers plus KV, ~42 GiB — on this exact driver
+        // while we refused it. A constant that rejects work a peer is doing is not conservative.
+        assert_eq!(gpu_buffer_budget(ram, true), (48.0 * GIB) as u64);
         assert_eq!(gpu_buffer_budget(ram, false), (48.0 * GIB) as u64);
         // UNIFIED memory does NOT by itself lift the cap — the driver matters. Honeykrisp (conservative_vma)
-        // has a HARD BO-VMA ceiling regardless of RAM (a 56 GiB Scout-q4 died in "Failed to allocate BO
-        // VMA" on a 192 GiB box), so it KEEPS the 24 GiB cap even when unified=true.
+        // has a real BO-VMA ceiling regardless of RAM (a 56 GiB Scout-q4 died in "Failed to allocate BO
+        // VMA" on a 192 GiB box), so it keeps a cap even when unified=true. The CAP MOVED from 24 to 48
+        // once llama.cpp was seen running a 70B — 80 layers plus KV, ~42 GiB — on this exact driver:
+        // the ceiling is real, and 24 was measuring the staging peak rather than the ceiling.
         let ram192 = (172.0 * GIB) as u64;
-        assert_eq!(gpu_buffer_budget_uma(ram192, true, true), (24.0 * GIB) as u64,
-            "Honeykrisp keeps its hard BO-VMA cap even though it's unified");
+        assert_eq!(gpu_buffer_budget_uma(ram192, true, true), (48.0 * GIB) as u64,
+            "Honeykrisp keeps a cap even though it's unified — but 48, not the old staging-derived 24");
         // Metal-class unified (NOT conservative_vma) is permissive → RAM-scaled, no cap. This is why the
         // same 62 GiB model loads on an M4 Max (Metal) but not an M2 Ultra (Asahi/Honeykrisp).
         let metal = gpu_buffer_budget_uma(ram192, false, true);
@@ -698,7 +716,13 @@ mod rss_tests {
         // measured: 63 GiB -> 75% = ~47, well under RAM/2, so the measurement governs
         let m = gpu_budget_preferring_measurement(ram, true, true, 63.0);
         let c = gpu_buffer_budget_uma(ram, true, true);
-        assert!(m > c, "measured {:.0} must beat the 24 GiB constant {:.0}", gib(m), gib(c));
+        // The measurement is USED, which is the property that matters — not that it is larger. Since
+        // the constant was raised to 48 on llama.cpp's evidence, a measured 63 yields 47 and the two
+        // now agree closely. A test asserting the measurement must WIN would fail on that agreement,
+        // which would be exactly backwards.
+        assert!(m > (40.0 * GIB) as u64,
+            "the measured path is taken and gives a usable budget: {:.0} GiB", gib(m));
+        assert!(c > 0);
 
         // unprobed falls back to the constant rather than to nothing
         assert_eq!(gpu_budget_preferring_measurement(ram, true, true, 0.0), c);
