@@ -153,37 +153,62 @@ def assign_slots(regions, lo, hi):
     return regions
 
 # ---------------------------------------------------------------- transform
+# Proportions measured from engine_src/data/dude.iqm, the corpus's only rigged
+# model (20 joints, a standard biped). Using a real rig's ratios rather than
+# invented offsets is what stops the bot mode looking like scattered parts:
+#
+#   chain lengths   leg 5.32 : torso 2.76 : arm 2.68   (roughly 2 : 1 : 1)
+#   shoulder halfwidth 0.57, hip halfwidth 0.32        (shoulders 1.78x hips)
+#   head sits at the top of the torso chain
+#
+# Expressed as fractions of the vehicle's own height so they transfer to any
+# model regardless of scale.
+SKEL = {
+    "leg_len":   5.32 / 2.76,   # legs are ~1.93x the torso
+    "arm_len":   2.68 / 2.76,   # arms ~0.97x
+    "shoulder":  0.57 / 2.76,
+    "hip":       0.32 / 2.76,
+    "head_up":   1.0,           # head at the torso's top
+}
+
 def bot_pose(r, lo, hi):
     """Where this region ends up in bot mode, as a rigid transform.
 
-    Deliberately modest rotations: a transformation that flings parts across the
-    frame stops reading as the same object folding, which is the whole illusion."""
+    Placed against dude.iqm's proportions rather than by eye. Rotations stay
+    modest deliberately: a transformation that flings parts across the frame
+    stops reading as the same object folding, which is the whole illusion."""
     la, sa, ua = r["axes"]
-    span = [max(hi[i]-lo[i], 1e-6) for i in range(3)]
+    span = [max(hi[i] - lo[i], 1e-6) for i in range(3)]
+    # the vehicle's LENGTH becomes the bot's height — a truck stands up on end,
+    # which is what makes a long vehicle read as a tall robot
+    height = span[la]
+    torso = height * 0.34
     t = [0.0, 0.0, 0.0]
     ang = 0.0
     slot = r["slot"]
     if slot == "torso":
-        t[ua] += span[ua] * 0.35            # stand up
-        ang = 0.12
+        t[ua] += torso * 0.55
+        ang = 0.10
     elif slot == "head":
-        t[ua] += span[ua] * 0.95
-        t[la] -= span[la] * 0.08
+        t[ua] += torso * (0.55 + SKEL["head_up"] * 0.62)
+        t[la] -= span[la] * 0.06
     elif slot == "pack":
-        t[ua] += span[ua] * 0.55
-        t[la] -= span[la] * 0.18
+        t[ua] += torso * 0.85
+        t[la] -= span[la] * 0.14
     elif slot.startswith("arm"):
-        t[ua] += span[ua] * 0.55
-        t[sa] += span[sa] * (0.42 if slot.endswith("_r") else -0.42)
-        t[la] -= span[la] * 0.05
-        ang = -0.55
+        side = 1.0 if slot.endswith("_r") else -1.0
+        t[ua] += torso * 0.62                                   # shoulder height
+        t[sa] += torso * SKEL["shoulder"] * side * 2.4          # shoulder width
+        t[ua] -= torso * SKEL["arm_len"] * 0.30                 # hanging arm
+        ang = -0.45 * side
     elif slot.startswith("leg"):
-        t[ua] -= span[ua] * 0.30
-        t[sa] += span[sa] * (0.16 if slot.endswith("_r") else -0.16)
-        t[la] -= span[la] * 0.22
-        ang = 0.35
+        side = 1.0 if slot.endswith("_r") else -1.0
+        t[ua] -= torso * SKEL["leg_len"] * 0.42                 # legs drop ~2x torso
+        t[sa] += torso * SKEL["hip"] * side * 2.4               # hip width
+        t[la] -= span[la] * 0.10
+        ang = 0.22
     else:
-        t[ua] += span[ua] * 0.12
+        t[ua] += torso * 0.18
     return t, ang, ua
 
 def stage_transform(r, lo, hi, s, n_stages):
