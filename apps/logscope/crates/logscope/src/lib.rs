@@ -49,6 +49,7 @@ pub mod constrain;
 pub mod smallrole;
 pub mod sketchexpand;
 pub mod hybridsplit;
+pub mod tensorplace;
 pub mod coresidency;
 pub mod loadadvice;
 pub mod deliberate;
