@@ -425,6 +425,48 @@ fn ref_index(root: &str) -> ! {
         }
     }
 
+    // The `like <model>` verb: proportions, handed to the Grow model as a steerable spine.
+    let mut like_targets: Vec<String> = measured.iter().take(2).map(|(n, _, _)| n.to_string()).collect();
+    like_targets.push("velgorn".into()); // an IQM: header only, nothing to measure
+    like_targets.push("no_such_form".into());
+    for name in like_targets {
+        match idx.like(&name, 12) {
+            Ok(p) => {
+                let (waist_r, waist_at) = p.waist();
+                let spine = p.to_spine(0.1, 1.0);
+                let meshed = spine
+                    .to_sdf()
+                    .map(|s| cad_kernel::dual_contour(&s, MeshOpts { resolution: 32 }).tri_count())
+                    .unwrap_or(0);
+                println!(
+                    "  like {:24} {} verts, slenderness {:.2}, symmetry {:.2}/{:.2}, waist {:.2} at {:.0}%",
+                    name,
+                    p.vertices,
+                    p.slenderness(),
+                    p.symmetry,
+                    p.symmetry_worst,
+                    waist_r,
+                    waist_at * 100.0
+                );
+                println!(
+                    "      -> spine of {} stations, {} tris when grown",
+                    spine.nodes.len(),
+                    meshed
+                );
+                if meshed == 0 {
+                    fail_ref += 1;
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains(name.as_str()) {
+                    fail_ref += 1;
+                }
+                println!("  like {:24} declined: {msg}", name);
+            }
+        }
+    }
+
     // Name resolution, which is what a person actually uses.
     for q in ["puma", "shark", "obsidian", "nosuchmodelanywhere"] {
         let hits = idx.resolve(q, None, 3);

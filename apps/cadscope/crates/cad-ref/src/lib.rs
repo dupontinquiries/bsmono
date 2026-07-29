@@ -24,6 +24,7 @@ pub mod doc;
 pub mod iqm;
 pub mod obj;
 pub mod png;
+pub mod shape;
 pub mod verbs;
 
 /// The unit a file's numbers are in. Deliberately defaults to `Unknown` and is never inferred:
@@ -692,6 +693,37 @@ impl Index {
             keepouts: n.keepouts.clone(),
             components: n.components,
         })
+    }
+
+    /// The `like <model>` verb (plan §17.2), and the last of the five.
+    ///
+    /// It returns proportions, never geometry. "Arms like velgorn" should give you *your* arms at
+    /// velgorn's proportions; pasting velgorn's mesh is a different request with a different name
+    /// (`import`), and conflating them is how a reference library turns into a clip-art bin.
+    ///
+    /// Requires a model we read vertices from, which today means OBJ. An IQM is indexed from its
+    /// header and has nothing to measure, and that is reported rather than approximated from the
+    /// bounding box.
+    pub fn like(&self, name: &str, stations: usize) -> Result<shape::Proportions, RefError> {
+        let models: Vec<&Entry> = self.exact(name).into_iter().filter(|e| e.kind == Kind::Model).collect();
+        if models.is_empty() {
+            return Err(if self.exact(name).is_empty() {
+                let nearest = self
+                    .resolve(name, Some(Kind::Model), 3)
+                    .into_iter()
+                    .map(|(e, _)| e.name.clone())
+                    .collect();
+                RefError::NotIndexed { name: name.into(), searched: self.len(), nearest }
+            } else {
+                RefError::NotAModel { name: name.into() }
+            });
+        }
+        for e in &models {
+            if let Some(p) = shape::from_obj(&e.path, name, stations) {
+                return Ok(p);
+            }
+        }
+        Err(RefError::NoGeometry { name: name.into() })
     }
 
     /// All maps belonging to one material name — the `texture from <model>` verb's payload.

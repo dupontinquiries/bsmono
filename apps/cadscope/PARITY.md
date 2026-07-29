@@ -96,10 +96,21 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   with declared units and `volume of` correctly declines every one of them. That is the mechanism
   working, not failing, but it means the verb is unusable tree-wide until someone who knows the
   conventions writes the declarations.
-- **Four verbs live, one to go.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
+- **`like` projects onto one axis; it is not a medial axis.** Proportions come from the dominant
+  axis by power iteration on the vertex covariance, with a silhouette radius per station. A limb
+  reads well; a branching form does not — a hand with five fingers summarises as one thick stub.
+  Real skeletonisation would follow branches, and this deliberately does not pretend to.
+- **`like` needs vertices, so it needs an OBJ.** An IQM is indexed from its header and declines
+  with "no vertices to measure" rather than approximating proportions from a bounding box. That
+  rules out most of the corpus — 2,150 IQM against 1,000 OBJ.
+- **Symmetry is measured about both principal planes, and both numbers matter.** A form symmetric
+  about one plane and lopsided about the other — most limbs, most brackets — shows a high
+  `symmetry` and a low `symmetry_worst`. Reporting only the first would call such a form symmetric,
+  which is how the first version of this test passed while being wrong.
+- **All five verbs live.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
   `texture from` (`Index::textures_of_model`, a join that reports unresolved materials rather than
-  dropping them), `fit <doc>` and `fits <niftyplot>` all work against the real tree. Only
-  `like <model>` remains (M7). The three live verbs are now reachable from the UI: a reference
+  dropping them), `fit <doc>`, `fits <niftyplot>` and `like <model>` all work against the real
+  tree. The three live verbs are now reachable from the UI: a reference
   panel takes a typed sentence, runs it through `cad_ref::verbs::execute`, and shows the answer or
   the refusal. **That panel has never been seen** — like the rest of the UI it is compile-verified
   only, with no display here. What *is* verified is the funnel underneath it, which the CLI
