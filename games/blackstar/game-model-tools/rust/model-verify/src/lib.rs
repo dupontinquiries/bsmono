@@ -31,6 +31,8 @@
 //!   because a reconstruction can match every vertex position while having
 //!   welded two components into one.
 
+pub mod motion;
+
 /// A rigid transform: rotation (row-major 3×3) then translation.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rigid {
