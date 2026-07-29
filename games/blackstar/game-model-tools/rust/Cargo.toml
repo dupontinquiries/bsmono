@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "model-verify",
     "model-metadata",
     "raid-content",
     "extract-models",
