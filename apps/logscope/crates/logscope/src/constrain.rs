@@ -111,6 +111,49 @@ impl ScopeCache {
     pub fn clear(&mut self) { self.entries.clear(); }
 }
 
+// ── Pairing constraints with extreme quantization ───────────────────────────────────────────────
+//
+// The pairing is well motivated: a constraint collapses the decision from ranking 202,048 tokens to
+// ranking the handful in scope, and a model that has lost precision has degraded ORDERING ability
+// rather than lost all information.
+//
+//     unconstrained (Scout vocab)   202048 options = 17.62 bits
+//     syntax-constrained                30 options =  4.91 bits
+//     identifiers in scope              12 options =  3.58 bits
+//
+// So a scope constraint removes ~14 bits of the burden. That is why a sub-1-bit model behind a
+// constraint can still emit a name that exists, when unconstrained it emits `ratatouille`.
+//
+// ## The failure it creates, which is worse than the one it fixes
+//
+// A constraint guarantees the token is VALID. It says nothing about whether it is RIGHT. Given twelve
+// names in scope, an unconstrained degraded model writes something that does not compile — visibly,
+// immediately, with a compiler error pointing at it. The same model behind a constraint writes
+// `start_index` where `start_offset` was meant: it compiles, it runs, and it is wrong.
+//
+// So the pairing converts loud failures into quiet ones. That is a bad trade for a coding assistant
+// unless something downstream catches semantic errors, and `prechecks` explicitly cannot — it checks
+// that names RESOLVE, which is exactly the property the constraint just guaranteed.
+//
+// The honest position: constraints make extreme quantization SAFE TO SAMPLE FROM, not competent. They
+// belong together only where a test or a type checker judges the result, and the more aggressive the
+// quantization, the more that downstream judge is doing the actual work.
+
+/// How much of the decision the constraint removes, in bits.
+///
+/// The argument for pairing, computed rather than asserted.
+pub fn bits_removed(vocab: usize, allowed: usize) -> f32 {
+    if allowed == 0 || vocab == 0 { return 0.0; }
+    (vocab as f32).log2() - (allowed.max(1) as f32).log2()
+}
+
+/// Does a constrained position still require judgement the model may no longer have?
+///
+/// True whenever more than one option is semantically distinct. This is the check that stops
+/// "constrained" being read as "safe": two valid identifiers are a choice, and a degraded model makes
+/// it badly and silently.
+pub fn still_requires_judgement(allowed: usize) -> bool { allowed > 1 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,6 +195,27 @@ mod tests {
         // and this is the number that tells a caller to stop asking.
         let a = affordability(24.6, 0.10, 0.2, 2000.0);
         assert!(a > 1.0, "a 2 s query at 10% of positions is {a:.1}x the budget");
+    }
+
+    #[test]
+    fn a_scope_constraint_removes_most_of_the_decision() {
+        // Why pairing with extreme quantization is well motivated: 17.6 bits down to 3.6.
+        let b = bits_removed(202048, 12);
+        assert!(b > 13.0 && b < 15.0, "got {b:.1} bits");
+        // and a binary choice removes nearly all of it
+        assert!(bits_removed(202048, 2) > 16.0);
+    }
+
+    #[test]
+    fn a_constraint_does_NOT_remove_the_need_for_judgement() {
+        // The failure the pairing creates, and the reason it is not a free win. Twelve valid names is
+        // still a choice: unconstrained, a degraded model writes something that does not compile —
+        // loudly, with the compiler pointing at it. Constrained, it writes `start_index` where
+        // `start_offset` was meant, and that compiles.
+        assert!(still_requires_judgement(12));
+        assert!(still_requires_judgement(2), "even a boolean is a real decision");
+        // only a forced single option is judgement-free
+        assert!(!still_requires_judgement(1));
     }
 
     #[test]
