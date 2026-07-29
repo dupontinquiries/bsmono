@@ -745,16 +745,451 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             car.pos += n * 0.04;
             car.on_ground = false;
         }
-    } else {
-        // ---------------- airborne / body contact ----------------
-        // TRUE landing physics (separate from the learnable land-assist):
-        //
-        // (a) end-pivot: a car propped on its nose or tail — center hovering
-        //     just above the grounded threshold — pivots flat under gravity,
-        //     ~0.75 s from 45 deg, exactly like a see-saw losing its prop.
-        // (b) turtle scrape: roof/side against a surface is body contact —
-        //     no wheel traction, real friction, boost scrapes you along,
-        //     attitude inputs at reduced authority so you can wriggle over.
+        // original
+        /*
+If you want Rocket League-style diagonal flips
+
+RL actually does preserve diagonals. The "cardinal snap" is not how modern RL dodge direction works. The dodge direction is based on the dodge input vector.
+
+Replace this block:
+
+let dn = if c.throttle.abs() >= c.steer.abs() {
+    Vec3::new(0.0, 0.0, -c.throttle.signum())
+} else {
+    Vec3::new(c.steer.signum(), 0.0, 0.0)
+};
+
+with:
+
+let mut dn = Vec3::new(
+    c.steer,
+    0.0,
+    -c.throttle,
+);
+
+if dn.length_squared() > 1e-6 {
+    dn = dn.normalize();
+} else {
+    dn = Vec3::Z;
+}
+
+Now:
+
+Input	Flip
+W	forward flip
+S	backflip
+A	left flip
+D	right flip
+W+A	diagonal left flip
+W+D	diagonal right flip
+Your power issue
+
+Currently power is constant:
+
+car.vel += world_dir * 5.2 * cfg.flip.strength;
+
+If you use normalized dn, this remains constant. That is probably what you want.
+
+Do not use:
+
+dn.length()
+
+after normalization because it is always 1.
+
+If you want analog strength:
+
+let flip_power = d2.length().clamp(0.0, 1.0);
+
+car.vel += world_dir * 5.2 * cfg.flip.strength * flip_power;
+One more subtle bug
+
+Your forward axis convention:
+
+let d2 = Vec3::new(c.steer, 0.0, -c.throttle);
+
+is correct for your comment:
+
+// dodge direction in body frame: steer right = +x, throttle fwd = -z
+
+But later:
+
+if car.vel.y > 0.0 && dn.z < -0.5 {
+
+checks for forward flip.
+
+That assumes dn.z < 0 means forward. Good.
+
+The dodge_axis is fine
+
+This:
+
+car.dodge_axis = Vec3::Y.cross(dn).normalize_or(Vec3::X);
+
+actually benefits from diagonal dn.
+
+Example:
+
+dn = (0.707,0,-0.707)
+
+Y × dn = diagonal roll/pitch axis
+
+which gives the proper diagonal flip.
+
+I would change only the dn block first. Your scripted flip system is otherwise nicely structured:
+
+input vector
+    ↓
+dn
+    ↓
+dodge_axis
+    ↓
+dodge_turn
+    ↓
+orientation
+
+The current cardinal snap is the only thing preventing the keymap from fully controlling direction.
+        */
+    // } else {
+    //     // ---------------- airborne / body contact ----------------
+    //     // TRUE landing physics (separate from the learnable land-assist):
+    //     //
+    //     // (a) end-pivot: a car propped on its nose or tail — center hovering
+    //     //     just above the grounded threshold — pivots flat under gravity,
+    //     //     ~0.75 s from 45 deg, exactly like a see-saw losing its prop.
+    //     // (b) turtle scrape: roof/side against a surface is body contact —
+    //     //     no wheel traction, real friction, boost scrapes you along,
+    //     //     attitude inputs at reduced authority so you can wriggle over.
+    //     if car.dodge_timer <= 0.0 {
+    //         let f = car.forward();
+    //         let side = car.rot * Vec3::X;
+    //         let rim = car.wheel_r.max(0.10) + 0.06;
+    //         // four rim probes: nose, tail, left, right. Any planted point
+    //         // becomes a pivot and gravity torques the car FLAT: for a probe
+    //         // offset o from center, tau = (-o) x (m g) -> axis = g x o_dir.
+    //         // (v1.11 had this axis mirrored, which is why propped cars held
+    //         // their pose against the pushout instead of laying down.)
+    //         let probes = [
+    //             car.pos + f * (car.half_len * 0.85),
+    //             car.pos - f * (car.half_len * 0.85),
+    //             car.pos + side * (car.half_w.max(0.2) * 0.95),
+    //             car.pos - side * (car.half_w.max(0.2) * 0.95),
+    //         ];
+    //         let mut near = false; // any probe in its torque band
+    //         for pt in probes {
+    //             let dp = world.sdf(pt);
+    //             // torque works through a NEAR-contact band, not just true
+    //             // penetration — otherwise the pushout lifts the probe clear
+    //             // each frame and the settle stalls in a hover (the sim's
+    //             // landing matrix caught exactly that: nose45 "NEVER" flat)
+    //             let band = rim * 1.9;
+    //             if dp < band {
+    //                 near = true;
+    //                 let w = (1.0 - dp / band).clamp(0.0, 1.0);
+    //                 let o_dir = (pt - car.pos).normalize_or(f);
+    //                 let mut axis_w = gdir.cross(o_dir);
+    //                 if axis_w.length_squared() < 0.02 {
+    //                     // balanced EXACTLY on the point (nose-90 / side-90):
+    //                     // zero moment is mathematically true and physically
+    //                     // absurd — break the symmetry with a HORIZONTAL body
+    //                     // axis (projected off gravity, else a vertical pick
+    //                     // just yaws the car in place on its balance point)
+    //                     for cand in [car.rot * Vec3::X, car.rot * Vec3::NEG_Z] {
+    //                         let horiz = cand - gdir * cand.dot(gdir);
+    //                         if horiz.length_squared() > 0.04 {
+    //                             axis_w = horiz.normalize() * 0.9;
+    //                             break;
+    //                         }
+    //                     }
+    //                 }
+    //                 let tau_b = car.rot.inverse() * axis_w;
+    //                 // deeply inverted, "lay flat" would STABILIZE the
+    //                 // turtle (roof-flat is flat): hand righting entirely
+    //                 // to the inverted-hull roll below instead
+    //                 if ori > -0.2 {
+    //                     car.ang += tau_b * 15.0 * w * dt;
+    //                 }
+    //             }
+    //             if dp < rim {
+    //                 let np = world.normal(pt);
+    //                 car.pos += np * (rim - dp) * 0.55;
+    //                 let vn = car.vel.dot(np);
+    //                 if vn < 0.0 {
+    //                     car.vel -= np * vn * 0.5;
+    //                 }
+    //                 if ori > -0.15 {
+    //                     // wheels-ish contact still counts as touching down:
+    //                     // give the jump back (the air dribble needs it)
+    //                     car.has_dodge = true;
+    //                     car.dodge_window = 1.45;
+    //                 }
+    //             }
+    //         }
+    //         // roof/side scrape (center in range but not "grounded")
+    //         if d <= clearance + 0.11 {
+    //             if d < clearance {
+    //                 car.pos += n * (clearance - d);
+    //             }
+    //             let vn = car.vel.dot(n);
+    //             if vn < 0.0 {
+    //                 car.vel -= n * vn * 0.9;
+    //             }
+    //             // body friction: the paint pays for the slide
+    //             let vt = car.vel - n * car.vel.dot(n);
+    //             car.vel -= vt * (1.0 - (-2.4 * dt).exp());
+    //             car.ang *= (-1.5 * dt).exp();
+    //             if ori > -0.15 {
+    //                 // brushed the ground wheels-down, even if a beat too
+    //                 // tilted to count as driving: restore the jump so a
+    //                 // clean-LOOKING landing always refuels the air dribble
+    //                 car.has_dodge = true;
+    //                 car.dodge_window = 1.45;
+    //             }
+    //         }
+    //         // An inverted hull isn't a stable pose. Frame-independent
+    //         // righting: torque about up_car x up_world monotonically turns
+    //         // our up toward world up from ANY pose (a signum-in-body scalar
+    //         // flipped sign mid-roll and stabilized the turtle — the landing
+    //         // matrix caught it). Own gate with EXTRA reach: rolling onto
+    //         // the side lifts the center past the scrape gate, and the drive
+    //         // used to die right there, parked at 56 degrees inverted.
+    //         if std::env::var("SETTLE_DBG").is_ok() {
+    //             eprintln!("settle: ori={ori:.2} d={d:.2} clr={clearance:.2} dodge={:.2}", car.dodge_timer);
+    //         }
+    //         // GROUND-GIVES-FLIP at the actual WHEEL corners: the four slim
+    //         // body probes missed honest wheel brushes (too narrow a net).
+    //         // Any wheel within a tire's reach of a surface, wheels-down-ish,
+    //         // hands the flip back. Cost only while flipless.
+    //         if !car.has_dodge && ori > -0.15 {
+    //             let win = car.wheel_r + 0.12;
+    //             'wheels: for sz in [-1.0f32, 1.0] {
+    //                 for sx in [-1.0f32, 1.0] {
+    //                     let wp = car.pos
+    //                         + car.rot
+    //                             * Vec3::new(
+    //                                 sx * car.half_w * 0.98,
+    //                                 -car.half_h * 0.45,
+    //                                 sz * car.half_len * 0.62,
+    //                             );
+    //                     if world.sdf(wp) < win {
+    //                         car.has_dodge = true;
+    //                         car.dodge_window = 1.45;
+    //                         break 'wheels;
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //         // reach: near-probe covers END-props of any model length (a
+    //         // tumbled car parked on a nose probe at d=0.66 sat 2 cm past
+    //         // the old fixed reach — the landing matrix found it)
+    //         if ori < 0.2 && (near || d <= clearance + 0.45) {
+    //             let upw = -gdir;
+    //             let mut axw = car.up().cross(upw);
+    //             if axw.length_squared() < 0.02 {
+    //                 // exactly inverted: any horizontal axis breaks it
+    //                 for cand in [car.rot * Vec3::X, car.rot * Vec3::NEG_Z] {
+    //                     let h = cand - gdir * cand.dot(gdir);
+    //                     if h.length_squared() > 0.04 {
+    //                         axw = h;
+    //                         break;
+    //                     }
+    //                 }
+    //             }
+    //             let drive = 5.0 + 11.0 * (-ori).clamp(0.0, 1.0);
+    //             car.ang += (car.rot.inverse() * axw.normalize_or(Vec3::X)) * drive * dt;
+    //         }
+    //     }
+
+    //     car.susp += (0.0 - car.susp) * (1.0 - (-9.0 * dt).exp());
+    //     car.dodge_window = (car.dodge_window - dt).max(0.0);
+    //     if cfg.flip.unlimited {
+    //         car.has_dodge = true;
+    //         car.dodge_window = 1.45;
+    //     }
+
+    //     if car.jump_hold > 0.0 {
+    //         if c.jump_held {
+    //             let depth = 0.88 + 0.12 * c.jump_depth.clamp(0.0, 1.0);
+    //             car.vel += car.up() * 14.6 * cfg.car.jump * depth * dt;
+    //         } else {
+    //             car.jump_hold = 0.0;
+    //         }
+    //         car.jump_hold -= dt;
+    //     }
+
+    //     if c.jump_pressed && car.has_dodge && car.dodge_window > 0.0 {
+    //         car.jbuf = 0.0; // an intentional dodge shouldn't also hop on land
+    //         // dodge direction in body frame: steer right = +x, throttle fwd = -z
+    //         let d2 = Vec3::new(c.steer, 0.0, -c.throttle);
+    //         if d2.length() > 0.3 {
+    //             // CARDINAL SNAP (Rocket League): any key combination sharing
+    //             // a dominant direction flips in THAT axis — no half-diagonal
+    //             // tumbles. Ties break toward pitch, as in RL.
+    //             let dn = if c.throttle.abs() >= c.steer.abs() {
+    //                 Vec3::new(0.0, 0.0, -c.throttle.signum())
+    //             } else {
+    //                 Vec3::new(c.steer.signum(), 0.0, 0.0)
+    //             };
+    //             // flip: burst of body-frame spin + a velocity kick along the dodge
+    //             // toned from 8.4: full-rate spin read too violent, and the
+    //             // FLIP SPIN dial rides on top for +-50% in 5% steps
+    //             car.dodge_axis = Vec3::Y.cross(dn).normalize_or(Vec3::X);
+    //             car.dodge_ang = car.dodge_axis * 7.4 * cfg.flip.strength.sqrt() * cfg.flip.spin;
+    //             // one full rotation, always: duration scales with FLIP SPIN
+    //             car.dodge_len = (0.76 / cfg.flip.spin.max(0.3)).clamp(0.38, 1.60);
+    //             car.dodge_timer = car.dodge_len;
+    //             car.dodge_start = car.rot;
+    //             car.dodge_roll = 0.0;
+    //             car.dodge_turn = 0.0;
+    //             car.dodge_cancel = false;
+    //             let yaw_only = yaw_quat(car.rot);
+    //             let world_dir = yaw_only * dn;
+    //             car.vel += world_dir * 5.2 * cfg.flip.strength;
+    //             ev.dodged = true;
+    //             if car.vel.y > 0.0 && dn.z < -0.5 {
+    //                 car.vel.y *= 0.65; // forward flips flatten the arc a touch
+    //             }
+    //         } else {
+    //             car.vel += car.up() * 2.92 * cfg.car.jump; // straight double jump
+    //             ev.jumped = true;
+    //         }
+    //         car.has_dodge = false;
+    //     }
+
+    //     if car.dodge_timer > 0.0 {
+    //         car.dodge_timer -= dt;
+    //         if car.dodge_timer <= 0.0 && !car.dodge_cancel {
+    //             // exact close-out: land on the start orientation with no
+    //             // drift from the eased integration
+    //             car.rot = (car.dodge_start * Quat::from_rotation_z(car.dodge_roll)).normalize();
+    //             car.dodge_ang = Vec3::ZERO;
+    //             car.ang = Vec3::ZERO;
+    //         }
+    //         // flip cancel: hold the opposite pitch to kill the rotation
+    //         // (front flip + hold back = the speedflip/cancel family)
+    //         if cfg.flip.cancel && c.pitch * car.dodge_ang.x < -3.0 {
+    //             car.dodge_ang.x = 0.0;
+    //             car.dodge_cancel = true; // freeze the rotation where it is
+    //             if c.roll.abs() > 0.2 {
+    //                 car.dodge_timer = car.dodge_timer.min(0.16);
+    //             }
+    //         }
+    //         // SCRIPTED FLIP: drive the orientation directly from the start
+    //         // pose through exactly one turn about the cardinal axis, eased
+    //         // out. Because the total is 2-pi, the flip lands on the SAME
+    //         // orientation it began with — wheels-down starts finish
+    //         // wheels-down, air starts finish level.
+    //         if !car.dodge_cancel {
+    //             let p = 1.0 - (car.dodge_timer / car.dodge_len.max(0.01)).clamp(0.0, 1.0);
+    //             // Rotation profile, measured decile by decile: the old curve
+    //             // put 30% of the turn in the first 10% of the time (~1100
+    //             // deg/s) and 90% of it in the first half, so the flip
+    //             // lunged and then appeared to stop dead. This blend of a
+    //             // smoothstep and a mild ease-out peaks at 13% per decile,
+    //             // starts decisively without snapping, and is STILL turning
+    //             // at the end (3%) instead of asymptoting into a freeze.
+    //             let inv = 1.0 - p;
+    //             let smooth = p * p * (3.0 - 2.0 * p);
+    //             let mild = 1.0 - inv * inv.sqrt();
+    //             let e = 0.5 * smooth + 0.5 * mild;
+    //             car.dodge_turn = std::f32::consts::TAU * e;
+    //         }
+    //         // air roll layers ON TOP (the half-flip's 180) without stealing
+    //         // from the flip's own rotation
+    //         car.dodge_roll += c.roll * 5.0 * dt;
+    //         car.rot = (car.dodge_start
+    //             * Quat::from_axis_angle(car.dodge_axis, car.dodge_turn)
+    //             * Quat::from_rotation_z(car.dodge_roll))
+    //         .normalize();
+    //         car.ang = Vec3::ZERO; // orientation is scripted; no integration
+
+    //         if car.dodge_timer <= 0.0 {
+    //             // flip complete: shed the flip spin entirely (RL's
+    //             // end-of-dodge damping) so held keys can't keep the tumble
+    //             car.ang = Vec3::ZERO;
+    //             car.dodge_ang = Vec3::ZERO;
+    //         }
+    //     } else {
+    //         // free air control (reduced authority while scraping a surface), RL torque magnitudes
+    //         let auth = if d <= clearance + 0.11 { 0.45 } else { 1.0 };
+    //         let sr = cfg.car.steer_rate;
+    //         car.ang.x += c.pitch * 12.5 * auth * dt;
+    //         car.ang.y += c.yaw * 9.1 * sr * auth * dt;
+    //         car.ang.z += c.roll * 12.0 * sr * auth * dt;
+    //         if c.pitch.abs() < 0.1 {
+    //             car.ang.x *= (-4.0 * dt).exp();
+    //         }
+    //         if c.yaw.abs() < 0.1 {
+    //             car.ang.y *= (-4.0 * dt).exp();
+    //         }
+    //         if c.roll.abs() < 0.1 {
+    //             car.ang.z *= (-4.0 * dt).exp();
+    //         }
+    //         let l = car.ang.length();
+    //         if l > 5.5 {
+    //             car.ang *= 5.5 / l;
+    //         }
+    //     }
+    //     car.steer_vis *= (-8.0 * dt).exp();
+    //     car.wheel_spin *= 1.0 - (0.4 * dt).min(1.0);
+
+    //     // ---- landing assist: when falling toward a nearby surface with no
+    //     // flip in progress, softly magnetize wheels-down and bleed off any
+    //     // leftover tumble, so grounding after a flip stops fighting you.
+    //     // Scaled by settings and eased off while the player is actively
+    //     // steering the air (aerials stay yours).
+    //     let assist = cfg.flip.land_assist;
+    //     if assist > 0.01 && car.dodge_timer <= 0.0 && car.vel.dot(gdir) > 0.5 && d < 6.0 {
+    //         let input_mag = c.pitch.abs().max(c.yaw.abs()).max(c.roll.abs());
+    //         let hold = 1.0 - 0.65 * input_mag.min(1.0);
+    //         let t = ((6.0 - d) / 6.0).clamp(0.0, 1.0) * assist * hold;
+    //         let target_n = if n.dot(up_w) > 0.2 { n } else { up_w };
+    //         let corr = Quat::from_rotation_arc(car.up(), target_n);
+    //         let k = 1.0 - (-7.0 * t * dt).exp();
+    //         car.rot = (Quat::IDENTITY.slerp(corr, k) * car.rot).normalize();
+    //         let damp = (-9.0 * t * dt).exp();
+    //         car.ang.x *= damp;
+    //         car.ang.z *= damp;
+    //     }
+
+    //     // ---- flip reset: wheels-side contact gives the flip back ---------
+    //     if cfg.flip.resets && car.reset_cd <= 0.0 && !car.has_dodge {
+    //         let align_need = if cfg.flip.strict { 0.72 } else { 0.30 };
+    //         let up = car.up();
+    //         let underside = car.pos - up * (car.half_h * 0.8);
+    //         let mut got: Option<Vec3> = None;
+    //         // off the ball (the classic): underside pressed onto the ball
+    //         let delta = car.pos - ball.pos;
+    //         let dist = delta.length();
+    //         if dist < ball.r + car.half_h + 0.22 && dist > 1e-4 && (delta / dist).dot(up) > align_need {
+    //             got = Some(ball.pos + (delta / dist) * ball.r);
+    //         }
+    //         // off any world surface that isn't drivable ground
+    //         if got.is_none() {
+    //             let dw = world.sdf(underside);
+    //             if dw < car.half_h * 0.65 {
+    //                 let nw = world.normal(underside);
+    //                 if nw.dot(up) > align_need && !(grounded) {
+    //                     got = Some(underside - nw * dw);
+    //                 }
+    //             }
+    //         }
+    //         if let Some(p) = got {
+    //             car.has_dodge = true;
+    //             car.dodge_window = 1.45;
+    //             car.reset_cd = 0.30;
+    //             ev.flip_reset = Some(p);
+    //         }
+    //     }
+         } else {
+         // ---------------- airborne / body contact ----------------
+         // TRUE landing physics (separate from the learnable land-assist):
+        
+         // (a) end-pivot: a car propped on its nose or tail — center hovering
+         //     just above the grounded threshold — pivots flat under gravity,
+         //     ~0.75 s from 45 deg, exactly like a see-saw losing its prop.
+         // (b) turtle scrape: roof/side against a surface is body contact —
+         //     no wheel traction, real friction, boost scrapes you along,
+         //     attitude inputs at reduced authority so you can wriggle over.
         if car.dodge_timer <= 0.0 {
             let f = car.forward();
             let side = car.rot * Vec3::X;
@@ -917,14 +1352,35 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             // dodge direction in body frame: steer right = +x, throttle fwd = -z
             let d2 = Vec3::new(c.steer, 0.0, -c.throttle);
             if d2.length() > 0.3 {
+                //
+                //
+                // 
                 // CARDINAL SNAP (Rocket League): any key combination sharing
                 // a dominant direction flips in THAT axis — no half-diagonal
                 // tumbles. Ties break toward pitch, as in RL.
-                let dn = if c.throttle.abs() >= c.steer.abs() {
-                    Vec3::new(0.0, 0.0, -c.throttle.signum())
+                // original
+                // let dn = if c.throttle.abs() >= c.steer.abs() {
+                //     Vec3::new(0.0, 0.0, -c.throttle.signum())
+                // } else {
+                //     Vec3::new(c.steer.signum(), 0.0, 0.0)
+                // };
+                //
+                // fix v1
+                let mut dn = Vec3::new(
+                    c.steer,
+                    0.0,
+                    -c.throttle,
+                );
+                
+                if dn.length_squared() > 1e-6 {
+                    dn = dn.normalize();
                 } else {
-                    Vec3::new(c.steer.signum(), 0.0, 0.0)
-                };
+                    dn = Vec3::Z;
+                }
+
+                
+                //
+                // 
                 // flip: burst of body-frame spin + a velocity kick along the dodge
                 // toned from 8.4: full-rate spin read too violent, and the
                 // FLIP SPIN dial rides on top for +-50% in 5% steps
