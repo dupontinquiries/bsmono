@@ -52,7 +52,7 @@ edits exactly reversible, which floats are not.
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, **multiband** | 33 |
+| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, **imager** | 40 |
 
 ## Realtime collaboration, concretely
 
@@ -667,3 +667,28 @@ reimplementation inverts once), and `reductions_db()` for the per-band gain
 meters an Ozone-style display draws under the spectrum. Bypassed bands still
 pass through the splitter, so bypassing one band cannot change the crossover
 behaviour of the others.
+
+## The imager, and the invariant that makes it safe
+
+Width is done by scaling the **side** signal (L−R) and leaving the **mid** (L+R)
+alone. That one choice buys the property that makes a widener safe on a master:
+
+> **The mono fold-down does not change, whatever you do to the width.**
+
+Mono *is* the mid, and width never touches it — so you can widen the air without
+the phone-speaker version of the mix quietly losing material, which is exactly
+what delay- or phase-based widening does. A test asserts it sample by sample,
+because it is the entire reason to build it this way rather than the easy way.
+
+Per band, because the two moves every mastering engineer makes are opposite and
+both standard: **narrow the bass** (below ~120 Hz, where a wide low end smears
+the mix and wrecks a vinyl cut) and **widen the air** (above ~8 kHz, where it
+costs nothing and buys space). One width knob cannot do both. It rides the same
+Linkwitz–Riley splitter as the multiband, which is why unity width everywhere is
+genuinely transparent rather than nearly.
+
+The goniometer is oriented so mono draws a **vertical** line and out-of-phase a
+horizontal one — what every hardware vectorscope does, and why an engineer can
+read it at a glance. Per-band correlation completes the picture: not "this mix
+has phase problems" but "your 200 Hz is out of phase", which is the difference
+between a meter you act on and one you learn to ignore.

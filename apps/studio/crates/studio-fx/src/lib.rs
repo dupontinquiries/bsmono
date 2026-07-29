@@ -14,6 +14,7 @@
 pub mod analysis;
 pub mod saturation;
 pub mod multiband;
+pub mod imager;
 
 use std::collections::BTreeMap;
 use studio_core::Ticks;

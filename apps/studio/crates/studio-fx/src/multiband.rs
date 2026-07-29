@@ -89,7 +89,7 @@ impl Crossover {
 /// Splits into N bands that reconstruct.
 #[derive(Debug, Clone)]
 pub struct Splitter {
-    xs: Vec<Crossover>,
+    pub(crate) xs: Vec<Crossover>,
     /// Per-band allpass sections: `aps[b][j]` aligns band `b` with the
     /// crossover `b + 1 + j`.
     ///
