@@ -1,0 +1,152 @@
+//! Chase camera, now gravity-aware. The camera keeps a smoothed local UP
+//! (following world.gravity_dir under a rate cap), so inside a perplexus
+//! tube the horizon rolls with you and "down" on screen is the tube wall
+//! under your wheels. CAMERA -> GRAVITY CAMERA blends between classic Y-up
+//! (0%) and full field-following (100%). The temporal heading that keeps
+//! flips from whipping the car cam lives in the local-up plane now.
+
+use glam::{Mat4, Quat, Vec3};
+
+use crate::config::CamCfg;
+use crate::physics::{Ball, Car};
+use crate::world::World;
+
+pub struct Camera {
+    pub pos: Vec3,
+    pub look: Vec3,
+    pub up: Vec3, // smoothed local up used for the view basis
+    pub ball_cam: bool,
+    heading: Vec3,  // smoothed forward, kept in the up-plane
+    reverse_t: f32, // how long the car has pointed "the other way"
+    shake: f32,
+    shake_t: f32,
+}
+
+impl Camera {
+    pub fn new() -> Camera {
+        Camera {
+            pos: Vec3::new(0.0, 3.0, 34.0),
+            look: Vec3::ZERO,
+            up: Vec3::Y,
+            ball_cam: true,
+            heading: Vec3::NEG_Z,
+            reverse_t: 0.0,
+            shake: 0.0,
+            shake_t: 0.0,
+        }
+    }
+
+    pub fn add_shake(&mut self, amt: f32) {
+        self.shake = (self.shake + amt).min(1.2);
+    }
+
+    /// Rotate `v` toward `target` by at most `max_ang` radians.
+    fn rotate_toward(v: Vec3, target: Vec3, max_ang: f32) -> Vec3 {
+        let dot = v.dot(target).clamp(-1.0, 1.0);
+        let ang = dot.acos();
+        if ang < 1e-4 {
+            return target;
+        }
+        let t = (max_ang / ang).min(1.0);
+        v.lerp(target, t).normalize_or(target)
+    }
+
+    fn update_heading(&mut self, car: &Car, flipping: bool, dt: f32) {
+        // project everything into the current up-plane
+        self.heading = (self.heading - self.up * self.heading.dot(self.up)).normalize_or(Vec3::NEG_Z);
+        if flipping {
+            self.reverse_t = 0.0;
+            return;
+        }
+        let f = car.forward();
+        let fp = (f - self.up * f.dot(self.up)).normalize_or(self.heading);
+        if (f - self.up * f.dot(self.up)).length_squared() < 0.05 {
+            return; // nose along gravity: keep the old heading
+        }
+        let ang = self.heading.dot(fp).clamp(-1.0, 1.0).acos();
+        if ang > 2.2 {
+            self.reverse_t += dt;
+            if self.reverse_t < 0.35 {
+                return;
+            }
+        } else {
+            self.reverse_t = 0.0;
+        }
+        let rate = (ang * 7.0).min(5.0);
+        self.heading = Self::rotate_toward(self.heading, fp, rate * dt);
+    }
+
+    pub fn update(
+        &mut self,
+        car: &Car,
+        ball: &Ball,
+        world: &World,
+        cfg: &CamCfg,
+        flipping: bool,
+        rear: bool,
+        dt: f32,
+    ) {
+        // ---- gravity-aware up basis: smoothed, rate-capped, blendable ----
+        let g = world.gravity_dir(car.pos);
+        let want_up = (Vec3::Y * (1.0 - cfg.grav_follow) + (-g) * cfg.grav_follow).normalize_or(Vec3::Y);
+        self.up = Self::rotate_toward(self.up, want_up, 2.4 * dt);
+
+        self.update_heading(car, flipping, dt);
+
+        let target = if self.ball_cam {
+            ball.pos
+        } else {
+            car.pos + self.heading * 12.0
+        };
+        let mut dir = target - car.pos;
+        if dir.length_squared() < 1e-4 {
+            dir = self.heading;
+        }
+        let mut dir = dir.normalize();
+        if rear {
+            dir = -dir;
+        }
+        // the BOOM lives in the up-plane: a high ball must not drag the
+        // camera down into the terrain clamp (which was eating the dist,
+        // height and angle settings whole — the cam sim caught boom_up
+        // pinned at the floor regardless of cfg). Only the LOOK tilts up.
+        let dir_flat = (dir - self.up * dir.dot(self.up)).normalize_or(self.heading);
+        let mut want = car.pos - dir_flat * cfg.dist + self.up * cfg.height;
+        // terrain clamp only makes sense while up is world-ish
+        if self.up.y > 0.7 {
+            let floor = world.ground_h(want.x, want.z) + 0.35;
+            if want.y < floor {
+                want.y = floor;
+            }
+        }
+        let k = 1.0 - (-9.0 * cfg.stiffness * dt).exp();
+        self.pos += (want - self.pos) * k;
+
+        let aim = if rear { car.pos - (target - car.pos) } else { target };
+        let tilt = cfg.dist * (-cfg.angle_deg.to_radians()).tan();
+        let want_look = aim + self.up * (0.35 - tilt);
+        self.look += (want_look - self.look) * (1.0 - (-14.0 * cfg.stiffness * dt).exp());
+
+        self.shake_t += dt;
+        self.shake = (self.shake - dt * 2.2).max(0.0);
+        if self.shake > 0.001 && cfg.shake > 0.001 {
+            let a = self.shake * cfg.shake * 0.12;
+            let t = self.shake_t * 43.0;
+            self.pos += Vec3::new(t.sin() * 0.9, (t * 1.31 + 1.7).sin(), (t * 0.83 + 4.1).sin() * 0.7) * a;
+        }
+    }
+
+    pub fn view_proj(&self, cfg: &CamCfg, aspect: f32) -> (Mat4, Mat4) {
+        // guard against a degenerate basis when look-dir ~ up
+        let fwd = (self.look - self.pos).normalize_or(Vec3::NEG_Z);
+        let up = if fwd.dot(self.up).abs() > 0.985 { fwd.cross(Vec3::X).normalize_or(Vec3::Y) } else { self.up };
+        let view = Mat4::look_at_rh(self.pos, self.look, up);
+        let proj = Mat4::perspective_rh(cfg.fov_deg.to_radians(), aspect, 0.08, 2600.0);
+        let vp = proj * view;
+        (vp, vp.inverse())
+    }
+}
+
+// quiet the unused import if Quat drops out of future edits
+#[allow(unused)]
+fn _k(_q: Quat) {}
