@@ -658,6 +658,41 @@ mod rss_tests {
     }
 }
     #[test]
+    fn int8_from_a_K_QUANT_is_not_worth_the_disk() {
+        // Both use one scale per 32 weights, so the conversion cannot add precision — it stores 4-bit
+        // values in 8 bits, using 16 of 256 levels, and Q4_K's dmin term has nowhere to go. Worse on
+        // memory, worse on disk, no better on quality.
+        assert!(!int8_worth_it(12), "Q4_K");
+        assert!(!int8_worth_it(14), "Q6_K");
+        assert!(!int8_worth_it(8), "Q8_0 is already 8-bit");
+    }
+
+    #[test]
+    fn int8_from_full_precision_IS_worth_it() {
+        // The case the cache was built for: F16 weights genuinely carry more than 8 bits, so this is a
+        // real compression rather than a re-encoding.
+        assert!(int8_worth_it(0), "F32");
+        assert!(int8_worth_it(1), "F16");
+    }
+
+    #[test]
+    fn an_unknown_source_does_not_get_the_benefit_of_the_doubt() {
+        // Spending gigabytes of disk on a format nobody has checked is the wrong default, and a wrong
+        // guess here is silent — the cache is written and simply never helps.
+        assert!(!int8_worth_it(999));
+    }
+
+    #[test]
+    fn the_waste_is_quantified_rather_than_described() {
+        // A 8B model at ~8e9 weights writes ~7.5 GiB of int8 cache that buys nothing. Saying "some
+        // disk" would not have got this changed.
+        let w = 8_000_000_000u64;
+        let gib = int8_cache_waste(12, w) as f64 / GIB;
+        assert!(gib > 7.0, "{gib:.1} GiB wasted per 8B Q4_K model");
+        assert_eq!(int8_cache_waste(1, w), 0, "and nothing wasted from an F16 source");
+    }
+
+    #[test]
     fn a_measurement_replaces_the_constant_but_RAM_still_bounds_it() {
         let ram = (192.0 * GIB) as u64;
         // measured: 63 GiB -> 75% = ~47, well under RAM/2, so the measurement governs
@@ -695,3 +730,42 @@ mod rss_tests {
         assert!(budget_from_measurement(-1.0).is_none());
     }
 
+
+
+/// Is converting this source format to int8 residency worth anything?
+///
+/// ## The answer for Q4_K is no, and it costs disk twice
+///
+/// A load of a Q4_K_M model currently quantizes to int8 residency and writes a content-addressed cache
+/// so the next load can skip the conversion — gigabytes on device per model. But:
+///
+/// * int8 residency uses **one scale per 32 weights** (`quantize_q8_resident`: `kb = k / 32`).
+/// * Q4_K uses **one scale per 32 weights** too — eight sub-blocks per 256-weight super-block.
+///
+/// Same granularity, so the conversion cannot add precision. The values came from 4-bit quants and take
+/// at most 16 distinct levels per sub-block; storing them in 8 bits uses 16 of 256 levels and doubles
+/// the bytes. Q4_K additionally carries a `dmin` minimum term that int8 has no place for, so the
+/// conversion has to fold it into a symmetric scale — which can LOSE accuracy rather than preserve it.
+///
+/// So int8-from-Q4_K is worse on memory, worse on disk, and no better on quality. llama.cpp never does
+/// it: its kernels consume Q4_K directly, and `--gate-q4k` proved ours can too — its success message has
+/// said "the loader can stop requantizing" since it went green.
+///
+/// ## Where int8 IS worth it
+///
+/// From an F16 or F32 source, where the weights genuinely carry more precision than 8 bits and the
+/// conversion is a real compression rather than a re-encoding.
+pub fn int8_worth_it(src_ggml_type: u32) -> bool {
+    match src_ggml_type {
+        0 | 1 => true,      // F32, F16: a real compression
+        // Every K-quant and Q8_0 already has per-block scales at 32-weight granularity or finer.
+        // Re-encoding them to int8 doubles the size and cannot add information.
+        2..=20 => false,
+        _ => false,         // unknown: do not spend the disk on a guess
+    }
+}
+
+/// Bytes saved on device by skipping the int8 cache for a source that does not benefit.
+pub fn int8_cache_waste(src_ggml_type: u32, n_weights: u64) -> u64 {
+    if int8_worth_it(src_ggml_type) { 0 } else { n_weights }   // ~1 byte/weight for the int8 blob
+}
