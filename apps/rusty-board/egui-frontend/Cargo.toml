@@ -15,12 +15,21 @@ required-features = ["app"]
 
 [features]
 default = ["app"]
+# Dictation. Off by default because whisper-rs pulls a native build and a model
+# file; the keyboard is fully usable without it, and a phone build that cannot
+# compile is worse than one that cannot dictate.
+voice = ["dep:whisper-rs", "dep:cpal"]
 # The runnable eframe app is default-on so `cargo build --release` (what the build orchestrator runs,
 # with no extra flags — see manifest/projects.toml) produces the deploy binary directly. A lib-only
 # consumer can still opt out with `default-features = false`.
 app = ["dep:eframe"]
 
 [dependencies]
+# Voice: the port mounts rusty-board's own voice stack by #[path] (it is
+# GTK-free), so these are the same deps the GTK build uses, at the same versions.
+whisper-rs = { version = "0.13", optional = true }
+cpal = { version = "0.15", optional = true }
+parking_lot = "0.12"
 tracing = "0.1"
 anyhow = "1"
 directories = "5"
