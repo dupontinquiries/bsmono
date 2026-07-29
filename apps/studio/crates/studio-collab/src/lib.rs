@@ -40,6 +40,7 @@ pub mod wire;
 pub mod carrier;
 pub mod file;
 pub mod assets;
+pub mod session;
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
