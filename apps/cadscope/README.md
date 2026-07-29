@@ -84,7 +84,7 @@ which needs it for the paint callback.
 | `cad-ref` | M4 ▸ | the reference corpus: index models, textures and specs by name so "same volume as `puma`" resolves to a measured fact. IQM/PNG/doc parsing works today; the verbs are M4–M7. |
 | `cad-pool` | M5 | asset pools: manifests, budgets, per-game injection. |
 | `cad-net` | M6 | forge-op replication over snapcore clusters. |
-| `cad-nifty` | M6 | niftyplot emit; the `%kind: hardware` implementation (upstreams to `shared/nifty-core`). |
+| `cad-nifty` | M6 ▸ | niftyplot emit; the `%kind: hardware` implementation (upstreams to `shared/nifty-core`). |
 
 ## Design commitments worth knowing before editing
 

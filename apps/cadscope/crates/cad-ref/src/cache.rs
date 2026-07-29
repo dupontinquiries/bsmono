@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 
-use crate::{Dimension, DocFacts, Entry, Facts, Kind, ModelFacts, TextureFacts, TextureRole, Units};
+use crate::{Dimension, DocFacts, Entry, Facts, Kind, ModelFacts, NiftyFacts, TextureFacts, TextureRole, Units};
 
-const VERSION: &str = "cadref-cache v1";
+const VERSION: &str = "cadref-cache v2";
 /// Separator inside list fields. Escaped like the others, so it can never appear in a value.
 const LIST_SEP: char = '\x1f';
 
@@ -189,6 +189,25 @@ pub fn encode(c: &Cached) -> String {
                 .collect();
             f.push(join(&flat));
         }
+        Facts::Nifty(n) => {
+            f.push("N".into());
+            f.push(esc(&n.kind));
+            f.push(esc(n.title.as_deref().unwrap_or("")));
+            f.push(n.components.to_string());
+            f.push(n.pins.to_string());
+            f.push(n.traces.to_string());
+            match n.extent_mm {
+                Some((lo, hi)) => f.push(format!("{} {} {} {}", lo.x, lo.y, hi.x, hi.y)),
+                None => f.push("-".into()),
+            }
+            let flat: Vec<String> = n
+                .keepouts
+                .iter()
+                .flat_map(|(a, b)| [a.x.to_string(), a.y.to_string(), b.x.to_string(), b.y.to_string()])
+                .collect();
+            f.push(join(&flat));
+            f.push(n.warnings.to_string());
+        }
         Facts::Unparsed => f.push("U".into()),
     }
     f.join("\t")
@@ -265,6 +284,38 @@ pub fn decode(line: &str) -> Option<Cached> {
                 title: (!title.is_empty()).then_some(title),
                 headings: split(f[7]),
                 dimensions,
+            })
+        }
+        "N" => {
+            if f.len() < 14 {
+                return None;
+            }
+            let title = unesc(f[7]);
+            let extent = if f[11] == "-" {
+                None
+            } else {
+                let v: Vec<f32> = f[11].split(' ').filter_map(|x| x.parse().ok()).collect();
+                (v.len() == 4).then(|| (glam::Vec2::new(v[0], v[1]), glam::Vec2::new(v[2], v[3])))
+            };
+            let flat = split(f[12]);
+            let keepouts = flat
+                .chunks_exact(4)
+                .filter_map(|c| {
+                    Some((
+                        glam::Vec2::new(c[0].parse().ok()?, c[1].parse().ok()?),
+                        glam::Vec2::new(c[2].parse().ok()?, c[3].parse().ok()?),
+                    ))
+                })
+                .collect();
+            Facts::Nifty(NiftyFacts {
+                kind: unesc(f[6]),
+                title: (!title.is_empty()).then_some(title),
+                components: f[8].parse().ok()?,
+                pins: f[9].parse().ok()?,
+                traces: f[10].parse().ok()?,
+                extent_mm: extent,
+                keepouts,
+                warnings: f[13].parse().ok()?,
             })
         }
         "U" => Facts::Unparsed,
@@ -356,6 +407,32 @@ mod tests {
                 },
             },
         ]
+    }
+
+    #[test]
+    fn nifty_facts_survive_the_cache() {
+        let c = Cached {
+            bytes: 42,
+            mtime: 7,
+            entry: Entry {
+                name: "breakout".into(),
+                kind: Kind::Niftyplot,
+                path: "refs/breakout.nifty".into(),
+                bytes: 42,
+                facts: Facts::Nifty(NiftyFacts {
+                    kind: "hardware".into(),
+                    title: Some("I2C breakout v1".into()),
+                    components: 2,
+                    pins: 8,
+                    traces: 4,
+                    extent_mm: Some((glam::Vec2::new(10.0, 20.0), glam::Vec2::new(60.0, 30.0))),
+                    keepouts: vec![(glam::Vec2::new(40.0, 10.0), glam::Vec2::new(50.0, 30.0))],
+                    warnings: 0,
+                }),
+            },
+        };
+        let back = decode(&encode(&c)).expect("decodes");
+        assert_eq!(back.entry.facts, c.entry.facts, "board geometry must survive exactly");
     }
 
     #[test]

@@ -1,0 +1,38 @@
+# A worked example of the hardware kind, and the corpus's first board.
+# Coordinates are millimetres by definition of %kind: hardware — this is the one
+# reference CADscope can measure against without a ref.toml declaration.
+%kind: hardware
+%title: "Sensor hub breakout v1"
+%units: mm
+
+chip MCU at (12, 18) {
+    pin VCC : top-right
+    pin GND : bottom-left
+    pin SDA : right
+    pin SCL : right + 5
+    pin RST : left + 3
+}
+
+chip SENSOR at (48, 18) rotated 90° {
+    pin VCC : top
+    pin GND : bottom
+    pin SDA : left
+    pin SCL : left + 5
+}
+
+connector USB at (4, 6)
+regulator U2 at (30, 34)
+resistor R1 at (24, 28) (10k)
+resistor R2 at (28, 28) (10k)
+capacitor C1 at (34, 12) (100nF)
+
+trace MCU.SDA → SENSOR.SDA width 0.2
+trace MCU.SCL → SENSOR.SCL width 0.2
+trace MCU.VCC → SENSOR.VCC width 0.4
+trace MCU.GND → SENSOR.GND width 0.6 ground
+
+# The antenna cutout: nothing may sit here, and an enclosure must not cover it.
+zone "keepout_antenna" : rect (44, 30) to (56, 40) on "top copper"
+# Mounting holes, as through-vias at the board corners.
+via "mount_nw" at (3, 40) through all layers
+via "mount_se" at (57, 3) through all layers

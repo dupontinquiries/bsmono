@@ -81,6 +81,7 @@ pub enum RefError {
     NotIndexed { name: String, searched: usize, nearest: Vec<String> },
     NotAModel { name: String },
     NotADoc { name: String },
+    NotABoard { name: String },
     /// Indexed, but only a header was read — no vertices, so nothing to measure.
     NoGeometry { name: String },
     /// Measured, but the surface does not enclose anything.
@@ -104,6 +105,10 @@ impl std::fmt::Display for RefError {
             }
             RefError::NotAModel { name } => write!(f, "'{name}' is not a model"),
             RefError::NotADoc { name } => write!(f, "'{name}' is not a document"),
+            RefError::NotABoard { name } => write!(
+                f,
+                "'{name}' is not a niftyplot hardware diagram with placed components, so there is no board outline to design around"
+            ),
             RefError::NoGeometry { name } => {
                 write!(f, "'{name}' was indexed from a header only; no vertices to measure")
             }
@@ -211,6 +216,23 @@ pub struct Dimension {
     pub context: String,
 }
 
+/// What a niftyplot diagram contributes to the corpus. A hardware diagram is dimensioned in
+/// millimetres *by definition of its kind*, so unlike every model file it needs no `ref.toml`
+/// declaration — it is the one entry whose units are never in question.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NiftyFacts {
+    /// `hardware`, `graph`, ... as declared.
+    pub kind: String,
+    pub title: Option<String>,
+    pub components: u32,
+    pub pins: u32,
+    pub traces: u32,
+    /// Board extent in millimetres, when the diagram places anything.
+    pub extent_mm: Option<(glam::Vec2, glam::Vec2)>,
+    pub keepouts: Vec<(glam::Vec2, glam::Vec2)>,
+    pub warnings: u32,
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct DocFacts {
     pub title: Option<String>,
@@ -223,7 +245,8 @@ pub enum Facts {
     Model(ModelFacts),
     Texture(TextureFacts),
     Doc(DocFacts),
-    /// Indexed but not yet parsed — niftyplot lands at M6 with the hardware-kind implementation.
+    Nifty(NiftyFacts),
+    /// Indexed but not parsed by any reader we have.
     Unparsed,
 }
 
@@ -411,7 +434,25 @@ impl Index {
                 (name, Facts::Texture(f))
             }
             Kind::Doc => (stem, Facts::Doc(doc::facts(path).unwrap_or_default())),
-            Kind::Niftyplot => (stem, Facts::Unparsed),
+            Kind::Niftyplot => {
+                let facts = std::fs::read_to_string(path)
+                    .ok()
+                    .map(|t| {
+                        let d = cad_nifty::parse(&t);
+                        NiftyFacts {
+                            kind: format!("{:?}", d.kind).to_ascii_lowercase(),
+                            title: d.title.clone(),
+                            components: d.components.len() as u32,
+                            pins: d.components.iter().map(|c| c.pins.len() as u32).sum(),
+                            traces: d.traces.len() as u32,
+                            extent_mm: d.extent_mm(),
+                            keepouts: d.keepouts(),
+                            warnings: d.warnings.len() as u32,
+                        }
+                    })
+                    .unwrap_or_default();
+                (stem, Facts::Nifty(facts))
+            }
         };
         Some(Entry { name, kind, path: path.to_path_buf(), bytes, facts })
     }
@@ -618,6 +659,41 @@ impl Index {
         Ok(report)
     }
 
+    /// The `fits <niftyplot>` verb (plan §17.2): a board's outline and keep-outs, in millimetres,
+    /// ready to be designed around.
+    ///
+    /// This is the one reference that needs no unit declaration. Niftyplot's hardware kind is
+    /// millimetres by definition, so a board extent is directly comparable with a CADscope
+    /// document without anybody writing anything into `ref.toml`.
+    ///
+    /// Note what the extent *is*: the bounding box of placed components, zones and vias. It is not
+    /// the board outline, because the format does not carry one — a real enclosure wants clearance
+    /// added, which is the caller's decision and not something to bake in silently here.
+    pub fn fits(&self, name: &str) -> Result<BoardFit, RefError> {
+        let Some(entry) = self.exact(name).into_iter().find(|e| e.kind == Kind::Niftyplot) else {
+            return Err(if self.exact(name).is_empty() {
+                let nearest = self
+                    .resolve(name, Some(Kind::Niftyplot), 3)
+                    .into_iter()
+                    .map(|(e, _)| e.name.clone())
+                    .collect();
+                RefError::NotIndexed { name: name.into(), searched: self.len(), nearest }
+            } else {
+                RefError::NotABoard { name: name.into() }
+            });
+        };
+        let Facts::Nifty(n) = &entry.facts else { return Err(RefError::NotABoard { name: name.into() }) };
+        let Some((lo, hi)) = n.extent_mm else { return Err(RefError::NotABoard { name: name.into() }) };
+        Ok(BoardFit {
+            board: entry.name.clone(),
+            title: n.title.clone(),
+            extent_mm: (lo, hi),
+            size_mm: hi - lo,
+            keepouts: n.keepouts.clone(),
+            components: n.components,
+        })
+    }
+
     /// All maps belonging to one material name — the `texture from <model>` verb's payload.
     pub fn material_set(&self, name: &str) -> Vec<&Entry> {
         self.exact(name).into_iter().filter(|e| e.kind == Kind::Texture).collect()
@@ -658,6 +734,25 @@ impl FitReport {
     /// True only when there is something testable and everything testable passed.
     pub fn all_within(&self) -> bool {
         self.count(Verdict::Within) > 0 && self.count(Verdict::Exceeds) == 0
+    }
+}
+
+/// A board, as something to design around.
+#[derive(Clone, Debug)]
+pub struct BoardFit {
+    pub board: String,
+    pub title: Option<String>,
+    pub extent_mm: (glam::Vec2, glam::Vec2),
+    pub size_mm: glam::Vec2,
+    pub keepouts: Vec<(glam::Vec2, glam::Vec2)>,
+    pub components: u32,
+}
+
+impl BoardFit {
+    /// Outline grown by a clearance on every side — the usual first move when an enclosure has to
+    /// contain a board rather than merely coincide with it.
+    pub fn with_clearance(&self, mm: f32) -> (glam::Vec2, glam::Vec2) {
+        (self.extent_mm.0 - glam::Vec2::splat(mm), self.extent_mm.1 + glam::Vec2::splat(mm))
     }
 }
 

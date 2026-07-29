@@ -3,7 +3,7 @@ name = "cad-nifty"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "STUB (M6): niftyplot emit + the hardware-kind implementation (upstreams into shared/nifty-core)."
+description = "niftyplot's hardware kind: components, pins, traces, vias, zones — the dimensioned board description CADscope designs around. Intended to upstream into shared/nifty-core."
 
 [dependencies]
-
+glam.workspace = true

@@ -297,6 +297,9 @@ version = "0.1.0"
 [[package]]
 name = "cad-nifty"
 version = "0.1.0"
+dependencies = [
+ "glam",
+]
 
 [[package]]
 name = "cad-pool"
@@ -307,6 +310,7 @@ name = "cad-ref"
 version = "0.1.0"
 dependencies = [
  "cad-kernel",
+ "cad-nifty",
  "glam",
 ]
 

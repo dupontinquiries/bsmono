@@ -96,16 +96,25 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   with declared units and `volume of` correctly declines every one of them. That is the mechanism
   working, not failing, but it means the verb is unusable tree-wide until someone who knows the
   conventions writes the declarations.
-- **Three verbs live, two to go.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
+- **Four verbs live, one to go.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
   `texture from` (`Index::textures_of_model`, a join that reports unresolved materials rather than
-  dropping them) and `fit <doc>` all work against the real tree. `fits <niftyplot>` and
-  `like <model>` remain M6–M7. The three live verbs are now reachable from the UI: a reference
+  dropping them), `fit <doc>` and `fits <niftyplot>` all work against the real tree. Only
+  `like <model>` remains (M7). The three live verbs are now reachable from the UI: a reference
   panel takes a typed sentence, runs it through `cad_ref::verbs::execute`, and shows the answer or
   the refusal. **That panel has never been seen** — like the rest of the UI it is compile-verified
   only, with no display here. What *is* verified is the funnel underneath it, which the CLI
   exercises on the real corpus through the identical code path.
-- **Niftyplot entries parse to nothing.** No `.nifty` files exist in the tree yet, and the parser
-  arrives at M6 with the hardware-kind implementation.
+- **The board extent is not the board outline.** `fits` returns the bounding box of placed
+  components, zones and vias, because niftyplot's hardware kind carries no outline statement. A
+  real enclosure wants clearance added, and `BoardFit::with_clearance` makes that the caller's
+  explicit decision rather than a silent constant. Do not read the extent as the edge of the PCB.
+- **Only the hardware kind is interpreted.** `cad-nifty` parses its header for every kind and its
+  body only for `hardware`; graph bodies belong to `shared/nifty-core`, which already parses them,
+  and a second spelling of one format would be worse than none. Gantt, sequence and state remain
+  unparsed by anybody.
+- **The corpus contains exactly one board**, `apps/cadscope/refs/sensor_hub.nifty`, written as a
+  worked example because the tree had no `.nifty` files at all. The parser is tested against the
+  spec's own I2C example, but it has never met a board somebody else wrote.
 
 ## Not verified in-sandbox
 

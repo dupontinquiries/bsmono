@@ -381,6 +381,50 @@ fn ref_index(root: &str) -> ! {
         }
     }
 
+    // The `fits <niftyplot>` verb: a board's outline and keep-outs, already in millimetres.
+    let boards: Vec<String> = idx
+        .entries
+        .iter()
+        .filter(|e| e.kind == Kind::Niftyplot)
+        .map(|e| e.name.clone())
+        .collect();
+    if boards.is_empty() {
+        println!("  fits: no niftyplot diagrams indexed");
+    }
+    for name in boards.iter().take(2).chain(std::iter::once(&"no_such_board".to_string())) {
+        match idx.fits(name) {
+            Ok(b) => {
+                let (clo, chi) = b.with_clearance(2.0);
+                println!(
+                    "  fits {:24} {:.0}x{:.0} mm, {} components, {} keep-out(s){}",
+                    b.board,
+                    b.size_mm.x,
+                    b.size_mm.y,
+                    b.components,
+                    b.keepouts.len(),
+                    b.title.as_ref().map(|t| format!("  \"{t}\"")).unwrap_or_default()
+                );
+                println!(
+                    "      with 2mm clearance: ({:.0}, {:.0}) to ({:.0}, {:.0}) mm",
+                    clo.x, clo.y, chi.x, chi.y
+                );
+                for (a, c) in b.keepouts.iter().take(2) {
+                    println!(
+                        "      keep-out ({:.0}, {:.0}) to ({:.0}, {:.0}) mm",
+                        a.x, a.y, c.x, c.y
+                    );
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains(name.as_str()) {
+                    fail_ref += 1;
+                }
+                println!("  fits {:24} declined: {msg}", name);
+            }
+        }
+    }
+
     // Name resolution, which is what a person actually uses.
     for q in ["puma", "shark", "obsidian", "nosuchmodelanywhere"] {
         let hits = idx.resolve(q, None, 3);

@@ -7,4 +7,5 @@ description = "The reference corpus (plan §17): index models, textures, diagram
 
 [dependencies]
 cad-kernel.workspace = true
+cad-nifty.workspace = true
 glam.workspace = true
