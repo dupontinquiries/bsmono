@@ -1,0 +1,5 @@
+[package]
+name = "model-verify"
+version = "0.1.0"
+edition = "2021"
+description = "Proves a mesh survived instancing: recovers each instance's rigid transform and checks the reconstruction against the original vertex for vertex."
