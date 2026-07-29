@@ -75,6 +75,40 @@ impl ModelEntry {
 }
 
 /// Map a model name to a family folder.
+/// Rewrite a shard path to the FIRST shard of its set.
+///
+/// A split checkpoint's metadata and tensor index live in shard 1; the rest are payload. Handing shard 2
+/// to a loader gives it a file with no header, and llama.cpp reports exactly that:
+///
+/// ```text
+/// Load failed: failed to load GGUF '...Q4_K_M-00002-of-00002.gguf': null result from llama cpp
+/// ```
+///
+/// The message is accurate and useless — the file is fine, it is simply not the entry point. Every
+/// loader that understands shards expects the first and finds the others itself, so resolving here means
+/// no backend has to know.
+///
+/// Returns None when the path is not a shard, so a caller can pass the original through unchanged
+/// rather than needing a fallback.
+pub fn resolve_to_first_shard(path: &str) -> Option<String> {
+    let (dir, file) = match path.rfind('/') {
+        Some(i) => (&path[..=i], &path[i + 1..]),
+        None => ("", path),
+    };
+    let (stem, idx, total) = parse_shard(file)?;
+    if idx == 1 { return None; }                       // already the entry point
+    Some(format!("{dir}{stem}-{:05}-of-{:05}.gguf", 1, total))
+}
+
+/// Is this path a shard that is NOT the first?
+///
+/// Used by the picker: listing every shard as a separate model invites selecting one that cannot load,
+/// which is how the error above happens in the first place.
+pub fn is_secondary_shard(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    matches!(parse_shard(file), Some((_, idx, total)) if total > 1 && idx > 1)
+}
+
 pub fn family_of(name: &str) -> &'static str {
     let n = name.to_ascii_lowercase();
     const FAMILIES: &[(&str, &str)] = &[
@@ -266,6 +300,51 @@ pub fn apply_moves(moves: &[Move]) -> (Vec<PathBuf>, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_secondary_shard_resolves_to_the_first() {
+        // The reported failure: llama.cpp given shard 2 of 2 says "null result", which is accurate and
+        // useless — the file is fine, it is simply not the entry point. Metadata and the tensor index
+        // live in shard 1.
+        let p = "/m/Llama4Scout/Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00002-of-00002.gguf";
+        assert_eq!(resolve_to_first_shard(p).as_deref(),
+                   Some("/m/Llama4Scout/Llama-4-Scout-17B-16E-Instruct-Q4_K_M-00001-of-00002.gguf"));
+    }
+
+    #[test]
+    fn the_first_shard_and_a_plain_file_resolve_to_nothing() {
+        // None means "pass the original through", so a caller needs no fallback branch — and a plain
+        // file must never be rewritten into a shard name that does not exist.
+        assert!(resolve_to_first_shard("/m/x-00001-of-00002.gguf").is_none());
+        assert!(resolve_to_first_shard("/m/plain.gguf").is_none());
+        assert!(resolve_to_first_shard("/m/no-extension").is_none());
+    }
+
+    #[test]
+    fn the_directory_is_preserved() {
+        // Rewriting the name and losing the path would turn a load error into a file-not-found, which is
+        // a worse error because it points at the wrong thing entirely.
+        let r = resolve_to_first_shard("/deep/nested/dir/model-00003-of-00004.gguf").unwrap();
+        assert!(r.starts_with("/deep/nested/dir/"), "{r}");
+        assert!(r.ends_with("model-00001-of-00004.gguf"), "{r}");
+    }
+
+    #[test]
+    fn only_secondary_shards_are_hidden_from_a_picker() {
+        // Listing every shard as a separate model is how the wrong one gets selected. The FIRST must
+        // stay visible — hiding all of them would make a split model unloadable.
+        assert!(is_secondary_shard("/m/a-00002-of-00003.gguf"));
+        assert!(is_secondary_shard("/m/a-00003-of-00003.gguf"));
+        assert!(!is_secondary_shard("/m/a-00001-of-00003.gguf"), "the entry point stays listed");
+        assert!(!is_secondary_shard("/m/plain.gguf"));
+    }
+
+    #[test]
+    fn a_single_file_set_is_not_treated_as_a_shard() {
+        // `-00001-of-00001` is a valid name for an unsplit model and must load normally.
+        assert!(!is_secondary_shard("/m/a-00001-of-00001.gguf"));
+        assert!(resolve_to_first_shard("/m/a-00001-of-00001.gguf").is_none());
+    }
+
     use super::*;
 
     #[test]

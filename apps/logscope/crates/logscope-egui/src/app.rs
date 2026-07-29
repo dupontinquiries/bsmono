@@ -152,6 +152,12 @@ impl LogscopeApp {
         // Restore the selection BY IDENTITY, not by index. A rescan reorders the list — adding one file
         // to the models folder shifts every index after it — and the old index is still in range, just
         // pointing at a different model. The picker then shows one name while the engine loads another.
+        // Hide shards that are not the entry point. Listing every shard as its own model is how the
+        // wrong one gets selected, and selecting one is unrecoverable from the UI — the load simply
+        // fails with a message about the file rather than about the choice.
+        let items: Vec<_> = items.into_iter()
+            .filter(|it| !logscope::modelorg::is_secondary_shard(it.name()))
+            .collect();
         if !self.model.replace_items(items) && !self.model.items.is_empty() {
             self.local_status = format!("{} — previously selected model is gone; reset to {}",
                 self.local_status, self.model.current());
@@ -250,6 +256,11 @@ impl LogscopeApp {
         if since.elapsed() < std::time::Duration::from_millis(AUTOLOAD_SETTLE_MS) { return; }
 
         let Some(path) = self.local_path_for(&name) else { self.pending_target = None; return };
+        // Resolve a shard to the FIRST of its set. Metadata and the tensor index live there; handing a
+        // loader shard 2 gives it a file with no header, and llama.cpp reports "null result" — accurate
+        // and useless, because the file is fine and simply is not the entry point. Done here so no
+        // backend has to know about shards.
+        let path = logscope::modelorg::resolve_to_first_shard(&path).unwrap_or(path);
         self.pending_target = None;
         self.autoloaded = Some(name.clone());
         self.local_status = format!("auto-loading {name}…");
