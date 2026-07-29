@@ -47,7 +47,7 @@ edits exactly reversible, which floats are not.
 | crate | what it is | tests |
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
-| `studio-collab` | convergent op log, presence, wire, carrier, **project files** | 25 |
+| `studio-collab` | convergent op log, presence, wire, carrier, project files, **assets** | 32 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
@@ -769,3 +769,37 @@ would be missed. Comparing bands of different widths must **sum**, so
 `band_power_db` now does, and the findings compare octave totals against the
 median octave. The median rather than the mean, because it ignores one loud band
 instead of being dragged by it — which is what a tonal-balance judgement wants.
+
+## Streaming the media
+
+Ops are tiny; media is not. A session where everyone sees the same timeline but
+only one person has the takes is not collaboration, it is screen-sharing with
+extra steps.
+
+Assets are **content-addressed and chunked**, for one reason above the others:
+peers usually already have most of it. Two editors working from the same shoot
+have the same rushes; a re-render changes a few seconds of a ten-minute file;
+someone rejoining has everything from yesterday. Addressing chunks by content
+rather than position makes all of that free to discover and free to transfer.
+
+Boundaries are **content-defined** — a chunk ends where a rolling hash of the
+last 48 bytes hits a pattern — not at fixed offsets. The difference shows the
+moment anything is inserted: with fixed offsets, adding a frame at the head of a
+file shifts every subsequent boundary and *nothing* dedupes, so a ten-minute
+take re-transfers in full because a second was added at the front. A test
+inserts 5 KB at the head of an 800 KB file and requires most chunks to survive.
+
+My first cut got this wrong in the way that still passes a casual look: it
+accumulated the hash over the whole chunk and reset at each boundary, so
+boundaries depended on where the *previous* boundary fell rather than on the
+content. Two tests caught it — a file containing the same block twice shared no
+chunks, and a run of zeros did not either. A true rolling window (buzhash, with
+the hash deliberately *not* reset at a boundary) fixes it.
+
+Assembly re-hashes every chunk instead of trusting it, because a take that is
+subtly wrong in one place gets discovered at the mix, which is far too late.
+`need` returns missing chunks in first-appearance order so playback can start
+before the transfer finishes. What is deliberately absent: transfer scheduling,
+rarest-first, peer selection — that belongs with whoever is moving the bytes,
+and guessing at it here would be inventing policy for a network this crate
+cannot see.
