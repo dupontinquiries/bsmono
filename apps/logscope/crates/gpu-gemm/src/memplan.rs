@@ -280,6 +280,21 @@ pub fn gpu_buffer_budget(ram_budget: u64, conservative_vma: bool) -> u64 {
 /// a staging artifact, so it holds regardless of the 192 GiB of RAM behind it. Metal (macOS, unified but
 /// NOT conservative_vma) has no such ceiling and can go to RAM. So: conservative_vma keeps the hard cap
 /// even though it's unified; Metal-class unified lifts to a RAM fraction. LOGSCOPE_MAX_GPU_GB overrides.
+/// Budget from a MEASURED ceiling, when one exists.
+///
+/// A measurement outranks every constant here. `--gate-vram` found this device honouring 63 GiB where
+/// the constant assumed 24 — the constant was an empirical figure from the staging upload path, taken
+/// before the arena removed the staging, and nothing in the code distinguished "the driver refuses"
+/// from "we assumed it would". Models that fitted were being streamed for no reason.
+///
+/// Keeps a margin below the measurement rather than using it whole: the probe finds where allocation
+/// FAILS, and running at exactly that point leaves nothing for the KV cache, transients, or another
+/// process on the same GPU.
+pub fn budget_from_measurement(measured_gib: f32) -> Option<u64> {
+    if measured_gib <= 0.0 { return None; }        // 0 = never probed, not "no memory"
+    Some((measured_gib as f64 * 0.75 * GIB) as u64)
+}
+
 pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: bool) -> u64 {
     if let Ok(s) = std::env::var("LOGSCOPE_MAX_GPU_GB") {
         if let Ok(gb) = s.trim().parse::<f64>() { return (gb * GIB) as u64; }
@@ -294,6 +309,26 @@ pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: b
     // q4/refusal (→ streaming) up front instead of dying mid-allocation.
     let cap = if conservative_vma { 24.0 } else { 48.0 };
     (ram_budget / 2).min((cap * GIB) as u64)
+}
+
+/// The budget, preferring a MEASURED ceiling over either constant.
+///
+/// Both 24.0 and 48.0 are guesses that have outlived their evidence. `--gate-vram` measures what the
+/// device actually honours — 63 GiB on an M2 Ultra where the constant said 24 — and a measurement
+/// should win over a number nobody has checked since it was written.
+///
+/// Worth recording what a read of the driver added, because it changes what the measurement MEANS: the
+/// GPU virtual address space is 512 GiB (`UAT_IAS = 39`), and a run mapping ~110 GiB across three
+/// models sits at 21% of it. So the "Failed to allocate BO VMA" the probe hits at 63 GiB is NOT address
+/// space exhaustion. Something else is bounded — and until that is identified, a measured number is the
+/// only trustworthy input, because no constant can encode a limit whose mechanism is unknown.
+pub fn gpu_budget_preferring_measurement(ram_budget: u64, conservative_vma: bool, unified: bool,
+                                         measured_gib: f32) -> u64 {
+    match budget_from_measurement(measured_gib) {
+        // Still bounded by RAM: honouring an allocation is not the same as it being wise to make.
+        Some(b) => b.min(ram_budget / 2),
+        None => gpu_buffer_budget_uma(ram_budget, conservative_vma, unified),
+    }
 }
 
 const GIB: f64 = (1u64 << 30) as f64;
@@ -511,9 +546,15 @@ mod tests {
     }
 }
 
-/// Total system RAM in bytes, or 0 when it cannot be determined. Linux reads `MemTotal` from
-/// /proc/meminfo; other platforms return 0 so callers treat the check as unavailable rather than
-/// assuming a value and refusing a load that would have worked.
+/// Total system RAM in bytes, or 0 when it cannot be determined.
+///
+/// Linux reads `MemTotal`; macOS reads `hw.memsize` via sysctl. Everything else returns 0, and 0 means
+/// UNKNOWN rather than "none" — callers must disable the guard rather than refuse a load that would have
+/// worked.
+///
+/// The macOS path matters more than it looks: on unified memory this figure also drives the GPU buffer
+/// budget, so returning 0 there made a 192 GiB machine fall back to a conservative guess and pick q4
+/// where int8 would have fitted. A missing probe was silently costing model quality.
 pub fn system_ram_bytes() -> u64 {
     if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
         for line in s.lines() {
@@ -521,6 +562,38 @@ pub fn system_ram_bytes() -> u64 {
                 if let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
                     return kb * 1024;
                 }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `sysctl -n hw.memsize` is the total physical RAM in bytes. Shelling out rather than linking
+        // libc's sysctl keeps this dependency-free, and it runs once at load where a few ms is nothing.
+        if let Ok(out) = std::process::Command::new("/usr/sbin/sysctl").args(["-n", "hw.memsize"]).output() {
+            if let Ok(txt) = String::from_utf8(out.stdout) {
+                if let Ok(b) = txt.trim().parse::<u64>() { if b > 0 { return b; } }
+            }
+        }
+    }
+    0
+}
+
+/// Resident set size of this process in bytes, or 0 when unavailable.
+///
+/// macOS has no `smaps_rollup`, so the anonymous/file split is not available there — but the TOTAL is,
+/// via `ps`. Reporting a total with an honest "split unavailable" beats reporting nothing, because the
+/// total is what tells you whether you are about to swap.
+pub fn process_rss_bytes() -> u64 {
+    let (_, _, total) = rss_split();
+    if total > 0 { return total; }
+    #[cfg(target_os = "macos")]
+    {
+        let pid = std::process::id();
+        if let Ok(out) = std::process::Command::new("/bin/ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()]).output() {
+            if let Ok(txt) = String::from_utf8(out.stdout) {
+                // ps reports KiB
+                if let Ok(kb) = txt.trim().parse::<u64>() { return kb * 1024; }
             }
         }
     }
@@ -553,30 +626,22 @@ pub fn rss_split() -> (u64, u64, u64) {
     };
     let anon = kb("Anonymous:");
     let total = kb("Rss:");
-    // macOS: no smaps_rollup, so the anon/file SPLIT is unavailable — but the TOTAL is one ps
-    // call away, and "total known, split unknown" beats the old "resident memory: unavailable"
-    // (the report can say which part it can't see instead of going silent).
-    #[cfg(target_os = "macos")]
-    if total == 0 {
-        if let Ok(out) = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &std::process::id().to_string()]).output() {
-            if let Ok(kb_rss) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
-                return (0, 0, kb_rss * 1024);
-            }
-        }
-    }
     (anon, total.saturating_sub(anon), total)
 }
 
 /// One line describing where this process's memory actually is.
 pub fn rss_report() -> String {
     let (anon, file, total) = rss_split();
-    if total == 0 { return "resident memory: unavailable on this platform".into(); }
-    if anon == 0 && file == 0 {
-        // macOS path: ps gives the total; the anon/file split needs smaps_rollup (Linux-only).
-        // Say WHICH part is unknown instead of going silent (field-report ask).
-        return format!("resident memory: {:.1} GiB total (anon/file split unavailable on this platform)",
-                       total as f64 / (1u64 << 30) as f64);
+    if total == 0 {
+        // Fall back to the total-only probe before giving up: on macOS the anon/file SPLIT is
+        // unavailable but the total is not, and the total is the number that tells you whether you are
+        // about to swap.
+        let t = process_rss_bytes();
+        if t > 0 {
+            return format!("resident memory: {:.1} GiB total (anonymous/file split unavailable on this \
+platform — the total is what matters for swap pressure)", t as f64 / (1u64 << 30) as f64);
+        }
+        return "resident memory: unavailable on this platform".into();
     }
     format!("resident memory: {:.1} GiB total = {:.1} GiB anonymous (our allocations) + {:.1} GiB file-backed \
 (mmap'd model; reclaimable by the kernel under pressure)",
@@ -591,4 +656,116 @@ mod rss_tests {
         if t == 0 { assert_eq!((a, f), (0, 0), "unavailable must be all-zero, not partial"); }
         else { assert_eq!(a + f, t, "the two halves must reconcile to the total"); }
     }
+}
+    #[test]
+    fn int8_from_a_K_QUANT_is_not_worth_the_disk() {
+        // Both use one scale per 32 weights, so the conversion cannot add precision — it stores 4-bit
+        // values in 8 bits, using 16 of 256 levels, and Q4_K's dmin term has nowhere to go. Worse on
+        // memory, worse on disk, no better on quality.
+        assert!(!int8_worth_it(12), "Q4_K");
+        assert!(!int8_worth_it(14), "Q6_K");
+        assert!(!int8_worth_it(8), "Q8_0 is already 8-bit");
+    }
+
+    #[test]
+    fn int8_from_full_precision_IS_worth_it() {
+        // The case the cache was built for: F16 weights genuinely carry more than 8 bits, so this is a
+        // real compression rather than a re-encoding.
+        assert!(int8_worth_it(0), "F32");
+        assert!(int8_worth_it(1), "F16");
+    }
+
+    #[test]
+    fn an_unknown_source_does_not_get_the_benefit_of_the_doubt() {
+        // Spending gigabytes of disk on a format nobody has checked is the wrong default, and a wrong
+        // guess here is silent — the cache is written and simply never helps.
+        assert!(!int8_worth_it(999));
+    }
+
+    #[test]
+    fn the_waste_is_quantified_rather_than_described() {
+        // A 8B model at ~8e9 weights writes ~7.5 GiB of int8 cache that buys nothing. Saying "some
+        // disk" would not have got this changed.
+        let w = 8_000_000_000u64;
+        let gib = int8_cache_waste(12, w) as f64 / GIB;
+        assert!(gib > 7.0, "{gib:.1} GiB wasted per 8B Q4_K model");
+        assert_eq!(int8_cache_waste(1, w), 0, "and nothing wasted from an F16 source");
+    }
+
+    #[test]
+    fn a_measurement_replaces_the_constant_but_RAM_still_bounds_it() {
+        let ram = (192.0 * GIB) as u64;
+        // measured: 63 GiB -> 75% = ~47, well under RAM/2, so the measurement governs
+        let m = gpu_budget_preferring_measurement(ram, true, true, 63.0);
+        let c = gpu_buffer_budget_uma(ram, true, true);
+        assert!(m > c, "measured {:.0} must beat the 24 GiB constant {:.0}", gib(m), gib(c));
+
+        // unprobed falls back to the constant rather than to nothing
+        assert_eq!(gpu_budget_preferring_measurement(ram, true, true, 0.0), c);
+
+        // and a huge measurement is still bounded by RAM: honouring an allocation is not the same as
+        // it being wise to make, and the probe deliberately allocates past what a real run should.
+        let small_ram = (8.0 * GIB) as u64;
+        let big = gpu_budget_preferring_measurement(small_ram, false, true, 500.0);
+        assert!(big <= small_ram / 2, "RAM still bounds it: {:.1} GiB", gib(big));
+    }
+
+    #[test]
+    fn a_measurement_outranks_the_constant_but_keeps_a_margin() {
+        // The constant said 24 GiB; --gate-vram measured 63 on the same device. A measurement has to
+        // win, or the probe is decoration.
+        let b = budget_from_measurement(63.0).unwrap();
+        let gib = |n: f64| (n * GIB) as u64;
+        assert!(b > gib(40.0) && b < gib(63.0), "got {:.1} GiB", b as f64 / GIB);
+        // Not the whole measurement: the probe finds where allocation FAILS, and running at exactly
+        // that point leaves nothing for KV, transients, or another process on the same GPU.
+        assert!(b < gib(63.0));
+    }
+
+    #[test]
+    fn an_unprobed_device_returns_None_rather_than_zero_budget() {
+        // 0 means "never measured", not "no memory". Returning a zero budget would refuse every model
+        // on a machine that had simply not run the probe yet.
+        assert!(budget_from_measurement(0.0).is_none());
+        assert!(budget_from_measurement(-1.0).is_none());
+    }
+
+
+
+/// Is converting this source format to int8 residency worth anything?
+///
+/// ## The answer for Q4_K is no, and it costs disk twice
+///
+/// A load of a Q4_K_M model currently quantizes to int8 residency and writes a content-addressed cache
+/// so the next load can skip the conversion — gigabytes on device per model. But:
+///
+/// * int8 residency uses **one scale per 32 weights** (`quantize_q8_resident`: `kb = k / 32`).
+/// * Q4_K uses **one scale per 32 weights** too — eight sub-blocks per 256-weight super-block.
+///
+/// Same granularity, so the conversion cannot add precision. The values came from 4-bit quants and take
+/// at most 16 distinct levels per sub-block; storing them in 8 bits uses 16 of 256 levels and doubles
+/// the bytes. Q4_K additionally carries a `dmin` minimum term that int8 has no place for, so the
+/// conversion has to fold it into a symmetric scale — which can LOSE accuracy rather than preserve it.
+///
+/// So int8-from-Q4_K is worse on memory, worse on disk, and no better on quality. llama.cpp never does
+/// it: its kernels consume Q4_K directly, and `--gate-q4k` proved ours can too — its success message has
+/// said "the loader can stop requantizing" since it went green.
+///
+/// ## Where int8 IS worth it
+///
+/// From an F16 or F32 source, where the weights genuinely carry more precision than 8 bits and the
+/// conversion is a real compression rather than a re-encoding.
+pub fn int8_worth_it(src_ggml_type: u32) -> bool {
+    match src_ggml_type {
+        0 | 1 => true,      // F32, F16: a real compression
+        // Every K-quant and Q8_0 already has per-block scales at 32-weight granularity or finer.
+        // Re-encoding them to int8 doubles the size and cannot add information.
+        2..=20 => false,
+        _ => false,         // unknown: do not spend the disk on a guess
+    }
+}
+
+/// Bytes saved on device by skipping the int8 cache for a source that does not benefit.
+pub fn int8_cache_waste(src_ggml_type: u32, n_weights: u64) -> u64 {
+    if int8_worth_it(src_ggml_type) { 0 } else { n_weights }   // ~1 byte/weight for the int8 blob
 }

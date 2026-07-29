@@ -3,6 +3,9 @@ use logscope_egui::app::LogscopeApp;
 use logscope_egui::theme;
 
 fn main() -> eframe::Result {
+    // Install the diagnostic writer FIRST, so a crash during setup still produces a report — the runs
+    // worth reporting are exactly the ones that do not finish cleanly. Held for the whole of main.
+    let _diag = logscope_egui::diag::install();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])

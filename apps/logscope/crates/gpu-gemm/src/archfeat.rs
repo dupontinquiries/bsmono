@@ -51,6 +51,12 @@ pub enum Feature {
     PerLayerHeadDim,
     /// A learned scalar multiplying each layer's output (Gemma 4 `layer_output_scale`).
     LayerOutputScale,
+    /// MLA reconstruction matrices shipped as SEPARATE, THREE-dimensional `attn_k_b` / `attn_v_b`
+    /// (`[head_dim x lora x n_head]`) rather than one fused 2-D `attn_kv_b`.
+    ///
+    /// Purely a loading concern — the MLA forward itself is implemented and validated — but it blocks
+    /// every checkpoint that uses this layout, which is GLM-4.7-Flash and GLM-5.2 at least.
+    MlaSplit3dProjections,
     /// GELU-gated FFN instead of SiLU-gated (all Gemma).
     GeGluActivation,
     /// Gemma's RMS norm: `x/rms(x) · (1 + w)`, computed in f32 — the `1 +` is not a detail, it changes
@@ -64,6 +70,19 @@ pub enum Feature {
     /// (Gemma `rope.freq_base_swa`). Distinct from `PerLayerRopeFreqs`, which is per-layer rope
     /// frequency TENSORS in Gemma 4.
     PerLayerRopeBase,
+    /// Routed-expert weights are multiplied by a constant from metadata (`expert_weights_scale`).
+    ///
+    /// Llama-4 and Qwen3 leave it unset, so it defaulted harmlessly to 1. GLM-5.2 sets **2.5** — ignoring
+    /// it makes every MoE layer's contribution 2.5x too small, which does not error and does not produce
+    /// noise: it produces a model that is quietly worse than it should be.
+    ExpertWeightsScale,
+    /// Top-k routed weights are renormalized to sum to 1 (`expert_weights_norm`).
+    ExpertWeightsNorm,
+    /// DeepSeek-style SPARSE ATTENTION: a separate small indexer scores keys, and full attention runs
+    /// only over its top-k. GLM-5.2 uses 32 indexer heads of key_length 128 selecting top_k 2048 out of a
+    /// 1M context. Structural — there is no dense fallback that is merely slower, because attending to
+    /// everything at 1M context is not a thing the engine can do.
+    SparseAttentionIndexer,
     /// The attention scale is a hyperparameter rather than 1/sqrt(head_dim). Equal to the default on
     /// most Gemma 3, but NOT on the 27B, which uses 1/sqrt(n_embd/n_head).
     AttentionScaleHparam,
@@ -85,12 +104,16 @@ impl Feature {
             Feature::PerLayerRopeFreqs => "per-layer rope frequency tensors",
             Feature::PerLayerHeadDim => "per-layer head dimension (SWA layers differ from full-attention ones)",
             Feature::LayerOutputScale => "per-layer learned output scale",
+            Feature::MlaSplit3dProjections => "split 3-D attn_k_b / attn_v_b instead of fused attn_kv_b",
             Feature::GeGluActivation => "GELU-gated FFN",
             Feature::GemmaRmsNorm => "Gemma (1+w) RMS norm",
             Feature::LogitSoftcap => "tanh soft-cap on attention and final logits",
             Feature::EmbeddingScale => "token embedding scaled by sqrt(d)",
             Feature::PerLayerRopeBase => "separate rope base for windowed layers",
             Feature::AttentionScaleHparam => "attention scale from hparams, not 1/sqrt(head_dim)",
+            Feature::ExpertWeightsScale => "routed-expert weights scaled by a metadata constant",
+            Feature::ExpertWeightsNorm => "routed-expert weights renormalized to sum to 1",
+            Feature::SparseAttentionIndexer => "sparse attention: an indexer selects top-k keys",
         }
     }
 
@@ -124,12 +147,21 @@ impl Feature {
             Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
             Feature::LayerOutputScale => false,  // the tensor is not read
+            // Implemented in _289: the loader now reads attn_k_b + attn_v_b and concatenates them, having
+            // established from llama.cpp PR #12801 that the 3-D GGUF form is byte-identical to the 2-D
+            // declaration. This flag stayed false for four commits after the code landed — the fifth
+            // instance of a registry disagreeing with the loader, and the one that made a fixed gap keep
+            // reporting itself as a gap.
+            Feature::MlaSplit3dProjections => true,
             Feature::GeGluActivation => true,    // selected per block from ArchConfig::act (--gate-gemma)
             Feature::GemmaRmsNorm => true,       // (1+w) folded into the weight at load (--gate-gemma)
             Feature::LogitSoftcap => false,      // not implemented anywhere
             Feature::EmbeddingScale => true,     // Model::embed_scale, set from the arch at load
             Feature::PerLayerRopeBase => true,   // BlockWeights::rope_base, from rope.freq_base_swa
             Feature::AttentionScaleHparam => false, // 1/sqrt(head_dim) is hardcoded in the kernels
+            Feature::ExpertWeightsScale => false,   // the key is never read; effectively hardcoded to 1
+            Feature::ExpertWeightsNorm => false,    // moe::route normalizes for softmax only
+            Feature::SparseAttentionIndexer => false, // no indexer exists
         }
     }
 
@@ -146,6 +178,12 @@ file and ignored"),
             Feature::LogitSoftcap => Some("Gemma 2 only; Gemma 3 and 4 default it off"),
             Feature::AttentionScaleHparam => Some("matches the 1/sqrt(head_dim) default on Gemma 3 12B \
 and below; differs only on the 27B, which uses 1/sqrt(n_embd/n_head)"),
+            Feature::ExpertWeightsScale => Some("GLM-5.2 sets 2.5; ignoring it scales every MoE layer's \
+output down by that factor — a quietly worse model, not a broken one"),
+            Feature::MlaSplit3dProjections => Some("a LOADING gap, not a maths one — the MLA forward is \
+implemented and validated; these checkpoints just store k_b and v_b separately and in 3-D"),
+            Feature::SparseAttentionIndexer => Some("STRUCTURAL: without the indexer there is no dense \
+fallback, because attending to a 1M context in full is not something the engine can do"),
             Feature::Mla => Some("wired and validated against the CPU reference, but never yet run on a \
 real DeepSeek/GLM checkpoint — the first such load is the test"),
             _ => None,
@@ -183,7 +221,18 @@ pub fn required(arch: &str, variant: u32) -> Vec<Feature> {
                          Feature::GeGluActivation, Feature::GemmaRmsNorm,
                          Feature::PerLayerRopeFreqs, Feature::PerLayerHeadDim, Feature::LayerOutputScale,
                          Feature::EmbeddingScale, Feature::PerLayerRopeBase, Feature::AttentionScaleHparam],
-        "glm4moe" | "glm-dsa" | "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert],
+        // deepseek2/3 covers GLM-4.7-Flash, which ships the split 3-D projections. Listed so the
+        // refusal names the real blocker rather than blaming the MLA forward, which is implemented.
+        "deepseek2" | "deepseek3" => vec![Feature::Mla, Feature::SharedExpert,
+                                          Feature::MlaSplit3dProjections],
+        "glm4moe" => vec![Feature::Mla, Feature::SharedExpert],
+        // GLM-5.2. Transcribed from the shipped first shard's metadata rather than guessed:
+        //   expert_gating_func 2 (sigmoid), expert_weights_norm true, expert_weights_scale 2.5,
+        //   kv_lora_rank 512 / q_lora_rank 2048 (MLA), expert_shared_count 1,
+        //   attention.indexer.{head_count 32, key_length 128, top_k 2048} over a 1048576 context.
+        "glm-dsa" => vec![Feature::Mla, Feature::SharedExpert, Feature::ExpertWeightsScale,
+                          Feature::ExpertWeightsNorm, Feature::SparseAttentionIndexer,
+                          Feature::MlaSplit3dProjections],
         _ => Vec::new(),
     }
 }
@@ -224,6 +273,23 @@ mod tests {
     }
 
     #[test]
+    fn maverick_differs_from_scout_only_where_llamacpp_says() {
+        // Llama-4 Maverick: 17B active, 400B total, 128 experts, 1M context — versus Scout's 16 experts
+        // and 10M. The ONLY architectural difference llama4.cpp encodes is use_kq_norm, which is
+        // `type != LLM_TYPE_17B_128E` — so Maverick skips the post-rope norm Scout needs.
+        let scout = required("llama4", 16);
+        let mav = required("llama4", 128);
+        assert!(scout.contains(&Feature::KqNormPostRope), "Scout applies it");
+        assert!(!mav.contains(&Feature::KqNormPostRope), "Maverick does NOT — the 128E branch");
+        // everything else is shared, and both are gap-free
+        for f in [Feature::NoPe, Feature::AttnTemp, Feature::ChunkedSwa, Feature::SharedExpert,
+                  Feature::InterleavedMoe] {
+            assert!(scout.contains(&f) && mav.contains(&f), "{f:?} is shared");
+        }
+        assert!(gaps("llama4", 128).is_empty(), "{:?}", gaps("llama4", 128));
+    }
+
+    #[test]
     fn scout_has_no_remaining_declared_gaps() {
         // Llama-4 needed NoPE, attention temperature, chunked SWA, a shared expert, interleaved MoE and
         // use_kq_norm. Every one is now implemented; the last two landed this session.
@@ -234,16 +300,24 @@ mod tests {
     }
 
     #[test]
-    fn glm_no_longer_reports_mla_as_a_blocker() {
-        // It DID, through most of this project: the kernels existed but nothing called them. Forward,
-        // compressed cache, projections, decode block and per-layer routing are now all in place.
-        assert!(Feature::Mla.implemented());
+    fn mla_is_not_the_blocker_but_the_tensor_LAYOUT_is() {
+        // This test has now said three things across the project, and the progression is the point:
+        // first "MLA blocks GLM" (true — the kernels existed but nothing called them), then "MLA no
+        // longer blocks it" (true — _211 wired it), and now the accurate version. GLM-4.7-Flash still
+        // fails to load, but NOT because of MLA maths.
+        assert!(Feature::Mla.implemented(), "the forward is wired and validated");
+        assert!(!gaps("deepseek2", 0).contains(&Feature::Mla), "MLA is not what blocks it");
+
+        // FOURTH thing this test has said, and the reason the running commentary is kept: the layout gap
+        // is now CLOSED too (_289 reads attn_k_b + attn_v_b and concatenates). The flag stayed false for
+        // four commits after the code landed, so a fixed gap kept reporting itself as a gap in the
+        // loader's own warning — the fifth instance of a registry disagreeing with what the code does.
+        assert!(Feature::MlaSplit3dProjections.implemented(), "_289 reads the split form");
+        assert!(!gaps("deepseek2", 0).contains(&Feature::MlaSplit3dProjections));
+        assert!(!gaps("glm-dsa", 0).contains(&Feature::MlaSplit3dProjections));
+
+        // glm4moe uses the fused form and is genuinely clear.
         assert!(gaps("glm4moe", 0).is_empty(), "{:?}", gaps("glm4moe", 0));
-        assert!(gaps("deepseek3", 0).is_empty());
-        // but the note must still say it has never run on a real checkpoint — validated against a CPU
-        // reference is not the same as having loaded a 200 GB model, and pretending otherwise is how a
-        // "supported" architecture surprises someone
-        assert!(Feature::Mla.note().unwrap().contains("never yet run on a real"));
     }
 
     #[test]
@@ -331,8 +405,8 @@ mod tests {
     fn the_three_moe_gating_shapes_stay_distinct() {
         // Graph-level reads confirmed two DIFFERENT MoE conventions, and a third architecture family
         // uses a third. Collapsing them is the same class of mistake as the two Q/K norms.
-        let l4 = crate::archcfg::moe_config(&crate::archcfg::for_arch("llama4"), 16, 1, 1, crate::archcfg::MoeMeta::default());
-        let q3 = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0, crate::archcfg::MoeMeta::default());
+        let l4 = crate::archcfg::moe_config(&crate::archcfg::for_arch("llama4"), 16, 1, 1);
+        let q3 = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
         // llama4: sigmoid, weight on the expert INPUT, no normalization
         assert_eq!(l4.norm, crate::moe::RouteNorm::Sigmoid);
         assert!(l4.weight_before && !l4.normalize);
@@ -351,14 +425,35 @@ mod tests {
         // Getting that wrong would degrade output without any error, so it is worth a standing assertion
         // rather than a note in a commit.
         let c = crate::archcfg::for_arch("llama4");
-        let mc = crate::archcfg::moe_config(&c, 16, 1, 1, crate::archcfg::MoeMeta::default());
+        let mc = crate::archcfg::moe_config(&c, 16, 1, 1);
         assert_eq!(mc.norm, crate::moe::RouteNorm::Sigmoid, "llama.cpp: EXPERT_GATING_FUNC_TYPE_SIGMOID");
         assert!(mc.weight_before, "the gate multiplies the expert INPUT");
         assert!(!mc.normalize, "llama.cpp passes norm_w = false");
         // and the contrast: qwen3moe is the ordinary softmax-over-normalized-weights case
-        let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0, crate::archcfg::MoeMeta::default());
+        let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
         assert_eq!(q.norm, crate::moe::RouteNorm::Softmax);
         assert!(!q.weight_before && q.normalize);
+    }
+
+    #[test]
+    fn glm52_requirements_come_from_its_shipped_metadata() {
+        // Transcribed from GLM-5_2-UD-IQ1_S-00001-of-00006.gguf, not inferred from the family name.
+        // glm-dsa is NOT glm4moe: it adds a sparse-attention indexer and two expert-weighting knobs that
+        // the GLM-4 line does not have, and treating them as one architecture would silently apply the
+        // wrong forward pass.
+        let g = gaps("glm-dsa", 0);
+        for f in [Feature::SparseAttentionIndexer, Feature::ExpertWeightsScale, Feature::ExpertWeightsNorm] {
+            assert!(g.contains(&f), "glm-dsa needs {f:?}");
+            assert!(!required("glm4moe", 0).contains(&f), "glm4moe does NOT — they are different archs");
+        }
+        // MLA is shared and already implemented, so it must not appear as a gap for either
+        assert!(!g.contains(&Feature::Mla));
+
+        // The scale is the dangerous one: it fails QUIETLY. 2.5 ignored means every MoE layer contributes
+        // 40% of what it should, which reads as a mediocre model rather than a broken one.
+        assert!(Feature::ExpertWeightsScale.note().unwrap().contains("quietly worse"));
+        // The indexer is the blocking one, and the report must say why there is no degraded mode.
+        assert!(gap_report("glm-dsa", 0).iter().any(|s| s.contains("STRUCTURAL")));
     }
 
     #[test]

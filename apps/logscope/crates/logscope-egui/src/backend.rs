@@ -183,7 +183,17 @@ pub(crate) mod engine {
             // Retained for the process lifetime (Colibri's g_maps): weights that want to be VIEWS into
             // the file cannot borrow a mapping the loader drops on return. Reused by path, so reloading
             // the same model does not map it twice.
+            crate::diag::note(&format!("wgpu-engine: STAGE begin mmap+retain {path}"));
             let bytes: &'static [u8] = gpu_kernels::retain_map(path).map_err(|e| format!("open {path}: {e}"))?;
+            crate::diag::note("wgpu-engine: STAGE end mmap+retain");
+            // Hand back the page cache of any model we mapped earlier and are no longer using. The
+            // registry cannot unmap (weights hold 'static slices into it), but residency is reclaimable
+            // — and a session that switches models was otherwise holding every one of them resident.
+            let stale = gpu_kernels::release_stale_map_residency(path);
+            if stale > 0 {
+                eprintln!("wgpu-engine: released page cache from {stale} previously-loaded model file(s) \
+— only the active model stays resident");
+            }
             // Configure the engine from the tuning profile BEFORE the device is created — these values are
             // read during setup. Adapter-specific defaults need the adapter name, which we do not have
             // yet, so this applies the portable ones; the driver-detected fallbacks (Honeykrisp subgroup
@@ -333,6 +343,19 @@ pub(crate) mod engine {
                     // Write the central blob so the NEXT load (any project, incl. crash-recovery) skips
                     // this. Make room BEFORE writing (evict to cap − incoming) so the dir never briefly
                     // holds old+new; the post-write evict is then just an exact final guard.
+                    // Skip the cache entirely when the source is already a K-quant. int8 residency
+                    // from Q4_K has the SAME scale granularity (one per 32 weights), so it stores 4-bit
+                    // values in 8 bits and cannot add precision — it doubles memory and writes
+                    // gigabytes of cache that buy nothing. ~7.5 GiB per 8B model, on device, per model.
+                    let src_type = g.tensor("blk.0.attn_q.weight").map(|t| t.ggml_type).unwrap_or(0);
+                    let incoming_est = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
+                    if !gpu_kernels::memplan::int8_worth_it(src_type) {
+                        eprintln!("wgpu-engine: int8 cache SKIPPED — source is ggml type {src_type}, \
+which already carries per-32 scales. Converting to int8 would double the bytes without adding \
+precision, and cost {:.1} GiB of disk for nothing",
+                            gpu_kernels::memplan::int8_cache_waste(src_type, incoming_est) as f64
+                                / (1u64 << 30) as f64);
+                    } else {
                     let cap = gpu_kernels::store::cache_cap_bytes();
                     let incoming = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
                     gpu_kernels::store::make_room_for(cap, incoming);
@@ -344,6 +367,7 @@ pub(crate) mod engine {
                         }
                         Ok(false) => eprintln!("wgpu-engine: int8 cache skipped (bias/QK-Norm/MoE/q4 layouts aren't cacheable yet — reloads from the GGUF)"),
                         Err(e) => eprintln!("wgpu-engine: int8 cache write skipped: {e}"),
+                    }
                     }
                     m
                 }
@@ -357,6 +381,25 @@ pub(crate) mod engine {
             eprintln!("wgpu-engine: loaded in {:.1}s — d={} layers={} heads={}/{} head_dim={} rope_base={} kv ff={} vocab={} | output int8={} | eos={:?} stop={:?} template={:?} | tokenizer byte_level={} vocab={}",
                 t0.elapsed().as_secs_f32(), model.d, model.n_layers, model.n_heads, model.n_kv_heads, model.head_dim, model.base, model.h, model.vocab,
                 model.output_is_quantized(), eos, stop_ids, template, tok.is_byte_level(), tok.vocab_size());
+            // LOAD ADVICE. Runs the planners against this model and says only what they DISAGREE with —
+            // an unprobed budget, a split that would beat streaming, a GPU the planner would skip. Every
+            // planner is otherwise tested logic with no caller, and a hypothesis that has never seen a
+            // real model is exactly what produced the 24 GiB constant and the thread-spawn figure.
+            {
+                // Bytes touched per layer per token: the dense weights, approximated from the model's
+                // own dimensions rather than a residency figure that may not be in scope here.
+                let per_layer = (4 * model.d * model.d + 3 * model.d * model.h) as u64 / 2;  // ~q4
+                let facts = logscope::loadadvice::LoadFacts {
+                    n_layers: model.n_layers, bytes_per_layer: per_layer,
+                    gpu_budget_bytes: gpu_kernels::memplan::gpu_buffer_budget_uma(
+                        gpu_kernels::memplan::system_ram_bytes(), gpu.conservative_vma, true),
+                    measured_vram_gib: 0.0,
+                    gpu_gib_s: 258.1, cpu_gib_s: 113.2, d: model.d,
+                };
+                for line in logscope::loadadvice::advise(&facts) {
+                    eprintln!("wgpu-engine: advice — {line}");
+                }
+            }
             if std::env::var("LOGSCOPE_DISPATCH_BENCH").is_ok() { gpu.dispatch_bench(); }
             if std::env::var("LOGSCOPE_WEIGHT_CHECK").is_ok() { eprintln!("wgpu-engine: {}", model.weight_probe(&gpu)); }
             // Prewarm: compile the prefill + decode pipelines now (in the load window) so the
@@ -942,8 +985,15 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                         self.name, d[0], pc(d[0]), d[1], pc(d[1]), d[2], pc(d[2]), d[3], pc(d[3]), d[4], pc(d[4]), d[5], pc(d[5]));
                 }
             }
+            eprint!("[{}] ", gpu_kernels::stamp());
             eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
                 self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
+            // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
+            // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
+            // said which mechanism was responsible.
+            let attr = format!("wgpu-engine: [{}] {}", self.name, gpu_kernels::submit_attribution());
+            eprintln!("[{}] {attr}", gpu_kernels::stamp());
+            crate::diag::note(&attr);
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
             if bgh + bgm > 0 {
                 eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} lookups ({:.0}% reused, {:.0}/tok saved) [LOGSCOPE_BG_CACHE]",
