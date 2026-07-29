@@ -27,7 +27,6 @@ const MSG_PEERS: u8 = 4;
 const MSG_BALL: u8 = 5;
 const MSG_BYE: u8 = 6;
 const SEND_DT: f32 = 1.0 / 30.0;
-// const SEND_DT: f32 = 1.0 / 30.0;
 const PEER_TIMEOUT: f32 = 5.0;
 pub const MAX_PLAYERS: usize = 8;
 

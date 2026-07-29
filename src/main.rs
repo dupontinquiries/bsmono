@@ -111,14 +111,13 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
     let pct = |get: fn(&Config) -> f32, set: fn(&mut Config, f32), min: f32, max: f32| Slider {
         get, set, min, max, step: 0.05, def: 1.0, fmt: 0,
     };
-    // KESS menu here
     match menu {
         1 => vec![
-            ("FIELD OF VIEW", Slider { get: |c| c.cam.fov_deg, set: |c, v| c.cam.fov_deg = v, min: 50.0, max: 200.0, step: 1.0, def: 76.0, fmt: 2 }),
+            ("FIELD OF VIEW", Slider { get: |c| c.cam.fov_deg, set: |c, v| c.cam.fov_deg = v, min: 50.0, max: 115.0, step: 1.0, def: 76.0, fmt: 2 }),
             ("DISTANCE", Slider { get: |c| c.cam.dist, set: |c, v| c.cam.dist = v, min: 2.5, max: 9.0, step: 0.1, def: 4.9, fmt: 1 }),
-            ("HEIGHT", Slider { get: |c| c.cam.height, set: |c, v| c.cam.height = v, min: 0.4, max: 24.0, step: 0.05, def: 1.35, fmt: 1 }),
-            ("ANGLE", Slider { get: |c| c.cam.angle_deg, set: |c, v| c.cam.angle_deg = v, min: -25.0, max: 25.0, step: 1.0, def: -3.0, fmt: 2 }),
-            ("STIFFNESS", pct(|c| c.cam.stiffness, |c, v| c.cam.stiffness = v, 0.25, 3.2)),
+            ("HEIGHT", Slider { get: |c| c.cam.height, set: |c, v| c.cam.height = v, min: 0.4, max: 3.2, step: 0.05, def: 1.35, fmt: 1 }),
+            ("ANGLE", Slider { get: |c| c.cam.angle_deg, set: |c, v| c.cam.angle_deg = v, min: -15.0, max: 15.0, step: 1.0, def: -3.0, fmt: 2 }),
+            ("STIFFNESS", pct(|c| c.cam.stiffness, |c, v| c.cam.stiffness = v, 0.25, 2.2)),
             ("SHAKE", pct(|c| c.cam.shake, |c, v| c.cam.shake = v, 0.0, 1.5)),
             ("GRAVITY CAMERA (TUBES)", pct(|c| c.cam.grav_follow, |c, v| c.cam.grav_follow = v, 0.0, 1.0)),
             ("BACK", Back),
@@ -130,12 +129,12 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("GRAVITY", pct(|c| c.arena.gravity, |c, v| c.arena.gravity = v, 0.0, 2.6)),
             ("ARENA BOUNCINESS", pct(|c| c.arena.bounce, |c, v| c.arena.bounce = v, 0.2, 2.0)),
             ("ARENA FRICTION", pct(|c| c.arena.friction, |c, v| c.arena.friction = v, 0.1, 2.5)),
-            ("WORLD SIZE (REBUILDS)", pct(|c| c.arena.scale, |c, v| c.arena.scale = v, 0.55, 10.6)),
+            ("WORLD SIZE (REBUILDS)", pct(|c| c.arena.scale, |c, v| c.arena.scale = v, 0.55, 1.6)),
             ("BALL", Header),
-            ("BALL SIZE", pct(|c| c.ball.size, |c, v| c.ball.size = v, 0.35, 30.0)),
-            ("BALL BOUNCINESS", pct(|c| c.ball.bounce, |c, v| c.ball.bounce = v, 0.2, 3.0)),
+            ("BALL SIZE", pct(|c| c.ball.size, |c, v| c.ball.size = v, 0.35, 3.0)),
+            ("BALL BOUNCINESS", pct(|c| c.ball.bounce, |c, v| c.ball.bounce = v, 0.2, 2.0)),
             ("BALL FRICTION", pct(|c| c.ball.friction, |c, v| c.ball.friction = v, 0.0, 2.5)),
-            ("BALL WEIGHT", pct(|c| c.ball.weight, |c, v| c.ball.weight = v, 0.25, 6.0)),
+            ("BALL WEIGHT", pct(|c| c.ball.weight, |c, v| c.ball.weight = v, 0.25, 3.0)),
             ("BACK", Back),
         ],
         3 => vec![
@@ -144,11 +143,11 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("CAR SIZE", pct(|c| c.car.size, |c, v| c.car.size = v, 0.55, 2.0)),
             ("TIRE GRIP", pct(|c| c.car.grip, |c, v| c.car.grip = v, 0.3, 2.5)),
             ("POWER", Header),
-            ("TOP SPEED", pct(|c| c.car.top_speed, |c, v| c.car.top_speed = v, 0.5, 10.0)),
-            ("ACCELERATION", pct(|c| c.car.accel, |c, v| c.car.accel = v, 0.4, 3.6)),
+            ("TOP SPEED", pct(|c| c.car.top_speed, |c, v| c.car.top_speed = v, 0.5, 1.9)),
+            ("ACCELERATION", pct(|c| c.car.accel, |c, v| c.car.accel = v, 0.4, 2.6)),
             ("JUMP STRENGTH", pct(|c| c.car.jump, |c, v| c.car.jump = v, 0.5, 2.2)),
             ("BOOST", Header),
-            ("BOOST POWER", pct(|c| c.car.boost, |c, v| c.car.boost = v, 0.4, 3.6)),
+            ("BOOST POWER", pct(|c| c.car.boost, |c, v| c.car.boost = v, 0.4, 2.6)),
             ("BOOST REGEN /S", Slider { get: |c| c.car.boost_regen, set: |c, v| c.car.boost_regen = v, min: 0.0, max: 35.0, step: 1.0, def: 0.0, fmt: 1 }),
             ("BOOST TANK", pct(|c| c.car.boost_max, |c, v| c.car.boost_max = v, 0.3, 2.5)),
             ("UNLIMITED BOOST", Toggle { get: |c| c.car.unlimited_boost, set: |c, v| c.car.unlimited_boost = v }),
@@ -2364,17 +2363,6 @@ impl Game {
             }
         }
 
-        // KESS TODO fix the vibrating car effect by using better predictive lerping
-        /*
-        struct PlayStyle
-
-        fn predict_next_move
-
-        fn lerp_next_move
-
-        build a state probability FSM based on the last physics frames
-        blend the state probability for top four states weighted by confidence
-        */
         // ---- draw (interpolated between fixed physics steps: no stutter) ----
         let (rc, rb) = if self.mode == Mode::Play {
             let al = (self.acc / FIXED_DT).clamp(0.0, 1.0);
