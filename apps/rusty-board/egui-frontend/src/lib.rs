@@ -11,7 +11,9 @@ use egui::{Align2, FontId, Rect, CornerRadius, Sense, Stroke, Ui, Vec2};
 use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 
 pub mod real_layout;
+pub mod dictation;
 pub mod settings;
+pub mod voice;
 // config/mod.rs refers to `crate::util`, so the port re-exports it at the root.
 pub use settings::util;
 pub mod swipe;
