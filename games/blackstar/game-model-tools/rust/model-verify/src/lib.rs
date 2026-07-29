@@ -306,3 +306,252 @@ mod tests {
         assert!(v.max_error * 1000.0 < EPSILON, "a correct transform is far inside it");
     }
 }
+
+// ── instancing: finding the repeats in the first place ──────────────────────
+
+/// Weld vertices that occupy the same position, returning a remap from each
+/// input index to a canonical one.
+///
+/// This is the step that makes instancing work on this corpus at all. Half of
+/// it is **unwelded** — `scorponoktrnasfolmb_part2` is 15,336 verts across
+/// 5,112 triangles, i.e. every triangle its own island with three private
+/// vertices — so walking shared indices finds *no* connected components and
+/// reports, misleadingly, that there is nothing to instance. Welding by
+/// POSITION first turns that mesh into the one the artist actually made, after
+/// which ordinary connectivity works on both kinds.
+///
+/// A grid hash rather than an O(n²) scan: at 250k vertices the quadratic
+/// version is minutes per mesh, and there are 2,133 meshes.
+pub fn weld(verts: &[[f64; 3]], epsilon: f64) -> Vec<usize> {
+    use std::collections::HashMap;
+    let cell = epsilon.max(1e-9) * 2.0;
+    let key = |p: &[f64; 3]| -> (i64, i64, i64) {
+        ((p[0] / cell).floor() as i64, (p[1] / cell).floor() as i64, (p[2] / cell).floor() as i64)
+    };
+    let mut buckets: HashMap<(i64, i64, i64), Vec<usize>> = HashMap::new();
+    let mut remap = vec![0usize; verts.len()];
+    for (i, p) in verts.iter().enumerate() {
+        let k = key(p);
+        let mut found = None;
+        // the point may sit near a cell boundary, so the 27 neighbours are
+        // checked — skipping them welds inconsistently depending on where the
+        // model happens to sit in space, which is a maddening bug to chase
+        'outer: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(b) = buckets.get(&(k.0 + dx, k.1 + dy, k.2 + dz)) {
+                        for &j in b {
+                            let q = &verts[j];
+                            let d2 = (p[0]-q[0]).powi(2) + (p[1]-q[1]).powi(2) + (p[2]-q[2]).powi(2);
+                            if d2 <= epsilon * epsilon { found = Some(remap[j]); break 'outer; }
+                        }
+                    }
+                }
+            }
+        }
+        remap[i] = found.unwrap_or(i);
+        buckets.entry(k).or_default().push(i);
+    }
+    remap
+}
+
+/// Connected components over welded indices. Returns the ORIGINAL vertex
+/// indices per component, so callers keep their own vertex data.
+pub fn components(vert_count: usize, tris: &[u32], remap: &[usize]) -> Vec<Vec<usize>> {
+    use std::collections::BTreeMap;
+    let canon = |i: usize| if i < remap.len() { remap[i] } else { i };
+    let mut par: Vec<usize> = (0..vert_count).collect();
+    fn find(par: &mut Vec<usize>, mut x: usize) -> usize {
+        while par[x] != x { par[x] = par[par[x]]; x = par[x]; }
+        x
+    }
+    for t in tris.chunks_exact(3) {
+        let (a, b, c) = (canon(t[0] as usize), canon(t[1] as usize), canon(t[2] as usize));
+        for (u, v) in [(a, b), (b, c)] {
+            if u >= vert_count || v >= vert_count { continue; }
+            let (ru, rv) = (find(&mut par, u), find(&mut par, v));
+            if ru != rv { par[ru] = rv; }
+        }
+    }
+    let mut groups: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for i in 0..vert_count {
+        let r = find(&mut par, canon(i).min(vert_count - 1));
+        groups.entry(r).or_default().push(i);
+    }
+    groups.into_values().filter(|g| !g.is_empty()).collect()
+}
+
+/// A rotation- and translation-invariant fingerprint: vertex count plus the
+/// sorted distances from the centroid, quantised.
+///
+/// Invariant because a rigid transform preserves distance, which is the same
+/// property that makes the reconstruction exact. Quantised so float noise in
+/// two copies of one part does not produce two different fingerprints.
+pub fn shape_key(verts: &[[f64; 3]], quantum: f64) -> (usize, Vec<i64>) {
+    let c = centroid(verts);
+    let mut d: Vec<f64> = verts.iter()
+        .map(|p| ((p[0]-c[0]).powi(2) + (p[1]-c[1]).powi(2) + (p[2]-c[2]).powi(2)).sqrt())
+        .collect();
+    d.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let n = d.len();
+    // a fixed-size profile, so the key stays small on a 250k-vertex component
+    let take = 32.min(n);
+    let prof = (0..take)
+        .map(|i| (d[i * (n - 1) / take.max(1).min(n - 1).max(1)] / quantum.max(1e-12)).round() as i64)
+        .collect();
+    (n, prof)
+}
+
+/// What an instancing pass found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceReport {
+    pub components: usize,
+    pub unique_shapes: usize,
+    /// Vertices that would not need storing.
+    pub redundant_verts: usize,
+    pub total_verts: usize,
+}
+
+impl InstanceReport {
+    pub fn saving(&self) -> f64 {
+        if self.total_verts == 0 { 0.0 } else { self.redundant_verts as f64 / self.total_verts as f64 }
+    }
+}
+
+/// Group components by shape and report what could be deduplicated.
+///
+/// Reports rather than rewrites: the decision to re-author a mesh belongs to
+/// whoever owns the model, and a number they can check beats a conversion they
+/// have to trust.
+pub fn analyse(verts: &[[f64; 3]], tris: &[u32], weld_eps: f64, quantum: f64) -> InstanceReport {
+    use std::collections::HashMap;
+    let remap = weld(verts, weld_eps);
+    let comps: Vec<Vec<usize>> = components(verts.len(), tris, &remap)
+        .into_iter().filter(|c| c.len() >= 3).collect();
+    let mut by_shape: HashMap<(usize, Vec<i64>), usize> = HashMap::new();
+    let mut total = 0usize;
+    for c in &comps {
+        let pts: Vec<[f64; 3]> = c.iter().map(|&i| verts[i]).collect();
+        total += pts.len();
+        *by_shape.entry(shape_key(&pts, quantum)).or_insert(0) += 1;
+    }
+    let redundant = by_shape.iter().map(|(k, n)| k.0 * (n - 1)).sum();
+    InstanceReport {
+        components: comps.len(),
+        unique_shapes: by_shape.len(),
+        redundant_verts: redundant,
+        total_verts: total,
+    }
+}
+
+#[cfg(test)]
+mod instancing_tests {
+    use super::*;
+
+    fn cube(o: [f64; 3]) -> Vec<[f64; 3]> {
+        let mut v = Vec::new();
+        for x in [0.0, 1.0] { for y in [0.0, 1.0] { for z in [0.0, 1.0] {
+            v.push([o[0] + x, o[1] + y, o[2] + z]);
+        }}}
+        v
+    }
+
+    /// An UNWELDED mesh: every triangle carries its own three vertices, which is
+    /// what half this corpus looks like.
+    fn unwelded_quad(o: [f64; 3]) -> (Vec<[f64; 3]>, Vec<u32>) {
+        let p = [[0.0,0.0,0.0],[1.0,0.0,0.0],[1.0,1.0,0.0],[0.0,1.0,0.0]];
+        let mut v = Vec::new();
+        for idx in [[0,1,2],[0,2,3]] {
+            for i in idx { v.push([o[0]+p[i][0], o[1]+p[i][1], o[2]+p[i][2]]); }
+        }
+        let t: Vec<u32> = (0..6).collect();
+        (v, t)
+    }
+
+    #[test]
+    fn welding_finds_the_components_connectivity_alone_cannot() {
+        // THE reason this exists: an unwelded quad is two triangles sharing an
+        // edge by POSITION but no index, so index-walking reports two islands
+        // and the mesh looks un-instanceable. It is one component.
+        let (v, t) = unwelded_quad([0.0; 3]);
+        let none: Vec<usize> = (0..v.len()).collect();
+        let raw = components(v.len(), &t, &none);
+        assert_eq!(raw.len(), 2, "unwelded: index-walking sees two islands");
+
+        let remap = weld(&v, 1e-6);
+        let welded = components(v.len(), &t, &remap);
+        assert_eq!(welded.len(), 1, "welded by position: one component, as authored");
+    }
+
+    #[test]
+    fn welding_is_position_based_not_order_based() {
+        let v = vec![[0.0,0.0,0.0],[1.0,0.0,0.0],[0.0,0.0,0.0],[1.0,0.0,0.0]];
+        let r = weld(&v, 1e-9);
+        assert_eq!(r[0], r[2], "duplicate positions collapse");
+        assert_eq!(r[1], r[3]);
+        assert_ne!(r[0], r[1], "distinct positions do not");
+    }
+
+    #[test]
+    fn points_either_side_of_a_grid_boundary_still_weld() {
+        // Skipping the 27 neighbours welds inconsistently depending on where the
+        // model sits in space — a maddening bug to chase later.
+        let eps = 1e-4;
+        let v = vec![[0.0, 0.0, 0.0], [eps * 0.5, 0.0, 0.0]];
+        assert_eq!(weld(&v, eps)[0], weld(&v, eps)[1], "within epsilon must weld regardless of cell");
+        let far = vec![[0.0, 0.0, 0.0], [eps * 4.0, 0.0, 0.0]];
+        let r = weld(&far, eps);
+        assert_ne!(r[0], r[1], "beyond epsilon must not");
+    }
+
+    #[test]
+    fn identical_shapes_at_different_places_and_angles_share_a_key() {
+        // The fingerprint has to survive the transform, or nothing dedupes.
+        let a = cube([0.0; 3]);
+        let moved: Vec<[f64;3]> = a.iter().map(|p| [p[0]+31.0, p[1]-7.5, p[2]+0.25]).collect();
+        let rot = Rigid { r: [[0.0,-1.0,0.0],[1.0,0.0,0.0],[0.0,0.0,1.0]], t: [4.0, 4.0, 4.0] };
+        let turned: Vec<[f64;3]> = a.iter().map(|p| rot.apply(*p)).collect();
+        let k = shape_key(&a, 1e-4);
+        assert_eq!(k, shape_key(&moved, 1e-4), "translation must not change the key");
+        assert_eq!(k, shape_key(&turned, 1e-4), "nor rotation");
+        // a genuinely different shape does not collide
+        let stretched: Vec<[f64;3]> = a.iter().map(|p| [p[0]*2.0, p[1], p[2]]).collect();
+        assert_ne!(k, shape_key(&stretched, 1e-4));
+    }
+
+    #[test]
+    fn the_report_counts_what_could_be_saved() {
+        // Three copies of one quad: one unique shape, two thirds redundant.
+        let mut verts = Vec::new();
+        let mut tris: Vec<u32> = Vec::new();
+        for i in 0..3 {
+            let (v, t) = unwelded_quad([i as f64 * 10.0, 0.0, 0.0]);
+            let base = verts.len() as u32;
+            verts.extend(v);
+            tris.extend(t.iter().map(|x| x + base));
+        }
+        let r = analyse(&verts, &tris, 1e-6, 1e-4);
+        assert_eq!(r.components, 3, "three separate quads");
+        assert_eq!(r.unique_shapes, 1, "all the same shape");
+        assert!((r.saving() - 2.0/3.0).abs() < 0.01, "two of three are redundant: {}", r.saving());
+    }
+
+    #[test]
+    fn distinct_shapes_are_not_collapsed() {
+        // A dedupe that over-matches destroys geometry, which is worse than one
+        // that under-matches and merely saves less.
+        let mut verts = Vec::new();
+        let mut tris: Vec<u32> = Vec::new();
+        for (i, scale) in [1.0f64, 2.5, 7.0].iter().enumerate() {
+            let p = [[0.0,0.0,0.0],[*scale,0.0,0.0],[*scale,*scale,0.0],[0.0,*scale,0.0]];
+            let base = verts.len() as u32;
+            for idx in [[0,1,2],[0,2,3]] {
+                for k in idx { verts.push([p[k][0] + i as f64 * 50.0, p[k][1], p[k][2]]); }
+            }
+            tris.extend((0..6).map(|x| x + base));
+        }
+        let r = analyse(&verts, &tris, 1e-6, 1e-4);
+        assert_eq!(r.unique_shapes, 3, "three different sizes are three shapes");
+        assert_eq!(r.redundant_verts, 0);
+    }
+}
