@@ -34,18 +34,22 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 
 ## The reference corpus (§17, v0)
 
-- **Indexed, but nothing is cached.** A scan of the monorepo takes ~33 s for 4,894 entries and is
-  redone from scratch every time. §17.4 calls for a content-hashed derived cache; until it exists,
-  `--ref-index` is a diagnostic rather than something the app can afford at startup.
+- **Indexed, but nothing is cached.** A scan of 4,894 entries takes ~50 s cold and ~0.7 s with the
+  files in the page cache, which locates the cost precisely: this is I/O bound, not parser bound.
+  A content-hashed derived cache (§17.4) therefore buys the cold-start case and nothing else — but
+  the cold-start case is the one a user actually experiences. Until it exists, `--ref-index` is a
+  diagnostic rather than something app startup can afford.
 - **glTF/GLB models index by name only.** IQM gives headers and OBJ gives measured geometry;
   3,150 of 3,155 model entries now carry real facts, and the remainder are glTF. A reader for it is
   the obvious next parser.
-- **Units are unknown, and that limits what `volume of` means.** Nothing in the corpus records
-  whether a file is in millimetres, metres or engine units — the measured volumes span twelve
-  orders of magnitude, and some of the largest are almost certainly a unit convention rather than a
-  large object. §17.1 lists unit scale and up-axis as derived facts; they are not implemented.
-  Until they are, "same volume as X" is only meaningful between files that share a convention, and
-  `ref.toml`'s per-root unit hint is the intended fix.
+- **Units are declared, never inferred — and nothing is declared yet.** `ref.toml` exists and is
+  parsed (longest path prefix wins, so a subtree overrides the root it sits in), but this
+  repository's file ships with every declaration commented out, deliberately: nobody has
+  established what unit these game assets were exported in, and guessing wrong is a factor of a
+  thousand in length and a billion in volume. The consequence is that `Index::volume_mm3` currently
+  refuses for **every** model in the tree with `UnknownUnits`. That is the system working, not
+  failing — but it does mean the verb is unusable here until someone fills the file in.
+- **`up_axis` is still not derived.** §17.1 lists it beside unit scale; only units landed.
 - **Most of the corpus cannot be measured, and now says so.** The closed-manifold gate is
   implemented: vertices are welded by quantized position (exporters duplicate coincident vertices
   constantly), edges are censused, and `volume` is withheld unless every edge is shared by exactly
@@ -60,6 +64,10 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   has none: exactly 1 IQM in the tree reports bounds, against 1,000 OBJ files that now compute
   theirs from vertices. This is what settled the design — reference volume comes from vertex data,
   measured with the mesher's own sum.
+- **Ambiguity is refused only when it matters.** The greeble catalogue ships an `.iqm` and an
+  `.obj` for the same part, and only the OBJ carries vertices — that is one model described twice,
+  not two models in conflict, so the measurable candidate answers. Two candidates with genuinely
+  *different* volumes still refuse and list their paths.
 - **Names are ambiguous and that is deliberate.** `obsidian` resolves to three entries (its base,
   normal and specular maps, correctly grouped under one name); `puma` resolves to a top hit plus
   two weaker ones. `resolve` returns a ranked list and never collapses to one answer — a silent

@@ -1,0 +1,21 @@
+# ref.toml — declarations for the reference corpus (plan §17).
+#
+# Units are DECLARED here, never inferred. Nothing inside an OBJ or an IQM says whether a
+# coordinate is a millimetre or a metre, and a wrong guess is not a small error: it is a factor of
+# a thousand in length and a billion in volume. So the index leaves every subtree `unknown` until
+# somebody who actually knows writes it down, and `volume of <model>` refuses — by name, with the
+# reason — rather than comparing a number in unknown units against a document in millimetres.
+#
+# Longest matching path prefix wins, so a subtree can override the root it sits in.
+#
+# Nothing is declared yet for this repository, deliberately: the author of this file does not know
+# what unit the game assets were exported in, and inventing an answer here would poison every
+# measurement downstream. Fill these in as each subtree's convention is established.
+
+# [[root]]
+# path = "games/clawbound/assets"
+# units = "m"          # mm | cm | m | in
+#
+# [[root]]
+# path = "games/blackstar/parts"
+# units = "mm"

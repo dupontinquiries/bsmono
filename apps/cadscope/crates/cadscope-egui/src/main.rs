@@ -83,10 +83,22 @@ fn demo_doc() -> Doc {
 /// behind "same volume as `puma`" — before any of that can be trusted, the index has to be able to
 /// walk a real, messy asset tree and come back with facts rather than guesses.
 fn ref_index(root: &str) -> ! {
-    use cad_ref::{Facts, Index, Kind, ScanOpts};
+    use cad_ref::{Facts, Index, Kind, RefError, ScanOpts, Units};
     let t0 = std::time::Instant::now();
     let mut fail_ref = 0usize;
-    let idx = Index::scan(std::path::Path::new(root), &ScanOpts::default());
+    let root_path = std::path::Path::new(root);
+    // Unit declarations, if anyone has written any. Their absence is not an error; it is the
+    // reason `volume of` will refuse, and refusing is the correct behaviour.
+    let mut opts = ScanOpts::default();
+    let toml_path = root_path.join("apps/cadscope/ref.toml");
+    match std::fs::read_to_string(&toml_path) {
+        Ok(text) => {
+            opts = opts.with_ref_toml(&text);
+            println!("ref.toml: {} unit declaration(s)", opts.unit_hints.len());
+        }
+        Err(_) => println!("ref.toml: none found at {}", toml_path.display()),
+    }
+    let idx = Index::scan(root_path, &opts);
     println!(
         "indexed {} entries from {root} in {:.2}s",
         idx.len(),
@@ -252,6 +264,40 @@ fn ref_index(root: &str) -> ! {
         }
         None => println!("  texture-from: no model resolved any material"),
     }
+
+    // `volume of` in CADscope's own unit, over real names — including the ways it declines.
+    // Every refusal has to name its reason; a plausible number would be worse than no number.
+    let first_closed = idx.entries.iter().find_map(|e| match &e.facts {
+        Facts::Model(m) if m.closed => Some(e.name.clone()),
+        _ => None,
+    });
+    let first_open = idx.entries.iter().find_map(|e| match &e.facts {
+        Facts::Model(m) if m.area.is_some() && !m.closed => Some(e.name.clone()),
+        _ => None,
+    });
+    let declared = idx
+        .entries
+        .iter()
+        .filter(|e| matches!(&e.facts, Facts::Model(m) if m.units != Units::Unknown))
+        .count();
+    println!("  {declared} models have declared units");
+    for name in [first_closed, first_open, Some("velgorn".to_string()), Some("no_such_thing".to_string())]
+        .into_iter()
+        .flatten()
+    {
+        match idx.volume_mm3(&name) {
+            Ok(v) => println!("  volume-of {:24} {:.1} mm^3", name, v),
+            Err(e) => {
+                // A miss must still be a *useful* answer, so check the message earns its place.
+                let msg = e.to_string();
+                if msg.len() < 20 || !msg.contains(&name) {
+                    fail_ref += 1;
+                }
+                println!("  volume-of {:24} declined: {}", name, msg);
+            }
+        }
+    }
+    let _ = RefError::NotAModel { name: String::new() }; // keep the import honest if unused above
 
     // Name resolution, which is what a person actually uses.
     for q in ["puma", "shark", "obsidian", "nosuchmodelanywhere"] {
