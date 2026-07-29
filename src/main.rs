@@ -2364,6 +2364,17 @@ impl Game {
             }
         }
 
+        // KESS TODO fix the vibrating car effect by using better predictive lerping
+        /*
+        struct PlayStyle
+
+        fn predict_next_move
+
+        fn lerp_next_move
+
+        build a state probability FSM based on the last physics frames
+        blend the state probability for top four states weighted by confidence
+        */
         // ---- draw (interpolated between fixed physics steps: no stutter) ----
         let (rc, rb) = if self.mode == Mode::Play {
             let al = (self.acc / FIXED_DT).clamp(0.0, 1.0);
