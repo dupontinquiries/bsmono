@@ -43,6 +43,7 @@ pub mod conversation_db;
 pub mod model_selector;
 pub mod modelroles;
 pub mod cpuplacement;
+pub mod coreclass;
 pub mod deliberate;
 pub mod activemodel;
 pub mod cratecheck;
