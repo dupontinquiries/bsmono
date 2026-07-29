@@ -183,7 +183,8 @@ directly comparable.";
 pub fn feedback(c: &Comparison) -> Option<String> {
     let q = c.review_queue();
     if q.is_empty() { return None; }
-    let mut s = String::from("Other models were asked for the same pieces. They diverged here:\n");
+    let mut s = String::from(crate::promptframe::Frame::ToolStatus.banner());
+    s.push_str("\nOther models were asked for the same pieces. They diverged here:\n");
     for p in q.iter().take(6) {
         s.push_str(&format!("- {} — {}", p.path, p.agreement.label()));
         if !p.missing.is_empty() { s.push_str(&format!("; not produced by {}", p.missing.join(", "))); }
@@ -209,6 +210,8 @@ pub struct Coordinator {
     pub policy: crate::buildpolicy::Policy,
     history: Vec<f32>,
     builds: crate::buildpolicy::RetryLedger,
+    /// The coordinator's own account of what it has done — the liaison's source material.
+    log: Vec<crate::liaison::Statement>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -258,7 +261,33 @@ impl Coordinator {
 
     pub fn for_mode(mode: crate::buildpolicy::Mode, max_rounds: usize) -> Self {
         Coordinator { max_rounds: max_rounds.max(1), policy: crate::buildpolicy::Policy::for_mode(mode),
-                      history: Vec::new(), builds: crate::buildpolicy::RetryLedger::new() }
+                      history: Vec::new(), builds: crate::buildpolicy::RetryLedger::new(), log: Vec::new() }
+    }
+
+    /// Everything the coordinator has observed, as grounded statements.
+    ///
+    /// The liaison is not a separate system reporting on this one — it IS this one's voice. A narrator
+    /// that has to reconstruct what happened from logs will occasionally reconstruct it wrong; a
+    /// coordinator that emits its own observations cannot, because the observation and the decision come
+    /// from the same place. So `Round` outcomes are recorded here as they are produced, with their
+    /// source, and the liaison prompt is built from them rather than from anything re-derived.
+    pub fn observations(&self) -> &[crate::liaison::Statement] { &self.log }
+
+    /// Record an observation with its source. Called by the coordinator itself, not by a watcher.
+    fn observe(&mut self, text: impl Into<String>, source: &str) {
+        self.log.push(crate::liaison::Statement::new(text.into(), vec![source.to_string()]));
+        // Bounded: a long autonomous run would otherwise grow this without limit, and the liaison only
+        // ever reads the recent tail.
+        if self.log.len() > 64 { self.log.remove(0); }
+    }
+
+    /// The prompt for a liaison model to narrate the current state, or None when nothing has happened.
+    ///
+    /// Returns None rather than an empty narration: with no observations there is nothing to say, and
+    /// asking a model to comment on an empty list is how "should be done soon" gets invented.
+    pub fn liaison_prompt(&self, ask: Option<&str>, audience: crate::exploration::Audience)
+        -> Option<crate::liaison_prompt::LiaisonPrompt> {
+        crate::liaison_prompt::build(&self.log, ask, audience)
     }
 
     /// Feed a build result in. A failing build outranks a comparison: there is no point scoring which
@@ -274,7 +303,10 @@ impl Coordinator {
                     "The build failed:\n{signature}\n\nFix only what this reports. Do not restructure \
 anything else — a second change in the same round makes the next failure impossible to attribute."))
             }
-            Retry::SameFailure(s) => Round::Stop(StopReason::BuildStuck(s)),
+            Retry::SameFailure(s) => {
+                self.observe(format!("build failed identically twice ({s}) — stopping"), "build");
+                Round::Stop(StopReason::BuildStuck(s))
+            }
             Retry::Exhausted(n) if matches!(a, Attempt::Failed { .. }) =>
                 Round::Stop(StopReason::BuildStuck(format!("{n} rebuild attempts used"))),
             _ => Round::Continue(String::new()),
@@ -288,6 +320,8 @@ anything else — a second change in the same round makes the next failure impos
         let Some(cons) = c.consensus() else { return Round::Stop(StopReason::NothingToCompare) };
         let prev = self.history.last().copied();
         self.history.push(cons);
+        self.observe(format!("round {}: {:.0}% of pieces agreed across models", self.history.len(),
+            cons * 100.0), "comparator");
         if c.review_queue().is_empty() { return Round::Stop(StopReason::Converged); }
         if self.history.len() >= self.max_rounds { return Round::Stop(StopReason::RoundLimit(self.max_rounds)); }
         // A round that did not raise consensus will probably not be improved by repeating it. Strict
@@ -448,6 +482,48 @@ mod tests {
         // second call hits the limit before the stall check, and says which
         assert_eq!(co.step(&split), Round::Stop(StopReason::RoundLimit(2)));
         assert_eq!(co.rounds_done(), 2);
+    }
+
+    #[test]
+    fn the_coordinator_is_its_own_narrator() {
+        // The liaison is not a watcher reconstructing events from logs — it reads the coordinator's OWN
+        // observations, emitted at the moment each decision is made. A reconstruction can be wrong;
+        // this cannot, because the observation and the decision come from the same place.
+        use crate::buildpolicy::{Attempt, Mode};
+        use crate::exploration::Audience;
+        let mut co = Coordinator::for_mode(Mode::Aggressive, 4);
+        assert!(co.observations().is_empty());
+        assert!(co.liaison_prompt(None, Audience::Operator).is_none(),
+            "nothing observed means nothing to narrate — asking a model to comment on an empty list is \
+how a fabricated status gets invented");
+
+        let split = compare(&[cand("m1", &[("x.rs", "a()")]), cand("m2", &[("x.rs", "b()")])]);
+        let _ = co.step(&split);
+        let f = Attempt::Failed { signature: "error[E0308]".into() };
+        let _ = co.build_result(&f);
+        let _ = co.build_result(&f);   // same failure -> stop, and say so
+
+        let obs = co.observations();
+        assert!(obs.iter().any(|s| s.text.contains("0% of pieces agreed")), "{obs:?}");
+        assert!(obs.iter().any(|s| s.text.contains("failed identically twice")), "{obs:?}");
+        assert!(obs.iter().all(|s| s.is_grounded()), "every observation carries its source");
+
+        // and the prompt is built from exactly those, not from anything re-derived
+        let p = co.liaison_prompt(Some("is it stuck?"), Audience::Operator).unwrap();
+        let user = &p.turns[1].1;
+        assert!(user.contains("failed identically twice"));
+        assert!(user.contains("[source: build]"));
+        assert!(user.contains("QUESTION: is it stuck?"));
+    }
+
+    #[test]
+    fn the_observation_log_is_bounded() {
+        // An autonomous run can go for hours; the liaison only reads the recent tail.
+        use crate::buildpolicy::Mode;
+        let mut co = Coordinator::for_mode(Mode::Aggressive, 10_000);
+        let split = compare(&[cand("m1", &[("x.rs", "a()")]), cand("m2", &[("x.rs", "b()")])]);
+        for _ in 0..200 { let _ = co.step(&split); }
+        assert!(co.observations().len() <= 64, "got {}", co.observations().len());
     }
 
     #[test]

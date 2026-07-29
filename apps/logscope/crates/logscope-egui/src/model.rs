@@ -16,6 +16,22 @@ impl PickerItem {
         match self { PickerItem::Ollama(e) => &e.model, PickerItem::Local(m) => &m.name }
     }
     pub fn is_local(&self) -> bool { matches!(self, PickerItem::Local(_)) }
+
+    /// A stable identity that survives a rescan.
+    ///
+    /// The picker's `selected` is an INDEX, and a rescan rebuilds the list — so adding one file to the
+    /// models folder shifts every index after it and the index now names a different model. A bounds
+    /// check does not help: the old index is still in range, just wrong. Selection has to be restored by
+    /// identity.
+    ///
+    /// Local models key on PATH rather than name, because two files can share a display name (the same
+    /// model at different quantizations) and the path is what actually loads.
+    pub fn key(&self) -> String {
+        match self {
+            PickerItem::Ollama(e) => format!("ollama:{}", e.model),
+            PickerItem::Local(m) => format!("file:{}", m.path.to_string_lossy()),
+        }
+    }
     /// (name, subtitle, kind-badge)
     fn row(&self) -> (String, String, String) {
         match self {
@@ -44,6 +60,24 @@ impl ModelState {
     pub fn selected_is_local(&self) -> bool {
         self.selected_item().map(|i| i.is_local()).unwrap_or(false)
     }
+    /// The selected model's stable key, for surviving a rescan.
+    pub fn selected_key(&self) -> Option<String> { self.selected_item().map(|i| i.key()) }
+
+    /// Replace the list, restoring the previous selection BY IDENTITY.
+    ///
+    /// Returns whether the previously-selected model is still present. A caller that ignores this gets
+    /// the safe behaviour (index 0); one that cares can tell the user their model disappeared instead of
+    /// silently loading a different one — which is the actual harm here, since the picker keeps showing
+    /// a name and the engine loads something else.
+    pub fn replace_items(&mut self, items: Vec<PickerItem>) -> bool {
+        let want = self.selected_key();
+        self.items = items;
+        match want.and_then(|k| self.items.iter().position(|i| i.key() == k)) {
+            Some(pos) => { self.selected = pos; true }
+            None => { self.selected = 0; false }
+        }
+    }
+
     pub fn selected_local_path(&self) -> Option<String> {
         match self.selected_item() {
             Some(PickerItem::Local(m)) => Some(m.path.to_string_lossy().into_owned()),
@@ -313,6 +347,65 @@ mod walk_tests {
         assert!(names.iter().any(|n| *n == "mistral-7b-instruct-q4"), "nested found: {names:?}");
         assert!(names.iter().any(|n| n.contains("meta-llama/Llama-3.2-3B")), "HF name unwrapped: {names:?}");
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+
+#[cfg(test)]
+mod reselect_tests {
+    use super::*;
+    use logscope::llm_backend::LocalModel;
+    use std::path::PathBuf;
+
+    fn local(name: &str, path: &str) -> PickerItem {
+        PickerItem::Local(LocalModel { name: name.into(), path: PathBuf::from(path),
+            size_bytes: 1, params_billions: 1.0 })
+    }
+
+    #[test]
+    fn adding_a_file_does_not_change_which_model_is_selected() {
+        // The reported bug. `selected` is an index; a rescan that inserts a file BEFORE the selected one
+        // shifts it, the old index is still in range, and the picker silently points at a neighbour.
+        let mut st = ModelState { items: vec![local("b", "/m/b.gguf"), local("c", "/m/c.gguf")], selected: 1 };
+        assert_eq!(st.current(), "c");
+        let still_there = st.replace_items(vec![
+            local("a", "/m/a.gguf"), local("b", "/m/b.gguf"), local("c", "/m/c.gguf")]);
+        assert!(still_there);
+        assert_eq!(st.current(), "c", "index moved 1 -> 2, selection did not move");
+        assert_eq!(st.selected, 2);
+    }
+
+    #[test]
+    fn removing_the_selected_model_reports_it_rather_than_silently_switching() {
+        // The harm is not the reset — it is a picker that keeps showing a name while the engine loads
+        // something else. The caller has to be able to say so.
+        let mut st = ModelState { items: vec![local("a", "/m/a.gguf"), local("b", "/m/b.gguf")], selected: 1 };
+        let still_there = st.replace_items(vec![local("a", "/m/a.gguf")]);
+        assert!(!still_there, "the caller is told the model disappeared");
+        assert_eq!(st.selected, 0, "and lands somewhere valid rather than out of bounds");
+    }
+
+    #[test]
+    fn two_files_with_the_same_display_name_are_distinguished_by_path() {
+        // The same model at two quantizations shares a name; the path is what actually loads, so keying
+        // on the name would make the selection ambiguous exactly where it matters.
+        assert_ne!(local("qwen3", "/m/qwen3-q4.gguf").key(), local("qwen3", "/m/qwen3-q8.gguf").key());
+        let mut st = ModelState {
+            items: vec![local("qwen3", "/m/qwen3-q4.gguf"), local("qwen3", "/m/qwen3-q8.gguf")],
+            selected: 1 };
+        // rescan returns them in the other order
+        st.replace_items(vec![local("qwen3", "/m/qwen3-q8.gguf"), local("qwen3", "/m/qwen3-q4.gguf")]);
+        assert_eq!(st.selected, 0, "followed the q8 file, not the position");
+        assert_eq!(st.selected_local_path().as_deref(), Some("/m/qwen3-q8.gguf"));
+    }
+
+    #[test]
+    fn an_empty_rescan_does_not_panic_or_point_at_nothing() {
+        let mut st = ModelState { items: vec![local("a", "/m/a.gguf")], selected: 0 };
+        assert!(!st.replace_items(Vec::new()));
+        assert_eq!(st.selected, 0);
+        assert_eq!(st.current(), "—", "reads as empty rather than indexing an absent item");
+        assert!(st.selected_item().is_none());
     }
 }
 

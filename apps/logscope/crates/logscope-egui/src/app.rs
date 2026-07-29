@@ -31,6 +31,13 @@ fn glass_chrome_frame() -> egui::Frame {
 
 type HostBatch = (String, Vec<ModelInfo>);
 
+/// How long the resolved target must hold still before a load is kicked.
+///
+/// Long enough to cover a startup where the scan, the deployment plan and the role plan each move it;
+/// short enough that a deliberate model change still feels immediate. A user picking from a dropdown
+/// will not notice 400 ms; three abandoned 30 GiB loads take 45 seconds.
+const AUTOLOAD_SETTLE_MS: u64 = 400;
+
 pub struct LogscopeApp {
     tab: Tab,
     last_tab: Tab,
@@ -55,6 +62,8 @@ pub struct LogscopeApp {
     show_pipeline: bool, // Active-pipeline window (Large/Small/Voice/Image selectors) toggled by the ⚙ button
     deployment: logscope::deploy::Deployment, // multi-model/multi-device plan behind the tile picker
     autoloaded: Option<String>,               // name of the model we last auto-kicked a load for (debounce)
+    /// Target that wants loading, and when it was first seen. Cleared once loaded or abandoned.
+    pending_target: Option<(String, std::time::Instant)>,
 }
 
 impl Default for LogscopeApp {
@@ -89,6 +98,7 @@ impl Default for LogscopeApp {
                 mem_bytes: logscope::model_selector::read_free_bytes().max(1),
             }]),
             autoloaded: None,
+            pending_target: None,
         };
         app.rescan();
         app.boot_env();
@@ -139,9 +149,19 @@ impl LogscopeApp {
         let mut items: Vec<PickerItem> =
             self.ollama_entries.iter().cloned().map(PickerItem::Ollama).collect();
         items.extend(self.local_models.iter().cloned().map(PickerItem::Local));
-        let n = items.len();
-        self.model.items = items;
-        if self.model.selected >= n { self.model.selected = 0; }
+        // Restore the selection BY IDENTITY, not by index. A rescan reorders the list — adding one file
+        // to the models folder shifts every index after it — and the old index is still in range, just
+        // pointing at a different model. The picker then shows one name while the engine loads another.
+        // Hide shards that are not the entry point. Listing every shard as its own model is how the
+        // wrong one gets selected, and selecting one is unrecoverable from the UI — the load simply
+        // fails with a message about the file rather than about the choice.
+        let items: Vec<_> = items.into_iter()
+            .filter(|it| !logscope::modelorg::is_secondary_shard(it.name()))
+            .collect();
+        if !self.model.replace_items(items) && !self.model.items.is_empty() {
+            self.local_status = format!("{} — previously selected model is gone; reset to {}",
+                self.local_status, self.model.current());
+        }
     }
     fn scan_local(&mut self) {
         let entered = Path::new(&self.models_dir).to_path_buf(); // owned: no borrow of self held
@@ -157,14 +177,21 @@ impl LogscopeApp {
             }
         }
     }
-    /// The model generation should run: the deployment's Target when the plan is valid, else the dropdown
-    /// pick. This is the routing switch — the tile deployment now drives which model loads.
-    fn active_target_name(&self) -> Option<String> {
-        if self.deployment.is_valid() {
-            if let Some(t) = self.deployment.target() { return Some(t.model.clone()); }
-        }
-        Some(self.model.current()).filter(|s| s != "—")
+    /// The ONE resolution of "what am I talking to", with its source.
+    ///
+    /// This used to be a silent precedence rule: the deployment won when its plan was valid, and nothing
+    /// said so. Changing the picker then did nothing at all, with no indication why — every control
+    /// looked live and one of them was not. `Resolution` carries the loser too, so the UI can say which
+    /// control is currently inert instead of leaving someone to conclude the app is broken.
+    fn active_model(&self) -> logscope::activemodel::Resolution {
+        let dep = if self.deployment.is_valid() {
+            self.deployment.target().map(|t| t.model.clone())
+        } else { None };
+        logscope::activemodel::resolve(dep.as_deref(), Some(&self.model.current()))
     }
+
+    /// The model generation should run.
+    fn active_target_name(&self) -> Option<String> { self.active_model().name }
 
     /// The deployment's Draft model name, if one is configured (for speculative/tree decoding).
     fn active_draft_name(&self) -> Option<String> {
@@ -194,11 +221,47 @@ impl LogscopeApp {
     /// AUTOLOAD: whenever the resolved active local target changes, kick a load automatically — no Load
     /// button. Debounced by name (only re-loads when the target actually changes) and skipped while scanning
     /// (models aren't settled yet). Ollama/remote targets need no local load, so they're left alone.
+    /// Load the resolved target, but only once it has STOPPED CHANGING.
+    ///
+    /// This used to fire on every change, and the resolved target passes through intermediate values
+    /// during startup — the scan completes and picks a default, then the deployment plan resolves, then
+    /// the role plan applies. Each intermediate value triggered a full load. Observed on a real run:
+    /// DeepSeek-8B, then GLM-4.7-Flash, then Qwen3-30B, three models mapped in 45 seconds for one
+    /// model's worth of work, with the first two abandoned immediately.
+    ///
+    /// A settle delay fixes it without needing to find and serialise every writer — which is the real
+    /// problem, and one this does not solve. It makes the symptom go away and buys time; the number of
+    /// things that can write the target is still three.
     fn autoload_if_changed(&mut self) {
         if self.scanning { return; }
-        let Some(name) = self.active_target_name() else { return };
+        // COLLAPSE THE SOURCES before resolving. If a deployment names a model the picker also has, move
+        // the picker to it once — after that there is a single source and the override stops being a
+        // standing disagreement. Done here rather than at render time so it happens whether or not the
+        // pipeline panel is open.
+        {
+            let items: Vec<String> = self.model.items.iter().map(|i| i.name().to_string()).collect();
+            if let Some(idx) = logscope::activemodel::write_through(&self.active_model(), &items) {
+                self.model.selected = idx;
+            }
+        }
+        let Some(name) = self.active_target_name() else { self.pending_target = None; return };
         if self.autoloaded.as_deref() == Some(name.as_str()) { return; } // already (auto)loaded this one
-        let Some(path) = self.local_path_for(&name) else { return };     // only local files are loaded here
+
+        // Restart the timer whenever the target moves; load only when it has held still.
+        match &self.pending_target {
+            Some((prev, _)) if *prev == name => {}
+            _ => { self.pending_target = Some((name.clone(), std::time::Instant::now())); return; }
+        }
+        let Some((_, since)) = &self.pending_target else { return };
+        if since.elapsed() < std::time::Duration::from_millis(AUTOLOAD_SETTLE_MS) { return; }
+
+        let Some(path) = self.local_path_for(&name) else { self.pending_target = None; return };
+        // Resolve a shard to the FIRST of its set. Metadata and the tensor index live there; handing a
+        // loader shard 2 gives it a file with no header, and llama.cpp reports "null result" — accurate
+        // and useless, because the file is fine and simply is not the entry point. Done here so no
+        // backend has to know about shards.
+        let path = logscope::modelorg::resolve_to_first_shard(&path).unwrap_or(path);
+        self.pending_target = None;
         self.autoloaded = Some(name.clone());
         self.local_status = format!("auto-loading {name}…");
         self.model_loaded = false;
@@ -383,6 +446,20 @@ impl eframe::App for LogscopeApp {
                             .default_width(480.0)
                             .show(ui.ctx(), |ui| {
                                 ui.label(RichText::new("pick the model for each stage").color(theme::DIM()).small());
+                                // WHAT YOU ARE ACTUALLY TALKING TO, resolved once and stated here. This
+                                // window and the picker can disagree, and the deployment wins — which is
+                                // fine, but it has to be VISIBLE or the picker reads as broken.
+                                let act = self.active_model();
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(RichText::new("active:").color(theme::DIM()).small());
+                                    ui.label(RichText::new(act.name.as_deref().unwrap_or("—"))
+                                        .color(theme::CYAN()).strong().small());
+                                    ui.label(RichText::new(format!("(from {})", act.source.label()))
+                                        .color(theme::FAINT()).small());
+                                });
+                                if let Some(note) = act.note() {
+                                    ui.label(RichText::new(note).color(theme::AMBER()).small());
+                                }
                                 ui.add_space(4.0);
                                 crate::model::pipeline_selectors(ui, &mut self.deployment, &available, &est);
                                 ui.add_space(6.0);
@@ -426,11 +503,24 @@ impl eframe::App for LogscopeApp {
                 ui.label(RichText::new(txt).color(col).small());
                 // routing: show which model actually runs (deployment Target, else dropdown) + a draft note.
                 // No Load button — autoload_if_changed() loads the active target automatically.
-                if let Some(t) = self.active_target_name() {
+                let act = self.active_model();
+                if let Some(t) = act.name.clone() {
                     let loaded = self.model_loaded && self.autoloaded.as_deref() == Some(t.as_str());
                     let mark = if loaded { "●" } else { "○" };
-                    ui.label(RichText::new(format!("{mark} → {t}")).color(if loaded { theme::GREEN() } else { theme::DIM() }).small())
-                        .on_hover_text("The model generation runs (deployment Target if set, else the picker). Loads automatically when it changes.");
+                    // The top bar is where someone looks to answer "what am I talking to", so it names
+                    // the SOURCE too. An amber dot means a visible control is currently inert — the
+                    // picker says one thing and the deployment is doing another.
+                    let inert = act.picker_is_inert();
+                    let col = if inert { theme::AMBER() } else if loaded { theme::GREEN() } else { theme::DIM() };
+                    let hover = act.note().unwrap_or_else(|| format!(
+                        "Talking to {t}, chosen by the {}. Loads automatically when it changes.",
+                        act.source.label()));
+                    ui.label(RichText::new(format!("{mark} → {t}")).color(col).small())
+                        .on_hover_text(hover);
+                    if inert {
+                        ui.label(RichText::new("⚠").color(theme::AMBER()).small())
+                            .on_hover_text(act.note().unwrap_or_default());
+                    }
                     if let Some(d) = self.active_draft_name() {
                         ui.label(RichText::new(format!("+draft {d}")).color(theme::FAINT()).small());
                     }

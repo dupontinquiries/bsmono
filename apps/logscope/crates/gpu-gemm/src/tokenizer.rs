@@ -13,13 +13,25 @@
 use crate::gguf::{Gguf, Value};
 use std::collections::HashMap;
 
+/// Bytes dropped during encoding because their mapped char was not in the vocab.
+///
+/// Should be zero for a well-formed byte-level vocab. Non-zero means the prompt the model receives is
+/// not the text that was typed, and every later explanation is chasing a corruption that happened
+/// before inference started.
+pub static ENCODE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Characters dropped during decoding because they were not in the byte table.
+pub static DECODE_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One line reporting any silent losses, or None when there were none.
+pub fn drop_report() -> Option<String> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (e, d) = (ENCODE_DROPS.load(Relaxed), DECODE_DROPS.load(Relaxed));
+    if e == 0 && d == 0 { return None; }
+    Some(format!("tokenizer: {e} byte(s) dropped while ENCODING and {d} char(s) while DECODING — the \
+text the model saw is not the text that was typed. A complete byte-level vocab drops nothing"))
+}
+
 pub struct Tokenizer {
-    /// `tokenizer.ggml.bos_token_id` — the sequence-start token, when the vocab declares one.
-    pub bos_id: Option<u32>,
-    /// `tokenizer.ggml.add_bos_token` — llama.cpp prepends BOS to every prompt when true.
-    /// DeepSeek-LLM/Coder depend on it: their chat template has NO in-body special tokens,
-    /// so without this the model never sees its start token at all.
-    pub add_bos: bool,
     tokens: Vec<Vec<u8>>,
     vocab: HashMap<Vec<u8>, u32>,
     /// (left_id, right_id) -> (rank, merged_id)
@@ -98,7 +110,7 @@ impl Tokenizer {
         }
         let byte_encoder = byte_to_unicode();
         let byte_decoder = byte_encoder.iter().enumerate().map(|(b, &c)| (c, b as u8)).collect();
-        Self { bos_id: None, add_bos: false, tokens, vocab, merges, byte_level, byte_encoder, byte_decoder,
+        Self { tokens, vocab, merges, byte_level, byte_encoder, byte_decoder,
             specials: Vec::new(), special_ids: std::collections::HashSet::new() }
     }
 
@@ -136,6 +148,16 @@ impl Tokenizer {
     }
 
     pub fn vocab_size(&self) -> usize { self.tokens.len() }
+
+    /// Does this vocabulary carry a given special token?
+    ///
+    /// The capability check for model-specific wire formats — Gemma's `<|file_separator|>` being the
+    /// first. Sending such a token to a model that lacks it does NOT error: it tokenizes as a dozen
+    /// literal punctuation characters the model has never seen arranged that way, and the reply
+    /// degrades in a manner that looks like the model being bad at the task rather than like a
+    /// protocol mistake. Deciding from the vocab is exact; deciding from a model NAME is wrong at
+    /// every edge — a finetune, a requant, a renamed file.
+    pub fn has_special(&self, text: &str) -> bool { self.special_id(text).is_some() }
     pub fn is_byte_level(&self) -> bool { self.byte_level }
 
     /// Greedy lowest-rank merge over a symbol-id sequence.
@@ -190,7 +212,15 @@ impl Tokenizer {
             let mut syms = Vec::new();
             for &b in chunk.as_bytes() {
                 let key = self.byte_encoder[b as usize].to_string().into_bytes();
-                if let Some(&id) = self.vocab.get(&key) { syms.push(id); }
+                match self.vocab.get(&key) {
+                    Some(&id) => syms.push(id),
+                    // A byte whose mapped char is absent from the vocab was previously DROPPED here,
+                    // silently. The prompt then differs from what the user typed with nothing to say so,
+                    // and every downstream explanation — bad weights, bad sampler — is chasing a
+                    // corruption that happened before the model saw anything. Counted so a load can
+                    // report it; a complete byte-level vocab has all 256 and this stays zero.
+                    None => { ENCODE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                }
             }
             out.extend(self.bpe_merge(syms));
         }
@@ -215,7 +245,15 @@ impl Tokenizer {
                 bytes.extend_from_slice(t);
             } else {
                 let s = String::from_utf8_lossy(t);
-                for c in s.chars() { if let Some(&b) = self.byte_decoder.get(&c) { bytes.push(b); } }
+                for c in s.chars() {
+                    match self.byte_decoder.get(&c) {
+                        Some(&b) => bytes.push(b),
+                        // Same silent drop on the way out. A char that is not in the byte table is
+                        // usually U+FFFD from a lossy conversion above, which means the token bytes were
+                        // not valid in the mapped alphabet — worth counting rather than swallowing.
+                        None => { DECODE_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                    }
+                }
             }
         }
         bytes
@@ -237,8 +275,6 @@ impl Tokenizer {
         };
         let byte_level = matches!(g.get_str("tokenizer.ggml.model"), Some("gpt2") | Some("llama") | Some("bpe"));
         let mut tk = Self::build(tokens, merges, byte_level);
-        tk.bos_id = g.get_u32("tokenizer.ggml.bos_token_id");
-        tk.add_bos = g.get_bool("tokenizer.ggml.add_bos_token").unwrap_or(false);
         // Register control (3) / user-defined (4) tokens as verbatim specials so
         // chat markers like "<|eot_id|>" tokenize to a single id and decode literally.
         let mut specials = Vec::new();
@@ -263,20 +299,6 @@ impl Tokenizer {
                 specials.push((s.into_owned(), i as u32));
             }
         }
-        // Gemma-3 GGUFs type ~6.4k tokens as CONTROL/USER_DEFINED — including plain
-        // formatting tokens ("\n" is id 108!) and thousands of <unusedN> placeholder slots.
-        // Registering those as specials had three visible failures at once (the gemma3.log
-        // report): the stop set inherited them (every reply died at its FIRST NEWLINE — "stop:
-        // model emitted stop token 108"), the specials-swallow ate newlines out of any output
-        // that survived, and encode split on "\n". A special here means "matched verbatim and
-        // handled out of band"; pure-whitespace text and <unusedN> placeholders are neither
-        // turn markers nor content markers, so they don't belong in the set at all.
-        specials.retain(|(text, _)| {
-            let is_ws = !text.is_empty() && text.chars().all(|c| c.is_whitespace());
-            let is_unused = text.starts_with("<unused") && text.ends_with('>')
-                && text[7..text.len() - 1].chars().all(|c| c.is_ascii_digit());
-            !is_ws && !is_unused
-        });
         tk.set_specials(specials);
         // Diagnostic: did the ChatML/Llama markers actually register? If these are None, the vocab doesn't
         // store them as literal "<|...|>" strings (so the <|...|> scan can't see them); if they're Some but
@@ -328,32 +350,49 @@ mod control_stop_tests {
         assert!(t.control_stop_ids().is_empty());
     }
 }
-
-#[cfg(test)]
-mod gemma3_specials_tests {
-    use super::*;
     #[test]
-    fn whitespace_and_unused_slots_are_not_specials_or_stops() {
-        // The gemma3.log failure in miniature: "\n" (108) and <unusedN> typed as control.
-        let mut tk = Tokenizer::build(
-            (0..8).map(|i| format!("t{i}").into_bytes()).collect(), vec![], true);
-        let mut sp = vec![
-            ("\n".to_string(), 1u32), ("<unused0>".to_string(), 2), ("<unused123>".to_string(), 3),
-            ("<end_of_turn>".to_string(), 4), ("<start_of_turn>".to_string(), 5),
-        ];
-        sp.retain(|(text, _)| {
-            let is_ws = !text.is_empty() && text.chars().all(|c| c.is_whitespace());
-            let is_unused = text.starts_with("<unused") && text.ends_with('>')
-                && text[7..text.len() - 1].chars().all(|c| c.is_ascii_digit());
-            !is_ws && !is_unused
-        });
-        let mut t2 = Tokenizer::build((0..8).map(|i| format!("t{i}").into_bytes()).collect(), vec![], true);
-        t2.set_specials(sp);
-        assert!(!t2.is_special(1), "newline must not be special (it was stop token 108)");
-        assert!(!t2.is_special(2) && !t2.is_special(3), "<unusedN> slots are placeholders");
-        assert!(t2.is_special(4) && t2.is_special(5), "real turn markers stay special");
-        let stops: std::collections::HashSet<u32> = t2.control_stop_ids().into_iter().collect();
-        assert!(stops.contains(&4) && !stops.contains(&1) && !stops.contains(&2));
-        let _ = tk; let _ = &mut tk;
+    fn a_round_trip_through_byte_level_loses_NOTHING_and_says_so() {
+        // The complaint that prompted this: a model describing plain ASCII input as "Arabic and Persian
+        // letters". Whatever caused that, silent drops in either direction would produce exactly that
+        // class of confusion — the model genuinely receiving different text than was typed — and until
+        // now nothing would have reported it.
+        use std::sync::atomic::Ordering::Relaxed;
+        ENCODE_DROPS.store(0, Relaxed);
+        DECODE_DROPS.store(0, Relaxed);
+
+        // A byte-level vocab covering all 256 mapped chars, as a real one does.
+        let enc = byte_to_unicode();
+        let tokens: Vec<Vec<u8>> = enc.iter().map(|c| c.to_string().into_bytes()).collect();
+        let tk = Tokenizer::new_byte_level(tokens, Vec::new());
+
+        for text in ["hi there", "héllo wörld", "日本語", "\u{627}\u{644}\u{639}\u{631}\u{628}\u{64a}\u{629}", "emoji \u{1f600} ok"] {
+            let ids = tk.encode(text);
+            let back = tk.decode(&ids);
+            assert_eq!(back, text, "round trip changed {text:?} into {back:?}");
+        }
+        assert_eq!(ENCODE_DROPS.load(Relaxed), 0, "a complete vocab drops nothing");
+        assert_eq!(DECODE_DROPS.load(Relaxed), 0);
+        assert!(drop_report().is_none(), "and reports nothing when there is nothing to report");
     }
-}
+
+    #[test]
+    fn an_incomplete_vocab_is_COUNTED_rather_than_swallowed() {
+        // The failure this exists to surface. Drop one byte's mapping and the text silently changes;
+        // previously nothing anywhere would have said so.
+        use std::sync::atomic::Ordering::Relaxed;
+        ENCODE_DROPS.store(0, Relaxed);
+        DECODE_DROPS.store(0, Relaxed);
+        let enc = byte_to_unicode();
+        // omit the mapping for 'z' (0x7a)
+        let tokens: Vec<Vec<u8>> = enc.iter().enumerate()
+            .filter(|(b, _)| *b != 0x7a)
+            .map(|(_, c)| c.to_string().into_bytes()).collect();
+        let tk = Tokenizer::new_byte_level(tokens, Vec::new());
+        let ids = tk.encode("puzzle");
+        let back = tk.decode(&ids);
+        assert_ne!(back, "puzzle", "the text really did change");
+        assert!(ENCODE_DROPS.load(Relaxed) > 0, "and the loss is now counted");
+        let r = drop_report().expect("reported");
+        assert!(r.contains("not the text that was typed"));
+    }
+

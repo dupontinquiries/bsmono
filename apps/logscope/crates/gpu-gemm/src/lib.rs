@@ -8,8 +8,15 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
 pub mod gguf;
+pub mod cpumatvec;
+pub mod cpupool;
+pub mod cpuattn;
+pub mod cpudecode;
+pub mod tensornames;
+pub mod cpuops;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
 #[allow(dead_code)] pub mod memplan; // scratchwork: footprint + memory-fit planner for bigger models
+pub mod enginelevers;
 pub mod archfeat;
 
 /// Engine tuning knobs a host application may set before the first `Gpu::new()`.
@@ -75,9 +82,7 @@ pub mod governor; // backend-agnostic GPU resource governor: per-device budget +
 pub mod wgsl_validate; // in-process WGSL fitness gate (naga parse + validate)
 #[allow(dead_code)] pub mod sparse; // sparse-residency planner (+ gated binder) — the arena's architectural replacement
 #[allow(dead_code)] pub mod archcfg; // scratchwork: multi-architecture config registry (qwen2/gemma2…)
-#[allow(dead_code)] pub mod moe;
-pub mod kernels;
-pub use kernels::*;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
+#[allow(dead_code)] pub mod moe;     // mixture-of-experts routing (Qwen4/Llama4 decode): top-k + weights
 #[allow(dead_code)] pub mod mla;     // Multi-head Latent Attention (DeepSeek/GLM) compressed-KV — CPU reference
 #[allow(dead_code)] pub mod dsa;     // DeepSeek Sparse Attention lightning indexer — CPU reference
 #[allow(dead_code)] pub mod ngram;   // prompt-lookup (n-gram) speculative draft source — lossless speedup
@@ -149,7 +154,82 @@ pub fn retain_map(path: &str) -> std::io::Result<&'static [u8]> {
 /// reclaimable. Releasing it hands that decision back to the kernel immediately instead of leaving it to
 /// memory pressure. Nothing is lost: a later expert fill re-faults the pages it needs, which is precisely
 /// the streaming design ("the kernel page cache IS the cache").
+/// Set when any weight is held as a VIEW into a retained mapping, rather than copied out of it.
+///
+/// Releasing page residency under a live view turns every subsequent read of that weight into a disk
+/// fault. For a streamed MoE that is one fault storm per expert fill — the exact path the view mode
+/// exists to make cheap.
+pub static MAP_VIEWS_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Declare that a retained mapping is being VIEWED, not just read during load.
+pub fn mark_map_views_live() {
+    MAP_VIEWS_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Drop page residency for every mapping EXCEPT the one currently in use.
+///
+/// The registry is deliberately leak-on-purpose — weights hold `&'static [u8]` into it, so a mapping can
+/// never be unmapped while a model that references it is alive. But nothing evicted a mapping when the
+/// model was REPLACED, and `autoload_if_changed` fires on every selection change: a session that touches
+/// three models ends up holding three models' worth of page cache, only one of which is live.
+///
+/// Observed: DeepSeek-8B, GLM-4.7-Flash and Qwen3-30B all mapped in one run, ~110 GiB of address space
+/// for one model's worth of work. The address space itself is cheap; the PAGE CACHE is not, and on a
+/// machine where the GPU budget is already the binding constraint it is competing for exactly the memory
+/// the live model needs.
+///
+/// This releases residency rather than unmapping, because unmapping would invalidate slices that a
+/// still-referenced model may hold. The pages come back on demand if anything does touch them.
+/// Ask the kernel to start faulting in part of a retained mapping, before it is needed.
+///
+/// The CPU analogue of Colibri's `couple_prefetch`: a 60 GiB model faults every page exactly once, and
+/// without this that happens during the first token, serialised against the arithmetic that wants them.
+/// `WillNeed` starts the work asynchronously.
+///
+/// Deliberately not a blocking populate — that would move the stall rather than hide it. Advisory, so
+/// this reports whether the call was made rather than pretending pages are resident afterwards.
+pub fn prefetch_mapped(path: &str, offset: usize, len: usize) -> bool {
+    let Some(reg) = RETAINED_MAPS.get() else { return false };
+    let g = reg.lock().unwrap();
+    let Some(fb) = g.get(path) else { return false };
+    if let FileBytes::Mapped(m) = *fb {
+        if offset >= m.len() || len == 0 { return false; }
+        let n = len.min(m.len() - offset);
+        return m.advise_range(memmap2::Advice::WillNeed, offset, n).is_ok();
+    }
+    false
+}
+
+pub fn release_stale_map_residency(keep: &str) -> usize {
+    if MAP_VIEWS_LIVE.load(std::sync::atomic::Ordering::Relaxed) { return 0; }
+    let Some(reg) = RETAINED_MAPS.get() else { return 0 };
+    let g = reg.lock().unwrap();
+    let mut n = 0usize;
+    for (path, fb) in g.iter() {
+        if path == keep { continue; }
+        if let FileBytes::Mapped(m) = *fb {
+            // SAFETY: same argument as release_map_residency — read-only, file-backed, shared mapping of
+            // a file we never write, so discarding resident pages loses nothing but the cache.
+            if unsafe { m.unchecked_advise(memmap2::UncheckedAdvice::DontNeed) }.is_ok() { n += 1; }
+        }
+    }
+    n
+}
+
 pub fn release_map_residency() -> usize {
+    // GUARD. This was unconditional, and it is safe ONLY when the load pass has finished reading and
+    // nothing holds a view into the mapping. When experts are file VIEWS (`RawExpertSrc`), the mapping is
+    // live for the process lifetime and MADV_DONTNEED turns every fill into a page fault from disk —
+    // converting the view path's whole advantage into its opposite, and stalling the CPU inside the
+    // write_buffer that a GPU dispatch is waiting on.
+    //
+    // Scout does not hit this today because its Q6_K expert tensor forces the host-copy path. Any
+    // all-Q4_K MoE checkpoint would, which is precisely the case the view path was built for.
+    if MAP_VIEWS_LIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        eprintln!("wgpu-engine: keeping page cache — expert weights are VIEWS into the mapped file, so \
+dropping residency would fault every fill from disk");
+        return 0;
+    }
     let Some(reg) = RETAINED_MAPS.get() else { return 0 };
     let g = reg.lock().unwrap();
     let mut n = 0;
@@ -216,11 +296,54 @@ pub static DIMS_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static DIMS_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BG_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static BG_MISSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// SUBMIT ATTRIBUTION — which cause drained the frame. `GPU_SUBMITS` says how many; these say WHY,
+/// which is the question that actually leads to a fix. Added because a Metal run showed 1119
+/// submits/token at 2.0 ms each while `flush_every` was 128 — meaning ~5 passes per submit, so
+/// something other than the pass counter was doing the flushing and no amount of reasoning from the
+/// outside could tell which.
+pub static SUBMIT_BY_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_RETAIN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_DOWNLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_DIMS_WRAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Dispatches that ran with NO frame open, each becoming its own command buffer. This is the expensive
+/// one and it was the only path left untagged — a run showed 4256 submits against 729 attributed, and
+/// the missing 3500 had to be here.
+pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One line attributing every submit to its cause, for the profile report.
+pub fn submit_attribution() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (p, r, d, w, e, nf) = (SUBMIT_BY_PASSES.load(Relaxed), SUBMIT_BY_RETAIN.load(Relaxed),
+        SUBMIT_BY_DOWNLOAD.load(Relaxed), SUBMIT_BY_DIMS_WRAP.load(Relaxed),
+        SUBMIT_BY_END_FRAME.load(Relaxed), SUBMIT_BY_NO_FRAME.load(Relaxed));
+    let counted = p + r + d + w + e + nf;
+    let actual = GPU_SUBMITS.load(Relaxed);
+    let total = counted.max(1);
+    // Report the SHORTFALL too. The first version of this line accounted for 729 of 4256 submits and
+    // said nothing about the other 3527, which made a partial answer look like a complete one.
+    let gap = actual.saturating_sub(counted);
+    format!("submit causes — no-frame {} ({:.0}%), passes {} ({:.0}%), download {} ({:.0}%), \
+end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} attributed{}",
+        nf, nf as f64 * 100.0 / total as f64, p, p as f64 * 100.0 / total as f64,
+        d, d as f64 * 100.0 / total as f64, e, e as f64 * 100.0 / total as f64, w, r,
+        counted, actual,
+        if gap > 0 { format!(" — {gap} UNATTRIBUTED, a submit path is still untagged") } else { String::new() })
+}
 
 /// Max retained (submitted-but-not-freed) keep-buffers before a mid-window flush forces a poll+free.
 /// Bounds live uniform buffers so a big sampler window can't exhaust Metal's pool. ~8k tiny uniforms
 /// is a few hundred KB — well under any limit — while still amortizing the poll across many dispatches.
 const DIMS_RETAIN_CAP: usize = 8192;
+/// Largest batch allowed after a readback on a driver whose submit governor cannot run.
+///
+/// UNUSED. Kept with its history because the idea recurs and the implementation was worse than the
+/// problem: applied as a permanent `store` it ratcheted the tuner's 128 down to 32 on the first
+/// readback of the first token and never let it back up. If pacing is ever needed here again, it must
+/// bound a single batch and restore the tuner's value afterwards — `stream_session_window` already does
+/// exactly that with a `saved_flush`, and that is the pattern to copy.
+#[allow(dead_code)]
+const POST_READBACK_FLUSH_CAP: u32 = 32;
 /// Windowed-decode mid-loop flush cadence: flush+poll every N sampler slots so a large window's
 /// per-slot buffers (bind groups, dims, decode intermediates) free instead of accumulating in one
 /// pinned frame until the device runs out of buffer objects. Small enough to bound live buffers on
@@ -243,7 +366,14 @@ const BG_CACHE_CAP: usize = 8192;
 /// streaming MoE weights are all views into slot buffers, which is precisely the workload that was
 /// bypassing the cache. A view whose offset is not in the key would be a correctness bug (one range's
 /// bind group reused for another); including it makes the reuse sound.
-type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, wgpu::Buffer, wgpu::Buffer);
+/// (pipeline, inputs as (buffer, offset, size), OUTPUT as (buffer, offset, size), dims buffer).
+///
+/// The output carries its offset and size for the same reason the inputs do (_220): a cached bind group
+/// reused with a different view writes to the wrong place. This was missed when views were added to the
+/// inputs, and the output was bound with `as_entire_binding()` — so a chunked conversion wrote every
+/// chunk at offset 0. Fixing the binding without fixing the KEY would have been worse than leaving it:
+/// the first chunk's bind group would be reused for all of them, silently.
+type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, (wgpu::Buffer, u64, u64), wgpu::Buffer);
 /// Reusable dims-ring size: how many uniform buffers the cache-full path rotates through. Bounds the
 /// TOTAL live dims buffer count (cache cap + ring) so Metal's buffer-object ceiling is never hit no
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
@@ -265,19 +395,7 @@ pub fn gpu_submits() -> u64 { GPU_SUBMITS.load(std::sync::atomic::Ordering::Rela
 pub fn gpu_polls() -> u64 { GPU_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_setup_ns() -> u64 { GPU_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Relaxed) }
-pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES] { c.store(0, std::sync::atomic::Ordering::Relaxed); } for c in &SUBMIT_CAUSES { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
-/// WHY each submit happened — the diagnosis the Scout/Metal field report had to instrument mid-hunt
-/// (1119 submits/tok at 2.0 ms each with flush_every=128; three wrong guesses before tagging every
-/// flush site named the mechanism). Indices: 0 passes-cadence, 1 download, 2 end_frame, 3 dims-wrap,
-/// 4 frameless dispatch (no open frame — should be ~0 during decode after the reopen fix), 5 other.
-pub static SUBMIT_CAUSES: [std::sync::atomic::AtomicU64; 6] = [
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0),
-    std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)];
-#[inline] fn submit_cause(i: usize) { SUBMIT_CAUSES[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
-pub fn gpu_submit_causes() -> [u64; 6] {
-    [0, 1, 2, 3, 4, 5].map(|i| SUBMIT_CAUSES[i].load(std::sync::atomic::Ordering::Relaxed))
-}
+pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES] { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
 
 /// Cached per-shader GPU objects: the bind-group layout and compiled compute
 /// pipeline. Building these is expensive (shader compilation), so they're created
@@ -365,9 +483,6 @@ pub struct Gpu {
     /// false = llama-style adjacent pairs. Set at model load from the arch config; lives on Gpu to avoid
     /// threading one flag through ~20 rope call sites. (Single-resident-model assumption, like the arena.)
     pub rope_neox: std::sync::atomic::AtomicBool,
-    /// Partial-rotary width (phi3 family): rope only the first `rot` dims of each head.
-    /// 0 = full head_dim (every other architecture). Stored per load like `rope_neox`.
-    pub rope_rot: std::sync::atomic::AtomicU32,
     /// YaRN attention scale (f32 bits; 1.0 = off), set by the loader when the GGUF declares
     /// rope.scaling.type = "yarn". Applied inside every rope host fn (multiplies the rotated
     /// output — the ggml formulation: both q and k scaled, so scores scale by mscale²). Gpu-level
@@ -789,19 +904,6 @@ impl SubmitTuner {
     pub fn results(&self) -> &[(u32, f64, f64)] { &self.results }
 }
 
-/// Is this adapter name a SOFTWARE rasterizer rather than real silicon? The recognizers are the
-/// three CPU implementations a Vulkan/GL loader actually hands out — Mesa llvmpipe ("llvmpipe
-/// (LLVM 17.0.6, 256 bits)"), SwiftShader, and Microsoft's WARP/"Basic Render Driver" — plus
-/// softpipe and the word "software" itself. Matching is on the raw adapter name,
-/// case-insensitive, because that string is the only portable signal wgpu exposes; wgpu's own
-/// DeviceType::Cpu would also work for Vulkan but GL adapters frequently report Other, and
-/// llvmpipe-behind-GL is exactly the CI case that must stay recognizable.
-pub fn adapter_is_software(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    n.contains("llvmpipe") || n.contains("swiftshader") || n.contains("softpipe")
-        || n.contains("software") || n.contains("basic render driver")
-}
-
 impl Gpu {
     pub fn new() -> Self {
         let instance = wgpu::Instance::default();
@@ -810,23 +912,6 @@ impl Gpu {
         })).expect("no GPU adapter");
         let info = adapter.get_info();
         let adapter_name = format!("{} [{:?}]", info.name, info.backend);
-        // Never run on a software rasterizer SILENTLY (ramalama's per-accelerator-image lesson,
-        // transcribed in maintenance/ASAHI_VULKAN_LESSONS.md: the failure mode on an Asahi kit is a
-        // missing/old mesa-vulkan-drivers → the Vulkan loader offers only llvmpipe → wgpu happily
-        // returns it as "HighPerformance" → decode runs 100× slow and nothing says why). CI runs
-        // llvmpipe DELIBERATELY, so the default is a loud warning, not a refusal; a real deployment
-        // sets LOGSCOPE_REQUIRE_HW_GPU=1 (serve/fleet paths) to turn the warning into a hard stop
-        // with the fix spelled out.
-        if adapter_is_software(&info.name) {
-            let msg = format!(
-                "wgpu-engine: SOFTWARE rasterizer adapter '{adapter_name}' — no hardware GPU was \
-                 offered. On an Asahi kit this almost always means mesa-vulkan-drivers (Honeykrisp) \
-                 is missing or shadowed: install from asahi-repos and check `vulkaninfo --summary`.");
-            if std::env::var("LOGSCOPE_REQUIRE_HW_GPU").is_ok_and(|v| v == "1") {
-                panic!("{msg} (LOGSCOPE_REQUIRE_HW_GPU=1 → refusing to start on software)");
-            }
-            eprintln!("{msg} (continuing — CI/dev mode; set LOGSCOPE_REQUIRE_HW_GPU=1 to refuse)");
-        }
         // Use the adapter's actual maximum limits, not the conservative downlevel
         // defaults (which cap buffers at 256 MiB / storage bindings at 128 MiB —
         // far too small for a real model's large vocab projections, e.g. a 128k×2048
@@ -865,9 +950,6 @@ impl Gpu {
                 } else {
                     // non-OOM validation/internal errors: log loudly (these were the old default-panic set)
                     eprintln!("wgpu-engine: device error (non-fatal, logged): {msg}");
-                    if std::env::var("LOGSCOPE_DEVICE_ERROR_FATAL").is_ok() {
-                        panic!("LOGSCOPE_DEVICE_ERROR_FATAL: {msg}");
-                    }
                 }
             }));
         }
@@ -891,6 +973,10 @@ impl Gpu {
         // (k·~36 dispatches) in ONE submit, since on Metal encoder setup — not GPU sync — is the
         // wall. A pinned FLUSH_EVERY=8192 used to be silently clamped to 1024 (≈28 tokens), so a
         // 128-window still flushed ~5×; the higher ceiling lets the window actually be one submit.
+        STALL_MS.store(std::env::var("LOGSCOPE_STALL_MS").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
+        PROGRESS_EVERY.store(std::env::var("LOGSCOPE_PROGRESS_EVERY").ok()
+            .and_then(|v| v.parse::<u64>().ok()).unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
         let flush_every = std::sync::atomic::AtomicU32::new(
             std::env::var("LOGSCOPE_FLUSH_EVERY").ok().and_then(|v| v.parse::<u32>().ok()).map(|n| n.clamp(1, 65536)).unwrap_or(FLUSH_EVERY_DEFAULT));
         let inflight_cap = std::sync::atomic::AtomicU32::new(
@@ -908,7 +994,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_rot: std::sync::atomic::AtomicU32::new(0), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -973,19 +1059,37 @@ impl Gpu {
 
     /// Run the subgroup decode kernel against the plain (byte-per-thread) reference on a tiny random shape;
     /// true iff they agree within f32-reassociation tolerance. Gates whether the autotuner may pick sg.
+    /// Does the subgroup matvec agree with the reference kernel on THIS driver?
+    ///
+    /// Checked at MODEL SCALE, not at a token size. The original check used k=256, n=128 and passed on a
+    /// driver whose subgroup kernel is wrong by rel 2.5 at k=2048 — because a small k fits in one
+    /// subgroup-reduction step and never exercises the cross-wave accumulation where the bug lives. A
+    /// self-check that cannot fail on a broken driver is worse than none: it converts "unknown" into a
+    /// false "verified", and the engine then enables a kernel that silently corrupts every projection.
+    ///
+    /// The sizes below are a real attention projection and a real FFN width, so a driver that passes has
+    /// been asked the question that matters. Two shapes rather than one: the failure observed was
+    /// size-dependent, so a single shape could still be lucky.
     fn self_check_sg(&self) -> bool {
-        let (k, n) = (256usize, 128usize);
-        let mut rng = 0x00C0_FFEE_1234_5678u64;
-        let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
-        let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
-        let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
-        let qw = self.quantize_q8_resident(&w, n, k);
-        let a = self.upload(&act, 1, k);
-        let base = self.download(&self.matvec_decode_v1(&a, &qw, 1));
-        let sg = self.download(&self.matvec_decode_v2sg(&a, &qw, 4));
-        let scale = base.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
-        let worst = base.iter().zip(&sg).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
-        worst / scale < 1e-3
+        for (k, n) in [(2048usize, 2048usize), (8192, 1024)] {
+            let mut rng = 0x00C0_FFEE_1234_5678u64;
+            let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
+            let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
+            let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+            let qw = self.quantize_q8_resident(&w, n, k);
+            let a = self.upload(&act, 1, k);
+            let base = self.download(&self.matvec_decode_v1(&a, &qw, 1));
+            let sg = self.download(&self.matvec_decode_v2sg(&a, &qw, 4));
+            if base.len() != sg.len() || base.is_empty() { return false; }
+            let scale = base.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1e-6);
+            let worst = base.iter().zip(&sg).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+            if !(worst / scale < 1e-3) {
+                eprintln!("wgpu-engine: subgroup matvec self-check FAILED at k={k} n={n} \
+(rel {:.2e}) — using the barrier-reduction kernel instead", worst / scale);
+                return false;
+            }
+        }
+        true
     }
 
     /// Generic compute dispatch. Convention: storage inputs at bindings 0..n
@@ -1462,27 +1566,14 @@ impl Gpu {
         // treats empty as "step failed, back off" rather than crashing.
         if self.oom_backoff() { return Vec::new(); }
         let bytes = (t.len() * 4) as u64;
-        debug_assert!(t.buf.size() >= bytes,
-            "download: tensor claims {}x{} ({} B) but its buffer holds {} B — shape/buffer mismatch at the enqueue site",
-            t.rows, t.cols, bytes, t.buf.size());
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        // Explicit guard (NOT an if-let scrutinee): the scrutinee temporary would hold the frame
-        // lock for the whole block, and the reopen below re-locks it — a self-deadlock that hung
-        // the windowed-sampler path on its very first readback.
-        let mut fr = self.frame.lock().unwrap();
-        let _keep = if let Some(mut frame) = fr.take() {
+        let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
-            submit_cause(1);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
-            // Reopen — same rule and same field evidence as download(); the windowed sampler calls
-            // THIS between windows, so without the reopen every windowed decode degraded too.
-            *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
-            drop(fr);
             None::<()>
         } else {
-            drop(fr);
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             self.submit(enc);
@@ -1581,38 +1672,6 @@ impl Tensor {
 }
 
 /// Weights for one transformer block, uploaded to the GPU once and reused.
-/// Qwen3.5 Gated DeltaNet dimensions (llama.cpp hparams): S = ssm_d_state is BOTH the
-/// per-head key dim and value dim; H_k = ssm_n_group, H_v = ssm_dt_rank; the conv runs
-/// depthwise over the fused [q|k|v] stream of 2*H_k*S + H_v*S channels.
-#[derive(Clone, Copy, Debug)]
-pub struct DeltaDims {
-    pub s: usize, pub hk: usize, pub hv: usize, pub d_conv: usize,
-}
-impl DeltaDims {
-    pub fn key_dim(&self) -> usize { self.hk * self.s }
-    pub fn value_dim(&self) -> usize { self.hv * self.s }
-    pub fn conv_dim(&self) -> usize { 2 * self.key_dim() + self.value_dim() }
-}
-/// Per-layer weights of a Gated DeltaNet (linear attention) block.
-pub struct DeltaWeights {
-    pub qkv: Lin,              // [2K+V, d] fused q|k|v
-    pub z: Lin,                // [V, d]   output gate (attn_gate)
-    pub conv_w: Tensor,        // [conv_dim * d_conv] depthwise taps, oldest first
-    pub dtb: Tensor,           // [H_v] ssm_dt.bias
-    pub a: Tensor,             // [H_v] ssm_a  (= -exp(A_log))
-    pub beta: Lin,             // [H_v, d]
-    pub alpha: Lin,            // [H_v, d]
-    pub ssm_norm: Tensor,      // [S] rms weight over each v-head row
-    pub out: Lin,              // [d, V]
-}
-/// Recurrent caches, per layer: conv history packed behind its y-slot
-/// ([conv_dim | conv_dim*(d_conv-1)]) and the delta state packed behind its
-/// out-slot ([H_v*S | H_v*S*S]) — both the single read_write buffers their
-/// kernels update in place. Non-recurrent layers hold 1-float dummies.
-pub struct DeltaCache {
-    pub conv: Vec<Tensor>,
-    pub state: Vec<Tensor>,
-}
 pub struct BlockWeights {
     pub wq: Lin, pub wk: Lin, pub wv: Lin, pub wo: Lin,
     /// Fused Q||K||V projection [d+2·kv, d]: one matmul emitting [m, d+2kv] = [q(d) | k(kv) | v(kv)]
@@ -1656,12 +1715,6 @@ pub struct BlockWeights {
     /// windowed and full attention rotates them at different frequencies. `None` means use the model's
     /// base — which is every other architecture.
     pub rope_base: Option<f32>,
-    /// Gated DeltaNet weights — Some on Qwen3.5 recurrent layers, which replace attention
-    /// entirely (wqkv/wq/wk/wv/wo hold placeholders there, exactly the MoE/MLA pattern).
-    pub delta: Option<Box<DeltaWeights>>,
-    /// Qwen3.5 gated attention: wq is the FUSED [q|gate] projection (rows = 2*attn_dim,
-    /// per-head interleaved) and the attention output is sigmoid-gated before wo.
-    pub qgate: bool,
     /// Sliding-window attention for this layer: (window, rule). None = attend to the whole context.
     /// Set per layer because these architectures alternate windowed and full-attention layers.
     pub swa: Option<(u32, crate::swa::SwaType)>,
@@ -1898,6 +1951,119 @@ const REPIN_EVERY: u64 = 16;
 /// probe put break-even at >43%), and `MOE_BYTES` is what that costs in bytes actually moved. Printed
 /// periodically under LOGSCOPE_MOE_STATS=1.
 pub static MOE_FILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// A LOGICAL POSITION marker, printed periodically so a GPU watchdog entry can be placed in the sequence
+/// rather than only on the wall clock.
+///
+/// The distinction matters and I got it wrong once: a watchdog fires a second or two AFTER the GPU
+/// hangs, so the journal timestamp says when the fault was NOTICED, not where the offending work sat.
+/// "43% through the run" is compatible with "the first fill of a phase that starts at 43%" — and with
+/// only two faults, a boundary is at least as likely as a coincidence. Wall time alone cannot separate
+/// them; a periodic (layer, fill, phase) breadcrumb can.
+pub static PROGRESS_EVERY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `HH:MM:SS.mmm` local time, for prefixing engine log lines.
+///
+/// Every correlation in this project has been done by hand because the engine's own output carries no
+/// clock — the diagnostic report has stamps, but the terminal log that people actually paste does not.
+/// Local rather than UTC because journalctl is local, and a stamp you have to convert is a stamp you
+/// will convert wrongly at least once.
+pub fn stamp() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let (secs, ms) = (now.as_secs() as i64 + local_offset_secs(), now.subsec_millis());
+    let t = secs.rem_euclid(86400);
+    format!("{:02}:{:02}:{:02}.{:03}", t / 3600, (t % 3600) / 60, t % 60, ms)
+}
+
+/// Seconds to add to UTC for local time, read once from `date +%z`.
+fn local_offset_secs() -> i64 {
+    static OFF: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| {
+        std::process::Command::new("date").arg("+%z").output().ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| {
+                let t = s.trim();
+                if t.len() < 5 { return None; }
+                let sign = if t.starts_with('-') { -1i64 } else { 1 };
+                Some(sign * (t[1..3].parse::<i64>().ok()? * 3600 + t[3..5].parse::<i64>().ok()? * 60))
+            }).unwrap_or(0)
+    })
+}
+
+/// Timestamped engine log line. Use for anything that may need correlating with a kernel log.
+#[macro_export]
+macro_rules! elog {
+    ($($a:tt)*) => { eprintln!("[{}] {}", $crate::stamp(), format!($($a)*)) };
+}
+
+/// The last dispatch recorded, as (shader source pointer, workgroups, dims[0]).
+///
+/// Kept as raw atomics rather than a String because it is written on EVERY dispatch — tens of thousands
+/// per token — and anything allocating would change the timing of the thing being measured.
+pub static LAST_SHADER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+pub static LAST_WG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static LAST_DIM0: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+/// Dispatches recorded so far, so a stall can be located in the sequence.
+pub static DISPATCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Stalls observed (a poll that took longer than the threshold).
+pub static STALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Milliseconds a device poll may take before it is reported as a stall. 0 disables the check.
+///
+/// A GPU hang shows up on our side as a poll that takes SECONDS instead of milliseconds — the kernel
+/// recovers the device and we carry on, so the only trace we normally keep is a journal line with no
+/// idea what was running. Timing the poll ourselves means the fault names the exact operation that
+/// caused it, and two runs answer "is it deterministic" without needing the journal at all.
+pub static STALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record the dispatch about to be submitted, so a stall can name it.
+#[inline]
+pub fn mark_dispatch(pipe_id: usize, wg: (u32, u32, u32), dim0: u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if STALL_MS.load(Relaxed) == 0 { return; }
+    // The PIPELINE identity, not a name: pipelines are cached for the process lifetime so the value is
+    // stable and comparable across a run, and storing it is one atomic write on a path taken tens of
+    // thousands of times per token. A String here would allocate and change the timing of the thing
+    // being measured.
+    LAST_SHADER.store(pipe_id, Relaxed);
+    LAST_WG.store(((wg.0 as u64) << 32) | (wg.1 as u64) << 16 | wg.2 as u64, Relaxed);
+    LAST_DIM0.store(dim0, Relaxed);
+    DISPATCH_SEQ.fetch_add(1, Relaxed);
+}
+
+/// Check whether a poll stalled, and if so report exactly what was in flight.
+///
+/// NOT OBSERVED FIRING in the container: lavapipe's polls on the small gate workloads stay under any
+/// useful threshold, so there is nothing here to detect. The wiring is at both blocking polls
+/// (flush_and_wait and the download map) and is gated, but "it compiles and is in the right place" is a
+/// weaker claim than "it fired", and the difference is worth stating.
+///
+/// Reports the SEQUENCE NUMBER as well as the shape: "the 41,203rd dispatch" is what makes two runs
+/// comparable. If the same sequence number stalls twice, the hang is deterministic and can be bisected;
+/// if it moves, it is a race and bisection would waste a day.
+pub fn check_stall(started: std::time::Instant, _unused: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let thresh = STALL_MS.load(Relaxed);
+    if thresh == 0 { return; }
+    let ms = started.elapsed().as_millis() as u64;
+    if ms < thresh { return; }
+    STALLS.fetch_add(1, Relaxed);
+    let wg = LAST_WG.load(Relaxed);
+    elog!("wgpu-engine: STALL {ms} ms at dispatch #{} — wg=({},{},{}) dim0={} pipe={:#x} \
+(a poll this long is a GPU hang; the kernel recovers and we continue)",
+        DISPATCH_SEQ.load(Relaxed), (wg >> 32) as u32, ((wg >> 16) & 0xFFFF) as u32, (wg & 0xFFFF) as u32,
+        LAST_DIM0.load(Relaxed), LAST_SHADER.load(Relaxed));
+}
+
+/// Emit a positional breadcrumb every `n` fills. 0 disables. Set from LOGSCOPE_PROGRESS_EVERY.
+pub fn progress_tick(phase: &str, layer: usize, extra: &str) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let every = PROGRESS_EVERY.load(Relaxed);
+    if every == 0 { return; }
+    let f = MOE_FILLS.load(Relaxed);
+    if f % every != 0 { return; }
+    elog!("wgpu-engine: PROGRESS {phase} layer={layer} fills={f} bytes={:.1}GiB {extra}",
+        MOE_BYTES.load(Relaxed) as f64 / (1u64 << 30) as f64);
+}
 pub static MOE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static MOE_REPINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1977,7 +2143,7 @@ impl StreamSlots {
         let Some(buf) = self.slots.get(idx) else { return };
         let n = (bytes.len() as u64).min(self.slot_bytes) as usize;
         if n == 0 { return; }
-        gpu.queue.write_buffer(buf, 0, &bytes[..n]);
+        gpu.write_chunked(buf, 0, &bytes[..n]);   // expert slot fills are ~68 MiB
     }
 
     /// The whole slot as a word-addressed Tensor, for a kernel that writes packed data into it.
@@ -2071,19 +2237,6 @@ impl Lin {
     /// m=1 Q8 decode case — the norm→matmul pair that fires twice per layer. Any other case (F32/Q4
     /// weight, prefill m>1, biased, or the fusion disabled via LOGSCOPE_FUSE_NORM=0) falls back to an
     /// explicit rmsnorm_t then apply(), so this is a pure speed swap with identical output.
-    /// Fused SwiGLU + down-projection + residual for the m=1 decode case. Returns None
-    /// when the weight format has no fused kernel (f32) or carries a bias — the caller
-    /// falls back to the two-pass chain, so this is a pure pass-count optimization with
-    /// identical math (the gate is computed in f32 either way; fusing skips one
-    /// intermediate buffer round-trip). LOGSCOPE_NO_FFN_FUSE=1 disables for bisection.
-    pub fn swiglu_apply_add(&self, gpu: &Gpu, gu: &Tensor, resid: &Tensor) -> Option<Tensor> {
-        if self.bias.is_some() { return None; }
-        match &self.kind {
-            LinKind::Q8(w) => Some(gpu.linear_q8_0_swiglu_add(gu, w, resid)),
-            LinKind::Q4(w) => Some(gpu.linear_q4_swiglu_add(gu, w, resid)),
-            _ => None,
-        }
-    }
     pub fn norm_apply(&self, gpu: &Gpu, a: &Tensor, nw: &Tensor, cols: usize, eps: f32, m: usize) -> Tensor {
         if m == 1 && self.bias.is_none() && fuse_norm_enabled() {
             if let LinKind::Q8(q) = &self.kind {
@@ -2182,7 +2335,17 @@ impl Gpu {
     /// records a CATCHABLE OutOfMemory instead of the fatal get_mapped_range abort a failed map-on-create
     /// gives. The UMA map path is safe because weight loads memplan-preflight the fit before any upload.
     fn upload_bytes(&self, bytes: &[u8], label: &'static str) -> wgpu::Buffer {
-        let size = (bytes.len().max(4)) as u64;
+        // ROUND UP TO A WHOLE WORD. Shaders view these buffers as `array<u32>`, so the last partial word
+        // is unreadable if the buffer ends mid-word: a WGSL index past the array length yields zero, not
+        // an error.
+        //
+        // Found via Q6_K, whose super-block is 210 bytes — 52.5 words. Its f16 scale lives at bytes
+        // 208..209, inside word 52, which spans 208..211 and lies past a 210-byte buffer. The scale read
+        // as ZERO, so every weight in the block came out zero, and the gate reported max|diff| 3.3e5
+        // against the CPU path. Any quant whose block size is not a multiple of 4 has the same exposure;
+        // Q4_K (144) and Q8_0 (34→ padded) happen to be safe or already padded, which is why this
+        // survived until a 210-byte format arrived.
+        let size = (bytes.len().max(4).div_ceil(4) * 4) as u64;
         let usage = wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         if self.unified && !bytes.is_empty() {
             let buf = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: true });
@@ -2217,36 +2380,27 @@ impl Gpu {
         // error, so bail early with an empty result once the device has signalled OOM this step.
         if self.oom_backoff() { return Vec::new(); }
         let bytes = (t.len() * 4) as u64;
-        debug_assert!(t.buf.size() >= bytes, "download-site: {}x{} needs {} B, buffer {} B", t.rows, t.cols, bytes, t.buf.size());
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         // If a frame is open, append the readback copy to it and flush the whole frame in one
         // submit. frame.keep (dims uniforms + bind groups) is RETAINED past the submit — it's async,
         // and dropping it before the poll below recycles buffers the GPU is still reading → "Buffer
         // 'dims' is invalid" on Metal. clear_retained() after the poll frees them safely.
-        {
-            let mut fr = self.frame.lock().unwrap();
-            if let Some(mut frame) = fr.take() {
-                frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
-                submit_cause(1);
-                self.submit(frame.enc);
-                self.retain_keep(frame.keep);
-                // REOPEN the frame. A mid-decode readback (MoE router pick, windowed-sampler ids,
-                // logits) used to TAKE the frame and never put one back, so every dispatch after it
-                // fell into the frameless one-submit-per-dispatch branch — the Scout/Metal field
-                // report measured exactly this: 1119 submits/tok (~23/layer for 48 layers) with
-                // flush_every=128, at 2.0 ms of Metal command-buffer overhead each. The cadence
-                // flush three lines up already reopens; downloads now follow the same rule. This
-                // changes WHEN work is submitted, never what it computes.
-                *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
-            } else {
-                let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-                enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
-                submit_cause(5);
-                self.submit(enc);
-            }
+        // Remember whether a frame was OPEN, because taking it here is what silently ends batching for
+        // everything that follows. See the reopen at the end of this function.
+        let had_frame = self.frame.lock().unwrap().is_some();
+        if let Some(mut frame) = self.frame.lock().unwrap().take() {
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            self.submit(frame.enc);
+            self.retain_keep(frame.keep);
+        } else {
+            let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            self.submit(enc);
         }
         let slice = staging.slice(..);
+        let t_dl_poll = std::time::Instant::now();
         slice.map_async(wgpu::MapMode::Read, |_| {});
         let t_sync = std::time::Instant::now();
         GPU_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
@@ -2254,7 +2408,40 @@ impl Gpu {
         let data = slice.get_mapped_range();
         let v = bytemuck::cast_slice(&data).to_vec();
         drop(data); staging.unmap();
+        check_stall(t_dl_poll, 0);   // a readback that waited seconds is a hang, not a slow kernel
         self.clear_retained(); // poll waited for completion → retained dims/bind-groups are safe to free
+        // REOPEN THE FRAME. Taking it above is necessary — the readback has to be submitted to be read —
+        // but leaving it closed meant every subsequent dispatch took `dispatch`'s no-frame branch, which
+        // submits ONE COMMAND BUFFER PER DISPATCH. In a MoE decode the router readback happens once per
+        // layer, so the frame died at the first layer and never came back: measured at 1119 submits/token
+        // on Metal (48 layers x ~23 dispatches after each readback) at 2.0 ms each, which was the entire
+        // step time. `flush_every` looked ignored because the code path it governs was not being used.
+        //
+        // Only reopened if one was open on entry: a caller that downloads without a frame does not want
+        // one opened behind its back.
+        if had_frame {
+            self.begin_frame();
+            // PACING. Reopening restores batching, but it also removes the pacing that
+            // one-submit-per-dispatch accidentally provided: with the submit governor disabled — which it
+            // is on Honeykrisp, where completion callbacks are slow or absent — nothing else bounds how
+            // much work piles into a single submit. Measured consequence: GPU watchdog timeouts and a
+            // visibly stuttering desktop, because the compositor shares this GPU and never gets between
+            // the batches.
+            //
+            // So on a driver with no working governor, cap the batch after a readback. This gives back
+            // most of the submit reduction while leaving gaps the display can be serviced in. Drivers
+            // with a functioning governor keep the full batch, because there the governor already does
+            // this job properly.
+            // NOTE: this used to STORE a reduced flush_every here, which was a one-way ratchet — the
+            // submit tuner picks 128, the first readback lowers it to 32, and nothing ever restores it,
+            // so every token after the first ran at four times the submit count the tuner chose. The
+            // pacing was meant to be per-batch and was implemented as a permanent mutation.
+            //
+            // Removed rather than repaired: the readback cadence already paces this path. A MoE decode
+            // reads the router back once per layer, so the frame is drained ~48 times per token no
+            // matter what flush_every says, and the compositor gets its gaps from that. Adding a second
+            // pacing mechanism on top only destroyed the tuner's measurement.
+        }
         v
     }
 
@@ -2299,6 +2486,51 @@ impl Gpu {
         }
         Some(r)
     }
+    /// Find the largest total GPU allocation this device will actually HONOUR.
+    ///
+    /// The Asahi budget of 24 GiB is an empirical figure from the staging upload path, measured before
+    /// the map-at-creation arena existed. Nobody has measured what the device really allows, and the
+    /// loader's own message says "raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling" — so this probes
+    /// it rather than leaving that to a person with a env var and an afternoon.
+    ///
+    /// ## Allocation succeeding is not the answer
+    ///
+    /// A driver can return a buffer it cannot back, and the failure then appears later as wrong results
+    /// rather than an error. So every step WRITES a pattern and READS IT BACK. A step counts only if the
+    /// data survives; anything else is treated as failure, because an overcommitted allocation that
+    /// reports success is worse than one that refuses.
+    ///
+    /// Allocates in `slab` chunks and keeps them all live, because the ceiling is on TOTAL resident
+    /// bytes rather than any single buffer — one 30 GiB buffer failing says nothing about thirty 1 GiB
+    /// ones, and the arena packs into ≤2047 MiB slabs anyway.
+    ///
+    /// Returns the highest verified total in bytes. Everything is dropped before returning.
+    pub fn probe_vram_ceiling(&self, slab_bytes: u64, max_bytes: u64) -> u64 {
+        let slab = slab_bytes.max(1 << 20);
+        let words = (slab / 4) as usize;
+        let mut held: Vec<Tensor> = Vec::new();
+        let mut verified = 0u64;
+        // A recognisable pattern: zeros would pass against a buffer that was never written.
+        let pattern: Vec<f32> = (0..1024).map(|i| (i as f32) * 3.5 + 1.0).collect();
+        while verified + slab <= max_bytes {
+            let step = self.run_guarded("vram-probe", || {
+                let t = self.alloc_resident_words(words);
+                self.queue.write_buffer(&t.buf, 0, bytemuck::cast_slice(&pattern));
+                t
+            });
+            let Some(t) = step else { break };
+            // Read it back. An allocation the driver cannot honour often accepts the write and returns
+            // garbage — which is the case this whole probe exists to catch.
+            let got = self.download(&self.view_pub(&t, 0, pattern.len()));
+            if got.len() < pattern.len() || got != pattern { break; }
+            held.push(t);
+            verified += slab;
+        }
+        drop(held);
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        verified
+    }
+
     /// GPU keep-alive spin (cf. Colibri's COLI_METAL_SPIN). Decode is dispatch-bound: our own profile says
     /// "encoder setup, not GPU sync, is the wall", and on Apple Silicon the GPU ramps its clock DOWN
     /// between the short per-token bursts, so the next burst starts on a cold clock (Colibri measured this
@@ -2395,6 +2627,7 @@ impl Gpu {
         let idx = *next;
         if idx == 0 {
             drop(ring); // release the ring lock before touching the frame/queue
+            SUBMIT_BY_DIMS_WRAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.flush_and_wait();
             ring = self.dims_ring.lock().unwrap();
         }
@@ -2419,12 +2652,13 @@ impl Gpu {
     }
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
     fn flush_and_wait(&self) {
-        submit_cause(3); // dims-ring wrap (its only caller)
         if let Some(frame) = self.frame.lock().unwrap().take() {
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
         }
+        let t_poll = std::time::Instant::now();
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        check_stall(t_poll, 0);
         self.clear_retained();
     }
 
@@ -2501,10 +2735,7 @@ impl Gpu {
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     pub fn end_frame(&self) {
         if let Some(frame) = self.frame.lock().unwrap().take() {
-            // The download-reopen can leave a frame with zero recorded passes at the decode tail;
-            // submitting an empty encoder is a pure submit-overhead tax, so skip it.
-            if frame.passes == 0 && frame.keep.is_empty() { return; }
-            submit_cause(2);
+            SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc); self.retain_keep(frame.keep);
         }
     }
@@ -2555,7 +2786,8 @@ impl Gpu {
         let cache_key: Option<BgKey> = if bg_cache_on {
             let bufs: Vec<(wgpu::Buffer, u64, u64)> = inputs.iter()
                 .map(|t| { let (o, l) = t.view.unwrap_or((0, 0)); (t.buf.clone(), o, l) }).collect();
-            Some((pipe_ptr, bufs, out.buf.clone(), (*dbuf).clone()))
+            let ov = out.view.unwrap_or((0, out.buf.size()));
+            Some((pipe_ptr, bufs, (out.buf.clone(), ov.0, ov.1), (*dbuf).clone()))
         } else { None };
         if let Some(key) = &cache_key {
             if let Some(bg) = self.bg_cache.lock().unwrap().get(key).cloned() {
@@ -2573,7 +2805,15 @@ impl Gpu {
             };
             bg_entries.push(wgpu::BindGroupEntry { binding: i as u32, resource });
         }
-        bg_entries.push(wgpu::BindGroupEntry { binding: n, resource: out.buf.as_entire_binding() });
+        // Honour the OUTPUT's view, exactly as the inputs above do. Without this a chunked dispatch
+        // writes every chunk at offset 0 — the Q6_K conversion produced a correct first chunk and then
+        // overwrote it 37 times.
+        let out_res = match out.view {
+            None => out.buf.as_entire_binding(),
+            Some((off, len)) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: &out.buf, offset: off, size: std::num::NonZeroU64::new(len) }),
+        };
+        bg_entries.push(wgpu::BindGroupEntry { binding: n, resource: out_res });
         bg_entries.push(wgpu::BindGroupEntry { binding: n + 1, resource: dbuf.as_entire_binding() });
         let bg = dev.create_bind_group(&wgpu::BindGroupDescriptor { label: None, layout: bgl, entries: &bg_entries });
         let bg = std::sync::Arc::new(bg);
@@ -2583,6 +2823,7 @@ impl Gpu {
             if cache.len() < BG_CACHE_CAP { cache.insert(key, bg.clone()); }
         }
         GPU_SETUP_NS.fetch_add(t_setup.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        mark_dispatch(pipe_ptr, wg, dims.first().map(|b| *b as u32).unwrap_or(0));
         self.record_dispatch(pipeline, &bg, wg, Some(&dbuf));
     }
 
@@ -2606,8 +2847,9 @@ impl Gpu {
             let over_flush = frame.passes >= self.flush_every.load(std::sync::atomic::Ordering::Relaxed);
             let over_retain = frame.keep.len() >= DIMS_RETAIN_CAP;
             if over_flush || over_retain {
+                if over_flush { SUBMIT_BY_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
+                else { SUBMIT_BY_RETAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                 let old = fr.take().unwrap();
-                submit_cause(0); // passes cadence (flush_every / retain cap)
                 self.submit(old.enc);
                 self.retain_keep(old.keep);
                 *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
@@ -2620,14 +2862,13 @@ impl Gpu {
             }
         } else {
             drop(fr);
-            submit_cause(4); // FRAMELESS: one submit per dispatch — during decode this is the
-                             // 20x Metal catastrophe; the download() frame-reopen keeps it ~0
             let mut enc = dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             {
                 let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
+            SUBMIT_BY_NO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc); // queue order makes each op's writes visible to the next
         }
     }
@@ -2694,7 +2935,7 @@ impl Gpu {
             let mut view = slab.slice(off..off + len).get_mapped_range_mut();
             view.copy_from_slice(bytes);
         } else {
-            self.queue.write_buffer(&slab, off, bytes);
+            self.write_chunked(&slab, off, bytes);   // arena slabs are up to 2 GiB
         }
         a.used = off + len;
         Tensor { buf: slab, rows, cols, pool: None, view: Some((off, len)) }
@@ -2705,9 +2946,6 @@ impl Gpu {
     /// decode's GPU-side row gather (`gather_q8_at`). ~4× smaller than an f32 embed copy — a
     /// 151k×2048 table costs ~350 MB instead of ~1.2 GB of Asahi's VMA budget.
     pub fn embed_q8(&self, m: &Model) -> QWeight { self.quantize_q8_resident(&m.embed, m.vocab, m.d) }
-    /// The full embedding table as a resident f32 tensor — the EmbedT::F32 source for windowed
-    /// decode and for gates that need the exact-math embed path (Model.embed stays private).
-    pub fn embed_table_t(&self, m: &Model) -> Tensor { self.upload(&m.embed, m.vocab, m.d) }
 
     /// The GPU-resident embedding table for windowed decode. Under MoE streaming (tight VMA budget) the
     /// table is q8 — ~4× smaller than f32, saving ~2.9 GiB on a Scout-class vocab, at ~0.5% RMSE (the
@@ -2956,16 +3194,55 @@ impl Gpu {
                         *c += 1;
                         // Wrapping means slot 0 is about to be rewritten while an earlier fill may still
                         // be queued against it — that is the one point where the frame must close.
-                        if s == 0 { self.end_frame(); }
+                        // DO NOT REOPEN HERE. Reopening was tried in _274 and CHANGED THE MODEL'S OUTPUT
+                        // on hardware, which a submission-structure change must never do.
+                        //
+                        // This end_frame is a FENCE, not a flush. `queue.write_buffer` data is applied at
+                        // the START of a submit, before every command buffer in it — so if the frame stays
+                        // open, a later fill's staging writes join the same submit as an earlier fill's
+                        // dispatches and land BEFORE them. The earlier fill then reads the later expert's
+                        // bytes. That is the hazard _181 fixed, and reopening reintroduced it.
+                        //
+                        // The cost is real: this is most of the 99% no-frame submits. The fix is to make
+                        // the fence cheaper (fewer fills, or converting Q6_K so experts can be file VIEWS
+                        // and need no staging at all), not to remove it.
+                        //
+                        // AND IT MUST FENCE ON COMPLETION, NOT SUBMISSION. end_frame() only submits, which
+                        // orders the commands but does not wait for them. Slot 0 can therefore be
+                        // rewritten while an earlier fill's dispatches are still IN FLIGHT — and on
+                        // Honeykrisp nothing throttles queue depth, because the submit governor disables
+                        // itself when completion callbacks are slow or absent. In-flight submits then
+                        // accumulate until more than STAGE_RING fills overlap and a slot is overwritten
+                        // underneath a running dispatch.
+                        //
+                        // That matches the observed failure shape better than resource accumulation does:
+                        // thousands of fills succeed, then timeouts begin and continue — which is what a
+                        // hazard that needs deep queues to manifest looks like, not what a leak looks
+                        // like. The dims ring already fences with flush_and_wait for exactly this reason;
+                        // the staging ring using the weaker primitive was an inconsistency, not a choice.
+                        //
+                        // LOGSCOPE_STAGE_FENCE=submit restores the old behaviour for A/B, because the wait
+                        // costs real time and the hypothesis deserves a measurement rather than my word.
+                        if s == 0 {
+                            // The ring wrap IS a candidate boundary, so it is where a breadcrumb is most
+                            // useful: if faults cluster on wrap ticks the ring is implicated, and if they
+                            // fall between them it is not.
+                            progress_tick("ring-wrap", 0, "fence");
+                            if std::env::var("LOGSCOPE_STAGE_FENCE").as_deref() == Ok("submit") {
+                                self.end_frame();
+                            } else {
+                                self.flush_and_wait();
+                            }
+                        }
                         s
                     };
                     let base = slot * per_fill;
                     let (o0, o1) = (base, base + al(g.len()));
                     let o2 = o1 + al(u.len());
                     let stage = self.moe_stage(Self::STAGE_RING * per_fill);
-                    self.queue.write_buffer(&stage.buf, o0 as u64, g);
-                    self.queue.write_buffer(&stage.buf, o1 as u64, u);
-                    self.queue.write_buffer(&stage.buf, o2 as u64, dw);
+                    self.write_chunked(&stage.buf, o0 as u64, g);
+                    self.write_chunked(&stage.buf, o1 as u64, u);
+                    self.write_chunked(&stage.buf, o2 as u64, dw);
                     let view = |off: usize, len: usize| Tensor {
                         buf: stage.buf.clone(), rows: 1, cols: len / 4, pool: None,
                         view: Some((off as u64, al(len) as u64)) };
@@ -3004,6 +3281,14 @@ impl Gpu {
                                 n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize) -> MoeStream {
         let gu_expert_bytes = ff * d / 256 * 144;
         let dn_expert_bytes = d * ff / 256 * 144;
+        // These are VIEWS into a retained mapping, not copies — so the mapping must stay resident for the
+        // process lifetime. Declaring it here rather than at the release site keeps the fact next to the
+        // thing that makes it true.
+        mark_map_views_live();
+        // These slices point INTO the retained mapping and stay live for the process lifetime, so the
+        // page cache must not be dropped underneath them. Declaring it here rather than at the release
+        // site keeps the fact next to the thing that makes it true.
+        mark_map_views_live();
         let raw = RawExpertSrc { gate, up, down, gu_expert_bytes, dn_expert_bytes, ff, d };
         let (_, gu_total) = raw.gu_layout();
         let (_, dn_total) = raw.dn_layout();
@@ -3283,25 +3568,6 @@ impl Gpu {
         let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
         let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
         self.dispatch(MATVEC_Q8_0_ADD, &[a, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
-        out
-    }
-    /// SwiGLU fused into the q8_0 down matvec + residual (decode m=1): reads the PACKED
-    /// [gate|up] buffer and gates inline — replaces swiglu_packed + linear_q8_0_add with
-    /// one dispatch per layer (the FFN tail's two-pass chain was the last non-minimal
-    /// pass count in the dense decode block).
-    pub fn linear_q8_0_swiglu_add(&self, gu: &Tensor, w: &QWeight, resid: &Tensor) -> Tensor {
-        let out = self.alloc(1, w.n);
-        let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
-        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
-        self.dispatch(SWIGLU_MATVEC_Q8_0_ADD, &[gu, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
-        out
-    }
-    /// q4 twin of `linear_q8_0_swiglu_add`.
-    pub fn linear_q4_swiglu_add(&self, gu: &Tensor, w: &Q4Weight, resid: &Tensor) -> Tensor {
-        let out = self.alloc(1, w.n);
-        let gx = (w.n as u32).min(32768); let gy = (w.n as u32).div_ceil(gx);
-        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 32) as u32, gx, 0, 0, 0];
-        self.dispatch(SWIGLU_MATVEC_Q4_ADD, &[gu, &w.qw, &w.qs, resid], &out, bytemuck::cast_slice(&dims), (gx, gy, 1));
         out
     }
     pub fn linear_q4_0_add(&self, a: &Tensor, w: &Q4Weight, resid: &Tensor) -> Tensor {
@@ -3685,13 +3951,6 @@ impl Gpu {
         // Dense SwiGLU FFN. norm_apply fuses norm2→wgate_up in the m=1 decode case (one dispatch),
         // and falls back to explicit rmsnorm_t+apply for prefill (t>1) — identical output either way.
         let gu = w.wgate_up.norm_apply(self, x2, &w.g2, d, eps, t);
-        // Dense SiLU decode tail, FUSED: silu(gate)*up folds into the down matvec's input
-        // read, and the residual into its epilogue — one dispatch where there were two.
-        // Gemma (geglu / post_ffn) and prefill (t>1) keep the explicit chain.
-        if t == 1 && !w.geglu && w.post_ffn.is_none()
-            && std::env::var("LOGSCOPE_NO_FFN_FUSE").is_err() {
-            if let Some(y) = w.wdown.swiglu_apply_add(self, &gu, x2) { return y; }
-        }
         // Gemma gates with GELU rather than SiLU. The kernel has always existed; selecting it per block
         // is what turns it from dead code into support.
         let hmid = if w.geglu { self.geglu_packed(&gu) } else { self.swiglu_packed(&gu) };
@@ -3750,7 +4009,13 @@ impl Gpu {
         // the v2 kernels are wrong, not the weights. LOGSCOPE_MOE_V1=1 forces the v1 path for A/B.
         // Streaming (m.stream) MUST use v1: the stacked weights are placeholders under streaming; experts
         // are served per-expert from the stream store, which the v1 loop intercepts.
-        if t == 1 && m.stream.is_none() && matches!(m.cfg.norm, crate::moe::RouteNorm::Softmax) && !m.cfg.weight_before
+        // Sigmoid gating is now handled by MOE_TOPK's mode 1, so it no longer forces v1. `weight_before`
+        // still does, and that is the remaining piece for Llama-4: the weight must scale the expert's
+        // INPUT rather than its output, and SwiGLU is nonlinear so the two are genuinely different —
+        // `silu(w*g)*(w*u) != w*silu(g)*u`. Doing it needs the routed path to build per-slot scaled
+        // activations (xper=1 for gate_up) instead of broadcasting one row, which is a real change
+        // rather than a flag.
+        if t == 1 && m.stream.is_none() && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
             if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
@@ -3967,7 +4232,9 @@ impl Gpu {
         let logits = m.router.apply(self, n2, 1);
         // 2) top-k selection + combine weights → selw [k idx (u32) | k weights (f32 bitcast)]
         let selw = self.alloc(1, 2 * slots);
-        let tk = [ne as u32, slots as u32, 0, 0];
+        // mode 1 = sigmoid. Selection is unchanged either way; only the weighting differs.
+        let mode = match m.cfg.norm { crate::moe::RouteNorm::Sigmoid => 1u32, _ => 0 };
+        let tk = [ne as u32, slots as u32, mode, m.cfg.normalize as u32];
         self.dispatch(MOE_TOPK, &[&logits], &selw, bytemuck::cast_slice(&tk), (1, 1, 1));
         // 3) fused gate||up for each selected expert (broadcast activation)
         // one dispatch across ALL selected experts: wg.z = slot (was 8 dispatches — the dominant
@@ -4342,18 +4609,6 @@ impl Gpu {
     pub fn prefill_batched(&self, m: &Model, c: &KvCache, prompt: &[u32]) -> Vec<f32> {
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
-        // Qwen3.5 hybrid: recurrent state only advances token by token — a batched prefill
-        // would fill the attention KV but leave every DeltaNet layer's memory EMPTY, which
-        // decodes as if the prompt never happened. Sequential prefill is the correct (and
-        // for the linear layers, the natural O(t)) path; chunked GDN prefill is the queued
-        // optimization, not a correctness requirement.
-        if m.delta.is_some() {
-            let mut logits = Vec::new();
-            for (p, &tok) in prompt.iter().enumerate() {
-                logits = self.decode_step(m, c, tok, p);
-            }
-            return logits;
-        }
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in prompt { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
         let mut x = self.upload(&xh, t, m.d);
@@ -4375,18 +4630,15 @@ impl Gpu {
     pub fn prefill_chunked(&self, m: &Model, c: &KvCache, prompt: &[u32], chunk: usize) -> Vec<f32> {
         let t = prompt.len();
         if t == 0 { return Vec::new(); }
-        // Qwen3.5 hybrid: recurrent state only advances token by token — a batched prefill
-        // would fill the attention KV but leave every DeltaNet layer's memory EMPTY, which
-        // decodes as if the prompt never happened. Sequential prefill is the correct (and
-        // for the linear layers, the natural O(t)) path; chunked GDN prefill is the queued
-        // optimization, not a correctness requirement.
-        if m.delta.is_some() {
-            let mut logits = Vec::new();
-            for (p, &tok) in prompt.iter().enumerate() {
-                logits = self.decode_step(m, c, tok, p);
-            }
-            return logits;
-        }
+        // BATCH PREFILL INTO A FRAME. Prefill never opened one, so every dispatch took `dispatch`'s
+        // no-frame branch and became its own command buffer — the same defect just fixed in decode, in
+        // the path that dominates wall time for every MoE model measured (Qwen3-30B: 71 s of 75 s;
+        // Scout: 196 s of a 200 s turn). A MoE prefill issues one dispatch group per EXPERT per layer
+        // per chunk, so the count is large and the per-submit cost is paid on all of it.
+        //
+        // The router readbacks inside still flush, but `download` now reopens the frame, so each one
+        // ends a batch instead of ending batching.
+        self.begin_frame();
         let chunk = chunk.max(1);
         let mut logits = Vec::new();
         let mut start = 0;
@@ -4409,68 +4661,1789 @@ impl Gpu {
             }
             start = end;
         }
+        // Close the frame we opened: leaving it open would hand a live encoder to whatever runs next,
+        // and `begin_frame` would then flush it at an arbitrary point rather than here.
+        self.end_frame();
         logits
     }
 }
 
+const GEMM: &str = r#"
+struct D { m:u32,n:u32,k:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> b: array<f32>;
+@group(0)@binding(2) var<storage,read_write> c: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+const TILE:u32=16u;
+var<workgroup> as_: array<f32,256>; var<workgroup> bs: array<f32,256>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(local_invocation_id) l:vec3<u32>, @builtin(workgroup_id) w:vec3<u32>){
+  let row=w.y*TILE+l.y; let col=w.x*TILE+l.x; var acc=0.0;
+  let nt=(d.k+TILE-1u)/TILE;
+  for(var t=0u;t<nt;t=t+1u){
+    let ak=t*TILE+l.x; let bk=t*TILE+l.y;
+    if(row<d.m && ak<d.k){as_[l.y*TILE+l.x]=a[row*d.k+ak];}else{as_[l.y*TILE+l.x]=0.0;}
+    if(bk<d.k && col<d.n){bs[l.y*TILE+l.x]=b[bk*d.n+col];}else{bs[l.y*TILE+l.x]=0.0;}
+    workgroupBarrier();
+    for(var kk=0u;kk<TILE;kk=kk+1u){acc=acc+as_[l.y*TILE+kk]*bs[kk*TILE+l.x];}
+    workgroupBarrier();
+  }
+  if(row<d.m && col<d.n){c[row*d.n+col]=acc;}
+}"#;
 
+const LINEAR: &str = r#"
+struct D { m:u32,n:u32,k:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> wt: array<f32>;
+@group(0)@binding(2) var<storage,read_write> c: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+const TILE:u32=16u;
+var<workgroup> as_: array<f32,256>; var<workgroup> ws: array<f32,256>;
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(local_invocation_id) l:vec3<u32>, @builtin(workgroup_id) w:vec3<u32>){
+  let row=w.y*TILE+l.y; let col=w.x*TILE+l.x; var acc=0.0;
+  let nt=(d.k+TILE-1u)/TILE;
+  for(var t=0u;t<nt;t=t+1u){
+    let ak=t*TILE+l.x; let wk=t*TILE+l.y; let wcol=w.x*TILE+l.x;
+    if(row<d.m && ak<d.k){as_[l.y*TILE+l.x]=a[row*d.k+ak];}else{as_[l.y*TILE+l.x]=0.0;}
+    if(wcol<d.n && wk<d.k){ws[l.y*TILE+l.x]=wt[wcol*d.k+wk];}else{ws[l.y*TILE+l.x]=0.0;}
+    workgroupBarrier();
+    for(var kk=0u;kk<TILE;kk=kk+1u){acc=acc+as_[l.y*TILE+kk]*ws[kk*TILE+l.x];}
+    workgroupBarrier();
+  }
+  if(row<d.m && col<d.n){c[row*d.n+col]=acc;}
+}"#;
 
+// Decode mat-vec (m=1), coalesced: ONE workgroup per output, the 64 threads split the k
+// dimension so consecutive lanes read consecutive weights/activations (coalesced — bandwidth-
+// optimal, vs the GEMM's per-thread strided rows), then tree-reduce. 2D grid (col = wg.y*gx +
+// wg.x) so n>65535 (the vocab projection) fits the per-dimension workgroup limit. The reduction
+// reorders the dot sum, so this is numerically equivalent but not bit-identical (~1e-6).
+// Fused RMSNorm + int8 mat-vec (decode m=1): folds the input row's RMSNorm into the matvec's
+// prologue so a norm→matmul pair becomes ONE dispatch. On Metal, where per-dispatch encoder setup
+// (not GPU sync) is the decode wall, removing a dispatch is removing real time — and this pair fires
+// TWICE per layer (attention-in, FFN-in). Each workgroup independently computes the row's
+// inv = 1/sqrt(mean(x²)+eps) via a k-length reduction, then reads a[kk]·inv·nw[kk] in place of
+// a[kk]. TRADEOFF: the reduction is recomputed once per output column (workgroup) — k extra input
+// reads each — but the matmul's weight traffic is n·k and dominates bandwidth, so the redundant
+// 2·k input reads are noise next to saving a whole dispatch's encoder setup. Net win exactly when
+// setup cost > the extra reduction, which is the M4/Metal decode regime; LOGSCOPE_FUSE_NORM=0 backs
+// out to the two-dispatch path for the A/B. Output is bit-identical to RMSNORM then MATVEC_Q8_0.
+const RMSNORM_MATVEC_Q8: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,eps:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;      // raw (un-normed) input row [k]
+@group(0)@binding(1) var<storage,read> nw: array<f32>;     // RMSNorm weight [k]
+@group(0)@binding(2) var<storage,read> qw: array<u32>;
+@group(0)@binding(3) var<storage,read> qs: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+var<workgroup> inv_sh: f32;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  // --- RMS reduction over the input row (every workgroup; cheap vs the matmul) ---
+  var ss=0.0; var j=tid;
+  loop { if(j>=d.k){break;} let v=a[j]; ss=ss+v*v; j=j+64u; }
+  red[tid]=ss; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ inv_sh = 1.0/sqrt(red[0]/f32(d.k)+bitcast<f32>(d.eps)); }
+  workgroupBarrier();
+  let inv = inv_sh;
+  if(col>=d.n){ return; }
+  // --- int8 mat-vec over the normalized row ---
+  let wbase=col*(d.k/4u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    let an = a[kk]*inv*nw[kk];              // fused: normalize the activation in-place
+    acc=acc+an*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]; }
+}"#;
 
+const MATVEC_Q8_0: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let wbase=col*(d.k/4u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]; }
+}"#;
 
+// Decode small-batch mat-vec (2<=m<=8): ONE workgroup per output, 64 threads split k. Each
+// thread reads a weight value ONCE and accumulates it into all m activation rows — so the
+// (memory-bound) weight read is amortized across the batch, like the m=1 mat-vec but for a
+// small batch (the speculative-verify block, and batched decode at small N). Reduces per row.
+const MATVEC_SMALL_Q8_0: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>; // [m,n]
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>; // up to 8 rows x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let m=d.m;
+  let wbase=col*(d.k/4u); let sbase=col*d.kb;
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=f32(select(i32(ub), i32(ub)-256, ub>=128u))*scale; // weight read once
+    for(var r=0u;r<m;r=r+1u){ acc[r]=acc[r]+a[r*d.k+kk]*q; }
+    kk=kk+64u;
+  }
+  for(var r=0u;r<m;r=r+1u){ red[r*64u+tid]=acc[r]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var r=0u;r<m;r=r+1u){ red[r*64u+tid]=red[r*64u+tid]+red[r*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var r=0u;r<m;r=r+1u){ c[r*d.n+col]=red[r*64u]; } }
+}"#;
 
+const LINEAR_Q8_0: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k] activations
+@group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] int8, 4 packed per u32
+@group(0)@binding(2) var<storage,read> qs: array<f32>;  // [n,kb] per-block scales
+@group(0)@binding(3) var<storage,read_write> c: array<f32>; // [m,n]
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let col=g.x; let row=g.y;
+  if(row>=d.m || col>=d.n){return;}
+  let wbase=col*(d.k/4u); let sbase=col*d.kb; let arow=row*d.k;
+  var acc=0.0;
+  for(var b=0u;b<d.kb;b=b+1u){
+    let scale=qs[sbase+b]; let k0=b*32u;
+    for(var j=0u;j<32u;j=j+1u){
+      let kk=k0+j;
+      let word=qw[wbase+(kk/4u)];
+      let ub=extractBits(word,(kk%4u)*8u,8u);          // unsigned byte (AGX-safe dynamic offset)
+      let q=select(i32(ub), i32(ub)-256, ub>=128u);    // sign-extend i8, no underflow branch
+      acc=acc+a[arow+kk]*scale*f32(q);
+    }
+  }
+  c[row*d.n+col]=acc;
+}"#;
 
+// PREFILL GEMM, shared-memory tiled, with the workgroup tile as a wgpu OVERRIDE CONSTANT (`override
+// TILE`) so the autotuner can specialize pipelines per shape without re-authoring WGSL. Each thread owns
+// one output and accumulates k IN ORDER — so every TILE value is bit-exact to every other, and all match
+// the naive LINEAR_Q8_0 within float tol (the a·(s·q) vs (a·s)·q association). Workgroup arrays are sized
+// for the max tile (32 → 1024); a smaller TILE just uses a corner. Dequant happens on the W-tile load.
+const LINEAR_Q8_0_TILED: &str = r#"
+override TILE: u32 = 16u;
+struct D { m:u32,n:u32,k:u32,kb:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
+@group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] int8, 4 packed per u32
+@group(0)@binding(2) var<storage,read> qs: array<f32>;  // [n,kb] per-block scales
+@group(0)@binding(3) var<storage,read_write> c: array<f32>; // [m,n]
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> As: array<f32,1024>; // max tile 32×32; smaller tiles use the leading corner
+var<workgroup> Ws: array<f32,1024>;
+@compute @workgroup_size(TILE,TILE,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let ty=lid.y; let tx=lid.x;
+  let row=wg.y*TILE+ty; let col=wg.x*TILE+tx;
+  var acc=0.0;
+  let ntiles=(d.k+TILE-1u)/TILE;
+  for(var t=0u;t<ntiles;t=t+1u){
+    let kt=t*TILE;
+    let ak=kt+tx;                                   // A[row][kt+tx]
+    As[ty*TILE+tx]=select(0.0, a[row*d.k+ak], row<d.m && ak<d.k);
+    let wk=kt+ty;                                   // W[col][kt+ty], dequantized
+    var wv=0.0;
+    if(col<d.n && wk<d.k){
+      let scale=qs[col*d.kb+(wk/32u)];
+      let word=qw[col*(d.k/4u)+(wk/4u)];
+      let ub=extractBits(word,(wk%4u)*8u,8u);
+      let q=select(i32(ub), i32(ub)-256, ub>=128u);
+      wv=scale*f32(q);
+    }
+    Ws[ty*TILE+tx]=wv;
+    workgroupBarrier();
+    for(var j=0u;j<TILE;j=j+1u){ acc=acc+As[ty*TILE+j]*Ws[j*TILE+tx]; } // k in order
+    workgroupBarrier();
+  }
+  if(row<d.m && col<d.n){ c[row*d.n+col]=acc; }
+}"#;
 
+// Register-blocked q8 prefill GEMM: each thread computes a 4×4 micro-tile of C (16 outputs), so each value
+// loaded from the shared A/W tiles feeds 4 MACs instead of 1 — the arithmetic-intensity lever that takes a
+// GEMM from single-digit % of peak toward tens of % ON NVIDIA/AMD. MEASURED RESULT: on the M2 Ultra (AGX)
+// it LOST badly — 170 GFLOP/s vs the many-thread tiled@32's 999 — because AGX hides latency with high
+// thread counts (tiled@32 = 1024 threads/wg), not per-thread ILP (RB = 256 threads, 24 live registers). So
+// tiled stays the prefill default; RB is kept as a bench/portability option (it may still win on discrete
+// GPUs that reward register blocking, which is why it's an autotune-eligible candidate elsewhere).
+// Fixed params (no `override`) so it compiles on GL too and stays CI-validatable.
+const LINEAR_Q8_0_RB: &str = r#"
+const BM:u32=64u; const BN:u32=64u; const BK:u32=16u;
+struct D { m:u32,n:u32,k:u32,kb:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> As: array<f32,1024>; // BM*BK
+var<workgroup> Ws: array<f32,1024>; // BK*BN
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let brow=wg.y*BM; let bcol=wg.x*BN;
+  let tx=lid.x; let ty=lid.y; let tid=ty*16u+tx;
+  // 4×4 register tile as four vec4 rows — NAMED (constant-indexed) so they stay in registers, not spilled
+  // local memory (a dynamically-indexed array<f32,16> would spill and kill the whole point of blocking).
+  var acc0=vec4<f32>(0.0,0.0,0.0,0.0); var acc1=vec4<f32>(0.0,0.0,0.0,0.0);
+  var acc2=vec4<f32>(0.0,0.0,0.0,0.0); var acc3=vec4<f32>(0.0,0.0,0.0,0.0);
+  let ntiles=(d.k+BK-1u)/BK;
+  for(var t=0u;t<ntiles;t=t+1u){
+    let kbase=t*BK;
+    for(var i=tid;i<1024u;i=i+256u){
+      let r=i/BK; let kk=i%BK; let gk=kbase+kk;
+      As[i]=select(0.0, a[(brow+r)*d.k+gk], (brow+r)<d.m && gk<d.k);
+    }
+    for(var i=tid;i<1024u;i=i+256u){
+      let kk=i/BN; let cc=i%BN; let gk=kbase+kk; let gc=bcol+cc;
+      var wv=0.0;
+      if(gc<d.n && gk<d.k){
+        let scale=qs[gc*d.kb+(gk/32u)];
+        let word=qw[gc*(d.k/4u)+(gk/4u)];
+        let ub=extractBits(word,(gk%4u)*8u,8u);
+        let q=select(i32(ub), i32(ub)-256, ub>=128u);
+        wv=scale*f32(q);
+      }
+      Ws[i]=wv;
+    }
+    workgroupBarrier();
+    for(var kk=0u;kk<BK;kk=kk+1u){
+      let wb=kk*BN+tx*4u;
+      let br=vec4<f32>(Ws[wb],Ws[wb+1u],Ws[wb+2u],Ws[wb+3u]);
+      let ab=ty*4u;
+      let a0=As[(ab+0u)*BK+kk]; let a1=As[(ab+1u)*BK+kk]; let a2=As[(ab+2u)*BK+kk]; let a3=As[(ab+3u)*BK+kk];
+      acc0=acc0+a0*br; acc1=acc1+a1*br; acc2=acc2+a2*br; acc3=acc3+a3*br;
+    }
+    workgroupBarrier();
+  }
+  let r0=brow+ty*4u; let c0=bcol+tx*4u;
+  if(r0<d.m){ if(c0<d.n){c[r0*d.n+c0]=acc0.x;} if(c0+1u<d.n){c[r0*d.n+c0+1u]=acc0.y;} if(c0+2u<d.n){c[r0*d.n+c0+2u]=acc0.z;} if(c0+3u<d.n){c[r0*d.n+c0+3u]=acc0.w;} }
+  if(r0+1u<d.m){ let rr=r0+1u; if(c0<d.n){c[rr*d.n+c0]=acc1.x;} if(c0+1u<d.n){c[rr*d.n+c0+1u]=acc1.y;} if(c0+2u<d.n){c[rr*d.n+c0+2u]=acc1.z;} if(c0+3u<d.n){c[rr*d.n+c0+3u]=acc1.w;} }
+  if(r0+2u<d.m){ let rr=r0+2u; if(c0<d.n){c[rr*d.n+c0]=acc2.x;} if(c0+1u<d.n){c[rr*d.n+c0+1u]=acc2.y;} if(c0+2u<d.n){c[rr*d.n+c0+2u]=acc2.z;} if(c0+3u<d.n){c[rr*d.n+c0+3u]=acc2.w;} }
+  if(r0+3u<d.m){ let rr=r0+3u; if(c0<d.n){c[rr*d.n+c0]=acc3.x;} if(c0+1u<d.n){c[rr*d.n+c0+1u]=acc3.y;} if(c0+2u<d.n){c[rr*d.n+c0+2u]=acc3.z;} if(c0+3u<d.n){c[rr*d.n+c0+3u]=acc3.w;} }
+}"#;
 
+const MATVEC_Q4: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32
+@group(0)@binding(2) var<storage,read> qs: array<f32>;  // [n,kb] per-block scales
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let wbase=col*(d.k/8u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);   // 0..15 (AGX-safe dynamic offset)
+    let q=i32(nib)-8;                          // symmetric: value−8 ∈ [−7,7]
+    acc=acc+a[kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]; }
+}"#;
 
+// Residual-fold variants: identical to MATVEC_Q8_0 / MATVEC_Q4 but write c[col]=dot+resid[col],
+// folding the post-projection residual add (wo/wdown) into the matmul epilogue — saves one ADD
+// dispatch/layer each on the launch-bound decode path. resid is binding(3); c/dims shift to 4/5.
+const MATVEC_Q8_0_ADD: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> resid: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let wbase=col*(d.k/4u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]+resid[col]; }
+}"#;
 
+const MATVEC_Q4_ADD: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> resid: array<f32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let wbase=col*(d.k/8u); let sbase=col*d.kb;
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);
+    let q=i32(nib)-8;
+    acc=acc+a[kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[col]=red[0]+resid[col]; }
+}"#;
 
+// Small-batch (2≤m≤8) Q4 mat-vec: one workgroup per output column, 64 threads split k, each weight
+// nibble read ONCE and accumulated across all m rows (the bandwidth-bound cost stays near m=1 instead
+// of riding the strided LINEAR_Q4, which re-reads the weights per tile). Mirrors MATVEC_SMALL_Q8_0; the
+// per-term arithmetic (a*scale*qv) matches MATVEC_Q4 exactly, so each row is BIT-EXACT to the m=1 kernel.
+// This is what lets Q4-resident (half the weight bytes of int8) compound with speculative/batched decode.
+const MATVEC_SMALL_Q4: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k]
+@group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32
+@group(0)@binding(2) var<storage,read> qs: array<f32>;  // [n,kb] per-block scales
+@group(0)@binding(3) var<storage,read_write> c: array<f32>; // [m,n]
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>; // up to 8 rows x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.n){ return; }
+  let m=d.m;
+  let wbase=col*(d.k/8u); let sbase=col*d.kb;
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);   // 0..15
+    let qv=f32(i32(nib)-8);                     // symmetric, weight read once
+    for(var r=0u;r<m;r=r+1u){ acc[r]=acc[r]+a[r*d.k+kk]*scale*qv; }
+    kk=kk+64u;
+  }
+  for(var r=0u;r<m;r=r+1u){ red[r*64u+tid]=acc[r]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var r=0u;r<m;r=r+1u){ red[r*64u+tid]=red[r*64u+tid]+red[r*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var r=0u;r<m;r=r+1u){ c[r*d.n+col]=red[r*64u]; } }
+}"#;
 
+const LINEAR_Q4: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;   // [m,k] activations
+@group(0)@binding(1) var<storage,read> qw: array<u32>;  // [n,k] nibbles, 8 packed per u32
+@group(0)@binding(2) var<storage,read> qs: array<f32>;  // [n,kb] per-block scales
+@group(0)@binding(3) var<storage,read_write> c: array<f32>; // [m,n]
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(8,8,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let col=g.x; let row=g.y;
+  if(row>=d.m || col>=d.n){return;}
+  let wbase=col*(d.k/8u); let sbase=col*d.kb; let arow=row*d.k;
+  var acc=0.0;
+  for(var b=0u;b<d.kb;b=b+1u){
+    let scale=qs[sbase+b]; let k0=b*32u;
+    for(var j=0u;j<32u;j=j+1u){
+      let kk=k0+j;
+      let word=qw[wbase+(kk/8u)];
+      let nib=extractBits(word,(kk%8u)*4u,4u);
+      let q=i32(nib)-8;
+      acc=acc+a[arow+kk]*scale*f32(q);
+    }
+  }
+  c[row*d.n+col]=acc;
+}"#;
+// Decode mat-vec, TILED: one workgroup computes `tile` (≤8) output columns, 64 threads split k.
+// Each thread reads each activation a[kk] ONCE and reuses it across all `tile` columns — so the
+// activation-reread bandwidth (which dominates the FFN mat-vecs, where the vector is far larger than
+// one weight row) drops by `tile`×, while every weight is still read exactly once. Per-column
+// accumulation is identical to MATVEC_Q8_0, so results are bit-identical to the untiled kernel.
+const MATVEC_Q8_0_TILED: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>; // 8 columns x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let av=a[kk];                    // ONE activation read, reused across the tile
+    let blk=kk/32u; let widx=kk/4u; let bytepos=(kk%4u)*8u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let scale=qs[col*d.kb+blk];
+        let word=qw[col*(d.k/4u)+widx];
+        let ub=extractBits(word,bytepos,8u);
+        let q=select(i32(ub), i32(ub)-256, ub>=128u);
+        acc[ci]=acc[ci]+av*scale*f32(q);
+      }
+    }
+    kk=kk+64u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=red[ci*64u+tid]+red[ci*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*64u]; } } }
+}"#;
 
+// V3 decode mat-vec: 128-bit (vec4<u32>) wide loads — each thread pulls 4 words (16 q8 values) per memory
+// transaction instead of one. The profile says decode is latency/occupancy-bound (≈6% BW, ≈1% ALU — the
+// GPU idles on memory latency), and wider loads put more bytes in flight per request, the textbook fix.
+// Requires k % 16 == 0 (always true for q8: k is a multiple of the 32-wide block). Same math as the others;
+// results differ only by f32 reassociation.
+const MATVEC_Q8_0_TILED_V3: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw4: array<vec4<u32>>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words4=d.k/16u;               // vec4<u32> per column-row (16 q8 values each)
+  var w=tid;
+  loop {
+    if(w>=words4){break;}
+    let kk0=w*16u;
+    let blk=kk0/32u;                  // all 16 q8 in a vec4 load share ONE 32-block → ONE scale index
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let v=qw4[col*words4+w];     // ONE 128-bit load = 16 q8 values
+        let base=col*d.kb;
+        let sc=qs[base+blk];        // ONE scale load, reused across all 16 lanes (was 16 identical loads)
+        for(var jj=0u;jj<4u;jj=jj+1u){
+          let word=v[jj];
+          let kkw=kk0+jj*4u;
+          let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+          let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+          let q0=select(i32(u0),i32(u0)-256,u0>=128u);
+          let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+          let q2=select(i32(u2),i32(u2)-256,u2>=128u);
+          let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+          acc[ci]=acc[ci]
+            + a[kkw]*sc*f32(q0)
+            + a[kkw+1u]*sc*f32(q1)
+            + a[kkw+2u]*sc*f32(q2)
+            + a[kkw+3u]*sc*f32(q3);
+        }
+      }
+    }
+    w=w+64u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=red[ci*64u+tid]+red[ci*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*64u]; } } }
+}"#;
 
+// V2-T16: v2 with acc/red sized for tile up to 16 (more columns share each weight-word read). Costs 4 KiB
+// workgroup memory (red[16*64]) — may lower occupancy, so it's a bench candidate vs v2@8, not a given win.
+const MATVEC_Q8_0_TILED_V2_T16: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤16) x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,16>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u;
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let base=col*d.kb;
+        acc[ci]=acc[ci]+a0*qs[base+b0]*f32(q0)+a1*qs[base+b1]*f32(q1)+a2*qs[base+b2]*f32(q2)+a3*qs[base+b3]*f32(q3);
+      }
+    }
+    w=w+64u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=red[ci*64u+tid]+red[ci*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*64u]; } } }
+}"#;
 
+// V2-WG128: v2 with 128-thread workgroups — more threads per column split the k-reduction, exposing more
+// memory parallelism per workgroup to hide latency (at the cost of a 7-step reduction and fewer workgroups).
+const MATVEC_Q8_0_TILED_V2_WG128: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,1024>; // tile(≤8) x 128 threads
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let blk=kk0/32u; // 4 consecutive k (kk0..kk0+3) always share ONE 32-block, so ONE scale index
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let sc=qs[col*d.kb+blk]; // ONE scale load, reused across all 4 lanes (was 4 identical loads)
+        acc[ci]=acc[ci]+a0*sc*f32(q0)+a1*sc*f32(q1)+a2*sc*f32(q2)+a3*sc*f32(q3);
+      }
+    }
+    w=w+128u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=64u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*128u+tid]=red[ci*128u+tid]+red[ci*128u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*128u]; } } }
+}"#;
 
+// V2-WG128-SG: v2-wg128 with a SUBGROUP reduction. subgroupAdd collapses each 32-lane subgroup in one op
+// (no barriers), and only the per-subgroup partials (nsg × tile) touch workgroup memory — vs the full
+// red[tile*128] array + 7-step barrier tree. That frees shared memory and removes barriers, lifting
+// occupancy — the diagnosed decode bottleneck. Requires the SUBGROUP device feature (Gpu.subgroups).
+const MATVEC_Q8_0_TILED_V2_WG128_SG: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> part: array<f32,64>; // nsg(≤8) x tile(≤8) partials — tiny vs red[tile*128]
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(subgroup_invocation_id) sglid:u32, @builtin(subgroup_size) sgsz:u32){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;
+  var w=tid;
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let blk=kk0/32u; // 4 consecutive k share ONE 32-block → ONE scale index (was b0..b3, all equal)
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u); let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u); let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let sc=qs[col*d.kb+blk]; // ONE scale load, reused across all 4 lanes
+        acc[ci]=acc[ci]+a0*sc*f32(q0)+a1*sc*f32(q1)+a2*sc*f32(q2)+a3*sc*f32(q3);
+      }
+    }
+    w=w+128u;
+  }
+  let sgid=tid/sgsz;            // which subgroup
+  let nsg=128u/sgsz;           // subgroups per workgroup (4 at size 32)
+  for(var ci=0u;ci<d.tile;ci=ci+1u){
+    let s=subgroupAdd(acc[ci]); // reduce this subgroup's 32 lanes in one op, no barrier
+    if(sglid==0u){ part[sgid*d.tile+ci]=s; }
+  }
+  workgroupBarrier();
+  if(tid==0u){
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      var sum=0.0;
+      for(var g=0u;g<nsg;g=g+1u){ sum=sum+part[g*d.tile+ci]; }
+      let col=col0+ci; if(col<d.n){ c[col]=sum; }
+    }
+  }
+}"#;
 
+// V2 decode mat-vec: each thread owns WHOLE 32-bit weight words (4 quantized values), reading each word
+// exactly once and using all four bytes — vs the original, where 4 threads read the SAME word (widx=kk/4)
+// and extract one byte each. On drivers that don't coalesce same-address subgroup loads (a real risk on
+// Asahi/AGX), that was up to 4× redundant weight traffic — the leading suspect for the decode running at
+// ~6% of memory bandwidth. Fully coalesced (64 threads → 64 consecutive words). Bit-results differ from the
+// original only by f32 reassociation (4-per-word accumulation order), far below q8 quant error.
+const MATVEC_Q8_0_TILED_V2: &str = r#"
+struct D { m:u32,n:u32,k:u32,kb:u32,gx:u32,tile:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read_write> c: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+var<workgroup> red: array<f32,512>; // tile(≤8) x 64 threads
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col0=(wg.y*d.gx+wg.x)*d.tile; let tid=lid.x;
+  if(col0>=d.n){ return; }
+  var acc=array<f32,8>(0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0);
+  let words=d.k/4u;             // 32-bit words per column-row (4 q8 values each)
+  var w=tid;                    // each thread owns whole words → one global read per word, no redundancy
+  loop {
+    if(w>=words){break;}
+    let kk0=w*4u;
+    let a0=a[kk0]; let a1=a[kk0+1u]; let a2=a[kk0+2u]; let a3=a[kk0+3u];
+    let b0=kk0/32u; let b1=(kk0+1u)/32u; let b2=(kk0+2u)/32u; let b3=(kk0+3u)/32u; // block index per value
+    for(var ci=0u;ci<d.tile;ci=ci+1u){
+      let col=col0+ci;
+      if(col<d.n){
+        let word=qw[col*words+w];         // ONE read, all four bytes consumed
+        let u0=extractBits(word,0u,8u);  let u1=extractBits(word,8u,8u);
+        let u2=extractBits(word,16u,8u); let u3=extractBits(word,24u,8u);
+        let q0=select(i32(u0),i32(u0)-256,u0>=128u);
+        let q1=select(i32(u1),i32(u1)-256,u1>=128u);
+        let q2=select(i32(u2),i32(u2)-256,u2>=128u);
+        let q3=select(i32(u3),i32(u3)-256,u3>=128u);
+        let base=col*d.kb;
+        acc[ci]=acc[ci]
+          + a0*qs[base+b0]*f32(q0)
+          + a1*qs[base+b1]*f32(q1)
+          + a2*qs[base+b2]*f32(q2)
+          + a3*qs[base+b3]*f32(q3);
+      }
+    }
+    w=w+64u;
+  }
+  for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=acc[ci]; }
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){
+    if(tid<s){ for(var ci=0u;ci<d.tile;ci=ci+1u){ red[ci*64u+tid]=red[ci*64u+tid]+red[ci*64u+tid+s]; } }
+    workgroupBarrier();
+  }
+  if(tid==0u){ for(var ci=0u;ci<d.tile;ci=ci+1u){ let col=col0+ci; if(col<d.n){ c[col]=red[ci*64u]; } } }
+}"#;
 
+const DEQUANT_Q4_0: &str = r#"
+struct D { nw:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> q: array<u32>;
+@group(0)@binding(1) var<storage,read> s: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let i=g.x; if(i>=d.nw){return;}
+  let blk=i/32u; let within=i%32u;
+  // Plain branches (no `select`): the false-branch of a `select` is still
+  // evaluated, and `within-16u` underflows for within<16 — harmless on llvmpipe
+  // but mis-lowered on some younger Vulkan drivers (e.g. Mesa's Asahi/AGX
+  // Apple-GPU backend). Guarding the subtraction behind the condition is portable.
+  var j:u32; var hi:bool;
+  if(within<16u){ j=within; hi=false; } else { j=within-16u; hi=true; }
+  let gb=blk*16u+j;
+  let word=q[gb/4u];
+  // extractBits (canonical WGSL bitfield op → NIR bitfield_extract) instead of
+  // hand-rolled >>/& — the manual dynamic shift is the only such construct in
+  // these kernels and a prime suspect for the Asahi/Mesa (AGX) mismatch.
+  let byte=extractBits(word, (gb%4u)*8u, 8u);
+  var nib:u32;
+  if(hi){ nib=extractBits(byte, 4u, 4u); } else { nib=extractBits(byte, 0u, 4u); }
+  o[i]=(f32(nib)-8.0)*s[blk];
+}"#;
 
+const SOFTMAX: &str = r#"
+struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let r=g.x; if(r>=d.rows){return;}
+  let base=r*d.cols; var mx=-3.4e38;
+  for(var c=0u;c<d.cols;c=c+1u){mx=max(mx,x[base+c]);}
+  var sum=0.0;
+  for(var c=0u;c<d.cols;c=c+1u){let e=exp(x[base+c]-mx); o[base+c]=e; sum=sum+e;}
+  for(var c=0u;c<d.cols;c=c+1u){o[base+c]=o[base+c]/sum;}
+}"#;
 
+const RMSNORM: &str = r#"
+struct D { rows:u32,cols:u32,eps:f32,_p:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> wt: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let r=g.x; if(r>=d.rows){return;}
+  let base=r*d.cols; var ss=0.0;
+  for(var c=0u;c<d.cols;c=c+1u){let v=x[base+c]; ss=ss+v*v;}
+  let inv=1.0/sqrt(ss/f32(d.cols)+d.eps);
+  for(var c=0u;c<d.cols;c=c+1u){o[base+c]=x[base+c]*inv*wt[c];}
+}"#;
 
+const ATTENTION: &str = r#"
+struct D { t:u32,d:u32,causal:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> k: array<f32>;
+@group(0)@binding(2) var<storage,read> v: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let i=g.x; if(i>=dd.t){return;}
+  let dim=dd.d; let scale=1.0/sqrt(f32(dim));
+  let last=select(dd.t-1u, i, dd.causal==1u);
+  var mx=-3.4e38;
+  for(var jj=0u;jj<=last;jj=jj+1u){
+    var dot=0.0;
+    for(var c=0u;c<dim;c=c+1u){dot=dot+q[i*dim+c]*k[jj*dim+c];}
+    mx=max(mx,dot*scale);
+  }
+  for(var c=0u;c<dim;c=c+1u){o[i*dim+c]=0.0;}
+  var sum=0.0;
+  for(var jj=0u;jj<=last;jj=jj+1u){
+    var dot=0.0;
+    for(var c=0u;c<dim;c=c+1u){dot=dot+q[i*dim+c]*k[jj*dim+c];}
+    let p=exp(dot*scale-mx); sum=sum+p;
+    for(var c=0u;c<dim;c=c+1u){o[i*dim+c]=o[i*dim+c]+p*v[jj*dim+c];}
+  }
+  for(var c=0u;c<dim;c=c+1u){o[i*dim+c]=o[i*dim+c]/sum;}
+}"#;
 
+const ROPE: &str = r#"
+struct D { t:u32,d:u32,base:f32,pos0:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let half=dd.d/2u; let p=g.x; if(p>=dd.t*half){return;}
+  let row=p/half; let i=p%half;
+  let freq=f32(row+dd.pos0)/pow(dd.base,(2.0*f32(i))/f32(dd.d));
+  let c=cos(freq); let s=sin(freq);
+  let d0=row*dd.d+2u*i;
+  let x0=x[d0]; let x1=x[d0+1u];
+  o[d0]=x0*c-x1*s;
+  o[d0+1u]=x0*s+x1*c;
+}"#;
 
+// NEOX split-half RoPE (DeepSeek/Qwen/Gemma convention): rotates dim i with i+half, unlike ROPE's
+// adjacent (2i, 2i+1) pairing. Used by the MLA forward; matches mla.rs's rope_neox reference exactly.
+const ROPE_NEOX: &str = r#"
+struct D { t:u32,d:u32,base:f32,pos0:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let half=dd.d/2u; let p=g.x; if(p>=dd.t*half){return;}
+  let row=p/half; let i=p%half;
+  let freq=f32(row+dd.pos0)/pow(dd.base,(2.0*f32(i))/f32(dd.d));
+  let c=cos(freq); let s=sin(freq);
+  let base=row*dd.d;
+  let x0=x[base+i]; let x1=x[base+i+half];
+  o[base+i]=x0*c-x1*s;
+  o[base+i+half]=x0*s+x1*c;
+}"#;
 
+// ===== MoE v2 decode kernels: GPU-side routing (zero readbacks) =====
+// MOE_TOPK: serial top-k over the router logits (n<=512, k<=16 — trivial work, the win is staying on-GPU).
+// Selection order = descending logit; weights = softmax over the SELECTED logits (bit-faithful to
+// moe::route's Softmax path: global softmax renormalized to the top-k == softmax over the selected).
+// Output selw: [0..k) = expert index (u32), [k..2k) = combine weight (f32 bitcast to u32).
+const MOE_TOPK: &str = r#"
+// `mode` selects the WEIGHTING, not the selection: 0 = softmax over the chosen k, 1 = sigmoid of each
+// logit. Selection is identical either way because sigmoid is monotonic, so top-k by raw logit picks the
+// same experts — which is why this is a small change rather than a second kernel.
+struct D { n:u32,k:u32,mode:u32,normalize:u32 };
+@group(0)@binding(0) var<storage,read> logits: array<f32>;
+@group(0)@binding(1) var<storage,read_write> selw: array<u32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(1,1,1)
+fn main(){
+  var idx: array<u32,16>; var lg: array<f32,16>;
+  for(var s=0u;s<d.k;s=s+1u){
+    var bi=0u; var bv=-3.4e38;
+    for(var i=0u;i<d.n;i=i+1u){
+      var taken=false;
+      for(var t=0u;t<s;t=t+1u){ if(idx[t]==i){ taken=true; } }
+      if(!taken && logits[i]>bv){ bv=logits[i]; bi=i; }
+    }
+    idx[s]=bi; lg[s]=bv;
+  }
+  // softmax over the selected (selection is descending, so lg[0] is the max — hoist it BEFORE the loop
+  // mutates lg in place; using lg[0] inside the loop reads exp(0)=1.0 for s>=1, mis-weighting slot 0 by
+  // exp(max-1) after normalization — the exact wgtΔmax the differential checker caught)
+  let mx=lg[0];
+  var sum=0.0;
+  if (d.mode == 1u) {
+    // Sigmoid gating (Llama-4, GLM). Each weight is sigmoid(logit) INDEPENDENTLY — there is no shared
+    // denominator unless the model asks for one, so a softmax here would silently renormalize weights
+    // the reference leaves alone.
+    for(var s=0u;s<d.k;s=s+1u){ lg[s]=1.0/(1.0+exp(-lg[s])); sum=sum+lg[s]; }
+  } else {
+    for(var s=0u;s<d.k;s=s+1u){ lg[s]=exp(lg[s]-mx); sum=sum+lg[s]; }
+  }
+  // Softmax is normalized by construction; sigmoid only when the model says so.
+  let dnm = select(1.0, sum, d.mode == 0u || d.normalize == 1u);
+  for(var s=0u;s<d.k;s=s+1u){ selw[s]=idx[s]; selw[d.k+s]=bitcast<u32>(lg[s]/dnm); }
+}"#;
 
+// MOE_MATVEC_Q8 / MOE_MATVEC_Q4: the base MATVEC_Q8_0/MATVEC_Q4 kernels with the weight row indexed
+// through a GPU-side expert selection — row = sel[slot]*rstride + col — so the CPU never learns which
+// experts won (no readback). `xper=1` reads a per-slot activation row (the down projection consumes
+// hmid[slot]); `xper=0` broadcasts one activation row (gate_up consumes n2). Output c[slot*n + col].
+const MOE_MATVEC_Q8: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let row=selw[slot]*d.rstride+col;
+  let wbase=row*(d.k/4u); let sbase=row*d.kb;
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[slot*d.n+col]=red[0]; }
+}"#;
 
+const MOE_MATVEC_Q4: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> c: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let row=selw[slot]*d.rstride+col;
+  let wbase=row*(d.k/8u); let sbase=row*d.kb;
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  var acc=0.0; var kk=tid;
+  loop {
+    if(kk>=d.k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);
+    let q=i32(nib)-8;
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  red[tid]=acc; workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ red[tid]=red[tid]+red[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ c[slot*d.n+col]=red[0]; }
+}"#;
 
+// Fused gate‖up + SwiGLU (Q8). The unfused path was: MOE_MATVEC (write [slots,2ff]) → SWIGLU_PACKED
+// (reduce to [slots,ff]) — two dispatches + a 2ff scratch buffer. This does both in ONE dispatch: each
+// workgroup owns output column j in [0,ff), reduces BOTH the gate row (col=j) and the up row (col=ff+j)
+// against the same activation, and writes silu(gate)·up straight to o[slot·ff + j]. Bit-identical to the
+// two-step path (same reductions, same silu(v)=v/(1+exp(-v))). Halves the launch grid (ff not 2ff) and
+// drops the intermediate buffer. `d.n` here is ff (the OUTPUT width); gate/up rows live at col and col+ff
+// of the stacked weight (row stride rstride = 2ff).
+const MOE_MATVEC_GLU_Q8: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> rg: array<f32,64>;
+var<workgroup> ru: array<f32,64>;
+fn dotq8(row:u32, tid:u32, k:u32, kb:u32, abase:u32) -> f32 {
+  let wbase=row*(k/4u); let sbase=row*kb;
+  var acc=0.0; var kk=tid;
+  loop { if(kk>=k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/4u)];
+    let ub=extractBits(word,(kk%4u)*8u,8u);
+    let q=select(i32(ub), i32(ub)-256, ub>=128u);
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  return acc;
+}
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  let expert=selw[slot];
+  let grow=expert*d.rstride+col;         // gate row: column j
+  let urow=expert*d.rstride+d.n+col;     // up row:   column ff+j
+  rg[tid]=dotq8(grow,tid,d.k,d.kb,abase);
+  ru[tid]=dotq8(urow,tid,d.k,d.kb,abase);
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+}"#;
 
+// Fused gate‖up + SwiGLU (Q4) — identical structure, 4-bit weights (nibble − 8).
+const MOE_MATVEC_GLU_Q4: &str = r#"
+struct D { n:u32,k:u32,kb:u32,gx:u32,_slot:u32,rstride:u32,xper:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> rg: array<f32,64>;
+var<workgroup> ru: array<f32,64>;
+fn dotq4(row:u32, tid:u32, k:u32, kb:u32, abase:u32) -> f32 {
+  let wbase=row*(k/8u); let sbase=row*kb;
+  var acc=0.0; var kk=tid;
+  loop { if(kk>=k){break;}
+    let scale=qs[sbase+(kk/32u)];
+    let word=qw[wbase+(kk/8u)];
+    let nib=extractBits(word,(kk%8u)*4u,4u);
+    let q=i32(nib)-8;
+    acc=acc+a[abase+kk]*scale*f32(q);
+    kk=kk+64u;
+  }
+  return acc;
+}
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x; let slot=wg.z;
+  if(col>=d.n){ return; }
+  let abase=select(0u, slot*d.k, d.xper==1u);
+  let expert=selw[slot];
+  let grow=expert*d.rstride+col;
+  let urow=expert*d.rstride+d.n+col;
+  rg[tid]=dotq4(grow,tid,d.k,d.kb,abase);
+  ru[tid]=dotq4(urow,tid,d.k,d.kb,abase);
+  workgroupBarrier();
+  for(var s=32u;s>0u;s=s>>1u){ if(tid<s){ rg[tid]=rg[tid]+rg[tid+s]; ru[tid]=ru[tid]+ru[tid+s]; } workgroupBarrier(); }
+  if(tid==0u){ let g=rg[0]; o[slot*d.n+col]=(g/(1.0+exp(-g)))*ru[0]; }
+}"#;
 
+// Fused down-projection + weighted-combine + residual (Q8). The unfused path was: MOE_MATVEC (down,
+// write [slots,d]) → MOE_WSUM (out[col] = resid[col] + Σ_s w[s]·down[s·d+col]) — two dispatches + a
+// [slots,d] scratch. This does both in ONE: one workgroup per output column `col` loops over the selected
+// experts, reduces each expert's down row against that slot's hmid activation, accumulates weight[s]·result
+// (weights are the f32-bitcast tail of selw), adds the residual, and writes o[col]. Bit-identical to the
+// two-step path (same reductions, same combine order s=0..slots). Removes 1 dispatch/MoE-layer + scratch.
+const MOE_DOWN_COMBINE_Q8: &str = r#"
+struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> hmid: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read> resid: array<f32>;
+@group(0)@binding(5) var<storage,read_write> o: array<f32>;
+@group(0)@binding(6) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.d){ return; }
+  var total=resid[col];   // match MOE_WSUM order: acc=resid then += weighted terms
+  for(var s=0u;s<d.slots;s=s+1u){
+    let expert=selw[s];
+    let w=bitcast<f32>(selw[d.slots+s]);
+    let row=expert*d.d+col;
+    let wbase=row*(d.k/4u); let sbase=row*d.kb; let abase=s*d.k;
+    var acc=0.0; var kk=tid;
+    loop { if(kk>=d.k){break;}
+      let scale=qs[sbase+(kk/32u)];
+      let word=qw[wbase+(kk/4u)];
+      let ub=extractBits(word,(kk%4u)*8u,8u);
+      let q=select(i32(ub), i32(ub)-256, ub>=128u);
+      acc=acc+hmid[abase+kk]*scale*f32(q);
+      kk=kk+64u;
+    }
+    red[tid]=acc; workgroupBarrier();
+    for(var st=32u;st>0u;st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+    if(tid==0u){ total=total+w*red[0]; }
+    workgroupBarrier();
+  }
+  if(tid==0u){ o[col]=total; }
+}"#;
 
+// Fused down + combine + residual (Q4) — identical structure, 4-bit weights (nibble − 8).
+const MOE_DOWN_COMBINE_Q4: &str = r#"
+struct D { d:u32,k:u32,kb:u32,gx:u32,slots:u32,_r:u32,_x:u32,_p:u32 };
+@group(0)@binding(0) var<storage,read> hmid: array<f32>;
+@group(0)@binding(1) var<storage,read> qw: array<u32>;
+@group(0)@binding(2) var<storage,read> qs: array<f32>;
+@group(0)@binding(3) var<storage,read> selw: array<u32>;
+@group(0)@binding(4) var<storage,read> resid: array<f32>;
+@group(0)@binding(5) var<storage,read_write> o: array<f32>;
+@group(0)@binding(6) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let col=wg.y*d.gx+wg.x; let tid=lid.x;
+  if(col>=d.d){ return; }
+  var total=resid[col];   // match MOE_WSUM order: acc=resid then += weighted terms
+  for(var s=0u;s<d.slots;s=s+1u){
+    let expert=selw[s];
+    let w=bitcast<f32>(selw[d.slots+s]);
+    let row=expert*d.d+col;
+    let wbase=row*(d.k/8u); let sbase=row*d.kb; let abase=s*d.k;
+    var acc=0.0; var kk=tid;
+    loop { if(kk>=d.k){break;}
+      let scale=qs[sbase+(kk/32u)];
+      let word=qw[wbase+(kk/8u)];
+      let nib=extractBits(word,(kk%8u)*4u,4u);
+      let q=i32(nib)-8;
+      acc=acc+hmid[abase+kk]*scale*f32(q);
+      kk=kk+64u;
+    }
+    red[tid]=acc; workgroupBarrier();
+    for(var st=32u;st>0u;st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+    if(tid==0u){ total=total+w*red[0]; }
+    workgroupBarrier();
+  }
+  if(tid==0u){ o[col]=total; }
+}"#;
+const MOE_WSUM: &str = r#"
+struct D { n:u32,k:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<f32>;
+@group(0)@binding(1) var<storage,read> selw: array<u32>;
+@group(0)@binding(2) var<storage,read> resid: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;}
+  var acc=resid[i];
+  for(var s=0u;s<d.k;s=s+1u){ acc=acc+bitcast<f32>(selw[d.k+s])*src[s*d.n+i]; }
+  o[i]=acc;
+}"#;
 
+// Fused QK-Norm + RoPE for the decode step (t=1): ONE dispatch replaces the 4-chain
+// (qk_norm(q) → qk_norm(k) → rope(q) → rope(k)) on the Qwen path. One workgroup per HEAD (q heads then
+// k heads): 64 threads reduce the head's RMS (hd=128 → 2 elems/thread), normalize with the head's own
+// weight (q_norm for q heads, k_norm for k heads), then each thread rotates exactly one pair (hd/2=64
+// pairs) with the branch-free NORM/NEOX arithmetic. Output layout identical to the old chain:
+// [0,ad)=roped q, [ad,ad+kv)=roped k. Float-tolerance note: the RMS reduction order differs from the
+// standalone RMSNORM kernel → last-ulp differences, same tolerance class as the MoE v2 kernels.
+const QKNORM_ROPE: &str = r#"
+struct D { nq:u32,nk:u32,hd:u32,base:f32,pos:u32,neox:u32,eps:f32,msc:f32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> qn: array<f32>;
+@group(0)@binding(2) var<storage,read> kn: array<f32>;
+@group(0)@binding(3) var<storage,read> ff: array<f32>;
+@group(0)@binding(4) var<storage,read_write> o: array<f32>;
+@group(0)@binding(5) var<uniform> d: D;
+var<workgroup> red: array<f32,64>;
+var<workgroup> nx: array<f32,128>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let head=wg.x; let tid=lid.x; let hd=d.hd; let half=hd/2u;
+  let off=head*hd; // heads are contiguous: q heads [0,nq), then k heads
+  // per-head sum of squares (each thread covers hd/64 elems)
+  var ss=0.0; var i=tid;
+  loop { if(i>=hd){break;} let v=x[off+i]; ss=ss+v*v; i=i+64u; }
+  red[tid]=ss; workgroupBarrier();
+  for(var s2=32u;s2>0u;s2=s2>>1u){ if(tid<s2){ red[tid]=red[tid]+red[tid+s2]; } workgroupBarrier(); }
+  let inv=inverseSqrt(red[0]/f32(hd)+d.eps);
+  // normalize with the head-family weight into workgroup memory
+  i=tid;
+  loop { if(i>=hd){break;}
+    let w=select(kn[i], qn[i], head<d.nq);
+    nx[i]=x[off+i]*inv*w; i=i+64u; }
+  workgroupBarrier();
+  // one rotation pair per thread (branch-free NORM/NEOX pairing, same arithmetic as ROPE_MH)
+  if(tid<half){
+    let freq=f32(d.pos)/(pow(d.base,(2.0*f32(tid))/f32(hd))*ff[tid]);
+    let c=cos(freq)*d.msc; let s=sin(freq)*d.msc;
+    let j0=tid*(2u-d.neox);
+    let j1=j0 + 1u + d.neox*(half-1u);
+    let x0=nx[j0]; let x1=nx[j1];
+    o[off+j0]=x0*c-x1*s;
+    o[off+j1]=x0*s+x1*c;
+  }
+}"#;
 
+const GATHER_ROWS: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> src: array<f32>;
+@group(0)@binding(1) var<storage,read> idx: array<u32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n*d.c){return;}
+  let r=i/d.c; let col=i%d.c; o[i]=src[idx[r]*d.c+col]; }"#;
 
+const SCATTER_ADD_W: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> src: array<f32>;
+@group(0)@binding(1) var<storage,read> idx: array<u32>;
+@group(0)@binding(2) var<storage,read> wgt: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n*d.c){return;}
+  let r=i/d.c; let col=i%d.c; o[idx[r]*d.c+col]=o[idx[r]*d.c+col]+wgt[r]*src[i]; }"#;
 
+// Row-broadcast scale: o[r,c] = x[r,c]·w[r]. The Llama4 weight-before-FFN step — the router gate
+// multiplies the expert's INPUT rows (not equivalent to output-weighting through SwiGLU).
+const ROW_SCALE: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> w: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n*d.c){return;}
+  o[i]=x[i]*w[i/d.c]; }"#;
 
+const ADD: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> b: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]+b[i]; }"#;
 
+const ADD_BIAS: &str = r#"
+struct D { n:u32,c:u32,_b:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> bias: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]+bias[i%d.c]; }"#;
 
+const MUL: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> a: array<f32>;
+@group(0)@binding(1) var<storage,read> b: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} o[i]=a[i]*b[i]; }"#;
 
 // --- DiT (Z-Image-style diffusion transformer) primitives -------------------------------------------
 
+/// AdaLN-Zero modulation: `o[r,c] = x[r,c] * (1 + scale[c]) + shift[c]`. `scale`/`shift` are a single
+/// [1,cols] row derived from the timestep+conditioning embedding and broadcast over every token row —
+/// this is what replaces the usual learned-affine LayerNorm/RMSNorm gain in a DiT block.
+const DIT_MODULATE: &str = r#"
+struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> scale: array<f32>;
+@group(0)@binding(2) var<storage,read> shift: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.rows*d.cols){return;}
+  let c=i%d.cols; o[i]=x[i]*(1.0+scale[c])+shift[c];
+}"#;
 
+/// AdaLN-Zero gated residual: `o[r,c] = x[r,c] + gate[c] * y[r,c]`. `gate` starts at ~0 at
+/// initialization (the "-Zero" in AdaLN-Zero) so a freshly-added DiT block starts as a no-op.
+const DIT_GATED_ADD: &str = r#"
+struct D { rows:u32,cols:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> y: array<f32>;
+@group(0)@binding(2) var<storage,read> gate: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.rows*d.cols){return;}
+  let c=i%d.cols; o[i]=x[i]+gate[c]*y[i];
+}"#;
 
+/// Patchify: an [H,W,C] image (row-major, channel-last) → [num_patches, patch*patch*C] tokens, one
+/// row per non-overlapping `patch x patch` block, patches scanned left-to-right/top-to-bottom and each
+/// patch's contents flattened row-major-within-patch then channel-last (matches the ViT/DiT convention
+/// so a plain linear projection turns a patch row directly into a token embedding).
+const PATCHIFY: &str = r#"
+struct D { h:u32,w:u32,c:u32,psz:u32 };
+@group(0)@binding(0) var<storage,read> img: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let pw=d.w/d.psz; let ph=d.h/d.psz; let n=ph*pw; let plen=d.psz*d.psz*d.c;
+  let i=g.y*nwg.x*64u+g.x; if(i>=n*plen){return;}
+  let p=i/plen; let within=i%plen;
+  let py=p/pw; let px=p%pw;
+  let pc=within%d.c; let pp=within/d.c; let pyy=pp/d.psz; let pxx=pp%d.psz;
+  let sy=py*d.psz+pyy; let sx=px*d.psz+pxx;
+  o[i]=img[(sy*d.w+sx)*d.c+pc];
+}"#;
 
+/// Unpatchify: the exact inverse of `PATCHIFY` — [num_patches, patch*patch*C] tokens → [H,W,C] image.
+const UNPATCHIFY: &str = r#"
+struct D { h:u32,w:u32,c:u32,psz:u32 };
+@group(0)@binding(0) var<storage,read> tok: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let pw=d.w/d.psz; let ph=d.h/d.psz; let n=ph*pw; let plen=d.psz*d.psz*d.c;
+  let i=g.y*nwg.x*64u+g.x; if(i>=n*plen){return;}
+  let p=i/plen; let within=i%plen;
+  let py=p/pw; let px=p%pw;
+  let pc=within%d.c; let pp=within/d.c; let pyy=pp/d.psz; let pxx=pp%d.psz;
+  let sy=py*d.psz+pyy; let sx=px*d.psz+pxx;
+  o[(sy*d.w+sx)*d.c+pc]=tok[i];
+}"#;
 
+const SILU: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let v=x[i]; o[i]=v/(1.0+exp(-v)); }"#;
 
 // --- VAE decoder primitives (batched: every tensor carries an explicit N dimension) ------------------
 
+/// 2D convolution, channel-last, batched: `x[N,H,W,Cin] * w[Cout,Cin,K,K] + bias[Cout] -> o[N,Hout,Wout,Cout]`.
+/// Direct (untiled) accumulation — correctness first, matching how `block_decode`/`block_decode_at`
+/// (the non-fused paths) came before their fused/tiled speed-ups elsewhere in this file. `Hout =
+/// (H+2*pad-K)/stride+1` (same for W); the caller computes and passes these so the shader stays a flat
+/// index walk. One invocation per output element (n,ho,wo,co).
+const CONV2D: &str = r#"
+struct D { n_batch:u32,h:u32,w:u32,cin:u32,cout:u32,k:u32,stride:u32,pad:u32,hout:u32,wout:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> wt: array<f32>;
+@group(0)@binding(2) var<storage,read> bias: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; let total=d.n_batch*d.hout*d.wout*d.cout; if(i>=total){return;}
+  let co=i%d.cout; let rest1=i/d.cout;
+  let wo=rest1%d.wout; let rest2=rest1/d.wout;
+  let ho=rest2%d.hout; let n=rest2/d.hout;
+  var acc=bias[co];
+  for(var ci=0u;ci<d.cin;ci=ci+1u){
+    for(var kh=0u;kh<d.k;kh=kh+1u){
+      let hi_s=i32(ho*d.stride+kh)-i32(d.pad); if(hi_s<0||hi_s>=i32(d.h)){continue;}
+      let hi=u32(hi_s);
+      for(var kw=0u;kw<d.k;kw=kw+1u){
+        let wi_s=i32(wo*d.stride+kw)-i32(d.pad); if(wi_s<0||wi_s>=i32(d.w)){continue;}
+        let wi=u32(wi_s);
+        let xv=x[((n*d.h+hi)*d.w+wi)*d.cin+ci];
+        let wv=wt[((co*d.cin+ci)*d.k+kh)*d.k+kw];
+        acc=acc+xv*wv;
+      }
+    }
+  }
+  o[i]=acc;
+}"#;
 
+/// GroupNorm, channel-last, batched: split `C` channels into `groups` equal chunks, normalize each
+/// (n, group) over {its channels} × {every spatial position}, then apply the per-channel affine
+/// `gamma`/`beta`. One invocation per (n, group) — each walks the whole group's spatial×channel extent
+/// twice (stats, then write), same two-pass shape as `RMSNORM`'s per-row walk.
+const GROUP_NORM: &str = r#"
+struct D { n_batch:u32,hw:u32,c:u32,groups:u32,eps:f32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> gamma: array<f32>;
+@group(0)@binding(2) var<storage,read> beta: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n_batch*d.groups){return;}
+  let gi=i%d.groups; let n=i/d.groups;
+  let cpg=d.c/d.groups; let c0=gi*cpg;
+  var mean=0.0; var cnt=0.0;
+  for(var p=0u;p<d.hw;p=p+1u){ for(var cc=0u;cc<cpg;cc=cc+1u){ mean=mean+x[(n*d.hw+p)*d.c+c0+cc]; cnt=cnt+1.0; } }
+  mean=mean/cnt;
+  var v=0.0;
+  for(var p=0u;p<d.hw;p=p+1u){ for(var cc=0u;cc<cpg;cc=cc+1u){ let dd=x[(n*d.hw+p)*d.c+c0+cc]-mean; v=v+dd*dd; } }
+  v=v/cnt; let inv=1.0/sqrt(v+d.eps);
+  for(var p=0u;p<d.hw;p=p+1u){
+    for(var cc=0u;cc<cpg;cc=cc+1u){
+      let idx=(n*d.hw+p)*d.c+c0+cc;
+      o[idx]=(x[idx]-mean)*inv*gamma[c0+cc]+beta[c0+cc];
+    }
+  }
+}"#;
 
+/// Nearest-neighbor 2x spatial upsample, channel-last, batched: `x[N,H,W,C] -> o[N,2H,2W,C]`. The VAE
+/// decoder's upsample stages use this (not a learned transposed-conv) — a plain repeat, followed by an
+/// ordinary `conv2d` (stride 1, pad 1) to smooth/mix, matching the SD/SDXL-family VAE decoder design.
+const UPSAMPLE2X: &str = r#"
+struct D { n_batch:u32,h:u32,w:u32,c:u32,_a:u32,_b:u32,_c:u32,_d:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; let h2=d.h*2u; let w2=d.w*2u; let total=d.n_batch*h2*w2*d.c; if(i>=total){return;}
+  let cc=i%d.c; let rest1=i/d.c;
+  let wo=rest1%w2; let rest2=rest1/w2;
+  let ho=rest2%h2; let n=rest2/h2;
+  let hi=ho/2u; let wi=wo/2u;
+  o[i]=x[((n*d.h+hi)*d.w+wi)*d.c+cc];
+}"#;
 
+// True LayerNorm (mean-subtract + population variance + eps), then per-channel scale `gt` and bias
+// `bt`. One row per invocation, mirroring RMSNORM's launch. Vision towers (CLIP/SigLIP/Qwen2-VL).
+const LAYERNORM: &str = r#"
+struct D { rows:u32,cols:u32,eps:f32,_p:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> gt: array<f32>;
+@group(0)@binding(2) var<storage,read> bt: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let r=g.x; if(r>=d.rows){return;}
+  let base=r*d.cols; var mean=0.0;
+  for(var c=0u;c<d.cols;c=c+1u){mean=mean+x[base+c];}
+  mean=mean/f32(d.cols);
+  var vv=0.0;
+  for(var c=0u;c<d.cols;c=c+1u){let z=x[base+c]-mean; vv=vv+z*z;}
+  let inv=1.0/sqrt(vv/f32(d.cols)+d.eps);
+  for(var c=0u;c<d.cols;c=c+1u){o[base+c]=(x[base+c]-mean)*inv*gt[c]+bt[c];}
+}"#;
 
+// tanh-approx GELU: 0.5x(1+tanh(√(2/π)(x+0.044715x³))).
+const GELU_TANH: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let v=x[i]; let inner=0.7978845608028654*(v+0.044715*v*v*v); o[i]=0.5*v*(1.0+tanh(inner)); }"#;
 
+// QuickGELU: x·sigmoid(1.702x) (OpenAI CLIP).
+const GELU_QUICK: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let v=x[i]; o[i]=v/(1.0+exp(-1.702*v)); }"#;
 
+// Bidirectional multi-head attention — the ViT twin of ATTENTION_MH: identical layout & GQA mapping,
+// but each query attends over ALL tokens (loop j in 0..t, no causal `j<=i` bound).
+const ATTENTION_MH_FULL: &str = r#"
+struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> k: array<f32>;
+@group(0)@binding(2) var<storage,read> v: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let id=g.x; if(id>=dd.t*dd.nh){return;}
+  let i=id/dd.nh; let hh=id%dd.nh;
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;  // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  var mx=-3.4e38;
+  for(var j=0u;j<dd.t;j=j+1u){ var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*k[j*kvdm+kb+c];} mx=max(mx,dot*scale); }
+  for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=0.0;}
+  var sum=0.0;
+  for(var j=0u;j<dd.t;j=j+1u){
+    var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*k[j*kvdm+kb+c];}
+    let p=exp(dot*scale-mx); sum=sum+p;
+    for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=o[i*dm+b+c]+p*v[j*kvdm+kb+c];}
+  }
+  for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=o[i*dm+b+c]/sum;}
+}"#;
 
+// Fused SwiGLU: silu(gate)*up in one dispatch (replaces a separate SILU + MUL).
+const SWIGLU: &str = r#"
+struct D { n:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> gate: array<f32>;
+@group(0)@binding(1) var<storage,read> up: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let v=gate[i]; o[i]=(v/(1.0+exp(-v)))*up[i]; }"#;
 
+// SwiGLU over a packed gate||up buffer: input row = [gate(h) | up(h)] (the fused
+// wgate_up matmul output), so this reads both halves of one [t,2h] tensor and writes
+// [t,h] = silu(gate)*up — pairing with the fused gate+up projection.
+const SWIGLU_PACKED: &str = r#"
+struct D { n:u32,h:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> gu: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let r=i/d.h; let c=i%d.h; let base=r*2u*d.h; let v=gu[base+c]; o[i]=(v/(1.0+exp(-v)))*gu[base+d.h+c]; }"#;
 
+// GeGLU-packed: gemma-family MLP gate. Same [gate|up] packed layout as SWIGLU_PACKED but the gate uses
+// tanh-approx GELU (gelu_pytorch_tanh) instead of SiLU: gelu(v)·up. The building block for Gemma2 FFN.
+const GEGLU_PACKED: &str = r#"
+struct D { n:u32,h:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> gu: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=d.n){return;} let r=i/d.h; let c=i%d.h; let base=r*2u*d.h;
+  let v=gu[base+c];
+  let gelu=0.5*v*(1.0+tanh(0.7978845608028654*(v+0.044715*v*v*v)));  // √(2/π)=0.79788456
+  o[i]=gelu*gu[base+d.h+c];
+}"#;
 
+const GATHER: &str = r#"
+struct D { n:u32,d:u32,id_off:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> table: array<f32>;
+@group(0)@binding(1) var<storage,read> ids: array<u32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let p=g.x; if(p>=dd.n*dd.d){return;}
+  let i=p/dd.d; let c=p%dd.d;
+  o[p]=table[ids[dd.id_off+i]*dd.d+c];
+}"#;
+// GATHER from an int8-resident (Q8_0-style) table: dequantize ONE row selected by ids[id_off].
+// Dequant expression verbatim from MATVEC_Q8_0 (extractBits + select for AGX-safe signed bytes).
+const GATHER_Q8_AT: &str = r#"
+struct D { k:u32, id_off:u32, kb:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> qw: array<u32>;
+@group(0)@binding(1) var<storage,read> qs: array<f32>;
+@group(0)@binding(2) var<storage,read> ids: array<u32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let c=g.x; if(c>=d.k){return;}
+  let row=ids[d.id_off];
+  let word=qw[row*(d.k/4u)+c/4u];
+  let ub=extractBits(word,(c%4u)*8u,8u);
+  let q=select(i32(ub), i32(ub)-256, ub>=128u);
+  o[c]=qs[row*d.kb+(c/32u)]*f32(q);
+}"#;
+// GPU argmax over a [1, n] row → index of the max into a 1-element u32 buffer. Single workgroup:
+// grid-stride scan + shared-memory reduction. Tie-break MATCHES the CPU `argmax` (lowest index wins):
+// strict `>` keeps the earlier index within a thread, and the reduction prefers the smaller index on
+// equal values. Lets greedy decode pick the next token on-device — read back 4 bytes, not [vocab].
+const ARGMAX: &str = r#"
+struct D { n:u32, out_slot:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<u32>;
+@group(0)@binding(2) var<uniform> d: D;
+var<workgroup> sv: array<f32,256>;
+var<workgroup> si: array<u32,256>;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let t = lid.x;
+  var bv = -3.4028235e38;
+  var bi = 0u;
+  var i = t;
+  loop {
+    if (i >= d.n) { break; }
+    let v = x[i];
+    if (v > bv) { bv = v; bi = i; }
+    i = i + 256u;
+  }
+  sv[t] = bv; si[t] = bi;
+  workgroupBarrier();
+  var stride = 128u;
+  loop {
+    if (stride == 0u) { break; }
+    if (t < stride) {
+      let ov = sv[t + stride]; let oi = si[t + stride];
+      if (ov > sv[t] || (ov == sv[t] && oi < si[t])) { sv[t] = ov; si[t] = oi; }
+    }
+    workgroupBarrier();
+    stride = stride >> 1u;
+  }
+  if (t == 0u) { o[d.out_slot] = si[0]; }
+}"#;
 
+// Full CPU `pick()` on the GPU, depositing like ARGMAX: repeat-penalty → top-k → temperature
+// softmax → min-p → top-p → uniform CDF walk, writing the chosen id into o[out_slot] AND into a
+// rolling recent-context ring (o[kids..kids+rcap]) that the NEXT step's penalty reads — so a whole
+// window of sampled steps runs with no CPU round-trip (greedy already had this via ARGMAX; sampled
+// decode — what chat actually runs — did a full-vocab readback + a 151k-element CPU sort per token).
+// The uniform draw comes from a CPU-precomputed xorshift01 stream (uni[out_slot]) so behavior is
+// deterministic given the seed and directly comparable against the CPU sampler.
+//
+// Selection strategy (the part that must scale to a 151k vocab in ONE workgroup): penalties only
+// LOWER logits (x/p keeps sign and shrinks; negative×p sinks further), so every member of the true
+// post-penalty top-k lies within the RAW top-(top_k + n_penalized). We iterate raw maxima in exact
+// descending (value, then ascending index) order — which makes exclusion of already-picked elements
+// a single compare against the LAST pick (v < last_v || (v == last_v && i > last_i)) instead of any
+// membership test — collect top_k+n_over candidates, then thread 0 applies the (≤64-entry) penalty
+// override table, re-sorts the candidates by (post value desc, index asc) — exactly the CPU's
+// stable descending sort semantics — truncates to top_k, and replays the CPU's serial float-op
+// order for softmax/min-p/top-p/CDF. Host guarantees temperature>0 and 2 ≤ top_k ≤ 64.
+const SAMPLE_AT: &str = r#"
+struct D { n:u32, out_slot:u32, top_k:u32, rlast:u32,
+           temp:u32, top_p:u32, min_p:u32, penalty:u32,
+           seeded:u32, rcap:u32, kids:u32, abs_step:u32,
+           _p0:u32, _p1:u32, _p2:u32, _p3:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> uni: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<u32>;
+@group(0)@binding(3) var<uniform> d: D;
+var<workgroup> sv: array<f32,256>;
+var<workgroup> si: array<u32,256>;
+var<workgroup> cand_v: array<f32,128>;
+var<workgroup> cand_i: array<u32,128>;
+var<workgroup> ov_i: array<u32,64>;
+var<workgroup> ov_v: array<f32,64>;
+var<workgroup> n_over: u32;
+var<workgroup> last_v: f32;
+var<workgroup> last_i: u32;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  let t = lid.x;
+  let temp = bitcast<f32>(d.temp);
+  let pen  = bitcast<f32>(d.penalty);
+  // ── phase 1 (thread 0, serial): replay the CPU penalty over the last rlast ring entries ──
+  if (t == 0u) {
+    n_over = 0u;
+    let valid = min(d.rcap, d.seeded + d.abs_step);
+    let neff = min(d.rlast, valid);
+    if (pen != 1.0 && neff > 0u) {
+      let head = d.seeded + d.abs_step; // next write position (ring index modulo rcap)
+      var j: u32 = neff;
+      loop { // oldest → newest, exactly the CPU slice order (order is commutative but kept anyway)
+        if (j == 0u) { break; }
+        let tok = o[d.kids + ((head - j) % d.rcap)];
+        if (tok < d.n) {
+          // current value: staged override if present, else the raw logit
+          var cur = x[tok]; var slot = n_over;
+          var q = 0u;
+          loop { if (q >= n_over) { break; }
+                 if (ov_i[q] == tok) { cur = ov_v[q]; slot = q; break; } q = q + 1u; }
+          if (cur > 0.0) { cur = cur / pen; } else { cur = cur * pen; }
+          ov_i[slot] = tok; ov_v[slot] = cur;
+          if (slot == n_over) { n_over = n_over + 1u; }
+        }
+        j = j - 1u;
+      }
+    }
+    last_v = 3.4028235e38; last_i = 0xffffffffu; // sentinel: nothing picked yet
+  }
+  workgroupBarrier();
+  // ── phase 2: iterate raw maxima in exact (value desc, index asc) order ──
+  let want = min(d.top_k + n_over, min(128u, d.n));
+  var c: u32 = 0u;
+  loop {
+    if (c >= want) { break; }
+    var bv = -3.4028235e38;
+    var bi = 0xffffffffu;
+    var i = t;
+    loop {
+      if (i >= d.n) { break; }
+      // NaN/Inf guard (Colibri #369): a poisoned logit must not be selected. Reading non-finite as
+      // -inf excludes it from the max so the pick stays a finite, in-range token id (a lone +Inf would
+      // otherwise win and skew the softmax; a NaN sentinel could leave bi out of range).
+      var v = x[i];
+      if (!(v == v) || v > 3.0e38 || v < -3.0e38) { v = -3.4028235e38; }
+      // exclusion by order: already-picked ⇔ NOT (v < last_v || (v == last_v && i > last_i))
+      if (v < last_v || (v == last_v && i > last_i)) {
+        if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+      }
+      i = i + 256u;
+    }
+    sv[t] = bv; si[t] = bi;
+    workgroupBarrier();
+    var stride = 128u;
+    loop {
+      if (stride == 0u) { break; }
+      if (t < stride) {
+        let ovv = sv[t + stride]; let oii = si[t + stride];
+        if (ovv > sv[t] || (ovv == sv[t] && oii < si[t])) { sv[t] = ovv; si[t] = oii; }
+      }
+      workgroupBarrier();
+      stride = stride >> 1u;
+    }
+    if (t == 0u) {
+      cand_v[c] = sv[0]; cand_i[c] = si[0];
+      last_v = sv[0]; last_i = si[0];
+    }
+    workgroupBarrier();
+    c = c + 1u;
+  }
+  // ── phase 3 (thread 0, serial): overrides → stable re-sort → the CPU sampler tail verbatim ──
+  if (t == 0u) {
+    // apply penalty overrides to the candidate set
+    var a: u32 = 0u;
+    loop { if (a >= want) { break; }
+      var q = 0u;
+      loop { if (q >= n_over) { break; }
+        if (ov_i[q] == cand_i[a]) { cand_v[a] = ov_v[q]; break; } q = q + 1u; }
+      a = a + 1u; }
+    // insertion sort by (value desc, index asc) — the CPU's stable descending order
+    a = 1u;
+    loop { if (a >= want) { break; }
+      let vv = cand_v[a]; let ii = cand_i[a];
+      var b = a;
+      loop { if (b == 0u) { break; }
+        let pv = cand_v[b - 1u]; let pi = cand_i[b - 1u];
+        if (pv > vv || (pv == vv && pi < ii)) { break; }
+        cand_v[b] = pv; cand_i[b] = pi; b = b - 1u; }
+      cand_v[b] = vv; cand_i[b] = ii;
+      a = a + 1u; }
+    let k = min(d.top_k, want);
+    // temperature softmax over the k picks (same op order as CPU: exp((v-mx)/T), sum, divide)
+    let mx = cand_v[0];
+    var sum = 0.0;
+    var pi2: u32 = 0u;
+    loop { if (pi2 >= k) { break; }
+      let e = exp((cand_v[pi2] - mx) / temp);
+      cand_v[pi2] = e; sum = sum + e; pi2 = pi2 + 1u; }
+    pi2 = 0u;
+    loop { if (pi2 >= k) { break; } cand_v[pi2] = cand_v[pi2] / sum; pi2 = pi2 + 1u; }
+    var cut = k;
+    let minp = bitcast<f32>(d.min_p);
+    if (minp > 0.0) {
+      let thresh = minp * cand_v[0];
+      var f = cut; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; }
+        if (cand_v[pi2] < thresh) { f = pi2; break; } pi2 = pi2 + 1u; }
+      cut = max(f, 1u);
+      var s2 = 0.0; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } s2 = s2 + cand_v[pi2]; pi2 = pi2 + 1u; }
+      pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } cand_v[pi2] = cand_v[pi2] / s2; pi2 = pi2 + 1u; }
+    }
+    let topp = bitcast<f32>(d.top_p);
+    if (topp < 1.0) {
+      var cum = 0.0; var f = cut; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; }
+        cum = cum + cand_v[pi2];
+        if (cum >= topp) { f = pi2 + 1u; break; } pi2 = pi2 + 1u; }
+      cut = f;
+      var s3 = 0.0; pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } s3 = s3 + cand_v[pi2]; pi2 = pi2 + 1u; }
+      pi2 = 0u;
+      loop { if (pi2 >= cut) { break; } cand_v[pi2] = cand_v[pi2] / s3; pi2 = pi2 + 1u; }
+    }
+    let r = uni[d.out_slot];
+    var picked = cand_i[cut - 1u];
+    var cum2 = 0.0; pi2 = 0u;
+    loop { if (pi2 >= cut) { break; }
+      cum2 = cum2 + cand_v[pi2];
+      if (r < cum2) { picked = cand_i[pi2]; break; } pi2 = pi2 + 1u; }
+    o[d.out_slot] = picked;
+    o[d.kids + ((d.seeded + d.abs_step) % d.rcap)] = picked; // extend the ring for the NEXT step
+  }
+}"#;
 
 // ── model: load a GGUF into resident weights and run a stacked forward pass ──
 /// A loaded model: embedding (host, for lookup), N resident transformer blocks,
@@ -4488,9 +6461,6 @@ pub struct Model {
     pub base: f32, pub eps: f32,
     /// MLA (Multi-head Latent Attention) rank config, present only for DeepSeek-V3/GLM-MoE checkpoints.
     /// When set, the KV cache stores the compressed latent instead of per-head K/V. `None` = standard MHA/GQA.
-    pub delta: Option<DeltaDims>,
-    /// Per-layer recurrent flag (Qwen3.5 hybrid): true = Gated DeltaNet, false = attention.
-    pub recurrent: Vec<bool>,
     pub mla: Option<MlaConfig>,
     /// Multiplier applied to the token embedding before the first block.
     ///
@@ -4848,10 +6818,25 @@ a '{declared}'");
 metadata, so the latent dimensions are unknown. The MLA path is implemented and validated; this \
 particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layout}"));
             }
-            eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache (validated); \
-per-layer routing active");
+            // Only claim the path is ACTIVE if the weights actually loaded. Saying "per-layer routing
+            // active" and then failing two lines later with "the MLA forward isn't wired yet" is a log
+            // that contradicts itself, and the reader cannot tell which half to believe.
+            // The split form is now READ (k_b + v_b concatenated), so it is no longer a blocker. What
+            // remains unverified is whether the concatenation order and the 3-D-as-2-D flattening match
+            // what mla.rs expects — the shapes line up and llama.cpp's declaration says they should, but
+            // no MLA checkpoint has run end to end here.
+            let split_kv_b = g.tensor("blk.0.attn_k_b.weight").is_some();
+            eprintln!("wgpu-engine: MLA attention — compressed-latent KV cache, per-layer routing, \
+{} kv_b layout. UNVERIFIED on a real checkpoint: the decode block and cache are gated, the weight \
+layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
         }
-        let treat_unsupported = !acfg.supported;
+        // DERIVED, not read off the entry. archfeat can veto a declared-supported architecture — the
+        // direction that ships broken output — while a declared-unsupported one stays refused whatever
+        // the feature table says, because "no gap I know of" is not "verified on a real checkpoint".
+        // Variant = expert count, which distinguishes Llama-4 Scout (16) from Maverick (128). Read
+        // from metadata here rather than threaded down, since this is the only place that needs it.
+        let variant = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
+        let treat_unsupported = !crate::archcfg::is_supported(&arch, variant);
         if treat_unsupported {
             // MoE-aware escape: some architectures (e.g. Qwen4) are only PARTIALLY unsupported — their MoE
             // routing kernel isn't wired, but a DENSE checkpoint of the same arch runs on the existing
@@ -4870,6 +6855,10 @@ per-layer routing active");
                 // missing, one of them structural" is most of what a person needs to decide what to do.
                 let known = crate::archfeat::gap_report(&arch, expert_count);
                 let detail = if known.is_empty() { acfg.note.to_string() } else { known.join("; ") };
+                // trim a trailing period on `detail` before adding our own: notes end with one about half
+                // the time and "for now.. Use the" is the kind of sloppiness that makes a reader trust
+                // the rest of the message less
+                let detail = detail.trim_end_matches('.').to_string();
                 return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {detail}. \
                     Use the llama.cpp backend for this model.\n{layout}"));
             }
@@ -4903,64 +6892,21 @@ per-layer routing active");
         // Which layers are windowed. llama.cpp's default pattern puts the FULL-attention layer last in
         // each group (dense_first = false), so a period of 4 gives [swa, swa, swa, dense].
         let swa_period = g.get_u32(&format!("{}.attention.sliding_window_pattern", acfg.prefix))
-            // Format defaults when the key is absent, exactly as llama.cpp hardcodes them:
-            // llama4 = 4 (3 chunked : 1 rope-full), gemma3 = 6 (5 local : 1 global),
-            // gemma2 = 2 (alternating). Treating absence as "no pattern" made every gemma
-            // layer windowed — including the global ones, which then also took the SWA rope
-            // base. Absence of a key with a format-defined default is not zero.
-            .unwrap_or(match acfg.arch {
-                _ if is_llama4 => 4,
-                crate::archcfg::Arch::Gemma3 => 6,
-                crate::archcfg::Arch::Gemma2 => 2,
-                _ => 0,
-            });
+            .unwrap_or(if is_llama4 { 4 } else { 0 });
         let n_swa_layers = g.get_u32(&format!("{}.block_count", acfg.prefix)).unwrap_or(0) as usize;
         let swa_pattern: Vec<bool> = if swa_period > 0 {
             crate::swa::swa_layers(n_swa_layers, swa_period, false)
         } else { vec![true; n_swa_layers] };
-        // Qwen3.5 hybrid (Gated DeltaNet): the ssm.* keys are the signature. Recurrent
-        // layers come from `attention.recurrent_layers` when the file carries it, else
-        // llama.cpp's rule: (i+1) % full_attention_interval != 0 (default interval 4 —
-        // three DeltaNet layers, then one gated-attention layer).
-        let delta_dims: Option<DeltaDims> = {
-            let dcv = g.get_u32(&format!("{pfx}.ssm.conv_kernel")).unwrap_or(0) as usize;
-            if matches!(acfg.arch, crate::archcfg::Arch::Qwen35) && dcv > 0 {
-                let st = g.get_u32(&format!("{pfx}.ssm.state_size")).unwrap_or(0) as usize;
-                let hk = g.get_u32(&format!("{pfx}.ssm.group_count")).unwrap_or(0) as usize;
-                let hv = g.get_u32(&format!("{pfx}.ssm.time_step_rank")).unwrap_or(0) as usize;
-                for (nm, v, mx) in [("state_size", st, 4096usize), ("group_count", hk, 1024),
-                                    ("time_step_rank", hv, 4096), ("conv_kernel", dcv, 64)] {
-                    if v == 0 || v > mx {
-                        return Err(format!("qwen3.5 ssm.{nm} = {v} is out of range — corrupt/hostile header"));
-                    }
-                }
-                if hv % hk != 0 { return Err(format!("qwen3.5 ssm heads: {hv} v-heads not divisible by {hk} k-heads")); }
-                Some(DeltaDims { s: st, hk, hv, d_conv: dcv })
-            } else { None }
-        };
-        let recurrent: Vec<bool> = if delta_dims.is_some() {
-            let from_key: Option<Vec<bool>> = match g.metadata.get(&format!("{pfx}.attention.recurrent_layers")) {
-                Some(crate::gguf::Value::Arr(a)) => Some(a.iter().map(|v| match v {
-                    crate::gguf::Value::Bool(b) => *b,
-                    crate::gguf::Value::U32(x) => *x != 0,
-                    crate::gguf::Value::I32(x) => *x != 0,
-                    _ => false,
-                }).collect()),
-                _ => None,
-            };
-            from_key.unwrap_or_else(|| {
-                let interval = g.get_u32(&format!("{pfx}.full_attention_interval")).unwrap_or(4) as usize;
-                // layer count under the SNIFFED prefix — the registry spelling can differ
-                // (qwen3_5 vs the file's qwen35), and an empty map here silently routes
-                // every DeltaNet layer into the attention loaders.
-                let nl = g.get_u32(&format!("{pfx}.block_count")).unwrap_or(0) as usize;
-                (0..nl).map(|i| (i + 1) % interval.max(1) != 0).collect()
-            })
-        } else { Vec::new() };
-        if let Some(dd) = &delta_dims {
-            eprintln!("wgpu-engine: Qwen3.5 hybrid — {} Gated-DeltaNet + {} gated-attention layers (S={} H_k={} H_v={} conv={})",
-                recurrent.iter().filter(|&&r| r).count(), recurrent.iter().filter(|&&r| !r).count(),
-                dd.s, dd.hk, dd.hv, dd.d_conv);
+        // One line naming any optimization that is NOT in its default state, so a run is reproducible
+        // from its own log. Printing all twelve every load would be noise nobody reads; printing the
+        // deviations makes an unusual result traceable to the lever that caused it.
+        {
+            let overridden: Vec<String> = crate::enginelevers::LEVERS.iter().filter_map(|l| {
+                std::env::var(l.var).ok().map(|v| format!("{}={v}", l.var))
+            }).collect();
+            if !overridden.is_empty() {
+                eprintln!("wgpu-engine: non-default levers set — {}", overridden.join(" "));
+            }
         }
         // Newly enabled architectures say so. Every Gemma-3 requirement is implemented and unit-gated,
         // but no Gemma checkpoint has ever been loaded end to end here — and this project has repeatedly
@@ -5053,12 +6999,7 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
         // remainder. Only trust the MTP count if those trailing blocks genuinely lack attention tensors.
         let mtp = g.get_u32(&format!("{pfx}.nextn_predict_layers")).unwrap_or(0) as usize;
         let n = if mtp > 0 && mtp < n_blocks
-            && (matches!(acfg.arch, crate::archcfg::Arch::Qwen35)   // qwen3.5 MTP block LOOKS like a
-                                                                    // full-attn layer (has attn_q) —
-                                                                    // its nextn.* tensors are the tell,
-                                                                    // so trust the metadata here
-                || (g.tensor(&format!("blk.{}.attn_q.weight", n_blocks - 1)).is_none()
-                    && g.tensor(&format!("blk.{}.attn_q_a.weight", n_blocks - 1)).is_none())) {
+            && g.tensor(&format!("blk.{}.attn_q.weight", n_blocks - 1)).is_none() {
             eprintln!("loader: {mtp} nextn-predict (MTP draft head) block(s) present, not loaded as layers — {} transformer layers", n_blocks - mtp);
             n_blocks - mtp
         } else { n_blocks };
@@ -5338,58 +7279,77 @@ names this loader does not know (run --gate-quant-survey and dump blk.{i}.* to s
             }
             // Qwen2 carries a bias on Q/K/V (llama doesn't). Fetch the f32 bias once so it can both
             // attach to the separate projections AND concatenate for the fused wqkv bias.
-            // MLA q-compressed blocks (GLM-4.7-Flash, DeepSeek-V3: q_lora_rank > 0) ship NO
-            // attn_q/k/v — the low-rank factors loaded into `mla` below ARE the whole QKV.
-            // Same placeholder pattern as MoE's dense-FFN fields: tiny F32s, never bound
-            // (the forward matches `mla` first). Sniffed per BLOCK from the tensors, not
-            // from the config, so MTP draft blocks and mixed checkpoints stay honest.
-            // DeepSeek-V2-Lite (q_lora_rank == 0) keeps a real attn_q and takes the
-            // standard fetches below — its q is full-rank even though its KV is latent.
-            // Phi-3 family: ONE fused attn_qkv tensor, rows stacked [Q | K | V] — exactly the
-            // engine's own wqkv fusion layout, so the fused weight loads directly and the
-            // separate wq/wk/wv (the unfused/debug path) are row-slices of the same fetch.
-            // Qwen3.5 recurrent layers ALSO ship attn_qkv (the DeltaNet fused projection) —
-            // that is NOT phi3's attention QKV, so the recurrent check comes first and
-            // excludes it from the fused-attention sniff.
-            let is_recurrent = delta_dims.is_some() && recurrent.get(i).copied().unwrap_or(false);
-            let qgate = delta_dims.is_some() && !is_recurrent;   // qwen3.5 full-attn: fused [q|gate]
-            let fused_qkv = !is_recurrent && g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
-                && g.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some();
-            let qkv_f: Option<Vec<f32>> = if fused_qkv {
-                let f = fetch(&format!("blk.{i}.attn_qkv.weight"))?;
-                if f.len() != (attn_dim + 2 * kv) * d {
-                    return Err(format!("blk.{i}.attn_qkv.weight has {} values, expected ({attn_dim}+2*{kv})*{d} — \
-head_count/head_count_kv metadata disagrees with the tensor", f.len()));
-                }
-                Some(f)
-            } else { None };
-            let mla_q = g.tensor(&format!("blk.{i}.attn_q.weight")).is_none()
-                && (g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
-                    || g.tensor(&format!("blk.{i}.attn_q_a_proj.weight")).is_some());
-            let has_qkv_bias = !mla_q && !fused_qkv && g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
-            let fused_bias: Option<Vec<f32>> = if fused_qkv && g.tensor(&format!("blk.{i}.attn_qkv.bias")).is_some() {
-                Some(fetch(&format!("blk.{i}.attn_qkv.bias"))?)
-            } else { None };
+            let has_qkv_bias = g.tensor(&format!("blk.{i}.attn_q.bias")).is_some();
             let (fbq, fbk, fbv) = if has_qkv_bias {
                 (fetch(&format!("blk.{i}.attn_q.bias"))?, fetch(&format!("blk.{i}.attn_k.bias"))?, fetch(&format!("blk.{i}.attn_v.bias"))?)
             } else { (Vec::new(), Vec::new(), Vec::new()) };
-            let bq = if has_qkv_bias { Some(self.upload(&fbq, 1, d)) }
-                else { fused_bias.as_ref().map(|b| self.upload(&b[..attn_dim], 1, attn_dim)) };
-            let bk = if has_qkv_bias { Some(self.upload(&fbk, 1, kv)) }
-                else { fused_bias.as_ref().map(|b| self.upload(&b[attn_dim..attn_dim + kv], 1, kv)) };
-            let bv = if has_qkv_bias { Some(self.upload(&fbv, 1, kv)) }
-                else { fused_bias.as_ref().map(|b| self.upload(&b[attn_dim + kv..], 1, kv)) };
+            let bq = if has_qkv_bias { Some(self.upload(&fbq, 1, d)) } else { None };
+            let bk = if has_qkv_bias { Some(self.upload(&fbk, 1, kv)) } else { None };
+            let bv = if has_qkv_bias { Some(self.upload(&fbv, 1, kv)) } else { None };
             // Fused Q||K||V projection [d+2kv, d] (mirrors the wgate_up fusion): concatenate the q/k/v
             // weight ROWS then quantize — per-row quant of the concatenation is identical to quantizing
             // each separately (proven bit-exact by --gate-qkv). The bias concatenates the same way.
-            let wqkv = if mla_q || is_recurrent || qgate { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
-            else if let Some(f) = &qkv_f {
-                let l = self.make_lin(f, attn_dim + 2 * kv, d, q, q4_mode);
-                if let Some(b) = &fused_bias { l.with_bias(Some(self.upload(b, 1, attn_dim + 2 * kv))) } else { l }
-            } else {
-                let mut qkv = fetch(&format!("blk.{i}.attn_q.weight"))?;
-                qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
-                qkv.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
+            let wqkv = {
+                // REFUSE CLEANLY when this is an MLA checkpoint. MLA models have no `attn_q` — they
+                // have the low-rank pair attn_q_a/attn_q_b — so falling through to the dense path here
+                // reports "missing tensor blk.0.attn_q.weight", which sends the reader looking for a
+                // corrupt file. The tensor is not missing; the loader is reading the wrong architecture.
+                if g.tensor(&format!("blk.{i}.attn_q_a.weight")).is_some()
+                    || g.tensor(&format!("blk.{i}.attn_kv_a_mqa.weight")).is_some() {
+                    return Err(format!("blk.{i} is Multi-head Latent Attention (attn_q_a / attn_kv_a_mqa \
+present, attn_q absent) and the MLA path did not engage, so the dense loader ran instead. This is a \
+LOADER gap, not a bad checkpoint — see the MLA line earlier in this log for which part is missing"));
+                }
+                // DIAGNOSE rather than just report a name. "missing tensor blk.0.attn_q.weight" sends
+                // the reader to look for a corrupt file; the tensor is usually not missing at all, the
+                // model just names its attention weights differently — fused attn_qkv, MLA's low-rank
+                // pair, or a convention this loader has never seen. Listing what the block ACTUALLY has
+                // turns an hour of guessing into one line.
+                if g.tensor(&format!("blk.{i}.attn_q.weight")).is_none() {
+                    let mut found: Vec<String> = Vec::new();
+                    for suffix in ["attn_qkv", "attn_q_a", "attn_q_b", "attn_kv_a_mqa", "attn_k", "attn_v",
+                                   "attn_output", "attn_norm", "wqkv", "query_key_value"] {
+                        let n = format!("blk.{i}.{suffix}.weight");
+                        if let Some(t) = g.tensor(&n) {
+                            found.push(format!("{suffix} {:?}", t.dims));
+                        }
+                    }
+                    let hint = if found.iter().any(|f| f.starts_with("attn_qkv") || f.starts_with("wqkv")
+                                                   || f.starts_with("query_key_value")) {
+                        " — this looks like a FUSED qkv layout, which this loader does not split yet"
+                    } else if found.iter().any(|f| f.starts_with("attn_q_a")) {
+                        " — this is Multi-head Latent Attention"
+                    } else { "" };
+                    return Err(format!("blk.{i} has no `attn_q.weight`. What it DOES have: [{}]{hint}. \
+The file is not corrupt; this loader does not recognise its attention layout",
+                        if found.is_empty() { "nothing recognisable".into() } else { found.join(", ") }));
+                }
+                // The loader's internal layout IS q ++ k ++ v, so a checkpoint that ships them already
+                // fused needs no rearrangement — only a shape check. Guarded rather than assumed: some
+                // architectures interleave qkv PER HEAD instead of as three blocks, and those have the
+                // same total row count while being a completely different matrix. Matching rows is
+                // necessary, not sufficient, so this is accepted only when the split form is absent and
+                // the total is exactly right.
+                let want_rows = (attn_dim + 2 * kv) as u64;
+                let mut qkv = if g.tensor(&format!("blk.{i}.attn_q.weight")).is_none() {
+                    let name = format!("blk.{i}.attn_qkv.weight");
+                    let t = g.tensor(&name).ok_or_else(|| format!("blk.{i}: neither attn_q nor attn_qkv"))?;
+                    let rows = t.dims.last().copied().unwrap_or(0).max(t.dims.first().copied().unwrap_or(0));
+                    if rows != want_rows {
+                        return Err(format!("blk.{i}.attn_qkv has {rows} rows but this model needs \
+{want_rows} (attn_dim {attn_dim} + 2 x kv {kv}). A fused qkv with the wrong row count is a DIFFERENT \
+layout — probably per-head interleaved — and reading it as three blocks would produce fluent nonsense"));
+                    }
+                    eprintln!("wgpu-engine: blk.{i} ships a FUSED attn_qkv ({rows} rows, as expected) — \
+using it directly. UNVERIFIED against a real generation: the row count matching does not prove the \
+q/k/v block ORDER matches");
+                    fetch(&name)?
+                } else {
+                    let mut v = fetch(&format!("blk.{i}.attn_q.weight"))?;
+                    v.extend_from_slice(&fetch(&format!("blk.{i}.attn_k.weight"))?);
+                    v.extend_from_slice(&fetch(&format!("blk.{i}.attn_v.weight"))?);
+                    v
+                };
                 let fused = self.make_lin(&qkv, attn_dim + 2 * kv, d, q, q4_mode);
                 if has_qkv_bias {
                     let mut b = Vec::with_capacity(attn_dim + 2 * kv);
@@ -5397,102 +7357,22 @@ head_count/head_count_kv metadata disagrees with the tensor", f.len()));
                     fused.with_bias(Some(self.upload(&b, 1, attn_dim + 2 * kv)))
                 } else { fused }
             };
-            // MLA weight set with DIAGNOSTIC collection: the old closure collapsed every failure —
-            // a missing name OR a fetch/dequant error (e.g. an unsupported tensor type) — into one
-            // generic "incomplete" message via `.ok()?`. Now each tensor either resolves or records
-            // WHY it didn't, and the error names the exact tensors, their underlying errors, and
-            // dumps the block's attn tensors so the next unknown spelling/type self-diagnoses.
-            let mut mla_missing: Vec<String> = Vec::new();
-            let mla_w = {
-                let mut need = |a: &str, b: &str| -> Option<Vec<f32>> {
-                    let na = format!("blk.{i}.{a}.weight");
-                    let nb = format!("blk.{i}.{b}.weight");
-                    let name = if g.tensor(&na).is_some() { na }
-                               else if g.tensor(&nb).is_some() { nb }
-                               else { mla_missing.push(format!("{a}|{b}: neither name present")); return None; };
-                    match fetch(&name) {
-                        Ok(v) => Some(v),
-                        Err(e) => { mla_missing.push(format!("{name}: {e}")); None }
-                    }
-                };
-                let parts = (need("attn_q_a", "attn_q_a_proj"), need("attn_q_a_norm", "attn_q_a_layernorm"),
-                             need("attn_q_b", "attn_q_b_proj"), need("attn_kv_a_mqa", "attn_kv_a"),
-                             need("attn_kv_a_norm", "attn_kv_a_layernorm"), need("attn_kv_b", "attn_kv_b_proj"),
-                             need("attn_output", "attn_out"));
-                match parts {
-                    (Some(qa), Some(qaln), Some(qb), Some(kva), Some(kvaln), Some(kvb), Some(o)) =>
-                        Some(crate::mla::MlaWeightsT {
-                            q_a: self.upload_flat(&qa), q_a_ln: self.upload_flat(&qaln),
-                            q_b: self.upload_flat(&qb),
-                            kv_a: self.upload_flat(&kva), kv_a_ln: self.upload_flat(&kvaln),
-                            kv_b: self.upload_flat(&kvb),
-                            o: self.upload_flat(&o),
-                        }),
-                    _ => None,
-                }
-            };
-            if mla_q && mla_w.is_none() {
-                return Err(format!(
-                    "blk.{i}: q-compressed MLA block (attn_q absent, attn_q_a present) but the MLA \
-tensor set is incomplete:\n  {}\nblock tensors:\n{}",
-                    mla_missing.join("\n  "), g.dump_tensors(&format!("blk.{i}.attn"))));
-            }
-            let delta_w: Option<Box<DeltaWeights>> = if is_recurrent {
-                let dd = delta_dims.as_ref().unwrap();
-                let (kdim, vdim, cd) = (dd.key_dim(), dd.value_dim(), dd.conv_dim());
-                let need = |n: &str, want: usize| -> Result<Vec<f32>, String> {
-                    let v = fetch(n)?;
-                    if v.len() != want { return Err(format!("{n} has {} values, expected {want} — ssm.* metadata disagrees with the tensor", v.len())); }
-                    Ok(v)
-                };
-                Some(Box::new(DeltaWeights {
-                    qkv: self.make_lin(&need(&format!("blk.{i}.attn_qkv.weight"), (2 * kdim + vdim) * d)?, 2 * kdim + vdim, d, q, q4_mode),
-                    z: self.make_lin(&need(&format!("blk.{i}.attn_gate.weight"), vdim * d)?, vdim, d, q, q4_mode),
-                    conv_w: self.upload(&need(&format!("blk.{i}.ssm_conv1d.weight"), cd * dd.d_conv)?, 1, cd * dd.d_conv),
-                    dtb: self.upload(&need(&format!("blk.{i}.ssm_dt.bias"), dd.hv)?, 1, dd.hv),
-                    a: self.upload(&need(&format!("blk.{i}.ssm_a"), dd.hv)?, 1, dd.hv),        // NB: no .weight suffix
-                    beta: self.make_lin(&need(&format!("blk.{i}.ssm_beta.weight"), dd.hv * d)?, dd.hv, d, false, false),
-                    alpha: self.make_lin(&need(&format!("blk.{i}.ssm_alpha.weight"), dd.hv * d)?, dd.hv, d, false, false),
-                    ssm_norm: self.upload(&need(&format!("blk.{i}.ssm_norm.weight"), dd.s)?, 1, dd.s),
-                    out: self.make_lin(&need(&format!("blk.{i}.ssm_out.weight"), d * vdim)?, d, vdim, q, q4_mode),
-                }))
-            } else { None };
             layers.push(BlockWeights {
                 g1: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.attn_norm.weight"))?, &acfg), 1, d),
                 wqkv,
-                wq: if mla_q || is_recurrent { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
-                    else if qgate { lin(&format!("blk.{i}.attn_q.weight"), 2 * attn_dim, d, q)? }  // fused [q|gate]
-                    else if let Some(f) = &qkv_f { self.make_lin(&f[0..attn_dim * d], attn_dim, d, q, q4_mode).with_bias(bq) }
-                    else { lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq) },
-                wk: if mla_q || is_recurrent { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
-                    else if let Some(f) = &qkv_f { self.make_lin(&f[attn_dim * d..(attn_dim + kv) * d], kv, d, q, q4_mode).with_bias(bk) }
-                    else { lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk) },
-                wv: if mla_q || is_recurrent { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
-                    else if let Some(f) = &qkv_f { self.make_lin(&f[(attn_dim + kv) * d..(attn_dim + 2 * kv) * d], kv, d, q, q4_mode).with_bias(bv) }
-                    else { lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv) },
-                wo: if is_recurrent { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
-                    else { lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)? },
+                wq: lin(&format!("blk.{i}.attn_q.weight"), attn_dim, d, q)?.with_bias(bq),
+                wk: lin(&format!("blk.{i}.attn_k.weight"), kv, d, q)?.with_bias(bk),
+                wv: lin(&format!("blk.{i}.attn_v.weight"), kv, d, q)?.with_bias(bv),
+                wo: lin(&format!("blk.{i}.attn_output.weight"), d, attn_dim, q)?,
                 g2: self.upload(&gemma_norm(&fetch(&format!("blk.{i}.ffn_norm.weight"))
-                    .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))
-                    .or_else(|_| fetch(&format!("blk.{i}.attn_post_norm.weight")))?, &acfg), 1, d),
+                    .or_else(|_| fetch(&format!("blk.{i}.post_attention_norm.weight")))?, &acfg), 1, d),
                 // gate and up fused into one [2h, d] projection: a single matmul emits
                 // [t, 2h] = [gate(h) | up(h)] per row, which SWIGLU_PACKED then consumes.
                 // Halves the FFN projection dispatches/weight-binds; per-row int8 quant of
                 // the concatenation is identical to quantizing the two weights separately.
                 // MoE layers have no dense FFN tensors — tiny F32 placeholders, never applied
                 // (ffn_apply branches to the moe field first).
-                wgate_up: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) }
-                else if g.tensor(&format!("blk.{i}.ffn_gate.weight")).is_none() {
-                    // Phi-3: no ffn_gate tensor — ffn_up rows are [gate | up] stacked, llama.cpp's
-                    // LLM_FFN_SWIGLU split (first half gets SiLU). That is EXACTLY this engine's
-                    // wgate_up layout, so the tensor loads as the fusion directly.
-                    let gu = fetch(&format!("blk.{i}.ffn_up.weight"))?;
-                    if gu.len() != 2 * h * d {
-                        return Err(format!("blk.{i}.ffn_up.weight has {} values — no ffn_gate present, so \
-expected the phi3 fused [gate|up] shape 2*{h}*{d}", gu.len()));
-                    }
-                    self.make_lin(&gu, 2 * h, d, q, q4_mode)
-                } else {
+                wgate_up: if layer_is_moe { self.make_lin(&vec![0.0f32; 32], 1, 32, false, false) } else {
                     let gt = fetch(&format!("blk.{i}.ffn_gate.weight"))?;
                     let u = fetch(&format!("blk.{i}.ffn_up.weight"))?;
                     let mut gu = Vec::with_capacity(gt.len() + u.len());
@@ -5718,22 +7598,13 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     } else { None };
                     drop(gsrc); drop(usrc);
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
-                        // Routing semantics come from the checkpoint, not the arch tag: `deepseek2` spans
-                        // softmax-gated V2 and sigmoid-gated V3/GLM-4.7 (expert_gating_func = 2), and the
-                        // routed scaling factor is a trained constant the file carries. Absent keys keep
-                        // the per-arch defaults (see archcfg::MoeMeta).
-                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0,
-                            crate::archcfg::MoeMeta {
-                                gating_func: g.get_u32(&format!("{pfx}.expert_gating_func")),
-                                weights_scale: g.get_f32(&format!("{pfx}.expert_weights_scale")),
-                                weights_norm: g.get_bool(&format!("{pfx}.expert_weights_norm")),
-                            }) }))
+                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
-                q_norm: if has_qk_norm && !is_recurrent { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
+                q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
                         else if is_llama4 && !(nope_step > 0 && (i + 1) % nope_step == 0) { Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim)) }
                         else { None },
-                k_norm: if has_qk_norm && !is_recurrent { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) }
+                k_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_k_norm.weight"))?, 1, head_dim)) }
                         else if is_llama4 && !(nope_step > 0 && (i + 1) % nope_step == 0) { Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim)) }
                         else { None },
                 nope: nope_step > 0 && (i + 1) % nope_step == 0,
@@ -5750,18 +7621,10 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // is exactly how llama.cpp gates it (use_kq_norm = type != LLM_TYPE_17B_128E). Applied
                 // after rope by `kq_post`; rope layers only.
                 // Per-layer rope base: Gemma rotates its WINDOWED layers at rope.freq_base_swa and its
-                // full-attention layers at the model base. llama.cpp HARDCODES 10000 as the SWA-layer
-                // default for gemma2/gemma3 — most GGUFs don't write the key at all — so absence of the
-                // key on a Gemma is not "no override", it's "use the format's default". Without this,
-                // 5 of every 6 gemma3 layers roped at the GLOBAL base (1e6): 100x-wrong frequencies on
-                // almost the whole stack, which decoded as multilingual token soup on the first real
-                // gemma3 checkpoint this engine ever saw. Non-Gemma archs: key-only, untouched.
+                // full-attention layers at the model base. Only set when the file actually carries the
+                // key AND this layer is windowed — otherwise None, and every other model is untouched.
                 rope_base: {
-                    let swa_base = g.get_f32(&format!("{}.rope.freq_base_swa", acfg.prefix))
-                        .or(match acfg.arch {
-                            crate::archcfg::Arch::Gemma2 | crate::archcfg::Arch::Gemma3 => Some(10000.0),
-                            _ => None,
-                        });
+                    let swa_base = g.get_f32(&format!("{}.rope.freq_base_swa", acfg.prefix));
                     match (swa_base, swa_pattern.get(i).copied().unwrap_or(false)) {
                         (Some(b), true) if b > 0.0 => Some(b),
                         _ => None,
@@ -5780,9 +7643,52 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 // low-rank factors, and quantizing them is a separate question from quantizing the big
                 // weight matrices. GLM-5.2 (glm-dsa) names the reconstructed dims *_mla; both spellings
                 // of the tensor names are accepted so one loader covers DeepSeek-V3 and GLM.
-                mla: mla_w,
-                delta: delta_w,
-                qgate,
+                mla: {
+                    let t = |a: &str, b: &str| -> Option<String> {
+                        let na = format!("blk.{i}.{a}.weight");
+                        if g.tensor(&na).is_some() { return Some(na); }
+                        let nb = format!("blk.{i}.{b}.weight");
+                        if g.tensor(&nb).is_some() { return Some(nb); }
+                        None
+                    };
+                    (|| -> Option<crate::mla::MlaWeightsT> {
+                        let (qa, qaln, qb) = (t("attn_q_a", "attn_q_a_proj")?, t("attn_q_a_norm", "attn_q_a_layernorm")?, t("attn_q_b", "attn_q_b_proj")?);
+                        let (kva, kvaln) = (t("attn_kv_a_mqa", "attn_kv_a")?, t("attn_kv_a_norm", "attn_kv_a_layernorm")?);
+            // kv_b comes in TWO forms and only the legacy one is fused.
+            //
+            // llama.cpp PR #12801 declares the modern pair as 2-D:
+            //     wk_b = {qk_nope,  n_head * kv_lora}
+            //     wv_b = {kv_lora,  n_head * v_head_mla}
+            // and GGUF stores them 3-D — `attn_k_b [192, 512, 20]`, `attn_v_b [512, 256, 20]`. Those are
+            // THE SAME BYTES: ne0 varies fastest, so [a, b, c] is [a, b*c] without reshuffling. Reading
+            // the split form therefore needs a concatenation, not a transpose or a re-layout.
+            //
+            // "only old legacy GGUF files will have the unsplit wkv_b tensor" — so the fused name must
+            // stay supported, but it is the fallback, not the expectation.
+            let kvb_split = (t("attn_k_b", "attn_k_b_trans"), t("attn_v_b", "attn_v_b_proj"));
+            let kvb_fused = t("attn_kv_b", "attn_kv_b_proj");
+                        let o = t("attn_output", "attn_out")?;
+                        let g1 = |n: &str| fetch(n).ok();
+                        Some(crate::mla::MlaWeightsT {
+                            q_a: self.upload_flat(&g1(&qa)?), q_a_ln: self.upload_flat(&g1(&qaln)?),
+                            q_b: self.upload_flat(&g1(&qb)?),
+                            kv_a: self.upload_flat(&g1(&kva)?), kv_a_ln: self.upload_flat(&g1(&kvaln)?),
+                            kv_b: match (&kvb_split, &kvb_fused) {
+                    // Split form: concatenate k_b then v_b into the single [n_head*(qk_nope+v_head),
+                    // kv_lora] matrix mla.rs expects. Order matters and is k THEN v, matching the fused
+                    // layout llama.cpp splits FROM.
+                    ((Some(kb), Some(vb)), _) => {
+                        let (mut a, b) = (g1(kb)?, g1(vb)?);
+                        a.extend_from_slice(&b);
+                        self.upload_flat(&a)
+                    }
+                    (_, Some(f)) => self.upload_flat(&g1(f)?),
+                    _ => return None,
+                },
+                            o: self.upload_flat(&g1(&o)?),
+                        })
+                    })()
+                },
                 // Sliding window, per layer. Read from metadata rather than assumed: the window size is
                 // `<arch>.attention.sliding_window`, and the layer pattern decides which layers use it.
                 // Llama-4 is CHUNKED (aligned blocks); Gemma is STANDARD (last n positions) — different
@@ -5809,19 +7715,6 @@ host-copy path (dequantize + requantize every expert into RAM)");
         } else {
             self.make_lin(&embed, vocab, d, q, q4_mode)
         };
-        // Partial rotary (phi3 family): `rope.dimension_count` < head_dim ropes only the
-        // leading dims of each head. Absent/full → 0 → kernels use head_dim (bit-identical
-        // to the pre-partial kernels). Odd values are rejected: the pairing needs rot/2.
-        let rot = {
-            let r = g.get_u32(&format!("{pfx}.rope.dimension_count")).unwrap_or(0) as usize;
-            if r == 0 || r >= head_dim { 0 } else if r % 2 == 1 {
-                return Err(format!("rope.dimension_count = {r} is odd — split-half rope needs an even width"));
-            } else {
-                eprintln!("loader: partial rotary — rope on the first {r} of {head_dim} head dims");
-                r
-            }
-        };
-        self.rope_rot.store(rot as u32, std::sync::atomic::Ordering::Relaxed);
         // RoPE frequency factors (llama3 long-context scaling). GGUF ships them as
         // `rope_freqs.weight` (length head_dim/2); absent → all 1.0 (plain RoPE).
         let hd_half = head_dim / 2;
@@ -5836,19 +7729,6 @@ host-copy path (dequantize + requantize every expert into RAM)");
         // formulation, so scores scale by mscale²). Stored per load like `rope_neox`.
         let mut rope_vals = rope_vals;
         let mut mscale = 1.0f32;
-        // LINEAR rope scaling (position interpolation): DeepSeek-LLM/Coder 16k, Llama-2
-        // long-context finetunes. Every frequency divides by `factor` — which is literally
-        // ff[i] *= factor, since every rope kernel divides by ff. No mscale. Composes with
-        // llama3-style per-dim rope_freqs above (uniform factor × per-dim factors). Ignoring
-        // this key put positions 4x out of the trained range on DeepSeek-Coder-16k: prompts
-        // past ~orig/factor tokens decoded as degenerate frequent-token soup.
-        if g.get_str(&format!("{pfx}.rope.scaling.type")) == Some("linear") {
-            let f = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
-            if f > 1.0 {
-                for v in rope_vals.iter_mut() { *v *= f; }
-                eprintln!("wgpu-engine: LINEAR rope scaling ON — positions interpolated \u{d7}{f}");
-            }
-        }
         if g.get_str(&format!("{pfx}.rope.scaling.type")) == Some("yarn") {
             let sf = g.get_f32(&format!("{pfx}.rope.scaling.factor")).unwrap_or(1.0);
             let orig = g.get_u32(&format!("{pfx}.rope.scaling.original_context_length")).unwrap_or(0);
@@ -5857,25 +7737,6 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 let (ffv, ms) = yarn_factors(head_dim, base, sf, orig, 32.0, 1.0, attnf);
                 rope_vals = ffv; mscale = ms;
                 eprintln!("wgpu-engine: YaRN rope scaling ON — {sf}× over {orig} native ctx (mscale {mscale:.4})");
-            }
-        }
-        // Phi-3 LongRoPE: per-dim factor TENSORS at the root (long + short), selected by
-        // context. llama.cpp picks per-run n_ctx; this engine serves up to the shipped max,
-        // so the shipped `context_length` vs `rope.scaling.original_context_length` decides.
-        // The factors divide the frequency exactly like ggml's freq_factors — they fold into
-        // the same ff buffer, padded with 1.0 above the rotated width.
-        if g.tensor("rope_factors_long.weight").is_some() && g.tensor("rope_factors_short.weight").is_some() {
-            let ctx = g.get_u32(&format!("{pfx}.context_length")).unwrap_or(0);
-            let orig = g.get_u32(&format!("{pfx}.rope.scaling.original_context_length")).unwrap_or(ctx);
-            let which = if ctx > orig { "rope_factors_long.weight" } else { "rope_factors_short.weight" };
-            let v = fetch(which)?;
-            let want = (if rot > 0 { rot } else { head_dim }) / 2;
-            if v.len() == want {
-                for (dst, src) in rope_vals.iter_mut().zip(&v) { *dst = *src; }
-                mscale = g.get_f32(&format!("{pfx}.rope.scaling.attn_factor")).unwrap_or(1.0);
-                eprintln!("wgpu-engine: LongRoPE factors ON ({which}, ctx {ctx} vs {orig} native; mscale {mscale:.4})");
-            } else {
-                eprintln!("wgpu-engine: LongRoPE factor tensor len {} != rot/2 {} — ignoring factors", v.len(), want);
             }
         }
         self.rope_mscale.store(mscale.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -5941,6 +7802,10 @@ host-copy path (dequantize + requantize every expert into RAM)");
 file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             }
         }
+        // Report any silent tokenizer losses. Zero for a well-formed byte-level vocab; non-zero means
+        // the prompt differs from what was typed, and no amount of engine debugging downstream will
+        // explain it.
+        if let Some(r) = crate::tokenizer::drop_report() { eprintln!("wgpu-engine: {r}"); }
         let converted = self.flush_q4k();
         // The load pass read the whole file; hand that page cache back rather than holding ~61 GiB
         // resident for the life of the process.
@@ -5961,7 +7826,7 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
         if embed_scale != 1.0 {
             eprintln!("loader: embedding scaled by sqrt(d) = {embed_scale:.2} (Gemma)");
         }
-        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, delta: delta_dims, recurrent, dsa, mtp_layers: mtp })
+        Ok(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale, n_layers: n, n_heads, n_kv_heads, head_dim, base, eps, mla, dsa, mtp_layers: mtp })
     }
 
     // ── int8-resident weight cache ───────────────────────────────────────────────────────────
@@ -6037,12 +7902,11 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
             let (wq, wk, wv) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let (wo, wgate_up, wdown) = (self.read_lin(&mut r)?, self.read_lin(&mut r)?, self.read_lin(&mut r)?);
             let g2 = self.read_tensor(&mut r)?;
-            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, delta: None, qgate: false, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
+            layers.push(BlockWeights { wqkv, wq, wk, wv, wo, wgate_up, wdown, g1, g2, q_norm: None, k_norm: None, nope: false, attn_temp: None, kq_norm: None, swa: None, mla: None, geglu: false, post_attn: None, post_ffn: None, rope_base: None, moe: None });
         }
         // Cached models are llama-family only (bias/QK-Norm/MoE are never cached) → adjacent-pair RoPE.
         self.rope_neox.store(false, std::sync::atomic::Ordering::Relaxed);
-        self.rope_rot.store(0, std::sync::atomic::Ordering::Relaxed);
-        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, delta: None, recurrent: Vec::new(), dsa: None, mtp_layers: 0 })
+        Some(Model { embed, layers, out_norm, output, rope_factors, d, h, vocab, embed_scale: 1.0, n_layers, n_heads, n_kv_heads, head_dim: d / n_heads.max(1), base, eps, mla: None, dsa: None, mtp_layers: 0 })
     }
     fn read_tensor(&self, r: &mut Rd) -> Option<Tensor> {
         let (rows, cols) = (r.u32()? as usize, r.u32()? as usize);
@@ -6173,23 +8037,655 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
     }
 }
 
+const ROPE_MH: &str = r#"
+struct D { t:u32,dm:u32,base:f32,pos0:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> ff: array<f32>;   // per-dim-pair freq factors (len hd/2)
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let half=dd.hd/2u; let per=dd.dm/2u; let p=g.y*nwg.x*64u+g.x; if(p>=dd.t*per){return;}
+  let tok=p/per; let within=p%per; let head=within/half; let i=within%half;
+  let off=tok*dd.dm + head*dd.hd;
+  let freq=f32(tok+dd.pos0)/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
+  let c=cos(freq)*dd.msc; let s=sin(freq)*dd.msc;
+  // Pairing differs by family, angles do not. llama (NORM): rotate adjacent (2i, 2i+1).
+  // qwen/neox (NEOX): rotate split halves (i, i+hd/2). Wrong pairing = real words, scrambled meaning.
+  // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
+  //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
+  //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
+  let j0=off + i*(2u-dd.neox);
+  let j1=j0 + 1u + dd.neox*(half-1u);
+  let x0=x[j0]; let x1=x[j1];
+  o[j0]=x0*c-x1*s;
+  o[j1]=x0*s+x1*c;
+}"#;
 
+// Per-row-position RoPE: like ROPE_MH but each row reads its own absolute position
+// from `pos[row]` instead of pos0+row. Needed for batched decode, where the N rows
+// are N different sessions at N different positions.
+const ROPE_MH_ROWS: &str = r#"
+struct D { t:u32,dm:u32,base:f32,_p:u32,hd:u32,neox:u32,msc:f32,_c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> ff: array<f32>;
+@group(0)@binding(2) var<storage,read> pos: array<u32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let half=dd.hd/2u; let per=dd.dm/2u; let p=g.y*nwg.x*64u+g.x; if(p>=dd.t*per){return;}
+  let tok=p/per; let within=p%per; let head=within/half; let i=within%half;
+  let off=tok*dd.dm + head*dd.hd;
+  let freq=f32(pos[tok])/(pow(dd.base,(2.0*f32(i))/f32(dd.hd))*ff[i]);
+  let c=cos(freq)*dd.msc; let s=sin(freq)*dd.msc;
+  // Branch-free arithmetic pairing (no select — removes any backend-specific miscompile surface):
+  //   j0 = i*(2-neox)             -> NORM: 2i     NEOX: i
+  //   j1 = j0 + 1 + neox*(half-1) -> NORM: 2i+1   NEOX: i+half
+  let j0=off + i*(2u-dd.neox);
+  let j1=j0 + 1u + dd.neox*(half-1u);
+  let x0=x[j0]; let x1=x[j1];
+  o[j0]=x0*c-x1*s;
+  o[j1]=x0*s+x1*c;
+}"#;
 
+// MLA attention with SEPARATE score dim (qk) and value dim (vh) — MLA's qk_head (nope+rope) and v_head
+// generally differ (DeepSeek-V3: 192 vs 128), so the standard ATTENTION_MH (single hd) can't be reused.
+// One query row (decode step) at position `p` = t-1, causal over t cached rows. K is [t, nh·qk] with each
+// head's [k_nope | k_rot] already materialized; V is [t, nh·vh]; Q is [1, nh·qk]. One thread per head.
+// Pack the kv_b reconstruction [t, nh·(qk_nope+v_head)] + shared rot cache [t, qk_rope] into full per-head
+// K [t, nh·qk_head] (each head = [k_nope | k_rot]) and V [t, nh·v_head]. One thread per (row, head).
+// NEOX-rope the rope-part [qk_nope, qk_head) of each head of an MLA query [1, nh*qk_head] at position pos.
+const MLA_QROPE: &str = r#"
+struct D { nh:u32, qk_nope:u32, qk_rope:u32, pos:u32, base:f32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let qk=d.qk_nope+d.qk_rope; let half=d.qk_rope/2u;
+  let n=d.nh*qk;
+  let id=g.x; if(id>=n){return;}
+  let hh=id/qk; let c=id%qk;
+  // copy through by default; overwrite the rope-half pairs
+  o[id]=x[id];
+  if(c>=d.qk_nope && c<d.qk_nope+half){
+    let i=c-d.qk_nope;
+    let base_i=hh*qk+d.qk_nope;
+    let freq=f32(d.pos)/pow(d.base,(2.0*f32(i))/f32(d.qk_rope));
+    let cs=cos(freq); let sn=sin(freq);
+    let x0=x[base_i+i]; let x1=x[base_i+i+half];
+    o[base_i+i]=x0*cs-x1*sn;
+    o[base_i+i+half]=x0*sn+x1*cs;
+  }
+}"#;
 
+// Pack the kv_b reconstruction [t, nh·(qk_nope+v_head)] into full per-head K [t, nh·qk_head] by
+// concatenating the shared rot cache [t, qk_rope] onto each head's k_nope. One thread per (row, head).
+const MLA_PACK_K: &str = r#"
+struct D { t:u32, nh:u32, qk_nope:u32, qk_rope:u32, v_head:u32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> rec: array<f32>;
+@group(0)@binding(1) var<storage,read> rot: array<f32>;
+@group(0)@binding(2) var<storage,read_write> kout: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let id=g.x; let n=d.t*d.nh; if(id>=n){return;}
+  let row=id/d.nh; let hh=id%d.nh;
+  let recw=d.nh*(d.qk_nope+d.v_head); let recb=row*recw+hh*(d.qk_nope+d.v_head);
+  let qk=d.qk_nope+d.qk_rope; let kb=row*(d.nh*qk)+hh*qk;
+  for(var c=0u;c<d.qk_nope;c=c+1u){ kout[kb+c]=rec[recb+c]; }
+  for(var c=0u;c<d.qk_rope;c=c+1u){ kout[kb+d.qk_nope+c]=rot[row*d.qk_rope+c]; }
+}"#;
 
+const MLA_PACK_V: &str = r#"
+struct D { t:u32, nh:u32, qk_nope:u32, qk_rope:u32, v_head:u32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> rec: array<f32>;
+@group(0)@binding(1) var<storage,read_write> vout: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let id=g.x; let n=d.t*d.nh; if(id>=n){return;}
+  let row=id/d.nh; let hh=id%d.nh;
+  let recw=d.nh*(d.qk_nope+d.v_head); let recb=row*recw+hh*(d.qk_nope+d.v_head);
+  let vb=row*(d.nh*d.v_head)+hh*d.v_head;
+  for(var c=0u;c<d.v_head;c=c+1u){ vout[vb+c]=rec[recb+d.qk_nope+c]; }
+}"#;
 
+const MLA_ATTN: &str = r#"
+struct D { t:u32, nh:u32, qk:u32, vh:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> k: array<f32>;
+@group(0)@binding(2) var<storage,read> v: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let hh=g.x; if(hh>=d.nh){return;}
+  let qkdm=d.nh*d.qk; let vdm=d.nh*d.vh;
+  let qb=hh*d.qk; let vb=hh*d.vh;
+  let scale=1.0/sqrt(f32(d.qk));
+  var mx=-3.4e38;
+  for(var j=0u;j<d.t;j=j+1u){ var dot=0.0; for(var c=0u;c<d.qk;c=c+1u){dot=dot+q[qb+c]*k[j*qkdm+qb+c];} mx=max(mx,dot*scale); }
+  for(var c=0u;c<d.vh;c=c+1u){o[vb+c]=0.0;}
+  var sum=0.0;
+  for(var j=0u;j<d.t;j=j+1u){
+    var dot=0.0; for(var c=0u;c<d.qk;c=c+1u){dot=dot+q[qb+c]*k[j*qkdm+qb+c];}
+    let pw=exp(dot*scale-mx); sum=sum+pw;
+    for(var c=0u;c<d.vh;c=c+1u){o[vb+c]=o[vb+c]+pw*v[j*vdm+vb+c];}
+  }
+  for(var c=0u;c<d.vh;c=c+1u){o[vb+c]=o[vb+c]/sum;}
+}"#;
 
+// DSA lightning-indexer scoring (see dsa.rs::indexer_scores). One thread per cached key t computes
+//   score[t] = (1/√nh) · Σ_h w[h] · ReLU( (q_idx[h]·k_idx[t]) / √hd )
+// q_idx is [nh·hd] (rope'd), k_idx is [nk, hd] (one hd-wide key per position, shared across heads), w is
+// [nh]. Bit-exact to the CPU reference: same per-head ReLU-then-weight, same √hd / √nh scaling, same order
+// (heads inner, so the fp accumulation matches). This is the score that ranks keys for top-k selection.
+const DSA_INDEXER: &str = r#"
+struct D { nk:u32, nh:u32, hd:u32, _p:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;   // [nh*hd]
+@group(0)@binding(1) var<storage,read> k: array<f32>;   // [nk*hd]
+@group(0)@binding(2) var<storage,read> w: array<f32>;   // [nh]
+@group(0)@binding(3) var<storage,read_write> o: array<f32>; // [nk]
+@group(0)@binding(4) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let t=g.x; if(t>=d.nk){return;}
+  let wsc=1.0/sqrt(f32(d.nh));
+  let rs=1.0/sqrt(f32(d.hd));
+  let kbase=t*d.hd;
+  var a=0.0;
+  for(var h=0u;h<d.nh;h=h+1u){
+    let qbase=h*d.hd;
+    var d0=0.0;
+    for(var i=0u;i<d.hd;i=i+1u){ d0=d0+q[qbase+i]*k[kbase+i]; }
+    d0=d0*rs;
+    if(d0>0.0){ a=a+w[h]*d0; }   // ReLU on the per-head score, then weight
+  }
+  o[t]=a*wsc;
+}"#;
 
+// DSA masked attention (see dsa.rs::masked_attention). One thread per value-dim column; a single query
+// attends over only the keys whose mask[t] != 0, softmax renormalized over the selected set. q is [dk], k
+// is [nk·dk], v is [nk·dv], mask is [nk]. With an all-ones mask this is exactly dense attention (the
+// dense-equivalence anchor). Each thread owns one output column c and streams the selected keys twice
+// (max, then weighted sum) so no shared memory is needed and it's bit-comparable to the CPU reference.
+const DSA_MASKED_ATTN: &str = r#"
+struct D { nk:u32, dk:u32, dv:u32, _p:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;    // [dk]
+@group(0)@binding(1) var<storage,read> k: array<f32>;    // [nk*dk]
+@group(0)@binding(2) var<storage,read> v: array<f32>;    // [nk*dv]
+@group(0)@binding(3) var<storage,read> mask: array<f32>; // [nk]
+@group(0)@binding(4) var<storage,read_write> o: array<f32>; // [dv]
+@group(0)@binding(5) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let c=g.x; if(c>=d.dv){return;}
+  let scale=1.0/sqrt(f32(d.dk));
+  // pass 1: max over selected keys (same score each thread recomputes — cheap, dk small; keeps it
+  // one-output-per-thread with no cross-thread reduction).
+  var mx=-3.4e38;
+  for(var t=0u;t<d.nk;t=t+1u){
+    if(mask[t]==0.0){continue;}
+    var dot=0.0; let kb=t*d.dk; for(var i=0u;i<d.dk;i=i+1u){dot=dot+q[i]*k[kb+i];}
+    let s=dot*scale; if(s>mx){mx=s;}
+  }
+  // pass 2: weighted sum of this column
+  var denom=0.0; var acc=0.0;
+  for(var t=0u;t<d.nk;t=t+1u){
+    if(mask[t]==0.0){continue;}
+    var dot=0.0; let kb=t*d.dk; for(var i=0u;i<d.dk;i=i+1u){dot=dot+q[i]*k[kb+i];}
+    let p=exp(dot*scale-mx); denom=denom+p;
+    acc=acc+p*v[t*d.dv+c];
+  }
+  o[c]=acc/denom;
+}"#;
 
+// DSA top-k selection as a MASK (see dsa.rs::select_topk). One thread per key t sets mask[t]=1 iff key t is
+// among the top `keep` by score, breaking ties by position (earlier wins) — exactly the reference's
+// "> thr then == thr in ascending position order" rule, computed as a stable rank:
+//   rank(t) = #{j: score[j] > score[t]} + #{j: score[j] == score[t] AND j < t};  mask[t] = rank(t) < keep.
+// When keep >= nk every rank < nk <= keep, so all keys select (the no-op-below-threshold case) with no
+// special branch. O(nk²) but nk is bounded by index_topk; matches the CPU set bit-for-bit incl. ties.
+const DSA_TOPK_MASK: &str = r#"
+struct D { nk:u32, keep:u32, _a:u32, _b:u32 };
+@group(0)@binding(0) var<storage,read> s: array<f32>;        // [nk] scores
+@group(0)@binding(1) var<storage,read_write> mask: array<f32>; // [nk]
+@group(0)@binding(2) var<uniform> d: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let t=g.x; if(t>=d.nk){return;}
+  let st=s[t];
+  var rank=0u;
+  for(var j=0u;j<d.nk;j=j+1u){
+    let sj=s[j];
+    if(sj>st){ rank=rank+1u; }
+    else if(sj==st && j<t){ rank=rank+1u; }   // stable tie-break: earlier position ranks higher
+  }
+  if(rank<d.keep){ mask[t]=1.0; } else { mask[t]=0.0; }
+}"#;
 
+const ATTENTION_MH: &str = r#"
+struct D { t:u32,hd:u32,nh:u32,nkv:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> k: array<f32>;
+@group(0)@binding(2) var<storage,read> v: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let id=g.x; if(id>=dd.t*dd.nh){return;}
+  let i=id/dd.nh; let hh=id%dd.nh;
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;  // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  var mx=-3.4e38;
+  for(var j=0u;j<=i;j=j+1u){ var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*k[j*kvdm+kb+c];} mx=max(mx,dot*scale); }
+  for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=0.0;}
+  var sum=0.0;
+  for(var j=0u;j<=i;j=j+1u){
+    var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*k[j*kvdm+kb+c];}
+    let p=exp(dot*scale-mx); sum=sum+p;
+    for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=o[i*dm+b+c]+p*v[j*kvdm+kb+c];}
+  }
+  for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=o[i*dm+b+c]/sum;}
+}"#;
 
+// Prefill-extend attention: a segment of `s` queries at global positions [base, base+s)
+// attends over a cache already holding [0, base+s) rows (parent prefix + this segment),
+// causal by global position. Lets a shared segment be prefilled on top of a parent cache
+// in O(s·(base+s)) instead of recomputing the parent — the batched `extend_prefix`.
+// PARALLEL prefill attention: one workgroup per (query row, head), 64 threads splitting the causal KV
+// loop [0, qpos] with a shared-memory softmax reduction — instead of ATTENTION_MH_EXT's single serial
+// thread crawling the whole cache per row. Same math, same causal mask, but the per-row O(qpos·hd) work
+// is spread across the GPU. This is what keeps each prefill dispatch SHORT (no watchdog trip) and fast.
+//
+// Shared score buffer sized at 2048 f32 = 8 KB, NOT the 32 KB max. This is deliberate, grounded in the
+// Apple-GPU occupancy rule: every core has ~32 KB of threadgroup memory, and a workgroup's allocation
+// divides how many run concurrently — 8 KB ⇒ 4 groups/core, 16 KB ⇒ 2, 32 KB ⇒ 1 (a matmul benchmark
+// measured 400 vs 250 GFLOPS for 8 KB vs 32 KB for exactly this reason). 8 KB keeps occupancy high while
+// still covering causal rows up to 2048 in one workgroup; longer rows fall back to the serial kernel
+// (correct, slower) until a split-K causal prefill lands. `SCTILE` must match the array size below.
+const ATTENTION_MH_EXT_PAR: &str = r#"
+// `nswa`/`swaty` add sliding-window attention. Unlike decode — where a single query position gives one
+// contiguous range — every query ROW here has its own window, so the bound is computed per row from that
+// row's global position. It is still a range rather than a mask, because both windowing rules are
+// contiguous: the tile loop simply starts at the window instead of at 0. swaty: 0 none, 1 standard
+// (Gemma, last n positions), 2 chunked (Llama-4, current aligned chunk).
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+var<workgroup> sc: array<f32,2048>;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let row=wg.x;                                       // which (query row, head) this workgroup handles
+  let i=row/dd.nh; let hh=row%dd.nh; let tid=lid.x;
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;   // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  let qpos=dd.base+i;                                 // causal bound: attend to [0, qpos]
+  let l=qpos+1u;
+  let TILE=2048u;                                     // KV rows per shared-memory tile (matches sc size)
+  // Online-softmax over KV TILES so any causal length works at 8 KB shared memory (high occupancy):
+  // per tile, load scores into sc, then fold the tile into a running (max m, denom d, acc[hd]) with the
+  // standard rescale. acc for this row's head_dim is kept in registers, strided across the 64 threads.
+  var m=-3.4e38; var den=0.0;
+  // per-thread partial accumulator over head_dim columns this thread owns (c = tid, tid+64, …)
+  var acc0=0.0; var acc1=0.0; var acc2=0.0;           // hd<=192 for tid-strided (hd/64) cols; 128→2 cols
+  // sliding window: this row's earliest visible KV position (0 when unwindowed)
+  var lo=0u;
+  if(dd.nswa>0u){
+    if(dd.swaty==1u){ if(l>dd.nswa){ lo=l-dd.nswa; } }        // standard: keep the last nswa positions
+    else if(dd.swaty==2u){ lo=(qpos/dd.nswa)*dd.nswa; }        // chunked: start of qpos's aligned chunk
+  }
+  var t0=lo;
+  loop {
+    if(t0>=l){break;}
+    let t1=min(l, t0+TILE);
+    // scores for this tile → sc[0 .. t1-t0), and this tile's local max
+    var lmax=-3.4e38; var j=t0+tid;
+    loop { if(j>=t1){break;} var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*kc[j*kvdm+kb+c];} let sv=dot*scale; sc[j-t0]=sv; lmax=max(lmax,sv); j=j+64u; }
+    red[tid]=lmax; workgroupBarrier();
+    for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+    let tilemax=red[0]; workgroupBarrier();
+    // new running max and the rescale factor for the accumulator/denominator so far
+    let newm=max(m, tilemax);
+    let resc=exp(m-newm);
+    // exponentiate this tile's scores against newm; tile denom
+    var tden=0.0; j=t0+tid;
+    loop { if(j>=t1){break;} let p=exp(sc[j-t0]-newm); sc[j-t0]=p; tden=tden+p; j=j+64u; }
+    red[tid]=tden; workgroupBarrier();
+    for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+    let tilesum=red[0]; workgroupBarrier();
+    den=den*resc+tilesum;
+    // fold tile's V-weighted contribution into the register accumulators (rescaled), cols strided by 64
+    acc0=acc0*resc; acc1=acc1*resc; acc2=acc2*resc;
+    var c=tid; var slot=0u;
+    loop { if(c>=dd.hd){break;}
+      var a=0.0; for(var jj=t0;jj<t1;jj=jj+1u){ a=a+sc[jj-t0]*vc[jj*kvdm+kb+c]; }
+      if(slot==0u){acc0=acc0+a;} else if(slot==1u){acc1=acc1+a;} else {acc2=acc2+a;}
+      c=c+64u; slot=slot+1u;
+    }
+    m=newm; t0=t0+TILE;
+    workgroupBarrier();
+  }
+  // write normalized output: each thread writes the cols it owns
+  var c=tid; var slot=0u;
+  loop { if(c>=dd.hd){break;}
+    var a=acc0; if(slot==1u){a=acc1;} else if(slot==2u){a=acc2;}
+    o[i*dm+b+c]=a/den; c=c+64u; slot=slot+1u;
+  }
+}"#;
 
+const ATTENTION_MH_EXT: &str = r#"
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,_a:u32,_b:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let id=g.x; if(id>=dd.s*dd.nh){return;}
+  let i=id/dd.nh; let hh=id%dd.nh;
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;  // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  let qpos=dd.base+i;                                 // global position of this query row
+  var mx=-3.4e38;
+  for(var j=0u;j<=qpos;j=j+1u){ var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*kc[j*kvdm+kb+c];} mx=max(mx,dot*scale); }
+  for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=0.0;}
+  var sum=0.0;
+  for(var j=0u;j<=qpos;j=j+1u){
+    var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*kc[j*kvdm+kb+c];}
+    let p=exp(dot*scale-mx); sum=sum+p;
+    for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=o[i*dm+b+c]+p*vc[j*kvdm+kb+c];}
+  }
+  for(var c=0u;c<dd.hd;c=c+1u){o[i*dm+b+c]=o[i*dm+b+c]/sum;}
+}"#;
 
+// Flash-style SPLIT-K decode attention, pass 1 of 2 — the long-context kernel. One workgroup per
+// (query head, KV chunk): each computes its chunk's LOCAL softmax pieces — running max, exp-sum,
+// and the unnormalized V-weighted accumulation — into a partials buffer [nh][nch][hd+2]. Pass 2
+// combines chunks with the standard online-softmax rescale. Parallelism grows with context
+// (heads × chunks workgroups) instead of saturating at n_heads; nothing needs scores[l] in shared
+// memory, so there is no 4096-row cap. Numerics: per-chunk max + rescale reorders the summation
+// vs the monolithic kernels — same tolerance class as the other fused paths (~1e-6 rel).
+const DECODE_ATTN_FLASH_P1: &str = r#"
+struct D { l:u32,hd:u32,nh:u32,nkv:u32,chunk:u32,nch:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> part: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+var<workgroup> sc: array<f32,2048>;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hh=wg.x; let ch=wg.y; let tid=lid.x;
+  let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;  // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  let j0=ch*dd.chunk; let j1=min(dd.l, j0+dd.chunk);
+  let pbase=(hh*dd.nch+ch)*(dd.hd+2u);
+  var lmax=-3.4e38; var j=j0+tid;
+  loop { if(j>=j1){break;} var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[b+c]*kc[j*kvdm+kb+c];} let s=dot*scale; sc[j-j0]=s; lmax=max(lmax,s); j=j+64u; }
+  red[tid]=lmax; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+  let mx=red[0]; workgroupBarrier();
+  var lsum=0.0; j=j0+tid;
+  loop { if(j>=j1){break;} let p=exp(sc[j-j0]-mx); sc[j-j0]=p; lsum=lsum+p; j=j+64u; }
+  red[tid]=lsum; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+  let sum=red[0]; workgroupBarrier();
+  var c=tid;
+  loop { if(c>=dd.hd){break;} var acc=0.0; for(var jj=j0;jj<j1;jj=jj+1u){ acc=acc+sc[jj-j0]*vc[jj*kvdm+kb+c]; } part[pbase+c]=acc; c=c+64u; }
+  if(tid==0u){ part[pbase+dd.hd]=mx; part[pbase+dd.hd+1u]=sum; }
+}"#;
 
+// Two-span attention: the WARM (int8) span emitted as flash pass-1 partials. Same partial layout as
+// DECODE_ATTN_FLASH_P1 ([hd accumulators | local_max | local_sum] per (head, chunk)) so the SAME pass-2
+// combine folds warm chunks together with the hot f32 chunks — one online-softmax over the union. Reads
+// int8 K/V (packed u32 + per-row f32 scale) with inline dequant, matching DECODE_ATTN_MH_Q8's layout.
+// Writing into a shared `part` buffer at a chunk offset means warm and hot partials coexist and pass-2
+// needs no changes. `coff` = the chunk index where this span's chunks start (hot span occupies [0,coff)).
+const DECODE_ATTN_FLASH_P1_Q8: &str = r#"
+struct D { l:u32,hd:u32,nh:u32,nkv:u32,chunk:u32,nch:u32,coff:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kq: array<u32>;
+@group(0)@binding(2) var<storage,read> ks: array<f32>;
+@group(0)@binding(3) var<storage,read> vq: array<u32>;
+@group(0)@binding(4) var<storage,read> vs: array<f32>;
+@group(0)@binding(5) var<storage,read_write> part: array<f32>;
+@group(0)@binding(6) var<uniform> dd: D;
+var<workgroup> sc: array<f32,2048>;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hh=wg.x; let ch=wg.y; let tid=lid.x;
+  let kvdm=dd.nkv*dd.hd; let kvw=kvdm/4u;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;
+  let scale=1.0/sqrt(f32(dd.hd));
+  let j0=ch*dd.chunk; let j1=min(dd.l, j0+dd.chunk);
+  // this span's chunks are placed AFTER the hot span's chunks (coff), so pass-2 sees one chunk list
+  let pbase=(hh*dd.nch+(dd.coff+ch))*(dd.hd+2u);
+  var lmax=-3.4e38; var j=j0+tid;
+  loop { if(j>=j1){break;}
+    let ksc=ks[j]; var dot=0.0;
+    for(var c=0u;c<dd.hd;c=c+1u){
+      let idx=kb+c; let word=kq[j*kvw + idx/4u];
+      let ub=extractBits(word,(idx%4u)*8u,8u); let qi=select(i32(ub), i32(ub)-256, ub>=128u);
+      dot=dot+q[b+c]*(f32(qi)*ksc);
+    }
+    let s=dot*scale; sc[j-j0]=s; lmax=max(lmax,s); j=j+64u; }
+  red[tid]=lmax; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+  let mx=red[0]; workgroupBarrier();
+  var lsum=0.0; j=j0+tid;
+  loop { if(j>=j1){break;} let p=exp(sc[j-j0]-mx); sc[j-j0]=p; lsum=lsum+p; j=j+64u; }
+  red[tid]=lsum; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+  let sum=red[0]; workgroupBarrier();
+  var c=tid;
+  loop { if(c>=dd.hd){break;}
+    var acc=0.0;
+    for(var jj=j0;jj<j1;jj=jj+1u){
+      let idx=kb+c; let word=vq[jj*kvw + idx/4u];
+      let ub=extractBits(word,(idx%4u)*8u,8u); let qi=select(i32(ub), i32(ub)-256, ub>=128u);
+      acc=acc+sc[jj-j0]*(f32(qi)*vs[jj]);
+    }
+    part[pbase+c]=acc; c=c+64u; }
+  if(tid==0u){ part[pbase+dd.hd]=mx; part[pbase+dd.hd+1u]=sum; }
+}"#;
 
+// Split-K decode attention, pass 2: one workgroup per head folds its chunks — global max M,
+// rescaled sum S = Σ sᵢ·exp(mᵢ−M), and o = Σ oᵢ·exp(mᵢ−M) / S.
+const DECODE_ATTN_FLASH_P2: &str = r#"
+struct D { hd:u32,nch:u32,nh:u32,_a:u32 };
+@group(0)@binding(0) var<storage,read> part: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> dd: D;
+var<workgroup> wm: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hh=wg.x; let tid=lid.x;
+  var m=-3.4e38; var i=tid;
+  loop { if(i>=dd.nch){break;} m=max(m, part[(hh*dd.nch+i)*(dd.hd+2u)+dd.hd]); i=i+64u; }
+  wm[tid]=m; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ wm[tid]=max(wm[tid],wm[tid+st]); } workgroupBarrier(); }
+  let M=wm[0]; workgroupBarrier();
+  var s=0.0; i=tid;
+  loop { if(i>=dd.nch){break;} let pb=(hh*dd.nch+i)*(dd.hd+2u); s=s+part[pb+dd.hd+1u]*exp(part[pb+dd.hd]-M); i=i+64u; }
+  wm[tid]=s; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ wm[tid]=wm[tid]+wm[tid+st]; } workgroupBarrier(); }
+  let S=wm[0];
+  var c=tid;
+  loop { if(c>=dd.hd){break;}
+    var acc=0.0;
+    for(var ii=0u;ii<dd.nch;ii=ii+1u){ let pb=(hh*dd.nch+ii)*(dd.hd+2u); acc=acc+part[pb+c]*exp(part[pb+dd.hd]-M); }
+    o[hh*dd.hd+c]=acc/S; c=c+64u; }
+}"#;
 
+const DECODE_ATTN_MH_PAR: &str = r#"
+struct D { l:u32,hd:u32,nh:u32,nkv:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+var<workgroup> sc: array<f32,4096>;
+var<workgroup> red: array<f32,64>;
+// One workgroup per query head (so the GPU's many cores all work, vs the serial kernel's
+// single workgroup). 64 threads split the KV rows for QK + softmax (shared-memory reduction),
+// then split head_dim for the V-weighted sum (coalesced). Caller uses this only when l<=4096.
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hh=wg.x; let tid=lid.x;
+  let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;  // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  var lmax=-3.4e38; var j=tid;
+  loop { if(j>=dd.l){break;} var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[b+c]*kc[j*kvdm+kb+c];} let s=dot*scale; sc[j]=s; lmax=max(lmax,s); j=j+64u; }
+  red[tid]=lmax; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+  let mx=red[0]; workgroupBarrier();
+  var lsum=0.0; j=tid;
+  loop { if(j>=dd.l){break;} let p=exp(sc[j]-mx); sc[j]=p; lsum=lsum+p; j=j+64u; }
+  red[tid]=lsum; workgroupBarrier();
+  for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+  let sum=red[0]; workgroupBarrier();
+  var c=tid;
+  loop { if(c>=dd.hd){break;} var acc=0.0; for(var jj=0u;jj<dd.l;jj=jj+1u){ acc=acc+sc[jj]*vc[jj*kvdm+kb+c]; } o[b+c]=acc/sum; c=c+64u; }
+}"#;
 
+const DECODE_ATTN_MH: &str = r#"
+struct D { l:u32,hd:u32,nh:u32,nkv:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let hh=g.x; if(hh>=dd.nh){return;}
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;  // GQA: query head -> shared KV head
+  let scale=1.0/sqrt(f32(dd.hd));
+  var mx=-3.4e38;
+  for(var j=0u;j<dd.l;j=j+1u){ var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[b+c]*kc[j*kvdm+kb+c];} mx=max(mx,dot*scale); }
+  for(var c=0u;c<dd.hd;c=c+1u){o[b+c]=0.0;}
+  var sum=0.0;
+  for(var j=0u;j<dd.l;j=j+1u){
+    var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[b+c]*kc[j*kvdm+kb+c];}
+    let p=exp(dot*scale-mx); sum=sum+p;
+    for(var c=0u;c<dd.hd;c=c+1u){o[b+c]=o[b+c]+p*vc[j*kvdm+kb+c];}
+  }
+  for(var c=0u;c<dd.hd;c=c+1u){o[b+c]=o[b+c]/sum;}
+}"#;
 
+// ── int8 KV cache: per-row-quantized K/V (4x smaller than f32) ───────────────
+// Per-row absmax scale: scale = max|x|/127 over each row of [n,c].
+const ROW_ABSMAX: &str = r#"
+struct D { n:u32,c:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read_write> scales: array<f32>;
+@group(0)@binding(2) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let row=g.x; if(row>=dd.n){return;}
+  var mx=0.0;
+  for(var c=0u;c<dd.c;c=c+1u){ mx=max(mx, abs(x[row*dd.c+c])); }
+  scales[row]=mx/127.0;
+}"#;
+// Quantize+pack [n,c] f32 into [n,c/4] u32 (4 int8 per word) using per-row scales.
+const QUANT_PACK: &str = r#"
+struct D { n:u32,c:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> scales: array<f32>;
+@group(0)@binding(2) var<storage,read_write> q: array<u32>;
+@group(0)@binding(3) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let words=dd.c/4u; let p=g.x; if(p>=dd.n*words){return;}
+  let row=p/words; let w=p%words;
+  let sc=scales[row]; let inv=select(1.0/sc, 0.0, sc==0.0);
+  var packed=0u;
+  for(var b=0u;b<4u;b=b+1u){
+    let qi=clamp(i32(round(x[row*dd.c + w*4u + b]*inv)), -127, 127);
+    packed=packed | ((u32(qi) & 0xffu) << (b*8u));
+  }
+  q[p]=packed;
+}"#;
+// Inverse of QUANT_PACK: unpack [n,c/4] u32 + per-row scales back to [n,c] f32. Promotes
+// a demoted (int8) prefix cache to f32. AGX-safe signed extract (extractBits + select).
+const DEQUANT_Q8_ROWS: &str = r#"
+struct D { n:u32,c:u32,_a:u32,_b:u32 };
+@group(0)@binding(0) var<storage,read> q: array<u32>;
+@group(0)@binding(1) var<storage,read> scales: array<f32>;
+@group(0)@binding(2) var<storage,read_write> o: array<f32>;
+@group(0)@binding(3) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=g.y*nwg.x*64u+g.x; if(i>=dd.n*dd.c){return;}
+  let row=i/dd.c; let col=i%dd.c;
+  let word=q[row*(dd.c/4u)+(col/4u)];
+  let raw=extractBits(word, (col%4u)*8u, 8u);
+  let val=select(f32(raw), f32(raw)-256.0, raw>127u);
+  o[i]=val*scales[row];
+}"#;
+// GQA decode attention reading int8-packed K/V + per-row scales (dequant on the fly).
+const DECODE_ATTN_MH_Q8: &str = r#"
+// `start` is the first KV row to attend to — sliding-window attention for a single query position is a
+// contiguous range, so it is a loop bound rather than a mask. Passed as an offset instead of binding a
+// sub-view because the q8 cache keeps ONE SCALE PER ROW in a separate tensor, and a view into that would
+// need 64-row alignment which a sliding window almost never has. start = 0 is the unwindowed case.
+struct D { l:u32,hd:u32,nh:u32,nkv:u32,start:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kq: array<u32>;
+@group(0)@binding(2) var<storage,read> ks: array<f32>;
+@group(0)@binding(3) var<storage,read> vq: array<u32>;
+@group(0)@binding(4) var<storage,read> vs: array<f32>;
+@group(0)@binding(5) var<storage,read_write> o: array<f32>;
+@group(0)@binding(6) var<uniform> dd: D;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>){
+  let hh=g.x; if(hh>=dd.nh){return;}
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd; let kvw=kvdm/4u;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;
+  let scale=1.0/sqrt(f32(dd.hd));
+  var mx=-3.4e38;
+  for(var j=dd.start;j<dd.l;j=j+1u){
+    let ksc=ks[j]; var dot=0.0;
+    for(var c=0u;c<dd.hd;c=c+1u){
+      let idx=kb+c; let word=kq[j*kvw + idx/4u];
+      let ub=extractBits(word,(idx%4u)*8u,8u); let qi=select(i32(ub), i32(ub)-256, ub>=128u);
+      dot=dot+q[b+c]*(f32(qi)*ksc);
+    }
+    mx=max(mx,dot*scale);
+  }
+  for(var c=0u;c<dd.hd;c=c+1u){o[b+c]=0.0;}
+  var sum=0.0;
+  for(var j=dd.start;j<dd.l;j=j+1u){
+    let ksc=ks[j]; let vsc=vs[j]; var dot=0.0;
+    for(var c=0u;c<dd.hd;c=c+1u){
+      let idx=kb+c; let word=kq[j*kvw + idx/4u];
+      let ub=extractBits(word,(idx%4u)*8u,8u); let qi=select(i32(ub), i32(ub)-256, ub>=128u);
+      dot=dot+q[b+c]*(f32(qi)*ksc);
+    }
+    let p=exp(dot*scale-mx); sum=sum+p;
+    for(var c=0u;c<dd.hd;c=c+1u){
+      let idx=kb+c; let word=vq[j*kvw + idx/4u];
+      let ub=extractBits(word,(idx%4u)*8u,8u); let qi=select(i32(ub), i32(ub)-256, ub>=128u);
+      o[b+c]=o[b+c]+p*(f32(qi)*vsc);
+    }
+  }
+  for(var c=0u;c<dd.hd;c=c+1u){o[b+c]=o[b+c]/sum;}
+}"#;
 
 /// Per-layer key/value cache (resident [max_seq, d] buffers).
 pub struct KvCache {
@@ -6198,7 +8694,6 @@ pub struct KvCache {
     /// them: a checkpoint may mix MLA and standard attention layers, and the per-layer routing decides
     /// which is used. For a non-MLA model this is None and nothing about the standard path changes.
     pub mla: Option<crate::mla::MlaCache>,
-    pub delta: Option<DeltaCache>,
 }
 
 /// int8-quantized KV cache: K/V stored per-row as packed int8 (4x smaller than f32)
@@ -6636,7 +9131,7 @@ impl Gpu {
     pub fn new_cache(&self, n_layers: usize, max_seq: usize, d: usize) -> KvCache {
         KvCache { k: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
                   v: (0..n_layers).map(|_| self.alloc(max_seq, d)).collect(),
-                  mla: None, delta: None }
+                  mla: None }
     }
     /// A cache for `m`, adding the compressed MLA side when the model needs it.
     ///
@@ -6649,20 +9144,6 @@ impl Gpu {
         if let Some(cfg) = &m.mla {
             let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
             c.mla = Some(self.mla_new_cache(m.n_layers, max_seq, &dm));
-        }
-        if let Some(dd) = &m.delta {
-            // Recurrent state must start at ZERO (empty memory) — pooled buffers are
-            // recycled, so explicit uploads, not bare allocs. Non-recurrent layers get
-            // 1-float dummies (same indexing, no memory).
-            let (cv, st): (Vec<Tensor>, Vec<Tensor>) = (0..m.n_layers).map(|li| {
-                if m.recurrent.get(li).copied().unwrap_or(false) {
-                    (self.upload(&vec![0.0f32; dd.conv_dim() * dd.d_conv], 1, dd.conv_dim() * dd.d_conv),
-                     self.upload(&vec![0.0f32; dd.value_dim() * (1 + dd.s)], 1, dd.value_dim() * (1 + dd.s)))
-                } else {
-                    (self.upload(&[0.0f32], 1, 1), self.upload(&[0.0f32], 1, 1))
-                }
-            }).unzip();
-            c.delta = Some(DeltaCache { conv: cv, state: st });
         }
         c
     }
@@ -6699,8 +9180,7 @@ impl Gpu {
         if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; }
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
-        let rot = match self.rope_rot.load(std::sync::atomic::Ordering::Relaxed) { 0 => head_dim as u32, r => r };
-        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, rot];
+        let dims = [t as u32, dm as u32, base.to_bits(), pos0 as u32, head_dim as u32, neox, msc, 0];
         self.dispatch(ROPE_MH, &[x, ff], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
 
@@ -6743,9 +9223,9 @@ impl Gpu {
 
     /// As above, with an optional sliding window applied per query row.
     ///
-    /// BOTH kernels implement the window: the parallel tiled kernel (hd <= 192) and the serial
-    /// fallback (hd > 192 — gemma3-270m's head_dim=256 lands here). They share the same window
-    /// semantics and are gated against one CPU reference (--gate-swa-serial).
+    /// Only the PARALLEL kernel implements the window. The serial fallback (hd > 192) is left causal-only
+    /// and this refuses to pretend otherwise — silently ignoring the window there would give a model with
+    /// an unusual head_dim quietly wrong prefill, which is the failure mode this project keeps paying for.
     pub fn attention_mh_ext_swa(&self, q: &Tensor, kc: &Tensor, vc: &Tensor, base: usize, s: usize, dm: usize,
                                 n_heads: usize, n_kv_heads: usize,
                                 swa: Option<(u32, crate::swa::SwaType)>) -> Tensor {
@@ -6755,6 +9235,10 @@ impl Gpu {
             Some((n, crate::swa::SwaType::Chunked)) => (n, 2u32),
             _ => (0, 0),
         };
+        if nswa > 0 && hd > 192 {
+            eprintln!("wgpu-engine: sliding window NOT applied in prefill for head_dim={hd} (the serial \
+fallback kernel is causal-only) — long prompts on this model will attend outside the window");
+        }
         let dims = [s as u32, hd as u32, n_heads as u32, n_kv_heads as u32, base as u32, nswa, swaty, 0];
         // The parallel kernel now TILES the KV loop (online softmax over 2048-row tiles at 8 KB shared
         // memory), so it handles ANY causal length at high occupancy — no length cliff. Its per-thread
@@ -6777,6 +9261,156 @@ impl Gpu {
     /// Upload a flat f32 slice as a [1, n] tensor — for weights whose 2-D shape is carried in MlaDims
     /// rather than in the tensor itself.
     pub fn upload_flat(&self, v: &[f32]) -> Tensor { self.upload(v, 1, v.len()) }
+
+    /// Largest single `write_buffer` that stays on wgpu's fast staging path.
+    ///
+    /// MEASURED on Apple M2 Ultra / Honeykrisp, and the curve is backwards from what you would expect:
+    ///     16 MiB  21.8 GiB/s
+    ///     64 MiB   6.2 GiB/s
+    ///    256 MiB   6.0 GiB/s
+    /// Bigger transfers are ~3.5x SLOWER, because a write that does not fit the staging belt falls off
+    /// to a slower path. Every large upload here — expert fills at ~68 MiB, arena slabs up to 2 GiB —
+    /// was landing in the slow band.
+    ///
+    /// CHUNKING RECOVERS ABOUT HALF OF IT, not all, which is not what I predicted:
+    ///     64 MiB chunked  10.3 GiB/s   (vs 6.2 unchunked, vs 21.8 for a lone 16 MiB write)
+    ///    256 MiB chunked   9.8 GiB/s
+    /// So four 16 MiB writes in one frame are not equivalent to one 16 MiB write. The belt is a fixed
+    /// budget per submission, and chunks queued together still exhaust it — just less abruptly than one
+    /// oversized write does. `write_chunked_flushed` tests whether closing the frame between chunks
+    /// recovers the rest; until that is measured on hardware, 1.6x is what this is worth and the claim
+    /// stops there.
+    pub const UPLOAD_CHUNK: usize = 16 << 20;
+
+    /// As `write_chunked`, closing the frame between chunks so the staging belt can recycle.
+    ///
+    /// Costs a submit per chunk, which is only worth it if belt exhaustion is really the limit — hence a
+    /// separate function to be measured against the plain one rather than a change to it. If the numbers
+    /// come back equal, the ceiling is elsewhere and this should be deleted rather than kept "just in
+    /// case".
+    pub fn write_chunked_flushed(&self, buf: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let end = (off + Self::UPLOAD_CHUNK).min(bytes.len());
+            self.queue.write_buffer(buf, offset + off as u64, &bytes[off..end]);
+            self.end_frame();   // submit so the belt is released before the next chunk is staged
+            off = end;
+        }
+    }
+
+    /// Test hook for the flushed variant.
+    pub fn write_chunked_flushed_pub(&self, dst: &Tensor, src: &[f32]) {
+        self.write_chunked_flushed(&dst.buf, 0, bytemuck::cast_slice(src));
+    }
+
+    /// `write_buffer`, split so each piece stays on the fast path.
+    ///
+    /// Semantically identical to one large write: `write_buffer` writes are applied in submission order,
+    /// so N sequential chunks land exactly as one call would. What changes is only which internal path
+    /// wgpu takes.
+    pub fn write_chunked(&self, buf: &wgpu::Buffer, offset: u64, bytes: &[u8]) {
+        if bytes.len() <= Self::UPLOAD_CHUNK {
+            self.queue.write_buffer(buf, offset, bytes);
+            return;
+        }
+        let mut off = 0usize;
+        while off < bytes.len() {
+            let end = (off + Self::UPLOAD_CHUNK).min(bytes.len());
+            self.queue.write_buffer(buf, offset + off as u64, &bytes[off..end]);
+            off = end;
+        }
+    }
+
+    /// Test hook: raw host->device write, for measuring upload bandwidth.
+    pub fn queue_write_pub(&self, dst: &Tensor, src: &[f32]) {
+        self.queue.write_buffer(&dst.buf, 0, bytemuck::cast_slice(src));
+    }
+
+    /// Dequantize raw Q6_K bytes to f32 on the GPU.
+    ///
+    /// 210-byte super-block of 256 weights: 128 low-nibble bytes, 64 high-2-bit bytes, 16 SIGNED int8
+    /// sub-block scales, then an f16 `d`. A quant is `nib | (hi2 << 4)`, recentred by -32.
+    ///
+    /// Exists so Scout's experts can be FILE VIEWS: its `ffn_down_exps` is Q6_K, and one
+    /// non-convertible tensor forces the whole model onto the host-copy path — 200 GiB of traffic per
+    /// generation plus the staging fence that costs most of its submits.
+    ///
+    /// STATE: `--gate-q6k` is GREEN — bit-exact against the CPU reference at 1, 37 and 5000 blocks,
+    /// including the negative-scales case. Four faults, found in this order:
+    ///
+    ///   1. `d` at bytes 208..209 fell outside the binding. A 210-byte `array<u32>` exposes 52 whole
+    ///      words = 208 bytes, and WGSL reads out of range as ZERO, so every weight was `0 * s * q`. It
+    ///      produced NOTHING rather than something wrong, which is why the arithmetic looked correct.
+    ///   2. `dispatch` ignored the OUTPUT's view, so chunks overwrote at offset 0. Fixed there, with the
+    ///      bind-group cache key extended to match — a latent bug for every chunked dispatch, not just
+    ///      this one.
+    ///   3. `wg1` takes an ELEMENT count and divides by 64 itself; it was called pre-divided, so 65
+    ///      blocks got ONE workgroup and block 64 onward was never dispatched. A size sweep found the
+    ///      64->65 cliff immediately after two commits of reasoning about arithmetic that was fine.
+    ///   4. The f16 SUBNORMAL path seeded the exponent at -1 and biased by 127-15, which is exactly the
+    ///      bug `gguf::f16_to_f32`'s own comment documents as previously fixed there — "landing 2 too
+    ///      low ... every subnormal came out 4x small". The wrong version was transcribed into the
+    ///      shader FROM the comment explaining why it was wrong.
+    ///
+    /// The lesson worth keeping is (4): a reference implementation's comments describe bugs it no longer
+    /// has, and copying code that sits next to such a comment reintroduces them. The other three were
+    /// all size- or binding-related and invisible to a single-block test.
+    pub fn q6k_dequant(&self, raw: &[u8], n_weights: usize) -> Result<Tensor, String> {
+        if n_weights % 256 != 0 { return Err("q6_k: element count not a multiple of 256".into()); }
+        let nblk = n_weights / 256;
+        if raw.len() < nblk * 210 { return Err("q6_k: data truncated".into()); }
+        // PAD THE BUFFER to whole words as well as the view. Rounding the view up without padding the
+        // buffer asks for a range past its end — the view length is what the shader sees, but the
+        // buffer length is what bounds the view.
+        let src_bytes = (nblk * 210).div_ceil(4) * 4;
+        let mut padded = raw[..nblk * 210].to_vec();
+        padded.resize(src_bytes, 0);
+        let srcbuf = self.upload_bytes(&padded, "q6k-src");
+        let src = Tensor { buf: srcbuf, rows: 1, cols: src_bytes / 4, pool: None, view: None };
+        let out = self.alloc_resident_words(n_weights);
+        let chunk = engine_config().convert_chunk_blocks.max(1);
+        let mut b0 = 0usize;
+        while b0 < nblk {
+            let n = chunk.min(nblk - b0);
+            let byte_off = b0 * 210;
+            // The VIEW length bounds the shader's `array<u32>`, so it must cover whole words. A
+            // 210-byte block is 52.5 words; a 210-byte binding exposes 52, and the f16 scale at bytes
+            // 208..209 sits in word 52 — out of bounds, which WGSL reads as ZERO rather than faulting.
+            // Every weight then came out zero and the gate reported max|diff| 3.3e5.
+            //
+            // Padding the BUFFER was not enough: the binding range is what the shader sees.
+            let vlen = ((n * 210).div_ceil(4) * 4).min(src_bytes - byte_off);
+            let view = Tensor { buf: src.buf.clone(), rows: 1, cols: vlen / 4,
+                                pool: None, view: Some((byte_off as u64, vlen as u64)) };
+            let dstv = Tensor { buf: out.buf.clone(), rows: 1, cols: n * 256,
+                                pool: None, view: Some(((b0 * 256 * 4) as u64, (n * 256 * 4) as u64)) };
+            let dims = [n as u32, 0u32, 0u32, 0u32];
+            // wg1 takes the ELEMENT count and divides by 64 itself. Passing an already-divided value
+            // divides twice: 65 blocks asked for wg1(2) = ONE workgroup = 64 threads, so block 64 onward
+            // was never dispatched and kept whatever the allocator left. That is the 64->65 cliff in the
+            // size sweep — everything up to one workgroup looked perfect.
+            self.dispatch(Q6K_DEQUANT, &[&view], &dstv, bytemuck::cast_slice(&dims), wg1(n as u32));
+            b0 += n;
+        }
+        Ok(out)
+    }
+
+    /// The device's per-buffer ceiling. No single allocation may exceed it, whatever the total budget.
+    ///
+    /// Honeykrisp reports ~2047 MiB (2^31 - 1), which is why the arena packs into slabs of that size and
+    /// why a probe using larger ones measures the limit rather than the device.
+    pub fn max_buffer_bytes(&self) -> usize { self.device.limits().max_buffer_size as usize }
+
+    /// Test hook: chunked host->device write, to compare against the single-shot path.
+    pub fn write_chunked_pub(&self, dst: &Tensor, src: &[f32]) {
+        self.write_chunked(&dst.buf, 0, bytemuck::cast_slice(src));
+    }
+
+    /// Test hook: a small view of a tensor, to force a sync without downloading all of it.
+    pub fn view_pub(&self, t: &Tensor, off: usize, len: usize) -> Tensor {
+        Tensor { buf: t.buf.clone(), rows: 1, cols: len, pool: None,
+                 view: Some(((off * 4) as u64, (len * 4) as u64)) }
+    }
 
     /// Test hook: copy rows between tensors, for exercising allocator reuse from a gate.
     pub fn copy_rows_pub(&self, src: &Tensor, dst: &Tensor, dst_row: usize, n: usize, cols: usize) {
@@ -6926,7 +9560,7 @@ impl Gpu {
     }
     /// Promote an int8 prefix cache (first `len` rows) back to f32 for seeding (lossy).
     pub fn promote_cache(&self, q: &QKvCache, len: usize, kv_dim: usize) -> KvCache {
-        let mut c = KvCache { k: vec![], v: vec![], mla: None, delta: None };
+        let mut c = KvCache { k: vec![], v: vec![], mla: None };
         for li in 0..q.kq.len() {
             c.k.push(self.dequant_rows(&q.kq[li], &q.ks[li], len, kv_dim));
             c.v.push(self.dequant_rows(&q.vq[li], &q.vs[li], len, kv_dim));
@@ -7068,9 +9702,8 @@ impl Gpu {
                 else { self.block_decode_q8(l, &x, &m.rope_factors, kq, ks, vq, vs, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
-        // Head fold: out_norm rides the output matvec (norm_apply), same as g1/g2 — one
-        // fewer pass per token.
-        self.download(&m.output.norm_apply(self, &x, &m.out_norm, m.d, m.eps, 1))
+        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
+        self.download(&m.output.apply(self, &xn, 1))
     }
     /// Run `tokens` through a fresh int8 KV cache; returns last-position logits.
     pub fn forward_kv_q8(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
@@ -7387,7 +10020,7 @@ impl Gpu {
         if base == 0.0 { self.copy_buf(x, 0, &out, 0, ((x.rows * x.cols).min(t * dm) * 4) as u64); return out; } // NoPE sentinel
         let neox = self.rope_neox.load(std::sync::atomic::Ordering::Relaxed) as u32;
         let msc = self.rope_mscale.load(std::sync::atomic::Ordering::Relaxed);
-        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, msc, match self.rope_rot.load(std::sync::atomic::Ordering::Relaxed) { 0 => head_dim as u32, r => r }];
+        let dims = [t as u32, dm as u32, base.to_bits(), 0u32, head_dim as u32, neox, msc, 0];
         self.dispatch(ROPE_MH_ROWS, &[x, ff, pos], &out, bytemuck::cast_slice(&dims), wg1((t * dm / 2) as u32)); out
     }
     /// Process one token through all layers using the cache; returns logits [vocab].
@@ -7466,122 +10099,10 @@ impl Gpu {
             x = if fused { self.block_decode_at_fused(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) }
                 else { self.block_decode_at(l, &x, &m.rope_factors, k, v, pos, slot, attend_len, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps) };
         }
-        // Head fold: out_norm rides the output matvec (norm_apply), same as g1/g2 — one
-        // fewer pass per token.
-        self.download(&m.output.norm_apply(self, &x, &m.out_norm, m.d, m.eps, 1))
+        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
+        self.download(&m.output.apply(self, &xn, 1))
     }
 
-    /// Test hooks for the DeltaNet kernels: same dispatches block_decode_delta makes,
-    /// callable from --gate-qwen35 against CPU references. `packed` buffers follow the
-    /// cache layout ([y|conv-history], [out|state]) and update in place.
-    pub fn delta_conv_step_pub(&self, x: &Tensor, w: &Tensor, packed: &Tensor, ch: usize, dc: usize) {
-        let dims = [ch as u32, dc as u32, 0, 0];
-        self.dispatch(DELTA_CONV_STEP, &[x, w], packed, bytemuck::cast_slice(&dims), wg1(ch as u32));
-    }
-    pub fn delta_gb_pub(&self, alpha: &Tensor, beta: &Tensor, dtb: &Tensor, a: &Tensor, out: &Tensor, hv: usize) {
-        let dims = [hv as u32, 0, 0, 0];
-        self.dispatch(DELTA_GB, &[alpha, beta, dtb, a], out, bytemuck::cast_slice(&dims), wg1(hv as u32));
-    }
-    pub fn delta_step_pub(&self, q: &Tensor, k: &Tensor, v: &Tensor, gb: &Tensor, packed: &Tensor,
-                          s: usize, hv: usize, hk: usize) {
-        let dims = [s as u32, hv as u32, hk as u32, 0];
-        self.dispatch(DELTA_STEP, &[q, k, v, gb], packed, bytemuck::cast_slice(&dims), wg1((hv * s) as u32));
-    }
-    /// Row-wise L2 norm (ggml_l2_norm): rows are heads here, so a thread-per-row loop.
-    pub fn l2norm_rows_t(&self, x: &Tensor, rows: usize, cols: usize, eps: f32) -> Tensor {
-        let out = self.alloc(rows, cols);
-        let dims = [rows as u32, cols as u32, eps.to_bits(), 0];
-        self.dispatch(L2NORM_ROWS, &[x], &out, bytemuck::cast_slice(&dims), wg1(rows as u32));
-        out
-    }
-    /// Elementwise gate: mode 0 = a*silu(b) (DeltaNet z-gate), mode 1 = a*sigmoid(b)
-    /// (Qwen3.5 gated attention).
-    pub fn mul_gate_t(&self, a: &Tensor, b: &Tensor, n: usize, mode: u32) -> Tensor {
-        let out = self.alloc(1, n);
-        let dims = [n as u32, mode, 0, 0];
-        self.dispatch(MUL_GATE, &[a, b], &out, bytemuck::cast_slice(&dims), wg1(n as u32));
-        out
-    }
-    /// Qwen3.5 fused [q|gate] head-interleaved row → packed [q: heads*hd | gate: heads*hd].
-    pub fn deinterleave2_t(&self, x: &Tensor, heads: usize, hd: usize) -> Tensor {
-        let out = self.alloc(1, 2 * heads * hd);
-        let dims = [heads as u32, hd as u32, 0, 0];
-        self.dispatch(DEINTERLEAVE2, &[x], &out, bytemuck::cast_slice(&dims), wg1((heads * hd) as u32));
-        out
-    }
-    /// Public prefix view over a packed buffer (gates read the y/out region of the
-    /// [output | state] buffers without touching private Tensor fields).
-    pub fn view_prefix(&self, t: &Tensor, rows: usize, cols: usize) -> Tensor {
-        self.view_of(t, 0, rows, cols)
-    }
-    fn view_of(&self, t: &Tensor, off_words: usize, rows: usize, cols: usize) -> Tensor {
-        Tensor { buf: t.buf.clone(), rows, cols, pool: None,
-                 view: Some(((off_words * 4) as u64, ((rows * cols) * 4) as u64)) }
-    }
-    /// One Gated DeltaNet block, one token (Qwen3.5 recurrent layers). Mirrors
-    /// llama.cpp's build_layer_attn_linear + build_delta_net_autoregressive:
-    /// norm → fused qkv → depthwise conv (cached) + SiLU → L2-norm q,k → delta rule
-    /// (cached state) → rms-norm per v-head × silu(z) → out projection → residual → FFN.
-    pub fn block_decode_delta(&self, w: &BlockWeights, dw: &DeltaWeights, dd: &DeltaDims,
-                              x: &Tensor, c: &KvCache, li: usize, d: usize, eps: f32) -> Tensor {
-        let dc = c.delta.as_ref().expect("delta cache missing for a recurrent layer");
-        let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let mixed = dw.qkv.apply(self, &n1, 1);                    // [2K+V]
-        let z = dw.z.apply(self, &n1, 1);                          // [V]
-        // conv step: y (+cache) live in dc.conv[li] = [conv_dim | conv_dim*(d_conv-1)]
-        let cd = dd.conv_dim();
-        let cdims = [cd as u32, dd.d_conv as u32, 0, 0];
-        self.dispatch(DELTA_CONV_STEP, &[&mixed, &dw.conv_w], &dc.conv[li],
-                      bytemuck::cast_slice(&cdims), wg1(cd as u32));
-        let y = self.view_of(&dc.conv[li], 0, 1, cd);
-        // split conv output: [q: K | k: K | v: V], l2-norm q and k per head
-        let (kdim, vdim) = (dd.key_dim(), dd.value_dim());
-        let qc = self.l2norm_rows_t(&self.view_of(&y, 0, dd.hk, dd.s), dd.hk, dd.s, eps);
-        let kc = self.l2norm_rows_t(&self.view_of(&y, kdim, dd.hk, dd.s), dd.hk, dd.s, eps);
-        let vc = self.view_of(&y, 2 * kdim, 1, vdim);
-        // per-head gates on GPU: eg = exp(a*softplus(alpha+dtb)), be = sigmoid(beta)
-        let al = dw.alpha.apply(self, &n1, 1);
-        let be = dw.beta.apply(self, &n1, 1);
-        let gb = self.alloc(1, 2 * dd.hv);
-        let gdims = [dd.hv as u32, 0, 0, 0];
-        self.dispatch(DELTA_GB, &[&al, &be, &dw.dtb, &dw.a], &gb,
-                      bytemuck::cast_slice(&gdims), wg1(dd.hv as u32));
-        // delta rule: out + state live in dc.state[li] = [H_v*S | H_v*S*S]
-        let sdims = [dd.s as u32, dd.hv as u32, dd.hk as u32, 0];
-        self.dispatch(DELTA_STEP, &[&qc, &kc, &vc, &gb], &dc.state[li],
-                      bytemuck::cast_slice(&sdims), wg1((dd.hv * dd.s) as u32));
-        let core = self.view_of(&dc.state[li], 0, dd.hv, dd.s);
-        // gated norm: rms over each v-head row (ssm_norm [S]) × silu(z), then out proj
-        let normed = self.rmsnorm_t(&core, &dw.ssm_norm, dd.hv, dd.s, eps);
-        let gated = self.mul_gate_t(&normed, &z, vdim, 0);
-        let o = dw.out.apply(self, &gated, 1);
-        let x2 = self.add_t(x, &o);
-        self.ffn_apply(w, &x2, 1, d, eps)
-    }
-    /// Qwen3.5 gated full-attention block, one token: fused wq = per-head [q|gate];
-    /// q,k per-head RMSNorm; partial-rot NEOX rope; standard KV cache attention;
-    /// sigmoid(gate) on the attention output before wo.
-    pub fn block_decode_gated_attn(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor,
-                                   kc: &Tensor, vc: &Tensor, pos: usize, d: usize,
-                                   head_dim: usize, n_heads: usize, n_kv_heads: usize,
-                                   base: f32, eps: f32) -> Tensor {
-        let (ad, kv) = (n_heads * head_dim, n_kv_heads * head_dim);
-        let n1 = self.rmsnorm_t(x, &w.g1, 1, d, eps);
-        let qg = w.wq.apply(self, &n1, 1);                          // [2*ad] interleaved
-        let both = self.deinterleave2_t(&qg, n_heads, head_dim);    // [q: ad | gate: ad]
-        let qraw = self.view_of(&both, 0, 1, ad);
-        let gate = self.view_of(&both, ad, 1, ad);
-        let q = self.rope_mh_t(&self.qk_norm(qraw, &w.q_norm, 1, ad, head_dim, eps), ff, 1, ad, base, pos, head_dim);
-        let k = self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, 1), &w.k_norm, 1, kv, head_dim, eps), ff, 1, kv, base, pos, head_dim);
-        let v = w.wv.apply(self, &n1, 1);
-        self.write_row(kc, &k, pos, kv);
-        self.write_row(vc, &v, pos, kv);
-        let attn = self.decode_attention_mh(&q, kc, vc, pos + 1, ad, n_heads, n_kv_heads);
-        let gated = self.mul_gate_t(&attn, &gate, ad, 1);
-        let o = w.wo.apply(self, &gated, 1);
-        let x2 = self.add_t(x, &o);
-        self.ffn_apply(w, &x2, 1, d, eps)
-    }
     pub fn decode_step(&self, m: &Model, c: &KvCache, token: u32, pos: usize) -> Vec<f32> {
         self.begin_frame();
         let s = token as usize * m.d;
@@ -7594,12 +10115,8 @@ impl Gpu {
             let (w, k, v) = (&m.layers[li], &c.k[li], &c.v[li]);
             // Per-LAYER routing, not per-model: a checkpoint may mix MLA and standard attention, and a
             // layer takes the MLA path only when it has both the projections and a cache to write into.
-            x = match (&w.delta, &m.delta, &w.mla, &c.mla, &m.mla) {
-                // Qwen3.5 recurrent layers replace attention with the gated delta rule.
-                (Some(dw), Some(dd), ..) => self.block_decode_delta(w, dw, dd, &x, c, li, m.d, m.eps),
-                // Qwen3.5 full-attention layers gate the attention output (fused [q|gate] wq).
-                _ if w.qgate => self.block_decode_gated_attn(w, &x, &m.rope_factors, k, v, pos, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps),
-                (_, _, Some(mw), Some(mc), Some(cfg)) => {
+            x = match (&w.mla, &c.mla, &m.mla) {
+                (Some(mw), Some(mc), Some(cfg)) => {
                     let dm = self.mla_dims(cfg, m.d, m.n_heads, m.base, m.eps);
                     self.block_decode_mla(w, mw, &dm, &x, mc, li, pos, m.d, m.eps)
                 }
@@ -7608,9 +10125,8 @@ impl Gpu {
             };
         }
         if tracing { self.trace_layer.store(-1, std::sync::atomic::Ordering::Relaxed); }
-        // Head fold: out_norm rides the output matvec (norm_apply), same as g1/g2 — one
-        // fewer pass per token.
-        self.download(&m.output.norm_apply(self, &x, &m.out_norm, m.d, m.eps, 1))
+        let xn = self.rmsnorm_t(&x, &m.out_norm, 1, m.d, m.eps);
+        self.download(&m.output.apply(self, &xn, 1))
     }
 
     /// Staged-KV decode of one token: writes K/V into the hot f32 window and reads warm int8 tail + hot
@@ -8625,12 +11141,6 @@ impl Gpu {
                     EmbedT::F32(t) => self.gather_at(t, &o, j as u32, m.d),
                     EmbedT::Q8(q) => self.gather_q8_at(q, &o, j as u32),
                 };
-                // Gemma scales input embeddings by sqrt(d) (25.3 on the 270m!). Every per-token
-                // path goes through embed_scaled; this on-device gather MUST apply the same scale
-                // or every windowed token feeds a 25x-too-small hidden state — the "gemma3
-                // gibberish while llama is fine" report, invisible to per-token gates because the
-                // chat backend routes through THIS path. scale_embed_t is a no-op at scale 1.0.
-                let x = self.scale_embed_t(m, x);
                 pre.push(self.decode_layers_t(m, &s.cache, x, s.pos + j));
                 // If a dims uniform allocation was rejected by the device (buffer-object/VMA ceiling —
                 // the M4 windowed crash surfaces at the FIRST sample_at, slot 0), the frame is poisoned:
@@ -9116,25 +11626,6 @@ impl<'a, S: KvSession> WorkerPool<'a, S> {
 }
 
 #[cfg(test)]
-mod adapter_policy_tests {
-    use super::*;
-
-    #[test]
-    fn software_rasterizers_are_recognized_and_real_silicon_is_not() {
-        // the actual strings these stacks report (llvmpipe's includes its LLVM version)
-        for sw in ["llvmpipe (LLVM 17.0.6, 256 bits)", "SwiftShader Device (LLVM 10.0.0)",
-                   "softpipe", "Apple Software Renderer", "Microsoft Basic Render Driver"] {
-            assert!(adapter_is_software(sw), "{sw} must be classified software");
-        }
-        // the fleet's real adapters — and names that CONTAIN risky substrings must stay hardware
-        for hw in ["Apple M2 Max (G14C B1)", "AMD Radeon RX 7900 XTX", "NVIDIA GeForce RTX 4090",
-                   "Intel(R) Arc(tm) A770 Graphics", "Adreno (TM) 740"] {
-            assert!(!adapter_is_software(hw), "{hw} must NOT be classified software");
-        }
-    }
-}
-
-#[cfg(test)]
 mod fast_ab_tests {
     use super::*;
 
@@ -9387,4 +11878,363 @@ pub fn wrapped_grid(units: usize) -> (u32, u32) {
     (W as u32, units.div_ceil(W) as u32)
 }
 
+/// Q4_K super-block dequantization. One workgroup per 144-byte super-block (256 weights).
+///
+/// Ported line-for-line from the CPU `gguf::dequantize` type-12 arm, which is validated by every Q4_K
+/// model that loads today — so this shader has a reference to be checked against rather than a spec I
+/// reconstructed. `--gate-q4k` asserts they agree exactly.
+///
+/// Bytes are read through a u32 view: super-block b starts at byte b*144, i.e. word b*36. The 6-bit
+/// scale/min packing (`get_scale_min_k4`) is reproduced exactly, including the j>=4 branch that stitches
+/// the high 2 bits from an earlier byte.
 
+/// Q6_K -> f32 on the GPU, mirroring `gguf::dequantize` type 14 exactly.
+///
+/// 210-byte super-block of 256 weights: 128 low-nibble bytes `ql`, 64 high-2-bit bytes `qh`, 16 int8
+/// sub-block scales, then an f16 `d`. A 6-bit quant is `nib | (hi2 << 4)`, recentred by -32, and the
+/// weight is `d * sc * (q - 32)`. Processed in two 128-wide halves, same as the CPU path.
+///
+/// This exists so Scout's experts can be FILE VIEWS. Its `ffn_down_exps` is Q6_K, and the view path
+/// requires every expert tensor to be GPU-convertible — one Q6_K tensor forced the whole model onto the
+/// host-copy path, which is 200 GiB of traffic per generation and the staging fence that costs 99% of
+/// submits. Converting Q6_K removes the copies rather than making them faster.
+/// Extract a WGSL function body from a shader constant, normalised for comparison.
+///
+/// Used by the drift test below. Strips comments and collapses whitespace, so two copies that differ
+/// only in commentary compare equal while a changed constant does not.
+#[cfg(test)]
+fn wgsl_fn_body(src: &str, sig: &str) -> Option<String> {
+    let i = src.find(sig)?;
+    let b = src[i..].find('{')? + i;
+    let (mut depth, mut j) = (0i32, b);
+    for c in src[b..].chars() {
+        if c == '{' { depth += 1; } else if c == '}' { depth -= 1; if depth == 0 { break; } }
+        j += c.len_utf8();
+    }
+    let body = &src[b..=j];
+    let no_comments: String = body.lines()
+        .map(|l| l.split("//").next().unwrap_or(""))
+        .collect::<Vec<_>>().join(" ");
+    Some(no_comments.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+pub const Q6K_DEQUANT: &str = r#"
+struct D { n:u32, _a:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<u32>;
+@group(0)@binding(1) var<storage,read_write> dst: array<f32>;
+@group(0)@binding(2) var<uniform> dims: D;
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+fn f16(h: u32) -> f32 {
+    let sign = (h >> 15u) & 1u;
+    let exp  = (h >> 10u) & 0x1Fu;
+    let mant = h & 0x3FFu;
+    var bits: u32;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign << 31u;
+        } else {
+            // subnormal: normalize until bit 10 is the implicit leading 1
+            var e: i32 = -14; var m: u32 = mant;
+            loop { if ((m & 0x400u) != 0u) { break; } m = m << 1u; e = e - 1; }
+            bits = (sign << 31u) | (u32(e + 127) << 23u) | ((m & 0x3FFu) << 13u);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31u) | (0xFFu << 23u) | (mant << 13u);   // inf / nan, preserved
+    } else {
+        bits = (sign << 31u) | (u32(i32(exp) + 127 - 15) << 23u) | (mant << 13u);
+    }
+    return bitcast<f32>(bits);
+}
+
+// int8 from a byte: the scales are SIGNED, and reading them as unsigned silently doubles half of them.
+fn i8_at(i: u32) -> i32 {
+    let b = byte_at(i);
+    if (b >= 128u) { return i32(b) - 256; }
+    return i32(b);
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+    let blk = g.x + g.y * nwg.x * 64u;
+    if (blk >= dims.n) { return; }
+    let base = blk * 210u;
+    let d = f16(byte_at(base + 208u) | (byte_at(base + 209u) << 8u));
+    let out = blk * 256u;
+    for (var half: u32 = 0u; half < 2u; half = half + 1u) {
+        let ql = base + half * 64u;
+        let qh = base + 128u + half * 32u;
+        let sc = base + 192u + half * 8u;
+        let o  = out + half * 128u;
+        for (var l: u32 = 0u; l < 32u; l = l + 1u) {
+            let is = l / 16u;
+            let a = byte_at(ql + l);
+            let b = byte_at(ql + l + 32u);
+            let h = byte_at(qh + l);
+            let q1 = i32((a & 0xFu) | (((h >> 0u) & 3u) << 4u)) - 32;
+            let q2 = i32((b & 0xFu) | (((h >> 2u) & 3u) << 4u)) - 32;
+            let q3 = i32((a >> 4u)  | (((h >> 4u) & 3u) << 4u)) - 32;
+            let q4 = i32((b >> 4u)  | (((h >> 6u) & 3u) << 4u)) - 32;
+            // Bind (d * scale) to a NAMED value before multiplying by the quant. The CPU reference
+            // computes `dsc = d * sc` once per sub-block and then `dsc * q`; writing it as a single
+            // expression lets the compiler contract the chain into an FMA, which rounds ONCE instead of
+            // twice and lands 1-2 ULPs away. More accurate, and not what the reference does — and a
+            // dequantizer that disagrees with the reference by a ULP compounds across 48 layers.
+            let d1 = d * f32(i8_at(sc + is));
+            let d2 = d * f32(i8_at(sc + is + 2u));
+            let d3 = d * f32(i8_at(sc + is + 4u));
+            let d4 = d * f32(i8_at(sc + is + 6u));
+            dst[o + l]       = d1 * f32(q1);
+            dst[o + l + 32u] = d2 * f32(q2);
+            dst[o + l + 64u] = d3 * f32(q3);
+            dst[o + l + 96u] = d4 * f32(q4);
+        }
+    }
+}
+"#;
+
+pub const Q4K_DEQUANT: &str = r#"
+struct D { n:u32, grid_w:u32, _b:u32, _c:u32 };
+@group(0)@binding(0) var<storage,read> src: array<u32>;     // raw Q4_K bytes, viewed as words
+@group(0)@binding(1) var<storage,read_write> dst: array<f32>;
+@group(0)@binding(2) var<uniform> dims: D;                  // n = super-block count
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+// half -> f32 (subnormals and inf/nan handled the same way the CPU helper does)
+// Bit-for-bit twin of the CPU gguf::f16_to_f32: construct the f32 bit pattern and bitcast, rather than
+// computing a value. Approximating here is not safe — mapping Inf/NaN to a finite number diverges from the
+// reference exactly where a corrupt or synthetic block carries one, and the divergence shows up as
+// slightly wrong weights rather than an error.
+fn f16(h: u32) -> f32 {
+    let sign = (h >> 15u) & 1u;
+    let exp  = (h >> 10u) & 0x1Fu;
+    let mant = h & 0x3FFu;
+    var bits: u32;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign << 31u;
+        } else {
+            // subnormal: normalize until bit 10 is the implicit leading 1
+            var e: i32 = -14; var m: u32 = mant;
+            loop { if ((m & 0x400u) != 0u) { break; } m = m << 1u; e = e - 1; }
+            bits = (sign << 31u) | (u32(e + 127) << 23u) | ((m & 0x3FFu) << 13u);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31u) | (0xFFu << 23u) | (mant << 13u);   // inf / nan, preserved
+    } else {
+        bits = (sign << 31u) | (u32(i32(exp) + 127 - 15) << 23u) | (mant << 13u);
+    }
+    return bitcast<f32>(bits);
+}
+
+// the 6-bit scale/min unpack, byte-for-byte with get_scale_min_k4
+fn scale_min(j: u32, base: u32) -> vec2<f32> {
+    var sc: u32; var mn: u32;
+    if (j < 4u) {
+        sc = byte_at(base + j) & 63u;
+        mn = byte_at(base + j + 4u) & 63u;
+    } else {
+        sc = (byte_at(base + j + 4u) & 0x0Fu) | ((byte_at(base + j - 4u) >> 6u) << 4u);
+        mn = (byte_at(base + j + 4u) >> 4u) | ((byte_at(base + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // 2D grid: a workgroup-per-super-block overflows the 65535 per-dimension dispatch limit on any
+    // large tensor (a 26M-weight matrix needs 102400 of them), so the grid wraps at grid_w.
+    let blk = wg.y * dims.grid_w + wg.x;
+    if (blk >= dims.n) { return; }
+    let bbase = blk * 144u;                       // byte offset of this super-block
+    let d    = f16(byte_at(bbase) | (byte_at(bbase + 1u) << 8u));
+    let dmin = f16(byte_at(bbase + 2u) | (byte_at(bbase + 3u) << 8u));
+    let sbase = bbase + 4u;                       // 12 scale bytes
+    let qbase = bbase + 16u;                      // 128 nibble bytes
+    // 64 lanes each handle 4 of the 256 outputs, mirroring the CPU's 4 groups of 64
+    for (var t = lid.x; t < 256u; t = t + 64u) {
+        let grp = t / 64u;                        // which of the 4 groups
+        let idx = t % 64u;                        // position inside the group
+        let half = idx / 32u;                     // low nibbles then high nibbles
+        let l = idx % 32u;
+        let sm = scale_min(grp * 2u + half, sbase);
+        let q = byte_at(qbase + grp * 32u + l);
+        let nib = select(q & 0xFu, q >> 4u, half == 1u);
+        dst[blk * 256u + grp * 64u + half * 32u + l] = d * sm.x * f32(nib) - dmin * sm.y;
+    }
+}
+"#;
+
+/// Q4_K → our resident q4 layout, entirely on the GPU.
+///
+/// This is what removes the CPU load pass. Today the loader does Q4_K → f32 (CPU) → our q4 (CPU) → upload,
+/// which for Scout is ~50 GiB of host copies and many minutes. With this kernel the raw file blocks go up
+/// as-is and the conversion happens on the GPU, so nothing is materialized host-side and nothing is
+/// dequantized to f32 at any point.
+///
+/// Output is a single buffer laid out qw‖qs, matching `quantize_q4_host_bytes` — so `q4_lin_from_slots`
+/// wraps it unchanged. One workgroup per 256-weight super-block; its 8 lanes each own one 32-element
+/// block, computing that block's absmax scale and packing 8 nibbles per word exactly as the CPU
+/// `quantize_q4_resident_cpu` does (scale = amax/7, nibble = round(w/scale) + 8).
+pub const Q4K_TO_Q4: &str = r#"
+struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
+@group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
+@group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
+@group(0)@binding(2) var<uniform> dims: D;
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+// Bit-for-bit twin of the CPU gguf::f16_to_f32 (see the note on the dequant kernel): construct the f32
+// bit pattern and bitcast, so Inf/NaN survive instead of being approximated away.
+fn f16(h: u32) -> f32 {
+    let sign = (h >> 15u) & 1u;
+    let exp  = (h >> 10u) & 0x1Fu;
+    let mant = h & 0x3FFu;
+    var bits: u32;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign << 31u;
+        } else {
+            var e: i32 = -14; var m: u32 = mant;
+            loop { if ((m & 0x400u) != 0u) { break; } m = m << 1u; e = e - 1; }
+            bits = (sign << 31u) | (u32(e + 127) << 23u) | ((m & 0x3FFu) << 13u);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31u) | (0xFFu << 23u) | (mant << 13u);
+    } else {
+        bits = (sign << 31u) | (u32(i32(exp) + 127 - 15) << 23u) | (mant << 13u);
+    }
+    return bitcast<f32>(bits);
+}
+
+fn scale_min(j: u32, base: u32) -> vec2<f32> {
+    var sc: u32; var mn: u32;
+    if (j < 4u) { sc = byte_at(base + j) & 63u; mn = byte_at(base + j + 4u) & 63u; }
+    else {
+        sc = (byte_at(base + j + 4u) & 0x0Fu) | ((byte_at(base + j - 4u) >> 6u) << 4u);
+        mn = (byte_at(base + j + 4u) >> 4u) | ((byte_at(base + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+/// weight at position `t` (0..256) of super-block `blk`
+fn wq(blk: u32, t: u32) -> f32 {
+    let bbase = blk * 144u;
+    let d    = f16(byte_at(bbase) | (byte_at(bbase + 1u) << 8u));
+    let dmin = f16(byte_at(bbase + 2u) | (byte_at(bbase + 3u) << 8u));
+    let grp = t / 64u; let idx = t % 64u; let half = idx / 32u; let l = idx % 32u;
+    let sm = scale_min(grp * 2u + half, bbase + 4u);
+    let q = byte_at(bbase + 16u + grp * 32u + l);
+    let nib = select(q & 0xFu, q >> 4u, half == 1u);
+    return d * sm.x * f32(nib) - dmin * sm.y;
+}
+
+@compute @workgroup_size(8)
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+    // see the note on the dequant kernel: the grid wraps at grid_w to stay under 65535 per dimension
+    let blk = wg.y * dims.grid_w + wg.x;
+    if (blk >= dims.nblk) { return; }
+    let j = lid.x;                       // which 32-element block inside this super-block
+    let t0 = j * 32u;
+    // absmax over the 32 weights, then the same scale rule as the CPU quantizer
+    var amax = 0.0;
+    for (var l = 0u; l < 32u; l = l + 1u) {
+        let v = abs(wq(blk, t0 + l));
+        if (v == v) { amax = max(amax, v); }   // NaN-skipping, matching Rust's f32::max
+    }
+    var scale = 1.0;
+    if (amax > 0.0) { scale = amax / 7.0; }
+    let bi = blk * 8u + j;               // global index of this 32-block
+    dst[dims.qs_off + bi] = bitcast<u32>(scale);
+    // pack 8 nibbles per word, 4 words per 32-block
+    for (var w = 0u; w < 4u; w = w + 1u) {
+        var acc = 0u;
+        for (var b = 0u; b < 8u; b = b + 1u) {
+            let v = wq(blk, t0 + w * 8u + b);
+            // Two deliberate mismatches with the naive spelling, both to match the CPU reference:
+            //  * Rust's `f32 as i32` saturates NaN to 0; WGSL's i32() of NaN is undefined.
+            //  * Rust's f32::round() is half-AWAY-from-zero; WGSL's round() is half-to-even.
+            var qv = 0.0;
+            if (v == v) {
+                let x = v / scale;
+                let r = sign(x) * floor(abs(x) + 0.5);
+                qv = clamp(r, -7.0, 7.0);
+            }
+            let nib = u32(i32(qv) + 8) & 0xFu;
+            acc = acc | (nib << (b * 4u));
+        }
+        dst[dims.qw_base + bi * 4u + w] = acc;
+    }
+}
+"#;
+
+#[cfg(test)]
+mod shader_drift_tests {
+    /// `flush_every` must not be mutated by anything other than the tuner or an explicit pin.
+    ///
+    /// A permanent `store` of a reduced value was added here as "pacing after a readback" and acted as a
+    /// one-way ratchet: the tuner picks 128, the first readback lowers it to 32, nothing restores it, and
+    /// every subsequent token runs at four times the submit count that was measured as best. The symptom
+    /// was submits "firing too quickly again" — an autotuned value silently overridden by a second
+    /// mechanism that had no way to give it back.
+    ///
+    /// This is a source check rather than a runtime one because the failure is structural: any `store`
+    /// into flush_every outside `set_flush_every` is the same mistake. `stream_session_window` shows the
+    /// correct shape — save, cap, restore.
+    #[test]
+    fn flush_every_is_not_ratcheted_by_a_second_mechanism() {
+        let src = include_str!("lib.rs");
+        let stores: Vec<&str> = src.lines()
+            .filter(|l| l.contains("flush_every.store("))
+            .map(|l| l.trim())
+            .filter(|l| !l.starts_with("//"))
+            // and not this test's own filter line, which contains the string it searches for
+            .filter(|l| !l.contains("l.contains("))
+            .collect();
+        // Exactly one: the setter. Anything else is a second writer with no restore path.
+        assert_eq!(stores.len(), 1,
+            "flush_every should be written only by set_flush_every; found {} writers:\n{}",
+            stores.len(), stores.join("\n"));
+    }
+
+    /// The three shader copies of `f16()` must stay semantically identical.
+    ///
+    /// They are hand-copied into each quant kernel's source, and one of them carried a wrong subnormal
+    /// exponent — seeded at -1 and biased by 113 instead of -14 and +127, halving every subnormal — for
+    /// an unknown period. The other two were correct, so `--gate-q4k` stayed green throughout and gave
+    /// no hint at all. Duplication is what made that possible: three copies, one review each, no
+    /// coupling between them.
+    ///
+    /// Comparing bodies with comments stripped is the cheapest guard that actually holds.
+    /// Deduplicating into one shared constant would be better, but `concat!` does not work across const
+    /// items and the restructure would touch every kernel — this catches the same drift for a fraction
+    /// of the risk.
+    #[test]
+    fn the_three_shader_f16_helpers_do_not_drift() {
+        let srcs = [("Q6K", super::Q6K_DEQUANT), ("Q4K", super::Q4K_DEQUANT),
+                    ("Q4K_TO_Q4", super::Q4K_TO_Q4)];
+        let bodies: Vec<(&str, String)> = srcs.iter()
+            .filter_map(|(n, s)| super::wgsl_fn_body(s, "fn f16(h: u32)").map(|b| (*n, b)))
+            .collect();
+        assert_eq!(bodies.len(), 3, "expected three copies, found {}", bodies.len());
+        for (name, b) in &bodies[1..] {
+            assert_eq!(b, &bodies[0].1, "{}'s f16() has drifted from {}'s", name, bodies[0].0);
+        }
+        // and the subnormal seed must be the CPU's, not a plausible-looking alternative
+        assert!(bodies[0].1.contains("-14"), "subnormal exponent seeds at -14: {}", bodies[0].1);
+        assert!(bodies[0].1.contains("e + 127"), "and biases by +127");
+    }
+
+    /// `byte_at` is duplicated the same way and reads raw quant bytes — a wrong shift there would
+    /// misread every weight rather than a rare subnormal, so it is the more dangerous of the two.
+    #[test]
+    fn the_shader_byte_at_helpers_do_not_drift() {
+        let srcs = [super::Q6K_DEQUANT, super::Q4K_DEQUANT, super::Q4K_TO_Q4];
+        let bodies: Vec<String> = srcs.iter()
+            .filter_map(|s| super::wgsl_fn_body(s, "fn byte_at(i: u32)")).collect();
+        assert_eq!(bodies.len(), 3);
+        for b in &bodies[1..] { assert_eq!(b, &bodies[0], "byte_at has drifted"); }
+    }
+}

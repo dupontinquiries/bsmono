@@ -77,6 +77,17 @@ pub struct Defaults {
     /// chunk drives dispatch COUNT more than dispatch duration. Higher than the dense cap, but still a
     /// cap: attention does scale with the chunk, and that is what a GPU watchdog kills.
     pub prefill_chunk_max_moe: u32,
+    /// Largest total GPU allocation this device was MEASURED to honour, in GiB. 0 = never probed.
+    ///
+    /// The alternative is a constant, and the constant was wrong by 2.6x: `memplan`'s Asahi cap of
+    /// 24 GiB was an empirical figure from the STAGING upload path, taken before the map-at-creation
+    /// arena existed, and `--gate-vram` measured the same device honouring 63 GiB. Nothing in the code
+    /// distinguished "the driver refuses" from "we assumed it would", and a model that fitted was being
+    /// streamed for no reason.
+    ///
+    /// Cached because probing costs ~4.5 s and allocates everything on the device — acceptable once per
+    /// adapter, not per launch.
+    pub measured_vram_gib: f32,
     /// Compute passes per queue submission.
     pub submit_batch: u32,
     /// Minimum relative margin for an A/B verdict to be cached at all.
@@ -90,6 +101,10 @@ pub struct Defaults {
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
+            // 0 = never probed. NOT a conservative default value, because a plausible-looking number
+            // here would be indistinguishable from a measurement and would inherit exactly the
+            // authority the 24 GiB constant wrongly had.
+            measured_vram_gib: 0.0,
             // 3072 x 8192 is the shape the 256-token chunk was originally tuned on.
             prefill_work_budget: 3072 * 8192 * 256,
             prefill_chunk_max: 256,

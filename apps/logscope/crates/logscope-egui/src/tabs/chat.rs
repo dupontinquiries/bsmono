@@ -138,6 +138,8 @@ const PARAM_DIALS: [(usize, &str, f32, f32, bool); 5] = [
 const BACKEND_SEL: usize = 620; // LlamaCpp / Wgpu
 const PERSONA_SEL: usize = 621; // PERSONAS table
 const MODEL_SEL: usize = 622;   // ModelState::items — dynamic count
+/// Which job the selected model does: Liaison / Disciple / Thinker (see logscope::modelroles).
+const ROLE_SEL: usize = 623;
 
 /// Read a `Ctx` field as an f32 by its physical-dial id (for syncing the dial handle to the live value).
 fn ctx_get(ctx: &Ctx, id: usize) -> f32 {
@@ -177,6 +179,7 @@ fn phys_dock() -> crate::physui::Panel {
     p.add_selector(BACKEND_SEL, BackendKind::ALL.len(), 0);
     p.add_selector(PERSONA_SEL, PERSONAS.len(), 0);
     p.add_selector(MODEL_SEL, 1, 0); // real count set each frame via set_selector_count once known
+    p.add_selector(ROLE_SEL, 3, 2);  // default Thinker: the safe assumption is that a model is authoritative
     p
 }
 
@@ -411,6 +414,27 @@ struct VerifyJob {
 
 // ── Persistence: checkpoints, rollback, crash recovery ───────────────────────────────────────
 /// On-disk form of a turn (no UI/Instant state). Role 0 = user, 1 = assistant.
+/// The message list, as the view model sees it.
+///
+/// Implemented on a slice rather than on ChatTab so building rows borrows only the messages — the
+/// renderer no longer needs `&mut self` while it paints, which is what forced the collect-then-apply
+/// dance and the alternative of cloning every message to read it.
+struct MsgSlice<'a>(&'a [Msg]);
+
+impl logscope::msgview::MessageStore for MsgSlice<'_> {
+    fn len(&self) -> usize { self.0.len() }
+    fn is_user(&self, i: usize) -> bool { self.0[i].role == Role::User }
+    fn line_count(&self, i: usize) -> usize { self.0[i].text().lines().count() }
+    fn summary(&self, i: usize) -> String {
+        // Only called for rows that will actually collapse, so the parse cost is paid once per visible
+        // collapsed row rather than once per message per frame.
+        let t = self.0[i].text();
+        let edits = logscope::liaison_relay::parse_edits(t);
+        let cn = logscope::liaison_relay::cliffsnotes(t, &edits, None);
+        format!("\u{25b8} {}  ({} lines)", cn.label(), t.lines().count())
+    }
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct MsgSave { role: u8, variants: Vec<String>, cur: usize }
 /// A named, restorable snapshot of the whole conversation.
@@ -962,6 +986,19 @@ pub struct Chat {
     show_checkpoints: bool,                 // checkpoints panel open
     /// GPU phase-breakdown subpanel open (📊 in the composer bar).
     show_metrics: bool,
+    /// Steps the reader has opened, as (message, step). Per-step rather than per-message: opening one
+    /// long step usually means wanting that one, not every step of every later reply.
+    step_open: std::collections::HashSet<(usize, usize)>,
+    /// Rolling window of the Thinker's recent output, for the watch strip.
+    watch: logscope::thinkerwatch::ThinkerWindow,
+    /// The whole current reply: the forecast must count fences opened BEFORE the window, since a code
+    /// block started 300 words ago is still open and a window-local count would call it closed.
+    watch_full: String,
+    /// The Liaison's latest condensation, None until the first poll returns.
+    watch_gist: Option<String>,
+    /// Messages the reader has explicitly opened, overriding the cliffsnotes collapse. Explicit rather
+    /// than sticky-by-default: a reader who opens one long reply usually wants that one, not all of them.
+    expanded_msgs: std::collections::HashSet<usize>,
     /// Running backend account shown under the newest message while a reply is generating.
     hud: crate::liaisonhud::Hud,
     /// The liaison model's phrasing of the HUD, when one has produced a line. Empty = show the raw
@@ -1062,6 +1099,10 @@ impl Default for Chat {
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            step_open: Default::default(),
+            watch: logscope::thinkerwatch::ThinkerWindow::new(),
+            watch_full: String::new(), watch_gist: None,
+            expanded_msgs: Default::default(),
             hud: crate::liaisonhud::Hud::new(8), hud_narration: String::new(),
             show_metrics: false, metrics_base: Default::default(), metrics_wall_ns: 0, metrics_tokens: 0, metrics_start: None,
             vault: autosave_path().and_then(|p| p.parent().map(|d| d.join("vault")))
@@ -1260,6 +1301,8 @@ impl Chat {
         }
         match e {
             Evt::Token(t) => {
+                self.watch.push(&t);
+                self.watch_full.push_str(&t);
                 let mut stop = false;
                 let plain = self.backend != BackendKind::Wgpu; // template path stops on <|eot_id|>
                 let mut check_text: Option<String> = None;
@@ -1936,7 +1979,10 @@ impl Chat {
     }
 
     fn log_block(&self, doc: &crate::analysis::Doc) -> Option<String> {
-        if !self.attach_log || doc.lines.is_empty() { return None; }
+        // Never attach the BUILT-IN demo document. Attaching it tells the model to answer from a file
+        // the user has never seen, with "use only this data" — which is why a greeting came back as an
+        // analysis of sample.log. A real load clears the flag.
+        if !self.attach_log || doc.lines.is_empty() || doc.placeholder { return None; }
         let name = if doc.name.is_empty() { "(unnamed)" } else { &doc.name };
         let mut s = format!("CURRENT LOG: {name} ({} lines). Use only this data; cite line patterns or lines from it.", doc.lines.len());
         let tops = crate::analysis::repeated_templates(&doc.lines, 5);
@@ -4242,7 +4288,13 @@ impl Chat {
                             self.phys.set_selector_count(MODEL_SEL, m.items.len());
                             self.phys.set_index(MODEL_SEL, m.selected);
                         }
-                        let sel_rows: &[(usize, &str)] = &[(BACKEND_SEL, "BACKEND"), (PERSONA_SEL, "PERSONA"), (MODEL_SEL, "MODEL")];
+                        // ROLE row: which job the selected model is doing. Uses the Liaison/Disciple/
+                        // Thinker vocabulary rather than draft/target, because "target" reads as a
+                        // destination when it is the model doing the actual thinking, and a reader has
+                        // to be able to tell that a Disciple's output is PROVISIONAL.
+                        self.phys.set_selector_count(ROLE_SEL, 3);
+                        let sel_rows: &[(usize, &str)] = &[(BACKEND_SEL, "BACKEND"), (PERSONA_SEL, "PERSONA"),
+                                                           (MODEL_SEL, "MODEL"), (ROLE_SEL, "ROLE")];
                         for (row, &(id, label)) in sel_rows.iter().enumerate() {
                             if id == MODEL_SEL && model.is_none() { continue; } // no model context (headless/backdrop scene)
                             let off = (0.42 - (PARAM_DIALS.len() + row) as f32 * 0.26) * ps;
@@ -4252,6 +4304,12 @@ impl Chat {
                                 BACKEND_SEL => BackendKind::ALL[self.phys.index_of(id).min(1)].label().to_string(),
                                 PERSONA_SEL => PERSONAS.get(self.phys.index_of(id)).map(|(_, title, _)| title.to_string()).unwrap_or_default(),
                                 MODEL_SEL => model.as_deref().and_then(|m| m.items.get(m.selected)).map(|it| it.name().to_string()).unwrap_or_else(|| "—".into()),
+                                ROLE_SEL => {
+                                    use logscope::modelroles::Role;
+                                    [Role::Liaison, Role::Disciple, Role::Thinker]
+                                        .get(self.phys.index_of(ROLE_SEL)).copied()
+                                        .unwrap_or(Role::Thinker).label().to_string()
+                                }
                                 _ => String::new(),
                             };
                             let mut trk = m3::panel(rc, right, up, tw, th, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
@@ -4753,6 +4811,22 @@ impl Chat {
                 // outline only — let the 3D glossy pearl behind it show through
                 p.circle_stroke(pt, radius, egui::Stroke::new(1.0, col.linear_multiply(0.7)));
                 if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.5, egui::Stroke::new(1.0, theme::CYAN().linear_multiply(0.6))); }
+            } else if nd.kind.is_structural() {
+                // FAN-OUT / MERGE: a wide, flat bar rather than a blob. It reads as a junction — the
+                // point where the timeline splits or rejoins — instead of as one more thing that
+                // happened, which is how three alternatives came to look like three replies.
+                let h = radius * 0.45;
+                let r = egui::Rect::from_center_size(pt, egui::vec2(radius * 3.0, h * 2.0));
+                p.rect_filled(r, theme::r(2), theme::VIOLET());
+                if radius > 5.0 {
+                    p.text(pt, egui::Align2::CENTER_CENTER, nd.kind.glyph(),
+                        egui::FontId::proportional((radius * 1.1).min(13.0)), theme::INK());
+                }
+            } else if nd.kind.is_narration() {
+                // LIAISON: a hollow ring. Nobody said it and nothing was produced, so it should not
+                // carry the visual weight of a turn — but it must remain findable, hence a ring rather
+                // than a fainter dot, which would read as a quiet message.
+                p.circle_stroke(pt, radius * 0.85, egui::Stroke::new(1.5, theme::CYAN()));
             } else if nd.kind.is_artifact() {
                 // ARTIFACTS ARE SQUARES; conversation turns are circles. Shape is the fastest visual
                 // channel for "the conversation PRODUCED this" vs "someone SAID this", and unlike a hue
@@ -6845,6 +6919,20 @@ impl Chat {
                             if ui.button(RichText::new(format!("🕘 {}", self.checkpoints.len())).small())
                                 .on_hover_text("Checkpoint history (rollback)").clicked() { self.show_checkpoints = !self.show_checkpoints; }
                         }
+                        // THINKER WATCH, LEFT of the metrics toggle: what the big model is writing now, condensed,
+                        // plus a forecast inferred from the text's STRUCTURE. Shown only while generating — a strip
+                        // left beside a finished reply reads as current.
+                        if self.stream.is_some() {
+                            let w = logscope::thinkerwatch::Watch {
+                                gist: self.watch_gist.clone(),
+                                forecast: logscope::thinkerwatch::forecast(&self.watch_full),
+                                words_so_far: self.watch.total_words(),
+                            };
+                            ui.label(RichText::new(w.line()).color(theme::DIM()).small())
+                                .on_hover_text("What the Thinker is writing now. The tilde clause is INFERRED from the \
+text's structure — an unclosed fence, an open brace — not predicted by a model.");
+                            ui.add_space(6.0);
+                        }
                         if ui.button(RichText::new("📊").small())
                             .on_hover_text("GPU phase breakdown: where the last generation's time went")
                             .clicked() { self.show_metrics = !self.show_metrics; }
@@ -6890,6 +6978,19 @@ impl Chat {
                     let streaming_any = cur.is_some();
                     let nmsgs = self.msgs.len();
                     let scroll_to = self.scroll_chat_to.take(); // jump-scroll target from the graph
+                    let msg_count = self.msgs.len();
+                    // ROW DESCRIPTORS, built once per frame from a borrow of the messages that ends
+                    // here. The paint reads these instead of deciding per-message, so the collapse
+                    // decision and its label are computed in one place and the renderer stops needing
+                    // to know the rules. Summaries are computed only for rows that actually collapse.
+                    let rows = logscope::msgview::build_rows(
+                        &MsgSlice(&self.msgs), 0..msg_count, &self.expanded_msgs,
+                        logscope::liaison_relay::COLLAPSE_ABOVE_LINES);
+                    let expanded_now = self.expanded_msgs.clone();
+                    let step_open = self.step_open.clone();
+                    let mut toggle_step: Option<(usize, usize)> = None;
+                    let mut expand_msg: Option<usize> = None;
+                    let mut collapse_msg: Option<usize> = None;
                     for (i, m) in self.msgs.iter_mut().enumerate() {
                         if Some(i) == scroll_to { ui.scroll_to_cursor(Some(egui::Align::Center)); }
                         let (who, c, fill) = match m.role {
@@ -6933,6 +7034,47 @@ impl Chat {
                                         if ui.button("Cancel").clicked() { action = Some(MsgAction::EditCancel(i)); }
                                     });
                                 } else {
+                                    // CLIFFSNOTES COLLAPSE. A long assistant reply is relevant for one turn and is scenery
+                                    // afterwards, so it folds once it is no longer the latest message. Only when BOTH long and
+                                    // not-latest: collapsing what someone is currently reading is hostile, and folding a
+                                    // three-line answer saves nothing.
+                                    let row = rows.get(i);
+                                    let body_lines = row.map(|r| r.lines).unwrap_or(0);
+                                    let collapsible = m.role == Role::Assistant
+                                        && body_lines > logscope::liaison_relay::COLLAPSE_ABOVE_LINES
+                                        && i + 1 != msg_count;
+                                    let expanded = expanded_now.contains(&i);
+                                    if let Some(r) = row.filter(|r| r.collapsed) {
+                                        // The label was computed when the row was built; the paint just
+                                        // draws it. No parse, no summary, no clone at draw time.
+                                        if ui.button(RichText::new(r.label.clone()).color(theme::DIM()).small()).clicked() {
+                                            expand_msg = Some(i);
+                                        }
+                                        return;
+                                    }
+                                    if collapsible && expanded {
+                                        if ui.button(RichText::new("\u{25be} collapse").color(theme::FAINT()).small()).clicked() {
+                                            collapse_msg = Some(i);
+                                        }
+                                    }
+                                    // STEPWISE OUTLINE. A coordinator reply carries "STEP k/n — summary" markers, which are a table
+                                    // of contents the reader was scrolling past. Rendered as headers with the long middles folded,
+                                    // the verbosity stops being a cost — which matters because these replies arrive FAST, so the
+                                    // problem was never the tokens, only having to scroll through them to find the one that counts.
+                                    let steps = logscope::stepview::split_steps(m.text());
+                                    if steps.len() > 1 {
+                                        for (si2, st) in steps.iter().enumerate() {
+                                            let folded = logscope::stepview::fold_by_default(&steps, si2)
+                                                && !step_open.contains(&(i, si2));
+                                            if !st.summary.is_empty() {
+                                                let mark = if folded { "\u{25b8}" } else { "\u{25be}" };
+                                                if ui.button(RichText::new(format!("{mark} {}", st.header()))
+                                                    .color(theme::DIM()).small()).clicked() { toggle_step = Some((i, si2)); }
+                                            }
+                                            if !folded { render_markdown(ui, &st.body, ""); }
+                                        }
+                                        return;
+                                    }
                                     let segs = segment_message(m.text());
                                     let last = segs.len().saturating_sub(1);
                                     let think_open = m.think_open;
@@ -7017,6 +7159,16 @@ impl Chat {
                                 }
                             });
                         });
+                    }
+                    // Apply the chevron clicks here: the render closure holds `self.msgs` mutably, so it
+                    // records the intent and the mutation happens once the borrow ends.
+                    // Applied through the view model, so the expansion set has one mutation path and
+                    // the caller learns whether anything actually moved.
+                    let mut acts = Vec::new();
+                    if let Some(i) = expand_msg { acts.push(logscope::msgview::RowAction::Expand(i)); }
+                    if let Some(i) = collapse_msg { acts.push(logscope::msgview::RowAction::Collapse(i)); }
+                    if logscope::msgview::apply_actions(&mut self.expanded_msgs, &acts) {
+                        ui.ctx().request_repaint();
                     }
                     // ── LIAISON HUD: the running backend account, under the newest message ──
                     //

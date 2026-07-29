@@ -114,15 +114,6 @@ impl Gguf {
     pub fn get_f32(&self, key: &str) -> Option<f32> {
         match self.metadata.get(key) { Some(Value::F32(v)) => Some(*v), _ => None }
     }
-    /// Tolerant bool: some converters write flags (`expert_weights_norm`, …) as integers.
-    pub fn get_bool(&self, key: &str) -> Option<bool> {
-        match self.metadata.get(key)? {
-            Value::Bool(v) => Some(*v),
-            Value::U32(v) => Some(*v != 0),
-            Value::I32(v) => Some(*v != 0),
-            _ => None,
-        }
-    }
 
     /// The model architecture, resolved robustly for the metadata-key prefix used by the hyperparameters.
     /// GGUF stores those under `<arch>.embedding_length` etc., and `<arch>` should equal
@@ -466,7 +457,7 @@ pub fn ggml_type_name(t: u32) -> &'static str {
     match t {
         0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
         8 => "Q8_0", 9 => "Q8_1", 10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
-        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 20 => "IQ4_NL", 21 => "IQ3_S", 30 => "BF16",
+        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 20 => "IQ4_NL", 21 => "IQ3_S",
         _ => "?",
     }
 }
@@ -506,7 +497,6 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         19 => if n % 256 == 0 { Some(n / 256 * 50) } else { None },  // IQ1_S: 50 B per 256 → 1.5625 bits/wt
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block
-        30 => Some(n * 2),                                           // BF16: 2 bytes/value
         20 => if n % 32 == 0 { Some(n / 32 * 18) } else { None }, // IQ4_NL: f16 d + 16B 4-bit codebook idx
         _ => None,
     }
@@ -517,7 +507,7 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
 /// nibble is weight j and high nibble weight j+16; w = (nibble - 8) * d.
 /// Unpack the j-th 6-bit scale and min from a Q4_K/Q5_K 12-byte scale block
 /// (ggml `get_scale_min_k4`). Returns (scale6, min6), each 0..63.
-fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+pub(crate) fn get_scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
     if j < 4 {
         (q[j] & 63, q[j + 4] & 63)
     } else {
@@ -762,15 +752,6 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
                 }
             });
             Ok(out)
-        }
-        30 => {
-            // BF16: each value is the top 16 bits of an f32 — widen by shifting into the high half.
-            // Newer HF->GGUF converts (GLM-4.x era) store norms/biases as BF16 even in K-quant files,
-            // so a missing arm here silently failed whole MLA tensor sets.
-            Ok((0..n).map(|i| {
-                let b = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
-                f32::from_bits((b as u32) << 16)
-            }).collect())
         }
         20 => {
             // IQ4_NL: 18-byte blocks of 32 — f16 scale `d`, then 16 bytes of packed 4-bit indices into a

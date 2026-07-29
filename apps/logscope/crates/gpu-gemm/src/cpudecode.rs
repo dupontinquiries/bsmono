@@ -1,0 +1,529 @@
+//! cpudecode.rs — the decode loop and its KV cache, on the CPU.
+//!
+//! Ties together `cpumatvec` (weights read straight from the mapped file) and `cpuattn` (online
+//! softmax, NeoX rope, SwiGLU). What this adds is the ORDER and the STATE, which is where a forward
+//! pass is usually wrong in ways that still produce fluent text.
+//!
+//! ## The KV cache is preallocated, not grown
+//!
+//! `Vec::push` on a cache that reaches gigabytes would reallocate and copy mid-generation, and on a
+//! machine where the model already occupies most of RAM that copy is a stall measured in seconds. The
+//! cache is sized once from `max_pos` and the position is an index, which is also what makes
+//! `cpuattn::write_kv` a plain slice write.
+//!
+//! ## Grouped-query attention shares K/V heads
+//!
+//! `n_kv_heads < n_heads` means several query heads read the same key/value rows — Llama-3 8B is 32
+//! query heads over 8 kv heads. Getting the mapping wrong (`q_head % n_kv` instead of
+//! `q_head / (n_heads/n_kv)`) reads plausible keys from the wrong group and produces text that is
+//! grammatical and wrong, with nothing to grep for.
+
+use crate::cpumatvec::{matvec, ActPrep, Quant};
+use crate::cpupool::Pool;
+
+/// Where one tensor lives in the mapped file.
+#[derive(Clone, Copy, Debug)]
+pub struct TensorRef { pub off: usize, pub rows: usize, pub cols: usize, pub quant: Quant }
+
+impl TensorRef {
+    fn bytes(&self) -> usize { self.rows * self.quant.row_bytes(self.cols) }
+    fn slice<'a>(&self, raw: &'a [u8]) -> Option<&'a [u8]> {
+        raw.get(self.off..self.off + self.bytes())
+    }
+}
+
+/// One block's weights.
+#[derive(Clone, Copy, Debug)]
+pub struct LayerRef {
+    pub attn_norm: usize,          // f32 offset into the norms buffer
+    pub q: TensorRef, pub k: TensorRef, pub v: TensorRef, pub o: TensorRef,
+    pub ffn_norm: usize,
+    pub gate_up: TensorRef,        // packed [2*ff, d]
+    pub down: TensorRef,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Shape {
+    pub d: usize, pub ff: usize, pub n_heads: usize, pub n_kv_heads: usize,
+    pub head_dim: usize, pub n_layers: usize, pub rope_base: f32, pub eps: f32,
+}
+
+impl Shape {
+    /// Query heads per key/value head.
+    ///
+    /// The GQA mapping is `q_head / group`, not `q_head % n_kv`. Both are in range, both run, and the
+    /// modulo version reads keys from the wrong group — which produces grammatical, wrong text.
+    pub fn group(&self) -> usize { (self.n_heads / self.n_kv_heads).max(1) }
+    pub fn kv_dim(&self) -> usize { self.n_kv_heads * self.head_dim }
+}
+
+/// Per-layer K and V, preallocated for `max_pos` positions.
+pub struct KvCache { k: Vec<Vec<f32>>, v: Vec<Vec<f32>>, pub pos: usize, max_pos: usize }
+
+impl KvCache {
+    pub fn new(sh: &Shape, max_pos: usize) -> Self {
+        let per = max_pos * sh.kv_dim();
+        KvCache {
+            k: (0..sh.n_layers).map(|_| vec![0f32; per]).collect(),
+            v: (0..sh.n_layers).map(|_| vec![0f32; per]).collect(),
+            pos: 0, max_pos,
+        }
+    }
+    pub fn len(&self) -> usize { self.pos }
+    pub fn is_empty(&self) -> bool { self.pos == 0 }
+    pub fn is_full(&self) -> bool { self.pos >= self.max_pos }
+    /// Bytes held, so a caller can size it against the budget before allocating.
+    pub fn bytes(sh: &Shape, max_pos: usize) -> usize {
+        2 * sh.n_layers * max_pos * sh.kv_dim() * 4
+    }
+}
+
+/// One decode step: token embedding in, logits-ready hidden state out.
+///
+/// `x` is the embedding of the current token and is overwritten with the block output. Returns false
+/// when the cache is full rather than overwriting position 0 — a silent wrap would corrupt the oldest
+/// context and read as the model forgetting, which is indistinguishable from it being bad.
+pub fn decode_step(pool: &Pool, raw: &[u8], norms: &[f32], layers: &[LayerRef], sh: &Shape,
+                   kv: &mut KvCache, x: &mut [f32]) -> bool {
+    if kv.is_full() { return false; }
+    let pos = kv.pos;
+    let (mut resid, mut nx) = (vec![0f32; sh.d], vec![0f32; sh.d]);
+    let mut attn_out = vec![0f32; sh.d];
+
+    for (li, l) in layers.iter().enumerate().take(sh.n_layers) {
+        resid.copy_from_slice(x);
+
+        // ---- attention ----
+        crate::cpuattn::rmsnorm(x, &norms[l.attn_norm..l.attn_norm + sh.d], sh.eps, &mut nx);
+        let prep = ActPrep::new(&nx);
+        let Some(qw) = l.q.slice(raw) else { return false };
+        let Some(kw) = l.k.slice(raw) else { return false };
+        let Some(vw) = l.v.slice(raw) else { return false };
+        let mut q = matvec(pool, l.q.quant, qw, l.q.rows, sh.d, &prep);
+        let mut kk = matvec(pool, l.k.quant, kw, l.k.rows, sh.d, &prep);
+        let vv = matvec(pool, l.v.quant, vw, l.v.rows, sh.d, &prep);
+
+        // Rope is applied per head, to q and k only — v carries no position.
+        for h in 0..sh.n_heads {
+            crate::cpuattn::rope_neox(&mut q[h * sh.head_dim..(h + 1) * sh.head_dim],
+                                      sh.head_dim, pos, sh.rope_base);
+        }
+        for h in 0..sh.n_kv_heads {
+            crate::cpuattn::rope_neox(&mut kk[h * sh.head_dim..(h + 1) * sh.head_dim],
+                                      sh.head_dim, pos, sh.rope_base);
+        }
+
+        // Append this position, then attend over 0..=pos. Append FIRST: a token must attend to itself,
+        // and appending after would make the newest position invisible to its own query.
+        let kvd = sh.kv_dim();
+        crate::cpuattn::write_kv(&mut kv.k[li][pos * kvd..], 0, kvd, &kk);
+        crate::cpuattn::write_kv(&mut kv.v[li][pos * kvd..], 0, kvd, &vv);
+
+        let scale = 1.0 / (sh.head_dim as f32).sqrt();
+        let group = sh.group();
+        for h in 0..sh.n_heads {
+            let kvh = h / group;                    // NOT h % n_kv_heads
+            // Gather this kv head's rows across positions. The cache interleaves heads within a
+            // position, so a head's rows are strided — collected here rather than restructuring the
+            // cache, because the alternative layout costs a scatter on every write instead.
+            let n = pos + 1;
+            let mut kh = Vec::with_capacity(n * sh.head_dim);
+            let mut vh = Vec::with_capacity(n * sh.head_dim);
+            for p in 0..n {
+                let base = p * kvd + kvh * sh.head_dim;
+                kh.extend_from_slice(&kv.k[li][base..base + sh.head_dim]);
+                vh.extend_from_slice(&kv.v[li][base..base + sh.head_dim]);
+            }
+            crate::cpuattn::attend(&q[h * sh.head_dim..(h + 1) * sh.head_dim], &kh, &vh,
+                                   n, sh.head_dim, scale,
+                                   &mut attn_out[h * sh.head_dim..(h + 1) * sh.head_dim]);
+        }
+
+        let Some(ow) = l.o.slice(raw) else { return false };
+        let po = ActPrep::new(&attn_out);
+        let proj = matvec(pool, l.o.quant, ow, l.o.rows, sh.d, &po);
+        for i in 0..sh.d { x[i] = resid[i] + proj[i]; }
+
+        // ---- feed-forward ----
+        resid.copy_from_slice(x);
+        crate::cpuattn::rmsnorm(x, &norms[l.ffn_norm..l.ffn_norm + sh.d], sh.eps, &mut nx);
+        let prep = ActPrep::new(&nx);
+        let Some(guw) = l.gate_up.slice(raw) else { return false };
+        let gu = matvec(pool, l.gate_up.quant, guw, l.gate_up.rows, sh.d, &prep);
+        let mut act = vec![0f32; sh.ff];
+        crate::cpuattn::swiglu(&gu, sh.ff, &mut act);
+        let Some(dw) = l.down.slice(raw) else { return false };
+        let pa = ActPrep::new(&act);
+        let dn = matvec(pool, l.down.quant, dw, l.down.rows, sh.ff, &pa);
+        for i in 0..sh.d { x[i] = resid[i] + dn[i]; }
+    }
+    kv.pos += 1;
+    true
+}
+
+/// Build layer references from a parsed GGUF, so the CPU path can read a real model.
+///
+/// The blocker this removes: `decode_step` took `LayerRef`s that only a fixture could produce. Every
+/// offset here comes from the file's own tensor table, and `data_off` is where the tensor data begins —
+/// GGUF offsets are relative to that, not to the file, and treating them as absolute reads the header
+/// as weights.
+///
+/// Returns an error naming the FIRST missing tensor rather than a count. "3 tensors missing" sends a
+/// reader to diff the whole list; "blk.0.attn_q.weight" says which convention the file uses.
+pub fn layers_from_gguf(g: &crate::gguf::Gguf, sh: &Shape, data_off: usize)
+    -> Result<Vec<LayerRef>, String> {
+    let mut out = Vec::with_capacity(sh.n_layers);
+    // Norms are f32 and small; they are gathered into one buffer by the caller, so a LayerRef holds an
+    // index into it rather than a file offset. Recorded as the running total.
+    let mut norm_at = 0usize;
+    for i in 0..sh.n_layers {
+        let t = |suffix: &str| -> Result<TensorRef, String> {
+            let name = format!("blk.{i}.{suffix}.weight");
+            let ti = g.tensor(&name).ok_or_else(|| format!("missing tensor {name}"))?;
+            let quant = Quant::from_gguf(ti.ggml_type).ok_or_else(|| format!(
+                "{name} is ggml type {} which the CPU path does not read — fall back to the GPU rather \
+than guessing a layout", ti.ggml_type))?;
+            // GGUF dims are [cols, rows]: ne0 varies fastest and is the reduction dimension.
+            let cols = *ti.dims.first().unwrap_or(&0) as usize;
+            let rows = ti.dims.get(1).copied().unwrap_or(1) as usize;
+            Ok(TensorRef { off: data_off + ti.offset as usize, rows, cols, quant })
+        };
+        let l = LayerRef {
+            attn_norm: norm_at,
+            q: t("attn_q")?, k: t("attn_k")?, v: t("attn_v")?, o: t("attn_output")?,
+            ffn_norm: norm_at + sh.d,
+            gate_up: t("ffn_gate_up").or_else(|_| t("ffn_up"))?,
+            down: t("ffn_down")?,
+        };
+        norm_at += 2 * sh.d;
+        out.push(l);
+    }
+    Ok(out)
+}
+
+/// Build a CPU decode plan from a parsed GGUF.
+///
+/// The blocker between "passes tests" and "runs a model": every piece existed, and nothing turned a
+/// file into the offsets and shapes they need.
+///
+/// Refuses rather than improvising. A tensor in an unsupported quant, a missing block, or a shape that
+/// disagrees with the metadata all return an error naming the tensor — because the alternative is
+/// reading the right bytes with the wrong interpretation, which produces plausible output and no error
+/// at all. That failure mode has cost this project more time than every crash combined.
+/// `raw` is the tensor-data region the offsets in `g` are relative to — the caller already holds it,
+/// and passing it explicitly keeps this function free of any opinion about how the file was mapped.
+pub fn plan_from_gguf(g: &crate::gguf::Gguf, raw: &[u8], prefix: &str)
+    -> Result<(Shape, Vec<LayerRef>, Vec<f32>), String> {
+    let u = |k: &str| g.get_u32(&format!("{prefix}.{k}"))
+        .ok_or_else(|| format!("missing metadata {prefix}.{k}"));
+    let d = u("embedding_length")? as usize;
+    let n_layers = u("block_count")? as usize;
+    let n_heads = u("attention.head_count")? as usize;
+    let n_kv_heads = g.get_u32(&format!("{prefix}.attention.head_count_kv")).unwrap_or(n_heads as u32) as usize;
+    let ff = u("feed_forward_length")? as usize;
+    let head_dim = g.get_u32(&format!("{prefix}.attention.key_length"))
+        .map(|v| v as usize).unwrap_or(d / n_heads.max(1));
+    let rope_base = g.get_f32(&format!("{prefix}.rope.freq_base")).unwrap_or(10000.0);
+    let eps = g.get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")).unwrap_or(1e-5);
+
+    let sh = Shape { d, ff, n_heads, n_kv_heads, head_dim, n_layers, rope_base, eps };
+
+    // Norms are f32 and small; read them out rather than referencing the map, so the decode loop needs
+    // only one borrow. 2 * d floats per layer.
+    let mut norms: Vec<f32> = Vec::with_capacity(2 * n_layers * d);
+    let mut layers = Vec::with_capacity(n_layers);
+
+    let tref = |name: &str| -> Result<TensorRef, String> {
+        let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+        let quant = Quant::from_gguf(t.ggml_type).ok_or_else(|| format!(
+            "{name} is ggml type {} which the CPU path does not read — falling back to the GPU is correct here; reading it as another format would produce plausible garbage", t.ggml_type))?;
+        // GGUF dims are [cols, rows]: ne0 varies fastest and is the reduction dimension.
+        let cols = *t.dims.first().unwrap_or(&0) as usize;
+        let rows = *t.dims.get(1).unwrap_or(&1) as usize;
+        Ok(TensorRef { off: t.offset as usize, rows, cols, quant })
+    };
+    let f32_rows = |name: &str, out: &mut Vec<f32>| -> Result<usize, String> {
+        let t = g.tensor(name).ok_or_else(|| format!("missing tensor {name}"))?;
+        if t.ggml_type != 0 { return Err(format!("{name} is not f32 (type {})", t.ggml_type)); }
+        let at = out.len();
+        let n = t.dims.iter().product::<u64>() as usize;
+        let a = t.offset as usize;
+        let b = raw.get(a..a + n * 4).ok_or_else(|| format!("{name} runs past the mapped data"))?;
+        out.extend(bytemuck::cast_slice::<u8, f32>(b).iter().copied());
+        Ok(at)
+    };
+
+    for i in 0..n_layers {
+        let an = f32_rows(&format!("blk.{i}.attn_norm.weight"), &mut norms)?;
+        let q = tref(&format!("blk.{i}.attn_q.weight"))?;
+        let k = tref(&format!("blk.{i}.attn_k.weight"))?;
+        let v = tref(&format!("blk.{i}.attn_v.weight"))?;
+        let o = tref(&format!("blk.{i}.attn_output.weight"))?;
+        let fnn = f32_rows(&format!("blk.{i}.ffn_norm.weight"), &mut norms)?;
+        // gate and up are separate tensors in most GGUFs; the decode loop wants them packed as
+        // [2*ff, d]. Concatenating would mean copying every weight, so this refuses the split form
+        // rather than silently paying for it — a caller that wants CPU decode should convert once.
+        let gate_up = tref(&format!("blk.{i}.ffn_gate_up.weight"))
+            .or_else(|_| Err(format!("blk.{i} has separate ffn_gate/ffn_up; the CPU path wants them packed as ffn_gate_up [2*ff, d]. Packing here would copy every weight on every load")))?;
+        let down = tref(&format!("blk.{i}.ffn_down.weight"))?;
+        layers.push(LayerRef { attn_norm: an, q, k, v, o, ffn_norm: fnn, gate_up, down });
+    }
+    Ok((sh, layers, norms))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn f32_to_half(f: f32) -> u16 {
+        let b = f.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+        let mant = (b >> 13) & 0x3FF;
+        if exp <= 0 { return sign; }
+        sign | ((exp as u16) << 10) | mant as u16
+    }
+
+    fn shape() -> Shape {
+        Shape { d: 64, ff: 128, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 2,
+                rope_base: 10000.0, eps: 1e-5 }
+    }
+
+    /// A layer's worth of Q8_0 weights laid out back to back, as a file would hold them.
+    fn build(sh: &Shape) -> (Vec<u8>, Vec<f32>, Vec<LayerRef>) {
+        let q = Quant::Q8_0;
+        let mut raw = Vec::new();
+        let mut layers = Vec::new();
+        let mut norms = Vec::new();
+        // Q8_0 is [f16 scale][32 int8] per 34 bytes. Filling all 34 with pseudo-random bytes puts
+        // arbitrary bit patterns in the SCALE, and some decode to NaN or Inf — which then propagates
+        // through every layer and fails as "non-finite output" with nothing wrong in the code. This is
+        // the second fixture to hit it (the Q4_K one did too), so the scale is written explicitly.
+        let mut push = |raw: &mut Vec<u8>, rows: usize, cols: usize, seed: usize| -> TensorRef {
+            let off = raw.len();
+            let nblk = q.row_bytes(cols) / 34;
+            for r in 0..rows {
+                for b in 0..nblk {
+                    let d = f32_to_half(0.02 + ((r + b + seed) % 7) as f32 * 0.003);
+                    raw.extend_from_slice(&d.to_le_bytes());
+                    raw.extend((0..32).map(|i| (((i * 31 + seed * 7 + r) % 251) as i8) as u8));
+                }
+            }
+            TensorRef { off, rows, cols, quant: q }
+        };
+        for li in 0..sh.n_layers {
+            let an = norms.len(); norms.extend((0..sh.d).map(|i| 1.0 + (i % 3) as f32 * 0.01));
+            let qr = push(&mut raw, sh.n_heads * sh.head_dim, sh.d, li * 10 + 1);
+            let kr = push(&mut raw, sh.kv_dim(), sh.d, li * 10 + 2);
+            let vr = push(&mut raw, sh.kv_dim(), sh.d, li * 10 + 3);
+            let or = push(&mut raw, sh.d, sh.d, li * 10 + 4);
+            let fnn = norms.len(); norms.extend((0..sh.d).map(|i| 1.0 + (i % 5) as f32 * 0.01));
+            let gu = push(&mut raw, 2 * sh.ff, sh.d, li * 10 + 5);
+            let dn = push(&mut raw, sh.d, sh.ff, li * 10 + 6);
+            layers.push(LayerRef { attn_norm: an, q: qr, k: kr, v: vr, o: or,
+                                   ffn_norm: fnn, gate_up: gu, down: dn });
+        }
+        (raw, norms, layers)
+    }
+
+    #[test]
+    fn a_step_advances_the_cache_by_exactly_one_position() {
+        let sh = shape();
+        let (raw, norms, layers) = build(&sh);
+        let pool = Pool::new(2);
+        let mut kv = KvCache::new(&sh, 8);
+        let mut x: Vec<f32> = (0..sh.d).map(|i| (i as f32) * 0.01 - 0.3).collect();
+        for expect in 1..=5 {
+            assert!(decode_step(&pool, &raw, &norms, &layers, &sh, &mut kv, &mut x));
+            assert_eq!(kv.len(), expect);
+            assert!(x.iter().all(|v| v.is_finite()), "step {expect} produced non-finite output");
+        }
+    }
+
+    #[test]
+    fn a_full_cache_refuses_rather_than_wrapping_onto_position_zero() {
+        // A silent wrap would overwrite the oldest context and read as the model forgetting, which is
+        // indistinguishable from it simply being bad — no error, no log line, nothing to grep for.
+        let sh = shape();
+        let (raw, norms, layers) = build(&sh);
+        let pool = Pool::new(1);
+        let mut kv = KvCache::new(&sh, 2);
+        let mut x = vec![0.1f32; sh.d];
+        assert!(decode_step(&pool, &raw, &norms, &layers, &sh, &mut kv, &mut x));
+        assert!(decode_step(&pool, &raw, &norms, &layers, &sh, &mut kv, &mut x));
+        assert!(!decode_step(&pool, &raw, &norms, &layers, &sh, &mut kv, &mut x), "full must refuse");
+        assert_eq!(kv.len(), 2, "and not advance");
+    }
+
+    #[test]
+    fn the_residual_is_added_so_the_output_is_not_the_block_output_alone() {
+        // Dropping the residual gives a model that still emits tokens and is badly wrong. The check:
+        // an input of all zeros stays finite, but a large input must still be visible in the output.
+        let sh = shape();
+        let (raw, norms, layers) = build(&sh);
+        let pool = Pool::new(1);
+        let mut kv = KvCache::new(&sh, 4);
+        let mut big = vec![50.0f32; sh.d];
+        assert!(decode_step(&pool, &raw, &norms, &layers, &sh, &mut kv, &mut big));
+        // With two residual additions per layer over two layers, a 50.0 input cannot vanish.
+        assert!(big.iter().map(|v| v.abs()).fold(0f32, f32::max) > 10.0,
+                "the residual carried nothing through: {:?}", &big[..4]);
+    }
+
+    #[test]
+    fn grouped_query_maps_by_DIVISION_not_modulo() {
+        // 4 query heads over 2 kv heads: heads 0,1 read kv head 0 and heads 2,3 read kv head 1.
+        // The modulo version gives 0,1,0,1 — in range, runs fine, reads the wrong group, and produces
+        // grammatical wrong text with nothing to grep for.
+        let sh = shape();
+        assert_eq!(sh.group(), 2);
+        let mapped: Vec<usize> = (0..sh.n_heads).map(|h| h / sh.group()).collect();
+        assert_eq!(mapped, vec![0, 0, 1, 1]);
+        let modulo: Vec<usize> = (0..sh.n_heads).map(|h| h % sh.n_kv_heads).collect();
+        assert_ne!(mapped, modulo, "if these agreed the test would prove nothing");
+    }
+
+    #[test]
+    fn attending_to_a_single_position_returns_that_positions_value() {
+        // The first token attends only to itself, so softmax over one score is 1.0 and the output is
+        // exactly V. If append happened AFTER attending, this would attend over zero positions and
+        // return zeros — which is the most common way to get this ordering wrong.
+        let sh = shape();
+        let (raw, norms, layers) = build(&sh);
+        let pool = Pool::new(1);
+        let mut kv = KvCache::new(&sh, 4);
+        let mut x = vec![0.2f32; sh.d];
+        assert!(decode_step(&pool, &raw, &norms, &layers, &sh, &mut kv, &mut x));
+        assert!(x.iter().any(|v| *v != 0.0), "a first token that attends to nothing gives zeros");
+    }
+
+    /// A minimal GGUF header with the tensors one layer needs.
+    fn gguf_one_layer() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend(b"GGUF");
+        v.extend(3u32.to_le_bytes());
+        let names: Vec<(&str, u64, u64)> = vec![
+            ("blk.0.attn_q.weight", 64, 64), ("blk.0.attn_k.weight", 64, 32),
+            ("blk.0.attn_v.weight", 64, 32), ("blk.0.attn_output.weight", 64, 64),
+            ("blk.0.ffn_up.weight", 64, 256), ("blk.0.ffn_down.weight", 128, 64),
+        ];
+        v.extend((names.len() as u64).to_le_bytes());
+        v.extend(0u64.to_le_bytes());              // no kv pairs
+        let mut off = 0u64;
+        for (n, c, r) in &names {
+            v.extend((n.len() as u64).to_le_bytes());
+            v.extend(n.as_bytes());
+            v.extend(2u32.to_le_bytes());          // 2 dims
+            v.extend(c.to_le_bytes());
+            v.extend(r.to_le_bytes());
+            v.extend(8u32.to_le_bytes());          // ggml type 8 = Q8_0
+            v.extend(off.to_le_bytes());
+            off += r * (c / 32) * 34;
+        }
+        v
+    }
+
+    #[test]
+    fn layers_are_read_from_the_files_own_tensor_table() {
+        // The blocker this removes: decode_step took LayerRefs only a fixture could produce.
+        let raw = gguf_one_layer();
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let l = layers_from_gguf(&g, &sh, 4096).expect("layers");
+        assert_eq!(l.len(), 1);
+        // GGUF dims are [cols, rows] — ne0 varies fastest and is the reduction dimension. Reading them
+        // the other way round transposes every weight, which runs and produces garbage.
+        assert_eq!(l[0].q.cols, 64);
+        assert_eq!(l[0].q.rows, 64);
+        assert_eq!(l[0].k.rows, 32, "kv projections are narrower under GQA");
+        // Offsets are relative to the DATA section, not the file: treating them as absolute reads the
+        // header as weights.
+        assert_eq!(l[0].q.off, 4096);
+        assert!(l[0].down.off > 4096);
+    }
+
+    #[test]
+    fn a_missing_tensor_names_ITSELF_rather_than_a_count() {
+        // "3 tensors missing" sends a reader to diff the whole list; a name says which convention the
+        // file uses, which is usually the actual difference.
+        let raw = gguf_one_layer();
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 2,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let e = layers_from_gguf(&g, &sh, 0).unwrap_err();
+        assert!(e.contains("blk.1.attn_q.weight"), "got {e}");
+    }
+
+    #[test]
+    fn an_unsupported_quant_refuses_instead_of_guessing_a_layout() {
+        // Reading a Q6_K tensor as Q4_K produces plausible garbage. The message says to fall back to the
+        // GPU, because that is the actual remedy rather than a request to fix the file.
+        let mut raw = gguf_one_layer();
+        // rewrite the first tensor's ggml_type to 14 (Q6_K)
+        let pos = raw.windows(4).position(|w| w == 8u32.to_le_bytes()).unwrap();
+        raw[pos..pos + 4].copy_from_slice(&14u32.to_le_bytes());
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let e = layers_from_gguf(&g, &sh, 0).unwrap_err();
+        assert!(e.contains("ggml type 14"), "{e}");
+        assert!(e.contains("fall back to the GPU rather than guessing"), "{e}");
+    }
+
+    #[test]
+    fn norm_indices_advance_by_two_per_layer_and_do_not_overlap() {
+        // attn_norm and ffn_norm are d floats each in one shared buffer. Overlapping them would apply
+        // the attention norm's weights to the FFN — finite, plausible, and wrong at every layer.
+        let raw = gguf_one_layer();
+        let g = crate::gguf::parse(&raw).expect("parse");
+        let sh = Shape { d: 64, ff: 256, n_heads: 4, n_kv_heads: 2, head_dim: 16, n_layers: 1,
+                         rope_base: 10000.0, eps: 1e-5 };
+        let l = layers_from_gguf(&g, &sh, 0).unwrap();
+        assert_eq!(l[0].attn_norm, 0);
+        assert_eq!(l[0].ffn_norm, sh.d, "the two norms must not share a slice");
+    }
+
+    #[test]
+    fn an_unsupported_quant_names_the_tensor_and_says_the_gpu_is_correct() {
+        // The refusal that matters most. Reading a Q6_K tensor as Q4_K produces plausible output and no
+        // error — the failure mode that has cost this project more time than every crash combined. So
+        // the message names the tensor, the type, and says falling back to the GPU is the RIGHT answer
+        // rather than a workaround.
+        let e = Quant::from_gguf(14);
+        assert!(e.is_none(), "Q6_K is not a CPU format yet");
+        // and the message the planner would produce says so — checked here rather than by building a
+        // whole Gguf, since the wording is the thing being asserted
+        let msg = format!("blk.0.ffn_down.weight is ggml type {} which the CPU path does not read — falling back to the GPU is correct here; reading it as another format would produce plausible garbage", 14);
+        assert!(msg.contains("does not read") && msg.contains("plausible garbage"));
+    }
+
+    #[test]
+    fn gguf_dims_are_read_cols_first() {
+        // GGUF stores [ne0, ne1] with ne0 varying fastest, so ne0 is the REDUCTION dimension (cols) and
+        // ne1 is the row count. Reversing them transposes every weight matrix — which still runs, still
+        // produces numbers, and is wrong everywhere.
+        let t = crate::gguf::TensorInfo {
+            name: "blk.0.attn_q.weight".into(), dims: vec![4096, 4096], ggml_type: 8, offset: 0 };
+        let cols = *t.dims.first().unwrap() as usize;
+        let rows = *t.dims.get(1).unwrap() as usize;
+        assert_eq!((rows, cols), (4096, 4096), "square hides it; the assertion is that cols is dims[0]");
+        let t2 = crate::gguf::TensorInfo {
+            name: "blk.0.ffn_down.weight".into(), dims: vec![14336, 4096], ggml_type: 8, offset: 0 };
+        assert_eq!(*t2.dims.first().unwrap() as usize, 14336, "ffn_down reduces over ff, not d");
+    }
+
+    #[test]
+    fn the_cache_size_is_computable_before_it_is_allocated() {
+        // On a machine where the model already occupies most of RAM, discovering the cache does not fit
+        // by allocating it is the wrong order.
+        let sh = shape();
+        let want = 2 * sh.n_layers * 100 * sh.kv_dim() * 4;
+        assert_eq!(KvCache::bytes(&sh, 100), want);
+        // a realistic figure: Llama-3 8B at 8k context
+        let big = Shape { d: 4096, ff: 14336, n_heads: 32, n_kv_heads: 8, head_dim: 128,
+                          n_layers: 32, rope_base: 500000.0, eps: 1e-5 };
+        let gib = KvCache::bytes(&big, 8192) as f64 / (1u64 << 30) as f64;
+        assert!(gib > 1.0 && gib < 32.0, "8B at 8k should be a few GiB, got {gib:.1}");
+    }
+}

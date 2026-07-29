@@ -43,11 +43,3 @@ zerocopy = ["dep:ash", "wgpu/vulkan"]
 # sparse residency: one giant buffer backed by physical blocks via vkQueueBindSparse (the arena's
 # architectural replacement). Gated like zerocopy — pure planner is always on; the binder needs this.
 sparse = ["dep:ash", "wgpu/vulkan"]
-
-# Compile-speed policy (monorepo-wide, dev only): full DWARF is the single biggest
-# artifact + link cost in these workspaces, and the sandbox/CI boxes are disk-starved.
-# line-tables-only keeps file:line in backtraces (the part actually read) while
-# cutting debuginfo ~10x. Release profiles are untouched. Override locally with
-# CARGO_PROFILE_DEV_DEBUG=2 when a debugger session needs full types.
-[profile.dev]
-debug = "line-tables-only"
