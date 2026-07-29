@@ -32,13 +32,15 @@ gitmind work present and untouched.
 | `corpus/cadscope-main` | the CADscope reference corpus, 760 commits, shares base `e71cc7c` |
 | `corpus/cadscope-skydribble` | almost certainly skydribble's real development history |
 
-## The two follow-ups that matter
+## Follow-ups
 
-1. **Reconcile `corpus/cadscope-skydribble` with `import/skydribble`.** The
-   import is a v1.41 archive with *no history*; that branch appears to hold the
-   actual commits. Doing this replaces a single import commit with a real
-   lineage, and it is self-contained.
-2. **Re-apply the granular `submit_cause` breakdown** over 338's frame logic. It
+**Corrected:** skydribble **v1.41 is the better keep** — `corpus/cadscope-skydribble`
+is useful as *provenance* for a history that was never available, not as content
+to merge back. And the CADscope corpus was built **on** logscope, using the
+bundle as an egui-kit reference: a derived work, not an upstream. Neither needs
+merging into `main`; both stay as refs so the lineage is not lost.
+
+1. **Re-apply the granular `submit_cause` breakdown** over 338's frame logic. It
    is the one place the merge traded detail for coherence, and it was deliberate
    — recorded in `MERGE_338_AUDIT.md` rather than left to be rediscovered.
 
