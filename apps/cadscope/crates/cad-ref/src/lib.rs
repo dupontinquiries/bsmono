@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 
 use glam::Vec3;
 
+pub mod cache;
 pub mod doc;
 pub mod iqm;
 pub mod obj;
@@ -247,6 +248,9 @@ pub struct ScanOpts {
     pub max_entries: usize,
     /// Declared units per subtree, relative to the scan root. Longest matching prefix wins.
     pub unit_hints: Vec<(PathBuf, Units)>,
+    /// Where to read and write the scan cache. `None` disables caching entirely, which is what
+    /// `--no-cache` and the tests want.
+    pub cache: Option<PathBuf>,
 }
 
 impl Default for ScanOpts {
@@ -256,6 +260,7 @@ impl Default for ScanOpts {
             max_depth: 12,
             max_entries: 100_000,
             unit_hints: Vec::new(),
+            cache: None,
         }
     }
 }
@@ -318,7 +323,17 @@ impl Index {
     /// unrecognised extensions are skipped silently — a corpus is a pile of other people's output
     /// and must never be able to fail the scan.
     pub fn scan(root: &Path, opts: &ScanOpts) -> Index {
+        let (idx, _) = Self::scan_counting(root, opts);
+        idx
+    }
+
+    /// Scan, and report how many entries came from the cache rather than from a fresh parse —
+    /// which is the number that tells you whether caching is doing anything.
+    pub fn scan_counting(root: &Path, opts: &ScanOpts) -> (Index, usize) {
         let mut idx = Index::default();
+        let cached = opts.cache.as_deref().and_then(cache::load).unwrap_or_default();
+        let mut fresh: Vec<cache::Cached> = Vec::new();
+        let mut reused = 0usize;
         let mut stack = vec![(root.to_path_buf(), 0usize)];
         while let Some((dir, depth)) = stack.pop() {
             if depth > opts.max_depth || idx.entries.len() >= opts.max_entries {
@@ -338,9 +353,29 @@ impl Index {
                         stack.push((path, depth + 1));
                     }
                 } else if ft.is_file() {
+                    if Kind::of_path(&path).is_none() {
+                        continue;
+                    }
+                    let md = ent.metadata().ok();
+                    let bytes = md.as_ref().map(|m| m.len()).unwrap_or(0);
+                    let mtime = md.as_ref().map(cache::mtime_of).unwrap_or(0);
+                    // Reuse only when size and mtime both still match what was recorded.
+                    if let Some(hit) = cached.get(&path) {
+                        if hit.bytes == bytes && hit.mtime == mtime {
+                            reused += 1;
+                            idx.entries.push(hit.entry.clone());
+                            if opts.cache.is_some() {
+                                fresh.push(hit.clone());
+                            }
+                            continue;
+                        }
+                    }
                     if let Some(mut e) = Self::entry_of(&path) {
                         if let Facts::Model(m) = &mut e.facts {
                             m.units = opts.units_for(root, &e.path);
+                        }
+                        if opts.cache.is_some() {
+                            fresh.push(cache::Cached { bytes, mtime, entry: e.clone() });
                         }
                         idx.entries.push(e);
                     }
@@ -349,7 +384,13 @@ impl Index {
         }
         idx.entries.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
         idx.reindex();
-        idx
+        if let Some(p) = opts.cache.as_deref() {
+            if let Err(e) = cache::save(p, &fresh) {
+                // A cache that cannot be written is a slower scan, never a failed one.
+                eprintln!("cad-ref: could not write cache {}: {e}", p.display());
+            }
+        }
+        (idx, reused)
     }
 
     fn entry_of(path: &Path) -> Option<Entry> {
@@ -815,6 +856,62 @@ mod tests {
             Err(RefError::NotIndexed { .. })
         ));
         assert!(matches!(idx.fit_check("plating", None), Err(RefError::NotADoc { .. })));
+    }
+
+    #[test]
+    fn a_second_scan_reuses_the_cache_and_agrees_with_the_first() {
+        let dir = std::env::temp_dir().join(format!("cadref-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("box.obj"),
+            "o box
+usemtl steel
+v 0 0 0
+v 1 0 0
+v 1 1 0
+v 0 1 0
+v 0 0 1
+v 1 0 1
+v 1 1 1
+v 0 1 1
+             f 1 4 3 2
+f 5 6 7 8
+f 1 2 6 5
+f 2 3 7 6
+f 3 4 8 7
+f 4 1 5 8
+",
+        )
+        .unwrap();
+        std::fs::write(dir.join("spec.md"), "# Spec
+The cavity is 120 mm across.
+").unwrap();
+
+        let opts = ScanOpts { cache: Some(dir.join("index.cache")), ..Default::default() };
+        let (first, reused_a) = Index::scan_counting(&dir, &opts);
+        assert_eq!(reused_a, 0, "nothing to reuse on a cold scan");
+        assert_eq!(first.len(), 2);
+
+        let (second, reused_b) = Index::scan_counting(&dir, &opts);
+        assert_eq!(reused_b, 2, "a warm scan must reuse every unchanged file");
+        // And the reused facts must be identical, not merely present.
+        for (a, b) in first.entries.iter().zip(second.entries.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.facts, b.facts, "cached facts diverged for {}", a.name);
+        }
+
+        // Touching a file invalidates just that one.
+        std::fs::write(dir.join("spec.md"), "# Spec
+The cavity is 200 mm across.
+").unwrap();
+        let (third, reused_c) = Index::scan_counting(&dir, &opts);
+        assert!(reused_c < 2, "an edited file must be re-read (reused {reused_c})");
+        let spec = third.exact("spec");
+        let Facts::Doc(d) = &spec[0].facts else { panic!("not a doc") };
+        assert_eq!(d.dimensions[0].value, 200.0, "the new content must win");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

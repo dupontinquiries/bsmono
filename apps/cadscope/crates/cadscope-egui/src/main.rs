@@ -98,11 +98,16 @@ fn ref_index(root: &str) -> ! {
         }
         Err(_) => println!("ref.toml: none found at {}", toml_path.display()),
     }
-    let idx = Index::scan(root_path, &opts);
+    // Cache beside the tree being scanned, unless asked not to.
+    let no_cache = std::env::args().any(|a| a == "--no-cache");
+    opts.cache = (!no_cache).then(|| root_path.join(".cadscope-ref.cache"));
+    let (idx, reused) = Index::scan_counting(root_path, &opts);
     println!(
-        "indexed {} entries from {root} in {:.2}s",
+        "indexed {} entries from {root} in {:.2}s ({} reused from cache{})",
         idx.len(),
-        t0.elapsed().as_secs_f32()
+        t0.elapsed().as_secs_f32(),
+        reused,
+        if no_cache { ", caching off" } else { "" }
     );
     for (kind, label) in [
         (Kind::Model, "models"),
