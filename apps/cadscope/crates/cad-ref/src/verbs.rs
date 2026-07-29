@@ -14,7 +14,7 @@
 //! answer into a document op is the caller's decision, made explicitly. A verb that quietly edited
 //! the model would be a verb nobody could audit.
 
-use crate::{FitReport, Index, MaterialMaps, RefError};
+use crate::{BoardFit, FitReport, Index, MaterialMaps, RefError};
 
 /// A constrained reference query. Deliberately small: this is the entire vocabulary a language
 /// model is permitted to emit, and every field is a name the corpus can be asked about.
@@ -24,16 +24,25 @@ pub enum RefRequest {
     VolumeOf { model: String },
     /// "use the texture from <model>"
     TextureFrom { model: String },
-    /// "design this to fit <doc>"
+    /// "design this to fit <doc>" — and, when the name turns out to be a board rather than a
+    /// document, the same sentence answers with the board. Which one it is, is a corpus lookup
+    /// rather than a second word the person has to remember.
     Fit { doc: String },
+    /// "design around <board>" — the explicit board phrasing.
+    Fits { board: String },
+    /// "arms like <model>" — proportions, never geometry.
+    Like { model: String },
 }
 
 impl RefRequest {
     /// The name being asked about, whichever verb it is.
     pub fn subject(&self) -> &str {
         match self {
-            RefRequest::VolumeOf { model } | RefRequest::TextureFrom { model } => model,
+            RefRequest::VolumeOf { model }
+            | RefRequest::TextureFrom { model }
+            | RefRequest::Like { model } => model,
             RefRequest::Fit { doc } => doc,
+            RefRequest::Fits { board } => board,
         }
     }
 }
@@ -70,6 +79,16 @@ pub fn parse_request(input: &str) -> Option<RefRequest> {
             return Some(RefRequest::TextureFrom { model });
         }
     }
+    for p in ["proportions of ", "shaped like ", "like "] {
+        if let Some(model) = rest_after(p) {
+            return Some(RefRequest::Like { model });
+        }
+    }
+    for p in ["design around ", "around ", "board "] {
+        if let Some(board) = rest_after(p) {
+            return Some(RefRequest::Fits { board });
+        }
+    }
     for p in ["fits ", "fit "] {
         if let Some(doc) = rest_after(p) {
             return Some(RefRequest::Fit { doc });
@@ -88,6 +107,10 @@ pub enum RefOutcome<'a> {
     /// The material maps a model references, including the ones nothing implements.
     Textures { model: String, maps: Vec<MaterialMaps<'a>> },
     Fit(FitReport),
+    /// A board outline and its keep-outs, in millimetres.
+    Board(BoardFit),
+    /// A reference form's proportions, ready to be handed to Grow.
+    Proportions(crate::shape::Proportions),
     Refused(RefError),
 }
 
@@ -112,6 +135,22 @@ impl RefOutcome<'_> {
                     if missing > 0 { format!(", {missing} unresolved") } else { String::new() }
                 )
             }
+            RefOutcome::Board(b) => format!(
+                "{}: {:.0}x{:.0} mm, {} component(s), {} keep-out(s)",
+                b.board,
+                b.size_mm.x,
+                b.size_mm.y,
+                b.components,
+                b.keepouts.len()
+            ),
+            RefOutcome::Proportions(p) => format!(
+                "{}: slenderness {:.2}, symmetry {:.2}/{:.2}, {} stations",
+                p.name,
+                p.slenderness(),
+                p.symmetry,
+                p.symmetry_worst,
+                p.radii.len()
+            ),
             RefOutcome::Fit(r) => format!(
                 "{}: {} within, {} exceed, {} untestable",
                 r.doc,
@@ -157,6 +196,26 @@ pub fn execute<'a>(
             }
             RefOutcome::Textures { model: model.clone(), maps }
         }
+        RefRequest::Like { model } => match idx.like(model, 12) {
+            Ok(p) => RefOutcome::Proportions(p),
+            Err(e) => RefOutcome::Refused(e),
+        },
+        RefRequest::Fits { board } => match idx.fits(board) {
+            Ok(b) => RefOutcome::Board(b),
+            Err(e) => RefOutcome::Refused(e),
+        },
+        // "fits X" is natural for both a spec and a board. Rather than make someone remember which
+        // word goes with which kind, resolve it by what X actually is in the corpus — a lookup, so
+        // still deterministic, and still one implementation.
+        RefRequest::Fit { doc }
+            if idx.exact(doc).iter().any(|e| e.kind == crate::Kind::Niftyplot)
+                && !idx.exact(doc).iter().any(|e| e.kind == crate::Kind::Doc) =>
+        {
+            match idx.fits(doc) {
+                Ok(b) => RefOutcome::Board(b),
+                Err(e) => RefOutcome::Refused(e),
+            }
+        }
         RefRequest::Fit { doc } => match idx.fit_check(doc, part_extent_mm) {
             Ok(r) => RefOutcome::Fit(r),
             Err(e) => RefOutcome::Refused(e),
@@ -167,6 +226,20 @@ pub fn execute<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_new_verbs_parse_in_the_words_people_use() {
+        assert!(matches!(parse_request("arms like velgorn"), None), "a leading noun is not yet handled");
+        assert!(matches!(parse_request("like velgorn"), Some(RefRequest::Like { model }) if model == "velgorn"));
+        assert!(matches!(parse_request("shaped like Puma"), Some(RefRequest::Like { model }) if model == "Puma"));
+        assert!(matches!(parse_request("proportions of puma"), Some(RefRequest::Like { .. })));
+        assert!(matches!(parse_request("design around sensor_hub"), Some(RefRequest::Fits { board }) if board == "sensor_hub"));
+        assert!(matches!(parse_request("board sensor_hub"), Some(RefRequest::Fits { .. })));
+        // Incomplete sentences stay unparsed rather than naming a connective.
+        assert!(parse_request("like").is_none());
+        assert!(parse_request("design around the").is_none());
+    }
+
 
     #[test]
     fn parses_the_spoken_forms() {

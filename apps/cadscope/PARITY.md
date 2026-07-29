@@ -107,6 +107,11 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   about one plane and lopsided about the other — most limbs, most brackets — shows a high
   `symmetry` and a low `symmetry_worst`. Reporting only the first would call such a form symmetric,
   which is how the first version of this test passed while being wrong.
+- **All five verbs go through one funnel.** `verbs::parse_request` and `verbs::execute` are the
+  only path from a sentence to an outcome; the panel, the CLI and (later) `cad-liaison` all call
+  them rather than growing their own parsers. `fits <name>` resolves to a board or a document by
+  what the name *is* in the corpus, so nobody has to remember which word goes with which kind —
+  a lookup, so still deterministic and still one implementation.
 - **All five verbs live.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
   `texture from` (`Index::textures_of_model`, a join that reports unresolved materials rather than
   dropping them), `fit <doc>`, `fits <niftyplot>` and `like <model>` all work against the real

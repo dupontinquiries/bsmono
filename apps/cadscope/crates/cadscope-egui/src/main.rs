@@ -965,6 +965,39 @@ impl App {
                         ));
                     }
                 }
+                RefOutcome::Board(b) => {
+                    let (lo, hi) = b.with_clearance(2.0);
+                    detail.push(format!(
+                        "{:.0} x {:.0} mm, {} components",
+                        b.size_mm.x, b.size_mm.y, b.components
+                    ));
+                    detail.push(format!(
+                        "with 2mm clearance: ({:.0}, {:.0}) to ({:.0}, {:.0})",
+                        lo.x, lo.y, hi.x, hi.y
+                    ));
+                    for (a, c) in b.keepouts.iter().take(4) {
+                        detail.push(format!(
+                            "keep-out ({:.0}, {:.0}) to ({:.0}, {:.0})",
+                            a.x, a.y, c.x, c.y
+                        ));
+                    }
+                }
+                RefOutcome::Proportions(p) => {
+                    let (r, at) = p.waist();
+                    detail.push(format!(
+                        "slenderness {:.2}, symmetry {:.2} / {:.2}",
+                        p.slenderness(),
+                        p.symmetry,
+                        p.symmetry_worst
+                    ));
+                    detail.push(format!(
+                        "{} stations, widest {:.2} at {:.0}% of length",
+                        p.radii.len(),
+                        r,
+                        at * 100.0
+                    ));
+                    detail.push("proportions only — no geometry is copied".into());
+                }
                 RefOutcome::Refused(_) => {
                     // The refusal text is the answer; nothing to add to it.
                 }
