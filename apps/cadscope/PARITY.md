@@ -34,6 +34,13 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 
 ## The reference corpus (§17, v0)
 
+- **The corpus is scanned lazily, on first reference query, and synchronously.** A warm scan is
+  0.06 s and imperceptible; a cold one on a large tree will visibly stall the window. It belongs on
+  the worker/progress model planned for the liaison (M3), which is also where meshing should go.
+- **A reference never edits the document on its own.** `verbs::execute` answers questions; turning
+  a measured volume into `Op::MatchVolume` requires an explicit button press. A verb that quietly
+  edited the model would be one nobody could audit.
+
 - **Indexed, but nothing is cached.** A scan of 4,894 entries takes ~50 s cold and ~0.7 s with the
   files in the page cache, which locates the cost precisely: this is I/O bound, not parser bound.
   A content-hashed derived cache (§17.4) therefore buys the cold-start case and nothing else — but
@@ -92,8 +99,11 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 - **Three verbs live, two to go.** `volume of` (via `Op::MatchVolume`, measured and re-checked)
   `texture from` (`Index::textures_of_model`, a join that reports unresolved materials rather than
   dropping them) and `fit <doc>` all work against the real tree. `fits <niftyplot>` and
-  `like <model>` remain M6–M7. **None of the live verbs is wired into the UI** — they are reachable
-  only from `--ref-index` and from the document format.
+  `like <model>` remain M6–M7. The three live verbs are now reachable from the UI: a reference
+  panel takes a typed sentence, runs it through `cad_ref::verbs::execute`, and shows the answer or
+  the refusal. **That panel has never been seen** — like the rest of the UI it is compile-verified
+  only, with no display here. What *is* verified is the funnel underneath it, which the CLI
+  exercises on the real corpus through the identical code path.
 - **Niftyplot entries parse to nothing.** No `.nifty` files exist in the tree yet, and the parser
   arrives at M6 with the hardware-kind implementation.
 

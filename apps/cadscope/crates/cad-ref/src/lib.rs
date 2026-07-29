@@ -24,6 +24,7 @@ pub mod doc;
 pub mod iqm;
 pub mod obj;
 pub mod png;
+pub mod verbs;
 
 /// The unit a file's numbers are in. Deliberately defaults to `Unknown` and is never inferred:
 /// nothing in an OBJ or an IQM says whether a coordinate is a millimetre or a metre, and guessing

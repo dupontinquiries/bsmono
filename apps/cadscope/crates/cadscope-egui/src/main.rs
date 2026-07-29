@@ -15,6 +15,8 @@ use std::sync::Arc;
 use cad_forge::{BoolMode, Doc, Op, OpWarning, ShapeSpec, SpineNode};
 use cad_kernel::{Grower, MeshOpts, Model, Sdf, Section};
 use cad_motion::{Action, GrowAction, Mode};
+use cad_ref::verbs::{self, RefOutcome};
+use cad_ref::{Index, ScanOpts};
 use cad_view::camera::{ndc_of, OrbitCamera};
 use cad_view::meshgen::{from_trimesh, MeshData};
 use cad_view::renderer::{FrameDraw, Globals, MeshKind, ObjectRaw, ViewRenderer};
@@ -354,6 +356,31 @@ fn ref_index(root: &str) -> ! {
         }
     }
 
+    // The verb funnel exactly as the UI and (later) the liaison call it: a typed sentence in, a
+    // measured answer or a typed refusal out. Same code path, one implementation of the boundary.
+    println!("  -- verb funnel --");
+    for line in [
+        "volume of part_wheel_6fb4256a",
+        ":texture from arena",
+        "fit no_such_spec",
+        "volume of",
+        "make it look cool",
+    ] {
+        match cad_ref::verbs::parse_request(line) {
+            None => println!("    {:34} not understood (correctly)", format!("'{line}'")),
+            Some(req) => {
+                let out = cad_ref::verbs::execute(&idx, &req, Some([48.0, 10.0, 32.0]));
+                let refused = out.refused().is_some();
+                println!(
+                    "    {:34} {}{}",
+                    format!("'{line}'"),
+                    if refused { "declined: " } else { "" },
+                    out.summary()
+                );
+            }
+        }
+    }
+
     // Name resolution, which is what a person actually uses.
     for q in ["puma", "shark", "obsidian", "nosuchmodelanywhere"] {
         let hits = idx.resolve(q, None, 3);
@@ -534,6 +561,15 @@ struct App {
     meshed: HashMap<u32, Arc<MeshData>>,
     /// Bumped on every re-evaluation so the renderer can drop stale generated buffers.
     epoch: u64,
+    /// The reference corpus, loaded on first use rather than at startup: a cold scan of a large
+    /// tree is not something a window should block on, and most sessions never ask.
+    ref_idx: Option<Index>,
+    ref_input: String,
+    ref_status: String,
+    ref_detail: Vec<String>,
+    /// A measured volume waiting for the person to say yes. Reference verbs answer questions; only
+    /// an explicit press edits the document.
+    ref_pending: Option<(String, f32)>,
     /// Live Grow session, if any.
     grower: Option<Grower>,
     /// Seconds banked toward the next station, so growth rate is wall-clock and not frame-rate.
@@ -578,6 +614,11 @@ impl App {
             start: std::time::Instant::now(),
             meshed: HashMap::new(),
             epoch: 0,
+            ref_idx: None,
+            ref_input: String::new(),
+            ref_status: "type a reference: volume of <model> · texture from <model> · fit <doc>".into(),
+            ref_detail: Vec::new(),
+            ref_pending: None,
             grower: None,
             grow_accum: 0.0,
             preview: None,
@@ -764,6 +805,115 @@ impl App {
         self.warns = warns;
         self.remesh();
         self.selected = self.model.parts.iter().find(|p| p.name == name).map(|p| p.id);
+    }
+
+    /// Scan the corpus if it has not been scanned yet. Root defaults to the monorepo two levels up
+    /// (the app runs from apps/cadscope); `CADSCOPE_REF_ROOT` overrides it.
+    fn ensure_corpus(&mut self) {
+        if self.ref_idx.is_some() {
+            return;
+        }
+        let root = std::env::var("CADSCOPE_REF_ROOT").unwrap_or_else(|_| "../..".into());
+        let root = std::path::PathBuf::from(root);
+        let opts = ScanOpts { cache: Some(root.join(".cadscope-ref.cache")), ..Default::default() };
+        let (idx, reused) = Index::scan_counting(&root, &opts);
+        self.ref_status = format!("corpus: {} entries, {reused} from cache", idx.len());
+        self.ref_idx = Some(idx);
+    }
+
+    /// The selected part's bounding extents in millimetres — the document unit — for `fit`.
+    fn selected_extent_mm(&self) -> Option<[f32; 3]> {
+        let p = self.model.part(self.selected?)?;
+        let (lo, hi) = p.sdf.aabb();
+        Some((hi - lo).to_array())
+    }
+
+    /// Run a typed reference request through the one funnel in `cad_ref::verbs`.
+    fn run_reference(&mut self) {
+        let input = self.ref_input.trim().to_string();
+        if input.is_empty() {
+            return;
+        }
+        let Some(req) = verbs::parse_request(&input) else {
+            self.ref_status = format!("not understood: '{input}'");
+            self.ref_detail =
+                vec!["try: volume of <model> · texture from <model> · fit <doc>".into()];
+            self.ref_pending = None;
+            return;
+        };
+        self.ensure_corpus();
+        let extent = self.selected_extent_mm();
+        // Borrow the index only long enough to produce owned results.
+        let (summary, detail, pending) = {
+            let Some(idx) = self.ref_idx.as_ref() else {
+                self.ref_status = "corpus unavailable".into();
+                return;
+            };
+            let out = verbs::execute(idx, &req, extent);
+            let mut detail: Vec<String> = Vec::new();
+            let mut pending = None;
+            match &out {
+                RefOutcome::Volume { name, mm3 } => {
+                    pending = Some((name.clone(), *mm3));
+                    detail.push(format!("{mm3:.1} mm³ measured from vertex data"));
+                    if self.selected.is_none() {
+                        detail.push("select a part before applying".into());
+                    }
+                }
+                RefOutcome::Textures { maps, .. } => {
+                    for m in maps.iter().take(8) {
+                        detail.push(format!(
+                            "{:<20} base {} norm {} spec {}",
+                            m.name,
+                            m.base.is_some() as u8,
+                            m.normal.is_some() as u8,
+                            m.specular.is_some() as u8
+                        ));
+                    }
+                }
+                RefOutcome::Fit(r) => {
+                    for l in r.lines.iter().take(8) {
+                        detail.push(format!(
+                            "{:>8.2} {:<4} {:?}",
+                            l.required.value, l.required.unit, l.verdict
+                        ));
+                    }
+                }
+                RefOutcome::Refused(_) => {
+                    // The refusal text is the answer; nothing to add to it.
+                }
+            }
+            (out.summary(), detail, pending)
+        };
+        self.ref_status = summary;
+        self.ref_detail = detail;
+        self.ref_pending = pending;
+    }
+
+    /// Turn a pending measured volume into a document op. This is the only path by which a
+    /// reference edits the model, and it is a button press.
+    fn apply_pending_volume(&mut self) {
+        let Some((name, mm3)) = self.ref_pending.take() else { return };
+        let Some(part) = self.selected.and_then(|id| self.model.part(id)) else {
+            self.ref_status = "select a part first".into();
+            return;
+        };
+        let part_name = part.name.clone();
+        self.doc.ops.push(Op::MatchVolume {
+            name: part_name.clone(),
+            volume: mm3,
+            tol: 0.02,
+            resolution: 40,
+        });
+        let (model, warns) = self.doc.apply();
+        self.model = model;
+        self.warns = warns;
+        self.remesh();
+        self.ref_status = if self.warns.is_empty() {
+            format!("{part_name} resized to {name}'s volume ({mm3:.1} mm³), verified")
+        } else {
+            format!("{part_name}: {}", self.warns.last().unwrap().reason)
+        };
     }
 
     fn viewport(&mut self, ui: &mut egui::Ui) {
@@ -1013,6 +1163,45 @@ impl eframe::App for App {
                 let tris: usize = self.meshed.values().map(|m| m.idx.len() / 3).sum();
                 ui.label(format!("{} ops → {} parts", self.doc.ops.len(), self.model.parts.len()));
                 ui.label(format!("{} meshed, {tris} tris", self.meshed.len()));
+            });
+
+        egui::Panel::right("reference")
+            .resizable(true)
+            .default_size(280.0)
+            .show_inside(root, |ui| {
+                ui.heading("reference");
+                ui.label(
+                    egui::RichText::new("names resolve to measured facts, never to recollection")
+                        .small()
+                        .weak(),
+                );
+                ui.separator();
+                let submit = ui
+                    .add(
+                        egui::TextEdit::singleline(&mut self.ref_input)
+                            .hint_text("volume of puma")
+                            .desired_width(f32::INFINITY),
+                    )
+                    .lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if submit || ui.button("ask").clicked() {
+                    self.run_reference();
+                }
+                ui.separator();
+                ui.label(egui::RichText::new(&self.ref_status).monospace());
+                for line in &self.ref_detail {
+                    ui.label(egui::RichText::new(line).monospace().small());
+                }
+                if self.ref_pending.is_some() {
+                    ui.separator();
+                    let enabled = self.selected.is_some();
+                    if ui
+                        .add_enabled(enabled, egui::Button::new("apply to selected part"))
+                        .clicked()
+                    {
+                        self.apply_pending_volume();
+                    }
+                }
             });
 
         egui::Panel::bottom("status").show_inside(root, |ui| {
