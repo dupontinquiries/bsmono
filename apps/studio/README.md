@@ -47,7 +47,7 @@ edits exactly reversible, which floats are not.
 | crate | what it is | tests |
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
-| `studio-collab` | convergent op log, presence, wire, carrier, project files, **assets** | 32 |
+| `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, **sessions** | 41 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
@@ -803,3 +803,48 @@ before the transfer finishes. What is deliberately absent: transfer scheduling,
 rarest-first, peer selection — that belongs with whoever is moving the bytes,
 and guessing at it here would be inventing policy for a network this crate
 cannot see.
+
+## Teams, join and leave
+
+A **team** is a name plus a list of snapclone sc-IDs — the contacts already on
+the device. Nothing new to configure and no separate account: if you can send
+someone a snap, you can invite them to an edit. The team id is derived from the
+*sorted* member list, so two people building "the same team" independently land
+on the same session, and the session key comes from that id the same way
+snapclone derives a key from an sc-ID — every member computes it without being
+told where the session lives.
+
+The session key is **not a secret** (anyone who can guess the team id can find
+it), so the roster is what decides who counts. A join from a contact outside the
+team is refused.
+
+### The distinction that matters on leave
+
+Leaving removes your **presence**, not your **edits**. A collaborator who goes
+home has still done the work, and their ops are part of the project's history —
+deleting a departed peer's contributions is exactly what a naive "clean up on
+disconnect" does. `leave` drops presence and touches nothing else, and a test
+asserts the project is byte-identical afterwards with their clip still in it.
+
+### Crashes do not say goodbye
+
+A peer whose laptop shuts mid-edit never sends a leave, so liveness is a timeout
+on the last thing heard from them — a session that only removes polite
+departures fills with ghosts. Presence packets count as signs of life, because
+separating "merge presence" from "note we heard from them" is how someone
+actively scrubbing gets swept for silence. Members go **stale** before they are
+swept, so the UI can say "connection may be poor" rather than letting a
+collaborator silently vanish, and returning is a `Rejoined` rather than a new
+arrival so the UI can say "ada is back".
+
+`is_idle()` answers the question membership exists for: can this project be
+archived, or is someone still working on it?
+
+### One bug worth recording
+
+`broadcast` first sent only the op log — but the log describes edits made *this
+session*, and a project opened from a file has a base state predating it. A
+newcomer therefore received a clip op with no track to put it on. It now sends a
+full snapshot via `file::snapshot`, so the ops that rebuild a project for a
+collaborator are literally the ones that rebuild it from disk. Same class of bug
+as `Doc::rebuild` starting from an empty project, caught the same way.
