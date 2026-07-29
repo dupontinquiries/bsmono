@@ -19,7 +19,12 @@ and then STOP. You will be told to continue; when you do, produce the NEXT step'
 plan or restatement). Do not do more than one step between markers. \
 If the work needs more steps than you first planned, just keep numbering past <n> (e.g. 4/3, 5/3) — the \
 plan can grow. The run ends ONLY when you write TASK_COMPLETE on its own line, NOT when k reaches n; so on \
-your actual final step, write your marker line and then TASK_COMPLETE.";
+your actual final step, write your marker line and then TASK_COMPLETE.\n\
+\n\
+NOT EVERY MESSAGE IS A TASK. If the message is conversational \u{2014} a greeting, a question you can \
+answer in a sentence, small talk \u{2014} do NOT produce a plan or any STEP markers. Answer it directly and \
+write TASK_COMPLETE. A nine-step plan for \"hi there\" is worse than no protocol at all: it buries the \
+answer, spends the context, and reads as a model that has misunderstood the question.";
 
 /// Spliced into a continuation when the previous resume produced no step work (the model emitted a bare
 /// marker then stopped). An explicit, concrete push to produce the next step's real content.
@@ -183,6 +188,26 @@ pub fn checklist(text: &str) -> (Vec<StepMark>, bool) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_protocol_exempts_conversational_messages() {
+        // Observed on a real run: "hi there" produced a NINE-step plan, each step narrating that it was
+        // about to respond, ending in TASK_COMPLETE. The model was not confused — the protocol was
+        // appended unconditionally and it followed it exactly. A plan for a greeting buries the answer,
+        // spends the context, and reads as a model that has misunderstood the question.
+        assert!(STEPWISE_PROMPT.contains("NOT EVERY MESSAGE IS A TASK"));
+        assert!(STEPWISE_PROMPT.contains("Answer it directly and write TASK_COMPLETE"));
+        // and it says WHY: a rule without its reason gets optimised away by the next model
+        assert!(STEPWISE_PROMPT.contains("worse than no protocol at all"));
+    }
+
+    #[test]
+    fn the_exemption_names_the_cases_rather_than_gesturing_at_them() {
+        // "Use judgement" is not an instruction a 3B model can act on; concrete examples are.
+        for case in ["greeting", "question you can answer in a sentence", "small talk"] {
+            assert!(STEPWISE_PROMPT.contains(case), "missing {case:?}");
+        }
+    }
+
     use super::*;
 
     #[test]
