@@ -29,6 +29,7 @@
 #[allow(dead_code)] pub mod ollama;
 #[allow(dead_code)] pub mod quest;
 #[allow(dead_code)] pub mod stepwise;
+#[allow(dead_code)] pub mod stepverify;
 #[allow(dead_code)] pub mod treeexport;
 #[allow(dead_code)] pub mod verdict;
 #[allow(dead_code)] pub mod vimmode;
