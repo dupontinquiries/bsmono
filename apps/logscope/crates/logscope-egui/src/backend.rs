@@ -339,6 +339,19 @@ pub(crate) mod engine {
                     // Write the central blob so the NEXT load (any project, incl. crash-recovery) skips
                     // this. Make room BEFORE writing (evict to cap − incoming) so the dir never briefly
                     // holds old+new; the post-write evict is then just an exact final guard.
+                    // Skip the cache entirely when the source is already a K-quant. int8 residency
+                    // from Q4_K has the SAME scale granularity (one per 32 weights), so it stores 4-bit
+                    // values in 8 bits and cannot add precision — it doubles memory and writes
+                    // gigabytes of cache that buy nothing. ~7.5 GiB per 8B model, on device, per model.
+                    let src_type = g.tensor("blk.0.attn_q.weight").map(|t| t.ggml_type).unwrap_or(0);
+                    let incoming_est = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
+                    if !gpu_kernels::memplan::int8_worth_it(src_type) {
+                        eprintln!("wgpu-engine: int8 cache SKIPPED — source is ggml type {src_type}, \
+which already carries per-32 scales. Converting to int8 would double the bytes without adding \
+precision, and cost {:.1} GiB of disk for nothing",
+                            gpu_kernels::memplan::int8_cache_waste(src_type, incoming_est) as f64
+                                / (1u64 << 30) as f64);
+                    } else {
                     let cap = gpu_kernels::store::cache_cap_bytes();
                     let incoming = gpu_kernels::store::estimate_int8_resident(&g).unwrap_or(0);
                     gpu_kernels::store::make_room_for(cap, incoming);
@@ -350,6 +363,7 @@ pub(crate) mod engine {
                         }
                         Ok(false) => eprintln!("wgpu-engine: int8 cache skipped (bias/QK-Norm/MoE/q4 layouts aren't cacheable yet — reloads from the GGUF)"),
                         Err(e) => eprintln!("wgpu-engine: int8 cache write skipped: {e}"),
+                    }
                     }
                     m
                 }
