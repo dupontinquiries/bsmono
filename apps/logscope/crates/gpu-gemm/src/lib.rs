@@ -7144,10 +7144,12 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
                             } else {
                             // report what streaming WOULD do so it's actionable, even though execution isn't wired
                             let ceiling_note = if self.conservative_vma {
-                                " (this is the Asahi/Honeykrisp BO-VMA ceiling — a hard driver limit well below the machine's RAM; the same model loads on macOS/Metal, which has no such ceiling)"
+                                " (a CONSTANT for Asahi/Honeykrisp, not a measurement — it was taken from the staging upload path before the arena removed the staging, and `--gate-vram` measured this same device honouring 63 GiB)"
                             } else { "" };
                             let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
-                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s). Options: the llama.cpp backend, run on Metal (macOS), or raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling.",
+                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 21 GiB/s, the MEASURED upload rate). \
+FIRST CHECK WHETHER THIS BUDGET IS REAL: it is a compiled-in constant, and on an M2 Ultra `kernel-validate --gate-vram` measured the device honouring 63 GiB against this figure's 24 — a model this size may simply fit. \
+Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp backend.",
                                     gib(gpu_budget), ceiling_note, p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
                                 None => format!("won't fit even a streaming ring in ~{:.1} GiB{}; use the llama.cpp backend.", gib(gpu_budget), ceiling_note),
                             };
