@@ -52,7 +52,7 @@ edits exactly reversible, which floats are not.
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, **saturation** | 27 |
+| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, **multiband** | 33 |
 
 ## Realtime collaboration, concretely
 
@@ -632,3 +632,38 @@ defeats the entire point of putting everything on it:
 * **Column averaging in the power domain.** A pixel column spanning many bins up
   high would otherwise under-read whenever one bin is hot, which is precisely
   the partial you are looking at.
+
+## Multiband: the property that decides whether it is any good
+
+Split a signal into bands, do nothing to them, add them back — you must get what
+you started with. It sounds obvious and most naive implementations fail it, and
+the failure is a dip or bump at every crossover that no amount of knob-twiddling
+fixes, because it is in the splitter rather than the settings.
+
+**Linkwitz–Riley 4th order** is the standard answer, and building it turned up
+two errors worth recording:
+
+1. **I inverted the high band.** That is the rule for LR*2*, where the halves sit
+   180° apart at the crossover — but LR4 is two cascaded Butterworth sections
+   and brings them back *in phase*, so flipping produces a deep null exactly at
+   the crossover. The reconstruction test found it instantly: −24.7 dB in,
+   −42.9 dB out at 1 kHz.
+2. **Every lower band shared one allpass filter's state.** With three or more
+   bands, each band below a crossover needs the phase that crossover imposed, or
+   the sum has a hole — so each needs its *own* allpass instance. Two- and
+   three-band still passed; four-band came out 1.7 dB off, which is exactly the
+   kind of small, plausible error that ships.
+
+A third finding was in the **test**, not the code: measuring reconstruction with
+a fast log sweep compares a window of output against the same window of input,
+but the filters have group delay, so those windows hold different parts of the
+sweep. A four-band chain read 1.8 dB "wrong" from measurement artefact alone.
+Steady tones that have settled have no such ambiguity, and reconstruction now
+holds within 0.5 dB across two, three and four bands.
+
+The rest is assembly: per-band compressor, gain, mute and solo (solo beats mute
+and silences everything not soloed — the rule every mixer shares and every
+reimplementation inverts once), and `reductions_db()` for the per-band gain
+meters an Ozone-style display draws under the spectrum. Bypassed bands still
+pass through the splitter, so bypassing one band cannot change the crossover
+behaviour of the others.
