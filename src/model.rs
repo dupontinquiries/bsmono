@@ -32,6 +32,9 @@ pub struct Model {
     pub prims: Vec<Prim>,
     /// downsampled surface points (final meters) for the reflection SDF bake
     pub cloud: Vec<Vec3>,
+    /// outward normal for each cloud point — this is what makes the baked
+    /// field SIGNED (solid inside) instead of a hollow shell
+    pub cloud_n: Vec<Vec3>,
     /// symmetric half-extents of the baked SDF box (set by the bake)
     pub sdf_half: Vec3,
     pub half_len: f32,
@@ -218,6 +221,7 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
     let mut tex_cache: HashMap<String, usize> = HashMap::new();
     let mut prims = Vec::new();
     let mut cloud_all: Vec<Vec3> = Vec::new();
+    let mut cloud_nrm: Vec<Vec3> = Vec::new();
     let mut wheel_bottom = f32::MAX;
     let mut wheel_top = f32::MIN;
     for r in raws {
@@ -243,6 +247,7 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
         }
         for v in &r.verts {
             cloud_all.push(Vec3::from_array(v.pos));
+            cloud_nrm.push(Vec3::from_array(v.nrm).normalize_or(Vec3::Y));
         }
         let mesh_id = gpu.add_mesh(&MeshData { verts: r.verts, idx: r.idx });
         prims.push(Prim { mesh_id, tex_id, color: r.color, tag: r.tag, pivot });
@@ -254,7 +259,11 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
     } else {
         half.y * 0.55
     };
-    let stride = (cloud_all.len() / 520).max(1);
+    // 520 points over a whole car left 5-8 cm between samples, and the bake
+    // inflated that into a puffy blob — the "bubble" in the mirror. Denser
+    // sampling plus a smaller inflation gives back the silhouette.
+    let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
-    Model { prims, cloud, sdf_half: Vec3::ZERO, half_len: half.z, half_h: half.y, half_w: half.x, wheel_r }
+    let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
+    Model { prims, cloud, cloud_n, sdf_half: Vec3::ZERO, half_len: half.z, half_h: half.y, half_w: half.x, wheel_r }
 }

@@ -28,6 +28,49 @@ pub struct BallCfg {
     pub weight: f32,   // mass x (touch impulse feel)
 }
 
+/// One-touch graphics tiers. AUTO follows the detected hardware; the rest
+/// are explicit so a phone can be forced to LOW from the menu.
+pub const GFX_TIERS: [&str; 4] = ["AUTO", "LOW", "MEDIUM", "HIGH"];
+
+pub fn apply_gfx_tier(cfg: &mut Config, tier: u8) {
+    match tier {
+        1 => {
+            cfg.video.rays = false;
+            cfg.video.quality = 0.30;
+            cfg.video.render_scale = 0.5;
+            cfg.video.bloom = cfg.video.bloom.min(0.35);
+            cfg.video.screen_door = 0.0;
+            cfg.video.vsync = true;
+        }
+        2 => {
+            cfg.video.rays = true;
+            cfg.video.quality = 0.55;
+            cfg.video.render_scale = 0.75;
+            cfg.video.bloom = 0.55;
+        }
+        3 => {
+            cfg.video.rays = true;
+            cfg.video.quality = 1.0;
+            cfg.video.render_scale = 1.0;
+            cfg.video.bloom = 0.7;
+        }
+        _ => {}
+    }
+    cfg.video.tier = tier;
+}
+
+#[derive(Clone, Copy)]
+pub struct GyroCfg {
+    pub on: bool,
+    pub sens: f32,
+    pub deadzone: f32,
+    pub smooth: f32,
+    pub invert_x: bool,
+    pub invert_y: bool,
+    pub air_mode: u8, // 0 = roll+pitch (flick aim), 1 = yaw+pitch
+    pub gate: u8,     // 0 = always, 1 = while boosting, 2 = airborne only
+}
+
 pub struct CarCfg {
     pub steer_rate: f32,   // 0.5..1.5 x ground steering yaw rate
     pub input_ease: f32,   // 0.5..1.5 x temporal buildup on steer/roll
@@ -57,6 +100,12 @@ pub struct FlipCfg {
                                 // powerslide-doubles-as-air-roll scheme)
 }
 
+pub struct TouchCfg {
+    pub enabled: bool,
+    pub scale: f32, // on-screen control size multiplier
+    pub tap_to_move: bool,
+}
+
 pub struct VideoCfg {
     pub rays: bool,     // ray-traced shadows / AO / reflections
     pub quality: f32,   // ray step budget x
@@ -67,10 +116,14 @@ pub struct VideoCfg {
     pub letterbox: bool,// cinema bars
     pub bloom: f32,     // bloom strength, 0..2
     pub vsync: bool,
-    pub screen_door: f32, // subtle checker mask, 0..0.35
+    pub screen_door: f32,
+    /// 0 AUTO, 1 LOW, 2 MEDIUM, 3 HIGH
+    pub tier: u8,
+    pub render_scale: f32, // scene resolution factor (0.5 = half res) // subtle checker mask, 0..0.35
 }
 
 pub struct Config {
+    pub gyro: GyroCfg,
     pub cam: CamCfg,
     pub arena: ArenaCfg,
     pub ball: BallCfg,
@@ -78,17 +131,20 @@ pub struct Config {
     pub flip: FlipCfg,
     pub video: VideoCfg,
     pub preset: usize, // last mutator preset picked (display only)
+    pub touch: TouchCfg,
 }
 
 impl Default for Config {
     fn default() -> Config {
         Config {
-            cam: CamCfg { fov_deg: 76.0, dist: 4.9, height: 1.35, angle_deg: -3.0, stiffness: 1.0, shake: 0.6, grav_follow: 1.0 },
+            gyro: GyroCfg { on: false, sens: 1.0, deadzone: 0.06, smooth: 0.05, invert_x: false, invert_y: false, air_mode: 0, gate: 0 },
+            cam: CamCfg { fov_deg: 86.0, dist: 4.9, height: 5.0, angle_deg: -30.0, stiffness: 1.0, shake: 0.6, grav_follow: 1.0 },
             arena: ArenaCfg { gravity: 1.0, bounce: 1.0, friction: 1.0, scale: 1.0 },
             ball: BallCfg { size: 1.0, bounce: 1.0, friction: 1.0, weight: 1.0 },
             car: CarCfg { steer_rate: 0.9, input_ease: 1.1, size: 1.0, grip: 1.0, top_speed: 1.0, accel: 1.0, boost: 1.0, boost_regen: 0.0, boost_max: 1.0, unlimited_boost: false, jump: 1.0, analog: true, analog_soft: 0.45 },
-            flip: FlipCfg { spin: 1.0, strength: 1.0, resets: true, strict: true, unlimited: false, cancel: true, land_assist: 1.0, air_roll_default: false },
-            video: VideoCfg { rays: true, quality: 1.0, filmic: true, exposure: 1.0, vignette: 0.32, grain: 0.12, letterbox: false, bloom: 0.7, vsync: true, screen_door: 0.05 },
+            flip: FlipCfg { spin: 1.0, strength: 1.0, resets: true, strict: true, unlimited: false, cancel: true, land_assist: 0.0, air_roll_default: false },
+            video: VideoCfg { render_scale: 1.0, rays: true, quality: 1.0, filmic: true, exposure: 1.0, vignette: 0.32, grain: 0.12, letterbox: false, bloom: 0.7, vsync: true, screen_door: 0.05, tier: 0 },
+            touch: TouchCfg { enabled: false, scale: 1.0, tap_to_move: true },
             preset: 0,
         }
     }
@@ -154,10 +210,19 @@ impl Config {
         w("flip_cancel", self.flip.cancel as u8 as f32);
         w("land_assist", self.flip.land_assist);
         w("flip_spin", self.flip.spin);
+        w("gyro_on", if self.gyro.on { 1.0 } else { 0.0 });
+        w("gyro_sens", self.gyro.sens);
+        w("gyro_dz", self.gyro.deadzone);
+        w("gyro_smooth", self.gyro.smooth);
+        w("gyro_ix", if self.gyro.invert_x { 1.0 } else { 0.0 });
+        w("gyro_iy", if self.gyro.invert_y { 1.0 } else { 0.0 });
+        w("gyro_air", self.gyro.air_mode as f32);
+        w("gyro_gate", self.gyro.gate as f32);
         w("steer_rate", self.car.steer_rate);
         w("input_ease", self.car.input_ease);
         w("air_roll_default", self.flip.air_roll_default as u8 as f32);
         w("rays", self.video.rays as u8 as f32);
+        w("gfx_tier", self.video.tier as f32);
         w("ray_quality", self.video.quality);
         w("filmic", self.video.filmic as u8 as f32);
         w("exposure", self.video.exposure);
@@ -167,6 +232,9 @@ impl Config {
         w("bloom", self.video.bloom);
         w("vsync", self.video.vsync as u8 as f32);
         w("screen_door", self.video.screen_door);
+        w("render_scale", self.video.render_scale);
+        w("touch_enabled", if self.touch.enabled { 1.0 } else { 0.0 });
+        w("touch_scale", self.touch.scale);
         w("preset", self.preset as f32);
     }
 
@@ -174,13 +242,14 @@ impl Config {
         let Ok(v) = val.trim().parse::<f32>() else { return };
         let b = v > 0.5;
         match key {
-            "cam_fov" => self.cam.fov_deg = v.clamp(50.0, 115.0),
+            "cam_fov" => self.cam.fov_deg = v.clamp(50.0, 215.0),
             "cam_dist" => self.cam.dist = v.clamp(2.5, 9.0),
-            "cam_height" => self.cam.height = v.clamp(0.4, 3.2),
-            "cam_angle" => self.cam.angle_deg = v.clamp(-15.0, 15.0),
+            "cam_height" => self.cam.height = v.clamp(0.4, 9.2),
+            "cam_angle" => self.cam.angle_deg = v.clamp(-25.0, 25.0),
+            // "cam_angle" => self.cam.angle_deg = v.clamp(-15.0, 15.0),
             "cam_shake" => self.cam.shake = v.clamp(0.0, 1.5),
             "cam_grav" => self.cam.grav_follow = v.clamp(0.0, 1.0),
-            "cam_stiff" => self.cam.stiffness = v.clamp(0.25, 2.2),
+            "cam_stiff" => self.cam.stiffness = v.clamp(0.15, 3.2),
             "gravity" => self.arena.gravity = v.clamp(0.0, 2.6),
             "arena_bounce" => self.arena.bounce = v.clamp(0.2, 2.0),
             "arena_friction" => self.arena.friction = v.clamp(0.1, 2.5),
@@ -188,13 +257,13 @@ impl Config {
             "ball_size" => self.ball.size = v.clamp(0.35, 3.0),
             "ball_bounce" => self.ball.bounce = v.clamp(0.2, 2.0),
             "ball_friction" => self.ball.friction = v.clamp(0.0, 2.5),
-            "ball_weight" => self.ball.weight = v.clamp(0.25, 3.0),
+            "ball_weight" => self.ball.weight = v.clamp(0.25, 9.0),
             "car_size" => self.car.size = v.clamp(0.55, 2.0),
             "car_grip" => self.car.grip = v.clamp(0.3, 2.5),
             "car_top" => self.car.top_speed = v.clamp(0.5, 1.9),
             "car_accel" => self.car.accel = v.clamp(0.4, 2.6),
-            "car_boost" => self.car.boost = v.clamp(0.4, 2.6),
-            "car_boost_regen" => self.car.boost_regen = v.clamp(0.0, 35.0),
+            "car_boost" => self.car.boost = v.clamp(0.4, 20.0),
+            "car_boost_regen" => self.car.boost_regen = v.clamp(0.0, 50.0),
             "car_boost_max" => self.car.boost_max = v.clamp(0.3, 2.5),
             "car_boost_unl" => self.car.unlimited_boost = b,
             "car_jump" => self.car.jump = v.clamp(0.5, 2.2),
@@ -207,10 +276,22 @@ impl Config {
             "flip_cancel" => self.flip.cancel = b,
             "land_assist" => self.flip.land_assist = v.clamp(0.0, 1.5),
             "flip_spin" => self.flip.spin = v.clamp(0.5, 1.5),
+            "gyro_on" => self.gyro.on = v > 0.5,
+            "gyro_sens" => self.gyro.sens = v.clamp(0.1, 4.0),
+            "gyro_dz" => self.gyro.deadzone = v.clamp(0.0, 0.4),
+            "gyro_smooth" => self.gyro.smooth = v.clamp(0.008, 0.3),
+            "gyro_ix" => self.gyro.invert_x = v > 0.5,
+            "gyro_iy" => self.gyro.invert_y = v > 0.5,
+            "gyro_air" => self.gyro.air_mode = v as u8 & 1,
+            "gyro_gate" => self.gyro.gate = (v as u8).min(2),
+            "render_scale" => self.video.render_scale = v.clamp(0.25, 1.0),
+            "touch_enabled" => self.touch.enabled = v > 0.5,
+            "touch_scale" => self.touch.scale = v.clamp(0.6, 1.8),
             "steer_rate" => self.car.steer_rate = v.clamp(0.5, 1.5),
             "input_ease" => self.car.input_ease = v.clamp(0.5, 1.5),
             "air_roll_default" => self.flip.air_roll_default = b,
             "rays" => self.video.rays = b,
+            "gfx_tier" => self.video.tier = (v as u8).min(3),
             "ray_quality" => self.video.quality = v.clamp(0.4, 1.8),
             "filmic" => self.video.filmic = b,
             "exposure" => self.video.exposure = v.clamp(0.5, 1.8),

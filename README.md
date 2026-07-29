@@ -395,3 +395,19 @@ Psyonix/Epic — this is a fan-made, non-commercial homage.
 MONKEY RUN: dusk-jungle canopy coasters with weather and floodwater — when a vine line floods, ride the flush.
 
 `--sim mp` proves the bsgames multiplayer path on loopback: announce, resolve, dial, HELLO/WELCOME, state sync.
+
+`--sim flip` audits flip fidelity: cardinal axis snap, full rotation, orientation error, landing attitude.
+
+Handhelds (postmarketOS/Fairphone) auto-detect: low graphics, half render scale, on-screen stick + BOOST/JUMP, flick-to-flip and tap-to-move. `--sim plat` verifies it headlessly; `SKYDRIBBLE_MOBILE=1` forces it anywhere.
+
+Gyro drive (ported from gyro-ball): reads IIO sysfs directly, accepts `./tilt_sensor | skydribble`, or falls back to monitor-sensor. `--sim gyro` verifies the stack headless.
+
+Menus are fully touch-driven: tap to pick, drag to scrub sliders, flick down to go back, and the pause screen has real buttons. `--sim touch` checks the hit-test math.
+
+`--sim shot` measures power shots: exit speed, loft, and distance at 1 s and 3 s.
+
+KUIPER runs live sky events: a world collapses into a black hole every five minutes then detonates, and a new planet falls in to break the field. `--sim kuiper` checks the whole system.
+
+`--sim spawn` audits every map's spawn point: clearance, settling, and final attitude.
+
+`--sim dribble` checks the input-to-rotation mapping and how long the ball rides the hood.

@@ -50,9 +50,9 @@ pub const MAX_RT_SHAPES: usize = 512;
 pub const RC_DIM: usize = 40;
 /// car reflection SDF atlas: per-model 3D distance slabs stacked on Z,
 /// distances byte-encoded as (d + 0.6) / 2.4
-pub const CSDF_W: u32 = 28;
-pub const CSDF_H: u32 = 18;
-pub const CSDF_SLAB: u32 = 32;
+pub const CSDF_W: u32 = 36;
+pub const CSDF_H: u32 = 24;
+pub const CSDF_SLAB: u32 = 44;
 pub const CSDF_MAXM: u32 = 12;
 pub const RC_K: usize = 28;
 pub const RC_STRIDE: usize = 32;
@@ -118,6 +118,8 @@ pub struct Gpu {
     globals_bg: wgpu::BindGroup,
     rt_buf: wgpu::Buffer,
     rc_buf: wgpu::Buffer,
+    /// scene render resolution factor (1.0 native, 0.5 = quarter the pixels)
+    pub render_scale: f32,
     csdf_tex: wgpu::Texture,
     hmap_tex: wgpu::Texture,
     obj_buf: wgpu::Buffer,
@@ -198,8 +200,8 @@ impl Gpu {
             desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &config);
-        let depth = make_depth(&device, &config);
-        let msaa = make_msaa(&device, &config);
+        let depth = make_depth(&device, (config.width, config.height));
+        let msaa = make_msaa(&device, (config.width, config.height));
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("shader"),
@@ -631,6 +633,7 @@ impl Gpu {
             globals_bg,
             rt_buf,
             rc_buf,
+            render_scale: 1.0,
             csdf_tex,
             hmap_tex,
             obj_buf,
@@ -680,15 +683,40 @@ impl Gpu {
         self.config.width = w;
         self.config.height = h;
         self.surface.configure(&self.device, &self.config);
-        self.depth = make_depth(&self.device, &self.config);
-        self.msaa = make_msaa(&self.device, &self.config);
+        let rd = self.render_dims();
+        self.depth = make_depth(&self.device, rd);
+        self.msaa = make_msaa(&self.device, rd);
         self.rebuild_post();
     }
 
     /// (Re)create the HDR + bloom targets and their bind groups for the
     /// current size, and refresh the per-pass texel/dir params.
+    /// Scene-pass dimensions: the surface size scaled by `render_scale`.
+    /// The composite pass samples this with a linear filter, so a half-scale
+    /// scene upscales to the native window for free.
+    pub fn render_dims(&self) -> (u32, u32) {
+        let s = self.render_scale.clamp(0.25, 1.0);
+        (
+            (((self.config.width.max(1)) as f32 * s) as u32).max(64),
+            (((self.config.height.max(1)) as f32 * s) as u32).max(64),
+        )
+    }
+
+    /// Change the scene render resolution and rebuild every sized target.
+    pub fn set_render_scale(&mut self, s: f32) {
+        let s = s.clamp(0.25, 1.0);
+        if (s - self.render_scale).abs() < 0.01 {
+            return;
+        }
+        self.render_scale = s;
+        let rd = self.render_dims();
+        self.depth = make_depth(&self.device, rd);
+        self.msaa = make_msaa(&self.device, rd);
+        self.rebuild_post();
+    }
+
     fn rebuild_post(&mut self) {
-        let (w, h) = (self.config.width.max(1), self.config.height.max(1));
+        let (w, h) = self.render_dims();
         let (hw, hh) = ((w / 2).max(1), (h / 2).max(1));
         let mk = |dev: &wgpu::Device, w: u32, h: u32| {
             dev.create_texture(&wgpu::TextureDescriptor {
@@ -988,15 +1016,11 @@ impl Gpu {
     }
 }
 
-fn make_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+fn make_depth(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::TextureView {
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("depth"),
-            size: wgpu::Extent3d {
-                width: config.width.max(1),
-                height: config.height.max(1),
-                depth_or_array_layers: 1,
-            },
+            size: wgpu::Extent3d { width: dims.0.max(1), height: dims.1.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: SAMPLES,
             dimension: wgpu::TextureDimension::D2,
@@ -1007,16 +1031,12 @@ fn make_depth(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgp
         .create_view(&Default::default())
 }
 
-fn make_msaa(device: &wgpu::Device, config: &wgpu::SurfaceConfiguration) -> wgpu::TextureView {
+fn make_msaa(device: &wgpu::Device, dims: (u32, u32)) -> wgpu::TextureView {
     // (renders at HDR precision; resolved into the hdr target for post)
     device
         .create_texture(&wgpu::TextureDescriptor {
             label: Some("msaa"),
-            size: wgpu::Extent3d {
-                width: config.width.max(1),
-                height: config.height.max(1),
-                depth_or_array_layers: 1,
-            },
+            size: wgpu::Extent3d { width: dims.0.max(1), height: dims.1.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: SAMPLES,
             dimension: wgpu::TextureDimension::D2,

@@ -26,6 +26,9 @@ pub struct Save {
     pub map: usize,
     pub seed: u64,
     pub name: String,       // multiplayer display name / profile id
+    /// which hardware profile these settings were auto-tuned for, so a save
+    /// carried onto a phone (or off one) re-tunes exactly once
+    pub tuned_profile: u8,
 }
 
 impl Default for Save {
@@ -46,12 +49,18 @@ impl Default for Save {
             map: 0,
             seed: 20260726,
             name: String::new(),
+            tuned_profile: 255,
         }
     }
 }
 
 pub fn path() -> PathBuf {
     PathBuf::from("skydribble.save")
+}
+
+/// Does a save already exist? (first run gets platform defaults applied)
+pub fn exists() -> bool {
+    path().exists()
 }
 
 pub fn load() -> (Save, Bindings, Config) {
@@ -64,6 +73,7 @@ pub fn load() -> (Save, Bindings, Config) {
         let Some((k, v)) = line.split_once(' ') else { continue };
         let v = v.trim();
         match k {
+            "tuned_profile" => s.tuned_profile = v.parse().unwrap_or(s.tuned_profile),
             "total_rings" => s.total_rings = v.parse().unwrap_or(s.total_rings),
             "total_car_rings" => s.total_car_rings = v.parse().unwrap_or(s.total_car_rings),
             "total_goals" => s.total_goals = v.parse().unwrap_or(s.total_goals),
@@ -107,6 +117,7 @@ pub fn load() -> (Save, Bindings, Config) {
 
 pub fn store(s: &Save, b: &Bindings, cfg: &Config) {
     let mut out = String::with_capacity(1024);
+    let _ = writeln!(out, "tuned_profile {}", s.tuned_profile);
     let _ = writeln!(out, "total_rings {}", s.total_rings);
     let _ = writeln!(out, "total_car_rings {}", s.total_car_rings);
     let _ = writeln!(out, "total_goals {}", s.total_goals);

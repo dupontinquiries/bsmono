@@ -1,6 +1,6 @@
 [package]
 name = "skydribble"
-version = "1.26.0"
+version = "1.41.0"
 edition = "2021"
 description = "Rocket-League-inspired open-world air-dribble playground: Rust + wgpu, SDF-generated playful shapes, real RL car/ball models."
 
@@ -29,6 +29,7 @@ env_logger = "0.11"
 # The fleet's control plane, vendored from the logscope-c4-273 monorepo:
 # netcode (profiles/sessions/handoff) over the snapcore DHT store.
 netcode = { path = "vendor/netcode" }
+touchkit = { path = "vendor/touchkit" }
 cpal = { version = "0.15", optional = true }
 gilrs = { version = "0.11", optional = true }
 libloading = { version = "0.8", optional = true }

@@ -54,9 +54,46 @@ const CYAN: [f32; 4] = [0.59, 0.82, 0.92, 0.95];  // soldier's info color
 const SHADOW: [f32; 4] = [0.02, 0.02, 0.05, 0.75];
 
 /// Drop-shadowed text: one dark offset copy under the real one.
+/// A filled circle in NDC (aspect-corrected), for the touch controls.
+pub fn disc(ui: &mut Vec<UiVert>, cx: f32, cy: f32, r: f32, aspect: f32, c: [f32; 4]) {
+    let seg = 28;
+    for i in 0..seg {
+        let a0 = i as f32 / seg as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / seg as f32 * std::f32::consts::TAU;
+        let p = |a: f32| [cx + a.cos() * r / aspect, cy + a.sin() * r];
+        let (p0, p1) = (p(a0), p(a1));
+        ui.push(UiVert { pos: [cx, cy], color: c });
+        ui.push(UiVert { pos: p0, color: c });
+        ui.push(UiVert { pos: p1, color: c });
+    }
+}
+
+/// A ring outline (two radii), same conventions as `disc`.
+pub fn ring(ui: &mut Vec<UiVert>, cx: f32, cy: f32, r: f32, w: f32, aspect: f32, c: [f32; 4]) {
+    let seg = 30;
+    for i in 0..seg {
+        let a0 = i as f32 / seg as f32 * std::f32::consts::TAU;
+        let a1 = (i + 1) as f32 / seg as f32 * std::f32::consts::TAU;
+        let p = |a: f32, rr: f32| [cx + a.cos() * rr / aspect, cy + a.sin() * rr];
+        let (o0, o1) = (p(a0, r), p(a1, r));
+        let (i0, i1) = (p(a0, r - w), p(a1, r - w));
+        ui.push(UiVert { pos: o0, color: c });
+        ui.push(UiVert { pos: i0, color: c });
+        ui.push(UiVert { pos: o1, color: c });
+        ui.push(UiVert { pos: i0, color: c });
+        ui.push(UiVert { pos: i1, color: c });
+        ui.push(UiVert { pos: o1, color: c });
+    }
+}
+
 pub fn label(ui: &mut Vec<UiVert>, x: f32, y: f32, px: f32, a: f32, c: [f32; 4], s: &str) {
     font::text(ui, x + px * 0.16 / a, y - px * 0.16, px, a, SHADOW, s);
     font::text(ui, x, y, px, a, c, s);
+}
+/// Centre a label on an arbitrary x (buttons, not just the screen middle).
+fn label_c_at(ui: &mut Vec<UiVert>, cx: f32, y: f32, px: f32, a: f32, c: [f32; 4], s: &str) {
+    let w = font::width(s, px, a);
+    label(ui, cx - w * 0.5, y, px, a, c, s);
 }
 fn label_c(ui: &mut Vec<UiVert>, y: f32, px: f32, a: f32, c: [f32; 4], s: &str) {
     let w = font::width(s, px, a);
@@ -117,6 +154,61 @@ fn inset(ui: &mut Vec<UiVert>, a: f32, x0: f32, y0: f32, x1: f32, y1: f32) {
 }
 
 // -------------------------------------------------------- layout consts ----
+// TYPE SCALE — one ratio ladder instead of ad-hoc sizes per menu. Each step
+// is ~1.25x the last, which is the standard readable progression, and the
+// body size is deliberately small: dense settings screens read better with
+// air around modest text than with big text crammed together.
+pub const T_TITLE: f32 = 0.0138;
+pub const T_SECTION: f32 = 0.0074;
+pub const T_BODY: f32 = 0.0082;
+pub const T_HINT: f32 = 0.0068;
+
+// A row is a fixed, comfortable height — it does NOT shrink to fit the list.
+// (It used to: `1.44 / n`, so every setting added made every menu tighter.
+// Long lists scroll instead, which is what keeps rows readable and finger
+// -sized no matter how many there are.)
+pub const TW_ROW_H: f32 = 0.062;
+/// Bottom of the scrolling viewport (above the legend).
+pub const TW_BOTTOM: f32 = -0.78; // above the nav strip
+
+/// How many rows fit in a menu viewport.
+pub fn vis_rows(row_h: f32, top: f32, bottom: f32) -> usize {
+    (((top - bottom) / row_h).floor() as usize).max(3)
+}
+
+/// First visible index for a selection: the list scrolls only when the
+/// selection would leave the viewport, and keeps a row of context (the
+/// standard "scrolloff") at each edge.
+pub fn scroll_for(sel: usize, n: usize, vis: usize) -> usize {
+    if n <= vis {
+        return 0;
+    }
+    let pad = 1usize;
+    let max_start = n - vis;
+    if sel < pad {
+        0
+    } else if sel + pad >= n {
+        max_start
+    } else {
+        // centre-ish: keep the selection off both edges
+        sel.saturating_sub(vis / 2).min(max_start)
+    }
+}
+
+/// Draw a scrollbar for a scrolled list (only when it can scroll).
+pub fn scrollbar(ui: &mut Vec<UiVert>, a: f32, x: f32, top: f32, bottom: f32, n: usize, vis: usize, start: usize) {
+    if n <= vis {
+        return;
+    }
+    let h = top - bottom;
+    quad(ui, x, bottom, x + 0.008 / a, top, [0.20, 0.23, 0.30, 0.55]);
+    let frac = vis as f32 / n as f32;
+    let th = (h * frac).max(0.04);
+    let t = start as f32 / (n - vis) as f32;
+    let y1 = top - (h - th) * t;
+    quad(ui, x, y1 - th, x + 0.008 / a, y1, [GOLD[0], GOLD[1], GOLD[2], 0.75]);
+}
+
 pub const TW_TOP: f32 = 0.70;
 pub const TW_BAR_X0: f32 = 0.26;
 pub const TW_BAR_X1: f32 = 0.60;
@@ -124,13 +216,101 @@ pub fn rows_h(n: usize) -> f32 {
     (1.44 / n.max(1) as f32).min(0.095)
 }
 pub const BIND_TOP: f32 = 0.76;
-pub const BIND_ROW_H: f32 = 0.049;
+pub const BIND_ROW_H: f32 = 0.058; // finger-sized; the list scrolls instead
 pub const MAPS_TOP: f32 = 0.70;
 pub fn maps_row_h() -> f32 {
-    rows_h(crate::world::STYLE_COUNT)
+    // fixed: the map list scrolls rather than squeezing 30 rooms onto one page
+    0.058
 }
 pub const ONL_TOP: f32 = 0.60;
 pub const ONL_ROW_H: f32 = 0.105;
+
+// ---- menu NAV STRIP: jump straight to any screen with a thumb ----
+pub const NAV_BTNS: [&str; 6] = ["BACK", "SETUP", "CONTROLS", "MAPS", "VIDEO", "ONLINE"];
+pub const NAV_Y: f32 = -0.885;
+pub const NAV_H: f32 = 0.070;
+pub const NAV_W: f32 = 0.235;
+pub const NAV_GAP: f32 = 0.012;
+
+pub fn nav_x0(i: usize) -> f32 {
+    let n = NAV_BTNS.len() as f32;
+    let total = n * NAV_W + (n - 1.0) * NAV_GAP;
+    -total * 0.5 + i as f32 * (NAV_W + NAV_GAP)
+}
+
+pub fn hit_nav(x: f32, y: f32) -> Option<usize> {
+    if y < NAV_Y - NAV_H * 0.5 || y > NAV_Y + NAV_H * 0.5 {
+        return None;
+    }
+    (0..NAV_BTNS.len()).find(|&i| {
+        let x0 = nav_x0(i);
+        x >= x0 && x <= x0 + NAV_W
+    })
+}
+
+pub fn nav_strip(ui: &mut Vec<UiVert>, a: f32, cur: (f32, f32), here: usize) {
+    for (i, name) in NAV_BTNS.iter().enumerate() {
+        let x0 = nav_x0(i);
+        let (y0, y1) = (NAV_Y - NAV_H * 0.5, NAV_Y + NAV_H * 0.5);
+        let hot = hit_nav(cur.0, cur.1) == Some(i);
+        let on = here == i;
+        let bg = if hot {
+            [0.24, 0.30, 0.38, 0.95 * a]
+        } else if on {
+            [0.18, 0.21, 0.28, 0.92 * a]
+        } else {
+            [0.12, 0.14, 0.19, 0.82 * a]
+        };
+        quad(ui, x0, y0, x0 + NAV_W, y1, bg);
+        if hot || on {
+            quad(ui, x0, y1 - 0.005, x0 + NAV_W, y1, [GOLD[0], GOLD[1], GOLD[2], (if hot { 0.9 } else { 0.5 }) * a]);
+        }
+        label_c_at(ui, x0 + NAV_W * 0.5, NAV_Y - 0.010, T_HINT, a, if hot || on { PAPER } else { DIM }, name);
+    }
+}
+
+// ---- pause screen touch buttons (a phone has no ESC key) ----
+pub const PAUSE_BTNS: [&str; 5] = ["RESUME", "SETTINGS", "MAPS", "ONLINE", "QUIT"];
+pub const PBTN_Y: f32 = -0.70;
+pub const PBTN_H: f32 = 0.075;
+pub const PBTN_W: f32 = 0.285;
+pub const PBTN_GAP: f32 = 0.015;
+
+/// Left edge of pause button `i` (buttons are centred as a row).
+pub fn pbtn_x0(i: usize) -> f32 {
+    let n = PAUSE_BTNS.len() as f32;
+    let total = n * PBTN_W + (n - 1.0) * PBTN_GAP;
+    -total * 0.5 + i as f32 * (PBTN_W + PBTN_GAP)
+}
+
+/// Which pause button (if any) is under a point in clip space.
+pub fn hit_pause_btn(x: f32, y: f32) -> Option<usize> {
+    if y < PBTN_Y - PBTN_H * 0.5 || y > PBTN_Y + PBTN_H * 0.5 {
+        return None;
+    }
+    (0..PAUSE_BTNS.len()).find(|&i| {
+        let x0 = pbtn_x0(i);
+        x >= x0 && x <= x0 + PBTN_W
+    })
+}
+
+/// Slider value fraction for a touch/click x on the bar (clamped).
+pub fn bar_t(x: f32) -> f32 {
+    ((x - TW_BAR_X0) / (TW_BAR_X1 - TW_BAR_X0)).clamp(0.0, 1.0)
+}
+
+/// Is this x within grabbing distance of a slider bar? Phones need a fatter
+/// target than a mouse, so the band is generous on both sides.
+pub fn near_bar(x: f32) -> bool {
+    x >= TW_BAR_X0 - 0.10 && x <= TW_BAR_X1 + 0.10
+}
+
+/// Which row is under a cursor y in a SCROLLED viewport (absolute index).
+pub fn hit_row_scrolled(top: f32, row_h: f32, n: usize, vis: usize, start: usize, y: f32) -> Option<usize> {
+    let i = hit_row(top, row_h, vis.min(n.saturating_sub(start)), y)?;
+    let abs = start + i;
+    (abs < n).then_some(abs)
+}
 
 /// Which row (if any) is under a cursor y for a menu laid out like ours.
 pub fn hit_row(top: f32, row_h: f32, n: usize, y: f32) -> Option<usize> {
@@ -300,7 +480,7 @@ fn minimap(ui: &mut Vec<UiVert>, a: f32, world: &World, car: &Car, ball: &Ball, 
 }
 
 // ---------------------------------------------------------------- pause ----
-pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32) {
+pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: (f32, f32)) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.78, -0.90, 0.78, 0.90);
     label_c(ui, 0.78, 0.024, a, PAPER, "PAUSED");
@@ -332,25 +512,41 @@ pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32) {
     label_c(ui, -0.52, 0.0078, a, DIM, "MODELS: JAKO (FAIRLIGHT51) + 97MASON, CC-BY 4.0.  A FAN HOMAGE - ROCKET LEAGUE IS PSYONIX/EPIC'S.");
     label_c(ui, -0.56, 0.0078, a, DIM, "NETCODE, MAP MOODS + MENU KIT IDEAS FROM THE LOGSCOPE-C4 MONOREPO");
 
-    legend(ui, -0.70, a, 0.0105, &[("ESC", "RESUME"), ("ENTER", "SETTINGS"), ("G", "MAPS"), ("O", "ONLINE")]);
-    legend(ui, -0.765, a, 0.0105, &[("Q / X", "SAVE + QUIT"), ("MOUSE", "WORKS IN EVERY MENU")]);
+    // tappable buttons: the whole pause menu works with a finger
+    for (i, name) in PAUSE_BTNS.iter().enumerate() {
+        let x0 = pbtn_x0(i);
+        let (y0, y1) = (PBTN_Y - PBTN_H * 0.5, PBTN_Y + PBTN_H * 0.5);
+        let hot = hit_pause_btn(cur.0, cur.1) == Some(i);
+        let bg = if hot { [0.24, 0.30, 0.38, 0.95 * a] } else { [0.13, 0.15, 0.20, 0.85 * a] };
+        quad(ui, x0, y0, x0 + PBTN_W, y1, bg);
+        quad(ui, x0, y1 - 0.006, x0 + PBTN_W, y1, [GOLD[0], GOLD[1], GOLD[2], (if hot { 0.9 } else { 0.35 }) * a]);
+        label_c_at(ui, x0 + PBTN_W * 0.5, PBTN_Y - 0.011, 0.0105, a, if hot { PAPER } else { DIM }, name);
+    }
+    legend(ui, -0.80, a, 0.0098, &[("ESC", "RESUME"), ("ENTER", "SETTINGS"), ("TAP", "ANY BUTTON")]);
 }
 
 // ------------------------------------------------------------- controls ----
 pub const BIND_ROWS: usize = ACTIONS.len() + 3; // + classic, dvorak, back
 
-pub fn bindings_menu(ui: &mut Vec<UiVert>, a: f32, b: &Bindings, sel: usize, capturing: bool) {
+pub fn bindings_menu(ui: &mut Vec<UiVert>, a: f32, b: &Bindings, sel: usize, capturing: bool, scroll: usize, cur: (f32, f32)) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.80, -0.985, 0.80, 0.955);
-    label_c(ui, 0.885, 0.019, a, PAPER, "CONTROLS");
+    label_c(ui, 0.885, T_TITLE, a, PAPER, "CONTROLS");
 
-    let px = 0.0074;
+    let px = T_BODY;
     let row_h = BIND_ROW_H;
     let top = BIND_TOP;
     let lx = -0.70;
     let rx = 0.16;
+    let vis = vis_rows(row_h, top, TW_BOTTOM);
+    let start = scroll.min(BIND_ROWS.saturating_sub(vis.min(BIND_ROWS)));
+    let end = (start + vis).min(BIND_ROWS);
+    scrollbar(ui, a, 0.762, TW_BOTTOM, top + 0.02, BIND_ROWS, vis, start);
     for (i, act) in ACTIONS.iter().enumerate() {
-        let y = top - i as f32 * row_h;
+        if i < start || i >= end {
+            continue;
+        }
+        let y = top - (i - start) as f32 * row_h;
         if i == sel {
             quad(ui, -0.74, y - row_h + 0.016, 0.74, y + 0.016, SEL);
             quad(ui, -0.755, y - row_h + 0.016, -0.74, y + 0.016, GOLD);
@@ -364,7 +560,10 @@ pub fn bindings_menu(ui: &mut Vec<UiVert>, a: f32, b: &Bindings, sel: usize, cap
     let extras = ["PRESET: CLASSIC (WASD)", "PRESET: DVORAK (.OEU HOME ROW)", "BACK"];
     for (k, lab) in extras.iter().enumerate() {
         let i = ACTIONS.len() + k;
-        let y = top - i as f32 * row_h;
+        if i < start || i >= end {
+            continue;
+        }
+        let y = top - (i - start) as f32 * row_h;
         if i == sel {
             quad(ui, -0.72, y - row_h + 0.016, 0.72, y + 0.016, SEL);
             quad(ui, -0.735, y - row_h + 0.016, -0.72, y + 0.016, GOLD);
@@ -372,26 +571,32 @@ pub fn bindings_menu(ui: &mut Vec<UiVert>, a: f32, b: &Bindings, sel: usize, cap
         font::text(ui, lx, y, px, a, if i == sel { GOLD } else { PAPER }, lab);
     }
 
+    nav_strip(ui, a, cur, 2);
     if capturing {
-        legend(ui, -0.93, a, 0.0085, &[("ANY INPUT", "BIND IT"), ("DEL", "CLEAR"), ("ESC", "CANCEL")]);
+        legend(ui, -0.93, a, T_HINT, &[("ANY INPUT", "BIND IT"), ("DEL", "CLEAR"), ("ESC", "CANCEL")]);
     } else {
-        legend(ui, -0.93, a, 0.0085, &[("CLICK / ENTER", "REBIND"), ("DEL", "CLEAR"), ("ESC", "BACK")]);
+        legend(ui, -0.93, a, T_HINT, &[("CLICK / ENTER", "REBIND"), ("DEL", "CLEAR"), ("ESC", "BACK")]);
     }
 }
 
 // ----------------------------------------------------------------- maps ----
-pub fn maps_menu(ui: &mut Vec<UiVert>, a: f32, sel: usize, current: usize, seed: u64) {
+pub fn maps_menu(ui: &mut Vec<UiVert>, a: f32, sel: usize, current: usize, seed: u64, scroll: usize, cur: (f32, f32)) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.62, -0.985, 0.62, 0.955);
-    label_c(ui, 0.885, 0.019, a, PAPER, "MAPS");
-    label_c(ui, 0.825, 0.0088, a, DIM, "TWENTY MOODS - ROOM STYLES FROM THE LOGSCOPE SCENE, PLUS NET-GOAL ARENAS");
+    label_c(ui, 0.885, T_TITLE, a, PAPER, "MAPS");
+    label_c(ui, 0.828, T_HINT, a, DIM, "ROOM STYLES FROM THE LOGSCOPE SCENE, PLUS NET-GOAL ARENAS");
 
     let row_h = maps_row_h();
-    let px = 0.0090;
+    let px = T_BODY;
     let top = MAPS_TOP;
-    for i in 0..crate::world::STYLE_COUNT {
+    let n = crate::world::STYLE_COUNT;
+    let vis = vis_rows(row_h, top, TW_BOTTOM);
+    let start = scroll.min(n.saturating_sub(vis.min(n)));
+    let end = (start + vis).min(n);
+    scrollbar(ui, a, 0.575, TW_BOTTOM, top + 0.02, n, vis, start);
+    for i in start..end {
         let st = crate::world::style(i);
-        let y = top - i as f32 * row_h;
+        let y = top - (i - start) as f32 * row_h;
         if i == sel {
             quad(ui, -0.55, y - row_h + 0.020, 0.55, y + 0.020, SEL);
             quad(ui, -0.565, y - row_h + 0.020, -0.55, y + 0.020, GOLD);
@@ -406,7 +611,8 @@ pub fn maps_menu(ui: &mut Vec<UiVert>, a: f32, sel: usize, current: usize, seed:
     }
 
     label_c(ui, -0.86, 0.0095, a, DIM, &format!("SEED {seed}"));
-    legend(ui, -0.93, a, 0.0085, &[("CLICK / ENTER", "LOAD"), ("R", "NEW SEED"), ("ESC", "BACK")]);
+    nav_strip(ui, a, cur, 3);
+    legend(ui, -0.93, a, T_HINT, &[("CLICK / ENTER", "LOAD"), ("R", "NEW SEED"), ("ESC", "BACK")]);
 }
 
 // --------------------------------------------------------------- online ----
@@ -461,7 +667,7 @@ pub fn online_menu(ui: &mut Vec<UiVert>, a: f32, o: &OnlineUi, blink: f32) {
     }
 
     label_c(ui, -0.86, 0.0085, a, DIM, "HOSTING ANNOUNCES YOU AS <NAME> FOR FRIENDS TO JOIN BY THAT NAME");
-    legend(ui, -0.93, a, 0.0085, &[("TYPE", "EDIT FIELD"), ("CLICK / ENTER", "ACTIVATE"), ("ESC", "BACK")]);
+    legend(ui, -0.93, a, T_HINT, &[("TYPE", "EDIT FIELD"), ("CLICK / ENTER", "ACTIVATE"), ("ESC", "BACK")]);
 }
 
 // --------------------------------------------------------------- tweaks ----
@@ -473,25 +679,30 @@ pub struct TweakRow {
     pub action: bool,     // an "activates something" row: gets a chevron
 }
 
-pub fn tweaks_menu(ui: &mut Vec<UiVert>, a: f32, title: &str, rows: &[TweakRow], sel: usize) {
+pub fn tweaks_menu(ui: &mut Vec<UiVert>, a: f32, title: &str, rows: &[TweakRow], sel: usize, scroll: usize, cur: (f32, f32), here: usize) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.80, -0.985, 0.80, 0.955);
-    label_c(ui, 0.885, 0.017, a, PAPER, title);
+    label_c(ui, 0.885, T_TITLE, a, PAPER, title);
 
-    let row_h = rows_h(rows.len());
-    let px = (row_h * 0.17).clamp(0.0072, 0.0094);
+    let row_h = TW_ROW_H;
     let top = TW_TOP;
-    // section inset cards first: each header owns the rows until the next
-    let mut i0 = 0usize;
-    while i0 < rows.len() {
+    let vis = vis_rows(row_h, top, TW_BOTTOM);
+    let start = scroll.min(rows.len().saturating_sub(vis.min(rows.len())));
+    let end = (start + vis).min(rows.len());
+    let px = T_BODY;
+
+    // section cards, clipped to the viewport: a header owns rows until the
+    // next header, and the card is what makes groups scannable
+    let mut i0 = start;
+    while i0 < end {
         if rows[i0].header {
             let mut i1 = i0 + 1;
-            while i1 < rows.len() && !rows[i1].header {
+            while i1 < end && !rows[i1].header {
                 i1 += 1;
             }
             if i1 > i0 + 1 {
-                let y_top = top - i0 as f32 * row_h - row_h * 0.42;
-                let y_bot = top - (i1 - 1) as f32 * row_h - row_h + 0.018;
+                let y_top = top - (i0 - start) as f32 * row_h - row_h * 0.40;
+                let y_bot = top - (i1 - 1 - start) as f32 * row_h - row_h + 0.016;
                 inset(ui, a, -0.76, y_bot, 0.76, y_top);
             }
             i0 = i1;
@@ -499,39 +710,48 @@ pub fn tweaks_menu(ui: &mut Vec<UiVert>, a: f32, title: &str, rows: &[TweakRow],
             i0 += 1;
         }
     }
-    for (i, r) in rows.iter().enumerate() {
-        let y = top - i as f32 * row_h;
+
+    for i in start..end {
+        let r = &rows[i];
+        let y = top - (i - start) as f32 * row_h;
         if r.header {
-            // section caption: cyan caps sitting on the inset's top edge
-            label(ui, -0.73, y, px * 0.78, a, CYAN, &r.label);
+            // section caption sitting on the card's top edge
+            label(ui, -0.735, y, T_SECTION, a, CYAN, &r.label);
             continue;
         }
-        if i == sel {
-            quad(ui, -0.74, y - row_h + 0.020, 0.74, y + 0.020, SEL);
-            quad(ui, -0.755, y - row_h + 0.020, -0.74, y + 0.020, GOLD);
+        let selected = i == sel;
+        if selected {
+            quad(ui, -0.74, y - row_h + 0.026, 0.74, y + 0.022, SEL);
+            quad(ui, -0.757, y - row_h + 0.026, -0.742, y + 0.022, GOLD);
         }
-        let lx = if r.action { -0.65 } else { -0.68 };
+        // ALIGNMENT GRID: labels share one left edge, values share one right
+        // edge, and the action caret lives outside the label column so text
+        // never shifts as you move the selection
         if r.action {
-            font::text(ui, -0.70, y, px, a, GOLD, ">");
+            font::text(ui, -0.715, y, px, a, GOLD, ">");
         }
-        let lab = fit(&r.label, 0.24 - lx, px, a);
-        font::text(ui, lx, y, px, a, if i == sel { GOLD } else { PAPER }, &lab);
-        let val = fit(&r.value, 0.42, px, a);
+        let lab = fit(&r.label, 0.94, px, a);
+        font::text(ui, -0.68, y, px, a, if selected { GOLD } else { PAPER }, &lab);
+        let val = fit(&r.value, 0.40, px, a);
         let vw = font::width(&val, px, a);
-        let vcol = if i == sel { CYAN } else { [1.0, 0.98, 0.94, 0.42] };
+        let vcol = if selected { CYAN } else { [1.0, 0.98, 0.94, 0.45] };
         font::text(ui, 0.70 - vw, y, px, a, vcol, &val);
-        // slider bars only under the selected row: everything else is text,
-        // which is most of the de-cluttering
-        if i != sel {
-            continue;
-        }
-        if let Some(t) = r.bar {
-            let by = y - row_h * 0.55;
-            quad(ui, TW_BAR_X0, by, TW_BAR_X1, by + 0.010, [0.22, 0.27, 0.32, 0.6]);
-            quad(ui, TW_BAR_X0, by, TW_BAR_X0 + (TW_BAR_X1 - TW_BAR_X0) * t.clamp(0.0, 1.0), by + 0.010, GOLD);
+        // the bar draws under the SELECTED row only: one moving part at a
+        // time is the whole de-cluttering idea
+        if selected {
+            if let Some(t) = r.bar {
+                let by = y - row_h * 0.46;
+                quad(ui, TW_BAR_X0, by, TW_BAR_X1, by + 0.009, [0.22, 0.27, 0.32, 0.6]);
+                quad(ui, TW_BAR_X0, by, TW_BAR_X0 + (TW_BAR_X1 - TW_BAR_X0) * t.clamp(0.0, 1.0), by + 0.009, GOLD);
+            }
         }
     }
-    legend(ui, -0.93, a, 0.0085, &[
+    scrollbar(ui, a, 0.762, TW_BOTTOM, top + 0.02, rows.len(), vis, start);
+    if rows.len() > vis {
+        label_c(ui, TW_BOTTOM - 0.035, T_HINT, a, DIM, &format!("{}-{} OF {}", start + 1, end, rows.len()));
+    }
+    nav_strip(ui, a, cur, here);
+    legend(ui, -0.93, a, T_HINT, &[
         ("ARROWS", "ADJUST"),
         ("ENTER", "OPEN / RESET"),
         ("WHEEL", "NUDGE"),
@@ -564,5 +784,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.26    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.41    ESC QUITS FROM THIS SCREEN");
 }

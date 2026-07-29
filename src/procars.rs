@@ -54,7 +54,7 @@ pub fn breadbox(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.27, 0.10, 0.10), Quat::IDENTITY, Vec3::new(0.0, 0.16, -0.50)), [0.16, 0.20, 0.24, 1.0]));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.24, 0.02, 0.40), Quat::IDENTITY, Vec3::new(0.0, 0.38, 0.04)), [0.93, 0.90, 0.80, 1.0]));
     wheels(gpu, &mut prims, 0.115, 0.27, -0.36, 0.36, -0.10);
-    Model { prims, cloud: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.30, half_w: 0.31, wheel_r: 0.115 }
+    Model { prims, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.30, half_w: 0.31, wheel_r: 0.115 }
 }
 
 pub fn wedge(gpu: &mut Gpu) -> Model {
@@ -64,7 +64,7 @@ pub fn wedge(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.34, 0.055, 0.16), Quat::IDENTITY, Vec3::new(0.0, 0.10, 0.58)), [0.16, 0.16, 0.19, 1.0]));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.05, 0.078, 0.70), Quat::from_rotation_x(-0.10), Vec3::new(0.0, 0.02, 0.0)), [0.85, 0.16, 0.16, 1.0]));
     wheels(gpu, &mut prims, 0.095, 0.36, -0.52, 0.52, -0.06);
-    Model { prims, cloud: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.80, half_h: 0.125, half_w: 0.42, wheel_r: 0.095 }
+    Model { prims, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.80, half_h: 0.125, half_w: 0.42, wheel_r: 0.095 }
 }
 
 pub fn roller(gpu: &mut Gpu) -> Model {
@@ -74,7 +74,7 @@ pub fn roller(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::sphere(16, 22), Vec3::new(0.20, 0.20, 0.22), Quat::IDENTITY, Vec3::new(0.0, 0.16, -0.02)), [0.55, 0.85, 0.92, 1.0]));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.25, 0.012, 0.10), Quat::IDENTITY, Vec3::new(0.0, 0.012, 0.34)), [0.95, 0.45, 0.25, 1.0]));
     wheels(gpu, &mut prims, 0.13, 0.22, -0.30, 0.30, -0.05);
-    Model { prims, cloud: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.22, half_w: 0.26, wheel_r: 0.13 }
+    Model { prims, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.22, half_w: 0.26, wheel_r: 0.13 }
 }
 
 pub fn longboy(gpu: &mut Gpu) -> Model {
@@ -84,7 +84,7 @@ pub fn longboy(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.26, 0.07, 0.30), Quat::IDENTITY, Vec3::new(0.0, 0.13, -0.30)), [0.10, 0.10, 0.13, 1.0]));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.31, 0.012, 1.00), Quat::IDENTITY, Vec3::new(0.0, 0.105, 0.0)), [0.85, 0.78, 0.30, 1.0]));
     wheels(gpu, &mut prims, 0.095, 0.27, -0.74, 0.74, -0.055);
-    Model { prims, cloud: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.04, half_h: 0.14, half_w: 0.32, wheel_r: 0.095 }
+    Model { prims, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.04, half_h: 0.14, half_w: 0.32, wheel_r: 0.095 }
 }
 
 pub fn cube(gpu: &mut Gpu) -> Model {
@@ -94,7 +94,7 @@ pub fn cube(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::splat(0.30), Quat::IDENTITY, Vec3::new(0.0, 0.05, 0.0)), [0.90, 0.35, 0.30, 1.0]));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.31, 0.06, 0.31), Quat::IDENTITY, Vec3::new(0.0, 0.36, 0.0)), [0.98, 0.92, 0.85, 1.0]));
     wheels(gpu, &mut prims, 0.11, 0.28, -0.24, 0.24, -0.16);
-    Model { prims, cloud: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.34, half_h: 0.34, half_w: 0.34, wheel_r: 0.11 }
+    Model { prims, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.34, half_h: 0.34, half_w: 0.34, wheel_r: 0.11 }
 }
 
 pub fn shark(gpu: &mut Gpu) -> Model {
@@ -104,5 +104,5 @@ pub fn shark(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.025, 0.17, 0.16), Quat::from_rotation_x(0.28), Vec3::new(0.0, 0.24, 0.14)), [0.30, 0.42, 0.55, 1.0]));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.30, 0.02, 0.10), Quat::IDENTITY, Vec3::new(0.0, -0.02, -0.60)), [0.92, 0.92, 0.95, 1.0]));
     wheels(gpu, &mut prims, 0.10, 0.28, -0.44, 0.44, -0.09);
-    Model { prims, cloud: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.20, half_w: 0.31, wheel_r: 0.10 }
+    Model { prims, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.20, half_w: 0.31, wheel_r: 0.10 }
 }

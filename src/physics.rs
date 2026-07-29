@@ -52,6 +52,10 @@ pub struct Car {
     pub half_h: f32,
     pub half_w: f32,
     pub susp: f32, // suspension compression 0..1 (renderer bobs the body)
+    /// world-space angular velocity INCLUDING the grounded steering yaw,
+    /// which is applied straight to the rotation and never enters `ang`
+    pub omega: Vec3,
+    prev_rot: Quat,
     pub wheel_r: f32,
     pub wheel_spin: f32,
     pub steer_vis: f32,
@@ -62,6 +66,14 @@ pub struct Car {
     has_dodge: bool,
     dodge_timer: f32,
     dodge_ang: Vec3,
+    // RL-style scripted flip: a full 2-pi rotation about ONE cardinal body
+    // axis, so a flip always ends at the orientation it started from
+    dodge_axis: Vec3,
+    dodge_start: Quat,
+    dodge_len: f32,
+    dodge_roll: f32,
+    dodge_turn: f32,
+    dodge_cancel: bool,
     reset_cd: f32,
     pub supersonic: bool,
 }
@@ -81,6 +93,8 @@ impl Car {
             wheel_r: 0.11,
             half_w: 0.32,
             susp: 0.0,
+            omega: Vec3::ZERO,
+            prev_rot: Quat::IDENTITY,
             wheel_spin: 0.0,
             steer_vis: 0.0,
             jump_hold: 0.0,
@@ -89,6 +103,12 @@ impl Car {
             has_dodge: false,
             dodge_timer: 0.0,
             dodge_ang: Vec3::ZERO,
+            dodge_axis: Vec3::X,
+            dodge_start: Quat::IDENTITY,
+            dodge_len: 0.62,
+            dodge_roll: 0.0,
+            dodge_turn: 0.0,
+            dodge_cancel: false,
             reset_cd: 0.0,
             supersonic: false,
         }
@@ -98,6 +118,36 @@ impl Car {
     }
     pub fn up(&self) -> Vec3 {
         self.rot * Vec3::Y
+    }
+    /// Which cardinal axis the active flip turns about (flip sim).
+    pub fn flip_axis_name(&self) -> &'static str {
+        if self.dodge_axis.x.abs() > self.dodge_axis.z.abs() {
+            if self.dodge_axis.x > 0.0 { "+X" } else { "-X" }
+        } else if self.dodge_axis.z > 0.0 {
+            "+Z"
+        } else {
+            "-Z"
+        }
+    }
+    /// Is a flip currently playing? (flip sim)
+    pub fn is_flipping(&self) -> bool {
+        self.dodge_timer > 0.0
+    }
+    /// Is the dodge window still open? (flip sim)
+    pub fn dodge_window_open(&self) -> bool {
+        self.dodge_window > 0.0
+    }
+    /// The orientation the active flip began from (flip sim).
+    pub fn dodge_start_pose(&self) -> Quat {
+        self.dodge_start
+    }
+    /// The active flip's total duration (flip sim).
+    pub fn dodge_len_for_sim(&self) -> f32 {
+        self.dodge_len
+    }
+    /// How far the active flip has turned, radians (flip sim).
+    pub fn flip_turn(&self) -> f32 {
+        self.dodge_turn
     }
     /// A jump/flip is banked (restoration probe for the landing sim).
     pub fn has_flip(&self) -> bool {
@@ -112,13 +162,17 @@ impl Car {
         self.has_dodge && self.dodge_window > 0.0
     }
     pub fn reset(&mut self, world: &World) {
-        let h = world.ground_h(0.0, 26.0);
+        // land on the real surface, not the terrain height: raised decks
+        // (DROPSHOT) used to spawn the car INSIDE the platform
+        let clr = self.half_h + 0.05;
+        let p = world.spawn_at(0.0, 26.0, clr);
         *self = Car {
             half_len: self.half_len,
             half_h: self.half_h,
+            half_w: self.half_w,
             wheel_r: self.wheel_r,
             boost: 45.0,
-            pos: Vec3::new(0.0, h + self.half_h + 0.05, 26.0),
+            pos: p,
             ..Car::new()
         };
     }
@@ -171,6 +225,7 @@ pub struct StepEvents {
     pub jumped: bool,
     pub dodged: bool,
     pub pinched: bool,
+    pub blasted: bool,
     pub ball_bounce: Option<(Vec3, f32)>, // world-contact point + impact speed
     pub flip_reset: Option<Vec3>,               // underside contact restored the flip
     pub landed: Option<f32>,                    // car landing impact speed
@@ -204,7 +259,24 @@ pub fn step(
             ball.vel = Vec3::new(0.0, 5.0, 0.0);
         }
     }
-    step_bodies(world, car, ball, dt);
+    // SHOCKWAVE: the detonation frame throws car, ball and every loose
+    // world outward, falling off with distance (never inward, never NaN)
+    if let Some((c, power)) = world.blast {
+        let kick = |p: Vec3, mass: f32| -> Vec3 {
+            let to = p - c;
+            let d = to.length().max(2.0);
+            let f = (power / d).min(70.0) * (12.0 / mass.max(1.0)).clamp(0.25, 1.6);
+            to / d * f
+        };
+        car.vel += kick(car.pos, 12.0);
+        ball.vel += kick(ball.pos, 3.0);
+        for b in world.bodies.iter_mut() {
+            let k = kick(b.pos, b.mass);
+            b.vel += k;
+        }
+        ev.blasted = true;
+    }
+    step_bodies(world, car, ball, dt, cfg.arena.gravity);
     collide_car_ball(car, ball, cfg, WHO_PLAYER, ev);
 
     // blast-off launchers: anything on the ring gets the arrow
@@ -298,7 +370,7 @@ pub fn step(
 /// The net-goal crossing test (shared by the full step and the sim).
 /// KUIPER free bodies: drift, collide with the world and each other, and get
 /// SHOVED — light asteroids move for the player, heavy ones move the player.
-fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32) {
+fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32, cfg_gravity: f32) {
     if world.bodies.is_empty() {
         return;
     }
@@ -308,7 +380,19 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32) {
             let b = &world.bodies[i];
             (b.pos, b.vel, b.r, b.mass)
         };
-        vel *= (-0.02 * dt).exp(); // the faintest drag: space, but playable
+        // free worlds are in the same field as everything else: they fall
+        // toward whatever is nearest and heaviest, which is what makes the
+        // vertical billiards break
+        let (gd, gm) = world.gravity_field(pos);
+        vel += gd * 6.5 * gm * 0.55 * dt;
+        let bouncy = world.bodies[i].bouncy;
+        if bouncy {
+            // drifters fall, so they can land, squash and spring back
+            vel += world.gravity_dir(pos) * GRAV * cfg_gravity * dt;
+        }
+        if !bouncy {
+            vel *= (-0.02 * dt).exp(); // the faintest drag: space, but playable
+        }
         pos += vel * dt;
         // world surfaces
         let d = world.sdf(pos);
@@ -317,7 +401,18 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32) {
             pos += nw * (r - d);
             let vn = vel.dot(nw);
             if vn < 0.0 {
-                vel -= nw * vn * 1.55; // e = 0.55
+                // planets keep (almost) everything: the DVD logo never
+                // stops. Everything else loses the usual 45%.
+                let e = if bouncy { 0.985 } else { 0.55 };
+                vel -= nw * vn * (1.0 + e);
+                let b = &mut world.bodies[i];
+                if bouncy {
+                    // SQUASH: flatten along the impact normal, scaled by how
+                    // hard it hit, then let the wobble spring it back out
+                    b.squash = b.squash.max(((-vn) / 9.0).clamp(0.06, 0.42));
+                    b.sq_dir = nw;
+                    b.sq_t = 0.0;
+                }
             }
         }
         // car shove (both ways, mass-weighted)
@@ -350,6 +445,16 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32) {
                 ball.vel -= nn * (j / 3.0);
             }
             ball.pos -= nn * (rb - dist) * 0.8;
+        }
+        // jelly wobble: a damped oscillation, so the squash overshoots
+        // back past round before settling — that is the "bounce back"
+        if world.bodies[i].squash > 0.0 {
+            let b = &mut world.bodies[i];
+            b.sq_t += dt;
+            if b.sq_t > 1.4 {
+                b.squash = 0.0;
+                b.sq_t = 0.0;
+            }
         }
         world.bodies[i].pos = pos;
         world.bodies[i].vel = vel;
@@ -385,11 +490,23 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32) {
     }
     // sync the drawn/marched shapes
     for i in 0..n {
-        let (shape, pos) = (world.bodies[i].shape, world.bodies[i].pos);
+        let b = &world.bodies[i];
+        let (shape, pos, r) = (b.shape, b.pos, b.r);
+        // squash-and-stretch, volume-ish preserving: flatten along the hit
+        // normal, bulge sideways, wobbling out through zero as it settles
+        let (rot, sc) = if b.squash > 0.0 {
+            let a = b.squash * (-3.4 * b.sq_t).exp() * (b.sq_t * 19.0).cos();
+            (
+                glam::Quat::from_rotation_arc(glam::Vec3::Y, b.sq_dir),
+                glam::Vec3::new(r * (1.0 + a * 0.5), r * (1.0 - a), r * (1.0 + a * 0.5)),
+            )
+        } else {
+            (glam::Quat::IDENTITY, glam::Vec3::splat(r))
+        };
         let sh = &mut world.shapes[shape];
-        let sc = glam::Vec3::splat(world.bodies[i].r);
         sh.pos = pos;
-        sh.mat = glam::Mat4::from_scale_rotation_translation(sc, glam::Quat::IDENTITY, pos);
+        sh.inv_rot = rot.inverse();
+        sh.mat = glam::Mat4::from_scale_rotation_translation(sc, rot, pos);
     }
 }
 
@@ -449,7 +566,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         car.jbuf = (car.jbuf - dt).max(0.0);
     }
 
-    let gdir = world.gravity_dir(car.pos);
+    let (gdir, gmul) = world.gravity_field(car.pos);
     let up_w = -gdir;
     let ori = car.up().dot(n);
     let tang_sp = (car.vel - n * car.vel.dot(n)).length();
@@ -496,7 +613,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     car.reset_cd = (car.reset_cd - dt).max(0.0);
 
     // gravity
-    car.vel += gdir * GRAV * cfg.arena.gravity * dt;
+    car.vel += gdir * GRAV * gmul * cfg.arena.gravity * dt;
     // FLOODWATER: a flooded tube's current owns you — strong downstream
     // servo (buoyancy is implicit: the target velocity has no fall in it)
     if let Some(cv) = world.current(car.pos) {
@@ -530,9 +647,14 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         let corr = Quat::from_rotation_arc(cur_up, n);
         let k = 1.0 - (-18.0 * dt).exp();
         car.rot = (Quat::IDENTITY.slerp(corr, k) * car.rot).normalize();
-        car.ang.x *= (-16.0 * dt).exp();
-        car.ang.z *= (-16.0 * dt).exp();
-        car.ang.y = 0.0;
+        // A GROUNDED CAR HAS NO FREE ROTATION. Orientation comes from two
+        // things only: the surface (the align above) and your steering (the
+        // yaw below) — RL's direct input-to-rotation mapping. Pitch/roll
+        // were merely DAMPED here, so leftover spin from a landing or a
+        // bump kept turning the car for a quarter second, fighting the
+        // align and stealing commanded yaw (a hard turn delivered 54% of
+        // what the stick asked for; after a landing, 76%).
+        car.ang = Vec3::ZERO;
 
         // basis in the contact plane
         let f_raw = car.forward();
@@ -553,6 +675,9 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         let yaw_rate = -c.steer * rate * dir_sign;
         if sp > 0.25 {
             car.rot = (Quat::from_axis_angle(n, yaw_rate * dt) * car.rot).normalize();
+            // (omega is measured after integration; see step_car's tail)
+        } else {
+            // (omega measured below)
         }
         car.steer_vis += (c.steer * 0.42 - car.steer_vis) * (1.0 - (-16.0 * dt).exp());
 
@@ -591,12 +716,17 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         } else if d < clearance + 0.02 {
             let e = (clearance - d) / zone; // 1 at the stop, <0 just above ride
             // asymmetric damping: swallow the hit, let the rebound breathe
-            let cdamp = if vn < 0.0 { 24.0 } else { 9.0 };
+            // rebound damping was light enough that a landing bounced the
+            // car clean off the ground again — you cannot dribble on a
+            // trampoline. Compression stays soft; the way back is firm.
+            let cdamp = if vn < 0.0 { 24.0 } else { 19.0 };
             car.vel += n * (e * 58.0 - vn * cdamp) * dt;
         } else {
             // stick to the surface: gentle over crests on the floor, strong
             // magnetic grip on walls and ceilings (the RL wall-drive feel)
-            let stick = if steep { 22.0 } else { 2.4 };
+            // stickier on a heavy world: the surface holds you through the
+            // curve instead of letting you drift off the horizon
+            let stick = if steep { 22.0 } else { 2.4 } * gmul.clamp(1.0, 3.2);
             car.vel -= n * stick * dt;
         }
         let starget = ((clearance - d) / zone).clamp(0.0, 1.0);
@@ -787,12 +917,26 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             // dodge direction in body frame: steer right = +x, throttle fwd = -z
             let d2 = Vec3::new(c.steer, 0.0, -c.throttle);
             if d2.length() > 0.3 {
-                let dn = d2.normalize();
+                // CARDINAL SNAP (Rocket League): any key combination sharing
+                // a dominant direction flips in THAT axis — no half-diagonal
+                // tumbles. Ties break toward pitch, as in RL.
+                let dn = if c.throttle.abs() >= c.steer.abs() {
+                    Vec3::new(0.0, 0.0, -c.throttle.signum())
+                } else {
+                    Vec3::new(c.steer.signum(), 0.0, 0.0)
+                };
                 // flip: burst of body-frame spin + a velocity kick along the dodge
                 // toned from 8.4: full-rate spin read too violent, and the
                 // FLIP SPIN dial rides on top for +-50% in 5% steps
-                car.dodge_ang = Vec3::Y.cross(dn).normalize_or(Vec3::X) * 7.4 * cfg.flip.strength.sqrt() * cfg.flip.spin;
-                car.dodge_timer = 0.62;
+                car.dodge_axis = Vec3::Y.cross(dn).normalize_or(Vec3::X);
+                car.dodge_ang = car.dodge_axis * 7.4 * cfg.flip.strength.sqrt() * cfg.flip.spin;
+                // one full rotation, always: duration scales with FLIP SPIN
+                car.dodge_len = (0.76 / cfg.flip.spin.max(0.3)).clamp(0.38, 1.60);
+                car.dodge_timer = car.dodge_len;
+                car.dodge_start = car.rot;
+                car.dodge_roll = 0.0;
+                car.dodge_turn = 0.0;
+                car.dodge_cancel = false;
                 let yaw_only = yaw_quat(car.rot);
                 let world_dir = yaw_only * dn;
                 car.vel += world_dir * 5.2 * cfg.flip.strength;
@@ -809,29 +953,51 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
 
         if car.dodge_timer > 0.0 {
             car.dodge_timer -= dt;
+            if car.dodge_timer <= 0.0 && !car.dodge_cancel {
+                // exact close-out: land on the start orientation with no
+                // drift from the eased integration
+                car.rot = (car.dodge_start * Quat::from_rotation_z(car.dodge_roll)).normalize();
+                car.dodge_ang = Vec3::ZERO;
+                car.ang = Vec3::ZERO;
+            }
             // flip cancel: hold the opposite pitch to kill the rotation
             // (front flip + hold back = the speedflip/cancel family)
             if cfg.flip.cancel && c.pitch * car.dodge_ang.x < -3.0 {
                 car.dodge_ang.x = 0.0;
-                // half-flips: a cancel WITH roll intent hands control back
-                // fast. Gated on roll so a mere held pitch (the bots' air
-                // habit) doesn't truncate flicks — the sim caught the
-                // whole offense collapsing when it did.
+                car.dodge_cancel = true; // freeze the rotation where it is
                 if c.roll.abs() > 0.2 {
                     car.dodge_timer = car.dodge_timer.min(0.16);
                 }
             }
-            // TAPER: the flip spins full for its first 55%, then eases to
-            // 42% by the end — the rotation fades out instead of cutting
-            let tf = 1.0 - (car.dodge_timer / 0.62).clamp(0.0, 1.0);
-            let taper = if tf < 0.55 { 1.0 } else { 1.0 - (tf - 0.55) / 0.45 * 0.58 };
-            car.ang = car.dodge_ang * taper;
-            // air roll stays LIVE through a dodge (the half-flip's 180):
-            // the hard assign above used to eat the roll key entirely
-            // roll must not STACK onto the flip's own spin (it was adding
-            // 8.5 rad/s on a side flip = 1.5-2 rotations): reduced
-            // authority plus a hard cap on the total
-            car.ang.z = (car.dodge_ang.z * taper + c.roll * 5.0).clamp(-8.0, 8.0);
+            // SCRIPTED FLIP: drive the orientation directly from the start
+            // pose through exactly one turn about the cardinal axis, eased
+            // out. Because the total is 2-pi, the flip lands on the SAME
+            // orientation it began with — wheels-down starts finish
+            // wheels-down, air starts finish level.
+            if !car.dodge_cancel {
+                let p = 1.0 - (car.dodge_timer / car.dodge_len.max(0.01)).clamp(0.0, 1.0);
+                // Rotation profile, measured decile by decile: the old curve
+                // put 30% of the turn in the first 10% of the time (~1100
+                // deg/s) and 90% of it in the first half, so the flip
+                // lunged and then appeared to stop dead. This blend of a
+                // smoothstep and a mild ease-out peaks at 13% per decile,
+                // starts decisively without snapping, and is STILL turning
+                // at the end (3%) instead of asymptoting into a freeze.
+                let inv = 1.0 - p;
+                let smooth = p * p * (3.0 - 2.0 * p);
+                let mild = 1.0 - inv * inv.sqrt();
+                let e = 0.5 * smooth + 0.5 * mild;
+                car.dodge_turn = std::f32::consts::TAU * e;
+            }
+            // air roll layers ON TOP (the half-flip's 180) without stealing
+            // from the flip's own rotation
+            car.dodge_roll += c.roll * 5.0 * dt;
+            car.rot = (car.dodge_start
+                * Quat::from_axis_angle(car.dodge_axis, car.dodge_turn)
+                * Quat::from_rotation_z(car.dodge_roll))
+            .normalize();
+            car.ang = Vec3::ZERO; // orientation is scripted; no integration
+
             if car.dodge_timer <= 0.0 {
                 // flip complete: shed the flip spin entirely (RL's
                 // end-of-dodge damping) so held keys can't keep the tumble
@@ -928,8 +1094,25 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     car.boost = car.boost.min(tank);
 
     // integrate rotation (body-frame angular velocity)
+    if !car.on_ground {
+        // (omega measured after the rotation integration)
+    }
     if car.ang.length_squared() > 1e-8 {
         car.rot = (car.rot * Quat::from_scaled_axis(car.ang * dt)).normalize();
+    }
+    // MEASURE the turn actually taken this frame — UNCONDITIONALLY. A
+    // scripted flip drives the quaternion directly and leaves `ang` at
+    // zero, so this used to sit inside the `ang != 0` guard and never ran
+    // during the exact manoeuvre that throws the ball: omega read stale
+    // and no flick could work.
+    {
+        let dq = (car.rot * car.prev_rot.inverse()).normalize();
+        let (ax, mut angle) = dq.to_axis_angle();
+        if angle > std::f32::consts::PI {
+            angle -= std::f32::consts::TAU;
+        }
+        car.omega = ax * (angle / dt.max(1e-5));
+        car.prev_rot = car.rot;
     }
 
     // clamp + integrate position
@@ -998,7 +1181,8 @@ fn yaw_quat(q: Quat) -> Quat {
 /// Public for the sim harness: the ball vs world, no car required.
 pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut StepEvents) {
     ball.pinch_cd = (ball.pinch_cd - dt).max(0.0);
-    ball.vel += world.gravity_dir(ball.pos) * GRAV * cfg.arena.gravity * dt;
+    let (bdir, bmul) = world.gravity_field(ball.pos);
+    ball.vel += bdir * GRAV * bmul * cfg.arena.gravity * dt;
     if let Some(cv) = world.current(ball.pos) {
         ball.vel += (cv - ball.vel) * (1.0 - (-2.2 * dt).exp());
     }
@@ -1017,10 +1201,18 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 if -vn > 2.0 {
                     ev.ball_bounce = Some((ball.pos, -vn));
                 }
-                ball.vel = vt * 0.714 - n * vn * e; // RL bounce, tuned restitution
+                // keep most of the tangential speed through a bounce (0.714
+                // scrubbed 29% per landing, so any driven shot died on its
+                // first touchdown); the roll friction below still settles it
+                ball.vel = vt * 0.88 - n * vn * e;
                 ev.bounces.push((ball.pos, n, -vn));
             } else {
-                let roll = 1.8 * cfg.ball.friction * cfg.arena.friction;
+                // Rolling friction turned out NOT to be the shot killer (a
+                // driven ball spends its first seconds airborne, and the sim
+                // measured identical travel from 0.42 to 1.8). It IS what
+                // lets a ball settle for a dribble, so it stays high — 1.5
+                // scored best across the bot air-dribble runs.
+                let roll = 1.5 * cfg.ball.friction * cfg.arena.friction;
                 ball.vel = vt * (1.0 - (roll * dt).min(1.0)); // rolling friction
             }
             ball.ang = n.cross(ball.vel) / ball.r;
@@ -1042,14 +1234,19 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
 
 // ---------------------------------------------------- car <-> ball -------
 pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, ev: &mut StepEvents) {
-    // car as a capsule along its length, slightly above center (hood-biased)
-    let f = car.forward();
-    let up = car.up();
-    let a = car.pos + f * (car.half_len * 0.78) + up * 0.03;
-    let b = car.pos - f * (car.half_len * 0.78) + up * 0.03;
-    let ab = b - a;
-    let t = ((ball.pos - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0);
-    let cp = a + ab * t;
+    // THE HITBOX IS A BOX. A capsule is round on top, so a ball resting on
+    // it had barely a hand's width of contact before separating — which is
+    // why flips never caught the ball and no flick in this game worked.
+    // Rocket League's flicks come from a boxy hull whose nose and roof
+    // corner sweep UP into the ball. Closest point on an oriented box:
+    let half = Vec3::new(
+        car.half_w.max(0.18),
+        car.half_h.max(0.12),
+        car.half_len.max(0.30),
+    );
+    let local = car.rot.inverse() * (ball.pos - car.pos);
+    let clamped = local.clamp(-half, half);
+    let cp = car.pos + car.rot * clamped;
     let delta = ball.pos - cp;
     let dist = delta.length();
     // the car is NOT a thin spine: width counts, and a car mid-dodge gets
@@ -1058,8 +1255,9 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
     // half its excess (side hits connect), and the flat margin is small —
     // the earlier max()+0.08 raised the ball's ride 11 cm and the striker
     // carry pipeline fell apart (air1 touches went to zero in the sim)
-    let body = car.half_h * 1.12 + (car.half_w - car.half_h).max(0.0) * 0.5 + 0.04;
-    let lunge = if car.dodge_timer > 0.0 { 0.14 } else { 0.0 };
+    // skin over the box: a little give, plus a lunge margin mid-dodge
+    let body = 0.06;
+    let lunge = if car.dodge_timer > 0.0 { 0.45 } else { 0.0 };
     let radius = ball.r + body + lunge;
     if dist >= radius || dist < 1e-5 {
         return;
@@ -1070,7 +1268,10 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
     car.pos -= n * pen * 0.15;
 
     let m_ball = M_BALL * cfg.ball.weight;
-    let rel = ball.vel - car.vel;
+    // the patch under the ball moves with v + omega x r — a swinging hood
+    // is the whole mechanism behind every flick
+    let v_surf = car.vel + car.omega.cross((cp + n * body) - car.pos);
+    let rel = ball.vel - v_surf;
     let vn = rel.dot(n);
     if vn < 0.0 {
         ev.touches.push((cp, -vn));
@@ -1079,29 +1280,91 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // of pinging off the hood), hard hits keep full restitution
         let soft = ((-vn) / 8.0).clamp(0.0, 1.0);
         let e = (0.10 + 0.25 * soft) * cfg.ball.bounce.sqrt();
+        // A car meets a grounded ball from below-behind, so the contact
+        // normal points steeply UP and every shot ballooned. Hard hits now
+        // drive THROUGH: the impulse normal flattens toward horizontal as
+        // the hit gets stronger, while soft touches keep the true normal so
+        // dribbles and carries behave exactly as before.
+        let ni = if soft > 0.05 {
+            let flat = Vec3::new(n.x, n.y * (1.0 - 0.55 * soft), n.z).normalize_or(n);
+            n.lerp(flat, soft).normalize_or(n)
+        } else {
+            n
+        };
         let j = -(1.0 + e) * vn / (1.0 / M_CAR + 1.0 / m_ball);
-        ball.vel += n * (j / m_ball);
-        car.vel -= n * (j / M_CAR);
+        ball.vel += ni * (j / m_ball);
+        car.vel -= ni * (j / M_CAR);
 
         // carry assist: a ball riding on top of the car gets a whisper of
         // horizontal speed-matching, which is what makes hood dribbles and
         // nose-tip air carries balanceable ("match the ball's speed")
-        if n.y > 0.55 {
+        // ...but ONLY for dribble-speed contacts. On a power shot this was
+        // dragging the ball back toward the car's own speed every contact
+        // frame — the assist that makes carries balanceable was quietly
+        // capping every shot.
+        if n.y > 0.30 && -vn < 6.0 {
+            let w = 0.07 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
             let dvx = car.vel.x - ball.vel.x;
             let dvz = car.vel.z - ball.vel.z;
-            ball.vel.x += dvx * 0.16;
-            ball.vel.z += dvz * 0.16;
+            ball.vel.x += dvx * w;
+            ball.vel.z += dvz * w;
+            // CONTACT FRICTION — the missing piece. A ball resting on a
+            // moving surface is dragged by it: the contact point's velocity
+            // includes the car's YAW, so turning the car carries the ball
+            // around with you instead of leaving it behind. (Grounded yaw is
+            // applied straight to the rotation, so it lives in `omega`, not
+            // in `ang`.)
+            let rel_c = ball.vel - v_surf;
+            let tang = rel_c - n * rel_c.dot(n);
+            // FRICTION, not glue: killing 75% of the slip every frame welded
+            // the ball to the roof — no roll-off, no feathering, and any
+            // flick was absorbed before it could leave. A capped fraction
+            // lets the ball live on the hood while still being flickable.
+            // Real dribbling is PRECARIOUS: the ball must be able to roll
+            // off if you turn too hard or too long. Friction that held it
+            // through anything made carries a formality rather than a skill.
+            // GROUND dribbling is precarious — hold a turn too long and the ball
+            // rolls off, which is the skill. An AIR carry is a different move:
+            // the ball rides the nose through small touches, and stripping the
+            // grip there kills air dribbles outright (the bots lost two thirds
+            // of their air touches when this was one number for both).
+            let mu = if car.on_ground { 0.16 } else { 0.34 };
+            ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.8 } else { 1.5 });
+            // and the hood is dished, so the ball rolls back to the middle
+            let side = car.rot * Vec3::X;
+            let off = (ball.pos - car.pos).dot(side);
+            let reach = car.half_w.max(0.25) + ball.r;
+            let hold = (1.0 - (off.abs() / reach).clamp(0.0, 1.0)).powi(2);
+            // the dish is a HINT toward the centre line, not a magnet: it
+            // only bites near the sweet spot, so a ball already sliding off
+            // keeps going
+            ball.vel -= side * (off.signum() * off.abs().min(reach) * hold * 1.5 * w);
         }
 
         // the "psyonix impulse": extra push that scales with the hit, biased
         // horizontal so touches carry the ball forward instead of ballooning
-        let mut dir = ball.pos - car.pos;
-        dir.y *= 0.35;
-        // hits go where you're DRIVING: blend a slice of car velocity into
-        // the push direction so committed touches carry intent
-        let dir = (dir.normalize_or(n) + car.vel * 0.025).normalize_or(n);
+        // A SHOT SHOULD GO WHERE THE CAR POINTS. The contact normal off a
+        // box corner points diagonally, and blending raw car velocity in
+        // skewed it further — that combination is the "weird angles". The
+        // harder the hit, the more the push direction leaves the contact
+        // normal behind and follows the car's own heading; soft touches
+        // still use the true normal, which is what dribbles need.
+        let mut dir_n = ball.pos - car.pos;
+        dir_n.y *= 0.35;
+        let dir_n = dir_n.normalize_or(n);
+        let aim = {
+            let f = car.forward();
+            let flat = Vec3::new(f.x, f.y * 0.35, f.z).normalize_or(dir_n);
+            flat
+        };
+        let dir = dir_n.lerp(aim, 0.65 * soft).normalize_or(dir_n);
         let strength = (-vn).min(23.0) * 0.38 / cfg.ball.weight.sqrt();
         ball.vel += dir * strength;
-        ball.ang += n.cross(rel) * 0.35 / ball.r;
+        // SPIN: a gentle touch rolls the ball (dribbles need that), a hard
+        // hit drives THROUGH it. Spin used to scale up with the impact,
+        // which is what made shots knuckle off at odd angles.
+        let spin_w = 0.30 * (1.0 - soft);
+        ball.ang += n.cross(rel) * spin_w / ball.r;
+        ball.ang += car.omega * 0.12 * (1.0 - soft);
     }
 }

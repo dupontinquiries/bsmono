@@ -697,6 +697,588 @@ FIVE ARENAS (styles 25-29):
   different speeds and directions (Orbit anims lock position and
   orientation together) — the passages align, then they don't.
 
+## v1.27 — the flip law, open bores, a taller world
+
+FLIPS, REBUILT RL-STYLE. The dodge no longer applies a torque burst and
+hopes: input SNAPS to a cardinal (throttle dominant -> pitch axis, steer
+dominant -> roll axis, ties to pitch as in RL) and the orientation is
+SCRIPTED through exactly one 2-pi turn about that single body axis,
+eased out. Because the total is a full turn, a flip mathematically ends
+on the pose it began with — wheels-down starts land wheels-down, air
+starts finish at their entry attitude. Air roll layers on top without
+stealing from the flip. Cancel freezes the turn where it is.
+
+New `--sim flip` audits all eight input combos from ground and air,
+reporting chosen axis, degrees turned, orientation error at flip close,
+and landing up.y. Final numbers: 8/8 correct cardinal axis, 357-360
+degrees turned, error <= 1.0 deg (ground) and <= 1.9 deg (air), up.y
+1.00 everywhere. Two harness bugs found on the way: measuring after the
+settle (the landing snap, not flip drift) and spawning the air case
+mid-fall, where no dodge is legal because the car never touched ground.
+
+TUBES: the real reason joints were not smooth — meshgen::tube builds
+ANNULUS END CAPS, so while the CSG cutters opened the SDF, the raster
+kept drawing a solid ring at every mouth. That ring was the wall.
+`meshgen::tube_open` (no caps, plus a far-field LOD) now draws every
+chained/junction segment, each tube end gained a BEVEL COLLAR fillet
+torus in the blend group, and the smooth-union k went 2.2 -> 3.4 in
+both the physics SDF and the mirror marcher.
+
+SKY + OUTSKIRTS, every map: three altitude bands (26-48, 52-84, 88-132)
+of sky pads with launchers, aerial hoops, orbiting panels and floating
+islets with glow cores, plus a ring of distant landmarks at 320-520 m —
+spires, drive-through arches, stepped mesas with terrace pads, spinning
+ring gates, leaning beacon clusters. Density scales with the style;
+the LOD and distance culls absorb the cost.
+
+## v1.28 — the phone port
+
+Target: `Linux fp5-black 7.1.2 #1-postmarketos-qcom-sc7280 aarch64` — a
+Fairphone 5 (Snapdragon SC7280 / Adreno 644) on postmarketOS. A real
+Linux box with a real Vulkan driver, so it already BUILT; what it needed
+was a different game.
+
+DETECTION (src/platform.rs): `classify(version, host, model, arm)` is a
+pure function of the strings — /proc/version's build tag (postmarketOS,
+qcom-sc/sdm/msm), the device-tree model (Fairphone/PinePhone/Librem) and
+the hostname (fp*, *phone*, *pmos*), with aarch64 as a supporting signal.
+Being pure, the EXACT target device is proven headlessly in `--sim plat`
+without owning one: fp5-black classifies Handheld ("postmarketOS +
+mobile SoC + device name + aarch64"), an x86 workstation stays Desktop.
+`SKYDRIBBLE_MOBILE=1/0` and `--mobile` / `--desktop-ui` override.
+
+HANDHELD PRESET (first run only — a player's own tuning is never
+overwritten): quality 0.30 (AO off, short shadows, cheap reflections),
+reflections off, bloom capped, screen door off, vsync forced ON (Fifo:
+the monorepo's own Fairphone notes name compositor fighting as the
+stutter cause), camera pulled in, touch UI on, and RENDER SCALE 0.5.
+
+HALF RESOLUTION: the scene's MSAA, depth and HDR targets now size to
+`render_scale` while the surface stays native, so the composite pass
+upscales with its existing linear sampler — quarter the fragments for
+the expensive passes, crisp UI and text on top. A VIDEO slider exposes
+0.25-1.0 live for every platform.
+
+TOUCH (src/touch.rs on the vendored shared `touchkit` recognizer):
+a FLOATING virtual stick — it materializes wherever a thumb lands in the
+left 42%, dead-zoned, x=steer y=throttle (the WASD equivalent); fixed
+BOOST and JUMP pads bottom-right; a FLICK anywhere in the open area
+dodges in that direction (jump edge + cardinal input, which the v1.27
+flip law turns into a clean full rotation); TAP-TO-MOVE unprojects the
+touch through the inverse view-projection, marches the ray to the
+terrain and drives itself there, yielding the moment the stick moves;
+open-area drags steer the camera. In menus a touch simply IS a cursor
+move and a click, so every existing hover/click path works unchanged.
+HUD gained disc/ring primitives to draw it all.
+
+`--sim plat` proves the whole chain headlessly: device classification,
+preset application, stick math (up-left -> steer -0.66 / throttle
++0.66), both buttons with their press edge, swipe-right -> flick + jump
+edge, and drive-to steering. Verdict: PLATFORM+TOUCH: PASS.
+
+## v1.29 — gyro drive
+
+Ported from the monorepo's gyro-ball prototype (games/gyroball:
+`sensor_daemon/tilt_sensor_sysfs.c` plus the reader in `v15.py`) and
+reshaped for driving instead of a tilt maze — the sensor-controls plan's
+step 3 ("wire sensor controls into each game's input"), for skydribble.
+
+THREE SOURCES, auto-detected in order, all feeding one normalized
+vector: (1) IIO sysfs read NATIVELY — the C daemon's glob discovery and
+`_scale` handling rewritten in Rust, preferring a real gyroscope
+(`in_anglvel_*`) over the accelerometer, sampled at 50 Hz, no daemon and
+no pipe needed; (2) the daemon protocol on stdin — `TILT_SENSOR_V1` then
+`ACCEL x y z`, so `./tilt_sensor | skydribble` still works; (3)
+`monitor-sensor --accel` spawned as a last resort, whose coarse change
+events become decaying impulses exactly as in the prototype. The reader
+runs on its own thread behind a channel, so a stalled or absent sensor
+can never block a frame.
+
+THE DRIVING MODEL: calibrate (hold still two seconds; the average
+becomes the neutral bias — this is what kills gyro drift) -> sensitivity
+-> deadzone with re-normalized response -> clamp -> exponential smooth
+with a settle time in seconds. On the ground, tilt STEERS. In the air it
+is flick aim: mode 0 rolls and pitches, mode 1 yaws and pitches. An
+activation gate runs it always, only while boosting, or only airborne.
+Gyro ADDS to the sticks rather than replacing them, so keyboard, pad and
+phone can all be live at once.
+
+Menu (all saved): GYRO DRIVE, SENSITIVITY, DEADZONE, SMOOTHING, AIR
+MODE, WHEN, INVERT TILT, INVERT PITCH. Toggling it on spins up the
+reader and recalibrates.
+
+`--sim gyro` verifies the whole stack headless in 12 checks: protocol
+and fallback parsing, calibration removing a biased-at-rest device,
+motion passing the deadzone, jitter not passing it, sensitivity scaling
+with a clamped output, all three drive mappings, a closed gate emitting
+nothing, and impulse kicks decaying to rest. All pass.
+
+## v1.30 — menus you can touch
+
+Touch reached the menus as a synthesized mouse click: a finger-down was
+a left click, so any drag fired whatever it passed over, sliders could
+only be tapped (never scrubbed), and the PAUSE screen was pure keyboard
+(ESC/ENTER/G/O/Q) — unusable on a phone, which is where touch lives.
+
+A real gesture model now sits in front of the menus. FINGER DOWN
+selects the row under it and grabs a slider immediately (with a fat
+finger band, +-0.10 clip units around the bar, so the target is bigger
+than a mouse would need). FINGER MOVE scrubs a grabbed slider
+continuously, snapped to that row's own step so touch lands on real
+values, or slides the highlight along the list once past a 0.02
+threshold. FINGER UP activates only if it was a TAP (movement under
+0.03, no scrub) — which is what keeps scrolling from firing buttons —
+and a downward FLICK (0.25 down, under 0.25 sideways) backs out of the
+menu, the gesture equivalent of Escape.
+
+The pause screen gained five real buttons — RESUME, SETTINGS, MAPS,
+ONLINE, QUIT — centred, hover-lit, tappable, and equally clickable with
+a mouse.
+
+`--sim touch` verifies the layout math headless in 14 checks: row
+hit-testing at the top, middle and both out-of-range ends, a sweep
+proving every row is reachable (no dead gaps a finger can fall into),
+slider mapping at both ends and the middle plus clamping, the fat-finger
+band, all five pause buttons hitting their own index, misses above and
+below the button row, and the row being both centred and on-screen.
+
+## v1.31 — the power shot, measured
+
+New `--sim shot`: drive into a resting ball at a held approach speed on
+open ground, then report exit speed, LOFT, and distance travelled along
+the shot line at 1 s and 3 s. (Two harness lies had to go first: the
+boxed arena let a wall rebound masquerade as travel, and a straight-line
+distance counted a returning ball as progress.)
+
+Baseline said the complaint out loud — an 11.5 m/s shot went 12.8 m in
+its first second and only 3.3 m in the next two — and the trace named
+two causes, neither of which was the one I expected:
+
+1. THE SHOT BALLOONED. A car meets a grounded ball from below-behind, so
+   the contact normal points steeply up: exit velocity was 6.7 m/s
+   VERTICAL out of 14. Hard hits now drive THROUGH — the impulse normal
+   flattens toward horizontal in proportion to hit strength, while soft
+   touches keep the true normal so carries are untouched.
+2. BOUNCES SCRUBBED 29% of tangential speed (0.714), so any driven ball
+   died on its first landing. Now 0.88.
+3. THE CARRY ASSIST WAS CAPPING SHOTS. The 16%-per-frame speed match
+   that makes hood dribbles balanceable applied to EVERY contact,
+   dragging the ball back toward the car's own speed on power shots. It
+   now fades out with closing speed and stops entirely above 6 m/s.
+
+Result at 3 s: 16.4 -> 20.1 m (8 m/s), 40 -> 44.1 m (14 m/s), 67.5 ->
+71.9 m (22 m/s), with loft roughly halved throughout.
+
+ROLLING FRICTION, the negative result worth keeping: it was the obvious
+suspect (1.8/s bleeds ~83% of a roll per second) but the sim measured
+IDENTICAL travel from 0.42 to 1.8 — a driven ball spends those seconds
+airborne. Dropping it to 0.42 did break something else: the bots' air
+dribble collapsed (air1 style 33 -> 10 over eight trials) because a ball
+that never settles never gets popped. Restored at 1.5, where air1 scores
+5/8 goals and style 29.7 while shots keep every metre.
+
+FLIPS: too quick and too linear. Duration 0.62 -> 0.78 s and the ease-out
+went from quadratic to a much stronger falloff, so a flip snaps away and
+then visibly settles into its landing. Still exact: 360 degrees, error
+<= 1.7, wheels down.
+
+LAND ASSIST now ships OFF. The landing matrix's default block is the
+assist=OFF column: 45-degree poses upright in 1.37-1.59 s, roof 2.45 s,
+flip back in 0.88-1.54 s.
+
+## v1.32 — deep space gets dangerous
+
+THE PHYSICS QUESTION (centroid vs surface sampling): centroid gravity is
+EXACT for a sphere — Newton's shell theorem — so sampling buys nothing
+on a clean planet. It is wrong exactly where this map is interesting:
+carved throughways, ring decks, overhangs. Gravity is hybrid now. Far
+field: centroid, as before. NEAR field (within 6 m of a surface, on
+nodes flagged `surf`): blend toward the negated SDF GRADIENT — a free,
+exact surface normal we already compute — so "down" points into the deck
+you are actually on, whether that is the outside of a world, the inside
+of a bored tunnel, or the banked face of a ring. That is the
+surface-sampling intuition without the sampling.
+
+GRADED GRAVITY: GravNode gained a strength multiplier scaled ~r^1.6, so
+giants feel heavy without becoming traps (0.6x to 4.2x). Surface stick
+scales with it too, up to 3.2x — heavy worlds hold you through the curve
+instead of letting you drift off the horizon.
+
+PLANETS ARE BODIES: mini worlds, two roaming moons and every asteroid
+are free bodies that fall in each other's fields, collide and bounce —
+vertical billiards. Sizes run dwarf / mid / GIANT (26-38 m) spread
+through a 22-190 m altitude band instead of a disc, and ring worlds
+carry WIDE drivable rings (tube radius 2.6-5.5 m, in the fillet group,
+slowly spinning) with their own surface-following gravity node.
+
+SKY EVENTS, both on five-minute clocks: a heavy world COLLAPSES for
+fifteen seconds — its field overrides everything within six radii and
+hauls car, ball and worlds inward — then DETONATES, throwing everything
+outward with a 1/d shockwave and shaking the camera; and a NEW WORLD
+falls in from 300 m up at 46 m/s to break the field like a cue ball.
+Both announce themselves.
+
+`--sim kuiper` verifies all of it headless in ten checks: giants
+outpulling dwarfs (4.20 vs 0.60) with the far field relaxing to 1.0,
+gravity pointing sideways INTO a world from beside it, planet-planet
+momentum transfer (struck world at 16.7 m/s), the collapse dragging a
+ball inward, the detonation firing and throwing it at 11 m/s, the
+shockwave falling off with distance (38.7 m/s at 14 m vs 2.7 at 140 m),
+and arrivals landing high and falling. The harness caught its own bug
+first: it stepped physics without World::update, so the collapse timer
+never ran — the game calls both each frame, so the sim must too.
+
+## v1.33.0 — menus that breathe
+
+The crowding had a structural cause, not a cosmetic one: row height was
+`1.44 / n` — rows SHRANK TO FIT, so every setting added made every menu
+tighter, and text that stayed legible in a 10-row menu was crammed in a
+25-row one. Four standards applied:
+
+1. FIXED ROW HEIGHT + SCROLLING VIEWPORT. Rows are a constant 0.062
+   (bindings 0.049 -> 0.058), comfortably finger-sized, and long lists
+   scroll rather than compress. Scrolling keeps a row of context at each
+   edge, never jumps backwards, never scrolls past the end, and shows a
+   scrollbar plus an "n-m OF total" counter. Hit-testing follows the
+   viewport, so touch and mouse land on the right ABSOLUTE row.
+2. A TYPE SCALE, one ladder for every menu: title 0.0138, body 0.0082,
+   section 0.0074, hint 0.0068 — each step about 1.25x the last, and the
+   body size deliberately smaller than before. Dense screens read better
+   with air around modest text than with big text crammed together.
+3. AN ALIGNMENT GRID. Labels share one left edge, values share one right
+   edge, the action caret sits OUTSIDE the label column (so text no
+   longer shifts as the selection moves), and the slider bar keeps its
+   own fixed column, drawn under the selected row only.
+4. PROGRESSIVE DISCLOSURE. CAR SETUP had swollen to 25 rows — a full
+   screen — so the eight gyro rows moved to their own MOTION / GYRO
+   screen behind a link. Every settings page now fits without scrolling
+   (longest is 0.8 of a screen); scrolling remains for the genuinely
+   long lists, maps (30) and bindings.
+
+`--sim touch` grew to 23 checks plus a density report that prints every
+menu's row count and page depth and fails if any page exceeds two
+screens — so this cannot silently regress the next time a feature adds
+rows.
+
+## v1.34 — hex tiles and spawns that land
+
+UNPLAYABLE SPAWNS, fixed for every map. `Car::reset` placed the car at
+the TERRAIN height, so any map whose play space sits above or below the
+terrain buried it — DROPSHOT spawned inside its own catch basin, under
+the deck. First attempt (probe DOWN from the sky) was worse in a
+different way: it found ROOFS, parking the car on BOXBOWL's glass lid
+and GATEWORKS' goal lintel (tilted, up.y 0.60). The rule that actually
+works rises from the terrain to the first spot that is both clear and
+has HEADROOM (1, 2 and 3 m above all free) — which is the inside of an
+arena by construction — plus an explicit deck hint for maps whose play
+surface is raised. Bot lineups spawn through the same call.
+
+New `--sim spawn` audits all 30 maps, reporting spawn height, clearance,
+whether the car settles, and its final up.y: SPAWNS PASS, with BOXBOWL
+now starting inside the box (1.24) and DROPSHOT on its deck (6.79).
+
+HEX DROPSHOT: the deck is hexagons now — a new `Sdf::Hex` (exact
+hexagonal-prism distance, folded into one sextant) in the physics SDF,
+kind 6 in the mirror marcher, and a `meshgen::hex_prism` for the raster,
+laid out on a proper staggered flat-top grid. The look is muted base
+plus ENERGIZED FILL: each tile is a dark, low-spec hex with an inset
+panel that carries no collision and exists purely to light up —
+emissive rises from 0.12 to 1.0 as the tile takes damage, so a fresh
+deck reads dormant and a worn one glows along its seams. Healed tiles go
+dormant again.
+
+## v1.35.0 — loops are one piece
+
+"The loops render as hollow disk segments" was a bug, and the pipe
+joining code was exactly where it lived. A full loop was built by `arc`
+as 27 short straight shells — and TWO of my own earlier changes made
+that chain fall apart visually:
+
+- v1.18 put a cutter sphere at every internal elbow to "open the seam".
+  Once tubes were capped that was reasonable; it is not a seam-opener at
+  all, it is a hole punched clean through the pipe wall at every joint.
+- v1.27 removed the tube end caps so junction mouths would stop being
+  walls. Correct for mouths — but it also opened every ELBOW, so at each
+  of the 27 joints you now looked straight into the hollow interior. The
+  open ring ends read exactly as "hollow disk segments".
+
+Fixed at the level the geometry deserved rather than by patching the
+chain: a new `Sdf::TubeTorus` (hollow torus — `abs(torus) - thick`) with
+a matching `meshgen::torus_tube` that sweeps an outer skin and an inner
+bore, plus shader kind 9 for reflections. A full loop is now ONE
+seamless shape with no joints anywhere, at a ring radius derived from
+the bore so the baked mesh ratio always matches. The elbow cutters are
+gone from every chain (they were perforating the S-bends and swoops
+too), and remaining chained segments overlap 0.62 -> 0.78 so bends read
+as one pipe.
+
+Perplexus went 871 -> 654 shapes: two 27-piece chains and their 52
+cutters became two shapes.
+
+New `--sim loop` proves it per loop: one shape (a chain would be ~27),
+own-surface ripple sampled at 288 angles (0.00001 — float noise), zero
+holes in the wall top and bottom, and only 6-16% of the ring merged
+into the entry run, which is the intended junction. All four loops
+across both maps: SEAMLESS.
+
+## v1.36.0 — the flip curve, and planets that never settle
+
+FLIPS: "too quick, then corrected, jumpy, stops instantly" was all one
+curve. Profiled decile by decile, the v1.31 easing put 30% of the whole
+turn into the first 10% of the time (~1100 deg/s — the lunge), 90% into
+the first half, and left the last 40% covering 5% (the apparent freeze),
+after which the exact close-out snapped the remainder (the correction).
+Over-correction on my part: the previous complaint was that the falloff
+was too weak, and I swung far past even.
+
+The new profile is a blend of a smoothstep and a mild ease-out:
+10-11-12-13-14-12-11-9-6-2 per decile. It starts decisively without
+snapping, peaks at 14% (half the old spike), and is STILL turning at the
+end instead of asymptoting into a stop. Duration went 0.78 -> 0.76 s
+after a sweep found the real source of the "correction": at 0.86 s a
+side flip OUTLASTS the airtime, so the ground truncated it at 329
+degrees and the landing snap finished the job. At 0.76 flips complete in
+the air — 360 degrees, 0.0 error, with the worst case (side flips) at
+353 and 2.8. `--sim flip` now prints the rotation profile every run, so
+the shape of a flip is a measured thing from here on.
+
+KUIPER DRIFTERS: five planets that fall, SQUASH flat against whatever
+they land on, and spring back with 98.5% of what they arrived with —
+the DVD screensaver, in three dimensions. The squash is a damped
+oscillation flattening along the impact normal with a sideways bulge, so
+they wobble back out through round rather than popping. Their gravity
+wells travel with them (GravNode.follow), so you can chase one down and
+land on it mid-flight. The anchored worlds stay put: their carved
+throughways and ring decks are static geometry that cannot follow.
+
+New `--sim planets`: 5 drifters, 12 bounces in 40 s, peak squash 42%,
+returns to round, and still moving at 13.8 m/s at the end — it never
+settles, which is the whole point.
+
+## v1.37.0 — swiss cheese, ring roads, open bores
+
+WHY THE TUBES WERE STILL HARD TO DRIVE — three causes, all measured by
+a new bore survey that walks every drivable route and reports the free
+radius at the axis (p10, median, share of tight spots):
+
+1. DECORATION WAS COLLISION. Monkey Run's vine lines run through the
+   treetops, and the canopy spheres were SOLID — foliage was choking the
+   bore (p10 0.72 m, under the ~1.05 m a car needs). The glowing guide
+   hoops inside big pipes and the bevel collars at every mouth were
+   solid too: fittings pinching the passage they decorate. All three
+   now draw without colliding.
+2. CROSSING PIPES LEAVE WALLS IN EACH OTHER'S BORE. A union keeps both
+   hulls, so every place two hollow pipes meet has a wall across the
+   passage. Rather than hand-carve each junction, a ROUTE CLEARANCE PASS
+   now walks every route at generation, and wherever the free radius is
+   under what that pipe promises, it carves an opening (deduped, so
+   overlapping samples share one hole).
+3. THE FILLET RADIUS ATE THE BORE. Smooth-union at k=3.4 narrows a pipe
+   interior by up to ~0.85 m. Shape-to-shape blending is now 1.8, and
+   blending into the TERRAIN is 0.8.
+
+Result: PERPLEXUS p10 1.11 -> 2.86 m and tight spots 18% -> 1%;
+MONKEY RUN p10 0.72 -> 3.45 m, median 3.71 -> 8.36, tight 26% -> 0%.
+Loop routes also went from 12 waypoints to 28: at 12 the straight CHORD
+between neighbours sagged out through the pipe wall, and the clearance
+pass then carved the loop open trying to serve a route that was never
+inside it.
+
+RINGS YOU CAN DRIVE. Kuiper's planetary rings were fat tori — a round
+donut has no flat surface, which is exactly why they were not drivable.
+New `Sdf::RingDeck` (flat annulus slab) with a matching
+`meshgen::ring_deck` and shader kind 10: a banked track around the
+world with lip rails at both edges to catch a drift. Verified in the
+sim by parking a car on one — 234/240 frames grounded, stayed on.
+
+SWISS CHEESE. 12 worlds -> 18, and each is a warren: two to four bores
+on different axes, offset so they cross INSIDE the rock (the
+intersections make junction caverns for free), every mouth flared into
+a funnel, and two to nine blind pockets pitting the surface between
+them.
+
+GENERAL FILLETS. The blend group was pipes only; it now covers all
+built form — boxes, capsules, ramps, decks, rings and pipes — so ramps
+meet the ground and platforms meet pillars with the same blended
+transition the tubes have. Spheres stay hard-edged, so worlds and the
+ball keep their silhouette.
+
+## v1.38.0 — dribbling is a mapping, not a wrestle
+
+New `--sim dribble`: ball on the hood, a fixed steering input, and three
+numbers — the yaw the stick COMMANDED, the yaw actually delivered, and
+any pitch/roll rate nobody asked for — plus how long the ball rides and
+how much of the run was even on the ground.
+
+Two real faults, and one of my own test premises:
+
+1. A GROUNDED CAR HAD FREE ROTATION. Pitch and roll rates were merely
+   DAMPED while driving (12.5% a frame), so leftover spin from a landing
+   or a bump kept turning the car for a quarter second, fighting the
+   surface align and stealing commanded yaw. A grounded car's
+   orientation now comes from exactly two things, as in Rocket League:
+   the surface it sits on, and your steering. `ang` is cleared outright.
+2. NOTHING DRAGGED THE BALL AROUND A TURN. The hood had no tangential
+   friction, so a carried ball was simply left behind the moment the car
+   rotated — it separated rather than rolling off. Contact friction now
+   uses the contact POINT's velocity, which includes the car's yaw (that
+   yaw is applied straight to the rotation, so it never appeared in
+   `ang`; the car now publishes a world-space `omega` for exactly this).
+   A dished-hood centring nudge rides on top of it.
+3. My "flat ground" test was a rolling plain — the car was launching off
+   a HILL at 14 m/s, which is what made a hard turn look like it lost
+   half its steering. On genuinely flat ground the mapping was already
+   exact.
+
+Result: every case now delivers the commanded yaw exactly (-1.24 ->
+-1.24, -2.05 -> -2.07), stray rotation 0.00, grounded 100% of the run.
+Ball carried through a steady turn 30% -> 68% of the run, and through a
+turn after landing 31% -> 60%, under a FIXED input with no corrective
+driving at all.
+
+Landings also plant instead of springing (rebound damping 9 -> 19) —
+you cannot dribble on a trampoline.
+
+The bots inherited all of it: air1 air touches 0.4 -> 22.5 and style
+10.5 -> 36.5, pass2 style ~44 -> 136.8. They could always reach the
+ball; now they can carry it. Power shots, flips, landings, loops and
+bores all regress unchanged.
+
+## v1.39.0 — flicks exist now
+
+THE FLICK BUG, in three layers, each hiding the next:
+
+1. THE HITBOX WAS A CAPSULE. Round on top, so a ball resting on the car
+   had about eight centimetres of contact before it separated. Rocket
+   League flicks come from a BOXY hull whose nose and roof corner sweep
+   up into the ball. The contact test is now the closest point on an
+   oriented box.
+2. THE IMPULSE IGNORED ROTATION. The collision used `car.vel` — pure
+   linear velocity — so a flipping car imparted nothing but its travel
+   speed. The patch under the ball actually moves at v + omega x r, and
+   that swinging hood IS the flick. Both the impulse and the push
+   direction now use the true surface velocity, and the hood's spin
+   transfers to the ball as well.
+3. OMEGA WAS MEASURED IN THE WRONG PLACE. `omega = rot * ang` misses a
+   SCRIPTED flip entirely, because the flip drives the quaternion and
+   leaves `ang` at zero — and the measurement I added sat inside an
+   `if ang != 0` guard, so during the exact manoeuvre that throws the
+   ball it never ran and omega read stale (1.9 rad/s instead of ~8).
+   It is now measured from the frame's quaternion delta,
+   unconditionally, which covers steering, tumbling and scripted flips
+   alike.
+
+THE STICKY DRIBBLE: contact friction was killing 75% of the ball's slip
+every frame — that welds it to the roof, kills roll-off and feathering,
+and swallows any flick before it can leave. Now a capped 30%, the
+speed-match assist is 10% (was 16%), and the hood dish is gentler.
+
+`--sim flick` balances the ball on the nose at driving speed, then runs
+seven real input sequences and reports exit speed, height, elevation,
+gain, contacts during the flip, and what the analyzer calls it:
+
+  FORWARD     19.6 m/s  +7.6 up  23 deg  189%   BIG
+  45-DEGREE   19.6      +7.6     23      189%   BIG
+  DELAYED     20.1      +7.1     21      194%   BIG  (POWER FLICK)
+  TORNADO     17.8      +6.4     21      172%   works
+  MUSTY       11.8      +5.8     30      114%   lofted, not yet powerful
+  SIDEWAYS    12.1      +3.6     17      117%
+  BREEZI      11.6      +5.4     28      111%
+
+Forward, 45-degree, delayed and tornado flicks are now genuinely
+game-worthy. The musty gets its steep shape but not its power yet, and
+the sideways flick needs the ball off-centre to whip properly — both
+are honest gaps, both now measurable.
+
+THE STYLE ANALYZER (`src/style.rs`) watches the event stream and names
+plays: FLICK, POWER FLICK, MUSTY FLICK, CEILING FLICK, AIR DRIBBLE,
+AIR DRIBBLE SHOT, AIR CONTROL, DRIBBLE, WALL SHOT, RESET SHOT, PINCH,
+FLIP RESET, AERIAL, SUPERSONIC HIT and GOAL, each scored and multiplied
+by a combo that compounds while tricks are chained inside a three
+second window. It judges a launch against the BALL's carried speed
+rather than the car's (a backflip slows the car, which made the weakest
+flick look like the strongest), and it reads shape as well as
+magnitude, so a steep lofted launch is a musty and a flat fast one is a
+power flick. Awards toast in-game and print in the sim.
+
+## v1.40.0 — the menus go mobile
+
+Three blockers, all of them the difference between "playable on a phone"
+and not.
+
+1. LOW GRAPHICS NEVER APPLIED. The handheld profile — no ray marching,
+   half render scale, Fifo vsync, touch on — was only applied when NO
+   SAVE FILE EXISTED. Any phone that had ever launched the game, or any
+   save copied onto one, kept desktop graphics forever. The save now
+   records which hardware profile it was tuned for and re-tunes whenever
+   that changes. On top of that, a GRAPHICS PRESET row (AUTO / LOW /
+   MEDIUM / HIGH) sets rays, ray quality, render scale, bloom and vsync
+   in one tap, so any device can be forced down by hand.
+2. NO DRAG TO SCROLL. Dragging moved the SELECTION, which scrolled the
+   list only as a side effect. Now the content follows the finger
+   directly — one row per row-height of travel — with a fling that keeps
+   the list moving after you let go and settles under damping. The
+   selection is left alone while scrolling, because that is what a tap is
+   for. Keyboard navigation keeps its own behaviour: the viewport follows
+   the selection.
+3. NO WAY INTO THE SUBMENUS. Reaching MAPS or VIDEO meant a keyboard
+   shortcut or walking the tree. Every menu now carries a NAV STRIP —
+   BACK, SETUP, CONTROLS, MAPS, VIDEO, ONLINE — as real tappable buttons
+   with hover and current-screen states, sitting below the list viewport
+   so a nav tap can never also hit a row.
+
+`--sim touch` grew to 28 checks: every nav button hitting its own index,
+the strip centred, on screen and clear of the viewport, nav taps missing
+rows through the real hit path, LOW genuinely cheaper than HIGH, and the
+handheld profile forcing low graphics and touch from any starting
+config.
+
+## v1.41.0 — worlds that pull, mirrors that look like cars
+
+KUIPER GRAVITY WAS BACKWARDS. Planets were flagged `tube: true`, and for
+a tube "down" points OUTWARD from the axis — right inside a pipe, exactly
+wrong on a world, so every planet pushed you away. GravNode gained a real
+`inward` flag: tubes push out, worlds pull in. Strength came down too
+(r^1.6 clamped to 4.2x -> r^1.3 clamped to 1.6x): giants still feel heavy
+without swallowing a car that drifts past. `--sim loop` now checks the
+sign directly — dot(down, toward centre) reads 0.99, attractive.
+
+DRIBBLING WAS GLUE. Contact friction killed so much slip that the ball
+could not fall off. Ground grip is now 0.16 (capped at 0.8 m/s) and the
+dished-hood nudge more than halved, so holding a turn too long loses the
+ball — the skill is back. Air carries keep their grip (0.34) because an
+air dribble is a different move and stripping it there kills air
+dribbles outright. Ground dribble through a steady turn: 100% -> 75% of
+the run; through a hard turn 64% -> 42%; straight-line carries still
+hold 100%.
+
+WEIRD SHOT ANGLES. The push direction came off the CONTACT NORMAL, which
+points diagonally off a box corner, with raw car velocity blended in on
+top. Now the harder the hit, the more the push follows the car's own
+heading instead — a shot goes where you point. Spin was scaling UP with
+impact; it now scales DOWN (soft touches roll the ball for dribbles,
+hard hits drive through), which is what stops shots knuckling.
+
+PERPLEXUS TUBES. Overlapping shells put each other's INNER wall across
+the bore, and the clearance pass only opens what it knows you drive —
+the lattice links were never registered as routes, so every crossing
+kept its blocker. Links are routes now, and elbow seams are carved again
+at 0.96r: wider than the inner surface (0.935r), well inside the outer
+(1.005r), so the blocker goes and the pipe skin stays. Bore p10 2.86 ->
+3.73 m, median 5.17 -> 7.10, tight spots 0%. And it goes SKY-HIGH: 20
+anchors -> 32 across three altitude tiers (top tier 110-190 m), four
+links each, reach 105 m — 94 drivable routes in all.
+
+THE MIRROR BUBBLE. The baked car field was distance-to-a-point-cloud,
+which is a hollow SHELL: reflection rays passed straight through the car
+and fell back on its bounding box — the bubble. The bake is SIGNED now,
+using each cloud point's outward normal, over a denser cloud (520 ->
+2600 points) and a finer atlas (28x18x32 -> 36x24x44), with a
+grid-accelerated nearest lookup so it stays instant at load. New
+`--sim carsdf` measures the baked silhouette: 0.31 / 0.29 / 0.62 against
+a model of 0.32 / 0.31 / 0.64 — longer than wide, flatter than long,
+within 3 cm.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -53,6 +53,111 @@ pub fn merge(into: &mut MeshData, other: &MeshData) {
 /// Hollow tube: outer + inner cylinder walls and annulus end caps. Unit
 /// outer radius 1, inner 0.9, y in [-1, 1] — scale (R, H, R) at push and you
 /// can drive on the INSIDE (matched by Sdf::Shell in world + shader kind 5).
+/// A hollow TORUS — a pipe bent into a closed ring, with an inner surface
+/// you can drive on. Unit major radius 1, tube radius `TT_R`, wall `TT_T`
+/// baked in (like the other torus meshes), so a loop is ONE smooth shape
+/// instead of a chain of straight segments with a seam at every elbow.
+pub const TT_R: f32 = 0.45;
+pub const TT_T: f32 = 0.045;
+
+/// A flat RING DECK — an annulus band with a top, a bottom and two rims.
+/// Unit outer radius 1; the bore is `RD_IN` of it and the slab is `RD_H`
+/// half-thick, so a planetary ring is a road instead of a wire.
+pub const RD_IN: f32 = 0.62;
+pub const RD_H: f32 = 0.055;
+
+pub fn ring_deck(seg: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let n = seg.max(24);
+    let mut band = |r0: f32, r1: f32, y: f32, up: bool| {
+        let base = m.verts.len() as u32;
+        let nrm = [0.0, if up { 1.0 } else { -1.0 }, 0.0];
+        for i in 0..=n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (c, sn) = (a.cos(), a.sin());
+            for r in [r0, r1] {
+                m.verts.push(Vertex { pos: [c * r, y, sn * r], nrm, uv: [i as f32 / n as f32, if r == r0 { 0.0 } else { 1.0 }] });
+            }
+        }
+        for i in 0..n {
+            let k = base + i * 2;
+            let (a, b, c2, d) = (k, k + 1, k + 2, k + 3);
+            if up {
+                m.idx.extend_from_slice(&[a, c2, b, b, c2, d]);
+            } else {
+                m.idx.extend_from_slice(&[a, b, c2, b, d, c2]);
+            }
+        }
+    };
+    band(RD_IN, 1.0, RD_H, true);   // the road
+    band(RD_IN, 1.0, -RD_H, false); // underside
+    let mut rim = |r: f32, outward: bool| {
+        let base = m.verts.len() as u32;
+        for i in 0..=n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (c, sn) = (a.cos(), a.sin());
+            let nrm = if outward { [c, 0.0, sn] } else { [-c, 0.0, -sn] };
+            for y in [-RD_H, RD_H] {
+                m.verts.push(Vertex { pos: [c * r, y, sn * r], nrm, uv: [i as f32 / n as f32, y * 0.5 + 0.5] });
+            }
+        }
+        for i in 0..n {
+            let k = base + i * 2;
+            let (a, b, c2, d) = (k, k + 1, k + 2, k + 3);
+            if outward {
+                m.idx.extend_from_slice(&[a, b, c2, b, d, c2]);
+            } else {
+                m.idx.extend_from_slice(&[a, c2, b, b, c2, d]);
+            }
+        }
+    };
+    rim(1.0, true);
+    rim(RD_IN, false);
+    m
+}
+
+pub fn torus_tube(maj: u32, min: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let (nm, nn) = (maj.max(16), min.max(8));
+    let mut surface = |tr: f32, inward: bool| {
+        let base = m.verts.len() as u32;
+        for i in 0..=nm {
+            let u = i as f32 / nm as f32 * std::f32::consts::TAU;
+            let (cu, su) = (u.cos(), u.sin());
+            for j in 0..=nn {
+                let v = j as f32 / nn as f32 * std::f32::consts::TAU;
+                let (cv, sv) = (v.cos(), v.sin());
+                // ring centre at (cu, 0, su); the minor circle sweeps it
+                let px = cu * (1.0 + tr * cv);
+                let py = tr * sv;
+                let pz = su * (1.0 + tr * cv);
+                let n = [cu * cv, sv, su * cv];
+                let nrm = if inward { [-n[0], -n[1], -n[2]] } else { n };
+                m.verts.push(Vertex {
+                    pos: [px, py, pz],
+                    nrm,
+                    uv: [i as f32 / nm as f32, j as f32 / nn as f32],
+                });
+            }
+        }
+        let stride = nn + 1;
+        for i in 0..nm {
+            for j in 0..nn {
+                let k = base + i * stride + j;
+                let (a, b, c, d) = (k, k + 1, k + stride, k + stride + 1);
+                if inward {
+                    m.idx.extend_from_slice(&[a, c, b, b, c, d]);
+                } else {
+                    m.idx.extend_from_slice(&[a, b, c, b, d, c]);
+                }
+            }
+        }
+    };
+    surface(TT_R + TT_T, false); // outer skin
+    surface(TT_R - TT_T, true);  // the bore you drive
+    m
+}
+
 pub fn tube(seg: u32) -> MeshData {
     let mut m = MeshData::new();
     let n = seg.max(8);
@@ -99,6 +204,78 @@ pub fn tube(seg: u32) -> MeshData {
             }
         }
     }
+    m
+}
+
+/// Tube WITHOUT annulus end caps: at a carved junction the cap ring is
+/// the visible wall you drive into — the SDF is open but the raster was
+/// not. Chained/junction segments use this.
+/// A flat-top hexagonal prism, circumradius 1 in XZ, half-height 1 in Y —
+/// the DROPSHOT tile. Scale gives the real dimensions.
+pub fn hex_prism() -> MeshData {
+    let mut m = MeshData { verts: Vec::new(), idx: Vec::new() };
+    let ang = |k: usize| std::f32::consts::TAU * (k as f32) / 6.0;
+    let pts: Vec<(f32, f32)> = (0..6).map(|k| (ang(k).cos(), ang(k).sin())).collect();
+    // top and bottom faces
+    for (sign, ny) in [(1.0f32, 1.0f32), (-1.0, -1.0)] {
+        let base = m.verts.len() as u32;
+        m.verts.push(Vertex { pos: [0.0, sign, 0.0], nrm: [0.0, ny, 0.0], uv: [0.5, 0.5] });
+        for &(x, z) in &pts {
+            m.verts.push(Vertex { pos: [x, sign, z], nrm: [0.0, ny, 0.0], uv: [x * 0.5 + 0.5, z * 0.5 + 0.5] });
+        }
+        for k in 0..6u32 {
+            let (a, b) = (base + 1 + k, base + 1 + (k + 1) % 6);
+            if sign > 0.0 {
+                m.idx.extend_from_slice(&[base, a, b]);
+            } else {
+                m.idx.extend_from_slice(&[base, b, a]);
+            }
+        }
+    }
+    // sides
+    for k in 0..6usize {
+        let (x0, z0) = pts[k];
+        let (x1, z1) = pts[(k + 1) % 6];
+        let nx = (x0 + x1) * 0.5;
+        let nz = (z0 + z1) * 0.5;
+        let l = (nx * nx + nz * nz).sqrt().max(1e-5);
+        let n = [nx / l, 0.0, nz / l];
+        let b = m.verts.len() as u32;
+        m.verts.push(Vertex { pos: [x0, 1.0, z0], nrm: n, uv: [0.0, 0.0] });
+        m.verts.push(Vertex { pos: [x1, 1.0, z1], nrm: n, uv: [1.0, 0.0] });
+        m.verts.push(Vertex { pos: [x1, -1.0, z1], nrm: n, uv: [1.0, 1.0] });
+        m.verts.push(Vertex { pos: [x0, -1.0, z0], nrm: n, uv: [0.0, 1.0] });
+        m.idx.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+    }
+    m
+}
+
+pub fn tube_open(seg: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let n = seg.max(8);
+    let (ro, ri) = (1.0f32, 0.9f32);
+    let mut ring = |r: f32, inward: bool| {
+        let base = m.verts.len() as u32;
+        for i in 0..=n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (c, sn) = (a.cos(), a.sin());
+            let nrm = if inward { [-c, 0.0, -sn] } else { [c, 0.0, sn] };
+            for y in [-1.0f32, 1.0] {
+                m.verts.push(Vertex { pos: [c * r, y, sn * r], nrm, uv: [i as f32 / n as f32, y * 0.5 + 0.5] });
+            }
+        }
+        for i in 0..n {
+            let k = base + i * 2;
+            let (a, b, c2, d) = (k, k + 1, k + 2, k + 3);
+            if inward {
+                m.idx.extend_from_slice(&[a, c2, b, b, c2, d]);
+            } else {
+                m.idx.extend_from_slice(&[a, b, c2, b, d, c2]);
+            }
+        }
+    };
+    ring(ro, false);
+    ring(ri, true);
     m
 }
 

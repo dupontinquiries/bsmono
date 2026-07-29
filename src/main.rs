@@ -8,17 +8,21 @@ mod config;
 mod font;
 mod fx;
 mod gamepad;
+mod gyro;
 mod hud;
 mod input;
 mod meshgen;
 mod model;
 mod net;
 mod physics;
+mod platform;
 mod procars;
 mod render;
+mod style;
 mod save;
 mod sim;
 mod sound;
+mod touch;
 mod world;
 
 use std::collections::HashSet;
@@ -80,8 +84,18 @@ enum Row {
     Back,
 }
 
+/// Which nav-strip button is "here" for a settings screen.
+fn nav_here(menu: u8) -> usize {
+    match menu {
+        5 => 4,       // VIDEO
+        3 | 4 | 7 => 1, // CAR SETUP / FLIPS / MOTION live under SETUP
+        _ => 1,
+    }
+}
+
 fn menu_title(menu: u8) -> &'static str {
     match menu {
+        7 => "MOTION / GYRO",
         6 => "GAME MODES",
         1 => "CAMERA",
         2 => "ARENA + BALL MUTATORS",
@@ -97,13 +111,14 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
     let pct = |get: fn(&Config) -> f32, set: fn(&mut Config, f32), min: f32, max: f32| Slider {
         get, set, min, max, step: 0.05, def: 1.0, fmt: 0,
     };
+    // KESS menu here
     match menu {
         1 => vec![
-            ("FIELD OF VIEW", Slider { get: |c| c.cam.fov_deg, set: |c, v| c.cam.fov_deg = v, min: 50.0, max: 115.0, step: 1.0, def: 76.0, fmt: 2 }),
+            ("FIELD OF VIEW", Slider { get: |c| c.cam.fov_deg, set: |c, v| c.cam.fov_deg = v, min: 50.0, max: 200.0, step: 1.0, def: 76.0, fmt: 2 }),
             ("DISTANCE", Slider { get: |c| c.cam.dist, set: |c, v| c.cam.dist = v, min: 2.5, max: 9.0, step: 0.1, def: 4.9, fmt: 1 }),
-            ("HEIGHT", Slider { get: |c| c.cam.height, set: |c, v| c.cam.height = v, min: 0.4, max: 3.2, step: 0.05, def: 1.35, fmt: 1 }),
-            ("ANGLE", Slider { get: |c| c.cam.angle_deg, set: |c, v| c.cam.angle_deg = v, min: -15.0, max: 15.0, step: 1.0, def: -3.0, fmt: 2 }),
-            ("STIFFNESS", pct(|c| c.cam.stiffness, |c, v| c.cam.stiffness = v, 0.25, 2.2)),
+            ("HEIGHT", Slider { get: |c| c.cam.height, set: |c, v| c.cam.height = v, min: 0.4, max: 24.0, step: 0.05, def: 1.35, fmt: 1 }),
+            ("ANGLE", Slider { get: |c| c.cam.angle_deg, set: |c, v| c.cam.angle_deg = v, min: -25.0, max: 25.0, step: 1.0, def: -3.0, fmt: 2 }),
+            ("STIFFNESS", pct(|c| c.cam.stiffness, |c, v| c.cam.stiffness = v, 0.25, 3.2)),
             ("SHAKE", pct(|c| c.cam.shake, |c, v| c.cam.shake = v, 0.0, 1.5)),
             ("GRAVITY CAMERA (TUBES)", pct(|c| c.cam.grav_follow, |c, v| c.cam.grav_follow = v, 0.0, 1.0)),
             ("BACK", Back),
@@ -115,12 +130,12 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("GRAVITY", pct(|c| c.arena.gravity, |c, v| c.arena.gravity = v, 0.0, 2.6)),
             ("ARENA BOUNCINESS", pct(|c| c.arena.bounce, |c, v| c.arena.bounce = v, 0.2, 2.0)),
             ("ARENA FRICTION", pct(|c| c.arena.friction, |c, v| c.arena.friction = v, 0.1, 2.5)),
-            ("WORLD SIZE (REBUILDS)", pct(|c| c.arena.scale, |c, v| c.arena.scale = v, 0.55, 1.6)),
+            ("WORLD SIZE (REBUILDS)", pct(|c| c.arena.scale, |c, v| c.arena.scale = v, 0.55, 10.6)),
             ("BALL", Header),
-            ("BALL SIZE", pct(|c| c.ball.size, |c, v| c.ball.size = v, 0.35, 3.0)),
-            ("BALL BOUNCINESS", pct(|c| c.ball.bounce, |c, v| c.ball.bounce = v, 0.2, 2.0)),
+            ("BALL SIZE", pct(|c| c.ball.size, |c, v| c.ball.size = v, 0.35, 30.0)),
+            ("BALL BOUNCINESS", pct(|c| c.ball.bounce, |c, v| c.ball.bounce = v, 0.2, 3.0)),
             ("BALL FRICTION", pct(|c| c.ball.friction, |c, v| c.ball.friction = v, 0.0, 2.5)),
-            ("BALL WEIGHT", pct(|c| c.ball.weight, |c, v| c.ball.weight = v, 0.25, 3.0)),
+            ("BALL WEIGHT", pct(|c| c.ball.weight, |c, v| c.ball.weight = v, 0.25, 6.0)),
             ("BACK", Back),
         ],
         3 => vec![
@@ -129,16 +144,17 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("CAR SIZE", pct(|c| c.car.size, |c, v| c.car.size = v, 0.55, 2.0)),
             ("TIRE GRIP", pct(|c| c.car.grip, |c, v| c.car.grip = v, 0.3, 2.5)),
             ("POWER", Header),
-            ("TOP SPEED", pct(|c| c.car.top_speed, |c, v| c.car.top_speed = v, 0.5, 1.9)),
-            ("ACCELERATION", pct(|c| c.car.accel, |c, v| c.car.accel = v, 0.4, 2.6)),
+            ("TOP SPEED", pct(|c| c.car.top_speed, |c, v| c.car.top_speed = v, 0.5, 10.0)),
+            ("ACCELERATION", pct(|c| c.car.accel, |c, v| c.car.accel = v, 0.4, 3.6)),
             ("JUMP STRENGTH", pct(|c| c.car.jump, |c, v| c.car.jump = v, 0.5, 2.2)),
             ("BOOST", Header),
-            ("BOOST POWER", pct(|c| c.car.boost, |c, v| c.car.boost = v, 0.4, 2.6)),
+            ("BOOST POWER", pct(|c| c.car.boost, |c, v| c.car.boost = v, 0.4, 3.6)),
             ("BOOST REGEN /S", Slider { get: |c| c.car.boost_regen, set: |c, v| c.car.boost_regen = v, min: 0.0, max: 35.0, step: 1.0, def: 0.0, fmt: 1 }),
             ("BOOST TANK", pct(|c| c.car.boost_max, |c, v| c.car.boost_max = v, 0.3, 2.5)),
             ("UNLIMITED BOOST", Toggle { get: |c| c.car.unlimited_boost, set: |c, v| c.car.unlimited_boost = v }),
             ("INPUT", Header),
             ("ANALOG KEYS (WOOTING)", Toggle { get: |c| c.car.analog, set: |c, v| c.car.analog = v }),
+            ("MOTION / GYRO DRIVE", Link(7)),
             ("ANALOG WIND-IN DEPTH", pct(|c| c.car.analog_soft, |c, v| c.car.analog_soft = v, 0.0, 0.8)),
             ("BACK", Back),
         ],
@@ -159,6 +175,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("BACK", Back),
         ],
         5 => vec![
+            ("GRAPHICS PRESET", Slider { get: |c| c.video.tier as f32, set: |c, v| config::apply_gfx_tier(c, v as u8), min: 0.0, max: 3.0, step: 1.0, def: 0.0, fmt: 1 }),
             ("RAYS", Header),
             ("RAY TRACING", Toggle { get: |c| c.video.rays, set: |c, v| c.video.rays = v }),
             ("RAY QUALITY", pct(|c| c.video.quality, |c, v| c.video.quality = v, 0.4, 1.8)),
@@ -168,6 +185,9 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("VIGNETTE", Slider { get: |c| c.video.vignette, set: |c, v| c.video.vignette = v, min: 0.0, max: 1.0, step: 0.05, def: 0.32, fmt: 0 }),
             ("FILM GRAIN", Slider { get: |c| c.video.grain, set: |c, v| c.video.grain = v, min: 0.0, max: 1.0, step: 0.05, def: 0.12, fmt: 0 }),
             ("BLOOM", pct(|c| c.video.bloom, |c, v| c.video.bloom = v, 0.0, 2.0)),
+            ("RENDER SCALE", Slider { get: |c| c.video.render_scale, set: |c, v| c.video.render_scale = v, min: 0.25, max: 1.0, step: 0.05, def: 1.0, fmt: 1 }),
+            ("TOUCH CONTROLS", Toggle { get: |c| c.touch.enabled, set: |c, v| c.touch.enabled = v }),
+            ("TOUCH SIZE", Slider { get: |c| c.touch.scale, set: |c, v| c.touch.scale = v, min: 0.6, max: 1.8, step: 0.05, def: 1.0, fmt: 1 }),
             ("SCREEN DOOR", Slider { get: |c| c.video.screen_door, set: |c, v| c.video.screen_door = v, min: 0.0, max: 0.35, step: 0.02, def: 0.08, fmt: 0 }),
             ("LETTERBOX (CINEMA BARS)", Toggle { get: |c| c.video.letterbox, set: |c, v| c.video.letterbox = v }),
             ("DISPLAY", Header),
@@ -186,6 +206,18 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("VERSUS 4 V 4", GameMode(6)),
             ("VERSUS 5 V 5", GameMode(7)),
             ("EVERY BOT IS IN BALLCHASE MODE. GOOD LUCK.", Header),
+            ("BACK", Back),
+        ],
+        7 => vec![
+            ("MOTION CONTROL", Header),
+            ("GYRO DRIVE", Toggle { get: |c| c.gyro.on, set: |c, v| c.gyro.on = v }),
+            ("GYRO SENSITIVITY", Slider { get: |c| c.gyro.sens, set: |c, v| c.gyro.sens = v, min: 0.1, max: 4.0, step: 0.1, def: 1.0, fmt: 1 }),
+            ("GYRO DEADZONE", Slider { get: |c| c.gyro.deadzone, set: |c, v| c.gyro.deadzone = v, min: 0.0, max: 0.4, step: 0.01, def: 0.06, fmt: 0 }),
+            ("GYRO SMOOTHING", Slider { get: |c| c.gyro.smooth, set: |c, v| c.gyro.smooth = v, min: 0.008, max: 0.3, step: 0.008, def: 0.05, fmt: 1 }),
+            ("GYRO AIR MODE (0 ROLL 1 YAW)", Slider { get: |c| c.gyro.air_mode as f32, set: |c, v| c.gyro.air_mode = v as u8 & 1, min: 0.0, max: 1.0, step: 1.0, def: 0.0, fmt: 1 }),
+            ("GYRO WHEN (0 ALWAYS 1 BOOST 2 AIR)", Slider { get: |c| c.gyro.gate as f32, set: |c, v| c.gyro.gate = v as u8, min: 0.0, max: 2.0, step: 1.0, def: 0.0, fmt: 1 }),
+            ("GYRO INVERT TILT", Toggle { get: |c| c.gyro.invert_x, set: |c, v| c.gyro.invert_x = v }),
+            ("GYRO INVERT PITCH", Toggle { get: |c| c.gyro.invert_y, set: |c, v| c.gyro.invert_y = v }),
             ("BACK", Back),
         ],
         _ => vec![
@@ -253,6 +285,8 @@ struct Opts {
     name: Option<String>,
     host: bool,
     join: Option<String>,
+    mobile: bool,
+    desktop_ui: bool,
 }
 
 fn parse_args() -> Opts {
@@ -266,7 +300,9 @@ fn parse_args() -> Opts {
         name: None,
         host: false,
         join: None,
-    };
+            mobile: false,
+        desktop_ui: false,
+};
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -276,6 +312,10 @@ fn parse_args() -> Opts {
             "--fullscreen" => o.fullscreen = Some(true),
             "--windowed" => o.fullscreen = Some(false),
             "--mute" => o.mute = true,
+            "--mobile" => o.mobile = true,
+            "--desktop-ui" => o.desktop_ui = true,
+            "--mobile" => o.mobile = true,
+            "--desktop-ui" => o.desktop_ui = true,
             "--dvorak" => o.dvorak = true,
             "--name" => o.name = args.next(),
             "--host" => o.host = true,
@@ -348,6 +388,22 @@ struct Game {
     last_vsync: bool,
     roll_mix_s: f32, // smoothed slide->roll blend (kills regime flicker)
     scores: [u32; 2],   // sparta team score: [blue, orange]
+    tpad: touch::TouchPad, // on-screen controls (handhelds)
+    last_ivp: Mat4,       // for resolving taps into world points
+    last_scale: f32,      // render-scale watcher
+    tap_drive: (f32, f32), // throttle/steer from the drive-to target
+    gyro: gyro::Gyro,
+    style: style::Analyzer,
+    // touch menu gesture state: where the finger went down, which row it
+    // grabbed, whether it has moved far enough to count as a drag
+    /// menu scroll position in ROWS (fractional: the finger drags content)
+    mscroll: f32,
+    mfling: f32,
+    mscroll_at_down: f32,
+    tdown: Option<(f32, f32)>,
+    tdrag_row: Option<usize>,
+    tscrub: bool,
+    tmoved: f32,
     wx_rain: f32,    // MONKEY RUN weather intensity (rain+storm)
     in_steer: f32,   // input-ease state: slight temporal buildup on
     in_yaw: f32,     // steering and rolling (the detent feel)
@@ -434,6 +490,23 @@ fn bake_car_sdfs(models: &mut [model::Model]) -> Vec<u8> {
         }
         let h = mn.abs().max(mx.abs()) + Vec3::splat(0.10);
         m.sdf_half = h;
+        // bucket the cloud so each voxel tests a handful of points, not all
+        // of them (this is what makes a 2600-point cloud affordable)
+        let gn = 12usize;
+        let cell = Vec3::new(2.0 * h.x / gn as f32, 2.0 * h.y / gn as f32, 2.0 * h.z / gn as f32);
+        let idx_of = |p: Vec3| -> (usize, usize, usize) {
+            (
+                (((p.x + h.x) / cell.x) as isize).clamp(0, gn as isize - 1) as usize,
+                (((p.y + h.y) / cell.y) as isize).clamp(0, gn as isize - 1) as usize,
+                (((p.z + h.z) / cell.z) as isize).clamp(0, gn as isize - 1) as usize,
+            )
+        };
+        let mut buckets: Vec<Vec<(Vec3, Vec3)>> = vec![Vec::new(); gn * gn * gn];
+        for (ci, &c) in m.cloud.iter().enumerate() {
+            let (i, j, k) = idx_of(c);
+            let nrm = m.cloud_n.get(ci).copied().unwrap_or(Vec3::Y);
+            buckets[(k * gn + j) * gn + i].push((c, nrm));
+        }
         for z in 0..CSDF_SLAB {
             for y in 0..CSDF_H {
                 for x in 0..CSDF_W {
@@ -443,10 +516,46 @@ fn bake_car_sdfs(models: &mut [model::Model]) -> Vec<u8> {
                         ((z as f32 + 0.5) / CSDF_SLAB as f32 * 2.0 - 1.0) * h.z,
                     );
                     let mut d2 = f32::MAX;
-                    for &c in &m.cloud {
-                        d2 = d2.min(p.distance_squared(c));
+                    let mut near_n = Vec3::Y;
+                    let mut near_p = Vec3::ZERO;
+                    let (bi, bj, bk) = idx_of(p);
+                    let mut ring = 1isize;
+                    while ring <= gn as isize {
+                        for dk in -ring..=ring {
+                            for dj in -ring..=ring {
+                                for di in -ring..=ring {
+                                    // only the shell of the ring is new work
+                                    if di.abs() != ring && dj.abs() != ring && dk.abs() != ring {
+                                        continue;
+                                    }
+                                    let (i2, j2, k2) = (bi as isize + di, bj as isize + dj, bk as isize + dk);
+                                    if i2 < 0 || j2 < 0 || k2 < 0 || i2 >= gn as isize || j2 >= gn as isize || k2 >= gn as isize {
+                                        continue;
+                                    }
+                                    for &(c, cn) in &buckets[((k2 as usize) * gn + j2 as usize) * gn + i2 as usize] {
+                                        let dd = p.distance_squared(c);
+                                        if dd < d2 {
+                                            d2 = dd;
+                                            near_n = cn;
+                                            near_p = c;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // one ring past the first hit is enough for a cloud
+                        if d2 < f32::MAX && ring >= 2 {
+                            break;
+                        }
+                        ring += 1;
                     }
-                    let d = d2.sqrt() - 0.07;
+                    // SIGNED: distance to the nearest surface point, negative
+                    // when we are behind that point's outward normal. Without
+                    // the sign this was a hollow SHELL — rays passed through
+                    // the car and fell back on the bounding box, which is
+                    // exactly the "bubble" in the mirror.
+                    let dist = d2.sqrt();
+                    let d = if (p - near_p).dot(near_n) < 0.0 { -dist } else { dist } - 0.012;
                     let idx = (((mi as u32 * CSDF_SLAB + z) * CSDF_H + y) * CSDF_W + x) as usize;
                     out[idx] = (((d + 0.6) / 2.4).clamp(0.0, 1.0) * 255.0) as u8;
                 }
@@ -488,9 +597,12 @@ fn bake_rcells(world: &world::World) -> Vec<u32> {
                     world::Sdf::None => 0.0,
                     world::Sdf::Sphere { r } => r,
                     world::Sdf::Torus { big, tube } => big + tube,
+                    world::Sdf::Hex { r, h } => (r * r + h * h).sqrt(),
                     world::Sdf::Capsule { r, half } => r + half,
                     world::Sdf::RBox { half, .. } => half.length(),
                     world::Sdf::Shell { r, half, thick } => ((r + thick) * (r + thick) + half * half).sqrt(),
+                    world::Sdf::TubeTorus { big, tube, thick } => big + tube + thick,
+                    world::Sdf::RingDeck { big, wide, .. } => big + wide,
                 } + travel[wi];
                 let d = glam::Vec2::new(sh.pos.x, sh.pos.z).distance(cc) - bound - half_diag;
                 if d < 135.0 {
@@ -551,6 +663,21 @@ fn main() {
     if let Some(n) = &opts.name {
         sv.name = n.clone();
     }
+    // ---- platform detection: phones get a different game ----
+    let plat = platform::detect();
+    let fresh = !save::exists();
+    // Re-tune when the hardware CHANGES, not only on a first run: a save
+    // copied onto a phone (or a phone that had ever launched the game
+    // before) used to keep desktop graphics forever, which is the single
+    // biggest reason mobile ran badly.
+    let pcode = plat.profile as u8;
+    if plat.profile == platform::Profile::Handheld && (fresh || opts.mobile || sv.tuned_profile != pcode) {
+        plat.profile.apply(&mut cfg);
+    }
+    sv.tuned_profile = pcode;
+    if opts.desktop_ui {
+        cfg.touch.enabled = false;
+    }
     if opts.dvorak {
         binds = Bindings::dvorak();
     }
@@ -587,6 +714,11 @@ fn main() {
         gpu.add_mesh(&meshgen::terrain(world::TG_HALF, 2, |_, _| 0.0)), // real one lands post-generate
         gpu.add_mesh(&meshgen::tube(28)),
         gpu.add_mesh(&meshgen::tube(10)), // M_SHELL_LO: far-field tube
+        gpu.add_mesh(&meshgen::tube_open(28)), // M_SHELL_OPEN: no cap rings
+        gpu.add_mesh(&meshgen::tube_open(10)), // M_SHELL_OPEN_LO
+        gpu.add_mesh(&meshgen::torus_tube(64, 20)), // M_TORUS_TUBE: seamless loop
+        gpu.add_mesh(&meshgen::ring_deck(72)), // M_RING_DECK: drivable ring
+        gpu.add_mesh(&meshgen::hex_prism()),   // M_HEX: dropshot tiles
     ];
     assert_eq!(ids[world::M_TERRAIN], world::M_TERRAIN);
     bake_heightmap(&gpu, seed, style0);
@@ -632,6 +764,8 @@ fn main() {
 
     let (pv_cp, pv_cr, pv_bp, pv_br) = (car.pos, car.rot, ball.pos, ball.rot);
     let vs0 = cfg.video.vsync;
+    let rs0 = cfg.video.render_scale;
+    let gyro_on0 = cfg.gyro.on;
     let mut game = Game {
         gpu,
         world,
@@ -664,6 +798,19 @@ fn main() {
         last_vsync: vs0,
         roll_mix_s: 0.0,
         scores: [0, 0],
+        tpad: touch::TouchPad::new(),
+        last_ivp: Mat4::IDENTITY,
+        last_scale: rs0,
+        tap_drive: (0.0, 0.0),
+        gyro: gyro::Gyro::new(gyro_on0),
+        style: style::Analyzer::new(),
+        mscroll: 0.0,
+        mfling: 0.0,
+        mscroll_at_down: 0.0,
+        tdown: None,
+        tdrag_row: None,
+        tscrub: false,
+        tmoved: 0.0,
         wx_rain: 0.0,
         in_steer: 0.0,
         in_yaw: 0.0,
@@ -765,6 +912,35 @@ fn main() {
                         winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 / 40.0,
                     };
                     game.wheel(dy);
+                }
+                WindowEvent::Touch(t) => {
+                    // normalized, y down — the layout is resolution-agnostic
+                    let sz = win.inner_size();
+                    let p = glam::Vec2::new(
+                        t.location.x as f32 / sz.width.max(1) as f32,
+                        t.location.y as f32 / sz.height.max(1) as f32,
+                    );
+                    if !game.tpad.enabled {
+                        // a touchscreen announces itself: enable on first touch
+                        game.tpad.enabled = true;
+                        game.cfg.touch.enabled = true;
+                    }
+                    match t.phase {
+                        winit::event::TouchPhase::Started => game.tpad.down(t.id, p),
+                        winit::event::TouchPhase::Moved => game.tpad.moved(t.id, p),
+                        _ => game.tpad.up(t.id),
+                    }
+                    if !matches!(game.mode, Mode::Play) {
+                        // menus run on the cursor, so a finger IS a cursor —
+                        // but taps, drags and scrubs are distinct gestures
+                        game.cursor = (p.x * 2.0 - 1.0, 1.0 - p.y * 2.0);
+                        game.cursor_moved = true;
+                        match t.phase {
+                            winit::event::TouchPhase::Started => game.touch_menu_down(),
+                            winit::event::TouchPhase::Moved => game.touch_menu_move(),
+                            _ => game.touch_menu_up(&win, elwt),
+                        }
+                    }
                 }
                 WindowEvent::MouseInput { state, button, .. } => match state {
                     ElementState::Pressed => {
@@ -879,11 +1055,11 @@ impl Game {
                 let bp = self.ball.pos;
                 let mut spawn = |team: u8, k: usize, brain: bots::Brain, sel: &mut Self| {
                     let side = if team == bots::TEAM_BLUE { 1.0 } else { -1.0 };
-                    let pos = Vec3::new(
-                        (k as f32 - (n as f32 - 1.0) * 0.5) * 7.0,
-                        1.2,
-                        bp.z + side * (24.0 + (k % 2) as f32 * 6.0),
-                    );
+                    // teammates spawn on the real surface too (a raised
+                    // deck would otherwise swallow the whole lineup)
+                    let px = (k as f32 - (n as f32 - 1.0) * 0.5) * 7.0;
+                    let pz = bp.z + side * (24.0 + (k % 2) as f32 * 6.0);
+                    let pos = sel.world.spawn_at(px, pz, 0.5);
                     let d = bp - pos;
                     let yaw = f32::atan2(-d.x, -d.z);
                     sel.bots.push(bots::mk_bot_brain(pos, yaw, team, sel.bots.len() + k * 13, brain));
@@ -989,6 +1165,8 @@ impl Game {
     fn open_menu(&mut self, m: Mode) {
         self.menu_from_pause = self.mode == Mode::Pause;
         self.mode = m;
+        self.mscroll = 0.0;
+        self.mfling = 0.0;
     }
     fn close_menu(&mut self) {
         self.mode = if self.menu_from_pause { Mode::Pause } else { Mode::Splash };
@@ -1067,19 +1245,241 @@ impl Game {
 
     /// The menu row currently under the mouse, using the same layout metrics
     /// hud.rs draws with.
+    // ------------------------------------------------ touch menu gestures --
+    /// Finger down in a menu: select what it landed on, and grab a slider
+    /// immediately so scrubbing feels instant.
+    fn touch_menu_down(&mut self) {
+        self.tdown = Some(self.cursor);
+        self.tmoved = 0.0;
+        self.tscrub = false;
+        self.mfling = 0.0;
+        self.mscroll_at_down = self.mscroll;
+        if hud::hit_nav(self.cursor.0, self.cursor.1).is_some() {
+            self.tdrag_row = None; // the nav strip is buttons, not rows
+            return;
+        }
+        self.tdrag_row = self.hover_row();
+        if let (Mode::Tweaks { menu, .. }, Some(i)) = (self.mode, self.tdrag_row) {
+            let rows = tweak_rows(menu);
+            if let Some((_, Row::Slider { .. })) = rows.get(i) {
+                self.mode = Mode::Tweaks { menu, sel: i };
+                if hud::near_bar(self.cursor.0) {
+                    self.tscrub = true;
+                    self.touch_scrub_to(self.cursor.0);
+                }
+            } else {
+                self.mode = Mode::Tweaks { menu, sel: i };
+            }
+        } else if let Some(i) = self.tdrag_row {
+            // highlight under the finger, activate on release
+            self.select_row(i);
+        }
+    }
+
+    /// Finger moved: scrub a grabbed slider, or slide the highlight along
+    /// the list. Past a small threshold this stops being a tap.
+    fn touch_menu_move(&mut self) {
+        let Some(d0) = self.tdown else { return };
+        self.tmoved = self.tmoved.max((self.cursor.0 - d0.0).abs() + (self.cursor.1 - d0.1).abs());
+        if self.tscrub {
+            self.touch_scrub_to(self.cursor.0);
+            return;
+        }
+        // DRAG TO SCROLL: past the threshold the CONTENT follows the finger
+        // (one row per row-height of travel), which is what a phone expects.
+        // The selection is left alone — that is what a tap is for.
+        if self.tmoved > 0.02 {
+            let dy = d0.1 - self.cursor.1;
+            let rh = self.menu_row_h();
+            let want = self.mscroll_at_down + dy / rh;
+            let max = self.menu_max_scroll();
+            self.mfling = (want - self.mscroll) / 0.016_f32.max(1e-3);
+            self.mscroll = want.clamp(0.0, max);
+        }
+    }
+
+    /// Row height of whatever menu is open (touch maths shares this).
+    /// Keep the selected row inside the viewport after a keyboard move.
+    fn follow_selection(&mut self) {
+        let (sel, n) = match self.mode {
+            Mode::Tweaks { menu, sel } => (sel, tweak_rows(menu).len()),
+            Mode::Binds { sel, .. } => (sel, hud::BIND_ROWS),
+            Mode::Maps { sel } => (sel, world::STYLE_COUNT),
+            _ => return,
+        };
+        let rh = self.menu_row_h();
+        let top = match self.mode {
+            Mode::Maps { .. } => hud::MAPS_TOP,
+            Mode::Binds { .. } => hud::BIND_TOP,
+            _ => hud::TW_TOP,
+        };
+        let vis = hud::vis_rows(rh, top, hud::TW_BOTTOM);
+        let start = self.mscroll.max(0.0) as usize;
+        if sel < start {
+            self.mscroll = sel as f32;
+        } else if sel + 1 > start + vis {
+            self.mscroll = (sel + 1 - vis) as f32;
+        }
+        self.mscroll = self.mscroll.clamp(0.0, (n.saturating_sub(vis)) as f32);
+    }
+
+    fn menu_row_h(&self) -> f32 {
+        match self.mode {
+            Mode::Maps { .. } => hud::maps_row_h(),
+            Mode::Binds { .. } => hud::BIND_ROW_H,
+            _ => hud::TW_ROW_H,
+        }
+    }
+
+    /// How far this menu can scroll, in rows.
+    fn menu_max_scroll(&self) -> f32 {
+        let rh = self.menu_row_h();
+        let top = match self.mode {
+            Mode::Maps { .. } => hud::MAPS_TOP,
+            Mode::Binds { .. } => hud::BIND_TOP,
+            _ => hud::TW_TOP,
+        };
+        let vis = hud::vis_rows(rh, top, hud::TW_BOTTOM);
+        let n = match self.mode {
+            Mode::Maps { .. } => world::STYLE_COUNT,
+            Mode::Binds { .. } => hud::BIND_ROWS,
+            Mode::Tweaks { menu, .. } => tweak_rows(menu).len(),
+            _ => 0,
+        };
+        (n.saturating_sub(vis)) as f32
+    }
+
+    /// Finger up: a tap (little movement, same row) activates. A drag does
+    /// not — which is what keeps scrolling from firing buttons.
+    fn touch_menu_up(&mut self, win: &winit::window::Window, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
+        let was_tap = self.tmoved < 0.03 && !self.tscrub;
+        let start = self.tdown.take();
+        self.tdrag_row = None;
+        self.tscrub = false;
+        let Some(_) = start else { return };
+        if !was_tap {
+            // a downward flick anywhere = back out of this menu
+            if let Some(d0) = start {
+                if self.cursor.1 < d0.1 - 0.25 && (self.cursor.0 - d0.0).abs() < 0.25 {
+                    self.menu_back(elwt);
+                }
+            }
+            return;
+        }
+        if let Some(b) = hud::hit_nav(self.cursor.0, self.cursor.1) {
+            if !matches!(self.mode, Mode::Splash | Mode::Play | Mode::Pause) {
+                self.nav_to(b, elwt);
+                return;
+            }
+        }
+        match self.mode {
+            Mode::Splash => self.mode = Mode::Play,
+            Mode::Pause => {
+                if let Some(b) = hud::hit_pause_btn(self.cursor.0, self.cursor.1) {
+                    match b {
+                        0 => self.mode = Mode::Play,
+                        1 => self.open_menu(Mode::Tweaks { menu: 0, sel: 0 }),
+                        2 => self.open_menu(Mode::Maps { sel: self.save.map }),
+                        3 => self.open_menu(Mode::Online { sel: 0 }),
+                        _ => {
+                            self.net.leave();
+                            self.persist();
+                            elwt.exit();
+                        }
+                    }
+                }
+            }
+            Mode::Tweaks { menu, sel } => {
+                if self.hover_row().is_some() {
+                    self.tweaks_click(menu, sel, win);
+                }
+            }
+            _ => {
+                if self.hover_row().is_some() {
+                    self.mouse_down(MouseButton::Left, win);
+                }
+            }
+        }
+    }
+
+    /// Set the grabbed slider from an x position (drag scrubbing).
+    fn touch_scrub_to(&mut self, x: f32) {
+        let Mode::Tweaks { menu, sel } = self.mode else { return };
+        let rows = tweak_rows(menu);
+        if let Some((_, Row::Slider { set, min, max, step, .. })) = rows.get(sel) {
+            let t = hud::bar_t(x);
+            let raw = min + (max - min) * t;
+            // snap to the row's own step so touch lands on real values
+            let v = if *step > 0.0 { (raw / step).round() * step } else { raw };
+            set(&mut self.cfg, v.clamp(*min, *max));
+            if menu == 2 {
+                self.cfg.preset = 0;
+            }
+        }
+    }
+
+    /// Move the highlight to row `i` in whatever list menu is open.
+    fn select_row(&mut self, i: usize) {
+        self.mode = match self.mode {
+            Mode::Tweaks { menu, .. } => Mode::Tweaks { menu, sel: i },
+            Mode::Binds { capturing, .. } => Mode::Binds { sel: i, capturing },
+            Mode::Maps { .. } => Mode::Maps { sel: i },
+            Mode::Online { .. } => Mode::Online { sel: i },
+            m => m,
+        };
+    }
+
+    /// Nav-strip button: jump straight to a screen (mobile needs this —
+    /// there is no keyboard shortcut to reach MAPS or VIDEO).
+    fn nav_to(&mut self, b: usize, elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
+        self.mscroll = 0.0;
+        match b {
+            0 => self.menu_back(elwt),
+            1 => self.mode = Mode::Tweaks { menu: 0, sel: 0 },
+            2 => self.mode = Mode::Binds { sel: 0, capturing: false },
+            3 => self.mode = Mode::Maps { sel: self.save.map },
+            4 => self.mode = Mode::Tweaks { menu: 5, sel: 0 },
+            _ => self.mode = Mode::Online { sel: 0 },
+        }
+    }
+
+    /// Escape-equivalent for gestures: leave the current menu.
+    fn menu_back(&mut self, _elwt: &winit::event_loop::EventLoopWindowTarget<()>) {
+        self.mode = match self.mode {
+            Mode::Tweaks { .. } | Mode::Binds { .. } | Mode::Maps { .. } | Mode::Online { .. } => {
+                if self.menu_from_pause {
+                    Mode::Pause
+                } else {
+                    Mode::Splash
+                }
+            }
+            Mode::Pause => Mode::Play,
+            m => m,
+        };
+    }
+
     fn hover_row(&self) -> Option<usize> {
         let y = self.cursor.1;
         match self.mode {
             Mode::Tweaks { menu, .. } => {
                 let rows = tweak_rows(menu);
                 let n = rows.len();
-                hud::hit_row(hud::TW_TOP, hud::rows_h(n), n, y)
+                let vis = hud::vis_rows(hud::TW_ROW_H, hud::TW_TOP, hud::TW_BOTTOM);
+                let start = self.mscroll.max(0.0) as usize;
+                hud::hit_row_scrolled(hud::TW_TOP, hud::TW_ROW_H, n, vis, start, y)
                     .filter(|i| !is_header(&rows[*i].1))
             }
             Mode::Binds { capturing: false, .. } => {
-                hud::hit_row(hud::BIND_TOP, hud::BIND_ROW_H, hud::BIND_ROWS, y)
+                let vis = hud::vis_rows(hud::BIND_ROW_H, hud::BIND_TOP, hud::TW_BOTTOM);
+                let start = self.mscroll.max(0.0) as usize;
+                hud::hit_row_scrolled(hud::BIND_TOP, hud::BIND_ROW_H, hud::BIND_ROWS, vis, start, y)
             }
-            Mode::Maps { .. } => hud::hit_row(hud::MAPS_TOP, hud::maps_row_h(), world::STYLE_COUNT, y),
+            Mode::Maps { .. } => {
+                let n = world::STYLE_COUNT;
+                let vis = hud::vis_rows(hud::maps_row_h(), hud::MAPS_TOP, hud::TW_BOTTOM);
+                let start = self.mscroll.max(0.0) as usize;
+                hud::hit_row_scrolled(hud::MAPS_TOP, hud::maps_row_h(), n, vis, start, y)
+            }
             Mode::Online { .. } => hud::hit_row(hud::ONL_TOP, hud::ONL_ROW_H, hud::ONLINE_ROWS, y),
             _ => None,
         }
@@ -1105,6 +1505,11 @@ impl Game {
             }
             Row::Preset | Row::CarPick => {
                 self.tweaks_key(&Key::Named(NamedKey::ArrowRight), menu, i, win);
+            }
+            Row::Link(_) | Row::Controls => {
+                self.mscroll = 0.0;
+                self.mfling = 0.0;
+                self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
             }
             _ => {
                 self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
@@ -1249,6 +1654,7 @@ impl Game {
             }
             _ => {}
         }
+            self.follow_selection();
     }
 
     fn tweaks_key(
@@ -1299,6 +1705,7 @@ impl Game {
             Row::Slider { get, set, min, max, step, def, .. } => {
                 if dir != 0 {
                     let v = (get(&self.cfg) + step * dir as f32).clamp(min, max);
+                    let _ = &self.gyro;
                     set(&mut self.cfg, v);
                     if menu == 1 {
                         // live readback: proves the value reached the cfg the
@@ -1319,6 +1726,13 @@ impl Game {
                 if dir != 0 || matches!(key, Key::Named(NamedKey::Enter)) {
                     let v = !get(&self.cfg);
                     set(&mut self.cfg, v);
+                }
+                if self.cfg.gyro.on {
+                    // switching gyro on spins up the reader thread and takes
+                    // a fresh neutral bias (hold the device still)
+                    self.gyro.enable();
+                    self.gyro.calibrate();
+                    self.toastf("GYRO: CALIBRATING - HOLD STILL");
                 }
             }
             Row::Preset => {
@@ -1371,6 +1785,7 @@ impl Game {
                 }
             }
         }
+            self.follow_selection();
     }
 
     fn maps_key(&mut self, key: &Key, ch: &str, sel: usize) {
@@ -1401,6 +1816,7 @@ impl Game {
             }
             _ => {}
         }
+            self.follow_selection();
     }
 
     fn online_key(&mut self, key: &Key, ch: &str, sel: usize) {
@@ -1517,6 +1933,28 @@ impl Game {
         best
     }
 
+    /// Unproject a normalized screen point onto the terrain: the drive-to
+    /// target for tap-to-move. Marches the view ray until it goes underground.
+    fn screen_to_ground(&self, p: glam::Vec2) -> Option<Vec3> {
+        let ndc = glam::Vec4::new(p.x * 2.0 - 1.0, 1.0 - p.y * 2.0, 1.0, 1.0);
+        let w = self.last_ivp * ndc;
+        if w.w.abs() < 1e-6 {
+            return None;
+        }
+        let far = Vec3::new(w.x / w.w, w.y / w.w, w.z / w.w);
+        let ro = self.cam.pos;
+        let rd = (far - ro).normalize_or(Vec3::NEG_Y);
+        let mut t = 2.0f32;
+        while t < 320.0 {
+            let q = ro + rd * t;
+            if q.y <= self.world.ground_h(q.x, q.z) + 0.4 {
+                return Some(q);
+            }
+            t += 1.5;
+        }
+        None
+    }
+
     fn controls(&self) -> Controls {
         let ps = &self.last_pad;
         let fwd = self.axis(Action::Forward);
@@ -1541,14 +1979,37 @@ impl Game {
         let steer = steer_axis;
         let yaw_src = steer_axis * (1.0 - roll_mix);
         let roll_extra = -steer_axis * roll_mix;
+        // ---- on-screen controls fold in as another input source ----
+        let (mut t_thr, mut t_steer, mut t_boost, mut t_jump) = (0.0f32, 0.0f32, false, false);
+        if self.tpad.enabled {
+            let sv = self.tpad.stick_vec();
+            t_thr = sv.y;
+            t_steer = sv.x;
+            t_boost = self.tpad.boost_down();
+            t_jump = self.tpad.jump_down();
+            if self.tpad.has_target() {
+                // tap-to-move drives itself until you touch the stick
+                let (ft, fs) = (self.tap_drive.0, self.tap_drive.1);
+                if sv.length() < 0.05 {
+                    t_thr = ft;
+                    t_steer = fs;
+                }
+            }
+            if let Some(f) = self.tpad.flick {
+                // a flick dodges: feed the direction as this frame's input
+                t_thr = f.y;
+                t_steer = f.x;
+            }
+        }
+        let steer = (steer + t_steer).clamp(-1.0, 1.0);
         Controls {
-            throttle: (fwd - rev + ps.throttle).clamp(-1.0, 1.0),
+            throttle: (fwd - rev + ps.throttle + t_thr).clamp(-1.0, 1.0),
             steer,
             pitch: (rev - fwd - ps.stick_y).clamp(-1.0, 1.0),
             yaw: (-yaw_src).clamp(-1.0, 1.0),
             roll: (rl - rr + roll_extra).clamp(-1.0, 1.0),
-            boost: self.action_down(Action::Boost),
-            jump_held: self.action_down(Action::Jump),
+            boost: self.action_down(Action::Boost) || t_boost,
+            jump_held: self.action_down(Action::Jump) || t_jump,
             jump_pressed: false,
             jump_depth: self.axis_raw(Action::Jump).max(0.01),
             powerslide: slide_a > 0.35,
@@ -1557,6 +2018,25 @@ impl Game {
 
     fn frame(&mut self, dt: f32, win: &winit::window::Window) {
         self.time += dt;
+        // on-screen controls: recognizer + one-shot decay
+        self.tpad.enabled |= self.cfg.touch.enabled;
+        if self.tpad.enabled {
+            self.tpad.tick(dt);
+            if let Some(p) = self.tpad.tap_pending.take() {
+                if self.cfg.touch.tap_to_move {
+                    self.tpad.target = self.screen_to_ground(p);
+                }
+            }
+        }
+        if self.tpad.enabled {
+            let f = self.car.forward();
+            self.tap_drive = self.tpad.follow(self.car.pos, f);
+        }
+        // live render-scale changes (the VIDEO slider, or the phone preset)
+        if (self.cfg.video.render_scale - self.last_scale).abs() > 0.01 {
+            self.last_scale = self.cfg.video.render_scale;
+            self.gpu.set_render_scale(self.last_scale);
+        }
         self.analog.poll();
         {
             // roll/yaw blend: snap the ends (decisive digital feel), keep the
@@ -1654,11 +2134,35 @@ impl Game {
         }
 
         // ---- simulate ----
+        // menu fling: the list keeps moving after the finger leaves, then
+        // settles — standard touch scrolling
+        if self.tdown.is_none() && self.mfling.abs() > 0.01 {
+            let max = self.menu_max_scroll();
+            self.mscroll = (self.mscroll + self.mfling * dt).clamp(0.0, max);
+            self.mfling *= (-6.0 * dt).exp();
+            if self.mscroll <= 0.0 || self.mscroll >= max {
+                self.mfling = 0.0;
+            }
+        }
         let mut c = self.controls();
         if self.mode == Mode::Play {
             // slight temporal buildup into turns and rolls: ~55 ms attack
             // (x INPUT EASE) with a whisper of center-softening — the
             // detent. Player only; bots keep raw controls.
+            // GYRO DRIVE: device motion folded in beside the sticks
+            self.gyro.update(dt, &self.cfg.gyro);
+            if self.cfg.gyro.on {
+                let gate = match self.cfg.gyro.gate {
+                    1 => c.boost,
+                    2 => !self.car.on_ground,
+                    _ => true,
+                };
+                let (gs, gp, gr) = self.gyro.drive(&self.cfg.gyro, !self.car.on_ground, gate);
+                c.steer = (c.steer + gs).clamp(-1.0, 1.0);
+                c.pitch = (c.pitch + gp).clamp(-1.0, 1.0);
+                c.roll = (c.roll + gr).clamp(-1.0, 1.0);
+                c.yaw = (c.yaw + gs * self.roll_mix_s).clamp(-1.0, 1.0);
+            }
             let tau = 0.055 * self.cfg.car.input_ease;
             let ek = 1.0 - (-dt / tau.max(0.001)).exp();
             self.in_steer += (c.steer - self.in_steer) * ek;
@@ -1685,8 +2189,9 @@ impl Game {
                 // consume the jump edge INSIDE the loop: clearing it before
                 // guaranteed a substep meant frames with acc < FIXED_DT ate
                 // the press outright — the "jump sometimes never comes" bug
-                c.jump_pressed = self.jump_edge;
+                c.jump_pressed = self.jump_edge || self.tpad.jump_edge;
                 self.jump_edge = false;
+                self.tpad.jump_edge = false;
                 self.prev_cpos = self.car.pos;
                 self.prev_crot = self.car.rot;
                 self.prev_bpos = self.ball.pos;
@@ -1722,6 +2227,16 @@ impl Game {
 
             self.consume_events(&ev, dt);
             self.world.update(dt);
+            if let Some(n) = self.world.sky_news.take() {
+                match n {
+                    0 => self.toastf("A WORLD IS COLLAPSING - FIFTEEN SECONDS"),
+                    1 => {
+                        self.toastf("DETONATION");
+                        self.cam.add_shake(1.6);
+                    }
+                    _ => self.toastf("INBOUND: A NEW WORLD FALLING"),
+                }
+            }
             if let Some(ri) = self.world.flood_news.take() {
                 let nm = self.world.route_names.get(ri).cloned().unwrap_or_default();
                 self.toastf(&format!("FLOODWATER! {} IS FILLING", nm));
@@ -1787,6 +2302,16 @@ impl Game {
             self.snd.set_state(0.0, 0.0, false, false);
             if self.mode == Mode::Splash {
                 self.world.update(dt);
+            if let Some(n) = self.world.sky_news.take() {
+                match n {
+                    0 => self.toastf("A WORLD IS COLLAPSING - FIFTEEN SECONDS"),
+                    1 => {
+                        self.toastf("DETONATION");
+                        self.cam.add_shake(1.6);
+                    }
+                    _ => self.toastf("INBOUND: A NEW WORLD FALLING"),
+                }
+            }
             if let Some(ri) = self.world.flood_news.take() {
                 let nm = self.world.route_names.get(ri).cloned().unwrap_or_default();
                 self.toastf(&format!("FLOODWATER! {} IS FILLING", nm));
@@ -1868,20 +2393,24 @@ impl Game {
 
         let aspect = self.gpu.aspect();
         let (vp, ivp) = self.cam.view_proj(&self.cfg.cam, aspect);
+        self.last_ivp = ivp;
 
         let mut ui: Vec<UiVert> = Vec::new();
         self.peer_tags(&mut ui, vp, aspect);
         match self.mode {
             Mode::Splash => hud::splash(&mut ui, aspect, self.time, self.style().name),
-            Mode::Play => self.draw_hud(&mut ui, aspect),
+            Mode::Play => {
+                self.draw_hud(&mut ui, aspect);
+                self.draw_touch_ui(&mut ui, aspect);
+            }
             Mode::Pause => {
                 self.draw_hud(&mut ui, aspect);
-                hud::pause(&mut ui, aspect, &self.save, self.air_t);
+                hud::pause(&mut ui, aspect, &self.save, self.air_t, self.cursor);
             }
             Mode::Binds { sel, capturing } => {
-                hud::bindings_menu(&mut ui, aspect, &self.binds, sel, capturing)
+                hud::bindings_menu(&mut ui, aspect, &self.binds, sel, capturing, self.mscroll.max(0.0) as usize, self.cursor)
             }
-            Mode::Maps { sel } => hud::maps_menu(&mut ui, aspect, sel, self.save.map, self.save.seed),
+            Mode::Maps { sel } => hud::maps_menu(&mut ui, aspect, sel, self.save.map, self.save.seed, self.mscroll.max(0.0) as usize, self.cursor),
             Mode::Tweaks { menu, sel } => {
                 let rows = tweak_rows(menu);
                 let trs: Vec<hud::TweakRow> = rows
@@ -1900,7 +2429,7 @@ impl Game {
                         hud::TweakRow { label: (*l).to_string(), value, bar, header: is_header(r), action }
                     })
                     .collect();
-                hud::tweaks_menu(&mut ui, aspect, menu_title(menu), &trs, sel);
+                hud::tweaks_menu(&mut ui, aspect, menu_title(menu), &trs, sel, self.mscroll.max(0.0) as usize, self.cursor, nav_here(menu));
             }
             Mode::Online { sel } => {
                 let players: Vec<String> = std::iter::once(format!(
@@ -2014,6 +2543,41 @@ impl Game {
             self.fx.dust(pos - n * physics::BALL_R * 0.9, n, sp);
             self.snd.fire(Sfx::Bounce(sp));
         }
+        // ---- style analyzer: name what just happened ----
+        {
+            let n_under = self.world.normal(self.car.pos);
+            let sf = style::Frame {
+                dt,
+                car_pos: self.car.pos,
+                car_vel: self.car.vel,
+                car_up: self.car.up(),
+                on_ground: self.car.on_ground,
+                flipping: self.car.is_flipping(),
+                omega: self.car.omega.length(),
+                ball_pos: self.ball.pos,
+                ball_vel: self.ball.vel,
+                touch: ev.touches.first().map(|&(_, sp)| sp),
+                flip_reset: ev.flip_reset.is_some(),
+                pinch: ev.pinched,
+                goal: !ev.goals.is_empty(),
+                surf_up: n_under.y,
+                supersonic: self.car.supersonic,
+            };
+            if self.style.step(&sf) > 0 {
+                let combo = self.style.combo();
+                let awards: Vec<style::Award> = self.style.fresh.drain(..).collect();
+                for a in awards {
+                    if combo > 1 {
+                        self.toastf(&format!("{}  +{}  x{}", a.name, a.points, combo));
+                    } else {
+                        self.toastf(&format!("{}  +{}", a.name, a.points));
+                    }
+                }
+            } else {
+                self.style.fresh.clear();
+            }
+        }
+
         for &(_, sp) in ev.touches.iter().take(1) {
             if sp > 0.7 {
                 self.snd.fire(Sfx::Touch(sp));
@@ -2093,6 +2657,45 @@ impl Game {
         let sp = self.car.vel.length();
         if sp > self.save.top_speed {
             self.save.top_speed = sp;
+        }
+    }
+
+    /// On-screen controls: floating stick, BOOST/JUMP pads, drive-to marker.
+    /// Normalized (0..1, y down) layout converted to NDC here.
+    fn draw_touch_ui(&self, ui: &mut Vec<UiVert>, aspect: f32) {
+        if !self.tpad.enabled || !matches!(self.mode, Mode::Play) {
+            return;
+        }
+        let sc = self.cfg.touch.scale.clamp(0.6, 1.8);
+        let to_ndc = |p: glam::Vec2| (p.x * 2.0 - 1.0, 1.0 - p.y * 2.0);
+        let b = touch::buttons();
+        let br = touch::BTN_R * 2.0 * sc;
+        // BOOST
+        let (bx, by) = to_ndc(b.boost);
+        let hot = self.tpad.boost_down();
+        hud::disc(ui, bx, by, br, aspect, if hot { [1.0, 0.72, 0.25, 0.55] } else { [1.0, 0.72, 0.25, 0.20] });
+        hud::ring(ui, bx, by, br, br * 0.10, aspect, [1.0, 0.82, 0.45, 0.75]);
+        hud::label(ui, bx - 0.055, by - 0.012, 0.030, 1.0, [1.0, 0.95, 0.85, 0.9], "BOOST");
+        // JUMP
+        let (jx, jy) = to_ndc(b.jump);
+        let jhot = self.tpad.jump_down();
+        hud::disc(ui, jx, jy, br * 0.86, aspect, if jhot { [0.45, 0.85, 1.0, 0.55] } else { [0.45, 0.85, 1.0, 0.20] });
+        hud::ring(ui, jx, jy, br * 0.86, br * 0.09, aspect, [0.65, 0.92, 1.0, 0.75]);
+        hud::label(ui, jx - 0.042, jy - 0.012, 0.030, 1.0, [0.92, 0.98, 1.0, 0.9], "JUMP");
+        // floating stick
+        if let Some((base, knob)) = self.tpad.stick_draw() {
+            let (ox, oy) = to_ndc(base);
+            let (kx, ky) = to_ndc(knob);
+            hud::ring(ui, ox, oy, 0.27 * sc, 0.016, aspect, [1.0, 1.0, 1.0, 0.35]);
+            hud::disc(ui, kx, ky, 0.10 * sc, aspect, [1.0, 1.0, 1.0, 0.42]);
+        } else {
+            // resting hint so a new player knows where to put a thumb
+            let (ox, oy) = to_ndc(glam::Vec2::new(0.17, 0.80));
+            hud::ring(ui, ox, oy, 0.27 * sc, 0.010, aspect, [1.0, 1.0, 1.0, 0.13]);
+        }
+        // drive-to marker
+        if self.tpad.has_target() {
+            hud::label(ui, -0.06, 0.86, 0.032, 1.0, [0.7, 1.0, 0.8, 0.8], "DRIVING TO MARK");
         }
     }
 
@@ -2255,6 +2858,29 @@ impl Game {
                     em,
                     s.spec,
                 ),
+                Sdf::TubeTorus { big, tube, thick } => push(
+                    &mut v,
+                    9.0 + kb,
+                    s.pos,
+                    big + tube + thick + 0.1,
+                    [big, tube, thick, 0.0],
+                    s.inv_rot,
+                    s.color,
+                    em,
+                    s.spec,
+                ),
+                Sdf::RingDeck { big, wide, half_h } => push(
+                    &mut v,
+                    10.0 + kb,
+                    s.pos,
+                    big + wide + 0.2,
+                    [big, wide, half_h, 0.0],
+                    s.inv_rot,
+                    s.color,
+                    em,
+                    s.spec,
+                ),
+                Sdf::Hex { r, h } => push(&mut v, 6.0 + kb, s.pos, (r * r + h * h).sqrt() + 0.1, [r, h, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
                 Sdf::Capsule { r, half } => push(&mut v, 2.0, s.pos, half + r + 0.1, [r, half, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
                 Sdf::RBox { half, round } => push(&mut v, 3.0, s.pos, half.length() + 0.1, [half.x, half.y, half.z, round], s.inv_rot, s.color, em, s.spec),
                 Sdf::None => {}
@@ -2390,9 +3016,12 @@ impl Game {
                 let small = match s.sdf {
                     world::Sdf::Sphere { r } => r < 4.0,
                     world::Sdf::Torus { big, tube } => big + tube < 4.5,
+                    world::Sdf::Hex { r, .. } => r < 5.0,
                     world::Sdf::Capsule { r, half } => r + half < 5.0,
                     world::Sdf::RBox { half, .. } => half.length() < 5.0,
                     world::Sdf::Shell { r, half, .. } => r.max(half) < 6.0,
+                    world::Sdf::TubeTorus { .. } => false, // loops are landmarks
+                    world::Sdf::RingDeck { .. } => false,
                     world::Sdf::None => true,
                 };
                 if small {
@@ -2400,10 +3029,11 @@ impl Game {
                 }
             }
             // tube LOD: far shells swap to the 10-segment mesh (same SDF)
-            let mesh = if s.mesh == world::M_SHELL && s.pos.distance_squared(rc.0) > 140.0 * 140.0 {
-                world::M_SHELL_LO
-            } else {
-                s.mesh
+            let far = s.pos.distance_squared(rc.0) > 140.0 * 140.0;
+            let mesh = match (s.mesh, far) {
+                (world::M_SHELL, true) => world::M_SHELL_LO,
+                (world::M_SHELL_OPEN, true) => world::M_SHELL_OPEN_LO,
+                _ => s.mesh,
             };
             push(&mut objs, mesh, None, s.mat, s.color, [0.0, em, s.spec, 0.0]);
         }

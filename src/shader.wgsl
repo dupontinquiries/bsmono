@@ -160,6 +160,22 @@ fn shape_sdf(i: u32, p: vec3<f32>) -> f32 {
     } else if (kind == 5) {                             // hollow tube shell
         let ring = abs(length(q.xz) - s.b.x) - s.b.z;
         return max(ring, abs(q.y) - s.b.y);
+    } else if (kind == 6) {                             // hexagonal prism
+        let k6 = vec3(-0.8660254, 0.5, 0.57735);
+        var a6 = abs(q);
+        let d6 = 2.0 * min(k6.x * a6.x + k6.y * a6.z, 0.0);
+        a6 = vec3(a6.x - d6 * k6.x, a6.y, a6.z - d6 * k6.y);
+        let cl6 = clamp(a6.x, -k6.z * s.b.x, k6.z * s.b.x);
+        let dxz = length(vec2(a6.x - cl6, a6.z - s.b.x)) * sign(a6.z - s.b.x);
+        let dy6 = a6.y - s.b.y;
+        return min(max(dxz, dy6), 0.0) + length(max(vec2(dxz, dy6), vec2(0.0)));
+    } else if (kind == 10) {                            // flat ring deck
+        let radial = abs(length(q.xz) - s.b.x) - s.b.y;
+        let vert = abs(q.y) - s.b.z;
+        return min(max(radial, vert), 0.0) + length(vec2(max(radial, 0.0), max(vert, 0.0))) - 0.12;
+    } else if (kind == 9) {                             // hollow torus (loop)
+        let ring = vec2(length(q.xz) - s.b.x, q.y);
+        return abs(length(ring) - s.b.y) - s.b.z;
     } else if (kind == 8) {                             // EXACT car model SDF
         let h = s.b.xyz;
         let a8 = abs(q) - h;
@@ -233,12 +249,12 @@ fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
         let id = (*c).id[j];
         let sd = shape_sdf(id, p);
         if (RTS[id].e.y >= 16.0) {
-            db = smin(db, sd, 2.2);
+            db = smin(db, sd, 1.8);
         } else {
             d = min(d, sd);
         }
     }
-    d = min(d, db);
+    d = smin(d, db, 1.8); // built form fillets into the terrain as well
     return d;
 }
 

@@ -236,7 +236,7 @@ fn land_matrix() {
         ("tumble", Quat::from_rotation_x(0.6), Vec3::new(5.0, 0.0, 2.0)),
         ("spin", Quat::from_rotation_z(0.5), Vec3::new(0.0, 4.0, 4.0)),
     ];
-    for (assist, h, label) in [(1.0f32, 5.0f32, "assist=default drop=5m"), (0.0, 5.0, "assist=OFF drop=5m"), (0.0, 2.2, "assist=OFF drop=2.2m (post-flip case)")] {
+    for (assist, h, label) in [(1.0f32, 5.0f32, "assist=1.0 (opt-in) drop=5m"), (0.0, 5.0, "assist=OFF (DEFAULT) drop=5m"), (0.0, 2.2, "assist=OFF (DEFAULT) drop=2.2m")] {
         println!("-- {label}");
         println!("{:<8} {:>9} {:>9} {:>9}", "pose", "contact", "flipback", "upright");
         for (name, q, a) in poses {
@@ -263,6 +263,1362 @@ pub fn run(args: &[String]) {
                 "{:>2} {:<12} shapes={:<4} grav={:<3} anims={:<3} zones={} launchers={} routes={} rcell_avg={:.1}",
                 si, st.name, w.shapes.len(), w.grav.len(), w.anims.len(), w.zones.len(), w.launchers.len(), w.routes.len(), avg
             );
+        }
+        return;
+    }
+    if name == "plat" {
+        // platform detection + the handheld preset, verifiable headlessly
+        let d = crate::platform::detect();
+        println!("detected: {:?}  ({})", d.profile, d.why);
+        // the exact target: Fairphone 5 / postmarketOS / SC7280
+        let fp5 = crate::platform::classify(
+            "Linux version 7.1.2 #1-postmarketos-qcom-sc7280 SMP PREEMPT Mon Jul 13 21:02:06 UTC",
+            "fp5-black",
+            "Fairphone 5",
+            true,
+        );
+        println!("fp5-black        : {:?}  ({})", fp5.profile, fp5.why);
+        let pc = crate::platform::classify("Linux version 6.8.0-generic #1 SMP", "workstation", "", false);
+        println!("desktop x86      : {:?}  ({})", pc.profile, pc.why);
+        let target_ok = fp5.profile == crate::platform::Profile::Handheld
+            && pc.profile == crate::platform::Profile::Desktop;
+        let mut cfg = crate::config::Config::default();
+        println!(
+            "desktop defaults : quality={:.2} rays={} render_scale={:.2} touch={}",
+            cfg.video.quality, cfg.video.rays, cfg.video.render_scale, cfg.touch.enabled
+        );
+        crate::platform::Profile::Handheld.apply(&mut cfg);
+        println!(
+            "handheld applied : quality={:.2} rays={} render_scale={:.2} touch={} vsync={}",
+            cfg.video.quality, cfg.video.rays, cfg.video.render_scale, cfg.touch.enabled, cfg.video.vsync
+        );
+        // the on-screen pad: stick math, buttons, flick-to-dodge, tap-to-move
+        let mut pad = crate::touch::TouchPad::new();
+        pad.enabled = true;
+        pad.down(1, glam::Vec2::new(0.18, 0.80));
+        pad.moved(1, glam::Vec2::new(0.18 - 0.09, 0.80 - 0.09)); // up-left
+        pad.tick(1.0 / 120.0);
+        let sv = pad.stick_vec();
+        println!("stick up-left    : steer={:+.2} throttle={:+.2}", sv.x, sv.y);
+        let stick_ok = sv.x < -0.3 && sv.y > 0.3;
+        pad.up(1);
+        let b = crate::touch::buttons();
+        pad.down(2, b.boost);
+        pad.down(3, b.jump);
+        pad.tick(1.0 / 120.0);
+        println!("buttons          : boost={} jump={} jump_edge={}", pad.boost_down(), pad.jump_down(), pad.jump_edge);
+        let btn_ok = pad.boost_down() && pad.jump_down() && pad.jump_edge;
+        pad.up(2);
+        pad.up(3);
+        pad.jump_edge = false;
+        // a flick in the open area: swipe right -> dodge right
+        let mut t = 0.0f64;
+        pad.down(4, glam::Vec2::new(0.60, 0.45));
+        for k in 1..=6 {
+            pad.moved(4, glam::Vec2::new(0.60 + k as f32 * 0.03, 0.45));
+            pad.tick(1.0 / 240.0);
+            t += 1.0;
+        }
+        pad.up(4);
+        pad.tick(1.0 / 240.0);
+        let _ = t;
+        let flick = pad.flick;
+        println!("swipe right      : flick={:?} jump_edge={}", flick.map(|f| (f.x, f.y)), pad.jump_edge);
+        let flick_ok = flick.map(|f| f.x > 0.5).unwrap_or(false) && pad.jump_edge;
+        // tap-to-move follow
+        pad.target = Some(Vec3::new(30.0, 0.0, 0.0));
+        let (thr, steer) = pad.follow(Vec3::ZERO, Vec3::Z);
+        println!("drive-to (+X)    : throttle={thr:+.2} steer={steer:+.2}");
+        let follow_ok = thr > 0.5 && steer.abs() > 0.5;
+        println!(
+            "{}",
+            if target_ok && stick_ok && btn_ok && flick_ok && follow_ok { "PLATFORM+TOUCH: PASS" } else { "PLATFORM+TOUCH: FAIL" }
+        );
+        return;
+    }
+    if name == "plat" {
+        // platform detection + the handheld preset, verifiable headlessly
+        let d = crate::platform::detect();
+        println!("detected: {:?}  ({})", d.profile, d.why);
+        // the exact target: Fairphone 5 / postmarketOS / SC7280
+        let fp5 = crate::platform::classify(
+            "Linux version 7.1.2 #1-postmarketos-qcom-sc7280 SMP PREEMPT Mon Jul 13 21:02:06 UTC",
+            "fp5-black",
+            "Fairphone 5",
+            true,
+        );
+        println!("fp5-black        : {:?}  ({})", fp5.profile, fp5.why);
+        let pc = crate::platform::classify("Linux version 6.8.0-generic #1 SMP", "workstation", "", false);
+        println!("desktop x86      : {:?}  ({})", pc.profile, pc.why);
+        let target_ok = fp5.profile == crate::platform::Profile::Handheld
+            && pc.profile == crate::platform::Profile::Desktop;
+        let mut cfg = crate::config::Config::default();
+        println!(
+            "desktop defaults : quality={:.2} rays={} render_scale={:.2} touch={}",
+            cfg.video.quality, cfg.video.rays, cfg.video.render_scale, cfg.touch.enabled
+        );
+        crate::platform::Profile::Handheld.apply(&mut cfg);
+        println!(
+            "handheld applied : quality={:.2} rays={} render_scale={:.2} touch={} vsync={}",
+            cfg.video.quality, cfg.video.rays, cfg.video.render_scale, cfg.touch.enabled, cfg.video.vsync
+        );
+        // the on-screen pad: stick math, buttons, flick-to-dodge, tap-to-move
+        let mut pad = crate::touch::TouchPad::new();
+        pad.enabled = true;
+        pad.down(1, glam::Vec2::new(0.18, 0.80));
+        pad.moved(1, glam::Vec2::new(0.18 - 0.09, 0.80 - 0.09)); // up-left
+        pad.tick(1.0 / 120.0);
+        let sv = pad.stick_vec();
+        println!("stick up-left    : steer={:+.2} throttle={:+.2}", sv.x, sv.y);
+        let stick_ok = sv.x < -0.3 && sv.y > 0.3;
+        pad.up(1);
+        let b = crate::touch::buttons();
+        pad.down(2, b.boost);
+        pad.down(3, b.jump);
+        pad.tick(1.0 / 120.0);
+        println!("buttons          : boost={} jump={} jump_edge={}", pad.boost_down(), pad.jump_down(), pad.jump_edge);
+        let btn_ok = pad.boost_down() && pad.jump_down() && pad.jump_edge;
+        pad.up(2);
+        pad.up(3);
+        pad.jump_edge = false;
+        // a flick in the open area: swipe right -> dodge right
+        let mut t = 0.0f64;
+        pad.down(4, glam::Vec2::new(0.60, 0.45));
+        for k in 1..=6 {
+            pad.moved(4, glam::Vec2::new(0.60 + k as f32 * 0.03, 0.45));
+            pad.tick(1.0 / 240.0);
+            t += 1.0;
+        }
+        pad.up(4);
+        pad.tick(1.0 / 240.0);
+        let _ = t;
+        let flick = pad.flick;
+        println!("swipe right      : flick={:?} jump_edge={}", flick.map(|f| (f.x, f.y)), pad.jump_edge);
+        let flick_ok = flick.map(|f| f.x > 0.5).unwrap_or(false) && pad.jump_edge;
+        // tap-to-move follow
+        pad.target = Some(Vec3::new(30.0, 0.0, 0.0));
+        let (thr, steer) = pad.follow(Vec3::ZERO, Vec3::Z);
+        println!("drive-to (+X)    : throttle={thr:+.2} steer={steer:+.2}");
+        let follow_ok = thr > 0.5 && steer.abs() > 0.5;
+        println!(
+            "{}",
+            if target_ok && stick_ok && btn_ok && flick_ok && follow_ok { "PLATFORM+TOUCH: PASS" } else { "PLATFORM+TOUCH: FAIL" }
+        );
+        return;
+    }
+    if name == "carsdf" {
+        // Does the baked reflection field actually resemble a CAR? Sample
+        // the atlas the shader samples and compare its silhouette with the
+        // model's real dimensions: a blob reads round, a car reads long.
+        use crate::render::{CSDF_H, CSDF_SLAB, CSDF_W};
+        // a stand-in model with known proportions (length >> width > height)
+        let mut m = crate::model::Model {
+            prims: Vec::new(),
+            cloud: Vec::new(),
+            cloud_n: Vec::new(),
+            sdf_half: Vec3::ZERO,
+            half_len: 0.64,
+            half_h: 0.31,
+            half_w: 0.32,
+            wheel_r: 0.16,
+        };
+        // a box-ish shell of points, the shape a car actually is
+        for i in 0..40 {
+            for j in 0..40 {
+                let (u, v) = (i as f32 / 39.0 * 2.0 - 1.0, j as f32 / 39.0 * 2.0 - 1.0);
+                for (p, n) in [
+                    (Vec3::new(u * 0.32, 0.31, v * 0.64), Vec3::Y),
+                    (Vec3::new(u * 0.32, -0.31, v * 0.64), Vec3::NEG_Y),
+                    (Vec3::new(0.32, u * 0.31, v * 0.64), Vec3::X),
+                    (Vec3::new(-0.32, u * 0.31, v * 0.64), Vec3::NEG_X),
+                    (Vec3::new(u * 0.32, v * 0.31, 0.64), Vec3::Z),
+                    (Vec3::new(u * 0.32, v * 0.31, -0.64), Vec3::NEG_Z),
+                ] {
+                    m.cloud.push(p);
+                    m.cloud_n.push(n);
+                }
+            }
+        }
+        let mut models = [m];
+        let atlas = crate::bake_car_sdfs(&mut models);
+        let h = models[0].sdf_half;
+        let dec = |x: usize, y: usize, z: usize| -> f32 {
+            let i = ((z as u32 * CSDF_H + y as u32) * CSDF_W + x as u32) as usize;
+            (atlas[i] as f32 / 255.0) * 2.4 - 0.6
+        };
+        // walk out from the centre along each axis: where does solid end?
+        let extent = |axis: usize| -> f32 {
+            let (cx, cy, cz) = (CSDF_W as usize / 2, CSDF_H as usize / 2, CSDF_SLAB as usize / 2);
+            let n = match axis {
+                0 => CSDF_W as usize,
+                1 => CSDF_H as usize,
+                _ => CSDF_SLAB as usize,
+            };
+            let mut last = 0usize;
+            for k in (n / 2)..n {
+                let d = match axis {
+                    0 => dec(k, cy, cz),
+                    1 => dec(cx, k, cz),
+                    _ => dec(cx, cy, k),
+                };
+                if d <= 0.0 {
+                    last = k;
+                }
+            }
+            let frac = (last as f32 + 0.5) / n as f32 * 2.0 - 1.0;
+            frac * match axis {
+                0 => h.x,
+                1 => h.y,
+                _ => h.z,
+            }
+        };
+        let (ex, ey, ez) = (extent(0), extent(1), extent(2));
+        println!("baked half-extents: x {ex:.2}  y {ey:.2}  z {ez:.2}  (model 0.32 / 0.31 / 0.64)");
+        let long_enough = ez > ex * 1.5;
+        let flat_enough = ey < ez * 0.75;
+        let tight = (ex - 0.32).abs() < 0.10 && (ez - 0.64).abs() < 0.12;
+        println!("{:<34} {}", "longer than wide (not a sphere)", if long_enough { "ok" } else { "FAIL" });
+        println!("{:<34} {}", "flatter than long", if flat_enough { "ok" } else { "FAIL" });
+        println!("{:<34} {}", "matches the model within 10 cm", if tight { "ok" } else { "FAIL" });
+        println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
+        return;
+    }
+    if name == "dribble" {
+        // RL dribbling is a DIRECT mapping: steer in, yaw out, nothing else
+        // rotating. This measures the mapping fidelity and any rotation the
+        // stick did not ask for, with the ball riding the hood.
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        println!("{:<16} {:>9} {:>9} {:>9} {:>8} {:>6}", "case", "yaw_cmd", "yaw_out", "stray", "carry", "gnd");
+        for (label, steer, bump) in [
+            ("straight", 0.0f32, false),
+            ("steady turn", 0.6, false),
+            ("hard turn", 1.0, false),
+            ("turn after land", 0.6, true),
+        ] {
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            let mut world2 = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            // get rolling, then set the ball on the hood
+            for _ in 0..90 {
+                physics::step_car_only(&mut car, &ball, &world2, &c, &cfg, DT);
+            }
+            if bump {
+                // land from a small hop with leftover tumble, as you would
+                // after any aerial touch
+                car.pos += Vec3::Y * 1.2;
+                car.ang = Vec3::new(1.6, 0.0, -1.2);
+                // let the landing FINISH: the recovery is measured by the
+                // landing matrix, this case is about dribbling once down
+                for _ in 0..150 {
+                    physics::step_car_only(&mut car, &ball, &world2, &c, &cfg, DT);
+                }
+            }
+            ball.pos = car.pos + car.forward() * 0.55 + car.up() * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.ang = Vec3::ZERO;
+            c.steer = steer;
+            let mut stray = 0.0f32;
+            let mut yaw_out = 0.0f32;
+            let mut carried = 0;
+            let mut grounded_frames = 0;
+            let mut frame = 0usize;
+            let mut prev_og = true;
+            let f0 = car.forward();
+            let mut prev_f = Vec3::new(f0.x, 0.0, f0.z).normalize_or(Vec3::Z);
+            let steps = 240;
+            for _ in 0..steps {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world2, &c, &cfg, DT, &mut ev);
+                // yaw actually delivered, per second
+                let f = car.forward();
+                let fh = Vec3::new(f.x, 0.0, f.z).normalize_or(prev_f);
+                let dyaw = prev_f.cross(fh).y.asin() / DT;
+                yaw_out += dyaw;
+                prev_f = fh;
+                // rotation the stick did NOT ask for: pitch and roll rates
+                let body = car.rot.inverse() * car.ang;
+                stray = stray.max(body.x.abs().max(body.z.abs()));
+                if ball.pos.distance(car.pos) < 2.2 && ball.pos.y > car.pos.y {
+                    carried += 1;
+                }
+                if car.on_ground {
+                    grounded_frames += 1;
+                }
+                if std::env::var("DRIB_DBG").map(|v| v == label).unwrap_or(false) && car.on_ground != prev_og {
+                    prev_og = car.on_ground;
+                    eprintln!(
+                        "  f={:3} y={:6.3} d={:6.3} og={} vy={:6.2} sp={:5.1}",
+                        frame, car.pos.y, world2.sdf(car.pos), car.on_ground as u8, car.vel.y, car.vel.length()
+                    );
+                }
+                frame += 1;
+                let _ = &prev_og;
+            }
+            let sp = car.vel.length();
+            let cmd = -(steer) * (3.0 - (sp * 0.050).min(1.65)).max(1.15) * cfg.car.steer_rate;
+            println!(
+                "{:<16} {:>9.2} {:>9.2} {:>9.2} {:>7.0}% {:>6.0}%",
+                label,
+                cmd,
+                yaw_out / steps as f32,
+                stray,
+                carried as f32 / steps as f32 * 100.0,
+                grounded_frames as f32 / steps as f32 * 100.0
+            );
+        }
+        return;
+    }
+    if name == "flick" {
+        // FAMOUS FLICKS, attempted for real: balance the ball on the hood,
+        // drive, then run each input sequence and measure what leaves.
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(0), 0.31, 1.0);
+        // settle a dribble: ball resting on the hood at driving speed
+        let setup = |speed: f32, an: &mut crate::style::Analyzer| -> (physics::Car, Ball) {
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            let mut ball = Ball::new();
+            ball.pos = car.pos + car.forward() * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+            ball.vel = Vec3::ZERO;
+            let mut c = physics::Controls::default();
+            let mut w2 = World::generate(31, crate::world::style(0), 0.31, 1.0);
+            let mut ev = StepEvents::default();
+            let mut t = 0.0f32;
+            while t < 2.6 {
+                let sp = car.vel.length();
+                c.throttle = if sp < speed { 1.0 } else { 0.0 };
+                // steer gently toward the ball to keep it centred, as a
+                // human dribbler would
+                let off = (ball.pos - car.pos).dot(car.rot * Vec3::X);
+                c.steer = (off * 1.6).clamp(-1.0, 1.0);
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut w2, &c, &cfg, DT, &mut ev);
+                an.step(&crate::style::Frame {
+                    dt: DT,
+                    car_pos: car.pos,
+                    car_vel: car.vel,
+                    car_up: car.up(),
+                    on_ground: car.on_ground,
+                    flipping: car.is_flipping(),
+                    omega: car.omega.length(),
+                    ball_pos: ball.pos,
+                    ball_vel: ball.vel,
+                    touch: ev.touches.first().map(|&(_, sp)| sp),
+                    flip_reset: ev.flip_reset.is_some(),
+                    pinch: ev.pinched,
+                    goal: false,
+                    surf_up: w2.normal(car.pos).y,
+                    supersonic: car.supersonic,
+                });
+                t += DT;
+            }
+            // A flick starts with the ball WORKED ONTO THE NOSE — that is
+            // the setup every one of these plays begins from. Place it
+            // there, matched in speed, and let contact settle a beat.
+            ball.pos = car.pos + car.forward() * 0.52 + car.up() * (car.half_h + ball.r + 0.01);
+            ball.vel = car.vel;
+            for _ in 0..14 {
+                let off = (ball.pos - car.pos).dot(car.rot * Vec3::X);
+                c.steer = (off * 1.6).clamp(-1.0, 1.0);
+                c.throttle = 0.0;
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut w2, &c, &cfg, DT, &mut ev);
+                an.step(&crate::style::Frame {
+                    dt: DT,
+                    car_pos: car.pos,
+                    car_vel: car.vel,
+                    car_up: car.up(),
+                    on_ground: car.on_ground,
+                    flipping: car.is_flipping(),
+                    omega: car.omega.length(),
+                    ball_pos: ball.pos,
+                    ball_vel: ball.vel,
+                    touch: ev.touches.first().map(|&(_, sp)| sp),
+                    flip_reset: ev.flip_reset.is_some(),
+                    pinch: ev.pinched,
+                    goal: false,
+                    surf_up: w2.normal(car.pos).y,
+                    supersonic: car.supersonic,
+                });
+            }
+            if std::env::var("FLICK_DBG").is_ok() {
+                let rel = ball.pos - car.pos;
+                eprintln!(
+                    "  setup: car spd {:.1}, ball above hood {:.2}, fwd offset {:.2}, side {:.2}, ball spd {:.1}",
+                    car.vel.length(),
+                    rel.dot(car.up()),
+                    rel.dot(car.forward()),
+                    rel.dot(car.rot * Vec3::X),
+                    ball.vel.length()
+                );
+            }
+            (car, ball)
+        };
+        struct Flick {
+            name: &'static str,
+            hint: &'static str,
+            // (jump_pressed, throttle, steer, pitch, roll) per phase
+            seq: &'static [(f32, f32, f32, f32, f32, bool)],
+        }
+        // phases are (seconds, throttle, steer, pitch, roll, jump_pressed)
+        let flicks: [Flick; 7] = [
+            Flick { name: "MUSTY", hint: "nose-down, then backflip under it", seq: &[(0.02, 0.0, 0.0, 0.0, 0.0, true), (0.05, 0.0, 0.0, -0.5, 0.0, false), (0.02, -1.0, 0.0, 0.0, 0.0, true), (0.60, 0.0, 0.0, 0.0, 0.0, false)] },
+            Flick { name: "FORWARD", hint: "jump, front flip through it", seq: &[(0.02, 0.0, 0.0, 0.0, 0.0, true), (0.07, 0.0, 0.0, 0.0, 0.0, false), (0.02, 1.0, 0.0, 0.0, 0.0, true), (0.60, 1.0, 0.0, 0.0, 0.0, false)] },
+            Flick { name: "45-DEGREE", hint: "diagonal flip, the classic", seq: &[(0.02, 0.0, 0.0, 0.0, 0.0, true), (0.07, 0.0, 0.0, 0.0, 0.0, false), (0.02, 1.0, 0.8, 0.0, 0.0, true), (0.60, 1.0, 0.8, 0.0, 0.0, false)] },
+            Flick { name: "SIDEWAYS", hint: "side flip: pure lateral whip", seq: &[(0.02, 0.0, 0.0, 0.0, 0.0, true), (0.07, 0.0, 0.0, 0.0, 0.0, false), (0.02, 0.0, 1.0, 0.0, 0.0, true), (0.60, 0.0, 1.0, 0.0, 0.0, false)] },
+            Flick { name: "TORNADO", hint: "air roll into the flip", seq: &[(0.02, 0.0, 0.0, 0.0, 0.0, true), (0.14, 0.0, 0.0, 0.0, 1.0, false), (0.02, 1.0, 0.0, 0.0, 1.0, true), (0.60, 1.0, 0.0, 0.0, 1.0, false)] },
+            Flick { name: "DELAYED", hint: "pop, wait, then flip", seq: &[(0.02, 0.0, 0.0, 0.0, 0.0, true), (0.26, 0.0, 0.0, 0.0, 0.0, false), (0.02, 1.0, 0.0, 0.0, 0.0, true), (0.60, 1.0, 0.0, 0.0, 0.0, false)] },
+            Flick { name: "BREEZI", hint: "backflip, cancel, roll out", seq: &[(0.02, 0.0, 0.0, 0.0, 0.0, true), (0.07, 0.0, 0.0, 0.0, 0.0, false), (0.02, -1.0, 0.0, 0.0, 0.0, true), (0.16, -1.0, 0.0, 0.0, 0.0, false), (0.50, 0.0, 0.0, -1.0, 1.0, false)] },
+        ];
+        println!("{:<11} {:>7} {:>7} {:>7} {:>7} {:>4} {:<6} {}", "flick", "exit", "up", "elev", "gain", "hits", "feel", "the analyzer says");
+        for f in flicks {
+            let mut an = crate::style::Analyzer::new();
+            let (mut car, mut ball) = setup(11.0, &mut an);
+            let base = car.vel.length();
+            let mut w2 = World::generate(31, crate::world::style(0), 0.31, 1.0);
+            let mut ev = StepEvents::default();
+            let mut c = physics::Controls::default();
+            // the launch is the ball's velocity AS IT LEAVES THE CAR, not
+            // whatever it has after gravity has been at it
+            let mut best = ball.vel;
+            let mut touches = 0;
+            let mut flip_touches = 0;
+            let mut flipping = false;
+            let mut record = |ev: &StepEvents, ball: &Ball, best: &mut Vec3, touches: &mut i32| {
+                if !ev.touches.is_empty() {
+                    *touches += 1;
+                    *best = ball.vel; // last contact wins: that is separation
+                }
+            };
+            for &(dur, thr, st, pit, roll, jump) in f.seq {
+                let mut t = 0.0f32;
+                let mut fired = false;
+                while t < dur {
+                    c.throttle = thr;
+                    c.steer = st;
+                    c.pitch = pit;
+                    c.roll = roll;
+                    c.jump_pressed = jump && !fired;
+                    fired = true;
+                    ev.touches.clear();
+                    physics::step(&mut car, &mut ball, &mut w2, &c, &cfg, DT, &mut ev);
+                    flipping = car.is_flipping();
+                    if std::env::var("FLICK_TRACE").map(|v| v == f.name).unwrap_or(false) {
+                        let rel = ball.pos - car.pos;
+                        eprintln!(
+                            "    up={:5.2} fwd={:5.2} gap={:5.2} omega={:5.1} flip={} touch={}",
+                            rel.dot(car.up()), rel.dot(car.forward()), rel.length() - 0.9,
+                            car.omega.length(), flipping as u8, !ev.touches.is_empty() as u8
+                        );
+                    }
+                    if flipping && !ev.touches.is_empty() {
+                        flip_touches += 1;
+                    }
+                    record(&ev, &ball, &mut best, &mut touches);
+                    let sf = crate::style::Frame {
+                        dt: DT,
+                        car_pos: car.pos,
+                        car_vel: car.vel,
+                        car_up: car.up(),
+                        on_ground: car.on_ground,
+                        flipping: car.is_flipping(),
+                        omega: car.omega.length(),
+                        ball_pos: ball.pos,
+                        ball_vel: ball.vel,
+                        touch: ev.touches.first().map(|&(_, sp)| sp),
+                        flip_reset: ev.flip_reset.is_some(),
+                        pinch: ev.pinched,
+                        goal: !ev.goals.is_empty(),
+                        surf_up: w2.normal(car.pos).y,
+                        supersonic: car.supersonic,
+                    };
+                    an.step(&sf);
+                    t += DT;
+                }
+            }
+            c = physics::Controls::default();
+            for _ in 0..40 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut w2, &c, &cfg, DT, &mut ev);
+                record(&ev, &ball, &mut best, &mut touches);
+                let sf = crate::style::Frame {
+                    dt: DT,
+                    car_pos: car.pos,
+                    car_vel: car.vel,
+                    car_up: car.up(),
+                    on_ground: car.on_ground,
+                    flipping: car.is_flipping(),
+                    omega: car.omega.length(),
+                    ball_pos: ball.pos,
+                    ball_vel: ball.vel,
+                    touch: ev.touches.first().map(|&(_, sp)| sp),
+                    flip_reset: ev.flip_reset.is_some(),
+                    pinch: ev.pinched,
+                    goal: !ev.goals.is_empty(),
+                    surf_up: w2.normal(car.pos).y,
+                    supersonic: car.supersonic,
+                };
+                an.step(&sf);
+            }
+            let _ = touches;
+            let sp = best.length();
+            let elev = best.y.atan2(Vec3::new(best.x, 0.0, best.z).length()).to_degrees();
+            let named: Vec<String> = an.fresh.iter().map(|x| format!("{} +{}", x.name, x.points)).collect();
+            let named = if named.is_empty() { format!("(nothing named)") } else { named.join(", ") };
+            let feel = if sp > base * 1.8 && best.y > 4.0 {
+                "BIG"
+            } else if sp > base * 1.25 {
+                "works"
+            } else {
+                "weak"
+            };
+            println!(
+                "{:<11} {:>7.1} {:>7.1} {:>6.0}d {:>6.0}% {:>4} {:<6} {}",
+                f.name, sp, best.y, elev, sp / base.max(0.1) * 100.0, flip_touches, feel, named
+            );
+        }
+        return;
+    }
+    if name == "shot" {
+        // POWER SHOT audit: drive into a resting ball at speed, then measure
+        // exit speed, how far it actually travels, and how fast a roll dies
+        let cfg = Config::default();
+        // open plain, not the boxed arena: a wall rebound would fake the
+        // travel numbers (the first run measured exactly that)
+        let world = World::generate(31, crate::world::style(0), 0.31, 1.0);
+        println!("{:<10} {:>7} {:>7} {:>7} {:>7} {:>7}", "approach", "exit", "loft", "1s", "3s", "carry%");
+        for target in [8.0f32, 15.0, 24.0] {
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            let mut ball = Ball::new();
+            // the car's nose points -Z, so the ball goes in FRONT of it
+            ball.pos = Vec3::new(0.0, world.ground_h(0.0, -30.0) + ball.r, -30.0);
+            let _ = &world;
+            ball.vel = Vec3::ZERO;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            c.boost = true;
+            let mut ev = StepEvents::default();
+            let mut approach = 0.0f32;
+            let mut exit = 0.0f32;
+            let mut loft = 0.0f32;
+            let mut d1 = 0.0f32;
+            let mut d3 = 0.0f32;
+            let start = ball.pos;
+            let mut t = 0.0f32;
+            let mut hit_t = -1.0f32;
+            let mut world2 = World::generate(31, crate::world::style(0), 0.31, 1.0);
+            while t < 11.0 {
+                if hit_t < 0.0 {
+                    // hold the approach speed rather than coasting: a slow
+                    // target used to stall out before ever reaching the ball
+                    let sp = car.vel.length();
+                    c.throttle = if sp < target { 1.0 } else { 0.0 };
+                    c.boost = sp < target - 1.0 && target > 16.0;
+                }
+                ev.touches.clear();
+                let pre = car.vel.length();
+                physics::step(&mut car, &mut ball, &mut world2, &c, &cfg, DT, &mut ev);
+                if hit_t < 0.0 && ball.vel.length() > 0.5 {
+                    hit_t = t;
+                    approach = pre;
+                }
+                if hit_t >= 0.0 {
+                    let since = t - hit_t;
+                    if std::env::var("SHOT_DBG").is_ok() && (since * 4.0).fract() < DT * 4.0 && since < 3.1 {
+                        eprintln!(
+                            "  t={:4.2} spd={:5.1} y={:5.2} vy={:6.2} spin={:5.1} d={:6.1}",
+                            since, ball.vel.length(), ball.pos.y, ball.vel.y, ball.ang.length(), ball.pos.distance(start)
+                        );
+                    }
+                    if exit == 0.0 && since > 0.10 {
+                        exit = ball.vel.length();
+                        loft = ball.vel.y;
+                    }
+                    // distance ALONG the shot line, so a rebound cannot
+                    // masquerade as travel
+                    let along = (ball.pos - start).dot(Vec3::NEG_Z);
+                    if d1 == 0.0 && since >= 1.0 {
+                        d1 = along;
+                    }
+                    if d3 == 0.0 && since >= 3.0 {
+                        d3 = along;
+                        break;
+                    }
+                }
+                t += DT;
+            }
+            println!(
+                "{:<10.1} {:>7.1} {:>7.1} {:>7.1} {:>7.1} {:>6.0}%",
+                approach, exit, loft, d1, d3, if approach > 0.0 { exit / approach * 100.0 } else { 0.0 }
+            );
+        }
+        return;
+    }
+    if name == "spawn" {
+        // EVERY map must put the car on a surface, not inside one. Raised
+        // decks (DROPSHOT) used to bury the spawn and made maps unplayable.
+        let cfg = Config::default();
+        let mut bad = 0;
+        println!("{:<14} {:>8} {:>8} {:>7} {:>6}", "map", "spawn_y", "clear", "settled", "up.y");
+        for si in 0..crate::world::STYLE_COUNT {
+            let st = crate::world::style(si);
+            let world = World::generate(9, st, 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.reset(&world);
+            let spawn_y = car.pos.y;
+            let clear = world.sdf(car.pos);
+            let ball = Ball::new();
+            let c = physics::Controls::default();
+            for _ in 0..300 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            let settled = car.on_ground && car.pos.y > -5.0;
+            let ok = clear > 0.0 && settled && car.up().y > 0.85;
+            if !ok {
+                bad += 1;
+            }
+            println!(
+                "{:<14} {:>8.2} {:>8.2} {:>7} {:>6.2}{}",
+                st.name,
+                spawn_y,
+                clear,
+                if settled { "yes" } else { "NO" },
+                car.up().y,
+                if ok { "" } else { "   <-- BAD" }
+            );
+        }
+        println!("{}", if bad == 0 { "SPAWNS: PASS" } else { "SPAWNS: FAIL" });
+        return;
+    }
+    if name == "kuiper" {
+        // the deep-space systems: graded gravity, surface following, the
+        // collapse/detonation event, arrivals, and planet billiards
+        let cfg = Config::default();
+        let mut world = World::generate(9, crate::world::style(28), 0.31, 1.0);
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<42} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // 1. bigger worlds pull harder
+        let mut heavy = (0.0f32, Vec3::ZERO, 0.0f32);
+        let mut light = (f32::MAX, Vec3::ZERO, 0.0f32);
+        for g in world.grav.iter() {
+            if g.g > heavy.0 {
+                heavy = (g.g, g.pos, g.r);
+            }
+            if g.g < light.0 {
+                light = (g.g, g.pos, g.r);
+            }
+        }
+        let gh = world.gravity_field(heavy.1 + Vec3::Y * heavy.2 * 0.3).1;
+        let gl = world.gravity_field(light.1 + Vec3::Y * light.2 * 0.3).1;
+        println!("  heaviest well g={:.2}, lightest g={:.2}", gh, gl);
+        check("giants pull harder than dwarfs", gh > gl * 1.5);
+        check("far field relaxes to normal gravity", (world.gravity_field(Vec3::new(900.0, 400.0, 900.0)).1 - 1.0).abs() < 0.01);
+        // 2. gravity points INTO the nearest world, not just down
+        let side = heavy.1 + Vec3::X * (heavy.2 * 0.35);
+        let d = world.gravity_field(side).0;
+        check("gravity points at the world from the side", d.x < -0.3);
+        // 3. planets are free bodies that collide
+        let n_bodies = world.bodies.len();
+        check("free worlds exist", n_bodies >= 8);
+        let (i, j) = (0usize, 1usize);
+        world.bodies[i].pos = Vec3::new(0.0, 400.0, 0.0);
+        world.bodies[j].pos = world.bodies[i].pos + Vec3::new(world.bodies[i].r + world.bodies[j].r - 0.3, 0.0, 0.0);
+        world.bodies[i].vel = Vec3::new(24.0, 0.0, 0.0);
+        world.bodies[j].vel = Vec3::ZERO;
+        let mut car = physics::Car::new();
+        car.pos = Vec3::new(600.0, 20.0, 600.0);
+        let mut ball = Ball::new();
+        ball.pos = Vec3::new(620.0, 20.0, 620.0);
+        let c = physics::Controls::default();
+        let mut ev = StepEvents::default();
+        for _ in 0..30 {
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+        }
+        let struck = world.bodies[j].vel.x;
+        println!("  billiards: struck world now moving at {:.1} m/s", struck);
+        check("planet-planet collision transfers momentum", struck > 1.0);
+        // 4. the collapse event: pull inward, then a detonation that throws
+        world.force_collapse_for_test();
+        let bh_pos = world.bh_pos_for_test().unwrap();
+        ball.pos = bh_pos + Vec3::new(40.0, 0.0, 0.0);
+        ball.vel = Vec3::ZERO;
+        car.pos = bh_pos + Vec3::new(52.0, 0.0, 0.0);
+        car.vel = Vec3::ZERO;
+        let d0 = ball.pos.distance(bh_pos);
+        for _ in 0..120 {
+            world.update(DT);
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+        }
+        let d1 = ball.pos.distance(bh_pos);
+        println!("  collapse: ball {d0:.1} m -> {d1:.1} m from the singularity");
+        check("black hole hauls things inward", d1 < d0 - 1.0);
+        // run out the fifteen seconds and catch the blast
+        let mut blasted = false;
+        let mut speed_after = 0.0;
+        for _ in 0..(16 * 120) {
+            ev.blasted = false;
+            world.update(DT);
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            if ev.blasted {
+                blasted = true;
+                speed_after = ball.vel.length();
+                break;
+            }
+        }
+        println!("  detonation: ball thrown at {speed_after:.1} m/s");
+        check("collapse detonates and throws things", blasted && speed_after > 4.0);
+        // 5. the shockwave falls off with distance
+        let mut w2 = World::generate(9, crate::world::style(28), 0.31, 1.0);
+        w2.force_collapse_for_test();
+        let c2 = w2.bh_pos_for_test().unwrap();
+        let (mut near_b, mut far_b) = (Ball::new(), Ball::new());
+        near_b.pos = c2 + Vec3::new(14.0, 0.0, 0.0);
+        far_b.pos = c2 + Vec3::new(140.0, 0.0, 0.0);
+        w2.set_blast_for_test(c2, 260.0);
+        let mut car2 = physics::Car::new();
+        car2.pos = c2 + Vec3::new(800.0, 0.0, 0.0);
+        physics::step(&mut car2, &mut near_b, &mut w2, &c, &cfg, DT, &mut ev);
+        let vn = near_b.vel.length();
+        w2.set_blast_for_test(c2, 260.0);
+        physics::step(&mut car2, &mut far_b, &mut w2, &c, &cfg, DT, &mut ev);
+        let vf = far_b.vel.length();
+        println!("  shockwave: {vn:.1} m/s at 14 m vs {vf:.1} m/s at 140 m");
+        check("shockwave falls off with distance", vn > vf * 2.0);
+        // 6. arrivals add a world
+        let before = world.bodies.len();
+        world.force_arrival_for_test();
+        check("a new world arrives", world.bodies.len() == before + 1);
+        let nb = world.bodies.last().unwrap();
+        check("it arrives from high above, falling", nb.pos.y > 200.0 && nb.vel.y < -10.0);
+        println!("{}", if pass { "KUIPER: PASS" } else { "KUIPER: FAIL" });
+        return;
+    }
+    if name == "planets" {
+        // The DVD-screensaver planets: do they squash on impact, spring
+        // back to round, keep almost all their bounce, and never settle?
+        let cfg = Config::default();
+        let mut world = World::generate(9, crate::world::style(28), 0.31, 1.0); // KUIPER
+        let n_bouncy = world.bodies.iter().filter(|b| b.bouncy).count();
+        println!("drifting planets: {n_bouncy}");
+        let bi = world.bodies.iter().position(|b| b.bouncy).unwrap();
+        // park the car and ball far away so only the planet is in play
+        let mut car = physics::Car::new();
+        car.pos = Vec3::new(600.0, 40.0, 600.0);
+        let mut ball = Ball::new();
+        ball.pos = Vec3::new(-600.0, 40.0, -600.0);
+        let c = physics::Controls::default();
+        let mut ev = StepEvents::default();
+        let (mut peak_squash, mut bounces, mut apex, mut first_apex) = (0.0f32, 0, 0.0f32, 0.0f32);
+        let (mut prev_vy, mut settled_round) = (0.0f32, false);
+        let mut t = 0.0f32;
+        while t < 40.0 {
+            ev.goals.clear();
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            let b = &world.bodies[bi];
+            peak_squash = peak_squash.max(b.squash);
+            if b.squash == 0.0 && t > 6.0 {
+                settled_round = true; // it does return to a sphere
+            }
+            let vy = b.vel.y;
+            if prev_vy < 0.0 && vy > 0.0 {
+                bounces += 1; // direction flip at the ground = a bounce
+            }
+            if vy.abs() < 0.3 {
+                apex = apex.max(b.pos.y);
+                if first_apex == 0.0 && bounces >= 1 {
+                    first_apex = b.pos.y;
+                }
+            }
+            prev_vy = vy;
+            t += DT;
+        }
+        let b = &world.bodies[bi];
+        let still_moving = b.vel.length();
+        println!("bounces in 40 s: {bounces}   peak squash: {:.0}%   returns to round: {}", peak_squash * 100.0, settled_round);
+        println!("still moving after 40 s: {still_moving:.1} m/s   highest apex {apex:.0} m");
+        let ok = n_bouncy >= 3 && bounces >= 3 && peak_squash > 0.05 && settled_round && still_moving > 1.0;
+        println!("{}", if ok { "PLANETS: PASS" } else { "PLANETS: FAIL" });
+        return;
+    }
+    if name == "loop" {
+        // Loops must be ONE seamless piece, not a chain. Three things are
+        // checked per loop: it is a single shape (a chain would be ~27),
+        // its own surface is continuous at every angle, and the bore has no
+        // holes in the wall (the old elbow cutters punched clean through).
+        let mut pass = true;
+        for (si, label) in [(21usize, "PERPLEXUS"), (24, "MONKEY RUN")] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let rings: Vec<(Vec3, glam::Quat, f32, f32, f32)> = w
+                .shapes
+                .iter()
+                .filter_map(|sh| match sh.sdf {
+                    crate::world::Sdf::TubeTorus { big, tube, thick } => {
+                        Some((sh.pos, sh.inv_rot, big, tube, thick))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if rings.is_empty() {
+                println!("{label:<12} no loops found");
+                pass = false;
+                continue;
+            }
+            for (k, &(c, inv_rot, big, tube, thick)) in rings.iter().enumerate() {
+                let rot = inv_rot.inverse();
+                let (u, v) = (rot * Vec3::X, rot * Vec3::Z);
+                let axis = rot * Vec3::Y;
+                // 1. the primitive's own surface, sampled all the way round
+                let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+                // 2. the wall: solid at every angle, top and bottom
+                let mut wall_holes = 0;
+                let mut open_flags: Vec<bool> = Vec::new();
+                // 3. how much of the ring is merged into the entry run
+                let mut buried = 0;
+                for i in 0..288 {
+                    let a = i as f32 / 288.0 * std::f32::consts::TAU;
+                    let dir = u * a.cos() + v * a.sin();
+                    let centre = c + dir * big;
+                    let q = inv_rot * (centre - c);
+                    let ring = glam::Vec2::new(glam::Vec2::new(q.x, q.z).length() - big, q.y);
+                    let own = (ring.length() - tube).abs() - thick;
+                    lo = lo.min(own);
+                    hi = hi.max(own);
+                    let mut open_here = false;
+                    for s in [1.0f32, -1.0] {
+                        if w.sdf(centre + axis * (s * tube)) > 0.0 {
+                            wall_holes += 1;
+                            open_here = true;
+                        }
+                    }
+                    open_flags.push(open_here);
+                    if w.sdf(centre) < 0.0 {
+                        buried += 1;
+                    }
+                }
+                // A loop MUST be open where you ride in and out. What it must
+                // not be is perforated: count contiguous openings, not holes.
+                let n = open_flags.len();
+                let mut mouths = 0;
+                for i in 0..n {
+                    if open_flags[i] && !open_flags[(i + n - 1) % n] {
+                        mouths += 1;
+                    }
+                }
+                let open_pct = wall_holes as f32 / (n as f32 * 2.0) * 100.0;
+                let ripple = hi - lo;
+                let bury_pct = buried as f32 / n as f32 * 100.0;
+                let ok = ripple < 1e-3 && mouths <= 4 && open_pct < 25.0 && bury_pct < 30.0;
+                pass &= ok;
+                println!(
+                    "{label:<12} loop {k}: 1 shape  ripple {ripple:.5}  mouths {mouths} ({open_pct:.0}% open)  merged {bury_pct:.0}%  {}",
+                    if ok { "SEAMLESS" } else { "PROBLEM" }
+                );
+            }
+        }
+        // ---- BORE CLEARANCE: how much room does a car actually have? ----
+        // The car needs ~1.0 m of radius to fit and wants far more to move.
+        let car_need = 1.05f32;
+        for (si, label) in [(21usize, "PERPLEXUS"), (24, "MONKEY RUN")] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let mut all: Vec<f32> = Vec::new();
+            let dbg = std::env::var("BORE_DBG").is_ok();
+            for (ri, (pts, _r)) in w.routes.iter().enumerate() {
+                let mut route_min = f32::MAX;
+                let mut route_tight = 0;
+                let mut route_n = 0;
+                for seg in pts.windows(2) {
+                    for k in 0..6 {
+                        let p = seg[0].lerp(seg[1], k as f32 / 6.0);
+                        // waypoints AT chamber walls and mouths sit inside
+                        // solid by construction, so sample the open bore:
+                        // anything grazing a wall is a junction, not a pipe
+                        let d = w.sdf(p);
+                        if d > 0.35 {
+                            all.push(d); // free radius at the axis
+                            route_min = route_min.min(d);
+                            route_n += 1;
+                            if d < car_need * 1.6 {
+                                route_tight += 1;
+                            }
+                        }
+                    }
+                }
+                if dbg && route_n > 0 {
+                    eprintln!(
+                        "  {label} route {ri}: {} pts, min {:.2}, tight {:.0}%",
+                        route_n,
+                        route_min,
+                        route_tight as f32 / route_n as f32 * 100.0
+                    );
+                }
+            }
+            all.sort_by(f32::total_cmp);
+            if all.is_empty() {
+                continue;
+            }
+            let p10 = all[all.len() / 10];
+            let med = all[all.len() / 2];
+            let tight = all.iter().filter(|&&d| d < car_need * 1.6).count();
+            let tpct = tight as f32 / all.len() as f32 * 100.0;
+            let ok = p10 > car_need && tpct < 15.0;
+            pass &= ok;
+            println!(
+                "{label:<12} bore: p10 {p10:.2} m  median {med:.2} m  tight {tpct:.0}%  {}",
+                if ok { "drivable" } else { "CRAMPED" }
+            );
+        }
+        // ---- KUIPER: do worlds PULL? ----
+        {
+            let w = World::generate(9, crate::world::style(28), 0.31, 1.0);
+            let planet = w
+                .grav
+                .iter()
+                .filter(|n| n.inward)
+                .max_by(|a, b| a.r.total_cmp(&b.r));
+            match planet {
+                Some(n) => {
+                    let above = n.pos + Vec3::Y * (n.r * 0.5);
+                    let g = w.gravity_dir(above);
+                    let toward = (n.pos - above).normalize();
+                    let dot = g.dot(toward);
+                    let ok = dot > 0.5;
+                    pass &= ok;
+                    println!(
+                        "KUIPER       planet field: dot(down, toward centre) = {dot:.2}  {}",
+                        if ok { "attractive" } else { "REPULSIVE" }
+                    );
+                }
+                None => {
+                    println!("KUIPER       no planet gravity nodes");
+                    pass = false;
+                }
+            }
+        }
+        // ---- RING DECKS: can a car actually stand on one? ----
+        {
+            let cfg = Config::default();
+            let mut w = World::generate(9, crate::world::style(28), 0.31, 1.0); // KUIPER
+            let deck = w.shapes.iter().find_map(|sh| match sh.sdf {
+                crate::world::Sdf::RingDeck { big, wide, half_h } => {
+                    Some((sh.pos, sh.inv_rot.inverse(), big, wide, half_h))
+                }
+                _ => None,
+            });
+            match deck {
+                Some((c, rot, big, wide, half_h)) => {
+                    let _ = wide;
+                    let up = rot * Vec3::Y;
+                    let out = rot * Vec3::X;
+                    let mut car = physics::Car::new();
+                    car.pos = c + out * big + up * (half_h + 0.45);
+                    car.rot = glam::Quat::from_rotation_arc(Vec3::Y, up);
+                    car.vel = Vec3::ZERO;
+                    let ball = Ball::new();
+                    let ctl = physics::Controls::default();
+                    let mut grounded = 0;
+                    for _ in 0..240 {
+                        physics::step_car_only(&mut car, &ball, &w, &ctl, &cfg, DT);
+                        if car.on_ground {
+                            grounded += 1;
+                        }
+                    }
+                    let held = car.pos.distance(c + out * big) < 6.0;
+                    let ok = grounded > 120 && held;
+                    pass &= ok;
+                    println!(
+                        "KUIPER       ring deck: grounded {grounded}/240 frames, stayed on {} {}",
+                        if held { "yes" } else { "no" },
+                        if ok { "drivable" } else { "NOT DRIVABLE" }
+                    );
+                }
+                None => {
+                    println!("KUIPER       no ring decks found");
+                    pass = false;
+                }
+            }
+            let _ = &mut w;
+        }
+        println!("{}", if pass { "LOOPS: PASS" } else { "LOOPS: FAIL" });
+        return;
+    }
+    if name == "touch" {
+        // the menu touch model, headless: row hit-testing, slider mapping,
+        // fat-finger bar targets, pause buttons, tap-vs-drag classification
+        use crate::hud;
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<40} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // ---- readability + layout standards ----
+        let vis = hud::vis_rows(hud::TW_ROW_H, hud::TW_TOP, hud::TW_BOTTOM);
+        check("row height is finger-sized", hud::TW_ROW_H >= 0.055);
+        check("viewport shows a workable page", (8..=26).contains(&vis));
+        check(
+            "type scale is ordered and modest",
+            hud::T_HINT < hud::T_SECTION
+                && hud::T_SECTION < hud::T_BODY
+                && hud::T_BODY < hud::T_TITLE
+                && hud::T_BODY <= 0.0090,
+        );
+        // long lists scroll instead of shrinking: selection always visible
+        let big = 44usize;
+        let mut always_visible = true;
+        let mut monotone = true;
+        let mut prev = 0usize;
+        for sel in 0..big {
+            let st = hud::scroll_for(sel, big, vis);
+            if sel < st || sel >= st + vis {
+                always_visible = false;
+            }
+            if st < prev {
+                monotone = false;
+            }
+            prev = st;
+            if st + vis > big {
+                always_visible = false; // never scrolls past the end
+            }
+        }
+        check("scroll keeps the selection on screen", always_visible);
+        check("scroll never jumps backwards", monotone);
+        check("short lists never scroll", hud::scroll_for(3, 9, vis) == 0);
+        // a scrolled viewport hit-tests to ABSOLUTE indices
+        let st = hud::scroll_for(30, big, vis);
+        let first = hud::hit_row_scrolled(hud::TW_TOP, hud::TW_ROW_H, big, vis, st, hud::TW_TOP);
+        let third = hud::hit_row_scrolled(hud::TW_TOP, hud::TW_ROW_H, big, vis, st, hud::TW_TOP - hud::TW_ROW_H * 2.0);
+        check("scrolled hit: first visible row", first == Some(st));
+        check("scrolled hit: third visible row", third == Some(st + 2));
+        let past = hud::hit_row_scrolled(hud::TW_TOP, hud::TW_ROW_H, big, vis, st, hud::TW_TOP - hud::TW_ROW_H * (vis as f32 + 1.0));
+        check("scrolled hit: past the page misses", past.is_none());
+
+        // rows: first row under the top, later rows below, nothing above
+        let n = 12usize;
+        let rh = hud::rows_h(n);
+        let first = hud::hit_row(hud::TW_TOP, rh, n, hud::TW_TOP);
+        let third = hud::hit_row(hud::TW_TOP, rh, n, hud::TW_TOP - rh * 2.0);
+        let above = hud::hit_row(hud::TW_TOP, rh, n, hud::TW_TOP + rh * 2.0);
+        let below = hud::hit_row(hud::TW_TOP, rh, n, hud::TW_TOP - rh * (n as f32 + 3.0));
+        check("row hit: top row", first == Some(0));
+        check("row hit: third row", third == Some(2));
+        check("row hit: above the list misses", above.is_none());
+        check("row hit: below the list misses", below.is_none());
+        // every row is reachable and unique (no gaps a finger can fall into)
+        let mut seen = vec![false; n];
+        let mut steps = 0;
+        let mut y = hud::TW_TOP + rh * 0.5;
+        while y > hud::TW_TOP - rh * (n as f32 + 1.0) {
+            if let Some(i) = hud::hit_row(hud::TW_TOP, rh, n, y) {
+                if i < n {
+                    seen[i] = true;
+                }
+            }
+            y -= rh * 0.05;
+            steps += 1;
+        }
+        check("every row is touchable", seen.iter().all(|&b| b) && steps > 0);
+        // slider bar mapping + fat targets
+        check("bar left end = 0", hud::bar_t(hud::TW_BAR_X0) == 0.0);
+        check("bar right end = 1", hud::bar_t(hud::TW_BAR_X1) == 1.0);
+        let mid = hud::bar_t((hud::TW_BAR_X0 + hud::TW_BAR_X1) * 0.5);
+        check("bar middle = 0.5", (mid - 0.5).abs() < 1e-5);
+        check("bar clamps past the ends", hud::bar_t(-1.0) == 0.0 && hud::bar_t(1.0) == 1.0);
+        check(
+            "fat finger band is generous",
+            hud::near_bar(hud::TW_BAR_X0 - 0.08) && hud::near_bar(hud::TW_BAR_X1 + 0.08) && !hud::near_bar(-0.5),
+        );
+        // pause buttons: all five hit, gaps between them miss, row is centred
+        let hits: Vec<Option<usize>> = (0..hud::PAUSE_BTNS.len())
+            .map(|i| hud::hit_pause_btn(hud::pbtn_x0(i) + hud::PBTN_W * 0.5, hud::PBTN_Y))
+            .collect();
+        check(
+            "every pause button is tappable",
+            hits.iter().enumerate().all(|(i, h)| *h == Some(i)),
+        );
+        check(
+            "taps above/below the buttons miss",
+            hud::hit_pause_btn(0.0, hud::PBTN_Y + hud::PBTN_H).is_none()
+                && hud::hit_pause_btn(0.0, hud::PBTN_Y - hud::PBTN_H).is_none(),
+        );
+        let x0 = hud::pbtn_x0(0);
+        let xn = hud::pbtn_x0(hud::PAUSE_BTNS.len() - 1) + hud::PBTN_W;
+        check("button row is centred", (x0 + xn).abs() < 1e-5);
+        check("buttons stay on screen", x0 > -1.0 && xn < 1.0);
+        // ---- mobile: nav strip + drag-to-scroll maths ----
+        let hits: Vec<Option<usize>> = (0..hud::NAV_BTNS.len())
+            .map(|i| hud::hit_nav(hud::nav_x0(i) + hud::NAV_W * 0.5, hud::NAV_Y))
+            .collect();
+        check(
+            "every nav button is tappable",
+            hits.iter().enumerate().all(|(i, h)| *h == Some(i)),
+        );
+        let nx0 = hud::nav_x0(0);
+        let nxn = hud::nav_x0(hud::NAV_BTNS.len() - 1) + hud::NAV_W;
+        check("nav strip is centred and on screen", (nx0 + nxn).abs() < 1e-5 && nx0 > -1.0 && nxn < 1.0);
+        check(
+            "nav strip clears the list viewport",
+            hud::NAV_Y + hud::NAV_H * 0.5 < hud::TW_BOTTOM,
+        );
+        // the real path hit-tests through the VIEWPORT, which stops above
+        // the strip — so a nav tap can never also hit a row
+        check(
+            "nav taps do not land on rows",
+            hud::hit_row_scrolled(hud::TW_TOP, hud::TW_ROW_H, 40, vis, 0, hud::NAV_Y).is_none(),
+        );
+        // graphics tiers exist and LOW really is cheaper than HIGH
+        let mut lo = crate::config::Config::default();
+        crate::config::apply_gfx_tier(&mut lo, 1);
+        let mut hi = crate::config::Config::default();
+        crate::config::apply_gfx_tier(&mut hi, 3);
+        check(
+            "LOW preset drops rays, quality and resolution",
+            !lo.video.rays && lo.video.quality < hi.video.quality && lo.video.render_scale < hi.video.render_scale,
+        );
+        // the handheld profile must force low graphics from ANY starting cfg
+        let mut phone = crate::config::Config::default();
+        crate::platform::Profile::Handheld.apply(&mut phone);
+        check(
+            "handheld profile forces low graphics + touch",
+            !phone.video.rays && phone.video.render_scale <= 0.5 && phone.touch.enabled,
+        );
+
+        // every real settings page: how much does it actually scroll?
+        println!("{:<14} {:>5} {:>6} {:>7}", "menu", "rows", "pages", "scroll");
+        let mut worst = 0.0f32;
+        for m in 0..8u8 {
+            let rows = crate::tweak_rows(m);
+            let pages = rows.len() as f32 / vis as f32;
+            worst = worst.max(pages);
+            println!(
+                "{:<14} {:>5} {:>6.1} {:>7}",
+                crate::menu_title(m),
+                rows.len(),
+                pages,
+                if rows.len() > vis { "yes" } else { "no" }
+            );
+        }
+        check("no page is a marathon (<= 2 screens)", worst <= 2.0);
+        println!("{}", if pass { "TOUCH MENUS: PASS" } else { "TOUCH MENUS: FAIL" });
+        return;
+    }
+    if name == "gyro" {
+        // the ported gyro stack, end to end: protocol parsing, drift
+        // calibration, deadzone/scale shaping, and the drive mapping
+        use crate::gyro::{parse_line, Gyro};
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<34} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // 1. the daemon protocol (tilt_sensor_sysfs.c emits these)
+        let a1 = parse_line("ACCEL 0.42 -0.15 9.71").unwrap();
+        check("ACCEL line parses", (a1.x - 0.42).abs() < 1e-6 && (a1.y + 0.15).abs() < 1e-6 && a1.analog);
+        check("header/garbage ignored", parse_line("TILT_SENSOR_V1").is_none() && parse_line("").is_none());
+        // 2. monitor-sensor fallback events
+        let t1 = parse_line("    Tilt changed: tilted-up").unwrap();
+        let t2 = parse_line("Accelerometer orientation changed: right-up").unwrap();
+        check("monitor-sensor tilt/orient parse", t1.y < 0.0 && !t1.analog && t2.x > 0.0);
+        // 3. calibration kills a biased-at-rest device
+        let mut cfg = crate::config::GyroCfg { on: true, sens: 1.0, deadzone: 0.05, smooth: 0.02, invert_x: false, invert_y: false, air_mode: 0, gate: 0 };
+        let mut g = Gyro::new(false);
+        g.feed_test(0.30, -0.20); // a device that reads non-zero while still
+        g.calibrate();
+        for _ in 0..140 {
+            g.feed_test(0.30, -0.20);
+            g.update(1.0 / 60.0, &cfg);
+        }
+        for _ in 0..60 {
+            g.feed_test(0.30, -0.20);
+            g.update(1.0 / 60.0, &cfg);
+        }
+        check("calibration removes rest bias", g.x.abs() < 0.02 && g.y.abs() < 0.02);
+        // 4. real motion still gets through, deadzone still bites
+        for _ in 0..90 {
+            g.feed_test(0.30 + 0.5, -0.20);
+            g.update(1.0 / 60.0, &cfg);
+        }
+        check("motion above deadzone drives", g.x > 0.35);
+        for _ in 0..90 {
+            g.feed_test(0.30 + 0.02, -0.20);
+            g.update(1.0 / 60.0, &cfg);
+        }
+        check("small jitter stays in deadzone", g.x.abs() < 0.001);
+        // 5. sensitivity scales, output clamps to the stick range
+        cfg.sens = 4.0;
+        for _ in 0..120 {
+            g.feed_test(0.30 + 0.9, -0.20);
+            g.update(1.0 / 60.0, &cfg);
+        }
+        check("output clamped to stick range", g.x <= 1.0 + 1e-5 && g.x > 0.95);
+        // 6. the drive mapping: ground steers, air flick-aims, gate closes
+        g.set_live_for_test(true);
+        let (gs, gp, gr) = g.drive(&cfg, false, true);
+        check("ground: tilt steers only", gs.abs() > 0.5 && gp == 0.0 && gr == 0.0);
+        let (as_, ap, ar) = g.drive(&cfg, true, true);
+        check("air mode 0: tilt rolls", ar.abs() > 0.5 && as_ == 0.0 && ap.abs() <= 1.0);
+        cfg.air_mode = 1;
+        let (ys, _, yr) = g.drive(&cfg, true, true);
+        check("air mode 1: tilt yaws", ys.abs() > 0.5 && yr == 0.0);
+        let closed = g.drive(&cfg, true, false);
+        check("closed gate emits nothing", closed == (0.0, 0.0, 0.0));
+        // 7. discrete impulses decay to rest (no runaway from event sources)
+        let mut g2 = Gyro::new(false);
+        g2.impulse_test(1.0, 0.0);
+        let mut peak: f32 = 0.0;
+        for _ in 0..30 {
+            g2.update(1.0 / 60.0, &cfg);
+            peak = peak.max(g2.x.abs());
+        }
+        for _ in 0..180 {
+            g2.update(1.0 / 60.0, &cfg);
+        }
+        check("impulse kicks then decays", peak > 0.2 && g2.x.abs() < 0.02);
+        println!("{}", if pass { "GYRO: PASS" } else { "GYRO: FAIL" });
+        return;
+    }
+    if name == "flip" {
+        // RL-style flip audit: every cardinal combo, from ground and air.
+        // A flip must complete ONE full turn about ONE axis and finish at
+        // the orientation it started from (wheels-down stays wheels-down).
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let ball = Ball::new();
+        let combos: [(&str, f32, f32); 8] = [
+            ("forward", 1.0, 0.0),
+            ("back", -1.0, 0.0),
+            ("left", 0.0, -1.0),
+            ("right", 0.0, 1.0),
+            ("fwd+left", 1.0, -0.7),
+            ("fwd+right", 1.0, 0.7),
+            ("back+left", -1.0, -0.7),
+            ("diag even", 0.8, 0.8),
+        ];
+        // rotation profile: how the turn is distributed across the flip
+        {
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            let mut c = physics::Controls::default();
+            for _ in 0..60 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            c.jump_pressed = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            for _ in 0..12 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            c.throttle = 1.0;
+            c.jump_pressed = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            c.throttle = 0.0;
+            let len = car.dodge_len_for_sim();
+            let mut samples: Vec<f32> = Vec::new();
+            let mut t = 0.0f32;
+            while t < len {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                samples.push(car.flip_turn().to_degrees());
+                t += DT;
+            }
+            print!("flip profile ({:.2}s):", len);
+            let n = samples.len().max(1);
+            let mut prev = 0.0f32;
+            let mut peak: f32 = 0.0;
+            for d in 0..10 {
+                let idx = ((d + 1) * n / 10).min(n) - 1;
+                let v = samples[idx];
+                let slice = (v - prev) / 3.6;
+                peak = peak.max(slice);
+                print!(" {slice:.0}%");
+                prev = v;
+            }
+            println!("   peak decile {peak:.0}%");
+        }
+        for (air, label) in [(false, "GROUND START"), (true, "AIR START")] {
+            println!("-- {label}");
+            println!("{:<11} {:>8} {:>9} {:>9} {:>8}", "input", "axis", "turn", "err_deg", "up.y");
+            for (name2, thr, steer) in combos {
+                let mut car = physics::Car::new();
+                // both cases start grounded: a dodge is only legal after a jump —
+                // "air start" means the FLIP begins mid-air at an arbitrary
+                // attitude, which is exactly the post-jump state
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+                let mut start = car.rot;
+                let mut c = physics::Controls::default();
+                if air {
+                    // jump for a legal dodge window, then take an ARBITRARY
+                    // attitude mid-air: the flip must return to THAT pose
+                    for _ in 0..60 {
+                        physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    }
+                    c.jump_pressed = true;
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    c.jump_pressed = false;
+                    for _ in 0..14 {
+                        physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    }
+                    car.rot = (glam::Quat::from_rotation_x(0.55) * glam::Quat::from_rotation_z(0.35)).normalize();
+                    car.ang = Vec3::ZERO;
+                } else {
+                    for _ in 0..60 {
+                        physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    }
+                    c.jump_pressed = true;
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    c.jump_pressed = false;
+                    for _ in 0..12 {
+                        physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    }
+                }
+                // the dodge
+                c.throttle = thr;
+                c.steer = steer;
+                c.jump_pressed = true;
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                c.jump_pressed = false;
+                if air && std::env::var("FLIP_DBG").is_ok() {
+                    eprintln!("  air gate: has_flip={} window_ok={} on_ground={}", car.has_flip(), car.dodge_window_open(), car.on_ground);
+                }
+                let axis = car.flip_axis_name();
+                start = car.dodge_start_pose(); // the pose the flip began from
+                // release the sticks: isolate flip fidelity from driving
+                c.throttle = 0.0;
+                c.steer = 0.0;
+                let mut turn_max: f32 = 0.0;
+                let mut end_rot = car.rot;
+                let mut was = false;
+                for _ in 0..150 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    turn_max = turn_max.max(car.flip_turn());
+                    if was && !car.is_flipping() {
+                        end_rot = car.rot; // the pose the instant the flip closes
+                        was = false;
+                    }
+                    was = was || car.is_flipping();
+                }
+                // settle out
+                for _ in 0..240 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                let dq = (start.inverse() * end_rot).normalize();
+                let err = 2.0 * dq.w.abs().clamp(0.0, 1.0).acos();
+                println!(
+                    "{:<11} {:>8} {:>8.0}d {:>8.1} {:>8.2}",
+                    name2,
+                    axis,
+                    turn_max.to_degrees(),
+                    err.to_degrees(),
+                    car.up().y
+                );
+            }
         }
         return;
     }
@@ -375,7 +1731,19 @@ pub fn run(args: &[String]) {
             ("near/low/flat", 3.0f32, 0.6f32, 0.0f32),
             ("far/high/down", 9.0, 3.0, -14.0),
         ] {
-            let mut cfg = crate::config::Config::default();
+            // the exact target: Fairphone 5 / postmarketOS / SC7280
+        let fp5 = crate::platform::classify(
+            "Linux version 7.1.2 #1-postmarketos-qcom-sc7280 SMP PREEMPT Mon Jul 13 21:02:06 UTC",
+            "fp5-black",
+            "Fairphone 5",
+            true,
+        );
+        println!("fp5-black        : {:?}  ({})", fp5.profile, fp5.why);
+        let pc = crate::platform::classify("Linux version 6.8.0-generic #1 SMP", "workstation", "", false);
+        println!("desktop x86      : {:?}  ({})", pc.profile, pc.why);
+        let target_ok = fp5.profile == crate::platform::Profile::Handheld
+            && pc.profile == crate::platform::Profile::Desktop;
+        let mut cfg = crate::config::Config::default();
             cfg.cam.dist = dist;
             cfg.cam.height = height;
             cfg.cam.angle_deg = ang;
