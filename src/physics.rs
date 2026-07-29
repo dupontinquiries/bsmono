@@ -1272,7 +1272,8 @@ ball.ang = ball.vel.cross(n) / ball.r;
             // ball.ang = ball.vel.cross(n) / ball.r;
             // fix v2
             let target_ang = ball.vel.cross(n) / ball.r;
-            ball.ang += (target_ang - ball.ang) * 0.15;
+            ball.ang += (target_ang - ball.ang) * 0.3;
+            // ball.ang += (target_ang - ball.ang) * 0.15;
             // original impl
             // ball.ang = n.cross(ball.vel) / ball.r;
         }
@@ -1418,7 +1419,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         };
         let dir = dir_n.lerp(aim, 0.65 * soft).normalize_or(dir_n);
         let strength = (-vn).min(23.0) * 0.38 / cfg.ball.weight.sqrt();
-        ball.vel += dir * strength;
+        ball.vel += dir * strength * 0.1;
         // SPIN: a gentle touch rolls the ball (dribbles need that), a hard
         // hit drives THROUGH it. Spin used to scale up with the impact,
         // which is what made shots knuckle off at odd angles.
