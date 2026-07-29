@@ -13,6 +13,7 @@
 
 pub mod analysis;
 pub mod saturation;
+pub mod multiband;
 
 use std::collections::BTreeMap;
 use studio_core::Ticks;
@@ -150,6 +151,8 @@ fn time_const(ms: f32, rate: f32) -> f32 {
 
 fn to_db(x: f32) -> f32 { 20.0 * x.abs().max(1e-9).log10() }
 fn from_db(db: f32) -> f32 { 10f32.powf(db / 20.0) }
+/// dB → linear, for sibling modules.
+pub fn from_db_pub(db: f32) -> f32 { from_db(db) }
 
 impl Compressor {
     pub fn new(rate: f32, threshold_db: f32, ratio: f32, attack_ms: f32, release_ms: f32) -> Compressor {
