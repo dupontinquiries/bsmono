@@ -938,6 +938,8 @@ pub struct Chat {
     show_checkpoints: bool,                 // checkpoints panel open
     /// GPU phase-breakdown subpanel open (📊 in the composer bar).
     show_metrics: bool,
+    /// Tracks which step faults have already been reported, so a repeat can stop the run.
+    step_verifier: crate::stepverify::Verifier,
     /// Steps the reader has opened, as (message, step). Per-step rather than per-message: opening one
     /// long step usually means wanting that one, not every step of every later reply.
     step_open: std::collections::HashSet<(usize, usize)>,
@@ -1048,6 +1050,7 @@ impl Default for Chat {
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            step_verifier: crate::stepverify::Verifier::new(),
             step_open: Default::default(),
             watch: logscope::thinkerwatch::ThinkerWindow::new(),
             watch_full: String::new(), watch_gist: None,
@@ -1260,6 +1263,44 @@ impl Chat {
                                 // nominal plan so an under-planned reply still finishes. cap is the loop
                                 // backstop; grace bounds overshoot beyond n without an explicit finish.
                                 let cont = crate::stepwise::should_continue_ex(&mark, m.text(), self.step_continues, 24, crate::stepwise::DEFAULT_GRACE);
+                                // VERIFY BEFORE ADVANCING. A 30-turn run on a 1B model produced the
+                                // same broken snippet every turn because nothing ever checked whether
+                                // the code parsed — the prompts varied only in tone. prechecks has been
+                                // able to catch exactly that since _240 and had no caller.
+                                //
+                                // Runs on every step, not only ones whose summary mentions tests: a
+                                // step that does not say "test" is precisely the one that advances with
+                                // a dangling `else if` and takes the next step down with it.
+                                let mut cont = cont;
+                                if cont {
+                                    let blocking: Vec<String> = crate::stepwise::extract_files(m.text())
+                                        .iter()
+                                        .flat_map(|(name, body)| {
+                                            crate::prechecks::scan_rust(body).into_iter()
+                                                .filter(|f| f.confidence == crate::prechecks::Confidence::Certain)
+                                                .map(move |f| format!("{name}:{}: {} — {}", f.line, f.what, f.fix))
+                                        })
+                                        .collect();
+                                    match self.step_verifier.check(&blocking) {
+                                        crate::stepverify::Verdict::Advance => {}
+                                        crate::stepverify::Verdict::Revise { prompt, findings } => {
+                                            // Reuse the channel the cargo hook already uses to reach
+                                            // the model. A second mechanism would have been a field
+                                            // nobody reads — which is how prechecks ended up with zero
+                                            // callers in the first place.
+                                            self.step_inject = Some(prompt);
+                                            self.note = format!("step {}/{} — {} error(s), revising",
+                                                mark.k, mark.n, findings.len());
+                                        }
+                                        crate::stepverify::Verdict::Stuck { repeated } => {
+                                            // The same fault survived being reported. Thirty more turns
+                                            // will not fix it; stopping is the useful answer.
+                                            cont = false;
+                                            self.note = format!("step {}/{} — stopped: {} fault(s) \
+survived being reported, so more turns will not fix them", mark.k, mark.n, repeated.len());
+                                        }
+                                    }
+                                }
                                 self.step_pending_continue = cont;
                                 self.note = format!("step {}/{} — {}", mark.k, mark.n, mark.summary);
                                 // tests→cargo hook: a test/build step pauses, we materialize the reply's
@@ -1300,6 +1341,11 @@ impl Chat {
                                 // prefer it), scan the code so far for mechanical breaks. On a hit, queue a
                                 // ⟲ CHECK self-review nudge so the model looks back and fixes it in place on
                                 // resume — a review point offered, not a correction imposed.
+                                // Only when nothing more definite is already queued. A prechecks
+                                // finding is a fact about the code; the tripwire note is a nudge to
+                                // self-review. Letting the nudge overwrite the fact would send the
+                                // model to "look over your work" when the answer is "line 4 does not
+                                // parse" — which is the tone-instead-of-correctness failure again.
                                 if cont && self.step_shell.is_none() && self.step_inject.is_none() {
                                     let sig = crate::tripwire::scan(m.text());
                                     if let Some(note) = crate::tripwire::review_note(&sig) {
