@@ -769,3 +769,55 @@ pub fn int8_worth_it(src_ggml_type: u32) -> bool {
 pub fn int8_cache_waste(src_ggml_type: u32, n_weights: u64) -> u64 {
     if int8_worth_it(src_ggml_type) { 0 } else { n_weights }   // ~1 byte/weight for the int8 blob
 }
+
+
+/// Would this model fit if the budget were the MEASURED ceiling rather than the constant?
+///
+/// The refusal path compares a model against `gpu_buffer_budget_uma`, which on Asahi returns a
+/// compiled-in 24 GiB. `--gate-vram` measured the same device honouring 63. A 70B at Q4 is 40 GiB: it
+/// is refused by the constant and would be accepted by the measurement.
+///
+/// That is the worst shape a refusal can have — it is not "this will not work", it is "we did not
+/// check". So when a model is refused, this reports whether measuring would change the answer, and the
+/// message can say so instead of recommending another backend for a model that fits.
+pub fn would_fit_if_measured(model_bytes: u64, current_budget: u64, measured_gib: f32) -> Option<u64> {
+    let measured = budget_from_measurement(measured_gib)?;
+    if model_bytes <= current_budget { return None; }   // already fits; nothing to report
+    if model_bytes <= measured { Some(measured) } else { None }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn a_70b_refused_by_the_constant_fits_the_measurement() {
+        // The reported case. 40.5 GiB against a 24 GiB constant is a refusal; against 63 GiB measured
+        // it is a load. The user was told to use another backend for a model the device honours.
+        let model = (40.5 * GIB) as u64;
+        let constant = (24.0 * GIB) as u64;
+        let r = would_fit_if_measured(model, constant, 63.0);
+        assert!(r.is_some(), "40.5 GiB must fit inside 75% of a measured 63 GiB");
+    }
+
+    #[test]
+    fn a_model_that_fits_either_way_reports_nothing() {
+        // Silence when there is nothing to say: a load that already works should not be told it might
+        // work differently.
+        assert!(would_fit_if_measured((10.0 * GIB) as u64, (24.0 * GIB) as u64, 63.0).is_none());
+    }
+
+    #[test]
+    fn a_model_too_big_for_BOTH_reports_nothing() {
+        // Suggesting a probe that would not help is worse than saying nothing — it sends someone to
+        // run a five-minute measurement for an answer that does not change.
+        assert!(would_fit_if_measured((200.0 * GIB) as u64, (24.0 * GIB) as u64, 63.0).is_none());
+    }
+
+    #[test]
+    fn an_unprobed_device_reports_nothing_rather_than_guessing() {
+        // measured_gib = 0 means never probed. Inventing a ceiling to recommend would be the same
+        // mistake as the constant it is meant to correct.
+        assert!(would_fit_if_measured((40.5 * GIB) as u64, (24.0 * GIB) as u64, 0.0).is_none());
+    }
+}
