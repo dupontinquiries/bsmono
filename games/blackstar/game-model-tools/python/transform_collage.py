@@ -152,6 +152,56 @@ def assign_slots(regions, lo, hi):
         r["axes"] = (length_axis, side_axis, up_axis)
     return regions
 
+
+# ------------------------------------------------------- kinematic hierarchy
+def build_hierarchy(regions):
+    """Parent each region to the nearest region closer to the torso.
+
+    This is the thing the first version lacked. Movie transformations are
+    KINEMATIC: a rotation at the hip carries the whole leg, so parts sweep
+    around each other instead of drifting apart in parallel. Without a
+    hierarchy every region translates independently and the result reads as an
+    explosion diagram, which is exactly what it looked like."""
+    root = min(range(len(regions)), key=lambda i: 0 if regions[i]["slot"] == "torso" else 1)
+    order = sorted(range(len(regions)), key=lambda i: -regions[i]["n"])
+    parent = {root: -1}
+    placed = [root]
+    for i in order:
+        if i in parent: continue
+        # nearest already-placed region becomes the parent, so the chain grows
+        # outward from the torso the way a body does
+        best = min(placed, key=lambda j: sum((regions[i]["c"][a]-regions[j]["c"][a])**2 for a in range(3)))
+        parent[i] = best
+        placed.append(i)
+    depth = {}
+    def d(i):
+        if i in depth: return depth[i]
+        depth[i] = 0 if parent[i] < 0 else d(parent[i]) + 1
+        return depth[i]
+    for i in range(len(regions)): d(i)
+    return parent, depth, root
+
+def hinge_point(child, par):
+    """The seam where a part meets its parent — the point it swings about.
+
+    Rotating a region about its own CENTROID makes it spin in place; rotating
+    about the contact with its parent makes it swing, which is what a hinged
+    panel actually does. The contact is approximated as the point on the child's
+    bounding box closest to the parent's centre."""
+    return [min(max(par["c"][a], child["lo"][a]), child["hi"][a]) for a in range(3)]
+
+def stage_window(depth_i, max_depth, stages):
+    """When this part moves, as a (start, end) fraction of the whole sequence.
+
+    Parts BEND AND STOP: the torso rises first, then limbs unfold, then
+    extremities settle. Moving everything at once is the other half of why the
+    first version looked wrong — real transformations are sequenced, and the
+    pauses are what make them read as mechanical."""
+    if max_depth <= 0: return 0.0, 1.0
+    f = depth_i / max_depth
+    start = 0.55 * f
+    return start, min(1.0, start + 0.55)
+
 # ---------------------------------------------------------------- transform
 # Proportions measured from engine_src/data/dude.iqm, the corpus's only rigged
 # model (20 joints, a standard biped). Using a real rig's ratios rather than
@@ -211,11 +261,15 @@ def bot_pose(r, lo, hi):
         t[ua] += torso * 0.18
     return t, ang, ua
 
-def stage_transform(r, lo, hi, s, n_stages):
-    """Stage s of n: interpolate the rigid pose. Ease-in-out, because a linear
-    blend reads as a slideshow rather than a mechanism."""
+def stage_transform(r, lo, hi, s, n_stages, window=(0.0, 1.0)):
+    """Stage s of n, respecting this part's own movement window.
+
+    Ease-in-out within the window, because a linear blend reads as a slideshow;
+    clamped outside it, which is the "stop" half of bend-and-stop."""
     u = s / max(n_stages - 1, 1)
-    e = u * u * (3.0 - 2.0 * u)
+    a, b = window
+    local = 0.0 if u <= a else 1.0 if u >= b else (u - a) / max(b - a, 1e-6)
+    e = local * local * (3.0 - 2.0 * local)
     t, ang, ua = bot_pose(r, lo, hi)
     return [x * e for x in t], ang * e, ua
 
@@ -234,10 +288,27 @@ def apply(p, c, t, ang, ua):
 def render(verts, tris, regions, lo, hi, stage, n_stages, W, H, axes):
     la, sa, ua = axes
     posed, colour = [None]*len(verts), [0]*len(verts)
+    parent, depth, root = build_hierarchy(regions)
+    maxd = max(depth.values()) if depth else 0
+    # resolve each region's transform by walking UP the chain, so a rotation at
+    # the hip carries the leg — the whole point of having a hierarchy
+    def place(i, p):
+        chain = []
+        j = i
+        while j >= 0:
+            chain.append(j)
+            j = parent[j]
+        q = list(p)
+        for j in chain:                     # child first, then each ancestor
+            r = regions[j]
+            t, ang, u = stage_transform(r, lo, hi, stage, n_stages,
+                                        stage_window(depth[j], maxd, n_stages))
+            piv = r["c"] if parent[j] < 0 else hinge_point(r, regions[parent[j]])
+            q = apply(q, piv, t, ang, u)
+        return q
     for ri, r in enumerate(regions):
-        t, ang, u = stage_transform(r, lo, hi, stage, n_stages)
         for i in r["idx"]:
-            posed[i] = apply(verts[i], r["c"], t, ang, u)
+            posed[i] = place(ri, verts[i])
             colour[i] = ri
     pts = [p for p in posed if p]
     if not pts: return None
