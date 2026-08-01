@@ -36,6 +36,7 @@ pub mod anatomy;
 pub mod unwrap;
 pub mod profile;
 pub mod interior;
+pub mod joints;
 pub mod descriptor;
 pub mod fold;
 pub mod assign;
