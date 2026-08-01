@@ -28,6 +28,7 @@ cad-view = { path = "crates/cad-view" }
 cad-motion = { path = "crates/cad-motion" }
 cad-ref = { path = "crates/cad-ref" }
 cad-nifty = { path = "crates/cad-nifty" }
+cad-liaison = { path = "crates/cad-liaison" }
 
 [profile.dev]
 opt-level = 2                 # skydribble's lesson: geometry at opt 0 is unusable

@@ -132,6 +132,29 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   worked example because the tree had no `.nifty` files at all. The parser is tested against the
   spec's own I2C example, but it has never met a board somebody else wrote.
 
+## The sanitization boundary (`cad-liaison`)
+
+- **No model has ever talked to it.** `cad-liaison` implements the boundary — a constrained JSON
+  `Proposal` in, clamped `cad-forge` ops out — and `--propose` exercises it with hand-written JSON.
+  What has *not* happened is any connection to an actual LLM: no `logscope-fan` dispatch, no
+  prompting, no GBNF grammar. The boundary is tested against what a model might say, not against
+  what one did say.
+- **A measurement cannot be asserted, only requested.** `match_volume_of` names a part and a
+  reference and carries no number; the corpus measures. A proposal containing `volume_mm3` has
+  nowhere to put it and serde drops it. This is the mechanism that makes "same volume as puma"
+  trustworthy — the number never travels through the model — and it is tested directly.
+- **Names are not paths.** Anything containing a slash, a backslash, or `..` is refused as a name,
+  so a proposal cannot reach a file the corpus never indexed.
+- **An unknown boolean mode defaults to union and complains.** It deliberately does not guess:
+  `subtrct` becoming `subtract` would silently remove material on a misspelling, so it unions and
+  says what it did.
+- **`SCHEMA` is a string, kept honest only by a test.** One test asserts every op and shape name
+  appears in it. That catches a vocabulary that grows past its documentation, but nothing enforces
+  that the prose around it is accurate.
+- **No `pending_volume` execution path in the UI.** The liaison reports what must be measured; the
+  caller is expected to run it through `cad-ref` and build `Op::MatchVolume`. `--propose` prints
+  the pending list rather than resolving it.
+
 ## Not verified in-sandbox
 
 - **The app has never been run.** The build environment had one core, 3 GB RAM, no GPU and no

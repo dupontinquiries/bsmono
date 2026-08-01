@@ -29,6 +29,9 @@ fn main() -> eframe::Result<()> {
     if args.iter().any(|a| a == "--selftest") {
         selftest();
     }
+    if let Some(i) = args.iter().position(|a| a == "--propose") {
+        propose(args.get(i + 1).map(String::as_str).unwrap_or(""));
+    }
     if let Some(i) = args.iter().position(|a| a == "--ref-index") {
         ref_index(args.get(i + 1).map(String::as_str).unwrap_or("."));
     }
@@ -79,6 +82,61 @@ fn demo_doc() -> Doc {
             Op::Pattern { name: "studs".into(), count: 4, step: [3.0, 0.0, 0.0] },
         ],
     }
+}
+
+/// Run a proposal through the sanitization boundary and report exactly what survived. This is the
+/// §17.3/§7 claim made inspectable: hand it whatever a model might say, and see what CADscope will
+/// actually do with it. Nothing here talks to a model — the JSON comes from the caller, which is
+/// what makes it a test of the boundary rather than of a model's manners.
+fn propose(json: &str) -> ! {
+    let json = if json.is_empty() {
+        // A worked example that exercises the interesting cases at once: two good ops, a path
+        // traversal, an asserted measurement, and a misspelled boolean.
+        r#"{"note":"a plate with a bore, sized like a reference",
+            "ops":[
+              {"op":"add","name":"plate","shape":"cuboid","half":[20,3,12]},
+              {"op":"add","name":"bore","shape":"cylinder","r":4,"hh":6},
+              {"op":"combine","into":"plate","other":"bore","mode":"subtrct"},
+              {"op":"add","name":"../../etc/passwd","shape":"sphere","r":1},
+              {"op":"match_volume_of","name":"plate","reference":"puma","volume_mm3":999999}
+            ]}"#
+    } else {
+        json
+    };
+    let s = cad_liaison::sanitize_json(json);
+    println!("proposal -> {} op(s), {} pending measurement(s), {} complaint(s)",
+        s.ops.len(), s.pending_volume.len(), s.complaints.len());
+    for op in &s.ops {
+        let line = match op {
+            Op::Add { name, .. } => format!("add {name}"),
+            Op::Combine { into, other, mode, k } => {
+                format!("combine {into} <- {other} ({mode:?}, blend {k})")
+            }
+            Op::Nudge { name, .. } => format!("move {name}"),
+            Op::Shell { name, t } => format!("shell {name} {t}mm"),
+            Op::Pattern { name, count, .. } => format!("pattern {name} x{count}"),
+            Op::Remove { name } => format!("remove {name}"),
+            other => format!("{other:?}"),
+        };
+        println!("  op       {line}");
+    }
+    for (part, reference) in &s.pending_volume {
+        println!("  measure  {part} <- volume of '{reference}' (the corpus answers, not the model)");
+    }
+    for c in &s.complaints {
+        println!("  refused  #{}: {}", c.index, c.reason);
+    }
+
+    // And prove the surviving ops actually build something.
+    let mut doc = Doc { name: "proposed".into(), ops: Vec::new() };
+    let warns = cad_liaison::apply_to(&mut doc, &s);
+    let (model, _) = doc.apply();
+    println!("  built    {} part(s){}", model.parts.len(),
+        if warns.is_empty() { String::new() } else { format!(", {} forge warning(s)", warns.len()) });
+    for w in &warns {
+        println!("           {w}");
+    }
+    std::process::exit(0);
 }
 
 /// Scan a tree into the reference corpus (plan §17) and report what it found. This is the verb

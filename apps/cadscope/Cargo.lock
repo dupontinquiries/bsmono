@@ -285,6 +285,14 @@ dependencies = [
 [[package]]
 name = "cad-liaison"
 version = "0.1.0"
+dependencies = [
+ "cad-forge",
+ "cad-kernel",
+ "cad-ref",
+ "glam",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cad-motion"
@@ -338,6 +346,7 @@ version = "0.1.0"
 dependencies = [
  "cad-forge",
  "cad-kernel",
+ "cad-liaison",
  "cad-motion",
  "cad-ref",
  "cad-view",
