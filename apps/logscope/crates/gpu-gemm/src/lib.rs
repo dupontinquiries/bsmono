@@ -13,6 +13,7 @@ pub mod cpupool;
 pub mod cpuattn;
 pub mod cpudecode;
 pub mod perfverdict;
+pub mod qkvsplit;
 pub mod gateclass;
 pub mod tensornames;
 pub mod cpuops;
@@ -7523,7 +7524,14 @@ LOADER gap, not a bad checkpoint — see the MLA line earlier in this log for wh
                     }
                     let hint = if found.iter().any(|f| f.starts_with("attn_qkv") || f.starts_with("wqkv")
                                                    || f.starts_with("query_key_value")) {
-                        " — this looks like a FUSED qkv layout, which this loader does not split yet"
+                        // Says what the shapes WOULD have to be, so a reader can tell in one glance
+                    // whether the file matches the q|k|v blocked layout qkvsplit implements — or
+                    // whether it is something else and the split would produce attention over the
+                    // wrong projections. A message naming only the symptom leaves that unanswerable.
+                    " — this looks like a FUSED qkv layout. qkvsplit::split() implements the q|k|v \
+BLOCKED form (n_head*head_dim rows of q, then n_kv*head_dim of k, then the same of v); what remains \
+is wiring it here and checking that those rows sum to the tensor's own row count, because a layout \
+that is interleaved instead would slice plausibly and be wrong"
                     } else if found.iter().any(|f| f.starts_with("attn_q_a")) {
                         " — this is Multi-head Latent Attention"
                     } else { "" };
