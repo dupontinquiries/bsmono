@@ -165,8 +165,8 @@ role = "app"
 daemon = false
 flatpak = false
 runtime = "none"
-targets = []              # REGISTERED BUT NOT BUILDABLE YET — see notes
-notes = "ebook reader drop (2026-07-26): 7 source files landed verbatim, but the archive lacked src/main.rs, src/util.rs and src/bin/shelfctl.rs, so the crate does not compile — no stubs were fabricated (apps/tomescope/DROP_STATUS.md has the exact gap). targets=[] keeps it out of every build plan until the three files arrive; flip to [\"desktop\"] then."
+targets = ["desktop"]              # REGISTERED BUT NOT BUILDABLE YET — see notes
+notes = "overkill ebook/PDF/textbook reader on uikit-egui: EPUB, PDF, CBZ/CBT, FB2, MD, HTML, TXT; library shelves, pagination engine, highlights and margin notes, flashcards with SRS, citations, per-book glossary, reading stats, OPDS import, TTS hook. The 2026-07-26 partial drop is now COMPLETE — the three missing files (main.rs, util.rs, bin/shelfctl.rs) arrived with the rest, 22 files and 7,594 lines, and the crate builds and tests clean at 45/45."
 
 [system.snapclone]
 path = "system/snapclone"

@@ -5,7 +5,7 @@
 //! hints at spine boundaries) → TOC from the EPUB3 nav doc or the EPUB2 NCX,
 //! anchors resolved to block indices where possible.
 
-use crate::content::{Block, BookImage, Span, TocEntry};
+use crate::content::{Block, BookImage, TocEntry};
 use crate::formats::{parse_html_fragment, Format, HtmlSink, LoadedBook};
 use anyhow::{bail, Context, Result};
 use quick_xml::events::Event;

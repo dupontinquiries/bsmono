@@ -35,11 +35,11 @@ pub struct BookRecord {
     pub description: Option<String>,
     pub tags: Vec<String>,
     pub file_size: u64,
-    pub added_unix: u64,
+    pub added_unix: i64,
     /// Cached cover bytes on disk (under the covers dir), if extracted.
     pub cover_file: Option<PathBuf>,
     // --- reading state ---
-    pub last_open_unix: Option<u64>,
+    pub last_open_unix: Option<i64>,
     pub position: Locus,
     /// For raster books, the page index instead.
     pub raster_page: usize,
