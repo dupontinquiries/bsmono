@@ -930,7 +930,9 @@ pub struct Chat {
     preview: Option<usize>,                 // index of the generated file whose body is expanded
     auto_continue: bool,                    // decode a fresh reply continuously up to the reply ceiling
     stepwise: bool,                         // checkpoint mode: model pauses at ⏸ STEP k/n markers, harness auto-continues
-    patch_mode: bool,                       // edit mode: model emits unified-diff patches instead of full files
+    patch_mode: bool,
+    /// Debate-panel mode: several small models instead of one thinker, able to stop and ask.
+    panel_mode: bool,                       // edit mode: model emits unified-diff patches instead of full files
     step_last_paused: u32,                  // dedup: highest step number already paused on this reply
     step_continues: u32,                    // auto-continues issued for this reply (hard-capped)
     step_pending_continue: bool,            // a step pause finished → issue the continue when the stream closes
@@ -1054,7 +1056,7 @@ impl Default for Chat {
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
-            auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
+            auto_continue: true, stepwise: false, patch_mode: false, panel_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
             step_verifier: crate::stepverify::Verifier::new(),
             step_open: Default::default(),
@@ -6695,6 +6697,13 @@ them to", patches.len());
                         ui.label(RichText::new(e).color(egui::Color32::from_rgb(0xe0, 0x6c, 0x6c)).small());
                     }
                     ui.label(RichText::new(if self.threading { "threaded" } else { "single-shot" }).color(theme::FAINT()).small());
+                    // PANEL MODE. Built in _373/_375 and never given a control, which is why it could not be
+                    // found in the menu. Its advantage is not answer quality — it is that several short turns
+                    // can each stop and ask, where one long generation cannot interrupt itself usefully.
+                    ui.checkbox(&mut self.panel_mode, RichText::new("debate panel").small())
+                        .on_hover_text("Several small models debate instead of one thinker. They can pause to \
+ask you a question between messages, and one member is held BLIND to the answer — so the next \
+round can tell whether your hint drove the conclusion or the question did.");
                     ui.checkbox(&mut self.stepwise, RichText::new("stepwise").small())
                         .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
                     ui.checkbox(&mut self.auto_continue, RichText::new("auto-continue").small())
