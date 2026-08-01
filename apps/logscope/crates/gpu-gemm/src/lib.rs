@@ -4658,6 +4658,18 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd; // ad = attention width (== d for plain MHA)
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
+        // ORDER VERIFIED against llama.cpp models/qwen3moe.cpp, which does:
+        //
+        //     97:  Qcur = build_norm(Qcur, attn_q_norm, LLM_NORM_RMS, il);   <- QK-norm FIRST
+        //     100: Qcur = ggml_rope_ext(...);                               <- RoPE SECOND
+        //
+        // Read inside-out, the line below is project -> qk_norm -> rope -> post, which matches. The
+        // norm tensor is sized {n_embd_head_k} there and `hd` is passed here, so both are per
+        // head_dim rather than over the full projection.
+        //
+        // Pinned as a comment because the ordering lives inside one nested expression: a refactor
+        // that hoists these into statements could reorder them without looking wrong, and swapping
+        // norm and rope produces gibberish rather than an error.
         let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
         let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd), w, t, kv, hd, eps);
         let v = w.wv.apply(self, &n1, t);
