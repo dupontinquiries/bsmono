@@ -1403,6 +1403,49 @@ impl Gpu {
     ///
     /// The qs region is placed on a 256-byte boundary so it can be bound as a storage view; the shader is
     /// told where it starts, so alignment padding costs a few bytes and no special-casing.
+    /// Convert a raw expert tensor of EITHER Q4_K or Q6_K into the resident q4 layout.
+    ///
+    /// ## Why this unblocks every Q4_K_M model
+    ///
+    /// `Q4_K_M` is a MIXTURE: most tensors are Q4_K, and `ffn_down` is Q6_K. The file-view path checked
+    /// `ggml_type != 12` and rejected the whole model on that one tensor, falling back to the host-copy
+    /// path — which dequantizes and requantizes every expert into RAM. On a 64 GiB machine that host
+    /// store was 15.2 GiB and the load was OOM-killed.
+    ///
+    /// So a single stale type check cost the entire zero-copy path for every model in common use.
+    ///
+    /// Q6_K goes through `q6k_dequant` — bit-exact against the CPU reference since the gate went green
+    /// — and then the same quantizer the resident path already uses. That is two passes rather than
+    /// one, paid ONCE at load, against a host copy paid in RAM for the whole session.
+    pub fn raw_expert_to_q4_resident(&self, raw: &[u8], ggml_type: u32, n: usize, k: usize)
+        -> Option<Q4Weight> {
+        match ggml_type {
+            12 => Some(self.q4k_to_q4_resident(raw, n, k)),
+            14 => {
+                // Q6_K: dequantize exactly, then quantize to the resident layout.
+                let f = self.download(&self.q6k_dequant(raw, n * k).ok()?);
+                Some(self.quantize_q4_resident(&f, n, k))
+            }
+            // Anything else is refused rather than guessed. Reading a type we have not verified would
+            // produce plausible weights and a quietly worse model — the failure this codebase keeps
+            // paying for.
+            _ => None,
+        }
+    }
+
+    /// Bytes one tensor of `count` weights occupies in its source format.
+    ///
+    /// Q4_K is 144 bytes per 256-weight super-block; Q6_K is 210. The file-view slicing was hardcoded
+    /// to 144, so a Q6_K tensor would have been sliced at the wrong stride even if the type check had
+    /// let it through — the two changes are only useful together.
+    pub fn source_block_bytes(ggml_type: u32, count: usize) -> Option<usize> {
+        match ggml_type {
+            12 => Some(count / 256 * 144),
+            14 => Some(count / 256 * 210),
+            _ => None,
+        }
+    }
+
     pub fn q4k_to_q4_resident(&self, raw: &[u8], n: usize, k: usize) -> Q4Weight {
         assert!(k % 256 == 0, "q4_k conversion needs k % 256 == 0 (got {k})");
         let total = n * k;
@@ -1811,6 +1854,12 @@ pub struct RawExpertSrc {
     /// Bytes per expert in gate/up (each an [ff, d] matrix) and in down (a [d, ff] matrix).
     pub gu_expert_bytes: usize,
     pub dn_expert_bytes: usize,
+    /// Source ggml type of gate/up, and of down SEPARATELY.
+    ///
+    /// They differ in practice: Q4_K_M stores gate and up as Q4_K and ffn_down as Q6_K, which is the
+    /// mixture that made a single-type check reject every such model.
+    pub gu_type: u32,
+    pub dn_type: u32,
     pub ff: usize,
     pub d: usize,
 }
@@ -3332,7 +3381,8 @@ impl Gpu {
         // page cache must not be dropped underneath them. Declaring it here rather than at the release
         // site keeps the fact next to the thing that makes it true.
         mark_map_views_live();
-        let raw = RawExpertSrc { gate, up, down, gu_expert_bytes, dn_expert_bytes, ff, d };
+        let raw = RawExpertSrc { gate, up, down, gu_expert_bytes, dn_expert_bytes, ff, d,
+                                 gu_type: 12, dn_type: 12 };
         let (_, gu_total) = raw.gu_layout();
         let (_, dn_total) = raw.dn_layout();
         MoeStream {
@@ -7538,22 +7588,58 @@ q/k/v block ORDER matches");
                                          format!("blk.{i}.ffn_up_exps.weight"),
                                          format!("blk.{i}.ffn_down_exps.weight")];
                             let mut spans = Vec::new();
+                            // Captured per tensor: gate/up and down differ in Q4_K_M.
+                            let mut types = [0u32; 3];
                             for (idx, nm) in names.iter().enumerate() {
                                 let t = g.tensor(nm).ok_or(format!("{nm} not found"))?;
-                                if t.ggml_type != 12 {
-                                    return Err(format!("{nm} is {}, not Q4_K — Q4_K_M mixes in other types",
+                                // Q4_K and Q6_K both. The check was `!= 12`, and Q4_K_M stores
+                                // ffn_down as Q6_K — so one tensor rejected the whole model and sent
+                                // it to the host-copy path. --gate-q6k has been bit-exact since it
+                                // went green; the check simply never learned.
+                                // GATE HELD AT Q4_K FOR NOW, deliberately. The type plumbing below is
+                                // Q6_K-ready — strides, per-tensor types, and a load-time conversion —
+                                // but the streaming FILL converts on-GPU via q4k_convert_from, and the
+                                // Q6_K equivalent needs a shader that does not exist yet
+                                // (Q6K_DEQUANT produces f32; quantize_q4_resident is CPU).
+                                //
+                                // Opening the gate without it would take the file-view path and then
+                                // produce garbage at fill time, which is strictly worse than the host
+                                // copy it replaced. LOGSCOPE_Q6K_VIEWS=1 opts in for anyone wiring the
+                                // shader.
+                                let q6_ok = std::env::var("LOGSCOPE_Q6K_VIEWS").is_ok();
+                                let allowed: &[u32] = if q6_ok { &[12, 14] } else { &[12] };
+                                if !allowed.contains(&t.ggml_type) {
+                                    return Err(format!("{nm} is {} — the file-view path reads Q4_K \
+today. Q6_K is bit-exact (--gate-q6k) and the loader is plumbed for it; what is missing is the on-GPU \
+Q6_K->q4 fill conversion. Until that exists this falls back to the host copy rather than reading a \
+format the fill path cannot convert",
                                         gguf::ggml_type_name(t.ggml_type)));
                                 }
                                 let count = t.dims.iter().product::<u64>() as usize;
                                 let want = if idx == 2 { d * expert_ff * n_expert } else { expert_ff * d * n_expert };
                                 if count != want { return Err(format!("{nm} has {count} elements, expected {want}")); }
-                                let nbytes = gguf::type_nbytes(12, count).ok_or("q4_k size")?;
+                                types[idx] = t.ggml_type;
+                                let nbytes = gguf::type_nbytes(t.ggml_type, count)
+                                    .ok_or("source block size")?;
                                 spans.push(sset.slice(t.offset, nbytes).ok_or(format!("{nm} span escapes the shards"))?);
                             }
+                            // gate and up must match each other; down may differ.
+                            if types[0] != types[1] {
+                                return Err(format!("gate is {} and up is {} — the streaming path packs \
+them as one blob, so they must share a format",
+                                    gguf::ggml_type_name(types[0]), gguf::ggml_type_name(types[1])));
+                            }
+                            let (gu_ty, dn_ty) = (types[0], types[2]);
                             Ok(RawExpertSrc {
                                 gate: spans[0], up: spans[1], down: spans[2],
-                                gu_expert_bytes: expert_ff * d / 256 * 144,
-                                dn_expert_bytes: d * expert_ff / 256 * 144,
+                                // Per-tensor strides: Q4_K is 144 bytes per 256 weights and Q6_K is
+                                // 210, so a hardcoded 144 would slice a Q6_K tensor at the wrong
+                                // offset even once the type check let it through.
+                                gu_expert_bytes: Self::source_block_bytes(gu_ty, expert_ff * d)
+                                    .ok_or_else(|| format!("no block size for type {gu_ty}"))?,
+                                dn_expert_bytes: Self::source_block_bytes(dn_ty, d * expert_ff)
+                                    .ok_or_else(|| format!("no block size for type {dn_ty}"))?,
+                                gu_type: gu_ty, dn_type: dn_ty,
                                 ff: expert_ff, d,
                             })
                         })();
@@ -12261,6 +12347,31 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// Source strides must follow the tensor's own type.
+    ///
+    /// Q4_K is 144 bytes per 256-weight super-block and Q6_K is 210. The file-view slicing was
+    /// hardcoded to 144, so even with the type check lifted a Q6_K tensor would have been sliced at
+    /// the wrong offset — every expert after the first reading from the middle of its predecessor.
+    /// The two changes are only useful together, which is why the stride is tested rather than assumed.
+    #[test]
+    fn source_block_bytes_follows_the_type() {
+        let count = 256 * 100;
+        assert_eq!(super::Gpu::source_block_bytes(12, count), Some(100 * 144), "Q4_K");
+        assert_eq!(super::Gpu::source_block_bytes(14, count), Some(100 * 210), "Q6_K");
+        assert_ne!(super::Gpu::source_block_bytes(12, count),
+                   super::Gpu::source_block_bytes(14, count),
+                   "if these matched, a hardcoded stride would have been harmless and this is noise");
+    }
+
+    #[test]
+    fn an_unverified_source_type_has_NO_block_size() {
+        // Returning a plausible size for a format nobody has checked is how a model loads and produces
+        // quietly wrong output. None sends it to the host copy instead.
+        for t in [0u32, 8, 13, 19, 99] {
+            assert_eq!(super::Gpu::source_block_bytes(t, 256), None, "type {t}");
+        }
+    }
+
     /// The mobile-GPU names that disable the subgroup kernel.
     ///
     /// Reported from a Fairphone: llama3.2-1B loaded and then failed with a driver message about "not
