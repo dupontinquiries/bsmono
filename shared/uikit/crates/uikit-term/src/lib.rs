@@ -12,6 +12,7 @@
 //! and calls [`App::render`] each frame; [`Terminal::stage`] drops a command on the input line
 //! (the cross-app action-protocol seam) without running it.
 
+pub mod keys;
 pub mod blocks;
 
 // ── colours + style ──────────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ impl Default for Cell {
 
 /// A fixed-size character grid with a cursor and current pen style. Mutated by the parser.
 #[derive(Debug, Clone)]
+
 pub struct Grid {
     pub cols: usize,
     pub rows: usize,
@@ -820,6 +822,10 @@ pub struct Selection {
 /// mail panes attach here later.
 pub struct App {
     pub terminal: Terminal,
+    /// Raw bytes from the last input pass that go straight to the PTY —
+    /// control codes, arrows, tab. Distinct from the submitted line, which is
+    /// user text the host may echo or log.
+    pending_bytes: Vec<u8>,
     pub prefs: settings_kit::Prefs,
     pub cell: (f32, f32),
     pub font_size: f32,
@@ -853,6 +859,7 @@ pub struct App {
 impl App {
     pub fn new(cols: usize, rows: usize) -> App {
         App {
+            pending_bytes: Vec::new(),
             terminal: Terminal::new(cols, rows),
             prefs: settings_kit::Prefs::default(),
             cell: (DEFAULT_FONT_SIZE * CELL_W_RATIO, DEFAULT_FONT_SIZE * CELL_H_RATIO),
@@ -905,6 +912,8 @@ impl App {
     /// (the submitted line, already taken out of the input); typing appends, Backspace deletes, and a
     /// paste inserts its text (control chars stripped). The host runs the returned command on its PTY.
     pub fn handle_input(&mut self, ui: &egui::Ui) -> Option<String> {
+        self.pending_bytes.clear();
+        let mut pending: Vec<u8> = Vec::new();
         let mut submitted = None;
         ui.input(|i| {
             for ev in &i.events {
@@ -932,6 +941,50 @@ impl App {
                     egui::Event::Key { key: egui::Key::Enter, pressed: true, .. } => {
                         submitted = Some(std::mem::take(&mut self.terminal.input));
                     }
+                    // Everything else a SHELL needs, encoded as the bytes it
+                    // parses. Without these the widget is a text field that
+                    // submits lines: no Ctrl-C to stop a runaway command, no
+                    // up-arrow so every command is retyped, no tab completion.
+                    egui::Event::Key { key: k, pressed: true, modifiers, .. } => {
+                        let m = keys::Mods {
+                            ctrl: modifiers.ctrl || modifiers.command,
+                            alt: modifiers.alt,
+                            shift: modifiers.shift,
+                        };
+                        let mapped = match k {
+                            egui::Key::ArrowUp => Some(keys::Key::Up),
+                            egui::Key::ArrowDown => Some(keys::Key::Down),
+                            egui::Key::ArrowLeft => Some(keys::Key::Left),
+                            egui::Key::ArrowRight => Some(keys::Key::Right),
+                            egui::Key::Home => Some(keys::Key::Home),
+                            egui::Key::End => Some(keys::Key::End),
+                            egui::Key::Insert => Some(keys::Key::Insert),
+                            egui::Key::Delete => Some(keys::Key::Delete),
+                            egui::Key::Tab => Some(keys::Key::Tab),
+                            egui::Key::Escape => Some(keys::Key::Escape),
+                            // PageUp/PageDown WITHOUT shift go to the shell;
+                            // with shift they scroll the scrollback, which the
+                            // arms above already claimed.
+                            egui::Key::PageUp if !m.shift => Some(keys::Key::PageUp),
+                            egui::Key::PageDown if !m.shift => Some(keys::Key::PageDown),
+                            other => {
+                                // Ctrl-<letter>: the control codes. egui gives
+                                // no Text event for these, so without this arm
+                                // Ctrl-C simply does nothing.
+                                if m.ctrl {
+                                    other.name().chars().next()
+                                        .filter(|c| c.is_ascii_alphabetic())
+                                        .map(keys::Key::Char)
+                                } else { None }
+                            }
+                        };
+                        if let Some(mk) = mapped {
+                            if let Some(bytes) = keys::encode(mk, m) {
+                                self.terminal.grid.scroll_to_bottom();
+                                pending.extend_from_slice(&bytes);
+                            }
+                        }
+                    }
                     egui::Event::Key { key: egui::Key::F, pressed: true, modifiers, .. }
                         if modifiers.command || modifiers.ctrl =>
                     {
@@ -941,7 +994,18 @@ impl App {
                 }
             }
         });
+        self.pending_bytes = pending;
         submitted
+    }
+
+    /// Bytes produced by the last `handle_input` that must go straight to the
+    /// PTY rather than into the line buffer — control codes, arrows, tab.
+    ///
+    /// Separate from the submitted line because they are a different thing: a
+    /// line is user text the host may echo or log, these are raw terminal
+    /// input the shell interprets immediately.
+    pub fn take_pending_bytes(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.pending_bytes)
     }
 
     /// Open the find bar (the compass "search" action / Ctrl+F).
