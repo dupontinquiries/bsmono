@@ -3421,6 +3421,15 @@ stops at the limit it was given has measured the limit, not the device.");
         } else if gib * (1u64 << 30) as f64 > assumed as f64 * 1.25 {
             println!("gate-vram: the device honours MORE than the engine budgets — \
 memplan's cap is measuring something that no longer applies (see docs/asahi-vram-ceiling.md)");
+        } else if (assumed as f64) > gib * (1u64 << 30) as f64 {
+            // THE DANGEROUS DIRECTION, and I only ever checked the other one. A budget ABOVE what the
+            // device honours is what plans an allocation that cannot be satisfied — it is the enabler
+            // for the OOM class, not a conservatism. Measured on a 64 GiB M2 Max: ceiling 31.0 GiB
+            // against a 48.0 GiB budget, reported as "consistent".
+            println!("gate-vram: THE BUDGET EXCEEDS THE CEILING — {:.1} GiB budgeted against {gib:.1} \
+GiB verified. A plan sized to the budget will be approved and then fail to allocate. Set \
+LOGSCOPE_MAX_GPU_GB={:.0} or lower until the measurement is wired in",
+                assumed as f64 / (1u64 << 30) as f64, gib * 0.75);
         } else if got == 0 {
             println!("gate-vram: nothing verified — the probe could not allocate even one slab");
         } else {
