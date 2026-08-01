@@ -558,6 +558,34 @@ static void imp_transform_step(float dt, float *squash, float *spin_deg){
  * robot in Z) gives the axis. Parts further from the centre swing further,
  * which is what makes a limb unfold rather than the whole model rotating.
  */
+/* LETTER binds, not positions.
+ *
+ * WASD movement and the orientation cluster stay POSITIONAL and that is correct:
+ * there the finger position is the point, not the letter printed on the cap. The
+ * rule is simple — if the binding is described by its letter ("press T to
+ * transform"), bind the letter; if it is described by where it sits ("the right
+ * hand home row"), bind the position.
+ *
+ * ex_keys_down is indexed by SDL_Scancode, which is a PHYSICAL key. SDL_SCANCODE_T
+ * is the key where QWERTY has T — on Dvorak that key types `y`, and the key that
+ * types `t` is the one QWERTY calls K. So a scancode bind labelled "T" is the
+ * wrong key for a Dvorak user, silently.
+ *
+ * SDL_GetScancodeFromKey resolves a LETTER to whatever physical key produces it
+ * in the current layout, so `ex_letter('t')` is the T key on every layout. Used
+ * for binds whose name is the point (T for transform); the orientation cluster
+ * stays positional on purpose, because there the FINGER POSITION is the point
+ * and the existing comment already documents which letters it types.
+ *
+ * Looked up per call rather than cached: a user can change layout while the game
+ * is running, and a cached scancode would keep the old key working and the new
+ * one dead, which is far more confusing than a lookup nobody can measure.
+ */
+static int ex_letter(char c){
+  SDL_Scancode sc = SDL_GetScancodeFromKey((SDL_Keycode)c);
+  return (sc == SDL_SCANCODE_UNKNOWN) ? 0 : (int)sc;
+}
+
 static float g_fold_t = 0.0f;        /* 0 = vehicle, 1 = robot */
 static float g_fold_dir = 0.0f;
 
@@ -2705,8 +2733,8 @@ static void raid_update(ex_entity_t *e, float dt) {
         if (hd2 < 5.0f*5.0f && fabsf(dy) < 4.5f){ g_raid_enc_done[i]=1;
           snprintf(g_shot_msg,sizeof(g_shot_msg),"air node claimed"); g_shot_timer=1.8f;
           spawn_shockring(en->x,node_y,en->z,10.0f); sfx(g_sfx_pickup); }
-        if (ex_keys_down[SDL_SCANCODE_G] && g_raid_grapple_cd<=0.0f && hd2 < 26.0f*26.0f){
-          ex_keys_down[SDL_SCANCODE_G]=0; g_raid_grapple_cd=2.0f; float d=sqrtf(hd2)+1e-3f;
+        if (ex_keys_down[ex_letter('g')] && g_raid_grapple_cd<=0.0f && hd2 < 26.0f*26.0f){
+          ex_keys_down[ex_letter('g')]=0; g_raid_grapple_cd=2.0f; float d=sqrtf(hd2)+1e-3f;
           e->velocity[0]=-dx/d*14.0f; e->velocity[2]=-dz/d*14.0f; e->velocity[1]=19.0f;
           snprintf(g_shot_msg,sizeof(g_shot_msg),"GRAPPLE -- swing up to the node!"); g_shot_timer=0.9f; sfx(g_sfx_jump); }
         break; }
@@ -5396,8 +5424,9 @@ static void builder_preview(float dt)
     // T folds. A model with a PARTNER swaps (three characters have one); a model
     // split into PARTS folds in place (38 do). Preferring the part fold when
     // both exist, because a real fold beats a crush-and-swap.
-    if (ex_keys_down[SDL_SCANCODE_T]) {
-      ex_keys_down[SDL_SCANCODE_T]=0;
+    int kT = ex_letter('t');
+    if (kT && ex_keys_down[kT]) {
+      ex_keys_down[kT]=0;
       if (imp_group_of(g_imported_idx) >= 0) {
         g_fold_dir = (g_fold_t > 0.5f) ? -1.0f : 1.0f;
         game_log("fold %s -> %s", g_imported_names[g_imported_idx],
@@ -7967,7 +7996,7 @@ void game_update(double dt, double ft)
   // Thorn field (the Watch's vine form): press X and brambles erupt around you,
   // spreading outward to hold ground -- anything in them is torn and snared.
   if (g_thorns_cd > 0.0f) g_thorns_cd -= (float)dt;
-  if (is_vine_form && ex_keys_down[SDL_SCANCODE_X] && !g_thorns_on && g_thorns_cd <= 0.0f && !g_human_scale) {
+  if (is_vine_form && ex_keys_down[ex_letter('x')] && !g_thorns_on && g_thorns_cd <= 0.0f && !g_human_scale) {
     g_thorns_c[0]=e->position[0]; g_thorns_c[1]=e->position[1]; g_thorns_c[2]=e->position[2];
     g_thorns_on = 1; g_thorns_age = 0.0f; g_thorns_cd = 8.0f;
     snprintf(g_shot_msg,sizeof(g_shot_msg),"THORN FIELD"); g_shot_timer=1.4f; sfx(g_sfx_expl);
@@ -8148,7 +8177,7 @@ void game_update(double dt, double ft)
   // Resonance pulse (signature devourer power, ported from the source's Apex
   // resonance): tap G to emit a shockwave that flings nearby enemies + debris
   // outward and damages them. Cooldown-gated.
-  if (ex_keys_down[SDL_SCANCODE_G] && g_resonance_cd <= 0.0f && !g_human_scale) {
+  if (ex_keys_down[ex_letter('g')] && g_resonance_cd <= 0.0f && !g_human_scale) {
     apply_shockwave(e->position[0], e->position[1], e->position[2], 32.0f, 28.0f, 22.0f);
     spawn_shockring(e->position[0], e->position[1], e->position[2], 32.0f);
     uint8_t rc[3]={90,230,255}; ex_vfx_spawn_impact(&g_vfx, (vec3){e->position[0],e->position[1]+1.0f,e->position[2]}, 22, rc);
@@ -8168,14 +8197,14 @@ void game_update(double dt, double ft)
   // only ever fire when the viewer was OFF, where g_show_imported is false and
   // it does nothing. Kept as a no-op guard rather than deleted, because the
   // pulse below also reads T and the ordering is what stops them colliding.
-  if (0 && ex_keys_down[SDL_SCANCODE_T] && g_show_imported && g_imp_pair[g_imported_idx] >= 0) {
+  if (0 && ex_keys_down[ex_letter('t')] && g_show_imported && g_imp_pair[g_imported_idx] >= 0) {
     imp_transform_start(); ex_keys_down[SDL_SCANCODE_T]=0;
   }
   // T fires the pulse ONLY when the model viewer is not up. Without this guard,
   // pressing T to fold a model in patrol also fires a shockwave - which is
   // exactly the kind of collision that reads as "the transform does not work",
   // because something else visibly happened instead.
-  if (ex_keys_down[SDL_SCANCODE_T] && !g_show_imported && g_pulse_cd <= 0.0f && !g_human_scale) {
+  if (ex_keys_down[ex_letter('t')] && !g_show_imported && g_pulse_cd <= 0.0f && !g_human_scale) {
     float fx=camera->front[0], fz=camera->front[2]; float fl=sqrtf(fx*fx+fz*fz); if(fl>1e-3f){fx/=fl;fz/=fl;}
     float cx=e->position[0]+fx*14.0f, cz=e->position[2]+fz*14.0f;   // burst out in front
     apply_shockwave(cx, e->position[1], cz, 20.0f, 24.0f, 26.0f); g_spark_loud=1.0f;
@@ -8183,7 +8212,7 @@ void game_update(double dt, double ft)
     uint8_t pc[3]={255,150,90}; ex_vfx_spawn_impact(&g_vfx,(vec3){cx,e->position[1]+1.0f,cz},16,pc);
     sfx(g_sfx_expl); g_cam_trauma+=0.3f;
     snprintf(g_shot_msg,sizeof(g_shot_msg),"PULSE BLAST"); g_shot_timer=1.2f; g_pulse_cd=6.0f;
-    ex_keys_down[SDL_SCANCODE_T]=0;
+    ex_keys_down[ex_letter('t')]=0;
   }
   if (g_pulse_cd > 0.0f) g_pulse_cd -= dt;
 
@@ -12116,7 +12145,7 @@ void game_update(double dt, double ft)
       if (ex_keys_down[SDL_SCANCODE_SEMICOLON]){ g_joint_conf+=0.05f; ex_keys_down[SDL_SCANCODE_SEMICOLON]=0; ch=1; }
       // X restricts the browser to models that transform, so cycling shows only
       // subjects the generalizer can act on rather than every imported mesh.
-      if (ex_keys_down[SDL_SCANCODE_X]){ g_xform_only=!g_xform_only; ex_keys_down[SDL_SCANCODE_X]=0; ch=1; }
+      if (ex_keys_down[ex_letter('x')]){ g_xform_only=!g_xform_only; ex_keys_down[ex_letter('x')]=0; ch=1; }
       if (ex_keys_down[SDL_SCANCODE_DELETE]||ex_keys_down[SDL_SCANCODE_BACKSPACE]){
         g_joint_tol=0.04f; g_joint_conf=0.25f; ex_keys_down[SDL_SCANCODE_DELETE]=ex_keys_down[SDL_SCANCODE_BACKSPACE]=0; ch=1; }
       // Clamped, because a tolerance of zero finds nothing and one of 1.0 makes
