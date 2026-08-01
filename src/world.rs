@@ -29,6 +29,8 @@ pub const M_SHELL_OPEN_LO: usize = 11; // ...and its far-field LOD
 pub const M_TORUS_TUBE: usize = 12; // hollow torus: a seamless loop of pipe
 pub const M_RING_DECK: usize = 13; // flat annulus: a drivable planetary ring
 pub const M_HEX: usize = 12; // hexagonal tile prism
+pub const TERRAIN_CHUNKS: u32 = 6; // 6x6 cullable ground tiles
+pub const M_TERRAIN_0: usize = 17; // first of TERRAIN_CHUNKS^2 chunk meshes
 pub const M_SPHERE_LO: usize = 15; // far-field sphere: a fifth of the triangles
 pub const M_CAP_TALL_LO: usize = 16; // far-field capsule
 /// Terrain ground-truth grid: physics, placement, the render mesh and the
@@ -4166,6 +4168,13 @@ impl World {
             }
         }
         None
+    }
+
+    /// Is this shape animated (a platform, a chess piece, a spinner)? Those
+    /// travel, so they must never be baked into the static candidate grid —
+    /// their reflections would be stuck wherever they started.
+    pub fn is_mover(&self, i: usize) -> bool {
+        self.dyn_shapes.contains(&(i as u16))
     }
 
     /// Distance to ONE shape (platform queries: which deck am I on?)

@@ -480,6 +480,55 @@ pub fn pad_disc(cols: u32) -> MeshData {
 /// Terrain disk: radius `radius`, `n` cells across, displaced by `h(x, z)`.
 /// Normals from central differences of the same height function, so lighting
 /// matches the physics SDF exactly.
+/// One CHUNK of the terrain grid: the same nodes as `terrain`, but only the
+/// cells in [i0,i1) x [j0,j1). Splitting the ground into chunks is what
+/// makes it cullable — as one 97k-triangle mesh, every blade of it was
+/// drawn every frame no matter where you looked. Returns the mesh and its
+/// bounding sphere (centre, radius).
+pub fn terrain_chunk<F: Fn(f32, f32) -> f32>(
+    radius: f32,
+    n: u32,
+    i0: u32,
+    i1: u32,
+    j0: u32,
+    j1: u32,
+    h: &F,
+) -> (MeshData, Vec3, f32) {
+    let mut m = MeshData::new();
+    let step = radius * 2.0 / n as f32;
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    let w = i1 - i0 + 1;
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let x = -radius + i as f32 * step;
+            let z = -radius + j as f32 * step;
+            let y = h(x, z);
+            lo = lo.min(y);
+            hi = hi.max(y);
+            let e = 0.6;
+            let nx = h(x - e, z) - h(x + e, z);
+            let nz = h(x, z - e) - h(x, z + e);
+            let nrm = Vec3::new(nx, 2.0 * e, nz).normalize();
+            m.push(Vec3::new(x, y, z), nrm, Vec2::new(x, z));
+        }
+    }
+    for j in 0..(j1 - j0) {
+        for i in 0..(i1 - i0) {
+            let a = j * w + i;
+            let b = a + 1;
+            let c = a + w;
+            let d = c + 1;
+            m.idx.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    let cx = -radius + (i0 + i1) as f32 * 0.5 * step;
+    let cz = -radius + (j0 + j1) as f32 * 0.5 * step;
+    let cy = (lo + hi) * 0.5;
+    let half_xz = (i1 - i0) as f32 * step * 0.5;
+    let r = (half_xz * half_xz * 2.0 + ((hi - lo) * 0.5).powi(2)).sqrt() + step;
+    (m, Vec3::new(cx, cy, cz), r)
+}
+
 pub fn terrain<F: Fn(f32, f32) -> f32>(radius: f32, n: u32, h: F) -> MeshData {
     let mut m = MeshData::new();
     let step = radius * 2.0 / n as f32;

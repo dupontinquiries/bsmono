@@ -1872,6 +1872,30 @@ Both helpers (`frustum_planes`, `sphere_visible`, `shape_bound`) are free
 functions so the sim can measure exactly what the renderer does, rather
 than a model of it.
 
+## v1.58.0 — the ground stops drawing itself twice
+
+THE TERRAIN WAS ONE MESH. 221x221 nodes, 96,800 triangles, submitted whole
+every single frame — the largest draw in the game and, as one mesh,
+impossible to cull. It is now built as 6x6 CHUNKS over the same grid nodes
+(so it stays node-identical with the physics heightmap, which is what keeps
+the car sitting where the ground looks), each with a bounding sphere and
+each frustum-tested. Measured across eight headings: 96,800 -> 42,380
+triangles, 56% saved, with no visible change because what is dropped is
+behind you.
+
+MOVERS ARE DYNAMICS NOW, which is a correctness fix as much as a
+performance one. Animated shapes were baked into the STATIC reflection
+candidate grid at their load-time positions, so a moving platform reflected
+wherever it had started — on CHAMBER that is 190 chess parts mirrored in
+the wrong squares. They are excluded from the bake and appended to the
+dynamic suffix instead, which is scanned live. Because that scan runs
+per-fragment, the list is distance-sorted and capped at 28 within 190 m,
+so a busy map cannot flood it.
+
+Both changes are exercised by `--sim render`, which now also reports the
+terrain triangle budget alongside the per-map instance counts and the LOD
+savings.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -445,6 +445,8 @@ struct Game {
     last_scale: f32,      // render-scale watcher
     tap_drive: (f32, f32), // throttle/steer from the drive-to target
     gyro: gyro::Gyro,
+    /// bounding spheres of the terrain chunks, for culling the ground
+    tchunks: Vec<(Vec3, f32)>,
     style: style::Analyzer,
     // touch menu gesture state: where the finger went down, which row it
     // grabbed, whether it has moved far enough to count as a drag
@@ -643,8 +645,8 @@ fn bake_rcells(world: &world::World) -> Vec<u32> {
             cand.clear();
             let mut si = 0u32;
             for (wi, sh) in world.shapes.iter().enumerate() {
-                if sh.cut {
-                    continue;
+                if sh.cut || world.is_mover(wi) {
+                    continue; // movers live in the dynamic suffix instead
                 }
                 let bound = match sh.sdf {
                     world::Sdf::None => 0.0,
@@ -687,6 +689,27 @@ fn bake_heightmap(gpu: &render::Gpu, seed: u64, style: &world::MapStyle) {
         }
     }
     gpu.set_heightmap(&data);
+}
+
+/// Rebuild every terrain chunk and hand back their bounding spheres.
+fn terrain_chunks(gpu: &mut render::Gpu, w: &world::World) -> Vec<(Vec3, f32)> {
+    let nc = world::TERRAIN_CHUNKS;
+    let n = (world::TG_N - 1) as u32;
+    let per = n / nc;
+    let h = |x: f32, z: f32| w.ground_h(x, z);
+    let mut bounds = Vec::with_capacity((nc * nc) as usize);
+    for cj in 0..nc {
+        for ci in 0..nc {
+            let i0 = ci * per;
+            let i1 = if ci + 1 == nc { n } else { (ci + 1) * per };
+            let j0 = cj * per;
+            let j1 = if cj + 1 == nc { n } else { (cj + 1) * per };
+            let (m, c, r) = meshgen::terrain_chunk(world::TG_HALF, n, i0, i1, j0, j1, &h);
+            gpu.replace_mesh(world::M_TERRAIN_0 + (cj * nc + ci) as usize, &m);
+            bounds.push((c, r));
+        }
+    }
+    bounds
 }
 
 fn terrain_mesh(w: &world::World) -> meshgen::MeshData {
@@ -776,6 +799,11 @@ fn main() {
         gpu.add_mesh(&meshgen::capsule(world::CAP_TALL_HH, 5, 10)), // M_CAP_TALL_LO
 ];
     assert_eq!(ids[world::M_TERRAIN], world::M_TERRAIN);
+    // the ground, split into cullable chunks (placeholders until generate)
+    let nc = world::TERRAIN_CHUNKS;
+    for _ in 0..(nc * nc) {
+        gpu.add_mesh(&meshgen::MeshData::new());
+    }
     bake_heightmap(&gpu, seed, style0);
 
     // ---- models -----------------------------------------------------------
@@ -807,7 +835,8 @@ fn main() {
     let mut car = Car::new();
     apply_car_dims(&mut car, &cars.models[cars.active], cfg.car.size);
     let world = World::generate(seed, style0, cars.models[cars.active].half_h, cfg.arena.scale);
-    gpu.replace_mesh(world::M_TERRAIN, &terrain_mesh(&world));
+    gpu.replace_mesh(world::M_TERRAIN, &meshgen::MeshData::new()); // chunks draw it now
+    let tchunks = terrain_chunks(&mut gpu, &world);
     gpu.set_rcells(&bake_rcells(&world));
     car.reset(&world);
     let mut ball = Ball::new();
@@ -858,6 +887,7 @@ fn main() {
         last_scale: rs0,
         tap_drive: (0.0, 0.0),
         gyro: gyro::Gyro::new(gyro_on0),
+        tchunks,
         style: style::Analyzer::new(),
         mscroll: 0.0,
         mfling: 0.0,
@@ -1060,7 +1090,7 @@ impl Game {
         let style = world::style(self.save.map);
         self.world = World::generate(seed, style, self.cars.models[self.cars.active].half_h, self.cfg.arena.scale);
         self.applied_scale = self.cfg.arena.scale;
-        self.gpu.replace_mesh(world::M_TERRAIN, &terrain_mesh(&self.world));
+        self.tchunks = terrain_chunks(&mut self.gpu, &self.world);
         self.gpu.set_rcells(&bake_rcells(&self.world));
         bake_heightmap(&self.gpu, seed, style);
         let dims_i = self.cars.active;
@@ -2918,9 +2948,12 @@ impl Game {
             });
         };
 
-        for s in &self.world.shapes {
+        for (wi, s) in self.world.shapes.iter().enumerate() {
             if s.cut {
                 continue; // CSG cutters carve the SDF; they are not drawn
+            }
+            if self.world.is_mover(wi) {
+                continue; // appended below, after static_n
             }
             // statics come first in STABLE shape order: the baked candidate
             // cells index into this prefix, per-frame culls would shift it
@@ -2969,6 +3002,41 @@ impl Game {
             }
         }
         let static_n = v.len();
+        // ---- MOVERS, as dynamics ----
+        // A platform baked into the static grid reflects wherever it was
+        // when the map loaded, which on CHAMBER is 190 chess parts sitting
+        // in the wrong squares. They go in the dynamic suffix instead, which
+        // is scanned live — capped and distance-sorted, because that scan is
+        // per-fragment and CHAMBER would otherwise put 190 spheres in it.
+        {
+            let mut movers: Vec<(f32, usize)> = self
+                .world
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(wi, sh)| !sh.cut && self.world.is_mover(*wi) && !matches!(sh.sdf, Sdf::None))
+                .map(|(wi, sh)| (sh.pos.distance_squared(rc.0), wi))
+                .filter(|(d2, _)| *d2 < 190.0 * 190.0)
+                .collect();
+            movers.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, wi) in movers.into_iter().take(28) {
+                let s = &self.world.shapes[wi];
+                let em = (s.emissive + s.flash * 1.1).min(1.0);
+                let kb = if s.blend { 16.0 } else { 0.0 };
+                match s.sdf {
+                    Sdf::Sphere { r } => push(&mut v, kb, s.pos, r + 0.1, [r, 0.0, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Torus { big, tube } => push(&mut v, 1.0 + kb, s.pos, big + tube + 0.1, [big, tube, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Capsule { r, half } => push(&mut v, 2.0 + kb, s.pos, r + half + 0.1, [r, half, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::RBox { half, round } => push(&mut v, 3.0 + kb, s.pos, half.length() + 0.1, [half.x, half.y, half.z, round], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Hex { r, h } => push(&mut v, 6.0 + kb, s.pos, (r * r + h * h).sqrt() + 0.1, [r, h, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Shell { r, half, thick } => push(&mut v, 5.0 + kb, s.pos, ((r + thick) * (r + thick) + half * half).sqrt() + 0.1, [r, half, thick, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::TubeTorus { big, tube, thick } => push(&mut v, 9.0 + kb, s.pos, big + tube + thick + 0.1, [big, tube, thick, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::RingDeck { big, wide, half_h } => push(&mut v, 10.0 + kb, s.pos, big + wide + 0.2, [big, wide, half_h, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::None => {}
+                }
+            }
+        }
+
 
         // live pad orbs, gold and glowing (bob matches build_scene)
         for p in self.world.pads.iter().filter(|p| p.timer <= 0.0) {
@@ -3072,15 +3140,22 @@ impl Game {
             objs.push(ObjDraw { mesh, tex, raw });
         };
 
-        // terrain
-        push(
-            &mut objs,
-            world::M_TERRAIN,
-            None,
-            Mat4::IDENTITY,
-            self.style().grass,
-            [1.0, 0.0, 0.04, 0.0],
-        );
+        // terrain, chunk by chunk — the ground is 97k triangles and used to
+        // be a single mesh, so all of it drew every frame regardless of
+        // where you were looking
+        for (ci, (c, r)) in self.tchunks.iter().enumerate() {
+            if !sphere_visible(planes, *c, *r) {
+                continue;
+            }
+            push(
+                &mut objs,
+                world::M_TERRAIN_0 + ci,
+                None,
+                Mat4::IDENTITY,
+                self.style().grass,
+                [1.0, 0.0, 0.04, 0.0],
+            );
+        }
 
         // playful shapes
         for (si, s) in self.world.shapes.iter().enumerate() {

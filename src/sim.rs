@@ -900,6 +900,51 @@ pub fn run(args: &[String]) {
                 saved * 100.0
             );
         }
+        // ---- the ground: how much of 97k triangles survives culling? ----
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let nc = crate::world::TERRAIN_CHUNKS;
+            let n = (crate::world::TG_N - 1) as u32;
+            let per = n / nc;
+            let h = |x: f32, z: f32| w.ground_h(x, z);
+            let mut bounds = Vec::new();
+            let mut tris_total = 0usize;
+            for cj in 0..nc {
+                for ci in 0..nc {
+                    let i0 = ci * per;
+                    let i1 = if ci + 1 == nc { n } else { (ci + 1) * per };
+                    let j0 = cj * per;
+                    let j1 = if cj + 1 == nc { n } else { (cj + 1) * per };
+                    let (m, c, r) = crate::meshgen::terrain_chunk(crate::world::TG_HALF, n, i0, i1, j0, j1, &h);
+                    tris_total += m.idx.len() / 3;
+                    bounds.push((c, r, m.idx.len() / 3));
+                }
+            }
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
+            let mut drawn_sum = 0.0f32;
+            let turns = 8;
+            for t in 0..turns {
+                let a2 = t as f32 / turns as f32 * std::f32::consts::TAU;
+                let look = eye + Vec3::new(a2.sin() * 30.0, -3.0, a2.cos() * 30.0);
+                let view = glam::Mat4::look_at_rh(eye, look, Vec3::Y);
+                let proj = glam::Mat4::perspective_rh(86f32.to_radians(), 16.0 / 9.0, 0.1, 900.0);
+                let planes = frustum_planes(&(proj * view));
+                let mut tri = 0usize;
+                for (c, r, t3) in &bounds {
+                    if sphere_visible(&planes, *c, *r) {
+                        tri += t3;
+                    }
+                }
+                drawn_sum += tri as f32;
+            }
+            let avg = drawn_sum / turns as f32;
+            println!(
+                "terrain: {} chunks, {tris_total} tris total -> {:.0} drawn ({:.0}% saved)",
+                nc * nc,
+                avg,
+                (1.0 - avg / tris_total as f32) * 100.0
+            );
+        }
         // ---- triangle budget: what the LOD swap is worth ----
         {
             let hi_sphere = crate::meshgen::sphere(22, 34).idx.len() / 3;
