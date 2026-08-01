@@ -180,7 +180,18 @@ pub fn device_defaults(adapter: &str) -> Defaults {
     let mut d = Defaults::default();
     // Asahi/Honeykrisp on Apple silicon: subgroup matvec can hang large matmuls, so it is opt-in; the
     // firmware watchdog is strict, so conversion dispatches are kept small.
-    if a.contains("apple") && a.contains("vulkan") {
+    // WATCHDOG-PRONE DEVICES, not Apple. This table encodes the same decision the engine's subgroup
+    // guard makes, and _358 widened THAT one to mobile GPUs after a Fairphone reported "not enough
+    // wavelets" — while this copy stayed Apple-only. Duplicated policy, fixed in one place.
+    //
+    // Both properties generalise: the subgroup matvec is now known wrong or unsupported on three
+    // drivers, and every mobile driver has the strict dispatch watchdog that motivates the small
+    // conversion chunk. A phone taking this table's defaults gets the fast path that hangs it.
+    let watchdog_prone = ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante"]
+        .iter().any(|m| a.contains(m))
+        || (a.contains("apple") && a.contains("vulkan"))
+        || a.contains("agx") || a.contains("honeykrisp");
+    if watchdog_prone {
         d.subgroup_matvec = false;
         d.convert_chunk_blocks = 16384;
         // Submission is the dominant cost here, so a larger batch is worth more than on other drivers.
@@ -268,6 +279,36 @@ measurements will be taken again", path.display()))),
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_MOBILE_gpu_gets_the_same_defaults_as_apple() {
+        // The bug: this table and the engine's subgroup guard encode the same decision, and _358
+        // widened only the guard — after a Fairphone reported "not enough wavelets", which is a driver
+        // refusing a workgroup that demands more subgroups than it can schedule. A phone taking this
+        // table's defaults got subgroup_matvec ON, which is the path that fails.
+        for a in ["Adreno (TM) 740", "Mali-G715", "Immortalis-G720", "Samsung Xclipse 940"] {
+            let d = device_defaults(a);
+            assert!(!d.subgroup_matvec, "{a} must not take the subgroup path");
+            assert_eq!(d.convert_chunk_blocks, 16384, "{a} has the same strict dispatch watchdog");
+        }
+    }
+
+    #[test]
+    fn apple_still_gets_them() {
+        let d = device_defaults("Apple M2 Max (G14C B1) [Vulkan]");
+        assert!(!d.subgroup_matvec);
+        assert_eq!(d.submit_batch, 16);
+    }
+
+    #[test]
+    fn a_desktop_card_keeps_the_FAST_defaults() {
+        // The other direction, and it matters as much: applying the conservative table everywhere
+        // costs every desktop the subgroup kernel for a watchdog it does not have.
+        for a in ["NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX", "Intel Arc A770"] {
+            let d = device_defaults(a);
+            assert!(d.subgroup_matvec, "{a} should keep the fast path");
+        }
+    }
+
     use super::*;
 
     #[test]
