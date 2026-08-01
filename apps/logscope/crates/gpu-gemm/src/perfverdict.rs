@@ -205,6 +205,24 @@ mod tests {
     }
 
     #[test]
+    fn the_REAL_deepseek_run_gets_an_actionable_verdict_without_bandwidth() {
+        // Measured on an M2 Max: 81 tokens in 18.3s, 610 submits, setup 19ms, sync 0ms. The profile
+        // line called it "GPU-execution-bound, 0.1% accounted", which says where the time ISN'T.
+        //
+        // With active_bytes and gib_per_s unavailable the roofline cannot be evaluated, so
+        // AtBandwidthLimit is unreachable — the verdict that would say STOP. What remains is still
+        // useful: 7.5 submits/token is neither dispatch-heavy nor starving, and sync is zero, so the
+        // honest answer is that the profile cannot see it and --gate-perf is the next measurement.
+        let s = Sample { tokens: 81, wall_ms: 18_300.0, setup_ms: 19.0, sync_ms: 0.0,
+                         submits: 610, active_bytes: 0, gib_per_s: 0.0 };
+        assert!((s.submits_per_token() - 7.5).abs() < 0.1);
+        let v = verdict(&s, 30.0);
+        assert!(matches!(v, Verdict::ComputeBoundBelowRoofline { .. }), "{v:?}");
+        assert!(v.advice().contains("profile cannot see which"));
+        assert!(v.advice().contains("--gate-perf"), "and names the measurement that would");
+    }
+
+    #[test]
     fn efficiency_is_zero_rather_than_infinite_when_bandwidth_is_unknown() {
         // gib_per_s = 0 means --gate-perf never ran. Dividing by it would produce a confident verdict
         // from no measurement, which is the shape this project keeps getting caught by.
