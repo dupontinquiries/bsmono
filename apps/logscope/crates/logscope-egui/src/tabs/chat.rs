@@ -359,8 +359,14 @@ impl Msg {
     fn user(text: String) -> Self { Self { role: Role::User, variants: vec![text], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None } }
     fn assistant() -> Self { Self { role: Role::Assistant, variants: vec![String::new()], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None } }
     fn text(&self) -> &str { &self.variants[self.cur] }
+    /// All variants, for an export that must not drop regenerations.
+    fn all_variants(&self) -> &[String] { &self.variants }
     fn cur_mut(&mut self) -> &mut String { &mut self.variants[self.cur] }
 }
+impl logscope::branchtree::Node for Msg {
+    fn parent(&self) -> Option<usize> { self.parent }
+}
+
 /// A structural edit requested from a message's controls, applied after the render pass (so the
 /// render can borrow `msgs` immutably-ish while the buttons just record intent).
 enum MsgAction { Copy(usize), EditStart(usize), EditSave(usize), EditCancel(usize), Regenerate(usize), Delete(usize), PrevVar(usize), NextVar(usize) }
@@ -5290,6 +5296,18 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 let mut cur = self.active_leaf;
                 while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
                 chain.reverse();
+                // EVERY BRANCH, EVERY MESSAGE, EVERY VARIANT. This walked active_leaf back through
+                // parents and wrote that ONE chain — dropping every alternative a fan-out produced, and
+                // within each surviving turn every regeneration except the selected one. It reported the
+                // turns it saved, so nothing indicated what was missing — the worst shape a data-loss bug
+                // can have.
+                let all_branches = logscope::branchtree::branches(&self.msgs, self.active_leaf);
+                let alt_variants: usize =
+                    self.msgs.iter().map(|m| m.all_variants().len().saturating_sub(1)).sum();
+                if all_branches.len() > 1 || alt_variants > 0 {
+                    eprintln!("export: {}", logscope::branchtree::manifest(&all_branches));
+                    eprintln!("export: {alt_variants} alternative variant(s) beyond the selected ones");
+                }
                 let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
                     .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(), m.text().to_string()))
                     .collect();
@@ -5405,6 +5423,18 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 let mut cur = self.active_leaf;
                 while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
                 chain.reverse();
+                // EVERY BRANCH, EVERY MESSAGE, EVERY VARIANT. This walked active_leaf back through
+                // parents and wrote that ONE chain — dropping every alternative a fan-out produced, and
+                // within each surviving turn every regeneration except the selected one. It reported the
+                // turns it saved, so nothing indicated what was missing — the worst shape a data-loss bug
+                // can have.
+                let all_branches = logscope::branchtree::branches(&self.msgs, self.active_leaf);
+                let alt_variants: usize =
+                    self.msgs.iter().map(|m| m.all_variants().len().saturating_sub(1)).sum();
+                if all_branches.len() > 1 || alt_variants > 0 {
+                    eprintln!("export: {}", logscope::branchtree::manifest(&all_branches));
+                    eprintln!("export: {alt_variants} alternative variant(s) beyond the selected ones");
+                }
                 let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
                     .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(), m.text().to_string()))
                     .collect();
@@ -5426,6 +5456,18 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 let mut cur = self.active_leaf;
                 while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
                 chain.reverse();
+                // EVERY BRANCH, EVERY MESSAGE, EVERY VARIANT. This walked active_leaf back through
+                // parents and wrote that ONE chain — dropping every alternative a fan-out produced, and
+                // within each surviving turn every regeneration except the selected one. It reported the
+                // turns it saved, so nothing indicated what was missing — the worst shape a data-loss bug
+                // can have.
+                let all_branches = logscope::branchtree::branches(&self.msgs, self.active_leaf);
+                let alt_variants: usize =
+                    self.msgs.iter().map(|m| m.all_variants().len().saturating_sub(1)).sum();
+                if all_branches.len() > 1 || alt_variants > 0 {
+                    eprintln!("export: {}", logscope::branchtree::manifest(&all_branches));
+                    eprintln!("export: {alt_variants} alternative variant(s) beyond the selected ones");
+                }
                 let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
                     .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(), m.text().to_string()))
                     .collect();
