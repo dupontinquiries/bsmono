@@ -70,6 +70,63 @@ def describe(pts, tris_local, res=3):
             cells[k][3] += ar
     return cells, max(total, 1e-12), RES
 
+# The 24 orientation-preserving rotations of a cube, as (axis permutation, sign
+# flips). A part that has been rotated 90 degrees between vehicle and bot form
+# produces a completely different axis-aligned grid, so an unrotated comparison
+# simply cannot see it — which is most of what a transformation DOES to a part.
+def _cube_rotations():
+    import itertools
+    out = []
+    for perm in itertools.permutations(range(3)):
+        for sx in (1, -1):
+            for sy in (1, -1):
+                for sz in (1, -1):
+                    signs = (sx, sy, sz)
+                    # keep only proper rotations (determinant +1); the rest are
+                    # mirrors, and a mirrored match is a different part
+                    par = 1
+                    q = list(perm)
+                    for a in range(3):
+                        for b in range(a+1, 3):
+                            if q[a] > q[b]: par = -par
+                    if par * sx * sy * sz == 1:
+                        out.append((perm, signs))
+    return out
+
+CUBE_ROTS = _cube_rotations()
+
+def rotate_cells(cells, res, perm, signs):
+    """Re-index a descriptor grid under one cube rotation, rotating the stored
+    normal vectors to match."""
+    out = [[0.0]*4 for _ in range(res**3)]
+    for z in range(res):
+        for y in range(res):
+            for x in range(res):
+                src = (z*res + y)*res + x
+                c = cells[src]
+                if c[3] <= 0.0: continue
+                p = (x, y, z)
+                q = [p[perm[i]] for i in range(3)]
+                for i in range(3):
+                    if signs[i] < 0: q[i] = res - 1 - q[i]
+                dst = (q[2]*res + q[1])*res + q[0]
+                n = [c[perm[i]] * signs[i] for i in range(3)]
+                for i in range(3): out[dst][i] += n[i]
+                out[dst][3] += c[3]
+    return out
+
+def dist_rot(A, B, rots=None):
+    """Best distance over all 24 cube rotations — so a part matches its twin
+    however it has been turned. This is the pass the scan was missing."""
+    ca, ta, ra = A; cb, tb, rb = B
+    if ra != rb: return float('inf')
+    best = float('inf')
+    for perm, signs in (rots or CUBE_ROTS):
+        rc = rotate_cells(ca, ra, perm, signs)
+        d = dist((rc, ta, ra), B)
+        if d < best: best = d
+    return best
+
 def dist(A, B):
     """Distance, or infinity when the two parts are described at different
     resolutions — which is itself a size filter: a bracket cannot match a hull,
