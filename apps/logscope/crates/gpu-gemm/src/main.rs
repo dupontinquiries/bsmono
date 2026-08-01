@@ -3502,11 +3502,38 @@ everywhere: it looks like a hardware problem"
         eprintln!("gate-q6k: adapter = {}", gpu.adapter_name);
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
         // Pseudo-random blocks, including bytes that exercise the sign of the scales and the high bits.
+        // REALISTIC f16 SCALES, not random bytes. Every byte was pseudo-random, INCLUDING the f16 `d`
+        // at offsets 208..209 — which lands on inf, NaN and subnormal patterns that no real checkpoint
+        // contains, and produces the absurd reference values this gate was printing (weights of 45139,
+        // a "scale" of 3241731).
+        //
+        // CPU and GPU are ALLOWED to differ on inf and NaN, and Apple hardware flushes denormals where
+        // a software rasterizer does not. So the gate was comparing two implementations on inputs where
+        // disagreement is legal, and calling it a kernel fault.
+        //
+        // The same trap was fixed in the unit tests twice (the Q4_K fixture and the decode fixture) and
+        // never here — the tests learned and the gates did not.
+        let f32_to_half = |f: f32| -> u16 {
+            let b = f.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            let mant = (b >> 13) & 0x3FF;
+            if exp <= 0 { return sign; }
+            sign | ((exp as u16) << 10) | mant as u16
+        };
         let mk = |nblk: usize, seed: u32| -> Vec<u8> {
-            (0..nblk * 210).map(|i| {
+            let mut v: Vec<u8> = (0..nblk * 210).map(|i| {
                 let z = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
                 ((z >> 13) & 0xFF) as u8
-            }).collect()
+            }).collect();
+            for b in 0..nblk {
+                // A scale in the range a real Q6_K checkpoint uses. Signed, so the negative-scale
+                // check still exercises what it is for.
+                let d = 0.002 + ((b + seed as usize) % 23) as f32 * 0.0007;
+                let d = if (b + seed as usize) % 5 == 0 { -d } else { d };
+                v[b * 210 + 208..b * 210 + 210].copy_from_slice(&f32_to_half(d).to_le_bytes());
+            }
+            v
         };
         // HAND-CHECKED BLOCK FIRST. A single block with known bytes isolates the arithmetic from the
         // chunking, and prints the first few values from both paths so the divergence is visible rather
@@ -3590,10 +3617,30 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         // d/dmin, both branches of the 6-bit scale/min unpack, and both nibble halves.
         let nblk = 37usize; // deliberately not a round number
         let n = nblk * 256;
-        let raw: Vec<u8> = (0..nblk * 144).map(|i| {
+        // Q4_K super-block: f16 `d` at 0..2, f16 `dmin` at 2..4, then packed scales and nibbles. Both
+        // f16 fields were pseudo-random, landing on inf/NaN/subnormal patterns no checkpoint contains —
+        // which is why the reference printed a "scale" of 3,241,731. CPU and GPU may legally disagree
+        // there, and Apple hardware flushes denormals where a software rasterizer does not, so the gate
+        // was calling a legal disagreement a kernel fault.
+        let half = |f: f32| -> u16 {
+            let b = f.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            let mant = (b >> 13) & 0x3FF;
+            if exp <= 0 { return sign; }
+            sign | ((exp as u16) << 10) | mant as u16
+        };
+        let mut raw: Vec<u8> = (0..nblk * 144).map(|i| {
             let x = (i as u32).wrapping_mul(2654435761).wrapping_add(0x9E37);
             (x >> 13) as u8
         }).collect();
+        for b in 0..nblk {
+            let d = 0.003 + (b % 17) as f32 * 0.0011;
+            let dmin = 0.001 + (b % 11) as f32 * 0.0004;
+            raw[b * 144..b * 144 + 2].copy_from_slice(&half(d).to_le_bytes());
+            raw[b * 144 + 2..b * 144 + 4].copy_from_slice(&half(dmin).to_le_bytes());
+        }
+        let raw = raw;
         let want = gpu_kernels::gguf::dequantize(12, &raw, n).expect("cpu q4_k");
         let got = gpu.dequant_q4k(&raw, n);
         ck(&format!("output length matches ({} values)", want.len()), got.len() == want.len());
