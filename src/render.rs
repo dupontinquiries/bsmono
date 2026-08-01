@@ -29,6 +29,10 @@ pub struct Globals {
     pub gcol: [f32; 4], // rgb terrain base color, w rt shape count
     pub cine: [f32; 4], // x exposure, y vignette, z grain, w filmic
     pub post: [f32; 4], // x bloom strength, y bloom threshold, zw spare
+    /// Up to 4 portals for the ray marcher: per portal, [pos.xyz, radius]
+    /// then the face quaternion. `pcount.x` is how many are live.
+    pub pcount: [f32; 4],
+    pub portals: [[f32; 4]; 8],
 }
 
 /// Ray-marchable shape record for the shader (mirrors world::Shape plus the

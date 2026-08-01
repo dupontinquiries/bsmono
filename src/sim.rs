@@ -1238,6 +1238,127 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "portal" {
+        // Portal's rules, checked: speed in equals speed out, direction is
+        // rotated by the pair transform, a fall becomes a launch (the
+        // FLING), and nothing ping-pongs between the two faces.
+        let cfg = Config::default();
+        let world = World::generate(9, crate::world::style(31), 0.31, 1.0);
+        let ball0 = Ball::new();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<38} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("map has linked portal pairs", world.portals.len() >= 6);
+        // every link is mutual, and every transform is a pure rotation
+        let mut mutual = true;
+        let mut orthonormal = true;
+        for (i, p) in world.portals.iter().enumerate() {
+            if world.portals[p.link].link != i {
+                mutual = false;
+            }
+            let r = world.portal_rot(i);
+            let v = Vec3::new(0.3, -0.9, 0.31).normalize();
+            if ((r * v).length() - 1.0).abs() > 1e-4 {
+                orthonormal = false;
+            }
+        }
+        check("links are mutual", mutual);
+        check("transform preserves length (pure rotation)", orthonormal);
+        // a ray INTO a portal leaves the partner pointing OUT of its face
+        let mut exits_outward = true;
+        for (i, p) in world.portals.iter().enumerate() {
+            let n_in = p.rot * Vec3::Z;
+            let out = world.portal_rot(i) * (-n_in); // travelling into the face
+            let n_out = world.portals[p.link].rot * Vec3::Z;
+            if out.dot(n_out) < 0.98 {
+                exits_outward = false;
+            }
+        }
+        check("entering a face exits the partner's face", exits_outward);
+
+        // ---- drive a car through: speed and direction ----
+        let mut car = physics::Car::new();
+        let pf = &world.portals[0];
+        let n0 = pf.rot * Vec3::Z;
+        car.pos = pf.pos + n0 * 4.0;
+        car.vel = -n0 * 26.0;
+        car.prev = car.pos;
+        car.rot = glam::Quat::from_rotation_arc(Vec3::NEG_Z, -n0);
+        let ctl = physics::Controls::default();
+        let mut speed_in = car.vel.length();
+        let mut teleported = false;
+        let mut speed_out = 0.0;
+        let mut exit_dir = Vec3::ZERO;
+        for _ in 0..60 {
+            let before = car.pos;
+            // speed measured at the instant of crossing, not at spawn: a few
+            // frames of air drag on the approach is not a portal loss
+            if !teleported {
+                speed_in = car.vel.length();
+            }
+            physics::step_car_only(&mut car, &ball0, &world, &ctl, &cfg, DT);
+            if !teleported && car.pos.distance(before) > 3.0 {
+                teleported = true;
+                speed_out = car.vel.length();
+                exit_dir = car.vel.normalize_or(Vec3::Z);
+            }
+        }
+        let n_exit = world.portals[world.portals[0].link].rot * Vec3::Z;
+        check("car teleports on crossing", teleported);
+        check(
+            "speed is conserved through the portal",
+            (speed_out - speed_in).abs() / speed_in.max(1.0) < 0.08,
+        );
+        check("car leaves along the exit face", exit_dir.dot(n_exit) > 0.9);
+        println!("   in {speed_in:.1} m/s -> out {speed_out:.1} m/s, exit alignment {:.2}", exit_dir.dot(n_exit));
+
+        // ---- THE FLING: fall into a floor portal, leave a wall horizontally
+        let mut car = physics::Car::new();
+        let fp = &world.portals[0];
+        car.pos = fp.pos + Vec3::Y * 40.0;
+        car.vel = Vec3::ZERO;
+        car.prev = car.pos;
+        let mut peak_h = 0.0f32;
+        let mut fell = 0.0f32;
+        for f in 0..900 {
+            let before_y = car.pos.y;
+            physics::step_car_only(&mut car, &ball0, &world, &ctl, &cfg, DT);
+            if std::env::var("PORTAL_DBG").is_ok() && f % 20 == 0 {
+                eprintln!("  f={:3} pos=({:6.1},{:6.1},{:6.1}) vel=({:5.1},{:6.1},{:5.1}) sdf={:6.2} og={}",
+                    f, car.pos.x, car.pos.y, car.pos.z, car.vel.x, car.vel.y, car.vel.z, world.sdf(car.pos), car.on_ground as u8);
+            }
+            if car.pos.y < before_y {
+                fell += before_y - car.pos.y;
+            }
+            let horiz = Vec3::new(car.vel.x, 0.0, car.vel.z).length();
+            peak_h = peak_h.max(horiz);
+        }
+        check("a fall becomes horizontal speed (the fling)", peak_h > 18.0);
+        println!("   fell {fell:.0} m -> {peak_h:.1} m/s horizontal");
+
+        // ---- no ping-pong: park a ball right at a face and watch it settle
+        let mut ball = Ball::new();
+        let lp = &world.portals[2];
+        ball.pos = lp.pos + (lp.rot * Vec3::Z) * 1.2;
+        ball.vel = Vec3::ZERO;
+        ball.prev = ball.pos;
+        let mut world2 = World::generate(9, crate::world::style(31), 0.31, 1.0);
+        let mut jumps = 0;
+        let mut ev = StepEvents::default();
+        for _ in 0..600 {
+            let before = ball.pos;
+            physics::step_ball(&mut ball, &mut world2, &cfg, DT, &mut ev);
+            if ball.pos.distance(before) > 5.0 {
+                jumps += 1;
+            }
+        }
+        check("no runaway ping-pong at a face", jumps < 40);
+        println!("   {jumps} transits in 5 s of hovering at a portal mouth");
+        println!("{}", if pass { "PORTALS: PASS" } else { "PORTALS: FAIL" });
+        return;
+    }
     if name == "platform" {
         // Can a car RIDE a moving platform? Park one on each kind of mover
         // in CLOCKWORK and check it is carried rather than left behind.

@@ -52,6 +52,10 @@ pub struct Car {
     pub half_h: f32,
     pub half_w: f32,
     pub susp: f32, // suspension compression 0..1 (renderer bobs the body)
+    /// where we were last step, for portal plane crossing
+    pub prev: Vec3,
+    /// brief lockout so an exit cannot immediately re-enter its own partner
+    pub tp_cd: f32,
     /// world-space angular velocity INCLUDING the grounded steering yaw,
     /// which is applied straight to the rotation and never enters `ang`
     pub omega: Vec3,
@@ -93,6 +97,8 @@ impl Car {
             wheel_r: 0.11,
             half_w: 0.32,
             susp: 0.0,
+            prev: Vec3::ZERO,
+            tp_cd: 0.0,
             omega: Vec3::ZERO,
             prev_rot: Quat::IDENTITY,
             wheel_spin: 0.0,
@@ -185,12 +191,14 @@ pub struct Ball {
     pub ang: Vec3,
     pub r: f32,
     pub last_touch: u8, // WHO_* code of the last car to touch the ball
+    pub prev: Vec3,
+    pub tp_cd: f32,
     pinch_cd: f32,
 }
 
 impl Ball {
     pub fn new() -> Ball {
-        Ball { pos: Vec3::new(0.0, BALL_R + 4.0, 14.0), vel: Vec3::ZERO, rot: Quat::IDENTITY, ang: Vec3::ZERO, r: BALL_R, last_touch: WHO_NONE, pinch_cd: 0.0 }
+        Ball { pos: Vec3::new(0.0, BALL_R + 4.0, 14.0), vel: Vec3::ZERO, rot: Quat::IDENTITY, ang: Vec3::ZERO, r: BALL_R, last_touch: WHO_NONE, pinch_cd: 0.0, prev: Vec3::ZERO, tp_cd: 0.0 }
     }
     pub fn reset_in_front(&mut self, car: &Car) {
         self.pos = car.pos + car.forward() * 4.0 + Vec3::Y * (0.6 + self.r);
@@ -1130,6 +1138,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     if !car.on_ground {
         // (omega measured after the rotation integration)
     }
+    portal_car(car, world, dt);
     if car.ang.length_squared() > 1e-8 {
         car.rot = (car.rot * Quat::from_scaled_axis(car.ang * dt)).normalize();
     }
@@ -1212,8 +1221,45 @@ fn yaw_quat(q: Quat) -> Quat {
 
 // --------------------------------------------------------------- ball ----
 /// Public for the sim harness: the ball vs world, no car required.
+/// Teleport a car through any portal its motion crossed this step. Position,
+/// velocity, orientation and spin all take the same rotation, so momentum is
+/// preserved exactly and a fall becomes a launch.
+pub fn portal_car(car: &mut Car, world: &World, dt: f32) -> bool {
+    car.tp_cd = (car.tp_cd - dt).max(0.0);
+    if world.portals.is_empty() || car.tp_cd > 0.0 {
+        car.prev = car.pos;
+        return false;
+    }
+    if let Some(i) = world.portal_crossed(car.prev, car.pos) {
+        let r = world.portal_rot(i);
+        car.pos = world.portal_point(i, car.pos);
+        car.vel = r * car.vel;
+        car.rot = (r * car.rot).normalize();
+        car.ang = r * car.ang;
+        car.pos += (r * Vec3::Z) * 0.15; // clear of the exit face
+        car.tp_cd = 0.12;
+        car.prev = car.pos;
+        return true;
+    }
+    car.prev = car.pos;
+    false
+}
+
 pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut StepEvents) {
     ball.pinch_cd = (ball.pinch_cd - dt).max(0.0);
+    // the ball goes through portals too — half the play depends on it
+    ball.tp_cd = (ball.tp_cd - dt).max(0.0);
+    if !world.portals.is_empty() && ball.tp_cd <= 0.0 {
+        if let Some(i) = world.portal_crossed(ball.prev, ball.pos) {
+            let r = world.portal_rot(i);
+            ball.pos = world.portal_point(i, ball.pos);
+            ball.vel = r * ball.vel;
+            ball.ang = r * ball.ang;
+            ball.pos += (r * Vec3::Z) * 0.2;
+            ball.tp_cd = 0.12;
+        }
+    }
+    ball.prev = ball.pos;
     let (bdir, bmul) = world.gravity_field(ball.pos);
     ball.vel += bdir * GRAV * bmul * cfg.arena.gravity * dt;
     if let Some(cv) = world.current(ball.pos) {

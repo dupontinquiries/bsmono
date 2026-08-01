@@ -19,6 +19,8 @@ struct Globals {
     gcol: vec4<f32>,       // rgb terrain base color, w shape count
     cine: vec4<f32>,       // x exposure, y vignette, z grain, w filmic tonemap
     post: vec4<f32>,       // x bloom strength, y bloom threshold, zw spare
+    pcount: vec4<f32>,     // x = live portal count (max 4)
+    portals: array<vec4<f32>, 8>, // per portal: [pos.xyz, r], then face quat
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 
@@ -239,6 +241,46 @@ fn gather(ro: vec3<f32>, rd: vec3<f32>, tmax: f32, skip: i32) -> Cands {
     return c;
 }
 
+fn qconj(q: vec4<f32>) -> vec4<f32> {
+    return vec4(-q.x, -q.y, -q.z, q.w);
+}
+
+/// Did the segment a->b cross a portal face from the front? If so, return
+/// the teleported point and direction. This is what lets a ray SEE THROUGH
+/// a portal: it does not stop at the face, it comes out of the partner and
+/// keeps marching, so reflections and shadows carry through the pair too.
+fn portal_hop(a: vec3<f32>, b: vec3<f32>, rd: vec3<f32>, out_p: ptr<function, vec3<f32>>, out_d: ptr<function, vec3<f32>>) -> bool {
+    let n = i32(G.pcount.x);
+    for (var i = 0; i < n; i = i + 1) {
+        let base = u32(i) * 2u;
+        let pa = G.portals[base].xyz;
+        let ra = G.portals[base].w;
+        let qa = G.portals[base + 1u];
+        // partner is the paired index: 0<->1, 2<->3
+        let j = select(i - 1, i + 1, (i % 2) == 0);
+        if (j < 0 || j >= n) { continue; }
+        let pb = G.portals[u32(j) * 2u].xyz;
+        let qb = G.portals[u32(j) * 2u + 1u];
+        let na = qrot(qa, vec3(0.0, 0.0, 1.0));
+        let d0 = dot(a - pa, na);
+        let d1 = dot(b - pa, na);
+        if (d0 <= 0.0 || d1 > 0.0) { continue; }
+        let t = clamp(d0 / (d0 - d1), 0.0, 1.0);
+        let hit = mix(a, b, t);
+        if (length(hit - pa) > ra) { continue; }
+        // local = inverse(qa) * (hit - pa); half turn about the portal up;
+        // then out through the partner's frame
+        var loc = qrot(qconj(qa), hit - pa);
+        var ldir = qrot(qconj(qa), rd);
+        loc = vec3(-loc.x, loc.y, -loc.z);
+        ldir = vec3(-ldir.x, ldir.y, -ldir.z);
+        *out_p = pb + qrot(qb, loc) + qrot(qb, vec3(0.0, 0.0, 1.0)) * 0.05;
+        *out_d = normalize(qrot(qb, ldir));
+        return true;
+    }
+    return false;
+}
+
 fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
     var d = 1e6;
     var db = 1e6; // fillet group: tubes + junction rooms smooth-union
@@ -328,22 +370,43 @@ fn trace_reflection(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32) -> 
     if (qn < 0.35 && base_dist > 70.0) { return sky_color(rd); }
     let lod = clamp(base_dist / 150.0, 0.0, 1.0);
     let tmax = mix(260.0, 90.0, lod) * mix(0.4, 1.0, qn);
-    var c = gather(ro, rd, tmax, skip);
+    // PORTAL-AWARE MARCH: the ray walks in its own frame (ro2/rd2) so that
+    // when a step crosses a portal face the ray is teleported and simply
+    // keeps going — the far side is then genuinely visible THROUGH the
+    // portal in reflections and in the portal's own surface. Two hops, so a
+    // pair facing each other terminates instead of recursing forever.
+    var ro2 = ro;
+    var rd2 = rd;
+    var c = gather(ro2, rd2, tmax, skip);
     var t = 0.06;
     var hit = false;
+    var hops = 0;
     let steps = i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn));
     let skip_ter = ro.y > 17.0 && rd.y > 0.05;
     for (var i = 0; i < steps; i = i + 1) {
-        let p = ro + rd * t;
+        let p = ro2 + rd2 * t;
         let d = map_d(p, &c, skip_ter);
         if (d < 0.004 * t + 0.006) { hit = true; break; }
-        t = t + d * 0.96;
+        let nt = t + d * 0.96;
+        if (hops < 2) {
+            var np = vec3(0.0);
+            var nd = vec3(0.0);
+            if (portal_hop(p, ro2 + rd2 * nt, rd2, &np, &nd)) {
+                ro2 = np;
+                rd2 = nd;
+                t = 0.06;
+                hops = hops + 1;
+                c = gather(ro2, rd2, tmax, skip);
+                continue;
+            }
+        }
+        t = nt;
         if (t > tmax) { break; }
     }
     if (!hit) {
-        return sky_color(rd);
+        return sky_color(rd2);
     }
-    let p = ro + rd * t;
+    let p = ro2 + rd2 * t;
     let id = map_id(p, &c);
     var alb = G.gcol.rgb;
     var em = 0.0;

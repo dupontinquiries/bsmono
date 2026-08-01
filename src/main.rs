@@ -2508,6 +2508,18 @@ impl Game {
             ],
             misc: [st.zenith[0], st.zenith[1], st.zenith[2], 0.0],
             rt: [if self.cfg.video.rays { 1.0 } else { 0.0 }, self.cfg.video.quality, rt_ids.static_n as f32, st.wet.max(wx_wet)],
+            pcount: [self.world.portals.len().min(4) as f32, 0.0, 0.0, 0.0],
+            portals: {
+                // up to four portals for the marcher; pairs are adjacent, so
+                // the shader's partner rule (0<->1, 2<->3) matches the map's
+                let mut out = [[0.0f32; 4]; 8];
+                for (i, p) in self.world.portals.iter().take(4).enumerate() {
+                    out[i * 2] = [p.pos.x, p.pos.y, p.pos.z, p.r];
+                    let q = p.rot;
+                    out[i * 2 + 1] = [q.x, q.y, q.z, q.w];
+                }
+                out
+            },
             hmap: [
                 render::HMAP_HALF,
                 render::HMAP_SIZE as f32,

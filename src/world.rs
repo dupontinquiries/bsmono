@@ -174,6 +174,19 @@ pub struct Body {
     pub drag: f32,
 }
 
+/// A PORTAL. Two of these are linked: anything crossing one's face comes
+/// out of the other, rotated by the transform between them and carrying its
+/// speed. "Speedy thing goes in, speedy thing comes out."
+pub struct Portal {
+    pub pos: Vec3,
+    /// orientation: rot * Z is the face normal, rot * Y is the portal's up
+    pub rot: Quat,
+    pub r: f32,
+    /// index of the portal this one exits from
+    pub link: usize,
+    pub shape: usize,
+}
+
 /// An arcade ball-hitter: a paddle that fires when the ball comes near.
 pub struct Hitter {
     pub pos: Vec3,
@@ -247,6 +260,7 @@ pub struct World {
     pub floods: Vec<(usize, f32, f32)>,
     pub tiles: Vec<Tile>,
     pub hitters: Vec<Hitter>,
+    pub portals: Vec<Portal>,
     pub bodies: Vec<Body>,
     /// KUIPER: which grav node is collapsing, and how long it has left
     pub bh: Option<(usize, f32)>,
@@ -425,7 +439,7 @@ pub struct MapStyle {
     pub focal: u8,
 }
 
-pub const STYLE_COUNT: usize = 31;
+pub const STYLE_COUNT: usize = 32;
 
 /// Adapted from logscope scene3d's ROOMS table — same sixteen names, each
 /// translated from an indoor room into an open-world mood.
@@ -469,6 +483,7 @@ pub fn styles() -> &'static [MapStyle; STYLE_COUNT] {
             MapStyle { name: "KUIPER", grass: g(0x0A0C14), zenith: rgb3(0x05060C), fog: rgb3(0x10142A), fog_d: 0.0010, sun: [-0.5, 0.4, 0.5], accent: g(0x9FD4FF), pal_mix: 0.65, amp: 0.15, freq: 0.6, wet: 0.05, glow: 0.6, rings: 6, halos: 6, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 24, nets: 2, focal: 17 },
             MapStyle { name: "ZOETROPE", grass: g(0x2A2432), zenith: rgb3(0x1A1526), fog: rgb3(0x352B4A), fog_d: 0.0014, sun: [0.3, 0.5, 0.4], accent: g(0xFFC24D), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.28, glow: 0.5, rings: 0, halos: 3, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 26, nets: 1, focal: 18 },
             MapStyle { name: "CLOCKWORK", grass: g(0x2E2A38), zenith: rgb3(0x1B2436), fog: rgb3(0x33405C), fog_d: 0.0011, sun: [0.4, 0.6, 0.3], accent: g(0x6FE3C4), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.26, glow: 0.45, rings: 3, halos: 3, balloons: 0, domes: 0, ramps: 3, platforms: 6, trees: 0, small_pads: 30, nets: 2, focal: 19 },
+            MapStyle { name: "APERTURE", grass: g(0x9A9384), zenith: rgb3(0xBFCBD6), fog: rgb3(0xD7DEE4), fog_d: 0.0010, sun: [0.3, 0.75, 0.35], accent: g(0x35C8FF), pal_mix: 0.4, amp: 0.0, freq: 1.0, wet: 0.34, glow: 0.4, rings: 2, halos: 2, balloons: 0, domes: 0, ramps: 4, platforms: 6, trees: 0, small_pads: 22, nets: 2, focal: 20 },
         ]
     })
 }
@@ -486,6 +501,7 @@ impl World {
         let mut floodable: Vec<usize> = Vec::new();
         let mut tiles: Vec<Tile> = Vec::new();
         let mut hitters: Vec<Hitter> = Vec::new();
+        let mut portals: Vec<Portal> = Vec::new();
         let mut bodies: Vec<Body> = Vec::new();
         let mut drop_pit: Option<f32> = None;
         let mut spawn_hint: Option<Vec3> = None;
@@ -2408,6 +2424,95 @@ impl World {
                 deck(&mut shapes, Vec3::new(-96.0, g0 + 72.0, 0.0), Vec3::new(11.0, 1.0, 11.0), mix4(acc, [1.0; 4], 0.3), 0.5);
                 zones.push(Zone { pos: Vec3::new(-96.0, g0 + 74.0, 0.0), r: 8.0, kind: ZoneKind::Boost });
             }
+            20 => {
+                // ============== APERTURE: the portal chambers ==============
+                // Clean white test rooms with linked portal pairs, playing by
+                // Portal's rules: what goes in comes out with its speed
+                // intact and its direction rotated. A long fall into a floor
+                // portal therefore becomes a horizontal launch out of a wall
+                // — the FLING — and the rewards are placed where only a
+                // fling can reach.
+                let g0 = th(0.0, 0.0);
+                let white = mix4(PLINTH, [1.0; 4], 0.55);
+                let trim = mix4(acc, [1.0; 4], 0.2);
+                let panel = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4]| {
+                    let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.2 }, col, 0.03, 0.5);
+                    shapes[i].blend = true;
+                };
+                panel(&mut shapes, Vec3::new(0.0, g0 + 0.6, 0.0), Vec3::new(64.0, 0.8, 58.0), white);
+                for (px, pz, hx, hz) in [
+                    (-64.0f32, 0.0f32, 1.2f32, 58.0f32),
+                    (64.0, 0.0, 1.2, 58.0),
+                    (0.0, -58.0, 64.0, 1.2),
+                    (0.0, 58.0, 64.0, 1.2),
+                ] {
+                    panel(&mut shapes, Vec3::new(px, g0 + 12.0, pz), Vec3::new(hx, 12.0, hz), white);
+                }
+                let mut mk_portal = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool| -> usize {
+                    let n = normal.normalize_or(Vec3::Z);
+                    let u = (up - n * up.dot(n)).normalize_or(Vec3::Y);
+                    let right = u.cross(n).normalize_or(Vec3::X);
+                    let rot = Quat::from_mat3(&glam::Mat3::from_cols(right, u, n));
+                    let col = if warm { [1.0, 0.55, 0.12, 1.0] } else { [0.16, 0.62, 1.0, 1.0] };
+                    push(shapes, M_TORUS_FAT, pos, rot * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(r), Sdf::Torus { big: r, tube: r * 0.10 }, col, 0.95, 0.5);
+                    // A PORTAL IS A HOLE. The face is drawn but never solid,
+                    // and the surface it sits in is carved away behind it —
+                    // without this the floor portal was sealed under the
+                    // floor panel and nothing could fall through (the portal
+                    // sim caught exactly that: 4/4 on the transform maths and
+                    // zero teleports).
+                    for t in 0..5 {
+                        let d = t as f32 * 0.55;
+                        let ci = push(shapes, M_SPHERE, pos - n * d, Quat::IDENTITY, Vec3::splat(r * 0.94), Sdf::Sphere { r: r * 0.94 }, [0.0; 4], 0.0, 0.0);
+                        shapes[ci].cut = true;
+                    }
+                    let fi = push(shapes, M_SPHERE, pos, rot, Vec3::new(r * 0.94, r * 0.94, 0.06), Sdf::None, [col[0], col[1], col[2], 0.5], 0.75, 0.5);
+                    portals.push(Portal { pos, rot, r: r * 0.94, link: 0, shape: fi });
+                    portals.len() - 1
+                };
+                // CHAMBER 1 — the fling: climb the tower, drop into the floor
+                // portal, come out of the far wall at speed.
+                for k in 0..5 {
+                    let y = g0 + 8.0 + k as f32 * 9.0;
+                    // the climb stands BESIDE the shaft, not over it: steps
+                    // above a floor portal are a lid on the drop
+                    panel(&mut shapes, Vec3::new(-25.0 + (k % 2) as f32 * 5.0, y, -34.0), Vec3::new(5.5, 0.5, 5.5), mix4(white, acc, 0.1));
+                }
+                let p_floor = mk_portal(&mut shapes, &mut portals, Vec3::new(-38.0, g0 + 1.5, -34.0), Vec3::Y, Vec3::NEG_Z, 6.0, false);
+                let p_wall = mk_portal(&mut shapes, &mut portals, Vec3::new(-62.6, g0 + 7.0, 10.0), Vec3::X, Vec3::Y, 6.0, true);
+                portals[p_floor].link = p_wall;
+                portals[p_wall].link = p_floor;
+                zones.push(Zone { pos: Vec3::new(-38.0, g0 + 47.0, -34.0), r: 5.0, kind: ZoneKind::Boost });
+                panel(&mut shapes, Vec3::new(6.0, g0 + 7.0, 12.0), Vec3::new(9.0, 0.7, 9.0), mix4(white, acc, 0.2));
+                zones.push(Zone { pos: Vec3::new(6.0, g0 + 8.4, 12.0), r: 6.0, kind: ZoneKind::Boost });
+                // CHAMBER 2 — the loop: floor and ceiling portals facing each
+                // other, so a fall never ends until you steer out of it.
+                let l_a = mk_portal(&mut shapes, &mut portals, Vec3::new(34.0, g0 + 1.5, -30.0), Vec3::Y, Vec3::Z, 5.5, false);
+                let l_b = mk_portal(&mut shapes, &mut portals, Vec3::new(34.0, g0 + 34.0, -30.0), Vec3::NEG_Y, Vec3::Z, 5.5, true);
+                portals[l_a].link = l_b;
+                portals[l_b].link = l_a;
+                for k in 0..4 {
+                    let a2 = k as f32 * 1.5707;
+                    panel(&mut shapes, Vec3::new(34.0 + a2.cos() * 9.0, g0 + 17.0, -30.0 + a2.sin() * 9.0), Vec3::new(3.2, 0.4, 3.2), trim);
+                }
+                // CHAMBER 3 — the crosswalk: wall to wall at driving height.
+                let c_a = mk_portal(&mut shapes, &mut portals, Vec3::new(0.0, g0 + 4.6, -56.6), Vec3::Z, Vec3::Y, 5.0, false);
+                let c_b = mk_portal(&mut shapes, &mut portals, Vec3::new(0.0, g0 + 4.6, 56.6), Vec3::NEG_Z, Vec3::Y, 5.0, true);
+                portals[c_a].link = c_b;
+                portals[c_b].link = c_a;
+                for sz in [-1.0f32, 1.0] {
+                    let rot = Quat::from_rotation_x(sz * 0.30);
+                    let half = Vec3::new(7.0, 0.5, 12.0);
+                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 3.0, sz * 44.0), rot, half, Sdf::RBox { half, round: 0.2 }, white, 0.03, 0.5);
+                }
+                for k in 0..6 {
+                    let a2 = k as f32 * 1.047;
+                    let gl = Vec3::new(7.0, 4.0, 0.3);
+                    push(&mut shapes, M_BOX, Vec3::new(a2.cos() * 50.0, g0 + 23.0, a2.sin() * 44.0), Quat::from_rotation_y(a2), gl, Sdf::RBox { half: gl, round: 0.1 }, [0.6, 0.8, 0.95, 0.30], 0.15, 0.6);
+                    let st = Vec3::new(6.0, 0.12, 0.12);
+                    push(&mut shapes, M_BOX, Vec3::new(a2.cos() * 40.0, g0 + 23.6, a2.sin() * 36.0), Quat::from_rotation_y(a2), st, Sdf::RBox { half: st, round: 0.05 }, trim, 0.9, 0.4);
+                }
+            }
             _ => {}
         }
 
@@ -2784,7 +2889,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
+        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.
@@ -3140,6 +3245,42 @@ impl World {
         self.kuiper = true;
         self.drop_cd = 0.0;
         self.update(0.001);
+    }
+
+    /// The rotation that takes anything travelling INTO portal `i` and
+    /// turns it to leave portal `i`'s partner: partner_rot * (180 deg about
+    /// the portal's own up) * inverse(entry_rot). The half turn is what
+    /// makes you come OUT of the far portal instead of reversing back into
+    /// it, and it is the whole of Portal's momentum rule.
+    pub fn portal_rot(&self, i: usize) -> Quat {
+        let a = &self.portals[i];
+        let b = &self.portals[a.link];
+        (b.rot * Quat::from_rotation_y(std::f32::consts::PI) * a.rot.inverse()).normalize()
+    }
+
+    /// Map a world point through portal `i` to its partner.
+    pub fn portal_point(&self, i: usize, p: Vec3) -> Vec3 {
+        let r = self.portal_rot(i);
+        self.portals[self.portals[i].link].pos + r * (p - self.portals[i].pos)
+    }
+
+    /// Which portal (if any) does the segment `prev -> now` cross, entering
+    /// from the front? Returns the portal index.
+    pub fn portal_crossed(&self, prev: Vec3, now: Vec3) -> Option<usize> {
+        for (i, pt) in self.portals.iter().enumerate() {
+            let n = pt.rot * Vec3::Z;
+            let (d0, d1) = ((prev - pt.pos).dot(n), (now - pt.pos).dot(n));
+            // front to back, this step
+            if d0 <= 0.0 || d1 > 0.0 {
+                continue;
+            }
+            let t = (d0 / (d0 - d1)).clamp(0.0, 1.0);
+            let hit = prev.lerp(now, t);
+            if (hit - pt.pos).length() < pt.r {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// Arcade bumpers: if the ball is inside a charged hitter, fire it away

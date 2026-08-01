@@ -1464,6 +1464,52 @@ physical, with a 1.1 s recharge and a flash on the ring. World gained a
 Battery after: platforms, mechanics, loops, stream, touch, flips and
 dribbling all green.
 
+## v1.46.0 — APERTURE: portals, and rays that go through them
+
+PORTAL PHYSICS. A `Portal` is a face (position, orientation, radius) linked
+to a partner. The transform is the whole of Portal's momentum rule:
+
+    R = partner_rot * (180 deg about the portal's up) * inverse(entry_rot)
+
+Position, velocity, orientation and angular velocity all take that same R,
+so speed is preserved exactly and a fall becomes a launch. The half turn is
+what makes you come OUT of the far portal rather than reversing back into
+it. Cars and the ball both go through, with a 0.12 s lockout so an exit
+cannot immediately re-enter its own partner.
+
+APERTURE (style 31): clean white test chambers. THE FLING — a five-step
+tower over a floor portal that exits a wall portal, aimed at an island only
+reachable at speed. THE LOOP — floor and ceiling portals facing each other,
+so a fall never ends until you steer out of it. THE CROSSWALK — wall to
+wall at driving height, with ramps into both faces.
+
+`--sim portal` checks the rules rather than trusting them: links mutual,
+transform a pure rotation, entering a face exits the partner's face
+(alignment 1.00), speed conserved (23.0 m/s in, 23.0 out), the fling real
+(a 45 m fall becomes 22.9 m/s horizontal), and no runaway ping-pong when
+something hovers at a mouth. All pass.
+
+Two bugs it caught, both invisible from the maths: A PORTAL IS A HOLE —
+the floor portal was sealed under the floor panel, so the transform was
+perfect and nothing could ever reach it; each face now carves the surface
+behind it. And the climb tower stood directly OVER its own drop shaft,
+which is a lid on the fling.
+
+RENDERING THROUGH THEM. The reflection marcher is now portal-aware: it
+walks in its own frame, and when a step crosses a portal face the ray is
+teleported to the partner and keeps marching (two hops, so a facing pair
+terminates instead of recursing). The far side is therefore genuinely
+visible through a portal wherever marched rays contribute — reflections,
+and the portal surface itself. Portals ride in the uniform block (up to
+four; pairs are adjacent so the shader's partner rule matches the map's).
+
+HONESTLY: the naga test validates the shader and the transform is the same
+one the physics uses and passes in the sim, but the visual result is
+unverified — I have no GPU here. The primary raster view still draws the
+portal face as a translucent disc; a true recursive raster pass (render the
+scene from the virtual camera into a target, sample it on the quad) is the
+next step and needs hardware to tune.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
