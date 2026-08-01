@@ -15,10 +15,28 @@ import sys, os, math, colorsys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from transform_collage import load_iqm, weld, components, bbox, centre
 
-RES = 3
+# A FIXED box that slides, rather than a fixed grid stretched over each part.
+#
+# The first version normalised every component to its own bounds and always used
+# 3x3x3, so a large complex mass was summarised into the same 27 cells as a tiny
+# bracket - the big parts came out as mush and barely any of them matched (1 of
+# 38 over 200 verts). Sizing the grid from the part's real extent means a big
+# part gets MORE cells and is described in proportion to how much there is to
+# describe, which is what "slide the box" meant in the first place.
+#
+# Resolution is capped: past 6 the descriptor gets sparse and starts keying on
+# noise instead of form.
+CELL_FRACTION = 0.16      # box edge, as a fraction of the whole model's extent
+RES_MIN, RES_MAX = 2, 6
 
-def describe(pts, tris_local):
-    """(cells, total_area) for one component, normalised to its own bounds."""
+def part_res(pts, model_span):
+    ext = max(max(p[i] for p in pts) - min(p[i] for p in pts) for i in range(3))
+    box = model_span * CELL_FRACTION
+    return max(RES_MIN, min(RES_MAX, int(round(ext / max(box, 1e-9)))))
+
+def describe(pts, tris_local, res=3):
+    """(cells, total_area, res) for one component."""
+    RES = res
     lo, hi = bbox(pts)
     span = [max(hi[i]-lo[i], 1e-9) for i in range(3)]
     cell = max(span) / RES
@@ -50,10 +68,14 @@ def describe(pts, tris_local):
             k = (g[2]*RES + g[1])*RES + g[0]
             for i in range(3): cells[k][i] += n[i]*ar
             cells[k][3] += ar
-    return cells, max(total, 1e-12)
+    return cells, max(total, 1e-12), RES
 
 def dist(A, B):
-    ca, ta = A; cb, tb = B
+    """Distance, or infinity when the two parts are described at different
+    resolutions — which is itself a size filter: a bracket cannot match a hull,
+    and refusing the comparison is cheaper and more honest than scoring it."""
+    ca, ta, ra = A; cb, tb, rb = B
+    if ra != rb: return float('inf')
     acc = 0.0
     for x, y in zip(ca, cb):
         da, db = x[3]/ta, y[3]/tb
