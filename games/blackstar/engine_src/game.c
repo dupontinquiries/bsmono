@@ -4853,13 +4853,23 @@ static void menu_input(void)
     g_menu.controls_store = 0;
     save_config();   // write keybinds + settings to the XDG config dir
   }
-  // IMPORTED-MODEL BROWSER (customize/builder screen): F3 toggles the imported
-  // real model, [ and ] cycle through the list. Handled here so it works in-menu.
+  // IMPORTED-MODEL BROWSER. F3 toggles the imported model, [ and ] cycle, T
+  // folds.
+  //
+  // Previously gated to CUSTOMIZE and BUILDER, which is why nothing transformed
+  // while playing patrol: none of this code ran outside the menus. The browser
+  // is a debug surface and belongs wherever you are standing when you want to
+  // look at a model, so the gate is gone. The MENU-ONLY part is the reassembly
+  // effect below, which drives the built bot's parts and has nothing to browse.
+  // The reassembly effect drives the BUILT bot's parts, so it stays menu-only:
+  // there is no built bot to disperse while playing.
   if (g_menu.state == EX_GS_CUSTOMIZE || g_menu.state == EX_GS_BUILDER) {
-    if (ex_keys_down[SDL_SCANCODE_F3]) { g_show_imported = !g_show_imported; ex_keys_down[SDL_SCANCODE_F3]=0; }
-    // F4 runs the reassembly: parts fly out, then gather back into the model
     if (ex_keys_down[SDL_SCANCODE_F4]) { g_morph_dir = (g_morph > 0.5f) ? -1.0f : 1.0f;
                                         ex_keys_down[SDL_SCANCODE_F4]=0; }
+  }
+  {
+    if (ex_keys_down[SDL_SCANCODE_F3]) { g_show_imported = !g_show_imported; ex_keys_down[SDL_SCANCODE_F3]=0;
+      game_log("imported view %s", g_show_imported?"ON":"off"); }
     if (g_show_imported) {
       // [ and ] cycle. With X set on the generalizer page they step only models
       // that transform, so browsing shows subjects the generalizer can act on
@@ -5369,6 +5379,17 @@ static void builder_preview(float dt)
   // IMPORTED MODEL SHOWCASE (F3): swap the built bot for a real imported model,
   // from a browsable list ([ / ] cycle). Placed where the built bot goes so the
   // EXISTING builder camera frames it correctly (no custom camera).
+  // LEFTOVER PARTS. Imported models keep whatever position they were last given,
+  // so leaving the showcase - or switching away from a folding GROUP, whose
+  // parts were each placed individually - leaves them standing in the world.
+  // Playing patrol after browsing showed exactly that. Parking every imported
+  // model when the showcase is off costs one pass over a pointer array and
+  // removes the whole class of bug, rather than trying to remember which ones
+  // were touched.
+  if (!g_show_imported) {
+    for (int i=0;i<EX_N_IMPORTED;i++)
+      if (g_imported_tpl[i]) g_imported_tpl[i]->position[1]=-100000.0f;
+  }
   if (g_show_imported && g_imported_tpl[g_imported_idx]) {
     for (int i=0;i<EX_ROBOT_PARTS;i++) g_player_parts[i]->position[1]=-100000.0f;  // hide built bot
     // T: transform to the paired form (vehicle<->robot), when this model has one
@@ -8142,10 +8163,19 @@ void game_update(double dt, double ft)
   // imported-mode transform first: when showcasing a paired model, T is the
   // transform (vehicle<->robot) and the pulse yields -- DESIGN_NOTES: the flip is
   // the tactical tool, it must never lose to another binding while in this mode.
-  if (ex_keys_down[SDL_SCANCODE_T] && g_show_imported && g_imp_pair[g_imported_idx] >= 0) {
+  // The showcase's own T handler (around line 5399) owns the key while the
+  // imported viewer is up, and it clears the flag - so this second copy could
+  // only ever fire when the viewer was OFF, where g_show_imported is false and
+  // it does nothing. Kept as a no-op guard rather than deleted, because the
+  // pulse below also reads T and the ordering is what stops them colliding.
+  if (0 && ex_keys_down[SDL_SCANCODE_T] && g_show_imported && g_imp_pair[g_imported_idx] >= 0) {
     imp_transform_start(); ex_keys_down[SDL_SCANCODE_T]=0;
   }
-  if (ex_keys_down[SDL_SCANCODE_T] && g_pulse_cd <= 0.0f && !g_human_scale) {
+  // T fires the pulse ONLY when the model viewer is not up. Without this guard,
+  // pressing T to fold a model in patrol also fires a shockwave - which is
+  // exactly the kind of collision that reads as "the transform does not work",
+  // because something else visibly happened instead.
+  if (ex_keys_down[SDL_SCANCODE_T] && !g_show_imported && g_pulse_cd <= 0.0f && !g_human_scale) {
     float fx=camera->front[0], fz=camera->front[2]; float fl=sqrtf(fx*fx+fz*fz); if(fl>1e-3f){fx/=fl;fz/=fl;}
     float cx=e->position[0]+fx*14.0f, cz=e->position[2]+fz*14.0f;   // burst out in front
     apply_shockwave(cx, e->position[1], cz, 20.0f, 24.0f, 26.0f); g_spark_loud=1.0f;
