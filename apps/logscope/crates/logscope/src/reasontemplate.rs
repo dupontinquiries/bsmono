@@ -79,6 +79,29 @@ pub fn cargo_shaped() -> Template {
     ]}
 }
 
+/// A template whose slots feed an executable refuter.
+///
+/// The upgrade over `claim_shaped`: its check is not a description of how one would verify, it is a
+/// domain the machine can substitute into. `refute::PROBEABLE_SLOT` is the slot that produces it, and
+/// `refute::refute` is what consumes it.
+///
+/// This is the pairing that makes templates work on knowledge-bound questions after all — not because
+/// the template supplies knowledge, but because the refuter does not need any. It only needs the claim
+/// in a shape it can execute, and destroying a false claim requires no understanding of why it is
+/// false.
+pub fn probeable_shaped() -> Template {
+    Template { name: "claim-domain-refute", slots: vec![
+        Slot { prompt: "State the claim in one sentence, with no hedging.",
+               check: Some("a claim that cannot be stated plainly is not yet a claim") },
+        Slot { prompt: crate::refute::PROBEABLE_SLOT,
+               check: Some("either the variables and range can be named, or the claim is not universal") },
+        Slot { prompt: "Now substitute the small values and the edges. Report the first failure.",
+               check: Some("EXECUTED, not described: refute::refute returns a counter-example or a probe count, and a counter-example is certain where survival is not") },
+        Slot { prompt: "If nothing failed, say what remains unproven and stop.",
+               check: Some("survival is the absence of cheap counter-examples, never a proof") },
+    ]}
+}
+
 /// A template for a claim the model may not have the knowledge for.
 ///
 /// The key slot is the third: naming what would falsify the claim is what stops a small model producing
@@ -146,6 +169,28 @@ mod tests {
         let t = claim_shaped();
         let last = t.slots.last().unwrap();
         assert!(last.prompt.contains("say so and stop"));
+    }
+
+    #[test]
+    fn the_probeable_template_EXECUTES_rather_than_describing() {
+        // The upgrade. claim_shaped's checks are prose telling a reader how they might verify;
+        // probeable_shaped's third slot is run by refute::refute and returns a counter-example. A
+        // template cannot supply knowledge, but a refuter does not need any — destroying a false claim
+        // requires no understanding of why it is false.
+        let t = probeable_shaped();
+        assert_eq!(t.checkable_fraction(), 1.0);
+        let exec = t.slots.iter().find(|s| s.check.unwrap().contains("EXECUTED")).expect("present");
+        assert!(exec.check.unwrap().contains("counter-example is certain where survival is not"));
+    }
+
+    #[test]
+    fn the_probeable_template_still_permits_stopping() {
+        // A claim that cannot be put in executable form is a finding, not a failure to comply. Without
+        // this the model invents variables for a claim that has none, and the refuter then probes
+        // something the claim never said.
+        let t = probeable_shaped();
+        assert!(t.slots.iter().any(|s| s.prompt.contains("say so and stop")
+                                    || s.prompt.contains("and stop")));
     }
 
     #[test]
