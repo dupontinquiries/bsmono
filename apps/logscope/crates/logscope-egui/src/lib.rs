@@ -53,6 +53,7 @@ pub mod repetition; // pure repetition detection + graded recovery (decode + age
 #[allow(dead_code)] pub mod segment; // detect explain↔code / new-thought seams → pause, branch, checkpoint, predict
 #[allow(dead_code)] pub mod taskclass; // classify one-shot/long-horizon × maintenance/greenfield → build posture
 pub use logscope_fan::stepwise; // checkpoint protocol: prompt block, step-marker parsing, auto-continue policy, checklist
+pub mod debatepanel; // live debate strip: last COMPLETE line per debater, blind members marked
 pub mod voiceconfirm; // voice interjection review, on voiceterm ConfirmDialog shape
 pub mod readability; // the measure: line length, the one readability factor the palette cannot fix
 pub mod revealpace; // reveal at semantic boundaries when the model outruns reading speed
