@@ -3780,7 +3780,12 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         }
 
         println!("gate-q4k: {}", if ok {
-            "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
+            // CLAIMS ONLY WHAT IT TESTS. This said "the loader can stop requantizing", and I acted on
+            // that for several commits. It exercises dequant_q4k — exact Q4_K -> f32 — which is NOT a
+            // native matvec over Q4_K blocks. The loader cannot stop requantizing on this evidence,
+            // and a gate that overstates its own scope is worse than a missing gate: it is a green
+            // light nobody re-derives.
+            "Q4_K dequantizes exactly \u{2713} — this is the CONVERSION, not a native Q4_K matvec"
         } else { "FAIL \u{2717}" });
         return;
     }
