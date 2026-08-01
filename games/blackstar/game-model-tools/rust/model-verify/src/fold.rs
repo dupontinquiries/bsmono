@@ -123,6 +123,42 @@ impl Fit {
     pub fn error(&self) -> f64 { self.spill * 3.0 + self.vacancy }
 }
 
+/// How unevenly the bones would divide the vehicle between them.
+///
+/// The term that was missing, and its absence is why the whole pipeline produced
+/// "a tank, then a slightly different tank". Filling a volume says nothing about
+/// filling it WITH A BODY: a skeleton standing almost upright inside a tank
+/// scores about as well as one properly folded, so the optimiser had no reason
+/// to fold and chose 28/43/35/26/-7/2 degrees — a person standing up straight.
+/// Interpolating from that to upright is nearly a no-op, so the vehicle barely
+/// moved.
+///
+/// Measuring how evenly the bones divide the space forces each limb into its own
+/// region, which is what a fold IS. Returns 0 for a perfectly even share and
+/// approaches 1 as one bone takes everything.
+pub fn imbalance(bones: &[Bone], vol: &Volume) -> f64 {
+    if bones.is_empty() { return 1.0; }
+    let mut claim = vec![0usize; bones.len()];
+    let mut total = 0usize;
+    for k in 0..vol.filled.len() {
+        if !vol.filled[k] { continue; }
+        let c = vol.cell_centre(k);
+        let mut best = 0usize;
+        let mut bd = f64::MAX;
+        for (i, b) in bones.iter().enumerate() {
+            let d = b.dist_to(c);
+            if d < bd { bd = d; best = i; }
+        }
+        claim[best] += 1;
+        total += 1;
+    }
+    if total == 0 { return 1.0; }
+    let ideal = total as f64 / bones.len() as f64;
+    // mean absolute deviation from an even share, normalised
+    let dev: f64 = claim.iter().map(|c| (*c as f64 - ideal).abs()).sum();
+    (dev / (2.0 * total as f64)).min(1.0)
+}
+
 /// Sample the posed body against the volume.
 ///
 /// Samples along each bone rather than voxelising the body: a skeleton is a
@@ -374,7 +410,21 @@ fn apply_angles(base: &[Bone], limits: &[Limit], angles: &[f64]) -> Vec<Bone> {
 pub fn optimise(base: &[Bone], vol: &Volume, limits: &[Limit],
                 iters: usize, seed: u64) -> Fold {
     let mut rng = Rng(seed | 1);
-    let mut cur: Vec<f64> = limits.iter().map(|l| (l.min + l.max) * 0.5).collect();
+    // START FOLDED, not at the midpoint of each range.
+    //
+    // Annealing explores near where it starts, and starting a near-upright body
+    // inside a vehicle means it never discovers that folding pays: it reached
+    // angles like -4/-3 degrees on the legs, which is a person standing up. A
+    // transformation that begins from a standing pose produces "a tank, then a
+    // slightly different tank" - which is exactly what the render showed.
+    //
+    // The far end of each joint's range is the folded end by construction (the
+    // limits are written with 0 as neutral and the maximum as fully tucked), so
+    // starting there means the search has to justify UNFOLDING rather than
+    // stumbling onto folding.
+    let mut cur: Vec<f64> = limits.iter()
+        .map(|l| if l.max.abs() > l.min.abs() { l.max * 0.85 } else { l.min * 0.85 })
+        .collect();
     let mut cur_bones = apply_angles(base, limits, &cur);
     let mut cur_fit = evaluate(&cur_bones, vol, 5);
     let mut best = (cur.clone(), cur_fit, cur_bones.clone());
@@ -397,14 +447,18 @@ pub fn optimise(base: &[Bone], vol: &Volume, limits: &[Limit],
         let bones = apply_angles(base, limits, &cand);
         let fit = evaluate(&bones, vol, 5);
         evaluated += 1;
-        let d = fit.error() - cur_fit.error();
+        // Score = fit + imbalance. Without the second term the optimiser is
+        // indifferent between a folded body and a standing one, and picks
+        // whichever it stumbled on first.
+        let score = |f: Fit, b: &[Bone]| f.error() + imbalance(b, vol) * 1.5;
+        let d = score(fit, &bones) - score(cur_fit, &cur_bones);
         // accept improvements always, worse poses sometimes — that is what gets
         // a limb out of a local minimum it is wedged in
         if d < 0.0 || rng.next() < (-d / temp.max(1e-6)).exp() {
             cur = cand;
             cur_fit = fit;
             cur_bones = bones;
-            if fit.error() < best.1.error() {
+            if score(fit, &cur_bones) < score(best.1, &best.2) {
                 best = (cur.clone(), fit, cur_bones.clone());
             }
         }
