@@ -99,6 +99,75 @@ pub struct Bot {
     jitter: f32, // per-bot phase so the mob swirls instead of stacking
     shot_t: f32, // power-shot micro-sequence timer (hop, then dodge through)
     tube_iq: f32, // 0..1: odds per window of pursuing prey INTO tube routes
+    /// GUIDED LEARNING: a tiny (1+1) hill-climb over four aerial knobs,
+    /// scored on what we actually want to see (air touches and engagement)
+    /// and re-evaluated every episode, so a bot gets better DURING a match.
+    lrn: Learner,
+    /// coordinated aerial: this bot has been elected to finish a mate's pop
+    finisher: bool,
+    air_hits: u32, // snapshot for reward accounting
+}
+
+#[derive(Clone, Copy)]
+pub struct Learner {
+    /// [0] intercept lead, [1] jump distance, [2] boost commit, [3] aim lift
+    pub p: [f32; 4],
+    best: [f32; 4],
+    best_r: f32,
+    r: f32,
+    t: f32,
+    sigma: f32,
+    pub episodes: u32,
+    enabled: bool,
+}
+
+impl Learner {
+    fn new(seed: u32) -> Learner {
+        let h = |k: u32| ((seed.wrapping_mul(2654435761).wrapping_add(k * 40503) >> 8) & 1023) as f32 / 1023.0;
+        let p = [
+            0.55 + h(1) * 0.5,
+            2.2 + h(2) * 1.6,
+            0.45 + h(3) * 0.4,
+            0.8 + h(4) * 0.9,
+        ];
+        Learner { p, best: p, best_r: -1.0, r: 0.0, t: 0.0, sigma: 0.22, episodes: 0, enabled: true }
+    }
+    /// One episode of experience: keep what scored, else fall back and try
+    /// a new perturbation around the best-known setting.
+    fn tick(&mut self, dt: f32, reward: f32) {
+        if !self.enabled {
+            return;
+        }
+        self.r += reward;
+        self.t += dt;
+        if self.t < 9.0 {
+            return;
+        }
+        if self.r > self.best_r {
+            self.best_r = self.r;
+            self.best = self.p;
+        } else {
+            // decay the memory a little so a lucky episode cannot freeze the
+            // search forever — the match keeps teaching
+            self.best_r *= 0.94;
+        }
+        let seed = (self.episodes as u32).wrapping_mul(2246822519) ^ (self.t.to_bits());
+        let rnd = |k: u32| {
+            let h = (seed ^ k.wrapping_mul(2654435761)).wrapping_mul(747796405);
+            (((h >> 16) & 2047) as f32 / 2047.0) * 2.0 - 1.0
+        };
+        for i in 0..4 {
+            self.p[i] = self.best[i] + rnd(i as u32) * self.sigma * self.best[i].abs().max(0.2);
+        }
+        self.p[0] = self.p[0].clamp(0.25, 1.5);
+        self.p[1] = self.p[1].clamp(1.2, 5.0);
+        self.p[2] = self.p[2].clamp(0.15, 1.0);
+        self.p[3] = self.p[3].clamp(0.2, 2.2);
+        self.sigma = (self.sigma * 0.97).max(0.06);
+        self.episodes += 1;
+        self.r = 0.0;
+        self.t = 0.0;
+    }
 }
 
 pub fn mk_bot_brain(pos: Vec3, yaw: f32, team: u8, i: usize, brain: Brain) -> Bot {
@@ -119,6 +188,9 @@ pub fn mk_bot_brain(pos: Vec3, yaw: f32, team: u8, i: usize, brain: Brain) -> Bo
         jitter: i as f32 * 2.399, // golden-angle-ish spread
         shot_t: 0.0,
         tube_iq: 0.35 + ((i.wrapping_mul(2654435761) >> 8) & 255) as f32 / 255.0 * 0.6,
+        lrn: Learner::new(i as u32 + 7),
+        finisher: false,
+        air_hits: 0,
     }
 }
 
@@ -182,6 +254,36 @@ pub fn update(
     }
     let grav = physics::GRAV * cfg.arena.gravity;
 
+    // COORDINATED AERIAL. When the ball is genuinely up and travelling, the
+    // attacker who popped it is busy underneath — so the best-placed MATE is
+    // elected to meet it in the air. One finisher per team, re-elected each
+    // frame from whoever can actually reach the intercept.
+    let ball_up = ball.pos.y > 3.2 && ball.vel.y > -9.0;
+    let mut finisher_of: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    if ball_up {
+        for (i, b) in bots.iter().enumerate() {
+            if nearest.get(&b.team).map(|e| e.1) == Some(i) {
+                continue; // the attacker is the setter, not the finisher
+            }
+            if !matches!(b.brain, Brain::Striker | Brain::Passer { .. }) {
+                continue;
+            }
+            // where the ball will be at this bot's chosen lead time
+            let lead = b.lrn.p[0];
+            let meet = ball.pos + ball.vel * lead - Vec3::Y * (0.5 * grav * lead * lead);
+            let cost = b.car.pos.distance(meet) - b.car.vel.dot((meet - b.car.pos).normalize_or(Vec3::Z)) * 0.35;
+            let e = finisher_of.entry(b.team).or_insert(i);
+            let cur = &bots[*e];
+            let cur_lead = cur.lrn.p[0];
+            let cur_meet = ball.pos + ball.vel * cur_lead - Vec3::Y * (0.5 * grav * cur_lead * cur_lead);
+            let cur_cost = cur.car.pos.distance(cur_meet)
+                - cur.car.vel.dot((cur_meet - cur.car.pos).normalize_or(Vec3::Z)) * 0.35;
+            if cost < cur_cost {
+                *e = i;
+            }
+        }
+    }
+
     let mut scratch = physics::StepEvents::default();
     for (bi, b) in bots.iter_mut().enumerate() {
         b.jump_cd = (b.jump_cd - dt).max(0.0);
@@ -199,9 +301,20 @@ pub fn update(
             Brain::Passer { next: _ } => striker(b, ball, world, &ctx, dt),
         };
         let mut c = c;
+        b.finisher = finisher_of.get(&b.team) == Some(&bi);
+        if b.finisher {
+            air_finish(b, ball, world, grav, &mut c);
+        }
         route_override(world, b, ball, time, &mut c);
         power_shot(world, b, ball, dt, ctx.attacker, &mut c);
         let info = physics::step_car_only(&mut b.car, ball, world, &c, cfg, dt);
+        // REWARD: exactly the behaviour we want more of — touches made in
+        // the air, and time spent engaged with a ball that is up.
+        let gained = b.touches_air.saturating_sub(b.air_hits);
+        b.air_hits = b.touches_air;
+        let near = b.car.pos.distance(ball.pos);
+        let engaged = if ball.pos.y > 2.5 && near < 12.0 { dt * 0.6 } else { 0.0 };
+        b.lrn.tick(dt, gained as f32 * 3.0 + engaged);
         if info.flip_reset {
             b.got_reset = true;
             if b.phase == Phase::Reset {
@@ -636,5 +749,78 @@ fn route_override(world: &World, b: &Bot, ball: &Ball, time: f32, c: &mut Contro
     c.boost = to.length() > 20.0 && flat.dot(fw) > 0.7;
     if to.y > 3.0 && to.length() < 14.0 {
         c.jump_pressed = true; // hop for a raised mouth
+    }
+}
+
+/// A small mixed squad for headless experiments (sim harnesses).
+pub fn spawn_match(world: &World, per_team: usize) -> Vec<Bot> {
+    let goal = attack_goal(world).unwrap_or(Vec3::new(0.0, 2.0, 400.0));
+    let mut v = Vec::new();
+    for t in 0..2u8 {
+        let side = if t == TEAM_BLUE { -1.0 } else { 1.0 };
+        for k in 0..per_team {
+            let pos = Vec3::new((k as f32 - 1.0) * 8.0, 1.0, side * 26.0);
+            let brain = match k {
+                0 => Brain::Striker,
+                1 => Brain::Passer { next: 0 },
+                _ => Brain::Defender { home: goal * -side },
+            };
+            v.push(mk_bot_brain(pos, if side < 0.0 { 0.0 } else { std::f32::consts::PI }, t, v.len() + k, brain));
+        }
+    }
+    v
+}
+
+/// Freeze or enable mid-match learning (the sim's control condition).
+pub fn set_learning(bots: &mut [Bot], on: bool) {
+    for b in bots.iter_mut() {
+        b.lrn.enabled = on;
+    }
+}
+
+impl Bot {
+    pub fn episodes(&self) -> u32 {
+        self.lrn.episodes
+    }
+}
+
+// ------------------------------------------------- coordinated aerial ----
+/// Meet a mate's pop in the air: drive at the predicted intercept, jump at
+/// the bot's own learned distance, then boost and steer the nose through the
+/// ball toward goal. Every constant here is one of the four learned knobs,
+/// so the squad's aerial timing is what improves during a match.
+fn air_finish(b: &mut Bot, ball: &Ball, world: &World, grav: f32, c: &mut Controls) {
+    let lead = b.lrn.p[0];
+    let jump_d = b.lrn.p[1];
+    let commit = b.lrn.p[2];
+    let lift = b.lrn.p[3];
+    let meet = ball.pos + ball.vel * lead - Vec3::Y * (0.5 * grav * lead * lead);
+    let goal = attack_goal(world).unwrap_or(Vec3::new(0.0, 2.0, 400.0));
+    // aim UNDER-BEHIND the ball, on the goal side: that is what turns a
+    // collision into a carry instead of a clearance
+    let toward_goal = (goal - ball.pos).normalize_or(Vec3::Z);
+    let aim = meet - toward_goal * 0.9 - Vec3::Y * lift * 0.35;
+    let to = aim - b.car.pos;
+    let f = b.car.forward();
+    let fw = Vec3::new(f.x, 0.0, f.z).normalize_or(Vec3::Z);
+    let right = Vec3::new(-fw.z, 0.0, fw.x);
+    let flat = Vec3::new(to.x, 0.0, to.z);
+    let aligned = flat.normalize_or(fw).dot(fw);
+    c.steer = (flat.normalize_or(fw).dot(right) * 3.0).clamp(-1.0, 1.0);
+    c.throttle = 1.0;
+    if b.car.on_ground {
+        // still chasing: boost only when pointed at the intercept
+        c.boost = aligned > 0.75 && flat.length() > 6.0;
+        if flat.length() < jump_d * 2.2 && aligned > 0.6 && b.jump_cd <= 0.0 {
+            c.jump_pressed = true;
+            b.jump_cd = 0.5;
+        }
+    } else {
+        // airborne: nose at the ball, feather the boost toward it
+        let dir = (aim - b.car.pos).normalize_or(f);
+        c.pitch = (dir.y - f.y).clamp(-1.0, 1.0);
+        c.yaw = (dir.cross(f).y * -2.0).clamp(-1.0, 1.0);
+        c.boost = dir.dot(f) > commit && to.length() > 1.2;
+        c.throttle = 1.0;
     }
 }

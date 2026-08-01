@@ -1049,6 +1049,139 @@ pub fn run(args: &[String]) {
         println!("{}", if ok { "PLANETS: PASS" } else { "PLANETS: FAIL" });
         return;
     }
+    if name == "learn" {
+        // Does the squad actually get better DURING a match? Run one long
+        // match and compare aerial output in the first third against the
+        // last third. Learning off (params frozen) is the control.
+        let cfg = Config::default();
+        println!("{:<10} {:>9} {:>9} {:>9} {:>8}", "mode", "early", "late", "gain", "episodes");
+        for learn_on in [false, true] {
+            let mut early = 0u32;
+            let mut late = 0u32;
+            let mut eps = 0u32;
+            let trials: u64 = 3;
+            for tr in 0..trials {
+                let world = World::generate(31 + tr, crate::world::style(ARENA), 0.31, 1.0);
+                let mut ball = Ball::new();
+                ball.pos = Vec3::new(0.0, 6.0, 0.0);
+                let mut player = physics::Car::new();
+                player.pos = Vec3::new(0.0, 0.4, -40.0);
+                let mut bots = crate::bots::spawn_match(&world, 3);
+                crate::bots::set_learning(&mut bots, learn_on);
+                let mut t = 0.0f32;
+                let total = 150.0f32;
+                let mut base: Vec<u32> = bots.iter().map(|b| b.touches_air).collect();
+                while t < total {
+                    crate::bots::update(&mut bots, &mut ball, &mut player, &world, &cfg, t, DT);
+                    let mut ev = StepEvents::default();
+                    physics::step_ball(&mut ball, &world, &cfg, DT, &mut ev);
+                    if ball.pos.y < 0.2 && ball.vel.length() < 1.0 {
+                        ball.pos = Vec3::new(0.0, 6.0, 0.0);
+                        ball.vel = Vec3::ZERO;
+                    }
+                    t += DT;
+                    if (t - total / 3.0).abs() < DT * 0.5 {
+                        let now: Vec<u32> = bots.iter().map(|b| b.touches_air).collect();
+                        early += now.iter().zip(&base).map(|(a, b)| a - b).sum::<u32>();
+                        base = now;
+                    }
+                    if (t - total * 2.0 / 3.0).abs() < DT * 0.5 {
+                        base = bots.iter().map(|b| b.touches_air).collect();
+                    }
+                }
+                let end: Vec<u32> = bots.iter().map(|b| b.touches_air).collect();
+                late += end.iter().zip(&base).map(|(a, b)| a - b).sum::<u32>();
+                eps += bots.iter().map(|b| b.episodes()).sum::<u32>();
+            }
+            let gain = if early > 0 { late as f32 / early as f32 } else { 0.0 };
+            println!(
+                "{:<10} {:>9} {:>9} {:>8.2}x {:>8}",
+                if learn_on { "learning" } else { "frozen" },
+                early,
+                late,
+                gain,
+                eps / (trials as u32).max(1)
+            );
+        }
+        return;
+    }
+    if name == "platform" {
+        // Can a car RIDE a moving platform? Park one on each kind of mover
+        // in CLOCKWORK and check it is carried rather than left behind.
+        let cfg = Config::default();
+        let mut world = World::generate(9, crate::world::style(30), 0.31, 1.0);
+        let ball = Ball::new();
+        let ctl = physics::Controls::default();
+        // find one shape per anim kind
+        let mut cases: Vec<(&str, usize)> = Vec::new();
+        for a in world.anims.iter() {
+            let (kind, si) = match *a {
+                crate::world::Anim::Slide { shape, dir, .. } => {
+                    (if dir.y.abs() > 0.5 { "paternoster" } else { "shuttle" }, shape)
+                }
+                crate::world::Anim::Orbit { shape, .. } => ("carriage", shape),
+                crate::world::Anim::Spin { shape, .. } => ("turntable", shape),
+                crate::world::Anim::Door { shape, .. } => ("door", shape),
+            };
+            if !cases.iter().any(|(k, _)| *k == kind) {
+                cases.push((kind, si));
+            }
+        }
+        println!("{:<13} {:>9} {:>9} {:>8}", "platform", "drift", "carried", "grounded");
+        let mut pass = true;
+        for (kind, si) in cases {
+            // settle the world so platform velocities are live
+            for _ in 0..30 {
+                world.update(DT);
+            }
+            let sh = &world.shapes[si];
+            // stand on the actual DECK: a ring deck's centre is its hole,
+            // and a box deck's centre is inside it
+            let top = match sh.sdf {
+                crate::world::Sdf::RingDeck { big, half_h, .. } => sh.pos + Vec3::new(big, half_h + 0.34, 0.0),
+                crate::world::Sdf::RBox { half, .. } => sh.pos + Vec3::Y * (half.y + 0.34),
+                _ => sh.pos + Vec3::Y * 1.2,
+            };
+            let mut car = physics::Car::new();
+            car.pos = top;
+            car.rot = glam::Quat::IDENTITY;
+            car.vel = Vec3::ZERO;
+            // measure in the platform's OWN frame: a rider on a spinner
+            // moves in world space by design, so world drift is meaningless
+            let start_rel = world.shapes[si].inv_rot * (car.pos - world.shapes[si].pos);
+            let mut grounded = 0;
+            let dbg = std::env::var("PLAT_DBG").map(|v| v == kind).unwrap_or(false);
+            for f in 0..240 {
+                world.update(DT);
+                physics::step_car_only(&mut car, &ball, &world, &ctl, &cfg, DT);
+                if car.on_ground {
+                    grounded += 1;
+                }
+                if dbg && f % 24 == 0 {
+                    let sp = world.shapes[si].pos;
+                    eprintln!(
+                        "  f={:3} car=({:6.1},{:6.1},{:6.1}) deck=({:6.1},{:6.1},{:6.1}) sdf={:6.2} shape_d={:6.2} og={}",
+                        f, car.pos.x, car.pos.y, car.pos.z, sp.x, sp.y, sp.z,
+                        world.sdf(car.pos), world.shape_sdf_at(si, car.pos), car.on_ground as u8
+                    );
+                }
+            }
+            let end_rel = world.shapes[si].inv_rot * (car.pos - world.shapes[si].pos);
+            // how far did the car slip relative to the deck it stands on?
+            let drift = (end_rel - start_rel).length();
+            let carried = grounded > 120 && drift < 4.0;
+            pass &= carried;
+            println!(
+                "{:<13} {:>8.2}m {:>9} {:>7}%",
+                kind,
+                drift,
+                if carried { "yes" } else { "NO" },
+                grounded * 100 / 240
+            );
+        }
+        println!("{}", if pass { "PLATFORMS: PASS" } else { "PLATFORMS: FAIL" });
+        return;
+    }
     if name == "drive" {
         // THE REAL TEST: can a car actually get through a tube? Spawn one
         // inside a route, point it down the pipe, hold throttle, and follow

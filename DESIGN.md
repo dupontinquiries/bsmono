@@ -1320,6 +1320,69 @@ Also measured and REJECTED: strengthening in-tube gravity (1.0 -> 1.9)
 to hold cars against the bore. It cost traversals (21/24 -> 17/24) by
 slamming cars into walls, so the pipe still pulls at 1.0.
 
+## v1.43.0 — moving platforms, and bots that learn
+
+THE BUG UNDER EVERYTHING: animated shapes were baked into the physics
+spatial grid at their STARTING cell, so the moment one travelled away it
+vanished from collision entirely. Every orbiting sky panel, the roaming
+moon, every spinner, door and closing gate has been a ghost to physics
+since the grid landed — found by tracing a car standing on an orbiting
+deck and watching `world.sdf` return terrain-only distance while the deck
+was demonstrably under it. Movers are now queried directly (there are
+only a few dozen) instead of through the grid.
+
+PLATFORM RIDING. The fix that matters is not carrying the car, it is
+WHERE the maths happens: grip, braking, steering and the suspension are
+all written for ground that stands still, and on a moving deck that code
+was braking the car to a stop in WORLD space while the deck slid out from
+under it. The whole ground solve now runs in the platform's reference
+frame — step in, solve as if on the floor, step out — so riding feels
+like driving and jumping off hands you the platform's momentum. New
+`--sim platform` measures drift in each platform's OWN rotating frame (a
+rider on a spinner is supposed to move in world space): shuttle 0.74 m /
+94% grounded, carriage 0.42 m / 94%, turntable 0.04 m / 100%,
+paternoster 0.15 m / 91%.
+
+CLOCKWORK (style 30): a machine you play inside — shuttling decks,
+orbiting carriages, spinning turntables, a paternoster of rising steps to
+a prize platform, and sweeper arms. Two design fixes came straight out of
+the sim: carriages hold a constant ~5 m/s RIM SPEED instead of a constant
+angular rate (the outer ring was doing 18 m/s, which no landing survives)
+and outer decks are now BIGGER, not smaller.
+
+CAMERA: MOVING PLATFORM BEND (0..1, default 0.55) adopts a smoothed slice
+of the nearby platform's motion, so a fast deck reads nearly still while
+you line up the landing.
+
+TOUCH: the joystick now flies the car in the air (pitch, and roll or yaw
+by the slide modifier), an on-screen MENU button opens the menu without a
+keyboard, and handhelds get GYRO FLYING on by default — gated to the air,
+where it helps and cannot disturb driving. Menu text scales with aspect
+and truncates to its column, which is the mobile overlap fix.
+
+AI, and this is the part worth testing yourself: bots run a small guided
+(1+1) hill-climb over four aerial knobs — intercept lead, jump distance,
+boost commit and aim lift — scored on exactly what we want more of, air
+touches and engagement with a ball that is up, re-evaluated every nine
+seconds. On top of that, COORDINATED AERIALS: when the ball is genuinely
+up and moving, the attacker underneath it is busy, so the best-placed
+MATE is elected finisher and flies the intercept, aiming under-behind on
+the goal side so a collision becomes a carry.
+
+`--sim learn` runs a 150 s match and compares aerial output in the first
+third against the last, with learning frozen as the control. Frozen:
+31 -> 17 touches (0.55x, it decays). Learning: 31 -> 58 (1.87x) over 96
+episodes. Same start, same conditions; the only difference is whether the
+learner updates.
+
+STILL OPEN: two Monkey Run vine lines stall mid-route (unchanged), and
+the DHT ray-streaming idea is designed but unbuilt — phone-side
+reprojection of remotely traced rays is the right shape for hiding
+latency, but it needs real GPUs at both ends to develop and I will not
+ship a renderer path I cannot measure. The order would be: prove the
+transport headless (as `--sim mp` did for multiplayer), then a half-res
+remote radiance buffer with local reprojection and disocclusion fill.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

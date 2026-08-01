@@ -158,6 +158,13 @@ fn inset(ui: &mut Vec<UiVert>, a: f32, x0: f32, y0: f32, x1: f32, y1: f32) {
 // is ~1.25x the last, which is the standard readable progression, and the
 // body size is deliberately small: dense settings screens read better with
 // air around modest text than with big text crammed together.
+/// Phone screens are narrow: a label sized for a desktop aspect renders
+/// WIDER in NDC there and runs out of its button. Everything in the menus
+/// scales through this, and long labels additionally get `fit()`.
+pub fn ui_k(a: f32) -> f32 {
+    (a / 1.70).clamp(0.62, 1.0)
+}
+
 pub const T_TITLE: f32 = 0.0138;
 pub const T_SECTION: f32 = 0.0074;
 pub const T_BODY: f32 = 0.0082;
@@ -249,6 +256,7 @@ pub fn hit_nav(x: f32, y: f32) -> Option<usize> {
 }
 
 pub fn nav_strip(ui: &mut Vec<UiVert>, a: f32, cur: (f32, f32), here: usize) {
+    let k = ui_k(a);
     for (i, name) in NAV_BTNS.iter().enumerate() {
         let x0 = nav_x0(i);
         let (y0, y1) = (NAV_Y - NAV_H * 0.5, NAV_Y + NAV_H * 0.5);
@@ -265,7 +273,8 @@ pub fn nav_strip(ui: &mut Vec<UiVert>, a: f32, cur: (f32, f32), here: usize) {
         if hot || on {
             quad(ui, x0, y1 - 0.005, x0 + NAV_W, y1, [GOLD[0], GOLD[1], GOLD[2], (if hot { 0.9 } else { 0.5 }) * a]);
         }
-        label_c_at(ui, x0 + NAV_W * 0.5, NAV_Y - 0.010, T_HINT, a, if hot || on { PAPER } else { DIM }, name);
+        let txt = fit(name, NAV_W * 0.86, T_HINT * k, a);
+        label_c_at(ui, x0 + NAV_W * 0.5, NAV_Y - 0.010 * k, T_HINT * k, a, if hot || on { PAPER } else { DIM }, &txt);
     }
 }
 
@@ -520,7 +529,9 @@ pub fn pause(ui: &mut Vec<UiVert>, a: f32, save: &Save, best_air_now: f32, cur: 
         let bg = if hot { [0.24, 0.30, 0.38, 0.95 * a] } else { [0.13, 0.15, 0.20, 0.85 * a] };
         quad(ui, x0, y0, x0 + PBTN_W, y1, bg);
         quad(ui, x0, y1 - 0.006, x0 + PBTN_W, y1, [GOLD[0], GOLD[1], GOLD[2], (if hot { 0.9 } else { 0.35 }) * a]);
-        label_c_at(ui, x0 + PBTN_W * 0.5, PBTN_Y - 0.011, 0.0105, a, if hot { PAPER } else { DIM }, name);
+        let k = ui_k(a);
+        let txt = fit(name, PBTN_W * 0.86, 0.0105 * k, a);
+        label_c_at(ui, x0 + PBTN_W * 0.5, PBTN_Y - 0.011 * k, 0.0105 * k, a, if hot { PAPER } else { DIM }, &txt);
     }
     legend(ui, -0.80, a, 0.0098, &[("ESC", "RESUME"), ("ENTER", "SETTINGS"), ("TAP", "ANY BUTTON")]);
 }
@@ -730,9 +741,13 @@ pub fn tweaks_menu(ui: &mut Vec<UiVert>, a: f32, title: &str, rows: &[TweakRow],
         if r.action {
             font::text(ui, -0.715, y, px, a, GOLD, ">");
         }
-        let lab = fit(&r.label, 0.94, px, a);
+        let k = ui_k(a);
+        let px = px * k;
+        // the label column stops where the value column starts, so a long
+        // setting name is truncated rather than running under its own value
+        let lab = fit(&r.label, 1.02, px, a);
         font::text(ui, -0.68, y, px, a, if selected { GOLD } else { PAPER }, &lab);
-        let val = fit(&r.value, 0.40, px, a);
+        let val = fit(&r.value, 0.42, px, a);
         let vw = font::width(&val, px, a);
         let vcol = if selected { CYAN } else { [1.0, 0.98, 0.94, 0.45] };
         font::text(ui, 0.70 - vw, y, px, a, vcol, &val);
@@ -784,5 +799,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.42    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.43    ESC QUITS FROM THIS SCREEN");
 }

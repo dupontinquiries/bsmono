@@ -66,6 +66,10 @@ pub struct Shape {
     pub color: [f32; 4],
     pub emissive: f32,
     pub flash: f32,
+    /// world-space linear velocity of this shape (animated shapes only)
+    pub vel: Vec3,
+    /// world-space angular velocity — a spinner drags riders around too
+    pub omega: Vec3,
     pub spec: f32,
     /// CSG cutter: subtracts from the union (carves holes) and is not drawn
     pub cut: bool,
@@ -207,6 +211,11 @@ pub struct World {
     pub grav: Vec<GravNode>,
     /// XZ spatial hash over shapes: sdf() walks one cell, not the world
     sgrid: Vec<Vec<u16>>,
+    /// ANIMATED shapes are never in the grid — they travel far outside the
+    /// cell they were baked into (an orbiting carriage leaves it entirely
+    /// and simply vanished from the physics world). They are few, so every
+    /// query walks them directly.
+    dyn_shapes: Vec<u16>,
     scell: f32,
     sdim: i32,
     /// drivable tube routes for bot pathing: (waypoints, radius)
@@ -397,7 +406,7 @@ pub struct MapStyle {
     pub focal: u8,
 }
 
-pub const STYLE_COUNT: usize = 30;
+pub const STYLE_COUNT: usize = 31;
 
 /// Adapted from logscope scene3d's ROOMS table — same sixteen names, each
 /// translated from an indoor room into an open-world mood.
@@ -440,6 +449,7 @@ pub fn styles() -> &'static [MapStyle; STYLE_COUNT] {
             MapStyle { name: "GATEWORKS", grass: g(0x33302A), zenith: rgb3(0xC9B98F), fog: rgb3(0xD9CBA5), fog_d: 0.0012, sun: [0.5, 0.6, 0.2], accent: g(0x74E0B0), pal_mix: 0.45, amp: 0.15, freq: 1.0, wet: 0.18, glow: 0.35, rings: 4, halos: 2, balloons: 0, domes: 0, ramps: 4, platforms: 4, trees: 0, small_pads: 28, nets: 2, focal: 16 },
             MapStyle { name: "KUIPER", grass: g(0x0A0C14), zenith: rgb3(0x05060C), fog: rgb3(0x10142A), fog_d: 0.0010, sun: [-0.5, 0.4, 0.5], accent: g(0x9FD4FF), pal_mix: 0.65, amp: 0.15, freq: 0.6, wet: 0.05, glow: 0.6, rings: 6, halos: 6, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 24, nets: 2, focal: 17 },
             MapStyle { name: "ZOETROPE", grass: g(0x2A2432), zenith: rgb3(0x1A1526), fog: rgb3(0x352B4A), fog_d: 0.0014, sun: [0.3, 0.5, 0.4], accent: g(0xFFC24D), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.28, glow: 0.5, rings: 0, halos: 3, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 26, nets: 1, focal: 18 },
+            MapStyle { name: "CLOCKWORK", grass: g(0x2E2A38), zenith: rgb3(0x1B2436), fog: rgb3(0x33405C), fog_d: 0.0011, sun: [0.4, 0.6, 0.3], accent: g(0x6FE3C4), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.26, glow: 0.45, rings: 3, halos: 3, balloons: 0, domes: 0, ramps: 3, platforms: 6, trees: 0, small_pads: 30, nets: 2, focal: 19 },
         ]
     })
 }
@@ -518,6 +528,8 @@ impl World {
             sdf,
             Sdf::Shell { .. } | Sdf::RBox { .. } | Sdf::Capsule { .. } | Sdf::TubeTorus { .. } | Sdf::RingDeck { .. }
         ),
+        vel: Vec3::ZERO,
+        omega: Vec3::ZERO,
         cut: false,
         });
             shapes.len() - 1
@@ -2086,6 +2098,103 @@ impl World {
                 push(&mut shapes, M_CAP_TALL, Vec3::new(0.0, g0 + 5.0, 0.0), Quat::IDENTITY, Vec3::new(1.2, 5.0 / CAP_TALL_HH.max(1.0), 1.2), Sdf::Capsule { r: 1.2, half: 5.0 }, mix4(acc, [1.0; 4], 0.4), 0.9, 0.4);
                 zones.push(Zone { pos: Vec3::new(0.0, g0 + 2.0, 0.0), r: 9.0, kind: ZoneKind::Boost });
             }
+            19 => {
+                // ========== CLOCKWORK: everything is moving ==========
+                // A machine you play inside: shuttling decks, orbiting
+                // carriages, spinning turntables, a paternoster of rising
+                // steps, and long sweeper arms. Every surface here CARRIES
+                // you (physics::platform riding), so timing a landing means
+                // matching the platform, and jumping off inherits its speed.
+                let g0 = th(0.0, 0.0);
+                let deck = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4], glow: f32| -> usize {
+                    let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.25 }, col, glow, 0.45);
+                    shapes[i].blend = true;
+                    i
+                };
+                // the hub: a wide static landing you always come back to
+                deck(&mut shapes, Vec3::new(0.0, g0 + 1.0, 0.0), Vec3::new(15.0, 1.0, 15.0), mix4(PLINTH, acc, 0.25), 0.05);
+                for k in 0..4 {
+                    let a = k as f32 * 1.5707;
+                    zones.push(Zone { pos: Vec3::new(a.cos() * 10.0, g0 + 2.2, a.sin() * 10.0), r: 3.0, kind: ZoneKind::Boost });
+                }
+                // SHUTTLES: long decks sliding across the yard, generous
+                // enough to actually land on (the small fast ones are the
+                // hard mode, and they come later)
+                for k in 0..6u32 {
+                    let a = k as f32 * 1.047;
+                    let base = Vec3::new(a.cos() * 46.0, g0 + 6.0 + (k % 3) as f32 * 7.0, a.sin() * 46.0);
+                    let half = Vec3::new(9.0 - (k % 3) as f32 * 1.6, 0.55, 5.0);
+                    let col = mix4(*rng.pick(&pal), acc, 0.3);
+                    let i = deck(&mut shapes, base, half, col, 0.12);
+                    let dir = Vec3::new(-a.sin(), 0.0, a.cos());
+                    anims.push(Anim::Slide { shape: i, base, dir, amp: 26.0 + k as f32 * 4.0, rate: 0.22 + k as f32 * 0.035, phase: k as f32 * 0.9, rot: Quat::IDENTITY, scale: half });
+                    pads.push(Pad { pos: base + Vec3::Y * 1.2, big: false, timer: 0.0, phase: k as f32 * 0.3 });
+                }
+                // CARRIAGES: decks orbiting the hub at three radii, the
+                // classic "ride one, hop to the next" ladder
+                for ring in 0..3u32 {
+                    let rr = 26.0 + ring as f32 * 22.0;
+                    // clear of the sweeper arms below: at the old heights a
+                    // 30 m sweeper swept straight through the inner carriage
+                    // ring, and a rider was grabbed by whichever platform
+                    // happened to be nearest (0% grounded in the sim)
+                    let y = g0 + 18.0 + ring as f32 * 13.0;
+                    let cnt = 3 + ring;
+                    for k in 0..cnt {
+                        let ph = k as f32 / cnt as f32 * std::f32::consts::TAU;
+                        // BIG decks: the outer rings used to shrink, which is
+                        // backwards — a faster carriage needs MORE landing
+                        // area, not less
+                        let half = Vec3::new(9.0 + ring as f32 * 1.5, 0.5, 6.0 + ring as f32 * 0.8);
+                        let col = mix4(*rng.pick(&pal), acc, 0.25 + ring as f32 * 0.12);
+                        let i = deck(&mut shapes, Vec3::new(rr, y, 0.0), half, col, 0.15);
+                        anims.push(Anim::Orbit {
+                            shape: i,
+                            center: Vec3::new(0.0, y, 0.0),
+                            axis: Vec3::Y,
+                            r: rr,
+                            // constant RIM SPEED (~5 m/s), not constant
+                            // angular rate: at a fixed rate the outer ring
+                            // hit 18 m/s, which no landing survives and the
+                            // platform sim caught as a 15%-grounded ride
+                            rate: (5.0 / rr) * if ring == 1 { -1.0 } else { 1.0 },
+                            phase: ph,
+                            rot: Quat::IDENTITY,
+                            scale: half,
+                        });
+                    }
+                }
+                // TURNTABLES: spinning discs — stand near the rim and the
+                // spin throws you further when you leave
+                for k in 0..3u32 {
+                    let a = k as f32 * 2.1 + 0.5;
+                    let c = Vec3::new(a.cos() * 70.0, g0 + 4.0 + k as f32 * 6.0, a.sin() * 70.0);
+                    let big = 13.0;
+                    let i = push(&mut shapes, M_RING_DECK, c, Quat::IDENTITY, Vec3::splat(big), Sdf::RingDeck { big: big * 0.55, wide: big * 0.45, half_h: 0.6 }, mix4(acc, [1.0; 4], 0.2), 0.3, 0.45);
+                    shapes[i].blend = true;
+                    anims.push(Anim::Spin { shape: i, pos: c, scale: Vec3::splat(big), base: Quat::IDENTITY, axis: Vec3::Y, rate: 0.55 + k as f32 * 0.25 });
+                    zones.push(Zone { pos: c + Vec3::Y * 1.2, r: 5.0, kind: ZoneKind::Boost });
+                }
+                // PATERNOSTER: a column of steps rising and falling, the
+                // vertical route to the top deck
+                for k in 0..7u32 {
+                    let base = Vec3::new(-96.0, g0 + 5.0 + k as f32 * 8.0, 0.0);
+                    let half = Vec3::new(5.5, 0.5, 5.5);
+                    let i = deck(&mut shapes, base, half, mix4(PLINTH, acc, 0.35), 0.1);
+                    anims.push(Anim::Slide { shape: i, base, dir: Vec3::Y, amp: 7.0, rate: 0.42, phase: k as f32 * 0.9, rot: Quat::IDENTITY, scale: half });
+                }
+                // SWEEPERS: long arms turning at head height — duck, jump,
+                // or ride the end
+                for k in 0..2u32 {
+                    let c = Vec3::new(0.0, g0 + 3.4 + k as f32 * 6.2, 0.0);
+                    let half = Vec3::new(22.0, 0.45, 2.2);
+                    let i = deck(&mut shapes, c, half, mix4(acc, [1.0; 4], 0.15), 0.35);
+                    anims.push(Anim::Spin { shape: i, pos: c, scale: half, base: Quat::IDENTITY, axis: Vec3::Y, rate: if k == 0 { 0.45 } else { -0.30 } });
+                }
+                // the prize: a high platform reachable only by riding up
+                deck(&mut shapes, Vec3::new(-96.0, g0 + 72.0, 0.0), Vec3::new(11.0, 1.0, 11.0), mix4(acc, [1.0; 4], 0.3), 0.5);
+                zones.push(Zone { pos: Vec3::new(-96.0, g0 + 74.0, 0.0), r: 8.0, kind: ZoneKind::Boost });
+            }
             _ => {}
         }
 
@@ -2406,7 +2515,22 @@ impl World {
         let scell = 56.0f32;
         let sdim = ((TG_HALF * 2.0) / scell).ceil() as i32 + 2;
         let mut sgrid: Vec<Vec<u16>> = vec![Vec::new(); (sdim * sdim) as usize];
+        let mut dyn_shapes: Vec<u16> = Vec::new();
+        for a in &anims {
+            let si = match *a {
+                Anim::Spin { shape, .. }
+                | Anim::Door { shape, .. }
+                | Anim::Orbit { shape, .. }
+                | Anim::Slide { shape, .. } => shape,
+            };
+            if !dyn_shapes.contains(&(si as u16)) {
+                dyn_shapes.push(si as u16);
+            }
+        }
         for (i, s) in shapes.iter().enumerate() {
+            if dyn_shapes.contains(&(i as u16)) {
+                continue; // movers are queried directly, not through the grid
+            }
             let reach = match s.sdf {
                 Sdf::None => continue,
                 Sdf::Sphere { r } => r + 4.0,
@@ -2446,7 +2570,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        World { grav, sgrid, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
+        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.
@@ -2454,7 +2578,41 @@ impl World {
         self.zones.iter().find(|z| z.pos.distance_squared(p) < z.r * z.r).map(|z| z.kind)
     }
 
+    /// Surface velocity of any animated platform at `p` — what a car
+    /// standing there is being carried by. Only animated shapes are
+    /// considered, so this is a walk of a couple of dozen entries.
+    pub fn platform_vel(&self, p: Vec3, reach: f32) -> Option<Vec3> {
+        let mut best: Option<(f32, Vec3)> = None;
+        for a in &self.anims {
+            let si = match *a {
+                Anim::Spin { shape, .. }
+                | Anim::Door { shape, .. }
+                | Anim::Orbit { shape, .. }
+                | Anim::Slide { shape, .. } => shape,
+            };
+            let sh = &self.shapes[si];
+            if sh.vel.length_squared() < 1e-6 && sh.omega.length_squared() < 1e-6 {
+                continue;
+            }
+            let d = self.shape_sdf_at(si, p);
+            if d < reach && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, sh.vel + sh.omega.cross(p - sh.pos)));
+            }
+        }
+        best.map(|(_, v)| v)
+    }
+
     pub fn update(&mut self, dt: f32) {
+        let mut prev_pos: std::collections::HashMap<usize, Vec3> = std::collections::HashMap::new();
+        for a in &self.anims {
+            let si = match *a {
+                Anim::Spin { shape, .. }
+                | Anim::Door { shape, .. }
+                | Anim::Orbit { shape, .. }
+                | Anim::Slide { shape, .. } => shape,
+            };
+            prev_pos.insert(si, self.shapes[si].pos);
+        }
         self.time += dt;
         let t = self.time;
         for a in &self.anims {
@@ -2490,6 +2648,19 @@ impl World {
                     sh.mat = glam::Mat4::from_scale_rotation_translation(scale, rot, p);
                 }
             }
+        }
+        // platform motion, measured from what actually moved: any rider
+        // standing on one of these inherits it (see physics::step_car)
+        for a in &self.anims {
+            let (si, om) = match *a {
+                Anim::Spin { shape, axis, rate, .. } => (shape, axis.normalize_or(Vec3::Y) * rate),
+                Anim::Orbit { shape, axis, rate, .. } => (shape, axis.normalize_or(Vec3::Y) * rate),
+                Anim::Door { shape, .. } | Anim::Slide { shape, .. } => (shape, Vec3::ZERO),
+            };
+            let prev = prev_pos[&si];
+            let sh = &mut self.shapes[si];
+            sh.vel = if dt > 1e-5 { (sh.pos - prev) / dt } else { Vec3::ZERO };
+            sh.omega = om;
         }
         // gravity nodes riding on animated shapes (the roaming moon)
         for gi in 0..self.grav.len() {
@@ -2568,6 +2739,8 @@ impl World {
                 let col = [0.55, 0.42, 0.34, 1.0];
                 let si = self.shapes.len();
                 self.shapes.push(Shape {
+                    vel: Vec3::ZERO,
+                    omega: Vec3::ZERO,
                     mesh: M_SPHERE,
                     pos,
                     inv_rot: Quat::IDENTITY,
@@ -2631,7 +2804,10 @@ impl World {
         let mut db = f32::MAX; // blend group accumulates through smin
         let cx = (((p.x + TG_HALF) / self.scell).floor() as i32).clamp(0, self.sdim - 1);
         let cz = (((p.z + TG_HALF) / self.scell).floor() as i32).clamp(0, self.sdim - 1);
-        for &si in &self.sgrid[(cz * self.sdim + cx) as usize] {
+        for &si in self.sgrid[(cz * self.sdim + cx) as usize]
+            .iter()
+            .chain(self.dyn_shapes.iter())
+        {
             let s = &self.shapes[si as usize];
             // cheap broad-phase: skip shapes far away
             let rel = p - s.pos;
@@ -2840,6 +3016,42 @@ impl World {
             }
         }
         None
+    }
+
+    /// Distance to ONE shape (platform queries: which deck am I on?)
+    pub fn shape_sdf_at(&self, i: usize, p: Vec3) -> f32 {
+        let sh = &self.shapes[i];
+        let q = sh.inv_rot * (p - sh.pos);
+        match sh.sdf {
+            Sdf::None => f32::MAX,
+            Sdf::Sphere { r } => q.length() - r,
+            Sdf::Torus { big, tube } => {
+                let ring = Vec2::new(Vec2::new(q.x, q.z).length() - big, q.y);
+                ring.length() - tube
+            }
+            Sdf::Capsule { r, half } => {
+                let y = q.y.clamp(-half, half);
+                (q - Vec3::new(0.0, y, 0.0)).length() - r
+            }
+            Sdf::Hex { r, h } => (Vec2::new(q.x, q.z).length() - r).max(q.y.abs() - h),
+            Sdf::RBox { half, round } => {
+                let d3 = q.abs() - half + Vec3::splat(round);
+                d3.max(Vec3::ZERO).length() + d3.max_element().min(0.0) - round
+            }
+            Sdf::Shell { r, half, thick } => {
+                let ring = (Vec2::new(q.x, q.z).length() - r).abs() - thick;
+                ring.max(q.y.abs() - half)
+            }
+            Sdf::TubeTorus { big, tube, thick } => {
+                let ring = Vec2::new(Vec2::new(q.x, q.z).length() - big, q.y);
+                (ring.length() - tube).abs() - thick
+            }
+            Sdf::RingDeck { big, wide, half_h } => {
+                let radial = (Vec2::new(q.x, q.z).length() - big).abs() - wide;
+                let vert = q.y.abs() - half_h;
+                radial.max(vert).min(0.0) + Vec2::new(radial.max(0.0), vert.max(0.0)).length() - 0.12
+            }
+        }
     }
 
     pub fn normal(&self, p: Vec3) -> Vec3 {

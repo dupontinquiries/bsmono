@@ -12,6 +12,8 @@ use crate::physics::{Ball, Car};
 use crate::world::World;
 
 pub struct Camera {
+    /// smoothed velocity of the platform under the car (bend)
+    plat_lag: Vec3,
     pub pos: Vec3,
     pub look: Vec3,
     pub up: Vec3, // smoothed local up used for the view basis
@@ -25,6 +27,7 @@ pub struct Camera {
 impl Camera {
     pub fn new() -> Camera {
         Camera {
+            plat_lag: Vec3::ZERO,
             pos: Vec3::new(0.0, 3.0, 34.0),
             look: Vec3::ZERO,
             up: Vec3::Y,
@@ -111,7 +114,21 @@ impl Camera {
         // height and angle settings whole — the cam sim caught boom_up
         // pinned at the floor regardless of cfg). Only the LOOK tilts up.
         let dir_flat = (dir - self.up * dir.dot(self.up)).normalize_or(self.heading);
+        // MOVING-PLATFORM BEND: while you are near a fast deck, the camera
+        // adopts a slice of its motion. The platform then reads as (nearly)
+        // still and only your own approach moves — which is what makes a
+        // small, rapidly moving target landable.
         let mut want = car.pos - dir_flat * cfg.dist + self.up * cfg.height;
+        if cfg.plat_bend > 0.01 {
+            if let Some(pv) = world.platform_vel(car.pos, 6.0) {
+                self.plat_lag += (pv - self.plat_lag) * (1.0 - (-3.0 * dt).exp());
+            } else {
+                self.plat_lag *= (-2.0 * dt).exp();
+            }
+            // lead the camera along the platform's travel, capped so a
+            // spinner's rim speed cannot fling the view
+            want += (self.plat_lag * cfg.plat_bend * 0.22).clamp_length_max(3.0);
+        }
         // terrain clamp only makes sense while up is world-ish
         if self.up.y > 0.7 {
             let floor = world.ground_h(want.x, want.z) + 0.35;

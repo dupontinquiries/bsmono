@@ -120,6 +120,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("STIFFNESS", pct(|c| c.cam.stiffness, |c, v| c.cam.stiffness = v, 0.25, 2.2)),
             ("SHAKE", pct(|c| c.cam.shake, |c, v| c.cam.shake = v, 0.0, 1.5)),
             ("GRAVITY CAMERA (TUBES)", pct(|c| c.cam.grav_follow, |c, v| c.cam.grav_follow = v, 0.0, 1.0)),
+            ("MOVING PLATFORM BEND", Slider { get: |c| c.cam.plat_bend, set: |c, v| c.cam.plat_bend = v, min: 0.0, max: 1.0, step: 0.05, def: 0.55, fmt: 0 }),
             ("BACK", Back),
         ],
         2 => vec![
@@ -1980,10 +1981,17 @@ impl Game {
         let roll_extra = -steer_axis * roll_mix;
         // ---- on-screen controls fold in as another input source ----
         let (mut t_thr, mut t_steer, mut t_boost, mut t_jump) = (0.0f32, 0.0f32, false, false);
+        let mut t_air: Option<glam::Vec2> = None;
         if self.tpad.enabled {
             let sv = self.tpad.stick_vec();
             t_thr = sv.y;
             t_steer = sv.x;
+            // AIR ROTATION: off the ground the same thumb flies the car —
+            // push/pull pitches, left/right rolls (or yaws with the slide
+            // modifier), exactly like a stick in the air on a pad
+            if !self.car.on_ground {
+                t_air = Some(sv);
+            }
             t_boost = self.tpad.boost_down();
             t_jump = self.tpad.jump_down();
             if self.tpad.has_target() {
@@ -2004,9 +2012,9 @@ impl Game {
         Controls {
             throttle: (fwd - rev + ps.throttle + t_thr).clamp(-1.0, 1.0),
             steer,
-            pitch: (rev - fwd - ps.stick_y).clamp(-1.0, 1.0),
-            yaw: (-yaw_src).clamp(-1.0, 1.0),
-            roll: (rl - rr + roll_extra).clamp(-1.0, 1.0),
+            pitch: (rev - fwd - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0),
+            yaw: ((-yaw_src).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * roll_mix).clamp(-1.0, 1.0),
+            roll: ((rl - rr + roll_extra).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * (1.0 - roll_mix)).clamp(-1.0, 1.0),
             boost: self.action_down(Action::Boost) || t_boost,
             jump_held: self.action_down(Action::Jump) || t_jump,
             jump_pressed: false,
@@ -2148,6 +2156,11 @@ impl Game {
             // slight temporal buildup into turns and rolls: ~55 ms attack
             // (x INPUT EASE) with a whisper of center-softening — the
             // detent. Player only; bots keep raw controls.
+            // the on-screen MENU button: a phone has no Escape key
+            if self.tpad.enabled && self.tpad.menu_tapped() {
+                self.mode = Mode::Pause;
+                self.mscroll = 0.0;
+            }
             // GYRO DRIVE: device motion folded in beside the sticks
             self.gyro.update(dt, &self.cfg.gyro);
             if self.cfg.gyro.on {

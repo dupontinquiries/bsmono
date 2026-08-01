@@ -12,6 +12,9 @@ pub struct CamCfg {
     pub stiffness: f32, // smoothing speed multiplier
     pub shake: f32,     // impact shake multiplier
     pub grav_follow: f32, // 0 = classic Y-up, 1 = horizon follows local gravity
+    /// 0..1 — how much the camera adopts a nearby moving platform's frame,
+    /// so a fast deck reads as still while you line up a landing
+    pub plat_bend: f32,
 }
 
 pub struct ArenaCfg {
@@ -138,7 +141,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             gyro: GyroCfg { on: false, sens: 1.0, deadzone: 0.06, smooth: 0.05, invert_x: false, invert_y: false, air_mode: 0, gate: 0 },
-            cam: CamCfg { fov_deg: 76.0, dist: 4.9, height: 1.35, angle_deg: -3.0, stiffness: 1.0, shake: 0.6, grav_follow: 1.0 },
+            cam: CamCfg { fov_deg: 76.0, dist: 4.9, height: 1.35, angle_deg: -3.0, stiffness: 1.0, shake: 0.6, grav_follow: 1.0, plat_bend: 0.55 },
             arena: ArenaCfg { gravity: 1.0, bounce: 1.0, friction: 1.0, scale: 1.0 },
             ball: BallCfg { size: 1.0, bounce: 1.0, friction: 1.0, weight: 1.0 },
             car: CarCfg { steer_rate: 0.9, input_ease: 1.1, size: 1.0, grip: 1.0, top_speed: 1.0, accel: 1.0, boost: 1.0, boost_regen: 0.0, boost_max: 1.0, unlimited_boost: false, jump: 1.0, analog: true, analog_soft: 0.45 },
@@ -178,6 +181,7 @@ impl Config {
             let _ = writeln!(out, "cfg {k} {v:.3}");
         };
         w("cam_fov", self.cam.fov_deg);
+        w("cam_plat_bend", self.cam.plat_bend);
         w("cam_dist", self.cam.dist);
         w("cam_height", self.cam.height);
         w("cam_angle", self.cam.angle_deg);
@@ -243,6 +247,7 @@ impl Config {
         let b = v > 0.5;
         match key {
             "cam_fov" => self.cam.fov_deg = v.clamp(50.0, 115.0),
+            "cam_plat_bend" => self.cam.plat_bend = v.clamp(0.0, 1.0),
             "cam_dist" => self.cam.dist = v.clamp(2.5, 9.0),
             "cam_height" => self.cam.height = v.clamp(0.4, 3.2),
             "cam_angle" => self.cam.angle_deg = v.clamp(-15.0, 15.0),

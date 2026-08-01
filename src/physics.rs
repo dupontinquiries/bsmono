@@ -701,6 +701,18 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
 
         // keep the car pressed onto the surface
         let vn = car.vel.dot(n);
+        // MOVING FRAME. Everything below — grip, braking, steering, the
+        // suspension — is written for ground that stands still. On a moving
+        // deck that same code was braking the car to a stop in WORLD space
+        // while the deck slid out from under it. So we step into the
+        // platform's frame, run the ordinary ground solve there, and step
+        // back out at the end: riding a deck then feels exactly like driving
+        // on the floor, and leaving one hands you its momentum for free.
+        let plat_v = world
+            .platform_vel(car.pos - n * (clearance * 0.9), clearance * 3.0)
+            .unwrap_or(Vec3::ZERO);
+        car.vel -= plat_v;
+
         // WHEEL SUSPENSION: a spring-damper ride instead of a rigid snap.
         // The bottom 45% of clearance is the compression zone — landings
         // sink in and rebound, bumps stay glued, contact reads SOLID.
@@ -729,6 +741,10 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             let stick = if steep { 22.0 } else { 2.4 } * gmul.clamp(1.0, 3.2);
             car.vel -= n * stick * dt;
         }
+        // PLATFORM RIDING: a car standing on a moving deck is carried by
+        // it — position follows exactly (so a fast platform cannot slide out
+        // from under you) and velocity is dragged toward the surface, which
+        // is what lets you inherit its momentum when you jump off.
         let starget = ((clearance - d) / zone).clamp(0.0, 1.0);
         car.susp += (starget - car.susp) * (1.0 - (-14.0 * dt).exp());
 
@@ -745,7 +761,19 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             car.pos += n * 0.04;
             car.on_ground = false;
         }
+        // ...and back out of the platform frame
+        car.vel += plat_v;
+        car.pos += plat_v * dt;
     } else {
+        // A fast deck can outrun the frame in which contact is lost: keep
+        // carrying while the car is still within a whisker of one, so a
+        // 18 m/s carriage does not leave you standing in the air.
+        let probe = car.pos - Vec3::Y * (car.half_h + 0.12);
+        if let Some(pv) = world.platform_vel(probe, 0.9) {
+            car.pos += pv * dt;
+            let rel = car.vel - pv;
+            car.vel -= (rel - Vec3::Y * rel.y) * (1.0 - (-8.0 * dt).exp()) * 0.6;
+        }
         // ---------------- airborne / body contact ----------------
         // TRUE landing physics (separate from the learnable land-assist):
         //
