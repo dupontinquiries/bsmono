@@ -878,6 +878,11 @@ pub struct Session {
     pub files: Vec<FileEvent>,
     pub plan: Plan,
     pub verified: bool,
+    /// Was there a verify command at all?
+    ///
+    /// `verified` alone cannot answer this: it starts true when nothing is configured, so a run with
+    /// no verifier is indistinguishable from one that passed. The UI needs both to label honestly.
+    pub had_verifier: bool,
 }
 
 /// The sentinel a model prints when the task is complete.
@@ -1245,22 +1250,29 @@ pub fn run_agent_cfg(llm: &mut dyn Llm, ws: &mut Workspace, task: &str, cfg: &Ag
     let mut prompt = system_prompt(task, cfg);
     let mut turns = Vec::new();
     let mut plan = Plan::default();
-    let mut verified = cfg.verify_cmd.is_empty();
+    // TWO MEANINGS ON ONE BOOLEAN. This starts true when no verify command is configured, which is
+    // right for GATING — an unconfigured check must not block a run from finishing. But the same flag
+    // drives the UI badge, so "there was nothing to verify" renders as "· ✓ verified".
+    //
+    // A run where nothing was checked is not a verified run, and a badge saying otherwise is worse
+    // than no badge: it is the reason someone stops looking.
+    let has_verifier = !cfg.verify_cmd.is_empty();
+    let mut verified = !has_verifier;
     let mut guard = crate::repetition::LoopGuard::default();
 
     for step in 0..cfg.max_steps {
         let text = match llm.generate(&prompt) {
             Ok(t) => t,
-            Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified },
+            Err(e) => return Session { turns, stop: Stop::ModelError(e), files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier },
         };
         let (results, stop) = step_turn(&text, &mut prompt, ws, cfg, &mut plan, &mut verified, step, &mut guard);
         turns.push(Turn { model_text: text, results });
         if let Some(stop) = stop {
-            return Session { turns, stop, files: ws.events().to_vec(), plan, verified };
+            return Session { turns, stop, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier };
         }
     }
 
-    Session { turns, stop: Stop::StepLimit, files: ws.events().to_vec(), plan, verified }
+    Session { turns, stop: Stop::StepLimit, files: ws.events().to_vec(), plan, verified, had_verifier: has_verifier }
 }
 
 // ── async driver (non-blocking, interruptible): the agent as a channel-driven state machine ──────
@@ -1288,6 +1300,8 @@ pub struct AgentRun {
     reply: String,    // accumulates this turn's streamed tokens
     plan: Plan,
     verified: bool,
+    /// Whether a verify command existed. See `had_verifier()`.
+    had_verifier: bool,
     step: usize,
     turns: usize,
     guard: crate::repetition::LoopGuard,
@@ -1296,12 +1310,16 @@ pub struct AgentRun {
 impl AgentRun {
     /// Begin a run over `work_dir`. Returns the driver plus the first prompt to submit to the worker.
     pub fn start(work_dir: impl Into<std::path::PathBuf>, task: &str, cfg: AgentConfig) -> (Self, String) {
+        // Captured before cfg moves into the run: a run with no verifier must not read as passed.
+        let had_verifier = !cfg.verify_cmd.is_empty();
         let prompt = system_prompt(task, &cfg);
         let verified = cfg.verify_cmd.is_empty();
         let run = Self {
             ws: Workspace::new(work_dir), prompt: prompt.clone(), reply: String::new(),
             plan: Plan::default(), verified, step: 0, turns: 0, cfg,
             guard: crate::repetition::LoopGuard::default(),
+            // Mirrors the Session field: a run with no verifier must not read as one that passed.
+            had_verifier,
         };
         (run, prompt)
     }
@@ -1331,6 +1349,11 @@ impl AgentRun {
     pub fn events(&self) -> &[FileEvent] { self.ws.events() }
     pub fn plan(&self) -> &Plan { &self.plan }
     pub fn verified(&self) -> bool { self.verified }
+    /// Was a verify command configured at all?
+    ///
+    /// `verified()` cannot answer this — it starts true when nothing is configured, so a run with no
+    /// verifier is indistinguishable from one that passed.
+    pub fn had_verifier(&self) -> bool { self.had_verifier }
     pub fn root(&self) -> &Path { self.ws.root() }
     pub fn turns(&self) -> usize { self.turns }
 }

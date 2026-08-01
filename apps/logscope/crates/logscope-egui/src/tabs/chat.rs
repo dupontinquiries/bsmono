@@ -2333,8 +2333,8 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
 
     /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
     fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
-        let (files, plan, verified, turns) = match self.agent_run.take() {
-            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns()),
+        let (files, plan, verified, turns, had_verifier) = match self.agent_run.take() {
+            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier()),
             None => return,
         };
         self.agent_files = files;
@@ -2351,7 +2351,11 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         let snap = self.gitmind_session.as_ref()
             .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {}", self.agent_task)).ok())
             .unwrap_or(false);
-        let vnote = if verified { " · ✓ verified" } else { " · ⚠ unverified" };
+        // THREE STATES, NOT TWO. `verified` starts true when no verify command is configured, so a
+        // run where nothing was checked rendered as "✓ verified" — which is worse than no badge,
+        // because it is the reason someone stops looking.
+        let vnote = if !had_verifier { " · no verifier configured" }
+            else if verified { " · ✓ verified" } else { " · ⚠ unverified" };
         let snap_note = if snap { " · snapshotted" } else { "" };
         self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
     }
