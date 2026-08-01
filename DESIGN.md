@@ -1279,6 +1279,47 @@ grid-accelerated nearest lookup so it stays instant at load. New
 a model of 0.32 / 0.31 / 0.64 — longer than wide, flatter than long,
 within 3 cm.
 
+## v1.42.0 — actually driving the tubes
+
+Every previous tube fix was measured with a bore SURVEY: how much free
+radius sits at the pipe's axis. That number was healthy while the pipes
+were still unusable, because a car does not drive the axis. New
+`--sim drive` does the obvious thing instead — it spawns a car inside
+each route, points it down the pipe, holds throttle and boost, and
+follows it: how far along does it get, and does it ever leave the bore?
+
+The first run answered the complaint outright: cars fell out of 23 of
+24 Perplexus routes and all 3 Monkey Run lines. Three causes:
+
+1. TUNNELING. Shell walls were r*0.035 — 0.28 m on an 8 m pipe — while
+   a car at 23 m/s covers 0.19 m per physics step. Cars passed clean
+   THROUGH the pipe skin without ever touching it. (v1.37 thinned those
+   walls to win back bore clearance, which is what introduced this.)
+   Walls are now (r*0.10).max(0.55): thick enough that a step cannot
+   skip them.
+2. JUNCTIONS NARROWER THAN THEIR PIPES. Monkey Run's treehouse chambers
+   were 8 m radius while the vine bores feeding them run 8-12.5 m, so
+   the biggest line arrived at a wall in its own junction. Chambers are
+   22 m now.
+3. A NEAR-VERTICAL ENTRY. The vine lines climbed ~45 m of canopy height
+   in 25 m of run — a shaft, not a ramp. A car entering at speed stalled,
+   slid back and spat out of the mouth. The root mouth now starts ~75 m
+   out, so the climb is drivable.
+
+Perplexus now traverses 20-23 of 24 routes end to end (the remaining
+"escapes" are cars reaching 100% and leaving through the far mouth,
+which is the exit working). Monkey Run went from 3 escapes to 0 and its
+longest line reaches 90% of 2.2 km.
+
+STILL OPEN, honestly: two Monkey Run vine lines stall around 7-11% of
+their length without escaping — they are being driven, just not
+finishing. That is the next thread to pull, and `--sim drive` is now the
+tool for it.
+
+Also measured and REJECTED: strengthening in-tube gravity (1.0 -> 1.9)
+to hold cars against the bore. It cost traversals (21/24 -> 17/24) by
+slamming cars into walls, so the pipe still pulls at 1.0.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

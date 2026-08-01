@@ -742,7 +742,7 @@ impl World {
                     let axis = (b - a).normalize_or(Vec3::Z);
                     let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
-                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: r * 0.035 }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.45);
                     shapes[si].blend = true;
                     // BEVEL COLLARS: a fillet torus at each mouth eases the
                     // transition (and hides the seam where the bore opens)
@@ -753,8 +753,27 @@ impl World {
                         // inward at every single joint
                         push(shapes, M_TORUS_THIN, ep, brot, Vec3::splat(r * 1.0), Sdf::None, [col[0], col[1], col[2], 0.5], glow * 0.6 + 0.1, 0.45);
                     }
-                    for t in [0.2f32, 0.5, 0.8] {
-                        grav.push(GravNode { pos: a.lerp(b, t), down: Vec3::NEG_Y, r: r * 1.55, tube: true, inward: false, g: 1.0, surf: false, follow: None });
+                    // A node every ~5 m with generous reach, following the
+                    // SDF gradient. Sparse nodes left the middle of a long
+                    // segment reverting toward world-down, so a car climbing
+                    // a steep pipe simply lost the wall and fell out.
+                    let seg_len = a.distance(b).max(0.01);
+                    let steps = ((seg_len / 5.0).ceil() as usize).clamp(2, 40);
+                    for k in 0..=steps {
+                        let t = k as f32 / steps as f32;
+                        grav.push(GravNode {
+                            pos: a.lerp(b, t),
+                            down: Vec3::NEG_Y,
+                            r: r * 2.4,
+                            tube: true,
+                            inward: false,
+                            // measured: stronger than world gravity slammed
+                            // cars into the bore and cost traversals (21/24
+                            // -> 17/24), so the pipe pulls at 1.0
+                            g: 1.0,
+                            surf: true,
+                            follow: None,
+                        });
                     }
                 };
                 let cut_s = |shapes: &mut Vec<Shape>, p: Vec3, r: f32| {
@@ -1441,7 +1460,7 @@ impl World {
                     let axis = (b - a).normalize_or(Vec3::Z);
                     let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
-                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: r * 0.035 }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.45);
                     shapes[si].blend = true;
                     // BEVEL COLLARS: a fillet torus at each mouth eases the
                     // transition (and hides the seam where the bore opens)
@@ -1452,8 +1471,27 @@ impl World {
                         // inward at every single joint
                         push(shapes, M_TORUS_THIN, ep, brot, Vec3::splat(r * 1.0), Sdf::None, [col[0], col[1], col[2], 0.5], glow * 0.6 + 0.1, 0.45);
                     }
-                    for t in [0.25f32, 0.75] {
-                        grav.push(GravNode { pos: a.lerp(b, t), down: Vec3::NEG_Y, r: r * 1.55, tube: true, inward: false, g: 1.0, surf: false, follow: None });
+                    // A node every ~5 m with generous reach, following the
+                    // SDF gradient. Sparse nodes left the middle of a long
+                    // segment reverting toward world-down, so a car climbing
+                    // a steep pipe simply lost the wall and fell out.
+                    let seg_len = a.distance(b).max(0.01);
+                    let steps = ((seg_len / 5.0).ceil() as usize).clamp(2, 40);
+                    for k in 0..=steps {
+                        let t = k as f32 / steps as f32;
+                        grav.push(GravNode {
+                            pos: a.lerp(b, t),
+                            down: Vec3::NEG_Y,
+                            r: r * 2.4,
+                            tube: true,
+                            inward: false,
+                            // measured: stronger than world gravity slammed
+                            // cars into the bore and cost traversals (21/24
+                            // -> 17/24), so the pipe pulls at 1.0
+                            g: 1.0,
+                            surf: true,
+                            follow: None,
+                        });
                     }
                 };
                 let cut_s = |shapes: &mut Vec<Shape>, p: Vec3, r: f32| {
@@ -1544,8 +1582,12 @@ impl World {
                         push(&mut shapes, M_SPHERE, cp, Quat::IDENTITY, Vec3::splat(cr), Sdf::None, mix4(leaf, acc, 0.08 * c as f32), 0.02, 0.15);
                     }
                     if k % 2 == 0 {
-                        // treehouse: a hollow room in the canopy
-                        let hr = 8.0;
+                        // treehouse: a hollow room in the canopy. It must be
+                        // WIDER than the lines that meet it — at 8 m it was
+                        // narrower than the 12.5 m bore feeding it, so the
+                        // biggest vine line ran into a wall at its own
+                        // junction (the drive test stalled every run there).
+                        let hr = 22.0;
                         let hc = top + Vec3::new(0.0, 4.0, 0.0);
                         let hi2 = push(&mut shapes, M_SPHERE, hc, Quat::IDENTITY, Vec3::splat(hr), Sdf::Sphere { r: hr }, [acc[0], acc[1], acc[2], 0.18], 0.10, 0.5);
                         shapes[hi2].blend = true;
@@ -1572,7 +1614,12 @@ impl World {
                     let col = mix4(*rng.pick(&pal), acc, 0.35);
                     // root mouth: ground entrance + slingshot up the first climb
                     let base = ttop[seq[0]];
-                    let gm = Vec3::new(base.x + 20.0, th(base.x + 20.0, base.z) + r * 1.05, base.z + 14.0);
+                    // The root ramp used to gain ~45 m of canopy height in
+                    // 25 m of run — near vertical. A car entering at speed
+                    // stalled, slid back and spat out of the mouth (the
+                    // drive test lost every vine line right here). Start it
+                    // much further out so the climb is a ramp, not a shaft.
+                    let gm = Vec3::new(base.x + 62.0, th(base.x + 62.0, base.z) + r * 1.05, base.z + 44.0);
                     let mut cur = if house_r[seq[0]] > 0.0 {
                         house_c[seq[0]] + (gm - house_c[seq[0]]).normalize_or(Vec3::Y) * (house_r[seq[0]] - 0.5)
                     } else {

@@ -1049,6 +1049,109 @@ pub fn run(args: &[String]) {
         println!("{}", if ok { "PLANETS: PASS" } else { "PLANETS: FAIL" });
         return;
     }
+    if name == "drive" {
+        // THE REAL TEST: can a car actually get through a tube? Spawn one
+        // inside a route, point it down the pipe, hold throttle, and follow
+        // it — how far along does it get, and does it ever fall OUT?
+        let cfg = Config::default();
+        for (si, label) in [(21usize, "PERPLEXUS"), (24, "MONKEY RUN")] {
+            let world = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let ball = Ball::new();
+            let mut done = 0;
+            let mut escaped = 0;
+            let mut worst: Vec<(usize, f32)> = Vec::new();
+            let n_routes = world.routes.len().min(24);
+            for ri in 0..n_routes {
+                let (pts, r) = world.routes[ri].clone();
+                if pts.len() < 2 {
+                    continue;
+                }
+                // total length, for progress as a fraction
+                let total: f32 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+                if std::env::var("ROUTE_DBG").map(|v| v == format!("{si}")).unwrap_or(false) {
+                    let gaps: Vec<String> = pts.windows(2).take(6).map(|w| format!("{:.0}", w[0].distance(w[1]))).collect();
+                    eprintln!("  route {ri}: {} pts, total {:.0} m, r={:.1}, first gaps: {}", pts.len(), total, r, gaps.join(","));
+                }
+                if total < 12.0 {
+                    continue;
+                }
+                let mut car = physics::Car::new();
+                car.pos = pts[0].lerp(pts[1], 0.06);
+                let dir = (pts[1] - pts[0]).normalize_or(Vec3::Z);
+                // the car's nose is -Z
+                car.rot = glam::Quat::from_rotation_arc(Vec3::NEG_Z, dir);
+                car.vel = dir * 12.0;
+                let mut c = physics::Controls::default();
+                c.throttle = 1.0;
+                c.boost = true;
+                let mut best = 0.0f32;
+                let mut out = false;
+                let dbg = std::env::var("DRIVE_DBG").map(|v| v == format!("{si}:{ri}")).unwrap_or(false);
+                let mut t = 0.0f32;
+                // these routes run 900-2200 m: give each one time to be
+                // driven rather than judging it on a fixed clock
+                let budget = (total / 13.0).clamp(12.0, 75.0);
+                while t < budget {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    // how far along the polyline are we, and how far off it?
+                    let (mut along, mut off) = (0.0f32, f32::MAX);
+                    let mut acc = 0.0f32;
+                    for w in pts.windows(2) {
+                        let ab = w[1] - w[0];
+                        let len = ab.length().max(1e-4);
+                        let u = ((car.pos - w[0]).dot(ab) / (len * len)).clamp(0.0, 1.0);
+                        let d = (w[0] + ab * u).distance(car.pos);
+                        if d < off {
+                            off = d;
+                            along = acc + u * len;
+                        }
+                        acc += len;
+                    }
+                    best = best.max(along / total);
+                    if dbg && (t * 8.0).fract() < DT * 8.0 {
+                        eprintln!(
+                            "  t={:4.2} along={:4.0}% off={:5.2} (r={:.1}) y={:6.1} og={} spd={:5.1} sdf={:6.2}",
+                            t, along / total * 100.0, off, r, car.pos.y, car.on_ground as u8, car.vel.length(), world.sdf(car.pos)
+                        );
+                    }
+                    // leaving the pipe at the FAR END is the exit, not a
+                    // failure — only count escapes that happen en route
+                    // a chamber is wider than its pipes, so 2.2r counted
+                    // flying across a junction room as an escape
+                    if off > r * 3.2 {
+                        if along / total < 0.9 {
+                            out = true;
+                        }
+                        break;
+                    }
+                    t += DT;
+                }
+                // falling out is a FAILURE, not progress: the projection
+                // keeps advancing while the car flies off, which flattered
+                // the first version of this test
+                if out {
+                    escaped += 1;
+                    worst.push((ri, best));
+                } else if best > 0.85 {
+                    done += 1;
+                } else {
+                    worst.push((ri, best));
+                }
+            }
+            worst.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let checked = n_routes;
+            println!(
+                "{label:<12} traversed {done}/{checked} routes   fell out of {escaped}   worst: {}",
+                worst
+                    .iter()
+                    .take(4)
+                    .map(|(i, f)| format!("#{i} {:.0}%", f * 100.0))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+        }
+        return;
+    }
     if name == "loop" {
         // Loops must be ONE seamless piece, not a chain. Three things are
         // checked per loop: it is a single shape (a chain would be ~27),
