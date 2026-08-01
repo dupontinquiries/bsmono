@@ -934,6 +934,13 @@ pub struct Chat {
     auto_continue: bool,                    // decode a fresh reply continuously up to the reply ceiling
     stepwise: bool,                         // checkpoint mode: model pauses at ⏸ STEP k/n markers, harness auto-continues
     patch_mode: bool,
+    /// Measured decode rate, for revealpace. None until a generation has been timed — which starts
+    /// the reveal in token mode, the safe default on an unknown model.
+    last_tok_per_s: Option<f32>,
+    /// Milliseconds the current tail has been withheld, so a boundary that never arrives still flushes.
+    reveal_held_ms: u64,
+    /// Bytes revealed at the last frame, so the held clock resets when the boundary moves.
+    reveal_shown_len: usize,
     /// Debate-panel mode: several small models instead of one thinker, able to stop and ask.
     panel_mode: bool,                       // edit mode: model emits unified-diff patches instead of full files
     step_last_paused: u32,                  // dedup: highest step number already paused on this reply
@@ -1059,7 +1066,8 @@ impl Default for Chat {
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
-            auto_continue: true, stepwise: false, patch_mode: false, panel_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
+            auto_continue: true, stepwise: false, patch_mode: false, panel_mode: false,
+            last_tok_per_s: None, reveal_held_ms: 0, reveal_shown_len: 0, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
             step_verifier: crate::stepverify::Verifier::new(),
             step_open: Default::default(),
@@ -1405,6 +1413,9 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                         self.apply_patch_reply(&txt);
                     }
                 }
+                // A finished stream reveals everything; the held clock must not carry into the next turn.
+                self.reveal_held_ms = 0;
+                self.reveal_shown_len = 0;
                 self.stream = None;
                 self.rep_monitor.reset();
                 // Stepwise: the pause we requested has landed — arm the auto-continue. It fires in the
@@ -5968,6 +5979,9 @@ them to", patches.len());
                     ui.label(RichText::new(format!("thinking… ({:.0}s)", secs)).color(theme::CYAN()).small())
                         .on_hover_text("prefilling the prompt — the reply starts once this finishes");
                 } else if debug {
+                    // FEED REVEALPACE. Same numbers the debug readout uses, so the pace tracks the rate the
+                    // operator can see rather than a separate estimate that could disagree with it.
+                    if secs > 0.5 { self.last_tok_per_s = Some(toks as f32 / secs); }
                     ui.label(RichText::new(format!("{toks} tok · {:.1} tok/s", toks as f32 / secs)).color(theme::AMBER()).small());
                 } else if let Some(pred) = crate::estimate::predict(&self.gen_samples, self.last_prompt_tokens, 0.35) {
                     let pct = (crate::estimate::progress(toks, &pred) * 100.0).round() as u32;
@@ -6967,7 +6981,23 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                     .layout_no_wrap("0".into(), fid, theme::INK()).size().x;
                                     let prose_w = crate::readability::prose_width(ui.available_width(), char_px);
                                     ui.set_max_width(prose_w.max(120.0));
-                                    let segs = segment_message(m.text());
+                                    // SECTION-PACED REVEAL. Token-by-token was proof of life when generation was slow; above
+                                    // reading speed it is a jittering edge and half-formed words. revealpace holds the tail back
+                                    // to the last semantic boundary — but only when the model is FAST, because on a slow one a
+                                    // still screen reads as a hang, which is exactly when someone is deciding if anything works.
+                                    //
+                                    // The flush timeout bounds a boundary that never arrives (a long code block), and completion
+                                    // always reveals everything, so a held tail can never become text that never appears.
+                                    let shown = if streaming_here {
+                                        let pace = crate::revealpace::pace(self.last_tok_per_s);
+                                        let held = self.reveal_held_ms;
+                                        let n = crate::revealpace::reveal_upto(m.text(), pace, held, false);
+                    // Reset the clock whenever the boundary MOVED: the tail has only been withheld
+                    // since the last thing the reader actually saw, not since the turn began.
+                    if n != self.reveal_shown_len { self.reveal_held_ms = 0; self.reveal_shown_len = n; }
+                                        &m.text()[..n.min(m.text().len())]
+                                    } else { m.text() };
+                                    let segs = segment_message(shown);
                                     let last = segs.len().saturating_sub(1);
                                     let think_open = m.think_open;
                                     let mut toggle_think = false;
