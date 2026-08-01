@@ -2001,10 +2001,10 @@ impl World {
                 // start ON the deck, not in the catch basin under it
                 spawn_hint = Some(Vec3::new(0.0, py + 0.55, 19.0));
                 // the basin below: dark catch floor + glow ribs
-                push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.4, 0.0), Quat::IDENTITY, Vec3::new(30.0, 0.6, 30.0), Sdf::RBox { half: Vec3::new(30.0, 0.6, 30.0), round: 0.3 }, [0.06, 0.05, 0.10, 1.0], 0.05, 0.3);
-                for k in 0..6 {
-                    let z = -25.0 + k as f32 * 10.0;
-                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.9, z), Quat::IDENTITY, Vec3::new(28.0, 0.12, 0.35), Sdf::RBox { half: Vec3::new(28.0, 0.12, 0.35), round: 0.05 }, mix4(acc, [1.0; 4], 0.3), 0.8, 0.4);
+                push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.4, 0.0), Quat::IDENTITY, Vec3::new(74.0, 0.6, 50.0), Sdf::RBox { half: Vec3::new(74.0, 0.6, 50.0), round: 0.3 }, [0.06, 0.05, 0.10, 1.0], 0.05, 0.3);
+                for k in 0..10 {
+                    let z = -45.0 + k as f32 * 10.0;
+                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.9, z), Quat::IDENTITY, Vec3::new(70.0, 0.12, 0.35), Sdf::RBox { half: Vec3::new(70.0, 0.12, 0.35), round: 0.05 }, mix4(acc, [1.0; 4], 0.3), 0.8, 0.4);
                 }
                 // HEX DECK: flat-top hexagons on a proper staggered grid.
                 // Each tile is a muted base plus an inset panel that ENERGIZES
@@ -2013,11 +2013,11 @@ impl World {
                 let hr = 4.15f32; // circumradius
                 let px = hr * 1.5; // column pitch (flat-top hex)
                 let pz = hr * 1.7320508; // row pitch
-                for iz in -3i32..=3 {
-                    for ix in -6i32..=6 {
+                for iz in -5i32..=5 {
+                    for ix in -9i32..=9 {
                         let x = ix as f32 * px;
                         let z = iz as f32 * pz + if ix % 2 == 0 { 0.0 } else { pz * 0.5 };
-                        if x.abs() > 46.0 || z.abs() > 24.0 {
+                        if x.abs() > 62.0 || z.abs() > 40.0 {
                             continue;
                         }
                         let team_col = if z < -1.0 {
@@ -2027,7 +2027,7 @@ impl World {
                         } else {
                             [0.34, 0.34, 0.40, 1.0]
                         };
-                        let hp = if iz == 0 { 1 } else if iz.abs() == 1 { 2 } else { 3 };
+                        let hp = if iz == 0 { 1 } else if iz.abs() <= 2 { 2 } else { 3 };
                         let pos = Vec3::new(x, py, z);
                         let sdf = Sdf::Hex { r: hr, h: 0.5 };
                         // muted base: dark, low spec, barely lit
@@ -2061,17 +2061,76 @@ impl World {
                         });
                     }
                 }
-                // glass rails keep the ball over the deck; open ends for cars
+                // ---- RAMP WALLS: the bowl. A flat glass rail gives you a
+                // wall to bounce off; a RAMP gives you a wall to drive, and
+                // that is where Dropshot's verticality lives — carry up the
+                // side, turn over the deck, come down on a weak tile. Every
+                // ramp is in the blend group, so the deck-to-ramp seam
+                // fillets into a drivable transition instead of a lip.
+                let (hx, hz) = (64.0f32, 42.0f32); // deck edges
+                let lean = 0.62f32; // ~36 degrees: steep, still climbable
+                let rw = 17.0f32; // ramp length up the slope
+                let (cs, sn) = (lean.cos(), lean.sin());
+                let wall_col = mix4(PLINTH, acc, 0.18);
+                let mut ramp = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, rot: Quat| {
+                    let i = push(shapes, M_BOX, pos, rot, half, Sdf::RBox { half, round: 0.35 }, wall_col, 0.04, 0.45);
+                    shapes[i].blend = true;
+                };
+                // The toe is buried UNDER the deck: left flush with the edge,
+                // a car drove into the ramp's blunt end face and stopped dead
+                // (0.7 m of "climb" in the mech sim). Overlapping inward means
+                // the only surface you can meet is the slope itself.
+                let toe = 11.0f32;
                 for sx in [-1.0f32, 1.0] {
-                    push(&mut shapes, M_BOX, Vec3::new(sx * 51.5, py + 3.4, 0.0), Quat::IDENTITY, Vec3::new(0.5, 3.6, 26.0), Sdf::RBox { half: Vec3::new(0.5, 3.6, 26.0), round: 0.2 }, [acc[0], acc[1], acc[2], 0.30], 0.12, 0.5);
+                    ramp(
+                        &mut shapes,
+                        Vec3::new(sx * (hx - toe + rw * cs * 0.5), py - 0.25 + rw * sn * 0.5, 0.0),
+                        Vec3::new(rw * 0.5, 0.7, hz + rw * cs),
+                        Quat::from_rotation_z(sx * lean),
+                    );
                 }
                 for sz in [-1.0f32, 1.0] {
-                    push(&mut shapes, M_BOX, Vec3::new(0.0, py + 3.4, sz * 26.0), Quat::IDENTITY, Vec3::new(51.5, 3.6, 0.5), Sdf::RBox { half: Vec3::new(51.5, 3.6, 0.5), round: 0.2 }, [acc[0], acc[1], acc[2], 0.30], 0.12, 0.5);
-                    // entry ramps up from the plain at both ends
-                    let rz = sz * 34.0;
-                    let rot = Quat::from_rotation_x(-sz * 0.42);
-                    let half = Vec3::new(9.0, 0.5, 9.5);
-                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 3.2, rz), rot, half, Sdf::RBox { half, round: 0.2 }, mix4(PLINTH, acc, 0.2), 0.05, 0.4);
+                    ramp(
+                        &mut shapes,
+                        Vec3::new(0.0, py - 0.25 + rw * sn * 0.5, sz * (hz - toe + rw * cs * 0.5)),
+                        Vec3::new(hx + rw * cs, 0.7, rw * 0.5),
+                        Quat::from_rotation_x(-sz * lean),
+                    );
+                }
+                // corner ramps, turned 45 degrees in plan so the bowl closes
+                for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let yaw = f32::atan2(sx, sz);
+                    let c = Vec3::new(sx * (hx - toe * 0.7 + rw * cs * 0.35), py - 0.25 + rw * sn * 0.5, sz * (hz - toe * 0.7 + rw * cs * 0.35));
+                    ramp(
+                        &mut shapes,
+                        c,
+                        Vec3::new(rw * 0.75, 0.7, rw * 0.75),
+                        Quat::from_rotation_y(yaw) * Quat::from_rotation_x(lean * 0.85),
+                    );
+                }
+                // a glass lip above the ramp crest keeps the ball in play
+                let crest = py + rw * sn;
+                for sx in [-1.0f32, 1.0] {
+                    let h = Vec3::new(0.5, 3.2, hz + rw * cs + 2.0);
+                    push(&mut shapes, M_BOX, Vec3::new(sx * (hx + rw * cs + 0.5), crest + 3.2, 0.0), Quat::IDENTITY, h, Sdf::RBox { half: h, round: 0.2 }, [acc[0], acc[1], acc[2], 0.26], 0.12, 0.5);
+                }
+                for sz in [-1.0f32, 1.0] {
+                    let h = Vec3::new(hx + rw * cs + 2.0, 3.2, 0.5);
+                    push(&mut shapes, M_BOX, Vec3::new(0.0, crest + 3.2, sz * (hz + rw * cs + 0.5)), Quat::IDENTITY, h, Sdf::RBox { half: h, round: 0.2 }, [acc[0], acc[1], acc[2], 0.26], 0.12, 0.5);
+                }
+                // light strips tracing the crest, so the bowl edge reads
+                for k in 0..12 {
+                    let a2 = k as f32 / 12.0 * std::f32::consts::TAU;
+                    let p = Vec3::new(a2.cos() * (hx + rw * cs), crest + 0.3, a2.sin() * (hz + rw * cs));
+                    push(&mut shapes, M_BOX, p, Quat::from_rotation_y(-a2), Vec3::new(2.4, 0.10, 0.10), Sdf::None, mix4(acc, [1.0; 4], 0.4), 0.9, 0.4);
+                }
+                // entry ramps from the plain up to the crest at both ends
+                for sz in [-1.0f32, 1.0] {
+                    let rz = sz * (hz + rw * cs + 14.0);
+                    let rot = Quat::from_rotation_x(-sz * 0.34);
+                    let half = Vec3::new(11.0, 0.6, 15.0);
+                    let i = push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + (crest - g0) * 0.45, rz), rot, half, Sdf::RBox { half, round: 0.25 }, mix4(PLINTH, acc, 0.2), 0.05, 0.4);
+                    shapes[i].blend = true;
                 }
             }
             16 => {

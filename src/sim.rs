@@ -2162,7 +2162,29 @@ pub fn run(args: &[String]) {
         let v1 = world.bodies[bi].vel.length();
         println!("kuiper: lightest asteroid speed {v0:.2} -> {v1:.2} after a ball slam");
         let ok2 = v1 > v0 + 1.0;
-        println!("{}", if ok1 && ok2 { "MECHANICS: PASS" } else { "MECHANICS: FAIL" });
+        // ---- DROPSHOT ramp walls: is the bowl actually drivable? ----
+        let world3 = World::generate(9, crate::world::style(26), 0.31, 1.0);
+        let deck_y = world3.drop_pit.unwrap_or(6.0);
+        let mut climbed = 0.0f32;
+        {
+            let mut car = physics::Car::new();
+            // start on the deck near the edge, aimed at the wall
+            car.pos = Vec3::new(52.0, deck_y + 0.5, 0.0);
+            car.rot = glam::Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::X);
+            car.vel = Vec3::X * 20.0;
+            let mut c2 = physics::Controls::default();
+            c2.throttle = 1.0;
+            c2.boost = true;
+            let b2 = Ball::new();
+            for _ in 0..240 {
+                physics::step_car_only(&mut car, &b2, &world3, &c2, &cfg, DT);
+                climbed = climbed.max(car.pos.y - deck_y);
+            }
+        }
+        let ok3 = climbed > 6.0;
+        println!("dropshot: ramp wall climb {climbed:.1} m above the deck  {}",
+            if ok3 { "drivable verticality" } else { "NOT CLIMBABLE" });
+        println!("{}", if ok1 && ok2 && ok3 { "MECHANICS: PASS" } else { "MECHANICS: FAIL" });
         return;
     }
     if name == "mp" {

@@ -1510,6 +1510,27 @@ portal face as a translucent disc; a true recursive raster pass (render the
 scene from the virtual camera into a target, sample it on the quad) is the
 next step and needs hardware to tune.
 
+## v1.47.0 — DROPSHOT gets its bowl
+
+The arena had flat glass rails: a wall to BOUNCE off, not one to drive.
+That is where Dropshot's verticality lives — carry up the side, turn over
+the deck, and come down on a weakened tile — so the perimeter is now a
+RAMP BOWL: four side ramps at ~36 degrees, four corner ramps turned 45
+degrees in plan to close it, a glass lip above the crest to keep the ball
+in play, light strips tracing the rim, and longer entry ramps from the
+plain. Every ramp is in the blend group, so the deck-to-ramp seam fillets
+into a transition instead of a lip. The catch basin below grew to match
+(74 x 50) with ten glow ribs.
+
+`--sim mech` gained a ramp-climb check — drive off the deck into the wall
+and see how high you get — and it immediately earned its keep. Ramps
+flush with the deck edge measured **0.7 m of climb**: the car was hitting
+each ramp's blunt END FACE and stopping dead, because a rotated box
+presents a wall at its foot. Burying the toe 11 m under the deck leaves
+only the slope exposed, and the same test now reads **21.1 m above the
+deck** — the bowl is genuinely drivable, and the check will catch it if a
+future edit flattens it again.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
