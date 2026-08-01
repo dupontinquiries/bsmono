@@ -64,3 +64,53 @@ than a GPU one — and it is the first case where the CPU path is not a fallback
 2. If reuse is high: GLM-5.2 on the CPU path via mmap, no new quantization needed.
 3. If reuse is low: IQ3_XXS support, with a gate against a CPU reference — and note that Q6_K took four
    faults to get right, three invisible to inspection.
+
+
+## Colibri runs GLM-5.2, and its glm.c answers all three blockers
+
+`colibri-main/c/glm.c` is 6,657 lines of "Motore GLM-5.2 (architettura glm_moe_dsa)". Its header
+comment is an implementation guide, and one line removes the blocker I called structural.
+
+### The sparse attention indexer is a NO-OP at short context
+
+> *"Il DSA indexer e' un NO-OP per seq <= index_topk (seleziona tutte le key): qui si usa attenzione
+> causale densa -> output identico all'oracolo su prompt corti."*
+
+The indexer selects the top-k keys. When the sequence is **at or below `index_topk`, top-k is every
+key** — so dense causal attention is not an approximation of the sparse path, it is *the same
+computation*. Colibri validates this against a transformers oracle and reports identical output.
+
+GLM-5.2's `index_topk` is 2048. So **the whole indexer is unnecessary below 2048 tokens of context**,
+and above it the model degrades rather than breaking. That converts "structural blocker, no dense
+fallback" into "works today at short context".
+
+### The two weighting knobs, exactly
+
+```c
+3036:  if (norm_topk) { sum = Σ w; sum += 1e-20; w[k] /= sum; }   // normalize
+3037:  for (k) w[k] *= routed_scale;                              // THEN scale
+```
+
+**The order is load-bearing and the wrong order is silent.** Normalizing divides by the sum, which
+removes any common factor — so scaling *before* normalizing cancels the scale entirely. The model runs,
+looks fine, and `routed_scaling_factor` does nothing.
+
+### Residency is far smaller than the file
+
+> *"gli expert (streaming) e la parte DENSA residente … sono tenuti in int8 per-riga + scala … ~17B
+> param residenti a int4 ~= 8.7 GB"*
+
+The routed experts stream per-expert from disk; only the dense part, attention, embeddings, lm_head and
+the shared expert stay resident. That is **~17B parameters, not 200B+** — which is the `tensorplace`
+split arrived at independently, confirmed by an implementation that runs the model.
+
+## Revised status
+
+| blocker | status |
+|---|---|
+| `ExpertWeightsNorm` | **implemented** — sum, epsilon, divide |
+| `ExpertWeightsScale` | **implemented** — after the norm, with the ordering test |
+| `SparseAttentionIndexer` | **not needed below 2048 context**; dense causal is exact there |
+
+What remains before a run: the MLA path (`supported: false`, never verified end to end), and reading
+`routed_scaling_factor` out of GGUF metadata rather than defaulting to 1.0.

@@ -2825,7 +2825,7 @@ fn main() {
         let rw = mk(1, ne * d);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let n2v = mk(7, d); let xin = mk(8, d);
         let n2t = gpu.upload(&n2v, 1, d); let x2t = gpu.upload(&xin, 1, d);
         // streaming auto-forces the v1 path (its intercept lives there); resident uses V1 too for A/B parity.
@@ -2882,7 +2882,7 @@ fn main() {
         // already resident and prefetch is a no-op, which is itself worth knowing.)
         let (d, ff, ne, n_used) = (128usize, 256usize, 16usize, 4usize);
         let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         // two layers, each with its own router + experts
         let rw: Vec<Vec<f32>> = (0..2).map(|l| mk(1 + l as u32, ne * d)).collect();
         let gus: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(100 + l as u32 * 50 + e as u32, 2 * ff * d)).collect()).collect();
@@ -2990,7 +2990,7 @@ fn main() {
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
         let (d, ff, ne, n_used, ring, pin) = (128usize, 256usize, 8usize, 4usize, 3usize, 2usize);
         let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw = mk(1, ne * d);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
@@ -3815,7 +3815,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             gpu_kernels::gguf::dequantize(12, &down[e * dn_nb * 144..(e + 1) * dn_nb * 144], d * ff).unwrap()).collect();
 
         let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
-            norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+            norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw: Vec<f32> = (0..ne * d).map(|i| (((i as u32).wrapping_mul(2654435761) >> 9) as f32 / 8_388_608.0) - 1.0).collect();
         let xin: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.023).cos()).collect();
 
@@ -3883,7 +3883,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             (gpu_kernels::moe::RouteNorm::Sigmoid, false, "sigmoid, weight-after (GPU-routed v2)"),
         ] {
             let cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32,
-                n_shared: 0, norm, normalize: true, weight_before: wbefore };
+                n_shared: 0, norm, normalize: true, weight_before: wbefore, routed_scale: 1.0 };
             // ---- CPU reference ----
             let mut logits = vec![0f32; ne];
             for e in 0..ne { logits[e] = (0..d).map(|i| rw[e * d + i] * xin[i]).sum(); }
@@ -3961,7 +3961,7 @@ still pass, which is why this one exists."
             stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
             stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
             cfg: gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
-                norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false },
+                norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 },
             shared: if shared {
                 Some((gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(31, 2 * ff * d), 2 * ff, d)),
                       gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(32, d * ff), d, ff))))
@@ -4871,7 +4871,7 @@ still pass, which is why this one exists."
     // shared=None (must equal the old routed-only result) and shared=Some (routed + dense SwiGLU).
     {
         let (d, ff, sff, ne, t) = (8usize, 6usize, 10usize, 4usize, 3usize);
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw = rnd(ne * d, 51);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 60 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 70 + e)).collect();
@@ -4928,7 +4928,7 @@ still pass, which is why this one exists."
         // INPUT (weight-before-FFN), plus the shared expert. CPU reference mirrors HF/llama.cpp
         // semantics directly (FFN(w·x), combined with weight 1).
         let l4cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 1, n_shared: 1,
-            norm: gpu_kernels::moe::RouteNorm::Sigmoid, normalize: false, weight_before: true };
+            norm: gpu_kernels::moe::RouteNorm::Sigmoid, normalize: false, weight_before: true, routed_scale: 1.0 };
         let l4_ref = {
             let mut out = xin.clone();
             for tok in 0..t {
@@ -4956,7 +4956,7 @@ still pass, which is why this one exists."
     // fusion — the dispatch count drops, the numbers must not move.
     {
         let (d, ff, ne) = (64usize, 32usize, 4usize);
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw = rnd(ne * d, 151);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 160 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 170 + e)).collect();
