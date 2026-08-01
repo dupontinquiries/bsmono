@@ -965,16 +965,20 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                     setup_ms,
                     sync_ms,
                     submits: ds as u64,
-                    // BOTH ZERO FOR NOW, and the consequence is stated rather than papered over:
-                    // without them perfverdict cannot evaluate the roofline, so it can never return
-                    // AtBandwidthLimit — the one verdict that says to STOP optimising. It still
-                    // resolves the submit-side question, which is what the profile line leaves open.
-                    //
-                    // Wiring them needs a resident-bytes accessor on Model and the --gate-perf
-                    // bandwidth persisted somewhere the runtime can read. Passing a guess for either
-                    // would produce a confident efficiency figure from no measurement, which is the
-                    // shape of the 24 GiB constant.
-                    active_bytes: 0,
+                    // ACTIVE BYTES, derived from the architecture rather than stored — so it cannot
+                    // drift from what the model is. Parameters times the resident bytes-per-parameter:
+                    // ~0.56 for q4 residency, which is the format the loader reports.
+                    active_bytes: {
+                        let experts = self.model.n_active_experts();
+                        let params = gpu_kernels::active_params_per_token(
+                            self.model.d, self.model.h, self.model.vocab, self.model.n_layers,
+                            self.model.n_kv_heads, self.model.head_dim, experts);
+                        (params as f64 * 0.5625) as u64      // q4 + per-32 scales
+                    },
+                    // STILL ZERO, and the roofline stays unreachable until --gate-perf's measured
+                    // bandwidth is persisted where the runtime can read it. A guess here would produce
+                    // a confident efficiency figure from no measurement — the shape of the 24 GiB
+                    // constant. perfverdict returns efficiency 0 and says so.
                     gib_per_s: 0.0,
                 };
                 let expected_batch_ms = if ds > 0 { total_ms / ds as f64 } else { 0.0 };
