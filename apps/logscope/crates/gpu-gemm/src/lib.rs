@@ -6674,6 +6674,48 @@ impl DsaConfig {
     }
 }
 impl Model {
+    /// Weight PARAMETERS read for one decoded token.
+    ///
+    /// This is the numerator of the roofline bound, and it is architecture arithmetic rather than a
+    /// stored figure — so it cannot drift from what the model actually is.
+    ///
+    /// Parameters, not bytes, deliberately: the caller knows the residency format (q4, int8) and this
+    /// does not. Multiplying by a bytes-per-parameter guessed here would produce a confident figure
+    /// from an assumption, which is the shape of every memory bug in this codebase.
+    ///
+    /// `n_active_experts` is the routed count for an MoE and 0 for a dense model; the FFN is counted
+    /// once per active expert plus any shared one, because that is what decode reads.
+    pub fn active_params_per_token(&self, n_active_experts: usize) -> u64 {
+        active_params_per_token(self.d, self.h, self.vocab, self.n_layers,
+                                self.n_kv_heads, self.head_dim, n_active_experts)
+    }
+}
+
+/// The same arithmetic as a free function, so it can be tested without constructing a whole `Model`.
+///
+/// Extracted after the test could not build one: a figure this load-bearing should not be untestable
+/// because its container is awkward to make.
+pub fn active_params_per_token(d: usize, ff: usize, vocab: usize, n_layers: usize,
+                               n_kv_heads: usize, head_dim: usize, n_active_experts: usize) -> u64 {
+    {
+        let (d, ff) = (d as u64, ff as u64);
+        let kv = (n_kv_heads * head_dim) as u64;
+        // Attention: q and o are d x d; k and v are d x (n_kv * head_dim), which is SMALLER under GQA
+        // and is the whole point of GQA — assuming four d-by-d matrices overstates it by ~40% on a
+        // 32/8 model.
+        let attn = 2 * d * d + 2 * d * kv;
+        // SwiGLU: gate and up are d x ff, down is ff x d.
+        let one_ffn = 3 * d * ff;
+        let ffn = if n_active_experts == 0 { one_ffn } else { one_ffn * n_active_experts as u64 };
+        (attn + ffn) * n_layers as u64
+            // The output projection is read every token; the embedding table is a LOOKUP, not a matmul,
+            // so only one row of it moves and it does not belong in a per-token bandwidth figure.
+            + d * vocab as u64
+    }
+}
+
+impl Model {
+
     /// Cache key fragment describing what kind of decode this model performs. MoE and dense decode have
     /// very different dispatch profiles (a MoE layer issues per-expert work; a dense one does not), so
     /// anything tuned per-GPU must also be keyed on this — a verdict measured on a dense model does not
@@ -6693,6 +6735,15 @@ impl Model {
 
     /// Does any layer stream its experts from host memory? Changes what the prefill chunk should optimise
     /// for: refill traffic rather than dispatch duration.
+    /// Routed experts activated per token, or 0 for a dense model.
+    ///
+    /// Read from the first MoE layer's own config rather than a constant: this is the number that makes
+    /// a 30B-A3B read like a 3B, and getting it from anywhere but the model would put the roofline
+    /// bound an order of magnitude out.
+    pub fn n_active_experts(&self) -> usize {
+        self.layers.iter().find_map(|b| b.moe.as_ref().map(|m| m.cfg.n_used as usize)).unwrap_or(0)
+    }
+
     pub fn streams_experts(&self) -> bool {
         self.layers.iter().any(|b| b.moe.as_ref().is_some_and(|m| m.stream.is_some()))
     }
@@ -12547,6 +12598,36 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// The active-set arithmetic, checked against models whose size is known independently.
+    #[test]
+    fn active_params_matches_a_known_dense_model() {
+        // DeepSeek-R1-Distill-Llama-8B, from the loader's own line: d=4096 layers=32 heads=32/8
+        // head_dim=128 ff=14336 vocab=128256. An 8B dense model reads roughly all of itself per token,
+        // so the figure must land near 8e9 — and the GQA term is what makes it land there.
+        let p = super::active_params_per_token(4096, 14336, 128256, 32, 8, 128, 0);
+        assert!((7.0e9..9.0e9).contains(&(p as f64)), "got {:.2e}, expected ~8e9", p as f64);
+    }
+
+    #[test]
+    fn GQA_is_counted_and_NOT_four_square_matrices() {
+        // Assuming q, k, v and o are all d x d overstates attention on a 32/8 model. The roofline
+        // bound would then say the run was closer to the limit than it is — telling an operator to
+        // stop optimising a run that had headroom.
+        let gqa = super::active_params_per_token(4096, 14336, 128256, 32, 8, 128, 0);
+        let mha = super::active_params_per_token(4096, 14336, 128256, 32, 32, 128, 0);
+        assert!(mha > gqa, "full attention reads more: {mha} vs {gqa}");
+    }
+
+    #[test]
+    fn an_MoE_counts_only_the_ACTIVE_experts() {
+        // Qwen3-30B-A3B is 30B total and ~3B active. Counting all 128 experts would claim ten times
+        // the bandwidth the run needs, and the roofline verdict would then report a run as nowhere
+        // near the limit when it is at it.
+        let active8 = super::active_params_per_token(2048, 768, 151936, 48, 4, 128, 8);
+        let all128 = super::active_params_per_token(2048, 768, 151936, 48, 4, 128, 128);
+        assert!(all128 > active8 * 5, "routing is the whole difference: {all128} vs {active8}");
+    }
+
     /// The watchdog guard must fire on every device whose driver kills long dispatches.
     ///
     /// It was keyed on `conservative_vma` — "Vulkan on Apple" — while bounding the decode window to
