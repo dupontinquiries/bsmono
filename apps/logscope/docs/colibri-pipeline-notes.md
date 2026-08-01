@@ -49,3 +49,29 @@ buffer between them.
 llama.cpp's `-ot` tensor placement and Colibri's expert streaming both assume the host copy we are
 trying to remove. Neither is a model for a zero-copy path, because neither has one — llama.cpp reads
 native blocks in its kernels instead, which is the thing our `dequant_q4k` gate was mistaken for.
+
+## Reference-check log
+
+Running tally, because the pattern in it is more useful than any single result.
+
+| checked | outcome |
+|---|---|
+| multi-accumulator reductions | **corrected me** — Colibri uses no `-ffast-math`; the technique is accumulators, not a flag |
+| `-ot` tensor-class placement | **corrected me** — llama.cpp splits by class, not by layer |
+| routed-scale ordering | **corrected me** — normalize *then* scale; reversed, the scale cancels silently |
+| GLM sparse indexer | **corrected me** — a no-op at `seq ≤ index_topk`, so dense is exact below 2048 |
+| `expert_weights_norm` (Llama-4) | **corrected me** — architectural, hardcoded `false` |
+| `expert_weights_norm` (Qwen3-MoE) | **corrected me** — architectural, hardcoded `true`; my Llama-4 fix was half a fix |
+| `expert_weights_scale` | **confirmed** — read from hparams in both builders, so metadata-driven is right |
+| QK-Norm vs RoPE ordering | **confirmed** — norm first, per head_dim; ours matches |
+
+**The pattern:** six corrections, two confirmations — and *five of the six corrections were of my own recent
+changes*, not of old code. Checking a reference right after touching an area catches far more than a
+periodic sweep, because the thing most likely to be wrong is the thing most recently reasoned about
+without one.
+
+**A second pattern worth naming:** three of the corrections were *silent* failures — the scale
+cancelling, and both `expert_weights_norm` directions. Each would have produced a model that loads,
+runs, and answers plausibly. None would have shown up in a gate. That is the class where a reference
+implementation is worth more than any test we can write ourselves, because the test would encode the
+same misunderstanding.
