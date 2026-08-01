@@ -173,8 +173,94 @@ pub fn attention_step(x: &[f32], w: &MlaWeights, dm: &MlaDims, cache: &[MlaCache
     matmul_t(&out, w.o, 1, dm.d, h * dm.v_head)
 }
 
-#[cfg(test)]
+/// Rebuild the fused `kv_b` from the split `attn_k_b` / `attn_v_b` form.
+///
+/// ## The bug this replaces
+///
+/// The loader did `a.extend_from_slice(&b)` — every k row, then every v row. But `mla.rs` indexes
+/// `kvb[head * (qk_nope + v_head) ..]`, which is **per-head interleaved**: head 0's k rows, then head
+/// 0's v rows, then head 1's. The two agree only when `n_heads == 1`.
+///
+/// For any real model they differ, and the failure is the worst kind: head 0's k lands correctly by
+/// coincidence (both layouts start with it), so the model loads, runs, and produces text — with every
+/// head's V and every later head's K read from the wrong rows.
+///
+/// `k` is `[n_heads * qk_nope, kv_lora]` and `v` is `[n_heads * v_head, kv_lora]`, both row-major with
+/// heads contiguous, which is how llama.cpp's split writes them.
+pub fn fuse_kv_b(k: &[f32], v: &[f32], n_heads: usize, qk_nope: usize, v_head: usize,
+                 kv_lora: usize) -> Option<Vec<f32>> {
+    if n_heads == 0 || kv_lora == 0 { return None; }
+    if k.len() != n_heads * qk_nope * kv_lora || v.len() != n_heads * v_head * kv_lora {
+        return None;
+    }
+    let mut out = Vec::with_capacity(k.len() + v.len());
+    for h in 0..n_heads {
+        let ko = h * qk_nope * kv_lora;
+        out.extend_from_slice(&k[ko..ko + qk_nope * kv_lora]);
+        let vo = h * v_head * kv_lora;
+        out.extend_from_slice(&v[vo..vo + v_head * kv_lora]);
+    }
+    Some(out)
+}
+
+#[cfg(test)]#[cfg(test)]
 mod tests {
+    #[test]
+    fn the_split_form_fuses_PER_HEAD_not_as_two_blocks() {
+        // The bug: the loader appended every k row then every v row. mla.rs indexes
+        // kvb[head * (qk_nope + v_head)..], which is per-head interleaved. They agree only at
+        // n_heads == 1, and head 0's k lands right by coincidence in both — so the model loads, runs,
+        // and produces text with every head's V read from the wrong rows.
+        let (nh, nope, vh, lora) = (2usize, 2usize, 3usize, 1usize);
+        // k rows numbered 10.., v rows 20..
+        let k: Vec<f32> = (0..nh * nope * lora).map(|i| 10.0 + i as f32).collect();
+        let v: Vec<f32> = (0..nh * vh * lora).map(|i| 20.0 + i as f32).collect();
+        let fused = fuse_kv_b(&k, &v, nh, nope, vh, lora).expect("shapes agree");
+
+        let rec = nope + vh;
+        // head 0: its two k rows then its three v rows
+        assert_eq!(&fused[0..nope], &[10.0, 11.0], "head 0 k");
+        assert_eq!(&fused[nope..rec], &[20.0, 21.0, 22.0], "head 0 v");
+        // head 1: the NEXT k rows, not a continuation of v
+        assert_eq!(&fused[rec..rec + nope], &[12.0, 13.0], "head 1 k");
+        assert_eq!(&fused[rec + nope..2 * rec], &[23.0, 24.0, 25.0], "head 1 v");
+
+        // and the naive concatenation is a DIFFERENT array, which is the whole point
+        let mut naive = k.clone();
+        naive.extend_from_slice(&v);
+        assert_ne!(naive, fused, "if these matched, the old loader was fine and this is noise");
+    }
+
+    #[test]
+    fn a_single_head_makes_both_layouts_identical() {
+        // Why this survived review: at n_heads == 1 the naive concatenation IS correct, so any test
+        // written with one head would have passed.
+        let (nope, vh, lora) = (2usize, 3usize, 2usize);
+        let k: Vec<f32> = (0..nope * lora).map(|i| i as f32).collect();
+        let v: Vec<f32> = (0..vh * lora).map(|i| 100.0 + i as f32).collect();
+        let mut naive = k.clone();
+        naive.extend_from_slice(&v);
+        assert_eq!(fuse_kv_b(&k, &v, 1, nope, vh, lora).unwrap(), naive);
+    }
+
+    #[test]
+    fn mismatched_shapes_return_None_rather_than_a_short_array() {
+        // A silently truncated kv_b would read zeros for the last heads — plausible output again.
+        assert!(fuse_kv_b(&[1.0; 4], &[1.0; 6], 2, 2, 3, 1).is_some());
+        assert!(fuse_kv_b(&[1.0; 3], &[1.0; 6], 2, 2, 3, 1).is_none(), "k is short");
+        assert!(fuse_kv_b(&[1.0; 4], &[1.0; 5], 2, 2, 3, 1).is_none(), "v is short");
+        assert!(fuse_kv_b(&[], &[], 0, 2, 3, 1).is_none(), "no heads");
+    }
+
+    #[test]
+    fn the_fused_length_matches_what_mla_indexes() {
+        // n_heads * (qk_nope + v_head) * kv_lora — the shape mla.rs assumes when it slices by head.
+        let (nh, nope, vh, lora) = (4usize, 8usize, 16usize, 32usize);
+        let k = vec![0f32; nh * nope * lora];
+        let v = vec![0f32; nh * vh * lora];
+        assert_eq!(fuse_kv_b(&k, &v, nh, nope, vh, lora).unwrap().len(), nh * (nope + vh) * lora);
+    }
+
     use super::*;
 
     fn seeded(n: usize, seed: u64) -> Vec<f32> {
