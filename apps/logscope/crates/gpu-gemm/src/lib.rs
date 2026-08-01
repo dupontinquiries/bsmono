@@ -9616,6 +9616,23 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         Ok(out)
     }
 
+    /// Read `n` bytes back through the shader's own `byte_at`, to test the reader in isolation.
+    ///
+    /// Lives here rather than in the gate so `upload_bytes` and `dispatch` stay private — a diagnostic
+    /// is not a reason to widen an API surface.
+    pub fn byte_probe(&self, raw: &[u8]) -> Vec<f32> {
+        let n = raw.len();
+        let mut padded = raw.to_vec();
+        padded.resize(n.div_ceil(4) * 4, 0);
+        let src = self.upload_bytes(&padded, "byte-probe-src");
+        let srct = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, view: None };
+        let out = self.alloc_resident_words(n);
+        let dims = [n as u32, 0u32, 0u32, 0u32];
+        self.dispatch(BYTE_PROBE, &[&srct], &out, bytemuck::cast_slice(&dims),
+                      ((n as u32).div_ceil(64), 1, 1));
+        self.download(&out)
+    }
+
     /// The device's per-buffer ceiling. No single allocation may exceed it, whatever the total budget.
     ///
     /// Honeykrisp reports ~2047 MiB (2^31 - 1), which is why the arena packs into slabs of that size and
@@ -12138,6 +12155,38 @@ fn wgsl_fn_body(src: &str, sig: &str) -> Option<String> {
         .collect::<Vec<_>>().join(" ");
     Some(no_comments.split_whitespace().collect::<Vec<_>>().join(" "))
 }
+
+/// A shader that does NOTHING but read bytes back, so `byte_at` can be tested in isolation.
+///
+/// Five rounds of inference from dequantizer output have not settled whether `byte_at` advances past
+/// the first `u32`. The dequantizers do too much — scales, nibbles, sub-block indexing — for their
+/// output to name one cause. This does one thing, so its output is the answer rather than evidence for
+/// an argument.
+///
+/// `dst[i] = f32(byte_at(i))`. A correct run returns the source bytes. The failure modes are then
+/// distinguishable at a glance:
+///
+/// * `[0,1,2,3, 4,5,6,7, ...]` — `byte_at` is fine and the fault is in the dequantizers.
+/// * `[0,1,2,3, 0,1,2,3, ...]` — the index wraps within word 0.
+/// * `[0,1,2,3, 3,3,3,3, ...]` — reads past word 0 clamp to the last valid byte.
+/// * `[0,1,2,3, 0,0,0,0, ...]` — reads past the binding return zero, so the BINDING is short.
+///
+/// The last two are the ones the Q6_K signature is consistent with, and they need opposite fixes: a
+/// clamp means the binding is right and the index is wrong; a zero means the binding is short.
+pub const BYTE_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(byte_at(i));
+}
+"#;
 
 pub const Q6K_DEQUANT: &str = r#"
 struct D { n:u32, _a:u32, _b:u32, _c:u32 };
