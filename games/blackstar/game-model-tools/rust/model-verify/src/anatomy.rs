@@ -103,6 +103,57 @@ pub const MIRROR_TOL: f64 = 0.04;
 /// unpaired. A turret sits at 0.00 and a tread at ±0.32, so the gap is wide.
 pub const CENTRE_TOL: f64 = 0.06;
 
+/// Which axis actually carries the model's symmetry.
+///
+/// NOT the second-longest axis, which is what [`Axes::of`] guesses. That guess
+/// is wrong often enough to matter: the t4b tread mech has **28 mirror pairs
+/// across X** and none across Y, and assuming the middle axis reported it as a
+/// model with no symmetry at all — a completely wrong answer delivered
+/// confidently.
+///
+/// A hovertank is nearly square in plan (2.00 x 1.98) so its "middle" axis is
+/// decided by rounding, and a mech in an action pose can be symmetric across an
+/// axis its bounding box does not suggest. So the axis is FOUND by counting
+/// pairs across each of the three and taking the winner, which costs three
+/// passes and removes the guess.
+pub fn mirror_axis(parts: &[Part], span: [f64; 3]) -> (usize, usize) {
+    let scale = span.iter().cloned().fold(0.0f64, f64::max).max(1e-9);
+    let mut best = (0usize, 0usize);
+    for lat in 0..3 {
+        let n = count_pairs(parts, lat, scale);
+        if n > best.1 { best = (lat, n); }
+    }
+    best
+}
+
+/// Pairs across one axis. Cheap, and the only thing `mirror_axis` needs.
+fn count_pairs(parts: &[Part], lat: usize, scale: f64) -> usize {
+    if parts.is_empty() { return 0; }
+    let mid: f64 = parts.iter().map(|p| p.centre[lat]).sum::<f64>() / parts.len() as f64;
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(parts[*i].verts));
+    let mut used = vec![false; parts.len()];
+    let mut n = 0;
+    for &i in &order {
+        if used[i] { continue; }
+        let a = &parts[i];
+        let off = a.centre[lat] - mid;
+        for &j in &order {
+            if used[j] || j == i { continue; }
+            let b = &parts[j];
+            if b.verts != a.verts { continue; }
+            let bo = b.centre[lat] - mid;
+            if bo * off > 0.0 { continue; }
+            let d = ((bo + off).abs()
+                   + (0..3).map(|k| if k == lat { 0.0 }
+                                    else { (a.centre[k] - b.centre[k]).abs() }).sum::<f64>()
+                   + (0..3).map(|k| (a.extent[k] - b.extent[k]).abs()).sum::<f64>()) / scale;
+            if d <= MIRROR_TOL { used[i] = true; used[j] = true; n += 1; break; }
+        }
+    }
+    n
+}
+
 /// Find the body plan.
 ///
 /// Pairs are matched greedily from the largest part down, because a big part
@@ -310,5 +361,59 @@ mod tests {
         let s = summarise(&body_plan(&parts, span, Axes::of(span)));
         assert!(s.paired_fraction < 0.2, "should find almost nothing: {s:?}");
         assert!(s.odd >= 6);
+    }
+}
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+
+    fn part(i: usize, verts: usize, c: [f64; 3], e: [f64; 3]) -> Part {
+        Part { index: i, verts, centre: c, extent: e }
+    }
+
+    #[test]
+    fn the_mirror_axis_is_found_not_guessed() {
+        // The t4b tread mech has 28 pairs across X and none across Y, and its
+        // second-longest axis is Y — so assuming the middle axis reported a
+        // highly symmetric model as having no symmetry at all.
+        let span = [2.00, 1.26, 1.95];
+        assert_eq!(Axes::of(span).lateral, 2, "the bbox guess says Z");
+        // parts mirrored across X, which the guess would miss
+        let parts: Vec<Part> = (0..6).flat_map(|k| {
+            let y = k as f64 * 0.2;
+            [part(k * 2, 100 + k, [ 0.4, y, 0.1], [0.1, 0.1, 0.1]),
+             part(k * 2 + 1, 100 + k, [-0.4, y, 0.1], [0.1, 0.1, 0.1])]
+        }).collect();
+        let (lat, n) = mirror_axis(&parts, span);
+        assert_eq!(lat, 0, "the symmetry is across X");
+        assert_eq!(n, 6, "and all six pairs are found");
+    }
+
+    #[test]
+    fn a_near_square_plan_does_not_decide_the_axis_by_rounding() {
+        // The hovertank is 2.00 x 1.98: which axis is "middle" is decided by
+        // noise, so the answer must come from the parts rather than the box.
+        let span = [2.00, 1.98, 1.13];
+        let parts: Vec<Part> = (0..4).flat_map(|k| {
+            let x = k as f64 * 0.3;
+            [part(k * 2, 50 + k, [x,  0.5, 0.0], [0.1, 0.1, 0.1]),
+             part(k * 2 + 1, 50 + k, [x, -0.5, 0.0], [0.1, 0.1, 0.1])]
+        }).collect();
+        let (lat, n) = mirror_axis(&parts, span);
+        assert_eq!(lat, 1, "these parts mirror across Y regardless of the span order");
+        assert_eq!(n, 4);
+    }
+
+    #[test]
+    fn a_genuinely_asymmetric_model_reports_zero_on_every_axis() {
+        // The honest answer is still available: an action pose, or a model with
+        // no symmetry, must not be forced into a body plan.
+        let parts: Vec<Part> = (0..7).map(|k|
+            part(k, 40 + k * 11, [k as f64 * 0.21, k as f64 * 0.13, k as f64 * 0.07],
+                 [0.1 + k as f64 * 0.02, 0.1, 0.1])
+        ).collect();
+        let (_, n) = mirror_axis(&parts, [2.0, 1.5, 1.0]);
+        assert_eq!(n, 0, "nothing pairs, and that is the correct answer");
     }
 }
