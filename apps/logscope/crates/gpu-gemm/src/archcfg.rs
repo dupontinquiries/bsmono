@@ -299,7 +299,25 @@ pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32,
         // expert_weights_norm=true would have silently switched Llama-4 into a shape it does not have.
         //
         // So the arch VETOES rather than merely defaulting, which is archfeat's rule arriving here.
-        normalize: if matches!(cfg.arch, Arch::Llama4) { false } else { norm.unwrap_or(true) },
+        // ARCHITECTURAL WHERE THE ARCHITECTURE DECIDES IT, metadata only where it does not.
+        //
+        // Checked against llama.cpp's per-model builders, and it hardcodes norm_w as a LITERAL for
+        // both of these — not from hparams:
+        //
+        //     models/llama4.cpp:228     LLM_FFN_SILU, false,   <- Llama-4
+        //     models/qwen3moe.cpp:144   LLM_FFN_SILU, true,    <- Qwen3-MoE
+        //
+        // So my _370 change was wrong for BOTH, not just Llama-4. A Qwen checkpoint carrying
+        // expert_weights_norm=false would have switched off a normalization the architecture requires,
+        // and the output would have been plausible rather than broken.
+        //
+        // The scale is different and IS read from metadata in both files
+        // (hparams.expert_weights_scale), which is why routed_scale stays metadata-driven.
+        normalize: match cfg.arch {
+            Arch::Llama4 => false,
+            Arch::Qwen3Moe => true,
+            _ => norm.unwrap_or(true),
+        },
         // GLM-5.2 sets routed_scaling_factor (2.5); everything else leaves it inert at 1.0. Applied
         // AFTER normalization — see the ordering note on the field.
         routed_scale: scale.unwrap_or(1.0),
@@ -518,9 +536,12 @@ mod tests {
         // llama.cpp reads expert_weights_norm from the checkpoint rather than deriving it from the
         // architecture. A model that sets it false without being Llama-4 would otherwise be normalized
         // against its own config — and the output would be plausible, not broken.
-        let qwen = for_arch("qwen3moe");
-        assert!(moe_config(&qwen, 128, 8, 0, None, None).normalize, "arch default: normalize");
-        assert!(!moe_config(&qwen, 128, 8, 0, None, Some(false)).normalize, "metadata wins");
+        // Rewritten twice as the reference check narrowed it. Qwen and Llama-4 are now BOTH
+        // architectural — llama.cpp hardcodes norm_w for each — so this exercises an arch that has
+        // not been checked against a reference, where the checkpoint is still the better source.
+        let ds = for_arch("deepseek2");
+        assert!(moe_config(&ds, 128, 8, 0, None, None).normalize, "default when absent");
+        assert!(!moe_config(&ds, 128, 8, 0, None, Some(false)).normalize, "metadata wins");
         // I asserted the other direction here in _370 — that metadata could turn Llama-4's gate ON.
         // That is the case now vetoed: its raw sigmoid multiplies the expert's INPUT, so a normalized
         // weight there is a different forward pass, not the same one scaled. The test asserted the
@@ -544,12 +565,38 @@ mod tests {
     }
 
     #[test]
-    fn other_architectures_still_take_the_metadata() {
-        // The veto is narrow: everywhere else the checkpoint knows better than a default.
+    fn QWEN3MOE_also_ignores_the_metadata_and_llamacpp_is_why() {
+        // The check found this and it widened the last fix. llama.cpp hardcodes norm_w as a LITERAL
+        // in both per-model builders:
+        //
+        //     models/llama4.cpp:228     LLM_FFN_SILU, false,
+        //     models/qwen3moe.cpp:144   LLM_FFN_SILU, true,
+        //
+        // Neither reads hparams.expert_weights_norm. So a Qwen checkpoint carrying
+        // expert_weights_norm=false would have switched off a normalization the architecture
+        // requires — the same class of silent breakage as the Llama-4 case, in the other direction.
         let q = for_arch("qwen3moe");
-        assert!(!moe_config(&q, 128, 8, 0, None, Some(false)).normalize);
-        assert!(moe_config(&q, 128, 8, 0, None, Some(true)).normalize);
-        assert!(moe_config(&q, 128, 8, 0, None, None).normalize, "default when absent");
+        assert!(moe_config(&q, 128, 8, 0, None, Some(false)).normalize,
+            "the architecture requires it; metadata cannot switch it off");
+        assert!(moe_config(&q, 128, 8, 0, None, None).normalize);
+    }
+
+    #[test]
+    fn the_SCALE_is_still_metadata_driven_for_both() {
+        // The scale IS read from hparams in both files, which is why it stays metadata-driven — the
+        // two knobs are not the same kind of thing and treating them alike was the original mistake.
+        for a in ["llama4", "qwen3moe"] {
+            let c = for_arch(a);
+            assert_eq!(moe_config(&c, 16, 1, 1, Some(2.5), None).routed_scale, 2.5, "{a}");
+        }
+    }
+
+    #[test]
+    fn an_architecture_we_have_not_checked_still_takes_the_metadata() {
+        // The hardcoding is only justified where a reference implementation was read. Elsewhere the
+        // checkpoint remains the better source.
+        let d = for_arch("deepseek2");
+        assert!(!moe_config(&d, 128, 8, 0, None, Some(false)).normalize);
     }
 
     #[test]
