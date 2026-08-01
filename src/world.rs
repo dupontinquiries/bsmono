@@ -790,16 +790,15 @@ impl World {
                     let axis = (b - a).normalize_or(Vec3::Z);
                     let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
-                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.34], glow, 0.92);
                     shapes[si].blend = true;
                     // BEVEL COLLARS: a fillet torus at each mouth eases the
                     // transition (and hides the seam where the bore opens)
                     for (ep, ea) in [(a, axis), (b, axis)] {
                         let brot = Quat::from_rotation_arc(Vec3::Y, ea) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                        // the collar is a VISUAL fillet: as a solid it sat
-                        // exactly on the bore wall and, blended, thickened it
-                        // inward at every single joint
-                        push(shapes, M_TORUS_THIN, ep, brot, Vec3::splat(r * 1.0), Sdf::None, [col[0], col[1], col[2], 0.5], glow * 0.6 + 0.1, 0.45);
+                        // (the mouth chamfer is part of the tube mesh now —
+                        // a collar torus here was one more ring in the way)
+                        let _ = (ep, brot);
                     }
                     // A node every ~5 m with generous reach, following the
                     // SDF gradient. Sparse nodes left the middle of a long
@@ -1028,9 +1027,12 @@ impl World {
                         let hrot = Quat::from_rotation_arc(Vec3::Y, dir) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
                         for k in 1..n {
                             let p = a.lerp(b, k as f32 / n as f32);
-                            // glowing guide rings: drawn only. As collision
-                            // they pinched the bore they were meant to light.
-                            push(&mut shapes, M_TORUS_THIN, p, hrot, Vec3::splat(r * 0.88), Sdf::None, mix4(acc, [1.0; 4], 0.3), 0.75, 0.4);
+                            // A LIGHT LINE, NOT A RING. Hoops every 20 m read
+                            // as clutter filling the pipe; a short glowing
+                            // strip laid along the bore wall lights the way
+                            // without standing in it.
+                            let strip = Vec3::new(r * 0.05, 0.05, 3.2);
+                            push(&mut shapes, M_BOX, p - Vec3::Y * (r * 0.82), hrot, strip, Sdf::None, mix4(acc, [1.0; 4], 0.35), 0.85, 0.4);
                         }
                     }
                     spine_pads.push(a.lerp(b, 0.5) - Vec3::Y * (r * 0.8));
@@ -1510,16 +1512,15 @@ impl World {
                     let axis = (b - a).normalize_or(Vec3::Z);
                     let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
-                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.34], glow, 0.92);
                     shapes[si].blend = true;
                     // BEVEL COLLARS: a fillet torus at each mouth eases the
                     // transition (and hides the seam where the bore opens)
                     for (ep, ea) in [(a, axis), (b, axis)] {
                         let brot = Quat::from_rotation_arc(Vec3::Y, ea) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                        // the collar is a VISUAL fillet: as a solid it sat
-                        // exactly on the bore wall and, blended, thickened it
-                        // inward at every single joint
-                        push(shapes, M_TORUS_THIN, ep, brot, Vec3::splat(r * 1.0), Sdf::None, [col[0], col[1], col[2], 0.5], glow * 0.6 + 0.1, 0.45);
+                        // (the mouth chamfer is part of the tube mesh now —
+                        // a collar torus here was one more ring in the way)
+                        let _ = (ep, brot);
                     }
                     // A node every ~5 m with generous reach, following the
                     // SDF gradient. Sparse nodes left the middle of a long
@@ -1576,7 +1577,7 @@ impl World {
                 let loop_ring = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, wp: &mut Vec<Vec3>, c: Vec3, axis: Vec3, r: f32, col: [f32; 4], glow: f32| -> f32 {
                     let big = r / crate::meshgen::TT_R;
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y));
-                    let i = push(shapes, M_TORUS_TUBE, c, rot, Vec3::splat(big), Sdf::TubeTorus { big, tube: r, thick: big * crate::meshgen::TT_T }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let i = push(shapes, M_TORUS_TUBE, c, rot, Vec3::splat(big), Sdf::TubeTorus { big, tube: r, thick: big * crate::meshgen::TT_T }, [col[0], col[1], col[2], 0.34], glow, 0.92);
                     shapes[i].blend = true;
                     let (u, v) = (rot * Vec3::X, rot * Vec3::Z);
                     // 28 waypoints, not 12: at 12 the straight CHORD between

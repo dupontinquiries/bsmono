@@ -3061,7 +3061,13 @@ impl Game {
                 (world::M_SHELL_OPEN, true) => world::M_SHELL_OPEN_LO,
                 _ => s.mesh,
             };
-            push(&mut objs, mesh, None, s.mat, s.color, [0.0, em, s.spec, 0.0]);
+            // params.x flags ROUGH GLASS: tubes and junction rooms get a
+            // frosted, scattering reflection instead of a mirror finish
+            let glassy = matches!(
+                s.mesh,
+                world::M_SHELL | world::M_SHELL_LO | world::M_SHELL_OPEN | world::M_SHELL_OPEN_LO | world::M_TORUS_TUBE
+            );
+            push(&mut objs, mesh, None, s.mat, s.color, [if glassy { 1.0 } else { 0.0 }, em, s.spec, 0.0]);
         }
 
         // ---- rain: instanced streaks around the car (MONKEY RUN) ----

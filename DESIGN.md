@@ -1531,6 +1531,37 @@ only the slope exposed, and the same test now reads **21.1 m above the
 deck** — the bowl is genuinely drivable, and the check will catch it if a
 future edit flattens it again.
 
+## v1.48.0 — the tubes get thickness, frost, and quiet
+
+Four complaints, four causes.
+
+NOT 3D — the mouths had ZERO THICKNESS. v1.27 removed the tube's annulus
+end caps because that flat ring was a wall you drove into at every
+junction; correct, but it left the outer and inner walls meeting at a bare
+edge, so a pipe read as a rolled sheet rather than something with a wall.
+`tube_open` now closes each end with a CHAMFER BAND joining the two
+surfaces, its inner lip pulled back along the axis — so the mouth is a
+tapered edge you can see the thickness of, and it catches a highlight
+instead of vanishing. It is a rim, not a cap: nothing to hit.
+
+NO TAPERED EDGES — same fix. The chamfer is geometry now, which also let
+the bevel COLLAR tori at every mouth go: they existed to fake this.
+
+FILLED WITH RINGS — the guide hoops every 20 m of bore, plus a collar at
+each joint. Both are gone. Lighting inside a pipe is now a short glowing
+STRIP laid along the bore wall: it lights the way without standing in it.
+The clutter was also expensive — Perplexus dropped 1241 -> 981 shapes and
+Monkey Run 1663 -> 1256 with no loss of anything you drive on.
+
+NOT GLASSY — shells were alpha 0.55 at spec 0.45: coloured film. They are
+now alpha 0.34 at spec 0.92, and flagged as ROUGH GLASS (params.x) so the
+shader gives them a fresnel-driven reflection (0.18 head-on to 0.92 at
+grazing) with the reflected ray JITTERED into a small cone per fragment.
+That scatter is what reads as thick, slightly frosted glass rather than a
+mirror — and it hides the banding a perfectly smooth curved surface shows.
+
+Bores, loops, portals, mechanics and driving all regress unchanged.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

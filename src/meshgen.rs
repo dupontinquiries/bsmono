@@ -276,6 +276,38 @@ pub fn tube_open(seg: u32) -> MeshData {
     };
     ring(ro, false);
     ring(ri, true);
+    // CHAMFERED MOUTHS. With bare outer and inner walls the rim was a
+    // zero-thickness edge — the tube read as a rolled sheet rather than a
+    // pipe with a wall. This band joins the two surfaces at each end and is
+    // pulled back along the axis as it goes in, so the mouth is a TAPERED
+    // chamfer you can see the thickness of, and it catches a highlight.
+    let cham = (ro - ri) * 0.9; // axial setback of the inner lip
+    let mut rim = |end: f32| {
+        let base = m.verts.len() as u32;
+        for i in 0..=n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            let (c, sn) = (a.cos(), a.sin());
+            // the chamfer faces outward AND along the axis: halfway between
+            let nrm = [c * 0.7, end * 0.71, sn * 0.7];
+            m.verts.push(Vertex { pos: [c * ro, end, sn * ro], nrm, uv: [i as f32 / n as f32, 0.0] });
+            m.verts.push(Vertex {
+                pos: [c * ri, end - end * cham, sn * ri],
+                nrm,
+                uv: [i as f32 / n as f32, 1.0],
+            });
+        }
+        for i in 0..n {
+            let k = base + i * 2;
+            let (a2, b2, c2, d2) = (k, k + 1, k + 2, k + 3);
+            if end > 0.0 {
+                m.idx.extend_from_slice(&[a2, b2, c2, b2, d2, c2]);
+            } else {
+                m.idx.extend_from_slice(&[a2, c2, b2, b2, c2, d2]);
+            }
+        }
+    };
+    rim(1.0);
+    rim(-1.0);
     m
 }
 

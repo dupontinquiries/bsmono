@@ -529,13 +529,31 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
     if (rays && O.params.y < 0.35 && dist0 < 150.0) {
             var f0 = O.params.z * 0.55;
         if (is_terrain) { f0 = G.rt.w; }
+        // ROUGH GLASS (tubes, junction rooms): a strong grazing reflection
+        // that scatters. The mirror-smooth version read as coloured film;
+        // jittering the reflected ray per-fragment and lifting the fresnel
+        // is what makes it look like thick, slightly frosted glass.
+        let glassy = O.params.x > 0.5;
+        if (glassy) {
+            let fres = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+            f0 = mix(0.18, 0.92, fres);
+        }
         // low-spec objects trade the full reflection march for a sky-tinted
         // sheen: visually a whisper, computationally half the glass bill
         let cheap_refl = !is_terrain && f0 < 0.14;
         let fres = f0 + (1.0 - f0) * pow(1.0 - max(dot(n, v), 0.0), 5.0);
         let amount = clamp(fres, 0.0, 0.85) * step(0.06, f0);
         if (amount > 0.03) {
-            let rr = reflect(-v, n);
+            var rr = reflect(-v, n);
+            if (glassy) {
+                // hash the surface point into a small cone around the mirror
+                // direction: cheap roughness, and it hides the banding a
+                // perfectly smooth curved surface would show
+                let h = fract(sin(dot(floor(in.wpos * 7.0), vec3(12.99, 78.23, 37.71))) * 43758.5453);
+                let h2 = fract(h * 197.31);
+                let jit = normalize(vec3(h - 0.5, h2 - 0.5, fract(h * 31.7) - 0.5));
+                rr = normalize(rr + jit * 0.16);
+            }
             if (cheap_refl) {
                 col = mix(col, sky_color(rr), amount * 0.8);
             } else {
