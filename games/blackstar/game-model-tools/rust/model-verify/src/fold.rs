@@ -189,10 +189,16 @@ pub fn bend(bones: &mut [Bone], joint: usize, axis: [f64; 3], angle: f64) {
 mod tests {
     use super::*;
 
-    fn bone(a: [f64;3], b: [f64;3], r: f64, parent: i32) -> Bone { Bone { a, b, r, parent } }
+    pub fn flat_box() -> Volume { box_volume(2.4, 1.2, 1.8, 10) }
+    pub fn scaled_body() -> Vec<Bone> {
+        body().iter().map(|b| Bone { a: [b.a[0]*0.5,b.a[1]*0.5,b.a[2]*0.5],
+            b: [b.b[0]*0.5,b.b[1]*0.5,b.b[2]*0.5], r: b.r*0.5, parent: b.parent }).collect()
+    }
+
+    pub fn bone(a: [f64;3], b: [f64;3], r: f64, parent: i32) -> Bone { Bone { a, b, r, parent } }
 
     /// A crude biped: spine, two arms, two legs.
-    fn body() -> Vec<Bone> {
+    pub fn body() -> Vec<Bone> {
         vec![
             bone([0.0,0.0,0.0], [0.0,1.0,0.0], 0.18, -1),   // 0 spine
             bone([0.0,1.0,0.0], [0.0,1.4,0.0], 0.14, 0),    // 1 head
@@ -203,7 +209,7 @@ mod tests {
         ]
     }
 
-    fn box_volume(w: f64, h: f64, d: f64, res: usize) -> Volume {
+    pub fn box_volume(w: f64, h: f64, d: f64, res: usize) -> Volume {
         let mut pts = Vec::new();
         let n = 12;
         for i in 0..=n { for j in 0..=n { for k in 0..=n {
@@ -305,5 +311,188 @@ mod tests {
         let vol = Volume::from_points(&[[0.0;3]], 4);
         let f = evaluate(&body(), &vol, 4);
         assert!(f.spill.is_finite() && f.vacancy.is_finite());
+    }
+}
+
+// ── searching for the fold ──────────────────────────────────────────────────
+
+/// What a joint is allowed to do. Anatomy is the search space's whole value: a
+/// knee that bends backwards would fit many vehicles beautifully and look wrong
+/// in every one of them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limit {
+    pub joint: usize,
+    pub axis: [f64; 3],
+    pub min: f64,
+    pub max: f64,
+}
+
+/// Deterministic pseudo-random, so a fold is reproducible. An optimiser that
+/// gives a different answer each run cannot be reviewed, and "it looked better
+/// last time" is not a debuggable report.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> f64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        (self.0 >> 11) as f64 / (1u64 << 53) as f64
+    }
+    fn range(&mut self, a: f64, b: f64) -> f64 { a + (b - a) * self.next() }
+}
+
+/// The result of a search.
+#[derive(Debug, Clone)]
+pub struct Fold {
+    /// Angle chosen per limit, in the order given.
+    pub angles: Vec<f64>,
+    pub fit: Fit,
+    pub bones: Vec<Bone>,
+    /// How many candidates were evaluated — reported so a poor result can be
+    /// told from an under-searched one.
+    pub evaluated: usize,
+}
+
+fn apply_angles(base: &[Bone], limits: &[Limit], angles: &[f64]) -> Vec<Bone> {
+    let mut b = base.to_vec();
+    for (l, a) in limits.iter().zip(angles) {
+        bend(&mut b, l.joint, l.axis, *a);
+    }
+    b
+}
+
+/// Search joint-angle space for the fold that best fills `vol`.
+///
+/// Simulated annealing rather than gradient descent: the error surface is full
+/// of local minima (a limb can be blocked by the hull in one direction and free
+/// in another), and there is no gradient to take — spill and vacancy are counts
+/// over a voxel grid, not smooth functions.
+///
+/// Proposals shrink as the temperature falls, so the search moves from "try a
+/// completely different pose" to "settle this joint", which is how a body
+/// actually gets packed into a box.
+pub fn optimise(base: &[Bone], vol: &Volume, limits: &[Limit],
+                iters: usize, seed: u64) -> Fold {
+    let mut rng = Rng(seed | 1);
+    let mut cur: Vec<f64> = limits.iter().map(|l| (l.min + l.max) * 0.5).collect();
+    let mut cur_bones = apply_angles(base, limits, &cur);
+    let mut cur_fit = evaluate(&cur_bones, vol, 5);
+    let mut best = (cur.clone(), cur_fit, cur_bones.clone());
+    let mut evaluated = 1usize;
+
+    for it in 0..iters.max(1) {
+        let t = 1.0 - it as f64 / iters.max(1) as f64;      // 1 -> 0
+        let temp = 0.02 + 0.6 * t * t;
+        let mut cand = cur.clone();
+        // perturb one joint at a time most of the time; occasionally several,
+        // because some folds only pay off once two joints move together
+        let n_move = if rng.next() < 0.75 { 1 } else { 2 + (rng.next() * 2.0) as usize };
+        for _ in 0..n_move {
+            if limits.is_empty() { break; }
+            let k = (rng.next() * limits.len() as f64) as usize % limits.len();
+            let l = &limits[k];
+            let step = (l.max - l.min) * temp;
+            cand[k] = (cand[k] + rng.range(-step, step)).clamp(l.min, l.max);
+        }
+        let bones = apply_angles(base, limits, &cand);
+        let fit = evaluate(&bones, vol, 5);
+        evaluated += 1;
+        let d = fit.error() - cur_fit.error();
+        // accept improvements always, worse poses sometimes — that is what gets
+        // a limb out of a local minimum it is wedged in
+        if d < 0.0 || rng.next() < (-d / temp.max(1e-6)).exp() {
+            cur = cand;
+            cur_fit = fit;
+            cur_bones = bones;
+            if fit.error() < best.1.error() {
+                best = (cur.clone(), fit, cur_bones.clone());
+            }
+        }
+    }
+    Fold { angles: best.0, fit: best.1, bones: best.2, evaluated }
+}
+
+#[cfg(test)]
+mod optimise_tests {
+    use super::*;
+    use super::tests::*;
+
+    fn limits() -> Vec<Limit> {
+        let q = std::f64::consts::FRAC_PI_2;
+        vec![
+            Limit { joint: 4, axis: [1.0,0.0,0.0], min: -0.2, max: 2.4 },  // leg L
+            Limit { joint: 5, axis: [1.0,0.0,0.0], min: -0.2, max: 2.4 },  // leg R
+            Limit { joint: 2, axis: [0.0,1.0,0.0], min: -q,   max: q   },  // arm L
+            Limit { joint: 3, axis: [0.0,1.0,0.0], min: -q,   max: q   },  // arm R
+            Limit { joint: 1, axis: [1.0,0.0,0.0], min: -0.9, max: 0.9 },  // head
+            Limit { joint: 0, axis: [0.0,0.0,1.0], min: -0.6, max: 0.6 },  // spine
+        ]
+    }
+
+    #[test]
+    fn the_search_finds_a_better_fold_than_the_pose_it_started_from() {
+        let vol = flat_box();
+        let base = scaled_body();
+        let start = evaluate(&base, &vol, 5);
+        let f = optimise(&base, &vol, &limits(), 400, 12345);
+        assert!(f.evaluated > 300, "it actually searched: {} candidates", f.evaluated);
+        assert!(f.fit.error() < start.error(),
+                "the search must improve on standing: {:.3} -> {:.3}", start.error(), f.fit.error());
+    }
+
+    #[test]
+    fn the_search_is_deterministic() {
+        // An optimiser that answers differently each run cannot be reviewed, and
+        // "it looked better last time" is not a debuggable report.
+        let vol = flat_box();
+        let base = scaled_body();
+        let a = optimise(&base, &vol, &limits(), 300, 999);
+        let b = optimise(&base, &vol, &limits(), 300, 999);
+        assert_eq!(a.angles, b.angles);
+        assert_eq!(a.fit, b.fit);
+        // and a different seed explores differently
+        let c = optimise(&base, &vol, &limits(), 300, 4242);
+        assert!(a.angles != c.angles || (a.fit.error() - c.fit.error()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn every_joint_stays_within_its_anatomical_limit() {
+        // A knee that bends backwards fits many vehicles beautifully and looks
+        // wrong in all of them.
+        let vol = flat_box();
+        let f = optimise(&scaled_body(), &vol, &limits(), 400, 7);
+        for (l, a) in limits().iter().zip(&f.angles) {
+            assert!(*a >= l.min - 1e-9 && *a <= l.max + 1e-9,
+                    "joint {} at {a} is outside [{}, {}]", l.joint, l.min, l.max);
+        }
+    }
+
+    #[test]
+    fn bone_lengths_survive_the_search() {
+        // The optimiser moves joints; it must never stretch anyone to fit.
+        let base = scaled_body();
+        let f = optimise(&base, &flat_box(), &limits(), 300, 3);
+        for (i, b) in f.bones.iter().enumerate() {
+            assert!((b.length() - base[i].length()).abs() < 1e-9,
+                    "bone {i} changed length during the search");
+        }
+    }
+
+    #[test]
+    fn the_control_a_body_shaped_volume_is_easier_to_fill_than_a_slab() {
+        // The discipline the part matcher lacked: check the score is WORSE where
+        // it should be. A body fits a body-shaped space better than a flat slab,
+        // and if the optimiser cannot tell those apart its error function is
+        // reporting nothing.
+        let base = scaled_body();
+        let upright_shaped = box_volume(0.9, 1.5, 0.9, 10);   // roughly body-shaped
+        let slab = box_volume(3.0, 0.35, 3.0, 10);            // nothing folds into this well
+        let a = optimise(&base, &upright_shaped, &limits(), 400, 21);
+        let b = optimise(&base, &slab, &limits(), 400, 21);
+        assert!(a.fit.error() < b.fit.error(),
+                "a body-shaped volume must score better than a slab: {:.3} vs {:.3}",
+                a.fit.error(), b.fit.error());
+        assert!(a.fit.spill < b.fit.spill,
+                "and spill less: {:.3} vs {:.3}", a.fit.spill, b.fit.spill);
     }
 }
