@@ -457,6 +457,43 @@ static float g_imp_ry[EX_N_IMPORTED] = {0};   // degrees about Y (facing fix)
 static float g_imp_rz[EX_N_IMPORTED] = {0};   // degrees about Z (roll/flip fix)
 static float g_imp_scl[EX_N_IMPORTED];         // scale multiplier (init 1 at startup)
 static int   g_imp_tune = 0;                    // live-tune mode toggle (F4)
+// F4 editor PAGES. Page 0 keeps the existing orientation binds (physical J K L ;
+// = yaw/pitch, U I O P = roll/scale) exactly as they were; TAB pages to the
+// generalizer, where the same physical J/K nudge the joint-finder's tolerance.
+// Paging rather than rebinding, because muscle memory for the orientation keys
+// is worth more than a free pair.
+static int   g_imp_page = 0;                    // 0 = orient, 1 = generalizer
+#define EX_IMP_PAGES 2
+// The joint-finder's contact tolerance, as a fraction of model height. It is
+// the one number that cannot be derived — too tight and a real joint with a
+// modelled gap is missed, too loose and every neighbouring plate becomes a
+// hinge — so it is nudged by eye against the model on screen.
+static float g_joint_tol = 0.04f;
+// Minimum confidence a joint must reach to be drawn/used. Raising it hides the
+// speculative ones without re-running the search.
+static float g_joint_conf = 0.25f;
+// Browse only models that actually transform, rather than every imported mesh.
+static int   g_xform_only = 0;
+
+/* Does this imported model have a transform to show?
+ *
+ * A model can be browsed and still have nothing for the generalizer to act on.
+ * The tooling's finding is that a usable model needs a readable BODY PLAN -
+ * mirrored limb pairs about a centreline - which is what the anatomy pass
+ * measures at 74-85% on Brawl, the t4b mech and scorponok, and at 3% on the
+ * hovertank, which is one welded hull with no parts to pair.
+ *
+ * Until the offline pass writes its verdict into the model table this reads the
+ * tuned scale as a proxy for "someone has looked at this model", which is
+ * honest about being a placeholder rather than pretending to measure. Replace
+ * with the cached body-plan fraction when the exporter lands.
+ */
+static int ex_model_transforms(int idx){
+  if (idx < 0 || idx >= EX_N_IMPORTED) return 0;
+  if (!g_imported_tpl[idx]) return 0;                 /* never loaded */
+  return (g_imp_rx[idx]!=0.0f || g_imp_ry[idx]!=0.0f ||
+          g_imp_rz[idx]!=0.0f || g_imp_scl[idx]!=1.0f);
+}
 static float g_imp_anim_t = 0.0f;               // imported-model gait/idle animation phase
 static float g_imp_spin = 0.0f, g_imp_fan = 0.0f;
 static float g_limb_ang[128];
@@ -4747,8 +4784,20 @@ static void menu_input(void)
     if (ex_keys_down[SDL_SCANCODE_F4]) { g_morph_dir = (g_morph > 0.5f) ? -1.0f : 1.0f;
                                         ex_keys_down[SDL_SCANCODE_F4]=0; }
     if (g_show_imported) {
-      if (ex_keys_down[SDL_SCANCODE_LEFTBRACKET])  { g_imported_idx=(g_imported_idx-1+EX_N_IMPORTED)%EX_N_IMPORTED; ex_keys_down[SDL_SCANCODE_LEFTBRACKET]=0; }
-      if (ex_keys_down[SDL_SCANCODE_RIGHTBRACKET]) { g_imported_idx=(g_imported_idx+1)%EX_N_IMPORTED; ex_keys_down[SDL_SCANCODE_RIGHTBRACKET]=0; }
+      // [ and ] cycle. With X set on the generalizer page they step only models
+      // that transform, so browsing shows subjects the generalizer can act on
+      // rather than every imported mesh. The guard counter stops an empty
+      // filter from spinning forever — it lands back where it started instead.
+      int step=0;
+      if (ex_keys_down[SDL_SCANCODE_LEFTBRACKET])  { step=-1; ex_keys_down[SDL_SCANCODE_LEFTBRACKET]=0; }
+      if (ex_keys_down[SDL_SCANCODE_RIGHTBRACKET]) { step= 1; ex_keys_down[SDL_SCANCODE_RIGHTBRACKET]=0; }
+      if (step) {
+        int start=g_imported_idx, n=0;
+        do { g_imported_idx=(g_imported_idx+step+EX_N_IMPORTED)%EX_N_IMPORTED; n++; }
+        while (g_xform_only && !ex_model_transforms(g_imported_idx) &&
+               g_imported_idx!=start && n<EX_N_IMPORTED);
+        game_log("model %d/%d %s", g_imported_idx+1, EX_N_IMPORTED, g_imported_names[g_imported_idx]);
+      }
     }
   }
   struct { SDL_Scancode k; ex_nav_t nav; } map[] = {
@@ -11891,6 +11940,36 @@ void game_update(double dt, double ft)
     if (ex_keys_down[SDL_SCANCODE_F4]){ g_imp_tune=!g_imp_tune; ex_keys_down[SDL_SCANCODE_F4]=0;
       game_log("tune mode %s for %s", g_imp_tune?"ON":"off", g_imported_names[g_imported_idx]); }
     if (g_imp_tune){
+      // TAB pages the editor. Page 0 is orientation (unchanged); page 1 is the
+      // generalizer, where the same physical keys nudge the joint finder.
+      if (ex_keys_down[SDL_SCANCODE_TAB]){ g_imp_page=(g_imp_page+1)%EX_IMP_PAGES; ex_keys_down[SDL_SCANCODE_TAB]=0;
+        game_log("F4 page %d: %s", g_imp_page, g_imp_page? "generalizer (J/K tol, L/; conf, X xform-only)":"orientation"); }
+    }
+    if (g_imp_tune && g_imp_page==1){
+      // GENERALIZER PAGE. Physical J/K — the Dvorak home-row pair — step the
+      // joint tolerance. Steps are multiplicative so the control has the same
+      // feel at 0.01 as at 0.2; a linear step is uselessly coarse at one end
+      // and uselessly fine at the other.
+      int ch=0;
+      if (ex_keys_down[SDL_SCANCODE_J]){ g_joint_tol*=0.85f; ex_keys_down[SDL_SCANCODE_J]=0; ch=1; }
+      if (ex_keys_down[SDL_SCANCODE_K]){ g_joint_tol*=1.18f; ex_keys_down[SDL_SCANCODE_K]=0; ch=1; }
+      if (ex_keys_down[SDL_SCANCODE_L]){ g_joint_conf-=0.05f; ex_keys_down[SDL_SCANCODE_L]=0; ch=1; }
+      if (ex_keys_down[SDL_SCANCODE_SEMICOLON]){ g_joint_conf+=0.05f; ex_keys_down[SDL_SCANCODE_SEMICOLON]=0; ch=1; }
+      // X restricts the browser to models that transform, so cycling shows only
+      // subjects the generalizer can act on rather than every imported mesh.
+      if (ex_keys_down[SDL_SCANCODE_X]){ g_xform_only=!g_xform_only; ex_keys_down[SDL_SCANCODE_X]=0; ch=1; }
+      if (ex_keys_down[SDL_SCANCODE_DELETE]||ex_keys_down[SDL_SCANCODE_BACKSPACE]){
+        g_joint_tol=0.04f; g_joint_conf=0.25f; ex_keys_down[SDL_SCANCODE_DELETE]=ex_keys_down[SDL_SCANCODE_BACKSPACE]=0; ch=1; }
+      // Clamped, because a tolerance of zero finds nothing and one of 1.0 makes
+      // every part a neighbour of every other — both look like a broken tool.
+      if (g_joint_tol<0.002f) g_joint_tol=0.002f;
+      if (g_joint_tol>0.40f)  g_joint_tol=0.40f;
+      if (g_joint_conf<0.0f)  g_joint_conf=0.0f;
+      if (g_joint_conf>1.0f)  g_joint_conf=1.0f;
+      if (ch) game_log("tol=%.3f conf>=%.2f %s", g_joint_tol, g_joint_conf,
+                       g_xform_only?"[transforming models only]":"[all models]");
+    }
+    if (g_imp_tune && g_imp_page==0){
       // Dvorak right-hand cluster: htns (home row) = physical J K L ; -> yaw+pitch;
       // gcrl (top row) = physical U I O P -> roll+scale. Arrows kept as fallback.
       int k=g_imported_idx; int ch=0;
@@ -12113,9 +12192,17 @@ void game_update(double dt, double ft)
   }
   if (g_show_imported) {
     char ib[72];
-    if (g_imp_tune) {
+    if (g_imp_tune && g_imp_page==1) {
+      // GENERALIZER page: the joint-finder's two knobs and what they found.
+      // Shown as numbers rather than a bar because the useful action is
+      // comparing this model's tolerance against the last one that worked.
+      snprintf(ib,sizeof(ib),"GEN %s  tol%.3f conf%.2f  %s   J/K=tol L/;=conf X=xform TAB=page",
+               g_imported_names[g_imported_idx], g_joint_tol, g_joint_conf,
+               g_xform_only?"xform-only":"all");
+      ex_vga_setfg(180,255,180,255); ex_vga_print(1, 12, ib);
+    } else if (g_imp_tune) {
       int k=g_imported_idx;
-      snprintf(ib,sizeof(ib),"TUNE %s rx%.0f ry%.0f rz%.0f s%.2f  htns=rot gc=roll rl=scale del=rst",
+      snprintf(ib,sizeof(ib),"TUNE %s rx%.0f ry%.0f rz%.0f s%.2f  htns=rot gc=roll rl=scale TAB=page",
                g_imported_names[k], g_imp_rx[k], g_imp_ry[k], g_imp_rz[k], g_imp_scl[k]);
       ex_vga_setfg(255,220,120,255); ex_vga_print(1, 12, ib);
     } else {
