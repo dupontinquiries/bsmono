@@ -1481,3 +1481,53 @@ fn simulate(prompt: &str, evt: &Sender<Evt>, start: Instant, cancel: &Arc<Atomic
     }
     let _ = evt.send(Evt::Done { tokens: n, secs: start.elapsed().as_secs_f32() });
 }
+
+/// The two watchdog tables must agree.
+///
+/// `gpu_kernels::watchdog_prone_name` and `logscope::tuneprofile::watchdog_prone` encode the same
+/// decision in two crates, because `logscope` cannot depend on `gpu-gemm` and duplicating the
+/// predicate was cheaper than restructuring for it.
+///
+/// That duplication already went wrong once. _358 widened the engine's guard to mobile GPUs after a
+/// Fairphone reported "not enough wavelets", and the tuning table stayed Apple-only — so a phone got
+/// the subgroup path from one table while the other was refusing it. **A policy expressed in two
+/// places gets corrected in one, and the survivor looks right because it matches the code around it.**
+///
+/// This crate sees both, so the agreement is checkable here even though neither crate can check it
+/// alone. That is the durable fix: another sweep would have found instance seven, and this stops it
+/// being written.
+#[cfg(all(test, feature = "wgpu-engine"))]
+mod watchdog_agreement {
+    #[test]
+    fn both_crates_classify_every_adapter_identically() {
+        let cases = [
+            // Mobile — the class that was missing from the tuning table.
+            "Adreno (TM) 740", "Mali-G715", "PowerVR B-Series BXM-8-256",
+            "Immortalis-G720", "Samsung Xclipse 940", "Vivante GC7000",
+            // Apple, in both the spellings that appear in real adapter strings.
+            "Apple M2 Max (G14C B1) [Vulkan]", "Apple M2 Ultra (G14D B1) [Vulkan]",
+            "honeykrisp", "AGX",
+            // Desktop — must stay on the fast path in both.
+            "NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX", "Intel Arc A770",
+            "llvmpipe (LLVM 20.1.2, 256 bits) [Vulkan]",
+            // Neither — a device nobody has enumerated must not be guessed at differently.
+            "Some Vendor GPU Nobody Has Heard Of",
+        ];
+        for a in cases {
+            let engine = gpu_kernels::watchdog_prone_name(a);
+            let tuning = logscope::tuneprofile::watchdog_prone(a);
+            assert_eq!(engine, tuning,
+                "{a}: engine says {engine}, tuning table says {tuning} — the two tables have drifted, \
+which is exactly how a phone got the subgroup path from one while the other refused it");
+        }
+    }
+
+    #[test]
+    fn the_agreement_test_would_have_CAUGHT_the_original_drift() {
+        // Before _358 the tuning table matched only Apple. Adreno is the case that exposed it, and the
+        // test above compares that string — so this asserts the fixture is the one that matters rather
+        // than a set that happens to agree.
+        assert!(gpu_kernels::watchdog_prone_name("Adreno (TM) 740"));
+        assert!(logscope::tuneprofile::watchdog_prone("Adreno (TM) 740"));
+    }
+}
