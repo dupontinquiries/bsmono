@@ -1208,6 +1208,16 @@ fn main() {
             let secs = t0.elapsed().as_secs_f64();
             let gibs = (bytes * iters as f64) / (1u64 << 30) as f64 / secs;
             println!("  {label:>16}: {:.3} ms/call · {:.1} GiB/s", secs / iters as f64 * 1000.0, gibs);
+            // PERSIST THE BEST FIGURE for this adapter. Measured here and nowhere else, and until now
+            // it went to stdout and stopped — so the running engine had no bandwidth and perfverdict
+            // could never say "at the memory limit, the split is irrelevant", the one verdict that
+            // stops work rather than directing it.
+            //
+            // bandwidth_put keeps the maximum: this loop measures several tiles and the fastest is the
+            // device's capability, while a slower tile is a fact about that tile.
+            if gibs > gpu_kernels::store::bandwidth_get(&gpu.adapter_name).unwrap_or(0.0) as f64 {
+                gpu_kernels::store::bandwidth_put(&gpu.adapter_name, gibs as f32);
+            }
         };
         for tile in [1u32, 2, 4, 8] {
             println!("— tile {tile} —");
