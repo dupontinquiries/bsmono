@@ -271,7 +271,15 @@ pub fn route_norm(cfg: &ArchConfig) -> crate::moe::RouteNorm {
 
 /// Build the MoE routing config from an arch + the checkpoint's expert counts (from `dim_keys`). `n_used`
 /// falls back to a sensible default when the metadata omits it.
-pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -> crate::moe::MoeConfig {
+/// `scale` and `norm` come from the checkpoint's `{arch}.expert_weights_scale` and
+/// `{arch}.expert_weights_norm` — the key names llama.cpp uses, arch-prefixed. Passed in rather than
+/// read here so this stays free of the Gguf, and taken as Options so "the metadata omits it" is
+/// distinguishable from "the metadata says 1.0".
+///
+/// The prefix matters more than it looks: reading these under the WRONG arch prefix returns None for a
+/// model that set them, which is exactly how glm-dsa's kv_lora_rank was misread as absent.
+pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32,
+                  scale: Option<f32>, norm: Option<bool>) -> crate::moe::MoeConfig {
     crate::moe::MoeConfig {
         n_routed,
         n_used: if n_used == 0 { 8.min(n_routed.max(1)) } else { n_used },
@@ -279,11 +287,13 @@ pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -
         norm: route_norm(cfg),
         // Llama4: raw-sigmoid top-1 gate applied to the expert's INPUT (weight-before-FFN);
         // everything else: normalized weights combined on the output.
-        normalize: !matches!(cfg.arch, Arch::Llama4),
+        // Metadata wins; the arch default is the fallback. llama.cpp reads this from the checkpoint
+        // rather than deriving it, and a model that sets expert_weights_norm=false without being
+        // Llama-4 would otherwise be normalized against its own config.
+        normalize: norm.unwrap_or(!matches!(cfg.arch, Arch::Llama4)),
         // GLM-5.2 sets routed_scaling_factor (2.5); everything else leaves it inert at 1.0. Applied
         // AFTER normalization — see the ordering note on the field.
-        // Read from GGUF metadata by the loader; 1.0 until then, which is inert.
-        routed_scale: 1.0,
+        routed_scale: scale.unwrap_or(1.0),
         weight_before: matches!(cfg.arch, Arch::Llama4),
     }
 }
@@ -403,7 +413,7 @@ mod tests {
         assert!(c.moe && !c.moe_shared_expert, "MoE with NO shared expert (unlike Qwen2-MoE)");
         assert_eq!(route_norm(&c), crate::moe::RouteNorm::Softmax);
         // Qwen3-30B-A3B: 128 experts, 8 active, no shared
-        let mc = moe_config(&c, 128, 8, 0);
+        let mc = moe_config(&c, 128, 8, 0, None, None);
         assert_eq!(mc.n_routed, 128);
         assert_eq!(mc.n_used, 8);
         assert_eq!(mc.n_shared, 0);
@@ -418,17 +428,17 @@ mod tests {
     fn moe_config_maps_arch_to_router() {
         // Qwen4: softmax gating, no shared expert
         let q = for_arch("qwen4");
-        let qc = moe_config(&q, 128, 8, 0);
+        let qc = moe_config(&q, 128, 8, 0, None, None);
         assert_eq!(qc.norm, crate::moe::RouteNorm::Softmax);
         assert_eq!(qc.n_used, 8);
         assert_eq!(qc.n_shared, 0);
         // Llama4: sigmoid gating, at least one shared expert
         let l = for_arch("llama4");
-        let lc = moe_config(&l, 128, 1, 1);
+        let lc = moe_config(&l, 128, 1, 1, None, None);
         assert_eq!(lc.norm, crate::moe::RouteNorm::Sigmoid);
         assert!(lc.n_shared >= 1, "llama4 forces a shared expert");
         // n_used defaults when metadata omits it
-        assert_eq!(moe_config(&q, 64, 0, 0).n_used, 8);
+        assert_eq!(moe_config(&q, 64, 0, 0, None, None).n_used, 8);
     }
 
     #[test]
@@ -474,6 +484,26 @@ mod tests {
         // and it must still refuse, because reading the weights is not the same as having run them
         assert!(!for_arch("deepseek2").supported);
         assert!(n.contains("unverified end to end"), "the remaining gap has to stay stated: {n}");
+    }
+
+    #[test]
+    fn checkpoint_metadata_OVERRIDES_the_arch_default() {
+        // llama.cpp reads expert_weights_norm from the checkpoint rather than deriving it from the
+        // architecture. A model that sets it false without being Llama-4 would otherwise be normalized
+        // against its own config — and the output would be plausible, not broken.
+        let qwen = for_arch("qwen3moe");
+        assert!(moe_config(&qwen, 128, 8, 0, None, None).normalize, "arch default: normalize");
+        assert!(!moe_config(&qwen, 128, 8, 0, None, Some(false)).normalize, "metadata wins");
+        assert!(moe_config(&for_arch("llama4"), 16, 1, 1, None, Some(true)).normalize,
+            "and wins in the other direction too");
+    }
+
+    #[test]
+    fn an_absent_scale_is_INERT_rather_than_zero() {
+        // None means the metadata omitted it, which must leave every weight untouched. Defaulting to
+        // 0.0 would silence every routed expert and look like a broken router.
+        assert_eq!(moe_config(&for_arch("qwen3moe"), 128, 8, 0, None, None).routed_scale, 1.0);
+        assert_eq!(moe_config(&for_arch("qwen3moe"), 128, 8, 0, Some(2.5), None).routed_scale, 2.5);
     }
 
     #[test]
