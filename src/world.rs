@@ -848,7 +848,7 @@ impl World {
                                 glow: f32| {
                     let mid = (a + b) * 0.5;
                     let axis = (b - a).normalize_or(Vec3::Z);
-                    let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
+                    let half = (b - a).length() * 0.92; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
                     let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.88);
                     shapes[si].blend = true;
@@ -879,7 +879,7 @@ impl World {
                             // cars into walls, 21/24 -> 17/24), but in a
                             // 12 m bore a boosting car flies up the middle
                             // and never touches a wall at all.
-                            g: (r / 6.0).clamp(1.0, 2.6),
+                            g: (r / 10.0).clamp(0.55, 1.5),
                             surf: true,
                             follow: None,
                         });
@@ -1573,7 +1573,7 @@ impl World {
                 let tube = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, a: Vec3, b: Vec3, r: f32, col: [f32; 4], glow: f32| {
                     let mid = (a + b) * 0.5;
                     let axis = (b - a).normalize_or(Vec3::Z);
-                    let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
+                    let half = (b - a).length() * 0.92; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
                     let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.88);
                     shapes[si].blend = true;
@@ -1604,7 +1604,7 @@ impl World {
                             // cars into walls, 21/24 -> 17/24), but in a
                             // 12 m bore a boosting car flies up the middle
                             // and never touches a wall at all.
-                            g: (r / 6.0).clamp(1.0, 2.6),
+                            g: (r / 10.0).clamp(0.55, 1.5),
                             surf: true,
                             follow: None,
                         });
@@ -2909,7 +2909,7 @@ impl World {
                         let steps = ((p0.distance(p1) / 5.0).ceil() as usize).clamp(2, 24);
                         for t in 0..=steps {
                             let q = p0.lerp(p1, t as f32 / steps as f32);
-                            grav.push(GravNode { pos: q, down: Vec3::NEG_Y, r: r * 2.4, tube: true, inward: false, g: (r / 6.0).clamp(1.0, 2.6), surf: true, follow: None });
+                            grav.push(GravNode { pos: q, down: Vec3::NEG_Y, r: r * 2.4, tube: true, inward: false, g: (r / 10.0).clamp(0.55, 1.5), surf: true, follow: None });
                             flows.push(Flow { pos: q, r: r * 0.95, vel: (p1 - p0).normalize_or(Vec3::Y) * 20.0 });
                         }
                     }
@@ -3360,7 +3360,7 @@ impl World {
                     }
                 }
                 if db < 1.0e8 {
-                    d = smin(d, db, 0.8);
+                    d = smin(d, db, 0.25);
                 }
                 if dcut < 1.0e8 {
                     d = d.max(-dcut);
@@ -3904,7 +3904,7 @@ impl World {
             // TIGHTER radius than shape-to-shape: measured against the
             // route bores, 1.8 here was quietly narrowing every pipe that
             // ran near the ground.
-            d = smin(d, db, 0.8);
+            d = smin(d, db, 0.25);
         }
         if dcut < 1.0e8 {
             d = d.max(-dcut);

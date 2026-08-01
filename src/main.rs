@@ -714,10 +714,10 @@ fn main() {
         gpu.add_mesh(&meshgen::capsule(world::CAP_TALL_HH, 8, 20)),
         gpu.add_mesh(&meshgen::pad_disc(28)),
         gpu.add_mesh(&meshgen::terrain(world::TG_HALF, 2, |_, _| 0.0)), // real one lands post-generate
-        gpu.add_mesh(&meshgen::tube(28)),
+        gpu.add_mesh(&meshgen::tube(40)),
         gpu.add_mesh(&meshgen::tube(10)), // M_SHELL_LO: far-field tube
-        gpu.add_mesh(&meshgen::tube_open(28)), // M_SHELL_OPEN: no cap rings
-        gpu.add_mesh(&meshgen::tube_open(10)), // M_SHELL_OPEN_LO
+        gpu.add_mesh(&meshgen::tube_open(40)), // M_SHELL_OPEN: no cap rings
+        gpu.add_mesh(&meshgen::tube_open(18)), // M_SHELL_OPEN_LO
         gpu.add_mesh(&meshgen::torus_tube(64, 20)), // M_TORUS_TUBE: seamless loop
         gpu.add_mesh(&meshgen::ring_deck(72)), // M_RING_DECK: drivable ring
         gpu.add_mesh(&meshgen::hex_prism()),   // M_HEX: dropshot tiles

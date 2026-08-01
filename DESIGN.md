@@ -1743,6 +1743,36 @@ when the hood was uniformly slippery, and 79/42/72 when it was sticky.
 Housekeeping: the container filled up mid-session (linker failure), so
 stale build artefacts were cleared — 6 GB back.
 
+## v1.54.0 — shots punch, carries slip, the ground is where it looks
+
+POWER SHOTS were killed by their own fix. Cutting the extra impulse to a
+flat tenth stopped touches feeling like blasts, but it treated a gentle
+dribble tap and a committed 22 m/s strike identically. It now SCALES with
+the hit: 0.06 + 0.55 x strength. A 22 m/s approach sends the ball out at
+22.4 m/s and 60 m in three seconds (it was 19.3 and 51). Soft touches are
+untouched.
+
+THE BALL COMES OFF THE ROOF. Three things were still holding it: ground
+grip at 0.10, a dished-hood pull at 3.2x, and a speed-match assist at
+0.055. Grip is 0.018 with a 0.18 m/s cap, the assist 0.012, and THE DISH
+IS GONE ENTIRELY — a hood that pulls the ball back to its centre line is
+exactly what made carries feel magnetic. Under a fixed input with no
+corrective steering: a straight line still carries 100% of the run, a
+steady turn 33% (was 61), a hard turn 25%. Keeping it is your driving now.
+
+THE TEXTURE / CAR MISMATCH, diagnosed. Physics blends built form into the
+terrain with a smooth-min, but the RASTERISED meshes have no such blend —
+so near any ramp, wall or platform the car was resting on a surface up to
+20 cm away from the one being drawn. The blend radius drops 0.8 -> 0.25
+(and the same in the shader, so reflections agree), cutting the worst case
+to about 6 cm while keeping transitions drivable. Bores got better as a
+side effect: Perplexus p10 2.86 -> 3.80 m and 21 of 24 routes traversed.
+
+TUBES: in-bore gravity down from (r/6, capped 2.6) to (r/10, capped 1.5) —
+it was pinning cars to the wall — and the sections are smoother: segment
+overlap 0.78 -> 0.92 of half-length so joints stop reading as seams, with
+the tube meshes up from 28 to 40 segments (18 for the far-field LOD).
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

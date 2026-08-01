@@ -1407,7 +1407,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // frame — the assist that makes carries balanceable was quietly
         // capping every shot.
         if n.y > 0.30 && -vn < 6.0 {
-            let w = 0.055 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
+            let w = 0.012 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
             let dvx = car.vel.x - ball.vel.x;
             let dvz = car.vel.z - ball.vel.z;
             ball.vel.x += dvx * w;
@@ -1438,7 +1438,10 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // runs away in front, and you recover it by scooping under from
             // the far side. Air carries keep more grip — that touch is the
             // whole move and there is no ground to catch a mistake.
-            let mu = if car.on_ground { 0.10 } else { 0.30 };
+            // Barely any grip on the ground: the ball keeps its own
+            // momentum and WILL leave the roof when you turn or brake. Air
+            // carries keep theirs — that touch is the whole move.
+            let mu = if car.on_ground { 0.018 } else { 0.30 };
             ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.35 } else { 1.4 });
             // and the hood is dished, so the ball rolls back to the middle
             let side = car.rot * Vec3::X;
@@ -1459,7 +1462,9 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // and neither of those is dribbling.
             let f = (off.abs() / reach).clamp(0.0, 1.0);
             let well = if f < 0.66 { (1.0 - f / 0.66).powi(2) } else { 0.0 };
-            ball.vel -= side * (off.signum() * off.abs().min(reach) * well * 3.2 * w);
+            // NO DISH. A hood that pulls the ball back to its centre line
+            // is what made carries feel magnetic. Keeping the ball is your
+            // steering now, not the car's shape.
             // fore/aft is deliberately looser: that axis is where you PLAY —
             // push the ball out front, boost past it, catch it up again
             let fwd = car.forward();
@@ -1491,7 +1496,10 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // The extra "psyonix" push on top of the elastic impulse was doing
         // most of the work, which is why touches felt like blasts. At a tenth
         // it shapes the hit instead of dominating it. (Your tuning.)
-        ball.vel += dir * strength * 0.1;
+        // A flat tenth killed power shots along with the blasting: a soft
+        // touch and a committed 22 m/s strike got the same treatment. Scale
+        // it with the hit — dribble touches stay gentle, real shots punch.
+        ball.vel += dir * strength * (0.06 + 0.55 * soft);
         // SPIN: a gentle touch rolls the ball (dribbles need that), a hard
         // hit drives THROUGH it. Spin used to scale up with the impact,
         // which is what made shots knuckle off at odd angles.

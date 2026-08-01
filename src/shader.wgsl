@@ -297,7 +297,7 @@ fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
             d = min(d, sd);
         }
     }
-    d = smin(d, db, 1.8); // built form fillets into the terrain as well
+    d = smin(d, db, 0.25); // match physics: the raster has no fillet // built form fillets into the terrain as well
     return d;
 }
 
