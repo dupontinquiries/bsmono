@@ -33,6 +33,7 @@
 
 pub mod motion;
 pub mod anatomy;
+pub mod unwrap;
 pub mod descriptor;
 pub mod fold;
 pub mod assign;
