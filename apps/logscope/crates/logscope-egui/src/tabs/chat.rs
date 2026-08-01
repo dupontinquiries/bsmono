@@ -2354,8 +2354,7 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         // THREE STATES, NOT TWO. `verified` starts true when no verify command is configured, so a
         // run where nothing was checked rendered as "✓ verified" — which is worse than no badge,
         // because it is the reason someone stops looking.
-        let vnote = if !had_verifier { " · no verifier configured" }
-            else if verified { " · ✓ verified" } else { " · ⚠ unverified" };
+        let vnote = crate::workspace_exec::VerifyBadge::of(verified, had_verifier).label();
         let snap_note = if snap { " · snapshotted" } else { "" };
         self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
     }
