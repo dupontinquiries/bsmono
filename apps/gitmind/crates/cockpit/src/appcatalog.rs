@@ -47,6 +47,21 @@ pub struct ManifestEntry {
     /// right way round once a port has taken over: the thing you get by default
     /// should be the thing the project actually ships.
     pub primary: bool,
+    /// `role` from the manifest: "app", "lib", "daemon"...
+    ///
+    /// The catalogue ignored this, which meant an entry like `settings-egui` —
+    /// a widget library embedded by other frontends, with no [[bin]] and no
+    /// `app` feature — would be offered as though it were a buildable
+    /// application. Building it produces nothing runnable, and the user is left
+    /// wondering why. Reading the role lets the UI say what a thing IS.
+    pub role: String,
+}
+
+impl ManifestEntry {
+    /// Can this entry be built into something you can run?
+    pub fn is_runnable(&self) -> bool {
+        self.role.is_empty() || self.role == "app" || self.role == "daemon"
+    }
 }
 
 /// Parse `manifest/projects.toml`'s `[apps.*]` sections into a flat list. Minimal hand-rolled
@@ -55,11 +70,12 @@ pub struct ManifestEntry {
 /// doesn't need one. Pure — no filesystem access; the caller reads the file.
 pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
     let mut out = Vec::new();
-    let mut cur: Option<(String, String, String, bool)> = None; // (app_id, path, notes, primary)
-    let flush = |cur: &mut Option<(String, String, String, bool)>, out: &mut Vec<ManifestEntry>| {
-        if let Some((id, path, notes, primary)) = cur.take() {
+    // (app_id, path, notes, primary, role)
+    let mut cur: Option<(String, String, String, bool, String)> = None;
+    let flush = |cur: &mut Option<(String, String, String, bool, String)>, out: &mut Vec<ManifestEntry>| {
+        if let Some((id, path, notes, primary, role)) = cur.take() {
             if !path.is_empty() {
-                out.push(ManifestEntry { app_id: id, path, notes, primary });
+                out.push(ManifestEntry { app_id: id, path, notes, primary, role });
             }
         }
     };
@@ -67,16 +83,17 @@ pub fn parse_manifest(text: &str) -> Vec<ManifestEntry> {
         let line = raw.trim();
         if let Some(rest) = line.strip_prefix("[apps.").and_then(|r| r.strip_suffix(']')) {
             flush(&mut cur, &mut out);
-            cur = Some((rest.to_string(), String::new(), String::new(), false));
+            cur = Some((rest.to_string(), String::new(), String::new(), false, String::new()));
             continue;
         }
         if line.starts_with('[') {
             flush(&mut cur, &mut out); // a different table — this app's section ended
             continue;
         }
-        if let Some((_, path, notes, primary)) = cur.as_mut() {
+        if let Some((_, path, notes, primary, role)) = cur.as_mut() {
             if let Some(v) = toml_string_value(line, "path") { *path = v; }
             if let Some(v) = toml_string_value(line, "notes") { *notes = v; }
+            if let Some(v) = toml_string_value(line, "role") { *role = v; }
             // `primary = true` (bare boolean, not a quoted string)
             if let Some(rest) = line.strip_prefix("primary") {
                 let rest = rest.trim_start().strip_prefix('=').map(|r| r.trim_start());
@@ -366,6 +383,27 @@ kind = "cargo"
         let claims = entries.iter()
             .filter(|e| e.path.starts_with(&qt.path) && e.primary).count();
         assert_eq!(claims, 1, "exactly one voiceterm build may be the default");
+    }
+
+    #[test]
+    fn a_library_entry_is_not_offered_as_a_buildable_app() {
+        // settings-egui is a widget library embedded by other frontends: no
+        // [[bin]], no `app` feature. Building it produces nothing runnable, and
+        // the catalogue used to ignore `role` entirely and offer it anyway.
+        let text = std::fs::read_to_string(
+            crate::ops::repo_root().join("manifest/projects.toml")).expect("manifest");
+        let entries = parse_manifest(&text);
+        let lib = entries.iter().find(|e| e.app_id == "settings-egui")
+            .expect("settings-egui must be catalogued at all — it was missing entirely");
+        assert_eq!(lib.role, "lib");
+        assert!(!lib.is_runnable(), "a lib must not be offered as a runnable app");
+        // and the real apps still are
+        let app = entries.iter().find(|e| e.app_id == "rusty-board-egui").expect("the keyboard");
+        assert!(app.is_runnable());
+        // an entry with no role stated is assumed runnable, which is the
+        // historical behaviour and safe: most entries are apps
+        let bare = parse_manifest("[apps.x]\npath = \"apps/x\"\n");
+        assert!(bare[0].is_runnable());
     }
 
     #[test]
