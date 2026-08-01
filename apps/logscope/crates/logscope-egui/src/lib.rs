@@ -53,6 +53,7 @@ pub mod repetition; // pure repetition detection + graded recovery (decode + age
 #[allow(dead_code)] pub mod segment; // detect explain↔code / new-thought seams → pause, branch, checkpoint, predict
 #[allow(dead_code)] pub mod taskclass; // classify one-shot/long-horizon × maintenance/greenfield → build posture
 pub use logscope_fan::stepwise; // checkpoint protocol: prompt block, step-marker parsing, auto-continue policy, checklist
+pub mod mobilelayout; // width rules: egui horizontal() does not wrap, so narrow rows overlap
 pub use logscope_fan::stepverify; // per-step verification: the feedback signal the coordinator lacked
 pub mod docorg; // document-organization convention: front-matter, generated index, branch merge
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod plaque_scroll;
