@@ -412,7 +412,15 @@ precision, and cost {:.1} GiB of disk for nothing",
                 let (k, n) = (model.d, 2 * model.h); // wgate_up: the largest decode mat-vec
                 if let Some(t) = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n) {
                     gpu.set_matvec_tile(t);
-                    eprintln!("wgpu-engine: decode tile = {t} (cached autotune for this GPU)");
+                    // UNPACK BEFORE PRINTING. The cache stores a packed (kernel, tile) u32 and this
+                    // printed it raw, so the line read "decode tile = 2147549192" — a value that
+                    // cannot be a tile, on every load, on both machines. Tiles are 1/2/4/8.
+                    //
+                    // Harmless to the engine and corrosive to the log: a number nobody can read is a
+                    // line nobody checks, and this is the line you would consult when a shape is slow.
+                    let dc = gpu_kernels::DecodeConfig::unpack(t);
+                    eprintln!("wgpu-engine: decode tile = {} (kernel {:?}, cached autotune for this GPU)",
+                        dc.tile, dc.kernel);
                 } else {
                     let t0 = std::time::Instant::now();
                     let best = gpu.autotune_matvec(k, n);
