@@ -29,6 +29,7 @@
 #[allow(dead_code)] pub mod ollama;
 #[allow(dead_code)] pub mod quest;
 #[allow(dead_code)] pub mod stepwise;
+#[allow(dead_code)] pub mod reflexive;
 #[allow(dead_code)] pub mod peerauth;
 #[allow(dead_code)] pub mod natpath;
 #[allow(dead_code)] pub mod rendezvous;
