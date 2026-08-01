@@ -17,6 +17,11 @@ import os, re, subprocess, sys, json
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 
+# Ports live in egui-frontend/ BY CONVENTION, not by rule. krapper had no egui
+# build at all and this list never said so, because a missing directory reads
+# the same as an app that was never meant to have one. The companion check
+# below walks every app and reports which have egui ANYWHERE, so an app with no
+# port cannot hide by not having the directory the audit looks in.
 PORTS = [
     ("bo-suite",    "apps/bo-suite"),
     ("bot-arena",   "apps/bot-arena"),
@@ -24,6 +29,7 @@ PORTS = [
     ("rusty-board", "apps/rusty-board"),
     ("snapclone",   "apps/snapclone"),
     ("voiceterm",   "apps/voiceterm"),
+    ("krapper",     "apps/krapper"),
 ]
 
 def surfaces(app_dir):
@@ -131,6 +137,26 @@ def main():
     for r in rows:
         if r["missing"]:
             print(f"{r['app']}: next surfaces — {', '.join(r['missing'][:6])}")
+    # Apps with no port at all — the gap the table above cannot show.
+    apps = os.path.join(ROOT, 'apps')
+    missing = []
+    for name in sorted(os.listdir(apps)):
+        d = os.path.join(apps, name)
+        if not os.path.isdir(d): continue
+        if any(p[0] == name for p in PORTS): continue
+        hit = False
+        for root, dirs, files in os.walk(d):
+            dirs[:] = [x for x in dirs if x != 'target']
+            if 'Cargo.toml' in files:
+                try:
+                    if 'egui' in open(os.path.join(root, 'Cargo.toml'), encoding='utf8').read():
+                        hit = True; break
+                except Exception: pass
+        if not hit: missing.append(name)
+    if missing:
+        print("\nNO egui anywhere (daemons are expected here):")
+        for m in missing: print(f"  {m}")
+
     if '--json' in sys.argv:
         json.dump(rows, open(os.path.join(ROOT, 'maintenance', 'parity.json'), 'w'), indent=1)
         print("\n-> maintenance/parity.json")

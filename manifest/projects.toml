@@ -430,3 +430,13 @@ flatpak = false
 runtime = "none"
 targets = ["desktop"]
 notes = "the egui settings editor, embedded by other frontends rather than run on its own — which is why it has no [[bin]] and no `app` feature, unlike every other egui port. It was missing from this manifest entirely, so it could never appear in gitmind's catalogue; role=\"lib\" is the honest description rather than giving it a binary it does not need."
+
+[apps.krapper-egui]
+path = "apps/krapper/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "the egui port of krapper (an iced app). krapper had NO egui build at all and the parity audit never noticed, because it looks for an egui-frontend/ directory and krapper has one src/ with main.rs calling iced::application. vibe.rs, scale.rs, vocab.rs and dict.rs are iced-free, so the port mounts the model by #[path] and carries only the surface: the stress ruler, the hot-mic meter, and blurb suggestions filtered to what still fits the bar."
