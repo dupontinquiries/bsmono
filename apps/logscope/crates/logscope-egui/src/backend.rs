@@ -942,6 +942,37 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             let accounted = setup_ms + sync_ms;
             let bound = if accounted < total_ms * 0.15 { "GPU-execution" }
                         else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
+            // NAME THE BOTTLENECK, not just the split. "GPU-execution-bound, 0.1% accounted" says
+            // where the time ISN'T and leaves an operator with nothing to act on. perfverdict resolves
+            // it into one verdict — or says the run is at the memory roofline and the split is
+            // irrelevant, which is the answer that stops work rather than misdirecting it.
+            //
+            // active_bytes comes from the resident footprint; gib_per_s is 0 unless --gate-perf has
+            // run, and perfverdict reports efficiency 0 and says so rather than dividing by it.
+            {
+                let sample = gpu_kernels::perfverdict::Sample {
+                    tokens: per as u64,
+                    wall_ms: total_ms,
+                    setup_ms,
+                    sync_ms,
+                    submits: ds as u64,
+                    // BOTH ZERO FOR NOW, and the consequence is stated rather than papered over:
+                    // without them perfverdict cannot evaluate the roofline, so it can never return
+                    // AtBandwidthLimit — the one verdict that says to STOP optimising. It still
+                    // resolves the submit-side question, which is what the profile line leaves open.
+                    //
+                    // Wiring them needs a resident-bytes accessor on Model and the --gate-perf
+                    // bandwidth persisted somewhere the runtime can read. Passing a guess for either
+                    // would produce a confident efficiency figure from no measurement, which is the
+                    // shape of the 24 GiB constant.
+                    active_bytes: 0,
+                    gib_per_s: 0.0,
+                };
+                let expected_batch_ms = if ds > 0 { total_ms / ds as f64 } else { 0.0 };
+                let v = gpu_kernels::perfverdict::verdict(&sample, expected_batch_ms);
+                eprint!("[{}] ", gpu_kernels::stamp());
+                eprintln!("wgpu-engine: [{}] bottleneck — {}", self.name, v.advice());
+            }
             eprint!("[{}] ", gpu_kernels::stamp());
             eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
                 self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
