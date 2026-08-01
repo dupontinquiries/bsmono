@@ -25,6 +25,14 @@ pub struct Uniforms {
     pub time: f32,                   // seconds, for animated materials (water)
     pub bump: f32,                   // normal-map relief strength
     pub exposure: f32,               // overall brightness
+    /// Last touch: world x,y,z and age in seconds. `None` when nothing has been touched.
+    ///
+    /// An Option rather than a sentinel at this layer, so a caller cannot forget which value means
+    /// "never" — the shader gets the sentinel and the Rust side gets a type that says it.
+    ///
+    /// This is the SAME mechanism for a plant that breathes and a rune that lights: what differs is
+    /// only whether the response drives a displacement along the normal or an emissive term.
+    pub touch: Option<[f32; 4]>,
     pub texscale: f32,              // world units → texture tile frequency (triplanar)
     pub threshold: f32,              // bloom bright-pass cutoff
     pub bloom_amt: f32, pub godray_amt: f32, pub godray_weight: f32, pub godray_decay: f32,
@@ -48,6 +56,7 @@ pub struct Uniforms {
 impl Default for Uniforms {
     fn default() -> Self {
         Uniforms {
+            touch: None,   // nothing touched yet; the shader reads the sentinel as "no response"
             viewproj: [0.0; 16], eye: [0.0; 3], sun_dir: [0.0, 1.0, 0.0], sun_col: [1.0; 3],
             sky: [0.46, 0.58, 0.77], ground: [0.25, 0.20, 0.16], ambient: 0.55,
             fog_col: [0.1, 0.12, 0.14], fog: 0.012, sun_uv: [0.5, 0.85], time: 0.0, bump: 0.7, exposure: 1.35, texscale: 0.35,
@@ -315,6 +324,11 @@ impl Renderer {
         gl.uniform_1_f32(loc("u_time").as_ref(), u.time);
         gl.uniform_1_f32(loc("u_bump").as_ref(), u.bump);
         gl.uniform_1_f32(loc("u_exposure").as_ref(), u.exposure);
+        // Last touch in world space, .w its age. Negative w means nothing has been touched — which the
+        // shader reads as "no response" rather than "touched at the origin", so surfaces near 0,0,0 do
+        // not glow on startup.
+        let tch = u.touch.unwrap_or([0.0, 0.0, 0.0, -1.0]);
+        gl.uniform_4_f32(loc("u_touch").as_ref(), tch[0], tch[1], tch[2], tch[3]);
         gl.uniform_matrix_4_f32_slice(loc("u_viewproj").as_ref(), false, &u.viewproj);
         gl.uniform_3_f32(loc("u_sun_dir").as_ref(), u.sun_dir[0], u.sun_dir[1], u.sun_dir[2]);
         gl.uniform_3_f32(loc("u_sun_col").as_ref(), u.sun_col[0], u.sun_col[1], u.sun_col[2]);

@@ -278,6 +278,10 @@ pub const SHADER_FS: &str = r#"
 in vec3 v_normal; in vec4 v_color; in vec3 v_world; flat in float v_mat; flat in float v_emissive;
 uniform sampler2DArray u_mat; uniform sampler2DArray u_nrm;
 uniform float u_texscale; uniform float u_time; uniform float u_bump; uniform float u_exposure;
+// Last touch in world space; .w is its age in seconds, NEGATIVE when nothing has been touched — which
+// must read as "no response" rather than "touched at the origin", or every surface near 0,0,0 glows
+// on startup.
+uniform vec4 u_touch;
 uniform vec3 u_sun_dir; uniform vec3 u_sun_col; uniform vec3 u_sky; uniform vec3 u_ground;
 uniform float u_ambient; uniform vec3 u_eye; uniform vec3 u_fog_col; uniform float u_fog;
 uniform float u_caustic; uniform vec3 u_caustic_col;   // >0 on aquatic scenes: animated underwater light dapple
@@ -297,6 +301,23 @@ vec3 tri(sampler2DArray t, float layer, vec3 wp, vec3 bw) {
 // blend at the seams so a 45-degree face does not pop between planes. The blend exponent controls
 // how sharp the transition is: too low and every face looks smeared, too high and the seam is a
 // visible line.
+// PROXIMITY RESPONSE. `u_touch.xyz` is the last touch point in world space and `u_touch.w` is its age
+// in seconds; a negative w means nothing has been touched, which must read as "no response" rather
+// than "touched at the origin" — otherwise every surface near 0,0,0 glows on startup.
+//
+// Returns 0..1, rising as a fragment is nearer the touch and decaying with age. This is the SAME
+// mechanism for a plant that breathes and a rune that lights: what differs is only how the value is
+// used — a displacement along the normal, or an emissive term.
+float touch_response(vec3 wp, float radius) {
+    if (u_touch.w < 0.0) return 0.0;
+    float d = distance(wp, u_touch.xyz);
+    float near = 1.0 - smoothstep(0.0, max(radius, 1e-3), d);
+    // Decay over roughly a second and a half: long enough to read as a response rather than a
+    // flicker, short enough that the surface settles before the next touch.
+    float fade = exp(-u_touch.w * 0.7);
+    return near * fade;
+}
+
 vec2 tri_uv(vec3 wp, vec3 n) {
     vec3 a = abs(normalize(n));
     a = pow(a, vec3(4.0));                       // sharpen toward the dominant axis
