@@ -1813,6 +1813,35 @@ Shots and dribbling are unchanged by this (22.4 m/s exit, 33% carry
 through a steady turn), and the bots read the new ball fine — air1 style
 back up to 38.5.
 
+## v1.56.0 — the pieces earn their squares
+
+Every piece is now built facing OUT from its own side and the black army
+is turned through half a turn, so ramps, kickers and chutes point down the
+board from both ends instead of the black half facing backwards into
+itself. Checked in the sim: a white pawn's ramp reaches +5.4 z, a black
+pawn's -5.4 z.
+
+And the pieces are things to play with rather than decorated blocks. Each
+one now does what the piece does:
+
+- PAWN — a kicker, and nothing else. The front rank is a row of take-offs
+  pointing down the board.
+- ROOK — a castle you drive INSIDE: a doorway at the foot, a spiral bore
+  carved up through the tower, crenellations at the top with gaps wide
+  enough to drive out of, and a boost on the battlement.
+- KNIGHT — the arched neck built as a curved quarter-pipe: ride up the
+  inside of the arch and it throws you, with the launch ring at the lip.
+- BISHOP — a diagonal chute, because that is how a bishop moves: a long
+  banked slide running corner to corner with lips to hold you in.
+- QUEEN — the hub: a ramp spiralling up the OUTSIDE of her spire to a wide
+  deck with boost, so you can leave her in any direction, as she does.
+- KING — a bowl. He is the slowest piece, so he is the skate park of the
+  set: a sunken court with banked walls to carve around and pop out of.
+
+CHAMBER went 201 -> 373 shapes. The board still plays Morphy move for
+move, still captures, still winds up with the score (0.28 -> 0.53 moves a
+second), and every piece is still a moving platform that carries you.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

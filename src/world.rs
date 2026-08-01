@@ -2962,73 +2962,131 @@ impl World {
                 let mut mk_piece = |shapes: &mut Vec<Shape>, launchers: &mut Vec<Launcher>, zones: &mut Vec<Zone>, kind: u8, file: i32, rank: i32, white: bool| {
                     let base = origin + Vec3::new(file as f32 * sq, 0.0, rank as f32 * sq);
                     let col = if white { mix4(light, acc, 0.10) } else { mix4(dark, acc, 0.18) };
+                    let hot = mix4(col, acc, 0.45);
+                    // BLACK IS MIRRORED. Every piece is designed facing "out"
+                    // from the white side; turning the black ones through half
+                    // a turn puts their ramps, kickers and chutes facing out
+                    // of THEIR side instead of into the board.
+                    let spin = if white { Quat::IDENTITY } else { Quat::from_rotation_y(std::f32::consts::PI) };
                     let mut parts: Vec<(usize, Vec3)> = Vec::new();
                     let mut launcher = None;
-                    let mut add = |shapes: &mut Vec<Shape>, off: Vec3, half: Vec3, rot: Quat, sdf: Sdf, c: [f32; 4], glow: f32| {
-                        let i = push(shapes, M_BOX, base + off, rot, half, sdf, c, glow, 0.5);
-                        shapes[i].blend = true;
-                        parts.push((i, off));
+                    // one builder for both solid parts and carves: two
+                    // closures cannot each hold `parts` mutably
+                    let mut add = |shapes: &mut Vec<Shape>, cut: bool, off: Vec3, half: Vec3, rot: Quat, sdf: Sdf, c: [f32; 4], glow: f32| {
+                        let o = spin * off;
+                        let mesh = if cut { M_SPHERE } else { M_BOX };
+                        let i = push(shapes, mesh, base + o, spin * rot, half, sdf, c, glow, 0.5);
+                        if cut {
+                            shapes[i].cut = true;
+                        } else {
+                            shapes[i].blend = true;
+                        }
+                        parts.push((i, o));
                     };
                     match kind {
-                        // PAWN: a low block with a ramp up its face
+                        // PAWN — a kicker. Small, and the ramp always faces
+                        // out of its own side, so the front rank is a row of
+                        // take-offs pointing down the board.
                         0 => {
-                            let h = Vec3::new(4.4, 3.0, 4.4);
-                            add(shapes, Vec3::new(0.0, 3.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.2 }, col, 0.03);
-                            let rh = Vec3::new(4.2, 0.5, 6.0);
-                            add(shapes, Vec3::new(0.0, 2.2, 6.6), rh, Quat::from_rotation_x(0.42), Sdf::RBox { half: rh, round: 0.3 }, mix4(col, acc, 0.25), 0.05);
+                            let h = Vec3::new(4.6, 2.4, 3.4);
+                            add(shapes, false, Vec3::new(0.0, 2.4, -1.6), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.0 }, col, 0.03);
+                            let rh = Vec3::new(4.4, 0.5, 6.4);
+                            add(shapes, false, Vec3::new(0.0, 2.6, 5.4), rh, Quat::from_rotation_x(-0.44), Sdf::RBox { half: rh, round: 0.35 }, hot, 0.12);
                         }
-                        // ROOK: a tower with a ramp spiralling one face and a
-                        // battlement you can land on
+                        // ROOK — a castle you drive INSIDE. A doorway at the
+                        // foot, a spiral bore up through the tower, and a
+                        // battlement to be flung off at the top.
                         1 => {
-                            let h = Vec3::new(5.4, 9.0, 5.4);
-                            add(shapes, Vec3::new(0.0, 9.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 0.9 }, col, 0.03);
-                            for k in 0..3 {
-                                let y = 4.0 + k as f32 * 5.0;
-                                let a2 = k as f32 * 2.094;
-                                let rh = Vec3::new(5.0, 0.5, 3.2);
-                                add(shapes, Vec3::new(a2.cos() * 7.4, y, a2.sin() * 7.4), rh, Quat::from_rotation_y(-a2) * Quat::from_rotation_z(0.5), Sdf::RBox { half: rh, round: 0.25 }, mix4(col, acc, 0.3), 0.06);
+                            let h = Vec3::new(6.2, 10.0, 6.2);
+                            add(shapes, false, Vec3::new(0.0, 10.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.0 }, col, 0.03);
+                            // the way in, and the helix up the inside
+                            add(shapes, true, Vec3::new(0.0, 3.0, 6.0), Vec3::splat(3.4), Quat::IDENTITY, Sdf::Sphere { r: 3.4 }, [0.0; 4], 0.0);
+                            let turns = 1.6f32;
+                            for t in 0..=26 {
+                                let f = t as f32 / 26.0;
+                                let a2 = f * turns * std::f32::consts::TAU;
+                                add(shapes, true, Vec3::new(a2.sin() * 3.0, 3.0 + f * 14.0, a2.cos() * 3.0), Vec3::splat(3.3), Quat::IDENTITY, Sdf::Sphere { r: 3.3 }, [0.0; 4], 0.0);
                             }
-                            let cap = Vec3::new(6.2, 0.6, 6.2);
-                            add(shapes, Vec3::new(0.0, 18.4, 0.0), cap, Quat::IDENTITY, Sdf::RBox { half: cap, round: 0.4 }, mix4(col, acc, 0.4), 0.15);
+                            // crenellations, with gaps you can drive out of
+                            for k in 0..4 {
+                                let a2 = k as f32 * 1.5707 + 0.785;
+                                let ch = Vec3::new(1.6, 1.6, 1.6);
+                                add(shapes, false, Vec3::new(a2.cos() * 4.8, 20.6, a2.sin() * 4.8), ch, Quat::IDENTITY, Sdf::RBox { half: ch, round: 0.3 }, hot, 0.2);
+                            }
+                            zones.push(Zone { pos: base + Vec3::Y * 21.0, r: 5.0, kind: ZoneKind::Boost });
                         }
-                        // KNIGHT: a wedge with a launcher ring on its crest
+                        // KNIGHT — the kicker. An arched neck built as a
+                        // curved quarter-pipe: ride up the inside of the arch
+                        // and it throws you, with a launch ring at the lip.
                         2 => {
-                            let h = Vec3::new(4.6, 4.0, 5.4);
-                            add(shapes, Vec3::new(0.0, 4.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.0 }, col, 0.03);
-                            let w = Vec3::new(4.2, 0.55, 7.5);
-                            add(shapes, Vec3::new(0.0, 6.4, -4.0), w, Quat::from_rotation_x(-0.55), Sdf::RBox { half: w, round: 0.3 }, mix4(col, acc, 0.3), 0.08);
-                            let lp = base + Vec3::Y * 11.0;
-                            let li = push(shapes, M_TORUS_FAT, lp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(3.0), Sdf::Torus { big: 3.0, tube: 0.5 }, mix4(acc, [1.0; 4], 0.4), 0.95, 0.5);
-                            parts.push((li, Vec3::Y * 11.0));
-                            launchers.push(Launcher { pos: lp, dir: Vec3::new(0.0, 1.0, -0.35).normalize(), power: 33.0, timer: 0.0, shape: li });
+                            let h = Vec3::new(5.0, 2.6, 5.0);
+                            add(shapes, false, Vec3::new(0.0, 2.6, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.2 }, col, 0.03);
+                            for t in 0..7 {
+                                let f = t as f32 / 6.0;
+                                let ang = f * 1.15;
+                                let rr = 9.0;
+                                let p = Vec3::new(0.0, 4.4 + rr * (1.0 - ang.cos()) * 0.9, -1.0 - rr * ang.sin() * 0.55);
+                                let seg = Vec3::new(4.4, 0.55, 2.4);
+                                add(shapes, false, p, seg, Quat::from_rotation_x(-ang), Sdf::RBox { half: seg, round: 0.3 }, mix4(col, acc, 0.12 + f * 0.3), 0.05 + f * 0.2);
+                            }
+                            let lp = base + spin * Vec3::new(0.0, 13.6, -6.0);
+                            let li = push(shapes, M_TORUS_FAT, lp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(3.2), Sdf::Torus { big: 3.2, tube: 0.5 }, mix4(acc, [1.0; 4], 0.45), 1.0, 0.5);
+                            parts.push((li, spin * Vec3::new(0.0, 13.6, -6.0)));
+                            launchers.push(Launcher { pos: lp, dir: spin * Vec3::new(0.0, 0.85, -0.53).normalize(), power: 36.0, timer: 0.0, shape: li });
                             launcher = Some(launchers.len() - 1);
                         }
-                        // BISHOP: a tall angled blade — a ramp with a spine
+                        // BISHOP — a diagonal chute, because that is how a
+                        // bishop moves. A long banked slide running corner to
+                        // corner, open at both ends.
                         3 => {
-                            let h = Vec3::new(3.4, 8.0, 3.4);
-                            add(shapes, Vec3::new(0.0, 8.0, 0.0), h, Quat::from_rotation_z(0.12), Sdf::RBox { half: h, round: 1.6 }, col, 0.03);
-                            let rh = Vec3::new(3.6, 0.5, 9.0);
-                            add(shapes, Vec3::new(0.0, 6.0, 7.4), rh, Quat::from_rotation_x(0.62), Sdf::RBox { half: rh, round: 0.3 }, mix4(col, acc, 0.35), 0.1);
-                        }
-                        // QUEEN: a broad landing deck with a boost crown
-                        4 => {
-                            let h = Vec3::new(6.0, 7.0, 6.0);
-                            add(shapes, Vec3::new(0.0, 7.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 2.2 }, col, 0.05);
-                            let deck = Vec3::new(9.0, 0.6, 9.0);
-                            add(shapes, Vec3::new(0.0, 14.6, 0.0), deck, Quat::IDENTITY, Sdf::RBox { half: deck, round: 0.6 }, mix4(col, acc, 0.45), 0.2);
-                            zones.push(Zone { pos: base + Vec3::Y * 16.0, r: 6.0, kind: ZoneKind::Boost });
-                        }
-                        // KING: a crown of pillars around an open floor
-                        _ => {
-                            let h = Vec3::new(5.6, 6.0, 5.6);
-                            add(shapes, Vec3::new(0.0, 6.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.8 }, col, 0.05);
-                            for k in 0..6 {
-                                let a2 = k as f32 * 1.047;
-                                let ph = Vec3::new(0.7, 3.4, 0.7);
-                                add(shapes, Vec3::new(a2.cos() * 5.0, 15.0, a2.sin() * 5.0), ph, Quat::IDENTITY, Sdf::RBox { half: ph, round: 0.3 }, mix4(col, acc, 0.5), 0.35);
+                            let h = Vec3::new(3.0, 5.0, 3.0);
+                            add(shapes, false, Vec3::new(0.0, 5.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.4 }, col, 0.03);
+                            let ch = Vec3::new(4.2, 0.5, 11.0);
+                            add(shapes, false, Vec3::new(0.0, 7.4, 0.0), ch, Quat::from_rotation_y(0.785) * Quat::from_rotation_x(0.5), Sdf::RBox { half: ch, round: 0.4 }, hot, 0.15);
+                            // banked lips so the chute holds you in
+                            for sxx in [-1.0f32, 1.0] {
+                                let lh = Vec3::new(0.5, 1.5, 11.0);
+                                add(shapes, false, Vec3::new(sxx * 4.0, 8.4, 0.0), lh, Quat::from_rotation_y(0.785) * Quat::from_rotation_x(0.5) * Quat::from_rotation_z(sxx * 0.5), Sdf::RBox { half: lh, round: 0.3 }, mix4(col, acc, 0.3), 0.25);
                             }
-                            let deck = Vec3::new(6.2, 0.6, 6.2);
-                            add(shapes, Vec3::new(0.0, 12.2, 0.0), deck, Quat::IDENTITY, Sdf::RBox { half: deck, round: 0.5 }, mix4(col, acc, 0.3), 0.15);
+                        }
+                        // QUEEN — the hub. A spire with a ramp spiralling up
+                        // the OUTSIDE to a wide deck: she reaches everywhere,
+                        // so you can leave her in any direction.
+                        4 => {
+                            let h = Vec3::new(4.6, 9.0, 4.6);
+                            add(shapes, false, Vec3::new(0.0, 9.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.8 }, col, 0.05);
+                            for t in 0..12 {
+                                let f = t as f32 / 11.0;
+                                let a2 = f * std::f32::consts::TAU * 1.25;
+                                let seg = Vec3::new(3.6, 0.5, 3.0);
+                                add(
+                                    shapes,
+                                    false,
+                                    Vec3::new(a2.cos() * 7.6, 2.0 + f * 14.0, a2.sin() * 7.6),
+                                    seg,
+                                    Quat::from_rotation_y(-a2) * Quat::from_rotation_z(0.30),
+                                    Sdf::RBox { half: seg, round: 0.3 },
+                                    mix4(col, acc, 0.2 + f * 0.3),
+                                    0.06 + f * 0.2,
+                                );
+                            }
+                            let deck = Vec3::new(9.5, 0.6, 9.5);
+                            add(shapes, false, Vec3::new(0.0, 18.6, 0.0), deck, Quat::IDENTITY, Sdf::RBox { half: deck, round: 0.8 }, hot, 0.25);
+                            zones.push(Zone { pos: base + Vec3::Y * 20.0, r: 7.0, kind: ZoneKind::Boost });
+                        }
+                        // KING — a bowl. Slow and short, so he is the skate
+                        // park of the set: a sunken court with banked walls
+                        // you can carve around and pop out of.
+                        _ => {
+                            let h = Vec3::new(8.0, 4.0, 8.0);
+                            add(shapes, false, Vec3::new(0.0, 4.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 2.4 }, col, 0.05);
+                            add(shapes, true, Vec3::new(0.0, 9.0, 0.0), Vec3::splat(6.6), Quat::IDENTITY, Sdf::Sphere { r: 6.6 }, [0.0; 4], 0.0);
+                            for k in 0..8 {
+                                let a2 = k as f32 * 0.785;
+                                let ph = Vec3::new(0.6, 2.6, 0.6);
+                                add(shapes, false, Vec3::new(a2.cos() * 7.2, 9.4, a2.sin() * 7.2), ph, Quat::IDENTITY, Sdf::RBox { half: ph, round: 0.25 }, hot, 0.4);
+                            }
+                            zones.push(Zone { pos: base + Vec3::Y * 6.0, r: 5.0, kind: ZoneKind::Boost });
                         }
                     }
                     pieces.push(ChessPiece {

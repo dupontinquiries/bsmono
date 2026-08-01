@@ -1656,7 +1656,24 @@ pub fn run(args: &[String]) {
             let calm_rate = played as f32 / 60.0;
             let fury_rate = (after - before) as f32 / 30.0;
             println!("   tempo: {calm_rate:.2} moves/s calm -> {fury_rate:.2} moves/s furious");
-            let ok = n0 == 32 && played >= 8 && gone >= 1 && fury_rate > calm_rate * 1.8;
+            // MIRRORING: a white pawn's ramp reaches toward +Z (down the
+            // board); a black pawn's must reach the other way, so its ramps
+            // face out of ITS side too.
+            let w2 = World::generate(9, crate::world::style(35), 0.31, 1.0);
+            let mut mirrored = false;
+            if let Some(c) = w2.chess.as_ref() {
+                let wp = c.pieces.iter().find(|p| p.sq.1 == 1); // white pawn rank
+                let bp = c.pieces.iter().find(|p| p.sq.1 == 6); // black pawn rank
+                if let (Some(a2), Some(b2)) = (wp, bp) {
+                    // the furthest-reaching part of each piece, in z
+                    let wz = a2.parts.iter().map(|(_, o)| o.z).fold(f32::MIN, f32::max);
+                    let bz = b2.parts.iter().map(|(_, o)| o.z).fold(f32::MAX, f32::min);
+                    mirrored = wz > 2.0 && bz < -2.0;
+                    println!("   pawn reach: white +{wz:.1} z, black {bz:.1} z");
+                }
+            }
+            let ok = n0 == 32 && played >= 8 && gone >= 1 && fury_rate > calm_rate * 1.8 && mirrored;
+            println!("   {}", if mirrored { "black pieces are mirrored" } else { "NOT MIRRORED" });
             pass &= ok;
             println!("   {}", if ok { "the board plays and winds up" } else { "CHESS FAIL" });
         }
