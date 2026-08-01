@@ -69,6 +69,21 @@ fn main() {
     println!("fold: spill {:.3} vacancy {:.3} error {:.3}", f.fit.spill, f.fit.vacancy, f.fit.error());
 
     let pts: Vec<Vec<[f64;3]>> = comps.iter().map(|c| c.iter().map(|&i| v[i]).collect()).collect();
+    // which component owns each vertex, so triangles can be routed to a bone
+    let mut owner = vec![usize::MAX; v.len()];
+    for (ci, c) in comps.iter().enumerate() { for &i in c { owner[i] = ci; } }
+    // triangles grouped by component (only those wholly inside one)
+    let mut ctris: Vec<Vec<[usize;3]>> = vec![vec![]; comps.len()];
+    for tri in t.chunks_exact(3) {
+        let (a,b,c) = (tri[0] as usize, tri[1] as usize, tri[2] as usize);
+        if a>=v.len()||b>=v.len()||c>=v.len() { continue; }
+        let o = owner[a];
+        if o != usize::MAX && owner[b]==o && owner[c]==o {
+            // local indices within the component
+            let li = |g: usize| comps[o].iter().position(|&x| x==g).unwrap_or(0);
+            ctris[o].push([li(a), li(b), li(c)]);
+        }
+    }
     let a = assign(&pts, &folded, 0.3);
     let cov = coverage(&a, folded.len(), s * 0.9);
     println!("assign: {} parts, per-bone {:?}, empty {}, orphans {}",
@@ -99,13 +114,39 @@ fn main() {
             o.sort_by(|&x,&y| sp[y].partial_cmp(&sp[x]).unwrap()); o };
         let (la, ua) = (ax[0], ax[1]);
         let mut img = vec![[14u8,16,22]; W*H];
-        let pal = [[232u8,122,90],[108,190,230],[140,210,120],[220,180,90],[190,140,230],[230,130,180]];
-        for (bone, m) in &moved {
-            let c = pal[bone % pal.len()];
-            for p in m {
-                let x = (((p[la]-lo[la])/sp[la])*(W as f64-8.0)) as usize + 4;
-                let y = ((1.0-(p[ua]-lo[ua])/sp[ua])*(H as f64-8.0)) as usize + 4;
-                if x < W && y < H { img[y*W+x] = c; }
+        let mut zbuf = vec![f64::MAX; W*H];
+        let pal = [[236u8,132,98],[112,192,232],[146,214,126],[226,186,96],[196,146,234],[234,138,186]];
+        // Solid shaded triangles with a depth buffer — a point cloud is
+        // unreadable at this density and cannot show whether parts travel as
+        // coherent bodies, which is the only question that matters here.
+        let da = ax[2];   // the axis we are looking along
+        for (ci, (bone, m)) in moved.iter().enumerate() {
+            let base = pal[bone % pal.len()];
+            for tri in &ctris[ci] {
+                let (p0, p1, p2) = (m[tri[0]], m[tri[1]], m[tri[2]]);
+                let sx = |p: [f64;3]| (((p[la]-lo[la])/sp[la])*(W as f64-8.0)) + 4.0;
+                let sy = |p: [f64;3]| ((1.0-(p[ua]-lo[ua])/sp[ua])*(H as f64-8.0)) + 4.0;
+                let (x0,y0,x1,y1,x2,y2) = (sx(p0),sy(p0),sx(p1),sy(p1),sx(p2),sy(p2));
+                // facing, for shading: a flat colour hides all the form
+                let e1 = [x1-x0, y1-y0]; let e2 = [x2-x0, y2-y0];
+                let cross = e1[0]*e2[1] - e1[1]*e2[0];
+                let depth = (p0[da]+p1[da]+p2[da])/3.0;
+                let shade = 0.45 + 0.55 * (cross.abs() / (cross.abs()+40.0)).min(1.0);
+                let col = [ (base[0] as f64*shade) as u8,
+                            (base[1] as f64*shade) as u8,
+                            (base[2] as f64*shade) as u8 ];
+                let (mnx, mxx) = (x0.min(x1).min(x2).max(0.0) as usize, x0.max(x1).max(x2).min(W as f64-1.0) as usize);
+                let (mny, mxy) = (y0.min(y1).min(y2).max(0.0) as usize, y0.max(y1).max(y2).min(H as f64-1.0) as usize);
+                if cross.abs() < 1e-9 { continue; }
+                for py in mny..=mxy { for px in mnx..=mxx {
+                    let (fx, fy) = (px as f64 + 0.5, py as f64 + 0.5);
+                    let w0 = ((y1-y2)*(fx-x2) + (x2-x1)*(fy-y2)) / ((y1-y2)*(x0-x2)+(x2-x1)*(y0-y2));
+                    let w1 = ((y2-y0)*(fx-x2) + (x0-x2)*(fy-y2)) / ((y1-y2)*(x0-x2)+(x2-x1)*(y0-y2));
+                    let w2 = 1.0 - w0 - w1;
+                    if w0 < -0.002 || w1 < -0.002 || w2 < -0.002 { continue; }
+                    let k = py*W + px;
+                    if depth < zbuf[k] { zbuf[k] = depth; img[k] = col; }
+                }}
             }
         }
         tiles.push(img);
