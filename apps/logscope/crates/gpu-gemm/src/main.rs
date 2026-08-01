@@ -3494,6 +3494,37 @@ everywhere: it looks like a hardware problem"
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-bytes") {
+        // ISOLATES byte_at. Five rounds of inference from dequantizer output have not settled whether
+        // it advances past the first u32, because the dequantizers do too much for their output to name
+        // one cause. This does one thing.
+        let gpu = Gpu::new();
+        println!("gate-bytes: adapter = {}", gpu.adapter_name);
+        let n = 64usize;
+        let raw: Vec<u8> = (0..n).map(|i| i as u8).collect();     // byte i holds the value i
+        let got = gpu.byte_probe(&raw);
+        let g: Vec<u8> = got.iter().take(16).map(|v| *v as u8).collect();
+        println!("  source bytes 0..16 : {:?}", &raw[..16]);
+        println!("  byte_at  0..16     : {g:?}");
+        let exact = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        if exact {
+            println!("gate-bytes: byte_at is CORRECT — the fault is in the dequantizers, not the reader \u{2713}");
+        } else {
+            let first_bad = got.iter().position(|v| (*v as u8) != raw[got.iter().position(|_| true).unwrap()]);
+            let bad = got.iter().enumerate().find(|(i, v)| **v as u8 != raw[*i]).map(|(i, _)| i);
+            let _ = first_bad;
+            println!("  first wrong index  : {bad:?}");
+            // Name the shape, because the fixes are opposite.
+            let tail_same = got.windows(2).skip(4).all(|w| w[0] == w[1]);
+            let tail_zero = got.iter().skip(4).all(|v| *v == 0.0);
+            println!("gate-bytes: byte_at is WRONG — {}",
+                if tail_zero { "reads past word 0 return ZERO, so the BINDING is short" }
+                else if tail_same { "reads past word 0 CLAMP to a stale value, so the binding is fine \
+and the INDEX is wrong" }
+                else { "the pattern is neither clamped nor zeroed; paste the two rows above" });
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--gate-q6k") {
         // Q6_K on the GPU, against the CPU reference in gguf.rs. Bit-exactness is the bar, not "close":
         // this decides whether Scout's experts can be FILE VIEWS instead of 200 GiB of host copies, and a
