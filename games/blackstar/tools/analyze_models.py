@@ -175,6 +175,25 @@ def pair_up(names):
             pair[b] = a
     return pair
 
+def part_groups(names):
+    """Logical models that are already split into `_partN` entries.
+
+    THE transform wire. The engine places an ex_model_t by position, rotation and
+    scale, which cannot bend a single mesh — but 38 models are already exported
+    as separate part files covering 442 entries, and separate models CAN each be
+    rotated about their own hinge. No vertex access, no shader change, no second
+    export: the parts are already on disk.
+
+    Returns (stem, [indices]) for groups of three or more. Two parts is usually
+    a mesh and its collision proxy rather than an articulated model.
+    """
+    from collections import defaultdict
+    g = defaultdict(list)
+    for i, n in enumerate(names):
+        m = re.match(r'(.+?)_part\d+$', re.sub(r'\.iqm$', '', n))
+        if m: g[m.group(1)].append(i)
+    return sorted((k, sorted(v)) for k, v in g.items() if len(v) >= 3)
+
 def main():
     hdr = os.path.join(ROOT, 'engine_src', 'imported_models.h')
     src = open(hdr).read()
@@ -215,6 +234,29 @@ def main():
             fh.write(f"  {{{verdict_code(r)},{r['up']},{r['lat']},{flags},"
                      f"{min(r['pairs'],65535)},{r['paired']:.3f}f}},\n")
         fh.write("};\n\n")
+        fh.write("// Logical models already split into _partN entries: the parts the engine\n")
+        fh.write("// can rotate individually. THIS is the transform wire - separate models each\n")
+        fh.write("// take their own rotation, so folding one needs no vertex access and no\n")
+        fh.write("// shader change. The parts are already on disk.\n")
+        fh.write("#define EX_MAX_GROUP_PARTS 96\n")
+        fh.write("typedef struct { unsigned short n; unsigned short part[EX_MAX_GROUP_PARTS]; } ex_part_group_t;\n")
+        groups = part_groups(names)
+        fh.write(f"#define EX_N_PART_GROUPS {len(groups)}\n")
+        fh.write(f"static const ex_part_group_t g_part_group[{max(len(groups),1)}] = {{\n")
+        for stem_name, idxs in groups:
+            idxs = idxs[:96]
+            fh.write(f"  {{{len(idxs)},{{" + ",".join(str(i) for i in idxs) + "}}},  // " + stem_name[:44] + "\n")
+        if not groups: fh.write("  {0,{0}},\n")
+        fh.write("};\n")
+        fh.write("// Which group a model belongs to, or -1.\n")
+        member = [-1]*len(rows)
+        for gi,(_,idxs) in enumerate(groups):
+            for i in idxs:
+                if i < len(member): member[i] = gi
+        fh.write(f"static const short g_part_group_of[{len(member)}] = {{\n")
+        for i in range(0, len(member), 16):
+            fh.write("  " + ",".join(str(x) for x in member[i:i+16]) + ",\n")
+        fh.write("};\n\n")
         fh.write("// Vehicle<->robot partner per model, or -1. Computed by stripping form\n")
         fh.write("// words (tank/vehicle/rb vs robot/bot/lmb) and matching the remaining stem.\n")
         fh.write("// Only a ROBOT pairs with a VEHICLE: two robots of one character are\n")
@@ -231,6 +273,7 @@ def main():
     print(f"\n-> engine_src/model_analysis.h")
     for k in sorted(counts): print(f"  {vnames[k]:12} {counts[k]:5}")
     print(f"  paired       {n_paired:5}  (models with a vehicle<->robot partner)")
+    print(f"  part groups  {len(part_groups(names)):5}  (logical models the engine can fold)")
     return 0
 
 if __name__ == '__main__':

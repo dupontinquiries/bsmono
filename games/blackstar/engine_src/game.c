@@ -542,6 +542,68 @@ static void imp_transform_step(float dt, float *squash, float *spin_deg){
   }
   if (g_imp_xf_t <= 0.0f) { g_imp_xf_t = 0.0f; g_imp_xf_to = -1; }
 }
+/* SINGLE-MODEL FOLD.
+ *
+ * The crush-spin-swap needs a partner and only three characters in the whole
+ * library have one, which is why nothing tested transformed. This folds a model
+ * that is already split into `_partN` entries - 38 of them, covering 442 model
+ * entries - by rotating each PART about its own hinge.
+ *
+ * That needs no vertex access and no shader change: separate ex_model_t's each
+ * take their own rotation, and the parts are already on disk.
+ *
+ * The hinge for part i is derived rather than authored: its offset from the
+ * group's centre gives the pivot, and the model's measured lateral axis
+ * (model_analysis.h, per model, because Brawl's tank is longest in Y and his
+ * robot in Z) gives the axis. Parts further from the centre swing further,
+ * which is what makes a limb unfold rather than the whole model rotating.
+ */
+static float g_fold_t = 0.0f;        /* 0 = vehicle, 1 = robot */
+static float g_fold_dir = 0.0f;
+
+static int imp_group_of(int idx){
+  if (idx < 0 || idx >= EX_N_IMPORTED) return -1;
+  if (idx >= (int)(sizeof(g_part_group_of)/sizeof(g_part_group_of[0]))) return -1;
+  return g_part_group_of[idx];
+}
+/* Can this model fold? Either it has a partner to swap with, or it is split
+ * into parts we can rotate. Reported as one predicate so the browser filter and
+ * the T key cannot disagree about what is foldable. */
+static int imp_can_fold(int idx){
+  return (idx >= 0 && idx < EX_N_IMPORTED &&
+          (g_imp_pair[idx] >= 0 || imp_group_of(idx) >= 0));
+}
+
+/* Pose one part of a folding group. `t` is 0 (vehicle) to 1 (robot). */
+static void imp_fold_part(int gi, int slot, float t, ex_model_t *m,
+                          float cx, float cy, float cz, float sc){
+  const ex_part_group_t *g = &g_part_group[gi];
+  if (slot >= g->n) return;
+  int idx = g->part[slot];
+  int lat = 0, up = 1;
+  if (idx < (int)(sizeof(g_model_plan)/sizeof(g_model_plan[0]))) {
+    lat = g_model_plan[idx].lat; up = g_model_plan[idx].up;
+  }
+  /* Ease so parts accelerate and settle rather than moving linearly - a linear
+   * blend reads as a slideshow rather than a mechanism. */
+  float e = t * t * (3.0f - 2.0f * t);
+  /* Sequence by slot: the big parts (earlier in the group) commit first and the
+   * detail follows into the space they opened. Without this every part moves on
+   * one clock, which is what makes a fold look like an explosion. */
+  float lead = (float)slot / (float)(g->n > 1 ? g->n : 1);
+  float w0 = lead * 0.45f, w1 = w0 + 0.55f;
+  float lt = (e <= w0) ? 0.0f : (e >= w1) ? 1.0f : (e - w0) / (w1 - w0);
+  float ang = lt * 62.0f * ((slot & 1) ? -1.0f : 1.0f);
+  /* rotate about the measured lateral axis, and rise along the up axis */
+  float rot[3] = {0.0f, 0.0f, 0.0f};
+  rot[lat] = ang;
+  m->rotation[0] += rot[0]; m->rotation[1] += rot[1]; m->rotation[2] += rot[2];
+  float rise = lt * sc * 0.20f * ((float)slot / (float)(g->n > 1 ? g->n : 1));
+  float pos[3] = {cx, cy, cz};
+  pos[up] += rise;
+  m->position[0] = pos[0]; m->position[1] = pos[1]; m->position[2] = pos[2];
+}
+
 static void imp_transform_start(void){
   int p = g_imp_pair[g_imported_idx];
   if (p < 0 || g_imp_xf_t > 0.0f) return;
@@ -4809,7 +4871,7 @@ static void menu_input(void)
       if (step) {
         int start=g_imported_idx, n=0;
         do { g_imported_idx=(g_imported_idx+step+EX_N_IMPORTED)%EX_N_IMPORTED; n++; }
-        while (g_xform_only && !ex_model_transforms(g_imported_idx) &&
+        while (g_xform_only && !imp_can_fold(g_imported_idx) &&
                g_imported_idx!=start && n<EX_N_IMPORTED);
         game_log("model %d/%d %s", g_imported_idx+1, EX_N_IMPORTED, g_imported_names[g_imported_idx]);
       }
@@ -5310,13 +5372,56 @@ static void builder_preview(float dt)
   if (g_show_imported && g_imported_tpl[g_imported_idx]) {
     for (int i=0;i<EX_ROBOT_PARTS;i++) g_player_parts[i]->position[1]=-100000.0f;  // hide built bot
     // T: transform to the paired form (vehicle<->robot), when this model has one
-    if (ex_keys_down[SDL_SCANCODE_T] && g_imp_pair[g_imported_idx] >= 0) {
-      imp_transform_start(); ex_keys_down[SDL_SCANCODE_T]=0; }
+    // T folds. A model with a PARTNER swaps (three characters have one); a model
+    // split into PARTS folds in place (38 do). Preferring the part fold when
+    // both exist, because a real fold beats a crush-and-swap.
+    if (ex_keys_down[SDL_SCANCODE_T]) {
+      ex_keys_down[SDL_SCANCODE_T]=0;
+      if (imp_group_of(g_imported_idx) >= 0) {
+        g_fold_dir = (g_fold_t > 0.5f) ? -1.0f : 1.0f;
+        game_log("fold %s -> %s", g_imported_names[g_imported_idx],
+                 g_fold_dir > 0 ? "robot" : "vehicle");
+      } else if (g_imp_pair[g_imported_idx] >= 0) {
+        imp_transform_start();
+      } else {
+        game_log("%s cannot fold: no partner and not split into parts",
+                 g_imported_names[g_imported_idx]);
+      }
+    }
+    if (g_fold_dir != 0.0f) {
+      g_fold_t += g_fold_dir * (float)dt * 1.1f;      /* ~0.9s, matches xform_dur */
+      if (g_fold_t >= 1.0f) { g_fold_t = 1.0f; g_fold_dir = 0.0f; }
+      if (g_fold_t <= 0.0f) { g_fold_t = 0.0f; g_fold_dir = 0.0f; }
+    }
     float xf_squash, xf_spin; imp_transform_step((float)dt, &xf_squash, &xf_spin);
-    for (int i=0;i<EX_N_IMPORTED;i++) if(i!=g_imported_idx && g_imported_tpl[i]) g_imported_tpl[i]->position[1]=-100000.0f;
+    // Hide every model except the selected one -- or, when the selection is part
+    // of a foldable group, except that whole GROUP, since a folding model is all
+    // of its parts and hiding the rest shows one panel moving alone.
+    int grp = imp_group_of(g_imported_idx);
+    for (int i=0;i<EX_N_IMPORTED;i++) {
+      if (i==g_imported_idx || !g_imported_tpl[i]) continue;
+      int keep = 0;
+      if (grp >= 0 && imp_group_of(i) == grp) keep = 1;
+      if (!keep) g_imported_tpl[i]->position[1]=-100000.0f;
+    }
     ex_model_t *im = g_imported_tpl[g_imported_idx];
     int k = g_imported_idx;
     float s = 2.0f * g_imp_scl[k] / 0.33f;   // harness scale over the library default
+    // FOLD: place every part of the group, each about its own hinge. Done here
+    // rather than in the per-model block below because a fold is a property of
+    // the GROUP -- the parts have to agree on a centre or they fly apart.
+    if (grp >= 0) {
+      const ex_part_group_t *G = &g_part_group[grp];
+      for (int sl=0; sl<G->n; sl++) {
+        int pi = G->part[sl];
+        ex_model_t *pm = (pi>=0 && pi<EX_N_IMPORTED) ? g_imported_tpl[pi] : 0;
+        if (!pm) continue;
+        pm->scale3[0]=pm->scale3[1]=pm->scale3[2]=s;
+        pm->rotation[0]=g_imp_rx[k]; pm->rotation[1]=g_imp_ry[k]; pm->rotation[2]=g_imp_rz[k];
+        pm->is_lit=1; pm->tint[0]=pm->tint[1]=pm->tint[2]=1.0f;
+        imp_fold_part(grp, sl, g_fold_t, pm, im->position[0], im->position[1], im->position[2], s);
+      }
+    }
     // per-kind idle so the plinth already shows the category's motion language:
     // robots breathe, vehicles settle on their suspension, ships hover, weapons/props sit.
     float idle_y = 0.0f, idle_rz = 0.0f;
@@ -7064,7 +7169,16 @@ void game_update(double dt, double ft)
     // model at the player's position/facing. Reuses the working game camera.
     if (g_show_imported && g_imported_tpl[g_imported_idx]) {
       for (int i=0;i<EX_ROBOT_PARTS;i++) g_player_parts[i]->position[1]=-100000.0f;  // hide built parts
-      for (int i=0;i<EX_N_IMPORTED;i++) if(i!=g_imported_idx && g_imported_tpl[i]) g_imported_tpl[i]->position[1]=-100000.0f;
+      // Hide every model except the selected one -- or, when the selection is part
+    // of a foldable group, except that whole GROUP, since a folding model is all
+    // of its parts and hiding the rest shows one panel moving alone.
+    int grp = imp_group_of(g_imported_idx);
+    for (int i=0;i<EX_N_IMPORTED;i++) {
+      if (i==g_imported_idx || !g_imported_tpl[i]) continue;
+      int keep = 0;
+      if (grp >= 0 && imp_group_of(i) == grp) keep = 1;
+      if (!keep) g_imported_tpl[i]->position[1]=-100000.0f;
+    }
       ex_model_t *im = g_imported_tpl[g_imported_idx];
       int k = g_imported_idx;
       float ph = g_build.height * 3.2f * g_imp_scl[k];   // stature * per-model harness scale
@@ -12222,8 +12336,14 @@ void game_update(double dt, double ft)
                g_imported_names[k], g_imp_rx[k], g_imp_ry[k], g_imp_rz[k], g_imp_scl[k]);
       ex_vga_setfg(255,220,120,255); ex_vga_print(1, 12, ib);
     } else {
-      snprintf(ib,sizeof(ib),"MODEL: %s  [ ] cycle  F4 tune%s", g_imported_names[g_imported_idx],
-               g_sandbox?"  D log":"  F5 sandbox");
+      {
+        int gg = imp_group_of(g_imported_idx);
+        const char *how = gg >= 0 ? "T folds" :
+                          (g_imp_pair[g_imported_idx] >= 0 ? "T swaps" : "no transform");
+        snprintf(ib,sizeof(ib),"MODEL: %s  [%s%s]  [ ] cycle  F4 tune%s",
+                 g_imported_names[g_imported_idx], how,
+                 gg >= 0 ? "" : "", g_sandbox?"  D log":"  F5 sandbox");
+      }
       ex_vga_setfg(150,200,255,255); ex_vga_print(1, 12, ib);
     }
   }
