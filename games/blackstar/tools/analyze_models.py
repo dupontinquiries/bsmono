@@ -119,6 +119,62 @@ def verdict_code(r):
     if r['paired'] < 0.25: return 3
     return 4
 
+# Words that mark which FORM a model is, not which character. Stripping them
+# leaves the stem, and two models sharing a stem are the same character in two
+# forms — which is exactly what the transform needs and what nothing was
+# computing. g_imp_pair was set for three models out of 1,012.
+VEHICLE_WORDS = ['vehicle', 'tank', 'car', 'truck', 'jet', 'alt', 'altmode',
+                 'vehicleform', 'cybertruck', 'veh', 'rb', 'rib']
+ROBOT_WORDS   = ['robot', 'bot', 'lmb', 'robotmode', 'bipedal']
+
+def stem(name):
+    """The character, with form words and part suffixes removed."""
+    n = name.lower()
+    n = re.sub(r'^imported_', '', n)
+    n = re.sub(r'\.iqm$', '', n)
+    n = re.sub(r'_?part\d+$', '', n)
+    n = re.sub(r'_?v\d+$', '', n)
+    toks = [t for t in re.split(r'[_\-\s]+', n) if t]
+    keep = [t for t in toks if t not in VEHICLE_WORDS and t not in ROBOT_WORDS]
+    return '_'.join(keep)
+
+def form_of(name):
+    """1 robot, 2 vehicle, 0 ambiguous.
+
+    An UNMARKED name counts as robot. Most characters are exported as
+    `<name>` and `<name>_vehicle`, not as `<name>_robot` and `<name>_vehicle`
+    — the robot is the default form and only the alt mode gets labelled. The
+    first version required an explicit robot word and found 2 partners in 400
+    models; treating unmarked as robot is what the corpus actually looks like.
+    """
+    toks = set(re.split(r'[_\-\s]+', name.lower()))
+    v = bool(toks & set(VEHICLE_WORDS))
+    r = bool(toks & set(ROBOT_WORDS))
+    if v and r: return 0          # both words: cannot tell, do not guess
+    if v: return 2
+    return 1                       # robot word, or no word at all
+
+def pair_up(names):
+    """Index -> partner index, or -1.
+
+    Only pairs a ROBOT with a VEHICLE sharing a stem. Two robots of one
+    character are variants, not a transformation, and pairing them would make
+    the T key swap between two nearly identical models — which reads as a bug
+    rather than a transform.
+    """
+    from collections import defaultdict
+    by_stem = defaultdict(lambda: {1: [], 2: []})
+    for i, n in enumerate(names):
+        f = form_of(n)
+        if f: by_stem[stem(n)][f].append(i)
+    pair = [-1] * len(names)
+    for st, forms in by_stem.items():
+        if not st: continue
+        for a, b in zip(forms[1], forms[2]):
+            pair[a] = b
+            pair[b] = a
+    return pair
+
 def main():
     hdr = os.path.join(ROOT, 'engine_src', 'imported_models.h')
     src = open(hdr).read()
@@ -135,6 +191,10 @@ def main():
         r = analyse(p) if os.path.exists(p) else None
         rows.append(r)
         if (i+1) % 50 == 0: print(f"  {i+1}/{len(files)}", file=sys.stderr)
+
+    names = [os.path.basename(f) for f in files]
+    pairs = pair_up(names)
+    n_paired = sum(1 for p in pairs if p >= 0)
 
     out = os.path.join(ROOT, 'engine_src', 'model_analysis.h')
     with open(out, 'w') as fh:
@@ -154,14 +214,23 @@ def main():
             flags = (1 if r['unwelded'] else 0) | (2 if r['openf'] > 0.05 else 0) | (4 if r['uv'] else 0)
             fh.write(f"  {{{verdict_code(r)},{r['up']},{r['lat']},{flags},"
                      f"{min(r['pairs'],65535)},{r['paired']:.3f}f}},\n")
+        fh.write("};\n\n")
+        fh.write("// Vehicle<->robot partner per model, or -1. Computed by stripping form\n")
+        fh.write("// words (tank/vehicle/rb vs robot/bot/lmb) and matching the remaining stem.\n")
+        fh.write("// Only a ROBOT pairs with a VEHICLE: two robots of one character are\n")
+        fh.write("// variants, and swapping between them reads as a bug, not a transform.\n")
+        fh.write(f"static const short g_model_pair[{len(pairs)}] = {{\n")
+        for i in range(0, len(pairs), 16):
+            fh.write("  " + ",".join(str(p) for p in pairs[i:i+16]) + ",\n")
         fh.write("};\n")
 
     counts = {}
     for r in rows:
         counts[verdict_code(r)] = counts.get(verdict_code(r), 0) + 1
-    names = {0:'unreadable',1:'weld first',2:'monolithic',3:'no plan',4:'USABLE'}
+    vnames = {0:'unreadable',1:'weld first',2:'monolithic',3:'no plan',4:'USABLE'}
     print(f"\n-> engine_src/model_analysis.h")
-    for k in sorted(counts): print(f"  {names[k]:12} {counts[k]:5}")
+    for k in sorted(counts): print(f"  {vnames[k]:12} {counts[k]:5}")
+    print(f"  paired       {n_paired:5}  (models with a vehicle<->robot partner)")
     return 0
 
 if __name__ == '__main__':
