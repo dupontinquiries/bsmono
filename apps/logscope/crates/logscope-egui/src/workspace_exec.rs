@@ -2440,3 +2440,69 @@ foo = "bar"
         assert!(p.contains("IS the documentation"), "explains source-as-docs");
     }
 }
+
+/// How a run's verification should be described.
+///
+/// Extracted from the badge so it can be tested: the UI change that introduced the third state had no
+/// coverage, and the bug it fixed had survived precisely because nothing asserted what the two-state
+/// version meant.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VerifyBadge {
+    /// A verifier ran and passed.
+    Passed,
+    /// A verifier ran and did not pass.
+    Failed,
+    /// No verifier was configured. NOT the same as passing.
+    None,
+}
+
+impl VerifyBadge {
+    /// `verified` is permissive-by-default — it starts true when no verify command exists, which is
+    /// correct for gating and wrong for display. `had_verifier` is what separates the two.
+    pub fn of(verified: bool, had_verifier: bool) -> VerifyBadge {
+        if !had_verifier { VerifyBadge::None }
+        else if verified { VerifyBadge::Passed }
+        else { VerifyBadge::Failed }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VerifyBadge::Passed => " · ✓ verified",
+            VerifyBadge::Failed => " · ⚠ unverified",
+            // Actionable, which the other two are not: the fix is to configure one.
+            VerifyBadge::None => " · no verifier configured",
+        }
+    }
+}
+
+#[cfg(test)]
+mod verify_badge_tests {
+    use super::*;
+
+    #[test]
+    fn no_verifier_is_NOT_passed() {
+        // The bug. `verified` starts true when nothing is configured, so the two-state badge rendered
+        // "✓ verified" for a run where nothing was ever checked — worse than no badge, because it is
+        // what makes someone stop looking.
+        assert_eq!(VerifyBadge::of(true, false), VerifyBadge::None);
+        assert_ne!(VerifyBadge::of(true, false), VerifyBadge::Passed);
+        assert!(VerifyBadge::None.label().contains("no verifier"));
+    }
+
+    #[test]
+    fn a_real_pass_and_a_real_failure_still_read_normally() {
+        assert_eq!(VerifyBadge::of(true, true), VerifyBadge::Passed);
+        assert_eq!(VerifyBadge::of(false, true), VerifyBadge::Failed);
+    }
+
+    #[test]
+    fn the_permissive_default_cannot_reach_the_display_as_affirmative() {
+        // The pattern stated as a rule: a boolean that is permissive-by-default gets read as
+        // affirmative-by-default the moment it reaches a display. `of` is the only path to a label, so
+        // the distinction cannot be dropped by a caller reading `verified` alone.
+        for had in [true, false] {
+            let b = VerifyBadge::of(true, had);
+            assert_eq!(b == VerifyBadge::Passed, had, "passing requires a verifier to have run");
+        }
+    }
+}
