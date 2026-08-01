@@ -13,6 +13,7 @@ pub mod cpupool;
 pub mod cpuattn;
 pub mod cpudecode;
 pub mod perfverdict;
+pub mod gateclass;
 pub mod tensornames;
 pub mod cpuops;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
