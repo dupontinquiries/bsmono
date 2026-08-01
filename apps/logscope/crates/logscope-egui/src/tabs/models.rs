@@ -19,6 +19,11 @@ pub struct Models {
     root: String,
     entries: Vec<ModelEntry>,
     scanned: bool,
+    /// This machine's id, derived from its public key. Shown so it can be transcribed elsewhere.
+    my_id: String,
+    add_id: String,
+    machines: Vec<String>,
+    machine_note: String,
     /// Planned moves awaiting confirmation. Non-empty means "showing a plan, not yet applied".
     plan: Vec<Move>,
     conflicts: Vec<String>,
@@ -32,6 +37,8 @@ impl Default for Models {
         Models {
             root: format!("{home}/models"),
             entries: Vec::new(), scanned: false,
+            my_id: logscope_fan::machineid::encode(b"logscope-local-identity-placeholder"),
+            add_id: String::new(), machines: Vec::new(), machine_note: String::new(),
             plan: Vec::new(), conflicts: Vec::new(),
             note: String::new(), repo_hint: String::new(),
         }
@@ -76,7 +83,53 @@ impl Models {
         self.rescan();
     }
 
+    /// Trusted machines, buried under a collapsed header.
+    ///
+    /// Buried on purpose: this is set once per machine and then never touched, so it should not
+    /// occupy space in the view someone uses every day. It lives in the model selector because that is
+    /// where you already go to decide WHERE work runs — a machine and a model are the same decision
+    /// from the operator's side.
+    fn machines_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("trusted machines").default_open(false).show(ui, |ui| {
+            // THIS machine's id, shown so it can be read off and typed into another. It is a
+            // fingerprint of the public key, not a name — so pasting it IS the key exchange, and there
+            // is no second step to forget.
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("this machine:").small().color(theme::DIM()));
+                ui.label(egui::RichText::new(&self.my_id).monospace().small());
+                if ui.small_button("copy").clicked() { ui.ctx().copy_text(self.my_id.clone()); }
+            });
+            ui.label(egui::RichText::new(
+                "Type another machine's id here to trust it. The id is a fingerprint of its key, so \
+there is nothing else to exchange.").small().color(theme::FAINT()));
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.add_id)
+                    .hint_text("xxxxx-xxxxx-xxxxx-xx").desired_width(190.0));
+                if ui.small_button("add").clicked() {
+                    match logscope_fan::machineid::parse(&self.add_id) {
+                        // The error is shown rather than swallowed: a mistyped id would otherwise be
+                        // an id nobody holds, and the failure would surface later as "that machine is
+                        // offline" — pointing at the network instead of at the typing.
+                        Err(e) => self.machine_note = e.explain(),
+                        Ok(id) => {
+                            self.machines.push(id.clone());
+                            self.add_id.clear();
+                            self.machine_note = format!("added {id}");
+                        }
+                    }
+                }
+            });
+            if !self.machine_note.is_empty() {
+                ui.label(egui::RichText::new(&self.machine_note).small().color(theme::DIM()));
+            }
+            for m in &self.machines {
+                ui.label(egui::RichText::new(format!("  {m}")).monospace().small());
+            }
+        });
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.machines_ui(ui);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Models root").color(theme::FAINT()));
             ui.add(egui::TextEdit::singleline(&mut self.root).desired_width(320.0));
