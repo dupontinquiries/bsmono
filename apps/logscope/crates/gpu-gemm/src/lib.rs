@@ -11418,6 +11418,19 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 // the next readback would map_async an invalid buffer and abort the process. Bail the
                 // window HERE — every slot, not just at the flush cadence — before download_u32, so the
                 // caller falls back to per-token decode (which doesn't hit the ceiling). Restore flush.
+                // A DEVICE OOM IS PRESSURE TOO, and it was the only kind this hardware actually
+                // reports. observe_pressure had exactly one trigger — dims_alloc_failed — while the
+                // failure your log shows is "DEVICE OOM caught (VMA exhausted)", handled elsewhere and
+                // never fed back. So the window climbed 8→10→12→15→18→22, hit VMA exhaustion, was
+                // degraded for that step, and CLIMBED STRAIGHT BACK on the next one, because the
+                // ceiling latch never learned.
+                //
+                // A ratchet whose only sensor is the failure mode this device does not produce is a
+                // ratchet that does not ratchet.
+                if self.oom_backoff() {
+                    self.governor.lock().unwrap().observe_pressure(k);
+                    self.clear_oom();
+                }
                 if self.dims_alloc_failed() {
                     self.end_frame();
                     let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
