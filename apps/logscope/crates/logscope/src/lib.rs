@@ -60,6 +60,7 @@ pub mod deliberate;
 pub mod panelmode;
 pub mod panelvoice;
 pub mod injecttime;
+pub mod injectfork;
 pub mod activemodel;
 pub mod cratecheck;
 pub mod diagreport;
