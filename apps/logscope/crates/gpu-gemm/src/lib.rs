@@ -1241,6 +1241,9 @@ impl Gpu {
             pass.dispatch_workgroups(wg.0, wg.1, wg.2);
         }
         enc.copy_buffer_to_buffer(&out, 0, &staging, 0, out_bytes);
+        // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
+        // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+        SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.submit(enc);
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -1681,12 +1684,18 @@ impl Gpu {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            // TAGGED: a readback, flushing the open frame first. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
             None::<()>
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc);
             None
         };
@@ -2514,6 +2523,9 @@ impl Gpu {
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc);
         }
         let slice = staging.slice(..);
@@ -2782,6 +2794,9 @@ impl Gpu {
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
     fn flush_and_wait(&self) {
         if let Some(frame) = self.frame.lock().unwrap().take() {
+            // TAGGED: the explicit end_frame path. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
         }
@@ -2858,6 +2873,9 @@ impl Gpu {
     /// Idempotent-safe: an already-open frame is flushed first (no commands are lost).
     pub fn begin_frame(&self) {
         let mut fr = self.frame.lock().unwrap();
+        // TAGGED: flushing a previous frame is an end_frame in all but name. Six of eight submit callers incremented nothing, which is
+        // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+        SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(prev) = fr.take() { self.submit(prev.enc); }
         *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
     }
@@ -9469,6 +9487,11 @@ impl Gpu {
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&src.buf, src_off, &dst.buf, dst_off, bytes);
+            // A device-side buffer copy, grouped with downloads as DATA MOVEMENT rather than
+            // compute. Not a readback — worth saying, because a counter named for one thing and
+            // counting another is the mislabel class this codebase keeps paying for. If the two
+            // ever need separating, this is the line to split.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc);
         }
     }
@@ -12607,6 +12630,33 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// Every caller of `submit` must tag a cause.
+    ///
+    /// The profile reported "N UNATTRIBUTED, a submit path is still untagged" for months. There is one
+    /// submit site and eleven callers, and SIX of them incremented nothing — four buffer readbacks and
+    /// two frame flushes. The counters were correct; nobody was calling them.
+    ///
+    /// Source-read rather than behavioural for the same reason as the reset-list test: an untagged
+    /// caller produces a number that is correct in isolation, and only the shortfall line reveals it —
+    /// which is exactly the signal everyone had learned to ignore.
+    #[test]
+    fn every_submit_caller_tags_a_cause() {
+        let src = include_str!("lib.rs");
+        let mut untagged = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        for (n, l) in lines.iter().enumerate() {
+            // Skip this test's own source, which contains the pattern it searches for.
+            if l.contains("l.contains") { continue; }
+            if !l.contains("self.submit(") { continue; }
+            // A cause must be incremented within the few lines above the flush.
+            let lo = n.saturating_sub(8);
+            let tagged = lines[lo..n].iter().any(|w| w.contains("SUBMIT_BY_"));
+            if !tagged { untagged.push(n + 1); }
+        }
+        assert!(untagged.is_empty(),
+            "submit callers at lines {untagged:?} tag no cause — the profile's attribution shortfall comes from exactly this, and a new one is invisible until someone reads the UNATTRIBUTED count");
+    }
+
     /// A packed decode config must not be readable as a tile.
     ///
     /// Both machines' logs printed "decode tile = 2147549192" on every load — 0x80010008, the packed
