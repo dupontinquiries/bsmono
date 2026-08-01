@@ -845,3 +845,68 @@ mod fit_tests {
         assert!(would_fit_if_measured((40.5 * GIB) as u64, (24.0 * GIB) as u64, 0.0).is_none());
     }
 }
+
+
+/// Does a streaming plan fit host RAM, counting unified memory once rather than twice?
+///
+/// On a discrete GPU the resident weights live in VRAM and the host store lives in system RAM — two
+/// pools, added separately. On an M-series machine they are the SAME physical memory, and a check that
+/// omits the resident side approves a plan that cannot run.
+///
+/// Measured failure, 64 GiB M2 Max with Qwen3-30B: host store 15.2 GiB plus 17.3 GiB of page cache is
+/// 32.5 against a 48 GiB threshold, so the plan was approved — then ~15.0 GiB of resident experts
+/// landed in the same RAM and the process was OOM-killed at layer 36 of 48.
+pub fn streaming_fits_host(host_store: u64, page_cache: u64, resident: u64, ram: u64,
+                           unified: bool) -> bool {
+    if ram == 0 { return true; }                 // unknown RAM: do not refuse on no information
+    let counted = host_store + page_cache + if unified { resident } else { 0 };
+    // A TIGHTER FRACTION WHEN UNIFIED, and the measured run is why. 15.2 + 17.3 + 15.0 = 47.5 against
+    // 3/4 of 64 GiB is 47.5 vs 48 — it passes by half a gigabyte, and the real load still died.
+    //
+    // The plan is not the whole footprint: the requantize pass needs scratch, the desktop and the
+    // browser are already resident, and the GPU allocator needs contiguous VM space it could not find
+    // (DRM_IOCTL_ASAHI_VM_BIND failed came BEFORE the kill). Two thirds leaves room for the parts a
+    // plan cannot enumerate, and still admits the same plan on a 192 GiB machine.
+    let limit = if unified { ram / 3 * 2 } else { ram / 4 * 3 };
+    counted <= limit
+}
+
+#[cfg(test)]
+mod uma_tests {
+    use super::*;
+
+    fn g(x: f64) -> u64 { (x * GIB) as u64 }
+
+    #[test]
+    fn the_measured_64gib_failure_is_now_REFUSED() {
+        // The exact numbers from the M2 Max run. Approved before, and killed at layer 36 of 48.
+        let (host, cache, resident, ram) = (g(15.2), g(17.3), g(15.0), g(64.0));
+        assert!(!streaming_fits_host(host, cache, resident, ram, true),
+            "unified: 15.2 + 17.3 + 15.0 = 47.5 GiB, which passed a 3/4 threshold by half a gigabyte \
+and still died — the plan is not the whole footprint");
+        assert!(streaming_fits_host(host, cache, resident, ram, false),
+            "on a DISCRETE gpu the same plan is fine — the resident side is a separate pool");
+    }
+
+    #[test]
+    fn being_killed_is_worse_than_being_refused() {
+        // Not a property test — a statement of why the threshold is conservative. A refusal costs a
+        // message; an OOM kill costs the load, the time, and returns no information about what failed.
+        let ram = g(64.0);
+        assert!(streaming_fits_host(g(10.0), g(10.0), g(10.0), ram, true), "comfortably under: allowed");
+        assert!(!streaming_fits_host(g(20.0), g(20.0), g(20.0), ram, true), "over: refused, not tried");
+    }
+
+    #[test]
+    fn unknown_ram_does_not_refuse() {
+        // system_ram_bytes returns 0 when it cannot read the figure. Refusing on that would block every
+        // load on a platform whose probe we have not written yet.
+        assert!(streaming_fits_host(g(100.0), g(100.0), g(100.0), 0, true));
+    }
+
+    #[test]
+    fn a_192gib_machine_still_takes_the_same_plan() {
+        // The fix must not make the Ultra refuse work it can do — the failure was specific to 64 GiB.
+        assert!(streaming_fits_host(g(15.2), g(17.3), g(15.0), g(192.0), true));
+    }
+}
