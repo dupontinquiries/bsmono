@@ -2579,10 +2579,7 @@ impl Gpu {
     ///
     /// Named for the property rather than the vendor, which is the whole lesson of the last four fixes.
     pub fn watchdog_prone(&self) -> bool {
-        if self.conservative_vma { return true; }
-        let n = self.adapter_name.to_ascii_lowercase();
-        ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx"]
-            .iter().any(|m| n.contains(m))
+        self.conservative_vma || watchdog_prone_name(&self.adapter_name)
     }
 
     pub fn oom_backoff(&self) -> bool { self.oom_flag.load(std::sync::atomic::Ordering::Relaxed) }
@@ -12329,6 +12326,18 @@ fn wgsl_fn_body(src: &str, sig: &str) -> Option<String> {
 ///
 /// The last two are the ones the Q6_K signature is consistent with, and they need opposite fixes: a
 /// clamp means the binding is right and the index is wrong; a zero means the binding is short.
+/// Does this adapter's driver kill long-running compute dispatches?
+///
+/// PURE, so it can be cross-checked against `tuneprofile::device_defaults`, which encodes the same
+/// decision in a separate crate. That duplication already went wrong once: _358 widened the engine's
+/// guard to mobile GPUs and the tuning table stayed Apple-only for four days, because a policy
+/// expressed in two places gets corrected in one and the survivor looks right.
+pub fn watchdog_prone_name(adapter: &str) -> bool {
+    let n = adapter.to_ascii_lowercase();
+    ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx", "honeykrisp"]
+        .iter().any(|m| n.contains(m))
+}
+
 pub const BYTE_PROBE: &str = r#"
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;

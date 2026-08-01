@@ -175,6 +175,19 @@ impl Defaults {
 /// Device-specific defaults, from measurements on this project rather than from guesses.
 ///
 /// Only deviations from `Defaults::default()` are set, and each one has a reason recorded next to it.
+/// Does this adapter's driver kill long-running compute dispatches?
+///
+/// EXPOSED so it can be cross-checked against the engine's `watchdog_prone_name`, which encodes the
+/// same decision in gpu-gemm. That duplication already went wrong once — _358 widened the engine's
+/// guard to mobile GPUs and this table stayed Apple-only, because a policy expressed in two places
+/// gets corrected in one and the survivor looks right. logscope cannot depend on gpu-gemm, so the two
+/// stay separate and a test in logscope-egui (which sees both) asserts they agree.
+pub fn watchdog_prone(adapter: &str) -> bool {
+    let a = adapter.to_ascii_lowercase();
+    ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx", "honeykrisp"]
+        .iter().any(|m| a.contains(m))
+}
+
 pub fn device_defaults(adapter: &str) -> Defaults {
     let a = adapter.to_ascii_lowercase();
     let mut d = Defaults::default();
@@ -187,11 +200,7 @@ pub fn device_defaults(adapter: &str) -> Defaults {
     // Both properties generalise: the subgroup matvec is now known wrong or unsupported on three
     // drivers, and every mobile driver has the strict dispatch watchdog that motivates the small
     // conversion chunk. A phone taking this table's defaults gets the fast path that hangs it.
-    let watchdog_prone = ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante"]
-        .iter().any(|m| a.contains(m))
-        || (a.contains("apple") && a.contains("vulkan"))
-        || a.contains("agx") || a.contains("honeykrisp");
-    if watchdog_prone {
+    if watchdog_prone(adapter) {
         d.subgroup_matvec = false;
         d.convert_chunk_blocks = 16384;
         // Submission is the dominant cost here, so a larger batch is worth more than on other drivers.
