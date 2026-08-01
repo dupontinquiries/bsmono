@@ -290,7 +290,16 @@ pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32,
         // Metadata wins; the arch default is the fallback. llama.cpp reads this from the checkpoint
         // rather than deriving it, and a model that sets expert_weights_norm=false without being
         // Llama-4 would otherwise be normalized against its own config.
-        normalize: norm.unwrap_or(!matches!(cfg.arch, Arch::Llama4)),
+        // METADATA WINS, EXCEPT WHERE THE ARCHITECTURE FORBIDS IT.
+        //
+        // Making this metadata-driven was right for Qwen and DeepSeek, and I introduced a risk with
+        // it: Llama-4's gate is not a normalization TOGGLE, it is a different forward pass. The raw
+        // sigmoid multiplies the expert's INPUT (weight_before), and a normalized weight applied there
+        // is not the same computation scaled — it is wrong. A checkpoint that happens to carry
+        // expert_weights_norm=true would have silently switched Llama-4 into a shape it does not have.
+        //
+        // So the arch VETOES rather than merely defaulting, which is archfeat's rule arriving here.
+        normalize: if matches!(cfg.arch, Arch::Llama4) { false } else { norm.unwrap_or(true) },
         // GLM-5.2 sets routed_scaling_factor (2.5); everything else leaves it inert at 1.0. Applied
         // AFTER normalization — see the ordering note on the field.
         routed_scale: scale.unwrap_or(1.0),
@@ -512,8 +521,35 @@ mod tests {
         let qwen = for_arch("qwen3moe");
         assert!(moe_config(&qwen, 128, 8, 0, None, None).normalize, "arch default: normalize");
         assert!(!moe_config(&qwen, 128, 8, 0, None, Some(false)).normalize, "metadata wins");
-        assert!(moe_config(&for_arch("llama4"), 16, 1, 1, None, Some(true)).normalize,
-            "and wins in the other direction too");
+        // I asserted the other direction here in _370 — that metadata could turn Llama-4's gate ON.
+        // That is the case now vetoed: its raw sigmoid multiplies the expert's INPUT, so a normalized
+        // weight there is a different forward pass, not the same one scaled. The test asserted the
+        // behaviour and the behaviour was the bug.
+        assert!(!moe_config(&for_arch("llama4"), 16, 1, 1, None, Some(true)).normalize,
+            "the architecture vetoes; see LLAMA4_ignores_expert_weights_norm");
+    }
+
+    #[test]
+    fn LLAMA4_ignores_expert_weights_norm_because_its_gate_is_ARCHITECTURAL() {
+        // A risk I introduced when making this metadata-driven in _370. Llama-4's raw sigmoid
+        // multiplies the expert's INPUT, so a normalized weight applied there is not the same
+        // computation scaled — it is a different forward pass. A checkpoint carrying
+        // expert_weights_norm=true would have silently switched it into a shape it does not have.
+        let l4 = for_arch("llama4");
+        assert!(!moe_config(&l4, 16, 1, 1, None, Some(true)).normalize,
+            "metadata cannot turn Llama-4's raw-sigmoid gate into a normalized one");
+        assert!(!moe_config(&l4, 16, 1, 1, None, None).normalize);
+        assert!(moe_config(&l4, 16, 1, 1, None, None).weight_before,
+            "and the weight still goes to the expert's input, which is why");
+    }
+
+    #[test]
+    fn other_architectures_still_take_the_metadata() {
+        // The veto is narrow: everywhere else the checkpoint knows better than a default.
+        let q = for_arch("qwen3moe");
+        assert!(!moe_config(&q, 128, 8, 0, None, Some(false)).normalize);
+        assert!(moe_config(&q, 128, 8, 0, None, Some(true)).normalize);
+        assert!(moe_config(&q, 128, 8, 0, None, None).normalize, "default when absent");
     }
 
     #[test]
