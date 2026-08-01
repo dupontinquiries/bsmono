@@ -207,8 +207,177 @@ Rules:
 Reprinting the whole file to change a few lines is how the untouched parts get quietly altered, which is \
 why this format does not allow it.";
 
+/// Content digest of the source that was NUMBERED for the model.
+///
+/// FNV-1a, inline, because this needs no cryptographic property — it must detect that a file changed,
+/// not resist someone forging a match.
+pub fn digest(src: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in src.as_bytes() { h ^= *b as u64; h = h.wrapping_mul(0x100_0000_01b3); }
+    h
+}
+
+/// An edit plus the text the model claims was at that line.
+///
+/// ## Why line numbers alone are not enough
+///
+/// `apply` refuses an out-of-range line, which catches a model working from a file of a different
+/// LENGTH. It cannot catch the dangerous case: an edit that lands cleanly on the wrong line of a file
+/// that is the right length. That applies silently, produces valid-looking source, and the resulting
+/// diff looks deliberate.
+///
+/// Two guards, catching different failures:
+///
+/// * **Digest** — the file changed between being numbered and being patched. Every line number is then
+///   suspect, so the whole patch is rejected rather than partly applied. No per-edit check can see
+///   this, because each individual edit may still look plausible.
+/// * **Anchor** — the model echoes the line it is editing, catching a miscount on an *unchanged* file,
+///   which the digest cannot see precisely because nothing changed.
+#[derive(Clone, PartialEq, Debug)]
+pub struct VerifiedEdit { pub edit: Edit, pub anchor: Option<String> }
+
+/// Why a patch was refused.
+#[derive(Clone, PartialEq, Debug)]
+pub enum PatchError {
+    Stale { expected: u64, actual: u64 },
+    AnchorMismatch { at: usize, expected: String, actual: String },
+    Range(String),
+}
+
+impl PatchError {
+    pub fn explain(&self) -> String {
+        match self {
+            PatchError::Stale { .. } => "the file changed after it was shown to the model, so every \
+line number in this patch refers to a version that no longer exists. Applying any of it would land \
+edits on unrelated lines — re-number and ask again".into(),
+            PatchError::AnchorMismatch { at, expected, actual } => format!(
+                "line {at} holds {actual:?} but the patch expected {expected:?}. The file is the right \
+length, so this would have applied CLEANLY to the wrong line and produced source that looks \
+deliberate"),
+            PatchError::Range(m) => m.clone(),
+        }
+    }
+}
+
+/// Apply a patch, verifying the file is unchanged and each anchor matches.
+///
+/// Rejects the WHOLE patch on any failure. A partly-applied patch is worse than a rejected one: the
+/// file is left in a state neither the model nor the user intended, and the edits that did apply are
+/// indistinguishable from ones someone made on purpose.
+pub fn apply_verified(src: &str, edits: &[VerifiedEdit], expected_digest: u64)
+    -> Result<String, PatchError> {
+    let actual = digest(src);
+    if actual != expected_digest {
+        return Err(PatchError::Stale { expected: expected_digest, actual });
+    }
+    let lines: Vec<&str> = src.lines().collect();
+    for v in edits {
+        let Some(want) = v.anchor.as_deref() else { continue };
+        if want.trim().is_empty() { continue; }
+        let at = v.edit.line();
+        if at == 0 { continue; }
+        let Some(got) = lines.get(at - 1) else {
+            return Err(PatchError::Range(format!("edit refers to line {at}, past the end")));
+        };
+        // Prefix match on trimmed text: the model reproduces the line's start, and demanding an exact
+        // match would fail on trailing whitespace it was never shown.
+        if !got.trim_start().starts_with(want.trim()) {
+            return Err(PatchError::AnchorMismatch {
+                at, expected: want.trim().to_string(), actual: got.trim().to_string() });
+        }
+    }
+    let plain: Vec<Edit> = edits.iter().map(|v| v.edit.clone()).collect();
+    apply(src, &plain).map_err(PatchError::Range)
+}
+
+
 #[cfg(test)]
 mod tests {
+
+    fn ve(e: Edit, anchor: Option<&str>) -> VerifiedEdit {
+        VerifiedEdit { edit: e, anchor: anchor.map(str::to_string) }
+    }
+    const VSRC: &str = "fn main() {\n    let x = 1;\n    println!(\"{x}\");\n}";
+
+    #[test]
+    fn an_edit_landing_cleanly_on_the_WRONG_line_is_caught_by_the_anchor() {
+        // The failure line numbers alone cannot catch. apply() refuses an out-of-range line, which
+        // catches a file of a different LENGTH. It cannot catch an edit that lands cleanly on the wrong
+        // line of a file that is the right length — that applies silently and the diff looks deliberate.
+        let d = digest(VSRC);
+        let bad = vec![ve(Edit::Replace { at: 2, text: "    let y = 2;".into() }, Some("println!"))];
+        match apply_verified(VSRC, &bad, d) {
+            Err(e @ PatchError::AnchorMismatch { at: 2, .. }) => {
+                assert!(e.explain().contains("applied CLEANLY to the wrong line"));
+            }
+            other => panic!("expected an anchor mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_matching_anchor_applies() {
+        let d = digest(VSRC);
+        let ok = vec![ve(Edit::Replace { at: 2, text: "    let x = 42;".into() }, Some("let x = 1;"))];
+        let out = apply_verified(VSRC, &ok, d).expect("applies");
+        assert!(out.contains("let x = 42;") && !out.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn a_file_that_changed_since_numbering_rejects_the_WHOLE_patch() {
+        // The concurrent-edit case, which no per-edit check can see: each individual edit may still
+        // look plausible against the new file. Every line number refers to a version that is gone.
+        let shown = digest(VSRC);
+        let now = "// a new header line\nfn main() {\n    let x = 1;\n    println!(\"{x}\");\n}";
+        let p = vec![ve(Edit::Replace { at: 2, text: "    let x = 9;".into() }, None)];
+        match apply_verified(now, &p, shown) {
+            Err(e @ PatchError::Stale { .. }) => {
+                assert!(e.explain().contains("re-number and ask again"));
+            }
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ONE_bad_anchor_rejects_every_edit_in_the_patch() {
+        // A partly-applied patch is worse than a rejected one: the file ends in a state neither the
+        // model nor the user intended, and the edits that DID apply are indistinguishable from ones
+        // someone made on purpose.
+        let d = digest(VSRC);
+        let mixed = vec![
+            ve(Edit::Replace { at: 2, text: "    let x = 42;".into() }, Some("let x = 1;")),
+            ve(Edit::Replace { at: 3, text: "    // gone".into() }, Some("let y =")),
+        ];
+        assert!(apply_verified(VSRC, &mixed, d).is_err());
+        // and the good edit did NOT land: the source is untouched, since apply_verified returns Err
+        // rather than a partially-edited string
+        assert!(VSRC.contains("let x = 1;"));
+    }
+
+    #[test]
+    fn an_edit_without_an_anchor_still_applies() {
+        // Backward compatible: anchors are optional, so an existing caller that has none is unchanged.
+        // The digest still guards it, which is the check that catches the dangerous concurrent edit.
+        let d = digest(VSRC);
+        let p = vec![ve(Edit::Delete { at: 2 }, None)];
+        assert!(apply_verified(VSRC, &p, d).is_ok());
+    }
+
+    #[test]
+    fn the_anchor_match_tolerates_indentation_it_was_never_shown() {
+        // The model reproduces the line's text, not its leading whitespace. Demanding an exact match
+        // would fail on formatting the model cannot see, and a guard that misfires gets disabled.
+        let d = digest(VSRC);
+        let p = vec![ve(Edit::Replace { at: 2, text: "    let x = 7;".into() }, Some("  let x = 1;  "))];
+        assert!(apply_verified(VSRC, &p, d).is_ok());
+    }
+
+    #[test]
+    fn the_digest_changes_with_the_content() {
+        assert_ne!(digest("a"), digest("b"));
+        assert_eq!(digest(VSRC), digest(VSRC));
+        assert_ne!(digest(VSRC), digest(&format!("{VSRC}\n")), "a trailing newline is a change");
+    }
+
     use super::*;
 
     const SRC: &str = "one\ntwo\nthree\nfour";
