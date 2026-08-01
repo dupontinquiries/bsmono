@@ -1391,6 +1391,15 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                     }
                 }
                 self.last = Some((tokens, secs));
+                // APPLY THE PATCHES. patch_mode injected PATCH_MODE_PROMPT and then did nothing with the
+                // reply — the model was asked for unified diffs that were never parsed, so "patch mode" was a
+                // prompt change with no mechanism behind it. parse_patches and apply_file_patch_strict both
+                // existed already; only this call was missing.
+                if self.patch_mode {
+                    if let Some(txt) = idx.and_then(|k| self.msgs.get(k)).map(|m| m.text().to_string()) {
+                        self.apply_patch_reply(&txt);
+                    }
+                }
                 self.stream = None;
                 self.rep_monitor.reset();
                 // Stepwise: the pause we requested has landed — arm the auto-continue. It fires in the
@@ -2329,6 +2338,52 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
     /// Turn-0 context for any agent/fan run over the loaded workspace: bounded file tree + shared
     /// crew docs. This is what makes "add more blocks" land on a model that can SEE the repo.
+    /// Parse a patch-mode reply and apply it to the workspace.
+    ///
+    /// STRICT, and failing hunks are reported rather than forced. A hunk whose context does not match
+    /// is a hunk aimed at a file the model was not looking at, and applying it by searching nearby
+    /// would land a change on whatever happened to resemble it — valid-looking source that nobody
+    /// asked for. `apply_file_patch_strict` already refuses; this surfaces the refusal.
+    ///
+    /// Nothing is written unless EVERY hunk in that file applied. A half-patched file is worse than an
+    /// unpatched one: it compiles or it does not, and either way it no longer matches the diff the
+    /// model produced or the source it was reasoning about.
+    fn apply_patch_reply(&mut self, reply: &str) {
+        let patches = crate::patchmode::parse_patches(reply);
+        if patches.is_empty() { return; }
+        let Some(sess) = self.gitmind_session.as_ref() else {
+            self.note = format!("patch mode: {} patch(es) parsed but no workspace is open to apply \
+them to", patches.len());
+            return;
+        };
+        let root = sess.work_dir().to_path_buf();
+        let (mut applied, mut refused) = (0usize, Vec::new());
+        for fp in &patches {
+            let path = root.join(&fp.path);
+            let Ok(orig) = std::fs::read_to_string(&path) else {
+                refused.push(format!("{}: not readable under the workspace", fp.path));
+                continue;
+            };
+            let out = crate::patchmode::apply_file_patch_strict(&orig, fp);
+            if !out.is_clean() {
+                // Report which hunks failed and why. A count alone tells nobody what to re-ask for.
+                for line in out.report() { refused.push(format!("{}: {line}", fp.path)); }
+                continue;
+            }
+            match std::fs::write(&path, &out.text) {
+                Ok(()) => applied += 1,
+                Err(e) => refused.push(format!("{}: write failed: {e}", fp.path)),
+            }
+        }
+        self.note = if refused.is_empty() {
+            format!("patch mode: {applied} file(s) patched")
+        } else {
+            for r in &refused { eprintln!("patch: {r}"); }
+            format!("patch mode: {applied} applied, {} refused — see the log; nothing was force-fitted",
+                    refused.len())
+        };
+    }
+
     fn agent_context(&self) -> String {
         let Some(sess) = self.gitmind_session.as_ref() else { return String::new() };
         let root = sess.work_dir();
