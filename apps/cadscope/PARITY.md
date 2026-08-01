@@ -151,9 +151,19 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 - **`SCHEMA` is a string, kept honest only by a test.** One test asserts every op and shape name
   appears in it. That catches a vocabulary that grows past its documentation, but nothing enforces
   that the prose around it is accurate.
-- **No `pending_volume` execution path in the UI.** The liaison reports what must be measured; the
-  caller is expected to run it through `cad-ref` and build `Op::MatchVolume`. `--propose` prints
-  the pending list rather than resolving it.
+- **The measurement loop closes, and is verified end to end.** `resolve_measurements` turns each
+  request into a real `Op::MatchVolume` carrying a number no model ever saw, and `--propose`
+  re-measures the built part afterwards: a proposal naming `ref_cube_20mm` produces a target of
+  8000.0 mm³ and a part measuring 8005.7 mm³, 0.07% out. Still absent from the *egui panel*, which
+  handles `volume of` typed by a person but not a proposal's pending list.
+- **`--propose` and `--ref-index` build their scan options separately.** Both must load `ref.toml`,
+  and `--propose` originally did not — every measurement declined for want of units, silently and
+  plausibly. Two call sites configuring one subsystem is the shape of that bug; a shared
+  constructor would be better than the comment now warning about it.
+- **The corpus contains one measurable reference**, `refs/ref_cube_20mm.obj`, authored so the loop
+  has something honest to hit: closed, manifold, exactly 8000 mm³, under the one `ref.toml` root
+  that declares units. Every other measurable model in the tree still declines for undeclared
+  units, which remains correct behaviour and an unwritten declaration rather than a defect.
 
 ## Not verified in-sandbox
 

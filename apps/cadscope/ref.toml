@@ -19,3 +19,9 @@
 # [[root]]
 # path = "games/blackstar/parts"
 # units = "mm"
+
+# CADscope's own reference shapes are authored in millimetres by definition — this is the
+# declaration that makes them measurable, and the worked example of the format.
+[[root]]
+path = "apps/cadscope/refs"
+units = "mm"

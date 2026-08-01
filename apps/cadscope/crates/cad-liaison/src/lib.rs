@@ -281,6 +281,32 @@ pub fn sanitize(p: &Proposal) -> Sanitized {
     out
 }
 
+/// Close the loop a `Proposal` deliberately leaves open: resolve each requested measurement
+/// against the corpus and turn it into a real `Op::MatchVolume`.
+///
+/// This lives here rather than in the app because it is part of the boundary's contract, not part
+/// of any one interface: the model asks for a measurement, Rust performs it, and the op that lands
+/// in the document carries a number **no model ever saw**. A reference that cannot be measured —
+/// unknown name, open mesh, undeclared units — produces a complaint naming the reason, and no op.
+/// The proposal is not retried and nothing is guessed.
+pub fn resolve_measurements(idx: &cad_ref::Index, s: &mut Sanitized) {
+    let pending = std::mem::take(&mut s.pending_volume);
+    for (i, (part, reference)) in pending.into_iter().enumerate() {
+        match idx.volume_mm3(&reference) {
+            Ok(mm3) => s.ops.push(Op::MatchVolume {
+                name: part,
+                volume: mm3,
+                tol: 0.02,
+                resolution: 40,
+            }),
+            Err(e) => s.complaints.push(Complaint {
+                index: i,
+                reason: format!("cannot size '{part}' from '{reference}': {e}"),
+            }),
+        }
+    }
+}
+
 /// Append sanitized ops to a document. Returns the document's own per-op warnings, so a caller
 /// sees both what the boundary refused and what the forge could not apply.
 pub fn apply_to(doc: &mut Doc, s: &Sanitized) -> Vec<String> {
@@ -341,6 +367,66 @@ mod tests {
         assert!(s.ops.is_empty(), "no path-shaped name may become an op");
         assert!(s.pending_volume.is_empty(), "nor a path-shaped reference");
         assert_eq!(s.complaints.len(), 3);
+    }
+
+    #[test]
+    fn a_resolved_measurement_carries_a_number_the_model_never_saw() {
+        use cad_ref::{Entry, Facts, Index, Kind, ModelFacts, Units};
+        // A corpus with one measurable model: closed, and with units declared.
+        let idx = Index::from_entries(vec![Entry {
+            name: "puma".into(),
+            kind: Kind::Model,
+            path: "puma.obj".into(),
+            bytes: 0,
+            facts: Facts::Model(ModelFacts {
+                volume: Some(2.0),
+                closed: true,
+                units: Units::Cm,
+                ..Default::default()
+            }),
+        }]);
+        let mut s = sanitize_json(
+            r#"{"ops":[{"op":"add","name":"blank","shape":"cuboid","half":[5,5,5]},
+                      {"op":"match_volume_of","name":"blank","reference":"puma"}]}"#,
+        );
+        assert_eq!(s.pending_volume.len(), 1);
+        resolve_measurements(&idx, &mut s);
+        assert!(s.pending_volume.is_empty(), "the request is consumed");
+        assert!(s.complaints.is_empty(), "{:?}", s.complaints);
+        // 2 cm^3 is 2000 mm^3 — a number produced by unit conversion in Rust, not by the proposal.
+        let Some(Op::MatchVolume { volume, name, .. }) = s.ops.last() else {
+            panic!("expected a measured op, got {:?}", s.ops)
+        };
+        assert_eq!(name, "blank");
+        assert_eq!(*volume, 2000.0);
+    }
+
+    #[test]
+    fn an_unmeasurable_reference_produces_a_complaint_not_a_guess() {
+        use cad_ref::{Entry, Facts, Index, Kind, ModelFacts, Units};
+        // Same model, but the surface is open — so it has no volume at all.
+        let idx = Index::from_entries(vec![Entry {
+            name: "shell".into(),
+            kind: Kind::Model,
+            path: "shell.obj".into(),
+            bytes: 0,
+            facts: Facts::Model(ModelFacts {
+                volume: None,
+                closed: false,
+                open_edges: 12,
+                units: Units::Mm,
+                ..Default::default()
+            }),
+        }]);
+        let mut s = sanitize_json(
+            r#"{"ops":[{"op":"match_volume_of","name":"blank","reference":"shell"},
+                      {"op":"match_volume_of","name":"blank","reference":"nobody"}]}"#,
+        );
+        resolve_measurements(&idx, &mut s);
+        assert!(s.ops.is_empty(), "no op may be built on an unmeasurable reference");
+        assert_eq!(s.complaints.len(), 2);
+        assert!(s.complaints[0].reason.contains("shell"), "{}", s.complaints[0].reason);
+        assert!(s.complaints[1].reason.contains("not in the corpus"), "{}", s.complaints[1].reason);
     }
 
     #[test]

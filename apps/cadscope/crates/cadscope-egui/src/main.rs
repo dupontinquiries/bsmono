@@ -103,9 +103,27 @@ fn propose(json: &str) -> ! {
     } else {
         json
     };
-    let s = cad_liaison::sanitize_json(json);
+    let mut s = cad_liaison::sanitize_json(json);
     println!("proposal -> {} op(s), {} pending measurement(s), {} complaint(s)",
         s.ops.len(), s.pending_volume.len(), s.complaints.len());
+    for (part, reference) in &s.pending_volume {
+        println!("  measure  {part} <- volume of '{reference}' (the corpus answers, not the model)");
+    }
+
+    // Close the loop: the corpus measures what the proposal only named. Cached, so this costs a
+    // fraction of a second on a warm tree rather than the full scan.
+    let root = std::path::Path::new(".");
+    // Unit declarations must be loaded here too, or every measurement declines for want of units —
+    // the scan options are not shared with --ref-index, and forgetting this is silent.
+    let mut opts = cad_ref::ScanOpts { cache: Some(root.join(".cadscope-ref.cache")), ..Default::default() };
+    if let Ok(text) = std::fs::read_to_string(root.join("apps/cadscope/ref.toml")) {
+        opts = opts.with_ref_toml(&text);
+    }
+    if !s.pending_volume.is_empty() {
+        let idx = cad_ref::Index::scan(root, &opts);
+        println!("  corpus   {} entries indexed from {}", idx.len(), root.display());
+        cad_liaison::resolve_measurements(&idx, &mut s);
+    }
     for op in &s.ops {
         let line = match op {
             Op::Add { name, .. } => format!("add {name}"),
@@ -115,13 +133,13 @@ fn propose(json: &str) -> ! {
             Op::Nudge { name, .. } => format!("move {name}"),
             Op::Shell { name, t } => format!("shell {name} {t}mm"),
             Op::Pattern { name, count, .. } => format!("pattern {name} x{count}"),
+            Op::MatchVolume { name, volume, .. } => {
+                format!("match volume {name} -> {volume:.1} mm3 (measured by Rust)")
+            }
             Op::Remove { name } => format!("remove {name}"),
             other => format!("{other:?}"),
         };
         println!("  op       {line}");
-    }
-    for (part, reference) in &s.pending_volume {
-        println!("  measure  {part} <- volume of '{reference}' (the corpus answers, not the model)");
     }
     for c in &s.complaints {
         println!("  refused  #{}: {}", c.index, c.reason);
@@ -131,6 +149,13 @@ fn propose(json: &str) -> ! {
     let mut doc = Doc { name: "proposed".into(), ops: Vec::new() };
     let warns = cad_liaison::apply_to(&mut doc, &s);
     let (model, _) = doc.apply();
+    // Re-measure what was built, so the claim is checked rather than reported.
+    for part in &model.parts {
+        let v = cad_kernel::dual_contour(&part.sdf, MeshOpts { resolution: 44 })
+            .signed_volume()
+            .abs();
+        println!("  verify   {} measures {:.1} mm3", part.name, v);
+    }
     println!("  built    {} part(s){}", model.parts.len(),
         if warns.is_empty() { String::new() } else { format!(", {} forge warning(s)", warns.len()) });
     for w in &warns {
