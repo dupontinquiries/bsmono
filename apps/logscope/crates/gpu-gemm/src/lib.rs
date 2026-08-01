@@ -9521,6 +9521,29 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     ///   first divergence at index 4, then a repeated constant
     /// ```
     ///
+    /// ## The signature, now that the fixtures are clean (bundle _382)
+    ///
+    /// With plausible f16 scales the values are sane and the failure is unambiguous:
+    ///
+    /// ```text
+    ///   cpu: [6.298, 0.899, 9.897, 12.147, 13.946,  8.547, 10.347, -9.447]
+    ///   gpu: [6.298, 0.899, 9.897, 12.147, 14.396, 14.396, 14.396, 14.396]
+    /// ```
+    ///
+    /// **Four outputs correct, then a constant.** Four is exactly one `u32` of source bytes. Output
+    /// `l` reads `ql[l]`, so outputs 0..3 come from source word 0 and output 4 needs word 1 — and
+    /// `byte_at` stops advancing there. The repeated value is that stale word re-decoded, which is why
+    /// the results REPEAT rather than going to zero.
+    ///
+    /// `byte_at(i) = (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu`, and `src` is `array<u32>`. The
+    /// arithmetic is correct WGSL, so the suspect is the BINDING: if the view exposes one word, every
+    /// read past it clamps to the last valid index on this driver rather than returning zero. That is
+    /// the _297 class — a binding range wrong in a way a reference rasterizer forgives — reappearing
+    /// where only real hardware can see it.
+    ///
+    /// Note the negative-scale check fails at 1.008e3 while the others sit near 1e2, so it is a
+    /// SEPARATE fault rather than the same one scaled.
+    ///
     /// The block is 2 halves x 32 iterations x 4 writes = 256. EXACTLY 64 LAND — one write per
     /// iteration instead of four — and the values REPEAT rather than being zero, so the writes are
     /// colliding rather than being skipped.
