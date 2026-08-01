@@ -784,6 +784,62 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "hood" {
+        // What does a carried ball ACTUALLY do? Park it on the hood of a car
+        // driving straight and watch its position in the CAR's frame: height
+        // above the shell, fore/aft drift, and how much it jitters. A
+        // dribble that will not settle shows up here as chatter.
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let mut world2 = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let mut car = physics::Car::new();
+        car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+        let mut ball = Ball::new();
+        let mut c = physics::Controls::default();
+        c.throttle = 1.0;
+        let mut ev = StepEvents::default();
+        for _ in 0..120 {
+            physics::step_car_only(&mut car, &ball, &world2, &c, &cfg, DT);
+        }
+        // set it gently on the hood, matching the car's speed
+        ball.pos = car.pos + car.up() * (car.half_h + ball.r) + car.forward() * 0.25;
+        ball.vel = car.vel;
+        ball.ang = Vec3::ZERO;
+        ball.prev = ball.pos;
+        println!("{:>5} {:>7} {:>7} {:>7} {:>7} {:>6}", "t", "above", "fore", "side", "dv", "spin");
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let mut chatter = 0.0f32;
+        let mut prev_above = 0.0f32;
+        let mut lost_at = -1.0f32;
+        let mut t = 0.0f32;
+        while t < 6.0 {
+            ev.touches.clear();
+            physics::step(&mut car, &mut ball, &mut world2, &c, &cfg, DT, &mut ev);
+            let rel = car.rot.inverse() * (ball.pos - car.pos);
+            let above = rel.y - car.half_h - ball.r;
+            let dv = (ball.vel - car.vel).length();
+            if t > 0.25 {
+                lo = lo.min(above);
+                hi = hi.max(above);
+                chatter += (above - prev_above).abs();
+            }
+            prev_above = above;
+            if lost_at < 0.0 && (rel.length() > 2.5 || above > 1.2) {
+                lost_at = t;
+            }
+            if (t * 4.0).fract() < DT * 4.0 && t < 3.01 {
+                println!(
+                    "{:5.2} {:7.3} {:7.2} {:7.2} {:7.2} {:6.1}",
+                    t, above, -rel.z, rel.x, dv, ball.ang.length()
+                );
+            }
+            t += DT;
+        }
+        println!("hover {lo:.3}..{hi:.3} m   chatter {:.2} m/s   {}",
+            chatter / 5.75,
+            if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
+        return;
+    }
     if name == "shot" {
         // POWER SHOT audit: drive into a resting ball at speed, then measure
         // exit speed, how far it actually travels, and how fast a roll dies

@@ -1358,7 +1358,9 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
     // the earlier max()+0.08 raised the ball's ride 11 cm and the striker
     // carry pipeline fell apart (air1 touches went to zero in the sim)
     // skin over the box: a little give, plus a lunge margin mid-dodge
-    let body = 0.06;
+    // contact skin: 6 cm held the ball visibly clear of the shell, so a
+    // carried ball looked like it was floating. 2 cm reads as resting on it.
+    let body = 0.02;
     let lunge = if car.dodge_timer > 0.0 { 0.45 } else { 0.0 };
     let radius = ball.r + body + lunge;
     if dist >= radius || dist < 1e-5 {
@@ -1405,7 +1407,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // frame — the assist that makes carries balanceable was quietly
         // capping every shot.
         if n.y > 0.30 && -vn < 6.0 {
-            let w = 0.035 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
+            let w = 0.055 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
             let dvx = car.vel.x - ball.vel.x;
             let dvz = car.vel.z - ball.vel.z;
             ball.vel.x += dvx * w;
@@ -1436,7 +1438,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // runs away in front, and you recover it by scooping under from
             // the far side. Air carries keep more grip — that touch is the
             // whole move and there is no ground to catch a mistake.
-            let mu = if car.on_ground { 0.055 } else { 0.30 };
+            let mu = if car.on_ground { 0.10 } else { 0.30 };
             ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.35 } else { 1.4 });
             // and the hood is dished, so the ball rolls back to the middle
             let side = car.rot * Vec3::X;
@@ -1448,7 +1450,24 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // keeps going
             // the dish only whispers now: enough that a centred ball stays
             // centred, not enough to drag a sliding one back
-            ball.vel -= side * (off.signum() * off.abs().min(reach) * hold * 0.55 * w);
+            // THE DISH is what makes a dribble a skill rather than a coin
+            // flip. Near the sweet spot the hood cradles the ball firmly, so
+            // small errors self-correct and you can hold a line; past about
+            // two thirds of the way out the cradle falls away to nothing and
+            // the ball is gone. That gradient IS the balance point — uniform
+            // grip (what this was) gives you either a magnet or a marble,
+            // and neither of those is dribbling.
+            let f = (off.abs() / reach).clamp(0.0, 1.0);
+            let well = if f < 0.66 { (1.0 - f / 0.66).powi(2) } else { 0.0 };
+            ball.vel -= side * (off.signum() * off.abs().min(reach) * well * 3.2 * w);
+            // fore/aft is deliberately looser: that axis is where you PLAY —
+            // push the ball out front, boost past it, catch it up again
+            let fwd = car.forward();
+            let foff = (ball.pos - car.pos).dot(fwd);
+            let freach = car.half_len + ball.r;
+            let ff = (foff.abs() / freach).clamp(0.0, 1.0);
+            let fwell = if ff < 0.7 { (1.0 - ff / 0.7).powi(2) } else { 0.0 };
+            ball.vel -= fwd * (foff.signum() * foff.abs().min(freach) * fwell * 0.9 * w);
         }
 
         // the "psyonix impulse": extra push that scales with the hit, biased

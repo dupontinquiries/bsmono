@@ -141,7 +141,7 @@ impl Default for Config {
     fn default() -> Config {
         Config {
             gyro: GyroCfg { on: false, sens: 1.0, deadzone: 0.06, smooth: 0.05, invert_x: false, invert_y: false, air_mode: 0, gate: 0 },
-            cam: CamCfg { fov_deg: 86.0, dist: 4.9, height: 5.0, angle_deg: -30.0, stiffness: 1.0, shake: 0.6, grav_follow: 1.0, plat_bend: 0.55 },
+            cam: CamCfg { fov_deg: 86.0, dist: 4.9, height: 1.21, angle_deg: 20.0, stiffness: 1.0, shake: 0.6, grav_follow: 1.0, plat_bend: 0.55 },
             arena: ArenaCfg { gravity: 1.0, bounce: 1.0, friction: 1.0, scale: 1.0 },
             ball: BallCfg { size: 1.0, bounce: 1.0, friction: 1.0, weight: 1.0 },
             car: CarCfg { steer_rate: 0.9, input_ease: 1.1, size: 1.0, grip: 1.0, top_speed: 1.0, accel: 1.0, boost: 1.0, boost_regen: 0.0, boost_max: 1.0, unlimited_boost: false, jump: 1.0, analog: true, analog_soft: 0.45 },

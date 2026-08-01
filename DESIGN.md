@@ -1710,6 +1710,39 @@ first 60 s at rest, 4 captures, and the tempo going 0.28 -> 0.53 moves per
 second once the fury is up. Pieces are proper moving platforms, so a rook
 crossing the board carries you with it.
 
+## v1.53.0 — the hood is a dish
+
+Defaults: camera height 1.21, angle 20 degrees.
+
+DRIBBLING, DIAGNOSED RATHER THAN GUESSED. New `--sim hood` parks a ball on
+a driving car and reports its position IN THE CAR'S FRAME — height above
+the shell, fore/aft, lateral, relative speed, spin. Two things fell out
+immediately:
+
+1. THE BALL WAS FLOATING. The contact skin was 6 cm, so a carried ball
+   rode visibly clear of the shell and its contact point sat above the real
+   hood. At 2 cm it rests on the car: measured hover 0.020-0.051 m (it was
+   0.060-0.337) and chatter halved to 0.02 m/s.
+2. THE HOOD WAS A SLIPPERY PLATE. Last version cut grip until the ball slid
+   off everything — which is not "challenging", it is just uncontrollable.
+   Uniform grip can only ever give you a magnet or a marble.
+
+So the hood is a DISH now. Within about two thirds of the way to the edge
+the cradle is firm and quadratic, so small errors self-correct and you can
+hold a line; past that it falls to nothing and the ball is gone. That
+gradient is the balance point, and it is what makes a dribble a skill.
+Fore/aft is deliberately much looser (0.9 against 3.2) because that axis is
+where the play is: boost past the ball and it rolls back down the hood,
+ease off and it runs out front, and you recover by scooping under from the
+far side.
+
+Carry through a FIXED turn with no corrective driving: straight 100%,
+steady turn 61%, hard turn 36%, after a landing 56% — against 45/29/40
+when the hood was uniformly slippery, and 79/42/72 when it was sticky.
+
+Housekeeping: the container filled up mid-session (linker failure), so
+stale build artefacts were cleared — 6 GB back.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
