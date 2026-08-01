@@ -12,8 +12,8 @@
 //! Real outlines (bookmarks) are read from the catalog when present and win
 //! over the heuristic TOC.
 
-use crate::content::{Block, BookContent, Span, SpanStyle, TocEntry};
-use crate::formats::{Format, LoadedBook, RasterDoc, RasterPage};
+use crate::content::{Block, Span, SpanStyle, TocEntry};
+use crate::formats::{Format, LoadedBook, RasterDoc};
 use anyhow::{Context, Result};
 use lopdf::{Document, Object, ObjectId};
 use std::collections::HashMap;
@@ -44,7 +44,7 @@ pub fn open_pdf(path: &Path) -> Result<LoadedBook> {
         for para in split_paragraphs(&text) {
             if let Some(level) = heading_guess(&para) {
                 let bi = book.content.blocks.len();
-                book.content.toc.push(TocEntry { title: para.clone(), depth: level - 1, block: bi });
+                book.content.toc.push(TocEntry { title: para.clone(), depth: (level - 1) as u8, block: bi });
                 book.content.blocks.push(Block::Heading {
                     level: level.min(6) as u8,
                     spans: vec![Span::styled(para, SpanStyle::bold())],

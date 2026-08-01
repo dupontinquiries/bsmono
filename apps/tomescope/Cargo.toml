@@ -12,6 +12,10 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Overkill ebook/PDF/textbook reader: EPUB, PDF, CBZ/CBT, FB2, MD, HTML, TXT; library shelves + covers; pagination engine with typography controls; highlights, margin notes, flashcards (SRS), citations, per-book glossary, reading stats + heatmap, OPDS import, TTS hook — all on uikit-egui."
 
+[lib]
+name = "tomescope"
+path = "src/lib.rs"
+
 [[bin]]
 name = "tomescope"
 path = "src/main.rs"
