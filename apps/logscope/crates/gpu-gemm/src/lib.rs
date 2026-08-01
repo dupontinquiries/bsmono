@@ -9510,7 +9510,29 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// non-convertible tensor forces the whole model onto the host-copy path — 200 GiB of traffic per
     /// generation plus the staging fence that costs most of its submits.
     ///
-    /// STATE: `--gate-q6k` is GREEN — bit-exact against the CPU reference at 1, 37 and 5000 blocks,
+    /// ## WARNING: GREEN ON LAVAPIPE, RED ON APPLE HARDWARE
+    ///
+    /// Everything below was verified on a software rasterizer. On an M2 Max it fails:
+    ///
+    /// ```text
+    ///   hand-checked block:  PASSES (first 4 weights exact)
+    ///   1 block:             rel 1.75    gpu non-zero: 64 of 256
+    ///   first divergence at index 4, then a repeated constant
+    /// ```
+    ///
+    /// The block is 2 halves x 32 iterations x 4 writes = 256. EXACTLY 64 LAND — one write per
+    /// iteration instead of four — and the values REPEAT rather than being zero, so the writes are
+    /// colliding rather than being skipped.
+    ///
+    /// A hand-checked single block passes because it exercises only the first few indices. The
+    /// cheapest check is the one that cannot see this.
+    ///
+    /// THE LESSON IS NOT ABOUT Q6_K. Lavapipe is a reference rasterizer — more permissive and more
+    /// nearly correct than a real driver — so it validates arithmetic and hides every codegen and
+    /// scheduling difference. Four faults were found and fixed against it, all four real, and the
+    /// kernel is still wrong on the only hardware that matters. See docs/gate-validity.md.
+    ///
+    /// STATE: `--gate-q6k` was green ON LAVAPIPE — bit-exact against the CPU reference at 1, 37 and 5000 blocks,
     /// including the negative-scales case. Four faults, found in this order:
     ///
     ///   1. `d` at bytes 208..209 fell outside the binding. A 210-byte `array<u32>` exposes 52 whole
