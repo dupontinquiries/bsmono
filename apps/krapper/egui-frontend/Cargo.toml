@@ -1,0 +1,20 @@
+[package]
+name = "krapper-egui"
+version = "0.1.0"
+edition = "2021"
+description = "kRapper's writing surface on egui: the vibe panel, the stress ruler, the hot-mic meter and the blurb list — over the app's own vibe/scale/vocab model, which is iced-free and therefore shared rather than reimplemented."
+
+[[bin]]
+name = "krapper-egui"
+path = "src/bin/krapper_egui.rs"
+required-features = ["app"]
+
+[dependencies]
+egui = "0.34"
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+serde = { version = "1", features = ["derive"] }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[features]
+default = ["app"]
+app = ["dep:eframe"]
