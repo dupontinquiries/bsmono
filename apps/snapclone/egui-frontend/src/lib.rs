@@ -11,6 +11,7 @@ use egui::Ui;
 use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteColors};
 
 pub mod camera;
+pub mod contacts;
 pub mod composer;
 pub mod group_voice;
 pub mod settings_page;
