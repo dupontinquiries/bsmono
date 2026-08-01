@@ -26,7 +26,7 @@
 pub enum RouteNorm { Softmax, Sigmoid }
 
 /// MoE routing config for a layer (from `{arch}.expert_count` / `expert_used_count` / `expert_shared_count`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MoeConfig {
     pub n_routed: u32,  // total routed experts (N)
     pub n_used: u32,    // top-k activated per token (k)
@@ -36,6 +36,15 @@ pub struct MoeConfig {
     /// Llama4: FALSE — the combine weight is the raw sigmoid of the selected logit (with top-1
     /// routing, normalizing would erase the gate entirely: every weight would become 1.0).
     pub normalize: bool,
+    /// GLM-5.2's `routed_scaling_factor`, applied to every routed weight AFTER normalization.
+    ///
+    /// ORDER IS LOAD-BEARING and the wrong order is silent. Normalizing divides by the sum, which
+    /// removes any common factor — so scaling BEFORE normalizing cancels the scale entirely and the
+    /// model runs, looking fine, with the factor doing nothing. Colibri's glm.c does norm at line 3036
+    /// and scale at 3037, in that order.
+    ///
+    /// 1.0 for every architecture that does not set it, so this is inert unless a config asks for it.
+    pub routed_scale: f32,
     /// Apply the combine weight to the expert's INPUT instead of its output (Llama4). NOT
     /// equivalent through SwiGLU's nonlinearity: silu(Wg·(w·x))·(Wu·(w·x)) ≠ w·silu(Wg·x)·(Wu·x).
     pub weight_before: bool,
@@ -101,6 +110,13 @@ pub fn route(logits: &[f32], cfg: &MoeConfig) -> Vec<Selected> {
             }
         }
     };
+    // ROUTED SCALE, applied AFTER normalization. Colibri's glm.c normalizes at line 3036 and scales at
+    // 3037, and the order is load-bearing: normalizing divides by the sum, which removes any common
+    // factor, so scaling FIRST cancels the scale entirely. The model would run, look fine, and have
+    // routed_scaling_factor doing nothing — a silent no-op rather than a visible error.
+    if cfg.routed_scale != 1.0 {
+        for x in sel.iter_mut() { x.weight *= cfg.routed_scale; }
+    }
     // keep a stable, descending-weight order for deterministic accumulation
     sel.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
     sel
@@ -147,6 +163,35 @@ pub fn layer_shape(d: usize, n_heads: usize, n_kv_heads: usize, attn_k_out: usiz
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_routed_scale_is_applied_AFTER_normalization() {
+        // The trap, from Colibri's glm.c ordering. Normalizing divides by the sum, which removes any
+        // common factor — so scaling BEFORE normalizing cancels the scale completely. The model runs,
+        // looks fine, and routed_scaling_factor does nothing.
+        let mut cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Sigmoid,
+                                  normalize: true, weight_before: false, routed_scale: 1.0 };
+        let logits = [2.0f32, 1.0, -1.0, -2.0];
+        let plain: f32 = route(&logits, &cfg).iter().map(|s| s.weight).sum();
+        assert!((plain - 1.0).abs() < 1e-5, "normalized weights sum to 1, got {plain}");
+
+        cfg.routed_scale = 2.5;                    // GLM-5.2's value
+        let scaled: f32 = route(&logits, &cfg).iter().map(|s| s.weight).sum();
+        assert!((scaled - 2.5).abs() < 1e-4,
+            "after normalizing to 1, a 2.5x scale must give 2.5 — got {scaled}. If this reads 1.0 the \
+scale was applied before the normalize and cancelled");
+    }
+
+    #[test]
+    fn a_scale_of_one_leaves_every_weight_untouched() {
+        // Inert for every architecture that does not set it, so adding the field changes nothing for
+        // Llama-4, Qwen or DeepSeek.
+        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax,
+                              normalize: true, weight_before: false, routed_scale: 1.0 };
+        let a = route(&[1.0, 2.0, 3.0, 0.5], &cfg);
+        let b = route(&[1.0, 2.0, 3.0, 0.5], &MoeConfig { routed_scale: 1.0, ..cfg });
+        assert_eq!(a, b);
+    }
+
     use super::*;
 
     fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-5 }
@@ -154,7 +199,7 @@ mod tests {
     #[test]
     fn softmax_route_picks_top_k_and_normalizes() {
         // 4 experts, top-2. logits favor experts 2 and 0.
-        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let sel = route(&[2.0, 0.5, 3.0, -1.0], &cfg);
         assert_eq!(sel.len(), 2);
         let ids: Vec<u32> = sel.iter().map(|s| s.expert).collect();
@@ -170,7 +215,7 @@ mod tests {
     fn softmax_topk_equals_global_softmax_renormalized() {
         // the identity the doc claims: top-k softmax == global softmax restricted to the top-k
         let logits = [1.0f32, 2.0, 0.0, 3.0, -1.0];
-        let cfg = MoeConfig { n_routed: 5, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfg = MoeConfig { n_routed: 5, n_used: 2, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let sel = route(&logits, &cfg);
         // global softmax
         let mut g = logits.to_vec(); softmax_in_place(&mut g);
@@ -183,7 +228,7 @@ mod tests {
 
     #[test]
     fn sigmoid_route_normalizes_selected_gates() {
-        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: true, weight_before: false };
+        let cfg = MoeConfig { n_routed: 4, n_used: 2, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: true, weight_before: false, routed_scale: 1.0 };
         let sel = route(&[3.0, -2.0, 1.0, 0.0], &cfg);
         assert_eq!(sel.len(), 2);
         assert_eq!(sel[0].expert, 0, "highest logit → highest sigmoid gate");
@@ -196,7 +241,7 @@ mod tests {
     #[test]
     fn k_clamped_and_offsets() {
         // k larger than n clamps to n; offsets index the stacked tensor by row
-        let cfg = MoeConfig { n_routed: 3, n_used: 8, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfg = MoeConfig { n_routed: 3, n_used: 8, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let sel = route(&[0.1, 0.2, 0.3], &cfg);
         assert_eq!(sel.len(), 3, "k clamps to the number of experts");
         assert_eq!(expert_row_offset(0, 4096), 0);
@@ -225,7 +270,7 @@ mod tests {
 
     #[test]
     fn dense_config_is_not_moe() {
-        let dense = MoeConfig { n_routed: 0, n_used: 0, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false };
+        let dense = MoeConfig { n_routed: 0, n_used: 0, n_shared: 0, norm: RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         assert!(!dense.is_moe());
         assert!(route(&[], &dense).is_empty());
     }
@@ -234,7 +279,7 @@ mod tests {
     fn llama4_gating_is_raw_sigmoid_top1() {
         // Llama4: top-1 by logit, weight = sigmoid(top logit) UNNORMALIZED (normalizing top-1
         // would always give 1.0 and erase the gate).
-        let cfg = MoeConfig { n_routed: 16, n_used: 1, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: false, weight_before: true };
+        let cfg = MoeConfig { n_routed: 16, n_used: 1, n_shared: 1, norm: RouteNorm::Sigmoid, normalize: false, weight_before: true, routed_scale: 1.0 };
         let mut logits = vec![-1.0f32; 16];
         logits[7] = 0.6;
         let sel = route(&logits, &cfg);
