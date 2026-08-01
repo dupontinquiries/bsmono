@@ -20,7 +20,7 @@ struct Globals {
     cine: vec4<f32>,       // x exposure, y vignette, z grain, w filmic tonemap
     post: vec4<f32>,       // x bloom strength, y bloom threshold, zw spare
     pcount: vec4<f32>,     // x = live portal count (max 4)
-    portals: array<vec4<f32>, 8>, // per portal: [pos.xyz, r], then face quat
+    portals: array<vec4<f32>, 16>, // per portal: [pos.xyz, r], then face quat
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 
@@ -533,7 +533,43 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         // that scatters. The mirror-smooth version read as coloured film;
         // jittering the reflected ray per-fragment and lifting the fresnel
         // is what makes it look like thick, slightly frosted glass.
-        let glassy = O.params.x > 0.5;
+        let glassy = O.params.x > 0.5 && O.params.x < 1.5;
+    // ---- THE VIEW THROUGH A PORTAL ----------------------------------
+    // A portal face shows what is on the far side, live: take the view ray,
+    // carry it through the pair transform, and march the world from the
+    // partner's mouth. Cars and the ball are in the marcher's shape list,
+    // so they appear through it too — which is the point, you can read an
+    // attack coming before it arrives. Three jittered samples soften the
+    // result just enough to read as a portal rather than a window.
+    if (O.params.x >= 1.5 && rays) {
+        let pi = u32(O.params.x - 2.0) * 2u;
+        let pa = G.portals[pi].xyz;
+        let qa = G.portals[pi + 1u];
+        let j = select(i32(pi / 2u) - 1, i32(pi / 2u) + 1, (pi / 2u) % 2u == 0u);
+        let jb = u32(max(j, 0)) * 2u;
+        let pb = G.portals[jb].xyz;
+        let qb = G.portals[jb + 1u];
+        let vd = normalize(in.wpos - G.cam.xyz);
+        var loc = qrot(qconj(qa), in.wpos - pa);
+        var ldir = qrot(qconj(qa), vd);
+        loc = vec3(-loc.x, loc.y, -loc.z);
+        ldir = vec3(-ldir.x, ldir.y, -ldir.z);
+        let ro2 = pb + qrot(qb, loc) + qrot(qb, vec3(0.0, 0.0, 1.0)) * 0.25;
+        let rd0 = normalize(qrot(qb, ldir));
+        var acc3 = vec3(0.0);
+        for (var k = 0; k < 3; k = k + 1) {
+            let h = fract(sin(dot(in.wpos.xz + f32(k) * 7.3, vec2(12.99, 78.23))) * 43758.5453);
+            let h2 = fract(h * 197.31);
+            let jit = vec3(h - 0.5, h2 - 0.5, fract(h * 31.7) - 0.5) * 0.035;
+            acc3 = acc3 + trace_reflection(ro2, normalize(rd0 + jit), -1, dist0);
+        }
+        var pcol = acc3 / 3.0;
+        // tint it with the mouth's own colour so the pair stays readable
+        pcol = mix(pcol, O.color.rgb, 0.22);
+        let edge = pow(1.0 - max(dot(n, v), 0.0), 2.0);
+        pcol = pcol + O.color.rgb * edge * 0.8;
+        return vec4(pcol, 1.0);
+    }
         if (glassy) {
             let fres = pow(1.0 - max(dot(n, v), 0.0), 3.0);
             f0 = mix(0.18, 0.92, fres);

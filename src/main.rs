@@ -2508,12 +2508,12 @@ impl Game {
             ],
             misc: [st.zenith[0], st.zenith[1], st.zenith[2], 0.0],
             rt: [if self.cfg.video.rays { 1.0 } else { 0.0 }, self.cfg.video.quality, rt_ids.static_n as f32, st.wet.max(wx_wet)],
-            pcount: [self.world.portals.len().min(4) as f32, 0.0, 0.0, 0.0],
+            pcount: [self.world.portals.len().min(8) as f32, 0.0, 0.0, 0.0],
             portals: {
                 // up to four portals for the marcher; pairs are adjacent, so
                 // the shader's partner rule (0<->1, 2<->3) matches the map's
-                let mut out = [[0.0f32; 4]; 8];
-                for (i, p) in self.world.portals.iter().take(4).enumerate() {
+                let mut out = [[0.0f32; 4]; 16];
+                for (i, p) in self.world.portals.iter().take(8).enumerate() {
                     out[i * 2] = [p.pos.x, p.pos.y, p.pos.z, p.r];
                     let q = p.rot;
                     out[i * 2 + 1] = [q.x, q.y, q.z, q.w];
@@ -3027,7 +3027,7 @@ impl Game {
         );
 
         // playful shapes
-        for s in &self.world.shapes {
+        for (si, s) in self.world.shapes.iter().enumerate() {
             if s.cut {
                 continue; // CSG cutters carve the SDF; they are not drawn
             }
@@ -3067,7 +3067,17 @@ impl Game {
                 s.mesh,
                 world::M_SHELL | world::M_SHELL_LO | world::M_SHELL_OPEN | world::M_SHELL_OPEN_LO | world::M_TORUS_TUBE
             );
-            push(&mut objs, mesh, None, s.mat, s.color, [if glassy { 1.0 } else { 0.0 }, em, s.spec, 0.0]);
+            // a portal FACE carries its index, so the shader can march the
+            // world from the far mouth and show what is actually over there
+            let pflag = self
+                .world
+                .portals
+                .iter()
+                .take(8)
+                .position(|p| p.shape == si)
+                .map(|k| 2.0 + k as f32);
+            let px = pflag.unwrap_or(if glassy { 1.0 } else { 0.0 });
+            push(&mut objs, mesh, None, s.mat, s.color, [px, em, s.spec, 0.0]);
         }
 
         // ---- rain: instanced streaks around the car (MONKEY RUN) ----

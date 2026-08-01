@@ -185,6 +185,12 @@ pub struct Portal {
     /// index of the portal this one exits from
     pub link: usize,
     pub shape: usize,
+    /// pair colour: every pair has its own hue, and the two ends differ in
+    /// shade, so a glance tells you which mouth you are looking at and
+    /// which one it feeds
+    pub tint: [f32; 4],
+    /// ride an animated shape: pos and rot re-sync from it every update
+    pub follow: Option<usize>,
 }
 
 /// An arcade ball-hitter: a paddle that fires when the ball comes near.
@@ -439,7 +445,7 @@ pub struct MapStyle {
     pub focal: u8,
 }
 
-pub const STYLE_COUNT: usize = 32;
+pub const STYLE_COUNT: usize = 33;
 
 /// Adapted from logscope scene3d's ROOMS table — same sixteen names, each
 /// translated from an indoor room into an open-world mood.
@@ -484,6 +490,7 @@ pub fn styles() -> &'static [MapStyle; STYLE_COUNT] {
             MapStyle { name: "ZOETROPE", grass: g(0x2A2432), zenith: rgb3(0x1A1526), fog: rgb3(0x352B4A), fog_d: 0.0014, sun: [0.3, 0.5, 0.4], accent: g(0xFFC24D), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.28, glow: 0.5, rings: 0, halos: 3, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 26, nets: 1, focal: 18 },
             MapStyle { name: "CLOCKWORK", grass: g(0x2E2A38), zenith: rgb3(0x1B2436), fog: rgb3(0x33405C), fog_d: 0.0011, sun: [0.4, 0.6, 0.3], accent: g(0x6FE3C4), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.26, glow: 0.45, rings: 3, halos: 3, balloons: 0, domes: 0, ramps: 3, platforms: 6, trees: 0, small_pads: 30, nets: 2, focal: 19 },
             MapStyle { name: "APERTURE", grass: g(0x9A9384), zenith: rgb3(0xBFCBD6), fog: rgb3(0xD7DEE4), fog_d: 0.0010, sun: [0.3, 0.75, 0.35], accent: g(0x35C8FF), pal_mix: 0.4, amp: 0.0, freq: 1.0, wet: 0.34, glow: 0.4, rings: 2, halos: 2, balloons: 0, domes: 0, ramps: 4, platforms: 6, trees: 0, small_pads: 22, nets: 2, focal: 20 },
+            MapStyle { name: "TURNSTILE", grass: g(0x6E6A62), zenith: rgb3(0x2A3446), fog: rgb3(0x8A93A2), fog_d: 0.0012, sun: [-0.3, 0.7, 0.4], accent: g(0xFFC24D), pal_mix: 0.45, amp: 0.0, freq: 1.0, wet: 0.30, glow: 0.5, rings: 3, halos: 3, balloons: 0, domes: 0, ramps: 3, platforms: 6, trees: 0, small_pads: 24, nets: 2, focal: 21 },
         ]
     })
 }
@@ -2513,7 +2520,17 @@ impl World {
                     let u = (up - n * up.dot(n)).normalize_or(Vec3::Y);
                     let right = u.cross(n).normalize_or(Vec3::X);
                     let rot = Quat::from_mat3(&glam::Mat3::from_cols(right, u, n));
-                    let col = if warm { [1.0, 0.55, 0.12, 1.0] } else { [0.16, 0.62, 1.0, 1.0] };
+                    // pair hue, entry/exit shade: pair 0 blue/orange (the
+                    // classic), then green, then violet — and within a pair
+                    // the exit end is the paler shade
+                    let hue = [
+                        ([0.16, 0.62, 1.00, 1.0], [1.00, 0.55, 0.12, 1.0]),
+                        ([0.20, 0.90, 0.45, 1.0], [0.85, 0.95, 0.20, 1.0]),
+                        ([0.66, 0.35, 1.00, 1.0], [1.00, 0.35, 0.80, 1.0]),
+                        ([0.20, 0.85, 0.90, 1.0], [1.00, 0.80, 0.30, 1.0]),
+                    ][(portals.len() / 2).min(3)];
+                    let base = if warm { hue.1 } else { hue.0 };
+                    let col = if warm { mix4(base, [1.0; 4], 0.22) } else { base };
                     push(shapes, M_TORUS_FAT, pos, rot * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(r), Sdf::Torus { big: r, tube: r * 0.10 }, col, 0.95, 0.5);
                     // A PORTAL IS A HOLE. The face is drawn but never solid,
                     // and the surface it sits in is carved away behind it —
@@ -2527,7 +2544,7 @@ impl World {
                         shapes[ci].cut = true;
                     }
                     let fi = push(shapes, M_SPHERE, pos, rot, Vec3::new(r * 0.94, r * 0.94, 0.06), Sdf::None, [col[0], col[1], col[2], 0.5], 0.75, 0.5);
-                    portals.push(Portal { pos, rot, r: r * 0.94, link: 0, shape: fi });
+                    portals.push(Portal { pos, rot, r: r * 0.94, link: 0, shape: fi, tint: col, follow: None });
                     portals.len() - 1
                 };
                 // CHAMBER 1 — the fling: climb the tower, drop into the floor
@@ -2571,6 +2588,114 @@ impl World {
                     push(&mut shapes, M_BOX, Vec3::new(a2.cos() * 50.0, g0 + 23.0, a2.sin() * 44.0), Quat::from_rotation_y(a2), gl, Sdf::RBox { half: gl, round: 0.1 }, [0.6, 0.8, 0.95, 0.30], 0.15, 0.6);
                     let st = Vec3::new(6.0, 0.12, 0.12);
                     push(&mut shapes, M_BOX, Vec3::new(a2.cos() * 40.0, g0 + 23.6, a2.sin() * 36.0), Quat::from_rotation_y(a2), st, Sdf::RBox { half: st, round: 0.05 }, trim, 0.9, 0.4);
+                }
+            }
+            21 => {
+                // ========= TURNSTILE: the portals themselves move =========
+                // Every portal here is bolted to something turning. Where a
+                // mouth sends you depends on WHEN you enter it, so the aim is
+                // no longer "find the portal" but "read the machine": a drum
+                // whose faces sweep past, carriages carrying a mouth around
+                // the room, and a lift that raises its portal as it climbs.
+                let g0 = th(0.0, 0.0);
+                let deck = mix4(PLINTH, [1.0; 4], 0.35);
+                let trim = mix4(acc, [1.0; 4], 0.25);
+                let mut slab = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4]| -> usize {
+                    let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.25 }, col, 0.04, 0.5);
+                    shapes[i].blend = true;
+                    i
+                };
+                slab(&mut shapes, Vec3::new(0.0, g0 + 0.7, 0.0), Vec3::new(70.0, 0.9, 62.0), deck);
+                for (px, pz, hx, hz) in [(-70.0f32, 0.0f32, 1.2f32, 62.0f32), (70.0, 0.0, 1.2, 62.0), (0.0, -62.0, 70.0, 1.2), (0.0, 62.0, 70.0, 1.2)] {
+                    slab(&mut shapes, Vec3::new(px, g0 + 10.0, pz), Vec3::new(hx, 10.0, hz), deck);
+                }
+                // one portal maker, shared: `mount` is the shape it rides
+                let mut mk = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool, mount: Option<usize>| -> usize {
+                    let n = normal.normalize_or(Vec3::Z);
+                    let u = (up - n * up.dot(n)).normalize_or(Vec3::Y);
+                    let right = u.cross(n).normalize_or(Vec3::X);
+                    let rot = Quat::from_mat3(&glam::Mat3::from_cols(right, u, n));
+                    let hue = [
+                        ([0.16, 0.62, 1.00, 1.0], [1.00, 0.55, 0.12, 1.0]),
+                        ([0.20, 0.90, 0.45, 1.0], [0.85, 0.95, 0.20, 1.0]),
+                        ([0.66, 0.35, 1.00, 1.0], [1.00, 0.35, 0.80, 1.0]),
+                        ([0.20, 0.85, 0.90, 1.0], [1.00, 0.80, 0.30, 1.0]),
+                    ][(portals.len() / 2).min(3)];
+                    let base = if warm { hue.1 } else { hue.0 };
+                    let col = if warm { mix4(base, [1.0; 4], 0.22) } else { base };
+                    push(shapes, M_TORUS_FAT, pos, rot * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(r), Sdf::Torus { big: r, tube: r * 0.10 }, col, 0.95, 0.5);
+                    for t in 0..5 {
+                        let d = t as f32 * 0.55;
+                        let ci = push(shapes, M_SPHERE, pos - n * d, Quat::IDENTITY, Vec3::splat(r * 0.94), Sdf::Sphere { r: r * 0.94 }, [0.0; 4], 0.0, 0.0);
+                        shapes[ci].cut = true;
+                    }
+                    let fi = push(shapes, M_SPHERE, pos, rot, Vec3::new(r * 0.94, r * 0.94, 0.06), Sdf::None, [col[0], col[1], col[2], 0.5], 0.75, 0.5);
+                    portals.push(Portal { pos, rot, r: r * 0.94, link: 0, shape: fi, tint: col, follow: mount });
+                    portals.len() - 1
+                };
+                // ---- THE DRUM: a turning cylinder with a mouth in its side.
+                // It comes around to face you; go through and you leave from
+                // wherever its partner happens to be pointing.
+                let drum_c = Vec3::new(-40.0, g0 + 10.0, 0.0);
+                let drum_half = Vec3::new(9.0, 8.0, 9.0);
+                let di = push(&mut shapes, M_BOX, drum_c, Quat::IDENTITY, drum_half, Sdf::RBox { half: drum_half, round: 1.6 }, mix4(deck, acc, 0.15), 0.06, 0.5);
+                shapes[di].blend = true;
+                anims.push(Anim::Spin { shape: di, pos: drum_c, scale: drum_half, base: Quat::IDENTITY, axis: Vec3::Y, rate: 0.42 });
+                let d_face = mk(&mut shapes, &mut portals, drum_c + Vec3::X * 9.2, Vec3::X, Vec3::Y, 5.0, false, Some(di));
+                // its partner sits still, high on the far wall
+                let d_out = mk(&mut shapes, &mut portals, Vec3::new(68.6, g0 + 16.0, 0.0), Vec3::NEG_X, Vec3::Y, 5.0, true, None);
+                portals[d_face].link = d_out;
+                portals[d_out].link = d_face;
+
+                // ---- THE CARRIAGES: two decks orbiting the room, each with
+                // a portal lying face-up on it. Drop into one, come out of
+                // the other — wherever it has got to.
+                for k in 0..2usize {
+                    let y = g0 + 14.0 + k as f32 * 9.0;
+                    let rr = 30.0 + k as f32 * 14.0;
+                    let half = Vec3::new(8.0, 0.6, 8.0);
+                    let ci = push(&mut shapes, M_BOX, Vec3::new(rr, y, 0.0), Quat::IDENTITY, half, Sdf::RBox { half, round: 0.3 }, trim, 0.08, 0.5);
+                    shapes[ci].blend = true;
+                    anims.push(Anim::Orbit {
+                        shape: ci,
+                        center: Vec3::new(0.0, y, 0.0),
+                        axis: Vec3::Y,
+                        r: rr,
+                        rate: (5.0 / rr) * if k == 0 { 1.0 } else { -1.0 },
+                        phase: k as f32 * 2.4,
+                        rot: Quat::IDENTITY,
+                        scale: half,
+                    });
+                    let _ = ci;
+                }
+                let c0 = mk(&mut shapes, &mut portals, Vec3::new(30.0, g0 + 15.0, 0.0), Vec3::Y, Vec3::Z, 4.6, false, None);
+                let c1 = mk(&mut shapes, &mut portals, Vec3::new(-44.0, g0 + 24.0, 0.0), Vec3::Y, Vec3::Z, 4.6, true, None);
+                portals[c0].link = c1;
+                portals[c1].link = c0;
+
+                // ---- THE LIFT: a portal that climbs. Enter at the bottom of
+                // its travel and you exit low; catch it at the top and the
+                // same mouth throws you across the room.
+                let lift_base = Vec3::new(0.0, g0 + 8.0, -46.0);
+                let lhalf = Vec3::new(7.0, 0.6, 7.0);
+                let li = push(&mut shapes, M_BOX, lift_base, Quat::IDENTITY, lhalf, Sdf::RBox { half: lhalf, round: 0.3 }, trim, 0.08, 0.5);
+                shapes[li].blend = true;
+                anims.push(Anim::Slide { shape: li, base: lift_base, dir: Vec3::Y, amp: 16.0, rate: 0.35, phase: 0.0, rot: Quat::IDENTITY, scale: lhalf });
+                let l_in = mk(&mut shapes, &mut portals, lift_base + Vec3::Y * 0.7, Vec3::Y, Vec3::Z, 4.4, false, Some(li));
+                let l_out = mk(&mut shapes, &mut portals, Vec3::new(0.0, g0 + 5.0, 56.0), Vec3::NEG_Z, Vec3::Y, 4.4, true, None);
+                portals[l_in].link = l_out;
+                portals[l_out].link = l_in;
+
+                // approach ramps and a boost ring, so there is speed to carry
+                for (sx, sz) in [(-1.0f32, 1.0f32), (1.0, 1.0)] {
+                    let rot = Quat::from_rotation_x(-0.30);
+                    let half = Vec3::new(8.0, 0.5, 12.0);
+                    let i = push(&mut shapes, M_BOX, Vec3::new(sx * 26.0, g0 + 4.0, sz * 40.0), rot, half, Sdf::RBox { half, round: 0.25 }, deck, 0.04, 0.5);
+                    shapes[i].blend = true;
+                }
+                for k in 0..4 {
+                    let a2 = k as f32 * 1.5707 + 0.78;
+                    zones.push(Zone { pos: Vec3::new(a2.cos() * 20.0, g0 + 2.4, a2.sin() * 20.0), r: 4.0, kind: ZoneKind::Boost });
                 }
             }
             _ => {}
@@ -3057,6 +3182,23 @@ impl World {
             let sh = &mut self.shapes[si];
             sh.vel = if dt > 1e-5 { (sh.pos - prev) / dt } else { Vec3::ZERO };
             sh.omega = om;
+        }
+        // MOVING PORTALS: a portal bolted to a carriage or a drum takes its
+        // transform from that shape every frame, so where it sends you keeps
+        // changing — timing the entry is the whole mechanic.
+        for pi in 0..self.portals.len() {
+            if let Some(fi) = self.portals[pi].follow {
+                let (spos, sinv) = (self.shapes[fi].pos, self.shapes[fi].inv_rot);
+                let rot = sinv.inverse();
+                self.portals[pi].pos = spos;
+                self.portals[pi].rot = rot;
+                let face = self.portals[pi].shape;
+                let r = self.portals[pi].r;
+                let sc = Vec3::new(r, r, 0.06);
+                self.shapes[face].pos = spos;
+                self.shapes[face].inv_rot = sinv;
+                self.shapes[face].mat = glam::Mat4::from_scale_rotation_translation(sc, rot, spos);
+            }
         }
         // gravity nodes riding on animated shapes (the roaming moon)
         for gi in 0..self.grav.len() {

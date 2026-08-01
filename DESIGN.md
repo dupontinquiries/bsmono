@@ -1562,6 +1562,41 @@ mirror — and it hides the banding a perfectly smooth curved surface shows.
 
 Bores, loops, portals, mechanics and driving all regress unchanged.
 
+## v1.49.0 — TURNSTILE, and a live view through the mouth
+
+MOVING PORTALS. A `Portal` can now be bolted to a shape (`follow`), and
+takes that shape's transform every update — so where a mouth sends you
+keeps changing. Because the exit rotation is read at the moment of
+crossing, timing the entry IS the mechanic.
+
+TURNSTILE (style 32): every portal is on something turning. THE DRUM — a
+spinning cylinder with a mouth in its side that comes around to face you.
+THE CARRIAGES — orbiting decks with face-up portals, so a drop leads
+wherever the partner has got to. THE LIFT — a portal that climbs, so
+entering at the bottom of its travel and catching it at the top throw you
+to different places. Verified in `--sim portal`: a moving portal's exit
+direction swings 143 degrees as its machine turns.
+
+COLOUR CODING. Each pair now has its own hue — blue/orange, green/lime,
+violet/magenta, cyan/amber — and within a pair the exit end is the paler
+shade, so a glance tells you both which mouth you are looking at and
+which one it feeds. Checked in the sim: every pair's two ends are shaded
+apart.
+
+THE VIEW THROUGH. A portal face is no longer a coloured disc. The
+fragment takes its own view ray, carries it through the pair transform,
+and marches the world from the partner's mouth — three jittered samples,
+averaged, so it reads as a portal rather than a hard window, then tinted
+with the mouth's own colour and rimmed at grazing angles. Cars and the
+ball live in the marcher's shape list, so THEY APPEAR THROUGH IT: you can
+read an attack before it arrives, and a shot through a portal stops being
+blind. Portal faces carry their index in params.x; the uniform block
+holds eight portals, enough for both maps' three pairs.
+
+Same honesty as before: the shader validates and the maths is the same
+transform the physics uses and passes, but the visual result is
+unverified — no GPU here.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

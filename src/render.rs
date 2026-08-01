@@ -32,7 +32,7 @@ pub struct Globals {
     /// Up to 4 portals for the ray marcher: per portal, [pos.xyz, radius]
     /// then the face quaternion. `pcount.x` is how many are live.
     pub pcount: [f32; 4],
-    pub portals: [[f32; 4]; 8],
+    pub portals: [[f32; 4]; 16],
 }
 
 /// Ray-marchable shape record for the shader (mirrors world::Shape plus the

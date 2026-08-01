@@ -1356,6 +1356,41 @@ pub fn run(args: &[String]) {
         }
         check("no runaway ping-pong at a face", jumps < 40);
         println!("   {jumps} transits in 5 s of hovering at a portal mouth");
+        // ---- MOVING PORTALS (TURNSTILE): does a mouth on a turning drum
+        // actually change where it sends you as it comes around? ----
+        {
+            let mut w2 = World::generate(9, crate::world::style(32), 0.31, 1.0);
+            let movers = w2.portals.iter().filter(|p| p.follow.is_some()).count();
+            check("turnstile has portals mounted on movers", movers >= 2);
+            // sample the exit transform of a moving portal over time
+            let mi = w2.portals.iter().position(|p| p.follow.is_some()).unwrap_or(0);
+            let probe = Vec3::new(0.0, 0.0, -1.0); // travelling into the face
+            let mut first = Vec3::ZERO;
+            let mut spread = 0.0f32;
+            for k in 0..90 {
+                w2.update(DT * 8.0);
+                let out = w2.portal_rot(mi) * probe;
+                if k == 0 {
+                    first = out;
+                }
+                spread = spread.max(first.angle_between(out).to_degrees());
+            }
+            check("a moving portal's exit direction changes", spread > 45.0);
+            println!("   exit direction swings {spread:.0} degrees as the machine turns");
+            // colours: every pair distinct, and the two ends differ
+            let mut hue_ok = true;
+            for i in (0..w2.portals.len()).step_by(2) {
+                if i + 1 >= w2.portals.len() {
+                    break;
+                }
+                let (a2, b2) = (w2.portals[i].tint, w2.portals[i + 1].tint);
+                let d = (a2[0] - b2[0]).abs() + (a2[1] - b2[1]).abs() + (a2[2] - b2[2]).abs();
+                if d < 0.25 {
+                    hue_ok = false;
+                }
+            }
+            check("the two ends of a pair are shaded apart", hue_ok);
+        }
         println!("{}", if pass { "PORTALS: PASS" } else { "PORTALS: FAIL" });
         return;
     }
