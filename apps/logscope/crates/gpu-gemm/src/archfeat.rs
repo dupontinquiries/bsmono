@@ -405,8 +405,8 @@ mod tests {
     fn the_three_moe_gating_shapes_stay_distinct() {
         // Graph-level reads confirmed two DIFFERENT MoE conventions, and a third architecture family
         // uses a third. Collapsing them is the same class of mistake as the two Q/K norms.
-        let l4 = crate::archcfg::moe_config(&crate::archcfg::for_arch("llama4"), 16, 1, 1);
-        let q3 = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
+        let l4 = crate::archcfg::moe_config(&crate::archcfg::for_arch("llama4"), 16, 1, 1, None, None);
+        let q3 = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0, None, None);
         // llama4: sigmoid, weight on the expert INPUT, no normalization
         assert_eq!(l4.norm, crate::moe::RouteNorm::Sigmoid);
         assert!(l4.weight_before && !l4.normalize);
@@ -425,12 +425,12 @@ mod tests {
         // Getting that wrong would degrade output without any error, so it is worth a standing assertion
         // rather than a note in a commit.
         let c = crate::archcfg::for_arch("llama4");
-        let mc = crate::archcfg::moe_config(&c, 16, 1, 1);
+        let mc = crate::archcfg::moe_config(&c, 16, 1, 1, None, None);
         assert_eq!(mc.norm, crate::moe::RouteNorm::Sigmoid, "llama.cpp: EXPERT_GATING_FUNC_TYPE_SIGMOID");
         assert!(mc.weight_before, "the gate multiplies the expert INPUT");
         assert!(!mc.normalize, "llama.cpp passes norm_w = false");
         // and the contrast: qwen3moe is the ordinary softmax-over-normalized-weights case
-        let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
+        let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0, None, None);
         assert_eq!(q.norm, crate::moe::RouteNorm::Softmax);
         assert!(!q.weight_before && q.normalize);
     }
