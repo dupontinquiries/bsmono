@@ -2569,6 +2569,21 @@ impl Gpu {
     /// Whether the device signalled OOM since the last clear (set by the uncaptured-error handler). The
     /// decode loop checks this to abort a step gracefully instead of pushing more allocations at a device
     /// that just failed one. Cleared by `clear_oom` once the caller has backed off (freed a window / cache).
+    /// Devices whose driver kills a long-running compute dispatch.
+    ///
+    /// Apple's Honeykrisp does, and so does every mobile driver — Android's GPU watchdog is the same
+    /// mechanism under a different name. `conservative_vma` was standing in for this and means "Vulkan
+    /// on Apple", so a phone took the unbounded path and would trip the very watchdog the guard exists
+    /// to avoid.
+    ///
+    /// Named for the property rather than the vendor, which is the whole lesson of the last four fixes.
+    pub fn watchdog_prone(&self) -> bool {
+        if self.conservative_vma { return true; }
+        let n = self.adapter_name.to_ascii_lowercase();
+        ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx"]
+            .iter().any(|m| n.contains(m))
+    }
+
     pub fn oom_backoff(&self) -> bool { self.oom_flag.load(std::sync::atomic::Ordering::Relaxed) }
     pub fn clear_oom(&self) { self.oom_flag.store(false, std::sync::atomic::Ordering::Relaxed); }
     /// Test/validation hook: force the OOM-backoff flag so the download guards can be exercised without an
@@ -11411,7 +11426,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             // proactive (not gated on governor_dead, which only latches AFTER the first stalled submit — too
             // late for the first window). LOGSCOPE_WINDOW_ONE_SUBMIT=1 restores the collapse for A/B.
             let force_collapse = std::env::var_os("LOGSCOPE_WINDOW_ONE_SUBMIT").is_some();
-            if (self.conservative_vma || self.degraded()) && !force_collapse {
+            // WATCHDOG-PRONE, not Apple. Mobile drivers kill long dispatches the same way Honeykrisp
+            // does, and this guard bounds the decode window precisely to avoid that — so keying it on
+            // an Apple-only flag left a phone taking the unbounded path.
+            if (self.watchdog_prone() || self.degraded()) && !force_collapse {
                 self.set_flush_every(saved_flush.clamp(1, 64));
             } else {
                 self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
@@ -12521,6 +12539,33 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// The watchdog guard must fire on every device whose driver kills long dispatches.
+    ///
+    /// It was keyed on `conservative_vma` — "Vulkan on Apple" — while bounding the decode window to
+    /// avoid a GPU watchdog. Android drivers have the same watchdog, so a phone took the unbounded
+    /// path and would trip the very thing the guard exists to prevent.
+    ///
+    /// Tested on the name list directly because `watchdog_prone` needs a live Gpu, and the list is the
+    /// part that goes stale when a vendor is added.
+    #[test]
+    fn the_watchdog_list_covers_mobile_AND_apple() {
+        let matches = |s: &str| {
+            let l = s.to_ascii_lowercase();
+            ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx"]
+                .iter().any(|m| l.contains(m))
+        };
+        for a in ["Adreno (TM) 740", "Mali-G715", "Immortalis-G720", "Samsung Xclipse 940",
+                  "Apple M2 Max (G14C B1) [Vulkan]", "Apple M2 Ultra (G14D B1) [Vulkan]"] {
+            assert!(matches(a), "{a} kills long dispatches and must be bounded");
+        }
+        // Desktop parts must NOT be bounded, or every one of them pays per-token submit overhead for
+        // a watchdog they do not have.
+        for a in ["NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX", "Intel Arc A770",
+                  "llvmpipe (LLVM 20.1.2, 256 bits)"] {
+            assert!(!matches(a), "{a} has no watchdog; bounding it costs speed for nothing");
+        }
+    }
+
     /// Every per-run counter must be reset together.
     ///
     /// Observed across four consecutive runs: `no-frame 1480` each time, while its reported share moved
