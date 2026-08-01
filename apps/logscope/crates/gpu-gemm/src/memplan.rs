@@ -321,7 +321,20 @@ pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: b
     // 48 is chosen to clear the case that exposed this — a 70B at Q4 needs 40.5 GiB plus KV — while
     // staying below what the probe verified. Still a constant, and still the wrong KIND of answer:
     // `gpu_budget_preferring_measurement` should be used wherever a measurement exists.
-    let cap = if conservative_vma { 48.0 } else { 48.0 };
+    // SCALED TO RAM, not a flat constant. 48 GiB was raised from 24 in _340 on evidence from a 192 GiB
+    // M2 Ultra, where llama.cpp runs a 70B. On a 64 GiB M2 Max the probe measures a ceiling of 31.0 GiB
+    // — so the same constant that was too LOW on the Ultra is too HIGH here, and a budget above the
+    // ceiling is what approves an allocation that cannot be satisfied.
+    //
+    // The ceiling tracks RAM because this is unified memory: the GPU allocator is drawing on the same
+    // pool. Half of RAM matches both observations — 96 on the Ultra (under the 63 it verified, so the
+    // min below governs) and 31.3 on the Max (against 31.0 measured, which is as close as a constant
+    // gets without being a measurement).
+    //
+    // Still the wrong KIND of answer. gpu_budget_preferring_measurement should be used wherever
+    // --gate-vram has run.
+    let ram_gib = ram_budget as f64 / GIB;
+    let cap = if conservative_vma { (ram_gib * 0.5).min(48.0) } else { 48.0 };
     (ram_budget / 2).min((cap * GIB) as u64)
 }
 
@@ -876,6 +889,28 @@ mod uma_tests {
     use super::*;
 
     fn g(x: f64) -> u64 { (x * GIB) as u64 }
+
+    #[test]
+    fn the_cap_tracks_RAM_because_the_pool_is_shared() {
+        // Two machines, one constant, and it cannot serve both. Measured ceilings: 63 GiB on a 192 GiB
+        // M2 Ultra, 31 GiB on a 64 GiB M2 Max. A flat 48 was too LOW on one and too HIGH on the other,
+        // and too high is the dangerous direction — it approves an allocation that cannot be satisfied.
+        let max64 = gpu_buffer_budget(g(62.6), true);
+        assert!(gib(max64) <= 31.5, "64 GiB machine: {:.1} GiB against a 31.0 measured ceiling", gib(max64));
+
+        let ultra = gpu_buffer_budget(g(192.0), true);
+        assert!(gib(ultra) >= 48.0, "192 GiB machine keeps the headroom it demonstrably has: {:.1}", gib(ultra));
+    }
+
+    #[test]
+    fn a_budget_above_the_measured_ceiling_is_the_case_that_MATTERS() {
+        // The gate reported "consistent" for a 48 GiB budget against a 31 GiB ceiling because it only
+        // checked whether the measurement was HIGHER. A budget above the ceiling is not conservatism —
+        // it is the enabler for the whole OOM class.
+        let measured = 31.0f32;
+        let derived = budget_from_measurement(measured).unwrap();
+        assert!(gib(derived) < 31.0, "75% of the measurement stays under it: {:.1}", gib(derived));
+    }
 
     #[test]
     fn the_measured_64gib_failure_is_now_REFUSED() {
