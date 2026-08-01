@@ -211,6 +211,30 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
 - **The palette is fixed at startup**, five patterns at seed 7. Nothing regenerates a material with
   a different seed or colours from the UI, though `Material::with_colours` supports it.
 
+## Asset pools (`cad-pool`, M5)
+
+- **Planning and applying are separate calls, and the default is a plan.** This is
+  `library_shrink_v8.py`'s rule in its own capitals — dry run by default — and `apply` is the only
+  function in the crate that writes. It also never deletes an original: reclaiming space by
+  discarding a source would break the v2 pipeline's re-processability guarantee, which is why those
+  scripts shrink rather than prune.
+- **Dedupe is a fingerprint, not a hash.** Size plus the first and last kilobyte. Two distinct
+  assets colliding would have to share a length *and* both ends, which is unlikely enough for
+  selection, and it is cheap over thousands of files. A full content hash is the upgrade if a
+  collision is ever observed. Against the real tree this identified 371 duplicates reclaiming
+  36.7 MB — most of them small emitter definitions that genuinely are byte-identical.
+- **The triangle budget is advisory.** It is reported and never enforced, because a budget that
+  silently drops a model the game needs is worse than one that warns. Only the byte budget stops
+  inclusion.
+- **Selection is name-ordered, not importance-ordered.** When a byte budget binds, what gets in is
+  whatever sorts first — there is no notion of which assets a game needs most. Against the demo
+  manifest that means 227 included and 3,018 over budget, which is a real limitation rather than a
+  tuning issue: a pool needs a priority signal (referenced-by-scene, hand-ranked, recently-used)
+  before its budget behaviour is trustworthy.
+- **No injection into `games/` yet.** `apply` copies into a destination directory. The per-game
+  adapters of §10 — writing into a game's own layout, honouring the bsgames handoff — are not
+  written.
+
 ## Not verified in-sandbox
 
 - **The app has never been run.** The build environment had one core, 3 GB RAM, no GPU and no

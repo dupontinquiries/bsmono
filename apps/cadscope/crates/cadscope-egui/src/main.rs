@@ -33,6 +33,9 @@ fn main() -> eframe::Result<()> {
     if let Some(i) = args.iter().position(|a| a == "--propose") {
         propose(args.get(i + 1).map(String::as_str).unwrap_or(""));
     }
+    if let Some(i) = args.iter().position(|a| a == "--pool") {
+        pool_plan(args.get(i + 1).map(String::as_str).unwrap_or("."), args.iter().any(|a| a == "--apply"));
+    }
     if let Some(i) = args.iter().position(|a| a == "--ref-index") {
         ref_index(args.get(i + 1).map(String::as_str).unwrap_or("."));
     }
@@ -83,6 +86,86 @@ fn demo_doc() -> Doc {
             Op::Pattern { name: "studs".into(), count: 4, step: [3.0, 0.0, 0.0] },
         ],
     }
+}
+
+/// Plan an asset pool against the corpus (plan §10). Prints what it would do and stops, which is
+/// the v2 scripts' rule stated in their own capitals: DRY RUN BY DEFAULT. `--apply` is a separate
+/// flag and the only way anything is copied.
+fn pool_plan(root: &str, do_apply: bool) -> ! {
+    let root_path = std::path::Path::new(root);
+    let manifest_path = root_path.join("apps/cadscope/pool.toml");
+    let manifest = match std::fs::read_to_string(&manifest_path) {
+        Ok(t) => cad_pool::PoolManifest::parse(&t),
+        Err(e) => {
+            println!("no pool manifest at {}: {e}", manifest_path.display());
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "pool '{}': kinds {:?}, budget {}",
+        manifest.name,
+        manifest.kinds,
+        manifest.budget.bytes.map(cad_pool::human).unwrap_or_else(|| "unlimited".into())
+    );
+
+    let mut opts = cad_ref::ScanOpts {
+        cache: Some(root_path.join(".cadscope-ref.cache")),
+        ..Default::default()
+    };
+    if let Ok(text) = std::fs::read_to_string(root_path.join("apps/cadscope/ref.toml")) {
+        opts = opts.with_ref_toml(&text);
+    }
+    let idx = cad_ref::Index::scan(root_path, &opts);
+    let plan = cad_pool::plan(&idx, &manifest, &[]);
+    println!("  corpus   {} entries", idx.len());
+    println!("  {}", cad_pool::summarise(&idx, &plan));
+
+    // Show a few of each interesting outcome rather than thousands of lines.
+    let mut shown = std::collections::HashMap::new();
+    for item in &plan.items {
+        let tag = match &item.action {
+            cad_pool::Action::Include { .. } => "include",
+            cad_pool::Action::Duplicate { .. } => "duplicate",
+            cad_pool::Action::OverBudget { .. } => "over budget",
+            cad_pool::Action::Excluded { .. } => "excluded",
+            cad_pool::Action::AlreadyPresent { .. } => "present",
+        };
+        let n = shown.entry(tag).or_insert(0usize);
+        if *n < 3 {
+            *n += 1;
+            let detail = match &item.action {
+                cad_pool::Action::Include { bytes, reason } => {
+                    format!("{} ({reason})", cad_pool::human(*bytes))
+                }
+                cad_pool::Action::Duplicate { bytes, of } => {
+                    format!("{} identical to '{of}'", cad_pool::human(*bytes))
+                }
+                cad_pool::Action::OverBudget { bytes } => {
+                    format!("{} would not fit", cad_pool::human(*bytes))
+                }
+                cad_pool::Action::Excluded { reason } => reason.clone(),
+                cad_pool::Action::AlreadyPresent { bytes } => cad_pool::human(*bytes),
+            };
+            println!("  {:11} {:32} {detail}", tag, item.name);
+        }
+    }
+
+    if do_apply {
+        let dest = root_path.join("apps/cadscope/pool-out");
+        match cad_pool::apply(&plan, &dest) {
+            Ok(a) => println!(
+                "  applied  {} file(s), {} written to {}{}",
+                a.copied,
+                cad_pool::human(a.bytes),
+                dest.display(),
+                if a.failed.is_empty() { String::new() } else { format!(", {} failed", a.failed.len()) }
+            ),
+            Err(e) => println!("  apply failed: {e}"),
+        }
+    } else {
+        println!("  (dry run — nothing was copied; pass --apply to execute this plan)");
+    }
+    std::process::exit(0);
 }
 
 /// Run a proposal through the sanitization boundary and report exactly what survived. This is the

@@ -312,6 +312,11 @@ dependencies = [
 [[package]]
 name = "cad-pool"
 version = "0.1.0"
+dependencies = [
+ "cad-ref",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cad-ref"
@@ -355,6 +360,7 @@ dependencies = [
  "cad-kernel",
  "cad-liaison",
  "cad-motion",
+ "cad-pool",
  "cad-ref",
  "cad-tex",
  "cad-view",

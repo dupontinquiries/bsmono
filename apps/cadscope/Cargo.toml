@@ -30,6 +30,7 @@ cad-ref = { path = "crates/cad-ref" }
 cad-nifty = { path = "crates/cad-nifty" }
 cad-liaison = { path = "crates/cad-liaison" }
 cad-tex = { path = "crates/cad-tex" }
+cad-pool = { path = "crates/cad-pool" }
 
 [profile.dev]
 opt-level = 2                 # skydribble's lesson: geometry at opt 0 is unusable
