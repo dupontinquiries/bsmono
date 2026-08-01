@@ -1049,6 +1049,139 @@ pub fn run(args: &[String]) {
         println!("{}", if ok { "PLANETS: PASS" } else { "PLANETS: FAIL" });
         return;
     }
+    if name == "stream" {
+        // LAN RENDER ASSIST, end to end on loopback: the client marches only
+        // the near field and hands the expensive tail to probes streamed by
+        // a host. Measures the transport (RTT, bitrate), how much work the
+        // split actually saves, and — the part that matters — how close the
+        // assisted result is to a full local march.
+        use crate::stream::{decode_probes, encode_probes, Cache, Endpoint, PoseMsg, Probe, DIRS, PROBES};
+        let world = World::generate(9, crate::world::style(21), 0.31, 1.0);
+        // a plain CPU march: the ground truth, and what the host runs
+        let march = |mut p: Vec3, d: Vec3, max_t: f32, steps: u32| -> (Option<Vec3>, f32) {
+            let mut t = 0.0f32;
+            for _ in 0..steps {
+                let dist = world.sdf(p);
+                if dist < 0.05 {
+                    return (Some(p), t);
+                }
+                t += dist.max(0.05);
+                if t > max_t {
+                    break;
+                }
+                p += d * dist.max(0.05);
+            }
+            (None, t)
+        };
+        let shade = |hit: Option<Vec3>, d: Vec3| -> [f32; 3] {
+            match hit {
+                Some(h) => {
+                    let n = world.normal(h);
+                    let l = Vec3::new(0.4, 0.8, 0.3).normalize();
+                    let k = n.dot(l).max(0.0) * 0.7 + 0.25;
+                    [k * 0.85, k * 0.9, k]
+                }
+                None => {
+                    let up = d.y * 0.5 + 0.5;
+                    [0.35 + up * 0.3, 0.45 + up * 0.35, 0.7 + up * 0.3]
+                }
+            }
+        };
+        let host = Endpoint::bind("127.0.0.1:0").expect("host bind");
+        let client = Endpoint::bind("127.0.0.1:0").expect("client bind");
+        let (haddr, caddr) = (host.addr().unwrap(), client.addr().unwrap());
+        let mut cache = Cache::default();
+        let mut buf = [0u8; 65536];
+        let mut rtt_sum = 0.0f64;
+        let mut bytes = 0usize;
+        let mut frames = 0u32;
+        let mut car = Vec3::new(0.0, 3.0, 0.0);
+        let vel = Vec3::new(0.0, 0.0, -22.0);
+        for seq in 0..40u32 {
+            car += vel * (1.0 / 30.0);
+            let t0 = std::time::Instant::now();
+            client.send(haddr, &PoseMsg { seq, pos: car, vel }.encode());
+            // ---- host side ----
+            if let Some((n, from)) = host.recv(&mut buf) {
+                let q = PoseMsg::decode(&buf[..n]).expect("pose decodes");
+                // probes go AHEAD of the car, where its rays will land
+                let mut probes = Vec::with_capacity(PROBES);
+                for i in 0..PROBES {
+                    let a = i as f32 * 0.61803 * std::f32::consts::TAU;
+                    let r = 6.0 + (i as f32 / PROBES as f32) * 34.0;
+                    let c = q.pos + q.vel.normalize_or(Vec3::NEG_Z) * (r * 0.6)
+                        + Vec3::new(a.cos() * r * 0.5, (i % 4) as f32 * 2.5, a.sin() * r * 0.5);
+                    let mut rgb = [[0u8; 3]; DIRS];
+                    for (k, slot) in rgb.iter_mut().enumerate() {
+                        let d = crate::stream::dir_of(k);
+                        let (hit, _) = march(c, d, 260.0, 64);
+                        let col = shade(hit, d);
+                        *slot = [
+                            (col[0] * 255.0) as u8,
+                            (col[1] * 255.0) as u8,
+                            (col[2] * 255.0) as u8,
+                        ];
+                    }
+                    probes.push(Probe { pos: c, rgb });
+                }
+                let pkt = encode_probes(q.seq, &probes);
+                bytes += pkt.len();
+                host.send(from, &pkt);
+                let _ = caddr;
+            }
+            // ---- client side ----
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            if let Some((n, _)) = client.recv(&mut buf) {
+                if let Some((seq_in, probes)) = decode_probes(&buf[..n]) {
+                    cache.probes = probes;
+                    cache.last_seq = seq_in;
+                    cache.age = 0.0;
+                    rtt_sum += t0.elapsed().as_secs_f64();
+                    frames += 1;
+                }
+            }
+        }
+        println!("transport   frames {frames}/40   mean RTT {:.2} ms   {:.1} KB/frame   {:.0} kbit/s at 30 Hz",
+            rtt_sum / frames.max(1) as f64 * 1000.0,
+            bytes as f32 / frames.max(1) as f32 / 1024.0,
+            bytes as f32 / frames.max(1) as f32 * 8.0 * 30.0 / 1000.0);
+        // ---- the split: near field local, far field from the cache ----
+        let near = 12.0f32;
+        let (mut local, mut handed, mut err_sum, mut n_err) = (0u32, 0u32, 0.0f32, 0u32);
+        let (mut steps_full, mut steps_split) = (0u64, 0u64);
+        for i in 0..600u32 {
+            let a = i as f32 * 0.7548;
+            let d = Vec3::new(a.cos(), (i % 7) as f32 * 0.12 - 0.3, a.sin()).normalize();
+            let p = car + Vec3::new((i % 11) as f32 - 5.0, 1.0 + (i % 5) as f32, (i % 13) as f32 - 6.0);
+            let (hit_full, _) = march(p, d, 260.0, 64);
+            let truth = shade(hit_full, d);
+            steps_full += 64;
+            // the client's cheap version: a short march, then the cache
+            let (hit_near, _) = march(p, d, near, 12);
+            steps_split += 12;
+            let got = if hit_near.is_some() {
+                local += 1;
+                shade(hit_near, d)
+            } else {
+                handed += 1;
+                match cache.sample(p, d) {
+                    Some(c) => c,
+                    None => shade(None, d),
+                }
+            };
+            let e = ((got[0] - truth[0]).abs() + (got[1] - truth[1]).abs() + (got[2] - truth[2]).abs()) / 3.0;
+            err_sum += e;
+            n_err += 1;
+        }
+        let err = err_sum / n_err.max(1) as f32;
+        println!("split       {:.0}% resolved locally, {:.0}% from probes   ray steps {:.0}% of full",
+            local as f32 / 600.0 * 100.0, handed as f32 / 600.0 * 100.0,
+            steps_split as f32 / steps_full as f32 * 100.0);
+        println!("accuracy    mean channel error {:.3} vs a full march", err);
+        let ok = frames >= 35 && err < 0.22;
+        println!("{}", if ok { "STREAM: PASS" } else { "STREAM: FAIL" });
+        return;
+    }
     if name == "learn" {
         // Does the squad actually get better DURING a match? Run one long
         // match and compare aerial output in the first third against the

@@ -415,3 +415,5 @@ KUIPER runs live sky events: a world collapses into a black hole every five minu
 `--sim drive` drives a car through every tube route and reports traversal and escapes.
 
 `--sim platform` checks that cars ride moving decks; `--sim learn` measures whether the bots improve mid-match.
+
+`--sim stream` measures the LAN render-assist split: transport, bitrate, ray-step saving and accuracy.

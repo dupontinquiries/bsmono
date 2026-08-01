@@ -779,10 +779,12 @@ impl World {
                             r: r * 2.4,
                             tube: true,
                             inward: false,
-                            // measured: stronger than world gravity slammed
-                            // cars into the bore and cost traversals (21/24
-                            // -> 17/24), so the pipe pulls at 1.0
-                            g: 1.0,
+                            // Scale with the BORE: a narrow pipe holds you
+                            // by geometry (and stronger pull there slammed
+                            // cars into walls, 21/24 -> 17/24), but in a
+                            // 12 m bore a boosting car flies up the middle
+                            // and never touches a wall at all.
+                            g: (r / 6.0).clamp(1.0, 2.6),
                             surf: true,
                             follow: None,
                         });
@@ -1497,10 +1499,12 @@ impl World {
                             r: r * 2.4,
                             tube: true,
                             inward: false,
-                            // measured: stronger than world gravity slammed
-                            // cars into the bore and cost traversals (21/24
-                            // -> 17/24), so the pipe pulls at 1.0
-                            g: 1.0,
+                            // Scale with the BORE: a narrow pipe holds you
+                            // by geometry (and stronger pull there slammed
+                            // cars into walls, 21/24 -> 17/24), but in a
+                            // 12 m bore a boosting car flies up the middle
+                            // and never touches a wall at all.
+                            g: (r / 6.0).clamp(1.0, 2.6),
                             surf: true,
                             follow: None,
                         });
@@ -1567,6 +1571,112 @@ impl World {
                     }
                     wp.push(at(n));
                 };
+
+                // ---- THE GIANTS: avatar-scale trees you drive INTO ----
+                // A handful of enormous trunks with a road spiralling up
+                // through the wood, smooth hollows opening off it, and
+                // giant vines strung between them at windscreen height.
+                {
+                    let bark_g = mix4(PLINTH, [0.26, 0.17, 0.10, 1.0], 0.75);
+                    let mut giant_tops: Vec<(Vec3, f32)> = Vec::new();
+                    for k in 0..4usize {
+                        let a = k as f32 * 1.5707 + 0.6;
+                        let rr = rng.range(120.0, 190.0) * ws;
+                        let (x, z) = (a.cos() * rr, a.sin() * rr);
+                        let g = th(x, z);
+                        let tr = rng.range(15.0, 26.0);
+                        let hgt = rng.range(95.0, 165.0);
+                        let half = hgt * 0.5;
+                        let base = Vec3::new(x, g + half, z);
+                        let ti = push(&mut shapes, M_CAP_TALL, base, Quat::IDENTITY, Vec3::new(tr, half / CAP_TALL_HH.max(1.0), tr), Sdf::Capsule { r: tr, half }, bark_g, 0.0, 0.25);
+                        shapes[ti].blend = true;
+                        giant_tops.push((Vec3::new(x, g + hgt, z), tr));
+
+                        // THE SPIRAL ROAD: a bore winding up through the
+                        // trunk, carved rather than built, so the wood itself
+                        // is the tunnel. Registered as a route, which is what
+                        // keeps the clearance pass opening it.
+                        let road_r = (tr * 0.30).clamp(4.5, 7.5);
+                        // The helix is derived from a DRIVABLE SLOPE, not a
+                        // turn count: a fixed 2-3 turns made the first stretch
+                        // a 60-degree shaft (the drive test stalled at 4% of
+                        // the route). Hug the bark at constant radius and take
+                        // as many turns as a ~1:3 climb needs.
+                        let rad = (tr - road_r * 1.05).max(4.0);
+                        let climb = hgt - 12.0;
+                        let turns = (climb / (0.34 * std::f32::consts::TAU * rad)).clamp(1.5, 7.0);
+                        let arc = turns * std::f32::consts::TAU * rad;
+                        let steps = ((arc / (road_r * 0.75)).ceil() as usize).clamp(40, 220);
+                        let mut way: Vec<Vec3> = Vec::new();
+                        for t in 0..=steps {
+                            let f = t as f32 / steps as f32;
+                            let ang = f * turns * std::f32::consts::TAU;
+                            let p = Vec3::new(x + ang.cos() * rad, g + 3.0 + f * climb, z + ang.sin() * rad);
+                            cut_s(&mut shapes, p, road_r);
+                            if t % 3 == 0 {
+                                way.push(p);
+                                grav.push(GravNode { pos: p, down: Vec3::NEG_Y, r: road_r * 2.2, tube: true, inward: false, g: 1.0, surf: true, follow: None });
+                            }
+                        }
+                        // the entrance: carve out through the bark at ground
+                        let ent = Vec3::new(x + (rad + tr) * 0.5 + tr * 0.75, g + 3.0, z);
+                        for t in 0..8 {
+                            let f = t as f32 / 7.0;
+                            cut_s(&mut shapes, ent.lerp(way[0], f), road_r * (1.25 - 0.25 * f));
+                        }
+                        let mut full = vec![ent];
+                        full.extend(way.iter().copied());
+                        routes.push((full, road_r));
+                        rim(&mut shapes, ent, Vec3::NEG_X, road_r, mix4(acc, [1.0; 4], 0.3));
+
+                        // SMOOTH HOLLOWS: bulb chambers opening off the road,
+                        // big enough to race up into and turn around in
+                        for h in 0..3usize {
+                            let f = 0.28 + h as f32 * 0.24;
+                            let ang = f * turns * std::f32::consts::TAU;
+                            let c = Vec3::new(x + ang.cos() * rad, g + 3.0 + f * climb, z + ang.sin() * rad);
+                            let hr = road_r * rng.range(1.7, 2.4);
+                            cut_s(&mut shapes, c, hr);
+                            zones.push(Zone { pos: c, r: hr * 0.7, kind: ZoneKind::Boost });
+                            grav.push(GravNode { pos: c, down: Vec3::NEG_Y, r: hr * 2.0, tube: true, inward: false, g: 1.0, surf: true, follow: None });
+                        }
+                        // a canopy mouth: the road surfaces at the top
+                        cut_s(&mut shapes, Vec3::new(x, g + hgt - 6.0, z), road_r * 1.6);
+                        // crown foliage (drawn only — never blocks the exit)
+                        for c in 0..4u32 {
+                            let ca = c as f32 * 1.6 + k as f32;
+                            let cr = tr * rng.range(1.4, 2.1);
+                            let cp = Vec3::new(x + ca.cos() * tr * 0.7, g + hgt + rng.range(2.0, 14.0), z + ca.sin() * tr * 0.7);
+                            push(&mut shapes, M_SPHERE, cp, Quat::IDENTITY, Vec3::splat(cr), Sdf::None, mix4([0.14, 0.30, 0.13, 1.0], acc, 0.06 * c as f32), 0.02, 0.15);
+                        }
+                    }
+                    // GIANT VINES: thick ropes slung between the giants at
+                    // driving height — solid, so you smack into them
+                    for k in 0..giant_tops.len() {
+                        let (a0, _) = giant_tops[k];
+                        let (b0, _) = giant_tops[(k + 1) % giant_tops.len()];
+                        for v in 0..2u32 {
+                            let sag = 18.0 + v as f32 * 26.0;
+                            let a1 = a0 - Vec3::Y * (12.0 + v as f32 * 22.0);
+                            let b1 = b0 - Vec3::Y * (12.0 + v as f32 * 22.0);
+                            let n = 7;
+                            for t in 0..n {
+                                let (f0, f1) = (t as f32 / n as f32, (t + 1) as f32 / n as f32);
+                                let bez = |f: f32| {
+                                    let m = a1.lerp(b1, f);
+                                    m - Vec3::Y * (sag * (4.0 * f * (1.0 - f)))
+                                };
+                                let (p0, p1) = (bez(f0), bez(f1));
+                                let mid = (p0 + p1) * 0.5;
+                                let axis = (p1 - p0).normalize_or(Vec3::X);
+                                let half = p0.distance(p1) * 0.5;
+                                let vr = 1.6 + v as f32 * 0.7;
+                                let vi = push(&mut shapes, M_CAP_TALL, mid, Quat::from_rotation_arc(Vec3::Y, axis), Vec3::new(vr, half / CAP_TALL_HH.max(1.0), vr), Sdf::Capsule { r: vr, half }, mix4([0.18, 0.34, 0.16, 1.0], acc, 0.2), 0.05, 0.35);
+                                shapes[vi].blend = true;
+                            }
+                        }
+                    }
+                }
 
                 // ---- the forest giants ----
                 let bark = mix4(PLINTH, [0.30, 0.20, 0.12, 1.0], 0.7);

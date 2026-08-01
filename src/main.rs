@@ -9,6 +9,7 @@ mod font;
 mod fx;
 mod gamepad;
 mod gyro;
+mod stream;
 mod hud;
 mod input;
 mod meshgen;

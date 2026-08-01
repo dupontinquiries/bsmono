@@ -1383,6 +1383,55 @@ ship a renderer path I cannot measure. The order would be: prove the
 transport headless (as `--sim mp` did for multiplayer), then a half-res
 remote radiance buffer with local reprojection and disocclusion fill.
 
+## v1.44.0 — the giants, and LAN render assist
+
+THE GIANTS (MONKEY RUN). Four avatar-scale trunks, 95-165 m tall and up
+to 26 m thick, with a ROAD CARVED THROUGH THE WOOD: a helix of cutter
+spheres spiralling up the inside of the bark, three smooth bulb hollows
+opening off it (boost pockets big enough to turn around in), a flared
+ground mouth, and a canopy exit at the top. Giant vines are slung
+between the crowns at windscreen height — solid capsules, so they are
+something you smack into.
+
+The helix is derived from a DRIVABLE SLOPE rather than a turn count. The
+first cut used a fixed 2-3 turns, which made the opening stretch a
+60-degree shaft (the drive test stalled at 4% of the route); it now hugs
+the bark at constant radius and takes as many turns as a ~1:3 climb
+needs, sampled densely enough that consecutive cutters overlap.
+
+TUBE GRAVITY now scales with the BORE. A narrow pipe holds you by
+geometry, and pulling harder there slammed cars into walls (21/24 ->
+17/24 traversals, measured). But in a 12 m bore a boosting car flies up
+the middle and never touches a wall at all — the drive trace showed
+exactly that, climbing 13 m with `og=0` throughout. Pull is now
+(r/6).clamp(1.0, 2.6).
+
+LAN RENDER ASSIST — your split, built and measured (`src/stream.rs`,
+`--sim stream`). A host on the same LAN (found through the same fleet
+store as multiplayer) marches the FAR field and publishes world-space
+RADIANCE PROBES; the client marches only the first few metres of each
+ray and, when it misses, samples a probe instead of continuing. The
+residual is local, the expensive tail is remote.
+
+Probes rather than video, deliberately: a probe grid is view-independent,
+so a late packet is still usable — it degrades to a slightly stale
+reflection instead of a torn frame, and the client never blocks on the
+network.
+
+Loopback numbers: 40/40 frames, 1.7 KB/frame — 417 kbit/s at 30 Hz —
+with the client resolving 18% of rays locally and handing 82% to probes,
+for 19% of the ray steps of a full march, at a mean channel error of
+0.163 against that full march. The protocol, transport, cache,
+direction blending and accuracy are all proven headless. NOT built: the
+GPU path that samples the cache inside the shader, which needs real
+hardware at both ends to tune.
+
+STILL OPEN: the long Monkey Run vine lines. Perplexus traverses 20-23 of
+24 routes; Monkey Run's three 900-2200 m lines still stall mid-route
+(4-38%) without falling out. They are wide, steep and very long, and the
+next thing I would try is banking them — rolling the bore so the driving
+line is the inside of the curve rather than fighting across it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
