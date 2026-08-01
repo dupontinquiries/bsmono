@@ -3,6 +3,14 @@ name = "ambient-learner"
 version = "0.1.0"
 edition = "2021"
 
+# The egui build's own library. Separate from main.rs, which is
+# 7,048 lines of GTK and does not compile without gtk4/adw/glib — building with
+# --features egui produced 240 errors, all of them unguarded gtk:: paths there.
+[lib]
+name = "ambient_learner_egui"
+path = "src/egui_lib.rs"
+required-features = ["egui"]
+
 [features]
 default = ["gtk"]
 gtk = ["gtk4", "libadwaita", "glib"]
@@ -53,6 +61,13 @@ libadwaita = { version = "0.6", optional = true, features = ["v1_4"] }
 glib = { version = "0.19", optional = true }
 
 # Iced dependencies (optional)
+# iced 0.12 caps web-sys at 0.3.67; eframe 0.34 requires >= 0.3.77. The two are
+# mutually exclusive in one dependency graph, which is why building --features
+# egui-app alongside iced fails to resolve rather than fails to compile.
+#
+# Both frontends are kept — iced's is 2,031 real lines — but they cannot be
+# enabled together, and `full` no longer implies iced. Upgrading iced past 0.12
+# would lift the cap and is the proper fix when someone needs both.
 iced_dep = { package = "iced", version = "0.12", optional = true, features = ["smol"] }
 
 # QT dependencies (optional)
