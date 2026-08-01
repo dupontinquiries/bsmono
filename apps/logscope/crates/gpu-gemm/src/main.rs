@@ -3522,9 +3522,20 @@ everywhere: it looks like a hardware problem"
         let n = 64usize;
         let raw: Vec<u8> = (0..n).map(|i| i as u8).collect();     // byte i holds the value i
         let got = gpu.byte_probe(&raw);
-        let g: Vec<u8> = got.iter().take(16).map(|v| *v as u8).collect();
+        // ALL OF IT, in rows of 16. The first run reported "neither clamped nor zeroed" while showing
+        // zeros at 4..15 — which means something PAST 16 is non-zero, so the pattern is not uniform and
+        // truncating the output hid the shape that identifies it.
         println!("  source bytes 0..16 : {:?}", &raw[..16]);
-        println!("  byte_at  0..16     : {g:?}");
+        for row in 0..(n / 16) {
+            let g: Vec<u8> = got[row * 16..(row + 1) * 16].iter().map(|v| *v as u8).collect();
+            println!("  byte_at {:>2}..{:<3}    : {g:?}", row * 16, row * 16 + 16);
+        }
+        let nz: Vec<usize> = got.iter().enumerate()
+            .filter(|(_, v)| **v != 0.0).map(|(i, _)| i).collect();
+        println!("  non-zero indices   : {nz:?}");
+        let correct: Vec<usize> = got.iter().enumerate()
+            .filter(|(i, v)| **v as u8 == raw[*i]).map(|(i, _)| i).collect();
+        println!("  CORRECT indices    : {correct:?}");
         let exact = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
         if exact {
             println!("gate-bytes: byte_at is CORRECT — the fault is in the dequantizers, not the reader \u{2713}");
@@ -3534,8 +3545,14 @@ everywhere: it looks like a hardware problem"
             let _ = first_bad;
             println!("  first wrong index  : {bad:?}");
             // Name the shape, because the fixes are opposite.
-            let tail_same = got.windows(2).skip(4).all(|w| w[0] == w[1]);
-            let tail_zero = got.iter().skip(4).all(|v| *v == 0.0);
+            // CLASSIFY FROM THE FIRST WRONG INDEX, not from index 4. The first version hardcoded a
+            // skip of 4 — an assumption that word 0 always reads correctly — and on the M2 Ultra it
+            // reported "neither clamped nor zeroed" for output that was plainly zeroed from index 4.
+            // The whole point of this probe was to stop guessing, and its verdict was itself a guess.
+            let bad = got.iter().enumerate().position(|(i, v)| *v as u8 != raw[i]).unwrap_or(got.len());
+            let tail = &got[bad..];
+            let tail_zero = !tail.is_empty() && tail.iter().all(|v| *v == 0.0);
+            let tail_same = !tail.is_empty() && tail.windows(2).all(|w| w[0] == w[1]);
             println!("gate-bytes: byte_at is WRONG — {}",
                 if tail_zero { "reads past word 0 return ZERO, so the BINDING is short" }
                 else if tail_same { "reads past word 0 CLAMP to a stale value, so the binding is fine \
