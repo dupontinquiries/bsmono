@@ -87,6 +87,9 @@ flatpak = true
 runtime = "tbd"          # GUI toolkit not yet confirmed
 targets = ["desktop"]
 notes = "AV1 encoding GUI; per-segment isolation/resume; runtime TBD"
+# STALE DUPLICATE: apps/av1tuner-m1 is the live fork and is ahead in all five
+# differing files (VVenC mkvmerge muxing, preflight check, verified cache hits).
+# See apps/av1tuner/DUPLICATE.md. Retire this entry once nothing references it.
 
 [apps.ambient-learner]
 path = "apps/ambient-learner"

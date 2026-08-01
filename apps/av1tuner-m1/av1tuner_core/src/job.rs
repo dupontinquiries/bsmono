@@ -135,7 +135,13 @@ impl JobState {
 pub fn derive_state_dir(output: &Path) -> PathBuf {
     let mut name = output.file_name().map(|s| s.to_os_string()).unwrap_or_default();
     name.push(".av1tuner");
-    output.parent().unwrap_or(Path::new(".")).join(name)
+    // Path::parent() returns Some("") for a bare filename, not None — so the
+    // `unwrap_or(".")` this used to rely on was DEAD CODE and the intended
+    // "./name" never happened. It still worked, because joining onto an empty
+    // path yields the name, but the explicit form is what the caller was
+    // promised and what makes the path unambiguous when it is logged.
+    let parent = output.parent().filter(|p| !p.as_os_str().is_empty());
+    parent.unwrap_or(Path::new(".")).join(name)
 }
 
 fn now_secs() -> u64 {
