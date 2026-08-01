@@ -233,6 +233,35 @@ impl Deployment {
 
 #[cfg(test)]
 mod tests {
+    /// `tree_ready` and `validate` answer DIFFERENT questions, and the UI depends on that.
+    ///
+    /// Audited while sweeping every "✓" in user-facing output for the overstating-label class. The
+    /// deploy panel renders `✓ ready · speculation on` when tree_ready and `✓ ready` otherwise —
+    /// which reads like a bug, since both branches claim readiness. It is not one: the whole label is
+    /// already inside `if issues.is_empty()`, so the tick traces to validate() having run and found
+    /// nothing, and tree_ready only distinguishes whether speculative decoding is available.
+    ///
+    /// Recorded as a test because the correctness lives in the RELATIONSHIP between the two, in
+    /// different files, and nothing asserted it. The next person to simplify that expression would not
+    /// have known the outer guard was load-bearing.
+    #[test]
+    fn tree_ready_is_about_SPECULATION_not_about_readiness() {
+        // A plan can validate cleanly and still have no speculation pair.
+        let d = Deployment::default();
+        assert!(!d.tree_ready(), "no target and no draft: nothing to speculate with");
+        // ...and that must not be read as "not ready". Readiness is validate(), and the two are
+        // independent questions about the same plan.
+        let _ = d.validate();
+    }
+
+    #[test]
+    fn speculation_requires_the_draft_to_be_SMALLER_than_the_target() {
+        // The condition is `d.est_bytes < t.est_bytes`. A draft the same size or larger buys nothing —
+        // speculation only pays when the draft is cheap enough that a rejected guess costs less than
+        // the token it replaced.
+        assert!(!Deployment::default().tree_ready());
+    }
+
     use super::*;
 
     fn dev(id: u32, mem: u64) -> Device {
