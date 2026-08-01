@@ -65,3 +65,42 @@ Do the LAN case first. It is small, it covers the common situation, and it will 
 format and the authentication requirement against something real. If travelling turns out to need more
 than a known relay address, revisit — but revisit with a measurement of what failed, not with a library
 chosen before the requirement was known.
+
+
+## Revised scope: port the traversal, not the DHT
+
+Two things narrow this further.
+
+**`shared/share-kit` already has the mailbox.** `Mailbox` posts to a `Backend` that is
+`put(key, value, ttl)` / `get(key)` — which is exactly a DHT's interface, and exactly the signalling
+channel hole punching needs. Peers post candidate addresses; the other side fetches them. A DHT, if one
+is ever wanted, is another `Backend` impl rather than a rewrite.
+
+**So the port scope is the traversal alone:** reflexive address discovery, punching, and classifying
+when punching cannot work. A few hundred lines of Rust against 29,346 of C++ whose routing layer solves
+a problem `trustkit` removed.
+
+`natpath` is the decision half:
+
+| local / remote | strategy |
+|---|---|
+| either side open | `Direct` — punching is wasted work, relaying wasted bandwidth |
+| either side punchable | `Punch` — one stable port is enough to aim at |
+| both symmetric | `RelayOnly` — the signalled address is not the one to reach |
+
+**CGNAT is distinguished from symmetric NAT deliberately.** Its defining property is that you cannot
+port-forward out of it, because the mapping lives on the carrier's equipment — so the usual advice
+("open a port on the router") is unavailable. That does not by itself prevent punching; being symmetric
+does. Conflating the two would send a punchable CGNAT peer to a relay for no reason.
+
+An **unmeasured** mapping is treated as punchable, so a first attempt happens and measures something.
+Assuming the worst would relay every unknown peer and never learn otherwise.
+
+### What is left to write
+
+* reflexive discovery — one STUN-shaped request to a known host, to learn what NAT rewrote you to;
+* the punch itself — simultaneous UDP open, bounded by `PUNCH_TIMEOUT_S`;
+* a relay — needed for the symmetric/symmetric case, which is not rare on mobile carriers;
+* peer authentication — a signed challenge, which `share-kit/keys.rs` is the natural home for.
+
+None of that needs GnuTLS, msgpack or asio.
