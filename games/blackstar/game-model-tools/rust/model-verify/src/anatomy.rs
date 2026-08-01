@@ -126,6 +126,71 @@ pub fn mirror_axis(parts: &[Part], span: [f64; 3]) -> (usize, usize) {
     best
 }
 
+/// The best mirror plane over a SWEPT rotation, not just the three
+/// axis-aligned ones.
+///
+/// Testing X, Y and Z only assumes the model was authored square to its axes.
+/// A model imported at an angle — or a vehicle whose symmetry plane is
+/// diagonal — has its symmetry invisible to all three, and the tool reports
+/// "asymmetric" for something plainly symmetric on screen.
+///
+/// So the plane is swept in `step_deg` increments and the best score wins.
+/// Returns `(axis, angle_degrees, pairs)`, where the plane is the `axis`
+/// direction rotated by `angle` within the plane of the other two.
+///
+/// The cost is `3 * 180 / step` passes over the parts, which is nothing at
+/// these sizes: the largest model here has 196 parts.
+pub fn best_mirror_plane(parts: &[Part], span: [f64; 3], step_deg: usize) -> (usize, f64, usize) {
+    let scale = span.iter().cloned().fold(0.0f64, f64::max).max(1e-9);
+    let step = step_deg.max(1);
+    let mut best = (0usize, 0.0f64, 0usize);
+    for lat in 0..3 {
+        let mut deg = 0usize;
+        while deg < 180 {
+            let n = count_pairs_rotated(parts, lat, scale, (deg as f64).to_radians());
+            if n > best.2 { best = (lat, deg as f64, n); }
+            deg += step;
+        }
+    }
+    best
+}
+
+/// Pairs across `lat` after rotating the parts by `angle` in the plane of the
+/// other two axes.
+fn count_pairs_rotated(parts: &[Part], lat: usize, scale: f64, angle: f64) -> usize {
+    if parts.is_empty() { return 0; }
+    let (u, w) = match lat { 0 => (1, 2), 1 => (0, 2), _ => (0, 1) };
+    let (c, s) = (angle.cos(), angle.sin());
+    // rotate each centre in the (lat, u) plane; the mirror coordinate becomes
+    // the rotated lat component
+    let rot: Vec<(f64, f64)> = parts.iter().map(|p| {
+        let (x, y) = (p.centre[lat], p.centre[u]);
+        (x * c - y * s, x * s + y * c)
+    }).collect();
+    let mid: f64 = rot.iter().map(|r| r.0).sum::<f64>() / rot.len() as f64;
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|i| std::cmp::Reverse(parts[*i].verts));
+    let mut used = vec![false; parts.len()];
+    let mut n = 0;
+    for &i in &order {
+        if used[i] { continue; }
+        let off = rot[i].0 - mid;
+        for &j in &order {
+            if used[j] || j == i { continue; }
+            if parts[j].verts != parts[i].verts { continue; }
+            let bo = rot[j].0 - mid;
+            if bo * off > 0.0 { continue; }
+            let d = ((bo + off).abs()
+                   + (rot[i].1 - rot[j].1).abs()
+                   + (parts[i].centre[w] - parts[j].centre[w]).abs()
+                   + (0..3).map(|k| (parts[i].extent[k] - parts[j].extent[k]).abs()).sum::<f64>())
+                   / scale;
+            if d <= MIRROR_TOL { used[i] = true; used[j] = true; n += 1; break; }
+        }
+    }
+    n
+}
+
 /// Pairs across one axis. Cheap, and the only thing `mirror_axis` needs.
 fn count_pairs(parts: &[Part], lat: usize, scale: f64) -> usize {
     if parts.is_empty() { return 0; }
@@ -415,5 +480,69 @@ mod axis_tests {
         ).collect();
         let (_, n) = mirror_axis(&parts, [2.0, 1.5, 1.0]);
         assert_eq!(n, 0, "nothing pairs, and that is the correct answer");
+    }
+}
+
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    fn part(i: usize, verts: usize, c: [f64; 3], e: [f64; 3]) -> Part {
+        Part { index: i, verts, centre: c, extent: e }
+    }
+
+    /// Parts mirrored across a plane at `deg` — a model imported at an angle.
+    fn tilted(deg: f64) -> Vec<Part> {
+        let a: f64 = deg.to_radians();
+        (0..5).flat_map(|k| {
+            let along = k as f64 * 0.3 - 0.6;
+            let off = 0.4;
+            // mirror pair sits at ±off along the rotated normal
+            let p = |sign: f64| {
+                let x = sign * off * a.cos() - along * a.sin();
+                let y = sign * off * a.sin() + along * a.cos();
+                [x, y, 0.1]
+            };
+            [part(k * 2, 60 + k, p(1.0), [0.1, 0.1, 0.1]),
+             part(k * 2 + 1, 60 + k, p(-1.0), [0.1, 0.1, 0.1])]
+        }).collect()
+    }
+
+    #[test]
+    fn a_model_imported_at_an_angle_is_still_found_symmetric() {
+        // Testing only X, Y and Z assumes the model was authored square to its
+        // axes. A diagonal symmetry plane is invisible to all three, and the
+        // tool would report "asymmetric" for something plainly symmetric.
+        let span = [2.0, 2.0, 1.0];
+        let parts = tilted(30.0);
+        // the axis-aligned test finds little
+        let (_, aligned) = mirror_axis(&parts, span);
+        // the swept test finds them all
+        let (_, angle, swept) = best_mirror_plane(&parts, span, 5);
+        assert_eq!(swept, 5, "all five pairs, at some angle");
+        assert!(swept > aligned, "sweeping beats the axis-aligned guess: {swept} vs {aligned}");
+        assert!(angle > 0.0, "and it is not at zero degrees: {angle}");
+    }
+
+    #[test]
+    fn a_square_on_model_is_still_found_at_zero() {
+        // The sweep must not make the ordinary case worse.
+        let span = [2.0, 2.0, 1.0];
+        let parts = tilted(0.0);
+        let (_, angle, n) = best_mirror_plane(&parts, span, 5);
+        assert_eq!(n, 5);
+        assert!(angle < 1.0 || angle > 179.0, "found square on, at {angle} degrees");
+    }
+
+    #[test]
+    fn a_genuinely_asymmetric_model_survives_the_sweep_without_inventing_pairs() {
+        // The sweep tries 108 planes, so a loose match would find a spurious
+        // "best" somewhere. It must not.
+        let parts: Vec<Part> = (0..9).map(|k|
+            part(k, 40 + k * 13, [k as f64 * 0.23, k as f64 * 0.11, k as f64 * 0.05],
+                 [0.1 + k as f64 * 0.03, 0.1, 0.1])
+        ).collect();
+        let (_, _, n) = best_mirror_plane(&parts, [2.0, 1.5, 1.0], 5);
+        assert_eq!(n, 0, "108 chances to invent a pair, and it found none");
     }
 }
