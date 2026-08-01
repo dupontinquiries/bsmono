@@ -940,8 +940,17 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             // mislabel sends optimisation effort at command setup when the kernels are the cost.
             let total_ms = (secs as f64) * 1000.0;
             let accounted = setup_ms + sync_ms;
-            let bound = if accounted < total_ms * 0.15 { "GPU-execution" }
-                        else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
+            // "GPU-execution-bound" WAS AN OVERSTATEMENT. The condition is that setup and sync together
+            // are under 15% of wall time — which says where the time ISN'T, not where it is. At the 0.1%
+            // seen in real runs, 99.9% is UNACCOUNTED, and unaccounted is not a bound: the GPU may be
+            // executing, or the timers may simply not cover the path that is slow.
+            //
+            // Same class as gate-q4k claiming "the loader can stop requantizing" while testing only
+            // dequantization — a label asserting more than its evidence, which is worse than no label
+            // because nobody re-derives it.
+            let bound = if accounted < total_ms * 0.02 { "UNACCOUNTED — neither setup nor sync sees it" }
+                else if accounted < total_ms * 0.15 { "likely GPU-execution" }
+                else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
             // NAME THE BOTTLENECK, not just the split. "GPU-execution-bound, 0.1% accounted" says
             // where the time ISN'T and leaves an operator with nothing to act on. perfverdict resolves
             // it into one verdict — or says the run is at the memory roofline and the split is
