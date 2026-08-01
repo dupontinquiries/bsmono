@@ -419,3 +419,13 @@ flatpak = false
 runtime = "none"
 targets = ["desktop"]
 notes = "video NLE + audio editor sharing one Rust core, informed by kdenlive and Audacity rather than transliterated from them. Every edit is a serializable invertible Op, which makes undo, macros and REALTIME COLLABORATION one mechanism — see apps/studio/README.md. studio-core (model/undo) and studio-collab (convergent op log + presence) are tested; media I/O, the render graph and the egui frontend are the named next steps."
+
+[apps.settings-egui]
+path = "apps/settings/egui-frontend"
+kind = "cargo"
+role = "lib"              # a WIDGET LIBRARY, not a deployable app
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "the egui settings editor, embedded by other frontends rather than run on its own — which is why it has no [[bin]] and no `app` feature, unlike every other egui port. It was missing from this manifest entirely, so it could never appear in gitmind's catalogue; role=\"lib\" is the honest description rather than giving it a binary it does not need."

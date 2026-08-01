@@ -1,0 +1,111 @@
+[
+ {
+  "app": "bo-suite",
+  "surfaces": 47,
+  "covered": 1,
+  "pct": 2,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": false,
+  "role": "app",
+  "missing": [
+   "AddToPlaylistDialog",
+   "AlbumDetailPage",
+   "AlbumsPage",
+   "AllTracksPage",
+   "AnticipationDot",
+   "ArtistDetailPage",
+   "ArtistsPage",
+   "BandSlider"
+  ]
+ },
+ {
+  "app": "bot-arena",
+  "surfaces": 2,
+  "covered": 1,
+  "pct": 50,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": false,
+  "role": "app",
+  "missing": [
+   "CorpusStudio"
+  ]
+ },
+ {
+  "app": "fao-codec",
+  "surfaces": 3,
+  "covered": 1,
+  "pct": 33,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": false,
+  "role": "app",
+  "missing": [
+   "V2Encoder",
+   "V8GpuRasterizer"
+  ]
+ },
+ {
+  "app": "rusty-board",
+  "surfaces": 8,
+  "covered": 4,
+  "pct": 50,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [
+   "Dbus",
+   "KeyboardBehaviorsTests",
+   "MicrotermView",
+   "RustyBoardTestHarness"
+  ]
+ },
+ {
+  "app": "snapclone",
+  "surfaces": 38,
+  "covered": 5,
+  "pct": 13,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": false,
+  "role": "app",
+  "missing": [
+   "AddLandmarkDialog",
+   "CameraWidget",
+   "ComposerView",
+   "ContactEditorDialog",
+   "ContactPickerDialog",
+   "ConversationDetailDialog",
+   "ConversationSecurityBar",
+   "DiagnosticsDialog"
+  ]
+ },
+ {
+  "app": "voiceterm",
+  "surfaces": 32,
+  "covered": 8,
+  "pct": 25,
+  "bin": true,
+  "app_default": true,
+  "manifest": true,
+  "primary": true,
+  "role": "app",
+  "missing": [
+   "ArchivedPage",
+   "BottomBar",
+   "DetectedBar",
+   "EntityExtract",
+   "Manpages",
+   "MessageView",
+   "NoteCards",
+   "PtyTerm"
+  ]
+ }
+]

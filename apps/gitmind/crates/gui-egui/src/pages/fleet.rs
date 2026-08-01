@@ -112,6 +112,16 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             // build and asking them to opt in. voiceterm is the first of these — the Qt/QML
             // shell stays available as the parity reference, but "voiceterm" now means the
             // egui build, and the button below offers the original instead.
+            // A library entry is catalogued but not buildable — offering it as
+            // an app wastes a build and leaves the user wondering why nothing
+            // ran. Say what it is instead.
+            if !port.is_runnable() {
+                ui.label(egui::RichText::new(format!(
+                    "📚 {} is a library, embedded by other frontends — nothing to build here",
+                    port.app_id))
+                    .color(egui::Color32::from_rgb(150, 150, 170)).small());
+                return;
+            }
             if port.primary && !app.fleet.primary_swapped {
                 let mut ported = sel.clone();
                 ported.name = format!("{}-egui", sel.name);
