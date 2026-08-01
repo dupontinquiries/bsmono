@@ -321,12 +321,19 @@ pub fn submit_attribution() -> String {
         SUBMIT_BY_END_FRAME.load(Relaxed), SUBMIT_BY_NO_FRAME.load(Relaxed));
     let counted = p + r + d + w + e + nf;
     let actual = GPU_SUBMITS.load(Relaxed);
+    // PERCENTAGES ARE OF THE ATTRIBUTED SUBSET, not of all submits, and the line now says so. Sharing a
+    // sentence with "N of M attributed" while using a different denominator is unreadable: your log
+    // showed "817 submits" in the profile line and causes summing to 4269 in the next, and no reader
+    // can reconcile those without knowing which clock each is on.
+    //
+    // They were also on different clocks in fact, until this commit: GPU_SUBMITS was reset per run and
+    // the SUBMIT_BY_* counters never were.
     let total = counted.max(1);
     // Report the SHORTFALL too. The first version of this line accounted for 729 of 4256 submits and
     // said nothing about the other 3527, which made a partial answer look like a complete one.
     let gap = actual.saturating_sub(counted);
     format!("submit causes — no-frame {} ({:.0}%), passes {} ({:.0}%), download {} ({:.0}%), \
-end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} attributed{}",
+end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} submits attributed{} (shares are of the attributed subset)",
         nf, nf as f64 * 100.0 / total as f64, p, p as f64 * 100.0 / total as f64,
         d, d as f64 * 100.0 / total as f64, e, e as f64 * 100.0 / total as f64, w, r,
         counted, actual,
@@ -422,7 +429,23 @@ pub fn gpu_submits() -> u64 { GPU_SUBMITS.load(std::sync::atomic::Ordering::Rela
 pub fn gpu_polls() -> u64 { GPU_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_setup_ns() -> u64 { GPU_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Relaxed) }
-pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES] { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
+/// Reset every per-run counter.
+///
+/// THE SUBMIT-CAUSE COUNTERS WERE MISSING, and the symptom was visible in every profile line: across
+/// four consecutive runs `no-frame` read 1480 each time while its share moved from 35% to 7%. The
+/// numerator was cumulative and the denominator was per-run, so the percentage described nothing —
+/// and it is the number an operator would tune against.
+///
+/// Adding a counter and forgetting the reset is easy precisely because the counter WORKS: it counts,
+/// the line prints, and only a comparison across runs shows it never moved.
+pub fn gpu_counters_reset() {
+    for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS,
+              &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES,
+              &SUBMIT_BY_PASSES, &SUBMIT_BY_RETAIN, &SUBMIT_BY_DOWNLOAD,
+              &SUBMIT_BY_DIMS_WRAP, &SUBMIT_BY_END_FRAME, &SUBMIT_BY_NO_FRAME] {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Cached per-shader GPU objects: the bind-group layout and compiled compute
 /// pipeline. Building these is expensive (shader compilation), so they're created
@@ -12452,6 +12475,32 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// Every per-run counter must be reset together.
+    ///
+    /// Observed across four consecutive runs: `no-frame 1480` each time, while its reported share moved
+    /// from 35% to 7%. The numerator was cumulative and the denominator per-run, so the percentage
+    /// described nothing — and it is the number an operator tunes against.
+    ///
+    /// The test reads the SOURCE of gpu_counters_reset rather than exercising it, because a counter
+    /// left out is invisible to a behavioural test: it counts correctly, the line prints, and only a
+    /// comparison across runs reveals it never moved. Checking the reset list directly is the only
+    /// thing that catches the omission at the moment someone adds a counter.
+    #[test]
+    fn every_submit_cause_counter_is_in_the_reset_list() {
+        let src = include_str!("lib.rs");
+        let start = src.find("pub fn gpu_counters_reset()").expect("reset fn");
+        let body = &src[start..start + 600];
+        for name in ["SUBMIT_BY_PASSES", "SUBMIT_BY_RETAIN", "SUBMIT_BY_DOWNLOAD",
+                     "SUBMIT_BY_DIMS_WRAP", "SUBMIT_BY_END_FRAME", "SUBMIT_BY_NO_FRAME"] {
+            assert!(body.contains(name),
+                "{name} is declared but never reset — its share of the profile will be nonsense");
+        }
+        // And the counters that were already there stay there.
+        for name in ["GPU_SUBMITS", "GPU_POLLS", "GPU_SETUP_NS", "GPU_SYNC_NS"] {
+            assert!(body.contains(name), "{name} dropped from the reset list");
+        }
+    }
+
     /// Source strides must follow the tensor's own type.
     ///
     /// Q4_K is 144 bytes per 256-weight super-block and Q6_K is 210. The file-view slicing was
