@@ -280,6 +280,10 @@ pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -
         // Llama4: raw-sigmoid top-1 gate applied to the expert's INPUT (weight-before-FFN);
         // everything else: normalized weights combined on the output.
         normalize: !matches!(cfg.arch, Arch::Llama4),
+        // GLM-5.2 sets routed_scaling_factor (2.5); everything else leaves it inert at 1.0. Applied
+        // AFTER normalization — see the ordering note on the field.
+        // Read from GGUF metadata by the loader; 1.0 until then, which is inert.
+        routed_scale: 1.0,
         weight_before: matches!(cfg.arch, Arch::Llama4),
     }
 }
