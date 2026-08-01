@@ -57,6 +57,7 @@ pub mod tensorplace;
 pub mod coresidency;
 pub mod loadadvice;
 pub mod deliberate;
+pub mod panelmode;
 pub mod activemodel;
 pub mod cratecheck;
 pub mod diagreport;
