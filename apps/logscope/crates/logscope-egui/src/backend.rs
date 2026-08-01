@@ -1330,7 +1330,18 @@ fn normalize_prompt_template(prompt: &str, t: TemplateKind) -> Option<String> {
             let s = prompt.replace("<|begin_of_text|>", "")
                 .replace("<|start_header_id|>", "<|im_start|>")
                 .replace("<|end_header_id|>\n\n", "\n")
+                // TOTAL, not best-effort. The line above only matches when the marker is followed by
+                // exactly two newlines. Followed by anything else — one newline, a space, content —
+                // it SURVIVES into the prompt, and the tokenizer byte-encodes it as literal text.
+                // That is a Llama-3 marker sitting inside a ChatML turn, which is precisely the shape
+                // that garbles a reply while the prompt still looks structurally fine.
+                .replace("<|end_header_id|>", "\n")
                 .replace("<|eot_id|>", "<|im_end|>\n");
+            // NO SOURCE MARKER MAY SURVIVE. A partial translation is worse than none: the prompt keeps
+            // its shape, the reply garbles, and nothing in the log says which marker leaked.
+            debug_assert!(!s.contains("<|start_header_id|>") && !s.contains("<|end_header_id|>")
+                          && !s.contains("<|eot_id|>"),
+                "Llama-3 markers survived translation to ChatML");
             Some(s)
         }
         TemplateKind::Llama4 if prompt.contains("<|start_header_id|>") || prompt.contains("<|im_start|>") => {
@@ -1529,5 +1540,40 @@ which is exactly how a phone got the subgroup path from one while the other refu
         // than a set that happens to agree.
         assert!(gpu_kernels::watchdog_prone_name("Adreno (TM) 740"));
         assert!(logscope::tuneprofile::watchdog_prone("Adreno (TM) 740"));
+    }
+}
+
+
+#[cfg(test)]
+mod template_translation_tests {
+    use super::*;
+
+    /// A Llama-3 prompt whose header marker is NOT followed by two newlines.
+    ///
+    /// The translation replaced `<|end_header_id|>\n\n` only. Real prompts do not always have that
+    /// exact spacing — a system block with a single newline, or content starting immediately, leaves
+    /// the marker in place and the tokenizer byte-encodes it as literal text. A Llama-3 marker inside
+    /// a ChatML turn garbles the reply while the prompt still looks structurally fine, which is why it
+    /// survived: the diag prints special-token IDs, and a leaked marker is not a special token.
+    #[test]
+    fn no_llama3_marker_survives_translation_whatever_the_spacing() {
+        for tail in ["\n\n", "\n", " ", "", "\n \n"] {
+            let p = format!("<|begin_of_text|><|start_header_id|>user<|end_header_id|>{tail}hi<|eot_id|>");
+            let out = normalize_prompt_template(&p, TemplateKind::ChatML)
+                .expect("a Llama-3 prompt to a ChatML model must be rewritten");
+            assert!(!out.contains("<|start_header_id|>"), "spacing {tail:?}: start leaked");
+            assert!(!out.contains("<|end_header_id|>"), "spacing {tail:?}: END LEAKED — {out:?}");
+            assert!(!out.contains("<|eot_id|>"), "spacing {tail:?}: eot leaked");
+            assert!(out.contains("<|im_start|>") && out.contains("<|im_end|>"),
+                "spacing {tail:?}: ChatML markers must be present");
+        }
+    }
+
+    #[test]
+    fn a_prompt_already_in_the_right_family_is_left_alone() {
+        // Returning Some for a correct prompt would fire the mismatch warning on every turn, and a
+        // warning that always fires is one nobody reads — the reason the real one was ignorable.
+        let p = "<|im_start|>user\nhi<|im_end|>\n";
+        assert!(normalize_prompt_template(p, TemplateKind::ChatML).is_none());
     }
 }
