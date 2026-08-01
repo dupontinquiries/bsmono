@@ -29,6 +29,7 @@
 #[allow(dead_code)] pub mod ollama;
 #[allow(dead_code)] pub mod quest;
 #[allow(dead_code)] pub mod stepwise;
+#[allow(dead_code)] pub mod workerkit;
 #[allow(dead_code)] pub mod buildfarm;
 #[allow(dead_code)] pub mod stepverify;
 #[allow(dead_code)] pub mod treeexport;
