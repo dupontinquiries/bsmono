@@ -32,6 +32,7 @@
 //!   welded two components into one.
 
 pub mod motion;
+pub mod anatomy;
 pub mod descriptor;
 pub mod fold;
 pub mod assign;
