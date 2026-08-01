@@ -6077,7 +6077,7 @@ them to", patches.len());
         if self.show_context {
             egui::SidePanel::right("chat_right").resizable(true).default_width(330.0).show_inside(ui, |ui| {
                 ui.add_space(theme::PAD_XS as f32);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(self.right_page == RightPage::Files, RichText::new("📄 Files").small()).clicked() { self.right_page = RightPage::Files; }
                     if ui.selectable_label(self.right_page == RightPage::Graph, RichText::new("⌗ Graph").small()).clicked() { self.right_page = RightPage::Graph; }
                     if ui.selectable_label(self.right_page == RightPage::Context, RichText::new("⚙ Context").small()).clicked() { self.right_page = RightPage::Context; }
@@ -6653,7 +6653,12 @@ them to", patches.len());
                     }
                 }
                 ui.add_space(theme::PAD_XS as f32);
-                ui.horizontal(|ui| {
+                // MOBILE OVERLAP. egui's horizontal() does not wrap: controls past the right edge are drawn
+                // anyway, on top of each other. On a desktop this bar never reaches the edge, so the failure is
+                // invisible in development and immediate on a phone. horizontal_wrapped stops the overlap;
+                // mobilelayout::row_mode decides when a row should instead SHED controls, because a wrapped
+                // four-line bar of tiny buttons is not usable either.
+                ui.horizontal_wrapped(|ui| {
                     if theme::carved_button(ui, "📎 Attach").on_hover_text("Attach a text file into your message (bounded)").clicked() {
                         let start = self.save_dir.clone()
                             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
@@ -6849,7 +6854,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                 ui.add_space(2.0);
                                 if m.editing {
                                     ui.add(egui::TextEdit::multiline(&mut m.edit_buf).id(egui::Id::new(("logscope_chat_edit", i))).desired_rows(2).desired_width(f32::INFINITY));
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if theme::action_button(ui, "Save & re-run", theme::GREEN(), true).clicked() { action = Some(MsgAction::EditSave(i)); }
                                         if ui.button("Cancel").clicked() { action = Some(MsgAction::EditCancel(i)); }
                                     });

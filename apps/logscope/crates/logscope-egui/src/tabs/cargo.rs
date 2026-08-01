@@ -121,7 +121,7 @@ impl Cargo {
         }
 
         // ── header: root picker + actions ────────────────────────────────────────────────────────
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Cargo root").color(theme::INK()).strong());
             let te = ui.add(egui::TextEdit::singleline(&mut self.root)
                 .desired_width(340.0).hint_text("/path/to/your/crate-or-workspace"));
@@ -209,14 +209,14 @@ impl Cargo {
                     inner_margin: egui::Margin::same(10), outer_margin: egui::Margin { bottom: 8, ..Default::default() },
                     ..Default::default() }
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new(d.level.to_uppercase()).color(lvl_color).strong().small());
                         if let Some(c) = &d.code { ui.label(RichText::new(format!("[{c}]")).color(theme::DIM()).small()); }
                         ui.label(RichText::new(format!("{}:{}", d.file, d.line)).color(theme::AMBER_SOFT()).monospace().small());
                     });
                     ui.label(RichText::new(&d.message).color(theme::INK()));
                     let open = self.expanded == Some(i);
-                    ui.horizontal(|ui| {
+                    ui.horizontal_wrapped(|ui| {
                         if ui.button(if open { "▾ source" } else { "▸ source" }).clicked() {
                             self.expanded = if open { None } else { Some(i) };
                         }
