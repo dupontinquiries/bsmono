@@ -8,6 +8,7 @@
 pub mod builder;
 pub mod code_mode;
 pub mod io;
+pub mod toml_io;
 pub mod key;
 pub mod state;
 
