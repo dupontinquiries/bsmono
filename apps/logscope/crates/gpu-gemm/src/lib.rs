@@ -7291,8 +7291,17 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                                 // ~15.0 GiB of resident experts landed in the SAME RAM and the process
                                 // was OOM-killed at layer 36 of 48. Being killed is far worse than a
                                 // refusal: seventeen seconds spent and no information returned.
-                                let uma_resident = if self.conservative_vma || cfg!(target_os = "macos")
-                                    { gpu_budget } else { 0 };
+                                // USE THE REAL SIGNAL. I wrote this as `conservative_vma ||
+                                // cfg!(macos)` — which is Apple-only, and misses every OTHER unified
+                                // device: an Adreno or Mali phone is an IntegratedGpu with exactly the
+                                // same shared pool, and it is the machine least able to absorb the
+                                // double-count.
+                                //
+                                // `self.unified` already exists and is derived from device_type via
+                                // zerocopy::is_unified_memory, which is the question actually being
+                                // asked. Third instance this session of a guard keyed on a proxy when
+                                // the real predicate was in scope.
+                                let uma_resident = if self.unified { gpu_budget } else { 0 };
                                 let unified = uma_resident > 0;
                                 if ram > 0 && !crate::memplan::streaming_fits_host(
                                     host_store, set_data_len, uma_resident, ram, unified) {
