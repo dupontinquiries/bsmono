@@ -1,0 +1,18 @@
+name = "en_us_qwerty"
+display_name = "English (QWERTY)"
+language = "en"
+symbols_layout = "symbols"
+
+# label|shifted|extended,extended — trailing parts optional
+
+[[rows]]
+keys = "q||1  w||2  e||3,é,è,ê,ë  r||4  t||5  y||6  u||7,ü,ú,ù  i||8,í,ï,î  o||9,ó,ò,ô,ö  p||0"
+
+[[rows]]
+keys = "a||à,á,â,ä,å  s  d  f  g  h  j  k  l"
+
+[[rows]]
+keys = "⇧  z  x  c  v  b  n  m  ⌫"
+
+[[rows]]
+keys = "?123  🎤  \   \,||!,?,;  .||?,!,…  ⏎"
