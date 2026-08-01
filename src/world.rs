@@ -197,6 +197,35 @@ pub struct Portal {
     pub cuts: Vec<(usize, Vec3)>,
 }
 
+/// One giant chess piece: a body plus whatever rides on it (ramps, a
+/// launcher ring), sliding square to square under its own power.
+pub struct ChessPiece {
+    /// every shape that travels with this piece, and its offset from the
+    /// piece origin — a piece is a little vehicle carrying its own furniture
+    pub parts: Vec<(usize, Vec3)>,
+    pub launcher: Option<usize>,
+    pub sq: (i32, i32),
+    pub from: Vec3,
+    pub to: Vec3,
+    pub t: f32,
+    pub dur: f32,
+    pub moving: bool,
+    pub vel: Vec3,
+    pub gone: bool,
+}
+
+/// The board plays a real game, move by move, and gets wilder as the score
+/// climbs: the interval shortens and pieces start moving in pairs.
+pub struct Chess {
+    pub pieces: Vec<ChessPiece>,
+    pub moves: Vec<((i32, i32), (i32, i32))>,
+    pub next: usize,
+    pub timer: f32,
+    pub square: f32,
+    pub origin: Vec3,
+    pub fury: f32,
+}
+
 /// A standing current: water moving through a place, carrying whatever is
 /// in it. Reuses the floodwater force path in the physics step.
 pub struct Flow {
@@ -279,6 +308,7 @@ pub struct World {
     pub tiles: Vec<Tile>,
     pub hitters: Vec<Hitter>,
     pub flows: Vec<Flow>,
+    pub chess: Option<Chess>,
     pub portals: Vec<Portal>,
     pub bodies: Vec<Body>,
     /// KUIPER: which grav node is collapsing, and how long it has left
@@ -318,6 +348,11 @@ pub struct World {
 }
 
 // ------------------------------------------------------------- random ----
+fn smoothstep01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// polynomial smooth-min: the SDF fillet
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
@@ -458,7 +493,7 @@ pub struct MapStyle {
     pub focal: u8,
 }
 
-pub const STYLE_COUNT: usize = 35;
+pub const STYLE_COUNT: usize = 36;
 
 /// Adapted from logscope scene3d's ROOMS table — same sixteen names, each
 /// translated from an indoor room into an open-world mood.
@@ -506,6 +541,7 @@ pub fn styles() -> &'static [MapStyle; STYLE_COUNT] {
             MapStyle { name: "TURNSTILE", grass: g(0x6E6A62), zenith: rgb3(0x2A3446), fog: rgb3(0x8A93A2), fog_d: 0.0012, sun: [-0.3, 0.7, 0.4], accent: g(0xFFC24D), pal_mix: 0.45, amp: 0.0, freq: 1.0, wet: 0.30, glow: 0.5, rings: 3, halos: 3, balloons: 0, domes: 0, ramps: 3, platforms: 6, trees: 0, small_pads: 24, nets: 2, focal: 21 },
             MapStyle { name: "WYRMFIRE", grass: g(0x2A1410), zenith: rgb3(0x2A0E12), fog: rgb3(0x6E2412), fog_d: 0.0016, sun: [0.4, 0.5, -0.3], accent: g(0xFF7A18), pal_mix: 0.6, amp: 0.35, freq: 1.2, wet: 0.22, glow: 0.75, rings: 4, halos: 4, balloons: 0, domes: 0, ramps: 5, platforms: 6, trees: 0, small_pads: 26, nets: 2, focal: 22 },
             MapStyle { name: "BREAKWATER", grass: g(0x8C8A84), zenith: rgb3(0x7FB4D8), fog: rgb3(0xC6D8E2), fog_d: 0.0011, sun: [0.5, 0.7, 0.2], accent: g(0x2FBFA6), pal_mix: 0.4, amp: 0.05, freq: 1.0, wet: 0.55, glow: 0.3, rings: 3, halos: 2, balloons: 0, domes: 0, ramps: 5, platforms: 8, trees: 0, small_pads: 28, nets: 2, focal: 23 },
+            MapStyle { name: "CHAMBER", grass: g(0x1E1C26), zenith: rgb3(0x0E1018), fog: rgb3(0x2A2636), fog_d: 0.0013, sun: [-0.35, 0.7, 0.25], accent: g(0x9FE3FF), pal_mix: 0.45, amp: 0.0, freq: 1.0, wet: 0.42, glow: 0.55, rings: 2, halos: 3, balloons: 0, domes: 0, ramps: 4, platforms: 6, trees: 0, small_pads: 24, nets: 2, focal: 24 },
         ]
     })
 }
@@ -524,6 +560,7 @@ impl World {
         let mut tiles: Vec<Tile> = Vec::new();
         let mut hitters: Vec<Hitter> = Vec::new();
         let mut flows: Vec<Flow> = Vec::new();
+        let mut chess: Option<Chess> = None;
         let mut portals: Vec<Portal> = Vec::new();
         let mut bodies: Vec<Body> = Vec::new();
         let mut drop_pit: Option<f32> = None;
@@ -1989,7 +2026,8 @@ impl World {
                 // group, so every wall-floor seam FILLETS into a drivable
                 // quarter-pipe transition. 300 sparta cars stay IN.
                 let g0 = th(0.0, 0.0);
-                let (hx, hz, wh) = (56.0f32, 52.0f32, 13.0f32);
+                // headroom: a 13 m lid made every aerial feel clipped
+                let (hx, hz, wh) = (64.0f32, 58.0f32, 26.0f32);
                 let wallc = mix4(PLINTH, acc, 0.18);
                 let mut wall = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4], al: f32| {
                     let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.4 }, [col[0], col[1], col[2], al], 0.05, 0.4);
@@ -2626,7 +2664,7 @@ impl World {
                 };
                 slab(&mut shapes, Vec3::new(0.0, g0 + 0.7, 0.0), Vec3::new(70.0, 0.9, 62.0), deck);
                 for (px, pz, hx, hz) in [(-70.0f32, 0.0f32, 1.2f32, 62.0f32), (70.0, 0.0, 1.2, 62.0), (0.0, -62.0, 70.0, 1.2), (0.0, 62.0, 70.0, 1.2)] {
-                    slab(&mut shapes, Vec3::new(px, g0 + 10.0, pz), Vec3::new(hx, 10.0, hz), deck);
+                    slab(&mut shapes, Vec3::new(px, g0 + 20.0, pz), Vec3::new(hx, 20.0, hz), deck);
                 }
                 // one portal maker, shared: `mount` is the shape it rides
                 let mut mk = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool, mount: Option<usize>| -> usize {
@@ -2886,6 +2924,160 @@ impl World {
                     shapes[i].blend = true;
                     zones.push(Zone { pos: Vec3::new(x, g0 + 6.6, 58.0), r: 3.4, kind: ZoneKind::Boost });
                 }
+            }
+            24 => {
+                // ====== CHAMBER: the board plays, you play on the board ======
+                // A giant chess set in a dark hall. The pieces move
+                // themselves, working through a real game (Morphy's Opera
+                // Game, 1858), and every goal you score winds the machine
+                // tighter — moves come faster and start overlapping. Each
+                // piece is drivable: rooks carry ramps, knights carry
+                // launchers, the queen is a landing deck.
+                let g0 = th(0.0, 0.0);
+                let sq = 26.0f32; // square pitch — a piece is a building
+                let origin = Vec3::new(-3.5 * sq, g0 + 1.4, -3.5 * sq);
+                let light = mix4(PLINTH, [0.90, 0.88, 0.82, 1.0], 0.65);
+                let dark = mix4(PLINTH, [0.14, 0.13, 0.20, 1.0], 0.75);
+                // the floor: 64 squares, plus a hall around them
+                let fl = Vec3::new(sq * 5.4, 1.0, sq * 5.4);
+                let fi4 = push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.5, 0.0), Quat::IDENTITY, fl, Sdf::RBox { half: fl, round: 0.8 }, dark, 0.02, 0.55);
+                shapes[fi4].blend = true;
+                for r in 0..8 {
+                    for f in 0..8 {
+                        if (r + f) % 2 == 0 {
+                            continue;
+                        }
+                        let c = origin + Vec3::new(f as f32 * sq, 0.75, r as f32 * sq);
+                        let half = Vec3::new(sq * 0.47, 0.28, sq * 0.47);
+                        push(&mut shapes, M_BOX, c, Quat::IDENTITY, half, Sdf::None, light, 0.06, 0.6);
+                    }
+                }
+                // hall walls with high arches, so aerials have room
+                for (px, pz, hx, hz) in [(-sq * 5.6, 0.0f32, 1.4f32, sq * 5.6), (sq * 5.6, 0.0, 1.4, sq * 5.6), (0.0, -sq * 5.6, sq * 5.6, 1.4), (0.0, sq * 5.6, sq * 5.6, 1.4)] {
+                    let i = push(&mut shapes, M_BOX, Vec3::new(px, g0 + 30.0, pz), Quat::IDENTITY, Vec3::new(hx, 30.0, hz), Sdf::RBox { half: Vec3::new(hx, 30.0, hz), round: 1.0 }, mix4(dark, acc, 0.08), 0.02, 0.5);
+                    shapes[i].blend = true;
+                }
+                // ---- piece builder: body + the furniture that rides it ----
+                let mut pieces: Vec<ChessPiece> = Vec::new();
+                let mut mk_piece = |shapes: &mut Vec<Shape>, launchers: &mut Vec<Launcher>, zones: &mut Vec<Zone>, kind: u8, file: i32, rank: i32, white: bool| {
+                    let base = origin + Vec3::new(file as f32 * sq, 0.0, rank as f32 * sq);
+                    let col = if white { mix4(light, acc, 0.10) } else { mix4(dark, acc, 0.18) };
+                    let mut parts: Vec<(usize, Vec3)> = Vec::new();
+                    let mut launcher = None;
+                    let mut add = |shapes: &mut Vec<Shape>, off: Vec3, half: Vec3, rot: Quat, sdf: Sdf, c: [f32; 4], glow: f32| {
+                        let i = push(shapes, M_BOX, base + off, rot, half, sdf, c, glow, 0.5);
+                        shapes[i].blend = true;
+                        parts.push((i, off));
+                    };
+                    match kind {
+                        // PAWN: a low block with a ramp up its face
+                        0 => {
+                            let h = Vec3::new(4.4, 3.0, 4.4);
+                            add(shapes, Vec3::new(0.0, 3.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.2 }, col, 0.03);
+                            let rh = Vec3::new(4.2, 0.5, 6.0);
+                            add(shapes, Vec3::new(0.0, 2.2, 6.6), rh, Quat::from_rotation_x(0.42), Sdf::RBox { half: rh, round: 0.3 }, mix4(col, acc, 0.25), 0.05);
+                        }
+                        // ROOK: a tower with a ramp spiralling one face and a
+                        // battlement you can land on
+                        1 => {
+                            let h = Vec3::new(5.4, 9.0, 5.4);
+                            add(shapes, Vec3::new(0.0, 9.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 0.9 }, col, 0.03);
+                            for k in 0..3 {
+                                let y = 4.0 + k as f32 * 5.0;
+                                let a2 = k as f32 * 2.094;
+                                let rh = Vec3::new(5.0, 0.5, 3.2);
+                                add(shapes, Vec3::new(a2.cos() * 7.4, y, a2.sin() * 7.4), rh, Quat::from_rotation_y(-a2) * Quat::from_rotation_z(0.5), Sdf::RBox { half: rh, round: 0.25 }, mix4(col, acc, 0.3), 0.06);
+                            }
+                            let cap = Vec3::new(6.2, 0.6, 6.2);
+                            add(shapes, Vec3::new(0.0, 18.4, 0.0), cap, Quat::IDENTITY, Sdf::RBox { half: cap, round: 0.4 }, mix4(col, acc, 0.4), 0.15);
+                        }
+                        // KNIGHT: a wedge with a launcher ring on its crest
+                        2 => {
+                            let h = Vec3::new(4.6, 4.0, 5.4);
+                            add(shapes, Vec3::new(0.0, 4.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.0 }, col, 0.03);
+                            let w = Vec3::new(4.2, 0.55, 7.5);
+                            add(shapes, Vec3::new(0.0, 6.4, -4.0), w, Quat::from_rotation_x(-0.55), Sdf::RBox { half: w, round: 0.3 }, mix4(col, acc, 0.3), 0.08);
+                            let lp = base + Vec3::Y * 11.0;
+                            let li = push(shapes, M_TORUS_FAT, lp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(3.0), Sdf::Torus { big: 3.0, tube: 0.5 }, mix4(acc, [1.0; 4], 0.4), 0.95, 0.5);
+                            parts.push((li, Vec3::Y * 11.0));
+                            launchers.push(Launcher { pos: lp, dir: Vec3::new(0.0, 1.0, -0.35).normalize(), power: 33.0, timer: 0.0, shape: li });
+                            launcher = Some(launchers.len() - 1);
+                        }
+                        // BISHOP: a tall angled blade — a ramp with a spine
+                        3 => {
+                            let h = Vec3::new(3.4, 8.0, 3.4);
+                            add(shapes, Vec3::new(0.0, 8.0, 0.0), h, Quat::from_rotation_z(0.12), Sdf::RBox { half: h, round: 1.6 }, col, 0.03);
+                            let rh = Vec3::new(3.6, 0.5, 9.0);
+                            add(shapes, Vec3::new(0.0, 6.0, 7.4), rh, Quat::from_rotation_x(0.62), Sdf::RBox { half: rh, round: 0.3 }, mix4(col, acc, 0.35), 0.1);
+                        }
+                        // QUEEN: a broad landing deck with a boost crown
+                        4 => {
+                            let h = Vec3::new(6.0, 7.0, 6.0);
+                            add(shapes, Vec3::new(0.0, 7.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 2.2 }, col, 0.05);
+                            let deck = Vec3::new(9.0, 0.6, 9.0);
+                            add(shapes, Vec3::new(0.0, 14.6, 0.0), deck, Quat::IDENTITY, Sdf::RBox { half: deck, round: 0.6 }, mix4(col, acc, 0.45), 0.2);
+                            zones.push(Zone { pos: base + Vec3::Y * 16.0, r: 6.0, kind: ZoneKind::Boost });
+                        }
+                        // KING: a crown of pillars around an open floor
+                        _ => {
+                            let h = Vec3::new(5.6, 6.0, 5.6);
+                            add(shapes, Vec3::new(0.0, 6.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.8 }, col, 0.05);
+                            for k in 0..6 {
+                                let a2 = k as f32 * 1.047;
+                                let ph = Vec3::new(0.7, 3.4, 0.7);
+                                add(shapes, Vec3::new(a2.cos() * 5.0, 15.0, a2.sin() * 5.0), ph, Quat::IDENTITY, Sdf::RBox { half: ph, round: 0.3 }, mix4(col, acc, 0.5), 0.35);
+                            }
+                            let deck = Vec3::new(6.2, 0.6, 6.2);
+                            add(shapes, Vec3::new(0.0, 12.2, 0.0), deck, Quat::IDENTITY, Sdf::RBox { half: deck, round: 0.5 }, mix4(col, acc, 0.3), 0.15);
+                        }
+                    }
+                    pieces.push(ChessPiece {
+                        parts,
+                        launcher,
+                        sq: (file, rank),
+                        from: base,
+                        to: base,
+                        t: 1.0,
+                        dur: 1.0,
+                        moving: false,
+                        vel: Vec3::ZERO,
+                        gone: false,
+                    });
+                };
+                // ---- the opening position ----
+                let back = [1u8, 2, 3, 4, 5, 3, 2, 1];
+                for f in 0..8i32 {
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, back[f as usize], f, 0, true);
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, 0, f, 1, true);
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, 0, f, 6, false);
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, back[f as usize], f, 7, false);
+                }
+                // ---- Morphy vs Duke Karl & Count Isouard, Paris 1858 ----
+                // (the Opera Game) in board coordinates, file 0 = a
+                let alg = |t: &str| -> ((i32, i32), (i32, i32)) {
+                    let b = t.as_bytes();
+                    (
+                        ((b[0] - b'a') as i32, (b[1] - b'1') as i32),
+                        ((b[2] - b'a') as i32, (b[3] - b'1') as i32),
+                    )
+                };
+                let moves: Vec<((i32, i32), (i32, i32))> = [
+                    "e2e4", "e7e5", "g1f3", "d7d6", "d2d4", "c8g4", "d4e5", "g4f3", "d1f3", "d6e5",
+                    "f1c4", "g8f6", "f3b3", "d8e7", "b1c3", "c7c6", "c1g5", "b7b5", "c3b5", "c6b5",
+                    "c4b5", "b8d7", "e1c1", "a8d8", "d1d7", "d8d7", "h1d1", "e7e6", "b5d7", "f6d7",
+                    "b3b8", "d7b8", "d1d8",
+                ]
+                .iter()
+                .map(|m| alg(m))
+                .collect();
+                chess = Some(Chess { pieces, moves, next: 0, timer: 3.0, square: sq, origin, fury: 0.0 });
+                // braziers around the hall, and a boost ring at the centre
+                for k in 0..8 {
+                    let a2 = k as f32 * 0.785;
+                    let p = Vec3::new(a2.cos() * sq * 5.0, g0 + 3.0, a2.sin() * sq * 5.0);
+                    push(&mut shapes, M_CAP_TALL, p, Quat::IDENTITY, Vec3::new(1.0, 3.0 / CAP_TALL_HH.max(1.0), 1.0), Sdf::Capsule { r: 1.0, half: 3.0 }, mix4(acc, [1.0; 4], 0.4), 0.9, 0.4);
+                }
+                zones.push(Zone { pos: Vec3::new(0.0, g0 + 2.0, 0.0), r: 10.0, kind: ZoneKind::Boost });
             }
             _ => {}
         }
@@ -3220,6 +3412,15 @@ impl World {
                 dyn_shapes.push(si as u16);
             }
         }
+        if let Some(ch) = &chess {
+            for pc in &ch.pieces {
+                for (si, _) in &pc.parts {
+                    if !dyn_shapes.contains(&(*si as u16)) {
+                        dyn_shapes.push(*si as u16);
+                    }
+                }
+            }
+        }
         for (i, s) in shapes.iter().enumerate() {
             if dyn_shapes.contains(&(i as u16)) {
                 continue; // movers are queried directly, not through the grid
@@ -3263,7 +3464,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
+        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.
@@ -3276,6 +3477,20 @@ impl World {
     /// considered, so this is a walk of a couple of dozen entries.
     pub fn platform_vel(&self, p: Vec3, reach: f32) -> Option<Vec3> {
         let mut best: Option<(f32, Vec3)> = None;
+        // a chess piece under way carries whatever is standing on it
+        if let Some(ch) = &self.chess {
+            for pc in &ch.pieces {
+                if !pc.moving {
+                    continue;
+                }
+                for (si, _) in &pc.parts {
+                    let d = self.shape_sdf_at(*si, p);
+                    if d < reach && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                        best = Some((d, pc.vel));
+                    }
+                }
+            }
+        }
         for a in &self.anims {
             let si = match *a {
                 Anim::Spin { shape, .. }
@@ -3372,6 +3587,71 @@ impl World {
             sh.vel = if dt > 1e-5 { (sh.pos - prev) / dt } else { Vec3::ZERO };
             sh.omega = om;
         }
+        // ---- THE GAME PLAYS ITSELF ----
+        if let Some(mut ch) = self.chess.take() {
+            let sq = ch.square;
+            let org = ch.origin;
+            for p in ch.pieces.iter_mut() {
+                if !p.moving {
+                    p.vel = Vec3::ZERO;
+                    continue;
+                }
+                let prev = p.from.lerp(p.to, smoothstep01(p.t));
+                p.t = (p.t + dt / p.dur.max(0.01)).min(1.0);
+                let now = p.from.lerp(p.to, smoothstep01(p.t));
+                p.vel = if dt > 1e-5 { (now - prev) / dt } else { Vec3::ZERO };
+                for (si, off) in &p.parts {
+                    let np = now + *off;
+                    let (scale, rot, _) = self.shapes[*si].mat.to_scale_rotation_translation();
+                    let sh = &mut self.shapes[*si];
+                    sh.pos = np;
+                    sh.mat = glam::Mat4::from_scale_rotation_translation(scale, rot, np);
+                }
+                if let Some(li) = p.launcher {
+                    self.launchers[li].pos = now + Vec3::Y * 6.0;
+                }
+                if p.t >= 1.0 {
+                    p.moving = false;
+                    p.from = p.to;
+                }
+            }
+            ch.timer -= dt;
+            if ch.timer <= 0.0 && !ch.moves.is_empty() {
+                let starts = 1 + (ch.fury / 3.0).floor() as usize;
+                for _ in 0..starts.min(3) {
+                    if ch.next >= ch.moves.len() {
+                        ch.next = 0;
+                        break;
+                    }
+                    let (fsq, tsq) = ch.moves[ch.next];
+                    ch.next += 1;
+                    let dur = (2.4 / (1.0 + ch.fury * 0.35)).max(0.45);
+                    let mover = ch.pieces.iter().position(|p| !p.gone && !p.moving && p.sq == fsq);
+                    let Some(mi) = mover else { continue };
+                    if let Some(ci) = ch.pieces.iter().position(|p| !p.gone && p.sq == tsq) {
+                        let away = ch.pieces[ci].to + Vec3::new(sq * 5.0, -16.0, 0.0);
+                        let cp = &mut ch.pieces[ci];
+                        cp.from = cp.to;
+                        cp.to = away;
+                        cp.t = 0.0;
+                        cp.dur = dur * 1.6;
+                        cp.moving = true;
+                        cp.gone = true;
+                        cp.sq = (99, 99);
+                    }
+                    let p = &mut ch.pieces[mi];
+                    p.from = p.to;
+                    p.to = org + Vec3::new(tsq.0 as f32 * sq, 0.0, tsq.1 as f32 * sq);
+                    p.t = 0.0;
+                    p.dur = dur;
+                    p.moving = true;
+                    p.sq = tsq;
+                }
+                ch.timer = (3.4 / (1.0 + ch.fury * 0.4)).max(0.7);
+            }
+            self.chess = Some(ch);
+        }
+
         // MOVING PORTALS: a portal bolted to a carriage or a drum takes its
         // transform from that shape every frame, so where it sends you keeps
         // changing — timing the entry is the whole mechanic.

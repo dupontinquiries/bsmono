@@ -1492,6 +1492,39 @@ pub fn run(args: &[String]) {
                 }
             }
         }
+        // ---- CHAMBER: does the board actually play the game? ----
+        {
+            let mut w = World::generate(9, crate::world::style(35), 0.31, 1.0);
+            let n0 = w.chess.as_ref().map(|c| c.pieces.len()).unwrap_or(0);
+            let mvs = w.chess.as_ref().map(|c| c.moves.len()).unwrap_or(0);
+            // run a while at rest tempo and count what happened
+            let mut moved = 0usize;
+            for _ in 0..(60 * 120) {
+                w.update(DT);
+            }
+            let played = w.chess.as_ref().map(|c| c.next).unwrap_or(0);
+            let gone = w.chess.as_ref().map(|c| c.pieces.iter().filter(|p| p.gone).count()).unwrap_or(0);
+            if let Some(c) = w.chess.as_ref() {
+                moved = c.pieces.iter().filter(|p| p.sq != (99, 99) && p.from != p.to || p.moving).count();
+            }
+            let _ = moved;
+            println!("chamber: {n0} pieces, {mvs} scripted moves, {played} played in 60 s, {gone} captured");
+            // now wind it up as if goals had been scored
+            if let Some(c) = w.chess.as_mut() {
+                c.fury = 6.0;
+            }
+            let before = w.chess.as_ref().map(|c| c.next).unwrap_or(0);
+            for _ in 0..(30 * 120) {
+                w.update(DT);
+            }
+            let after = w.chess.as_ref().map(|c| c.next).unwrap_or(0);
+            let calm_rate = played as f32 / 60.0;
+            let fury_rate = (after - before) as f32 / 30.0;
+            println!("   tempo: {calm_rate:.2} moves/s calm -> {fury_rate:.2} moves/s furious");
+            let ok = n0 == 32 && played >= 8 && gone >= 1 && fury_rate > calm_rate * 1.8;
+            pass &= ok;
+            println!("   {}", if ok { "the board plays and winds up" } else { "CHESS FAIL" });
+        }
         println!("{}", if pass { "PLATFORMS: PASS" } else { "PLATFORMS: FAIL" });
         return;
     }

@@ -547,6 +547,12 @@ pub fn ball_goal_check(ball: &Ball, ball_prev: Vec3, world: &mut World, ev: &mut
             }
         }
     }
+    // every goal winds the chess board tighter
+    if !ev.goals.is_empty() {
+        if let Some(ch) = world.chess.as_mut() {
+            ch.fury = (ch.fury + 1.0).min(9.0);
+        }
+    }
 }
 
 fn crossed(ring: &crate::world::Ring, a: Vec3, b: Vec3) -> bool {
@@ -1399,7 +1405,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // frame — the assist that makes carries balanceable was quietly
         // capping every shot.
         if n.y > 0.30 && -vn < 6.0 {
-            let w = 0.07 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
+            let w = 0.035 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
             let dvx = car.vel.x - ball.vel.x;
             let dvz = car.vel.z - ball.vel.z;
             ball.vel.x += dvx * w;
@@ -1424,8 +1430,14 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // the ball rides the nose through small touches, and stripping the
             // grip there kills air dribbles outright (the bots lost two thirds
             // of their air touches when this was one number for both).
-            let mu = if car.on_ground { 0.16 } else { 0.34 };
-            ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.8 } else { 1.5 });
+            // A dribble is a BALANCING ACT, not a magnet. Ground grip is
+            // now light enough that the ball keeps its own momentum: boost
+            // ahead and it rolls back down the hood toward you, brake and it
+            // runs away in front, and you recover it by scooping under from
+            // the far side. Air carries keep more grip — that touch is the
+            // whole move and there is no ground to catch a mistake.
+            let mu = if car.on_ground { 0.055 } else { 0.30 };
+            ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.35 } else { 1.4 });
             // and the hood is dished, so the ball rolls back to the middle
             let side = car.rot * Vec3::X;
             let off = (ball.pos - car.pos).dot(side);
@@ -1434,7 +1446,9 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // the dish is a HINT toward the centre line, not a magnet: it
             // only bites near the sweet spot, so a ball already sliding off
             // keeps going
-            ball.vel -= side * (off.signum() * off.abs().min(reach) * hold * 1.5 * w);
+            // the dish only whispers now: enough that a centred ball stays
+            // centred, not enough to drag a sliding one back
+            ball.vel -= side * (off.signum() * off.abs().min(reach) * hold * 0.55 * w);
         }
 
         // the "psyonix impulse": extra push that scales with the hit, biased

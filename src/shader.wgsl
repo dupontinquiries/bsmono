@@ -251,6 +251,7 @@ fn qconj(q: vec4<f32>) -> vec4<f32> {
 /// keeps marching, so reflections and shadows carry through the pair too.
 fn portal_hop(a: vec3<f32>, b: vec3<f32>, rd: vec3<f32>, out_p: ptr<function, vec3<f32>>, out_d: ptr<function, vec3<f32>>) -> bool {
     let n = i32(G.pcount.x);
+    if (n == 0) { return false; }
     for (var i = 0; i < n; i = i + 1) {
         let base = u32(i) * 2u;
         let pa = G.portals[base].xyz;
@@ -377,6 +378,22 @@ fn trace_reflection(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32) -> 
     // pair facing each other terminates instead of recursing forever.
     var ro2 = ro;
     var rd2 = rd;
+    // one bounds test up front: if no portal mouth is within reach of this
+    // ray at all, the per-step hop check is skipped entirely. That test was
+    // eight quaternion transforms EVERY march step on portal maps.
+    var near_portal = false;
+    {
+        let np = i32(G.pcount.x);
+        for (var i = 0; i < np; i = i + 1) {
+            let pp = G.portals[u32(i) * 2u];
+            let to = pp.xyz - ro;
+            let along = clamp(dot(to, rd), 0.0, tmax);
+            if (length(to - rd * along) < pp.w + 3.0) {
+                near_portal = true;
+                break;
+            }
+        }
+    }
     var c = gather(ro2, rd2, tmax, skip);
     var t = 0.06;
     var hit = false;
@@ -388,7 +405,7 @@ fn trace_reflection(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32) -> 
         let d = map_d(p, &c, skip_ter);
         if (d < 0.004 * t + 0.006) { hit = true; break; }
         let nt = t + d * 0.96;
-        if (hops < 2) {
+        if (hops < 2 && near_portal) {
             var np = vec3(0.0);
             var nd = vec3(0.0);
             if (portal_hop(p, ro2 + rd2 * nt, rd2, &np, &nd)) {
@@ -557,7 +574,7 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         let ro2 = pb + qrot(qb, loc) + qrot(qb, vec3(0.0, 0.0, 1.0)) * 0.25;
         let rd0 = normalize(qrot(qb, ldir));
         var acc3 = vec3(0.0);
-        for (var k = 0; k < 3; k = k + 1) {
+        for (var k = 0; k < 2; k = k + 1) {
             let h = fract(sin(dot(in.wpos.xz + f32(k) * 7.3, vec2(12.99, 78.23))) * 43758.5453);
             let h2 = fract(h * 197.31);
             let jit = vec3(h - 0.5, h2 - 0.5, fract(h * 31.7) - 0.5) * 0.035;
@@ -567,7 +584,7 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         }
         // lift it: the far side is lit by its own scene, and a portal reads
         // as a hole in the world only if it is at least as bright as one
-        var pcol = (acc3 / 3.0) * 1.35;
+        var pcol = (acc3 / 2.0) * 1.35;
         pcol = mix(pcol, O.color.rgb, 0.09); // just enough tint to tell pairs apart
         let edge = pow(1.0 - max(dot(n, v), 0.0), 3.0);
         pcol = pcol + O.color.rgb * edge * 0.55;

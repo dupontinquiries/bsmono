@@ -1671,6 +1671,45 @@ impulse they hold the ball far longer (pass4 air touches 105, pass2 style
 `presets/` now ships the save files from those sessions, with a README on
 how to load one.
 
+## v1.52.0 — CHAMBER, and a ball you can actually lose
+
+THE BALL IS NOT STICKY ANY MORE. Ground grip on a carried ball went 0.16
+-> 0.055 (cap 0.8 -> 0.35 m/s), the dished-hood nudge to a third, and the
+speed-match assist halved again. The point is that the ball now keeps its
+own momentum on your roof: BOOST AHEAD and it rolls back down toward you,
+lift off and it runs out in front, and the recovery is to scoop under it
+from the far side. Measured in `--sim dribble` under a FIXED input with no
+corrective driving: a straight line still carries 100% of the run, a
+steady turn 45% (was 79), a hard turn 29% (was 42). Air carries keep their
+grip — that touch is the whole move and there is no ground to catch a
+mistake.
+
+RAY-TRACE PERFORMANCE. The portal work cost more than it should: every
+march STEP was running up to eight quaternion plane tests. Now one cheap
+ray-versus-portal bounds test happens once per ray, and the per-step hop
+check is skipped entirely unless a mouth is actually within reach — which
+on the twenty-odd maps with no portals at all is now a single integer
+compare. The portal face view also went from three samples to two.
+
+LOW CEILINGS. BOXBOWL's lid was 13 m, which clipped every aerial: walls
+and ceiling are now 26 m over a wider floor, and TURNSTILE's hall doubled
+to 20 m.
+
+CHAMBER (style 35): a giant chess set in a dark hall that PLAYS ITSELF.
+Thirty-two pieces on 26 m squares, working through Morphy's Opera Game
+(Paris, 1858) move by move from the real score — including the captures,
+where the taken piece slides off the board and stays off. Every piece is
+drivable furniture: rooks carry three ramps up to a battlement, knights
+carry a launcher ring on the crest, bishops are angled blades, the queen
+is a landing deck with a boost crown, the king a ring of pillars.
+
+And it winds up. Every goal you score raises the board's FURY: the
+interval between moves shortens and, past a threshold, pieces start moving
+two and three at a time. Verified in the sim: 32 pieces, 17 moves in the
+first 60 s at rest, 4 captures, and the tempo going 0.28 -> 0.53 moves per
+second once the fury is up. Pieces are proper moving platforms, so a rook
+crossing the board carries you with it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
