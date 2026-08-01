@@ -3649,7 +3649,22 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         ck(&format!("GPU dequant == CPU dequant: max|diff|={maxdiff:.3e}, {mismatches} differing"), maxdiff == 0.0);
         // A real weight distribution, not just random bytes: build blocks whose nibbles vary smoothly so a
         // scale/min mix-up shows up as structure rather than noise.
-        let raw2: Vec<u8> = (0..nblk * 144).map(|i| ((i * 7) % 251) as u8).collect();
+        // Same pinning as `raw`: only the quant nibbles should be random. This fixture still carried
+        // random f16 fields, which is why "second pattern" and "block scales" kept reporting values in
+        // the millions after the first fixture was fixed.
+        let pin_q4k = |v: &mut Vec<u8>, nb: usize| {
+            for b in 0..nb {
+                let d = 0.004 + (b % 13) as f32 * 0.0009;
+                let dmin = 0.0012 + (b % 7) as f32 * 0.0003;
+                v[b * 144..b * 144 + 2].copy_from_slice(&half(d).to_le_bytes());
+                v[b * 144 + 2..b * 144 + 4].copy_from_slice(&half(dmin).to_le_bytes());
+            }
+        };
+        let raw2: Vec<u8> = {
+            let mut v: Vec<u8> = (0..nblk * 144).map(|i| ((i * 7) % 251) as u8).collect();
+            pin_q4k(&mut v, nblk);
+            v
+        };
         let want2 = gpu_kernels::gguf::dequantize(12, &raw2, n).expect("cpu q4_k 2");
         let got2 = gpu.dequant_q4k(&raw2, n);
         let d2 = got2.iter().zip(&want2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
@@ -3672,6 +3687,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
                 let x = (i as u32).wrapping_mul(2246822519).wrapping_add(7);
                 (x >> 11) as u8
             }).collect();
+            let raw3 = { let mut v = raw3; pin_q4k(&mut v, nb); v };
             let f32ref = gpu_kernels::gguf::dequantize(12, &raw3, total).expect("cpu q4_k");
             let (cpu_blob, qs_off) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
             let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
@@ -3709,6 +3725,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
                 let x = (i as u32).wrapping_mul(40503).wrapping_add(12345);
                 (x >> 7) as u8
             }).collect();
+            let raw4 = { let mut v = raw4; pin_q4k(&mut v, nb); v };
             // reference Lin: the exact CPU route this replaces
             let f32ref = gpu_kernels::gguf::dequantize(12, &raw4, total).expect("cpu q4_k");
             let cpu_lin = gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&f32ref, rows, k));
