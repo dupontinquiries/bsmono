@@ -742,6 +742,9 @@ const PERSONAS: &[(&str, &str, &str)] = &[
     // The LIAISON runs in FRONT of the big model: a small fast model that reports what the backend is
     // doing while the large one works. Its rules live in logscope::liaison_prompt so the same wording
     // governs the HUD strip and any direct chat with it — one prompt, not two that drift.
+    // Both halves. LIAISON_SYSTEM governs when there ARE observations; LIAISON_NO_OBSERVATIONS covers
+    // the turn it does not bear on — which is most of them when this is selected as a chat persona,
+    // and is why every reply opened with a backend status line including the answer to "hi there".
     ("liaison", "Liaison · reports backend state", logscope::liaison_prompt::LIAISON_SYSTEM),
 ];
 /// Look up a persona's full system prompt by key (the status-bar persona popup switches with this).
@@ -1744,6 +1747,14 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     fn build_prompt_upto(&self, upto: usize, doc: &crate::analysis::Doc) -> String {
         let mut sys = neutralize_markers(&self.full_system(doc));
         if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        // The liaison persona is written for a turn that HAS observations. Selected as a chat
+        // persona most turns have none — which is why every reply opened with a backend status line,
+        // including the answer to "hi there", and why "tell the debaters..." produced an error code
+        // for a run that never started.
+        if sys.contains("You are a liaison") {
+            sys.push_str("\n\n");
+            sys.push_str(logscope::liaison_prompt::LIAISON_NO_OBSERVATIONS);
+        }
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         match self.backend {
@@ -1773,6 +1784,14 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     fn build_continue_prompt(&self, doc: &crate::analysis::Doc) -> String {
         let mut sys = neutralize_markers(&self.full_system(doc));
         if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        // The liaison persona is written for a turn that HAS observations. Selected as a chat
+        // persona most turns have none — which is why every reply opened with a backend status line,
+        // including the answer to "hi there", and why "tell the debaters..." produced an error code
+        // for a run that never started.
+        if sys.contains("You are a liaison") {
+            sys.push_str("\n\n");
+            sys.push_str(logscope::liaison_prompt::LIAISON_NO_OBSERVATIONS);
+        }
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         let last = self.msgs.len().saturating_sub(1);
