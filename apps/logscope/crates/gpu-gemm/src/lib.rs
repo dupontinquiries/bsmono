@@ -7740,9 +7740,21 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     // kv_lora] matrix mla.rs expects. Order matters and is k THEN v, matching the fused
                     // layout llama.cpp splits FROM.
                     ((Some(kb), Some(vb)), _) => {
-                        let (mut a, b) = (g1(kb)?, g1(vb)?);
-                        a.extend_from_slice(&b);
-                        self.upload_flat(&a)
+                        // PER-HEAD, not two blocks. mla.rs indexes kvb[head * (qk_nope + v_head)..], so
+                        // appending every k row then every v row is correct only at n_heads == 1 — and
+                        // head 0's k lands right by coincidence in BOTH layouts, so the wrong version loads,
+                        // runs, and produces text with every head's V read from the wrong rows.
+                        let (a, b) = (g1(kb)?, g1(vb)?);
+                        // Dims from metadata plus the arrays themselves: n_heads and kv_lora are
+                        // declared, and the per-head row counts follow from the lengths. Deriving
+                        // rather than reaching for an outer binding keeps this correct if the
+                        // checkpoint disagrees with a config default.
+                        let nh = g.get_u32(&format!("{}.attention.head_count", acfg.prefix))? as usize;
+                        let lora = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix))? as usize;
+                        if nh == 0 || lora == 0 { return None; }
+                        let (nope, vh) = (a.len() / (nh * lora), b.len() / (nh * lora));
+                        let fused = crate::mla::fuse_kv_b(&a, &b, nh, nope, vh, lora)?;
+                        self.upload_flat(&fused)
                     }
                     (_, Some(f)) => self.upload_flat(&g1(f)?),
                     _ => return None,
