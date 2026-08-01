@@ -257,6 +257,28 @@ mod tests {
     }
 
     #[test]
+    fn the_cap_climbs_without_bound_until_SOMETHING_reports_pressure() {
+        // The bug this pairs with: observe_pressure had exactly one trigger — a dims-buffer allocation
+        // failure — while the failure this hardware actually produces is a device OOM, handled
+        // elsewhere and never fed back. So the window climbed 8→10→12→15→18→22 across a session, hit
+        // VMA exhaustion, was degraded for that step, and climbed straight back on the next.
+        //
+        // The governor itself is correct. A ratchet whose only sensor is a failure mode the device does
+        // not produce is a ratchet that does not ratchet.
+        let mut g = Governor::new(Budget::for_backend(WgpuBackend::Vulkan, false, false));
+        let start = g.learned_cap();
+        for _ in 0..12 { g.observe_clean(g.learned_cap()); }
+        assert!(g.learned_cap() > start * 3, "unbounded climb: {} from {start}", g.learned_cap());
+
+        // One pressure report latches it, and clean runs afterwards cannot climb back above it.
+        let at = g.learned_cap();
+        g.observe_pressure(at);
+        assert!(g.learned_cap() < at);
+        for _ in 0..12 { g.observe_clean(g.learned_cap()); }
+        assert!(g.learned_cap() < at, "the ceiling holds: {} vs {at}", g.learned_cap());
+    }
+
+    #[test]
     fn pressure_latch_never_climbs_back_above_the_failure() {
         let mut g = Governor::new(Budget::for_backend(WgpuBackend::Metal, true, false));
         // a clean run at the current cap lets it creep up
