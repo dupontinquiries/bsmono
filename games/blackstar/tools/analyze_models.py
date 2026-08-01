@@ -245,7 +245,11 @@ def main():
         fh.write(f"static const ex_part_group_t g_part_group[{max(len(groups),1)}] = {{\n")
         for stem_name, idxs in groups:
             idxs = idxs[:96]
-            fh.write(f"  {{{len(idxs)},{{" + ",".join(str(i) for i in idxs) + "}}},  // " + stem_name[:44] + "\n")
+            # The struct is { n, { parts } } so the tail is exactly "}}," — an
+            # earlier "}}}," emitted a third brace and every group line failed to
+            # compile. The f-string doubles braces and the concatenated tail does
+            # not, which is precisely where a miscount hides.
+            fh.write(f"  {{{len(idxs)},{{" + ",".join(str(i) for i in idxs) + "}},  // " + stem_name[:44] + "\n")
         if not groups: fh.write("  {0,{0}},\n")
         fh.write("};\n")
         fh.write("// Which group a model belongs to, or -1.\n")
