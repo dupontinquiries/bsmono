@@ -10,6 +10,8 @@
 use egui::Ui;
 use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteColors};
 
+pub mod camera;
+pub mod inbox;
 pub mod unified_nav;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
