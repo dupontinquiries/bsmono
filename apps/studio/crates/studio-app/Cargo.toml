@@ -1,0 +1,27 @@
+[package]
+name = "studio-app"
+version = "0.1.0"
+edition = "2021"
+description = "The runnable Studio: an eframe shell that wires the timeline, transport, mastering chain and collaboration into an application you can actually start."
+
+[[bin]]
+name = "studio"
+path = "src/main.rs"
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+studio-collab = { path = "../studio-collab" }
+studio-audio = { path = "../studio-audio" }
+studio-egui = { path = "../studio-egui" }
+studio-live = { path = "../studio-live" }
+studio-fx = { path = "../studio-fx" }
+studio-voice = { path = "../studio-voice" }
+egui = "0.34"
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+
+[features]
+# Default-on so `cargo build --release` produces the deployable binary directly,
+# the same convention every other egui frontend in the fleet uses.
+default = ["app"]
+app = ["dep:eframe"]

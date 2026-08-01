@@ -70,3 +70,26 @@ have concrete next-surface lists.
 *port* of an existing frontend — it is a new application with seven crates and
 164 tests, and its own README tracks what remains. Measuring it against a
 surface list would be measuring the wrong thing.
+
+## What the audit does NOT measure, learned the hard way
+
+The name-based audit says a surface is "covered" if the port mentions it. That is
+evidence it was addressed and nothing more, and a review of the actual ports
+found gaps the audit could not see:
+
+* **studio had no binary at all** — seven crates, 164 tests, and no `main.rs`
+  anywhere. Every crate's tests passed, so nothing looked wrong from inside. A
+  pile of well-tested libraries is not an application, and the audit checked for
+  a `[[bin]]` in `egui-frontend/` while studio's crates live elsewhere. **Fixed**:
+  `crates/studio-app` is the shell, `cargo build --release` produces `studio`.
+* **snapclone's port is a nav bar.** `src/` is `lib.rs` and `unified_nav.rs` —
+  no camera preview, no message list, no composer. The audit scored it 13%
+  because names appear in comments and docs, which is exactly the over-count the
+  method admits to.
+* **voiceterm has no text input.** Menus work; typing does not.
+
+So the audit is a floor, not a measure: a port scoring 13% is *at most* 13% done,
+and may be far less. The next revision should check for **rendered surfaces** —
+a function that takes a `&mut Ui` and is called from the app's draw path — rather
+than a name appearing anywhere in the tree. That distinguishes a widget that
+exists from a widget that is mentioned.

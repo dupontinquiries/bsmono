@@ -418,6 +418,7 @@ daemon = false
 flatpak = false
 runtime = "none"
 targets = ["desktop"]
+bin = "studio"            # crates/studio-app produces the runnable binary
 notes = "video NLE + audio editor sharing one Rust core, informed by kdenlive and Audacity rather than transliterated from them. Every edit is a serializable invertible Op, which makes undo, macros and REALTIME COLLABORATION one mechanism — see apps/studio/README.md. studio-core (model/undo) and studio-collab (convergent op log + presence) are tested; media I/O, the render graph and the egui frontend are the named next steps."
 
 [apps.settings-egui]
