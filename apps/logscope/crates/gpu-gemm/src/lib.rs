@@ -12598,6 +12598,37 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// A packed decode config must not be readable as a tile.
+    ///
+    /// Both machines' logs printed "decode tile = 2147549192" on every load — 0x80010008, the packed
+    /// (kernel, tile) form with the high marker bit, shown raw. Tiles are 1/2/4/8.
+    ///
+    /// Harmless to the engine and corrosive to the log: a number nobody can read is a line nobody
+    /// checks, and it is the line you consult when a shape is slow.
+    #[test]
+    fn the_packed_form_round_trips_and_is_NOT_a_plausible_tile() {
+        for kernel in [super::MatvecKernel::from_id(1), super::MatvecKernel::from_id(3)] {
+            for tile in [1u32, 2, 4, 8] {
+                let packed = super::DecodeConfig { kernel, tile }.pack();
+                assert!(packed > 0x8000_0000, "the marker bit is what makes it unreadable raw");
+                let back = super::DecodeConfig::unpack(packed);
+                assert_eq!(back.tile, tile);
+                assert_eq!(back.kernel, kernel);
+            }
+        }
+        // The exact values from the two logs.
+        assert_eq!(super::DecodeConfig::unpack(2147549192).tile, 8, "M2 Max");
+        assert_eq!(super::DecodeConfig::unpack(2147680264).tile, 8, "M2 Ultra");
+    }
+
+    #[test]
+    fn a_legacy_bare_tile_still_unpacks() {
+        // Caches written before the marker bit existed hold a plain tile. Reading one as a packed
+        // value would give kernel garbage and a tile of 0.
+        let d = super::DecodeConfig::unpack(4);
+        assert_eq!(d.tile, 4);
+    }
+
     /// The active-set arithmetic, checked against models whose size is known independently.
     #[test]
     fn active_params_matches_a_known_dense_model() {
