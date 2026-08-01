@@ -7381,7 +7381,19 @@ Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp ba
         let arena_on = match arena_env.as_deref() {
             Some("0") | Some("false") => false,     // hard opt-out
             Some(_) => true,                        // explicit opt-in
-            None => self.conservative_vma,          // default: on where BO VMA is the binding constraint
+            // ON WHERE OBJECT COUNT IS THE BINDING CONSTRAINT, which is what the comment above always
+            // said and what the code did not check. `conservative_vma` means "Vulkan on Apple"; the
+            // governor already classifies the limit KIND, and both BufferObjects (Metal) and
+            // AllocationCount (all Vulkan, commonly 4096 on desktop and tighter on mobile) are exactly
+            // the case the arena exists for.
+            //
+            // The practical miss was a phone: an Adreno or Mali device has the tightest object budget
+            // of anything we run on, and defaulted the arena OFF because it is not Apple.
+            None => {
+                let kind = self.governor.lock().unwrap().budget_kind();
+                matches!(kind, crate::governor::LimitKind::BufferObjects
+                             | crate::governor::LimitKind::AllocationCount)
+            }
         };
         let _arena_guard = if arena_on {
             let max_buf = self.device.limits().max_buffer_size;
