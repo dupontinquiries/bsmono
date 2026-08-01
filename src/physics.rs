@@ -961,11 +961,13 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                 // CARDINAL SNAP (Rocket League): any key combination sharing
                 // a dominant direction flips in THAT axis — no half-diagonal
                 // tumbles. Ties break toward pitch, as in RL.
-                let dn = if c.throttle.abs() >= c.steer.abs() {
-                    Vec3::new(0.0, 0.0, -c.throttle.signum())
-                } else {
-                    Vec3::new(c.steer.signum(), 0.0, 0.0)
-                };
+                // DIAGONAL FLIPS (your tuning). RL dodges along the input
+                // VECTOR, not a snapped cardinal — W+A is a diagonal flip,
+                // not a left one. Normalising keeps the flip's power constant
+                // regardless of how far the stick is pushed, while the
+                // direction stays exactly what you asked for.
+                let mut dn = Vec3::new(c.steer, 0.0, -c.throttle);
+                dn = if dn.length_squared() > 1e-6 { dn.normalize() } else { Vec3::Z };
                 // flip: burst of body-frame spin + a velocity kick along the dodge
                 // toned from 8.4: full-rate spin read too violent, and the
                 // FLIP SPIN dial rides on top for +-50% in 5% steps
@@ -1305,7 +1307,11 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 let roll = 1.5 * cfg.ball.friction * cfg.arena.friction;
                 ball.vel = vt * (1.0 - (roll * dt).min(1.0)); // rolling friction
             }
-            ball.ang = n.cross(ball.vel) / ball.r;
+            // Rolling spin was BACKWARDS (n x v spins against the travel)
+            // and snapped instantly. Correct handedness, and ease into it so
+            // a rolling ball looks like it has mass. (Your fix.)
+            let target_ang = ball.vel.cross(n) / ball.r;
+            ball.ang += (target_ang - ball.ang) * 0.3;
         }
     }
 
@@ -1449,7 +1455,10 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         };
         let dir = dir_n.lerp(aim, 0.65 * soft).normalize_or(dir_n);
         let strength = (-vn).min(23.0) * 0.38 / cfg.ball.weight.sqrt();
-        ball.vel += dir * strength;
+        // The extra "psyonix" push on top of the elastic impulse was doing
+        // most of the work, which is why touches felt like blasts. At a tenth
+        // it shapes the hit instead of dominating it. (Your tuning.)
+        ball.vel += dir * strength * 0.1;
         // SPIN: a gentle touch rolls the ball (dribbles need that), a hard
         // hit drives THROUGH it. Spin used to scale up with the impact,
         // which is what made shots knuckle off at odd angles.

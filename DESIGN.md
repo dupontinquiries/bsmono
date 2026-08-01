@@ -1636,6 +1636,41 @@ pipes that spit you out somewhere else. Built on a new `Flow` — a standing
 current with soft edges — folded into the same force path as floodwater.
 Verified: 58 flows, sample current 12.1 m/s, carries.
 
+## v1.51.0 — your tuning pass, merged forward
+
+Twelve patches of hand tuning, based on v1.41 while the tree had moved to
+v1.50. Rather than apply them over the top (which would have reverted
+platform riding, portals, the new maps and the tube work), the v1.41.0 tag
+was checked out, the series replayed onto it, and the resulting delta
+ported forward by intent. Four physics changes, all kept:
+
+1. DIAGONAL FLIPS. The cardinal snap is gone: the dodge now follows the
+   input VECTOR, normalised. W+A is a diagonal flip instead of a left one,
+   and normalising keeps flip power constant however far the stick goes.
+   (The earlier snap was built to an earlier request; this is closer to how
+   RL actually reads a dodge, and it is your call to make.)
+2. ROLLING SPIN WAS BACKWARDS. `n x v` spins a rolling ball AGAINST its
+   travel; it is `v x n`. It also snapped to the target instantly — now it
+   eases in at 0.3, so a rolling ball looks like it has mass.
+3. THE PSYONIX IMPULSE, DOWN TO A TENTH. The extra push layered on top of
+   the elastic impulse was doing most of the work in a hit, which is why
+   touches felt like blasts. At 0.1 it shapes the hit instead of dominating
+   it: exit speed is now 91-97% of approach (it was 121-125% — the ball was
+   gaining energy from being hit). Shots travel less far as a result: 57 m
+   at 3 s from a 22 m/s approach, down from 74. That is the trade, and the
+   feel is the thing worth trading for.
+4. Wider ranges throughout (FOV to 200, camera height to 24, world scale to
+   10.6x, ball size to 30x, top speed to 10x) and a new default camera:
+   FOV 86, height 5.0, angle -30 — a much higher, steeper chase view.
+
+Everything still passes: portals, platforms, mechanics, loops, touch, the
+shader validation, and the bots are healthier than before — with a gentler
+impulse they hold the ball far longer (pass4 air touches 105, pass2 style
+132.7).
+
+`presets/` now ships the save files from those sessions, with a README on
+how to load one.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
