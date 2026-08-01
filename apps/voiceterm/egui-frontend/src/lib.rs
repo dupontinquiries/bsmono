@@ -13,6 +13,7 @@
 //! rather than mis-rendered.
 
 pub mod mail_view;
+pub mod archived_view;
 pub mod graph_view;
 pub mod viz;
 pub mod confirm_dialog;
