@@ -21,6 +21,9 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# bo-mux/protocol.rs is mounted by #[path] and derives Serialize/Deserialize;
+# the port needs serde only to satisfy those derives, not to serialise anything.
+serde = { version = "1", features = ["derive"] }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }

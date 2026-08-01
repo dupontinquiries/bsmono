@@ -7,6 +7,7 @@
 //! carries a small view model so the crate builds and the logic is unit-tested.
 
 pub mod transport;
+pub mod spaces;
 use egui::Ui;
 use uikit_egui::{a11y::semantic_toggle, A11yScene, Adaptive, GestureLayer, PaletteColors};
 

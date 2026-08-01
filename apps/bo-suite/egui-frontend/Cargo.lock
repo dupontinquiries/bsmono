@@ -150,6 +150,7 @@ version = "0.1.0"
 dependencies = [
  "eframe",
  "egui",
+ "serde",
  "settings-kit",
  "snapclone-theme",
  "uikit-egui",
