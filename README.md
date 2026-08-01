@@ -419,3 +419,5 @@ KUIPER runs live sky events: a world collapses into a black hole every five minu
 `--sim stream` measures the LAN render-assist split: transport, bitrate, ray-step saving and accuracy.
 
 `--sim portal` verifies the portal transform: speed conservation, exit alignment, the fling, and no ping-pong.
+
+`--sim ballspin` checks that spin does what it should: curve, topspin, backspin, slide-to-roll.

@@ -1773,6 +1773,46 @@ it was pinning cars to the wall — and the sections are smoother: segment
 overlap 0.78 -> 0.92 of half-length so joints stop reading as seams, with
 the tube meshes up from 28 to 40 segments (18 for the far-field LOD).
 
+## v1.55.0 — the ball's spin becomes real
+
+The gap between our ball and Rocket League's was not a constant, it was
+structural: SPIN WAS A SLAVE TO VELOCITY. Every bounce set the tangential
+speed to 88% of what came in, then computed angular velocity FROM the
+result (`target_ang = v x n / r`). Spin could therefore never change where
+the ball went — no curve, no backspin, no topspin, and a dribble touch
+could not put shape on the ball.
+
+Contact is now a proper rigid-sphere impulse, which is what RL models:
+
+    contact point sits at -n*r from the centre
+    its material velocity is v + w x r_c
+    friction acts on the SLIP of that point, Coulomb-limited by the
+    normal impulse, and torques the ball in return
+    (solid sphere: I = 0.4*m*r^2, so tangential effective mass = m/3.5)
+
+Everything falls out of that one change, and `--sim ballspin` measures it:
+from an identical entry, a bounce exits at 6.34 m/s plain, 7.67 with
+topspin and 5.01 with backspin, and sidespin sends it 1.33 m/s sideways.
+A sliding ball spins UP until it rolls — |w| 3.47 against v/r 3.47, no
+slip — and a slide-to-roll transition costs exactly 2/7 of the speed,
+which is the textbook result for a rigid sphere and a good sign the model
+is right rather than merely tuned.
+
+Also RL-accurate now: ball spin caps at 6 rad/s (theirs), which means a
+ball above about 5.6 m/s CANNOT roll and must slide — true in RL too —
+and ball friction sits at 0.33 rather than the 0.7 that was braking a
+12 m/s roll to a stop in two seconds. Rolling resistance is 0.02, so a
+rolling ball now coasts (3.5% loss per second) instead of grinding down.
+
+One bug found on the way, in code I had added: a resting-contact line
+subtracted HALF of a negative normal velocity, so instead of cancelling
+the fall it ADDED upward speed every frame — an invisible ratchet that
+launched a rolling ball a metre into the air each second.
+
+Shots and dribbling are unchanged by this (22.4 m/s exit, 33% carry
+through a steady turn), and the bots read the new ball fine — air1 style
+back up to 38.5.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

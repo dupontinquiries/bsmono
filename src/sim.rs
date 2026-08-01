@@ -840,6 +840,85 @@ pub fn run(args: &[String]) {
             if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
         return;
     }
+    if name == "ballspin" {
+        // Does spin actually DO anything? In RL the ball's angular velocity
+        // is its own state: topspin drives a bounce forward, backspin kills
+        // it, sidespin curves it, and a sliding ball spins up until it rolls.
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let mut ev = StepEvents::default();
+        let gh = world.ground_h(0.0, 0.0);
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<40} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // one bounce, three spins, same entry velocity
+        let drop = |spin: Vec3| -> (f32, f32) {
+            let mut b = Ball::new();
+            b.pos = Vec3::new(0.0, gh + 6.0, 0.0);
+            b.vel = Vec3::new(9.0, -7.0, 0.0);
+            b.ang = spin;
+            b.prev = b.pos;
+            let mut w = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut e2 = StepEvents::default();
+            let mut bounced = false;
+            let mut after = Vec3::ZERO;
+            for _ in 0..240 {
+                let vy = b.vel.y;
+                physics::step_ball(&mut b, &mut w, &cfg, DT, &mut e2);
+                if !bounced && vy < 0.0 && b.vel.y > 0.0 {
+                    bounced = true;
+                    after = b.vel;
+                }
+            }
+            (after.x, after.z)
+        };
+        // spin axis for topspin when travelling +X and n = +Y is -Z
+        let (plain_x, _) = drop(Vec3::ZERO);
+        let (top_x, _) = drop(Vec3::new(0.0, 0.0, -5.0));
+        let (back_x, _) = drop(Vec3::new(0.0, 0.0, 5.0));
+        let (_, side_z) = drop(Vec3::new(-5.0, 0.0, 0.0));
+        println!("bounce exit along travel: plain {plain_x:.2}  topspin {top_x:.2}  backspin {back_x:.2} m/s");
+        println!("sidespin sideways exit: {side_z:.2} m/s");
+        check("topspin drives the bounce forward", top_x > plain_x + 0.5);
+        check("backspin kills forward speed", back_x < plain_x - 0.5);
+        check("sidespin curves the bounce", side_z.abs() > 0.5);
+        // a sliding ball should spin UP until it rolls without slipping
+        {
+            let mut b = Ball::new();
+            b.pos = Vec3::new(-120.0, world.ground_h(-120.0, -90.0) + b.r, -90.0);
+            b.vel = Vec3::new(5.0, 0.0, 0.0);
+            b.ang = Vec3::ZERO;
+            b.prev = b.pos;
+            let mut w = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            for _ in 0..300 {
+                physics::step_ball(&mut b, &mut w, &cfg, DT, &mut ev);
+            }
+            // rolling without slipping: |w| ~ |v| / r, spinning the right way
+            let want = b.vel.length() / b.r;
+            let got = b.ang.length();
+            let sign = b.ang.z < 0.0; // +X travel rolls about -Z
+            println!("slide -> roll: |w| {got:.2} vs v/r {want:.2}, speed kept {:.1} m/s", b.vel.length());
+            check("a sliding ball spins up into a roll", (got - want).abs() / want.max(0.1) < 0.25 && sign);
+            // A slide-to-roll transition costs exactly 2/7 of the speed (textbook
+        // rigid sphere), so 5.0 m/s becomes ~3.4 — the test is whether it
+        // COASTS from there rather than grinding down.
+        check("a rolling ball coasts", b.vel.length() > 3.0);
+        }
+        // spin is capped like RL's 6 rad/s
+        {
+            let mut b = Ball::new();
+            b.ang = Vec3::new(40.0, 0.0, 0.0);
+            b.pos = Vec3::new(0.0, gh + 12.0, 0.0);
+            b.prev = b.pos;
+            let mut w = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            physics::step_ball(&mut b, &mut w, &cfg, DT, &mut ev);
+            check("spin is capped at 6 rad/s", b.ang.length() <= 6.01);
+        }
+        println!("{}", if pass { "BALL SPIN: PASS" } else { "BALL SPIN: FAIL" });
+        return;
+    }
     if name == "shot" {
         // POWER SHOT audit: drive into a resting ball at speed, then measure
         // exit speed, how far it actually travels, and how fast a roll dies

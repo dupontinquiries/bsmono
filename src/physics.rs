@@ -1299,10 +1299,34 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 if -vn > 2.0 {
                     ev.ball_bounce = Some((ball.pos, -vn));
                 }
-                // keep most of the tangential speed through a bounce (0.714
-                // scrubbed 29% per landing, so any driven shot died on its
-                // first touchdown); the roll friction below still settles it
-                ball.vel = vt * 0.88 - n * vn * e;
+                // ---- RIGID-SPHERE CONTACT (the Rocket League bounce) ----
+                // Spin used to be a SLAVE to velocity: recomputed from it
+                // after every bounce, so it could never change where the ball
+                // went. In RL the angular velocity is its own state and the
+                // two trade through friction at the contact point, which is
+                // where curve, backspin and topspin all come from.
+                //
+                //   contact point sits at -n*r from the centre
+                //   its material velocity is v + w x r_c
+                //   friction acts on the SLIP of that point, Coulomb-limited
+                //   by the normal impulse, and it torques the ball in return.
+                let rc = -n * ball.r;
+                let u = ball.vel + ball.ang.cross(rc);
+                let slip = u - n * u.dot(n);
+                let jn = -(1.0 + e) * vn; // per unit mass
+                // solid sphere: I = 0.4 m r^2, so the tangential effective
+                // mass at the contact is m / 3.5
+                let inertia = 0.4 * ball.r * ball.r;
+                let m_t = 1.0 / (1.0 + ball.r * ball.r / inertia);
+                let want = -slip * m_t;
+                let mu_b = 0.36 * cfg.ball.friction;
+                let jt = if want.length() > mu_b * jn {
+                    want.normalize_or(Vec3::ZERO) * (mu_b * jn)
+                } else {
+                    want
+                };
+                ball.vel += n * jn + jt;
+                ball.ang += rc.cross(jt) / inertia;
                 ev.bounces.push((ball.pos, n, -vn));
             } else {
                 // Rolling friction turned out NOT to be the shot killer (a
@@ -1310,20 +1334,59 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 // measured identical travel from 0.42 to 1.8). It IS what
                 // lets a ball settle for a dribble, so it stays high — 1.5
                 // scored best across the bot air-dribble runs.
-                let roll = 1.5 * cfg.ball.friction * cfg.arena.friction;
-                ball.vel = vt * (1.0 - (roll * dt).min(1.0)); // rolling friction
+                // ---- RESTING / ROLLING CONTACT ----
+                // The same slip model, run continuously: a ball dropped with
+                // topspin drives itself forward, a sliding ball spins up
+                // until it rolls, and once it IS rolling the slip is zero so
+                // nothing fights it — that is why a rolling ball keeps going.
+                let rc = -n * ball.r;
+                let u = ball.vel + ball.ang.cross(rc);
+                let slip = u - n * u.dot(n);
+                let inertia = 0.4 * ball.r * ball.r;
+                let m_t = 1.0 / (1.0 + ball.r * ball.r / inertia);
+                // available friction from the weight it is resting under
+                // Coulomb friction from the ball's own weight. RL's ball
+                // friction is low (~0.35) and its spin caps at 6 rad/s, so a
+                // ball faster than about 5.5 m/s SLIDES rather than rolls —
+                // true in RL as well. At 0.7 that slide was a brake that
+                // stopped a 12 m/s ball dead in two seconds.
+                let load = GRAV * cfg.arena.gravity * dt;
+                let mu_b = 0.33 * cfg.ball.friction * cfg.arena.friction;
+                let want = -slip * m_t;
+                let jt = if want.length() > mu_b * load {
+                    want.normalize_or(Vec3::ZERO) * (mu_b * load)
+                } else {
+                    want
+                };
+                ball.vel += jt;
+                ball.ang += rc.cross(jt) / inertia;
+                // rolling resistance: a real ball on turf does eventually
+                // stop, but far more gently than a velocity haircut
+                let rr = 0.02 * cfg.ball.friction * cfg.arena.friction;
+                let vt2 = ball.vel - n * ball.vel.dot(n);
+                ball.vel -= vt2 * (rr * dt).min(0.4);
+                ball.ang *= 1.0 - (rr * 0.5 * dt).min(0.3);
+                // rest ON the surface: cancel what little downward velocity
+                // gravity added this step. (This line used to subtract HALF
+                // of a negative — an upward ratchet that launched a rolling
+                // ball a metre into the air every second.)
+                let vn2 = ball.vel.dot(n);
+                if vn2 < 0.0 {
+                    ball.vel -= n * vn2;
+                }
             }
-            // Rolling spin was BACKWARDS (n x v spins against the travel)
-            // and snapped instantly. Correct handedness, and ease into it so
-            // a rolling ball looks like it has mass. (Your fix.)
-            let target_ang = ball.vel.cross(n) / ball.r;
-            ball.ang += (target_ang - ball.ang) * 0.3;
         }
     }
 
     let sp = ball.vel.length();
     if sp > BALL_MAX {
         ball.vel *= BALL_MAX / sp;
+    }
+    // RL caps ball spin at 6 rad/s — without it a hard pinch can leave the
+    // ball spinning fast enough to drive itself across the pitch
+    let asp = ball.ang.length();
+    if asp > 6.0 {
+        ball.ang *= 6.0 / asp;
     }
     if ball.ang.length_squared() > 1e-8 {
         ball.rot = (Quat::from_scaled_axis(ball.ang * dt) * ball.rot).normalize();
