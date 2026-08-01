@@ -188,12 +188,19 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   the next op, so §8's auto-unwrap from feature edges is not implemented. Triplanar has a known
   cost — three samples per texel — and a known weakness: on a surface whose normal is exactly axis
   aligned, two opposite faces sample the same texel, which is visible on a cube's ±X faces.
-- **The viewport samples materials, but only the albedo.** The shader has a bind group 2 carrying a
-  2D array texture, does triplanar in the fragment stage matching `cad-tex`'s CPU implementation,
-  and a part's material is a layer index in its object uniform — so a scene with a dozen materials
-  is still one draw per mesh. The normal and specular maps are generated and exported but **not
-  uploaded**: lighting still comes from the SDF's own normal, so a texture reads as paint rather
-  than as relief.
+- **All three maps are bound.** Bind group 2 carries albedo, normal and specular as parallel array
+  textures — layer *i* of each is one material, so a single index selects all three. Albedo is
+  sRGB; the other two are linear, because a normal is a vector and a specular map is a mask and
+  decoding either as colour would bend the numbers.
+- **Normal mapping is whiteout blending, not a tangent basis.** An f-rep surface has no UVs and
+  therefore no consistent tangent direction, so the usual TBN construction has nothing to build
+  from. Each projection's sample is swizzled into its own plane and summed. This is the standard
+  answer and it is cheap, but it is an approximation: a normal map with strong directional detail
+  will read slightly differently across the three projections.
+- **Normal-map validity is checked on the CPU**, which is what can be checked without a GPU: every
+  texel decodes to unit length within 0.006 and none points into the surface, for all five
+  patterns, asserted in tests and reported by `--selftest`. That the *shader* then uses them
+  correctly is unverified.
 - **Never seen rendered.** The atlas upload, the sampler, and the shader path all compile and pass
   naga validation, and the palette is verified headlessly by `--selftest` (each material's wrap step
   measured against its own interior step). Nothing has drawn a textured pixel, because this

@@ -11,7 +11,7 @@ struct Globals {
     cam: vec4<f32>,   // xyz eye, w time (s)
     sun: vec4<f32>,   // xyz TO-sun dir (normalized on CPU), w intensity
     fog: vec4<f32>,   // rgb sky/fog colour, w density
-    misc: vec4<f32>,  // x selected_id+1, y texture scale (repeats per model unit), zw spare
+    misc: vec4<f32>,  // x selected_id+1, y texture scale, z normal-map strength, w spare
 };
 @group(0) @binding(0) var<uniform> g: Globals;
 
@@ -30,18 +30,59 @@ struct Obj {
 // which is what every part gets until one is assigned.
 @group(2) @binding(0) var mat_tex: texture_2d_array<f32>;
 @group(2) @binding(1) var mat_samp: sampler;
+// The normal and specular maps that ride beside every albedo in the engine's convention. Same
+// layer indexing, so one material is one index across all three.
+@group(2) @binding(2) var norm_tex: texture_2d_array<f32>;
+@group(2) @binding(3) var spec_tex: texture_2d_array<f32>;
 
 // Triplanar projection, matching cad-tex's CPU sample_triplanar exactly: abs(normal) raised to a
 // sharpness, normalised to weights, three lookups blended. Keeping the two implementations in step
 // is what lets a bake preview in the viewport and then export to the same pixels.
-fn triplanar(world: vec3<f32>, n: vec3<f32>, layer: i32, scale: f32) -> vec3<f32> {
-    var w = pow(abs(n), vec3<f32>(4.0));
+fn tri_weights(n: vec3<f32>) -> vec3<f32> {
+    let w = pow(abs(n), vec3<f32>(4.0));
     let sum = w.x + w.y + w.z;
-    w = select(vec3<f32>(0.0, 1.0, 0.0), w / sum, sum > 1e-6);
+    return select(vec3<f32>(0.0, 1.0, 0.0), w / sum, sum > 1e-6);
+}
+
+fn triplanar(world: vec3<f32>, n: vec3<f32>, layer: i32, scale: f32) -> vec3<f32> {
+    let w = tri_weights(n);
     let s = world * scale;
     let cx = textureSample(mat_tex, mat_samp, vec2<f32>(s.z, s.y), layer).rgb;
     let cy = textureSample(mat_tex, mat_samp, vec2<f32>(s.x, s.z), layer).rgb;
     let cz = textureSample(mat_tex, mat_samp, vec2<f32>(s.x, s.y), layer).rgb;
+    return cx * w.x + cy * w.y + cz * w.z;
+}
+
+/// Perturb the surface normal by the material's normal map, blended the triplanar way.
+///
+/// This is "whiteout" blending: each projection's tangent-space normal is added to the geometric
+/// normal in that projection's own frame, rather than being decoded into a shared tangent basis.
+/// An f-rep surface has no tangent basis to share — there are no UVs and therefore no consistent
+/// tangent direction — so the usual TBN construction has nothing to build from. Whiteout is the
+/// standard answer, and it is cheap: swizzle each sample into its plane and sum.
+fn triplanar_normal(world: vec3<f32>, n: vec3<f32>, layer: i32, scale: f32, strength: f32) -> vec3<f32> {
+    let w = tri_weights(n);
+    let s = world * scale;
+    // Decode from [0,1] to [-1,1].
+    let nx = textureSample(norm_tex, mat_samp, vec2<f32>(s.z, s.y), layer).rgb * 2.0 - 1.0;
+    let ny = textureSample(norm_tex, mat_samp, vec2<f32>(s.x, s.z), layer).rgb * 2.0 - 1.0;
+    let nz = textureSample(norm_tex, mat_samp, vec2<f32>(s.x, s.y), layer).rgb * 2.0 - 1.0;
+    // Each map's xy is a slope in its own plane; z points along that plane's axis, signed so a
+    // back-facing projection perturbs the right way.
+    let sign_n = sign(n);
+    let px = vec3<f32>(nx.z * sign_n.x, nx.y, nx.x);
+    let py = vec3<f32>(ny.x, ny.z * sign_n.y, ny.y);
+    let pz = vec3<f32>(nz.x, nz.y, nz.z * sign_n.z);
+    let perturbed = px * w.x + py * w.y + pz * w.z;
+    return normalize(mix(n, normalize(perturbed), clamp(strength, 0.0, 1.0)));
+}
+
+fn triplanar_spec(world: vec3<f32>, n: vec3<f32>, layer: i32, scale: f32) -> f32 {
+    let w = tri_weights(n);
+    let s = world * scale;
+    let cx = textureSample(spec_tex, mat_samp, vec2<f32>(s.z, s.y), layer).r;
+    let cy = textureSample(spec_tex, mat_samp, vec2<f32>(s.x, s.z), layer).r;
+    let cz = textureSample(spec_tex, mat_samp, vec2<f32>(s.x, s.y), layer).r;
     return cx * w.x + cy * w.y + cz * w.z;
 }
 
@@ -69,7 +110,14 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.nrm);
+    var n = normalize(in.nrm);
+    // A material perturbs the geometric normal before any lighting is computed, which is what
+    // makes a texture read as relief rather than as paint on a smooth surface.
+    var spec_mask = 1.0;
+    if (obj.params.y >= 0.0) {
+        n = triplanar_normal(in.world, n, i32(obj.params.y), g.misc.y, g.misc.z);
+        spec_mask = triplanar_spec(in.world, n, i32(obj.params.y), g.misc.y);
+    }
     let v = normalize(g.cam.xyz - in.world);
     let s = normalize(g.sun.xyz);
 
@@ -77,7 +125,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let hemi = mix(vec3<f32>(0.30, 0.32, 0.36), vec3<f32>(0.55, 0.59, 0.66), n.y * 0.5 + 0.5);
     let lam = max(dot(n, s), 0.0) * g.sun.w;
     let h = normalize(s + v);
-    let spec = pow(max(dot(n, h), 0.0), 48.0) * obj.params.z;
+    let spec = pow(max(dot(n, h), 0.0), 48.0) * obj.params.z * spec_mask;
     let rim = pow(1.0 - max(dot(n, v), 0.0), 3.0) * 0.22;
 
     // A material replaces the flat tint, still multiplied by the part's colour so a material can

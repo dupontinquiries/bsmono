@@ -724,17 +724,36 @@ fn selftest() -> ! {
                 worst_interior = worst_interior.max((f.at(i, j) - f.at(i, j - 1)).abs());
             }
         }
-        let ok = rgb.len() == cad_tex::N * cad_tex::N * 3 && worst_seam <= worst_interior + 1e-4;
+        // The normal map is the half the GPU relies on and the CPU can still check: every texel
+        // must decode to a unit vector pointing out of the surface, or the lighting bends.
+        let nmap = m.normal(1.0);
+        let mut worst_len = 0.0f32;
+        let mut inward = 0usize;
+        for px in nmap.chunks_exact(3) {
+            let v = glam::Vec3::new(
+                px[0] as f32 / 255.0 * 2.0 - 1.0,
+                px[1] as f32 / 255.0 * 2.0 - 1.0,
+                px[2] as f32 / 255.0 * 2.0 - 1.0,
+            );
+            worst_len = worst_len.max((v.length() - 1.0).abs());
+            if px[2] < 128 {
+                inward += 1;
+            }
+        }
+        let ok = rgb.len() == cad_tex::N * cad_tex::N * 3
+            && worst_seam <= worst_interior + 1e-4
+            && worst_len < 0.02
+            && inward == 0;
         if !ok {
             fail += 1;
         }
         println!(
-            "  material  {:9} {}x{}  wrap step {:.4} vs interior {:.4}  {}",
+            "  material  {:9} wrap {:.4}/{:.4}  normals unit+-{:.4}, {} inward  {}",
             p.name(),
-            cad_tex::N,
-            cad_tex::N,
             worst_seam,
             worst_interior,
+            worst_len,
+            inward,
             if ok { "ok" } else { "FAIL" }
         );
     }
@@ -766,6 +785,9 @@ struct App {
     /// Texture repeats per model unit. One knob, because triplanar has no per-part UV scale to
     /// inherit and a shared scale is what makes neighbouring parts look like one object.
     tex_scale: f32,
+    /// How far the normal map is allowed to bend the surface normal. Zero is flat paint, one is
+    /// the map's full slope; a machinist reading a form usually wants less than a game does.
+    bump: f32,
     /// The reference corpus, loaded on first use rather than at startup: a cold scan of a large
     /// tree is not something a window should block on, and most sessions never ask.
     ref_idx: Option<Index>,
@@ -818,19 +840,24 @@ impl App {
         );
         // Load the material palette once at startup. RGB from cad-tex, widened to RGBA because
         // that is what a sampled texture wants; the alpha is unused.
-        let palette: Vec<Vec<u8>> = MATERIALS
-            .iter()
-            .map(|p| {
-                let m = cad_tex::Material::new(*p, 7);
-                let rgb = m.albedo();
-                let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
-                for px in rgb.chunks_exact(3) {
-                    rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
-                }
-                rgba
-            })
-            .collect();
-        renderer.set_materials(&rs.device, &rs.queue, &palette, cad_tex::N as u32);
+        // All three maps of every material, in one pass so the layer indices stay parallel.
+        let widen = |rgb: Vec<u8>| {
+            let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+            for px in rgb.chunks_exact(3) {
+                rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+            }
+            rgba
+        };
+        let mut albedo = Vec::new();
+        let mut normal = Vec::new();
+        let mut spec = Vec::new();
+        for p in MATERIALS {
+            let m = cad_tex::Material::new(p, 7);
+            albedo.push(widen(m.albedo()));
+            normal.push(widen(m.normal(1.0)));
+            spec.push(widen(m.specular()));
+        }
+        renderer.set_materials(&rs.device, &rs.queue, &albedo, &normal, &spec, cad_tex::N as u32);
         rs.renderer.write().callback_resources.insert(renderer);
 
         let doc = demo_doc();
@@ -852,6 +879,7 @@ impl App {
             ref_pending: None,
             materials: HashMap::new(),
             tex_scale: 0.04,
+            bump: 0.6,
             grower: None,
             grow_accum: 0.0,
             preview: None,
@@ -1222,7 +1250,12 @@ impl App {
             cam: [eye.x, eye.y, eye.z, t],
             sun: [sun.x, sun.y, sun.z, 1.10],
             fog: [0.74, 0.77, 0.82, 0.0028],
-            misc: [self.selected.map_or(0.0, |id| id as f32 + 1.0), self.tex_scale, 0.0, 0.0],
+            misc: [
+                self.selected.map_or(0.0, |id| id as f32 + 1.0),
+                self.tex_scale,
+                self.bump,
+                0.0,
+            ],
         };
 
         let mut draws = Vec::with_capacity(self.model.parts.len() + 1);
@@ -1445,6 +1478,7 @@ impl eframe::App for App {
                             .logarithmic(true)
                             .text("tex scale"),
                     );
+                    ui.add(egui::Slider::new(&mut self.bump, 0.0..=1.0).text("bump"));
                 } else {
                     ui.label(egui::RichText::new("select a part to assign a material").small());
                 }

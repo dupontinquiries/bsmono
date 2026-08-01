@@ -333,6 +333,51 @@ mod tests {
     }
 
     #[test]
+    fn normal_maps_decode_to_unit_vectors() {
+        // The shader decodes these as n = rgb*2-1 and expects something it can normalize. A map
+        // whose texels do not decode to roughly unit length would light the surface wrongly in a
+        // way no CPU test of the albedo would ever catch.
+        for p in Pattern::all() {
+            let n = Material::new(p, 4).normal(1.0);
+            let mut worst = 0.0f32;
+            for px in n.chunks_exact(3) {
+                let v = glam::Vec3::new(
+                    px[0] as f32 / 255.0 * 2.0 - 1.0,
+                    px[1] as f32 / 255.0 * 2.0 - 1.0,
+                    px[2] as f32 / 255.0 * 2.0 - 1.0,
+                );
+                worst = worst.max((v.length() - 1.0).abs());
+            }
+            // 8-bit quantisation alone costs about 1/255 per channel.
+            assert!(worst < 0.02, "{}: normals off unit length by {worst}", p.name());
+        }
+    }
+
+    #[test]
+    fn normal_maps_point_outward_everywhere() {
+        // Blue channel above 128 means z > 0: the perturbed normal never points into the surface,
+        // which would turn a bump inside out.
+        for p in Pattern::all() {
+            let n = Material::new(p, 4).normal(1.0);
+            let inward = n.chunks_exact(3).filter(|px| px[2] < 128).count();
+            assert_eq!(inward, 0, "{}: {inward} texels point into the surface", p.name());
+        }
+    }
+
+    #[test]
+    fn strength_scales_the_slope() {
+        let flat = Material::new(Pattern::Rock, 4).normal(0.0);
+        let steep = Material::new(Pattern::Rock, 4).normal(4.0);
+        let tilt = |m: &[u8]| {
+            m.chunks_exact(3)
+                .map(|px| (px[0] as i32 - 128).abs() + (px[1] as i32 - 128).abs())
+                .sum::<i32>()
+        };
+        assert_eq!(tilt(&flat), 0, "zero strength must be perfectly flat");
+        assert!(tilt(&steep) > 0, "strength should tilt the normals");
+    }
+
+    #[test]
     fn a_flat_region_has_an_upward_normal() {
         // Rock has no lattice, so its normal map should average out to mostly +Z (128,128,~255).
         let n = Material::new(Pattern::Rock, 2).normal(1.0);

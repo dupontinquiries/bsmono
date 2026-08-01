@@ -186,6 +186,27 @@ impl ViewRenderer {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // norm_ and spec_ maps, same layer indexing as the albedo.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -250,7 +271,18 @@ impl ViewRenderer {
         // A one-layer placeholder so the pipeline is always bindable, even before any material is
         // loaded. Mid-grey rather than white: a missing texture should look plainly wrong, not
         // like a correctly lit unpainted surface.
-        let (mat_bg, mat_layers) = Self::make_atlas(device, queue, &mat_layout, &[vec![128u8; 4]], 1);
+        // Flat placeholders: mid-grey albedo, a normal map meaning "no perturbation" (0,0,1
+        // encoded), and full specular. A material that fails to load then looks unpainted rather
+        // than looking lit by a broken normal.
+        let (mat_bg, mat_layers) = Self::make_atlas(
+            device,
+            queue,
+            &mat_layout,
+            &[vec![128u8; 4]],
+            &[vec![128, 128, 255, 255]],
+            &[vec![255u8; 4]],
+            1,
+        );
 
         let obj_capacity = 256u32;
         let (obj_buf, obj_bg) = Self::make_obj_buffer(device, &obj_layout, obj_capacity);
@@ -289,21 +321,24 @@ impl ViewRenderer {
 
     /// Build the atlas from RGBA layers, each `size` square. Replacing it wholesale is simplest and
     /// costs nothing that matters: materials are loaded when a document opens, not per frame.
-    fn make_atlas(
+    fn array_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        layout: &wgpu::BindGroupLayout,
         layers: &[Vec<u8>],
         size: u32,
-    ) -> (wgpu::BindGroup, u32) {
+        srgb: bool,
+        label: &str,
+    ) -> wgpu::TextureView {
         let count = layers.len().max(1) as u32;
         let tex = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("cadscope-material-atlas"),
+            label: Some(label),
             size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: count },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // Albedo is colour and wants sRGB decode; a normal map is a vector and a specular map
+            // is a mask, and decoding either as colour would bend the numbers.
+            format: if srgb { wgpu::TextureFormat::Rgba8UnormSrgb } else { wgpu::TextureFormat::Rgba8Unorm },
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -329,10 +364,27 @@ impl ViewRenderer {
                 wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
             );
         }
-        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+        tex.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
-        });
+        })
+    }
+
+    /// Build the three-map atlas. `albedo`, `normal` and `spec` are parallel: layer *i* of each
+    /// belongs to the same material, which is what lets one index select all three.
+    fn make_atlas(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        albedo: &[Vec<u8>],
+        normal: &[Vec<u8>],
+        spec: &[Vec<u8>],
+        size: u32,
+    ) -> (wgpu::BindGroup, u32) {
+        let count = albedo.len().max(1) as u32;
+        let view = Self::array_texture(device, queue, albedo, size, true, "cadscope-albedo");
+        let nview = Self::array_texture(device, queue, normal, size, false, "cadscope-normal");
+        let sview = Self::array_texture(device, queue, spec, size, false, "cadscope-spec");
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("cadscope-material"),
             // Repeat, because triplanar coordinates run well past [0,1] and the textures tile.
@@ -349,14 +401,24 @@ impl ViewRenderer {
             entries: &[
                 wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&nview) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(&sview) },
             ],
         });
         (bg, count)
     }
 
     /// Replace the atlas with a new set of materials. Layer order is what `params.y` indexes.
-    pub fn set_materials(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layers: &[Vec<u8>], size: u32) {
-        let (bg, count) = Self::make_atlas(device, queue, &self.mat_layout, layers, size);
+    pub fn set_materials(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        albedo: &[Vec<u8>],
+        normal: &[Vec<u8>],
+        spec: &[Vec<u8>],
+        size: u32,
+    ) {
+        let (bg, count) = Self::make_atlas(device, queue, &self.mat_layout, albedo, normal, spec, size);
         self.mat_bg = bg;
         self.mat_layers = count;
     }
