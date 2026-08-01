@@ -259,6 +259,29 @@ pub mod imp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_PHONE_gpu_is_unified_and_a_proxy_for_apple_would_miss_it() {
+        // The bug this pins, which was mine. The unified-memory check in the MoE streaming planner was
+        // written as `conservative_vma || cfg!(macos)` — Apple-only — while an Adreno or Mali phone is
+        // an IntegratedGpu sharing exactly the same pool, and is the machine LEAST able to absorb a
+        // double-counted budget.
+        for name in ["Adreno (TM) 740", "Mali-G715", "Immortalis-G720", "Intel Arc Graphics"] {
+            assert!(is_unified_memory(AdapterDeviceType::Integrated, name),
+                "{name} is integrated: one pool");
+        }
+        // And a discrete card is NOT, so the resident side stays a separate budget there.
+        assert!(!is_unified_memory(AdapterDeviceType::Discrete, "NVIDIA GeForce RTX 4090"));
+    }
+
+    #[test]
+    fn apple_is_caught_even_when_the_device_type_is_not_Integrated() {
+        // Asahi/Honeykrisp does not always report Integrated, which is why the name fallback exists —
+        // and why removing it in favour of device_type alone would be a regression.
+        assert!(is_unified_memory(AdapterDeviceType::Other, "Apple M2 Max (G14C B1)"));
+        assert!(is_unified_memory(AdapterDeviceType::Other, "honeykrisp"));
+        assert!(!is_unified_memory(AdapterDeviceType::Other, "Some Discrete Card"));
+    }
+
     use super::*;
 
     #[test]
