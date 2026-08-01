@@ -66,17 +66,47 @@ explicitly to allow that — it is not granted by being on the same network",
 /// Absence is the default and means `Unknown`. A registry that defaulted to anything else would make
 /// forgetting to configure it indistinguishable from configuring it permissively.
 #[derive(Clone, Debug, Default)]
-pub struct Registry { entries: Vec<(String, Trust)> }
+pub struct Registry { entries: Vec<(String, Trust, Option<Vec<u8>>)> }
 
 impl Registry {
     pub fn new() -> Self { Self::default() }
 
-    /// Register a machine at a level. Explicit, per-machine, by a person.
+    /// Register a machine at a level, WITHOUT a key.
+    ///
+    /// Retained for callers that only need the level, but a name-only entry cannot be authenticated —
+    /// see `register_keyed`. `peerauth::verify` refuses such a peer rather than trusting the claim.
     pub fn register(&mut self, id: &str, level: Trust) {
-        match self.entries.iter_mut().find(|(k, _)| k == id) {
+        match self.entries.iter_mut().find(|(k, _, _)| k == id) {
             Some(e) => e.1 = level,
-            None => self.entries.push((id.to_string(), level)),
+            None => self.entries.push((id.to_string(), level, None)),
         }
+    }
+
+    /// Register a machine and bind its public key.
+    ///
+    /// THE GAP THIS CLOSES: registration recorded a level against a NAME. An id is whatever a peer
+    /// claims, so without a bound key the filter is decorative — anyone says "I am m2" and receives
+    /// what m2 was granted. `peerauth` consumes this key, and refuses any peer that has none.
+    pub fn register_keyed(&mut self, id: &str, level: Trust, key: Vec<u8>) {
+        match self.entries.iter_mut().find(|(k, _, _)| k == id) {
+            Some(e) => { e.1 = level; e.2 = Some(key); }
+            None => self.entries.push((id.to_string(), level, Some(key))),
+        }
+    }
+
+    /// The key bound at registration, if any.
+    pub fn key(&self, id: &str) -> Option<&[u8]> {
+        self.entries.iter().find(|(k, _, _)| k == id).and_then(|(_, _, v)| v.as_deref())
+    }
+
+    /// Registered machines that cannot be authenticated, for a UI to flag.
+    ///
+    /// Worth surfacing rather than silently downgrading: an operator who registered a machine expects
+    /// it to work, and "trusted but unverifiable" is a state they should see rather than discover when
+    /// a connection is refused.
+    pub fn unverifiable(&self) -> Vec<&str> {
+        self.entries.iter().filter(|(_, t, k)| *t != Trust::Unknown && k.is_none())
+            .map(|(id, _, _)| id.as_str()).collect()
     }
 
     /// Revoke immediately.
@@ -86,7 +116,7 @@ impl Registry {
     pub fn revoke(&mut self, id: &str) { self.register(id, Trust::Unknown); }
 
     pub fn level(&self, id: &str) -> Trust {
-        self.entries.iter().find(|(k, _)| k == id).map(|(_, t)| *t).unwrap_or(Trust::Unknown)
+        self.entries.iter().find(|(k, _, _)| k == id).map(|(_, t, _)| *t).unwrap_or(Trust::Unknown)
     }
 
     /// Filter workers to those permitted for a duty. Applied BEFORE ranking, never as a tie-break.
@@ -97,7 +127,7 @@ impl Registry {
 
     /// Machines a conversation may be resumed on.
     pub fn handoff_targets(&self) -> Vec<&str> {
-        self.entries.iter().filter(|(_, t)| t.permits_handoff()).map(|(k, _)| k.as_str()).collect()
+        self.entries.iter().filter(|(_, t, _)| t.permits_handoff()).map(|(k, _, _)| k.as_str()).collect()
     }
 }
 
@@ -199,6 +229,41 @@ mod tests {
         let eligible = r.eligible(Duty::Thinker, &ws);
         let chosen = crate::workerkit::assign(Duty::Thinker, &eligible).unwrap();
         assert_eq!(chosen.id, "mine", "the 999 GiB machine is unregistered and never considered");
+    }
+
+    #[test]
+    fn a_name_only_registration_is_flagged_as_UNVERIFIABLE() {
+        // The gap peerauth surfaced. An id is whatever a peer claims, so a level bound to a name and
+        // not a key means anyone claiming that name receives what it was granted. Surfaced rather than
+        // silently downgraded: an operator who registered a machine expects it to work, and "trusted
+        // but unverifiable" is a state they should SEE rather than discover at connection time.
+        let mut r = Registry::new();
+        r.register("named-only", Trust::Compute);
+        r.register_keyed("proper", Trust::Compute, vec![1, 2, 3]);
+        assert_eq!(r.unverifiable(), vec!["named-only"]);
+        assert!(r.key("named-only").is_none());
+        assert_eq!(r.key("proper"), Some(&[1u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn an_unknown_machine_is_not_listed_as_unverifiable() {
+        // It is not trusted at all, so "trusted but unverifiable" would be the wrong description and
+        // would fill the list with every stranger that ever answered a broadcast.
+        let r = Registry::new();
+        assert!(r.unverifiable().is_empty());
+    }
+
+    #[test]
+    fn adding_a_key_later_upgrades_the_same_entry() {
+        // Registering by name then supplying the key must not create a second entry, or a revocation
+        // could land on the keyless one and leave the keyed one live.
+        let mut r = Registry::new();
+        r.register("m", Trust::Build);
+        r.register_keyed("m", Trust::Handoff, vec![9]);
+        assert_eq!(r.level("m"), Trust::Handoff);
+        assert_eq!(r.key("m"), Some(&[9u8][..]));
+        r.revoke("m");
+        assert_eq!(r.level("m"), Trust::Unknown, "the single entry is revoked");
     }
 
     #[test]
