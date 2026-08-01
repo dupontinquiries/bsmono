@@ -49,6 +49,7 @@ pub mod constrain;
 pub mod smallrole;
 pub mod reasontemplate;
 pub mod refute;
+pub mod rolebench;
 pub mod branchtree;
 pub mod sketchexpand;
 pub mod hybridsplit;
