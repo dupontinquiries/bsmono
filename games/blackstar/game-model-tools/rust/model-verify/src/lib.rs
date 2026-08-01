@@ -34,6 +34,7 @@
 pub mod motion;
 pub mod descriptor;
 pub mod fold;
+pub mod assign;
 
 /// A rigid transform: rotation (row-major 3×3) then translation.
 #[derive(Debug, Clone, Copy, PartialEq)]
