@@ -188,8 +188,21 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   the next op, so §8's auto-unwrap from feature edges is not implemented. Triplanar has a known
   cost — three samples per texel — and a known weakness: on a surface whose normal is exactly axis
   aligned, two opposite faces sample the same texel, which is visible on a cube's ±X faces.
-- **Nothing is wired to the viewport.** Materials generate, map and export, but the renderer still
-  draws flat colours; the shader has no texture binding. That is the next step, not a done one.
+- **The viewport samples materials, but only the albedo.** The shader has a bind group 2 carrying a
+  2D array texture, does triplanar in the fragment stage matching `cad-tex`'s CPU implementation,
+  and a part's material is a layer index in its object uniform — so a scene with a dozen materials
+  is still one draw per mesh. The normal and specular maps are generated and exported but **not
+  uploaded**: lighting still comes from the SDF's own normal, so a texture reads as paint rather
+  than as relief.
+- **Never seen rendered.** The atlas upload, the sampler, and the shader path all compile and pass
+  naga validation, and the palette is verified headlessly by `--selftest` (each material's wrap step
+  measured against its own interior step). Nothing has drawn a textured pixel, because this
+  environment has no GPU.
+- **One texture scale for the whole scene**, on a slider. Triplanar has no per-part UV scale to
+  inherit, and a shared scale is what makes neighbouring parts read as one object; a per-part
+  override is a reasonable future addition, not an oversight.
+- **The palette is fixed at startup**, five patterns at seed 7. Nothing regenerates a material with
+  a different seed or colours from the UI, though `Material::with_colours` supports it.
 
 ## Not verified in-sandbox
 

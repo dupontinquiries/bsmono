@@ -338,6 +338,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "cad-kernel",
+ "cad-tex",
  "egui",
  "egui-wgpu",
  "glam",
@@ -355,6 +356,7 @@ dependencies = [
  "cad-liaison",
  "cad-motion",
  "cad-ref",
+ "cad-tex",
  "cad-view",
  "eframe",
  "egui",

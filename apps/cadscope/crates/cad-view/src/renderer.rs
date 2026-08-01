@@ -113,6 +113,12 @@ pub struct ViewRenderer {
     obj_buf: wgpu::Buffer,
     obj_bg: wgpu::BindGroup,
     obj_capacity: u32,
+    /// The material atlas: one array texture, one layer per loaded material. Assigning a material
+    /// to a part is then an index in its object uniform rather than a bind group swap, so a scene
+    /// with a dozen materials still draws in one pass.
+    mat_bg: wgpu::BindGroup,
+    mat_layers: u32,
+    mat_layout: wgpu::BindGroupLayout,
     meshes: HashMap<MeshKind, GpuMesh>,
     /// Bumped by the app whenever the model is re-evaluated; generated meshes are dropped on
     /// change so an edited document cannot leak GPU buffers for geometry that no longer exists.
@@ -125,6 +131,7 @@ impl ViewRenderer {
     /// likewise must match the pass (eframe default multisampling ⇒ 1).
     pub fn new(
         device: &wgpu::Device,
+        queue: &wgpu::Queue,
         target_format: wgpu::TextureFormat,
         depth_format: Option<wgpu::TextureFormat>,
         samples: u32,
@@ -160,9 +167,31 @@ impl ViewRenderer {
                 count: None,
             }],
         });
+        let mat_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cadscope-materials"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("cadscope-lit"),
-            bind_group_layouts: &[Some(&globals_layout), Some(&obj_layout)],
+            bind_group_layouts: &[Some(&globals_layout), Some(&obj_layout), Some(&mat_layout)],
             immediate_size: 0,
         });
 
@@ -218,6 +247,11 @@ impl ViewRenderer {
             entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals_buf.as_entire_binding() }],
         });
 
+        // A one-layer placeholder so the pipeline is always bindable, even before any material is
+        // loaded. Mid-grey rather than white: a missing texture should look plainly wrong, not
+        // like a correctly lit unpainted surface.
+        let (mat_bg, mat_layers) = Self::make_atlas(device, queue, &mat_layout, &[vec![128u8; 4]], 1);
+
         let obj_capacity = 256u32;
         let (obj_buf, obj_bg) = Self::make_obj_buffer(device, &obj_layout, obj_capacity);
 
@@ -229,6 +263,9 @@ impl ViewRenderer {
             obj_buf,
             obj_bg,
             obj_capacity,
+            mat_bg,
+            mat_layers,
+            mat_layout,
             meshes: HashMap::new(),
             epoch: 0,
         }
@@ -248,6 +285,84 @@ impl ViewRenderer {
             }),
             index_count: m.idx.len() as u32,
         }
+    }
+
+    /// Build the atlas from RGBA layers, each `size` square. Replacing it wholesale is simplest and
+    /// costs nothing that matters: materials are loaded when a document opens, not per frame.
+    fn make_atlas(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layout: &wgpu::BindGroupLayout,
+        layers: &[Vec<u8>],
+        size: u32,
+    ) -> (wgpu::BindGroup, u32) {
+        let count = layers.len().max(1) as u32;
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("cadscope-material-atlas"),
+            size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: count },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        for (i, data) in layers.iter().enumerate() {
+            let expect = (size * size * 4) as usize;
+            if data.len() != expect {
+                log::error!("material layer {i} is {} bytes, expected {expect}", data.len());
+                continue;
+            }
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: i as u32 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(size * 4),
+                    rows_per_image: Some(size),
+                },
+                wgpu::Extent3d { width: size, height: size, depth_or_array_layers: 1 },
+            );
+        }
+        let view = tex.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("cadscope-material"),
+            // Repeat, because triplanar coordinates run well past [0,1] and the textures tile.
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cadscope-materials"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+        (bg, count)
+    }
+
+    /// Replace the atlas with a new set of materials. Layer order is what `params.y` indexes.
+    pub fn set_materials(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layers: &[Vec<u8>], size: u32) {
+        let (bg, count) = Self::make_atlas(device, queue, &self.mat_layout, layers, size);
+        self.mat_bg = bg;
+        self.mat_layers = count;
+    }
+
+    pub fn material_count(&self) -> u32 {
+        self.mat_layers
     }
 
     fn make_obj_buffer(
@@ -314,6 +429,7 @@ impl ViewRenderer {
     fn draw(&self, render_pass: &mut wgpu::RenderPass<'_>, draws: &[FrameDraw]) {
         render_pass.set_pipeline(&self.pipeline);
         render_pass.set_bind_group(0, &self.globals_bg, &[]);
+        render_pass.set_bind_group(2, &self.mat_bg, &[]);
         for (i, d) in draws.iter().enumerate() {
             let Some(mesh) = self.meshes.get(&d.kind) else { continue };
             render_pass.set_bind_group(1, &self.obj_bg, &[i as u32 * OBJ_STRIDE as u32]);

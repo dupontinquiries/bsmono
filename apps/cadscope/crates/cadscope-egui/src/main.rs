@@ -18,6 +18,7 @@ use cad_motion::{Action, GrowAction, Mode};
 use cad_ref::verbs::{self, RefOutcome};
 use cad_ref::{Index, ScanOpts};
 use cad_view::camera::{ndc_of, OrbitCamera};
+use cad_tex::Pattern;
 use cad_view::meshgen::{from_trimesh, MeshData};
 use cad_view::renderer::{FrameDraw, Globals, MeshKind, ObjectRaw, ViewRenderer};
 use eframe::egui;
@@ -709,6 +710,35 @@ fn selftest() -> ! {
         if doc_ok { "ok" } else { "FAIL" }
     );
 
+    // The material palette: generated on the CPU exactly as the viewport uploads it, so a headless
+    // run still proves the textures exist, tile, and differ from one another.
+    for p in MATERIALS {
+        let m = cad_tex::Material::new(p, 7);
+        let rgb = m.albedo();
+        let f = m.field();
+        let mut worst_seam = 0.0f32;
+        let mut worst_interior = 0.0f32;
+        for i in 0..cad_tex::N {
+            worst_seam = worst_seam.max((f.at(i, 0) - f.at(i, cad_tex::N - 1)).abs());
+            for j in 1..cad_tex::N {
+                worst_interior = worst_interior.max((f.at(i, j) - f.at(i, j - 1)).abs());
+            }
+        }
+        let ok = rgb.len() == cad_tex::N * cad_tex::N * 3 && worst_seam <= worst_interior + 1e-4;
+        if !ok {
+            fail += 1;
+        }
+        println!(
+            "  material  {:9} {}x{}  wrap step {:.4} vs interior {:.4}  {}",
+            p.name(),
+            cad_tex::N,
+            cad_tex::N,
+            worst_seam,
+            worst_interior,
+            if ok { "ok" } else { "FAIL" }
+        );
+    }
+
     println!(
         "selftest: {} ({:.1}s)",
         if fail == 0 { "PASS" } else { "FAIL" },
@@ -730,6 +760,12 @@ struct App {
     meshed: HashMap<u32, Arc<MeshData>>,
     /// Bumped on every re-evaluation so the renderer can drop stale generated buffers.
     epoch: u64,
+    /// Material layer per part id. Absent means flat colour, which is the default — a part is not
+    /// textured until someone says so.
+    materials: HashMap<u32, usize>,
+    /// Texture repeats per model unit. One knob, because triplanar has no per-part UV scale to
+    /// inherit and a shared scale is what makes neighbouring parts look like one object.
+    tex_scale: f32,
     /// The reference corpus, loaded on first use rather than at startup: a cold scan of a large
     /// tree is not something a window should block on, and most sessions never ask.
     ref_idx: Option<Index>,
@@ -751,6 +787,15 @@ struct App {
     grown: u32,
 }
 
+/// The material palette, in atlas layer order — a part's `material` index points into this.
+const MATERIALS: [Pattern; 5] = [
+    Pattern::Plating,
+    Pattern::Hexmesh,
+    Pattern::Circuit,
+    Pattern::Rock,
+    Pattern::Sediment,
+];
+
 /// One station every 33 ms of growth: fine enough that the swept chain reads as a smooth tube,
 /// coarse enough that a long session stays cheap to mesh.
 const STATION_DT: f32 = 1.0 / 30.0;
@@ -764,12 +809,29 @@ impl App {
             .wgpu_render_state
             .as_ref()
             .expect("CADscope needs the wgpu backend (NativeOptions.renderer = Wgpu)");
-        rs.renderer.write().callback_resources.insert(ViewRenderer::new(
+        let mut renderer = ViewRenderer::new(
             &rs.device,
+            &rs.queue,
             rs.target_format,
             Some(wgpu::TextureFormat::Depth32Float), // pairs with depth_buffer: 32 above
             1,                                       // eframe default msaa; 4x is a PARITY debt
-        ));
+        );
+        // Load the material palette once at startup. RGB from cad-tex, widened to RGBA because
+        // that is what a sampled texture wants; the alpha is unused.
+        let palette: Vec<Vec<u8>> = MATERIALS
+            .iter()
+            .map(|p| {
+                let m = cad_tex::Material::new(*p, 7);
+                let rgb = m.albedo();
+                let mut rgba = Vec::with_capacity(rgb.len() / 3 * 4);
+                for px in rgb.chunks_exact(3) {
+                    rgba.extend_from_slice(&[px[0], px[1], px[2], 255]);
+                }
+                rgba
+            })
+            .collect();
+        renderer.set_materials(&rs.device, &rs.queue, &palette, cad_tex::N as u32);
+        rs.renderer.write().callback_resources.insert(renderer);
 
         let doc = demo_doc();
         let (model, warns) = doc.apply();
@@ -788,6 +850,8 @@ impl App {
             ref_status: "type a reference: volume of <model> · texture from <model> · fit <doc>".into(),
             ref_detail: Vec::new(),
             ref_pending: None,
+            materials: HashMap::new(),
+            tex_scale: 0.04,
             grower: None,
             grow_accum: 0.0,
             preview: None,
@@ -1158,7 +1222,7 @@ impl App {
             cam: [eye.x, eye.y, eye.z, t],
             sun: [sun.x, sun.y, sun.z, 1.10],
             fog: [0.74, 0.77, 0.82, 0.0028],
-            misc: [self.selected.map_or(0.0, |id| id as f32 + 1.0), 0.0, 0.0, 0.0],
+            misc: [self.selected.map_or(0.0, |id| id as f32 + 1.0), self.tex_scale, 0.0, 0.0],
         };
 
         let mut draws = Vec::with_capacity(self.model.parts.len() + 1);
@@ -1172,7 +1236,8 @@ impl App {
             mesh: None,
         });
         for part in &self.model.parts {
-            let params = [0.0, 0.0, 0.30, part.id as f32 + 1.0];
+            let layer = self.materials.get(&part.id).map_or(-1.0, |i| *i as f32);
+            let params = [0.0, layer, 0.30, part.id as f32 + 1.0];
             match display_of(&part.sdf) {
                 // A primitive: cached parametric mesh, placed by its model matrix.
                 Some((kind, model)) => draws.push(FrameDraw {
@@ -1361,6 +1426,29 @@ impl eframe::App for App {
                         ui.label(format!("#{}: {}", w.index, w.reason));
                     }
                 }
+                ui.separator();
+                // Material assignment for the selected part. Deliberately a per-part choice rather
+                // than a document-wide one: a bracket and its boss are usually different metals.
+                if let Some(id) = self.selected {
+                    ui.label(egui::RichText::new("material").strong());
+                    let current = self.materials.get(&id).copied();
+                    if ui.selectable_label(current.is_none(), "none (flat)").clicked() {
+                        self.materials.remove(&id);
+                    }
+                    for (i, p) in MATERIALS.iter().enumerate() {
+                        if ui.selectable_label(current == Some(i), p.name()).clicked() {
+                            self.materials.insert(id, i);
+                        }
+                    }
+                    ui.add(
+                        egui::Slider::new(&mut self.tex_scale, 0.005..=0.4)
+                            .logarithmic(true)
+                            .text("tex scale"),
+                    );
+                } else {
+                    ui.label(egui::RichText::new("select a part to assign a material").small());
+                }
+
                 ui.separator();
                 let tris: usize = self.meshed.values().map(|m| m.idx.len() / 3).sum();
                 ui.label(format!("{} ops → {} parts", self.doc.ops.len(), self.model.parts.len()));
