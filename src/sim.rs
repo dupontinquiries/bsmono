@@ -1470,6 +1470,28 @@ pub fn run(args: &[String]) {
                 grounded * 100 / 240
             );
         }
+        // ---- BREAKWATER flows: does the water actually carry you? ----
+        {
+            let w = World::generate(9, crate::world::style(34), 0.31, 1.0);
+            let f = w.flows.first().map(|f| (f.pos, f.vel));
+            match f {
+                Some((fp, fv)) => {
+                    let cur = w.current(fp);
+                    let carried = cur.map(|c| c.dot(fv.normalize_or(Vec3::Z)) > 5.0).unwrap_or(false);
+                    println!(
+                        "breakwater: {} flows, sample current {:.1} m/s  {}",
+                        w.flows.len(),
+                        cur.map(|c| c.length()).unwrap_or(0.0),
+                        if carried { "carries" } else { "NO PUSH" }
+                    );
+                    pass &= carried;
+                }
+                None => {
+                    println!("breakwater: no flows");
+                    pass = false;
+                }
+            }
+        }
         println!("{}", if pass { "PLATFORMS: PASS" } else { "PLATFORMS: FAIL" });
         return;
     }

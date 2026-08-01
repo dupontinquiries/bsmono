@@ -1597,6 +1597,45 @@ Same honesty as before: the shader validates and the maths is the same
 transform the physics uses and passes, but the visual result is
 unverified — no GPU here.
 
+## v1.50.0 — stuck no more, and two new arenas
+
+STUCK UNDER A TURNSTILE PORTAL — a moving portal carried its face but left
+its HOLE behind. The carve is five cutter spheres punched through whatever
+the mouth sits in; on a portal bolted to a spinning drum those stayed where
+they were baked while the mouth rode away, so the portal ended up against
+solid geometry and you parked inside it. Portals now remember their cutters
+with offsets in the mount's frame and move them every update. The exit also
+clears properly: 1.2 m out along the face, then up to eight pushes along the
+surface normal until the car is genuinely in open air.
+
+BALL JOINTS BLOCKING TUBES — the junction chambers. Their shells were thick
+enough to be a plug: the interior carve left 0.9 m of wall and each tube
+mouth was cut at only 1.12x its radius. Now 0.4 m and 1.45x, so a room is a
+room and its mouths are openings.
+
+TUBES STILL NOT 3D — a perfectly smooth cylinder of translucent glass has
+nothing for light to catch. The wall is now FLUTED: a shallow twelve-fold
+ribbing with normals tilted along each ridge, so the highlight runs around
+the pipe and it reads as round. Wall thickness went 0.10 -> 0.14 of radius
+and the glass back to alpha 0.55, so there is body to see.
+
+PORTAL VISIBILITY — the view is 35% brighter, the colour tint cut from 22%
+to 9% (it was washing the image), the edge glow softened, and crucially the
+march no longer passes the fragment's own distance, so the low-quality
+early-out can never turn a portal into flat sky.
+
+WYRMFIRE (style 33): a lava caldera with a wyrm coiled through it — 34
+vertebrae you drive along with a dorsal ridge, fire vents every seventh
+that fire the ball skyward, a head plate to land on, flowing lava that
+drags you toward the middle, and six fire columns that throw you up.
+
+BREAKWATER (style 34): concrete arena, rolling swell. Three giant wave
+walls sweep the deck and CARRY you (platform riding), each pushing a wash
+ahead of it, and two DRAINS take the water under the floor through glass
+pipes that spit you out somewhere else. Built on a new `Flow` — a standing
+current with soft edges — folded into the same force path as floodwater.
+Verified: 58 flows, sample current 12.1 m/s, carries.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

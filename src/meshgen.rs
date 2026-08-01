@@ -253,15 +253,27 @@ pub fn hex_prism() -> MeshData {
 pub fn tube_open(seg: u32) -> MeshData {
     let mut m = MeshData::new();
     let n = seg.max(8);
-    let (ro, ri) = (1.0f32, 0.9f32);
+    let (ro, ri) = (1.0f32, 0.86f32);
+    // FLUTES: a perfectly smooth cylinder of translucent glass has nothing
+    // for the light to catch, which is why the tubes kept reading flat. A
+    // shallow ribbing around the circumference gives the wall form — the
+    // highlight now runs along the flutes and the pipe looks round.
+    let flutes = 12.0f32;
     let mut ring = |r: f32, inward: bool| {
         let base = m.verts.len() as u32;
         for i in 0..=n {
             let a = i as f32 / n as f32 * std::f32::consts::TAU;
             let (c, sn) = (a.cos(), a.sin());
-            let nrm = if inward { [-c, 0.0, -sn] } else { [c, 0.0, sn] };
+            let rib = 1.0 + (a * flutes).cos() * if inward { 0.012 } else { 0.028 };
+            let rr = r * rib;
+            // tilt the normal with the flute so it shades as a ridge
+            let dt = -(a * flutes).sin() * flutes * 0.028;
+            let tang = [-sn + c * dt, 0.0, c + sn * dt];
+            let len = (tang[0] * tang[0] + tang[2] * tang[2]).sqrt().max(1e-5);
+            let nb = [tang[2] / len, 0.0, -tang[0] / len];
+            let nrm = if inward { [-nb[0], 0.0, -nb[2]] } else { nb };
             for y in [-1.0f32, 1.0] {
-                m.verts.push(Vertex { pos: [c * r, y, sn * r], nrm, uv: [i as f32 / n as f32, y * 0.5 + 0.5] });
+                m.verts.push(Vertex { pos: [c * rr, y, sn * rr], nrm, uv: [i as f32 / n as f32 * flutes * 0.25, y * 0.5 + 0.5] });
             }
         }
         for i in 0..n {

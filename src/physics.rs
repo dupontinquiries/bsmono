@@ -1236,7 +1236,18 @@ pub fn portal_car(car: &mut Car, world: &World, dt: f32) -> bool {
         car.vel = r * car.vel;
         car.rot = (r * car.rot).normalize();
         car.ang = r * car.ang;
-        car.pos += (r * Vec3::Z) * 0.15; // clear of the exit face
+        // Clear of the exit face — and if the far side is tight (a moving
+        // mouth can swing into its own mount), push out along the surface
+        // normal until we are actually in open air. Getting parked inside
+        // the drum was the worst bug in TURNSTILE.
+        car.pos += (r * Vec3::Z) * 1.2;
+        for _ in 0..8 {
+            let d = world.sdf(car.pos);
+            if d > car.half_h + 0.15 {
+                break;
+            }
+            car.pos += world.normal(car.pos) * (car.half_h + 0.25 - d).max(0.15);
+        }
         car.tp_cd = 0.12;
         car.prev = car.pos;
         return true;

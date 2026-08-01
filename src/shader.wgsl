@@ -561,13 +561,16 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
             let h = fract(sin(dot(in.wpos.xz + f32(k) * 7.3, vec2(12.99, 78.23))) * 43758.5453);
             let h2 = fract(h * 197.31);
             let jit = vec3(h - 0.5, h2 - 0.5, fract(h * 31.7) - 0.5) * 0.035;
-            acc3 = acc3 + trace_reflection(ro2, normalize(rd0 + jit), -1, dist0);
+            // base_dist 0 so the low-quality early-out cannot turn the view
+            // into flat sky — a portal you cannot see through is just a wall
+            acc3 = acc3 + trace_reflection(ro2, normalize(rd0 + jit), -1, 0.0);
         }
-        var pcol = acc3 / 3.0;
-        // tint it with the mouth's own colour so the pair stays readable
-        pcol = mix(pcol, O.color.rgb, 0.22);
-        let edge = pow(1.0 - max(dot(n, v), 0.0), 2.0);
-        pcol = pcol + O.color.rgb * edge * 0.8;
+        // lift it: the far side is lit by its own scene, and a portal reads
+        // as a hole in the world only if it is at least as bright as one
+        var pcol = (acc3 / 3.0) * 1.35;
+        pcol = mix(pcol, O.color.rgb, 0.09); // just enough tint to tell pairs apart
+        let edge = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+        pcol = pcol + O.color.rgb * edge * 0.55;
         return vec4(pcol, 1.0);
     }
         if (glassy) {
