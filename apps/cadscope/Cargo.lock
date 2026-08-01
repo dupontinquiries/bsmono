@@ -325,6 +325,12 @@ dependencies = [
 [[package]]
 name = "cad-tex"
 version = "0.1.0"
+dependencies = [
+ "cad-kernel",
+ "glam",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cad-view"

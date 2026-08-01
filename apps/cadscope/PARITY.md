@@ -165,6 +165,32 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   that declares units. Every other measurable model in the tree still declines for undeclared
   units, which remains correct behaviour and an unwritten declaration rather than a defect.
 
+## The texturing system (`cad-tex`, M4)
+
+- **The noise is not an FFT.** The Python gets tileability by band-limiting white noise with an
+  FFT; this synthesises the same object directly, summing random-phase sinusoids at the integer
+  frequencies the filter would have kept. Equivalent in kind, not bit-identical to upstream — the
+  textures will not match `gen_texture.py` pixel for pixel.
+- **A per-panel feature cannot tile, and that is correct.** With 64px panels in a 256px texture the
+  panel at row 0 and the panel at row 255 are different panels, so their tints differ across the
+  wrap exactly as they differ everywhere else. The first tiling test asserted otherwise and was
+  wrong; it now compares the wrap step against the pattern's own worst *interior* step, which is
+  the property that actually matters.
+- **The port diverges from `gen_texture.py`'s plating tint deliberately.** Upstream indexes panels
+  by absolute position, so the tint sequence restarts at the wrap and the texture shows a grid when
+  repeated. The port hashes wrapped panel coordinates instead. Worth reporting upstream.
+- **Normal maps are inferred from albedo luminance**, by Sobel gradient, as upstream does. A height
+  field derived from colour is not physically principled; it is what makes these read as the games'
+  own textures.
+- **PNG output uses stored zlib blocks, not deflate.** Files are roughly 3x larger than they need
+  to be. Every reader accepts them, and a bake runs occasionally, so the trade is deliberate.
+- **Triplanar only; no unwrap.** An SDF has no parameterisation and any unwrap is invalidated by
+  the next op, so §8's auto-unwrap from feature edges is not implemented. Triplanar has a known
+  cost — three samples per texel — and a known weakness: on a surface whose normal is exactly axis
+  aligned, two opposite faces sample the same texel, which is visible on a cube's ±X faces.
+- **Nothing is wired to the viewport.** Materials generate, map and export, but the renderer still
+  draws flat colours; the shader has no texture binding. That is the next step, not a done one.
+
 ## Not verified in-sandbox
 
 - **The app has never been run.** The build environment had one core, 3 GB RAM, no GPU and no
