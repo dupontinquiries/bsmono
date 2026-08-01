@@ -40,10 +40,22 @@ fn sum8(it: impl Iterator<Item = f32>) -> f32 {
 /// and lose the clarity.
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
-    // MULTI-ACCUMULATOR, not `iter().sum()`. Rust preserves IEEE order and will not reassociate a float
-    // reduction, so a single accumulator serialises the whole loop on one dependency chain. C++ built
-    // with -ffast-math reassociates freely, which is one reason llama.cpp's scalar code is faster than
-    // it looks. Measured here: 5.00 us against 0.63 us for the same dot — EIGHT TIMES.
+    // MULTI-ACCUMULATOR, not `iter().sum()`. A single accumulator serialises the whole loop on one
+    // dependency chain: every add waits for the previous one. Measured here: 5.00 us against 0.63 us
+    // for the same dot — EIGHT TIMES.
+    //
+    // CHECKED AGAINST COLIBRI, which corrects the obvious explanation. It does NOT build with
+    // -ffast-math — its Makefile is `-O3 -march=native -fopenmp`. Instead its kernels write the
+    // accumulators out by hand:
+    //
+    //     float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+    //     ...
+    //     a = vaddvq_f32(vaddq_f32(ac0, ac1));
+    //
+    // Two vectors of four lanes, combined at the end — the same eight chains this produces, reached by
+    // intrinsics rather than by letting LLVM vectorize eight scalars. So the technique is MULTIPLE
+    // ACCUMULATORS in any language, not a compiler flag, and C would need the same treatment. Rust's
+    // IEEE ordering makes it mandatory rather than merely advisable, which is the only real difference.
     //
     // Eight accumulators grant the permission explicitly, by choosing the order rather than asking the
     // compiler to pick one. Deterministic, and the reference tests still pass because the tolerance
