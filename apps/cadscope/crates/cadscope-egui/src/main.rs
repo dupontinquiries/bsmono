@@ -841,6 +841,61 @@ fn selftest() -> ! {
         );
     }
 
+    // A collaborative session, simulated end to end without a network: five peers each author an
+    // op, every peer hears every op in a different rotation, and all five must agree. This is the
+    // §11 claim — replicate ops, not geometry — checked rather than described.
+    {
+        use cad_net::Session;
+        let mut peers: Vec<Session> = (1..=5).map(|i| Session::new(i, "selftest")).collect();
+        let mut wire = Vec::new();
+        for (i, p) in peers.iter_mut().enumerate() {
+            wire.push(p.author(Op::Add {
+                name: format!("peer{i}_part"),
+                shape: ShapeSpec::Sphere { r: 1.0 + i as f32 * 0.5 },
+                at: [i as f32 * 3.0, 0.0, 0.0],
+                rot_axis_deg: None,
+                color: [0.7, 0.7, 0.8, 1.0],
+            }));
+        }
+        // Size the wire form through the forge, which already owns the JSON representation.
+        let bytes: usize = wire.len() * std::mem::size_of::<cad_net::Edit>();
+        for (i, p) in peers.iter_mut().enumerate() {
+            let mut order = wire.clone();
+            order.rotate_left(i);
+            // Deliver one edit twice, as a gossip transport would.
+            order.push(wire[0].clone());
+            p.receive_all(order);
+        }
+        let first = peers[0].digest();
+        let converged = peers.iter().all(|p| p.digest() == first);
+        let parts = peers[0].model().0.parts.len();
+        let ok = converged && parts == 5;
+        if !ok {
+            fail += 1;
+        }
+        println!(
+            "  collab    5 peers, {} edits in {bytes} bytes total -> {} parts, digests {}  {}",
+            wire.len(),
+            parts,
+            if converged { "agree" } else { "DIVERGED" },
+            if ok { "ok" } else { "FAIL" }
+        );
+
+        // And the soft locks, which are advisory by design.
+        let mut locks = cad_net::Locks::default();
+        locks.claim("shared_part", 1, 0).unwrap();
+        let blocked = locks.claim("shared_part", 2, 0).is_err();
+        let lapsed = locks.claim("shared_part", 2, cad_net::lock::LEASE + 1).is_ok();
+        let lock_ok = blocked && lapsed;
+        if !lock_ok {
+            fail += 1;
+        }
+        println!(
+            "  locks     held excludes others: {blocked}, lease lapses: {lapsed}  {}",
+            if lock_ok { "ok" } else { "FAIL" }
+        );
+    }
+
     println!(
         "selftest: {} ({:.1}s)",
         if fail == 0 { "PASS" } else { "FAIL" },

@@ -31,6 +31,7 @@ cad-nifty = { path = "crates/cad-nifty" }
 cad-liaison = { path = "crates/cad-liaison" }
 cad-tex = { path = "crates/cad-tex" }
 cad-pool = { path = "crates/cad-pool" }
+cad-net = { path = "crates/cad-net" }
 
 [profile.dev]
 opt-level = 2                 # skydribble's lesson: geometry at opt 0 is unusable

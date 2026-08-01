@@ -15,6 +15,7 @@ cad-forge.workspace = true
 cad-view.workspace = true
 cad-motion.workspace = true
 cad-liaison.workspace = true
+cad-net.workspace = true
 cad-pool.workspace = true
 cad-ref.workspace = true
 cad-tex.workspace = true

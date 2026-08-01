@@ -301,6 +301,12 @@ version = "0.1.0"
 [[package]]
 name = "cad-net"
 version = "0.1.0"
+dependencies = [
+ "cad-forge",
+ "cad-kernel",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "cad-nifty"
@@ -360,6 +366,7 @@ dependencies = [
  "cad-kernel",
  "cad-liaison",
  "cad-motion",
+ "cad-net",
  "cad-pool",
  "cad-ref",
  "cad-tex",

@@ -235,6 +235,27 @@ instead of assumptions. Nothing here is a bug report; these are known, chosen, o
   adapters of §10 — writing into a game's own layout, honouring the bsgames handoff — are not
   written.
 
+## Collaboration (`cad-net`, M6)
+
+- **Ops replicate; geometry never does.** An edit serialises to under 200 bytes and a test asserts
+  it. That is only sound because `Doc::apply` is deterministic, which the kernel's own tests pin —
+  if replay ever became order-dependent, convergence would break silently rather than loudly.
+- **The log is the truth and the document is derived.** Edits are Lamport-stamped and totally
+  ordered by (stamp, peer). Convergence is tested directly: ten peers, each hearing the same edits
+  in a different rotation, must produce identical digests.
+- **Locks are advisory and nothing enforces them.** A hard lock needs consensus, consensus needs a
+  quorum, and a quorum makes a two-person session on a flaky link stop working. Since the forge
+  tolerates conflicting ops per-op, the worst case of ignoring a lock is a warning, which is a
+  better failure than a stall. `advisable()` reports; it cannot refuse.
+- **`since(stamp)` is not a version vector.** Reconnect sends everything after a single stamp,
+  which over-sends when peers are at different points. Correct, and wasteful; a version vector is
+  the upgrade.
+- **No transport, and no snapcore integration.** This crate is sans-io by design and has never
+  touched a socket. `shared/snapcore`'s cluster API (`join`/`leave`/`members`, logical `now: u64`)
+  is what it is meant to sit on, and that wiring — announce, resolve, gossip — does not exist.
+  Nothing here has been tested under `snapcore::sim`.
+- **No UI.** Sessions run in tests and in `--selftest`; the app cannot join one.
+
 ## Not verified in-sandbox
 
 - **The app has never been run.** The build environment had one core, 3 GB RAM, no GPU and no
