@@ -6814,6 +6814,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                     let expanded_now = self.expanded_msgs.clone();
                     let step_open = self.step_open.clone();
                     let mut toggle_step: Option<(usize, usize)> = None;
+                    let mut swipe_variant: Option<(usize, i32)> = None;
                     let mut expand_msg: Option<usize> = None;
                     let mut collapse_msg: Option<usize> = None;
                     for (i, m) in self.msgs.iter_mut().enumerate() {
@@ -6825,6 +6826,26 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                         let a = theme::appear(m.born, 0.18);
                         if a < 1.0 { ui.ctx().request_repaint(); }
                         let streaming_here = cur == Some(i);
+                        // SWIPE BETWEEN REGENERATIONS. A horizontal drag on a message steps its
+                        // variants, the way a photo gallery does — which takes the arrow buttons out of
+                        // a bar that was already overlapping rather than adding to it. The axis lock and
+                        // the mid-stream refusal live in chatgesture; this only supplies the drag.
+                        if m.variants.len() > 1 && !streaming_here {
+                            let d = ui.input(|i| i.pointer.delta());
+                            if ui.rect_contains_pointer(ui.min_rect())
+                                && ui.input(|i| i.pointer.primary_down()) {
+                                let ax = crate::chatgesture::lock_axis(d.x, d.y);
+                                let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
+                                            else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 }
+                                            else { 0 };
+                                if let crate::chatgesture::Action::ShowVariant { delta, .. } =
+                                    crate::chatgesture::action(
+                                        crate::chatgesture::Target::Message(i), delta, ax,
+                                        streaming_here, m.variants.len(), m.cur) {
+                                    swipe_variant = Some((i, delta));
+                                }
+                            }
+                        }
                         theme::fade(ui, a, |ui| {
                             egui::Frame { fill, corner_radius: theme::r(10),
                                 inner_margin: egui::Margin::symmetric(theme::PAD_MD, theme::PAD_SM + 2),
