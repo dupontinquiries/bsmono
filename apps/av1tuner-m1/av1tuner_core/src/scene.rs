@@ -86,6 +86,12 @@ mod tests {
             duration_s: frames as f64 / fps,
             pixel_format: "yuv420p".into(),
             codec: "h264".into(),
+            // VideoInfo gained audio_streams when audio-encode mode landed and
+            // this helper was not updated, so av1tuner_core's tests stopped
+            // compiling while the library itself still built — which is why the
+            // breakage went unnoticed: nothing that ran was broken, only
+            // everything that would have checked it.
+            audio_streams: Vec::new(),
         }
     }
 
