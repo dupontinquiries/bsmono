@@ -7185,14 +7185,29 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                                 let ram = crate::memplan::system_ram_bytes();
                                 eprintln!("loader: MoE streaming will hold ~{:.1} GiB of expert weights in HOST RAM \
 (plus ~{:.1} GiB of this file in page cache while loading)", gib(host_store), gib(set_data_len));
-                                if ram > 0 && host_store + set_data_len > ram * 3 / 4 {
+                                // ON UNIFIED MEMORY THE GPU BUDGET IS ALSO HOST RAM. This check
+                                // counted the host expert store and the page cache and omitted the
+                                // RESIDENT allocation — which is a separate pool on a discrete GPU and
+                                // the same physical memory on an M-series machine.
+                                //
+                                // Measured failure: 64 GiB M2 Max, Qwen3-30B. host 15.2 + cache 17.3 =
+                                // 32.5 against a 48 GiB threshold, so the plan was approved — and then
+                                // ~15.0 GiB of resident experts landed in the SAME RAM and the process
+                                // was OOM-killed at layer 36 of 48. Being killed is far worse than a
+                                // refusal: seventeen seconds spent and no information returned.
+                                let uma_resident = if self.conservative_vma || cfg!(target_os = "macos")
+                                    { gpu_budget } else { 0 };
+                                let unified = uma_resident > 0;
+                                if ram > 0 && !crate::memplan::streaming_fits_host(
+                                    host_store, set_data_len, uma_resident, ram, unified) {
                                     return Err(format!(
-                                        "MoE expert streaming needs ~{:.1} GiB of host RAM for expert weights plus \
+                                        "MoE expert streaming needs ~{:.1} GiB of host RAM for expert weights, ~{:.1} GiB of \
+resident weights that share the SAME memory on this unified-memory machine, plus \
 ~{:.1} GiB of page cache for the file, against {:.1} GiB of system RAM — this would be OOM-killed partway \
 through the load. The engine requantizes every expert to its own q4 layout on load, which is the cost here. \
 Options: run a smaller checkpoint, use the llama.cpp backend (which reads the file's native Q4_K blocks \
 directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the resident-fit error instead.",
-                                        gib(host_store), gib(set_data_len), gib(ram)));
+                                        gib(host_store), gib(uma_resident), gib(set_data_len), gib(ram)));
                                 }
                                 auto_q4 = true;
                                 moe_stream_pin = Some(pin);
