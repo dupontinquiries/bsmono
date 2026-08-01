@@ -6887,7 +6887,7 @@ the '{arch}' prefix — proceeding as '{arch}' (a converter mislabel); report th
 a '{declared}'");
             }
         }
-        let acfg = crate::archcfg::for_arch(&arch);
+        let mut acfg = crate::archcfg::for_arch(&arch);
         // MLA is detected by TENSOR PRESENCE, not arch name. The glm4moe family ships in two forms: some
         // use Multi-head Latent Attention (attn_kv_a/kv_b down/up projections — not wired yet), but others
         // use ordinary GQA attention (attn_q/k/v, often with QK-norm + bias) plus shared-expert MoE, which
@@ -6975,6 +6975,16 @@ layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
                 }
             }
         };
+
+        // AND STORE IT. The sniff wrote a local `pfx` and left acfg.prefix pointing at the
+        // registry's value, so every later read through acfg.prefix silently returned None on a
+        // file whose prefix differs — rope base, norm epsilon, expert_weights_scale, all of them.
+        // Each defaulted quietly, and a model with the wrong rope base produces exactly the
+        // near-random output reported for Qwen3.5 ("doctrine%," for "hi there").
+        //
+        // The loader NOTICED the mismatch and printed it. Noticing and not acting is worse than
+        // not noticing: the log says the file's prefix is being used, and it was not.
+        acfg.prefix = pfx;
         // Qwen3/3.5: real blk.N.attn_{q,k}_norm.weight tensors. Llama4: attn_qk_norm is set in the
         // registry but the GGUF carries NO norm-weight tensors — its QK-Norm is WEIGHTLESS (an
         // L2/RMS norm ≡ all-ones weights), applied on RoPE layers only; handled per-layer below.

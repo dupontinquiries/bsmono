@@ -487,6 +487,24 @@ mod tests {
     }
 
     #[test]
+    fn the_registry_prefix_can_DISAGREE_with_the_file_and_the_file_wins() {
+        // Qwen3.5 ships files whose keys are `qwen35.*` while the registry says `qwen3_5`. The loader
+        // sniffed the real prefix, PRINTED that it was using it, and then never stored it — so every
+        // later read through acfg.prefix returned None on that file. Rope base, norm epsilon,
+        // expert_weights_scale: each defaulted silently, and a wrong rope base produces exactly the
+        // near-random output reported ("doctrine%," in answer to "hi there").
+        //
+        // NOTICING AND NOT ACTING IS WORSE THAN NOT NOTICING: the log claimed the file's prefix was in
+        // use, and it was not, so the one message that could have pointed here said the opposite.
+        let a = for_arch("qwen35");
+        let b = for_arch("qwen3_5");
+        assert_eq!(a.arch, b.arch, "both spellings are the same architecture");
+        // The registry's prefix is one spelling; a file using the other must override it, which is now
+        // done at the sniff site rather than left in a local.
+        assert_eq!(a.prefix, "qwen3_5", "registry default");
+    }
+
+    #[test]
     fn checkpoint_metadata_OVERRIDES_the_arch_default() {
         // llama.cpp reads expert_weights_norm from the checkpoint rather than deriving it from the
         // architecture. A model that sets it false without being Llama-4 would otherwise be normalized
