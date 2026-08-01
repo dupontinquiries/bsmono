@@ -975,11 +975,12 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                             self.model.n_kv_heads, self.model.head_dim, experts);
                         (params as f64 * 0.5625) as u64      // q4 + per-32 scales
                     },
-                    // STILL ZERO, and the roofline stays unreachable until --gate-perf's measured
-                    // bandwidth is persisted where the runtime can read it. A guess here would produce
-                    // a confident efficiency figure from no measurement — the shape of the 24 GiB
-                    // constant. perfverdict returns efficiency 0 and says so.
-                    gib_per_s: 0.0,
+                    // READ FROM THE MEASUREMENT, and None stays None. An adapter that has never run
+                    // --gate-perf yields 0 and perfverdict reports efficiency 0 and says the roofline
+                    // cannot be evaluated — rather than substituting a default, which would produce a
+                    // confident efficiency figure from no measurement.
+                    gib_per_s: gpu_kernels::store::bandwidth_get(&self.gpu.adapter_name)
+                        .unwrap_or(0.0) as f64,
                 };
                 let expected_batch_ms = if ds > 0 { total_ms / ds as f64 } else { 0.0 };
                 let v = gpu_kernels::perfverdict::verdict(&sample, expected_batch_ms);
