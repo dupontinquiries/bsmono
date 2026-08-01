@@ -94,6 +94,57 @@ fn nav_here(menu: u8) -> usize {
     }
 }
 
+/// Bounding radius of a shape, for culling.
+pub fn shape_bound(sdf: &world::Sdf) -> f32 {
+    match *sdf {
+        world::Sdf::None => 0.0,
+        world::Sdf::Sphere { r } => r,
+        world::Sdf::Torus { big, tube } => big + tube,
+        world::Sdf::Capsule { r, half } => r + half,
+        world::Sdf::Hex { r, h } => (r * r + h * h).sqrt(),
+        world::Sdf::RBox { half, .. } => half.length(),
+        world::Sdf::Shell { r, half, thick } => ((r + thick) * (r + thick) + half * half).sqrt(),
+        world::Sdf::TubeTorus { big, tube, thick } => big + tube + thick,
+        world::Sdf::RingDeck { big, wide, .. } => big + wide,
+    }
+}
+
+/// The six frustum planes of a view-projection, as (normal, d) in world
+/// space. A plane is stored so that `dot(n, p) + d > -r` means "inside".
+pub fn frustum_planes(vp: &Mat4) -> [[f32; 4]; 6] {
+    let m = vp.to_cols_array_2d(); // column-major: m[col][row]
+    let row = |r: usize| [m[0][r], m[1][r], m[2][r], m[3][r]];
+    let (rx, ry, rz, rw) = (row(0), row(1), row(2), row(3));
+    let mk = |a: [f32; 4], b: [f32; 4], sign: f32| {
+        let p = [
+            b[0] + sign * a[0],
+            b[1] + sign * a[1],
+            b[2] + sign * a[2],
+            b[3] + sign * a[3],
+        ];
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-6);
+        [p[0] / len, p[1] / len, p[2] / len, p[3] / len]
+    };
+    [
+        mk(rx, rw, 1.0),  // left
+        mk(rx, rw, -1.0), // right
+        mk(ry, rw, 1.0),  // bottom
+        mk(ry, rw, -1.0), // top
+        mk(rz, rw, 1.0),  // near
+        mk(rz, rw, -1.0), // far
+    ]
+}
+
+/// Is a bounding sphere at all visible in this frustum?
+pub fn sphere_visible(planes: &[[f32; 4]; 6], c: Vec3, r: f32) -> bool {
+    for p in planes.iter() {
+        if p[0] * c.x + p[1] * c.y + p[2] * c.z + p[3] < -r {
+            return false;
+        }
+    }
+    true
+}
+
 fn menu_title(menu: u8) -> &'static str {
     match menu {
         7 => "MOTION / GYRO",
@@ -721,7 +772,9 @@ fn main() {
         gpu.add_mesh(&meshgen::torus_tube(64, 20)), // M_TORUS_TUBE: seamless loop
         gpu.add_mesh(&meshgen::ring_deck(72)), // M_RING_DECK: drivable ring
         gpu.add_mesh(&meshgen::hex_prism()),   // M_HEX: dropshot tiles
-    ];
+            gpu.add_mesh(&meshgen::sphere(10, 16)),  // M_SPHERE_LO
+        gpu.add_mesh(&meshgen::capsule(world::CAP_TALL_HH, 5, 10)), // M_CAP_TALL_LO
+];
     assert_eq!(ids[world::M_TERRAIN], world::M_TERRAIN);
     bake_heightmap(&gpu, seed, style0);
 
@@ -2402,11 +2455,14 @@ impl Game {
         let rc = (rc.0 - rc.1 * Vec3::Y * (self.car.susp * 0.045), rc.1);
         let (rts, rt_ids) = self.build_rt_shapes(rc, rb);
         self.gpu.set_rt_shapes(&rts);
-        let mut objs = self.build_scene(&rt_ids, rc, rb);
-        self.fx.draw(&mut objs);
-
         let aspect = self.gpu.aspect();
         let (vp, ivp) = self.cam.view_proj(&self.cfg.cam, aspect);
+        let planes = frustum_planes(&vp);
+        let mut objs = self.build_scene(&rt_ids, rc, rb, &planes);
+        self.fx.draw(&mut objs);
+
+        // (view-projection and aspect computed above, before the scene build)
+        
         self.last_ivp = ivp;
 
         let mut ui: Vec<UiVert> = Vec::new();
@@ -2998,7 +3054,7 @@ impl Game {
         (v, RtIds { ball: ball_id, car: car_id, decor0, remote0, static_n })
     }
 
-    fn build_scene(&self, ids: &RtIds, rc: (Vec3, Quat), rb: (Vec3, Quat)) -> Vec<ObjDraw> {
+    fn build_scene(&self, ids: &RtIds, rc: (Vec3, Quat), rb: (Vec3, Quat), planes: &[[f32; 4]; 6]) -> Vec<ObjDraw> {
         let mut objs: Vec<ObjDraw> = Vec::with_capacity(self.world.shapes.len() + 1024);
 
         let push = |objs: &mut Vec<ObjDraw>,
@@ -3032,8 +3088,13 @@ impl Game {
                 continue; // CSG cutters carve the SDF; they are not drawn
             }
             let em = (s.emissive + s.flash * 1.1).min(1.0);
-            // small far shapes don't earn their draw call (monkey run is
-            // 775 instances otherwise, hoops and vines included)
+            // OFF-SCREEN SHAPES COST NOTHING TO SKIP. The renderer had a
+            // distance cull but never a frustum one, so on a big map most of
+            // what it submitted was behind the camera.
+            let bound = shape_bound(&s.sdf).max(2.0);
+            if !sphere_visible(planes, s.pos, bound + 6.0) {
+                continue;
+            }
             let dd2 = s.pos.distance_squared(rc.0);
             if dd2 > 640.0 * 640.0 {
                 continue;
@@ -3055,10 +3116,17 @@ impl Game {
                 }
             }
             // tube LOD: far shells swap to the 10-segment mesh (same SDF)
-            let far = s.pos.distance_squared(rc.0) > 140.0 * 140.0;
-            let mesh = match (s.mesh, far) {
-                (world::M_SHELL, true) => world::M_SHELL_LO,
-                (world::M_SHELL_OPEN, true) => world::M_SHELL_OPEN_LO,
+            // LOD: distant primitives swap to low-poly meshes. Spheres and
+            // capsules are the most-used shapes in the game (foliage, rocks,
+            // pillars, orbs) and the full-fat sphere is ~750 triangles.
+            let d2 = s.pos.distance_squared(rc.0);
+            let far = d2 > 140.0 * 140.0;
+            let vfar = d2 > 90.0 * 90.0;
+            let mesh = match (s.mesh, far, vfar) {
+                (world::M_SHELL, true, _) => world::M_SHELL_LO,
+                (world::M_SHELL_OPEN, true, _) => world::M_SHELL_OPEN_LO,
+                (world::M_SPHERE, _, true) => world::M_SPHERE_LO,
+                (world::M_CAP_TALL, _, true) => world::M_CAP_TALL_LO,
                 _ => s.mesh,
             };
             // params.x flags ROUGH GLASS: tubes and junction rooms get a

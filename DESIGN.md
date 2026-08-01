@@ -1842,6 +1842,36 @@ CHAMBER went 201 -> 373 shapes. The board still plays Morphy move for
 move, still captures, still winds up with the score (0.28 -> 0.53 moves a
 second), and every piece is still a moving platform that carries you.
 
+## v1.57.0 — half the frame was never on screen
+
+FRUSTUM CULLING. The renderer distance-culled but never checked whether a
+shape was in FRONT of the camera at all, so on a big map most of what it
+submitted every frame was behind the player. Six planes are pulled from
+the view-projection each frame and every shape's bounding sphere is tested
+before it becomes a draw. New `--sim render` measures it across seven maps
+from eight compass headings:
+
+    ARENA CLASSIC   96 shapes -> 38 drawn   60% saved
+    PERPLEXUS      486 shapes -> 149 drawn  69% saved
+    MONKEY RUN     593 shapes -> 176 drawn  70% saved
+    DROPSHOT       483 shapes -> 201 drawn  58% saved
+    CHAMBER        259 shapes -> 93 drawn   64% saved
+
+This is safe by construction: shadows and reflections are ray-marched from
+a SEPARATE shape list, so culling the raster instances cannot remove a
+shadow caster or something visible in a mirror — the usual reason engines
+have to be careful here.
+
+FAR-FIELD LOD for the two most-used primitives. Spheres and capsules are
+everywhere (foliage, rocks, pillars, orbs, portal faces) and the full
+sphere is 1496 triangles. Past 90 m they swap to low-poly versions:
+
+    sphere 1496 -> 320 triangles   capsule 720 -> 240   tube 320 -> 144
+
+Both helpers (`frustum_planes`, `sphere_visible`, `shape_bound`) are free
+functions so the sim can measure exactly what the renderer does, rather
+than a model of it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

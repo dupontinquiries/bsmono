@@ -421,3 +421,5 @@ KUIPER runs live sky events: a world collapses into a black hole every five minu
 `--sim portal` verifies the portal transform: speed conservation, exit alignment, the fling, and no ping-pong.
 
 `--sim ballspin` checks that spin does what it should: curve, topspin, backspin, slide-to-roll.
+
+`--sim render` reports how much of each map survives culling, and the LOD triangle budget.

@@ -840,6 +840,82 @@ pub fn run(args: &[String]) {
             if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
         return;
     }
+    if name == "render" {
+        // What does the renderer actually submit? Instance count is the
+        // honest proxy for GPU cost here, so measure it per map, from a
+        // player's eye, before and after culling.
+        use crate::{frustum_planes, shape_bound, sphere_visible};
+        println!("{:<13} {:>7} {:>8} {:>8} {:>8} {:>7}", "map", "shapes", "in view", "+dist", "drawn", "saved");
+        let mut worst = 0.0f32;
+        for si in [20usize, 21, 24, 26, 30, 33, 35] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
+            let mut vis_sum = 0.0f32;
+            let mut drawn_sum = 0.0f32;
+            let mut total = 0.0f32;
+            let turns = 8;
+            for t in 0..turns {
+                // a normal chase view sweeping the compass
+                let a = t as f32 / turns as f32 * std::f32::consts::TAU;
+                let look = eye + Vec3::new(a.sin() * 30.0, -3.0, a.cos() * 30.0);
+                let view = glam::Mat4::look_at_rh(eye, look, Vec3::Y);
+                let proj = glam::Mat4::perspective_rh(86f32.to_radians(), 16.0 / 9.0, 0.1, 900.0);
+                let planes = frustum_planes(&(proj * view));
+                let (mut vis, mut drawn, mut n) = (0u32, 0u32, 0u32);
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) && sh.mesh == usize::MAX {
+                        continue;
+                    }
+                    n += 1;
+                    let b = shape_bound(&sh.sdf).max(2.0);
+                    if !sphere_visible(&planes, sh.pos, b + 6.0) {
+                        continue;
+                    }
+                    vis += 1;
+                    // the distance rules that were already there
+                    let dd2 = sh.pos.distance_squared(eye);
+                    if dd2 > 640.0 * 640.0 {
+                        continue;
+                    }
+                    if dd2 > 250.0 * 250.0 && b < 5.0 {
+                        continue;
+                    }
+                    drawn += 1;
+                }
+                total = n as f32;
+                vis_sum += vis as f32;
+                drawn_sum += drawn as f32;
+            }
+            let vis_avg = vis_sum / turns as f32;
+            let drawn_avg = drawn_sum / turns as f32;
+            let saved = 1.0 - drawn_avg / total.max(1.0);
+            worst = worst.max(drawn_avg / total.max(1.0));
+            println!(
+                "{:<13} {:>7.0} {:>8.0} {:>8} {:>8.0} {:>6.0}%",
+                crate::world::style(si).name,
+                total,
+                vis_avg,
+                "",
+                drawn_avg,
+                saved * 100.0
+            );
+        }
+        // ---- triangle budget: what the LOD swap is worth ----
+        {
+            let hi_sphere = crate::meshgen::sphere(22, 34).idx.len() / 3;
+            let lo_sphere = crate::meshgen::sphere(10, 16).idx.len() / 3;
+            let hi_cap = crate::meshgen::capsule(4.0, 8, 20).idx.len() / 3;
+            let lo_cap = crate::meshgen::capsule(4.0, 5, 10).idx.len() / 3;
+            let hi_tube = crate::meshgen::tube_open(40).idx.len() / 3;
+            let lo_tube = crate::meshgen::tube_open(18).idx.len() / 3;
+            println!(
+                "LOD triangles: sphere {hi_sphere}->{lo_sphere}, capsule {hi_cap}->{lo_cap}, tube {hi_tube}->{lo_tube}"
+            );
+        }
+        println!("worst case still draws {:.0}% of the map", worst * 100.0);
+        println!("{}", if worst < 0.75 { "RENDER CULL: PASS" } else { "RENDER CULL: FAIL" });
+        return;
+    }
     if name == "ballspin" {
         // Does spin actually DO anything? In RL the ball's angular velocity
         // is its own state: topspin drives a bounce forward, backspin kills
