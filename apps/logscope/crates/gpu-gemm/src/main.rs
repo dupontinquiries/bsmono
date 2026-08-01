@@ -3779,14 +3779,13 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             ck(&format!("chunked conversion is exact across boundaries ({diff} words differ)"), diff == 0);
         }
 
-        println!("gate-q4k: {}", if ok {
-            // CLAIMS ONLY WHAT IT TESTS. This said "the loader can stop requantizing", and I acted on
-            // that for several commits. It exercises dequant_q4k — exact Q4_K -> f32 — which is NOT a
-            // native matvec over Q4_K blocks. The loader cannot stop requantizing on this evidence,
-            // and a gate that overstates its own scope is worse than a missing gate: it is a green
-            // light nobody re-derives.
-            "Q4_K dequantizes exactly \u{2713} — this is the CONVERSION, not a native Q4_K matvec"
-        } else { "FAIL \u{2717}" });
+        // CLAIMS ONLY WHAT IT TESTS. This said "the loader can stop requantizing", and I acted on
+        // that for several commits — it exercises dequant_q4k, which is exact Q4_K -> f32, NOT a
+        // native matvec over Q4_K blocks. And the verdict now routes through gateclass, so a pass on
+        // a software rasterizer cannot print the tick a reader skims for.
+        let line = gpu_kernels::gateclass::verdict_line("gate-q4k", &gpu.adapter_name,
+            "Q4_K dequantizes exactly — the CONVERSION, not a native Q4_K matvec");
+        println!("{}", if ok { line.as_str() } else { "gate-q4k: FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-moe-raw") {
