@@ -288,6 +288,23 @@ out vec4 frag;
 vec3 tri(sampler2DArray t, float layer, vec3 wp, vec3 bw) {
     return texture(t, vec3(wp.yz, layer)).rgb * bw.x + texture(t, vec3(wp.zx, layer)).rgb * bw.y + texture(t, vec3(wp.xy, layer)).rgb * bw.z;
 }
+// TRIPLANAR surface coordinates. Projecting world XZ onto a face is correct for a floor and wrong
+// for everything else: on a vertical face the pattern is constant along Y, so it stretches and
+// SLIDES ACROSS THE FACE as the camera moves. That is the "textures slide over faces" symptom, and
+// it is not a texture bug — there are no textures, only patterns sampled in the wrong space.
+//
+// The fix is to choose the projection plane per-fragment from the dominant axis of the normal, and
+// blend at the seams so a 45-degree face does not pop between planes. The blend exponent controls
+// how sharp the transition is: too low and every face looks smeared, too high and the seam is a
+// visible line.
+vec2 tri_uv(vec3 wp, vec3 n) {
+    vec3 a = abs(normalize(n));
+    a = pow(a, vec3(4.0));                       // sharpen toward the dominant axis
+    a /= max(a.x + a.y + a.z, 1e-5);
+    // Each plane drops the axis it faces along, so the coordinate always lies IN the surface.
+    return a.x * wp.zy + a.y * wp.xz + a.z * wp.xy;
+}
+
 // value noise (smooth, cheap) — used to break the caustic network into discontinuous, irregular bits.
 float vhash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float vnoise(vec2 p) {
@@ -349,7 +366,11 @@ void main() {
     // highlights shimmer like light through moving water. The dry AIR interior (stone, layer 2) is left crisp.
     bool is_water = (v_mat > 2.5 && v_mat < 3.5);
     if (is_water) {
-        vec2 w = v_world.xz * 0.7 + u_time * 0.18;
+        // Triplanar, not XZ. A surface wobble must follow the surface: projected on XZ it is
+        // constant along Y, so on the dome and the outer wall the highlight slid across the face
+        // instead of moving with it. Caustics and the rain-stain below keep XZ deliberately —
+        // both fall from above, so a top-down projection is what they physically are.
+        vec2 w = tri_uv(v_world, N) * 0.7 + u_time * 0.18;
         vec3 wob = vec3(sin(w.x * 1.7) + cos(w.y * 1.3), 0.0, cos(w.x * 1.1) + sin(w.y * 1.9));
         N = normalize(N + wob * 0.16);
     }
