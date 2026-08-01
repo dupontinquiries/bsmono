@@ -7658,7 +7658,9 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     } else { None };
                     drop(gsrc); drop(usrc);
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
-                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
+                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0,
+                            g.get_f32(&format!("{}.expert_weights_scale", acfg.prefix)),
+                            g.get_u32(&format!("{}.expert_weights_norm", acfg.prefix)).map(|v| v != 0)) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
                 q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
