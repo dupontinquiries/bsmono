@@ -6930,6 +6930,21 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                         }
                                         return;
                                     }
+                                    // BOUND THE MEASURE. Nothing capped prose width, so on a wide window a line ran past 200
+                                    // characters against a comfortable maximum of 80. The failure is not illegibility — it is
+                                    // the RETURN SWEEP: the eye travels back across the whole width and lands on the wrong line
+                                    // often enough to be exhausting over an hour. Nothing looks broken at any width, so it never
+                                    // presents as a bug; it presents as the reader being tired.
+                                    //
+                                    // Code is deliberately NOT bounded — a wrapped line of code loses its indentation as
+                                    // structure, so it takes the full width and scrolls instead.
+                                    // Measured from a laid-out glyph rather than assumed: the same point
+                                // size gives very different measures in a condensed face and a wide one.
+                                let fid = egui::TextStyle::Body.resolve(ui.style());
+                                let char_px = ui.painter()
+                                    .layout_no_wrap("0".into(), fid, theme::INK()).size().x;
+                                    let prose_w = crate::readability::prose_width(ui.available_width(), char_px);
+                                    ui.set_max_width(prose_w.max(120.0));
                                     let segs = segment_message(m.text());
                                     let last = segs.len().saturating_sub(1);
                                     let think_open = m.think_open;
