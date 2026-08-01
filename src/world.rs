@@ -102,6 +102,9 @@ pub enum Anim {
     Orbit { shape: usize, center: Vec3, axis: Vec3, r: f32, rate: f32, phase: f32, rot: Quat, scale: Vec3 },
     /// shuttles along dir (a moving stepping-stone)
     Slide { shape: usize, base: Vec3, dir: Vec3, amp: f32, rate: f32, phase: f32, rot: Quat, scale: Vec3 },
+    /// swings from a pivot like something hung on a rope — a true pendulum,
+    /// so a log bridge tilts as it swings and you have to time the crossing
+    Swing { shape: usize, pivot: Vec3, axis: Vec3, len: f32, amp: f32, rate: f32, phase: f32, rot: Quat, scale: Vec3 },
 }
 
 /// Field zones, pinball-machine style.
@@ -163,6 +166,21 @@ pub struct Body {
     pub sq_dir: Vec3,
     /// phase of the jelly wobble, so it springs back past round and settles
     pub sq_t: f32,
+    /// drawn size and attitude: a leaf is a wide flat blade, not a ball
+    pub scale: Vec3,
+    pub rot: Quat,
+    pub spin: Vec3,
+    /// air drag — a leaf flutters and settles, a rock coasts
+    pub drag: f32,
+}
+
+/// An arcade ball-hitter: a paddle that fires when the ball comes near.
+pub struct Hitter {
+    pub pos: Vec3,
+    pub r: f32,
+    pub power: f32,
+    pub timer: f32,
+    pub shape: usize,
 }
 
 pub struct GravNode {
@@ -228,6 +246,7 @@ pub struct World {
     /// active floods: (route, age, duration)
     pub floods: Vec<(usize, f32, f32)>,
     pub tiles: Vec<Tile>,
+    pub hitters: Vec<Hitter>,
     pub bodies: Vec<Body>,
     /// KUIPER: which grav node is collapsing, and how long it has left
     pub bh: Option<(usize, f32)>,
@@ -466,6 +485,7 @@ impl World {
         let mut route_shapes: Vec<Vec<u32>> = Vec::new();
         let mut floodable: Vec<usize> = Vec::new();
         let mut tiles: Vec<Tile> = Vec::new();
+        let mut hitters: Vec<Hitter> = Vec::new();
         let mut bodies: Vec<Body> = Vec::new();
         let mut drop_pit: Option<f32> = None;
         let mut spawn_hint: Option<Vec3> = None;
@@ -1650,6 +1670,85 @@ impl World {
                             push(&mut shapes, M_SPHERE, cp, Quat::IDENTITY, Vec3::splat(cr), Sdf::None, mix4([0.14, 0.30, 0.13, 1.0], acc, 0.06 * c as f32), 0.02, 0.15);
                         }
                     }
+                    // BROKEN LOG BRIDGES: fallen trunks hung in the vines,
+                    // swinging on their ropes. Platform riding makes them
+                    // real bridges — drive across while they sway, or wait
+                    // for the swing to bring one to you.
+                    for k in 0..giant_tops.len() {
+                        let (a0, _) = giant_tops[k];
+                        let (b0, _) = giant_tops[(k + 1) % giant_tops.len()];
+                        let span = a0.distance(b0);
+                        let logs = 3;
+                        for j in 0..logs {
+                            let f = (j as f32 + 1.0) / (logs as f32 + 1.0);
+                            let mid = a0.lerp(b0, f);
+                            let along = (b0 - a0).normalize_or(Vec3::X);
+                            let rope = 12.0 + (j % 2) as f32 * 6.0;
+                            let pivot = Vec3::new(mid.x, mid.y - 6.0, mid.z);
+                            let half = (span / logs as f32) * 0.30;
+                            let lr = 2.4;
+                            // the log lies ACROSS the gap; the swing axis is
+                            // the span direction, so it sways sideways
+                            let lie = Quat::from_rotation_arc(Vec3::Y, along);
+                            let li = push(&mut shapes, M_CAP_TALL, pivot - Vec3::Y * rope, lie, Vec3::new(lr, half / CAP_TALL_HH.max(1.0), lr), Sdf::Capsule { r: lr, half }, mix4(PLINTH, [0.30, 0.21, 0.13, 1.0], 0.7), 0.0, 0.3);
+                            shapes[li].blend = true;
+                            anims.push(Anim::Swing {
+                                shape: li,
+                                pivot,
+                                axis: along,
+                                len: rope,
+                                amp: 0.28 + (j % 3) as f32 * 0.09,
+                                rate: 0.55 + (j % 3) as f32 * 0.12,
+                                phase: k as f32 * 1.3 + j as f32 * 0.8,
+                                rot: lie,
+                                scale: Vec3::new(lr, half / CAP_TALL_HH.max(1.0), lr),
+                            });
+                            // the rope it hangs from, so the swing reads
+                            push(&mut shapes, M_CAP_TALL, pivot - Vec3::Y * (rope * 0.5), Quat::IDENTITY, Vec3::new(0.28, rope * 0.5 / CAP_TALL_HH.max(1.0), 0.28), Sdf::None, mix4([0.20, 0.32, 0.16, 1.0], acc, 0.15), 0.05, 0.3);
+                        }
+                    }
+
+                    // BIG LEAVES: broad blades adrift in the canopy air —
+                    // light enough that a car shoves them aside, heavy enough
+                    // to knock the ball off line
+                    for k in 0..10usize {
+                        let a = k as f32 * 0.9 + 0.3;
+                        let rr = rng.range(60.0, 200.0) * ws;
+                        let lp = Vec3::new(a.cos() * rr, rng.range(24.0, 90.0), a.sin() * rr);
+                        let lr = rng.range(3.2, 6.0);
+                        let col = mix4([0.20, 0.44, 0.17, 1.0], acc, rng.range(0.0, 0.25));
+                        let sc = Vec3::new(lr, lr * 0.10, lr * 1.5);
+                        let li = push(&mut shapes, M_BOX, lp, Quat::IDENTITY, sc, Sdf::None, col, 0.03, 0.3);
+                        bodies.push(Body {
+                            shape: li,
+                            pos: lp,
+                            vel: Vec3::new(a.sin(), 0.0, -a.cos()) * rng.range(0.5, 1.8),
+                            r: lr * 0.62,
+                            mass: 0.8,
+                            bouncy: false,
+                            squash: 0.0,
+                            sq_dir: Vec3::Y,
+                            sq_t: 0.0,
+                            scale: sc,
+                            rot: Quat::from_rotation_z(rng.range(-0.5, 0.5)),
+                            spin: Vec3::new(rng.range(-0.3, 0.3), rng.range(-0.6, 0.6), rng.range(-0.3, 0.3)),
+                            drag: 0.9, // flutters and settles instead of coasting
+                        });
+                    }
+
+                    // ARCADE POWER HITTERS: totem paddles that whack the ball
+                    // skyward on contact, then recharge
+                    for k in 0..5usize {
+                        let a = k as f32 * 1.257 + 0.4;
+                        let rr = rng.range(50.0, 150.0) * ws;
+                        let (x, z) = (a.cos() * rr, a.sin() * rr);
+                        let g = th(x, z);
+                        let hp = Vec3::new(x, g + 6.0, z);
+                        push(&mut shapes, M_CAP_TALL, Vec3::new(x, g + 3.0, z), Quat::IDENTITY, Vec3::new(1.1, 3.0 / CAP_TALL_HH.max(1.0), 1.1), Sdf::Capsule { r: 1.1, half: 3.0 }, mix4(PLINTH, acc, 0.4), 0.1, 0.4);
+                        let hi = push(&mut shapes, M_TORUS_FAT, hp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(4.2), Sdf::Torus { big: 4.2, tube: 0.75 }, mix4(acc, [1.0, 0.85, 0.3, 1.0], 0.5), 0.85, 0.5);
+                        hitters.push(Hitter { pos: hp, r: 5.4, power: 46.0, timer: 0.0, shape: hi });
+                    }
+
                     // GIANT VINES: thick ropes slung between the giants at
                     // driving height — solid, so you smack into them
                     for k in 0..giant_tops.len() {
@@ -2120,6 +2219,10 @@ impl World {
                     let col = mix4(mix4(rock, *rng.pick(&pal), 0.45), [1.0; 4], 0.12);
                     let i = push(&mut shapes, M_SPHERE, pos, Quat::IDENTITY, Vec3::splat(pr), Sdf::None, col, 0.05, 0.35);
                     bodies.push(Body {
+                        scale: Vec3::splat(pr),
+                        rot: Quat::IDENTITY,
+                        spin: Vec3::ZERO,
+                        drag: 0.0,
                         shape: i,
                         pos,
                         vel: Vec3::new(a.sin() * rng.range(3.0, 7.0), 0.0, -a.cos() * rng.range(3.0, 7.0)),
@@ -2159,7 +2262,7 @@ impl World {
                         a.sin() * rng.range(30.0, 120.0),
                     );
                     let i = push(&mut shapes, M_SPHERE, pos, Quat::IDENTITY, Vec3::splat(r), Sdf::None, mix4(rock, [1.0, 0.9, 0.75, 1.0], 0.15), 0.03, 0.35);
-                    bodies.push(Body { shape: i, pos, vel: Vec3::new(a.sin(), 0.0, -a.cos()) * rng.range(0.4, 1.6), r, mass, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0 });
+                    bodies.push(Body { shape: i, pos, vel: Vec3::new(a.sin(), 0.0, -a.cos()) * rng.range(0.4, 1.6), r, mass, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0, scale: Vec3::splat(r), rot: Quat::IDENTITY, spin: Vec3::ZERO, drag: 0.02 });
                     if r > 8.0 {
                         // a roaming moon carries its own well (follow syncs it)
                         grav.push(GravNode { pos, down: Vec3::NEG_Y, r: r * 2.6, tube: false, inward: true, g: 1.1, surf: true, follow: Some(i) });
@@ -2631,7 +2734,8 @@ impl World {
                 Anim::Spin { shape, .. }
                 | Anim::Door { shape, .. }
                 | Anim::Orbit { shape, .. }
-                | Anim::Slide { shape, .. } => shape,
+                | Anim::Slide { shape, .. }
+                | Anim::Swing { shape, .. } => shape,
             };
             if !dyn_shapes.contains(&(si as u16)) {
                 dyn_shapes.push(si as u16);
@@ -2680,7 +2784,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
+        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.
@@ -2698,7 +2802,8 @@ impl World {
                 Anim::Spin { shape, .. }
                 | Anim::Door { shape, .. }
                 | Anim::Orbit { shape, .. }
-                | Anim::Slide { shape, .. } => shape,
+                | Anim::Slide { shape, .. }
+                | Anim::Swing { shape, .. } => shape,
             };
             let sh = &self.shapes[si];
             if sh.vel.length_squared() < 1e-6 && sh.omega.length_squared() < 1e-6 {
@@ -2719,7 +2824,8 @@ impl World {
                 Anim::Spin { shape, .. }
                 | Anim::Door { shape, .. }
                 | Anim::Orbit { shape, .. }
-                | Anim::Slide { shape, .. } => shape,
+                | Anim::Slide { shape, .. }
+                | Anim::Swing { shape, .. } => shape,
             };
             prev_pos.insert(si, self.shapes[si].pos);
         }
@@ -2751,6 +2857,17 @@ impl World {
                     sh.inv_rot = spin.inverse();
                     sh.mat = glam::Mat4::from_scale_rotation_translation(scale, spin, p);
                 }
+                Anim::Swing { shape, pivot, axis, len, amp, rate, phase, rot, scale } => {
+                    let ax = axis.normalize_or(Vec3::Z);
+                    let ang = amp * (t * rate + phase).sin();
+                    let q = Quat::from_axis_angle(ax, ang);
+                    let p = pivot + q * (Vec3::NEG_Y * len);
+                    let orient = q * rot;
+                    let sh = &mut self.shapes[shape];
+                    sh.pos = p;
+                    sh.inv_rot = orient.inverse();
+                    sh.mat = glam::Mat4::from_scale_rotation_translation(scale, orient, p);
+                }
                 Anim::Slide { shape, base, dir, amp, rate, phase, rot, scale } => {
                     let p = base + dir * ((t * rate + phase).sin() * amp);
                     let sh = &mut self.shapes[shape];
@@ -2766,6 +2883,10 @@ impl World {
                 Anim::Spin { shape, axis, rate, .. } => (shape, axis.normalize_or(Vec3::Y) * rate),
                 Anim::Orbit { shape, axis, rate, .. } => (shape, axis.normalize_or(Vec3::Y) * rate),
                 Anim::Door { shape, .. } | Anim::Slide { shape, .. } => (shape, Vec3::ZERO),
+                Anim::Swing { shape, axis, amp, rate, phase, .. } => (
+                    shape,
+                    axis.normalize_or(Vec3::Z) * (amp * rate * (self.time * rate + phase).cos()),
+                ),
             };
             let prev = prev_pos[&si];
             let sh = &mut self.shapes[si];
@@ -2863,7 +2984,7 @@ impl World {
                     cut: false,
                     blend: false,
                 });
-                self.bodies.push(Body { shape: si, pos, vel: Vec3::new(0.0, -46.0, 0.0), r, mass: r * r * 1.4, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0 });
+                self.bodies.push(Body { shape: si, pos, vel: Vec3::new(0.0, -46.0, 0.0), r, mass: r * r * 1.4, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0, scale: Vec3::splat(r), rot: Quat::IDENTITY, spin: Vec3::ZERO, drag: 0.02 });
                 self.grav.push(GravNode { pos, down: Vec3::NEG_Y, r: r * 2.6, tube: false, inward: true, g: 1.2, surf: true, follow: Some(si) });
                 self.sky_news = Some(2);
             }
@@ -3019,6 +3140,31 @@ impl World {
         self.kuiper = true;
         self.drop_cd = 0.0;
         self.update(0.001);
+    }
+
+    /// Arcade bumpers: if the ball is inside a charged hitter, fire it away
+    /// hard and start its cooldown. Returns the launch velocity.
+    pub fn bump_ball(&mut self, ball_pos: Vec3, dt: f32) -> Option<Vec3> {
+        let mut out = None;
+        for i in 0..self.hitters.len() {
+            let (fire, power, shape) = {
+                let h = &mut self.hitters[i];
+                h.timer = (h.timer - dt).max(0.0);
+                let fire = out.is_none() && h.timer <= 0.0 && h.pos.distance(ball_pos) < h.r;
+                if fire {
+                    h.timer = 1.1;
+                }
+                (fire, h.power, h.shape)
+            };
+            if !fire {
+                continue;
+            }
+            let dir = (ball_pos - self.hitters[i].pos).normalize_or(Vec3::Y);
+            let launch = (Vec3::new(dir.x, 0.0, dir.z).normalize_or(Vec3::X) * 0.75 + Vec3::Y * 0.66).normalize();
+            self.shapes[shape].flash = 1.0;
+            out = Some(launch * power);
+        }
+        out
     }
 
     /// A ball strike at `p` with impact `power`: damage/open any tile there.

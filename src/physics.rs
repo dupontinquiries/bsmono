@@ -245,6 +245,11 @@ pub fn step(
 
     step_car(car, ball, world, c, cfg, dt, ev);
     step_ball(ball, world, cfg, dt, ev);
+    // arcade bumpers fire the ball on contact
+    if let Some(imp) = world.bump_ball(ball.pos, dt) {
+        ball.vel = imp;
+        ball.ang *= 0.4;
+    }
     // ball strikes open tiles (DROPSHOT panels, GATEWORKS doors)
     if let Some((bp, pow)) = ev.ball_bounce.take() {
         if pow > 3.0 && !world.tiles.is_empty() {
@@ -391,7 +396,7 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32, cfg_g
             vel += world.gravity_dir(pos) * GRAV * cfg_gravity * dt;
         }
         if !bouncy {
-            vel *= (-0.02 * dt).exp(); // the faintest drag: space, but playable
+            vel *= (-world.bodies[i].drag * dt).exp(); // leaves flutter, rocks coast
         }
         pos += vel * dt;
         // world surfaces

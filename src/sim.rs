@@ -1242,7 +1242,8 @@ pub fn run(args: &[String]) {
         // Can a car RIDE a moving platform? Park one on each kind of mover
         // in CLOCKWORK and check it is carried rather than left behind.
         let cfg = Config::default();
-        let mut world = World::generate(9, crate::world::style(30), 0.31, 1.0);
+        let style_i: usize = std::env::var("PLAT_MAP").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        let mut world = World::generate(9, crate::world::style(style_i), 0.31, 1.0);
         let ball = Ball::new();
         let ctl = physics::Controls::default();
         // find one shape per anim kind
@@ -1255,6 +1256,7 @@ pub fn run(args: &[String]) {
                 crate::world::Anim::Orbit { shape, .. } => ("carriage", shape),
                 crate::world::Anim::Spin { shape, .. } => ("turntable", shape),
                 crate::world::Anim::Door { shape, .. } => ("door", shape),
+                crate::world::Anim::Swing { shape, .. } => ("log bridge", shape),
             };
             if !cases.iter().any(|(k, _)| *k == kind) {
                 cases.push((kind, si));

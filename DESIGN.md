@@ -1432,6 +1432,38 @@ STILL OPEN: the long Monkey Run vine lines. Perplexus traverses 20-23 of
 next thing I would try is banking them — rolling the bore so the driving
 line is the inside of the curve rather than fighting across it.
 
+## v1.45.0 — swinging bridges, drifting leaves, arcade totems
+
+Three additions to MONKEY RUN, each built on machinery that already
+existed — which is the nice part: platform riding (v1.43) is what makes
+a swinging log a bridge rather than scenery.
+
+SWING, a new anim: a true pendulum about a pivot, so a hung object both
+translates AND tilts through its arc. BROKEN LOG BRIDGES use it —
+fallen trunks slung in the vines between the giant trees, three per gap,
+each on its own rope length, amplitude and phase. Drive across while it
+sways, or wait for the swing to bring one to you. Verified rideable with
+`PLAT_MAP=24 --sim platform`: 1.40 m drift in the log's own frame, 100%
+of the run grounded. (The other movers on that map — swaying vines,
+orbiting parrots — are decoration and are not meant to be stood on; the
+platform PASS criterion is the CLOCKWORK set.)
+
+BIG LEAVES: ten broad blades adrift in the canopy air as free bodies,
+mass 0.8 against a car's 12, with real air drag (0.9 against an
+asteroid's 0.0) so they flutter and settle rather than coasting like
+rocks in space. Bodies gained their own draw scale, orientation and spin
+for this — previously every body rendered as a sphere, which is why a
+leaf needed them. A car shoves one aside; the ball takes a nudge off
+line.
+
+ARCADE POWER HITTERS: five totem paddles that fire the ball when it
+comes within 5.4 m — always up and OUT at 46 m/s, arcade rather than
+physical, with a 1.1 s recharge and a flash on the ring. World gained a
+`hitters` list and `bump_ball`, applied in the ball step.
+
+Battery after: platforms, mechanics, loops, stream, touch, flips and
+dribbling all green.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

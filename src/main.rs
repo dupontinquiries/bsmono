@@ -575,6 +575,7 @@ fn bake_rcells(world: &world::World) -> Vec<u32> {
             world::Anim::Slide { shape, amp, .. } => travel[shape] = amp + 6.0,
             world::Anim::Door { shape, amp, .. } => travel[shape] = amp + 4.0,
             world::Anim::Spin { shape, scale, .. } => travel[shape] = scale.max_element() + 4.0,
+            world::Anim::Swing { shape, len, amp, .. } => travel[shape] = len * amp.sin().abs() + 6.0,
         }
     }
     let span = world::TG_HALF * 2.0;
