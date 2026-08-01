@@ -1041,13 +1041,30 @@ impl Gpu {
             // on this driver, skip the subgroup kernel by default and use the barrier-reduction kernel,
             // which is robust here. LOGSCOPE_MATVEC_SG=1 forces it back on for experimentation.
             let asahi_vulkan = conservative_vma; // set above iff Vulkan + adapter name contains "Apple"
+        // MOBILE GPUs TOO. This guard was keyed on Apple-Vulkan alone, so an Adreno or Mali took the
+        // subgroup path with no check that the driver actually provides enough invocations per
+        // workgroup. Reported from a Fairphone: a load failure about "not enough wavelets" — a driver
+        // term for waves/subgroups, and not a string in this codebase, so it came from the driver
+        // refusing a workgroup that demanded more subgroups than it can schedule.
+        //
+        // Detected by ADAPTER NAME rather than by a feature bit, because there is no bit for "this is a
+        // phone": the subgroup extension is present and honest, and the limit is on how many the
+        // hardware runs at once. Names are a blunt instrument and a false positive here costs a slower
+        // kernel, while a false negative costs a load failure the user cannot diagnose.
+        let mobile_gpu = {
+            let n = gpu.adapter_name.to_ascii_lowercase();
+            ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante"]
+                .iter().any(|m| n.contains(m))
+        };
+        let asahi_vulkan = asahi_vulkan || mobile_gpu;
             let force_sg = std::env::var_os("LOGSCOPE_MATVEC_SG").is_some();
             // The host may also disable it via EngineConfig (from a tuning profile). The env var still
             // wins: a knob exists to be turned during a bisection, and a config file that silently
             // overrode it would make that impossible.
             let cfg_off = !engine_config().subgroup_matvec;
             if (asahi_vulkan || cfg_off) && !force_sg {
-                let why = if asahi_vulkan { "Asahi/Honeykrisp subgroup support can hang large matmuls" }
+                let why = if mobile_gpu { "mobile GPUs often cannot schedule enough subgroups per workgroup for this kernel" }
+                else if asahi_vulkan { "Asahi/Honeykrisp subgroup support can hang large matmuls" }
                           else { "disabled by engine config" };
                 eprintln!("wgpu-engine: subgroup decode kernel DISABLED on {} ({why}; LOGSCOPE_MATVEC_SG=1 re-enables)", gpu.adapter_name);
                 gpu.sg_ok.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -12214,6 +12231,36 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// The mobile-GPU names that disable the subgroup kernel.
+    ///
+    /// Reported from a Fairphone: llama3.2-1B loaded and then failed with a driver message about "not
+    /// enough wavelets" — a driver term for waves/subgroups, and not a string in this codebase. The
+    /// guard existed but was keyed on Apple-Vulkan alone, so every mobile GPU took the subgroup path
+    /// with no check that the driver can schedule enough invocations per workgroup.
+    ///
+    /// Matched on ADAPTER NAME because there is no feature bit for "this is a phone" — the extension is
+    /// present and honest, and the limit is on how many subgroups run at once. A false positive costs a
+    /// slower kernel; a false negative costs a load failure the user cannot diagnose, so the list errs
+    /// toward matching.
+    #[test]
+    fn the_mobile_gpu_list_covers_the_major_vendors() {
+        let names = ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante"];
+        let matches = |s: &str| {
+            let l = s.to_ascii_lowercase();
+            names.iter().any(|m| l.contains(m))
+        };
+        // Real adapter strings, as reported by their drivers.
+        for a in ["Adreno (TM) 740", "Mali-G715", "PowerVR B-Series BXM-8-256",
+                  "Immortalis-G720", "Samsung Xclipse 940"] {
+            assert!(matches(a), "{a} must be recognised as mobile");
+        }
+        // And desktop parts must NOT match, or they lose the fast kernel for nothing.
+        for a in ["NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX",
+                  "Intel Arc A770", "Apple M2 Ultra (G14D B1)", "llvmpipe (LLVM 20.1.2, 256 bits)"] {
+            assert!(!matches(a), "{a} must NOT be treated as mobile");
+        }
+    }
+
     /// `flush_every` must not be mutated by anything other than the tuner or an explicit pin.
     ///
     /// A permanent `store` of a reduced value was added here as "pacing after a readback" and acted as a
