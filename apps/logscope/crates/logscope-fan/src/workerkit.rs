@@ -104,15 +104,19 @@ impl Worker {
     }
 }
 
-/// Choose a worker for a duty.
+/// Choose a worker for a duty, from a set already filtered by trust.
 ///
-/// Prefers the largest capacity among those that can take it, and breaks ties toward the UNMETERED
-/// machine — a local M2 that can hold the model should be used before an API that bills per token, even
-/// when the API is nominally more capable.
-pub fn assign<'a>(d: Duty, workers: &'a [Worker]) -> Option<&'a Worker> {
-    workers.iter().filter(|w| w.can_take(d))
+/// TAKES A PRE-FILTERED SLICE ON PURPOSE. An earlier version preferred unmetered machines as a
+/// tie-break, which is the wrong mechanism for a data-egress rule: a tie-break can be LOST, so a
+/// sufficiently capable remote would win the sort and the conversation would leave the machines you own
+/// with nothing having gone wrong.
+///
+/// `trustkit::Registry::eligible` is the filter, applied first. This function ranks what survives it —
+/// the metered preference below is now only about cost, which is a preference and may safely be one.
+pub fn assign<'a>(d: Duty, workers: &'a [&'a Worker]) -> Option<&'a Worker> {
+    workers.iter().copied().filter(|w| w.can_take(d))
         .max_by(|a, b| {
-            (a.metered.cmp(&b.metered).reverse())      // unmetered first
+            (a.metered.cmp(&b.metered).reverse())      // cheaper first — a cost preference, not a rule
                 .then(a.capacity_gib.partial_cmp(&b.capacity_gib).unwrap_or(std::cmp::Ordering::Equal))
         })
 }
@@ -171,15 +175,17 @@ mod tests {
         // when the API is nominally more capable — the tie-break has to be explicit or capacity alone
         // always picks the API.
         let ws = vec![w("m2", Some(15), 48.0, false), w("api", Some(300), 999.0, true)];
-        assert_eq!(assign(Duty::Thinker, &ws).unwrap().id, "m2");
+        let refs: Vec<&Worker> = ws.iter().collect();
+        assert_eq!(assign(Duty::Thinker, &refs).unwrap().id, "m2");
     }
 
     #[test]
     fn a_metered_api_is_still_chosen_when_nothing_local_qualifies() {
         // Preferring local must not mean refusing to work. With only the API eligible, it is the answer.
         let ws = vec![w("api", Some(300), 999.0, true)];
-        assert_eq!(assign(Duty::Thinker, &ws).unwrap().id, "api");
-        assert!(assign(Duty::SpeculativeDraft, &ws).is_none(), "but not for a draft");
+        let refs: Vec<&Worker> = ws.iter().collect();
+        assert_eq!(assign(Duty::Thinker, &refs).unwrap().id, "api");
+        assert!(assign(Duty::SpeculativeDraft, &refs).is_none(), "but not for a draft");
     }
 
     #[test]
@@ -194,7 +200,8 @@ mod tests {
         // A UI showing "no worker" teaches nobody why. The reason is the actionable part — it tells the
         // operator to move the draft, not to find a faster network.
         let ws = vec![w("api", Some(400), 999.0, true)];
-        let e = explain(Duty::SpeculativeDraft, assign(Duty::SpeculativeDraft, &ws));
+        let refs: Vec<&Worker> = ws.iter().collect();
+        let e = explain(Duty::SpeculativeDraft, assign(Duty::SpeculativeDraft, &refs));
         assert!(e.contains("no eligible worker"));
         assert!(e.contains("37% overhead"));
     }
