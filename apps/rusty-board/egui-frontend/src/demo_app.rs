@@ -23,6 +23,10 @@ struct Feel {
     tray_open: bool,
     microterm: crate::microterm::Microterm,
     dictation: crate::dictation::Dictation,
+    /// What the microphone broker said. Dictation had no audio source at all —
+    /// start() set a flag — so a refusal was invisible and the user just saw
+    /// dictation do nothing.
+    mic: crate::mic_source::MicState,
     /// The REAL layout files (resources/layouts/*.json), with shift/caps + the symbols toggle —
     /// shown when the sidebar's real-layout tabs are active (indices past the demo layouts).
     real: RealBoard,
@@ -50,6 +54,7 @@ impl Feel {
             tray_open: false,
             microterm: Default::default(),
             dictation: Default::default(),
+            mic: crate::mic_source::MicState::Idle,
             swipe: SwipeState::with_dictionary(
                 include_str!("../demo_words.txt").lines().map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty()).collect()),
@@ -104,6 +109,11 @@ impl eframe::App for Feel {
                                 self.typed.push_str(&text);
                             }
                         } else {
+                            // The broker decides. On device the host supplies a
+                            // real one; until then the state stays Idle rather
+                            // than pretending a grant was obtained, because
+                            // claiming to be listening when nothing is captured
+                            // is exactly the dud-demo failure.
                             self.dictation.start();
                         }
                     }
@@ -115,6 +125,15 @@ impl eframe::App for Feel {
                         self.microterm.set_content(crate::microterm::Content::VoicePreview {
                             partial: self.dictation.partial().to_string(), level: 0.4 });
                         self.microterm.show();
+                    }
+                }
+                // The mic state, including WHY it was refused — the two
+                // refusals need different fixes and a single "failed" hides
+                // which.
+                if !matches!(self.mic, crate::mic_source::MicState::Idle) {
+                    ui.label(egui::RichText::new(self.mic.label()).small());
+                    if self.mic.retryable() && ui.small_button("retry").clicked() {
+                        self.mic = crate::mic_source::MicState::Idle;
                     }
                 }
                 ui.separator();

@@ -12,6 +12,7 @@ use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 
 pub mod real_layout;
 pub mod dictation;
+pub mod mic_source;
 pub mod tray;
 pub mod microterm;
 pub mod voice;
