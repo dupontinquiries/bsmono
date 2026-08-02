@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Without this the app installs and launches but does not
+     appear in GNOME Software or KDE Discover at all — those read metainfo, not
+     .desktop entries, so a missing file makes an installed app invisible to the
+     one place most users look. -->
+<component type="desktop-application">
+  <id>org.bigsilicon.Settings</id>
+  <name>Settings</name>
+  <summary>Edit the preferences every app reads</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Settings edits one shared preference set — gesture feel, touch, palette, accessibility — that every app on the system reads.</p>
+    <ul>
+      <li>One place for gesture, touch and accessibility settings</li>
+      <li>Changes publish over the bus so running apps update live</li>
+      <li>Preferences persist under the XDG config directory</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.bigsilicon.Settings.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-08-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

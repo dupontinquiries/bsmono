@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Without this the app installs and launches but does not
+     appear in GNOME Software or KDE Discover at all — those read metainfo, not
+     .desktop entries, so a missing file makes an installed app invisible to the
+     one place most users look. -->
+<component type="desktop-application">
+  <id>org.faocodec.FaoCodec</id>
+  <name>FAO Codec</name>
+  <summary>Encode and inspect FAO media streams</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>FAO Codec encodes and inspects FAO media streams.</p>
+    <ul>
+      <li>Encode streams with configurable parameters</li>
+      <li>Inspect an existing stream's structure</li>
+      <li>GPU-assisted rasterisation where available</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.faocodec.FaoCodec.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-08-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

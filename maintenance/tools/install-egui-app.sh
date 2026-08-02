@@ -45,7 +45,8 @@ ICONS_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
 BIN_DIR="$PREFIX/bin"
 
 if [ "$UNINSTALL" = "1" ]; then
-  rm -f "$APPS_DIR/$APP_ID.desktop" "$ICONS_DIR/$ICON_NAME.svg" "$BIN_DIR/$EXEC_NAME"
+  rm -f "$APPS_DIR/$APP_ID.desktop" "$ICONS_DIR/$ICON_NAME.svg" \
+        "$BIN_DIR/$EXEC_NAME" "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
   echo "removed $APP_ID"
 else
   mkdir -p "$APPS_DIR" "$ICONS_DIR" "$BIN_DIR"
@@ -60,6 +61,14 @@ else
       *.*) echo "WARNING: $ENTRY names icon '$ICON_NAME' and no such file ships" >&2 ;;
       *)   echo "    icon '$ICON_NAME' expected from the theme" ;;
     esac
+  fi
+  # AppStream metadata: without it the app installs and launches but never
+  # appears in GNOME Software or KDE Discover, which read metainfo rather than
+  # .desktop entries.
+  META="$PKG/$APP_ID.metainfo.xml"
+  if [ -f "$META" ]; then
+    mkdir -p "$PREFIX/share/metainfo"
+    install -m644 "$META" "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
   fi
   echo "installed $APP_ID -> $APPS_DIR"
 fi

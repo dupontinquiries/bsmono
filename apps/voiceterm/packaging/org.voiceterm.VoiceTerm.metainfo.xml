@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Without this the app installs and launches but does not
+     appear in GNOME Software or KDE Discover at all — those read metainfo, not
+     .desktop entries, so a missing file makes an installed app invisible to the
+     one place most users look. -->
+<component type="desktop-application">
+  <id>org.voiceterm.VoiceTerm</id>
+  <name>VoiceTerm</name>
+  <summary>Terminal with voice control and split panes</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>VoiceTerm is a terminal you can drive by voice, with a pane split-tree, an integrated reader and mail.</p>
+    <ul>
+      <li>Dictation with whisper hallucination filtering, at a strength you choose</li>
+      <li>Pane split-tree and native tabs, navigable by voice</li>
+      <li>Web panes that surface the actions on a page rather than only rendering it</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.voiceterm.VoiceTerm.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-08-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>
