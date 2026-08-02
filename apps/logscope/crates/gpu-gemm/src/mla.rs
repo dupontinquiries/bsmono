@@ -325,3 +325,146 @@ mod tests {
         assert!(err < 1e-4, "delta-softmax MLA must equal o-proj of reconstructed V, err={err}");
     }
 }
+
+/// Cross-check the MLA tensor shapes against each other and the metadata.
+///
+/// MLA has five interlocking dimensions — `n_head`, `qk_nope_head_dim`, `qk_rope_head_dim`,
+/// `kv_lora_rank`, `v_head_dim` — and four tensors whose shapes are products of them. If any one is
+/// read wrong, the products still multiply out to *something* and the model runs on the wrong
+/// geometry, which is the failure mode that produces text rather than an error.
+///
+/// From a real GLM-4.7-Flash (deepseek2) checkpoint:
+///
+/// ```text
+/// attn_q_b       [768 x 5120]      n_head * (qk_nope + qk_rope) = 20 * 256 = 5120
+/// attn_output    [5120 x 2048]     n_head * v_head_dim          = 20 * 256 = 5120
+/// attn_k_b       [192 x 512 x 20]  qk_nope, kv_lora, n_head
+/// attn_v_b       [512 x 256 x 20]  kv_lora, v_head_dim, n_head
+/// attn_kv_a_norm [512]             kv_lora_rank
+/// ```
+///
+/// Every one of those is redundant with the metadata, which is what makes checking them worthwhile:
+/// agreement is evidence, and disagreement localises the error to one hparam rather than leaving a
+/// whole forward pass suspect.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ShapeDisagreement {
+    /// `attn_q_b`'s output width is not n_head * (qk_nope + qk_rope).
+    QbWidth { declared: usize, from_hparams: usize },
+    /// `attn_output`'s input width is not n_head * v_head_dim.
+    OutputWidth { declared: usize, from_hparams: usize },
+    /// A 3-D kv_b tensor's head axis disagrees with n_head.
+    HeadAxis { tensor: &'static str, declared: usize, n_head: usize },
+    /// The latent rank differs between kv_a_norm and a kv_b tensor.
+    LatentRank { tensor: &'static str, declared: usize, kv_lora_rank: usize },
+}
+
+impl ShapeDisagreement {
+    pub fn explain(&self) -> String {
+        match self {
+            ShapeDisagreement::QbWidth { declared, from_hparams } => format!(
+                "attn_q_b is {declared} wide and the hparams say n_head*(qk_nope+qk_rope) = \
+{from_hparams}. One of n_head, qk_nope_head_dim or qk_rope_head_dim is wrong — the products still \
+multiply out, so the model would run on the wrong geometry and produce text rather than an error"),
+            ShapeDisagreement::OutputWidth { declared, from_hparams } => format!(
+                "attn_output takes {declared} and the hparams say n_head*v_head_dim = {from_hparams}"),
+            ShapeDisagreement::HeadAxis { tensor, declared, n_head } => format!(
+                "{tensor}'s head axis is {declared} against n_head {n_head} — the per-head fusion \
+would stride by the wrong amount, which is correct for head 0 and wrong for every head after"),
+            ShapeDisagreement::LatentRank { tensor, declared, kv_lora_rank } => format!(
+                "{tensor} has latent rank {declared} against kv_lora_rank {kv_lora_rank}"),
+        }
+    }
+}
+
+/// Check what the file says against what the metadata says. Empty means they agree.
+#[allow(clippy::too_many_arguments)]
+pub fn check_shapes(
+    q_b_width: usize, output_width: usize,
+    k_b: Option<&[u64]>, v_b: Option<&[u64]>,
+    n_head: usize, qk_nope: usize, qk_rope: usize, kv_lora_rank: usize, v_head_dim: usize,
+) -> Vec<ShapeDisagreement> {
+    let mut v = Vec::new();
+    let want_q = n_head * (qk_nope + qk_rope);
+    if q_b_width != want_q {
+        v.push(ShapeDisagreement::QbWidth { declared: q_b_width, from_hparams: want_q });
+    }
+    let want_o = n_head * v_head_dim;
+    if output_width != want_o {
+        v.push(ShapeDisagreement::OutputWidth { declared: output_width, from_hparams: want_o });
+    }
+    // The 3-D forms: [qk_nope, kv_lora, n_head] and [kv_lora, v_head_dim, n_head]. Only checked when
+    // present, because the legacy fused attn_kv_b layout has neither.
+    if let Some(d) = k_b.filter(|d| d.len() == 3) {
+        if d[2] as usize != n_head {
+            v.push(ShapeDisagreement::HeadAxis { tensor: "attn_k_b", declared: d[2] as usize, n_head });
+        }
+        if d[1] as usize != kv_lora_rank {
+            v.push(ShapeDisagreement::LatentRank {
+                tensor: "attn_k_b", declared: d[1] as usize, kv_lora_rank });
+        }
+    }
+    if let Some(d) = v_b.filter(|d| d.len() == 3) {
+        if d[2] as usize != n_head {
+            v.push(ShapeDisagreement::HeadAxis { tensor: "attn_v_b", declared: d[2] as usize, n_head });
+        }
+        if d[0] as usize != kv_lora_rank {
+            v.push(ShapeDisagreement::LatentRank {
+                tensor: "attn_v_b", declared: d[0] as usize, kv_lora_rank });
+        }
+    }
+    v
+}
+
+#[cfg(test)]
+mod shape_check_tests {
+    use super::*;
+
+    /// The real GLM-4.7-Flash numbers, which cross-check exactly.
+    fn glm47() -> (usize, usize, Vec<u64>, Vec<u64>, usize, usize, usize, usize, usize) {
+        (5120, 5120, vec![192, 512, 20], vec![512, 256, 20], 20, 192, 64, 512, 256)
+    }
+
+    #[test]
+    fn a_real_checkpoint_agrees_with_its_own_metadata() {
+        let (q, o, kb, vb, nh, nope, rope, lora, vd) = glm47();
+        let d = check_shapes(q, o, Some(&kb), Some(&vb), nh, nope, rope, lora, vd);
+        assert!(d.is_empty(), "GLM-4.7-Flash should be self-consistent: {d:?}");
+    }
+
+    #[test]
+    fn a_wrong_HEAD_COUNT_is_caught_by_two_tensors_at_once() {
+        // The value that would be easiest to misread, and the check localises it: n_head appears in
+        // q_b's width, output's width and both kv_b head axes, so a wrong one disagrees four ways.
+        let (q, o, kb, vb, _, nope, rope, lora, vd) = glm47();
+        let d = check_shapes(q, o, Some(&kb), Some(&vb), 16, nope, rope, lora, vd);
+        assert!(d.len() >= 3, "a wrong n_head must disagree in several places: {d:?}");
+        assert!(d[0].explain().contains("produce text rather than an error"));
+    }
+
+    #[test]
+    fn a_wrong_LATENT_RANK_is_caught_even_though_it_is_not_in_q_b() {
+        // kv_lora_rank appears only in the kv_b tensors and kv_a_norm, so nothing about q_b or output
+        // constrains it — which is exactly why checking the 3-D shapes is worth the code.
+        let (q, o, kb, vb, nh, nope, rope, _, vd) = glm47();
+        let d = check_shapes(q, o, Some(&kb), Some(&vb), nh, nope, rope, 256, vd);
+        assert_eq!(d.len(), 2, "one per kv_b tensor: {d:?}");
+        assert!(d.iter().all(|x| matches!(x, ShapeDisagreement::LatentRank { .. })));
+    }
+
+    #[test]
+    fn the_LEGACY_fused_layout_is_not_penalised_for_lacking_3D_tensors() {
+        // The old attn_kv_b form has neither split tensor, and demanding them would refuse every
+        // checkpoint predating the split.
+        let (q, o, _, _, nh, nope, rope, lora, vd) = glm47();
+        assert!(check_shapes(q, o, None, None, nh, nope, rope, lora, vd).is_empty());
+    }
+
+    #[test]
+    fn a_wrong_v_head_dim_is_caught_by_the_OUTPUT_projection() {
+        // v_head_dim is the one dimension q_b says nothing about, and attn_output is the only tensor
+        // that pins it.
+        let (q, o, kb, vb, nh, nope, rope, lora, _) = glm47();
+        let d = check_shapes(q, o, Some(&kb), Some(&vb), nh, nope, rope, lora, 128);
+        assert!(d.iter().any(|x| matches!(x, ShapeDisagreement::OutputWidth { .. })));
+    }
+}
