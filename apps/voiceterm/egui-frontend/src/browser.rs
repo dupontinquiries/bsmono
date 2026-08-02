@@ -101,6 +101,10 @@ pub struct Browser {
     /// strip real content while claiming to remove ads.
     pub filter_mode: FilterMode,
     pub filter_stats: FilterStats,
+    /// Saved URLs. The star reads from here rather than from a flag on the
+    /// page, so it stays correct when the same URL is reached twice by
+    /// different routes.
+    pub bookmarks: crate::bookmarks_view::Bookmarks,
     pub url: String,
     pub title: String,
     pub actions: Vec<Action>,
@@ -142,6 +146,24 @@ impl Browser {
     pub fn filter_summary(&self) -> Option<String> {
         if self.filter_mode == FilterMode::Off { return None; }
         Some(self.filter_stats.summary())
+    }
+
+    /// Is the current page saved? Drives the star's filled state.
+    pub fn is_bookmarked(&self) -> bool { self.bookmarks.is_saved(&self.url) }
+
+    /// Toggle the star. Returns true when it is now saved.
+    ///
+    /// The page TITLE is passed rather than a derived fallback, and the merge
+    /// rule protects a user-edited one — so starring a page twice cannot rename
+    /// a bookmark someone named.
+    pub fn toggle_bookmark(&mut self, now_ms: u64) -> bool {
+        if self.is_bookmarked() {
+            self.bookmarks.remove(&self.url);
+            false
+        } else {
+            self.bookmarks.save(&self.url, &self.title, &[], now_ms);
+            true
+        }
     }
 
     pub fn load(&mut self, url: &str) {
@@ -220,6 +242,22 @@ mod tests {
             ..Default::default()
         };
         assert!(b.ranked()[0].label().contains("/real"));
+    }
+
+    #[test]
+    fn the_star_reflects_the_saved_set_not_a_page_flag() {
+        // A flag on the page goes stale when the same URL is reached twice by
+        // different routes — a link, then the history — and the star then lies.
+        let mut b = Browser::default();
+        b.load("https://x.test/a");
+        b.loaded("A", vec![]);
+        assert!(!b.is_bookmarked());
+        assert!(b.toggle_bookmark(100));
+        assert!(b.is_bookmarked());
+        // arrive again by another route
+        b.load("https://x.test/a");
+        assert!(b.is_bookmarked(), "still saved");
+        assert!(!b.toggle_bookmark(200), "and unstars");
     }
 
     #[test]

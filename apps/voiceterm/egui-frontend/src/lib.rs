@@ -18,6 +18,7 @@ pub mod cards_view;
 pub mod graph_view;
 pub mod bars;
 pub mod browser;
+pub mod bookmarks_view;
 pub mod build_view;
 pub mod backlinks_view;
 pub mod viz;
