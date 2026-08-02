@@ -37,7 +37,7 @@ starts hidden with the auto-login ordering rule.
 | GroupVoiceRoster | pending |  |
 | HelpManualDialog | pending |  |
 | InboxWidget | pending |  |
-| IncomingCallDialog | pending |  |
+| IncomingCallDialog | ported | ring.rs `IncomingCall` — 30s auto-decline, first-answer-wins, ring derived from outcome |
 | LoginWidget | ported | session.rs `Login` — optional password, Enter-moves-focus, error clears the password |
 | MainWindow | partial | 5-page shell + login-overlay ordering rule in lib.rs; status bar/export gate pending |
 | MediaSendSummary | pending |  |
@@ -50,7 +50,7 @@ starts hidden with the auto-login ordering rule.
 | PressGesture | pending |  |
 | QrCodeRenderer | pending |  |
 | QrScanDialog | pending |  |
-| RingtoneSynth | pending |  |
+| RingtoneSynth | ported | ring.rs `render_mono` — E5-C#5-A4 bells, feedback comb, silent loop point |
 | ScrollAreas | pending |  |
 | SegmentedTabStrip | pending |  |
 | SettingsPage | partial | sub-tab table only; 4680-line page body pending |

@@ -28,6 +28,7 @@ pub mod friends;
 pub mod modal;
 pub mod snaps;
 pub mod session;
+pub mod ring;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -119,6 +120,13 @@ pub struct Snapclone {
     /// Wall clock in seconds, for relative times. Held rather than read at
     /// draw time so tests can advance it.
     pub now_secs: i64,
+    /// The incoming-call ring (Qt IncomingCallDialog), presented into the
+    /// Confirm layer — it is a question that must be answered, so it sits above
+    /// any dialog already open.
+    pub incoming_call: Option<crate::ring::IncomingCall>,
+    /// Calls that ended without being taken, for the missed-call list. A
+    /// timeout and a decline are recorded apart: same effect, different history.
+    pub missed_calls: Vec<String>,
     gesture: GestureLayer,
     palette: String,
 }
@@ -157,6 +165,8 @@ impl Snapclone {
             outbox: Default::default(),
             login: Default::default(),
             now_secs: 0,
+            incoming_call: None,
+            missed_calls: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
             bar: UnifiedNav::new(),
@@ -267,6 +277,47 @@ impl Snapclone {
         for ev in self.viewer.tick(dt * 1000.0) {
             self.apply_snap_event(ev);
         }
+        // The ring declines itself after thirty seconds whether or not anyone
+        // is looking at this page.
+        if let Some(call) = self.incoming_call.as_mut() {
+            let caller = call.caller_name.clone();
+            if let Some(a) = call.tick(dt * 1000.0) { self.finish_call(&caller, a); }
+        }
+    }
+
+    /// A voice packet arrived for a conversation whose thread is not open.
+    pub fn ring(&mut self, caller: &str) {
+        self.incoming_call = Some(crate::ring::IncomingCall::new(caller));
+        self.modal.present(&format!("call:{caller}"), crate::modal::Layer::Confirm,
+                           crate::modal::Rect::new(0.0, 400.0, 400.0, 300.0),
+                           // NOT dismiss-on-tap-outside: a stray tap while the
+                           // phone is in a pocket must not answer or refuse a
+                           // call. Only the two buttons and the timeout decide.
+                           false, true);
+    }
+
+    /// Apply an answer: dismiss the sheet, and open the thread if it was taken.
+    pub fn answer_call(&mut self, a: crate::ring::Answer) {
+        let Some(call) = self.incoming_call.as_mut() else { return };
+        let caller = call.caller_name.clone();
+        if call.answer(a).is_none() { return; }
+        self.finish_call(&caller, a);
+    }
+
+    fn finish_call(&mut self, caller: &str, a: crate::ring::Answer) {
+        use crate::ring::Answer;
+        self.modal.dismiss(&format!("call:{caller}"));
+        match a {
+            Answer::Accepted => {
+                self.conversation_peer = caller.to_string();
+                self.group_voice.joined = true;
+            }
+            // Both rejections drop the buffered packets; only the ignored one
+            // is a MISSED call.
+            Answer::TimedOut => self.missed_calls.push(caller.to_string()),
+            Answer::Declined => {}
+        }
+        self.incoming_call = None;
     }
 
     /// Open a snap from the feed, view-once, presented into the modal Dialog
@@ -607,6 +658,45 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn accepting_a_call_opens_the_thread_and_joins_the_voice_session() {
+        let mut s = app();
+        s.ring("alice");
+        assert!(s.modal.blocks_input(), "the ring sits above whatever page is up");
+        s.answer_call(crate::ring::Answer::Accepted);
+        assert_eq!(s.conversation_peer, "alice");
+        assert!(s.group_voice.joined);
+        assert!(s.incoming_call.is_none());
+        assert!(s.modal.is_empty());
+    }
+
+    #[test]
+    fn an_ignored_ring_becomes_a_missed_call_but_a_declined_one_does_not() {
+        // Same effect on the packets, different history: a missed call and a
+        // refused one are not the same thing to whoever reads the list later.
+        let mut s = app();
+        s.ring("alice");
+        s.tick(31.0);
+        assert_eq!(s.missed_calls, vec!["alice".to_string()]);
+        assert!(s.incoming_call.is_none());
+
+        let mut t = app();
+        t.ring("bob");
+        t.answer_call(crate::ring::Answer::Declined);
+        assert!(t.missed_calls.is_empty());
+        assert_eq!(t.conversation_peer, "", "and it does not open the thread");
+    }
+
+    #[test]
+    fn a_stray_tap_outside_the_sheet_neither_answers_nor_refuses_the_call() {
+        // A phone in a pocket must not take or drop a call on its own.
+        let mut s = app();
+        s.ring("alice");
+        let out = s.modal.tap(10.0, 10.0);
+        assert_eq!(out, crate::modal::TapResult::Swallowed);
+        assert!(s.incoming_call.as_ref().unwrap().ringing());
     }
 
     #[test]

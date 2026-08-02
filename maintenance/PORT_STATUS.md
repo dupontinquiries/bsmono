@@ -36,7 +36,7 @@ not see.
 | bot-arena | 2 | 50% | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
-| snapclone | 51 | 53% | yes | yes | — |
+| snapclone | 51 | 55% | yes | yes | — |
 | voiceterm | 22 | 55% | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
