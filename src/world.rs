@@ -875,7 +875,7 @@ impl World {
                         grav.push(GravNode {
                             pos: a.lerp(b, t),
                             down: Vec3::NEG_Y,
-                            r: r * 2.4,
+                            r: r * 1.45,
                             tube: true,
                             inward: false,
                             // Scale with the BORE: a narrow pipe holds you
@@ -1600,7 +1600,7 @@ impl World {
                         grav.push(GravNode {
                             pos: a.lerp(b, t),
                             down: Vec3::NEG_Y,
-                            r: r * 2.4,
+                            r: r * 1.45,
                             tube: true,
                             inward: false,
                             // Scale with the BORE: a narrow pipe holds you
@@ -2913,7 +2913,7 @@ impl World {
                         let steps = ((p0.distance(p1) / 5.0).ceil() as usize).clamp(2, 24);
                         for t in 0..=steps {
                             let q = p0.lerp(p1, t as f32 / steps as f32);
-                            grav.push(GravNode { pos: q, down: Vec3::NEG_Y, r: r * 2.4, tube: true, inward: false, g: (r / 10.0).clamp(0.55, 1.5), surf: true, follow: None });
+                            grav.push(GravNode { pos: q, down: Vec3::NEG_Y, r: r * 1.45, tube: true, inward: false, g: (r / 10.0).clamp(0.55, 1.5), surf: true, follow: None });
                             flows.push(Flow { pos: q, r: r * 0.95, vel: (p1 - p0).normalize_or(Vec3::Y) * 20.0 });
                         }
                     }

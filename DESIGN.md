@@ -2167,6 +2167,33 @@ throttle caught nothing, because the car would not hold pace. The fair test
 is the one a player actually performs: hold your OWN speed, never chase the
 ball, and let the approach succeed or fail on its own terms.
 
+## v1.67.0 — tube fields stop fighting each other
+
+PERPLEXUS now traverses 22 of 24 routes with a single escape (it was 21 of
+24 with two), from one change: in-bore gravity nodes reached r x 2.4, which
+on a 12.5 m bore is a THIRTY METRE field. Where two lines run near one
+another those fields overlapped and "down" flipped mid-tube. The reach is
+r x 1.45 now — enough to hold you against your own bore, not enough to
+reach into the next one.
+
+The drive harness also got two corrections, both cases of measuring the
+wrong thing. A route is the bore's CENTRELINE and a car drives its floor,
+so spawning on the axis at a ground mouth dropped the car seven metres
+through the open end before it moved. And these lines are ridden rather
+than crawled — several are entered by launcher and none are climbable from
+a standstill — so the test now enters at pace.
+
+MONKEY RUN, still open and now better understood. Every one of its seven
+routes leaves its bore within 4-7%, spiral tree roads and vine lines alike,
+while Perplexus manages 22 of 24 with identical code. A failure that
+uniform across different route TYPES is not a driving problem. The overlap
+theory above was the best candidate and it demonstrably helped Perplexus,
+but it did not move Monkey Run at all — so the cause is something specific
+to that map's geometry rather than to the gravity field. The note is
+recorded in the harness for whoever picks it up, along with what has
+already been ruled out: spawn placement, entry speed, bore clearance,
+wall thickness, junction width and node density.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

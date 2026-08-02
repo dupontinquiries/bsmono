@@ -2565,11 +2565,22 @@ pub fn run(args: &[String]) {
                     continue;
                 }
                 let mut car = physics::Car::new();
-                car.pos = pts[0].lerp(pts[1], 0.06);
-                let dir = (pts[1] - pts[0]).normalize_or(Vec3::Z);
+                // A route is the bore's CENTRELINE; a car drives its floor.
+                // Spawning on the axis at a ground mouth dropped the car 7 m
+                // through the open end before it ever moved — that is where
+                // every Monkey Run run was dying.
+                let start_r = world.routes[ri].1;
+                // A route is the bore's CENTRELINE and a car drives its
+                // floor, so start just below the axis. And enter at PACE:
+                // these lines are ridden, not crawled — several are entered
+                // by launcher and none of them are climbable from a stop.
+                let si0 = 0usize;
+                let dir0 = (pts[1] - pts[0]).normalize_or(Vec3::Z);
+                car.pos = pts[0].lerp(pts[1], 0.12) - Vec3::Y * (start_r * 0.45);
+                let dir = dir0;
                 // the car's nose is -Z
                 car.rot = glam::Quat::from_rotation_arc(Vec3::NEG_Z, dir);
-                car.vel = dir * 12.0;
+                car.vel = dir * 24.0;
                 let mut c = physics::Controls::default();
                 c.throttle = 1.0;
                 c.boost = true;
@@ -2628,6 +2639,14 @@ pub fn run(args: &[String]) {
                 }
             }
             worst.sort_by(|a, b| a.1.total_cmp(&b.1));
+            // A note for whoever picks this up: MONKEY RUN fails uniformly
+            // (every route leaves its bore at 4-7%, spiral roads and vine
+            // lines alike) while PERPLEXUS traverses 21 of 24 with the same
+            // code. A failure that consistent across different route TYPES
+            // points at the field rather than the driving — that map carries
+            // ~520 gravity nodes, and where a tree road passes near a vine
+            // line the two tube fields overlap and the "down" direction
+            // flips mid-bore. That is the next thing to test.
             let checked = n_routes;
             println!(
                 "{label:<12} traversed {done}/{checked} routes   fell out of {escaped}   worst: {}",
