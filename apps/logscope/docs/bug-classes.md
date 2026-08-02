@@ -67,6 +67,23 @@ matters.
 `gateclass` now prints `ARITHMETIC ONLY` rather than a tick on a software adapter. The constraint stands
 regardless: **container-green is a precondition, never a verdict.**
 
+## Class 4 — written, benchmarked, unreachable
+
+`MATVEC_Q8_0_TILED_V3` did 128-bit `vec4<u32>` loads and could be selected only via
+`LOGSCOPE_MATVEC_V3`. The per-shape autotune searched every *other* kernel and picked `V2Wg128` — and I
+read that result as "kernel choice is exhausted". **It wins the search it was entered in.**
+
+This is worse than the ordinary no-caller case, because the code *appears* to have been evaluated. An
+autotune result reads as evidence; it is only evidence about its candidate list.
+
+**How to sweep for it, and how not to.** Grepping for `dispatch(SHADER` misses every shader selected
+through a `match` arm — `MOE_MATVEC_GLU_Q8` and friends are reached that way and show as false
+positives. Count *all* references and read the non-declaration ones. On this tree that sweep found
+exactly one real instance (V3, now wired) and four false ones.
+
+**The durable form** is not a sweep at all: assert the candidate list contains every variant of the
+enum it searches, so adding a kernel without entering it fails a test.
+
 ## Next hunt
 
 * The remaining `SUBMIT_BY_*` shortfall — the profile still reports an untagged submit path.
