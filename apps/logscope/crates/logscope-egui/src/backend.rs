@@ -893,6 +893,7 @@ was evicted)", prompt_ids.len())
             // per-generation report — your log showed "349 submits" beside causes summing to 4132, and
             // the causes grew across turns while the submit count did not.
             let cause0 = gpu_kernels::SubmitCauseSnapshot::now();
+            let submit_ns0 = gpu_kernels::gpu_submit_ns();
             use std::sync::atomic::Ordering as AOrd;
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
@@ -1042,7 +1043,14 @@ was evicted)", prompt_ids.len())
                 eprintln!("wgpu-engine: [{}] bottleneck — {}", self.name, v.advice());
             }
             eprint!("[{}] ", gpu_kernels::stamp());
-            eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
+            // THREE BUCKETS, not two. queue.submit was timed by nothing, and on a driver whose
+            // completion callbacks are slow enough to disable the governor — "submit stalled 739ms" —
+            // it is exactly where time hides. Reporting two terms and calling the remainder
+            // unaccounted was how 99.8% became a mystery about kernels.
+            // Delta, like the others — an absolute here would be the lifetime-total bug from _456.
+            let submit_ms = (gpu_kernels::gpu_submit_ns().saturating_sub(submit_ns0)) as f64 / 1e6;
+            let accounted = setup_ms + sync_ms + submit_ms;
+            eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms + submit {submit_ms:.0}ms + sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
                 self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
             // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
             // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
