@@ -189,7 +189,6 @@ pub fn watchdog_prone(adapter: &str) -> bool {
 }
 
 pub fn device_defaults(adapter: &str) -> Defaults {
-    let a = adapter.to_ascii_lowercase();
     let mut d = Defaults::default();
     // Asahi/Honeykrisp on Apple silicon: subgroup matvec can hang large matmuls, so it is opt-in; the
     // firmware watchdog is strict, so conversion dispatches are kept small.
