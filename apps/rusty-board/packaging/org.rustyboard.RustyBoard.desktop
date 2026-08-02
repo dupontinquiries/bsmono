@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Rusty Board
+GenericName=On-Screen Keyboard
+Comment=Swipe-typing on-screen keyboard with dictation and a minimized tray
+Exec=rusty-board-egui
+Icon=org.rustyboard.RustyBoard
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=keyboard;osk;swipe;dictation;accessibility;
+StartupNotify=true
+StartupWMClass=org.rustyboard.RustyBoard

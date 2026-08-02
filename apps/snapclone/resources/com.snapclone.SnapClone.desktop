@@ -9,4 +9,4 @@ Type=Application
 Categories=Network;InstantMessaging;Chat;
 Keywords=snap;chat;camera;messenger;p2p;encrypted;
 StartupNotify=true
-StartupWMClass=SnapClone
+StartupWMClass=com.snapclone.SnapClone

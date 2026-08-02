@@ -17,6 +17,7 @@
 //! `examples/logscope_touch.rs` for the reverse port (logscope's scene gaining
 //! the touch layer).
 
+pub mod desktop;
 pub mod a11y;
 pub mod adaptive;
 pub mod carved;

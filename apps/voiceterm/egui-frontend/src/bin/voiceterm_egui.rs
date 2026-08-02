@@ -563,6 +563,11 @@ impl eframe::App for VoicetermApp {
     }
 }
 
+/// Must match packaging/org.voiceterm.VoiceTerm.desktop exactly. A mismatch fails
+/// SILENTLY: the app runs and has no icon, no dock grouping and the wrong
+/// name in the switcher.
+const APP_ID: &str = "org.voiceterm.VoiceTerm";
+
 fn main() -> eframe::Result<()> {
     let mut app = App::new(80, 24);
     // First run (no prefs file yet): voiceterm's Voice identity, NOT settings-kit's generic
@@ -600,7 +605,10 @@ fn main() -> eframe::Result<()> {
     ]);
     eframe::run_native(
         "voiceterm (egui)",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+        viewport: uikit_egui::desktop::viewport(APP_ID, "VoiceTerm", [900.0, 700.0]),
+        ..Default::default()
+    },
         Box::new(move |_cc| {
             Ok(Box::new(VoicetermApp {
                 app,
