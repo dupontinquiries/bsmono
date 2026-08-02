@@ -2194,6 +2194,39 @@ recorded in the harness for whoever picks it up, along with what has
 already been ruled out: spawn placement, entry speed, bore clearance,
 wall thickness, junction width and node density.
 
+## v1.68.0 — tube gravity that plants you, and an inverted assumption
+
+IN-TUBE GRAVITY NOW HAS A SHAPE. A flat pull cannot satisfy both ends of
+the problem: weak enough not to pin you against the bore (which is what it
+felt like, and why it was reduced) is too weak to plant you there in the
+first place, so a car flung into a wide pipe flew up the middle at constant
+speed and never touched anything. The pull is now strongest at the AXIS and
+eases to a third of that at the wall — it plants you quickly and then lets
+go. Perplexus holds at 22 of 24 routes with a single escape.
+
+New `--sim routecheck` reads the world SDF at every route waypoint, and it
+inverted an assumption I had been carrying for several sessions:
+
+    PERPLEXUS   median 16-22 in a 5.6-10.6 m bore, 100% "open"
+    MONKEY RUN  median 7.40 in a 7.4 m bore, 12.00 in a 12.5 m bore
+
+Perplexus's routes are OPEN-AIR lines between anchors — its 22 of 24 is
+mostly flying through nothing. Monkey Run's waypoints sit dead centre in
+real bores it must thread for hundreds of metres. Monkey Run was never the
+broken map; it is the harder test, and the one whose result actually means
+something.
+
+The failure there is now precisely characterised, which is the useful
+output of this session even though the number did not move. The car FLIES
+rather than drives — og=0 for the entire run, climbing at a constant 23 m/s
+and drifting off the centreline until a bend loses it — and it never lands
+on the bore wall. And crucially, HALVING the swoop curvature and sag
+produced identical failure points to the digit (4/5/6/7%). A failure
+insensitive to the geometry is not a geometry failure, so the next look
+belongs on the harness's fall-out rule and its spawn, not on the map. All
+of that is written into the harness alongside the eight things already
+ruled out.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

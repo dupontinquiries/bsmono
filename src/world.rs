@@ -1946,7 +1946,7 @@ impl World {
                     // canopy to canopy, banking alternately
                     for (si, wpair) in seq.windows(2).enumerate() {
                         let (ta, tb) = (wpair[0], wpair[1]);
-                        let side = if si % 2 == 0 { 0.17 } else { -0.17 };
+                        let side = if si % 2 == 0 { 0.075 } else { -0.075 };
                         let from = if house_r[ta] > 0.0 { house_c[ta] } else { ttop[ta] + Vec3::Y * 3.0 };
                         let mut to = if house_r[tb] > 0.0 {
                             house_c[tb] + (from - house_c[tb]).normalize_or(Vec3::X) * (house_r[tb] - 0.5)
@@ -1956,9 +1956,9 @@ impl World {
                         if house_r[ta] > 0.0 {
                             let exit = house_c[ta] + (to - house_c[ta]).normalize_or(Vec3::X) * (house_r[ta] - 0.5);
                             cut_s(&mut shapes, house_c[ta] + (to - house_c[ta]).normalize_or(Vec3::X) * house_r[ta], r * 1.12);
-                            swoop(&mut shapes, &mut grav, &mut wp, exit, to, side, -0.10, r, col, 0.16);
+                            swoop(&mut shapes, &mut grav, &mut wp, exit, to, side, -0.045, r, col, 0.16);
                         } else {
-                            swoop(&mut shapes, &mut grav, &mut wp, from, to, side, -0.10, r, col, 0.16);
+                            swoop(&mut shapes, &mut grav, &mut wp, from, to, side, -0.045, r, col, 0.16);
                         }
                         if house_r[tb] > 0.0 {
                             cut_s(&mut shapes, house_c[tb] + (from - house_c[tb]).normalize_or(Vec3::X) * house_r[tb], r * 1.12);
@@ -4245,6 +4245,17 @@ impl World {
             let t = best.0 / n.r.max(0.01);
             let w = ((1.5 - t) / 0.75).clamp(0.0, 1.0);
             g = 1.0 + (n.g - 1.0) * w;
+            // INSIDE A TUBE the pull is strongest at the AXIS and eases off
+            // as you reach the wall. A flat pull cannot satisfy both ends:
+            // weak enough not to pin you to the bore (which is what it felt
+            // like) is too weak to plant you in the first place, so a car
+            // flung into a wide pipe simply flew up the middle at constant
+            // speed, never touching anything, until a bend lost it. This
+            // shape plants you quickly and then lets go.
+            if n.tube {
+                let axis_frac = (best.0 / (n.r / 1.45).max(0.01)).clamp(0.0, 1.0);
+                g *= 0.40 + 1.30 * (1.0 - axis_frac);
+            }
             // a collapsing node hauls on everything in reach
             if let Some((bi, _)) = self.bh {
                 let b = &self.grav[bi.min(self.grav.len() - 1)];

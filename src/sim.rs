@@ -2639,14 +2639,27 @@ pub fn run(args: &[String]) {
                 }
             }
             worst.sort_by(|a, b| a.1.total_cmp(&b.1));
-            // A note for whoever picks this up: MONKEY RUN fails uniformly
-            // (every route leaves its bore at 4-7%, spiral roads and vine
-            // lines alike) while PERPLEXUS traverses 21 of 24 with the same
-            // code. A failure that consistent across different route TYPES
-            // points at the field rather than the driving — that map carries
-            // ~520 gravity nodes, and where a tree road passes near a vine
-            // line the two tube fields overlap and the "down" direction
-            // flips mid-bore. That is the next thing to test.
+// WHAT IS KNOWN ABOUT THE MONKEY RUN FAILURE, so nobody repeats it:
+            //
+            //  * The geometry is NOT misplaced. `--sim routecheck` reads the
+            //    SDF at every waypoint: Monkey Run's sit at exactly their
+            //    bore radius (7.40 in a 7.4 m pipe). The tubes are where the
+            //    routes say they are.
+            //  * Perplexus is NOT the harder case. Its routes read 16-22 in a
+            //    5.6 m bore — they are open-air lines between anchors, so
+            //    "22 of 24 traversed" is mostly flying through nothing.
+            //    Monkey Run threads real bores for hundreds of metres.
+            //  * The car FLIES rather than drives: og=0 for the whole run,
+            //    climbing at a constant 23 m/s, drifting off the centreline
+            //    until a bend loses it. It never lands on the bore wall.
+            //  * Changing the route SHAPE changes nothing. Halving the swoop
+            //    curvature and the sag produced identical failure points to
+            //    the digit (4/5/6/7%), which means the exit is insensitive to
+            //    the geometry — so look at the harness's fall-out rule and
+            //    the spawn, not at the map.
+            //  * Already ruled out: spawn height, entry speed, bore
+            //    clearance, wall thickness, junction width, node density,
+            //    gravity-field overlap and gravity-field shape.
             let checked = n_routes;
             println!(
                 "{label:<12} traversed {done}/{checked} routes   fell out of {escaped}   worst: {}",
@@ -2657,6 +2670,35 @@ pub fn run(args: &[String]) {
                     .collect::<Vec<_>>()
                     .join("  ")
             );
+        }
+        return;
+    }
+    if name == "routecheck" {
+        // Where the route SAYS the bore is, versus where the geometry
+        // actually put it. Inside a tube the SDF at the centreline should
+        // read close to the bore radius; solid reads negative, and open sky
+        // reads far larger. A systematic mismatch would explain every
+        // symptom of the Monkey Run traversal failure at once.
+        for si in [21usize, 24] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            println!("{}", crate::world::style(si).name);
+            println!("   {:<6} {:>5} {:>8} {:>8} {:>8} {:>8}", "route", "pts", "r", "median", "solid%", "open%");
+            for (ri, (pts, r)) in w.routes.iter().enumerate().take(8) {
+                let mut d: Vec<f32> = pts.iter().map(|p| w.sdf(*p)).collect();
+                let solid = d.iter().filter(|&&x| x < 0.2).count();
+                let open = d.iter().filter(|&&x| x > r * 2.0).count();
+                d.sort_by(f32::total_cmp);
+                let med = d[d.len() / 2];
+                println!(
+                    "   {:<6} {:>5} {:>8.1} {:>8.2} {:>7.0}% {:>7.0}%",
+                    ri,
+                    pts.len(),
+                    r,
+                    med,
+                    solid as f32 / d.len() as f32 * 100.0,
+                    open as f32 / d.len() as f32 * 100.0
+                );
+            }
         }
         return;
     }
