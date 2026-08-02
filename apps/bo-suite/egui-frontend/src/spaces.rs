@@ -122,6 +122,44 @@ impl Routing {
         if let Some(c) = ca { self.assign.insert(b.to_string(), c); }
     }
 
+    /// The assignment, as `speaker = channel` lines under `[routing]`.
+    ///
+    /// Persisted because losing which speaker plays which channel on restart is
+    /// the worst failure a spatial router has: the room sounds wrong, and the
+    /// user has to rebuild an arrangement they set up once and expected to
+    /// keep. Everything else here — the speaker list, the layout's channels —
+    /// comes back from the mesh, so only the ASSIGNMENT is worth storing.
+    pub fn render(&self) -> String {
+        let mut out = String::from("# bo-suite speaker routing
+[routing]
+");
+        out.push_str(&format!("layout = {}
+", self.layout_name));
+        for (speaker, channel) in &self.assign {
+            out.push_str(&format!("{speaker} = {channel}
+"));
+        }
+        out
+    }
+
+    /// Restore an assignment over the CURRENT mesh.
+    ///
+    /// A saved assignment naming a speaker that is not here is skipped rather
+    /// than recreated: a speaker that has left the mesh cannot play anything,
+    /// and a phantom entry would make the room look complete while a channel is
+    /// silently missing. Same for a channel the current layout does not have —
+    /// restoring a 5.1 file onto a stereo layout must not invent channels.
+    pub fn restore(&mut self, text: &str) -> usize {
+        let ini = config_kit::Ini::parse(text);
+        let Some(section) = ini.sections.get("routing") else { return 0 };
+        let mut applied = 0;
+        for (speaker, channel) in section {
+            if speaker == "layout" { continue; }
+            if self.assign(speaker, channel) { applied += 1; }
+        }
+        applied
+    }
+
     /// Changing layout keeps whatever still applies.
     ///
     /// Going 5.1 → 2.0 and back should not lose the whole room. Channels the new
@@ -279,6 +317,59 @@ mod tests {
         r.set_layout(&Layout::surround_51());
         assert_eq!(r.unassigned().len(), 6);
         assert_eq!(r.channel_of("c"), None, "C is not in a stereo layout");
+    }
+
+    #[test]
+    fn a_routing_survives_a_restart() {
+        // The worst failure a spatial router has: the room sounds wrong and the
+        // user rebuilds an arrangement they set up once.
+        let mut a = room();
+        a.auto_assign();
+        let text = a.render();
+        let mut b = room();
+        assert_eq!(b.restore(&text), 4, "all four reapplied");
+        for s in ["a", "b", "c", "d"] {
+            assert_eq!(a.channel_of(s), b.channel_of(s), "speaker {s}");
+        }
+        assert!(b.is_complete());
+    }
+
+    #[test]
+    fn a_speaker_that_has_left_the_mesh_is_skipped_not_recreated() {
+        // A phantom entry makes the room look complete while a channel is
+        // silently missing — the user hears a gap and the UI says everything is
+        // assigned.
+        let mut a = room();
+        a.auto_assign();
+        let text = a.render();
+        let mut b = Routing::new(&Layout::quad(), vec![spk("a"), spk("b")]);
+        let n = b.restore(&text);
+        assert_eq!(n, 2, "only the speakers actually present");
+        assert!(!b.is_complete(), "and it says so rather than pretending");
+        assert_eq!(b.unassigned().len(), 2);
+    }
+
+    #[test]
+    fn restoring_a_surround_file_onto_stereo_invents_nothing() {
+        // The saved channels are not in this layout, so none apply.
+        let mut a = Routing::new(&Layout::surround_51(),
+                                 vec![spk("a"), spk("b"), spk("c"), spk("d")]);
+        a.auto_assign();
+        let text = a.render();
+        let mut b = Routing::new(&Layout::stereo(), vec![spk("a"), spk("b")]);
+        assert_eq!(b.restore(&text), 0, "FL is not L");
+        assert_eq!(b.channels, vec!["L", "R"]);
+    }
+
+    #[test]
+    fn a_missing_or_junk_file_leaves_the_room_alone() {
+        // First run, or a truncated write. Neither should clear a working
+        // arrangement.
+        let mut r = room();
+        r.auto_assign();
+        assert_eq!(r.restore(""), 0);
+        assert_eq!(r.restore("nonsense without a section"), 0);
+        assert!(r.is_complete(), "the live assignment is untouched");
     }
 
     #[test]

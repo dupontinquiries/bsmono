@@ -148,6 +148,7 @@ dependencies = [
 name = "bo-suite-egui"
 version = "0.1.0"
 dependencies = [
+ "config-kit",
  "eframe",
  "egui",
  "serde",
@@ -324,6 +325,10 @@ checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
 ]
+
+[[package]]
+name = "config-kit"
+version = "0.1.0"
 
 [[package]]
 name = "core-foundation"
