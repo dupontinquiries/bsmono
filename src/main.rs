@@ -890,7 +890,7 @@ fn main() {
     // stiffness, how much sideways motion they hold, and the reach and force
     // of the repulsor field. A stiff, low, tight-fielded machine darts and
     // pokes; a soft, high, wide-fielded one wallows and shepherds.
-    let hover_defs: [(&str, f32, physics::Hover); 6] = [
+    let hover_defs: [(&str, f32, physics::Hover); 14] = [
         // BRUTIS: a hover tank. Heavy, slow to settle, enormous soft field —
         // it does not shoot so much as lean on the ball.
         ("brutis", 1.36, physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0, ..physics::Hover::default() }),
@@ -908,6 +908,28 @@ fn main() {
         // CONTINGENCY: motorcycle-sized. Stiff, low, and a lance of a field —
         // it pokes the ball rather than pushing it.
         ("contingency", 1.10, physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0, ..physics::Hover::default() }),
+        // BLACKSTAR: a knife. The shortest pulse cooldown in the game, so it
+        // fights by shoving rather than by out-driving anyone.
+        ("blackstar", 1.22, physics::Hover { ride: 0.40, stiff: 60.0, hold: 0.10, field_r: 2.8, field_k: 30.0, pulse_cd: 1.05, pulse_k: 13.0, ..physics::Hover::default() }),
+        // ELEGANCE: long and floaty, with a generous base reserve — it is
+        // never quite out of thrust, which suits its complete lack of grip.
+        ("elegance", 1.34, physics::Hover { ride: 0.56, stiff: 38.0, hold: 0.12, field_r: 3.4, field_k: 25.0, base_tank: 40.0, base_regen: 50.0, ..physics::Hover::default() }),
+        // TRIFANG: three-pronged and stiff. A narrow, hard field: it stabs.
+        ("trifang", 1.26, physics::Hover { ride: 0.44, stiff: 62.0, hold: 0.11, field_r: 2.4, field_k: 38.0, ..physics::Hover::default() }),
+        // ECHOTRON: a civilian runabout. The most forgiving of them — real
+        // lateral hold and a soft, wide field.
+        ("echotron", 1.28, physics::Hover { ride: 0.50, stiff: 46.0, hold: 0.34, field_r: 3.6, field_k: 23.0, ..physics::Hover::default() }),
+        // HARDWALL: a police interceptor. Built to shove: the strongest
+        // pulse here, at the cost of a long wait for it.
+        ("hardwall", 1.32, physics::Hover { ride: 0.48, stiff: 50.0, hold: 0.22, field_r: 3.0, field_k: 26.0, pulse_k: 24.0, pulse_lift: 9.0, pulse_cd: 2.3, ..physics::Hover::default() }),
+        // FOLLY: a land surfer. Rides high and holds almost nothing, so it
+        // carves in long arcs and cannot stop.
+        ("folly", 1.24, physics::Hover { ride: 0.68, stiff: 32.0, hold: 0.06, field_r: 3.2, field_k: 24.0, ..physics::Hover::default() }),
+        // LINEBACK: a modular racer. The strongest charge tier, so a pad
+        // turns it into something else for a few seconds.
+        ("lineback", 1.30, physics::Hover { ride: 0.46, stiff: 54.0, hold: 0.14, field_r: 2.9, field_k: 28.0, charge_power: 1.55, ..physics::Hover::default() }),
+        // WHISTLEWIND: a hover IFV. Heavy, high, and it leans on the ball.
+        ("whistlewind", 1.42, physics::Hover { ride: 0.70, stiff: 34.0, hold: 0.30, field_r: 4.2, field_k: 22.0, pulse_lift: 6.5, ..physics::Hover::default() }),
     ];
     let hover_dir = dir.join("hover");
     let mut hovercars: Vec<model::Model> = Vec::new();
@@ -943,7 +965,7 @@ fn main() {
     };
     for (i, m) in hovercars.into_iter().enumerate() {
         cars.models.push(m);
-        cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency"][i]);
+        cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency", "Blackstar", "Elegance", "Trifang", "Echotron", "Hardwall", "Folly", "Lineback", "Whistlewind"][i]);
     }
     // EVERY car gets an electric variant. Rather than model them twice, the
     // petrol body is converted: light bars, blanked grille, battery sills and

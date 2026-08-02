@@ -247,7 +247,59 @@ fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
             ys.sort_by(f32::total_cmp);
             zs.sort_by(f32::total_cmp);
             xs.sort_by(f32::total_cmp);
-            let (cy, cz, cx) = (ys[ys.len() / 2], zs[zs.len() / 2], xs[xs.len() / 2]);
+            let (mut cy, mut cz, cx) = (ys[ys.len() / 2], zs[zs.len() / 2], xs[xs.len() / 2]);
+            // FIT THE CIRCLE, do not just take the middle. A median is pulled
+            // off the axle by whatever bodywork the cluster caught — an arch
+            // above the tyre drags the centre up, and the wheel then turns
+            // about a point that is not its own, which is the wobble. A tyre
+            // is a circle in the side view, so fit one: two rounds of
+            // least-squares, keeping only the points that agree with the
+            // first, which drops the attached bodywork before the second.
+            for round in 0..2 {
+                let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut sr2x, mut sr2y, mut n) =
+                    (0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64, 0.0f64);
+                // on the second round, keep points near the first estimate
+                let mut rs: Vec<f32> = c
+                    .iter()
+                    .map(|p| ((p.y - cy).powi(2) + (p.z - cz).powi(2)).sqrt())
+                    .collect();
+                rs.sort_by(f32::total_cmp);
+                let rmed = rs[rs.len() / 2];
+                for p in c.iter() {
+                    let (u, v) = ((p.y - cy) as f64, (p.z - cz) as f64);
+                    if round == 1 {
+                        let d = ((u * u + v * v).sqrt() as f32 - rmed).abs();
+                        if d > rmed * 0.45 {
+                            continue; // not on the tyre: an arch, a fender, a strut
+                        }
+                    }
+                    let r2 = u * u + v * v;
+                    sx += u;
+                    sy += v;
+                    sxx += u * u;
+                    syy += v * v;
+                    sxy += u * v;
+                    sr2x += r2 * u;
+                    sr2y += r2 * v;
+                    n += 1.0;
+                }
+                if n < 24.0 {
+                    break;
+                }
+                // solve the 2x2 normal equations for the circle centre
+                let (a11, a12, a22) = (sxx - sx * sx / n, sxy - sx * sy / n, syy - sy * sy / n);
+                let (b1, b2) = (0.5 * (sr2x - (sxx + syy) * sx / n), 0.5 * (sr2y - (sxx + syy) * sy / n));
+                let det = a11 * a22 - a12 * a12;
+                if det.abs() < 1e-9 {
+                    break;
+                }
+                let du = (b1 * a22 - b2 * a12) / det;
+                let dv = (a11 * b2 - a12 * b1) / det;
+                if du.is_finite() && dv.is_finite() && du.abs() < 1e3 && dv.abs() < 1e3 {
+                    cy += du as f32;
+                    cz += dv as f32;
+                }
+            }
             centres[i] = Vec3::new(cx, cy, cz);
             let mut rs: Vec<f32> = c
                 .iter()
@@ -307,8 +359,13 @@ fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
             // bumper and arch — Orion's bumper turned with its wheels. A
             // wheel also lives in a slab of its own along the axle, so the
             // triangle has to be near that too, not merely outboard.
-            let in_slab = (c.x - centres[i].x).abs() < radii[i] * 0.75;
-            if same_side && d < radii[i] * 0.92 && in_slab && c.x.abs() > half.x * 0.40 {
+            // ON THE TYRE, not merely near it. A wheel is an annulus in the
+            // side view — a triangle well inside the hub or well outside the
+            // tread belongs to something else, and taking it made brackets
+            // and arches turn with the wheel.
+            let in_slab = (c.x - centres[i].x).abs() < radii[i] * 0.70;
+            let on_wheel = d < radii[i] * 0.92 && d > radii[i] * 0.10;
+            if same_side && on_wheel && in_slab && c.x.abs() > half.x * 0.40 {
                 which = Some(i);
                 break;
             }

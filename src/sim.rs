@@ -4110,6 +4110,40 @@ pub fn run(args: &[String]) {
             donors.iter().all(|(_, d)| d.iter().all(|p| p.1.abs() <= 1.01 && p.2.abs() <= 1.01 && p.3.abs() <= 1.01))
         });
         check("no two donors produce the same car", min_d > 0.10);
+        // ---- and are they actually BODIES? ----
+        // A layout is a set of part positions, not a vehicle. Dropped in on
+        // their own they leave daylight between the pieces, which is what
+        // made these read as half-built. The hull is derived from where the
+        // donor put its mass, so it belongs to the donor — but it has to
+        // actually span the car.
+        {
+            let mut ok_all = true;
+            for (nm, d) in donors {
+                let mut w = [0.0f32; 5];
+                let mut h = [0.0f32; 5];
+                for (_, x, y, z, sz) in d.iter().copied() {
+                    let k = (((z + 1.0) * 0.5 * 4.0).round() as usize).min(4);
+                    w[k] = w[k].max(x.abs() + sz * 0.5);
+                    h[k] = h[k].max(y.abs() + sz * 0.5);
+                }
+                let raw = w.iter().filter(|v| **v > 0.25).count();
+                // mirror the builder's fallback: a station with nothing near
+                // it borrows from its neighbours rather than pinching the
+                // hull to a point. SPEARHEAD is a spine and legitimately has
+                // mass at two stations — the question is whether the HULL
+                // still spans the car, not whether the donor did.
+                for k in 0..5 {
+                    if w[k] < 0.25 {
+                        w[k] = if k == 0 { w[1] * 0.7 } else if k == 4 { w[3] * 0.7 } else { (w[k - 1] + w[k + 1]) * 0.4 };
+                    }
+                    w[k] = w[k].clamp(0.30, 1.0);
+                }
+                let spans = w.iter().filter(|v| **v >= 0.30).count();
+                println!("   {nm:<10} donor mass at {raw}/5 stations, hull spans {spans}/5");
+                ok_all &= spans == 5;
+            }
+            check("every donor gives the hull a shape to take", ok_all);
+        }
         check(
             "the classes are varied, not all blocks",
             donors.iter().all(|(_, d)| {
@@ -4362,6 +4396,98 @@ pub fn run(args: &[String]) {
                 corners.iter().filter(|c| **c >= 60).count(),
                 format!("{:.2}/{:.2}", rad.iter().cloned().fold(9.9f32, f32::min), rad.iter().cloned().fold(0.0f32, f32::max)),
                 if ok4 { "4 wheels" } else { "no split" }
+            );
+        }
+
+        // ---- IS THE AXLE WHERE WE THINK IT IS? ----
+        // The pivot used to come from the cluster's median, which is dragged
+        // off the axle by any bodywork the cluster caught — and a wheel that
+        // turns about a point which is not its own centre wobbles. Compare
+        // the median against a least-squares circle fit: the distance
+        // between them IS the wobble, and the residual says whether the
+        // points are really a circle at all.
+        println!();
+        println!("{:<12} {:>12} {:>12} {:>10}", "model", "median->fit", "residual", "verdict");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            let half = [(hi[0] - lo[0]) * 0.5, (hi[1] - lo[1]) * 0.5, (hi[2] - lo[2]) * 0.5];
+            // front-left corner is enough to characterise the method
+            let cl: Vec<[f32; 2]> = pts
+                .iter()
+                .filter(|p| {
+                    let q = [p[0] - mid[0], p[1] - mid[1], p[2] - mid[2]];
+                    q[1] < -half[1] * 0.15 && q[0] < -half[0] * 0.45 && q[2] < -half[2] * 0.25
+                })
+                .map(|p| [p[1] - mid[1], p[2] - mid[2]])
+                .collect();
+            if cl.len() < 60 {
+                println!("{:<12} {:>12} {:>12} {:>10}", n.trim_end_matches(".glb"), "-", "-", "no cluster");
+                continue;
+            }
+            let mut ys: Vec<f32> = cl.iter().map(|p| p[0]).collect();
+            let mut zs: Vec<f32> = cl.iter().map(|p| p[1]).collect();
+            ys.sort_by(f32::total_cmp);
+            zs.sort_by(f32::total_cmp);
+            let (m0, m1) = (ys[ys.len() / 2], zs[zs.len() / 2]);
+            let (mut cy, mut cz) = (m0, m1);
+            for round in 0..2 {
+                let mut rs: Vec<f32> = cl.iter().map(|p| ((p[0] - cy).powi(2) + (p[1] - cz).powi(2)).sqrt()).collect();
+                rs.sort_by(f32::total_cmp);
+                let rmed = rs[rs.len() / 2];
+                let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut sr2x, mut sr2y, mut cnt) =
+                    (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0f64);
+                for p in cl.iter() {
+                    let (u, v) = ((p[0] - cy) as f64, (p[1] - cz) as f64);
+                    if round == 1 && ((u * u + v * v).sqrt() as f32 - rmed).abs() > rmed * 0.45 {
+                        continue;
+                    }
+                    let r2 = u * u + v * v;
+                    sx += u; sy += v; sxx += u * u; syy += v * v; sxy += u * v;
+                    sr2x += r2 * u; sr2y += r2 * v; cnt += 1.0;
+                }
+                if cnt < 24.0 { break; }
+                let (a11, a12, a22) = (sxx - sx * sx / cnt, sxy - sx * sy / cnt, syy - sy * sy / cnt);
+                let (b1, b2) = (0.5 * (sr2x - (sxx + syy) * sx / cnt), 0.5 * (sr2y - (sxx + syy) * sy / cnt));
+                let det = a11 * a22 - a12 * a12;
+                if det.abs() < 1e-9 { break; }
+                cy += ((b1 * a22 - b2 * a12) / det) as f32;
+                cz += ((a11 * b2 - a12 * b1) / det) as f32;
+            }
+            let moved = (((cy - m0).powi(2) + (cz - m1).powi(2)).sqrt()) / half[1];
+            let mut rs: Vec<f32> = cl.iter().map(|p| ((p[0] - cy).powi(2) + (p[1] - cz).powi(2)).sqrt()).collect();
+            rs.sort_by(f32::total_cmp);
+            let rmed = rs[rs.len() / 2];
+            let inl: Vec<f32> = rs.iter().copied().filter(|r| (r - rmed).abs() < rmed * 0.45).collect();
+            let mean = inl.iter().sum::<f32>() / inl.len().max(1) as f32;
+            let resid = (inl.iter().map(|r| (r - mean).powi(2)).sum::<f32>() / inl.len().max(1) as f32).sqrt() / mean.max(1e-6);
+            println!(
+                "{:<12} {:>11.1}% {:>11.1}% {:>10}",
+                n.trim_end_matches(".glb"),
+                moved * 100.0,
+                resid * 100.0,
+                if resid < 0.30 { "round" } else { "not a wheel" }
             );
         }
 

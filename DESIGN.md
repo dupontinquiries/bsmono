@@ -3157,6 +3157,43 @@ helpless at the worst moment.
 And it adds rather than replaces, which is what makes these redirect
 machines: a ball already travelling at 14 m/s leaves the blast at 21.8.
 
+## v1.97.0 — bodies for the assembled cars, and better axles
+
+THE ASSEMBLED CARS HAD NO BODY. A mined layout is a set of PART POSITIONS,
+not a vehicle: dropping those in on their own leaves daylight between the
+pieces, which is exactly why they read as half-built. A donor's parts
+decorate a body — they are not the body.
+
+Each now gets a lofted hull first, with its section widths and heights taken
+from where the donor actually put its mass, so the shape still belongs to
+the donor rather than being a generic blob. A station with nothing near it
+borrows from its neighbours instead of pinching the hull to a point, which
+matters for SPEARHEAD: it is a rocket, it has mass at two of five stations,
+and it still needs a car around it. There is a darker glasshouse over the
+middle too, so the result reads as a cabin rather than a loaf. `--sim parts`
+checks the hull spans all five stations for every donor.
+
+THE AXLES WERE OFF. The pivot came from the cluster's MEDIAN, which is
+dragged off the axle by whatever bodywork the cluster caught — and a wheel
+that turns about a point which is not its own centre wobbles. A tyre is a
+circle in the side view, so fit one: two rounds of least-squares, the second
+keeping only the points that agreed with the first, which drops the attached
+bodywork before the final estimate. How far that moved each axle, as a
+fraction of the car's half-height:
+
+    assael 39%   vulcan 24%   xdevil 21%   breakout 16%   orion 10%
+
+And capture is an ANNULUS now, not a disc: a triangle well inside the hub or
+outside the tread belongs to something else, which is what had brackets and
+arches turning with the wheel.
+
+FOURTEEN HOVERCARS, up from six, and the numbers differentiate them:
+BLACKSTAR has the shortest pulse cooldown and fights by shoving, HARDWALL
+the strongest pulse and the longest wait for it, LINEBACK the fiercest
+charge tier so a pad transforms it, ELEGANCE a base reserve so large it is
+never quite out of thrust, ECHOTRON the only one with real lateral hold,
+FOLLY almost none at all.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
