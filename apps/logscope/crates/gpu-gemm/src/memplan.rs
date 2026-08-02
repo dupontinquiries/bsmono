@@ -872,6 +872,25 @@ mod fit_tests {
 pub fn streaming_fits_host(host_store: u64, page_cache: u64, resident: u64, ram: u64,
                            unified: bool) -> bool {
     if ram == 0 { return true; }                 // unknown RAM: do not refuse on no information
+    // THIS FRACTION CANNOT SEPARATE THE TWO MEASURED OUTCOMES, and that is worth stating rather than
+    // tuning around:
+    //
+    //   M2 Max 64 GiB, Qwen3-30B:  46.8 / 62.6  = 75%  -> OOM-KILLED
+    //   M2 Ultra 192 GiB, Scout:  159.5 / 189.7 = 84%  -> ran
+    //
+    // The FAILING case uses a SMALLER fraction of RAM than the passing one. No threshold on
+    // total/RAM puts them on opposite sides, so the ratio is not what decides — and a constant fitted
+    // to one point will mispredict the other.
+    //
+    // Discounting the page cache as reclaimable was my next attempt and it admits the case that was
+    // measured fatal, so that is not the discriminator either. What the Max log actually shows is
+    // DRM_IOCTL_ASAHI_VM_BIND failing BEFORE the kill — a VM-space or BO-count limit, not a byte
+    // total — which the 2047 MiB max_buffer_size and the arena's slab packing both point at.
+    //
+    // Left as it is, deliberately: it is conservative, it caught a real OOM, and it refuses Scout on a
+    // machine that can run it. That is a known cost paid for a check whose model is admittedly wrong,
+    // and LOGSCOPE_MOE_STREAM=0 is the escape until the real limit is measured. Fitting a number to
+    // make both points pass would produce a check that predicts nothing.
     let counted = host_store + page_cache + if unified { resident } else { 0 };
     // A TIGHTER FRACTION WHEN UNIFIED, and the measured run is why. 15.2 + 17.3 + 15.0 = 47.5 against
     // 3/4 of 64 GiB is 47.5 vs 48 — it passes by half a gigabyte, and the real load still died.
@@ -910,6 +929,24 @@ mod uma_tests {
         let measured = 31.0f32;
         let derived = budget_from_measurement(measured).unwrap();
         assert!(gib(derived) < 31.0, "75% of the measurement stays under it: {:.1}", gib(derived));
+    }
+
+    #[test]
+    fn no_ram_fraction_separates_the_two_measured_OUTCOMES() {
+        // The check's model is wrong and this records it, so the next person does not spend a day
+        // tuning the constant.
+        //
+        //   M2 Max 64 GiB, Qwen3-30B:  46.8 / 62.6  = 75%  -> OOM-KILLED
+        //   M2 Ultra 192 GiB, Scout:  159.5 / 189.7 = 84%  -> ran fine
+        //
+        // The failing case uses LESS of RAM than the passing one, so no threshold on total/RAM puts
+        // them on opposite sides. Whatever killed the Max is not the byte total — its log shows
+        // DRM_IOCTL_ASAHI_VM_BIND failing before the kill, which is VM space or BO count.
+        let max_frac = (15.2 + 14.3 + 17.3) / 62.6;
+        let ultra_frac = (50.6 + 48.0 + 60.9) / 189.7;
+        assert!(max_frac < ultra_frac,
+            "the FAILING case uses a smaller fraction ({max_frac:.2}) than the passing one \
+({ultra_frac:.2}) — a threshold cannot tell them apart");
     }
 
     #[test]
