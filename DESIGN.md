@@ -2994,6 +2994,44 @@ half-buried, which looks like a mistake rather than a joke. The lower body
 is four corner posts, two sills and a spine, leaving a real opening at each
 corner for the wheel.
 
+## v1.92.0 — cars assembled from other vehicles' layouts
+
+The supplied library ships NO GEOMETRY. It is a catalogue: 5,873 part
+signatures with a class and a size, and for 178 vehicles, WHERE each part
+sits. That is a compositional grammar rather than a set of meshes — and it
+is the more interesting input, because instead of importing someone's car a
+car can be ASSEMBLED from the layout of a tank, a mech or a rocket.
+
+Five donors, mined and normalised. Each arrives in its own units and axis
+convention, so each is treated the same way: keep the largest 54 parts (the
+structure, not the greeble dust), centre the cloud, then map its longest
+extent to Z, the next to X and the shortest to Y — which puts any donor,
+however it was authored, onto a car's envelope.
+
+    ROLLOUT    sci-fi tank      16 block, 9 panel      spread 0.50
+    CRYOFIN    slick racer      21 ring, 9 greeble     spread 0.44
+    TL-4       walking mech     18 panel, 10 block     spread 0.63
+    SPEARHEAD  rocket            38 ring, 9 block      spread 0.05
+    OUTBACK    sci-fi jeep      12 block, 10 greeble   spread 0.51
+
+The donor genuinely shows through, which was the thing worth checking rather
+than assuming: SPEARHEAD's lateral spread is 0.05 — it is a spine, because
+a rocket is — while TL-4 comes out plated and OUTBACK comes out covered in
+detail. `--sim parts` compares every pair of shape signatures and fails if
+any two donors would produce the same car; the closest pair differs by 0.12.
+
+Two things the library cannot supply, so this module does. GEOMETRY PER
+CLASS: a class is a hint about shape, so blocks become chamfered volumes,
+struts bars, discs and barrels round things, greebles crisp little boxes. And
+A LEGAL CHASSIS: the donor decides the look, the game decides the wheels —
+four, at the corners, the right size, able to steer. A donor with treads,
+three wheels or none still produces something you can drive.
+
+One case worth naming: a donor can be MOSTLY wheel-class, because a rocket's
+rings are catalogued as wheels. Dropping them all left SPEARHEAD nearly
+empty, so only the four lowest are treated as running gear and the rest are
+drawn as the rings they actually are.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

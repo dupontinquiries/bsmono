@@ -17,7 +17,7 @@ use crate::meshgen::{self, MeshData};
 use crate::model::{Drive, Model, Prim, Tag};
 use crate::render::Gpu;
 
-fn part(base: MeshData, scale: Vec3, rot: Quat, off: Vec3) -> MeshData {
+pub fn part(base: MeshData, scale: Vec3, rot: Quat, off: Vec3) -> MeshData {
     let mut m = base;
     meshgen::bake(&mut m, scale, rot, off);
     m

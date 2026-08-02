@@ -10,6 +10,8 @@ mod fx;
 mod gamepad;
 mod gyro;
 mod custom;
+mod partcars;
+mod partdata;
 mod trials;
 mod replay;
 mod academy;
@@ -877,6 +879,12 @@ fn main() {
     let tram = procars::tram(&mut gpu);
     let vipera = procars::vipera(&mut gpu);
     let aegis = procars::aegis(&mut gpu);
+    // assembled from mined part layouts (a tank, a racer, a mech, a rocket, a jeep)
+    let rollout = partcars::rollout(&mut gpu);
+    let cryofin = partcars::cryofin(&mut gpu);
+    let tl4 = partcars::tl4(&mut gpu);
+    let spearhead = partcars::spearhead(&mut gpu);
+    let outback = partcars::outback(&mut gpu);
     // imported bodies (single-file .glb, geometry and materials inline)
     let cars_dir = dir.join("cars");
     let backfire = model::load(&cars_dir.join("backfire"), &mut gpu, 1.28);
@@ -891,11 +899,13 @@ fn main() {
             octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark,
             volt, axion, hauler, pulse, tram, vipera, aegis,
             backfire, breakout, assael, guardian, orion, vulcan, xdevil,
+            rollout, cryofin, tl4, spearhead, outback,
         ],
         names: vec![
             "Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark",
             "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV", "Vipera", "Aegis",
             "Backfire", "Breakout", "Assael", "Guardian", "Orion", "Vulcan", "X-Devil",
+            "Rollout", "Cryofin", "TL-4", "Spearhead", "Outback",
         ],
         active: 0,
     };

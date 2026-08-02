@@ -453,3 +453,5 @@ GARAGE: ten animated skins, seven wheels, six trails, six goal explosions. `--si
 `--sim menus` checks menu layout across window shapes and verifies rows are hit-testable where they are drawn.
 
 The FPS readout counts frames that reached the screen, and shows dropped frames when the surface is abandoning them.
+
+Five cars are assembled from mined vehicle part layouts; `--sim parts` checks the donors stay distinct.

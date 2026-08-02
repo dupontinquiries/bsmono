@@ -3751,6 +3751,88 @@ pub fn run(args: &[String]) {
         println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
         return;
     }
+    if name == "parts" {
+        // Cars assembled from other vehicles' part LAYOUTS. The library ships
+        // no geometry — only a class and a position for each significant part
+        // of 178 vehicles — so the question worth asking is whether the donor
+        // actually shows through, or whether five donors produce five boxes.
+        use crate::partdata::*;
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        const CLASS_NAMES: [&str; 8] = ["block", "panel", "strut", "disc", "wheel", "barrel", "greeble", "tread"];
+        println!("{:<11} {:>6} {:>7} {:>7} {:>7}  composition", "donor", "parts", "spread", "height", "front");
+        let donors: [(&str, &[(u8, f32, f32, f32, f32)]); 5] =
+            [("ROLLOUT", ROLLOUT), ("CRYOFIN", CRYOFIN), ("TL4", TL4), ("SPEARHEAD", SPEARHEAD), ("OUTBACK", OUTBACK)];
+        let mut sigs: Vec<Vec<f32>> = Vec::new();
+        for (nm, d) in donors {
+            let mut counts = [0u32; 8];
+            for (c, _, _, _, _) in d.iter() {
+                counts[(*c as usize).min(7)] += 1;
+            }
+            // shape statistics: how wide, how tall, and where the mass sits
+            let n = d.len().max(1) as f32;
+            let spread = d.iter().map(|p| p.1.abs()).sum::<f32>() / n;
+            let height = d.iter().map(|p| p.2.abs()).sum::<f32>() / n;
+            let front = d.iter().filter(|p| p.3 < 0.0).count() as f32 / n;
+            let top: Vec<String> = {
+                let mut idx: Vec<usize> = (0..8).collect();
+                idx.sort_by_key(|i| std::cmp::Reverse(counts[*i]));
+                idx.iter().take(3).filter(|i| counts[**i] > 0).map(|i| format!("{} {}", counts[*i], CLASS_NAMES[*i])).collect()
+            };
+            println!(
+                "{:<11} {:>6} {:>7.2} {:>7.2} {:>6.0}%  {}",
+                nm,
+                d.len(),
+                spread,
+                height,
+                front * 100.0,
+                top.join(", ")
+            );
+            sigs.push(vec![spread, height, front, counts[1] as f32 / n, counts[2] as f32 / n, counts[6] as f32 / n]);
+        }
+        // Do the donors differ? Compare every pair of shape signatures; if a
+        // tank and a rocket come out the same, the layout is not surviving.
+        let mut min_d = f32::MAX;
+        let mut worst = (0usize, 0usize);
+        for i in 0..sigs.len() {
+            for j in (i + 1)..sigs.len() {
+                let d: f32 = sigs[i]
+                    .iter()
+                    .zip(sigs[j].iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>()
+                    .sqrt();
+                if d < min_d {
+                    min_d = d;
+                    worst = (i, j);
+                }
+            }
+        }
+        println!(
+            "   closest pair: {} and {} differ by {:.2}",
+            donors[worst.0].0, donors[worst.1].0, min_d
+        );
+        check("every donor keeps its structural parts", donors.iter().all(|(_, d)| d.len() >= 40));
+        check("the layouts are normalised onto a car envelope", {
+            donors.iter().all(|(_, d)| d.iter().all(|p| p.1.abs() <= 1.01 && p.2.abs() <= 1.01 && p.3.abs() <= 1.01))
+        });
+        check("no two donors produce the same car", min_d > 0.10);
+        check(
+            "the classes are varied, not all blocks",
+            donors.iter().all(|(_, d)| {
+                let mut seen = [false; 8];
+                for (c, _, _, _, _) in d.iter() {
+                    seen[(*c as usize).min(7)] = true;
+                }
+                seen.iter().filter(|s| **s).count() >= 4
+            }),
+        );
+        println!("{}", if pass { "PARTS: PASS" } else { "PARTS: FAIL" });
+        return;
+    }
     if name == "glb" {
         // Can the loader actually read these? Geometry only — no GPU needed
         // to answer whether a file parses, has a scene, and carries meshes.
