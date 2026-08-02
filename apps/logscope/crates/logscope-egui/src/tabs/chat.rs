@@ -7183,6 +7183,17 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                         }
                     }
+                    // APPLY THE SWIPE. This was computed and discarded, so the gesture has done nothing since
+                    // _368 — the model layer was correct, tested, and never consulted.
+                    //
+                    // chatgesture::action already refused mid-stream swipes and single-variant messages, so
+                    // reaching here means the change is allowed. The clamp is the second half of that contract:
+                    // CLAMP, not wrap, because wrapping from the last regeneration back to the first reads as
+                    // having lost the newest one.
+                    if let Some((i, d)) = swipe_variant {
+                        let n = self.msgs[i].variants.len();
+                        self.msgs[i].cur = (self.msgs[i].cur as i32 + d).clamp(0, n as i32 - 1) as usize;
+                    }
                 });
         });
 

@@ -749,8 +749,20 @@ pub fn ensure_contrast_accent(fg: Color32, bg: Color32, min: f32) -> Color32 {
     let lighter = lift_col(fg, 40);
     let darker = scale_col(fg, 0.6);
     let go_lighter = contrast_ratio(lighter, bg) >= contrast_ratio(darker, bg);
-    let mut best = fg;
-    // up to 24 fine steps in the chosen direction; keep the first that clears, else the strongest.
+    // Up to 24 fine steps in the chosen direction, returning the FIRST that clears.
+    //
+    // The comment here said "keep the first that clears, else the strongest", and a `best`
+    // variable tracked that strongest candidate — assigned every iteration and never read.
+    // The fallback below ignores it entirely.
+    //
+    // Deleting it rather than reviving it, because the current fallback is the better one: a
+    // candidate that survived all 24 steps still FAILS the contrast target, so returning it
+    // would hand back illegible text with the hue preserved. ensure_contrast goes to a
+    // guaranteed pole — legible, with some desaturation, which is the right trade in the corner
+    // where no hue-preserving move works.
+    //
+    // A comment describing behaviour the code abandoned is the same failure as a stale label:
+    // the next reader trusts it and reasons from a policy nothing implements.
     for i in 1..=24u32 {
         let t = i as f32 / 24.0;
         let cand = if go_lighter {
@@ -761,7 +773,6 @@ pub fn ensure_contrast_accent(fg: Color32, bg: Color32, min: f32) -> Color32 {
             // toward a dark version: scale down (keeps hue, drops value).
             scale_col(fg, 1.0 - 0.85 * t)
         };
-        best = cand;
         if contrast_ratio(cand, bg) >= min { return cand; }
     }
     // couldn't reach the target with hue-preserving moves (very mid-tone surface): fall back to the
