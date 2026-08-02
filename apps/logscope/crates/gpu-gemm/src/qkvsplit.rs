@@ -150,3 +150,107 @@ mod tests {
         assert_eq!(Split::byte_range(s.k, 72), (4096 * 72, 5120 * 72));
     }
 }
+
+/// Which fused tensor supplies a missing q/k/v, and which part of it.
+///
+/// The loader fetches `blk.{i}.attn_q.weight` and fails when a checkpoint ships `attn_qkv.weight`
+/// instead. This is the resolution step: given the name that was asked for, name the tensor that
+/// actually holds it and which of the three parts to take.
+///
+/// Separated from the byte arithmetic on purpose. A fetch shim needs to answer "where do I look"
+/// before it can answer "which bytes", and keeping them apart means the name mapping can be tested
+/// without a file and the byte mapping without a name table.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Part { Q, K, V }
+
+/// The fused spellings seen in the wild, in the order they should be tried.
+///
+/// `attn_qkv` is the GGUF convention; `wqkv` and `query_key_value` appear in checkpoints converted
+/// from other toolchains. Listed rather than pattern-matched, because a name that merely *contains*
+/// "qkv" could be something else entirely and guessing wrong slices the wrong tensor.
+pub const FUSED_NAMES: [&str; 3] = ["attn_qkv", "wqkv", "query_key_value"];
+
+/// Resolve `blk.{i}.attn_q.weight` → (`blk.{i}.attn_qkv.weight`, Part::Q).
+///
+/// Returns None for anything that is not a q/k/v projection, so a caller can use this as a filter
+/// rather than having to know in advance which names are splittable.
+pub fn resolve(wanted: &str, fused: &str) -> Option<(String, Part)> {
+    let (stem, suffix) = wanted.rsplit_once('.')?;      // "blk.0.attn_q" , "weight"
+    let (prefix, leaf) = stem.rsplit_once('.')?;        // "blk.0" , "attn_q"
+    let part = match leaf {
+        "attn_q" | "wq" | "q_proj" => Part::Q,
+        "attn_k" | "wk" | "k_proj" => Part::K,
+        "attn_v" | "wv" | "v_proj" => Part::V,
+        _ => return None,
+    };
+    Some((format!("{prefix}.{fused}.{suffix}"), part))
+}
+
+impl Split {
+    /// The row span for a part, so a caller can go straight from `resolve` to bytes.
+    pub fn span(&self, part: Part) -> (usize, usize) {
+        match part { Part::Q => self.q, Part::K => self.k, Part::V => self.v }
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    #[test]
+    fn a_q_projection_resolves_to_the_fused_tensor_and_its_part() {
+        let (name, part) = resolve("blk.0.attn_q.weight", "attn_qkv").expect("resolves");
+        assert_eq!(name, "blk.0.attn_qkv.weight");
+        assert_eq!(part, Part::Q);
+    }
+
+    #[test]
+    fn k_and_v_resolve_to_the_SAME_tensor_with_different_parts() {
+        // One fetch, three consumers — which is the whole reason the mapping is name-level rather
+        // than a per-tensor rewrite.
+        let (kn, kp) = resolve("blk.7.attn_k.weight", "attn_qkv").unwrap();
+        let (vn, vp) = resolve("blk.7.attn_v.weight", "attn_qkv").unwrap();
+        assert_eq!(kn, vn);
+        assert_ne!(kp, vp);
+    }
+
+    #[test]
+    fn a_non_projection_name_resolves_to_NOTHING() {
+        // So a caller can use this as a filter. Returning a guess for `attn_norm` would have the shim
+        // slice a normalization vector into thirds.
+        assert!(resolve("blk.0.attn_norm.weight", "attn_qkv").is_none());
+        assert!(resolve("token_embd.weight", "attn_qkv").is_none());
+        assert!(resolve("output.weight", "attn_qkv").is_none());
+    }
+
+    #[test]
+    fn the_alternate_spellings_all_resolve() {
+        // Converted checkpoints use q_proj/k_proj/v_proj and wq/wk/wv, and a loader that handles only
+        // the GGUF spelling refuses a file it could read.
+        for (n, want) in [("blk.1.q_proj.weight", Part::Q), ("blk.1.wk.weight", Part::K),
+                          ("blk.1.v_proj.weight", Part::V)] {
+            assert_eq!(resolve(n, "wqkv").map(|(_, p)| p), Some(want), "{n}");
+        }
+    }
+
+    #[test]
+    fn the_span_matches_the_split_it_came_from() {
+        // Connects the two halves: resolve says WHICH part, split says WHERE, and a caller composing
+        // them must land on the same rows the split defined.
+        let s = split(6144, 32, 8, 128).unwrap();
+        assert_eq!(s.span(Part::Q), s.q);
+        assert_eq!(s.span(Part::K), s.k);
+        assert_eq!(s.span(Part::V), s.v);
+        // And they tile the tensor with no gap and no overlap.
+        assert_eq!(s.span(Part::Q).1, s.span(Part::K).0);
+        assert_eq!(s.span(Part::K).1, s.span(Part::V).0);
+    }
+
+    #[test]
+    fn the_fused_name_list_is_ordered_and_specific() {
+        // Listed rather than pattern-matched: a name that merely CONTAINS "qkv" could be something
+        // else, and guessing wrong slices the wrong tensor into thirds.
+        assert_eq!(FUSED_NAMES[0], "attn_qkv", "the GGUF convention is tried first");
+        assert!(FUSED_NAMES.contains(&"query_key_value"));
+    }
+}
