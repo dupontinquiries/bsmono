@@ -796,9 +796,14 @@ would mislead every later load",
             // removes it — we re-insert the extended tip after generating.
             let kv_off = std::env::var("LOGSCOPE_KV_OFF").is_ok();
             let mut picked_session: Option<Session> = None; // Some ⇒ pool path (owns the source)
+            // `had_cache` distinguishes a MISS from a first turn. pool.pick returning None when the
+            // pool already holds entries means the prefix diverged or was evicted — and that costs the
+            // whole prompt again, which the log reported in words identical to a first turn.
+            let mut had_cache = false;
             let (reuse, l, pick_idx) = if kv_off {
                 (false, 0, 0)
             } else if let Some(pool) = self.pool.as_mut() {
+                had_cache = !pool.is_empty();
                 match pool.pick(&self.gpu, &self.model, &prompt_ids, 16, 256) {
                     Some((i, ln, sess)) => { picked_session = Some(sess); (true, ln, i) }
                     None => (false, 0, 0),
@@ -862,7 +867,22 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             }
             eprintln!("wgpu-engine: [{}] prompt {} tokens → up to {} (temp {:.2}); {} in {:.2}s, decoding…", self.name,
                 prompt_ids.len(), n_new, p.temperature,
-                if reuse { format!("reused {l} anchor tokens + prefilled {suffix_len}") } else { format!("full prefill") },
+                // NAME THE MISS. A hit says "reused N anchor tokens"; a miss said "full prefill",
+                // which is exactly what a FIRST turn says — so the one number worth watching was
+                // invisible, and a chat that silently lost its anchor every turn read as a chat with
+                // long prompts.
+                //
+                // A miss costs the whole prompt again: measured at 12.6 ms/tok on this device, so a
+                // 1700-token prompt is 20 s paid for nothing. The pool holds 3, and a fourth branch
+                // evicts one.
+                if reuse {
+                    format!("reused {l} anchor tokens + prefilled {suffix_len}")
+                } else if had_cache {
+                    format!("ANCHOR MISS — re-prefilled all {} tokens (the cached prefix diverged or \
+was evicted)", prompt_ids.len())
+                } else {
+                    format!("full prefill (first turn for this model)")
+                },
                 t0.elapsed().as_secs_f32());
             let td = Instant::now();
             // Batch 3: snapshot the engine's dispatch counters so we can report the CPU-bound (setup)
