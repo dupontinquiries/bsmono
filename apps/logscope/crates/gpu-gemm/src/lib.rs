@@ -8353,6 +8353,33 @@ host-copy path (dequantize + requantize every expert into RAM)");
                         }
                     } else { None };
                     drop(gsrc); drop(usrc);
+                    // PRINT THE ROUTING CONFIG AND ITS SOURCE, once. Five Llama-4 constants
+                    // turned out to be values the file carried, and each produced text that was
+                    // merely worse with every tensor present — the log line is where a wrong one
+                    // becomes visible. The same values decide MoE routing here: a normalize flag
+                    // read the wrong way, or a scale defaulted when the file specifies one,
+                    // rescales every expert's contribution and reads as a confused model.
+                    {
+                        static LOGGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            let norm_key = format!("{}.expert_weights_norm", acfg.prefix);
+                            let scale_key = format!("{}.expert_weights_scale", acfg.prefix);
+                            let c = crate::archcfg::moe_config(&acfg, n_expert as u32,
+                                n_expert_used as u32,
+                                g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(0),
+                                g.get_f32(&scale_key), g.get_u32(&norm_key).map(|v| v != 0));
+                            eprintln!("loader: MoE routing — {} of {} experts, normalize {} ({}), \
+scale {} ({}), shared {}, weight applied to {}",
+                                n_expert_used, n_expert,
+                                c.normalize,
+                                if g.get_u32(&norm_key).is_some() { "file" } else { "arch default" },
+                                c.routed_scale,
+                                if g.get_f32(&scale_key).is_some() { "file" } else { "default 1.0" },
+                                c.n_shared,
+                                if c.weight_before { "the expert's INPUT" } else { "its output" });
+                        }
+                    }
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
                         // SHARED EXPERT COUNT FROM METADATA. This was a literal 0, and it worked for
                         // Scout only because moe_config rescues an arch that declares
