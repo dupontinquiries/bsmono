@@ -3495,6 +3495,18 @@ pub fn run(args: &[String]) {
             println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
             pass &= ok;
         };
+        // the rim meshes the wheel slot actually draws
+        {
+            let mut tris = Vec::new();
+            for (n, spokes, dish) in WHEELS.iter() {
+                let m = crate::meshgen::rim(*spokes, *dish, 24);
+                tris.push(format!("{n} {}t", m.idx.len() / 3));
+            }
+            println!("rim styles: {}", tris.join(", "));
+            let solid = crate::meshgen::rim(0, 0.10, 24).idx.len();
+            let spoked = crate::meshgen::rim(12, 0.18, 24).idx.len();
+            check("a spoked rim has more geometry than a disc", spoked > solid);
+        }
         println!("skins {}  wheels {}  trails {}  explosions {}", SKINS.len(), WHEELS.len(), TRAILS.len(), EXPLOSIONS.len());
         println!("   {} combinations", SKINS.len() * WHEELS.len() * TRAILS.len() * EXPLOSIONS.len());
         check("every slot has choices", SKINS.len() >= 8 && WHEELS.len() >= 6 && TRAILS.len() >= 5 && EXPLOSIONS.len() >= 5);
@@ -3666,15 +3678,45 @@ pub fn run(args: &[String]) {
             let mut corners = [0usize; 4];
             let mut rad = [0.0f32; 4];
             let mut cl: Vec<Vec<[f32; 3]>> = vec![Vec::new(); 4];
-            for p in &pts {
-                let q = [p[0] - mid[0], p[1] - mid[1], p[2] - mid[2]];
-                if q[1] > half[1] * 0.15 || q[0].abs() < half[0] * 0.45 || q[2].abs() < half[2] * 0.25 {
+            let mut used_cut = 0.0f32;
+            for cut in [0.45f32, 0.35, 0.55, 0.28, 0.62] {
+                corners = [0usize; 4];
+                rad = [0.0f32; 4];
+                cl = vec![Vec::new(); 4];
+                for p in &pts {
+                    let q = [p[0] - mid[0], p[1] - mid[1], p[2] - mid[2]];
+                    if q[1] > half[1] * 0.15 || q[0].abs() < half[0] * cut || q[2].abs() < half[2] * 0.25 {
+                        continue;
+                    }
+                    let ci = (if q[0] > 0.0 { 1 } else { 0 }) + (if q[2] > 0.0 { 2 } else { 0 });
+                    corners[ci] += 1;
+                    cl[ci].push(q);
+                }
+                used_cut = cut;
+                if corners.iter().any(|c| *c < 60) {
                     continue;
                 }
-                let ci = (if q[0] > 0.0 { 1 } else { 0 }) + (if q[2] > 0.0 { 2 } else { 0 });
-                corners[ci] += 1;
-                cl[ci].push(q);
+                let mut good = true;
+                for i in 0..4 {
+                    let mut ys: Vec<f32> = cl[i].iter().map(|p| p[1]).collect();
+                    let mut zs: Vec<f32> = cl[i].iter().map(|p| p[2]).collect();
+                    ys.sort_by(f32::total_cmp);
+                    zs.sort_by(f32::total_cmp);
+                    let (cy, cz) = (ys[ys.len() / 2], zs[zs.len() / 2]);
+                    let mut rs: Vec<f32> = cl[i].iter().map(|p| ((p[1] - cy).powi(2) + (p[2] - cz).powi(2)).sqrt()).collect();
+                    rs.sort_by(f32::total_cmp);
+                    rad[i] = rs[rs.len() * 85 / 100] / half[1];
+                    if rad[i] < 0.16 || rad[i] > 1.7 {
+                        good = false;
+                    }
+                }
+                let rmn = rad.iter().cloned().fold(9.9f32, f32::min);
+                let rmx = rad.iter().cloned().fold(0.0f32, f32::max);
+                if good && rmx < rmn * 1.9 {
+                    break;
+                }
             }
+            let _ = used_cut;
             for i in 0..4 {
                 if cl[i].len() < 60 {
                     continue;
@@ -3688,7 +3730,13 @@ pub fn run(args: &[String]) {
                 rs.sort_by(f32::total_cmp);
                 rad[i] = rs[rs.len() * 85 / 100] / half[1];
             }
-            let ok4 = corners.iter().all(|c| *c >= 60) && rad.iter().all(|r| *r > 0.16 && *r < 1.7);
+            // mirror the loader's rule: four plausible wheels, all a similar
+            // size (a set that disagrees wildly means one is not a wheel)
+            let rmin = rad.iter().cloned().fold(9.9f32, f32::min);
+            let rmax = rad.iter().cloned().fold(0.0f32, f32::max);
+            let ok4 = corners.iter().all(|c| *c >= 60)
+                && rad.iter().all(|r| *r > 0.16 && *r < 1.7)
+                && rmax < rmin * 1.9;
             println!(
                 "{:<12} {:>9} {:>9} {:>9}",
                 n.trim_end_matches(".glb"),

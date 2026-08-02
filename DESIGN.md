@@ -2753,6 +2753,33 @@ along those.
 radii — so a future import that fails to split says so instead of quietly
 rolling on frozen tyres.
 
+## v1.85.0 — the wheel slot does something
+
+THE GARAGE PROMISED SEVEN WHEEL STYLES and changed nothing: the data was
+there and nothing drew it. Rims are real geometry now — a lip, a face and
+either a solid disc or a set of flat spokes — and they are drawn OVER
+whatever wheel a car already has, riding its own pivot and its own spin.
+That is what makes the slot work for every car in the game, the imported
+bodies included, without touching a single one of their meshes. Seven
+distinct meshes, 72 to 108 triangles each.
+
+That required care with the mesh registry: the rims took indices 17-23,
+which is where the terrain chunks had been, so `M_TERRAIN_0` moved to 24. A
+silent off-by-seven there would have drawn ground where wheels belong.
+
+THE WHEEL SPLITTER NOW SEARCHES for its threshold instead of assuming one.
+How far out a wheel sits varies between cars, and a single fixed cut caught
+a piece of bodywork in one of VULCAN's corners — a "wheel" of radius 0.04.
+Five cuts are tried and the first that yields four plausible wheels wins,
+with a new sanity rule that matters more than the radius bounds: THE FOUR
+WHEELS OF A CAR ARE THE SAME SIZE, so a set whose radii disagree by more
+than 1.9x is not four wheels. That tightened the detections on Guardian,
+Orion and Breakout as well.
+
+VULCAN still declines, at every threshold — its corners genuinely do not
+hold four similar wheels. It keeps a correct static body rather than a
+spinning door, which is the right answer, and `--sim glb` names it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

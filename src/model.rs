@@ -113,44 +113,66 @@ fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
     if half.x < 1e-4 || half.z < 1e-4 {
         return false;
     }
-    // candidate wheel region: outer, low, and away from the centre line
+    // SEARCH FOR THE THRESHOLD, do not assume one. How far out a wheel sits
+    // varies between cars: a single fixed cut found four wheels on six of
+    // seven models and, on the seventh, caught a piece of bodywork in one
+    // corner instead (a "wheel" of radius 0.04). Try several cuts and take
+    // the first that yields four plausible wheels everywhere.
     let mut corners: [Vec<Vec3>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    for v in &raws[0].verts {
-        let p = Vec3::from_array(v.pos) - mid;
-        if p.y > half.y * 0.15 || p.x.abs() < half.x * 0.45 || p.z.abs() < half.z * 0.25 {
-            continue;
-        }
-        let ci = (if p.x > 0.0 { 1 } else { 0 }) + (if p.z > 0.0 { 2 } else { 0 });
-        corners[ci].push(p);
-    }
-    // each corner needs enough of a cluster to be a wheel at all
     let mut centres = [Vec3::ZERO; 4];
     let mut radii = [0.0f32; 4];
+    let mut found_cut = false;
+    for cut in [0.45f32, 0.35, 0.55, 0.28, 0.62] {
+        corners = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        for v in &raws[0].verts {
+            let p = Vec3::from_array(v.pos) - mid;
+            if p.y > half.y * 0.15 || p.x.abs() < half.x * cut || p.z.abs() < half.z * 0.25 {
+                continue;
+            }
+            let ci = (if p.x > 0.0 { 1 } else { 0 }) + (if p.z > 0.0 { 2 } else { 0 });
+            corners[ci].push(p);
+        }
+        if corners.iter().any(|c| c.len() < 60) {
+            continue;
+        }
+        let mut ok = true;
+        for (i, c) in corners.iter().enumerate() {
+            let mut ys: Vec<f32> = c.iter().map(|p| p.y).collect();
+            let mut zs: Vec<f32> = c.iter().map(|p| p.z).collect();
+            let mut xs: Vec<f32> = c.iter().map(|p| p.x).collect();
+            ys.sort_by(f32::total_cmp);
+            zs.sort_by(f32::total_cmp);
+            xs.sort_by(f32::total_cmp);
+            let (cy, cz, cx) = (ys[ys.len() / 2], zs[zs.len() / 2], xs[xs.len() / 2]);
+            centres[i] = Vec3::new(cx, cy, cz);
+            let mut rs: Vec<f32> = c
+                .iter()
+                .map(|p| ((p.y - cy).powi(2) + (p.z - cz).powi(2)).sqrt())
+                .collect();
+            rs.sort_by(f32::total_cmp);
+            radii[i] = rs[rs.len() * 85 / 100];
+            if radii[i] < half.y * 0.16 || radii[i] > half.y * 1.7 {
+                ok = false;
+            }
+        }
+        // the four wheels of a car are the same size: a set that disagrees
+        // wildly means one of them is not a wheel
+        let rmin = radii.iter().cloned().fold(f32::MAX, f32::min);
+        let rmax = radii.iter().cloned().fold(0.0f32, f32::max);
+        if ok && rmax < rmin * 1.9 {
+            found_cut = true;
+            break;
+        }
+    }
+    if !found_cut {
+        return false;
+    }
     for (i, c) in corners.iter().enumerate() {
         if c.len() < 60 {
             return false;
         }
-        // centre in the side view (y,z); x is the track, taken as the median
-        let mut ys: Vec<f32> = c.iter().map(|p| p.y).collect();
-        let mut zs: Vec<f32> = c.iter().map(|p| p.z).collect();
-        let mut xs: Vec<f32> = c.iter().map(|p| p.x).collect();
-        ys.sort_by(f32::total_cmp);
-        zs.sort_by(f32::total_cmp);
-        xs.sort_by(f32::total_cmp);
-        let cy = ys[ys.len() / 2];
-        let cz = zs[zs.len() / 2];
-        let cx = xs[xs.len() / 2];
-        centres[i] = Vec3::new(cx, cy, cz);
-        // radius: the 85th percentile of distance in the side view, so a
-        // stray vertex on the arch does not inflate the wheel
-        let mut rs: Vec<f32> = c
-            .iter()
-            .map(|p| ((p.y - cy).powi(2) + (p.z - cz).powi(2)).sqrt())
-            .collect();
-        rs.sort_by(f32::total_cmp);
-        radii[i] = rs[rs.len() * 85 / 100];
-        if radii[i] < half.y * 0.16 || radii[i] > half.y * 1.7 {
-            return false; // that is not a wheel
+        let _ = i;
+        {
         }
     }
     // assign triangles whole, by centroid, so no tyre is half body

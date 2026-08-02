@@ -365,6 +365,61 @@ pub fn cbox(bevel: f32) -> MeshData {
     m
 }
 
+/// A RIM in one of the garage's styles, as a unit-radius disc facing X.
+///
+/// This is drawn OVER whatever wheel a car already has, at the wheel's own
+/// pivot and with its own spin, so a style applies to every car in the game
+/// — the imported bodies included — without touching their meshes.
+/// `spokes` of 0 means a solid disc; `dish` is how far the face is inset.
+pub fn rim(spokes: u32, dish: f32, seg: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let n = seg.max(16);
+    let x = 0.30 - dish * 0.5; // the face plane, inset by the dish
+    // the outer lip: a short cylinder so the rim has depth against the tyre
+    for i in 0..=n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        let (c, s2) = (a.cos(), a.sin());
+        for xx in [x, 0.30] {
+            m.push(Vec3::new(xx, c * 0.94, s2 * 0.94), Vec3::new(0.0, c, s2), Vec2::new(i as f32 / n as f32, 0.0));
+        }
+    }
+    for i in 0..n {
+        let k = i * 2;
+        m.idx.extend_from_slice(&[k, k + 1, k + 2, k + 1, k + 3, k + 2]);
+    }
+    // the face: a hub, plus either a solid disc or a set of spokes
+    let base = m.verts.len() as u32;
+    let nx = Vec3::new(1.0, 0.0, 0.0);
+    m.push(Vec3::new(x, 0.0, 0.0), nx, Vec2::new(0.5, 0.5));
+    let hub = if spokes == 0 { 0.94 } else { 0.30 };
+    for i in 0..=n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        m.push(Vec3::new(x, a.cos() * hub, a.sin() * hub), nx, Vec2::new(0.5, 0.5));
+    }
+    for i in 0..n {
+        m.idx.extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
+    }
+    // spokes: flat bars from the hub to the lip, each a quad
+    if spokes > 0 {
+        let w = (0.9 / spokes as f32).clamp(0.03, 0.16);
+        for k in 0..spokes {
+            let a = k as f32 / spokes as f32 * std::f32::consts::TAU;
+            let (ca, sa) = (a.cos(), a.sin());
+            let (px, py) = (-sa * w, ca * w); // across the spoke
+            let b2 = m.verts.len() as u32;
+            for (r, sgn) in [(0.28f32, 1.0f32), (0.28, -1.0), (0.93, 1.0), (0.93, -1.0)] {
+                m.push(
+                    Vec3::new(x, ca * r + px * sgn, sa * r + py * sgn),
+                    nx,
+                    Vec2::new(0.5, 0.5),
+                );
+            }
+            m.idx.extend_from_slice(&[b2, b2 + 1, b2 + 2, b2 + 1, b2 + 3, b2 + 2]);
+        }
+    }
+    m
+}
+
 /// A LOFTED HULL — the real answer to "these look like stacked boxes".
 ///
 /// Takes cross-sections along Z (nose to tail) and skins between them, so a

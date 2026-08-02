@@ -30,9 +30,11 @@ pub const M_TORUS_TUBE: usize = 12; // hollow torus: a seamless loop of pipe
 pub const M_RING_DECK: usize = 13; // flat annulus: a drivable planetary ring
 pub const M_HEX: usize = 12; // hexagonal tile prism
 pub const TERRAIN_CHUNKS: u32 = 6; // 6x6 cullable ground tiles
-pub const M_TERRAIN_0: usize = 17; // first of TERRAIN_CHUNKS^2 chunk meshes
+pub const M_TERRAIN_0: usize = 24; // after the seven rim styles // first of TERRAIN_CHUNKS^2 chunk meshes
 pub const M_SPHERE_LO: usize = 15; // far-field sphere: a fifth of the triangles
-pub const M_CAP_TALL_LO: usize = 16; // far-field capsule
+pub const M_CAP_TALL_LO: usize = 16;
+/// the seven garage rim styles, registered right after the car LODs
+pub const M_RIM_0: usize = 17; // far-field capsule
 /// Terrain ground-truth grid: physics, placement, the render mesh and the
 /// ray-marched shadows all sample THESE nodes, so the floor you see is the
 /// floor you drive on (the analytic fbm is only sampled once, node-wise).

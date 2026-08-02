@@ -834,6 +834,10 @@ fn main() {
         gpu.add_mesh(&meshgen::capsule(world::CAP_TALL_HH, 5, 10)), // M_CAP_TALL_LO
 ];
     assert_eq!(ids[world::M_TERRAIN], world::M_TERRAIN);
+    // the garage's rim styles, one mesh each
+    for (_, spokes, dish) in custom::WHEELS.iter() {
+        gpu.add_mesh(&meshgen::rim(*spokes, *dish, 24));
+    }
     // the ground, split into cullable chunks (placeholders until generate)
     let nc = world::TERRAIN_CHUNKS;
     for _ in 0..(nc * nc) {
@@ -3928,6 +3932,14 @@ impl Game {
             raw.skin = skin;
             objs.push(ObjDraw { mesh, tex, raw });
         };
+        // one rim per wheel position: a split wheel can be several prims
+        fn pivot_key(p: Vec3) -> [i32; 3] {
+            [(p.x * 400.0) as i32, (p.y * 400.0) as i32, (p.z * 400.0) as i32]
+        }
+        let mut seen_pivots: Vec<[i32; 3]> = Vec::new();
+        let rim_style = if rt_slot > 0.5 { self.look.wheels } else { 0 };
+        let wheel_r = self.cars.models[model_i].wheel_r * scale;
+        let rim_col = [0.72, 0.75, 0.80, 1.0];
         #[allow(unused)]
         let push = |objs: &mut Vec<ObjDraw>,
                     mesh: usize,
@@ -3977,6 +3989,18 @@ impl Game {
             // the skin rides on the BODY only — wheels keep their own look
             let sk = if matches!(prim.tag, model::Tag::Body) { skin } else { [0.0; 4] };
             push_skinned(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot], sk);
+            // THE GARAGE RIM, drawn over whatever wheel the car already has.
+            // Because it rides the wheel's own pivot and transform, a style
+            // applies to every car in the game — the imported bodies too —
+            // without touching a single one of their meshes.
+            if rim_style > 0 && !matches!(prim.tag, model::Tag::Body) && !seen_pivots.contains(&pivot_key(prim.pivot)) {
+                seen_pivots.push(pivot_key(prim.pivot));
+                let side = if prim.pivot.x >= 0.0 { 1.0 } else { -1.0 };
+                let rm = m
+                    * Mat4::from_translation(prim.pivot)
+                    * Mat4::from_scale(Vec3::new(side * wheel_r * 1.02, wheel_r * 1.02, wheel_r * 1.02));
+                push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4]);
+            }
         }
     }
 }
