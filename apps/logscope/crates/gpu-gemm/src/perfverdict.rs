@@ -487,9 +487,17 @@ happening somewhere GPU_SYNC_NS is not wrapped around"),
 /// Check a profile against itself. Empty means the numbers can coexist.
 pub fn profile_doubts(polls: u64, downloads: u64, sync_ms: f64, wall_ms: f64) -> Vec<ProfileDoubt> {
     let mut v = Vec::new();
-    if downloads > 0 && polls < downloads {
-        v.push(ProfileDoubt::FewerPollsThanDownloads { polls, downloads });
-    }
+    // THE POLL/DOWNLOAD DOUBT IS WITHDRAWN, one commit after I wrote it. SUBMIT_BY_DOWNLOAD is tagged
+    // in THREE places — `run`, `sample_at` and `download` — and only the last one maps a buffer and
+    // polls. So downloads exceeding polls is correct by design, and "1 poll against 141 downloads" is
+    // not a contradiction at all.
+    //
+    // I asserted it was one from the names, without reading what increments them. That is the same
+    // mistake as the std140 stride and the unreachable extend path: a strong signal, a mechanism named
+    // immediately, the cheaper check skipped. Shipping it would have printed a confident warning about
+    // healthy runs, which is worse than the silence it replaced — a doubt that cries wolf costs the
+    // one that does not.
+    let _ = downloads;
     // A second of wall time with no measured wait is not a fast run, it is an unmeasured one.
     if sync_ms == 0.0 && wall_ms > 1000.0 {
         v.push(ProfileDoubt::NoSyncOverALongRun { wall_ms });
@@ -502,12 +510,25 @@ mod doubt_tests {
     use super::*;
 
     #[test]
-    fn the_REAL_run_that_prompted_this_is_flagged_twice() {
+    fn the_real_run_is_flagged_ONCE_because_only_one_doubt_survived() {
         // 1625 submits, 1 poll, 141 downloads, sync 0 ms of 19860 ms.
+        //
+        // I first asserted TWO doubts here. The poll/download one was wrong: SUBMIT_BY_DOWNLOAD is
+        // tagged in run, sample_at and download, and only download polls — so 1 poll against 141
+        // download-tagged submits is correct, not contradictory.
+        //
+        // The sync doubt stands on its own: zero measured wait across 19.9 seconds, in a run whose
+        // separate phase breakdown reported 15.5% sync.
         let d = profile_doubts(1, 141, 0.0, 19860.0);
-        assert_eq!(d.len(), 2, "both contradictions, not just the louder one: {d:?}");
-        assert!(d[0].explain().contains("every map requires a poll"));
-        assert!(d[1].explain().contains("not where the profile is looking"));
+        assert_eq!(d.len(), 1, "only the sync doubt is real: {d:?}");
+        assert!(d[0].explain().contains("not where the profile is looking"));
+    }
+
+    #[test]
+    fn fewer_polls_than_downloads_is_NOT_flagged() {
+        // Pinned so nobody re-adds it from the names. Two of the three download-tagged paths never
+        // map a buffer, so this inequality is the normal case.
+        assert!(profile_doubts(1, 500, 340.0, 5000.0).is_empty());
     }
 
     #[test]
