@@ -2293,6 +2293,36 @@ and 25% saving on the whole simulation step. KUIPER's planet field still
 reads dot 1.00 attractive and every physics harness passes, so the index is
 transparent to the game.
 
+## v1.71.0 — movers get an index too
+
+Last version's profile left two leads. The larger one: CHAMBER managed only
+908 SDF queries per millisecond with a mere 373 shapes, because ~190 of
+them are moving chess parts and MOVERS CANNOT LIVE IN THE STATIC SHAPE GRID
+— they travel out of the cell they were baked into. So every SDF query
+walked all of them, and 190 branch-and-distance tests cost more than the
+other 180 shapes put together.
+
+They have their own index now, rebuilt each update (190 inserts a frame is
+nothing) on the same cell grid as the gravity nodes, and primed at
+generation so the first frame is already fast. That last detail mattered
+more than it sounds: with the index built only on update, a freshly
+generated world fell back to the full walk, and the benchmark showed almost
+no gain until it was primed.
+
+Across the two indexes, measured on the same harness:
+
+    SDF queries per ms      CHAMBER   908 -> 8298   (9x)
+                          PERPLEXUS   887 -> 1455
+                         MONKEY RUN  3929 -> 5772
+    physics step, 12 bots   CHAMBER 0.156 -> 0.045 ms  (3.5x)
+                          PERPLEXUS 0.347 -> 0.198 ms  (1.8x)
+                         MONKEY RUN 0.130 -> 0.101 ms
+    gravity_dir per call              4975 -> 3146 ns
+
+Every physics harness still passes — platforms, loops, portals, mechanics,
+ball spin, flicks, and CHAMBER's board still plays and winds up — so both
+indexes are transparent to the game.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

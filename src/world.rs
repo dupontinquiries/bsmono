@@ -302,6 +302,11 @@ pub struct World {
     gdim: i32,
     /// nodes that MOVE (they ride animated shapes) stay out of the grid
     gdyn: Vec<u16>,
+    /// Movers, bucketed by cell and rebuilt every update. They cannot live
+    /// in the static shape grid (they travel out of their cell), but walking
+    /// ALL of them on every SDF query is what made CHAMBER's 190 chess parts
+    /// cost more than the other 180 shapes put together.
+    mgrid: Vec<Vec<u16>>,
     /// XZ spatial hash over shapes: sdf() walks one cell, not the world
     sgrid: Vec<Vec<u16>>,
     /// ANIMATED shapes are never in the grid — they travel far outside the
@@ -366,6 +371,21 @@ pub struct World {
 fn smoothstep01(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
+}
+
+/// Bounding reach of a shape — used by the mover index and the broad phase.
+pub fn shape_reach(sdf: &Sdf) -> f32 {
+    match *sdf {
+        Sdf::None => 0.0,
+        Sdf::Sphere { r } => r,
+        Sdf::Torus { big, tube } => big + tube,
+        Sdf::Capsule { r, half } => r + half,
+        Sdf::Hex { r, h } => (r * r + h * h).sqrt(),
+        Sdf::RBox { half, .. } => half.length(),
+        Sdf::Shell { r, half, thick } => ((r + thick) * (r + thick) + half * half).sqrt(),
+        Sdf::TubeTorus { big, tube, thick } => big + tube + thick,
+        Sdf::RingDeck { big, wide, .. } => big + wide,
+    }
 }
 
 /// polynomial smooth-min: the SDF fillet
@@ -3563,7 +3583,10 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        World { grav, ggrid, gdim, gdyn, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
+        let mut w = World { grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
+        // prime the mover index so the very first frame is already fast
+        w.rebuild_movers();
+        w
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.
@@ -3686,6 +3709,9 @@ impl World {
             sh.vel = if dt > 1e-5 { (sh.pos - prev) / dt } else { Vec3::ZERO };
             sh.omega = om;
         }
+        // rebuild the mover index now that everything has been placed
+        self.rebuild_movers();
+
         // ---- THE GAME PLAYS ITSELF ----
         if let Some(mut ch) = self.chess.take() {
             let sq = ch.square;
@@ -3917,6 +3943,49 @@ impl World {
     }
 
     // ------------------------------------------------------------ SDF ----
+    /// Bucket the movers by cell. Rebuilt every update because they travel,
+    /// and primed at generation so the very first frame is already fast.
+    /// Bucket the movers by cell. Rebuilt every update because they travel,
+    /// and primed at generation so the very first frame is already fast.
+    pub fn rebuild_movers(&mut self) {
+        let cells = (self.gdim * self.gdim) as usize;
+        if self.mgrid.len() != cells {
+            self.mgrid = vec![Vec::new(); cells];
+        }
+        for c in self.mgrid.iter_mut() {
+            c.clear();
+        }
+        for k in 0..self.dyn_shapes.len() {
+            let si = self.dyn_shapes[k];
+            let sh = &self.shapes[si as usize];
+            if matches!(sh.sdf, Sdf::None) {
+                continue;
+            }
+            let reach = shape_reach(&sh.sdf) + 4.0;
+            let (px, pz) = (sh.pos.x, sh.pos.z);
+            let c0x = (((px - reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let c1x = (((px + reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let c0z = (((pz - reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let c1z = (((pz + reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            for cz in c0z..=c1z {
+                for cx in c0x..=c1x {
+                    self.mgrid[(cz * self.gdim + cx) as usize].push(si);
+                }
+            }
+        }
+    }
+
+    /// The movers whose reach could touch `p` — one cell, exactly like the
+    /// gravity index, so an empty cell proves nothing near is moving.
+    fn movers_at(&self, p: Vec3) -> &[u16] {
+        if self.mgrid.is_empty() {
+            return &self.dyn_shapes;
+        }
+        let cx = (((p.x + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+        let cz = (((p.z + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+        &self.mgrid[(cz * self.gdim + cx) as usize]
+    }
+
     pub fn sdf(&self, p: Vec3) -> f32 {
         let mut d = p.y - grid_h(&self.tgrid, p.x, p.z);
         let mut dcut = f32::MAX; // CSG: solid = max(union, -nearest cutter)
@@ -3925,7 +3994,7 @@ impl World {
         let cz = (((p.z + TG_HALF) / self.scell).floor() as i32).clamp(0, self.sdim - 1);
         for &si in self.sgrid[(cz * self.sdim + cx) as usize]
             .iter()
-            .chain(self.dyn_shapes.iter())
+            .chain(self.movers_at(p).iter())
         {
             let s = &self.shapes[si as usize];
             // cheap broad-phase: skip shapes far away
