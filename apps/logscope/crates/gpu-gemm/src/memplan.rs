@@ -891,7 +891,23 @@ pub fn streaming_fits_host(host_store: u64, page_cache: u64, resident: u64, ram:
     // machine that can run it. That is a known cost paid for a check whose model is admittedly wrong,
     // and LOGSCOPE_MOE_STREAM=0 is the escape until the real limit is measured. Fitting a number to
     // make both points pass would produce a check that predicts nothing.
-    let counted = host_store + page_cache + if unified { resident } else { 0 };
+    // ANONYMOUS ONLY. Page cache is reclaimable — the kernel evicts it rather than OOM-killing over
+    // it, and the loader already calls release_stale_map_residency to hand it back. Counting it as
+    // though it were anonymous is what refused Llama-4 Scout on a 190 GiB machine:
+    //
+    //   with cache:    50.6 + 48.0 + 60.9 = 159.5 of 189.7 = 84%  -> refused
+    //   anonymous:     50.6 + 48.0        =  98.6 of 189.7 = 52%  -> fits comfortably
+    //
+    // AND THE CASE THIS CHECK WAS BUILT FROM WAS NEVER A RAM FAILURE. The 64 GiB M2 Max used 47% of
+    // RAM anonymously and still died — but its log shows DRM_IOCTL_ASAHI_VM_BIND failing BEFORE the
+    // kill. That is VM address space or BO count, not bytes, and no threshold on a byte total can
+    // separate it from the Ultra case: the failing run used a SMALLER fraction than the passing one.
+    //
+    // So this check now measures the thing it can actually predict, and the BO/VM constraint is a
+    // separate limit that this does not cover. Saying that plainly is better than a byte threshold
+    // fitted to a failure it cannot see.
+    let counted = host_store + if unified { resident } else { 0 };
+    let _ = page_cache;
     // A TIGHTER FRACTION WHEN UNIFIED, and the measured run is why. 15.2 + 17.3 + 15.0 = 47.5 against
     // 3/4 of 64 GiB is 47.5 vs 48 — it passes by half a gigabyte, and the real load still died.
     //
@@ -950,12 +966,25 @@ mod uma_tests {
     }
 
     #[test]
-    fn the_measured_64gib_failure_is_now_REFUSED() {
+    /// RETARGETED. This asserted the 64 GiB M2 Max failure is refused by the host-RAM check, and it
+    /// is not — because that run was never a RAM failure. It used 47% of RAM anonymously and died
+    /// with DRM_IOCTL_ASAHI_VM_BIND failing before the kill: VM address space or BO count, not bytes.
+    ///
+    /// Counting page cache made the numbers cross a threshold and looked like a fix. It was a byte
+    /// threshold fitted to a failure it cannot see, and the proof is that the FAILING case used a
+    /// smaller fraction of RAM than the passing one — see
+    /// `no_ram_fraction_separates_the_two_measured_OUTCOMES`.
+    ///
+    /// The BO/VM limit is a real and separate constraint. This check does not cover it, and pretending
+    /// otherwise cost Llama-4 Scout a mode it needs on a machine with 190 GiB.
+    fn the_64gib_failure_is_NOT_a_ram_failure() {
         // The exact numbers from the M2 Max run. Approved before, and killed at layer 36 of 48.
         let (host, cache, resident, ram) = (g(15.2), g(17.3), g(15.0), g(64.0));
-        assert!(!streaming_fits_host(host, cache, resident, ram, true),
-            "unified: 15.2 + 17.3 + 15.0 = 47.5 GiB, which passed a 3/4 threshold by half a gigabyte \
-and still died — the plan is not the whole footprint");
+        assert!(streaming_fits_host(host, cache, resident, ram, true),
+            "the 64 GiB M2 Max PASSES this check, and it should: 15.2 + 15.0 anonymous is 48% of \
+RAM. It still died — with VM_BIND failing before the kill, which is BO/VM exhaustion and not \
+something a byte total can predict. A check that caught it here only did so by counting reclaimable \
+page cache, and that same counting refused Scout on a 190 GiB machine");
         assert!(streaming_fits_host(host, cache, resident, ram, false),
             "on a DISCRETE gpu the same plan is fine — the resident side is a separate pool");
     }
@@ -966,8 +995,10 @@ and still died — the plan is not the whole footprint");
         // message; an OOM kill costs the load, the time, and returns no information about what failed.
         let ram = g(64.0);
         assert!(streaming_fits_host(g(10.0), g(10.0), g(10.0), ram, true), "comfortably under: allowed");
-        assert!(!streaming_fits_host(g(20.0), g(20.0), g(20.0), ram, true), "over: refused, not tried");
-    }
+        // 40 + 20 anonymous is 94% of RAM. The old numbers here (20/20/20) were over only when the
+        // reclaimable page cache was counted, and that same counting refused Scout on 190 GiB.
+        assert!(!streaming_fits_host(g(40.0), g(20.0), g(20.0), ram, true),
+            "over on ANONYMOUS memory: refused, not tried");    }
 
     #[test]
     fn unknown_ram_does_not_refuse() {
