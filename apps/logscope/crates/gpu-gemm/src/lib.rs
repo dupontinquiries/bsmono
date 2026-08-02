@@ -7814,7 +7814,30 @@ format would save ~{:.1} GiB and is what would make this fit.",
                                 // whole GGUF (so the file lands in page cache). Both are large, and the
                                 // failure mode without this check is an OOM kill ~18 minutes into a load —
                                 // after the expensive dequant/requant pass, with nothing to show for it.
-                                let host_store = (n_expert as u64) * per_expert_all_layers;
+                                // ZERO WHEN THE VIEW PATH CAN TAKE IT. This figure is the cost of the HOST-COPY
+                    // path — dequantize every expert and requantize it into anonymous memory. The
+                    // file-view path reads experts straight from the mmap and converts Q4_K to q4 on
+                    // the GPU, exactly as the dense weights already are, and costs no host RAM at all.
+                    //
+                    // The check ran before that path was attempted, so Scout was refused for 50.6 GiB
+                    // it may never allocate. Asking the cheap question first — are the expert tensors
+                    // a type the view path reads, and do gate and up agree — costs a tensor-table
+                    // lookup and no memory.
+                    //
+                    // Conservative by construction: a false yes only means the load proceeds to a more
+                    // precise refusal at the real attempt, while a false no refuses a model that would
+                    // have run.
+                    let ty = |n: &str| g.tensor(&format!("blk.0.{n}.weight")).map(|t| t.ggml_type);
+                    let views_ok = crate::memplan::file_views_plausible(
+                        ty("ffn_gate_exps"), ty("ffn_up_exps"), ty("ffn_down_exps"),
+                        std::env::var_os("LOGSCOPE_Q6K_VIEWS").is_some());
+                    if views_ok {
+                        eprintln!("loader: MoE experts are a file-view type — reading them as views \
+into the mmap and converting on the GPU, so the host-copy cost below does not apply");
+                    }
+                    let host_store = if views_ok { 0 } else {
+                        (n_expert as u64) * per_expert_all_layers
+                    };
                                 let set_data_len = set.data_len();
                                 let ram = crate::memplan::system_ram_bytes();
                                 eprintln!("loader: MoE streaming will hold ~{:.1} GiB of expert weights in HOST RAM \
