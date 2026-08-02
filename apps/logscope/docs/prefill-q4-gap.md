@@ -145,3 +145,37 @@ loads are the default there, not an option. Colibri does the same on the CPU sid
 accumulators, which is where the 2× integer-dot finding came from.
 
 Both treat 4-wide as the baseline shape. This engine has it, benchmarks it, and does not select it.
+
+
+---
+
+# Correction: q4 prefill is not missing a GEMM, its TILE is too small
+
+The earlier framing above — "q8_0 has a GEMM and q4 does not" — is not quite right, and the difference
+matters for what to build.
+
+`LINEAR_Q4` dispatches `((n+7)/8, (m+7)/8, 1)`. It **is** a tiled GEMM: 8 output columns by 8 rows per
+workgroup. It is not the naive per-row kernel the comment implied.
+
+So weights are re-read `m/8` times — **128 times for a 1024-token prefill chunk**. That is inherent to
+an 8-row tile, not a consequence of the kernel being unsophisticated.
+
+`linear_q8_0_gemm_rb` reaches 2795 GFLOP/s by holding a larger tile in registers, so it re-reads
+correspondingly fewer times. The q4 gap is therefore **tile size**, not kernel absence.
+
+## What that changes
+
+* **Chunking `MATVEC_SMALL_Q4` (m≤8) through a long prefill buys nothing** — it re-reads exactly as
+  often as the 8×8 tile already does. That hypothesis is closed; it looked like a free win and is not.
+* The work is a **register-blocked q4 GEMM with a wider tile**, mirroring the q8_0 one. Q4 has an
+  advantage here that q8_0 does not: half the weight bytes per element, so the same register budget
+  covers twice the k-extent per load.
+* Tile width is the tunable, and this engine already has per-shape GEMM autotune (`gemm_tile_for`) —
+  so the new kernel should enter that search rather than pick a constant, which is the lesson from V3
+  being unreachable.
+
+## Why the correction is worth recording
+
+The original note read the small-batch kernel's comment — *"instead of the strided LINEAR_Q4 re-reading
+weights per tile"* — and inferred that LINEAR_Q4 was per-row. It says *per tile*, and the tile is 8×8.
+An accurate comment, read too quickly, produced a wrong conclusion about which kernel exists.
