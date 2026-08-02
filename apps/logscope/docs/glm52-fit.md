@@ -114,3 +114,58 @@ split arrived at independently, confirmed by an implementation that runs the mod
 
 What remains before a run: the MLA path (`supported: false`, never verified end to end), and reading
 `routed_scaling_factor` out of GGUF metadata rather than defaulting to 1.0.
+
+---
+
+# The IQ1_S memory blocker, quantified
+
+Your file is `GLM-5_2-UD-IQ1_S`, six shards, ~25 GiB — about **136B parameters at 1.58 bpw**.
+
+IQ1_S is readable: `gguf.rs` type 19 is a full port of llama.cpp's `dequantize_row_iq1_s`, with the
+2048-entry ternary codebook transcribed rather than derived.
+
+**But reading it is not the problem. Keeping it is.**
+
+```
+source (IQ1_S, 1.58 bpw)   25.1 GiB
+q4 resident                71.5 GiB   2.8× the source
+int8 resident             127.1 GiB   5.1× the source
+```
+
+Against **measured** GPU ceilings of 63 GiB (M2 Ultra) and 31 GiB (M2 Max) — so the q4 conversion alone
+overshoots the Ultra and is more than double the Max.
+
+This is the arithmetic that decides GLM-5.2 on both platforms, and it is not about the architecture at
+all. Every gap in `archfeat` could be closed and the model still would not fit, because **the loader
+inflates a 1.58-bit checkpoint to 4.5 bits before it ever runs a token.**
+
+## Why the conversion exists, and why it does not apply here
+
+The engine converts to q4 or int8 because those are its *compute* formats — the matvec kernels read
+them directly. That is the right trade for Q4_K and Q8_0 sources, where conversion is roughly
+size-neutral and buys a kernel that runs.
+
+For IQ1_S it is a 2.8× tax to reach a format the source was chosen to avoid. Someone shipping IQ1_S has
+already decided that 1.58 bpw is the acceptable quality point; converting up does not recover the
+quality, it only spends the memory.
+
+## What would actually make it run
+
+**A native IQ1_S matvec.** There is none — `iq1s_grid` appears once, in the CPU dequantizer. The kernel
+would read the 50-byte super-block directly: 11-bit codebook index per group of 8 weights (8 bits from
+`qs`, 3 from `qh`), a 3-bit per-sub-block scale and a sign bit, indexing the ternary grid.
+
+That is more work per weight than Q4_K unpacking, and decode is **latency-bound rather than ALU-bound**
+here (≈6% BW, ≈1% ALU) — so the extra arithmetic is close to free while the 2.8× bandwidth saving is
+not. The shape of the win is favourable in a way it would not be on a compute-bound device.
+
+**Expert streaming does not rescue it.** It converts experts to q4 on the way in, so it moves *when* the
+inflation happens, not whether.
+
+## Order of work
+
+1. **Try it with `LOGSCOPE_TRY_UNSUPPORTED_ARCH=1` anyway**, under 2048 tokens. It will refuse on
+   memory rather than on architecture, and the refusal will print the real numbers — which is worth
+   having as a measurement rather than the estimate above.
+2. If those numbers match, the native IQ1_S matvec is the whole remaining task, and it is a kernel
+   gated against the existing CPU dequantizer — **run that gate on hardware**, per `gate-validity.md`.
