@@ -14,6 +14,7 @@ pub mod cpuattn;
 pub mod cpudecode;
 pub mod perfverdict;
 pub mod qkvsplit;
+pub mod prefetch;
 pub mod specverify;
 pub mod lookupdraft;
 pub mod specloop;
@@ -4396,6 +4397,28 @@ impl Gpu {
                                       &h.prev_experts, m.cfg.n_used as usize)
                     }
                 };
+                // START THE READ. The prediction fed the eviction policy and nothing else, so it
+                // changed WHICH expert was resident and never WHEN its bytes arrived — and the model
+                // mapping is advised Random, so a page is not read until it is faulted on.
+                //
+                // WILLNEED on the predicted ranges closes that gap: the kernel begins the read now and
+                // the fault at use time finds the page warm. Advisory, so a wrong prediction costs
+                // pages the kernel would have dropped anyway, and a failure leaves the old behaviour.
+                if !predicted.is_empty() {
+                    // `raw` lives on MoeStream — present only on the file-VIEW path, which is
+                    // exactly where a prefetch can help: the host-copy path has already paid for the
+                    // bytes, so hinting them would advise pages that are not the bottleneck.
+                    let g = sm.lock().unwrap();
+                    if let Some(raw) = g.raw.as_ref() {
+                        let (gu, dn) = crate::prefetch::ranges_for(
+                            &predicted, n_expert, raw.gu_expert_bytes, raw.dn_expert_bytes);
+                        // gate/up share a stride, so one hint per expert covers both when they are
+                        // one tensor; down is separate. Hinting the slices directly rather than the
+                        // mapping, because these ARE views into it.
+                        crate::prefetch::hint_all(raw.gate, &gu, crate::prefetch::BUDGET);
+                        crate::prefetch::hint_all(raw.down, &dn, crate::prefetch::BUDGET);
+                    }
+                }
                 let pick = sm.lock().unwrap().policy.pick_repin_hinted(n_expert, &predicted);
                 if let Some((evict, admit)) = pick {
                     if self.stream_repin(sm, evict, admit) {
