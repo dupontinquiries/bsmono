@@ -125,6 +125,23 @@ pub struct Mixer {
     pub instrumental: f64,
 }
 
+/// How close to neutral a band snaps to exactly 0 dB, from `BandSlider.qml`.
+///
+/// A detent that "makes neutral easy to hit by feel". Without it, a slider left
+/// at 0.1 dB looks flat, reads as `0 dB` through the deadband in `db_label`, and
+/// is not flat — so `is_flat()` says the EQ is doing something while every label
+/// says it is not.
+pub const DETENT_DB: f64 = 0.4;
+
+/// Apply the detent.
+///
+/// `is_volume` gets NO detent, and the QML says why: "the user often wants
+/// subtle gain changes". A volume that refuses to sit at 0.3 is a volume that
+/// cannot be nudged, which is most of what a volume is for.
+pub fn detent(value_db: f64, is_volume: bool) -> f64 {
+    if !is_volume && value_db.abs() < DETENT_DB { 0.0 } else { value_db }
+}
+
 /// The furthest a band may be pushed. Beyond about 12 dB an EQ stops shaping
 /// and starts clipping, and a slider that allows it invites exactly that.
 pub const MAX_GAIN_DB: f64 = 12.0;
@@ -132,7 +149,11 @@ pub const MAX_GAIN_DB: f64 = 12.0;
 impl Mixer {
     pub fn set_gain(&mut self, i: usize, db: f64) -> bool {
         match self.bands.get_mut(i) {
-            Some(b) => { b.gain_db = db.clamp(-MAX_GAIN_DB, MAX_GAIN_DB); true }
+            // Detent BEFORE clamp: snapping a value that was already clamped
+            // would be a no-op at the rails, and the detent only ever applies
+            // near zero anyway — but the order is worth fixing so a future
+            // change to either cannot silently reorder them.
+            Some(b) => { b.gain_db = detent(db, false).clamp(-MAX_GAIN_DB, MAX_GAIN_DB); true }
             None => false,
         }
     }
@@ -254,6 +275,30 @@ mod tests {
         m.set_gain(0, -99.0);
         assert_eq!(m.bands[0].gain_db, -MAX_GAIN_DB);
         assert!(!m.set_gain(99, 3.0), "an unknown band is refused, not created");
+    }
+
+    #[test]
+    fn a_band_snaps_to_neutral_by_feel() {
+        // The detent from BandSlider.qml. Without it a band left at 0.1 dB
+        // LOOKS flat, READS as "0 dB" through db_label's deadband, and is not —
+        // so is_flat() disagrees with every label on screen.
+        let mut m = mixer();
+        m.set_gain(0, 0.3);
+        assert_eq!(m.bands[0].gain_db, 0.0, "snapped");
+        assert!(m.is_flat(), "and the EQ agrees with its own labels");
+        m.set_gain(0, 0.5);
+        assert_eq!(m.bands[0].gain_db, 0.5, "outside the detent, untouched");
+        m.set_gain(0, -0.39);
+        assert_eq!(m.bands[0].gain_db, 0.0, "symmetric about neutral");
+    }
+
+    #[test]
+    fn volume_has_no_detent_because_subtle_gain_changes_are_the_point() {
+        // The QML's own reason. A volume that refuses to sit at 0.3 cannot be
+        // nudged, which is most of what a volume is for.
+        assert_eq!(detent(0.3, true), 0.3);
+        assert_eq!(detent(0.3, false), 0.0);
+        assert_eq!(detent(0.0, true), 0.0);
     }
 
     #[test]

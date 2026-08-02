@@ -13,6 +13,7 @@ pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
 pub mod chrome;
+pub mod anticipation;
 pub mod dialogs;
 pub mod soundscape;
 use egui::Ui;
@@ -79,6 +80,10 @@ pub struct Controller {
     pub sinks: crate::settings_page::SinkPicker,
     pub now: crate::chrome::NowPlaying,
     pub toast: crate::chrome::Toast,
+    /// The anticipation dot, mounted in the header strip beside the device name
+    /// exactly as the QML specifies — "so it doesn't compete with any actual
+    /// control".
+    pub dot: crate::anticipation::AnticipationDot,
     pub add_to_playlist: crate::dialogs::AddToPlaylist,
     pub devices: Vec<Device>,
     pub scenes: Vec<Scene>,
@@ -105,6 +110,7 @@ impl Controller {
             sinks: Default::default(),
             now: Default::default(),
             toast: Default::default(),
+            dot: Default::default(),
             add_to_playlist: Default::default(), gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new() }
     }
 
@@ -142,6 +148,26 @@ impl Controller {
                 }
             });
             ui.separator();
+            // The dot lives in the header strip. Drawn before the body so it
+            // keeps its place when a view changes height.
+            {
+                let d = &mut self.dot;
+                d.tick(ui.input(|i| i.stable_dt));
+                if d.band().visible() {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(14.0, 14.0), egui::Sense::click());
+                    let a = (d.opacity() * 255.0) as u8;
+                    ui.painter().circle_filled(rect.center(), 4.0,
+                        egui::Color32::from_rgba_unmultiplied(
+                            colors.accent.r(), colors.accent.g(), colors.accent.b(), a));
+                    if resp.clicked() { d.tap(); }
+                    if let Some(text) = d.revealed() { resp.on_hover_text(text); }
+                    // Repaint while breathing: without this the dot only moves
+                    // when something else causes a frame, which reads as a
+                    // stuck indicator rather than a quiet one.
+                    ui.ctx().request_repaint();
+                }
+            }
             match self.view_idx {
                 0 => self.devices_view(ui, &colors),
                 1 => self.spaces_view(ui, &colors),
