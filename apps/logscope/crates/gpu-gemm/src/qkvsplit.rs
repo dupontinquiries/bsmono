@@ -338,3 +338,51 @@ mod locate_tests {
         assert_eq!(v.1, 6144 * 72, "and v ends at the tensor's end");
     }
 }
+
+/// Can a fused tensor be sliced at row boundaries without cutting a quantization block?
+///
+/// This is the assumption the loader's fallback rests on, and it was unstated. A K-quant packs 256
+/// weights per block: Q4_K in 144 bytes, Q6_K in 210, IQ1_S in 50. Slicing at a row boundary is only
+/// safe when a row is a whole number of blocks — otherwise q ends mid-block, and both q's last block
+/// and k's first are garbage.
+///
+/// Every dimension in common use is a multiple of 256 (2048, 4096, 5120, 8192), so this holds by luck
+/// rather than by design on every model anyone has run. Stating it means a model that breaks it fails
+/// with a reason instead of producing text.
+///
+/// `type_nbytes` already returns None for a non-multiple, so the loader's fallback declines such a
+/// tensor — but it declines by falling through to "missing tensor", which names the wrong problem.
+pub fn rows_are_block_aligned(cols: usize, block: usize) -> bool {
+    block > 0 && cols % block == 0
+}
+
+/// The K-quant block size. All of them share 256.
+pub const K_BLOCK: usize = 256;
+
+#[cfg(test)]
+mod alignment_tests {
+    use super::*;
+
+    #[test]
+    fn the_dimensions_anyone_actually_runs_are_ALL_aligned() {
+        // Which is why this has never bitten, and why it would be easy to leave unstated.
+        for cols in [2048, 4096, 5120, 8192, 14336, 1536] {
+            assert!(rows_are_block_aligned(cols, K_BLOCK), "cols {cols}");
+        }
+    }
+
+    #[test]
+    fn a_non_multiple_is_REFUSED_rather_than_sliced() {
+        // If a row is not a whole number of blocks, q ends mid-block and BOTH q's last block and k's
+        // first are garbage — a split that produces plausible-looking weights rather than an error.
+        for cols in [1000, 3000, 100] {
+            assert!(!rows_are_block_aligned(cols, K_BLOCK), "cols {cols}");
+        }
+    }
+
+    #[test]
+    fn a_zero_block_is_not_alignment() {
+        // A caller that could not determine the block size must not get "aligned" as the answer.
+        assert!(!rows_are_block_aligned(4096, 0));
+    }
+}
