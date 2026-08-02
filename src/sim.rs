@@ -414,6 +414,7 @@ pub fn run(args: &[String]) {
         // a stand-in model with known proportions (length >> width > height)
         let mut m = crate::model::Model {
             prims: Vec::new(),
+            drive: crate::model::Drive::Combustion,
             cloud: Vec::new(),
             cloud_n: Vec::new(),
             sdf_half: Vec3::ZERO,
@@ -2698,6 +2699,69 @@ pub fn run(args: &[String]) {
                     .join("  ")
             );
         }
+        return;
+    }
+    if name == "cars" {
+        // Do the electric cars actually FEEL different, and are the new
+        // models built to a higher standard than the block cars?
+        use crate::model::Drive;
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let ball = Ball::new();
+        println!("{:<10} {:>9} {:>9} {:>9} {:>9}", "drive", "0-8 m/s", "0-13 m/s", "top", "60m dash");
+        let run = |drive: Drive| -> (f32, f32, f32, f32) {
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            car.drive = drive;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let (mut t15, mut t25, mut dash) = (0.0f32, 0.0f32, 0.0f32);
+            let mut peak = 0.0f32;
+            let start = car.pos;
+            let mut t = 0.0f32;
+            while t < 8.0 {
+                // throttle only while we time the launch, then boost so the
+                // top-speed difference has somewhere to show (the drivetrain
+                // cap and the throttle cap are separate things)
+                c.boost = t > 3.0;
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+                let sp = car.vel.length();
+                // throttle-only tops out at ~14.2 m/s (RL's 1410 uu/s), so
+                // the gates have to sit below it — and top speed is the MAX
+                // seen, not the speed after the car has run into a wall
+                if t15 == 0.0 && sp >= 8.0 {
+                    t15 = t;
+                }
+                if t25 == 0.0 && sp >= 13.0 {
+                    t25 = t;
+                }
+                peak = peak.max(sp);
+                if dash == 0.0 && car.pos.distance(start) >= 60.0 {
+                    dash = t;
+                }
+                if std::env::var("CARS_DBG").is_ok() && (t * 4.0).fract() < DT * 4.0 && t < 3.0 {
+                    eprintln!("   t={:.2} sp={:5.2} og={} y={:6.3} thr={:.1}", t, sp, car.on_ground as u8, car.pos.y, c.throttle);
+                }
+            }
+            (t15, t25, peak, dash)
+        };
+        let ice = run(Drive::Combustion);
+        let ev = run(Drive::Electric);
+        println!("{:<10} {:>8.2}s {:>8.2}s {:>8.1} {:>8.2}s", "petrol", ice.0, ice.1, ice.2, ice.3);
+        println!("{:<10} {:>8.2}s {:>8.2}s {:>8.1} {:>8.2}s", "electric", ev.0, ev.1, ev.2, ev.3);
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<44} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("an EV is quicker off the line", ev.0 < ice.0 - 0.05);
+        check("...and gives it back at the top", ev.2 < ice.2);
+        let gain = (ice.0 - ev.0) / ice.0.max(0.01) * 100.0;
+        println!("   the EV reaches 8 m/s {gain:.0}% sooner");
+        check("the difference is felt, not cosmetic", gain > 8.0);
+        println!("{}", if pass { "CARS: PASS" } else { "CARS: FAIL" });
         return;
     }
     if name == "perf" {

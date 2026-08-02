@@ -2323,6 +2323,40 @@ Every physics harness still passes — platforms, loops, portals, mechanics,
 ball spin, flicks, and CHAMBER's board still plays and winds up — so both
 indexes are transparent to the game.
 
+## v1.72.0 — electric cars, and bodies built to a higher standard
+
+The procedural cars were assembled from hard-edged boxes and squashed
+spheres for wheels, which is exactly why they read as blocks rather than
+vehicles: a real body catches a highlight along every edge, and a wheel has
+a tyre and a rim. Two new primitives fix that at the source — `cbox`, a
+chamfered box with proper bevel bands between its faces, and `wheel`, a
+tyre torus with capped rim discs.
+
+THREE ELECTRIC CARS built on them, each with a smoked glasshouse, sill
+strips along the battery floor and light bars that emit:
+
+  VOLT    a compact hatch, short and friendly — the EV that dribbles like
+          an Octane
+  AXION   a low hypercar: long, flat, spoiler on struts, a single blade of
+          light across the nose — the flick blade
+  HAULER  an electric pickup, all shoulders and straight lines, with a bed
+          the ball settles into
+
+AND THEY DRIVE DIFFERENTLY, which is the point of adding them rather than
+three more skins. An electric motor makes its torque at zero revs, so
+`Drive::Electric` gets a torque curve worth 1.35x off the line that fades
+to parity with speed, and gives back 6% of top end for it. Measured in new
+`--sim cars`: an EV reaches 8 m/s 14% sooner (0.47 s against 0.55 s) and
+tops out at 21.6 m/s against 23.0. It wins the first two car-lengths off a
+kickoff and loses a long straight.
+
+The harness needed two corrections before it could say anything true. Its
+speed gates were set above the throttle-only cap — which is 14.16 m/s, RL's
+1410 uu/s almost exactly — so neither car ever reached them; and it read
+top speed at the end of the run, by which point the car had driven into a
+wall. It now times the launch on throttle alone and the top end under
+boost, because the drivetrain cap and the throttle cap are separate things.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

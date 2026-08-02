@@ -28,8 +28,38 @@ pub struct Prim {
     pub pivot: Vec3, // wheel spin pivot in normalized model space
 }
 
+/// How a car puts its power down. Combustion cars build speed; an electric
+/// one has its torque from a standstill and trades a little top end for it —
+/// which in this game means EVs win the first two car-lengths off a kickoff
+/// and lose a long straight.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Drive {
+    Combustion,
+    Electric,
+}
+
+impl Drive {
+    /// multiplier on acceleration, strongest from a stop
+    pub fn torque(self, speed_frac: f32) -> f32 {
+        match self {
+            Drive::Combustion => 1.0,
+            // flat torque curve: 1.35x off the line, fading to parity
+            Drive::Electric => 1.0 + 0.35 * (1.0 - speed_frac.clamp(0.0, 1.0)).powi(2),
+        }
+    }
+    /// multiplier on top speed
+    pub fn top(self) -> f32 {
+        match self {
+            Drive::Combustion => 1.0,
+            Drive::Electric => 0.94,
+        }
+    }
+}
+
 pub struct Model {
     pub prims: Vec<Prim>,
+    /// drivetrain character (electric cars pull harder off the line)
+    pub drive: Drive,
     /// downsampled surface points (final meters) for the reflection SDF bake
     pub cloud: Vec<Vec3>,
     /// outward normal for each cloud point — this is what makes the baked
@@ -265,5 +295,5 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, cloud, cloud_n, sdf_half: Vec3::ZERO, half_len: half.z, half_h: half.y, half_w: half.x, wheel_r }
+    Model { prims, drive: Drive::Combustion, cloud, cloud_n, sdf_half: Vec3::ZERO, half_len: half.z, half_h: half.y, half_w: half.x, wheel_r }
 }

@@ -851,10 +851,13 @@ fn main() {
     let longboy = procars::longboy(&mut gpu);
     let cube = procars::cube(&mut gpu);
     let shark = procars::shark(&mut gpu);
+    let volt = procars::volt(&mut gpu);
+    let axion = procars::axion(&mut gpu);
+    let hauler = procars::hauler(&mut gpu);
     let mut cars = CarModels {
-        models: vec![octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark],
-        names: vec!["Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark"],
-        active: sv.car.min(8),
+        models: vec![octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark, volt, axion, hauler],
+        names: vec!["Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark", "Volt EV", "Axion EV", "Hauler EV"],
+        active: sv.car.min(11),
     };
     gpu.set_car_sdfs(&bake_car_sdfs(&mut cars.models));
     let cars = cars;
@@ -1099,6 +1102,7 @@ fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.half_h = (m.half_h * size).max(0.10);
     car.half_w = (m.half_w * size).max(0.12);
     car.wheel_r = (m.wheel_r * size).max(0.05);
+    car.drive = m.drive;
 }
 
 impl Game {

@@ -323,6 +323,98 @@ pub fn tube_open(seg: u32) -> MeshData {
     m
 }
 
+/// A CHAMFERED BOX. The procedural cars were built from hard-edged boxes,
+/// which is what made them read as blocks rather than vehicles: a real body
+/// catches a highlight along every edge. `bevel` is in unit-box space.
+pub fn cbox(bevel: f32) -> MeshData {
+    let b = bevel.clamp(0.02, 0.45);
+    let i = 1.0 - b;
+    let mut m = MeshData::new();
+    // eight face quads (inset) plus the bevel bands between them
+    let faces: [(Vec3, Vec3, Vec3); 6] = [
+        (Vec3::X, Vec3::Y, Vec3::Z),
+        (Vec3::NEG_X, Vec3::Y, Vec3::NEG_Z),
+        (Vec3::Y, Vec3::NEG_Z, Vec3::X),
+        (Vec3::NEG_Y, Vec3::Z, Vec3::X),
+        (Vec3::Z, Vec3::Y, Vec3::NEG_X),
+        (Vec3::NEG_Z, Vec3::Y, Vec3::X),
+    ];
+    for (n, u, v) in faces {
+        let c = n;
+        let base = m.verts.len() as u32;
+        for (su, sv) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let p = c + u * (su * i) + v * (sv * i);
+            m.push(p, n, Vec2::new(su * 0.5 + 0.5, sv * 0.5 + 0.5));
+        }
+        m.idx.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+    // bevel strips: join each face edge to its neighbour with a slanted quad
+    for (n, u, v) in faces {
+        for (eu, ev) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            let e = u * eu + v * ev; // the edge direction on this face
+            let t = u * ev + v * eu; // along the edge
+            let base = m.verts.len() as u32;
+            let nrm = (n + e).normalize();
+            for st in [-1.0f32, 1.0] {
+                m.push(n + e * i + t * (st * i), nrm, Vec2::new(st * 0.5 + 0.5, 0.0));
+                m.push(n * i + e + t * (st * i), nrm, Vec2::new(st * 0.5 + 0.5, 1.0));
+            }
+            m.idx.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        }
+    }
+    m
+}
+
+/// A WHEEL: a tyre torus with a rim disc, instead of a squashed sphere.
+/// Unit radius 1 in Y/Z, `width` along X.
+pub fn wheel(width: f32, seg: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let n = seg.max(12);
+    let tube = 0.30f32;
+    let ring = 1.0 - tube;
+    // tyre
+    for i in 0..=n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        let (ca, sa) = (a.cos(), a.sin());
+        for j in 0..=8u32 {
+            let b = j as f32 / 8.0 * std::f32::consts::TAU;
+            let (cb, sb) = (b.cos(), b.sin());
+            let r = ring + tube * cb;
+            let p = Vec3::new(sb * tube * width, ca * r, sa * r);
+            let nr = Vec3::new(sb, ca * cb, sa * cb).normalize();
+            m.push(p, nr, Vec2::new(i as f32 / n as f32, j as f32 / 8.0));
+        }
+    }
+    let stride = 9u32;
+    for i in 0..n {
+        for j in 0..8 {
+            let k = i * stride + j;
+            m.idx.extend_from_slice(&[k, k + stride, k + 1, k + 1, k + stride, k + stride + 1]);
+        }
+    }
+    // rim faces, so the wheel is not hollow when you see it side-on
+    for sx in [-1.0f32, 1.0] {
+        let base = m.verts.len() as u32;
+        m.push(Vec3::new(sx * tube * width * 0.9, 0.0, 0.0), Vec3::new(sx, 0.0, 0.0), Vec2::new(0.5, 0.5));
+        for i in 0..=n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            m.push(
+                Vec3::new(sx * tube * width * 0.9, a.cos() * ring, a.sin() * ring),
+                Vec3::new(sx, 0.0, 0.0),
+                Vec2::new(a.cos() * 0.5 + 0.5, a.sin() * 0.5 + 0.5),
+            );
+        }
+        for i in 0..n {
+            if sx > 0.0 {
+                m.idx.extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
+            } else {
+                m.idx.extend_from_slice(&[base, base + 2 + i, base + 1 + i]);
+            }
+        }
+    }
+    m
+}
+
 pub fn sphere(rows: u32, cols: u32) -> MeshData {
     let mut m = MeshData::new();
     for r in 0..=rows {

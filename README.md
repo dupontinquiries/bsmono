@@ -439,3 +439,5 @@ ACADEMY: ten lessons that the game verifies with the same detectors that name yo
 `--sim drive` reports tube navigability: how much of a run is spent inside a bore and how much with wheels on a surface.
 
 `--sim perf` times worldgen, SDF throughput, the physics step and the per-call cost of the hot functions.
+
+Twelve cars now, including three EVs that pull harder off the line and top out lower. `--sim cars` measures the drivetrain difference.

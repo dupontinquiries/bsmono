@@ -61,6 +61,8 @@ pub struct Car {
     pub omega: Vec3,
     prev_rot: Quat,
     pub wheel_r: f32,
+    /// drivetrain: an electric car pulls harder from a standstill
+    pub drive: crate::model::Drive,
     pub wheel_spin: f32,
     pub steer_vis: f32,
     // jump / dodge state
@@ -95,6 +97,7 @@ impl Car {
             half_len: 0.62,
             half_h: 0.19,
             wheel_r: 0.11,
+            drive: crate::model::Drive::Combustion,
             half_w: 0.32,
             susp: 0.0,
             prev: Vec3::ZERO,
@@ -677,7 +680,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         _ => {}
     }
 
-    let top = CAR_MAX * cfg.car.top_speed;
+    let top = CAR_MAX * cfg.car.top_speed * car.drive.top();
     let drive_max = DRIVE_MAX * cfg.car.top_speed;
 
     if grounded {
@@ -725,7 +728,11 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         car.steer_vis += (c.steer * 0.42 - car.steer_vis) * (1.0 - (-16.0 * dt).exp());
 
         // throttle / brake / coast
-        let acc = 16.5 * cfg.car.accel;
+        // ELECTRIC TORQUE: full pull from zero, fading to parity with pace.
+        // This is the whole character difference — an EV wins the first two
+        // car-lengths off a kickoff and gives it back on a long straight.
+        let speed_frac = (vf.abs() / drive_max.max(1.0)).clamp(0.0, 1.0);
+        let acc = 16.5 * cfg.car.accel * car.drive.torque(speed_frac);
         let mut a = 0.0;
         if c.throttle > 0.05 {
             a = if vf < -0.3 { 35.0 * cfg.car.accel } else if vf < drive_max { acc * c.throttle } else { 0.0 };
