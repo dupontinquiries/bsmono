@@ -265,3 +265,53 @@ exists. The first read "re-reading weights per tile" as per-row; the second read
 governing the fast path when it governs the slow one. **Both were caught by grepping for the caller
 rather than trusting the name** — which is the same discipline that found V3 unreachable, and the same
 one that failed when I concluded the autotune had exhausted kernel choice.
+
+
+---
+
+# The q4 GEMM, specified
+
+`LINEAR_Q8_0_RB` is the register-blocked GEMM: `BM=64, BN=64, BK=16`, a 16×16 workgroup, two 1024-entry
+workgroup staging arrays, and a **4×4 register tile held as four named `vec4`** — named rather than an
+`array<f32,16>` on purpose, because a dynamically-indexed array spills to local memory and defeats the
+whole kernel.
+
+The q4 version differs in **three lines**. Everything else — the tiling, the staging loops, the
+accumulate, the epilogue — is unchanged, which is the argument for doing it rather than writing a new
+kernel.
+
+**q8_0, as it stands:**
+```wgsl
+let scale = qs[gc*d.kb + (gk/32u)];
+let word  = qw[gc*(d.k/4u) + (gk/4u)];        // 4 weights per u32
+let ub    = extractBits(word, (gk%4u)*8u, 8u);
+let q     = select(i32(ub), i32(ub)-256, ub>=128u);   // signed byte
+wv = scale * f32(q);
+```
+
+**q4, from `MATVEC_Q4`'s own unpack:**
+```wgsl
+let scale = qs[gc*d.kb + (gk/32u)];           // unchanged — per-32 scales either way
+let word  = qw[gc*(d.k/8u) + (gk/8u)];        // 8 weights per u32
+let nib   = extractBits(word, (gk%8u)*4u, 4u);
+let q     = i32(nib) - 8;                     // symmetric, [-7,7]
+wv = scale * f32(q);
+```
+
+`extractBits` with a dynamic offset is used deliberately in both — the comment in `MATVEC_Q4` marks it
+**AGX-safe**, which a shift-and-mask apparently was not.
+
+## Gating it
+
+Compare against `MATVEC_Q4` at m=1 (which is the verified path) and against `LINEAR_Q4` at m>8, over
+several shapes including one past the 65535 workgroup limit. `--gate-matvec` already has that harness.
+
+**Default it OFF and run the gate on hardware before flipping it.** Four Q6_K faults were found and
+fixed against a software rasterizer on a kernel that was still wrong on an M2 — the same mistake here
+costs a prefill path that looks fast and is wrong, which is worse than one that is slow and right.
+
+## What it is expected to buy
+
+~100× less traffic on prefill: one weight pass per chunk instead of one per tile. It does **not**
+address the separate 4%-of-bandwidth finding, and conflating the two would make the result
+uninterpretable.
