@@ -169,3 +169,47 @@ inflation happens, not whether.
    having as a measurement rather than the estimate above.
 2. If those numbers match, the native IQ1_S matvec is the whole remaining task, and it is a kernel
    gated against the existing CPU dequantizer — **run that gate on hardware**, per `gate-validity.md`.
+
+
+## The conversion goes through f32, and the precheck does not know
+
+`make_lin` takes **f32 weights** and produces q4 or int8. Every source format is dequantized to f32
+first — so the path for an IQ1_S tensor is:
+
+```
+IQ1_S  →  f32  →  q4
+1.58bpw   32bpw   4.5bpw
+```
+
+The f32 intermediate is **20× the source** for the same tensor. Per tensor, on GLM-5.2's largest:
+
+```
+token_embd (150k × 8k)   src 0.23 GiB → f32 4.58 GiB → q4 0.64 GiB
+output     (150k × 8k)   src 0.23 GiB → f32 4.58 GiB → q4 0.64 GiB
+one expert gate/up       src 0.02 GiB → f32 0.33 GiB → q4 0.05 GiB
+```
+
+Transient and per-tensor, so it does not multiply across the model — but it does mean **peak memory
+during load exceeds the resident total the precheck sizes**. That is the same shape as the UMA
+double-count fixed in _376: a plan approved on one figure and executed against another.
+
+For a Q4_K source the intermediate is 7× rather than 20×, and the peak is small enough beside the
+resident total that nobody noticed. For a 1.58-bit source it is the dominant term of the load.
+
+**Consequence for the native-IQ1_S-matvec argument:** it removes both costs at once. No f32
+intermediate, no q4 inflation, and the weights stay at the size the checkpoint author chose. It is not
+a 2.8× saving on top of a working path — it is what makes the path exist.
+
+## Status, both platforms
+
+| piece | state |
+|---|---|
+| `glm-dsa` architecture recognised | yes, distinct from `glm4moe` |
+| IQ1_S readable | yes — llama.cpp port, codebook transcribed |
+| ExpertWeightsScale / Norm | implemented, metadata-driven, ordered correctly |
+| MLA dims, `kv_b` fusion | read from metadata; per-head fusion fixed in _371 |
+| sparse-attention bound | read and reported; dense is exact at or below it |
+| attempting a run | `LOGSCOPE_TRY_UNSUPPORTED_ARCH=1` |
+| **fitting in memory** | **no — 71.5 GiB resident against 63 / 31 measured** |
+
+Everything except the last is done. The last needs a kernel.
