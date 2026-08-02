@@ -89,3 +89,42 @@ fan-out `shared` computation in `backend.rs:1108`, which already does exactly th
 branches.
 
 **The measured prize is unchanged**: 258 new tokens took 8.44 s on turn five against 1.05 s on turn one.
+
+
+---
+
+# Correction, again: it DOES extend, and the numbers say so
+
+Both sections above are wrong. A run on _443 shows the linear case working:
+
+```
+turn 1: 1634 tokens,    0 reused,  prefill 20.51 s
+turn 2: 1769 tokens, 1634 reused,  prefill  2.24 s   ("+ prefilled 135")
+```
+
+**Turn 2 paid for 135 tokens, not 1769.** At turn-1 rates a full re-prefill would have been ~22 s; it
+took 2.24 s. The anchor reuse is real and it is doing exactly what this document said it did not.
+
+## What the earlier figures actually were
+
+The 8.44 s series came from a different situation — a chat where each turn missed the anchor, which
+happens on a branch change, on eviction from the 3-entry pool, or when the prompt prefix genuinely
+differs (a changed system prompt, an edited earlier message). **Those are cache MISSES, not an absent
+feature**, and the fix for them is pool capacity or anchor stability, not the extend path.
+
+## The mistake worth keeping
+
+I read "attention_mh_ext is never used" and concluded a subsystem was dead, without checking the layer
+above it. Corrected that in the section above — and then kept the framing that prefill "always starts
+at base = 0", which the log disproves in one line it was already printing.
+
+**Twice on the same question, from the same habit**: taking one strong signal and building a mechanism
+around it before checking the cheapest available evidence. The engine had been printing `reused N anchor
+tokens` on every turn the whole time.
+
+## What is actually worth measuring here
+
+Not whether the cache extends. Whether it **hits**: `pool cap 3` means a fourth branch evicts one, and
+an eviction costs a full prefill that looks identical in the log to a first turn. A hit-rate counter
+would separate "cache is working" from "cache is working and being missed", which is the distinction
+this document spent two revisions failing to make.
