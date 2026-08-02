@@ -2034,6 +2034,32 @@ same range means the bounding spheres genuinely overlap, so there is little
 to reject. The optimisation helps most where geometry is spread out, which
 is also where there is most of it.
 
+## v1.63.0 — ordering the frame for the GPU
+
+The renderer submitted one draw call per object and re-bound EVERYTHING for
+each: the object's uniform slice, its texture bind group, its vertex buffer
+and its index buffer. Perspective on why that matters more than it sounds:
+after culling, a frame is a few hundred draws, and on a phone the state
+churn around a draw can cost more than the triangles inside it.
+
+The frame is now ordered for the hardware rather than for the code that
+built it. OPAQUE geometry is grouped by (mesh, texture), so consecutive
+draws share state and the buffer and bind-group changes collapse to run
+boundaries. Measured on PERPLEXUS: 171 opaque draws now cost 5 mesh
+switches — 34 draws per state change, where it used to change on nearly
+every one.
+
+TRANSLUCENT geometry is drawn afterwards, sorted BACK TO FRONT, and that
+half is a correctness fix as much as a performance one: the glass tubes and
+junction rooms were compositing in whatever order the world happened to
+store them, which is simply the wrong answer for alpha blending. They now
+composite in the only order that is right. Depth-ordered draws cannot also
+be mesh-batched — that is the trade, and it is the correct one.
+
+`--sim render` reports both halves separately, because they are allowed to
+do different things: it asserts the opaque half batches (at least three
+draws per state change) and that the glass is genuinely furthest-first.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

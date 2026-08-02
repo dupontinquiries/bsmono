@@ -1184,6 +1184,7 @@ pub fn run(args: &[String]) {
         use crate::{frustum_planes, shape_bound, sphere_visible};
         println!("{:<13} {:>7} {:>8} {:>8} {:>8} {:>7}", "map", "shapes", "in view", "+dist", "drawn", "saved");
         let mut worst = 0.0f32;
+        let mut order_ok = true;
         for si in [20usize, 21, 24, 26, 30, 33, 35] {
             let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
             let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
@@ -1236,6 +1237,79 @@ pub fn run(args: &[String]) {
                 drawn_avg,
                 saved * 100.0
             );
+        }
+        // ---- draw-call state churn: what ordering the frame is worth ----
+        {
+            use crate::render::{order_for_draw, ObjDraw, ObjectRaw};
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
+            // a frame's worth of draws, in the order the world stores them
+            let mut objs: Vec<ObjDraw> = Vec::new();
+            for sh in w.shapes.iter() {
+                if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                    continue;
+                }
+                if sh.pos.distance(eye) > 250.0 {
+                    continue;
+                }
+                let mut raw = ObjectRaw::default();
+                raw.model[12] = sh.pos.x;
+                raw.model[13] = sh.pos.y;
+                raw.model[14] = sh.pos.z;
+                raw.color = sh.color;
+                objs.push(ObjDraw { mesh: sh.mesh, tex: None, raw });
+            }
+            let churn = |v: &[ObjDraw]| -> (usize, usize) {
+                let (mut m, mut t) = (usize::MAX, usize::MAX);
+                let (mut mc, mut tc) = (0, 0);
+                for o in v {
+                    if o.mesh != m {
+                        mc += 1;
+                        m = o.mesh;
+                    }
+                    let tex = o.tex.unwrap_or(usize::MAX - 1);
+                    if tex != t {
+                        tc += 1;
+                        t = tex;
+                    }
+                }
+                (mc, tc)
+            };
+            let before = churn(&objs);
+            let n = objs.len();
+            let opaque = order_for_draw(&mut objs, [eye.x, eye.y, eye.z]);
+            let after = churn(&objs);
+            // and check the glass really is furthest-first
+            let mut sorted_back_to_front = true;
+            let mut last = f32::MAX;
+            for o in objs.iter().skip(opaque) {
+                let m = &o.raw.model;
+                let d = (Vec3::new(m[12], m[13], m[14]) - eye).length();
+                if d > last + 0.01 {
+                    sorted_back_to_front = false;
+                }
+                last = d;
+            }
+            // Opaque draws can be batched by mesh; translucent ones must be
+            // ordered by DEPTH for alpha to composite correctly, so they
+            // cannot be. Judge each on what it is allowed to do.
+            let opaque_after = churn(&objs[..opaque]);
+            println!(
+                "draw order: {n} draws ({} opaque, {} glass) - mesh switches {} -> {} ({} among opaque)",
+                opaque,
+                n - opaque,
+                before.0,
+                after.0,
+                opaque_after.0
+            );
+            let batched = opaque_after.0 * 3 <= opaque.max(1);
+            println!(
+                "   opaque batches {:.1} draws per state change; glass composites {}",
+                opaque as f32 / opaque_after.0.max(1) as f32,
+                if sorted_back_to_front { "back to front" } else { "OUT OF ORDER" }
+            );
+            order_ok = batched && sorted_back_to_front;
+
         }
         // ---- the ground: how much of 97k triangles survives culling? ----
         {
@@ -1295,7 +1369,7 @@ pub fn run(args: &[String]) {
             );
         }
         println!("worst case still draws {:.0}% of the map", worst * 100.0);
-        println!("{}", if worst < 0.75 { "RENDER CULL: PASS" } else { "RENDER CULL: FAIL" });
+        println!("{}", if worst < 0.75 && order_ok { "RENDER CULL: PASS" } else { "RENDER CULL: FAIL" });
         return;
     }
     if name == "ballspin" {

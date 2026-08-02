@@ -100,6 +100,37 @@ pub struct ObjDraw {
     pub raw: ObjectRaw,
 }
 
+/// Order the frame for the GPU rather than for the code that built it.
+///
+/// Two things happen here. OPAQUE geometry is grouped by (mesh, texture) so
+/// consecutive draws share state and the buffer/bind-group churn collapses —
+/// with a draw call per object, that churn was most of the cost. TRANSLUCENT
+/// geometry is then drawn afterwards, sorted BACK TO FRONT, which is also
+/// the only order in which alpha blending is actually correct: the glass
+/// tubes used to composite in whatever order the world happened to store
+/// them in.
+pub fn order_for_draw(objs: &mut [ObjDraw], eye: [f32; 3]) -> usize {
+    let depth = |o: &ObjDraw| -> f32 {
+        let m = &o.raw.model;
+        let (dx, dy, dz) = (m[12] - eye[0], m[13] - eye[1], m[14] - eye[2]);
+        dx * dx + dy * dy + dz * dz
+    };
+    let solid = |o: &ObjDraw| o.raw.color[3] >= 0.985;
+    objs.sort_by(|a, b| {
+        match (solid(a), solid(b)) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => a
+                .mesh
+                .cmp(&b.mesh)
+                .then(a.tex.cmp(&b.tex)),
+            // translucent: furthest first
+            (false, false) => depth(b).total_cmp(&depth(a)),
+        }
+    });
+    objs.iter().filter(|o| solid(o)).count()
+}
+
 struct GpuMesh {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
@@ -960,13 +991,25 @@ impl Gpu {
 
             rp.set_pipeline(&self.scene_pipe);
             rp.set_bind_group(0, &self.globals_bg, &[]);
+            // With the draws ordered by (mesh, texture), the state only
+            // changes when it genuinely has to — the vertex and index
+            // buffers and the texture bind group are re-bound on a run
+            // boundary instead of on every single object.
+            let mut cur_mesh = usize::MAX;
+            let mut cur_tex = usize::MAX;
             for (i, o) in objs.iter().take(n).enumerate() {
                 let mesh = &self.meshes[o.mesh];
                 let tex = o.tex.unwrap_or(self.white_tex);
                 rp.set_bind_group(1, &self.obj_bg, &[(i as u64 * OBJ_STRIDE) as u32]);
-                rp.set_bind_group(2, &self.tex_bgs[tex], &[]);
-                rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                if tex != cur_tex {
+                    rp.set_bind_group(2, &self.tex_bgs[tex], &[]);
+                    cur_tex = tex;
+                }
+                if o.mesh != cur_mesh {
+                    rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                    rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    cur_mesh = o.mesh;
+                }
                 rp.draw_indexed(0..mesh.icount, 0, 0..1);
             }
         }

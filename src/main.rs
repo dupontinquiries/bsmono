@@ -2759,6 +2759,9 @@ impl Game {
         let planes = frustum_planes(&vp);
         let mut objs = self.build_scene(&rt_ids, rc, rb, &planes);
         self.fx.draw(&mut objs);
+        // order the frame: opaque batched by mesh, glass last and back to front
+        let eye = self.cam.pos;
+        let _opaque = render::order_for_draw(&mut objs, [eye.x, eye.y, eye.z]);
 
         // (view-projection and aspect computed above, before the scene build)
         
