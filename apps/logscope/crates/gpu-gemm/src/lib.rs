@@ -597,11 +597,21 @@ pub struct Gpu {
 /// possible. The ggml-metal analogue is "rows per SIMD group": one 32-wide subgroup cooperatively reduces a
 /// column-tile with no threadgroup memory at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MatvecKernel { V1 = 0, V2 = 1, V2Wg128 = 2, V2WgSg = 3 }
+pub enum MatvecKernel { V1 = 0, V2 = 1, V2Wg128 = 2, V2WgSg = 3,
+    /// 128-bit `vec4<u32>` loads — four words per memory transaction instead of one.
+    ///
+    /// WAS UNREACHABLE. The kernel existed, was benchmarked in main.rs, and was selectable only via
+    /// LOGSCOPE_MATVEC_V3 — so the per-shape autotune searched every OTHER kernel and picked V2Wg128.
+    /// I read that as "kernel choice is exhausted"; it wins the search it was entered in.
+    ///
+    /// Its own comment says why it should win a latency-bound decode: the profile is ~6% bandwidth and
+    /// ~1% ALU, the GPU idling on memory, and wider loads put more bytes in flight per request. Both
+    /// references treat 4-wide as the baseline — ggml-metal loads `device const float4*` throughout.
+    V3 = 4 }
 impl MatvecKernel {
-    fn from_id(id: u32) -> MatvecKernel { match id { 0 => MatvecKernel::V1, 2 => MatvecKernel::V2Wg128, 3 => MatvecKernel::V2WgSg, _ => MatvecKernel::V2 } }
+    fn from_id(id: u32) -> MatvecKernel { match id { 0 => MatvecKernel::V1, 4 => MatvecKernel::V3, 2 => MatvecKernel::V2Wg128, 3 => MatvecKernel::V2WgSg, _ => MatvecKernel::V2 } }
     pub fn id(self) -> u32 { self as u32 }
-    pub fn label(self) -> &'static str { match self { MatvecKernel::V1 => "v1", MatvecKernel::V2 => "v2", MatvecKernel::V2Wg128 => "v2-wg128", MatvecKernel::V2WgSg => "v2-wg128-sg" } }
+    pub fn label(self) -> &'static str { match self { MatvecKernel::V3 => "v3-vec4", MatvecKernel::V1 => "v1", MatvecKernel::V2 => "v2", MatvecKernel::V2Wg128 => "v2-wg128", MatvecKernel::V2WgSg => "v2-wg128-sg" } }
     /// Whether this kernel needs the SUBGROUP device feature (so the autotuner can skip it where unsupported).
     pub fn needs_subgroups(self) -> bool { matches!(self, MatvecKernel::V2WgSg) }
 }
@@ -630,6 +640,10 @@ pub const DECODE_PROFILES: &[DecodeConfig] = &[
     DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 8 },
     DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 8 },
     DecodeConfig { kernel: MatvecKernel::V2, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2, tile: 8 },
+    // V3 FIRST AMONG THE NEW ENTRIES: it is the kernel the profile's own analysis expects to win a
+    // latency-bound decode, and it was searched by nobody. Tiles 2/4/8 mirror what the others probe.
+    DecodeConfig { kernel: MatvecKernel::V3, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V3, tile: 4 },
+    DecodeConfig { kernel: MatvecKernel::V3, tile: 8 },
     DecodeConfig { kernel: MatvecKernel::V1, tile: 1 }, DecodeConfig { kernel: MatvecKernel::V1, tile: 4 },
 ];
 /// Autotune probes at a capped output width: the best config transfers across n (it's set by k + kernel
@@ -3643,6 +3657,8 @@ impl Gpu {
             MatvecKernel::V2 => self.matvec_decode_v2(a, w, cfg.tile),
             MatvecKernel::V2Wg128 => self.matvec_decode_v2wg128(a, w, cfg.tile),
             MatvecKernel::V2WgSg => self.matvec_decode_v2sg(a, w, cfg.tile),
+            // The wide-load kernel, now reachable by autotune rather than only by env var.
+            MatvecKernel::V3 => self.matvec_decode_v3(a, w, cfg.tile),
         }
     }
 
@@ -12653,6 +12669,46 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// V3 must be reachable by the autotune, not only by an env var.
+    ///
+    /// It existed, was benchmarked, and was selectable only through LOGSCOPE_MATVEC_V3 — so the
+    /// per-shape search compared every OTHER kernel and picked V2Wg128. I read that as "kernel choice
+    /// is exhausted". It wins the search it was entered in.
+    #[test]
+    fn the_autotune_candidate_list_includes_the_wide_load_kernel() {
+        use super::{DECODE_PROFILES, MatvecKernel};
+        assert!(DECODE_PROFILES.iter().any(|c| c.kernel == MatvecKernel::V3),
+            "V3 is not searched, so it cannot be chosen however fast it is");
+        // And every other kernel stays in, since removing a candidate is how a search silently narrows.
+        for k in [MatvecKernel::V1, MatvecKernel::V2, MatvecKernel::V2Wg128, MatvecKernel::V2WgSg] {
+            assert!(DECODE_PROFILES.iter().any(|c| c.kernel == k), "{k:?} dropped from the search");
+        }
+    }
+
+    /// A cached id must resolve to the kernel it was written for.
+    ///
+    /// V3 took id 4, an unused value, precisely so an existing cache cannot re-resolve to it. Reusing
+    /// an id would make every previously-cached choice silently mean something else — the stale-cache
+    /// class, self-inflicted.
+    #[test]
+    fn kernel_ids_are_stable_across_the_addition() {
+        use super::MatvecKernel;
+        assert_eq!(MatvecKernel::V1.id(), 0);
+        assert_eq!(MatvecKernel::V2.id(), 1);
+        assert_eq!(MatvecKernel::V2Wg128.id(), 2);
+        assert_eq!(MatvecKernel::V2WgSg.id(), 3);
+        assert_eq!(MatvecKernel::V3.id(), 4, "a NEW id, so no existing cache re-resolves");
+    }
+
+    #[test]
+    fn V3_does_not_need_subgroups() {
+        // The point of wiring it now: it is the one decode speedup that does not wait on the subgroup
+        // chain, which is blocked behind the short-binding finding.
+        use super::MatvecKernel;
+        assert!(!MatvecKernel::V3.needs_subgroups());
+        assert!(MatvecKernel::V2WgSg.needs_subgroups());
+    }
+
     /// Every caller of `submit` must tag a cause.
     ///
     /// The profile reported "N UNATTRIBUTED, a submit path is still untagged" for months. There is one
