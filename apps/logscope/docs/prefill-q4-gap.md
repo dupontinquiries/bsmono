@@ -230,3 +230,38 @@ A register-blocked q4 GEMM addresses the 100×. The 4% is separate and may share
 6–10× — both are shapes where the GPU idles on memory, and both are on a driver whose subgroup path is
 disabled. Fixing one does not obviously fix the other, and the prefill number is large enough that it
 should be measured again after the GEMM rather than predicted.
+
+
+## Second correction: neither default path is autotuned — the gap is REGISTER BLOCKING
+
+I was about to write "q8_0's tile is autotuned per shape and q4's is a hardcoded workgroup size".
+Checking first: `gemm_tile_for` feeds only `linear_q8_0_gemm`, which is the **tiled** variant reached
+via `LOGSCOPE_PREFILL_TILED` — the opt-in *escape*, measured at 2.8× **slower** than the default.
+
+The default q8_0 prefill kernel is `linear_q8_0_gemm_rb`, and its own comment says it "has no override
+constants so it compiles on every backend". It is fixed-shape too.
+
+So the accurate statement is:
+
+| path | shape | tunable |
+|---|---|---|
+| q8_0 default | register-blocked, wide per-thread tile | no |
+| q8_0 escape | workgroup-tiled, override constants | yes, and 2.8× slower |
+| q4 default | `@workgroup_size(8,8,1)`, 8×8 per workgroup | no |
+
+**The difference is register blocking, not tunability.** A register-blocked kernel holds a wide tile of
+`a` in registers and streams weights past it once; an 8×8 workgroup tile re-reads the weight block for
+every group of 8 rows. That is why the q8_0 default beats the q8_0 *tunable* variant by 2.8× — and it is
+the property q4 lacks.
+
+So the work is unchanged in substance and clearer in shape: **port the register-blocking, not the
+tuning.** And q4's advantage still holds — half the weight bytes per element means the same register
+budget spans twice the k-extent.
+
+### Why both corrections happened
+
+Each time, a plausible reading of one comment produced a confident wrong claim about which kernel
+exists. The first read "re-reading weights per tile" as per-row; the second read `gemm_tile_for` as
+governing the fast path when it governs the slow one. **Both were caught by grepping for the caller
+rather than trusting the name** — which is the same discipline that found V3 unreachable, and the same
+one that failed when I concluded the autotune had exhausted kernel choice.
