@@ -89,6 +89,179 @@ impl Fx {
         }
     }
 
+    /// The garage's boost trails. Each is a different physical story rather
+    /// than a recolour: what the exhaust IS decides how it moves.
+    pub fn trail_of(&mut self, kind: usize, tail: Vec3, back: Vec3, car_vel: Vec3) {
+        match kind {
+            1 => self.ion_trail(tail, back, car_vel),
+            2 => {
+                // RIBBON: a flat sheet, nearly stationary once laid down, so
+                // it hangs in the air and marks the line you drove
+                for k in 0..2 {
+                    let side = if k == 0 { 1.0 } else { -1.0 };
+                    let pos = tail + Vec3::new(side * 0.11, 0.0, 0.0) + self.jitter(0.01);
+                    let __r0 = self.rng.range(0.55, 0.85);
+                    let __r1 = self.rng.range(0.10, 0.15);
+                    self.push(Particle {
+                        pos,
+                        vel: car_vel * 0.04,
+                        life: 0.0,
+                        max: __r0,
+                        size: __r1,
+                        grow: -0.08,
+                        color: [0.55, 0.85, 1.0, 1.0],
+                        emissive: 0.85,
+                        grav: 0.0,
+                        drag: 0.4,
+                    });
+                }
+            }
+            3 => {
+                // EMBER: sparks with real weight — they fall and go out
+                for _ in 0..3 {
+                    let pos = tail + self.jitter(0.05);
+                    let vel = car_vel * 0.3 + back * self.rng.range(1.5, 3.5) + self.jitter(1.6);
+                    let __r0 = self.rng.range(0.45, 0.9);
+                    let __r1 = self.rng.range(0.02, 0.045);
+                    self.push(Particle {
+                        pos,
+                        vel,
+                        life: 0.0,
+                        max: __r0,
+                        size: __r1,
+                        grow: -0.2,
+                        color: [1.0, 0.62, 0.18, 1.0],
+                        emissive: 1.0,
+                        grav: 5.5,
+                        drag: 0.9,
+                    });
+                }
+            }
+            4 => {
+                // VOID: dark, slow, and it drinks the light — emissive zero
+                // with a near-black colour reads as a hole in the scene
+                for _ in 0..2 {
+                    let pos = tail + self.jitter(0.09);
+                    let __r0 = self.rng.range(0.5, 1.4);
+                    let __r1 = self.rng.range(0.5, 0.9);
+                    let __r2 = self.rng.range(0.10, 0.20);
+                    let __j0 = self.jitter(0.5);
+                    self.push(Particle {
+                        pos,
+                        vel: car_vel * 0.12 + back * __r0 + __j0,
+                        life: 0.0,
+                        max: __r1,
+                        size: __r2,
+                        grow: 0.5,
+                        color: [0.04, 0.02, 0.07, 1.0],
+                        emissive: 0.0,
+                        grav: -0.6,
+                        drag: 1.6,
+                    });
+                }
+            }
+            5 => {
+                // PRISM: shards, each carrying one part of the spectrum, so
+                // the trail separates into colours as it spreads
+                for k in 0..3 {
+                    let hue = [[1.0, 0.25, 0.35, 1.0], [0.30, 1.0, 0.45, 1.0], [0.35, 0.45, 1.0, 1.0]][k];
+                    let pos = tail + self.jitter(0.04);
+                    let spread = 1.2 + k as f32 * 0.5;
+                    let __r0 = self.rng.range(3.0, 5.0);
+                    let __r1 = self.rng.range(0.25, 0.45);
+                    let __r2 = self.rng.range(0.035, 0.07);
+                    let __j0 = self.jitter(spread);
+                    self.push(Particle {
+                        pos,
+                        vel: car_vel * 0.2 + back * __r0 + __j0,
+                        life: 0.0,
+                        max: __r1,
+                        size: __r2,
+                        grow: -0.1,
+                        color: hue,
+                        emissive: 1.0,
+                        grav: 0.0,
+                        drag: 1.1,
+                    });
+                }
+            }
+            _ => self.boost_trail(tail, back, car_vel),
+        }
+    }
+
+    /// Goal explosions. Same rule: each has its own behaviour, not its own
+    /// palette — a shockwave expands, a singularity collapses first.
+    pub fn explosion_of(&mut self, kind: usize, at: Vec3) {
+        match kind {
+            1 => {
+                // SUPERNOVA: a hard flash, then a slow shell
+                for _ in 0..40 {
+                    let d = self.jitter(1.0).normalize_or(Vec3::Y);
+                    let __r0 = self.rng.range(14.0, 22.0);
+                    self.push(Particle { pos: at, vel: d * __r0, life: 0.0, max: 0.35, size: 0.5, grow: -0.5, color: [1.0, 0.97, 0.85, 1.0], emissive: 1.0, grav: 0.0, drag: 6.0 });
+                }
+                for _ in 0..60 {
+                    let d = self.jitter(1.0).normalize_or(Vec3::Y);
+                    let __r0 = self.rng.range(4.0, 8.0);
+                    self.push(Particle { pos: at, vel: d * __r0, life: 0.0, max: 1.6, size: 0.3, grow: 0.4, color: [1.0, 0.55, 0.20, 1.0], emissive: 0.9, grav: 1.5, drag: 0.7 });
+                }
+            }
+            2 => {
+                // HEXBURST: a lattice — particles on a ring of rings
+                for i in 0..7 {
+                    for k in 0..12 {
+                        let a = k as f32 / 12.0 * std::f32::consts::TAU;
+                        let tilt = (i as f32 / 6.0 - 0.5) * 1.5;
+                        let d = Vec3::new(a.cos(), tilt, a.sin()).normalize();
+                        self.push(Particle { pos: at, vel: d * (9.0 + i as f32 * 1.5), life: 0.0, max: 1.1, size: 0.16, grow: 0.1, color: [0.35, 1.0, 0.85, 1.0], emissive: 1.0, grav: 0.0, drag: 1.4 });
+                    }
+                }
+            }
+            3 => {
+                // INKFALL: plumes that rise, then rain back down
+                for _ in 0..70 {
+                    let d = (self.jitter(1.0) + Vec3::Y * 1.6).normalize_or(Vec3::Y);
+                    let __r0 = self.rng.range(6.0, 13.0);
+                    let __r1 = self.rng.range(0.2, 0.45);
+                    self.push(Particle { pos: at, vel: d * __r0, life: 0.0, max: 2.2, size: __r1, grow: 0.5, color: [0.10, 0.05, 0.16, 1.0], emissive: 0.05, grav: 7.0, drag: 0.9 });
+                }
+            }
+            4 => {
+                // PRISMATIC: the spectrum thrown in every direction
+                for k in 0..96 {
+                    let d = self.jitter(1.0).normalize_or(Vec3::Y);
+                    let h = (k % 6) as f32 / 6.0;
+                    let col = [0.5 + 0.5 * (h * 6.28).sin(), 0.5 + 0.5 * (h * 6.28 + 2.1).sin(), 0.5 + 0.5 * (h * 6.28 + 4.2).sin(), 1.0];
+                    let __r0 = self.rng.range(7.0, 18.0);
+                    self.push(Particle { pos: at, vel: d * __r0, life: 0.0, max: 1.4, size: 0.14, grow: 0.0, color: col, emissive: 1.0, grav: 0.0, drag: 1.0 });
+                }
+            }
+            5 => {
+                // SINGULARITY: everything rushes IN first — particles are
+                // spawned out wide travelling inward, and the outward burst
+                // only follows once they have collapsed
+                for _ in 0..80 {
+                    let d = self.jitter(1.0).normalize_or(Vec3::Y);
+                    let r = self.rng.range(6.0, 11.0);
+                    let __r0 = self.rng.range(9.0, 15.0);
+                    self.push(Particle { pos: at + d * r, vel: -d * __r0, life: 0.0, max: 0.75, size: 0.12, grow: -0.05, color: [0.65, 0.35, 1.0, 1.0], emissive: 1.0, grav: 0.0, drag: 0.2 });
+                }
+                for _ in 0..30 {
+                    let d = self.jitter(1.0).normalize_or(Vec3::Y);
+                    self.push(Particle { pos: at, vel: d * 3.0, life: -0.75, max: 1.5, size: 0.3, grow: 0.6, color: [0.95, 0.90, 1.0, 1.0], emissive: 1.0, grav: 0.0, drag: 1.2 });
+                }
+            }
+            _ => {
+                // SHOCKWAVE: one clean expanding ring
+                for k in 0..80 {
+                    let a = k as f32 / 80.0 * std::f32::consts::TAU;
+                    let d = Vec3::new(a.cos(), 0.06, a.sin());
+                    self.push(Particle { pos: at, vel: d * 16.0, life: 0.0, max: 1.0, size: 0.22, grow: 0.35, color: [0.55, 0.95, 0.65, 1.0], emissive: 1.0, grav: 0.0, drag: 2.2 });
+                }
+            }
+        }
+    }
+
     pub fn boost_trail(&mut self, tail: Vec3, back: Vec3, car_vel: Vec3) {
         for _ in 0..2 {
             let hot = self.rng.f();

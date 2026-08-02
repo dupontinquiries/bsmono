@@ -167,6 +167,13 @@ fn collect_node(
 /// longest run (nose axis if wheels exist) spans `target_len` along Z with the
 /// nose at -Z, centered at the origin.
 pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
+    load_oriented(dir, gpu, target_len, false)
+}
+
+/// As `load`, but `flip` turns the body around its vertical axis. The nose
+/// is inferred from the geometry, and inference is not always right — the
+/// Guardian arrived facing backwards, which is invisible until you drive it.
+pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> Model {
     // Two packagings of the same format. A .gltf folder keeps its buffer and
     // textures as sibling files; a .glb is one binary with the buffer inline
     // (and usually the images too). Take whichever is present, so a model
@@ -259,9 +266,13 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
     let center = (mn + mx) * 0.5;
     let long = ext.z.max(ext.x).max(ext.y).max(1e-6);
     let s = target_len / long;
+    let yaw = if flip { std::f32::consts::PI } else { 0.0 };
+    let turn = Quat::from_rotation_y(yaw);
     for r in raws.iter_mut() {
         for v in r.verts.iter_mut() {
-            v.pos = ((Vec3::from_array(v.pos) - center) * s).to_array();
+            let p = (Vec3::from_array(v.pos) - center) * s;
+            v.pos = (turn * p).to_array();
+            v.nrm = (turn * Vec3::from_array(v.nrm)).to_array();
         }
     }
 

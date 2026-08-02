@@ -72,7 +72,9 @@ pub struct ObjectRaw {
     pub nrm: [f32; 16],
     pub color: [f32; 4],
     pub params: [f32; 4], // x mode, y emissive, z spec, w rt self id + 1
-    pub _pad: [f32; 24],
+    /// x skin id, y phase, z intensity, w speed (0..1) — the skin's inputs
+    pub skin: [f32; 4],
+    pub _pad: [f32; 20],
 }
 
 impl Default for ObjectRaw {
@@ -82,7 +84,7 @@ impl Default for ObjectRaw {
             nrm: [0.0; 16],
             color: [1.0; 4],
             params: [0.0; 4],
-            _pad: [0.0; 24],
+            skin: [0.0; 4], _pad: [0.0; 20],
         }
     }
 }

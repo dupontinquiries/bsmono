@@ -9,6 +9,7 @@ mod font;
 mod fx;
 mod gamepad;
 mod gyro;
+mod custom;
 mod trials;
 mod replay;
 mod academy;
@@ -53,6 +54,7 @@ const COMBO_WINDOW: f32 = 7.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
+    Garage { sel: usize },
     Academy { sel: usize },
     Trials { sel: usize },
     Splash,
@@ -85,6 +87,7 @@ enum Row {
     Controls,
     Trials,
     Academy,
+    Garage,
     Fullscreen,
     Header,
     GameMode(u8), // 0 free, 1 sparta 50v50, 2 sparta 300
@@ -280,6 +283,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("BACK", Back),
         ],
         _ => vec![
+            ("GARAGE - SKINS, WHEELS, TRAILS", Garage),
             ("ACADEMY - LEARN THE TRICKS", Academy),
             ("TRIALS", Trials),
             ("CONTROLS + KEY BINDINGS", Controls),
@@ -329,7 +333,7 @@ fn row_value(cfg: &Config, row: &Row) -> (String, Option<f32>) {
         }
         Row::Toggle { get, .. } => ((if get(cfg) { "ON" } else { "OFF" }).into(), None),
         Row::Preset => (PRESETS[cfg.preset % PRESETS.len()].into(), None),
-        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::GameMode(_) => (String::new(), None),
+        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::GameMode(_) => (String::new(), None),
         Row::CarPick => ("<see below>".into(), None),
         Row::Fullscreen => ("TOGGLE".into(), None),
         Row::Header | Row::Back => (String::new(), None),
@@ -467,6 +471,9 @@ struct Game {
     moments: Vec<replay::Moment>,
     /// playing a replay: (which moment, time into it)
     watching: Option<(usize, f32)>,
+    /// the garage: skin, wheels, trail, goal explosion
+    look: custom::Loadout,
+    look_sel: usize,
     /// the trial being attempted, if any
     trial: Option<trials::Run>,
     /// best times, and the ghost of the best run for the current trial
@@ -863,7 +870,7 @@ fn main() {
     let backfire = model::load(&cars_dir.join("backfire"), &mut gpu, 1.28);
     let breakout = model::load(&cars_dir.join("breakout"), &mut gpu, 1.30);
     let assael = model::load(&cars_dir.join("assael"), &mut gpu, 1.34);
-    let guardian = model::load(&cars_dir.join("guardian"), &mut gpu, 1.30);
+    let guardian = model::load_oriented(&cars_dir.join("guardian"), &mut gpu, 1.30, true); // arrived nose-aft
     let orion = model::load(&cars_dir.join("orion"), &mut gpu, 1.32);
     let vulcan = model::load(&cars_dir.join("vulcan"), &mut gpu, 1.30);
     let xdevil = model::load(&cars_dir.join("xdevil"), &mut gpu, 1.32);
@@ -919,6 +926,7 @@ fn main() {
     let rs0 = cfg.video.render_scale;
     let gyro_on0 = cfg.gyro.on;
     let trials_bests0 = trials::Bests::decode(&sv.trials);
+    let look0 = custom::Loadout::decode(&sv.look);
     let academy_passed0 = academy::Passed::decode(&sv.academy);
     let mut game = Game {
         gpu,
@@ -965,6 +973,8 @@ fn main() {
         rec: replay::Recorder::default(),
         moments: Vec::new(),
         watching: None,
+        look: look0,
+        look_sel: 0,
         trial: None,
         bests: trials_bests0,
         ghost: Vec::new(),
@@ -1355,6 +1365,7 @@ impl Game {
         let esc = Key::Named(NamedKey::Escape);
         let enter = Key::Named(NamedKey::Enter);
         match self.mode {
+            Mode::Garage { .. } => {}
             Mode::Academy { sel } => {
                 if let Some(i) = self.hover_row() {
                     if i == sel {
@@ -1850,7 +1861,7 @@ impl Game {
             Row::Preset | Row::CarPick => {
                 self.tweaks_key(&Key::Named(NamedKey::ArrowRight), menu, i, win);
             }
-            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy => {
+            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage => {
                 self.mscroll = 0.0;
                 self.mfling = 0.0;
                 self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
@@ -1893,6 +1904,30 @@ impl Game {
             _ => "",
         };
         match self.mode {
+            Mode::Garage { sel } => {
+                let slots = custom::slots();
+                let n = slots.len();
+                let cnt = slots[sel.min(n - 1)].1;
+                let cur = match sel {
+                    0 => &mut self.look.skin,
+                    1 => &mut self.look.wheels,
+                    2 => &mut self.look.trail,
+                    _ => &mut self.look.explosion,
+                };
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowLeft), _) | (_, "a") => *cur = (*cur + cnt - 1) % cnt,
+                    (Key::Named(NamedKey::ArrowRight), _) | (_, "d") => *cur = (*cur + 1) % cnt,
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Garage { sel: (sel + n - 1) % n }
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Garage { sel: (sel + 1) % n }
+                    }
+                    _ => {}
+                }
+                self.save.look = self.look.encode();
+            }
             Mode::Academy { sel } => {
                 let n = academy::LESSONS.len();
                 match (&key, ch) {
@@ -2163,6 +2198,10 @@ impl Game {
             Row::Academy => {
                 self.mscroll = 0.0;
                 self.mode = Mode::Academy { sel: self.lesson_sel };
+            }
+            Row::Garage => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Garage { sel: self.look_sel };
             }
             Row::Fullscreen => {
                 if matches!(key, Key::Named(NamedKey::Enter)) || dir != 0 {
@@ -2688,12 +2727,16 @@ impl Game {
             if boosting {
                 let back = -self.car.forward();
                 let tail = self.car.pos + back * (self.car.half_len + 0.12);
-                // an electric car burns nothing: it runs an ion thruster
-                if self.cars.models[self.cars.active].drive == model::Drive::Electric {
-                    self.fx.ion_trail(tail, back, self.car.vel);
+                // the garage's trail wins; failing that, an electric car
+                // runs an ion thruster and everything else burns fuel
+                let kind = if self.look.trail > 0 {
+                    self.look.trail
+                } else if self.cars.models[self.cars.active].drive == model::Drive::Electric {
+                    1
                 } else {
-                    self.fx.boost_trail(tail, back, self.car.vel);
-                }
+                    0
+                };
+                self.fx.trail_of(kind, tail, back, self.car.vel);
             }
 
             // ---- adaptive-audio sense: measure, then hand to the mixer ----
@@ -2816,6 +2859,7 @@ impl Game {
         let mut ui: Vec<UiVert> = Vec::new();
         self.peer_tags(&mut ui, vp, aspect);
         match self.mode {
+            Mode::Garage { sel } => hud::garage_menu(&mut ui, aspect, sel, &self.look, self.cursor),
             Mode::Academy { sel } => hud::academy_menu(
                 &mut ui,
                 aspect,
@@ -3089,6 +3133,9 @@ impl Game {
         for &(gp, who) in &ev.goals {
             self.cam.add_shake(0.45);
             self.fx.ring_burst(gp, [0.45, 1.0, 0.55, 1.0], true);
+            if who == physics::WHO_PLAYER {
+                self.fx.explosion_of(self.look.explosion, gp);
+            }
             self.fx.pad_sparkle(gp, true);
             if who == physics::WHO_PLAYER {
                 // how far the shot travelled decides a couple of the names
@@ -3794,11 +3841,11 @@ impl Game {
             self.cfg.car.size,
             None,
             true,
-        );
+            self.skin_params(),);
         // remote cars + their boost flames
         for (i, p) in self.net.peers().enumerate() {
             self.push_car(&mut objs, p.car.min(self.cars.models.len() - 1), p.shown, p.rot, p.flip, p.wheel_spin, p.steer_vis,
-                (ids.remote0 + i + 1) as f32, 1.0, None, true);
+                (ids.remote0 + i + 1) as f32, 1.0, None, true, [0.0; 4],);
             if p.boosting {
                 let fwd = p.rot * Vec3::NEG_Z;
                 let tail = p.shown - fwd * (self.cars.models[p.car.min(2)].half_len + 0.12);
@@ -3825,8 +3872,7 @@ impl Game {
                 0.0,
                 1.0,
                 Some(bots::team_tint(b.team)),
-                d2 < 60.0 * 60.0,
-            );
+                d2 < 60.0 * 60.0, [0.0; 4],);
         }
 
         // local boost flame
@@ -3842,6 +3888,14 @@ impl Game {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The garage skin as shader inputs: id, a phase so two cars with the
+    /// same finish are not in lockstep, intensity, and the car's speed
+    /// (FORGE heats with it).
+    fn skin_params(&self) -> [f32; 4] {
+        let sp = (self.car.vel.length() / 25.0).clamp(0.0, 1.0);
+        [self.look.skin as f32, (self.save.car as f32) * 1.7, 1.0, sp]
+    }
+
     fn push_car(
         &self,
         objs: &mut Vec<ObjDraw>,
@@ -3855,7 +3909,26 @@ impl Game {
         scale: f32,
         tint: Option<[f32; 3]>,
         wheels: bool,
+        // [id, phase, intensity, speed] — the garage skin, or zeros
+        skin: [f32; 4],
     ) {
+        let push_skinned = |objs: &mut Vec<ObjDraw>,
+                    mesh: usize,
+                    tex: Option<usize>,
+                    model: Mat4,
+                    color: [f32; 4],
+                    params: [f32; 4],
+                    skin: [f32; 4]| {
+            let nrm3 = Mat3::from_mat4(model).inverse().transpose();
+            let mut raw = ObjectRaw::default();
+            raw.model = model.to_cols_array();
+            raw.nrm = Mat4::from_mat3(nrm3).to_cols_array();
+            raw.color = color;
+            raw.params = params;
+            raw.skin = skin;
+            objs.push(ObjDraw { mesh, tex, raw });
+        };
+        #[allow(unused)]
         let push = |objs: &mut Vec<ObjDraw>,
                     mesh: usize,
                     tex: Option<usize>,
@@ -3901,7 +3974,9 @@ impl Game {
                 }
             };
             let spec = if matches!(prim.tag, model::Tag::Body) { 0.6 } else { 0.15 };
-            push(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot]);
+            // the skin rides on the BODY only — wheels keep their own look
+            let sk = if matches!(prim.tag, model::Tag::Body) { skin } else { [0.0; 4] };
+            push_skinned(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot], sk);
         }
     }
 }

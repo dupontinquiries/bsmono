@@ -3320,6 +3320,50 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "garage" {
+        // The customizer, checked as data: every slot has options, every
+        // option has a name and a description, and a loadout survives a save.
+        use crate::custom::{Loadout, EXPLOSIONS, SKINS, TRAILS, WHEELS};
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        println!("skins {}  wheels {}  trails {}  explosions {}", SKINS.len(), WHEELS.len(), TRAILS.len(), EXPLOSIONS.len());
+        println!("   {} combinations", SKINS.len() * WHEELS.len() * TRAILS.len() * EXPLOSIONS.len());
+        check("every slot has choices", SKINS.len() >= 8 && WHEELS.len() >= 6 && TRAILS.len() >= 5 && EXPLOSIONS.len() >= 5);
+        check(
+            "every skin says what it does",
+            SKINS.iter().all(|(n, b)| !n.is_empty() && b.len() > 12),
+        );
+        check(
+            "trails and explosions do too",
+            TRAILS.iter().all(|(_, b)| b.len() > 10) && EXPLOSIONS.iter().all(|(_, b)| b.len() > 10),
+        );
+        check("wheel styles differ in spokes", {
+            let mut v: Vec<u32> = WHEELS.iter().map(|w| w.1).collect();
+            v.sort();
+            v.dedup();
+            v.len() == WHEELS.len()
+        });
+        let mut l = Loadout::default();
+        l.skin = 4;
+        l.wheels = 3;
+        l.trail = 5;
+        l.explosion = 2;
+        let round = Loadout::decode(&l.encode());
+        check(
+            "a loadout survives the save file",
+            round.skin == 4 && round.wheels == 3 && round.trail == 5 && round.explosion == 2,
+        );
+        check("nonsense in the save does not panic", {
+            let junk = Loadout::decode("999 abc -1");
+            junk.skin < SKINS.len() && junk.wheels < WHEELS.len()
+        });
+        println!("   e.g. {} / {} / {} / {}", round.skin_name(), round.wheel_name(), round.trail_name(), round.explosion_name());
+        println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
+        return;
+    }
     if name == "glb" {
         // Can the loader actually read these? Geometry only — no GPU needed
         // to answer whether a file parses, has a scene, and carries meshes.

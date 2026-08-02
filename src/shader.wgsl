@@ -306,6 +306,101 @@ fn portal_hop(a: vec3<f32>, b: vec3<f32>, rd: vec3<f32>, out_p: ptr<function, ve
     return false;
 }
 
+/// ---- SKINS -------------------------------------------------------------
+/// A finish gets the surface point, its normal, the view direction, the
+/// clock and the car's speed, and returns a modified albedo plus an
+/// emissive boost and a spec boost. Because it sees the view direction it
+/// can respond to HOW YOU ARE LOOKING at the car, which is what separates
+/// these from a scrolling texture — and because spec feeds the reflection
+/// march, a skin can hand itself over to the ray tracer entirely.
+struct SkinOut {
+    albedo: vec3<f32>,
+    emissive: f32,
+    spec: f32,
+}
+
+fn hue_shift(c: vec3<f32>, a: f32) -> vec3<f32> {
+    // rotate around the grey axis: cheap, and keeps luminance sane
+    let k = vec3(0.57735, 0.57735, 0.57735);
+    let cosa = cos(a);
+    return c * cosa + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - cosa);
+}
+
+fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, t: f32, speed: f32, phase: f32) -> SkinOut {
+    var o: SkinOut;
+    o.albedo = base;
+    o.emissive = 0.0;
+    o.spec = 0.0;
+    let facing = clamp(dot(n, v), 0.0, 1.0);
+    let graze = 1.0 - facing;
+    if (id == 1) {
+        // IRIDESCENT: hue follows the viewing angle, so a curved flank shows
+        // a whole spectrum at once and it MOVES as you orbit
+        o.albedo = hue_shift(base, graze * 4.2 + t * 0.35 + phase);
+        o.spec = 0.35 * graze;
+        o.emissive = 0.10 * graze;
+    } else if (id == 2) {
+        // ENERGY FLOW: bands running nose to tail along the body's own axis
+        let band = sin(p.z * 6.0 - t * 5.0 + phase);
+        let hot = smoothstep(0.55, 1.0, band);
+        o.albedo = mix(base, vec3(0.55, 0.95, 1.0), hot * 0.7);
+        o.emissive = hot * 0.9;
+    } else if (id == 3) {
+        // BREATHING: a slow cycle, with the seams (steep normals) brightest
+        // on the rise — a machine idling rather than a decal
+        let breath = 0.5 + 0.5 * sin(t * 1.15 + phase);
+        let seam = pow(graze, 3.0);
+        o.emissive = breath * (0.25 + seam * 1.5);
+        o.albedo = mix(base, base * 1.35, breath * 0.5);
+    } else if (id == 4) {
+        // LIQUID CHROME: almost no colour of its own, all reflection
+        o.albedo = base * 0.10 + vec3(0.06);
+        o.spec = 0.95;
+    } else if (id == 5) {
+        // SCANLINE: a sweep that traces the bodywork, brightest where the
+        // surface turns away — so the sweep draws the car's shape
+        let sweep = fract(p.y * 3.0 - t * 0.9 + phase);
+        let line = smoothstep(0.94, 1.0, sweep) + smoothstep(0.04, 0.0, sweep);
+        o.emissive = line * (0.4 + graze);
+        o.albedo = mix(base, vec3(0.7, 0.9, 1.0), line * 0.5);
+        o.spec = 0.25;
+    } else if (id == 6) {
+        // PLASMA: drifting cell noise in the BODY's space, so the slick
+        // belongs to the car instead of sliding over it
+        let q = p * 5.0 + vec3(t * 0.35, t * 0.2, -t * 0.3);
+        let a1 = sin(q.x) * sin(q.y * 1.3) * sin(q.z * 0.8);
+        let a2 = sin(q.x * 1.7 + 1.3) * sin(q.z * 1.1);
+        let m = 0.5 + 0.5 * (a1 * 0.6 + a2 * 0.4);
+        o.albedo = hue_shift(base, m * 3.0 + phase);
+        o.emissive = pow(m, 3.0) * 0.6;
+        o.spec = 0.4;
+    } else if (id == 7) {
+        // CIRCUIT: a lattice of traces with pulses travelling along them
+        let g = abs(fract(p.xz * 7.0) - 0.5);
+        let trace = smoothstep(0.46, 0.5, max(g.x, g.y));
+        let pulse = smoothstep(0.7, 1.0, sin(p.x * 4.0 + p.z * 3.0 - t * 4.0 + phase));
+        o.albedo = mix(base * 0.55, vec3(0.25, 1.0, 0.75), trace * 0.8);
+        o.emissive = trace * (0.25 + pulse * 1.3);
+    } else if (id == 8) {
+        // FORGE: heat driven by SPEED rather than time — the leading edges
+        // glow the harder you drive
+        let lead = clamp(-dot(n, vec3(0.0, 0.0, 1.0)), 0.0, 1.0);
+        let heat = clamp(speed * (0.35 + lead), 0.0, 1.0);
+        o.albedo = mix(base * 0.5, vec3(1.0, 0.42, 0.10), heat);
+        o.emissive = heat * heat * 1.6;
+    } else if (id == 9) {
+        // MOIRE: two lattices at slightly different scales, so the
+        // interference pattern shifts with both angle and time
+        let s1 = sin(p.x * 22.0 + t * 0.7);
+        let s2 = sin(p.x * 23.4 - t * 0.5 + graze * 6.0);
+        let m = 0.5 + 0.5 * s1 * s2;
+        o.albedo = hue_shift(base, m * 2.2 + graze * 2.0);
+        o.emissive = pow(m, 6.0) * 0.8;
+        o.spec = 0.5 * m;
+    }
+    return o;
+}
+
 fn map_d_from(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool, first: u32) -> f32 {
     var d = 1e6;
     var db = 1e6; // fillet group: tubes + junction rooms smooth-union
@@ -508,7 +603,9 @@ struct Object {
     model: mat4x4<f32>,
     nrm: mat4x4<f32>,
     color: vec4<f32>,      // base color factor (linear), a = alpha
-    params: vec4<f32>,     // x mode (0 plain, 1 terrain grid), y emissive, z spec, w rt self id + 1
+    params: vec4<f32>,
+    // x mode (0 plain, 1 terrain grid), y emissive, z spec, w rt self id + 1
+    skin: vec4<f32>,       // x id, y phase, z intensity, w speed 0..1
 };
 @group(1) @binding(0) var<uniform> O: Object;
 @group(2) @binding(0) var t_col: texture_2d<f32>;
@@ -582,20 +679,37 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
+    // ---- SKIN ----------------------------------------------------------
+    // Applied before lighting, so a finish changes what the light falls on
+    // rather than being painted over the top of it. Skins may also raise the
+    // spec, which feeds the reflection march below — that is how LIQUID
+    // CHROME becomes nothing but what the ray tracer sees.
+    var skin_em = 0.0;
+    var skin_spec = 0.0;
+    let skin_id = i32(O.skin.x);
+    if (skin_id > 0) {
+        // in the BODY's own space, so a moving car carries its finish
+        let lp = (in.wpos - O.model[3].xyz);
+        let sk = apply_skin(skin_id, base, lp, n, v, G.cam.w, O.skin.w, O.skin.y);
+        base = sk.albedo;
+        skin_em = sk.emissive * O.skin.z;
+        skin_spec = sk.spec;
+    }
+
     let dif = max(dot(n, l), 0.0);
     // hemisphere ambient: cool sky from above, warm ground bounce from below
     let amb = mix(vec3(0.42, 0.37, 0.34), vec3(0.55, 0.62, 0.74), n.y * 0.5 + 0.5);
     let h = normalize(l + v);
-    let spec = pow(max(dot(n, h), 0.0), 42.0) * (0.18 + O.params.z * 0.6);
+    let spec = pow(max(dot(n, h), 0.0), 42.0) * (0.18 + max(O.params.z, skin_spec) * 0.6);
 
     var col = base * (amb * ao + vec3(1.0, 0.97, 0.90) * dif * 0.95 * shadow)
         + vec3(spec) * (0.25 + 0.75 * shadow);
-    col = mix(col, base * 1.7 + vec3(0.12), clamp(O.params.y, 0.0, 1.0)); // emissive pop
+    col = mix(col, base * 1.7 + vec3(0.12), clamp(max(O.params.y, skin_em), 0.0, 1.0)); // emissive pop
 
     // real mirror reflections where the material (or a wet map floor) wants
     // them - and only inside reflection range (fog owns the far field)
     if (rays && O.params.y < 0.35 && dist0 < 150.0) {
-            var f0 = O.params.z * 0.55;
+            var f0 = max(O.params.z, skin_spec) * 0.55;
         if (is_terrain) { f0 = G.rt.w; }
         // ROUGH GLASS (tubes, junction rooms): a strong grazing reflection
         // that scatters. The mirror-smooth version read as coloured film;

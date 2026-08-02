@@ -33,6 +33,8 @@ pub struct Save {
     pub trials: String,
     /// academy lessons passed, as a bitmask
     pub academy: String,
+    /// garage loadout: skin, wheels, trail, explosion
+    pub look: String,
 }
 
 impl Default for Save {
@@ -56,6 +58,7 @@ impl Default for Save {
             tuned_profile: 255,
             trials: String::new(),
             academy: String::new(),
+            look: String::new(),
         }
     }
 }
@@ -82,6 +85,7 @@ pub fn load() -> (Save, Bindings, Config) {
             "tuned_profile" => s.tuned_profile = v.parse().unwrap_or(s.tuned_profile),
             "trials" => s.trials = v.to_string(),
             "academy" => s.academy = v.to_string(),
+            "look" => s.look = v.to_string(),
             "total_rings" => s.total_rings = v.parse().unwrap_or(s.total_rings),
             "total_car_rings" => s.total_car_rings = v.parse().unwrap_or(s.total_car_rings),
             "total_goals" => s.total_goals = v.parse().unwrap_or(s.total_goals),
@@ -128,6 +132,7 @@ pub fn store(s: &Save, b: &Bindings, cfg: &Config) {
     let _ = writeln!(out, "tuned_profile {}", s.tuned_profile);
     let _ = writeln!(out, "trials {}", s.trials);
     let _ = writeln!(out, "academy {}", s.academy);
+    let _ = writeln!(out, "look {}", s.look);
     let _ = writeln!(out, "total_rings {}", s.total_rings);
     let _ = writeln!(out, "total_car_rings {}", s.total_car_rings);
     let _ = writeln!(out, "total_goals {}", s.total_goals);

@@ -2579,6 +2579,56 @@ much (0.18 against 0.8), and runs white-hot at the throat through cyan into
 violet as it cools. Same particle system, opposite character, and it fires
 automatically for any car with an electric drivetrain.
 
+## v1.80.0 — the GARAGE
+
+GUARDIAN WAS FACING BACKWARDS. The loader infers the nose from the
+geometry, and inference is not always right — which is invisible until you
+drive it. `load_oriented` takes a flip, and the Guardian gets one.
+
+THE CUSTOMIZER. Rocket League's exotic items are mostly textures that move.
+This engine can do better, because it already ray-marches reflections: a
+SKIN here is a small shader program that receives the surface point, its
+normal, the VIEW DIRECTION, the clock and the car's speed, and returns an
+albedo, an emissive and a spec. Because it sees the view direction it can
+respond to how you are LOOKING at the car; because its spec feeds the
+reflection march, a skin can hand itself over to the ray tracer entirely.
+
+Ten finishes, each a different idea rather than a different palette:
+
+  IRIDESCENT     hue rotates with the viewing angle — a curved flank shows
+                 a whole spectrum at once, and it moves as you orbit
+  ENERGY FLOW    bands running nose to tail along the body's own axis
+  BREATHING      a slow cycle, seams brightest on the rise: a machine
+                 idling rather than a decal
+  LIQUID CHROME  albedo near zero, spec 0.95 — the finish IS the reflection
+  SCANLINE       a sweep that traces the bodywork, brightest where the
+                 surface turns away, so it draws the car's shape
+  PLASMA         drifting cell noise in the BODY's space, so the slick
+                 belongs to the car instead of sliding over it
+  CIRCUIT        a lattice of traces with pulses running along them
+  FORGE          heat driven by SPEED, not time: leading edges glow harder
+                 the faster you drive
+  MOIRE          two lattices at slightly different scales, so the
+                 interference shifts with both angle and time
+
+Skins run in the BODY's own space, so a moving car carries its finish
+rather than sliding through a world-space pattern, and each car gets a
+phase offset so two cars with the same skin are not in lockstep.
+
+SEVEN WHEEL STYLES (stock, turbine, blade, mesh, disc, spindle, halo), SIX
+BOOST TRAILS and SIX GOAL EXPLOSIONS — and each of those is a different
+physical story rather than a recolour. RIBBON hangs almost stationary and
+marks the line you drove; EMBER has real weight and falls; VOID is
+emissive-zero near-black, so it reads as a hole in the scene; PRISM splits
+into three spectra that separate as they spread. SINGULARITY spawns its
+particles out WIDE travelling inward and only bursts outward once they have
+collapsed.
+
+2520 combinations, four slots, all cosmetic and all saved. `--sim garage`
+checks every option has a name and a description, that wheel styles
+actually differ, that a loadout survives a save round trip, and that
+nonsense in the save file cannot panic the game.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

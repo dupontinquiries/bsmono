@@ -447,3 +447,5 @@ Twelve cars now, including three EVs that pull harder off the line and top out l
 VIPERA and AEGIS are built from a written specification, hardpoints first — see `procars.rs`.
 
 Drop a car in as `assets/cars/<name>.glb` and it loads; `--sim glb` verifies it. Every car has an EV variant with an ion thruster.
+
+GARAGE: ten animated skins, seven wheels, six trails, six goal explosions. `--sim garage` verifies the data.

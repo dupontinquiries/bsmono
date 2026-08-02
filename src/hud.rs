@@ -357,6 +357,57 @@ pub fn lesson_banner(ui: &mut Vec<UiVert>, a: f32, name: &str, hint: &str, progr
     quad(ui, x0 + 0.02, by, x0 + 0.02 + w * progress.clamp(0.0, 1.0), by + 0.008, GOLD);
 }
 
+/// The garage. Four slots, the current pick, and what it does — the blurb
+/// matters here because "MOIRE" tells you nothing on its own.
+pub fn garage_menu(
+    ui: &mut Vec<UiVert>,
+    a: f32,
+    sel: usize,
+    look: &crate::custom::Loadout,
+    cur: (f32, f32),
+) {
+    quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
+    panel(ui, a, -0.86, -0.985, 0.86, 0.955);
+    label_c(ui, 0.885, T_TITLE, a, PAPER, "GARAGE");
+    label_c(ui, 0.828, T_HINT, a, DIM, "LEFT / RIGHT TO CHANGE - EVERYTHING HERE IS COSMETIC");
+    let k = ui_k(a);
+    let rows: [(&str, String, usize, usize); 4] = [
+        ("SKIN", look.skin_name().to_string(), look.skin, crate::custom::SKINS.len()),
+        ("WHEELS", look.wheel_name().to_string(), look.wheels, crate::custom::WHEELS.len()),
+        ("BOOST TRAIL", look.trail_name().to_string(), look.trail, crate::custom::TRAILS.len()),
+        ("GOAL EXPLOSION", look.explosion_name().to_string(), look.explosion, crate::custom::EXPLOSIONS.len()),
+    ];
+    let top = 0.62;
+    let row_h = 0.115;
+    for (i, (name, val, idx, n)) in rows.iter().enumerate() {
+        let y = top - i as f32 * row_h;
+        if i == sel {
+            quad(ui, -0.80, y - row_h + 0.04, 0.80, y + 0.030, SEL);
+            quad(ui, -0.817, y - row_h + 0.04, -0.802, y + 0.030, GOLD);
+        }
+        let col = if i == sel { GOLD } else { PAPER };
+        font::text(ui, -0.78, y, T_BODY * k, a, col, name);
+        let w = font::width(val, T_BODY * k, a);
+        font::text(ui, 0.78 - w, y, T_BODY * k, a, CYAN, val);
+        // a dotted position indicator, so you can see how many there are
+        for d in 0..*n {
+            let x = -0.78 + d as f32 * 0.022;
+            let on = d == *idx;
+            quad(ui, x, y - 0.036, x + 0.012, y - 0.030, if on { GOLD } else { [0.3, 0.33, 0.38, 0.7] });
+        }
+    }
+    // what the current pick actually does
+    let blurb = match sel {
+        0 => look.skin_blurb().to_string(),
+        1 => format!("{} spokes", crate::custom::WHEELS[look.wheels].1),
+        2 => crate::custom::TRAILS[look.trail].1.to_string(),
+        _ => crate::custom::EXPLOSIONS[look.explosion].1.to_string(),
+    };
+    label_c(ui, top - 4.0 * row_h - 0.04, T_HINT * k, a, DIM, &fit(&blurb, 1.5, T_HINT * k, a));
+    nav_strip(ui, a, cur, 0);
+    legend(ui, -0.93, a, T_HINT, &[("LEFT/RIGHT", "CHANGE"), ("ESC", "BACK")]);
+}
+
 /// The trials list: name, what it asks, which map, and your best.
 pub fn trials_menu(
     ui: &mut Vec<UiVert>,
@@ -976,5 +1027,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.79    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.80    ESC QUITS FROM THIS SCREEN");
 }
