@@ -35,13 +35,25 @@ PORTS = [
 def surfaces(app_dir):
     """Every UI surface the original exposes, by toolkit convention.
 
-    Qt/C++: a class per .h with a Widget/Dialog/Page/View suffix.
+    Qt/C++: a class that INHERITS a widget base, plus the older
+      Widget/Dialog/Page/View/Panel/Bar/Overlay suffix rule as a fallback.
     QML: one surface per .qml file.
     GTK/Rust: a pub struct or a `mod` under src/ui.
-    Deliberately name-based: it must work across three toolkits without parsing
-    any of them, and a name that appears in the port is strong evidence the
-    surface was addressed."""
+
+    The suffix rule alone was undercounting badly. snapclone has 94 Qt classes
+    and the suffix list could see 38 of them, so ContactCard, ShutterButton,
+    ExportReminderCard, SegmentedTabStrip, ModalSurface, SmartRibbon and
+    SnapTile were not merely uncovered -- they were not in the DENOMINATOR, and
+    every percentage in the table was inflated by their absence. A port cannot
+    be measured against surfaces the measurer cannot see.
+
+    Inheritance is the better signal because it separates UI from services
+    without a vocabulary of suffixes: ContactCard : public QWidget is a surface,
+    NetworkManager : public QObject is not. The pass is transitive, since the
+    app defines its own bases -- most dialogs here inherit MobileDialog rather
+    than QDialog, and stopping at the Qt classes would miss all of them."""
     found = set()
+    inherits = {}          # base class -> {subclasses}
     for root, dirs, files in os.walk(app_dir):
         dirs[:] = [d for d in dirs if d not in ('target', 'build', '.git', 'egui-frontend')]
         for f in files:
@@ -56,6 +68,11 @@ def surfaces(app_dir):
                 except Exception: continue
                 for m in re.finditer(r'class\s+(\w+(?:Widget|Dialog|Page|View|Panel|Bar|Overlay))\b', txt):
                     found.add(m.group(1))
+                # Inheritance, which catches the families the suffix list
+                # cannot name. Recorded as edges and resolved below, because a
+                # base may be declared in a header we have not read yet.
+                for m in re.finditer(r'class\s+(\w+)\s*:\s*public\s+(\w+)', txt):
+                    inherits.setdefault(m.group(2), set()).add(m.group(1))
             elif f.endswith('.rs'):
                 # Not just src/ui/: bot-arena keeps its views in src/*.rs and
                 # fao-codec under fao_app/, so restricting to a ui/ directory
@@ -73,6 +90,25 @@ def surfaces(app_dir):
                     found.add(m.group(1))
                 if re.search(r'fn\s+\w*(?:ui|draw|render|show)\s*\(', txt):
                     found.add(''.join(w.capitalize() for w in f[:-3].split('_')))
+
+    # Everything reachable from a Qt widget base is a surface. Transitive, so
+    # ContactEditorDialog : public MobileDialog : public QDialog counts.
+    QT_UI_BASES = {
+        'QWidget', 'QDialog', 'QMainWindow', 'QFrame', 'QLabel', 'QPushButton',
+        'QAbstractButton', 'QScrollArea', 'QToolButton', 'QGroupBox',
+        'QStackedWidget', 'QListWidget', 'QGraphicsView', 'QOpenGLWidget',
+        'QQuickItem', 'QQuickPaintedItem',
+    }
+    frontier = [b for b in QT_UI_BASES if b in inherits]
+    seen_bases = set()
+    while frontier:
+        base = frontier.pop()
+        if base in seen_bases:
+            continue
+        seen_bases.add(base)
+        for sub in inherits.get(base, ()):
+            found.add(sub)
+            frontier.append(sub)
     return found
 
 def port_text(app_dir):
@@ -178,5 +214,47 @@ def main():
         json.dump(rows, open(os.path.join(ROOT, 'maintenance', 'parity.json'), 'w'), indent=1)
         print("\n-> maintenance/parity.json")
 
+def why(surface):
+    """Show WHERE a surface was counted as covered, file and line.
+
+    covered() matches the name anywhere in the port, so a doc comment reading
+    "unlike CameraWidget" scores the same as a ported widget. That false
+    positive cannot be regexed away without also punishing ports that rename
+    things idiomatically -- which is the right thing to do and which this tool
+    already penalised for months.
+
+    So instead of a cleverer guess, make the claim checkable: print every match
+    with its location and let a human spend ten seconds on it. A number nobody
+    can audit is how a port ends up reported as done.
+    """
+    needles = (surface, snake(surface))
+    hits = 0
+    for app, d in PORTS:
+        src = os.path.join(ROOT, d, 'egui-frontend')
+        for root, dirs, files in os.walk(src):
+            dirs[:] = [x for x in dirs if x != 'target']
+            for f in sorted(files):
+                if not f.endswith(('.rs', '.md', '.toml')):
+                    continue
+                fp = os.path.join(root, f)
+                try: lines = open(fp, encoding='utf8', errors='replace').readlines()
+                except Exception: continue
+                for n, line in enumerate(lines, 1):
+                    if any(x in line for x in needles):
+                        rel = os.path.relpath(fp, ROOT)
+                        # Flag the weak matches rather than hiding them.
+                        kind = 'comment' if line.lstrip().startswith(('//', '#', '*')) else 'code'
+                        print(f"  [{kind:7}] {rel}:{n}: {line.strip()[:100]}")
+                        hits += 1
+    if not hits:
+        print(f"  no match for {surface} in any port")
+
 if __name__ == '__main__':
-    main()
+    if '--why' in sys.argv:
+        i = sys.argv.index('--why')
+        if i + 1 < len(sys.argv):
+            why(sys.argv[i + 1])
+        else:
+            print("usage: parity_audit.py --why SurfaceName")
+    else:
+        main()
