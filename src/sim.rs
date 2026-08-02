@@ -3423,6 +3423,145 @@ pub fn run(args: &[String]) {
             println!("electrification adds {added} parts and flips the drivetrain");
             println!("   ion plume: collimated (spread 0.18 vs a flame's 0.8), 7-11 m/s vs 2.5-4.5, blue-white to violet");
         }
+        // ---- IS THE BODY CENTRED? ----
+        // The loader centres each model on its BOUNDING BOX. If a car's X
+        // extents are asymmetric — a mirror, an aerial, a one-sided part —
+        // the body ends up off-centre, and anything added symmetrically
+        // (sills, light bars) lands correctly on one side and visibly wrong
+        // on the other. That is exactly "the right door is misaligned".
+        println!();
+        println!("{:<12} {:>10} {:>10} {:>10}", "model", "bbox mid", "centroid", "offset");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let (mut lo, mut hi, mut sum, mut cnt) = (f32::MAX, f32::MIN, 0.0f64, 0u64);
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        for p in ps {
+                            lo = lo.min(p[0]);
+                            hi = hi.max(p[0]);
+                            sum += p[0] as f64;
+                            cnt += 1;
+                        }
+                    }
+                }
+            }
+            if cnt == 0 {
+                continue;
+            }
+            let mid = (lo + hi) * 0.5;
+            let centroid = (sum / cnt as f64) as f32;
+            let span = (hi - lo).max(1e-6);
+            let off = (mid - centroid).abs() / span;
+            println!(
+                "{:<12} {:>10.3} {:>10.3} {:>9.1}% {}",
+                n.trim_end_matches(".glb"),
+                mid,
+                centroid,
+                off * 100.0,
+                if off > 0.02 { "OFF CENTRE" } else { "" }
+            );
+        }
+
+        // ---- does the bounding box describe the BODY, or the wheels? ----
+        // EV cues were placed from half_w, which is the widest thing in the
+        // model. If the wheels are wider than the flank, anything placed
+        // there floats beside the doors instead of sitting on them.
+        println!();
+        println!("{:<12} {:>11} {:>11} {:>10}", "model", "bbox half", "door flank", "overhang");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "orion.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            let hw = (hi[0] - lo[0]) * 0.5;
+            let hh = (hi[1] - lo[1]) * 0.5;
+            let hlz = (hi[2] - lo[2]) * 0.5;
+            // the same measurement electrify now makes
+            let mut xs: Vec<f32> = pts
+                .iter()
+                .filter(|p| (p[2] - mid[2]).abs() < hlz * 0.45 && p[1] - mid[1] > -hh * 0.35 && p[1] - mid[1] < hh * 0.8)
+                .map(|p| (p[0] - mid[0]).abs())
+                .collect();
+            xs.sort_by(f32::total_cmp);
+            let flank = if xs.len() < 32 { hw * 0.88 } else { xs[xs.len() * 9 / 10] };
+            println!(
+                "{:<12} {:>11.3} {:>11.3} {:>9.0}% {}",
+                n.trim_end_matches(".glb"),
+                hw,
+                flank,
+                (hw - flank) / hw * 100.0,
+                if hw - flank > hw * 0.08 { "wheels wider than the doors" } else { "" }
+            );
+            // The EV cues are placed on the FLANK now, so they must sit
+            // inside the bounding box by roughly the overhang — if this ever
+            // reads ~0 again, the placement has gone back to the box and the
+            // sills are floating beside the doors.
+            ok_all &= flank < hw * 0.97;
+        }
+
+        // ---- node structure: where a misplaced panel would come from ----
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb"] {
+            let path = dir.join(n);
+            if let Ok(d) = gltf::Gltf::open(&path) {
+                let scene = d.default_scene().or_else(|| d.scenes().next());
+                let mut nodes = 0;
+                let mut with_mesh = 0;
+                let mut nonident = 0;
+                let mut mirrored = 0;
+                fn walk(node: &gltf::Node, nodes: &mut u32, with_mesh: &mut u32, nonident: &mut u32, mirrored: &mut u32) {
+                    *nodes += 1;
+                    if node.mesh().is_some() {
+                        *with_mesh += 1;
+                    }
+                    let m = node.transform().matrix();
+                    let ident = (0..4).all(|i| (0..4).all(|j| (m[i][j] - if i == j { 1.0 } else { 0.0 }).abs() < 1e-6));
+                    if !ident {
+                        *nonident += 1;
+                    }
+                    // a negative determinant means the node is MIRRORED, which
+                    // flips triangle winding — the classic cause of one side of
+                    // a car looking wrong while the other is fine
+                    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                        - m[1][0] * (m[0][1] * m[2][2] - m[0][2] * m[2][1])
+                        + m[2][0] * (m[0][1] * m[1][2] - m[0][2] * m[1][1]);
+                    if det < 0.0 {
+                        *mirrored += 1;
+                    }
+                    for c in node.children() {
+                        walk(&c, nodes, with_mesh, nonident, mirrored);
+                    }
+                }
+                if let Some(sc) = scene {
+                    for node in sc.nodes() {
+                        walk(&node, &mut nodes, &mut with_mesh, &mut nonident, &mut mirrored);
+                    }
+                }
+                println!("   {n:<14} nodes {nodes}, with mesh {with_mesh}, transformed {nonident}, MIRRORED {mirrored}");
+            }
+        }
         println!("{}", if ok_all { "GLB: PASS" } else { "GLB: FAIL" });
         return;
     }

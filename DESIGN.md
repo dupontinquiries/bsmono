@@ -2629,6 +2629,39 @@ checks every option has a name and a description, that wheel styles
 actually differ, that a loadout survives a save round trip, and that
 nonsense in the save file cannot panic the game.
 
+## v1.81.0 — the bounding box is not the body
+
+Reported: the Vulcan EV and the X-Devil EV both look wrong along one flank.
+
+Two hypotheses were checked and DISPROVED before the real one, which is
+worth recording because each was plausible:
+
+  * Mirrored node transforms. A negative determinant flips triangle winding
+    and is the classic cause of one side of a car looking wrong. Every one
+    of these models is a single untransformed node — no mirroring anywhere.
+  * An off-centre body. If a model's X extents are asymmetric, centring on
+    the bounding box puts the body off the axis and symmetric add-ons land
+    correctly on one side only. Measured: Vulcan is 0.8% off and X-Devil
+    0.1%, both fine. (ASSAEL is 5.1% off — a real finding, but not the one
+    being reported.)
+
+The cause was the EV conversion, and it is a lesson about what a bounding
+box actually describes. `electrify` placed its sills, bars and thruster at
+`half_w` — the widest thing in the model, which on a car is the WHEELS.
+Measured overhang of wheels beyond the door skin:
+
+    vulcan 18%   xdevil 18%   orion 14%   backfire 13%
+
+The two worst are precisely the two reported. The sills were hanging 18% of
+a half-width out in the air beside the doors.
+
+The cues are now placed on the BODY: `electrify` measures the real flank
+from the model's own surface points — the 90th percentile of lateral
+distance, taken along the middle of the car at door height, which excludes
+the wheels — and sits the sill just proud of it. `--sim glb` reports the
+overhang per model and now fails if the measured flank ever collapses back
+to the bounding box.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

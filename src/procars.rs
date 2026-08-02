@@ -294,7 +294,33 @@ pub fn tram(gpu: &mut Gpu) -> Model {
 /// Turn any model into its electric variant.
 pub fn electrify(gpu: &mut Gpu, base: &Model, accent: [f32; 4]) -> Model {
     let mut prims = base.prims.clone();
-    let (hl, hh, hw) = (base.half_len, base.half_h, base.half_w);
+    let (hl, hh) = (base.half_len, base.half_h);
+
+    // WHERE THE BODY ACTUALLY IS.
+    //
+    // Placing the cues at the bounding box put them on the widest thing the
+    // model contains — which on most cars is the WHEELS, not the flank. The
+    // sills then floated in the air beside the doors, and any asymmetry in
+    // the model made one side look worse than the other.
+    //
+    // Measure the real flank instead: take the surface points along the
+    // middle of the car, at door height, and use the 90th percentile of
+    // their lateral distance. That is the door skin, wheels excluded.
+    let flank = {
+        let mut xs: Vec<f32> = base
+            .cloud
+            .iter()
+            .filter(|p| p.z.abs() < hl * 0.45 && p.y > -hh * 0.35 && p.y < hh * 0.8)
+            .map(|p| p.x.abs())
+            .collect();
+        if xs.len() < 32 {
+            base.half_w * 0.88
+        } else {
+            xs.sort_by(f32::total_cmp);
+            xs[xs.len() * 9 / 10]
+        }
+    };
+    let hw = flank;
 
     // light bars: full width, front white and rear red
     prims.push(body_prim(
@@ -317,7 +343,7 @@ pub fn electrify(gpu: &mut Gpu, base: &Model, accent: [f32; 4]) -> Model {
     for sx in [-1.0f32, 1.0] {
         prims.push(body_prim(
             gpu,
-            part(meshgen::cbox(0.28), Vec3::new(0.011, 0.014, hl * 0.46), Quat::IDENTITY, Vec3::new(sx * hw * 0.97, -hh * 0.55, 0.0)),
+            part(meshgen::cbox(0.28), Vec3::new(0.010, 0.013, hl * 0.42), Quat::IDENTITY, Vec3::new(sx * (hw + 0.006), -hh * 0.30, 0.0)),
             accent,
         ));
     }
