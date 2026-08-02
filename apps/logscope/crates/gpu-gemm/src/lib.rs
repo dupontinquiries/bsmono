@@ -15,6 +15,7 @@ pub mod cpudecode;
 pub mod perfverdict;
 pub mod qkvsplit;
 pub mod prefetch;
+pub mod mladims;
 pub mod specverify;
 pub mod lookupdraft;
 pub mod specloop;
@@ -7231,9 +7232,37 @@ a '{declared}'");
 is EXACT at or below that many tokens (the indexer selects every key there), and an approximation \
 above it. Keep prompts under {topk} until the indexer is implemented");
             }
-            let have_cfg = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) > 0;
+            // DERIVE FROM THE SHAPES WHEN THE METADATA OMITS THE RANK. GLM-5.2's preview ships MLA
+            // tensors and no kv_lora_rank, and the refusal for it was honest but unnecessary: the
+            // norm vector's LENGTH is the latent rank, and kv_a_mqa's width is rank + rope_dim, so
+            // every dimension is recoverable from tensors the file already has.
+            //
+            // Safe here in a way it was not for the fused-qkv split, because the shapes OVER-determine
+            // the answer — four constrain three — so mladims cross-checks them and refuses a file
+            // whose tensors disagree rather than loading at a guessed rank.
+            let derived = crate::mladims::derive("blk.0.", &|n: &str| {
+                g.tensor(n).map(|t| t.dims.clone())
+            });
+            if let Ok(d) = &derived {
+                if g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) == 0 {
+                    eprintln!("loader: MLA dims DERIVED from tensor shapes (metadata omits \
+kv_lora_rank) — kv_lora {} q_lora {} rope_dim {} heads {} v_head_dim {}. The shapes cross-check, so \
+this is a reading of the file rather than a guess",
+                        d.kv_lora_rank, d.q_lora_rank, d.qk_rope_head_dim, d.n_head, d.v_head_dim);
+                }
+            }
+            let have_cfg = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) > 0
+                || derived.is_ok();
             if !have_cfg {
                 let layout = g.dump_tensors("blk.0.");
+                // The derivation was tried and failed; say WHY rather than repeating that the
+                // metadata is silent. "Unknown" sends someone looking for a config key; the real
+                // answer is usually a specific tensor that is absent or the wrong shape.
+                if let Err(e) = &derived {
+                    return Err(format!("architecture '{arch}' ships MLA tensors, the metadata omits \
+kv_lora_rank, and the dimensions could not be recovered from the shapes either: {}\n\nTensor layout:\n{}",
+                        e.explain(), layout));
+                }
                 return Err(format!("architecture '{arch}' ships MLA tensors but no kv_lora_rank in its \
 metadata, so the latent dimensions are unknown. The MLA path is implemented and validated; this \
 particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layout}"));
