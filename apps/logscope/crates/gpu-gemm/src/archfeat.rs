@@ -469,11 +469,11 @@ mod tests {
         //
         // GLM-5.2's index_topk is 2048. So "unsupported architecture" is the wrong verdict for a
         // short-context run, and a hard refusal costs a model that would have worked.
-        assert!(!indexer_needed_at(1, 2048));
-        assert!(!indexer_needed_at(2048, 2048), "exactly at the bound: still every key");
-        assert!(indexer_needed_at(2049, 2048), "past it, the indexer selects a subset");
+        assert!(!Feature::indexer_needed_at(1, 2048));
+        assert!(!Feature::indexer_needed_at(2048, 2048), "exactly at the bound: still every key");
+        assert!(Feature::indexer_needed_at(2049, 2048), "past it, the indexer selects a subset");
         // A model that declares no index_topk cannot be reasoned about this way.
-        assert!(!indexer_needed_at(100_000, 0));
+        assert!(!Feature::indexer_needed_at(100_000, 0));
     }
 
     #[test]
