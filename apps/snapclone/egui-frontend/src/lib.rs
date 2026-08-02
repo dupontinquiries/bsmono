@@ -11,6 +11,7 @@ use egui::Ui;
 use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteColors};
 
 pub mod camera;
+pub mod camera_source;
 pub mod contacts;
 pub mod conversation;
 pub mod composer;
@@ -40,6 +41,10 @@ pub struct Snapclone {
     /// widgets exist, nothing remembers anything, and the app looks unfinished
     /// because it IS.
     pub viewfinder: crate::camera::Viewfinder,
+    /// Which camera and format, from device-kit. `None` means no camera was
+    /// found — shown as such rather than as an empty preview, because a black
+    /// rectangle and a missing device look identical.
+    pub camera: Option<crate::camera_source::CameraChoice>,
     pub inbox: crate::inbox::Inbox,
     pub composer: crate::composer::Composer,
     pub settings: crate::settings_page::SettingsPage,
@@ -72,6 +77,7 @@ impl Snapclone {
     pub fn new_with_login(peers: Vec<Peer>, auto_logged_in: bool) -> Snapclone {
         Snapclone {
             viewfinder: Default::default(),
+            camera: None,
             inbox: Default::default(),
             composer: Default::default(),
             settings: crate::settings_page::SettingsPage::new(Default::default()),
@@ -164,6 +170,16 @@ impl Snapclone {
         ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
             crate::camera::viewfinder(ui, &mut self.viewfinder, None, c);
         });
+        // Say WHICH camera, or that there is none. The viewfinder mirrors only
+        // when device-kit says this device is front-facing.
+        match &self.camera {
+            Some(cam) => {
+                ui.colored_label(c.text_weak, crate::camera_source::describe(cam));
+            }
+            None => {
+                ui.colored_label(c.warning, "no camera found");
+            }
+        }
         ui.horizontal(|ui| {
             if ui.button("flip").clicked() { self.viewfinder.flip(); }
             if ui.selectable_label(self.viewfinder.full_bleed, "fill").clicked() {

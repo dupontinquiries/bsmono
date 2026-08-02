@@ -18,6 +18,9 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# The camera bridge device-kit was written for — its description names
+# snapclone explicitly, and no port had ever depended on it.
+device-kit = { path = "../../../shared/device-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-gesture = { path = "../../../shared/uikit/crates/uikit-gesture" }
