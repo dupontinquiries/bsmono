@@ -791,6 +791,17 @@ pub fn md_ink() -> Color32 { md_on_panel(INK(), 4.5) }
 /// Markdown accent (inline code / links), ≥ 4.5:1 on the panel — hue-preserving so `code` stays its accent
 /// color across light/dark themes and the day/night curve instead of collapsing toward black/white.
 pub fn md_accent() -> Color32 { md_accent_on_panel(CYAN(), 4.5) }
+/// Markdown **bold**, ≥ 7:1 on the panel.
+///
+/// The renderer took `ui.visuals().strong_text_color()` — egui's raw default, which never passes
+/// through the contrast adjustment every other markdown colour goes through. Links and inline code
+/// were fixed for exactly this ("the raw palette cyan is neon on several themes and simply fades
+/// against pale panels"); bold was left on the untreated value and is unreadable on some themes.
+///
+/// Held to 7:1 rather than the 4.5:1 body floor because bold exists to stand OUT from body text — a
+/// bold run that merely clears the same bar as its surroundings is bold that does not read as bold,
+/// which is a different failure from being invisible and just as useless.
+pub fn md_strong() -> Color32 { md_on_panel(INK(), 7.0) }
 /// Markdown secondary (bullets, quote text), ≥ 4.5:1 on the panel — real reading content gets the full
 /// body floor on the surface it lands on.
 pub fn md_dim() -> Color32 { md_on_panel(DIM(), 4.5) }
@@ -2088,5 +2099,34 @@ mod variant_tests {
         }
         assert_eq!(seen.len(), 16, "all sixteen detail tiers are distinct");
         set_variant(1);
+    }
+}
+
+#[cfg(test)]
+mod md_contrast_tests {
+    use super::*;
+
+    /// Every markdown colour must clear the body floor on the panel it lands on.
+    ///
+    /// Bold did not. The renderer used `ui.visuals().strong_text_color()` — egui's untreated default —
+    /// while links, inline code, body ink and secondary text all went through `ensure_contrast`. The
+    /// fix that was applied to the accent ("the raw palette cyan is neon on several themes and simply
+    /// fades against pale panels") was never applied to bold, and it read as an unreadable run in the
+    /// message view.
+    #[test]
+    fn every_markdown_colour_clears_the_body_floor() {
+        for (name, c) in [("ink", md_ink()), ("accent", md_accent()), ("strong", md_strong())] {
+            let r = contrast_ratio(c, PANEL());
+            assert!(r >= 4.4, "{name} is {r:.2}:1 against the panel — below the 4.5 body floor");
+        }
+    }
+
+    /// Bold is held higher than body, because bold that merely matches its surroundings is not bold.
+    #[test]
+    fn bold_stands_OUT_from_body_rather_than_merely_being_legible() {
+        let strong = contrast_ratio(md_strong(), PANEL());
+        let body = contrast_ratio(md_ink(), PANEL());
+        assert!(strong >= body, "bold {strong:.2}:1 vs body {body:.2}:1 — bold must not read weaker");
+        assert!(strong >= 6.9, "and it is held to 7:1, not the 4.5 floor: {strong:.2}");
     }
 }
