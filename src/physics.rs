@@ -1620,12 +1620,27 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // push follows that instead of the flattened line — so a backflip
         // lofts the ball and a forward flick stays low, which is exactly the
         // difference between the two in Rocket League.
+        // THE THROW DIRECTION MUST EARN ITS WEIGHT.
+        //
+        // `v_surf - car.vel` is how fast the hood is moving under the ball
+        // from the car's own rotation. Near the rotation axis that vector is
+        // almost zero — and the DIRECTION of an almost-zero vector is
+        // arbitrary, so normalising it hands back noise. Blending toward it
+        // on spin alone meant a fast flip could throw the ball somewhere
+        // unrelated to the contact, which is exactly "sometimes it goes in a
+        // weird direction".
+        //
+        // Weight it by the surface speed as well: a hood that is genuinely
+        // sweeping throws the ball, a contact sitting on the axis does not.
+        let surf = v_surf - car.vel;
+        let surf_speed = surf.length();
         let spin = (car.omega.length() / 7.0).clamp(0.0, 1.0);
-        let throw_dir = (v_surf - car.vel).normalize_or(Vec3::ZERO);
+        let throw_w = spin * (surf_speed / 3.0).clamp(0.0, 1.0);
+        let throw_dir = surf.normalize_or(Vec3::ZERO);
         let dir = dir_n
             .lerp(aim, 0.65 * soft)
             .normalize_or(dir_n)
-            .lerp(throw_dir, 0.62 * spin)
+            .lerp(throw_dir, 0.62 * throw_w)
             .normalize_or(dir_n);
         let strength = (-vn).min(23.0) * 0.38 / cfg.ball.weight.sqrt();
         // The extra "psyonix" push on top of the elastic impulse was doing
@@ -1638,9 +1653,9 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // ...and the hood's own motion carries the ball with it. Without
         // this a flick is only ever as strong as the collision, when in
         // truth the car is throwing the ball, not hitting it.
-        if spin > 0.05 {
-            let carry = (v_surf - car.vel).length().min(9.0);
-            ball.vel += throw_dir * carry * 0.85 * spin;
+        if throw_w > 0.05 {
+            let carry = surf_speed.min(9.0);
+            ball.vel += throw_dir * carry * 0.85 * throw_w;
         }
         // SPIN: a gentle touch rolls the ball (dribbles need that), a hard
         // hit drives THROUGH it. Spin used to scale up with the impact,

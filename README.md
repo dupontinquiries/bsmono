@@ -441,3 +441,5 @@ ACADEMY: ten lessons that the game verifies with the same detectors that name yo
 `--sim perf` times worldgen, SDF throughput, the physics step and the per-call cost of the hot functions.
 
 Twelve cars now, including three EVs that pull harder off the line and top out lower. `--sim cars` measures the drivetrain difference.
+
+`--sim hits` sweeps contact points and checks the ball's exit direction is continuous.

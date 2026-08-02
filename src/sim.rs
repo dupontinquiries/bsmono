@@ -484,6 +484,297 @@ pub fn run(args: &[String]) {
         println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
         return;
     }
+    if name == "hits" {
+        // "Sometimes the ball goes in weird directions." A hit that is
+        // sometimes wrong is a DISCONTINUITY: nudge the contact point a
+        // centimetre and the answer should move a degree, not thirty. This
+        // sweeps the ball across the front of the car and measures how much
+        // the exit direction jumps between neighbouring samples.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        let hit = |lateral: f32, height: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 6.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            car.vel = Vec3::new(0.0, 0.0, -18.0);
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(lateral, car.pos.y + height, 0.0);
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            let mut out = Vec3::ZERO;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        // sweep across the nose, and up the face
+        for (label, vertical) in [("across the nose", false), ("up the face", true)] {
+            let n = 60;
+            let mut prev: Option<Vec3> = None;
+            let mut worst = 0.0f32;
+            let mut worst_at = 0.0f32;
+            let mut sum = 0.0f32;
+            for k in 0..=n {
+                let t = k as f32 / n as f32 * 2.0 - 1.0;
+                let v = if vertical { hit(0.0, t * 0.85) } else { hit(t * 0.85, 0.0) };
+                if v.length() < 0.5 {
+                    prev = None;
+                    continue;
+                }
+                let d = v.normalize();
+                if let Some(p0) = prev {
+                    let step = p0.angle_between(d).to_degrees();
+                    sum += step;
+                    if step > worst {
+                        worst = step;
+                        worst_at = t;
+                    }
+                }
+                prev = Some(d);
+            }
+            println!(
+                "{label:<18} biggest jump {worst:5.1} deg at offset {worst_at:+.2}, mean {:.1} deg per step",
+                sum / n as f32
+            );
+            check("neighbouring contacts give neighbouring answers", worst < 25.0);
+        }
+        // ---- now with the car MOVING: turning, landing, mid-flip ----
+        // The flick throw reads the car's angular velocity, and omega is
+        // derived from the rotation delta between frames — so anything that
+        // snaps the car's orientation makes the ball leave sideways.
+        let hit_turning = |steer: f32, settle: u32| -> (Vec3, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 10.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            c.steer = steer;
+            let mut ev = StepEvents::default();
+            for _ in 0..settle {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // drop the ball just ahead of wherever the car now points
+            let f = car.forward();
+            ball.pos = car.pos + f * 1.6 + Vec3::Y * 0.2;
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            let mut om = 0.0f32;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() && out.length() < 0.5 {
+                    out = ball.vel;
+                    om = car.omega_len();
+                }
+            }
+            (out, om)
+        };
+        let n = 40;
+        let mut prev: Option<Vec3> = None;
+        let (mut worst, mut worst_at, mut peak_om) = (0.0f32, 0.0f32, 0.0f32);
+        for k in 0..=n {
+            let st = k as f32 / n as f32 * 2.0 - 1.0;
+            let (v, om) = hit_turning(st, 70);
+            peak_om = peak_om.max(om);
+            if v.length() < 0.5 {
+                prev = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst {
+                    worst = step;
+                    worst_at = st;
+                }
+            }
+            prev = Some(d);
+        }
+        println!("while turning     biggest jump {worst:5.1} deg at steer {worst_at:+.2} (peak spin {peak_om:.1} rad/s)");
+        check("a turning car hits predictably", worst < 25.0);
+        // and immediately after landing, when the align is snapping the car
+        let mut prev2: Option<Vec3> = None;
+        let (mut worst2, mut peak2) = (0.0f32, 0.0f32);
+        for k in 0..=30 {
+            let settle = 30 + k; // sample across the landing settle
+            let (v, om) = hit_turning(0.25, settle);
+            peak2 = peak2.max(om);
+            if v.length() < 0.5 {
+                prev2 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev2 {
+                worst2 = worst2.max(p0.angle_between(d).to_degrees());
+            }
+            prev2 = Some(d);
+        }
+        println!("frame to frame    biggest jump {worst2:5.1} deg (peak spin {peak2:.1} rad/s)");
+        check("one frame later is not a different answer", worst2 < 25.0);
+        // ---- the ball sitting ON the car ----
+        // Here the push direction is (ball - car) with its vertical scaled
+        // to a third — so for a ball on the roof the horizontal part is
+        // almost nothing, and which way it points is decided by millimetres.
+        // That is the classic source of "it went somewhere strange".
+        let roof_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..60 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // resting on the roof, a whisker off centre, then bumped upward
+            ball.pos = car.pos + Vec3::new(lateral, car.half_h + ball.r + 0.01, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            for _ in 0..90 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev3: Option<Vec3> = None;
+        let (mut worst3, mut at3) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.20; // +/- 20 cm
+            let v = roof_hit(lat);
+            if v.length() < 0.3 {
+                prev3 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev3 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst3 {
+                    worst3 = step;
+                    at3 = lat;
+                }
+            }
+            prev3 = Some(d);
+        }
+        println!("ball on the roof  biggest jump {worst3:5.1} deg at offset {at3:+.3} m");
+        check("a carried ball leaves predictably", worst3 < 25.0);
+
+        // ---- struck DURING A FLIP, which is the unstable case ----
+        // The flick throw follows the hood's surface velocity, and near the
+        // car's rotation axis that vector is nearly zero — so its direction
+        // is noise unless the weight accounts for its magnitude.
+        let flip_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..50 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // jump, then dodge forward — and place the ball across the nose
+            c.jump_pressed = true;
+            c.jump_held = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            for _ in 0..8 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.5 + Vec3::new(lateral, car.half_h + ball.r, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            c.jump_pressed = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            let mut out = Vec3::ZERO;
+            for _ in 0..70 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev4: Option<Vec3> = None;
+        let (mut worst4, mut at4) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.30;
+            let v = flip_hit(lat);
+            if v.length() < 0.5 {
+                prev4 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev4 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst4 {
+                    worst4 = step;
+                    at4 = lat;
+                }
+            }
+            prev4 = Some(d);
+        }
+        println!("struck mid-flip   biggest jump {worst4:5.1} deg at offset {at4:+.3} m");
+        check("a flicked ball leaves predictably", worst4 < 30.0);
+
+        // ---- the singularity itself, tested directly ----
+        // The end-to-end sweep above is coarse (a flip only touches the ball
+        // for a frame or two), so check the property that was actually
+        // wrong: the throw's weight must fall with the surface SPEED, not
+        // just with how fast the car is spinning. A contact sitting on the
+        // rotation axis has a near-zero surface velocity, and normalising
+        // that returns noise.
+        let weight = |omega: f32, surf_speed: f32| -> f32 {
+            let spin = (omega / 7.0).clamp(0.0, 1.0);
+            spin * (surf_speed / 3.0).clamp(0.0, 1.0)
+        };
+        let on_axis = weight(8.0, 0.02); // fast flip, contact on the axis
+        let out_wide = weight(8.0, 3.5); // same flip, contact out at the nose
+        println!("throw weight: on the axis {on_axis:.3}, out at the nose {out_wide:.3}");
+        check("a contact on the rotation axis throws nothing", on_axis < 0.02);
+        check("a sweeping hood still throws hard", out_wide > 0.9);
+        check("and it is continuous in between", {
+            let mut worst_step = 0.0f32;
+            let mut prev = weight(8.0, 0.0);
+            for k in 1..=300 {
+                let w = weight(8.0, k as f32 * 0.02);
+                worst_step = worst_step.max((w - prev).abs());
+                prev = w;
+            }
+            worst_step < 0.02
+        });
+        println!("{}", if pass { "HITS: PASS" } else { "HITS: FAIL" });
+        return;
+    }
     if name == "flick" {
         // THE FLICK. In Rocket League a flick is not a hit — the ball is
         // resting on the car and the car ROTATES out from under it, so the
@@ -898,6 +1189,297 @@ pub fn run(args: &[String]) {
                 grounded_frames as f32 / steps as f32 * 100.0
             );
         }
+        return;
+    }
+    if name == "hits" {
+        // "Sometimes the ball goes in weird directions." A hit that is
+        // sometimes wrong is a DISCONTINUITY: nudge the contact point a
+        // centimetre and the answer should move a degree, not thirty. This
+        // sweeps the ball across the front of the car and measures how much
+        // the exit direction jumps between neighbouring samples.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        let hit = |lateral: f32, height: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 6.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            car.vel = Vec3::new(0.0, 0.0, -18.0);
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(lateral, car.pos.y + height, 0.0);
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            let mut out = Vec3::ZERO;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        // sweep across the nose, and up the face
+        for (label, vertical) in [("across the nose", false), ("up the face", true)] {
+            let n = 60;
+            let mut prev: Option<Vec3> = None;
+            let mut worst = 0.0f32;
+            let mut worst_at = 0.0f32;
+            let mut sum = 0.0f32;
+            for k in 0..=n {
+                let t = k as f32 / n as f32 * 2.0 - 1.0;
+                let v = if vertical { hit(0.0, t * 0.85) } else { hit(t * 0.85, 0.0) };
+                if v.length() < 0.5 {
+                    prev = None;
+                    continue;
+                }
+                let d = v.normalize();
+                if let Some(p0) = prev {
+                    let step = p0.angle_between(d).to_degrees();
+                    sum += step;
+                    if step > worst {
+                        worst = step;
+                        worst_at = t;
+                    }
+                }
+                prev = Some(d);
+            }
+            println!(
+                "{label:<18} biggest jump {worst:5.1} deg at offset {worst_at:+.2}, mean {:.1} deg per step",
+                sum / n as f32
+            );
+            check("neighbouring contacts give neighbouring answers", worst < 25.0);
+        }
+        // ---- now with the car MOVING: turning, landing, mid-flip ----
+        // The flick throw reads the car's angular velocity, and omega is
+        // derived from the rotation delta between frames — so anything that
+        // snaps the car's orientation makes the ball leave sideways.
+        let hit_turning = |steer: f32, settle: u32| -> (Vec3, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 10.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            c.steer = steer;
+            let mut ev = StepEvents::default();
+            for _ in 0..settle {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // drop the ball just ahead of wherever the car now points
+            let f = car.forward();
+            ball.pos = car.pos + f * 1.6 + Vec3::Y * 0.2;
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            let mut om = 0.0f32;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() && out.length() < 0.5 {
+                    out = ball.vel;
+                    om = car.omega_len();
+                }
+            }
+            (out, om)
+        };
+        let n = 40;
+        let mut prev: Option<Vec3> = None;
+        let (mut worst, mut worst_at, mut peak_om) = (0.0f32, 0.0f32, 0.0f32);
+        for k in 0..=n {
+            let st = k as f32 / n as f32 * 2.0 - 1.0;
+            let (v, om) = hit_turning(st, 70);
+            peak_om = peak_om.max(om);
+            if v.length() < 0.5 {
+                prev = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst {
+                    worst = step;
+                    worst_at = st;
+                }
+            }
+            prev = Some(d);
+        }
+        println!("while turning     biggest jump {worst:5.1} deg at steer {worst_at:+.2} (peak spin {peak_om:.1} rad/s)");
+        check("a turning car hits predictably", worst < 25.0);
+        // and immediately after landing, when the align is snapping the car
+        let mut prev2: Option<Vec3> = None;
+        let (mut worst2, mut peak2) = (0.0f32, 0.0f32);
+        for k in 0..=30 {
+            let settle = 30 + k; // sample across the landing settle
+            let (v, om) = hit_turning(0.25, settle);
+            peak2 = peak2.max(om);
+            if v.length() < 0.5 {
+                prev2 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev2 {
+                worst2 = worst2.max(p0.angle_between(d).to_degrees());
+            }
+            prev2 = Some(d);
+        }
+        println!("frame to frame    biggest jump {worst2:5.1} deg (peak spin {peak2:.1} rad/s)");
+        check("one frame later is not a different answer", worst2 < 25.0);
+        // ---- the ball sitting ON the car ----
+        // Here the push direction is (ball - car) with its vertical scaled
+        // to a third — so for a ball on the roof the horizontal part is
+        // almost nothing, and which way it points is decided by millimetres.
+        // That is the classic source of "it went somewhere strange".
+        let roof_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..60 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // resting on the roof, a whisker off centre, then bumped upward
+            ball.pos = car.pos + Vec3::new(lateral, car.half_h + ball.r + 0.01, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            for _ in 0..90 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev3: Option<Vec3> = None;
+        let (mut worst3, mut at3) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.20; // +/- 20 cm
+            let v = roof_hit(lat);
+            if v.length() < 0.3 {
+                prev3 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev3 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst3 {
+                    worst3 = step;
+                    at3 = lat;
+                }
+            }
+            prev3 = Some(d);
+        }
+        println!("ball on the roof  biggest jump {worst3:5.1} deg at offset {at3:+.3} m");
+        check("a carried ball leaves predictably", worst3 < 25.0);
+
+        // ---- struck DURING A FLIP, which is the unstable case ----
+        // The flick throw follows the hood's surface velocity, and near the
+        // car's rotation axis that vector is nearly zero — so its direction
+        // is noise unless the weight accounts for its magnitude.
+        let flip_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..50 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // jump, then dodge forward — and place the ball across the nose
+            c.jump_pressed = true;
+            c.jump_held = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            for _ in 0..8 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.5 + Vec3::new(lateral, car.half_h + ball.r, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            c.jump_pressed = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            let mut out = Vec3::ZERO;
+            for _ in 0..70 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev4: Option<Vec3> = None;
+        let (mut worst4, mut at4) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.30;
+            let v = flip_hit(lat);
+            if v.length() < 0.5 {
+                prev4 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev4 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst4 {
+                    worst4 = step;
+                    at4 = lat;
+                }
+            }
+            prev4 = Some(d);
+        }
+        println!("struck mid-flip   biggest jump {worst4:5.1} deg at offset {at4:+.3} m");
+        check("a flicked ball leaves predictably", worst4 < 30.0);
+
+        // ---- the singularity itself, tested directly ----
+        // The end-to-end sweep above is coarse (a flip only touches the ball
+        // for a frame or two), so check the property that was actually
+        // wrong: the throw's weight must fall with the surface SPEED, not
+        // just with how fast the car is spinning. A contact sitting on the
+        // rotation axis has a near-zero surface velocity, and normalising
+        // that returns noise.
+        let weight = |omega: f32, surf_speed: f32| -> f32 {
+            let spin = (omega / 7.0).clamp(0.0, 1.0);
+            spin * (surf_speed / 3.0).clamp(0.0, 1.0)
+        };
+        let on_axis = weight(8.0, 0.02); // fast flip, contact on the axis
+        let out_wide = weight(8.0, 3.5); // same flip, contact out at the nose
+        println!("throw weight: on the axis {on_axis:.3}, out at the nose {out_wide:.3}");
+        check("a contact on the rotation axis throws nothing", on_axis < 0.02);
+        check("a sweeping hood still throws hard", out_wide > 0.9);
+        check("and it is continuous in between", {
+            let mut worst_step = 0.0f32;
+            let mut prev = weight(8.0, 0.0);
+            for k in 1..=300 {
+                let w = weight(8.0, k as f32 * 0.02);
+                worst_step = worst_step.max((w - prev).abs());
+                prev = w;
+            }
+            worst_step < 0.02
+        });
+        println!("{}", if pass { "HITS: PASS" } else { "HITS: FAIL" });
         return;
     }
     if name == "flick" {

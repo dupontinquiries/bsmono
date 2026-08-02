@@ -2483,6 +2483,35 @@ tube's "down" swung round — disorienting rather than dramatic. It leans two
 thirds of the way at 1.15 rad/s now: still unmistakably inside a pipe,
 without the room spinning.
 
+## v1.77.0 — the direction of an almost-zero vector
+
+Reported: the ball sometimes leaves in a strange direction on a hit. A
+result that is only SOMETIMES wrong is a discontinuity, so new `--sim hits`
+sweeps the contact and measures how much the exit direction jumps between
+neighbouring samples — nudge the contact a centimetre and the answer should
+move a degree, not thirty.
+
+Four regimes came back clean: across the nose (8.6 deg worst), up the face
+(7.1), from a turning car (5.6), and one frame to the next (1.7). So the
+contact geometry and the box hitbox were not the problem.
+
+The fault was in the flick throw, and it is a classic. The push direction
+blends toward `normalize(v_surf - car.vel)` — how fast the hood is sweeping
+under the ball from the car's own rotation — weighted only by how fast the
+car was SPINNING. But near the rotation axis that vector is almost zero,
+and THE DIRECTION OF AN ALMOST-ZERO VECTOR IS ARBITRARY: normalising it
+hands back noise. A fast flip touching the ball near the axis could
+therefore throw it somewhere unrelated to the contact.
+
+The weight now accounts for the surface SPEED as well as the spin, so a
+hood that is genuinely sweeping throws the ball and a contact sitting on
+the axis contributes nothing. Measured: throw weight 0.007 on the axis
+against 1.000 out at the nose, continuous in between (largest step 0.02
+across the range).
+
+Flicks, shots, dribbling and the spin harness all read unchanged, because
+the term only ever mattered where it was ill-defined.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
