@@ -14,6 +14,7 @@
 
 pub mod mail_view;
 pub mod archived_view;
+pub mod cards_view;
 pub mod graph_view;
 pub mod bars;
 pub mod viz;
