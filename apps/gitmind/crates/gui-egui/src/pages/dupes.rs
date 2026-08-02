@@ -81,6 +81,40 @@ pub struct State {
     pub preview: Option<PreviewView>,
     pub note: String,
     pub pending: Pending,
+    /// How the chosen pair actually relate: same / ahead / behind / diverged /
+    /// unrelated, with the commit counts each way.
+    ///
+    /// The page let the user LABEL one copy "older" and one "newer" with
+    /// nothing checking whether that was true — and then offered a
+    /// fast-forward, which only succeeds when one really is an ancestor of the
+    /// other. Getting it backwards produced a git error the page reported
+    /// verbatim, which is a poor way to learn that you picked the wrong side.
+    pub relation: Option<(String, usize, usize)>,
+}
+
+/// Can `older -> newer` fast-forward?
+///
+/// Only when the newer copy contains all of the older one's history. "diverged"
+/// and "unrelated" cannot, and neither can a pair chosen the wrong way round —
+/// which is the common mistake, since the labels are assigned by hand.
+pub fn can_fast_forward(relation: &str) -> bool {
+    // "behind" means A (the one we called older) is behind B — exactly the
+    // situation a fast-forward resolves.
+    matches!(relation, "behind" | "same")
+}
+
+/// What to tell the user about a relation, in terms of the action they are
+/// about to take rather than git's vocabulary.
+pub fn relation_hint(relation: &str, a_ahead: usize, b_ahead: usize) -> String {
+    match relation {
+        "same" => "identical — nothing to roll up".into(),
+        "behind" => format!("older is {b_ahead} commits behind — a fast-forward will work"),
+        "ahead" => format!("these are the wrong way round: the copy you marked older is \
+                            {a_ahead} commits AHEAD"),
+        "diverged" => format!("diverged: {a_ahead} and {b_ahead} commits each way — \
+                              a fast-forward cannot work, explore a merge instead"),
+        _ => "unrelated histories — not two copies of one project".into(),
+    }
 }
 
 // ── wire codec (Task carries one String; ok/err + records) ───────────────────
@@ -293,9 +327,13 @@ pub fn card(app: &mut App, ui: &mut egui::Ui) {
             ui.horizontal(|ui| {
                 if ui.selectable_label(st.older == *p, "older").clicked() {
                     st.older = p.clone();
+                    // A relation describes ONE pair; keeping it after a change
+                    // shows the previous pair's verdict beside the new one.
+                    st.relation = None;
                 }
                 if ui.selectable_label(st.newer == *p, "newer").clicked() {
                     st.newer = p.clone();
+                    st.relation = None;
                 }
                 ui.label(egui::RichText::new(p).monospace().small());
             });
@@ -305,6 +343,24 @@ pub fn card(app: &mut App, ui: &mut egui::Ui) {
     let pair_ready = !st.older.is_empty() && !st.newer.is_empty() && st.older != st.newer;
     if pair_ready {
         ui.separator();
+        // Work out how the pair ACTUALLY relate before offering an action on
+        // them. Cheap enough to do inline: relate() clones into a temp dir and
+        // counts, and it only runs when the pair changes.
+        ui.horizontal(|ui| {
+            if ui.small_button("check relation").clicked() {
+                let r = cockpit::identity::relate(
+                    std::path::Path::new(&st.older),
+                    std::path::Path::new(&st.newer),
+                    &std::env::var("PATH").unwrap_or_default());
+                st.relation = Some((r.relation, r.a_ahead, r.b_ahead));
+            }
+            if let Some((rel, a, b)) = st.relation.clone() {
+                let hint = relation_hint(&rel, a, b);
+                let col = if can_fast_forward(&rel) { ui.visuals().text_color() }
+                          else { egui::Color32::from_rgb(230, 170, 80) };
+                ui.colored_label(col, hint);
+            }
+        });
         ui.horizontal(|ui| {
             if ui.button("preview roll-up").clicked() {
                 let (o, n) = (st.older.clone(), st.newer.clone());
@@ -312,7 +368,11 @@ pub fn card(app: &mut App, ui: &mut egui::Ui) {
                     enc_rollup(&cockpit::flow::rollup_preview(std::path::Path::new(&o), std::path::Path::new(&n)))
                 });
             }
-            if ui.button("apply roll-up (ff-only)").clicked() {
+            // Gated on the relation when we know it. Offering a fast-forward
+            // that cannot succeed produces a git error the page reports
+            // verbatim, which is a poor way to find out the pair was backwards.
+            let ff_ok = st.relation.as_ref().map(|(r, _, _)| can_fast_forward(r)).unwrap_or(true);
+            if ui.add_enabled(ff_ok, egui::Button::new("apply roll-up (ff-only)")).clicked() {
                 let (o, n) = (st.older.clone(), st.newer.clone());
                 start(&app.task, st, Pending::RollupApply, move || {
                     match cockpit::flow::rollup_apply(std::path::Path::new(&o), std::path::Path::new(&n)) {
@@ -478,5 +538,57 @@ mod tests {
         assert_eq!(v.files[0], ("M".to_string(), "src/lib.rs".to_string()));
         assert_eq!(ok_body("err\x1eboom"), Err("boom".to_string()));
         assert!(ok_body("garbage").is_err());
+    }
+}
+
+#[cfg(test)]
+mod relation_tests {
+    use super::*;
+
+    #[test]
+    fn a_fast_forward_is_only_offered_when_it_can_succeed() {
+        // The page let the user LABEL one copy older and one newer with nothing
+        // checking it, then offered --ff-only. Getting it backwards produced a
+        // raw git error, which is a poor way to learn you picked the wrong side.
+        assert!(can_fast_forward("behind"), "the older copy really is behind");
+        assert!(can_fast_forward("same"), "nothing to do, but it will not fail");
+        assert!(!can_fast_forward("diverged"), "each has commits the other lacks");
+        assert!(!can_fast_forward("unrelated"));
+        assert!(!can_fast_forward("ahead"), "the pair is the wrong way round");
+    }
+
+    #[test]
+    fn the_wrong_way_round_says_so_rather_than_saying_ahead() {
+        // "ahead" is git's word for a fact about the pair; the USER needs to
+        // know they mislabelled the copies, which is a different sentence.
+        let h = relation_hint("ahead", 12, 0);
+        assert!(h.contains("wrong way round"), "{h}");
+        assert!(h.contains("12"), "and how far: {h}");
+    }
+
+    #[test]
+    fn diverged_points_at_the_action_that_can_work() {
+        // A dead end is only useful if it names the way out — the page has a
+        // merge exploration for exactly this case.
+        let h = relation_hint("diverged", 3, 5);
+        assert!(h.contains("merge"), "{h}");
+        assert!(h.contains('3') && h.contains('5'), "counts both ways: {h}");
+    }
+
+    #[test]
+    fn identical_copies_say_there_is_nothing_to_do() {
+        // Rather than offering a roll-up that would succeed and change nothing,
+        // which reads as the tool having done something.
+        let h = relation_hint("same", 0, 0);
+        assert!(h.contains("nothing"), "{h}");
+    }
+
+    #[test]
+    fn unrelated_histories_are_not_two_copies_of_one_project() {
+        // The grouping is by project key, which can collide — two repos with no
+        // git history fall back to a path hash. Saying "unrelated" is more
+        // useful than offering to merge them.
+        let h = relation_hint("unrelated", 0, 0);
+        assert!(h.contains("not two copies"), "{h}");
     }
 }
