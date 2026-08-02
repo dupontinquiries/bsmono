@@ -28,17 +28,33 @@ while [ $# -gt 0 ]; do
 done
 
 PKG="$APP_DIR/packaging"
-[ -d "$PKG" ] || { echo "ERROR: no packaging/ in $APP_DIR" >&2; exit 1; }
+ENTRY=""
+[ -d "$PKG" ] && ENTRY="$(find "$PKG" -maxdepth 1 -name '*.desktop' | head -1)"
 
-ENTRY="$(find "$PKG" -maxdepth 1 -name '*.desktop' | head -1)"
-[ -n "$ENTRY" ] || { echo "ERROR: no .desktop entry in $PKG" >&2; exit 1; }
-APP_ID="$(basename "$ENTRY" .desktop)"
+# A DAEMON has no .desktop entry and should not have one — it is not something
+# to launch from a menu. It still ships units and man pages, so an app without
+# packaging/ is installed rather than refused; refusing here is what would send
+# someone to write a pointless desktop entry for a socket-activated service.
+if [ -z "$ENTRY" ]; then
+    if [ ! -d "$APP_DIR/systemd" ] && [ ! -d "$APP_DIR/man" ]; then
+        echo "ERROR: $APP_DIR has no packaging/, systemd/ or man/ — nothing to install" >&2
+        exit 1
+    fi
+    APP_ID="$(basename "$APP_DIR")"
+    ICON_NAME=""
+    EXEC_NAME="$APP_ID"
+    echo "==> $APP_ID (daemon: units and man pages only)"
+else
+    APP_ID="$(basename "$ENTRY" .desktop)"
+fi
 
 # The Icon= line is the contract between entry and artwork. Reading it rather
 # than assuming it equals the app id means a deliberate stock icon (camera-photo,
 # say) still installs correctly.
-ICON_NAME="$(sed -n 's/^Icon=//p' "$ENTRY" | head -1)"
-EXEC_NAME="$(sed -n 's/^Exec=//p' "$ENTRY" | head -1 | awk '{print $1}')"
+if [ -n "$ENTRY" ]; then
+    ICON_NAME="$(sed -n 's/^Icon=//p' "$ENTRY" | head -1)"
+    EXEC_NAME="$(sed -n 's/^Exec=//p' "$ENTRY" | head -1 | awk '{print $1}')"
+fi
 
 APPS_DIR="$PREFIX/share/applications"
 ICONS_DIR="$PREFIX/share/icons/hicolor/scalable/apps"
@@ -47,9 +63,14 @@ BIN_DIR="$PREFIX/bin"
 if [ "$UNINSTALL" = "1" ]; then
   rm -f "$APPS_DIR/$APP_ID.desktop" "$ICONS_DIR/$ICON_NAME.svg" \
         "$BIN_DIR/$EXEC_NAME" "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
+  [ -d "$APP_DIR/man" ] && for m in "$APP_DIR"/man/*.1; do
+    [ -f "$m" ] && rm -f "$PREFIX/share/man/man1/$(basename "$m")"
+  done
   echo "removed $APP_ID"
 else
-  mkdir -p "$APPS_DIR" "$ICONS_DIR" "$BIN_DIR"
+  mkdir -p "$BIN_DIR"
+  if [ -n "$ENTRY" ]; then
+  mkdir -p "$APPS_DIR" "$ICONS_DIR"
   install -m644 "$ENTRY" "$APPS_DIR/$APP_ID.desktop"
   SRC_ICON="$PKG/icons/hicolor/scalable/apps/$ICON_NAME.svg"
   if [ -f "$SRC_ICON" ]; then
@@ -62,14 +83,26 @@ else
       *)   echo "    icon '$ICON_NAME' expected from the theme" ;;
     esac
   fi
+  fi
   # AppStream metadata: without it the app installs and launches but never
   # appears in GNOME Software or KDE Discover, which read metainfo rather than
   # .desktop entries.
   META="$PKG/$APP_ID.metainfo.xml"
-  if [ -f "$META" ]; then
+  if [ -n "$ENTRY" ] && [ -f "$META" ]; then
     mkdir -p "$PREFIX/share/metainfo"
     install -m644 "$META" "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
   fi
+  # Man pages. The service units carry Documentation=man:<name>(1), and a
+  # Documentation link that resolves to nothing is worse than none: systemctl
+  # status offers it and `man` then reports no entry.
+  if [ -d "$APP_DIR/man" ]; then
+    MAN_DIR="$PREFIX/share/man/man1"
+    mkdir -p "$MAN_DIR"
+    for m in "$APP_DIR"/man/*.1; do
+      [ -f "$m" ] && install -m644 "$m" "$MAN_DIR/$(basename "$m")"
+    done
+  fi
+
   # systemd user units, if the app ships any. @BIN_DIR@ is substituted here
   # rather than in the source, so the same unit file works at any prefix — a
   # hardcoded /usr/bin is why units so often need editing after a --user install.
@@ -83,7 +116,7 @@ else
     systemctl --user daemon-reload >/dev/null 2>&1 || true
     echo "    units in $UNIT_DIR — enable the .socket, not the .service"
   fi
-  echo "installed $APP_ID -> $APPS_DIR"
+  if [ -n "$ENTRY" ]; then echo "installed $APP_ID -> $APPS_DIR"; else echo "installed $APP_ID (daemon)"; fi
 fi
 
 # Both launchers and GTK read caches rather than the directories, so a new entry
