@@ -38,14 +38,14 @@ starts hidden with the auto-login ordering rule.
 | HelpManualDialog | pending |  |
 | InboxWidget | pending |  |
 | IncomingCallDialog | pending |  |
-| LoginWidget | pending |  |
+| LoginWidget | ported | session.rs `Login` — optional password, Enter-moves-focus, error clears the password |
 | MainWindow | partial | 5-page shell + login-overlay ordering rule in lib.rs; status bar/export gate pending |
 | MediaSendSummary | pending |  |
 | MobileDialog | pending |  |
 | ModalLayerTestPanel | pending |  |
 | ModalSurface | ported | modal.rs — six layers, derived scrim, tap-outside, dismissTopmost ordering |
 | MonthlyExportReminder | pending |  |
-| OutboxWidget | pending |  |
+| OutboxWidget | ported | session.rs `Outbox` — transport phases, delivered is terminal, 24h prune of delivered only |
 | PagePeelHint | pending |  |
 | PressGesture | pending |  |
 | QrCodeRenderer | pending |  |
