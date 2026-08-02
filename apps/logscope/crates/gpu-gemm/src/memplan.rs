@@ -1327,3 +1327,18 @@ mod file_view_tests {
         assert!(!file_views_plausible(Some(1), Some(1), Some(1), true));
     }
 }
+
+/// `StreamPlan` is a PROJECTION, not a capability.
+///
+/// It computes how many blocks would be pinned, how many streamed per token, and what that costs at
+/// the measured upload rate — and nothing executes it. `StreamPlan` has no consumer outside this
+/// module.
+///
+/// That matters because the figures appear in a REFUSAL MESSAGE. A reader sees "layer streaming would
+/// pin 37/48 blocks and stream 11 per token (~120 ms/tok)" and reasonably concludes the engine can do
+/// that and is choosing not to. It cannot. 120 ms/token is a perfectly usable number, which makes the
+/// implication worse: it describes a working fallback that does not exist.
+///
+/// The message now says so explicitly. If someone implements the executor, that caveat is the thing to
+/// delete.
+const _STREAM_PLAN_HAS_NO_EXECUTOR: () = ();
