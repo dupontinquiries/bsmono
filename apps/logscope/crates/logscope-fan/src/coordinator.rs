@@ -54,6 +54,21 @@ round shows whether your hint drove the conclusion or the question did.",
          Mode::LongHorizon, Mode::ThinkerLiaison, Mode::LiaisonDebate]
     }
 
+    /// Which axis this mode varies.
+    ///
+    /// Six entries in one list, and they answer two different questions: Barebones/Coordinator/
+    /// Aggressive vary HOW WIDE the fan-out is, and the other three vary WHO REASONS. An operator
+    /// picking from an undifferentiated list of six has to already know that to choose sensibly.
+    ///
+    /// One list is still right — you pick one mode — but the list should say which question each entry
+    /// answers rather than leaving it to be inferred from the names.
+    pub fn axis(self) -> &'static str {
+        match self {
+            Mode::Barebones | Mode::Coordinator | Mode::Aggressive => "how wide",
+            Mode::LongHorizon | Mode::ThinkerLiaison | Mode::LiaisonDebate => "who reasons",
+        }
+    }
+
     /// Does this mode run a debating panel?
     pub fn is_panel(self) -> bool { matches!(self, Mode::LiaisonDebate) }
 
@@ -160,6 +175,30 @@ pub fn aggregate_system() -> String { sys_aggregate() }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn all_modes_are_CONTIGUOUS_by_axis() {
+        // The UI prints a heading whenever the axis changes, so an interleaved list would print the
+        // same heading twice and read as a bug. Contiguity is a property of Mode::all() that the
+        // renderer depends on and nothing else enforced.
+        let axes: Vec<&str> = Mode::all().iter().map(|m| m.axis()).collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for a in &axes {
+            if seen.last() != Some(a) {
+                assert!(!seen.contains(a), "axis {a:?} appears in two runs: {axes:?}");
+                seen.push(a);
+            }
+        }
+        assert_eq!(seen.len(), 2, "two axes, two headings");
+    }
+
+    #[test]
+    fn every_mode_has_an_axis_and_they_are_the_expected_two() {
+        // A third axis is not wrong, but it would need a UI decision rather than appearing silently.
+        for m in Mode::all() {
+            assert!(matches!(m.axis(), "how wide" | "who reasons"), "{m:?} has axis {:?}", m.axis());
+        }
+    }
+
     #[test]
     fn the_three_reasoning_modes_are_selectable() {
         // They were built (panelmode, panelvoice, deliberate) and never given an entry, which is why
