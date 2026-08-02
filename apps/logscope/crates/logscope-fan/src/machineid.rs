@@ -200,3 +200,154 @@ mod tests {
         assert!(id.split('-').all(|g| g.len() <= 5));
     }
 }
+
+/// This machine's long-term identity.
+///
+/// ## Why it must persist
+///
+/// The id an operator pastes into another machine is a fingerprint of the public key. If the key is
+/// regenerated on restart, every registration made against the old id becomes dead — the peer is still
+/// listed, still trusted, and no longer reachable, which reads as a network fault rather than an
+/// identity change.
+///
+/// So: generated once, written to disk, and read back thereafter. `machineid::encode` of the public
+/// key is then stable for the life of the install, which is what makes "set it once and forget it"
+/// true rather than aspirational.
+///
+/// ## What is stored
+///
+/// Both keys, 64 bytes: private then public. Storing a derived value normally invites it to disagree
+/// with its source, and the private key alone would be the better file — but `crypto-kit` exposes
+/// `ed25519_keypair` and no derive-public-from-private, so recovering the public key from a stored
+/// private one is not possible through its API today.
+///
+/// Adding that function to `crypto-kit` is the better fix and belongs there rather than here; until
+/// then the two are written together and read together, so they cannot drift apart in practice.
+impl std::fmt::Debug for Identity {
+    /// Prints the id, never the key. A Debug that leaks a signing key into a log is a leak with a
+    /// convenient shape, and derive(Debug) would have produced exactly that.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Identity({})", self.id())
+    }
+}
+
+pub struct Identity {
+    signing: [u8; 32],
+    pub public: [u8; 32],
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum IdentityError {
+    /// The stored key is not 32 bytes.
+    Malformed { len: usize },
+    Io(String),
+}
+
+impl IdentityError {
+    pub fn explain(&self) -> String {
+        match self {
+            IdentityError::Malformed { len } => format!(
+                "the stored identity is {len} bytes, not 64. It is refused rather than regenerated, \
+because regenerating would silently change this machine's id and break every registration made \
+against the old one — a peer that is still listed, still trusted, and no longer reachable"),
+            IdentityError::Io(e) => format!("could not read or write the identity: {e}"),
+        }
+    }
+}
+
+impl Identity {
+    /// Load the identity at `path`, generating and persisting one if absent.
+    ///
+    /// Refuses a malformed file rather than replacing it. A corrupt key is a situation someone should
+    /// see, and silently minting a new one destroys every registration pointing at the old id.
+    pub fn load_or_create(path: &std::path::Path) -> Result<Identity, IdentityError> {
+        match std::fs::read(path) {
+            Ok(b) if b.len() == 64 => {
+                let mut signing = [0u8; 32];
+                let mut public = [0u8; 32];
+                signing.copy_from_slice(&b[..32]);
+                public.copy_from_slice(&b[32..]);
+                Ok(Identity { signing, public })
+            }
+            Ok(b) => Err(IdentityError::Malformed { len: b.len() }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let (sk, pk) = crypto_kit::ed25519_keypair();
+                if let Some(dir) = path.parent() {
+                    std::fs::create_dir_all(dir).map_err(|e| IdentityError::Io(e.to_string()))?;
+                }
+                let mut blob = Vec::with_capacity(64);
+                blob.extend_from_slice(&sk[..]);
+                blob.extend_from_slice(&pk[..]);
+                std::fs::write(path, &blob).map_err(|e| IdentityError::Io(e.to_string()))?;
+                let mut signing = [0u8; 32];
+                signing.copy_from_slice(&sk[..]);
+                Ok(Identity { signing, public: pk })
+            }
+            Err(e) => Err(IdentityError::Io(e.to_string())),
+        }
+    }
+
+    /// The typeable id others paste to trust this machine.
+    pub fn id(&self) -> String { encode(&self.public) }
+
+    /// Sign a `peerauth` challenge payload.
+    pub fn sign(&self, msg: &[u8]) -> [u8; 64] { crypto_kit::sign(&self.signing, msg) }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logscope-id-test-{name}-{}", std::process::id()));
+        p
+    }
+
+    #[test]
+    fn the_id_is_STABLE_across_loads() {
+        // The whole point. If the key regenerated on restart, every registration against the old id
+        // would be dead — the peer still listed, still trusted, no longer reachable, which reads as a
+        // network fault rather than an identity change.
+        let p = tmp("stable");
+        let _ = std::fs::remove_file(&p);
+        let a = Identity::load_or_create(&p).expect("creates");
+        let b = Identity::load_or_create(&p).expect("reads back");
+        assert_eq!(a.id(), b.id(), "the id must survive a restart");
+        assert_eq!(a.public, b.public);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn two_machines_get_DIFFERENT_ids() {
+        let (p, q) = (tmp("m1"), tmp("m2"));
+        for f in [&p, &q] { let _ = std::fs::remove_file(f); }
+        let a = Identity::load_or_create(&p).unwrap();
+        let b = Identity::load_or_create(&q).unwrap();
+        assert_ne!(a.id(), b.id());
+        for f in [&p, &q] { let _ = std::fs::remove_file(f); }
+    }
+
+    #[test]
+    fn a_malformed_key_is_REFUSED_rather_than_regenerated() {
+        // Silently minting a new one destroys every registration pointing at the old id, and does it
+        // at the moment someone is already confused about why a peer stopped working.
+        let p = tmp("bad");
+        std::fs::write(&p, b"too short").unwrap();
+        let e = Identity::load_or_create(&p).unwrap_err();
+        assert!(matches!(e, IdentityError::Malformed { .. }));
+        assert!(e.explain().contains("still trusted, and no longer reachable"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_id_round_trips_through_parse() {
+        // It is meant to be read off one screen and typed into another, so the generated form must
+        // survive the parser that receives it.
+        let p = tmp("rt");
+        let _ = std::fs::remove_file(&p);
+        let id = Identity::load_or_create(&p).unwrap().id();
+        assert!(parse(&id).is_ok(), "generated id must parse: {id}");
+        let _ = std::fs::remove_file(&p);
+    }
+}
