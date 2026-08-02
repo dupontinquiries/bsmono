@@ -117,3 +117,65 @@ here comes from llama.cpp rather than from both.
    the 14× directly rather than the constant in front of it.
 3. V3's autotune result on hardware.
 4. The q4 prefill GEMM.
+
+---
+
+# Colibri hides FMA latency with two accumulator chains; our decode matvec has one
+
+`glm.c`'s int8 matvec, NEON path:
+
+```c
+float32x4_t ac0 = vdupq_n_f32(0), ac1 = vdupq_n_f32(0);
+for (; i+8 <= I; i += 8) {
+    int16x8_t w16 = vmovl_s8(vld1_s8(w+i));
+    ac0 = vfmaq_f32(ac0, vld1q_f32(xs+i),   ...low half...);
+    ac1 = vfmaq_f32(ac1, vld1q_f32(xs+i+4), ...high half...);
+}
+a = vaddvq_f32(vaddq_f32(ac0, ac1));
+```
+
+**Two independent accumulators**, summed once at the end. `MATVEC_Q4` has one:
+
+```wgsl
+var acc = 0.0;
+...
+acc = acc + a[kk] * scale * f32(q);
+```
+
+Every iteration waits on the previous one's result. On a unit with multi-cycle FMA latency that
+serialises the whole loop to `iterations × latency`, regardless of how much bandwidth is available —
+which is the same shape as the 14× measured above, arriving one level down. Prefill hides latency with
+**more rows**; two chains hide it with **more independent work per row**, and decode has neither.
+
+## Why this is worth more here than in the reference
+
+Colibri does it on a CPU where the FMA latency is 3–4 cycles and the win is modest. On a GPU thread the
+dependency chain is the same shape but the loop is longer — `k` is 4096 or 14336 — so the serialised
+cost is proportionally larger, and there is no out-of-order engine to find the parallelism for you.
+
+## The change
+
+Split the accumulator, unroll the inner loop by two, sum at the end:
+
+```wgsl
+var acc0 = 0.0; var acc1 = 0.0;
+// ... two loads and two FMAs per iteration, independent ...
+let acc = acc0 + acc1;
+```
+
+Bit-exactness does **not** hold: floating-point addition is not associative, so the result differs by
+reassociation exactly as `linear_q8_0_gemm_rb` already notes about its own tiling. That is acceptable
+for the same reason it is there, and it means the gate must compare against a tolerance rather than
+byte-for-byte.
+
+## Where it sits in the order
+
+Below `--gate-bytes` — if the invocation index is wrong, kernel work is premature. But **above** both
+the q4 prefill GEMM and speculative verify, because it is the smallest change of the three, needs no
+draft model, and attacks decode's latency directly rather than around it.
+
+Also unlike those two, it applies to **every** decode kernel and quantization at once — `MATVEC_Q4`,
+`MATVEC_Q8_0`, and the MoE variants all have the same single-accumulator shape.
+
+**Written from Colibri's source, not measured here** — the container has no Rust toolchain after a
+reset, so this is a reading of two implementations rather than a benchmark of either.
