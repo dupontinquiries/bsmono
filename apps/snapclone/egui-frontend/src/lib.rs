@@ -27,6 +27,7 @@ pub mod unified_nav;
 pub mod friends;
 pub mod modal;
 pub mod snaps;
+pub mod session;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -110,6 +111,14 @@ pub struct Snapclone {
     /// other is "is the window over".
     pub snaps_expired: Vec<String>,
     pub last_saved: Option<String>,
+    /// Send status per snap (Qt OutboxWidget), shown on the Inbox "Sent" tab.
+    pub outbox: crate::session::Outbox,
+    /// The sign-in form behind the login overlay. The overlay's visibility rule
+    /// was ported long ago; this is what it was hiding.
+    pub login: crate::session::Login,
+    /// Wall clock in seconds, for relative times. Held rather than read at
+    /// draw time so tests can advance it.
+    pub now_secs: i64,
     gesture: GestureLayer,
     palette: String,
 }
@@ -145,6 +154,9 @@ impl Snapclone {
             snaps_viewed: Vec::new(),
             snaps_expired: Vec::new(),
             last_saved: None,
+            outbox: Default::default(),
+            login: Default::default(),
+            now_secs: 0,
             conversation: Default::default(),
             conversation_peer: String::new(),
             bar: UnifiedNav::new(),
@@ -525,6 +537,12 @@ impl Snapclone {
     /// messaging app read as a demo.
     fn inbox_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Messages");
+        // The nav has declared an Inbox "Sent" sub-tab since the shell was
+        // ported, with nothing behind it. That is the outbox.
+        if self.bar.sub[1] == 2 {
+            crate::session::outbox_ui(ui, &self.outbox, self.now_secs, c);
+            return;
+        }
         if let Some(id) = crate::inbox::inbox_ui(ui, &mut self.inbox, c) {
             self.inbox.mark_read(id);
             self.conversation_peer = id.to_string();
@@ -563,6 +581,13 @@ impl Snapclone {
 }
 
 impl Snapclone {
+    /// Draw the sign-in form. Returns credentials for the host to act on; this
+    /// view does not decide whether they are good.
+    pub fn login_ui(&mut self, ui: &mut Ui, c: &PaletteColors)
+        -> Option<crate::session::Credentials> {
+        crate::session::login_ui(ui, &mut self.login, c)
+    }
+
     /// Qt's `loginSucceeded` signal: hide the overlay (idempotent, per the ordering rule).
     pub fn login_succeeded(&mut self) { self.login_visible = false; }
 }
@@ -582,6 +607,31 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn the_sent_sub_tab_shows_the_outbox_the_nav_has_always_declared() {
+        // sub_tabs(1) has listed All/Unread/Sent since the shell was ported and
+        // "Sent" drew the inbox list like the other two.
+        let mut s = app();
+        s.outbox.add("s1", "ada", 0);
+        assert_eq!(sub_tabs(1)[2], "Sent");
+        s.bar.sub[1] = 2;
+        assert_eq!(s.outbox.len(), 1);
+        assert_eq!(s.outbox.summary().as_deref(), Some("0 / 1 delivered"));
+    }
+
+    #[test]
+    fn a_successful_sign_in_hides_the_overlay_and_leaves_no_plaintext() {
+        let mut s = Snapclone::new_with_login(vec![], false);
+        assert!(s.login_visible, "no auto-login, so the form is up");
+        s.login.username = "ada".into();
+        s.login.password = "hunter2".into();
+        let creds = s.login.submit().expect("valid");
+        s.login_succeeded();
+        assert!(!s.login_visible);
+        assert!(s.login.password.is_empty());
+        assert_eq!(creds.username, "ada");
     }
 
     #[test]
