@@ -42,6 +42,7 @@
 //! the multi-node story is exercised on loopback, which is what microdht enabled.
 
 pub mod cluster;
+pub mod schedule;
 pub mod lookup;
 pub mod node;
 pub mod proximity;
