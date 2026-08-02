@@ -904,6 +904,16 @@ pub struct Chat {
     request_smaller_model: bool,   // :why asked to spawn the smallest local model for the diagnosis; ui() applies it
     show_help: bool,               // `?` keybinding overlay is open
     note: String,                  // transient status line (e.g. export path), cleared on next action
+    /// A failure that must NOT scroll away: model load errors, and anything else an operator has to
+    /// act on or report.
+    ///
+    /// `note` is a transient status line and the next status overwrites it — which is the wrong home
+    /// for the one message someone needs to keep. A load failure prints a paragraph of arithmetic
+    /// (host RAM, resident, page cache, the flag that would help) and then vanishes on the next tick.
+    ///
+    /// Persistent, with copy and close, because the two things anyone does with an error are paste it
+    /// somewhere and dismiss it.
+    error_banner: Option<String>,
     gitmind_session: Option<crate::gitmind_session::Session>, // a loaded .gitmind /tmp work session, if any
     agent_files: Vec<crate::workspace_exec::FileEvent>, // live feed of files the agent/drops touched in the workspace
     agent_plan: Vec<(String, bool)>, // the agent's committed plan (2): (step text, done) — rendered as an in-scene checklist
@@ -1059,6 +1069,7 @@ impl Default for Chat {
             request_smaller_model: false,
             show_help: false,
             note: String::new(),
+            error_banner: None,
             gitmind_session: None,
             agent_files: Vec::new(),
             agent_plan: Vec::new(),
@@ -1512,7 +1523,11 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 // is wrong after a failure.
                 self.last_loaded = Some(info.path.clone());
             }
-            Evt::Loaded(Err(_)) => {
+            Evt::Loaded(Err(e)) => {
+                // The banner, not the note. This message carries the arithmetic — host RAM,
+                // resident, page cache, and the flag that would help — and it went to the
+                // terminal while the UI showed a line the next status overwrote.
+                self.error_banner = Some(e.to_string());
                 // The picker was set optimistically when the load STARTED, so a failure leaves it
                 // naming a model that is not running — and the menu then asserts the wrong model is
                 // loaded. A name in the active slot is the one piece of state nobody re-checks.
@@ -2719,7 +2734,7 @@ them to", patches.len());
                         if let Some(f) = self.agent_fan.as_mut() { f.set_width(lanes); steps.extend(f.fill()); }
                     }
                 }
-                crate::lanes::LaneEvt::LoadError(e) => { self.note = format!("lanes: load failed — {e}"); dead = true; }
+                crate::lanes::LaneEvt::LoadError(e) => { self.error_banner = Some(e.to_string()); self.note = format!("lanes: load failed — {e}"); dead = true; }
                 crate::lanes::LaneEvt::Token { job, text } => {
                     if let Some(&b) = self.lane_jobs.get(&job) {
                         if let Some(f) = self.agent_fan.as_mut() { f.on_token_branch(b, &text); }
@@ -5752,6 +5767,35 @@ them to", patches.len());
                         ui.label(RichText::new(format!("{c}×")).color(theme::CYAN()).small().strong());
                     }
                     if !self.note.is_empty() {
+// THE PERSISTENT BANNER, above the transient note. A load failure carries the numbers an
+// operator needs — host RAM, resident, page cache, the flag that would help — and it used to
+// land in `note`, which the next status overwrites.
+//
+// Copy comes first because the first thing anyone does with an error is paste it somewhere.
+// Close is explicit: an error that dismisses itself on a timer is one that vanishes while
+// being read, and this text is long enough to still be reading.
+if let Some(msg) = self.error_banner.clone() {
+    egui::Frame::none()
+        .fill(theme::RED().linear_multiply(0.12))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("model not loaded").color(theme::RED()).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("dismiss").clicked() {
+                        self.error_banner = None;
+                    }
+                    if ui.small_button("⧉").on_hover_text("copy the full message").clicked() {
+                        ui.ctx().copy_text(msg.clone());
+                    }
+                });
+            });
+            // Wrapped rather than truncated: the useful part of these messages is the numbers at
+            // the end, so eliding the tail removes exactly what someone opened it for.
+            ui.label(RichText::new(&msg).small());
+        });
+    ui.add_space(4.0);
+}
                         ui.label(RichText::new(&self.note).color(theme::GREEN()).small());
                     } else {
                         ui.label(RichText::new(self.modal_hint()).color(theme::FAINT()).small());
