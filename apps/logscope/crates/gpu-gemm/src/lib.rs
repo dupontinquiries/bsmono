@@ -9934,6 +9934,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     ///
     /// Confirms or refutes the 16-byte-stride diagnosis in one run: if this reads correctly where the
     /// scalar probe does not, `array<u32>` is being laid out with std140 padding.
+    /// `dst[i] = f32(i)` — tests the invocation index alone.
+    pub fn id_probe(&self, n: usize) -> Vec<f32> {
+        self.byte_probe_with(&vec![0u8; n], ID_PROBE)
+    }
+
     pub fn byte_probe_vec4(&self, raw: &[u8]) -> Vec<f32> {
         self.byte_probe_with(raw, BYTE_PROBE_VEC4)
     }
@@ -12576,6 +12581,34 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
     let i = g.x;
     if (i >= dims.x) { return; }
     dst[i] = f32(byte_at(i));
+}
+"#;
+
+/// Writes `dst[i] = f32(i)`. NO memory read, no source buffer, nothing but the builtin.
+///
+/// ## Why this is the probe that was missing
+///
+/// The upload is byte-exact and both element sizes fail identically, so the buffer is right and the
+/// read is right. What is left is the INDEX — and the set that comes back correct is
+/// `0,1,2,3, 16,17,18,19, 32,33,34,35, 48,49,50,51`.
+///
+/// That is not a memory pattern. It is four consecutive values every sixteen, which is what
+/// `global_invocation_id.x` looks like if the workgroup's x extent used in the builtin does not match
+/// the declared `@workgroup_size(64,1,1)`.
+///
+/// If this probe shows the same 4-of-16 pattern, nothing is wrong with any read: the invocations
+/// themselves are landing on the wrong indices, and every kernel that indexes by `global_invocation_id`
+/// is affected — which is all of them.
+pub const ID_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(i);
 }
 "#;
 
