@@ -344,6 +344,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_unverified_arch_can_never_verify_ITSELF_without_an_opt_in() {
+        // The deadlock this documents. `supported` flips only once an architecture has completed a
+        // forward pass on a real checkpoint — the right rule, and the reason deepseek2 stayed gated
+        // with no known gaps. But attempting the run IS what produces that evidence, and the loader
+        // refused the attempt, so the flag could never change.
+        //
+        // glm-dsa is precisely there: two of its three gaps implemented, the third a no-op below 2048
+        // context, MLA layout fixed — and unrunnable. LOGSCOPE_TRY_UNSUPPORTED_ARCH is the escape, and
+        // it claims nothing: it lets someone find out.
+        assert!(!is_supported("glm-dsa", 0), "still unverified, correctly");
+        assert!(!declared_supported("glm-dsa"), "and the declaration is what gates it, not the gaps");
+        // The gap list is now down to one, which is what makes the attempt worth offering.
+        assert_eq!(crate::archfeat::gaps("glm-dsa", 0).len(), 1,
+            "only the sparse indexer remains: {:?}", crate::archfeat::gaps("glm-dsa", 0));
+    }
+
+    #[test]
     fn llama_is_supported_today() {
         let c = for_arch("llama");
         assert!(c.supported && c.note.is_empty());
