@@ -10,6 +10,7 @@ mod fx;
 mod gamepad;
 mod gyro;
 mod trials;
+mod replay;
 mod stream;
 mod hud;
 mod input;
@@ -451,6 +452,11 @@ struct Game {
     gyro: gyro::Gyro,
     /// bounding spheres of the terrain chunks, for culling the ground
     tchunks: Vec<(Vec3, f32)>,
+    /// always-on replay buffer, plus the moments worth keeping
+    rec: replay::Recorder,
+    moments: Vec<replay::Moment>,
+    /// playing a replay: (which moment, time into it)
+    watching: Option<(usize, f32)>,
     /// the trial being attempted, if any
     trial: Option<trials::Run>,
     /// best times, and the ghost of the best run for the current trial
@@ -901,6 +907,9 @@ fn main() {
         tap_drive: (0.0, 0.0),
         gyro: gyro::Gyro::new(gyro_on0),
         tchunks,
+        rec: replay::Recorder::default(),
+        moments: Vec::new(),
+        watching: None,
         trial: None,
         bests: trials_bests0,
         ghost: Vec::new(),
@@ -1771,11 +1780,22 @@ impl Game {
             Mode::Play => {
                 match &key {
                     Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Tab) => {
+                        if self.watching.is_some() {
+                            self.watching = None; // skip the replay
+                            return;
+                        }
                         self.mode = Mode::Pause;
                         self.persist(); // checkpoint whenever the player pauses
                         return;
                     }
                     _ => {}
+                }
+                // R: watch the best moment you have (again)
+                if ch == "r" && !self.moments.is_empty() {
+                    self.watching = Some((0, 0.0));
+                    let m = &self.moments[0];
+                    self.toastf(&format!("REPLAY - {}", m.title));
+                    return;
                 }
                 if let Some(a) = self.action_for_key(&key) {
                     self.one_shot(a);
@@ -2816,6 +2836,48 @@ impl Game {
         if ev.jumped {
             self.snd.fire(Sfx::Jump);
         }
+        // ---- REPLAY: keep the last twelve seconds, and watch for tricks ----
+        {
+            let ground = self.world.sdf(self.car.pos);
+            let ball_air = self.world.sdf(self.ball.pos) > self.ball.r + 0.25;
+            if ev.flip_reset.is_some() {
+                self.rec.note(replay::Trick::FlipReset);
+            }
+            if ev.pinched {
+                self.rec.note(replay::Trick::Pinch);
+            }
+            if ev.dodged && self.car.on_ground {
+                self.rec.note(replay::Trick::WaveDash);
+            }
+            if !ev.touches.is_empty() && !self.car.on_ground {
+                self.rec.note(replay::Trick::Aerial);
+                if ball_air {
+                    // a touch on a ball that is already up, while up: that is
+                    // the air dribble, and the air-link timer proves it is a
+                    // continuation rather than a one-off
+                    if self.air_t > 0.6 {
+                        self.rec.note(replay::Trick::AirDribble);
+                    }
+                    if self.car.pos.y - self.world.ground_h(self.car.pos.x, self.car.pos.z) > 26.0 {
+                        self.rec.note(replay::Trick::Ceiling);
+                    }
+                    if self.ball.vel.length() > 26.0 {
+                        self.rec.note(replay::Trick::Redirect);
+                    }
+                }
+            }
+            let _ = ground;
+            self.rec.push(
+                dt,
+                replay::Frame {
+                    car: self.car.pos,
+                    car_rot: self.car.rot,
+                    ball: self.ball.pos,
+                    ball_rot: self.ball.rot,
+                    boosting: self.car.boost > 0.02 && self.car.vel.length() > 6.0,
+                },
+            );
+        }
         if ev.dodged {
             self.snd.fire(Sfx::Dodge);
             self.fx.dust(self.car.pos, self.car.up(), 3.0);
@@ -2825,6 +2887,27 @@ impl Game {
             self.fx.ring_burst(gp, [0.45, 1.0, 0.55, 1.0], true);
             self.fx.pad_sparkle(gp, true);
             if who == physics::WHO_PLAYER {
+                // how far the shot travelled decides a couple of the names
+                if self.car.pos.distance(gp) > 55.0 {
+                    self.rec.note(replay::Trick::LongShot);
+                }
+                let (title, score) = self.rec.moment(6.0);
+                self.toastf(&format!("{title}!"));
+                let frames = self.rec.frames();
+                if frames.len() > 20 {
+                    self.moments.push(replay::Moment { title, score, frames });
+                    // keep the best handful, rarest first
+                    self.moments.sort_by(|a, b| b.score.cmp(&a.score));
+                    self.moments.truncate(6);
+                    // watch it immediately if it was a good one — the whole
+                    // point is the beat after the goal
+                    if let Some(best) = self.moments.iter().position(|m| m.score >= 6) {
+                        if self.trial.is_none() && self.moments[best].score >= 6 {
+                            self.watching = Some((best, 0.0));
+                        }
+                    }
+                }
+                self.rec.clear_log();
                 self.goals += 1;
                 self.save.total_goals += 1;
                 self.combo = self.combo.max(1) + 2; // goals feed the combo hard
@@ -2872,6 +2955,23 @@ impl Game {
         let aerial_touch = !ev.touches.is_empty() && !self.car.on_ground && ball_air;
         if aerial_touch {
             self.air_link = 1.7;
+        }
+        // ---- REPLAY PLAYBACK: the game steps aside and shows you ----
+        if let Some((mi, t)) = self.watching {
+            let t2 = t + dt;
+            let frames_len = self.moments.get(mi).map(|m| replay::length_seconds(&m.frames)).unwrap_or(0.0);
+            if t2 >= frames_len {
+                self.watching = None;
+            } else {
+                self.watching = Some((mi, t2));
+                if let Some(m) = self.moments.get(mi) {
+                    if let Some((eye, focus)) = replay::cinema(&m.frames, t2) {
+                        self.cam.pos = eye;
+                        self.cam.look = focus;
+                        self.cam.up = Vec3::Y;
+                    }
+                }
+            }
         }
         self.tick_trial(dt);
         if ball_air && self.air_link > 0.0 {
@@ -2931,6 +3031,13 @@ impl Game {
     }
 
     fn draw_hud(&self, ui: &mut Vec<UiVert>, aspect: f32) {
+        // a replay owns the screen while it plays
+        if let Some((mi, t)) = self.watching {
+            if let Some(m) = self.moments.get(mi) {
+                hud::replay_banner(ui, aspect, &m.title, t, replay::length_seconds(&m.frames));
+                return;
+            }
+        }
         // TRIAL BANNER: what you are attempting, the clock, and a bar that
         // fills as you get there — plus the target to beat if you have one.
         if let Some(run) = self.trial.as_ref() {
@@ -3356,6 +3463,29 @@ impl Game {
                 .map(|k| 2.0 + k as f32);
             let px = pflag.unwrap_or(if glassy { 1.0 } else { 0.0 });
             push(&mut objs, mesh, None, s.mat, s.color, [px, em, s.spec, 0.0]);
+        }
+
+        // ---- REPLAY: draw the recorded car and ball ----
+        if let Some((mi, t)) = self.watching {
+            if let Some(m) = self.moments.get(mi) {
+                if let Some(f) = replay::pose_at(&m.frames, t) {
+                    let cm = &self.cars.models[self.cars.active];
+                    let base = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(self.cfg.car.size),
+                        f.car_rot,
+                        f.car,
+                    );
+                    for p in cm.prims.iter() {
+                        push(&mut objs, p.mesh_id, p.tex_id, base, p.color, [0.0, 0.0, 0.5, 0.0]);
+                    }
+                    let bm = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(self.ball.r),
+                        f.ball_rot,
+                        f.ball,
+                    );
+                    push(&mut objs, world::M_SPHERE, None, bm, [0.93, 0.93, 0.96, 1.0], [0.0, 0.03, 0.55, 0.0]);
+                }
+            }
         }
 
         // ---- GHOST: your best run on this trial, racing alongside ----

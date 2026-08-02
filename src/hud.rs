@@ -232,6 +232,21 @@ pub fn maps_row_h() -> f32 {
 pub const ONL_TOP: f32 = 0.60;
 pub const ONL_ROW_H: f32 = 0.105;
 
+/// The replay banner: what the game decided you just did.
+pub fn replay_banner(ui: &mut Vec<UiVert>, a: f32, title: &str, t: f32, total: f32) {
+    // letterbox: the clearest possible "this is a replay"
+    let bar = 0.12;
+    quad(ui, -1.0, 1.0 - bar, 1.0, 1.0, [0.02, 0.02, 0.04, 0.92]);
+    quad(ui, -1.0, -1.0, 1.0, -1.0 + bar, [0.02, 0.02, 0.04, 0.92]);
+    label_c(ui, 1.0 - bar * 0.62, 0.0128, a, GOLD, title);
+    label_c(ui, 1.0 - bar * 0.93, 0.0068, a, DIM, "REPLAY - ESC TO SKIP");
+    // a scrub line along the bottom bar
+    let p = (t / total.max(0.01)).clamp(0.0, 1.0);
+    let y = -1.0 + bar * 0.45;
+    quad(ui, -0.7, y, 0.7, y + 0.006, [0.25, 0.28, 0.34, 0.8]);
+    quad(ui, -0.7, y, -0.7 + 1.4 * p, y + 0.006, GOLD);
+}
+
 /// The in-run banner: goal, clock, progress, and the time to beat.
 #[allow(clippy::too_many_arguments)]
 pub fn trial_banner(
@@ -894,5 +909,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.59    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.60    ESC QUITS FROM THIS SCREEN");
 }

@@ -1927,6 +1927,41 @@ actually complete, running out of time fails you, records only improve,
 bests survive a save/load round trip, and ghosts replay where the run
 went (midpoint and clamped-past-the-end both correct).
 
+## v1.60.0 — the moment after the goal
+
+Rocket League's best trick is not its physics, it is the replay: the game
+stops, swings a camera round, and shows you what you did. Half of why a
+shot feels good is watching it again. Skydribble had none of that — the
+ball went in and play carried on.
+
+THE RECORDER runs always: a fixed ring buffer of the last twelve seconds of
+car and ball state at 30 Hz. Bounded by construction, so a ten-minute
+session costs the same as a ten-second one (verified: 360 frames held
+either way).
+
+TRICK RECOGNITION is the part I care about. The buffer also carries a log
+of what the PHYSICS reported — flip resets, pinches, dodges on landing,
+aerial touches, ball height, exit speed — so when a goal lands the game can
+name what happened rather than guess. Repeats collapse (a four-second air
+dribble is one entry, not two hundred), stale tricks fall out of the
+window, and the rarest one leads: "FLIP RESET INTO AIR DRIBBLE", not
+"GOAL". Nine tricks are recognised, weighted by rarity, and the weights
+also score the moment.
+
+THE CAMERA needs no director: it orbits the midpoint of car and ball,
+frames wider when they are far apart, and pulls in as the moment lands.
+Good goals (score 6 and up) play back automatically the instant they go in;
+R replays your best at any time; ESC skips. Letterbox bars and a scrub line
+make it unmistakably a replay, and the six best moments of a session are
+kept, rarest first.
+
+`--sim replay` checks it in fourteen assertions: the buffer stays bounded
+and holds the newest frames in order, the rarest trick leads the name, a
+second trick is mentioned, repeats collapse, a plain goal is just a goal,
+stale tricks leave the window, the camera keeps its distance and orbits and
+closes in, and playback interpolates between samples and clamps past the
+end.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -840,6 +840,81 @@ pub fn run(args: &[String]) {
             if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
         return;
     }
+    if name == "replay" {
+        // The replay layer: a fixed ring buffer, trick recognition that only
+        // ever reports what the physics reported, and a camera that frames
+        // the action without a director.
+        use crate::replay::{cinema, length_seconds, pose_at, Frame, Recorder, Trick, CAP, HZ};
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // the buffer must be bounded no matter how long you play
+        let mut r = Recorder::default();
+        for k in 0..(60 * 600) {
+            let x = k as f32 * 0.01;
+            r.push(
+                1.0 / 60.0,
+                Frame { car: Vec3::new(x, 1.0, 0.0), ball: Vec3::new(x, 2.0, 0.0), ..Default::default() },
+            );
+        }
+        let f = r.frames();
+        println!("   after 10 minutes: {} frames held ({} s at {} Hz)", f.len(), length_seconds(&f).round(), HZ);
+        check("the buffer stays bounded", f.len() == CAP);
+        // the window spans 12 s (7.2 units here); what matters is that the
+        // OLD frames were dropped — x started near 0 ten minutes ago
+        check("it holds the most RECENT frames", f[0].car.x > 300.0 && f.last().unwrap().car.x > f[0].car.x + 5.0);
+        check("frames are in order", f.windows(2).all(|w| w[1].car.x >= w[0].car.x));
+        // naming: rarest trick leads, and repeats do not spam the log
+        let mut r2 = Recorder::default();
+        for _ in 0..50 {
+            r2.push(1.0 / 60.0, Frame::default());
+            r2.note(Trick::Aerial);
+        }
+        r2.note(Trick::FlipReset);
+        r2.note(Trick::AirDribble);
+        let (title, score) = r2.moment(6.0);
+        println!("   named: \"{title}\" (score {score})");
+        check("the rarest trick leads the name", title.starts_with("FLIP RESET"));
+        check("a second trick is mentioned", title.contains("INTO"));
+        check("repeats are collapsed", score < 30);
+        let plain = Recorder::default().moment(6.0);
+        check("a plain goal is just a goal", plain.0 == "GOAL");
+        // old tricks fall out of the window
+        let mut r3 = Recorder::default();
+        r3.note(Trick::Ceiling);
+        for _ in 0..(8 * 60) {
+            r3.push(1.0 / 60.0, Frame::default());
+        }
+        r3.note(Trick::Aerial);
+        check("stale tricks leave the window", r3.moment(3.0).0 == "AERIAL");
+        // the camera: always frames the action, and moves
+        let mut frames = Vec::new();
+        for k in 0..120 {
+            let x = k as f32 * 0.5;
+            frames.push(Frame {
+                car: Vec3::new(x, 2.0, 0.0),
+                ball: Vec3::new(x + 4.0, 6.0, 1.0),
+                ..Default::default()
+            });
+        }
+        let total = length_seconds(&frames);
+        let (e0, f0) = cinema(&frames, 0.0).unwrap();
+        let (e1, f1) = cinema(&frames, total * 0.5).unwrap();
+        let (e2, _) = cinema(&frames, total).unwrap();
+        check("the camera keeps its distance", (e0 - f0).length() > 12.0 && (e1 - f1).length() > 10.0);
+        check("the camera orbits rather than sitting still", (e0 - e1).length() > 8.0 && (e1 - e2).length() > 8.0);
+        check("it pulls in as the moment lands", (e2 - f1).length() < (e0 - f0).length() + 30.0);
+        check("playback interpolates between samples", {
+            let a = pose_at(&frames, 0.0).unwrap().car.x;
+            let b = pose_at(&frames, 1.0 / HZ * 0.5).unwrap().car.x;
+            b > a && b < a + 0.5
+        });
+        check("playback clamps past the end", pose_at(&frames, total * 5.0).is_some());
+        println!("{}", if pass { "REPLAY: PASS" } else { "REPLAY: FAIL" });
+        return;
+    }
     if name == "trials" {
         // The challenge layer, checked headless: every trial points at a real
         // map, progress only comes from state the physics produces, the

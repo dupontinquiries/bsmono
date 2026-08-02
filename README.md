@@ -425,3 +425,5 @@ KUIPER runs live sky events: a world collapses into a black hole every five minu
 `--sim render` reports how much of each map survives culling, and the LOD triangle budget.
 
 TRIALS: fifteen challenges across eleven maps, with ghost replays of your best runs. `--sim trials` verifies the logic.
+
+Goals are replayed and NAMED from what the physics saw — press R to rewatch. `--sim replay` verifies the recorder, the trick recognition and the camera.
