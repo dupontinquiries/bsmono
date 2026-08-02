@@ -4,7 +4,11 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "gitmind",
         opts,
-        Box::new(|_cc| {
+        Box::new(|cc| {
+            // Without this, egui::Image silently draws nothing for every
+            // file:// URI — no panic, no log, just a blank where the preview
+            // tile should be.
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             let mut app = GitmindApp::default();
             // GITMIND_EGUI_TAB overrides the default starting tab — for automated screenshots/
             // testing (no UI-driving harness exists to click a tab button), not a user-facing
