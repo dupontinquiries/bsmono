@@ -630,6 +630,73 @@ pub fn run(args: &[String]) {
         check("and it is a pop, not a rocket", back.0 > 6.0 && back.0 < 18.0);
         check("forward flicks stay low", results.iter().find(|r| r.0 == "forward").map(|r| r.2 < 35.0).unwrap_or(false));
 
+        // ---- Does a flick answer to SPEED and to WHERE THE BALL SITS? ----
+        // In Rocket League both matter enormously: a flick at pace carries
+        // the car's momentum, and the ball's spot on the hood decides
+        // whether you drive it low or pop it up. A flick that ignores either
+        // reads as canned.
+        println!();
+        println!("{:<12} {:>8} {:>8} {:>8} {:>8}", "carry @", "5 m/s", "12 m/s", "20 m/s", "spread");
+        let flick_at = |speed: f32, along: f32| -> (f32, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            c.throttle = 1.0;
+            for _ in 0..240 {
+                if car.vel.length() >= speed {
+                    break;
+                }
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            c.throttle = 0.0;
+            let f = car.forward();
+            ball.pos = car.pos + f * along + car.up() * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..45 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            for _ in 0..12 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.throttle = 1.0;
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            let mut last = Vec3::ZERO;
+            for _ in 0..80 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    last = ball.vel;
+                }
+            }
+            let flat = Vec3::new(last.x, 0.0, last.z).length();
+            (last.length(), last.y.atan2(flat.max(0.01)).to_degrees())
+        };
+        let mut speed_spread = 0.0f32;
+        let mut angle_spread = 0.0f32;
+        for (label, along) in [("nose", 0.42f32), ("middle", 0.10), ("back", -0.22)] {
+            let a5 = flick_at(5.0, along);
+            let a12 = flick_at(12.0, along);
+            let a20 = flick_at(20.0, along);
+            println!(
+                "{:<12} {:>6.1}/{:<3.0} {:>5.1}/{:<3.0} {:>5.1}/{:<3.0} {:>7.1}",
+                label, a5.0, a5.1, a12.0, a12.1, a20.0, a20.1, a20.0 - a5.0
+            );
+            speed_spread = speed_spread.max(a20.0 - a5.0);
+            angle_spread = angle_spread.max((a5.1 - a20.1).abs());
+        }
+        check("a flick at pace is stronger than one at a crawl", speed_spread > 4.0);
+        println!("   (speed adds {speed_spread:.1} m/s across 5 -> 20 m/s)");
+
         // ---- AIR DRIBBLE: how long does the ball stay on the nose? ----
         println!();
         println!("{:<16} {:>9} {:>9} {:>8}", "air carry", "seconds", "touches", "drift");
@@ -674,6 +741,69 @@ pub fn run(args: &[String]) {
                 // hit — if this collapses, the carry has become a punt
                 check("an air dribble carries for seconds", carried > 1.5);
                 check("it is many small touches", touches > 15);
+            }
+        }
+        // ---- THE CATCH: turning a bouncing ball into a carry ----
+        // Every dribble starts here, and it is a skill in Rocket League
+        // because it depends on MATCHING the ball's motion: come in at the
+        // same speed and it settles on the hood, come in wrong and it
+        // bounces away. A physics that catches everything is as unfaithful
+        // as one that catches nothing.
+        println!();
+        println!("{:<18} {:>9} {:>9} {:>9}", "catch attempt", "settled", "bounces", "on car");
+        for (label, dv, drop) in [
+            ("matched speed", 0.0f32, 5.0f32),
+            ("too fast (+6)", 6.0, 5.0),
+            ("too slow (-6)", -6.0, 5.0),
+            ("steep drop", 0.0, 14.0),
+        ] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let gy = world.ground_h(0.0, 0.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, gy + 0.31, 6.0);
+            car.sync_rot();
+            car.vel = Vec3::new(0.0, 0.0, -11.0);
+            let mut ball = Ball::new();
+            // falling ahead of the car, travelling with it
+            ball.pos = Vec3::new(0.0, gy + drop, 0.0);
+            ball.vel = Vec3::new(0.0, -2.0, -11.0 + dv);
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            let mut bounces = 0;
+            let mut settled = 0.0f32;
+            let mut t = 0.0f32;
+            while t < 4.0 {
+                ev.touches.clear();
+                ev.bounces.clear();
+                // Hold the car's OWN speed — what a player does — but never
+                // chase the ball. A station-keeping controller drove under it
+                // whatever you did and caught everything; a fixed throttle
+                // caught nothing because the car would not hold pace. Whether
+                // the ball stays is then down to the approach itself.
+                c.throttle = if car.vel.length() < 11.0 { 1.0 } else { 0.0 };
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                bounces += ev.bounces.len();
+                let on_car = ball.pos.y > car.pos.y + 0.4 && ball.pos.distance(car.pos) < 2.0;
+                if on_car {
+                    settled += DT;
+                }
+                t += DT;
+            }
+            let riding = ball.pos.y > car.pos.y + 0.4 && ball.pos.distance(car.pos) < 2.2;
+            println!(
+                "{:<18} {:>8.2}s {:>9} {:>9}",
+                label,
+                settled,
+                bounces,
+                if riding { "yes" } else { "no" }
+            );
+            if label == "matched speed" {
+                check("a matched approach catches the ball", settled > 0.8);
+            }
+            if label == "too fast (+6)" {
+                check("a mistimed approach does not", settled < 0.8);
             }
         }
         println!("{}", if pass { "FLICK: PASS" } else { "FLICK: FAIL" });

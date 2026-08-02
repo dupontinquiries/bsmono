@@ -2132,6 +2132,41 @@ over-pitching loses it at 0.91 s, which is the correct failure mode. Both
 the duration and the touch count are asserted, so a future change that
 turns the carry back into a punt will say so.
 
+## v1.66.0 — flicks answer to pace and position, and the catch is a skill
+
+Two questions this time, both about whether the model has the RIGHT
+RELATIONSHIPS rather than the right numbers.
+
+DOES A FLICK ANSWER TO SPEED AND TO WHERE THE BALL SITS? In Rocket League
+both matter enormously — a flick at pace carries the car's momentum, and
+the ball's spot on the hood decides whether you drive it low or pop it up.
+A matrix of three carry positions against three approach speeds says ours
+does, without anything needing to change:
+
+    carry @        5 m/s     12 m/s    20 m/s
+    nose         18.3/30   22.2/21   24.4/19
+    middle       12.3/36   18.6/24   20.6/22
+    back          9.5/37   20.6/25   22.4/22
+
+Speed adds 13 m/s from a crawl to 20 m/s, and the position gradient is the
+right way round: nose flicks are the strongest and flattest (19 degrees),
+back-of-roof flicks the weakest and highest (37). That is the shape of the
+real thing, and it is now asserted.
+
+IS THE CATCH A SKILL? Every dribble starts by turning a bouncing ball into
+a carry, and in Rocket League that works by MATCHING the ball's motion. A
+physics that catches everything is as unfaithful as one that catches
+nothing. Ours: a matched approach settles the ball in 1.96 s and rides it;
+six metres per second too fast and it is gone in 0.18 s; too slow and it
+never settles; a fourteen-metre drop bounces away, as it should.
+
+Getting that measurement honest took three attempts and is the lesson of
+the session. First the harness drove a station-keeping controller under the
+ball, which corrected every mistake and caught everything. Then a fixed
+throttle caught nothing, because the car would not hold pace. The fair test
+is the one a player actually performs: hold your OWN speed, never chase the
+ball, and let the approach succeed or fail on its own terms.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
