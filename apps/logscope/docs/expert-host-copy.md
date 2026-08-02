@@ -104,3 +104,56 @@ have to be reconciled with the slab packing rather than adopted.
 **The transferable part is the format argument.** Converting at load is what forces the host copy, the
 q4 GEMM gap, and the IQ1_S expansion — and it is a decision this engine makes once, at the top, for
 reasons that were about kernel simplicity rather than memory.
+
+---
+
+# The expert predictor was ported from Colibri; the async read it feeds was not
+
+`MoeRouteHistory`'s own comment says where it came from:
+
+> Cross-layer routing history driving speculative expert prefetch — Colibri's `couple_prefetch`
+> (glm.c: "the routing of layer L predicts layer L+1's experts").
+
+The prediction works. What is missing is the half that makes a prediction worth having.
+
+**There is no asynchronous read anywhere in the engine.** No `madvise(WILLNEED)`, no `posix_fadvise`,
+no prefetch thread, no io_uring. And the loader deliberately sets the opposite hint:
+
+```rust
+// Expert fills touch scattered blocks, not a stream — tell the kernel so it stops reading ahead
+// [pages] we will never look at.
+m.advise(memmap2::Advice::Random);
+```
+
+That is right for scattered access and it also means **the kernel will not fetch a page until it is
+faulted on**. So the predictor identifies layer L+1's experts while layer L computes, and then the read
+still happens synchronously at the moment they are needed — the prediction changes nothing about when
+the bytes arrive.
+
+## What Colibri pairs it with
+
+`uring.h` submits positioned reads with a detail worth quoting, because it is the kind of thing only
+found by measuring:
+
+> Cold regular-file reads are allowed to execute inline during `io_uring_enter()` unless forced async.
+> That serializes the submitter on filesystems without native nonblocking buffered reads and **destroys
+> the intended I/O/compute overlap**. io-wq gives the ring a real bounded worker pool while CQEs retain
+> completion ordering.
+
+`sqe->flags = IOSQE_ASYNC;` — forced, deliberately, against the default.
+
+So even having built the async path, they found the obvious construction still serialized, and had to
+override it. **A prefetch that blocks the submitter is not a prefetch**, and that failure is invisible
+except as "streaming is slower than it should be".
+
+## The smallest version that would pay
+
+`madvise(WILLNEED)` on the predicted expert ranges, issued when the prediction is made. No thread, no
+io_uring, no new failure modes — the kernel starts the read and the fault later finds the page warm.
+It is one call against ranges the predictor already computes.
+
+Colibri's io_uring path is the fuller answer and carries the `IOSQE_ASYNC` trap with it. The `WILLNEED`
+version is where to start, because it tests whether the prediction is *accurate* before anything is
+built on the assumption that it is.
+
+**Read from both sources. Not measured** — no toolchain in the container after a reset.
