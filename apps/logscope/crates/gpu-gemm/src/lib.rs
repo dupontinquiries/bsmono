@@ -1827,8 +1827,20 @@ impl Gpu {
             None
         };
         let slice = staging.slice(..);
+        // MEASURED. This poll was recorded by nothing — not GPU_POLLS, not GPU_SYNC_NS — and it is
+        // the DECODE loop's readback, so the one wait that dominates decode was the one wait the
+        // profile could not see.
+        //
+        // That is why a real run reported "1 polls" and "sync 0ms of 19860ms" while a separate phase
+        // breakdown of the same run measured 15.5% sync: the profile was not wrong about the paths it
+        // watched, it was watching the wrong path. Every conclusion drawn from "setup 0.2% accounted"
+        // rested on a denominator missing its largest term.
         slice.map_async(wgpu::MapMode::Read, |_| {});
+        let t_sync = std::time::Instant::now();
+        GPU_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        GPU_SYNC_NS.fetch_add(t_sync.elapsed().as_nanos() as u64,
+                              std::sync::atomic::Ordering::Relaxed);
         let data = slice.get_mapped_range();
         let v = bytemuck::cast_slice::<u8, u32>(&data).to_vec();
         drop(data); staging.unmap();
