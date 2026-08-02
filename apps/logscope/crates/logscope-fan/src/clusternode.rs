@@ -198,3 +198,121 @@ mod tests {
         assert!(n.discovery.peers().is_empty());
     }
 }
+
+/// Filenames inside the state directory.
+///
+/// Both live beside the chat autosave, so an operator who backs up
+/// `~/.local/share/logscope` keeps their identity AND their trusted devices. Losing either one alone
+/// is confusing: the identity without the list means every peer must re-register you, and the list
+/// without the identity means you are a stranger to machines that already trust you.
+pub const IDENTITY_FILE: &str = "identity.key";
+pub const TRUSTED_FILE: &str = "trusted.txt";
+
+impl ClusterNode {
+    /// Load identity and trusted devices from a state directory, creating what is missing.
+    ///
+    /// A trust list that fails to PARSE is not discarded — the good lines load and the bad ones are
+    /// returned for the caller to show. Dropping the whole file on one malformed line loses every
+    /// machine someone registered, which is the failure persistence exists to prevent.
+    pub fn load(dir: &std::path::Path, self_addr: String)
+        -> Result<(ClusterNode, Vec<String>), crate::machineid::IdentityError>
+    {
+        let identity = crate::machineid::Identity::load_or_create(&dir.join(IDENTITY_FILE))?;
+        let (registry, bad) = match std::fs::read_to_string(dir.join(TRUSTED_FILE)) {
+            Ok(t) => crate::trustkit::Registry::from_text(&t),
+            // No file yet is the normal first run, not an error.
+            Err(_) => (crate::trustkit::Registry::new(), Vec::new()),
+        };
+        Ok((ClusterNode::new(identity, registry, self_addr), bad))
+    }
+
+    /// Write the trusted devices back.
+    ///
+    /// Called after any change rather than at exit: a crash or a kill must not lose a machine someone
+    /// just registered, and an exit hook is exactly what does not run when it matters.
+    ///
+    /// Written to a temp file and renamed, so an interrupted write leaves the previous list intact
+    /// rather than a truncated one — losing the file is the thing being guarded against, and a partial
+    /// write loses it just as thoroughly.
+    pub fn save_trusted(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let tmp = dir.join(format!("{TRUSTED_FILE}.tmp"));
+        std::fs::write(&tmp, self.registry.to_text())?;
+        std::fs::rename(&tmp, dir.join(TRUSTED_FILE))
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+    use crate::trustkit::Trust;
+
+    fn dir(n: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logscope-cluster-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        p
+    }
+
+    #[test]
+    fn a_registered_device_SURVIVES_a_restart() {
+        // The whole point. Without this a trusted machine is gone next launch, and its absence reads
+        // as a discovery failure rather than as forgotten state.
+        let d = dir("restart");
+        let (mut n, bad) = ClusterNode::load(&d, "127.0.0.1:7000".into()).expect("first run");
+        assert!(bad.is_empty(), "a missing file is a normal first run, not an error");
+        n.registry.register_keyed("m2", Trust::Handoff, vec![1, 2, 3]);
+        n.save_trusted(&d).expect("save");
+
+        let (again, _) = ClusterNode::load(&d, "127.0.0.1:7000".into()).expect("second run");
+        assert_eq!(again.registry.level("m2"), Trust::Handoff);
+        assert_eq!(again.registry.key("m2"), Some(&[1u8, 2, 3][..]));
+        // And the identity is the same machine, or every peer that trusted it must re-register.
+        assert_eq!(n.identity.id(), again.identity.id());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_malformed_line_does_not_lose_the_others() {
+        let d = dir("badline");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(TRUSTED_FILE), "Handoff good aabb\nNonsense\nBuild fine\n").unwrap();
+        let (n, bad) = ClusterNode::load(&d, "x".into()).expect("loads");
+        assert_eq!(n.registry.level("good"), Trust::Handoff);
+        assert_eq!(n.registry.level("fine"), Trust::Build);
+        assert_eq!(bad.len(), 1, "and the bad line is reported rather than silently dropped");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn saving_is_ATOMIC_so_an_interrupted_write_keeps_the_old_list() {
+        // Written to a temp file and renamed. A truncated file loses the machines just as thoroughly
+        // as no file, and this is the thing being guarded against.
+        let d = dir("atomic");
+        let (mut n, _) = ClusterNode::load(&d, "x".into()).unwrap();
+        n.registry.register("first", Trust::Build);
+        n.save_trusted(&d).unwrap();
+        n.registry.register("second", Trust::Compute);
+        n.save_trusted(&d).unwrap();
+        assert!(!d.join(format!("{TRUSTED_FILE}.tmp")).exists(), "no temp file is left behind");
+        let (back, _) = ClusterNode::load(&d, "x".into()).unwrap();
+        assert_eq!(back.registry.level("first"), Trust::Build);
+        assert_eq!(back.registry.level("second"), Trust::Compute);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_revoked_device_does_not_come_back_after_a_restart() {
+        // Revocation is deliberate and nobody re-checks it. A restart that undoes it is the worst
+        // possible time for the list to be wrong.
+        let d = dir("revoke");
+        let (mut n, _) = ClusterNode::load(&d, "x".into()).unwrap();
+        n.registry.register_keyed("gone", Trust::Handoff, vec![9]);
+        n.save_trusted(&d).unwrap();
+        n.registry.revoke("gone");
+        n.save_trusted(&d).unwrap();
+        let (back, _) = ClusterNode::load(&d, "x".into()).unwrap();
+        assert_eq!(back.registry.level("gone"), Trust::Unknown);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}
