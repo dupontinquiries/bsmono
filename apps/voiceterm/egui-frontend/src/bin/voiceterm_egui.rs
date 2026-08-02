@@ -82,6 +82,14 @@ struct VoicetermApp {
     graph: voiceterm_egui::graph_view::GraphView,
     archive: voiceterm_egui::bars::ArchiveView,
     bar_state: voiceterm_egui::bars::BarState,
+    /// The graph's SOURCE, not a prebuilt topology.
+    ///
+    /// A previous pass drew `Topology::new(&[], &[])` — an empty graph, which
+    /// the wiring checker now flags as a view fed nothing. The real path, from
+    /// the Qt bin's `nifty_topology`, is `niftyplot::parse(source)`: nodes and
+    /// edges come from text. Holding the SOURCE means the graph redraws when
+    /// the text changes, which is the point of a live diagram.
+    graph_source: String,
     /// The settings screen (QML settings page): sidebar ⚙ toggles the right panel; edits apply
     /// live (App::apply_settings + palette each frame) and persist to prefs.kv on change.
     settings_open: bool,
@@ -330,8 +338,23 @@ impl eframe::App for VoicetermApp {
                         }
                     }
                     CentralView::Graph => {
-                        let topo = voiceterm_egui::graph_view::nifty::Topology::new(&[], &[]);
-                        voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
+                        // Parsed from the source, exactly as the Qt bin's
+                        // nifty_topology does: parse, then take ids and edges.
+                        ui.add(egui::TextEdit::multiline(&mut self.graph_source)
+                               .desired_rows(3).hint_text("graph source"));
+                        let doc = nifty_core::niftyplot::parse(&self.graph_source);
+                        if doc.nodes.is_empty() {
+                            // An empty graph is a real state — an unwritten
+                            // diagram — but it must SAY so rather than drawing
+                            // an empty ring that looks like a failed render.
+                            ui.colored_label(c.text_weak, "no nodes — type a graph above");
+                        } else {
+                            let ids: Vec<String> = doc.nodes.iter().map(|n| n.id.clone()).collect();
+                            let edges: Vec<(String, String)> = doc.edges.iter()
+                                .map(|e| (e.from.clone(), e.to.clone())).collect();
+                            let topo = voiceterm_egui::graph_view::nifty::Topology::new(&ids, &edges);
+                            voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
+                        }
                     }
                     CentralView::Archive => {
                         ui.text_edit_singleline(&mut self.archive.query);
@@ -606,6 +629,7 @@ fn main() -> eframe::Result<()> {
                 graph: Default::default(),
                 archive: Default::default(),
                 bar_state: Default::default(),
+                graph_source: String::new(),
                 settings_open: false,
             }))
         }),
