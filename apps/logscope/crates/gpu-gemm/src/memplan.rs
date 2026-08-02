@@ -1254,3 +1254,76 @@ mod measurement_factor_tests {
         assert!((b - 75.0).abs() < 0.01, "headroom factor is 0.75, got {b:.2}/100");
     }
 }
+
+/// Would the MoE file-view path work for this checkpoint?
+///
+/// The streaming refusal reports ~50.6 GiB of host RAM for Llama-4 Scout, and that figure is the cost
+/// of the HOST-COPY path — dequantize every expert and requantize it into anonymous memory. There is
+/// another path: expert tensors read as views into the mmap and converted Q4_K→q4 **on the GPU**, the
+/// same way the dense weights already are, with no host copy at all.
+///
+/// The check runs BEFORE that path is attempted, so it refuses on a cost the model may never pay. And
+/// the file-view path prints when it declines — that line was absent from a real Scout log, meaning
+/// the views were not rejected, they were never asked.
+///
+/// This is the cheap question the precheck can ask first: are the expert tensors a type the view path
+/// reads, and do gate and up share one type so they can be packed together? Both are answerable from
+/// the tensor table without allocating anything.
+///
+/// Deliberately conservative: it answers "the types allow it", not "it will succeed". Span bounds and
+/// element counts are still checked at the real attempt, and a false *yes* here only means the load
+/// proceeds to a more precise refusal, while a false *no* refuses a model that would have run.
+pub fn file_views_plausible(gate_type: Option<u32>, up_type: Option<u32>, down_type: Option<u32>,
+                            q6k_views_enabled: bool) -> bool {
+    let allowed: &[u32] = if q6k_views_enabled { &[12, 14] } else { &[12] };
+    let (g, u, d) = match (gate_type, up_type, down_type) {
+        (Some(g), Some(u), Some(d)) => (g, u, d),
+        // A tensor the table does not have is not a type problem — it is a different layout, and the
+        // real attempt will say which.
+        _ => return false,
+    };
+    // gate and up are packed together, so they must agree. `down` is read separately and may differ,
+    // which is why RawExpertSrc carries gu_type and dn_type apart.
+    g == u && allowed.contains(&g) && allowed.contains(&d)
+}
+
+#[cfg(test)]
+mod file_view_tests {
+    use super::*;
+
+    #[test]
+    fn a_Q4_K_checkpoint_can_take_the_no_host_copy_path() {
+        // Llama-4 Scout: every expert tensor Q4_K. The 50.6 GiB host figure is for a path it does not
+        // need to take.
+        assert!(file_views_plausible(Some(12), Some(12), Some(12), false));
+    }
+
+    #[test]
+    fn gate_and_up_must_AGREE_because_they_are_packed_together() {
+        // down is read separately and may differ — RawExpertSrc carries gu_type and dn_type apart for
+        // exactly this reason, and a checkpoint mixing Q4_K gate with Q6_K up cannot be packed.
+        assert!(!file_views_plausible(Some(12), Some(14), Some(12), true));
+        assert!(file_views_plausible(Some(12), Some(12), Some(14), true), "down may differ");
+    }
+
+    #[test]
+    fn Q6_K_needs_its_flag_because_the_fill_shader_is_unproven() {
+        // The gate went green on lavapipe and RED on an M2. Until that is settled, Q6_K views stay
+        // behind LOGSCOPE_Q6K_VIEWS.
+        assert!(!file_views_plausible(Some(14), Some(14), Some(14), false));
+        assert!(file_views_plausible(Some(14), Some(14), Some(14), true));
+    }
+
+    #[test]
+    fn a_missing_tensor_is_NOT_a_type_problem() {
+        // Answering "no" here would attribute a layout difference to the quantization, and the real
+        // attempt reports which tensor is absent.
+        assert!(!file_views_plausible(None, Some(12), Some(12), false));
+    }
+
+    #[test]
+    fn an_f16_checkpoint_cannot_take_the_view_path() {
+        // The view path reads block-quantized experts; f16 has no blocks to convert on the GPU.
+        assert!(!file_views_plausible(Some(1), Some(1), Some(1), true));
+    }
+}
