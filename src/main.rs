@@ -893,21 +893,21 @@ fn main() {
     let hover_defs: [(&str, f32, physics::Hover); 6] = [
         // BRUTIS: a hover tank. Heavy, slow to settle, enormous soft field —
         // it does not shoot so much as lean on the ball.
-        ("brutis", 1.36, physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+        ("brutis", 1.36, physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0, ..physics::Hover::default() }),
         // AKIMBO: sleek and stiff. Almost no lateral hold, so it slides like
         // a puck and has to be flown rather than driven.
-        ("akimbo", 1.28, physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }),
+        ("akimbo", 1.28, physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0, ..physics::Hover::default() }),
         // MATRIS: the balanced one, and the place to start.
-        ("matris", 1.30, physics::Hover { ride: 0.52, stiff: 44.0, hold: 0.20, field_r: 3.2, field_k: 26.0 }),
+        ("matris", 1.30, physics::Hover { ride: 0.52, stiff: 44.0, hold: 0.20, field_r: 3.2, field_k: 26.0, ..physics::Hover::default() }),
         // VECTORZOID: shielded — the strongest field in the game, at the
         // cost of a soft cushion that pitches under its own thrust.
-        ("vectorzoid", 1.30, physics::Hover { ride: 0.58, stiff: 34.0, hold: 0.16, field_r: 4.0, field_k: 36.0 }),
+        ("vectorzoid", 1.30, physics::Hover { ride: 0.58, stiff: 34.0, hold: 0.16, field_r: 4.0, field_k: 36.0, ..physics::Hover::default() }),
         // TEMPEST: a hovertank. Rides high enough to clear things, and holds
         // enough to actually turn.
-        ("tempest", 1.40, physics::Hover { ride: 0.72, stiff: 36.0, hold: 0.26, field_r: 3.8, field_k: 24.0 }),
+        ("tempest", 1.40, physics::Hover { ride: 0.72, stiff: 36.0, hold: 0.26, field_r: 3.8, field_k: 24.0, ..physics::Hover::default() }),
         // CONTINGENCY: motorcycle-sized. Stiff, low, and a lance of a field —
         // it pokes the ball rather than pushing it.
-        ("contingency", 1.10, physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+        ("contingency", 1.10, physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0, ..physics::Hover::default() }),
     ];
     let hover_dir = dir.join("hover");
     let mut hovercars: Vec<model::Model> = Vec::new();
@@ -3325,6 +3325,26 @@ impl Game {
             self.snd.fire(Sfx::Dodge);
             self.fx.dust(self.car.pos, self.car.up(), 3.0);
         }
+        // ---- THE PULSE SHOVES EVERYTHING NEARBY ----
+        // Physics can reach the player's car and the ball; the bots live out
+        // here, so the blast is delivered as an event and applied to them by
+        // the caller. This is the half of the design that makes the pulse
+        // defensive rather than only a jump: an opponent lining up to knock
+        // you off the ball gets pushed away instead.
+        for &(at, r, k) in &ev.pulses {
+            for b in self.bots.iter_mut() {
+                let to = b.car.pos - at;
+                let d = to.length();
+                if d < r && d > 1e-4 {
+                    let f = 1.0 - (d / r).clamp(0.0, 1.0);
+                    // cars are heavier than the ball, so they move less
+                    b.car.vel += (to / d) * k * f * f * 0.55;
+                }
+            }
+            self.fx.ring_burst(at, [0.55, 0.85, 1.0, 1.0], false);
+            self.cam.add_shake(0.20);
+        }
+
         for &(gp, who) in &ev.goals {
             self.cam.add_shake(0.45);
             self.fx.ring_burst(gp, [0.45, 1.0, 0.55, 1.0], true);

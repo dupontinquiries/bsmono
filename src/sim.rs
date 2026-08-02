@@ -3844,9 +3844,9 @@ pub fn run(args: &[String]) {
         // ---- does it settle, and where? ----
         println!("{:<14} {:>10} {:>10} {:>10}", "chassis", "ride", "settle", "overshoot");
         let hovers: [(&str, physics::Hover); 3] = [
-            ("soft/wide", physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+            ("soft/wide", physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0, ..physics::Hover::default() }),
             ("balanced", physics::Hover::default()),
-            ("stiff/low", physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+            ("stiff/low", physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0, ..physics::Hover::default() }),
         ];
         let mut all_settled = true;
         for (nm, h) in hovers {
@@ -3890,7 +3890,7 @@ pub fn run(args: &[String]) {
             car.vel.normalize_or(f).angle_between(f).to_degrees().max(v0.angle_between(f).to_degrees() * 0.0)
         };
         let tyre = slide_of(None);
-        let hov = slide_of(Some(physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }));
+        let hov = slide_of(Some(physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0, ..physics::Hover::default() }));
         println!();
         println!("after a hard turn: a wheeled car drifts {tyre:.0} deg from its nose, a hovercar {hov:.0}");
         check("a hovercar slides where a tyre would grip", hov > tyre + 8.0);
@@ -3942,6 +3942,101 @@ pub fn run(args: &[String]) {
             }
             println!("field {v_plain:.1} m/s, pulse {v_pulse:.1} m/s");
             check("the pulse is the hovercar's shot", v_pulse > v_plain * 2.5);
+        }
+        // ---- TWO-TIER THRUST ----
+        // The design problem: a hovercar with no lateral grip and no boost
+        // cannot change direction at all, which is a far worse place to be
+        // than a wheeled car with an empty tank. So the base reserve has to
+        // come back OFTEN, and pad charge has to be worth collecting.
+        {
+            let h = physics::Hover::default();
+            let (mut car, world) = make(Some(h));
+            let ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.boost = true;
+            car.boost = h.base_tank;
+            car.charge = 0.0;
+            let mut t = 0.0f32;
+            let mut spent = 0.0f32;
+            while car.boost > 0.0 && t < 10.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+            }
+            spent = t;
+            c.boost = false;
+            let mut back = 0.0f32;
+            while car.boost < h.base_tank * 0.95 && back < 10.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                back += DT;
+            }
+            println!();
+            println!("base reserve: {spent:.2}s of thrust, back in {back:.2}s");
+            check("the base reserve refills faster than it drains", back < spent * 1.2);
+            check("and it is available again within about a second", back < 1.5);
+        }
+        // pad charge must actually be an upgrade
+        {
+            let h = physics::Hover::default();
+            let run = |charge: f32| -> f32 {
+                let (mut car, world) = make(Some(h));
+                let ball = Ball::new();
+                let mut c = physics::Controls::default();
+                c.boost = true;
+                car.charge = charge;
+                car.boost = h.base_tank;
+                for _ in 0..90 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                car.vel.length()
+            };
+            let base_only = run(0.0);
+            let charged = run(100.0);
+            println!("after 0.75s of thrust: base {base_only:.1} m/s, charged {charged:.1} m/s");
+            check("collected charge is the stronger tier", charged > base_only * 1.4);
+        }
+        // ---- THE PULSE ----
+        {
+            let h = physics::Hover::default();
+            let (mut car, world) = make(Some(h));
+            let mut ball = Ball::new();
+            ball.pos = car.pos + Vec3::new(1.8, 0.4, 0.0);
+            ball.prev = ball.pos;
+            let mut ev = StepEvents::default();
+            let v_before = ball.vel.length();
+            let y_before = car.vel.y;
+            let fired = physics::hover_pulse(&mut car, &mut ball, &mut ev);
+            println!();
+            println!(
+                "pulse: lift {:.1} m/s, ball {:.1} -> {:.1} m/s, blast events {}",
+                car.vel.y - y_before,
+                v_before,
+                ball.vel.length(),
+                ev.pulses.len()
+            );
+            check("the pulse lifts the car", fired && car.vel.y - y_before > 4.0);
+            check("it shoves the ball", ball.vel.length() > 3.0);
+            check("and it is reported so others get shoved too", ev.pulses.len() == 1);
+            // cooldown, not a resource: it must refuse and then return
+            let again = physics::hover_pulse(&mut car, &mut ball, &mut ev);
+            check("it will not fire twice at once", !again);
+            let c0 = physics::Controls::default();
+            let mut waited = 0.0f32;
+            while car.pulse_t > 0.0 && waited < 5.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c0, &cfg, DT);
+                waited += DT;
+            }
+            println!("   available again after {waited:.2}s");
+            check("but it always comes back", waited < h.pulse_cd + 0.2);
+            // a redirect: the blast should ADD to a ball already moving
+            let mut fast = Ball::new();
+            fast.pos = car.pos + Vec3::new(1.6, 0.3, 0.0);
+            fast.vel = Vec3::new(14.0, 0.0, 0.0);
+            fast.prev = fast.pos;
+            car.pulse_t = 0.0;
+            let before = fast.vel.length();
+            physics::hover_pulse(&mut car, &mut fast, &mut ev);
+            println!("   redirect: {before:.1} -> {:.1} m/s", fast.vel.length());
+            check("a moving ball is sped up, not stopped", fast.vel.length() > before);
         }
         println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
         return;

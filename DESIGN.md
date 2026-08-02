@@ -3125,6 +3125,38 @@ it. Hit-testing follows too — the panel is in a different place on a tall
 window, and a click has to land on the row it appears to be over. `--sim
 menus` checks both layouts.
 
+## v1.96.0 — hovercars get thrust that returns, and a pulse
+
+The diagnosis was right and worth restating, because it is not obvious: a
+hovercar with no lateral grip and no boost cannot change direction AT ALL.
+A wheeled car with an empty tank can still steer; a hovercar becomes a
+passenger. That is why they felt like a novelty rather than a role.
+
+TWO-TIER THRUST. Underneath everything there is now a small BASE reserve
+that refills faster than it drains — 0.91 s of thrust, back in 0.65 s — and
+pushes gently (55% of a wheeled car's boost). Pads no longer top that up:
+they fill a separate CHARGE pool which is spent first and pushes HARDER than
+a wheeled car's boost (125%). So a hovercar is never without a way to
+redirect itself, and a pad is still worth crossing the pitch for. Measured
+over three quarters of a second of thrust: 4.2 m/s on the base tier, 9.3 on
+collected charge.
+
+THE PULSE replaces the jump, which a wheeled chassis gets from pushing
+against the ground and a cushion cannot. It lifts the car 7.5 m/s straight
+up in the WORLD frame, and fires an omnidirectional blast that shoves the
+ball and everything else nearby away. That one move covers both gaps: the
+car can leave the ground to meet a ball, and it can refuse to be knocked off
+one — an opponent lining up to bump you gets pushed away instead. Physics
+can reach the player and the ball, so the blast is reported as an event and
+applied to the bots by the caller.
+
+It is on a COOLDOWN rather than a resource (1.6 s), for the same reason as
+the base reserve: a tool you can run out of is a tool that leaves you
+helpless at the worst moment.
+
+And it adds rather than replaces, which is what makes these redirect
+machines: a ball already travelling at 14 m/s leaves the blast at 21.8.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -459,3 +459,5 @@ Five cars are assembled from mined vehicle part layouts; `--sim parts` checks th
 Six hovercars: a cushion instead of wheels, momentum instead of grip, and a repulsor field that herds the ball. `--sim hover` verifies all three.
 
 `[` and `]` cycle cars in singleplayer, on QWERTY and Dvorak alike.
+
+Hovercars run a fast-regenerating base thrust plus stronger pad charge, and pulse instead of jumping.
