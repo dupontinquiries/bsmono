@@ -626,9 +626,11 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         let rd0 = normalize(qrot(qb, ldir));
         var acc3 = vec3(0.0);
         for (var k = 0; k < 2; k = k + 1) {
-            let h = fract(sin(dot(in.wpos.xz + f32(k) * 7.3, vec2(12.99, 78.23))) * 43758.5453);
-            let h2 = fract(h * 197.31);
-            let jit = vec3(h - 0.5, h2 - 0.5, fract(h * 31.7) - 0.5) * 0.035;
+            // a smooth offset per sample rather than a hash: two rays that
+            // differ by a fixed small angle soften the image without the
+            // salt-and-pepper a random direction gives
+            let ang = f32(k) * 2.399 + in.wpos.x * 0.7 + in.wpos.z * 0.5;
+            let jit = vec3(cos(ang), sin(ang), cos(ang * 1.7)) * 0.022;
             // base_dist 0 so the low-quality early-out cannot turn the view
             // into flat sky — a portal you cannot see through is just a wall
             acc3 = acc3 + trace_reflection(ro2, normalize(rd0 + jit), -1, 0.0);
@@ -642,8 +644,13 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         return vec4(pcol, 1.0);
     }
         if (glassy) {
-            let fres = pow(1.0 - max(dot(n, v), 0.0), 3.0);
-            f0 = mix(0.18, 0.92, fres);
+            // Glass raised f0 as high as 0.92, which sent nearly every glass
+            // fragment down the FULL reflection march — and on a map like
+            // PERPLEXUS half the screen is glass. Grazing angles still get a
+            // strong reflection, but the ceiling comes down and the falloff
+            // is gentler, so a face-on pane takes the cheap path.
+            let fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
+            f0 = mix(0.10, 0.72, fres);
         }
         // low-spec objects trade the full reflection march for a sky-tinted
         // sheen: visually a whisper, computationally half the glass bill
@@ -653,13 +660,23 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         if (amount > 0.03) {
             var rr = reflect(-v, n);
             if (glassy) {
-                // hash the surface point into a small cone around the mirror
-                // direction: cheap roughness, and it hides the banding a
-                // perfectly smooth curved surface would show
-                let h = fract(sin(dot(floor(in.wpos * 7.0), vec3(12.99, 78.23, 37.71))) * 43758.5453);
-                let h2 = fract(h * 197.31);
-                let jit = normalize(vec3(h - 0.5, h2 - 0.5, fract(h * 31.7) - 0.5));
-                rr = normalize(rr + jit * 0.16);
+                // FROSTED, NOT TILED. This used to hash floor(wpos * 7),
+                // which quantises the world into 14 cm cells — every
+                // fragment inside a cell got the SAME jitter, so the glass
+                // came out in visible blocks. A hash cannot be the answer
+                // here anyway: without temporal accumulation a per-pixel
+                // random direction is just static.
+                //
+                // A continuous ripple is both cheaper and correct: three
+                // sines across the surface wobble the reflection smoothly,
+                // which is what slightly imperfect glass actually does.
+                let w = in.wpos * 2.9;
+                let rip = vec3(
+                    sin(w.y * 2.3 + w.z * 1.7),
+                    sin(w.z * 2.1 + w.x * 1.9),
+                    sin(w.x * 2.7 + w.y * 1.3)
+                );
+                rr = normalize(rr + rip * 0.055);
             }
             if (cheap_refl) {
                 col = mix(col, sky_color(rr), amount * 0.8);

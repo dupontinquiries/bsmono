@@ -2420,6 +2420,40 @@ And it applied the roll as `-steer`, which is zero for a pure backflip, so
 the half-flip case exercised nothing: a half-flip dodges straight back and
 rolls AFTER the flip has started, so the roll is its own input.
 
+## v1.75.0 — the glass was tiled, and it was expensive
+
+Reported: the ray-traced look went blocky and slower somewhere between
+v1.44 and v1.55. Both symptoms trace to one change, v1.48's "rough glass".
+
+THE TILING. The roughness perturbed the reflection by hashing
+`floor(wpos * 7.0)` — which quantises the world into 14 cm cells, so every
+fragment inside a cell got the SAME jitter direction. That is a grid by
+construction. Measured by walking a line a millimetre at a time, the old
+hash jumps by up to 1.998 between adjacent samples (a complete direction
+flip at each cell boundary); the replacement moves by 0.0008.
+
+A hash was the wrong tool regardless: without temporal accumulation a
+per-pixel random direction is just static, and quantising it to hide the
+static is what produced the tiles. Three sines across the surface wobble
+the reflection CONTINUOUSLY instead, which is what slightly imperfect glass
+actually does, and it costs less than the hash did.
+
+THE COST. The same change raised glass f0 to 0.92 at grazing angles, which
+sent nearly every glass fragment down the full reflection march — and on
+PERPLEXUS half the screen is glass. The ceiling is 0.72 now with a gentler
+falloff, and the face-on value drops from 0.18 to 0.10, which is the number
+that matters: it is below the 0.14 threshold for the CHEAP sky-tinted
+reflection, so a pane viewed face-on — the fragments that fill the screen —
+no longer marches at all. Grazing angles still get the full treatment,
+which is where a reflection reads anyway.
+
+The portal view's per-sample hash had the same flaw and got the same
+treatment: a smooth angular offset per sample rather than a random one.
+
+`--sim render` now measures the perturbation's continuity directly, so a
+future roughness experiment that quantises space will fail rather than
+ship.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

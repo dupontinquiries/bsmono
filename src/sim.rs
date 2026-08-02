@@ -1638,6 +1638,43 @@ pub fn run(args: &[String]) {
             order_ok = batched && sorted_back_to_front;
 
         }
+        // ---- glass roughness must be CONTINUOUS ----
+        // A reflection perturbation that quantises space shows up as tiles.
+        // The old version hashed floor(wpos * 7), i.e. 14 cm cells: every
+        // fragment in a cell got the same jitter. This mirrors both the old
+        // and the new perturbation and walks a line through the world,
+        // measuring the biggest jump between samples a millimetre apart.
+        {
+            let old_jit = |p: Vec3| -> Vec3 {
+                let f = (p * 7.0).floor();
+                let h = ((f.x * 12.99 + f.y * 78.23 + f.z * 37.71).sin() * 43758.5453).fract();
+                let h2 = (h * 197.31).fract();
+                Vec3::new(h - 0.5, h2 - 0.5, (h * 31.7).fract() - 0.5).normalize_or(Vec3::X)
+            };
+            let new_jit = |p: Vec3| -> Vec3 {
+                let w = p * 2.9;
+                Vec3::new(
+                    (w.y * 2.3 + w.z * 1.7).sin(),
+                    (w.z * 2.1 + w.x * 1.9).sin(),
+                    (w.x * 2.7 + w.y * 1.3).sin(),
+                ) * 0.055
+            };
+            let (mut old_max, mut new_max) = (0.0f32, 0.0f32);
+            let mut p = Vec3::new(3.1, 2.2, -4.7);
+            let step = Vec3::new(0.001, 0.0004, 0.0007);
+            for _ in 0..20_000 {
+                let q = p + step;
+                old_max = old_max.max((old_jit(q) - old_jit(p)).length());
+                new_max = new_max.max((new_jit(q) - new_jit(p)).length());
+                p = q;
+            }
+            println!(
+                "glass roughness: largest jump per mm — hashed {old_max:.3} (tiles), rippled {new_max:.4}"
+            );
+            let ok = new_max < 0.01 && old_max > 0.5;
+            order_ok &= ok;
+            println!("   {}", if ok { "continuous: no tiling" } else { "STILL QUANTISED" });
+        }
         // ---- the ground: how much of 97k triangles survives culling? ----
         {
             let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
