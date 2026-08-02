@@ -7,16 +7,17 @@ tested; the flow does not run. This is where each stage stops.
 
 | # | stage | state | blocked on |
 |---|---|---|---|
-| 1 | this machine has an identity | **placeholder** | `crypto-kit` Ed25519 not wired; the id is identical on every install |
-| 2 | operator registers a peer by id | built (`machineid`, UI) | stage 1 — a shared placeholder id registers a twin |
-| 3 | registration binds a key | built (`trustkit::register_keyed`) | stage 1 supplies the key |
+| 1 | this machine has an identity | **done** — real Ed25519, persisted at `~/.local/share/logscope/identity.key` | — |
+| 2 | operator registers a peer by id | built (`machineid`, UI) | **nothing — exercisable now** |
+| 3 | registration binds a key | built (`trustkit::register_keyed`) | **nothing — exercisable now** |
 | 4 | find where the peer is now | built (`rendezvous`) | no announce; nothing writes an address anywhere |
 | 5 | learn our own public address | built (`reflexive`) | no socket; needs one STUN-shaped request |
 | 6 | decide punch vs relay | built (`natpath`) | stage 5 supplies the observations |
-| 7 | prove the peer is that peer | built (`peerauth`) | stage 1 supplies the keypair |
+| 7 | prove the peer is that peer | built (`peerauth`) | **nothing — exercisable now** |
 | 8 | place duties by reach | built (`workerkit`) | everything above |
 
-**Stage 1 gates five of the other seven.** It is also the smallest: generate an Ed25519 keypair, persist
+**Stage 1 is done.** It gated five of the other seven; three of those (2, 3, 7) are now exercisable with
+no network at all, and the remaining blockers are all one thing: **no socket has ever been opened.** It is also the smallest: generate an Ed25519 keypair, persist
 it beside the config, derive the id from the public half. `shared/crypto-kit` already provides the
 primitive; no crate here depends on it yet.
 
@@ -42,6 +43,10 @@ taken. Stage 5 answers it in one run.
 
 ## The immediate next step
 
-Add `crypto-kit` to `logscope-fan`, generate and persist an identity, and derive `machineid` from it.
-Until then the UI says so, in amber, rather than showing a plausible id for an identity that does not
-exist — the same failure as "✓ verified" for a run with no verifier.
+**Stages 4 and 5 share one dependency: a UDP socket.** Stage 5 needs a single request to a host that
+echoes the source address it saw; stage 4 needs a way to write an address somewhere the peer can read
+it, which `share-kit`'s `Mailbox` already models over a `put`/`get` backend.
+
+Do stage 5 first. It is one request, it classifies the NAT (`reflexive` needs two hosts to say
+anything), and its answer decides whether stage 6 ever needs a relay — which is currently the largest
+unknown in the whole flow and is a measurement, not a design question.
