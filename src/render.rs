@@ -1084,6 +1084,12 @@ impl Gpu {
         }
         self.queue.submit(Some(enc.finish()));
         frame.present();
+        // THE COUNTER HAS TO COUNT. This increment was added in the same
+        // change that made FPS mean "frames that reached the screen" — and
+        // it did not make it into the file, so `presented` stayed at zero
+        // and the readout dutifully reported 0 FPS forever. A counter is
+        // worth exactly as much as the line that advances it.
+        self.presented = self.presented.wrapping_add(1);
     }
 }
 

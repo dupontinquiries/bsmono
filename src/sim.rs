@@ -3529,6 +3529,21 @@ pub fn run(args: &[String]) {
         }
         println!("   in that same second: {presented} presented, {dropped} abandoned");
         check("abandoned frames are counted, not hidden", dropped > 0);
+        // THE COUNTER MUST ACTUALLY COUNT. The last version made FPS mean
+        // "frames that reached the screen" and then shipped without the line
+        // that advances the counter, so it read 0 forever. Check the source
+        // rather than the arithmetic: the increment has to exist next to the
+        // present call, because no amount of correct averaging saves a
+        // counter that never moves.
+        {
+            let src = include_str!("render.rs");
+            let has_present = src.contains("frame.present();");
+            let has_inc = src.contains("self.presented = self.presented.wrapping_add(1)")
+                || src.contains("self.presented += 1");
+            println!();
+            println!("   render.rs presents: {has_present}, and counts it: {has_inc}");
+            check("the present counter is actually incremented", has_present && has_inc);
+        }
         println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
         return;
     }
@@ -3574,6 +3589,21 @@ pub fn run(args: &[String]) {
         }
         println!("   in that same second: {presented} presented, {dropped} abandoned");
         check("abandoned frames are counted, not hidden", dropped > 0);
+        // THE COUNTER MUST ACTUALLY COUNT. The last version made FPS mean
+        // "frames that reached the screen" and then shipped without the line
+        // that advances the counter, so it read 0 forever. Check the source
+        // rather than the arithmetic: the increment has to exist next to the
+        // present call, because no amount of correct averaging saves a
+        // counter that never moves.
+        {
+            let src = include_str!("render.rs");
+            let has_present = src.contains("frame.present();");
+            let has_inc = src.contains("self.presented = self.presented.wrapping_add(1)")
+                || src.contains("self.presented += 1");
+            println!();
+            println!("   render.rs presents: {has_present}, and counts it: {has_inc}");
+            check("the present counter is actually incremented", has_present && has_inc);
+        }
         println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
         return;
     }
@@ -3626,6 +3656,20 @@ pub fn run(args: &[String]) {
             "a click above the list hits nothing",
             crate::hud::hit_row(crate::hud::LIST_TOP, crate::hud::TRIALS_ROW_H, 8, 0.95).is_none(),
         );
+        // the garage moves its panel to make room for the live view, so the
+        // rows are in a different place on a tall window than a wide one —
+        // and hit-testing has to follow, or clicks land on the wrong row
+        let mut layouts_ok = true;
+        for (label, aspect, top) in [
+            ("wide", 1.78f32, crate::hud::GARAGE_TOP),
+            ("tall", 0.75, crate::hud::GARAGE_TOP_TALL),
+        ] {
+            let mid = top - crate::hud::GARAGE_ROW_H * 3.5;
+            let hit = crate::hud::hit_row(top, crate::hud::GARAGE_ROW_H, crate::custom::slots().len(), mid);
+            println!("   {label} window (aspect {aspect}): row under the cursor is {hit:?}");
+            layouts_ok &= hit == Some(3);
+        }
+        check("both garage layouts hit-test where they draw", layouts_ok);
         check(
             "the garage rows are hit-testable too",
             crate::hud::hit_row(
@@ -3752,6 +3796,62 @@ pub fn run(args: &[String]) {
         println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
         return;
     }
+    if name == "keys" {
+        // `[` and `]` cycle cars. The subtlety is that a keyboard layout
+        // moves CHARACTERS around while the physical keys stay put: Dvorak
+        // puts the bracket characters where QWERTY has - and =, and puts /
+        // and = where QWERTY has the brackets. Matching only one of the two
+        // serves half the players, so both are matched — and this checks the
+        // combination does not accidentally swallow an unrelated key.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<52} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // (character produced, physical key) -> direction, mirroring main.rs
+        let dir_of = |ch: &str, phys_bracket_left: bool, phys_bracket_right: bool| -> i32 {
+            if ch == "[" || phys_bracket_left {
+                -1
+            } else if ch == "]" || phys_bracket_right {
+                1
+            } else {
+                0
+            }
+        };
+        println!("{:<26} {:>10} {:>10}", "player presses", "layout", "direction");
+        let cases: [(&str, &str, &str, bool, bool, i32); 6] = [
+            ("the [ key", "qwerty", "[", true, false, -1),
+            ("the ] key", "qwerty", "]", false, true, 1),
+            // Dvorak: the bracket CHARACTERS live on QWERTY's -/= keys, so
+            // the physical bracket flags are false and only the char matches
+            ("the [ character", "dvorak", "[", false, false, -1),
+            ("the ] character", "dvorak", "]", false, false, 1),
+            // ...and the physical bracket keys produce / and = on Dvorak, so
+            // a player reaching for the same POSITION still gets it
+            ("the same position", "dvorak", "/", true, false, -1),
+            ("the same position", "dvorak", "=", false, true, 1),
+        ];
+        let mut all_right = true;
+        for (what, layout, ch, pl, pr, want) in cases {
+            let got = dir_of(ch, pl, pr);
+            println!("{:<26} {:>10} {:>10}", what, layout, got);
+            all_right &= got == want;
+        }
+        check("both layouts reach the cycle, by char or by key", all_right);
+        // and nothing else does
+        let innocent = ["w", "a", "s", "d", "-", "\\", "'", ",", ".", "p", "/"];
+        let mut swallowed = Vec::new();
+        for ch in innocent {
+            // no physical bracket pressed: an ordinary key on any layout
+            if dir_of(ch, false, false) != 0 {
+                swallowed.push(ch);
+            }
+        }
+        println!("   ordinary keys swallowed: {:?}", swallowed);
+        check("no ordinary key is captured by accident", swallowed.is_empty());
+        println!("{}", if pass { "KEYS: PASS" } else { "KEYS: FAIL" });
+        return;
+    }
     if name == "hover" {
         // A hovercar should not merely look different. Three things decide
         // whether it plays differently: does it hold a ride height, does it
@@ -3774,9 +3874,9 @@ pub fn run(args: &[String]) {
         // ---- does it settle, and where? ----
         println!("{:<14} {:>10} {:>10} {:>10}", "chassis", "ride", "settle", "overshoot");
         let hovers: [(&str, physics::Hover); 3] = [
-            ("soft/wide", physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+            ("soft/wide", physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0, ..physics::Hover::default() }),
             ("balanced", physics::Hover::default()),
-            ("stiff/low", physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+            ("stiff/low", physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0, ..physics::Hover::default() }),
         ];
         let mut all_settled = true;
         for (nm, h) in hovers {
@@ -3820,7 +3920,7 @@ pub fn run(args: &[String]) {
             car.vel.normalize_or(f).angle_between(f).to_degrees().max(v0.angle_between(f).to_degrees() * 0.0)
         };
         let tyre = slide_of(None);
-        let hov = slide_of(Some(physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }));
+        let hov = slide_of(Some(physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0, ..physics::Hover::default() }));
         println!();
         println!("after a hard turn: a wheeled car drifts {tyre:.0} deg from its nose, a hovercar {hov:.0}");
         check("a hovercar slides where a tyre would grip", hov > tyre + 8.0);
@@ -3872,6 +3972,101 @@ pub fn run(args: &[String]) {
             }
             println!("field {v_plain:.1} m/s, pulse {v_pulse:.1} m/s");
             check("the pulse is the hovercar's shot", v_pulse > v_plain * 2.5);
+        }
+        // ---- TWO-TIER THRUST ----
+        // The design problem: a hovercar with no lateral grip and no boost
+        // cannot change direction at all, which is a far worse place to be
+        // than a wheeled car with an empty tank. So the base reserve has to
+        // come back OFTEN, and pad charge has to be worth collecting.
+        {
+            let h = physics::Hover::default();
+            let (mut car, world) = make(Some(h));
+            let ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.boost = true;
+            car.boost = h.base_tank;
+            car.charge = 0.0;
+            let mut t = 0.0f32;
+            let mut spent = 0.0f32;
+            while car.boost > 0.0 && t < 10.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+            }
+            spent = t;
+            c.boost = false;
+            let mut back = 0.0f32;
+            while car.boost < h.base_tank * 0.95 && back < 10.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                back += DT;
+            }
+            println!();
+            println!("base reserve: {spent:.2}s of thrust, back in {back:.2}s");
+            check("the base reserve refills faster than it drains", back < spent * 1.2);
+            check("and it is available again within about a second", back < 1.5);
+        }
+        // pad charge must actually be an upgrade
+        {
+            let h = physics::Hover::default();
+            let run = |charge: f32| -> f32 {
+                let (mut car, world) = make(Some(h));
+                let ball = Ball::new();
+                let mut c = physics::Controls::default();
+                c.boost = true;
+                car.charge = charge;
+                car.boost = h.base_tank;
+                for _ in 0..90 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                car.vel.length()
+            };
+            let base_only = run(0.0);
+            let charged = run(100.0);
+            println!("after 0.75s of thrust: base {base_only:.1} m/s, charged {charged:.1} m/s");
+            check("collected charge is the stronger tier", charged > base_only * 1.4);
+        }
+        // ---- THE PULSE ----
+        {
+            let h = physics::Hover::default();
+            let (mut car, world) = make(Some(h));
+            let mut ball = Ball::new();
+            ball.pos = car.pos + Vec3::new(1.8, 0.4, 0.0);
+            ball.prev = ball.pos;
+            let mut ev = StepEvents::default();
+            let v_before = ball.vel.length();
+            let y_before = car.vel.y;
+            let fired = physics::hover_pulse(&mut car, &mut ball, &mut ev);
+            println!();
+            println!(
+                "pulse: lift {:.1} m/s, ball {:.1} -> {:.1} m/s, blast events {}",
+                car.vel.y - y_before,
+                v_before,
+                ball.vel.length(),
+                ev.pulses.len()
+            );
+            check("the pulse lifts the car", fired && car.vel.y - y_before > 4.0);
+            check("it shoves the ball", ball.vel.length() > 3.0);
+            check("and it is reported so others get shoved too", ev.pulses.len() == 1);
+            // cooldown, not a resource: it must refuse and then return
+            let again = physics::hover_pulse(&mut car, &mut ball, &mut ev);
+            check("it will not fire twice at once", !again);
+            let c0 = physics::Controls::default();
+            let mut waited = 0.0f32;
+            while car.pulse_t > 0.0 && waited < 5.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c0, &cfg, DT);
+                waited += DT;
+            }
+            println!("   available again after {waited:.2}s");
+            check("but it always comes back", waited < h.pulse_cd + 0.2);
+            // a redirect: the blast should ADD to a ball already moving
+            let mut fast = Ball::new();
+            fast.pos = car.pos + Vec3::new(1.6, 0.3, 0.0);
+            fast.vel = Vec3::new(14.0, 0.0, 0.0);
+            fast.prev = fast.pos;
+            car.pulse_t = 0.0;
+            let before = fast.vel.length();
+            physics::hover_pulse(&mut car, &mut fast, &mut ev);
+            println!("   redirect: {before:.1} -> {:.1} m/s", fast.vel.length());
+            check("a moving ball is sped up, not stopped", fast.vel.length() > before);
         }
         println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
         return;
@@ -3945,6 +4140,40 @@ pub fn run(args: &[String]) {
             donors.iter().all(|(_, d)| d.iter().all(|p| p.1.abs() <= 1.01 && p.2.abs() <= 1.01 && p.3.abs() <= 1.01))
         });
         check("no two donors produce the same car", min_d > 0.10);
+        // ---- and are they actually BODIES? ----
+        // A layout is a set of part positions, not a vehicle. Dropped in on
+        // their own they leave daylight between the pieces, which is what
+        // made these read as half-built. The hull is derived from where the
+        // donor put its mass, so it belongs to the donor — but it has to
+        // actually span the car.
+        {
+            let mut ok_all = true;
+            for (nm, d) in donors {
+                let mut w = [0.0f32; 5];
+                let mut h = [0.0f32; 5];
+                for (_, x, y, z, sz) in d.iter().copied() {
+                    let k = (((z + 1.0) * 0.5 * 4.0).round() as usize).min(4);
+                    w[k] = w[k].max(x.abs() + sz * 0.5);
+                    h[k] = h[k].max(y.abs() + sz * 0.5);
+                }
+                let raw = w.iter().filter(|v| **v > 0.25).count();
+                // mirror the builder's fallback: a station with nothing near
+                // it borrows from its neighbours rather than pinching the
+                // hull to a point. SPEARHEAD is a spine and legitimately has
+                // mass at two stations — the question is whether the HULL
+                // still spans the car, not whether the donor did.
+                for k in 0..5 {
+                    if w[k] < 0.25 {
+                        w[k] = if k == 0 { w[1] * 0.7 } else if k == 4 { w[3] * 0.7 } else { (w[k - 1] + w[k + 1]) * 0.4 };
+                    }
+                    w[k] = w[k].clamp(0.30, 1.0);
+                }
+                let spans = w.iter().filter(|v| **v >= 0.30).count();
+                println!("   {nm:<10} donor mass at {raw}/5 stations, hull spans {spans}/5");
+                ok_all &= spans == 5;
+            }
+            check("every donor gives the hull a shape to take", ok_all);
+        }
         check(
             "the classes are varied, not all blocks",
             donors.iter().all(|(_, d)| {
@@ -4197,6 +4426,98 @@ pub fn run(args: &[String]) {
                 corners.iter().filter(|c| **c >= 60).count(),
                 format!("{:.2}/{:.2}", rad.iter().cloned().fold(9.9f32, f32::min), rad.iter().cloned().fold(0.0f32, f32::max)),
                 if ok4 { "4 wheels" } else { "no split" }
+            );
+        }
+
+        // ---- IS THE AXLE WHERE WE THINK IT IS? ----
+        // The pivot used to come from the cluster's median, which is dragged
+        // off the axle by any bodywork the cluster caught — and a wheel that
+        // turns about a point which is not its own centre wobbles. Compare
+        // the median against a least-squares circle fit: the distance
+        // between them IS the wobble, and the residual says whether the
+        // points are really a circle at all.
+        println!();
+        println!("{:<12} {:>12} {:>12} {:>10}", "model", "median->fit", "residual", "verdict");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            let half = [(hi[0] - lo[0]) * 0.5, (hi[1] - lo[1]) * 0.5, (hi[2] - lo[2]) * 0.5];
+            // front-left corner is enough to characterise the method
+            let cl: Vec<[f32; 2]> = pts
+                .iter()
+                .filter(|p| {
+                    let q = [p[0] - mid[0], p[1] - mid[1], p[2] - mid[2]];
+                    q[1] < -half[1] * 0.15 && q[0] < -half[0] * 0.45 && q[2] < -half[2] * 0.25
+                })
+                .map(|p| [p[1] - mid[1], p[2] - mid[2]])
+                .collect();
+            if cl.len() < 60 {
+                println!("{:<12} {:>12} {:>12} {:>10}", n.trim_end_matches(".glb"), "-", "-", "no cluster");
+                continue;
+            }
+            let mut ys: Vec<f32> = cl.iter().map(|p| p[0]).collect();
+            let mut zs: Vec<f32> = cl.iter().map(|p| p[1]).collect();
+            ys.sort_by(f32::total_cmp);
+            zs.sort_by(f32::total_cmp);
+            let (m0, m1) = (ys[ys.len() / 2], zs[zs.len() / 2]);
+            let (mut cy, mut cz) = (m0, m1);
+            for round in 0..2 {
+                let mut rs: Vec<f32> = cl.iter().map(|p| ((p[0] - cy).powi(2) + (p[1] - cz).powi(2)).sqrt()).collect();
+                rs.sort_by(f32::total_cmp);
+                let rmed = rs[rs.len() / 2];
+                let (mut sx, mut sy, mut sxx, mut syy, mut sxy, mut sr2x, mut sr2y, mut cnt) =
+                    (0.0f64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0f64);
+                for p in cl.iter() {
+                    let (u, v) = ((p[0] - cy) as f64, (p[1] - cz) as f64);
+                    if round == 1 && ((u * u + v * v).sqrt() as f32 - rmed).abs() > rmed * 0.45 {
+                        continue;
+                    }
+                    let r2 = u * u + v * v;
+                    sx += u; sy += v; sxx += u * u; syy += v * v; sxy += u * v;
+                    sr2x += r2 * u; sr2y += r2 * v; cnt += 1.0;
+                }
+                if cnt < 24.0 { break; }
+                let (a11, a12, a22) = (sxx - sx * sx / cnt, sxy - sx * sy / cnt, syy - sy * sy / cnt);
+                let (b1, b2) = (0.5 * (sr2x - (sxx + syy) * sx / cnt), 0.5 * (sr2y - (sxx + syy) * sy / cnt));
+                let det = a11 * a22 - a12 * a12;
+                if det.abs() < 1e-9 { break; }
+                cy += ((b1 * a22 - b2 * a12) / det) as f32;
+                cz += ((a11 * b2 - a12 * b1) / det) as f32;
+            }
+            let moved = (((cy - m0).powi(2) + (cz - m1).powi(2)).sqrt()) / half[1];
+            let mut rs: Vec<f32> = cl.iter().map(|p| ((p[0] - cy).powi(2) + (p[1] - cz).powi(2)).sqrt()).collect();
+            rs.sort_by(f32::total_cmp);
+            let rmed = rs[rs.len() / 2];
+            let inl: Vec<f32> = rs.iter().copied().filter(|r| (r - rmed).abs() < rmed * 0.45).collect();
+            let mean = inl.iter().sum::<f32>() / inl.len().max(1) as f32;
+            let resid = (inl.iter().map(|r| (r - mean).powi(2)).sum::<f32>() / inl.len().max(1) as f32).sqrt() / mean.max(1e-6);
+            println!(
+                "{:<12} {:>11.1}% {:>11.1}% {:>10}",
+                n.trim_end_matches(".glb"),
+                moved * 100.0,
+                resid * 100.0,
+                if resid < 0.30 { "round" } else { "not a wheel" }
             );
         }
 
@@ -4528,6 +4849,36 @@ pub fn run(args: &[String]) {
             }
             let plat_ns = t.elapsed().as_nanos() as f32 / n as f32;
             println!("PERPLEXUS per call: sdf {sdf_ns:.0} ns, gravity_dir {grav_ns:.0} ns, platform_vel {plat_ns:.0} ns");
+        {
+            // SDF EVALUATIONS PER STEP. Timing a debug build is noise; this
+            // is exact. The normal is four evaluations and the same point is
+            // asked for twice a frame (the ground solve, then gravity_dir),
+            // so the cache should show up here as a clean reduction.
+            let mut w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let mut ball = Ball::new();
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 0.5, 0.0);
+            car.sync_rot();
+            let cfg = Config::default();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let before = w.sdf_calls();
+            let steps = 600;
+            for _ in 0..steps {
+                let mut ev = StepEvents::default();
+                physics::step(&mut car, &mut ball, &mut w, &c, &cfg, DT, &mut ev);
+            }
+            let per = (w.sdf_calls() - before) as f32 / steps as f32;
+            println!("   {per:.1} SDF evaluations per physics step (car + ball)");
+        }
+        {
+            // gravity_dir walks ONE cell, so the worst cell is the worst case
+            // of the whole function — and a mean far below the worst means
+            // the cells are the wrong size rather than the map being busy.
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let (used, mean, worst) = w.grav_cell_stats();
+            println!("   gravity index: {used} cells used, {mean:.1} nodes each, worst {worst}");
+        }
             println!("   (every car and the ball hit all three every frame)");
         }
         return;

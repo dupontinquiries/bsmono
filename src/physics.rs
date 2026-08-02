@@ -67,6 +67,12 @@ pub struct Car {
     /// car does is wrong for it: it does not sit ON the ground, it does not
     /// grip sideways, and it does not strike the ball with its bodywork.
     pub hover: Option<Hover>,
+    /// pad-collected charge, spent before the base reserve (hovercars)
+    pub charge: f32,
+    /// seconds until the pulse is available again
+    pub pulse_t: f32,
+    /// counts up while a pulse is firing, for the effect
+    pub pulse_fire: f32,
     pub wheel_spin: f32,
     pub steer_vis: f32,
     // jump / dodge state
@@ -99,11 +105,50 @@ pub struct Hover {
     pub hold: f32,
     pub field_r: f32,
     pub field_k: f32,
+    // ---- TWO-TIER THRUST ----
+    // A hovercar with no lateral grip cannot change direction without
+    // thrust, so an empty tank leaves it a passenger — far worse than for a
+    // wheeled car, which can always steer. It therefore carries a small
+    // BASE reserve that refills quickly and pushes gently, and spends
+    // PAD-collected charge first at a higher output than a wheeled car gets.
+    /// base tank size, in the same units as the wheeled car's 0..100
+    pub base_tank: f32,
+    /// base refill per second — high on purpose: it has to come back often
+    pub base_regen: f32,
+    /// thrust multiplier while running on the base reserve
+    pub base_power: f32,
+    /// thrust multiplier while running on collected charge
+    pub charge_power: f32,
+    // ---- PULSE ----
+    /// seconds between pulses
+    pub pulse_cd: f32,
+    /// upward impulse it gives the car
+    pub pulse_lift: f32,
+    /// radius and strength of the omnidirectional blast
+    pub pulse_r: f32,
+    pub pulse_k: f32,
 }
 
 impl Default for Hover {
     fn default() -> Hover {
-        Hover { ride: 0.55, stiff: 42.0, hold: 0.18, field_r: 3.2, field_k: 26.0 }
+        Hover {
+            ride: 0.55,
+            stiff: 42.0,
+            hold: 0.18,
+            field_r: 3.2,
+            field_k: 26.0,
+            base_tank: 30.0,
+            // Faster than it drains, deliberately. A hovercar that has to
+            // WAIT for thrust is a hovercar that cannot steer, so the base
+            // tier is designed to be back before you miss it.
+            base_regen: 44.0,
+            base_power: 0.55,
+            charge_power: 1.25,
+            pulse_cd: 1.6,
+            pulse_lift: 7.5,
+            pulse_r: 5.0,
+            pulse_k: 15.0,
+        }
     }
 }
 
@@ -122,6 +167,9 @@ impl Car {
             wheel_r: 0.11,
             drive: crate::model::Drive::Combustion,
             hover: None,
+            charge: 0.0,
+            pulse_t: 0.0,
+            pulse_fire: 0.0,
             half_w: 0.32,
             susp: 0.0,
             prev: Vec3::ZERO,
@@ -284,6 +332,9 @@ pub struct StepEvents {
     pub goals: Vec<(Vec3, u8)>,                 // net opening pos + last toucher
     pub jumped: bool,
     pub dodged: bool,
+    /// a hovercar's pulse fired here, with this radius and strength — the
+    /// caller applies it to bots and peers, which physics cannot reach
+    pub pulses: Vec<(Vec3, f32, f32)>,
     pub pinched: bool,
     pub blasted: bool,
     pub ball_bounce: Option<(Vec3, f32)>, // world-contact point + impact speed
@@ -344,6 +395,10 @@ pub fn step(
     step_bodies(world, car, ball, dt, cfg.arena.gravity);
     collide_car_ball(car, ball, cfg, WHO_PLAYER, ev);
     hover_field(car, ball, dt, c.boost, ev);
+    // A hovercar's jump is the pulse: it has no wheels to push off with.
+    if car.hover.is_some() && c.jump_pressed && hover_pulse(car, ball, ev) {
+        ev.jumped = true;
+    }
 
     // blast-off launchers: anything on the ring gets the arrow
     for i in 0..world.launchers.len() {
@@ -372,7 +427,13 @@ pub fn step(
         let r = if p.big { 1.7 } else { 1.05 };
         let d = car.pos - p.pos;
         if d.y.abs() < 2.2 && Vec3::new(d.x, 0.0, d.z).length() < r {
-            car.boost = (car.boost + if p.big { 100.0 } else { 12.0 }).min(100.0 * cfg.car.boost_max);
+            // a hovercar's pads fill the CHARGE pool, not the base reserve:
+            // that is what makes picking one up matter to it
+            if car.hover.is_some() {
+                car.charge = (car.charge + if p.big { 100.0 } else { 12.0 }).min(100.0 * cfg.car.boost_max);
+            } else {
+                car.boost = (car.boost + if p.big { 100.0 } else { 12.0 }).min(100.0 * cfg.car.boost_max);
+            }
             p.timer = if p.big { 10.0 } else { 4.0 };
             ev.pads_taken += 1;
             ev.pad_hits.push((p.pos, p.big));
@@ -653,7 +714,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     // jump buffering: remember a press for a beat so hitting jump a frame
     // before touchdown still hops the instant wheels touch (the "getting my
     // jump back is slow" fix — the press used to be eaten mid-air)
-    if c.jump_pressed {
+    if (c.jump_pressed && car.hover.is_none()) {
         car.jbuf = 0.09;
     } else {
         car.jbuf = (car.jbuf - dt).max(0.0);
@@ -859,7 +920,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
 
         // first jump (a buffered press from just before touchdown counts);
         // wooting depth trims the impulse a touch for takeoff-pitch control
-        if c.jump_pressed || car.jbuf > 0.0 {
+        if (c.jump_pressed && car.hover.is_none()) || car.jbuf > 0.0 {
             car.jbuf = 0.0;
             ev.jumped = true;
             let depth = 0.95 + 0.05 * c.jump_depth.clamp(0.0, 1.0);
@@ -1047,7 +1108,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             car.jump_hold -= dt;
         }
 
-        if c.jump_pressed && car.has_dodge && car.dodge_window > 0.0 {
+        if (c.jump_pressed && car.hover.is_none()) && car.has_dodge && car.dodge_window > 0.0 {
             car.jbuf = 0.0; // an intentional dodge shouldn't also hop on land
             // dodge direction in body frame: steer right = +x, throttle fwd = -z
             let d2 = Vec3::new(c.steer, 0.0, -c.throttle);
@@ -1233,7 +1294,35 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     if cfg.car.unlimited_boost {
         car.boost = tank;
     }
-    if c.boost && car.boost > 0.0 {
+    if let Some(h) = car.hover {
+        // TWO TIERS. Collected charge is spent first and pushes harder than
+        // a wheeled car's boost; underneath it a small base reserve refills
+        // fast and pushes gently. The point is that a hovercar is never
+        // completely without thrust — with no lateral grip, an empty tank
+        // would leave it unable to change direction at all, which is a much
+        // worse place to be than a wheeled car with an empty tank.
+        car.pulse_t = (car.pulse_t - dt).max(0.0);
+        car.pulse_fire = (car.pulse_fire - dt * 4.0).max(0.0);
+        if c.boost {
+            if car.charge > 0.0 {
+                car.vel += car.forward() * BOOST_ACCEL * cfg.car.boost * h.charge_power * dt;
+                if !cfg.car.unlimited_boost {
+                    car.charge = (car.charge - BOOST_DRAIN * dt).max(0.0);
+                }
+            } else if car.boost > 0.0 {
+                car.vel += car.forward() * BOOST_ACCEL * cfg.car.boost * h.base_power * dt;
+                if !cfg.car.unlimited_boost {
+                    car.boost = (car.boost - BOOST_DRAIN * dt).max(0.0);
+                }
+            }
+        } else {
+            // the base reserve comes back quickly whether or not the config
+            // gives wheeled cars any regen at all
+            car.boost = (car.boost + h.base_regen * dt).min(h.base_tank);
+        }
+        car.boost = car.boost.min(h.base_tank);
+        car.charge = car.charge.min(tank);
+    } else if c.boost && car.boost > 0.0 {
         car.vel += car.forward() * BOOST_ACCEL * cfg.car.boost * dt;
         if !cfg.car.unlimited_boost {
             car.boost = (car.boost - BOOST_DRAIN * dt).max(0.0);
@@ -1241,7 +1330,9 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     } else if cfg.car.boost_regen > 0.0 {
         car.boost = (car.boost + cfg.car.boost_regen * dt).min(tank);
     }
-    car.boost = car.boost.min(tank);
+    if car.hover.is_none() {
+        car.boost = car.boost.min(tank);
+    }
 
     // integrate rotation (body-frame angular velocity)
     if !car.on_ground {
@@ -1503,6 +1594,40 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
 }
 
 // ---------------------------------------------------- car <-> ball -------
+/// THE PULSE — a hovercar's jump, and its only way to fight.
+///
+/// A hovercar has no wheels to push off with, so it cannot jump or flip. In
+/// exchange it gets a shove: an omnidirectional blast that lifts the car and
+/// pushes the ball AND anything else nearby away from it. That single move
+/// covers the two things the chassis was missing — it can leave the ground
+/// to meet a ball, and it can refuse to be knocked off one. Used on a ball
+/// already moving, the blast adds to the shot rather than replacing it,
+/// which is why a redirect is the thing these are for.
+///
+/// It is on a cooldown rather than a resource, so it is always eventually
+/// available — the same reasoning as the base thrust reserve.
+pub fn hover_pulse(car: &mut Car, ball: &mut Ball, ev: &mut StepEvents) -> bool {
+    let Some(h) = car.hover else { return false };
+    if car.pulse_t > 0.0 {
+        return false;
+    }
+    car.pulse_t = h.pulse_cd;
+    car.pulse_fire = 1.0;
+    // lift: straight up in the WORLD, so it works whatever the car is doing
+    car.vel += Vec3::Y * h.pulse_lift;
+    // and the blast, falling off to nothing at the rim
+    let to = ball.pos - car.pos;
+    let d = to.length();
+    if d < h.pulse_r + ball.r && d > 1e-4 {
+        let f = 1.0 - (d / (h.pulse_r + ball.r)).clamp(0.0, 1.0);
+        let push = h.pulse_k * f * f;
+        ball.vel += (to / d) * push;
+        ev.touches.push((ball.pos - (to / d) * ball.r, push));
+    }
+    ev.pulses.push((car.pos, h.pulse_r, h.pulse_k));
+    true
+}
+
 /// THE REPULSOR FIELD. A hovercar has no bodywork worth hitting a ball
 /// with — it is held up by pressure and it moves the ball the same way. A
 /// cone in front of the nose pushes the ball away, hardest straight ahead

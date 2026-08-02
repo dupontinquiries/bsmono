@@ -3075,6 +3075,159 @@ like a puck, CONTINGENCY pokes with a lance, TEMPEST rides high enough to
 clear things, VECTORZOID has the strongest field in the game, MATRIS is
 where to start.
 
+## v1.94.0 — [ and ] cycle cars
+
+With thirty-odd cars, walking to the garage to try the next one is the wrong
+amount of friction. `[` and `]` step through them in place.
+
+THE LAYOUT PROBLEM is the whole of the work here. A keyboard layout moves
+CHARACTERS while the physical keys stay put: Dvorak puts the bracket
+characters where QWERTY has - and =, and puts / and = where QWERTY has the
+brackets. Matching only the character serves the player who thinks "press
+the bracket"; matching only the position serves the one who thinks "press
+the key next to P". Both are matched, so both get what they reached for, and
+`--sim keys` confirms the combination captures nothing else — every ordinary
+key, including the / and - that Dvorak users hit constantly, passes through
+untouched.
+
+SINGLEPLAYER ONLY. In a net session the other players have been told which
+car you are driving and are predicting against its hitbox; swapping it
+mid-match would desync them.
+
+The swap also lifts the car clear of the floor if the new model is taller,
+rather than leaving it half-buried, and toasts the name and position in the
+list so you know where you are in thirty cars.
+
+## v1.95.0 — the garage puts the car on stage
+
+The customizer described a car in words while the car itself sat behind the
+panel. Twenty skins, six rigs and twelve paints are hard to choose between
+when you cannot see any of them.
+
+THE LIVE VIEW IS THE REAL CAR, not a thumbnail: the same model pushed into
+the scene a few metres in front of the camera, on a slow turntable with its
+wheels turning. Because it is genuinely in the scene it gets the real skin
+shader, the real rig motion, the real reflections and the real lighting —
+and none of that has to be kept in sync with a separate preview path, which
+is the usual way a preview drifts out of date. It stands upright in the
+world rather than in the camera's frame, since a car leaning with the camera
+reads as broken.
+
+THE PANEL MOVES ASIDE RATHER THAN THE CAR MOVING BEHIND IT. On a wide window
+there is room to the right and none above, so the car goes right and the
+panel takes the left. On a tall or square one the reverse: the car goes
+above and the panel drops to the lower part. The dimmer follows the panel
+instead of covering the screen, so the stage stays bright.
+
+The rows, dots, swatches and blurb are all laid out from the panel's own
+bounds now rather than from fixed screen coordinates, so they reflow with
+it. Hit-testing follows too — the panel is in a different place on a tall
+window, and a click has to land on the row it appears to be over. `--sim
+menus` checks both layouts.
+
+## v1.96.0 — hovercars get thrust that returns, and a pulse
+
+The diagnosis was right and worth restating, because it is not obvious: a
+hovercar with no lateral grip and no boost cannot change direction AT ALL.
+A wheeled car with an empty tank can still steer; a hovercar becomes a
+passenger. That is why they felt like a novelty rather than a role.
+
+TWO-TIER THRUST. Underneath everything there is now a small BASE reserve
+that refills faster than it drains — 0.91 s of thrust, back in 0.65 s — and
+pushes gently (55% of a wheeled car's boost). Pads no longer top that up:
+they fill a separate CHARGE pool which is spent first and pushes HARDER than
+a wheeled car's boost (125%). So a hovercar is never without a way to
+redirect itself, and a pad is still worth crossing the pitch for. Measured
+over three quarters of a second of thrust: 4.2 m/s on the base tier, 9.3 on
+collected charge.
+
+THE PULSE replaces the jump, which a wheeled chassis gets from pushing
+against the ground and a cushion cannot. It lifts the car 7.5 m/s straight
+up in the WORLD frame, and fires an omnidirectional blast that shoves the
+ball and everything else nearby away. That one move covers both gaps: the
+car can leave the ground to meet a ball, and it can refuse to be knocked off
+one — an opponent lining up to bump you gets pushed away instead. Physics
+can reach the player and the ball, so the blast is reported as an event and
+applied to the bots by the caller.
+
+It is on a COOLDOWN rather than a resource (1.6 s), for the same reason as
+the base reserve: a tool you can run out of is a tool that leaves you
+helpless at the worst moment.
+
+And it adds rather than replaces, which is what makes these redirect
+machines: a ball already travelling at 14 m/s leaves the blast at 21.8.
+
+## v1.97.0 — bodies for the assembled cars, and better axles
+
+THE ASSEMBLED CARS HAD NO BODY. A mined layout is a set of PART POSITIONS,
+not a vehicle: dropping those in on their own leaves daylight between the
+pieces, which is exactly why they read as half-built. A donor's parts
+decorate a body — they are not the body.
+
+Each now gets a lofted hull first, with its section widths and heights taken
+from where the donor actually put its mass, so the shape still belongs to
+the donor rather than being a generic blob. A station with nothing near it
+borrows from its neighbours instead of pinching the hull to a point, which
+matters for SPEARHEAD: it is a rocket, it has mass at two of five stations,
+and it still needs a car around it. There is a darker glasshouse over the
+middle too, so the result reads as a cabin rather than a loaf. `--sim parts`
+checks the hull spans all five stations for every donor.
+
+THE AXLES WERE OFF. The pivot came from the cluster's MEDIAN, which is
+dragged off the axle by whatever bodywork the cluster caught — and a wheel
+that turns about a point which is not its own centre wobbles. A tyre is a
+circle in the side view, so fit one: two rounds of least-squares, the second
+keeping only the points that agreed with the first, which drops the attached
+bodywork before the final estimate. How far that moved each axle, as a
+fraction of the car's half-height:
+
+    assael 39%   vulcan 24%   xdevil 21%   breakout 16%   orion 10%
+
+And capture is an ANNULUS now, not a disc: a triangle well inside the hub or
+outside the tread belongs to something else, which is what had brackets and
+arches turning with the wheel.
+
+FOURTEEN HOVERCARS, up from six, and the numbers differentiate them:
+BLACKSTAR has the shortest pulse cooldown and fights by shoving, HARDWALL
+the strongest pulse and the longest wait for it, LINEBACK the fiercest
+charge tier so a pad transforms it, ELEGANCE a base reserve so large it is
+never quite out of thrust, ECHOTRON the only one with real lateral hold,
+FOLLY almost none at all.
+
+## v1.98.0 — the counter that never counted, and a gradient computed twice
+
+FPS READ 0 BECAUSE OF MY OWN CHANGE. v1.90 made FPS mean "frames that
+reached the screen" and then shipped WITHOUT THE LINE THAT ADVANCES THE
+COUNTER — a regex insert that failed silently while the struct fields around
+it landed. So `presented` stayed at zero and the readout dutifully reported
+0 FPS forever. A counter is worth exactly as much as the line that advances
+it, and `--sim fps` now checks the source for that line rather than only
+testing the arithmetic around it. There is also a guard: a reading of
+exactly zero is not a measurement, it is a broken counter, so it falls back
+to the loop rate and lets the drop count tell the real story.
+
+THE PROFILER SENT ME TO THE WRONG PLACE, twice, which is worth recording.
+`gravity_dir` costs 3400 ns and it has a spatial index, so the obvious
+suspect was bucket occupancy: the worst cell held 44 nodes. Quartering the
+cell area cut that to 39 and changed the cost NOT AT ALL — because 39 nodes
+at ten nanoseconds each is 390 ns, not 3400. The number never fit the
+theory.
+
+The real cost is that `gravity_dir` takes an SDF GRADIENT near a surface to
+decide which way "down" is, and a gradient is four SDF evaluations. The
+physics ground solve has already computed the normal at that exact point one
+moment earlier. Two calls, eight evaluations, one answer.
+
+A one-entry cache on the last (point, normal) pair collapses it. Measured by
+COUNTING evaluations rather than timing them — timing a debug build is
+noise, counting is exact:
+
+    27.3 -> 19.3 SDF evaluations per physics step   (29% fewer)
+
+That count is now reported by `--sim perf` as a stable measure of physics
+cost, which is a better instrument than the timings for exactly the reason
+this session demonstrates.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

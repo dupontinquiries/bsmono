@@ -60,6 +60,62 @@ pub fn assemble(
 ) -> Model {
     let mut prims = Vec::new();
     let scale = env.length() * 0.20;
+
+    // ---- A HULL FIRST ----
+    // The mined layout is a set of PART POSITIONS, not a vehicle: dropping
+    // those in on their own gives a cloud of floating blocks with daylight
+    // between them, which is why these read as half-built. A donor's parts
+    // decorate a body; they are not the body. So the envelope is filled with
+    // a lofted hull first — its section widths taken from where the donor
+    // actually put its mass, so the shape still belongs to the donor — and
+    // the parts then sit ON it.
+    {
+        // how wide and how tall the donor is at five stations down its length
+        let mut w = [0.0f32; 5];
+        let mut h = [0.0f32; 5];
+        for (_, x, y, z, sz) in layout.iter().copied() {
+            let k = (((z + 1.0) * 0.5 * 4.0).round() as usize).min(4);
+            w[k] = w[k].max(x.abs() + sz * 0.5);
+            h[k] = h[k].max(y.abs() + sz * 0.5);
+        }
+        // a station with nothing near it still needs a body: fall back to
+        // the neighbours rather than pinching the hull to a point
+        for k in 0..5 {
+            if w[k] < 0.25 {
+                w[k] = if k == 0 { w[1] * 0.7 } else if k == 4 { w[3] * 0.7 } else { (w[k - 1] + w[k + 1]) * 0.4 };
+            }
+            if h[k] < 0.20 {
+                h[k] = if k == 0 { h[1] * 0.7 } else if k == 4 { h[3] * 0.7 } else { (h[k - 1] + h[k + 1]) * 0.4 };
+            }
+            w[k] = w[k].clamp(0.30, 1.0);
+            h[k] = h[k].clamp(0.28, 1.0);
+        }
+        let sec: Vec<(f32, f32, f32, f32, f32)> = (0..5)
+            .map(|k| {
+                let t = k as f32 / 4.0 * 2.0 - 1.0;
+                let round = 0.30 + 0.45 * (1.0 - (t.abs() - 0.5).abs());
+                (
+                    t * env.z,
+                    w[k] * env.x * 0.92,
+                    -h[k] * env.y * 0.85,
+                    h[k] * env.y * 0.85,
+                    round,
+                )
+            })
+            .collect();
+        let hull = crate::procars::part(meshgen::loft(&sec, 20), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO);
+        prims.push(Prim { mesh_id: gpu.add_mesh(&hull), tex_id: None, color: palette[0], tag: Tag::Body, pivot: Vec3::ZERO });
+        // a darker glasshouse over the middle, so it reads as a cabin rather
+        // than a loaf
+        let cab = [
+            (-env.z * 0.18, env.x * 0.52, env.y * 0.30, env.y * 0.62, 0.85),
+            (env.z * 0.10, env.x * 0.58, env.y * 0.28, env.y * 0.78, 0.80),
+            (env.z * 0.40, env.x * 0.46, env.y * 0.26, env.y * 0.58, 0.85),
+        ];
+        let glass = crate::procars::part(meshgen::loft(&cab, 18), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO);
+        prims.push(Prim { mesh_id: gpu.add_mesh(&glass), tex_id: None, color: [0.07, 0.09, 0.12, 1.0], tag: Tag::Body, pivot: Vec3::ZERO });
+    }
+
     // A donor can be MOSTLY wheel-class: the rocket's are rings down its
     // spine, not road wheels. Dropping them all left it nearly empty, so
     // only the four lowest are treated as running gear (the chassis supplies

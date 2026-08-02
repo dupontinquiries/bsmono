@@ -1,6 +1,6 @@
 [package]
 name = "skydribble"
-version = "1.93.0"
+version = "1.98.0"
 edition = "2021"
 # examples/shim.rs is an include! fragment, not a binary — declare the two
 # harnesses by hand so cargo does not try to build it as one.

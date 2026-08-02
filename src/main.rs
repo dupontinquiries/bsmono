@@ -890,24 +890,46 @@ fn main() {
     // stiffness, how much sideways motion they hold, and the reach and force
     // of the repulsor field. A stiff, low, tight-fielded machine darts and
     // pokes; a soft, high, wide-fielded one wallows and shepherds.
-    let hover_defs: [(&str, f32, physics::Hover); 6] = [
+    let hover_defs: [(&str, f32, physics::Hover); 14] = [
         // BRUTIS: a hover tank. Heavy, slow to settle, enormous soft field —
         // it does not shoot so much as lean on the ball.
-        ("brutis", 1.36, physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+        ("brutis", 1.36, physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0, ..physics::Hover::default() }),
         // AKIMBO: sleek and stiff. Almost no lateral hold, so it slides like
         // a puck and has to be flown rather than driven.
-        ("akimbo", 1.28, physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }),
+        ("akimbo", 1.28, physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0, ..physics::Hover::default() }),
         // MATRIS: the balanced one, and the place to start.
-        ("matris", 1.30, physics::Hover { ride: 0.52, stiff: 44.0, hold: 0.20, field_r: 3.2, field_k: 26.0 }),
+        ("matris", 1.30, physics::Hover { ride: 0.52, stiff: 44.0, hold: 0.20, field_r: 3.2, field_k: 26.0, ..physics::Hover::default() }),
         // VECTORZOID: shielded — the strongest field in the game, at the
         // cost of a soft cushion that pitches under its own thrust.
-        ("vectorzoid", 1.30, physics::Hover { ride: 0.58, stiff: 34.0, hold: 0.16, field_r: 4.0, field_k: 36.0 }),
+        ("vectorzoid", 1.30, physics::Hover { ride: 0.58, stiff: 34.0, hold: 0.16, field_r: 4.0, field_k: 36.0, ..physics::Hover::default() }),
         // TEMPEST: a hovertank. Rides high enough to clear things, and holds
         // enough to actually turn.
-        ("tempest", 1.40, physics::Hover { ride: 0.72, stiff: 36.0, hold: 0.26, field_r: 3.8, field_k: 24.0 }),
+        ("tempest", 1.40, physics::Hover { ride: 0.72, stiff: 36.0, hold: 0.26, field_r: 3.8, field_k: 24.0, ..physics::Hover::default() }),
         // CONTINGENCY: motorcycle-sized. Stiff, low, and a lance of a field —
         // it pokes the ball rather than pushing it.
-        ("contingency", 1.10, physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+        ("contingency", 1.10, physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0, ..physics::Hover::default() }),
+        // BLACKSTAR: a knife. The shortest pulse cooldown in the game, so it
+        // fights by shoving rather than by out-driving anyone.
+        ("blackstar", 1.22, physics::Hover { ride: 0.40, stiff: 60.0, hold: 0.10, field_r: 2.8, field_k: 30.0, pulse_cd: 1.05, pulse_k: 13.0, ..physics::Hover::default() }),
+        // ELEGANCE: long and floaty, with a generous base reserve — it is
+        // never quite out of thrust, which suits its complete lack of grip.
+        ("elegance", 1.34, physics::Hover { ride: 0.56, stiff: 38.0, hold: 0.12, field_r: 3.4, field_k: 25.0, base_tank: 40.0, base_regen: 50.0, ..physics::Hover::default() }),
+        // TRIFANG: three-pronged and stiff. A narrow, hard field: it stabs.
+        ("trifang", 1.26, physics::Hover { ride: 0.44, stiff: 62.0, hold: 0.11, field_r: 2.4, field_k: 38.0, ..physics::Hover::default() }),
+        // ECHOTRON: a civilian runabout. The most forgiving of them — real
+        // lateral hold and a soft, wide field.
+        ("echotron", 1.28, physics::Hover { ride: 0.50, stiff: 46.0, hold: 0.34, field_r: 3.6, field_k: 23.0, ..physics::Hover::default() }),
+        // HARDWALL: a police interceptor. Built to shove: the strongest
+        // pulse here, at the cost of a long wait for it.
+        ("hardwall", 1.32, physics::Hover { ride: 0.48, stiff: 50.0, hold: 0.22, field_r: 3.0, field_k: 26.0, pulse_k: 24.0, pulse_lift: 9.0, pulse_cd: 2.3, ..physics::Hover::default() }),
+        // FOLLY: a land surfer. Rides high and holds almost nothing, so it
+        // carves in long arcs and cannot stop.
+        ("folly", 1.24, physics::Hover { ride: 0.68, stiff: 32.0, hold: 0.06, field_r: 3.2, field_k: 24.0, ..physics::Hover::default() }),
+        // LINEBACK: a modular racer. The strongest charge tier, so a pad
+        // turns it into something else for a few seconds.
+        ("lineback", 1.30, physics::Hover { ride: 0.46, stiff: 54.0, hold: 0.14, field_r: 2.9, field_k: 28.0, charge_power: 1.55, ..physics::Hover::default() }),
+        // WHISTLEWIND: a hover IFV. Heavy, high, and it leans on the ball.
+        ("whistlewind", 1.42, physics::Hover { ride: 0.70, stiff: 34.0, hold: 0.30, field_r: 4.2, field_k: 22.0, pulse_lift: 6.5, ..physics::Hover::default() }),
     ];
     let hover_dir = dir.join("hover");
     let mut hovercars: Vec<model::Model> = Vec::new();
@@ -943,7 +965,7 @@ fn main() {
     };
     for (i, m) in hovercars.into_iter().enumerate() {
         cars.models.push(m);
-        cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency"][i]);
+        cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency", "Blackstar", "Elegance", "Trifang", "Echotron", "Hardwall", "Folly", "Lineback", "Whistlewind"][i]);
     }
     // EVERY car gets an electric variant. Rather than model them twice, the
     // petrol body is converted: light bars, blanked grille, battery sills and
@@ -1116,6 +1138,30 @@ fn main() {
                     match event.state {
                         ElementState::Pressed => {
                             game.analog.note_key(&key, &event.physical_key);
+                            // [ and ] cycle cars in singleplayer, matched on
+                            // BOTH the logical character and the physical key
+                            // position. Dvorak moves the bracket CHARACTERS to
+                            // where QWERTY has - and =, so a player who thinks
+                            // in characters and a player who thinks in key
+                            // positions both get what they reached for.
+                            if !event.repeat {
+                                use winit::keyboard::{KeyCode, PhysicalKey};
+                                let ch = match &key {
+                                    Key::Character(c) => c.as_str(),
+                                    _ => "",
+                                };
+                                let phys = event.physical_key;
+                                let dir = if ch == "[" || phys == PhysicalKey::Code(KeyCode::BracketLeft) {
+                                    -1
+                                } else if ch == "]" || phys == PhysicalKey::Code(KeyCode::BracketRight) {
+                                    1
+                                } else {
+                                    0
+                                };
+                                if dir != 0 {
+                                    game.cycle_car(dir);
+                                }
+                            }
                             if !event.repeat {
                                 game.key_down(key.clone(), elwt, &win);
                             } else if let Mode::Online { .. } = game.mode {
@@ -1402,6 +1448,32 @@ impl Game {
             self.cars.active = i;
             apply_car_dims(&mut self.car, &self.cars.models[i], self.cfg.car.size);
         }
+    }
+
+    /// Step through the garage with `[` and `]`.
+    ///
+    /// Only in singleplayer: in a net session everyone else has been told
+    /// which car you are driving, and swapping it mid-match would desync the
+    /// hitbox they are predicting against.
+    fn cycle_car(&mut self, dir: i32) {
+        if self.net.online() || self.mode != Mode::Play {
+            return;
+        }
+        let n = self.cars.models.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.cars.active;
+        let next = ((cur as i32 + dir).rem_euclid(n as i32)) as usize;
+        self.switch_car(next);
+        self.save.car = next;
+        // the hitbox changed under the car, so lift it clear of the floor
+        // rather than leaving a taller model half-buried in it
+        let d = self.world.sdf(self.car.pos);
+        if d < self.car.half_h {
+            self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
+        }
+        self.toastf(&format!("{} ({}/{})", self.cars.names[next], next + 1, n));
     }
 
     fn open_menu(&mut self, m: Mode) {
@@ -1939,7 +2011,13 @@ impl Game {
                 let start = self.mscroll.max(0.0) as usize;
                 hud::hit_row_scrolled(hud::LIST_TOP, hud::ACADEMY_ROW_H, n, vis, start, y)
             }
-            Mode::Garage { .. } => hud::hit_row(hud::GARAGE_TOP, hud::GARAGE_ROW_H, custom::slots().len(), y),
+            Mode::Garage { .. } => {
+                // the panel drops below the stage on a tall window, so the
+                // rows are somewhere else and hit-testing has to know
+                let a = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
+                let top = if a > 1.25 { hud::GARAGE_TOP } else { hud::GARAGE_TOP_TALL };
+                hud::hit_row(top, hud::GARAGE_ROW_H, custom::slots().len(), y)
+            }
             _ => None,
         }
     }
@@ -2656,7 +2734,15 @@ impl Game {
         {
             let (pres, recfg, drop) = self.gpu.present_stats();
             self.fps_win += dt;
-            if self.fps_win >= 0.5 {
+            // A COUNTER THAT READS EXACTLY ZERO IS NOT A MEASUREMENT, it is
+            // a broken counter — a running game always presents something.
+            // Falling back to the loop rate says "the accounting is wrong"
+            // rather than "your machine is dead", and the drop readout beside
+            // it still tells the true story.
+            if self.fps_win >= 0.5 && pres == self.fps_presented && pres == 0 {
+                self.fps = if dt > 1e-5 { 1.0 / dt } else { self.fps };
+                self.fps_win = 0.0;
+            } else if self.fps_win >= 0.5 {
                 let shown = (pres - self.fps_presented) as f32 / self.fps_win;
                 self.fps = shown;
                 self.frame_drops = (drop + recfg - self.fps_dropped) as u32;
@@ -3269,6 +3355,26 @@ impl Game {
             self.snd.fire(Sfx::Dodge);
             self.fx.dust(self.car.pos, self.car.up(), 3.0);
         }
+        // ---- THE PULSE SHOVES EVERYTHING NEARBY ----
+        // Physics can reach the player's car and the ball; the bots live out
+        // here, so the blast is delivered as an event and applied to them by
+        // the caller. This is the half of the design that makes the pulse
+        // defensive rather than only a jump: an opponent lining up to knock
+        // you off the ball gets pushed away instead.
+        for &(at, r, k) in &ev.pulses {
+            for b in self.bots.iter_mut() {
+                let to = b.car.pos - at;
+                let d = to.length();
+                if d < r && d > 1e-4 {
+                    let f = 1.0 - (d / r).clamp(0.0, 1.0);
+                    // cars are heavier than the ball, so they move less
+                    b.car.vel += (to / d) * k * f * f * 0.55;
+                }
+            }
+            self.fx.ring_burst(at, [0.55, 0.85, 1.0, 1.0], false);
+            self.cam.add_shake(0.20);
+        }
+
         for &(gp, who) in &ev.goals {
             self.cam.add_shake(0.45);
             self.fx.ring_burst(gp, [0.45, 1.0, 0.55, 1.0], true);
@@ -3982,6 +4088,51 @@ impl Game {
             None,
             true,
             self.skin_params(),);
+        // ---- GARAGE LIVE VIEW ----
+        // The customizer used to describe a car in words while the car
+        // itself sat behind the panel. So put it on stage: the SAME model,
+        // pushed into the scene near the camera, which means it gets the
+        // real skin, the real rig motion, the real reflections and the real
+        // lighting rather than a flat thumbnail that would have to be kept
+        // in sync with all four.
+        if let Mode::Garage { .. } = self.mode {
+            let aspect = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
+            // camera basis, so the stand follows wherever you are looking
+            let fwd = (self.cam.look - self.cam.pos).normalize_or(Vec3::NEG_Z);
+            let right = fwd.cross(self.cam.up).normalize_or(Vec3::X);
+            let up = right.cross(fwd).normalize_or(Vec3::Y);
+            // WIDE SCREENS PUT IT BESIDE THE PANEL, TALL ONES ABOVE IT.
+            // On a wide window there is room to the right and none above; on
+            // a tall or square one the reverse. The panel narrows to match
+            // (see `garage_menu`), so the two never overlap.
+            let wide = aspect > 1.25;
+            let dist = 4.2;
+            let off = if wide {
+                right * (dist * 0.40) + up * (dist * 0.02)
+            } else {
+                up * (dist * 0.30)
+            };
+            let at = self.cam.pos + fwd * dist + off;
+            // a slow turntable, so you see the whole car without touching it
+            let spin = Quat::from_rotation_y(self.time * 0.5);
+            // stand it upright in the world, not in the camera's frame: a
+            // car leaning with the camera reads as broken
+            self.push_car(
+                &mut objs,
+                self.cars.active,
+                at,
+                spin,
+                false,
+                self.time * 2.2,
+                0.0,
+                0.0,
+                self.cfg.car.size * 1.35,
+                None,
+                true,
+                self.skin_params(),
+            );
+        }
+
         // remote cars + their boost flames
         for (i, p) in self.net.peers().enumerate() {
             self.push_car(&mut objs, p.car.min(self.cars.models.len() - 1), p.shown, p.rot, p.flip, p.wheel_spin, p.steer_vis,
