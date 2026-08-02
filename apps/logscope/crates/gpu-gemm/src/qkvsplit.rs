@@ -254,3 +254,87 @@ mod resolve_tests {
         assert!(FUSED_NAMES.contains(&"query_key_value"));
     }
 }
+
+/// Everything a fetch shim needs, in one call.
+///
+/// `resolve` answers which tensor and which part; `split` answers which rows. A loader wiring this by
+/// hand would compose them at the fetch site — three steps, in a multi-line expression, in the one
+/// path where a mistake breaks loading for every model rather than one.
+///
+/// So the composition lives here and the call site is a single line.
+///
+/// Returns the source tensor name and the BYTE range within it, or an error explaining why the split
+/// cannot be made. `row_bytes` is the fused tensor's own per-row stride, which the caller has from its
+/// dims and quantization — it is not derivable here, and guessing it is how a Q6_K tensor gets sliced
+/// at a Q4_K stride.
+pub fn locate(wanted: &str, available: &dyn Fn(&str) -> Option<usize>,
+              n_head: usize, n_kv: usize, head_dim: usize, row_bytes: usize)
+    -> Option<Result<(String, (usize, usize)), SplitError>>
+{
+    // Try each known spelling, and stop at the first that the file actually HAS. Returning None when
+    // no fused tensor exists is what lets a caller treat this as "not applicable" rather than as a
+    // failure — most models are not fused and must not see an error.
+    for fused in FUSED_NAMES {
+        let (src, part) = resolve(wanted, fused)?;
+        let rows = match available(&src) { Some(r) => r, None => continue };
+        return Some(match split(rows, n_head, n_kv, head_dim) {
+            Ok(s) => Ok((src, Split::byte_range(s.span(part), row_bytes))),
+            Err(e) => Err(e),
+        });
+    }
+    None
+}
+
+#[cfg(test)]
+mod locate_tests {
+    use super::*;
+
+    /// A file holding one fused tensor of 6144 rows.
+    fn have_fused(name: &str) -> Option<usize> {
+        if name == "blk.0.attn_qkv.weight" { Some(6144) } else { None }
+    }
+    fn have_nothing(_: &str) -> Option<usize> { None }
+
+    #[test]
+    fn it_returns_the_source_and_the_BYTE_range_in_one_call() {
+        let r = locate("blk.0.attn_k.weight", &have_fused, 32, 8, 128, 72)
+            .expect("applicable").expect("splits");
+        assert_eq!(r.0, "blk.0.attn_qkv.weight");
+        // k occupies rows 4096..5120 of the fused tensor, at 72 bytes per row.
+        assert_eq!(r.1, (4096 * 72, 5120 * 72));
+    }
+
+    #[test]
+    fn a_model_with_NO_fused_tensor_is_not_applicable_rather_than_failing() {
+        // Most models are not fused. A caller must be able to ask unconditionally and get "this does
+        // not apply" — an error here would make every ordinary load look broken.
+        assert!(locate("blk.0.attn_q.weight", &have_nothing, 32, 8, 128, 72).is_none());
+    }
+
+    #[test]
+    fn a_non_projection_is_also_not_applicable() {
+        assert!(locate("blk.0.attn_norm.weight", &have_fused, 32, 8, 128, 72).is_none());
+    }
+
+    #[test]
+    fn a_shape_disagreement_is_an_ERROR_not_a_miss() {
+        // The distinction that matters. "No fused tensor" means carry on; "the fused tensor is not the
+        // shape the metadata describes" means STOP, because slicing it anyway produces attention over
+        // the wrong projections — a model that loads, runs, and writes nonsense.
+        let odd = |n: &str| if n == "blk.0.attn_qkv.weight" { Some(8192) } else { None };
+        let e = locate("blk.0.attn_q.weight", &odd, 32, 8, 128, 72).expect("applicable").unwrap_err();
+        assert_eq!(e, SplitError::RowMismatch { declared: 6144, actual: 8192 });
+    }
+
+    #[test]
+    fn the_three_parts_tile_the_fused_tensor_exactly() {
+        // Composed through locate rather than split, so this checks the whole path a loader takes.
+        let by = |w: &str| locate(w, &have_fused, 32, 8, 128, 72).unwrap().unwrap().1;
+        let (q, k, v) = (by("blk.0.attn_q.weight"), by("blk.0.attn_k.weight"),
+                         by("blk.0.attn_v.weight"));
+        assert_eq!(q.0, 0);
+        assert_eq!(q.1, k.0, "no gap between q and k");
+        assert_eq!(k.1, v.0, "no gap between k and v");
+        assert_eq!(v.1, 6144 * 72, "and v ends at the tensor's end");
+    }
+}
