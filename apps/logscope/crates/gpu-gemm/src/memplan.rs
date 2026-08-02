@@ -1178,3 +1178,48 @@ mod stride_alignment_tests {
         assert!(Gpu::source_block_bytes(12, 5472 * 2048).is_some(), "ff*d is aligned");
     }
 }
+
+#[cfg(test)]
+mod measurement_factor_tests {
+    use super::*;
+
+    /// The measured ceiling, discounted, is LOWER than the constant it would replace.
+    ///
+    /// `--gate-vram` measured an M2 Ultra honouring 63 GiB against a compiled-in 48.
+    /// `budget_from_measurement` then applies 0.75 for headroom: **47.25 GiB**.
+    ///
+    /// So wiring the measurement in as it stands would refuse MORE than the guess it replaces, and
+    /// Llama-4 Scout — which needs 54.8 — would be refused harder by the number that proves it fits.
+    ///
+    /// That is why the measurement was worth persisting and is not yet worth consuming. The 0.75 is
+    /// not obviously wrong: the probe finds what the device HONOURS, and running at 100% of a hard BO
+    /// ceiling leaves nothing for KV cache or transients. But 0.75 of a measured 63 landing below an
+    /// unmeasured 48 means one of the two numbers is not what its name says, and picking a factor to
+    /// make Scout fit would be fitting a constant to one model — the exact mistake `streaming_fits_host`
+    /// already made and that no threshold could repair.
+    #[test]
+    fn the_discounted_measurement_is_below_the_constant_it_would_replace() {
+        let measured = budget_from_measurement(63.0).expect("a probed device");
+        let as_gib = measured as f64 / GIB;
+        assert!(as_gib < 48.0, "0.75 of 63 is {as_gib:.2}, below the 48 GiB constant");
+        // And below what Scout needs, so the measurement does not by itself unblock it.
+        assert!(as_gib < 54.8, "Scout needs 54.8 and would still be refused");
+    }
+
+    #[test]
+    fn never_probed_is_NONE_not_zero() {
+        // The distinction the whole store exists for: a device nobody measured must not be treated as
+        // a device measured to have no memory.
+        assert!(budget_from_measurement(0.0).is_none());
+        assert!(budget_from_measurement(-1.0).is_none());
+        assert!(budget_from_measurement(63.0).is_some());
+    }
+
+    #[test]
+    fn the_factor_is_pinned_so_changing_it_is_a_DECISION() {
+        // 0.75 exactly. If someone raises it to make a model fit, this test fails and they have to say
+        // so in a commit rather than nudging a constant until a checkpoint loads.
+        let b = budget_from_measurement(100.0).unwrap() as f64 / GIB;
+        assert!((b - 75.0).abs() < 0.01, "headroom factor is 0.75, got {b:.2}/100");
+    }
+}
