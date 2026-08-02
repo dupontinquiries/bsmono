@@ -42,6 +42,11 @@ pub struct Scene {
 // Six views, not three. The port had eight ported modules and three views, two
 // of which were a heading and a sentence — "Browse ambient stems and playlists
 // (on-device: bo-mux catalog)" is a promise, not a library.
+/// Where the room is stored. Constants so the save and the restore cannot
+/// point at different files.
+pub const ROUTING_APP: &str = "bo-suite";
+pub const ROUTING_FILE: &str = "routing.conf";
+
 pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundscape", "Settings"];
 
 /// Move the view index by a swipe sign, clamped to the ends.
@@ -296,6 +301,33 @@ impl Controller {
     fn spaces_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
         ui.heading("Spaces");
         crate::spaces::spaces_ui(ui, &mut self.routing, c);
+        ui.separator();
+        ui.horizontal(|ui| {
+            // Saving the room is the one persistence bo-suite cannot do
+            // without: losing which speaker plays which channel means the room
+            // sounds wrong on next launch and the user rebuilds it by ear.
+            if ui.button("save room").clicked() {
+                match config_kit::save(ROUTING_APP, ROUTING_FILE, &self.routing.render()) {
+                    Ok(()) => self.toast.show("room saved"),
+                    // Shown, not swallowed: a save that silently fails is the
+                    // same lie as one that never wrote.
+                    Err(e) => self.toast.show(&format!("could not save: {e}")),
+                }
+            }
+            if ui.button("restore room").clicked() {
+                match config_kit::load(ROUTING_APP, ROUTING_FILE) {
+                    Some(text) => {
+                        let n = self.routing.restore(&text);
+                        // Say HOW MANY applied. A saved room restored onto a
+                        // mesh missing two speakers is a partial restore, and
+                        // silently succeeding would hide the gap.
+                        self.toast.show(&format!("{n} of {} speakers restored",
+                                                 self.routing.speakers.len()));
+                    }
+                    None => self.toast.show("no saved room yet"),
+                }
+            }
+        });
     }
 
     fn mixer_view(&mut self, ui: &mut Ui, c: &PaletteColors) {

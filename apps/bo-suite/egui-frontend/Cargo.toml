@@ -21,6 +21,8 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# XDG paths + flat [section] key=value, the fleet's one path rule.
+config-kit = { path = "../../../shared/config-kit" }
 # bo-mux/protocol.rs is mounted by #[path] and derives Serialize/Deserialize;
 # the port needs serde only to satisfy those derives, not to serialise anything.
 serde = { version = "1", features = ["derive"] }
