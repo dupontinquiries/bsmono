@@ -7847,7 +7847,12 @@ format would save ~{:.1} GiB and is what would make this fit.",
                                         "MoE expert streaming needs ~{:.1} GiB of host RAM for expert weights, ~{:.1} GiB of \
 resident weights that share the SAME memory on this unified-memory machine, plus \
 ~{:.1} GiB of page cache for the file, against {:.1} GiB of system RAM — this would be OOM-killed partway \
-through the load. The engine requantizes every expert to its own q4 layout on load, which is the cost here. \
+through the load. The engine requantizes every expert to its own q4 layout on load, which is the cost here — AND THIS \
+CHECK RUNS BEFORE THE FILE-VIEW PATH IS ATTEMPTED, so the figure assumes a host copy that may not be \
+needed at all: when experts can be read as views into the mmap, `raw_expert_to_q4_resident` converts \
+Q4_K straight to q4 ON THE GPU with no host copy and no f32 round-trip, exactly as the dense tensors \
+already do for the dense weights. If no file-views-unavailable line appears above this one, the path \
+was never tried. \
 Options: run a smaller checkpoint, use the llama.cpp backend (which reads the file's native Q4_K blocks \
 directly and needs no host copy){}.",
                                         gib(host_store), gib(uma_resident), gib(set_data_len), gib(ram),
