@@ -83,6 +83,149 @@ struct RawPrim {
     tag: Tag,
 }
 
+/// SPLIT THE WHEELS OFF A MERGED BODY.
+///
+/// A model exported as one mesh has no wheels as far as the game is
+/// concerned — nothing spins, nothing steers, and a car rolling on frozen
+/// tyres reads as a toy no matter how good the bodywork is. Named nodes
+/// solve it when they exist; these do not have them, so find the wheels
+/// geometrically instead.
+///
+/// The method: take the vertices in the lower half of the car, split them by
+/// which corner they sit in, and for each corner find the tightest
+/// concentration in the side view. A wheel is the one thing in a car that is
+/// round and centred on its own axle, so a cluster centre plus a radius
+/// describes it well — and triangles are then assigned whole, by their
+/// centroid, so a tyre never ends up half body.
+fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
+    // only worth attempting on a single merged prim with no wheels tagged
+    if raws.len() != 1 || raws[0].tag != Tag::Body {
+        return false;
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for v in &raws[0].verts {
+        let p = Vec3::from_array(v.pos);
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    let mid = (lo + hi) * 0.5;
+    let half = (hi - lo) * 0.5;
+    if half.x < 1e-4 || half.z < 1e-4 {
+        return false;
+    }
+    // candidate wheel region: outer, low, and away from the centre line
+    let mut corners: [Vec<Vec3>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for v in &raws[0].verts {
+        let p = Vec3::from_array(v.pos) - mid;
+        if p.y > half.y * 0.15 || p.x.abs() < half.x * 0.45 || p.z.abs() < half.z * 0.25 {
+            continue;
+        }
+        let ci = (if p.x > 0.0 { 1 } else { 0 }) + (if p.z > 0.0 { 2 } else { 0 });
+        corners[ci].push(p);
+    }
+    // each corner needs enough of a cluster to be a wheel at all
+    let mut centres = [Vec3::ZERO; 4];
+    let mut radii = [0.0f32; 4];
+    for (i, c) in corners.iter().enumerate() {
+        if c.len() < 60 {
+            return false;
+        }
+        // centre in the side view (y,z); x is the track, taken as the median
+        let mut ys: Vec<f32> = c.iter().map(|p| p.y).collect();
+        let mut zs: Vec<f32> = c.iter().map(|p| p.z).collect();
+        let mut xs: Vec<f32> = c.iter().map(|p| p.x).collect();
+        ys.sort_by(f32::total_cmp);
+        zs.sort_by(f32::total_cmp);
+        xs.sort_by(f32::total_cmp);
+        let cy = ys[ys.len() / 2];
+        let cz = zs[zs.len() / 2];
+        let cx = xs[xs.len() / 2];
+        centres[i] = Vec3::new(cx, cy, cz);
+        // radius: the 85th percentile of distance in the side view, so a
+        // stray vertex on the arch does not inflate the wheel
+        let mut rs: Vec<f32> = c
+            .iter()
+            .map(|p| ((p.y - cy).powi(2) + (p.z - cz).powi(2)).sqrt())
+            .collect();
+        rs.sort_by(f32::total_cmp);
+        radii[i] = rs[rs.len() * 85 / 100];
+        if radii[i] < half.y * 0.16 || radii[i] > half.y * 1.7 {
+            return false; // that is not a wheel
+        }
+    }
+    // assign triangles whole, by centroid, so no tyre is half body
+    let src = raws.remove(0);
+    let mut out: Vec<RawPrim> = Vec::new();
+    let mut body = RawPrim { verts: src.verts.clone(), idx: Vec::new(), color: src.color, tex_uri: src.tex_uri.clone(), tag: Tag::Body };
+    let mut wheels: Vec<RawPrim> = (0..4)
+        .map(|i| RawPrim {
+            verts: src.verts.clone(),
+            idx: Vec::new(),
+            color: src.color,
+            tex_uri: src.tex_uri.clone(),
+            tag: if centres[i].z < 0.0 { Tag::WheelFront } else { Tag::WheelBack },
+        })
+        .collect();
+    for t in src.idx.chunks_exact(3) {
+        let c = (Vec3::from_array(src.verts[t[0] as usize].pos)
+            + Vec3::from_array(src.verts[t[1] as usize].pos)
+            + Vec3::from_array(src.verts[t[2] as usize].pos))
+            / 3.0
+            - mid;
+        let mut which: Option<usize> = None;
+        for i in 0..4 {
+            let d = ((c.y - centres[i].y).powi(2) + (c.z - centres[i].z).powi(2)).sqrt();
+            let same_side = c.x.signum() == centres[i].x.signum();
+            if same_side && d < radii[i] * 1.05 && c.x.abs() > half.x * 0.35 {
+                which = Some(i);
+                break;
+            }
+        }
+        match which {
+            Some(i) => wheels[i].idx.extend_from_slice(t),
+            None => body.idx.extend_from_slice(t),
+        }
+    }
+    // COMPACT each piece to the vertices it actually uses. Without this
+    // every wheel carries a copy of the whole car's vertex buffer — five
+    // uploads of 130k vertices for one model — and the pivot, which is the
+    // mean of a prim's vertices, would come out as the centre of the car
+    // rather than the centre of the axle.
+    let compact = |pr: &mut RawPrim| {
+        let mut remap: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+        let mut verts: Vec<Vertex> = Vec::new();
+        let mut idx: Vec<u32> = Vec::with_capacity(pr.idx.len());
+        for &i in &pr.idx {
+            let ni = *remap.entry(i).or_insert_with(|| {
+                verts.push(pr.verts[i as usize]);
+                (verts.len() - 1) as u32
+            });
+            idx.push(ni);
+        }
+        pr.verts = verts;
+        pr.idx = idx;
+    };
+
+    // a split that finds almost nothing is not a split
+    let found: usize = wheels.iter().map(|w| w.idx.len()).sum();
+    if found < src.idx.len() / 50 {
+        raws[0] = src;
+        return false;
+    }
+    compact(&mut body);
+    out.push(body);
+    for mut w in wheels.into_iter() {
+        if w.idx.is_empty() {
+            continue;
+        }
+        compact(&mut w);
+        w.color = src.color;
+        out.push(w);
+    }
+    *raws = out;
+    true
+}
+
 fn detect_tag(name: Option<&str>) -> Option<Tag> {
     let n = name?;
     if n.contains("- FR") || n.contains("- FL") || n.contains("-FR") || n.contains("-FL") {
@@ -263,10 +406,40 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
         }
     }
     let ext = mx - mn;
-    let center = (mn + mx) * 0.5;
+    // CENTRE ON THE CAR, NOT ITS BOUNDING BOX.
+    //
+    // A car is left-right symmetric, so its lateral centre is where its mass
+    // balances. The bounding box is not that: one wing mirror, aerial or
+    // one-sided intake shifts it, and the whole body then sits off the axis.
+    // (Assael measured 5.1% off, which is visible.) Y and Z keep the box —
+    // there is no symmetry to appeal to along those — but X takes the
+    // centroid when the two disagree meaningfully.
+    let mut center = (mn + mx) * 0.5;
+    {
+        let mut sum = 0.0f64;
+        let mut cnt = 0u64;
+        for r in raws.iter() {
+            for v in r.verts.iter() {
+                sum += v.pos[0] as f64;
+                cnt += 1;
+            }
+        }
+        if cnt > 0 {
+            let centroid_x = (sum / cnt as f64) as f32;
+            let span = (mx.x - mn.x).max(1e-6);
+            if (center.x - centroid_x).abs() > span * 0.02 {
+                center.x = centroid_x;
+            }
+        }
+    }
     let long = ext.z.max(ext.x).max(ext.y).max(1e-6);
     let s = target_len / long;
     let yaw = if flip { std::f32::consts::PI } else { 0.0 };
+    // A merged export has no wheels the game can see: find them.
+    let split = split_wheels(&mut raws);
+    if split {
+        // (silent success — the count is reported by `--sim glb`)
+    }
     let turn = Quat::from_rotation_y(yaw);
     for r in raws.iter_mut() {
         for v in r.verts.iter_mut() {

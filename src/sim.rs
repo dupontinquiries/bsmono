@@ -3632,6 +3632,72 @@ pub fn run(args: &[String]) {
             );
         }
 
+        // ---- WHEELS: did the splitter find four of them? ----
+        // These models arrive as one merged mesh, so nothing spins unless
+        // the wheels are found geometrically. Mirror the splitter's method
+        // and report what it would produce per car.
+        println!();
+        println!("{:<12} {:>9} {:>10} {:>9}", "model", "corners", "wheel r", "verdict");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            let half = [(hi[0] - lo[0]) * 0.5, (hi[1] - lo[1]) * 0.5, (hi[2] - lo[2]) * 0.5];
+            let mut corners = [0usize; 4];
+            let mut rad = [0.0f32; 4];
+            let mut cl: Vec<Vec<[f32; 3]>> = vec![Vec::new(); 4];
+            for p in &pts {
+                let q = [p[0] - mid[0], p[1] - mid[1], p[2] - mid[2]];
+                if q[1] > half[1] * 0.15 || q[0].abs() < half[0] * 0.45 || q[2].abs() < half[2] * 0.25 {
+                    continue;
+                }
+                let ci = (if q[0] > 0.0 { 1 } else { 0 }) + (if q[2] > 0.0 { 2 } else { 0 });
+                corners[ci] += 1;
+                cl[ci].push(q);
+            }
+            for i in 0..4 {
+                if cl[i].len() < 60 {
+                    continue;
+                }
+                let mut ys: Vec<f32> = cl[i].iter().map(|p| p[1]).collect();
+                let mut zs: Vec<f32> = cl[i].iter().map(|p| p[2]).collect();
+                ys.sort_by(f32::total_cmp);
+                zs.sort_by(f32::total_cmp);
+                let (cy, cz) = (ys[ys.len() / 2], zs[zs.len() / 2]);
+                let mut rs: Vec<f32> = cl[i].iter().map(|p| ((p[1] - cy).powi(2) + (p[2] - cz).powi(2)).sqrt()).collect();
+                rs.sort_by(f32::total_cmp);
+                rad[i] = rs[rs.len() * 85 / 100] / half[1];
+            }
+            let ok4 = corners.iter().all(|c| *c >= 60) && rad.iter().all(|r| *r > 0.16 && *r < 1.7);
+            println!(
+                "{:<12} {:>9} {:>9} {:>9}",
+                n.trim_end_matches(".glb"),
+                corners.iter().filter(|c| **c >= 60).count(),
+                format!("{:.2}/{:.2}", rad.iter().cloned().fold(9.9f32, f32::min), rad.iter().cloned().fold(0.0f32, f32::max)),
+                if ok4 { "4 wheels" } else { "no split" }
+            );
+        }
+
         // ---- does the bounding box describe the BODY, or the wheels? ----
         // EV cues were placed from half_w, which is the widest thing in the
         // model. If the wheels are wider than the flank, anything placed

@@ -2718,6 +2718,41 @@ renderer: a cap that silently discards is not a performance decision, it is
 an unstated approximation. Draw distance discards what you cannot see; this
 discarded whatever happened to be indexed late.
 
+## v1.84.0 — the imported cars get their wheels back
+
+THE WHEELS DID NOT TURN. Every imported model arrives as ONE merged mesh,
+so the game had nothing to spin or steer: seven cars rolling on frozen
+tyres, which reads as a toy however good the bodywork is. Named nodes solve
+this when an exporter provides them, and none of these do.
+
+So find the wheels GEOMETRICALLY. Take the vertices in the lower half of
+the car, split them by corner, and in each corner find the tightest
+concentration in the SIDE VIEW — a wheel is the one part of a car that is
+round and centred on its own axle, so a cluster centre and a radius describe
+it well. Triangles are then assigned whole, by their centroid, so a tyre
+never ends up half body, and each piece is compacted to the vertices it
+actually uses (without that, every wheel carried a copy of the whole car's
+vertex buffer — five uploads of 130k vertices for one model — and the pivot,
+being the mean of a prim's vertices, would have come out as the centre of
+the car rather than the axle).
+
+Six of the seven split cleanly. VULCAN declines: one of its corners holds a
+cluster of radius 0.04, which is not a wheel, so the splitter refuses rather
+than guessing. That is the right failure — a car with static wheels is
+better than a car with a piece of its door spinning — and the guard is why
+the other six can be trusted.
+
+CENTRED ON THE CAR, NOT ITS BOUNDING BOX. A car is left-right symmetric, so
+its lateral centre is where its mass balances; the bounding box is not that,
+and one mirror or aerial shifts it. ASSAEL measured 5.1% off, which is
+visible. X now takes the centroid when the two disagree by more than 2% of
+the span. Y and Z keep the box, since there is no symmetry to appeal to
+along those.
+
+`--sim glb` reports, per model, how many corners look like wheels and their
+radii — so a future import that fails to split says so instead of quietly
+rolling on frozen tyres.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
