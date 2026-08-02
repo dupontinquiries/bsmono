@@ -672,7 +672,29 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
         }
     }
 
-    let half = ext * s * 0.5;
+    // MEASURE THE BODY WE ACTUALLY BUILT, not the one we were handed.
+    //
+    // `ext` is the bounding box of the SOURCE vertices, taken before the
+    // orientation search rotates them. For a car that arrives upright and
+    // nose-aft the two agree, which is why this went unnoticed. For anything
+    // the search actually turns they do not, and every dimension downstream
+    // is then wrong about which way is which: half_h, half_w and half_len
+    // feed the hitbox, the SDF box and the lift that keeps a model out of
+    // the floor.
+    //
+    // Caught on a rigged robot pose, where the loader reported
+    // [0.66 2.10 1.27] for geometry that measures [0.66 1.27 2.10] — a body
+    // lying down being described as standing up. The blackstar bot poses had
+    // width and height swapped the same way.
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for r in raws.iter() {
+        for v in r.verts.iter() {
+            let p = Vec3::from_array(v.pos);
+            lo = lo.min(p);
+            hi = hi.max(p);
+        }
+    }
+    let half = if hi.x >= lo.x { (hi - lo) * 0.5 } else { ext * s * 0.5 };
     (raws, half, center, s)
 }
 
