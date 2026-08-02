@@ -2516,6 +2516,7 @@ dependencies = [
  "peermux-core",
  "settings-kit",
  "snapclone-theme",
+ "touchkit",
  "uikit-egui",
  "uikit-gesture",
 ]

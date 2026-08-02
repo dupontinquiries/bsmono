@@ -23,6 +23,9 @@ app = ["dep:eframe"]
 # One authenticated session per peer, streams on demand. The roster was a
 # hardcoded Vec<Peer> of names with an online bool.
 peermux-core = { path = "../../../shared/peermux-core" }
+# Gesture recognition EXTRACTED FROM SNAPCLONE — its own description says so —
+# while the composer hand-rolled a swipe threshold.
+touchkit = { path = "../../../shared/touchkit" }
 device-kit = { path = "../../../shared/device-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }

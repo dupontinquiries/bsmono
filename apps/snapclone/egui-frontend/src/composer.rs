@@ -59,6 +59,25 @@ impl Duration {
 /// in a way that failing to send is not.
 pub const SEND_FRACTION: f32 = 0.18;
 
+/// Does a recognised gesture mean "send"?
+///
+/// `shared/touchkit` is the recogniser **extracted from snapclone** — its own
+/// description says so — and it already distinguishes a swipe from a pan and
+/// carries release velocity. This composer had hand-rolled a distance
+/// threshold, which cannot tell a slow deliberate drag from a fast flick, and
+/// those should not mean the same thing for an irreversible action.
+///
+/// So a send requires an UPWARD swipe with real velocity: a slow drag upward is
+/// someone repositioning the caption, and treating it as a send is the accident
+/// this rule exists to prevent.
+pub fn gesture_sends(g: &touchkit::Gesture) -> bool {
+    matches!(g, touchkit::Gesture::SwipeUp { vel } if *vel >= MIN_SEND_VELOCITY)
+}
+
+/// Minimum release speed for a send, in px/s. Below this it is a drag, not a
+/// flick.
+pub const MIN_SEND_VELOCITY: f32 = 320.0;
+
 /// Composer state.
 #[derive(Debug, Clone)]
 pub struct Composer {
@@ -166,6 +185,20 @@ mod tests {
         assert!(!c.end_drag(0.9), "downward never sends");
         c.begin_drag(0.5);
         assert!(!c.end_drag(0.48), "a short drag is a tap, not a send");
+    }
+
+    #[test]
+    fn a_slow_upward_drag_is_not_a_send() {
+        // A distance threshold alone cannot tell a deliberate slow drag from a
+        // flick, and for an irreversible action those must not mean the same
+        // thing. Someone repositioning the caption drags upward too.
+        use touchkit::Gesture;
+        assert!(!gesture_sends(&Gesture::SwipeUp { vel: 50.0 }));
+        assert!(gesture_sends(&Gesture::SwipeUp { vel: 900.0 }));
+        // and no other direction sends, however fast
+        assert!(!gesture_sends(&Gesture::SwipeDown { vel: 2000.0 }));
+        assert!(!gesture_sends(&Gesture::SwipeLeft { vel: 2000.0 }));
+        assert!(!gesture_sends(&Gesture::Tap(touchkit::Vec2::new(0.0, 0.0))));
     }
 
     #[test]
