@@ -1068,6 +1068,20 @@ was evicted)", prompt_ids.len())
             // submits rather than the process lifetime's.
             let attr = format!("wgpu-engine: [{}] {}", self.name,
                 gpu_kernels::submit_attribution_since(cause0, ds as u64));
+            // THE PROFILE CHECKED AGAINST ITSELF. A line that contradicts itself is worse than no
+            // line: every number in it gets used to reason about where time goes, and one that cannot
+            // be true poisons the conclusions drawn from the rest.
+            //
+            // Your run printed "1 polls" beside "download 141" — every download maps a buffer and
+            // every map polls — and "sync 0ms" across 19.9 s, while a separate phase breakdown of the
+            // same run reported 15.5% sync.
+            for d in gpu_kernels::perfverdict::profile_doubts(
+                dp as u64,
+                gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&cause0),
+                sync_ms as f64, total_ms as f64)
+            {
+                eprintln!("wgpu-engine: [{}] profile DOUBT — {}", self.name, d.explain());
+            }
             // THE SELF-RELATIVE VERDICT. Prefill and decode read the same weights in the same run, so
             // the ratio between their per-token costs measures how much latency decode fails to hide —
             // with no bandwidth ceiling, no active-byte count and no gate run beforehand.
