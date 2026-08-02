@@ -19,6 +19,7 @@ pub mod graph_view;
 pub mod bars;
 pub mod browser;
 pub mod build_view;
+pub mod backlinks_view;
 pub mod viz;
 pub mod confirm_dialog;
 pub mod chat_panel;
