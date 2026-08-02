@@ -7165,7 +7165,29 @@ not a surprise; coherent output is the evidence that would flip the flag",
         let has_qk_norm = acfg.attn_qk_norm && !is_llama4;
         // Llama4 iRoPE: every 4th layer uses NO positional encoding (llama.cpp hardcodes the same
         // step). NoPE layers also skip the weightless QK-Norm (it applies with RoPE only).
-        let nope_step = if is_llama4 { 4usize } else { 0 };
+        // NoPE INTERVAL FROM METADATA, with 4 as the fallback. This was hardcoded to 4 — every fourth
+        // layer skips rotation — which is Scout's documented pattern and an ASSUMPTION about every
+        // other Llama-4 checkpoint, including Maverick and any future variant.
+        //
+        // A wrong interval applies RoPE to a layer that should have none and vice versa. The model
+        // loads, every tensor is present, every shape matches, and the output is garbled — which is
+        // exactly the Scout symptom that has survived every GPU-side fix on both platforms.
+        //
+        // Same shape as expert_weights_scale being "effectively hardcoded to 1": a value the file
+        // carries, read from a constant instead.
+        let nope_step = if is_llama4 {
+            g.get_u32(&format!("{}.attention.no_rope_interval", acfg.prefix))
+                .or_else(|| g.get_u32(&format!("{}.no_rope_interval", acfg.prefix)))
+                .map(|v| v as usize)
+                .unwrap_or(4)
+        } else { 0 };
+        if is_llama4 {
+            // Printed because a wrong interval is invisible in the output: the model runs and the
+            // text is merely bad, so the one place it can be caught is a line stating what was chosen.
+            eprintln!("loader: Llama-4 iRoPE — every {nope_step} layers skips rotation (NoPE), \
+starting at layer {}. Read from metadata, or 4 if the file omits it",
+                nope_step.saturating_sub(1));
+        }
         // Which layers are windowed. llama.cpp's default pattern puts the FULL-attention layer last in
         // each group (dense_first = false), so a period of 4 gives [swa, swa, swa, dense].
         let swa_period = g.get_u32(&format!("{}.attention.sliding_window_pattern", acfg.prefix))
