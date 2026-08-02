@@ -31,6 +31,8 @@ pub struct HudInfo<'a> {
     pub air_t: f32,
     pub best_air: f32,
     pub fps: f32,
+    /// frames abandoned in the last window (surface lost, outdated, timeout)
+    pub frame_drops: u32,
     pub car_name: &'a str,
     pub ball_cam: bool,
     pub minimap: bool,
@@ -700,9 +702,17 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
         label(ui, x, 0.93, px, a, [1.0, 0.55, 0.2, 1.0], &or);
     }
 
-    // ---- top-right: fps ----
+    // ---- top-right: fps, and dropped frames when there are any ----
+    // The count is PRESENTED frames per second. If it sits well under the
+    // refresh rate while drops are non-zero, the renderer is abandoning
+    // frames rather than the GPU being slow — a distinction the old counter
+    // hid completely by counting loop iterations.
     let fps = format!("{:>3.0} FPS", info.fps);
     label(ui, 0.985 - font::width(&fps, 0.011, a), 0.98, 0.011, a, DIM, &fps);
+    if info.frame_drops > 0 {
+        let d = format!("{} DROPPED", info.frame_drops);
+        label(ui, 0.985 - font::width(&d, 0.009, a), 0.955, 0.009, a, [1.0, 0.55, 0.35, 1.0], &d);
+    }
 
     // ---- combo banner ----
     if info.combo >= 2 && info.combo_left > 0.0 {
@@ -1099,5 +1109,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.89    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.90    ESC QUITS FROM THIS SCREEN");
 }

@@ -513,6 +513,11 @@ struct Game {
     time: f32,
     acc: f32,
     fps: f32,
+    /// present-rate accounting: window, last counts, and drops in that window
+    fps_win: f32,
+    fps_presented: u64,
+    fps_dropped: u64,
+    frame_drops: u32,
     // session stats
     rings: u64,
     car_rings: u64,
@@ -1014,6 +1019,10 @@ fn main() {
         time: 0.0,
         acc: 0.0,
         fps: 60.0,
+        fps_win: 0.0,
+        fps_presented: 0,
+        fps_dropped: 0,
+        frame_drops: 0,
         rings: 0,
         car_rings: 0,
         combo: 0,
@@ -2589,8 +2598,25 @@ impl Game {
                 }
             }
         }
-        if dt > 1e-5 {
-            self.fps += (1.0 / dt - self.fps) * 0.06;
+        // FPS MEANS FRAMES THAT REACHED THE SCREEN.
+        //
+        // This used to smooth 1/dt of the redraw callback, which counts loop
+        // iterations — including every iteration that acquired nothing and
+        // drew nothing. With vsync on a 240 Hz panel it happily reported 600.
+        // Counting real presents over a wall-clock window cannot do that:
+        // the number is now bounded by the display, and if it reads 30 while
+        // the loop spins, that is the truth rather than a hidden failure.
+        {
+            let (pres, recfg, drop) = self.gpu.present_stats();
+            self.fps_win += dt;
+            if self.fps_win >= 0.5 {
+                let shown = (pres - self.fps_presented) as f32 / self.fps_win;
+                self.fps = shown;
+                self.frame_drops = (drop + recfg - self.fps_dropped) as u32;
+                self.fps_presented = pres;
+                self.fps_dropped = drop + recfg;
+                self.fps_win = 0.0;
+            }
         }
         self.toast_t = (self.toast_t - dt).max(0.0);
         if self.toast_t <= 0.0 {
@@ -3405,6 +3431,7 @@ impl Game {
             air_t: self.air_t,
             best_air: self.save.best_air,
             fps: self.fps,
+            frame_drops: self.frame_drops,
             car_name: self.cars.names[self.cars.active],
             ball_cam: self.cam.ball_cam,
             scores: if matches!(self.game_mode, 1 | 3..=7) { Some((self.scores[0], self.scores[1])) } else { None },

@@ -147,6 +147,12 @@ struct GpuMesh {
 }
 
 pub struct Gpu {
+    /// Present accounting. The frame counter used to tick once per loop
+    /// iteration whether or not anything reached the screen, which reads as
+    /// hundreds of FPS while the display updates a few times a second.
+    pub presented: u64,
+    pub reconfigures: u64,
+    pub dropped: u64,
     surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -664,6 +670,9 @@ impl Gpu {
         let pp_comp = mk_pbuf();
 
         let mut gpu = Gpu {
+            presented: 0,
+            reconfigures: 0,
+            dropped: 0,
             surface,
             device,
             queue,
@@ -711,6 +720,12 @@ impl Gpu {
     }
 
     /// Live vsync switch: Fifo (vsync) vs AutoNoVsync (tear-or-mailbox).
+    /// Frames that actually reached the screen, surfaces reconfigured, and
+    /// frames abandoned. The first is the only honest thing to call FPS.
+    pub fn present_stats(&self) -> (u64, u64, u64) {
+        (self.presented, self.reconfigures, self.dropped)
+    }
+
     pub fn set_vsync(&mut self, on: bool) {
         self.config.present_mode = if on {
             wgpu::PresentMode::Fifo

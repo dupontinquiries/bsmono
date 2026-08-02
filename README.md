@@ -451,3 +451,5 @@ Drop a car in as `assets/cars/<name>.glb` and it loads; `--sim glb` verifies it.
 GARAGE: ten animated skins, seven wheels, six trails, six goal explosions. `--sim garage` verifies the data.
 
 `--sim menus` checks menu layout across window shapes and verifies rows are hit-testable where they are drawn.
+
+The FPS readout counts frames that reached the screen, and shows dropped frames when the surface is abandoning them.

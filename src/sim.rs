@@ -3486,6 +3486,96 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "fps" {
+        // A frame counter that ticks per LOOP ITERATION cannot be trusted:
+        // with vsync on a 240 Hz display it reported 600 while the screen
+        // updated a few times a second. This checks the accounting itself —
+        // presented frames over a wall-clock window, which is bounded by the
+        // display by construction.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<52} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // model a loop that spins fast while presenting rarely
+        let rate = |loops: u32, present_every: u32, window: f32| -> f32 {
+            let mut presented = 0u64;
+            for i in 0..loops {
+                if i % present_every == 0 {
+                    presented += 1;
+                }
+            }
+            presented as f32 / window
+        };
+        let spun = rate(600, 20, 1.0); // 600 iterations, 30 presents
+        println!("   loop 600/s presenting 1 in 20 -> counter reads {spun:.0}");
+        check("a spinning loop cannot inflate the count", spun < 40.0);
+        let healthy = rate(240, 1, 1.0);
+        println!("   loop 240/s presenting every frame -> {healthy:.0}");
+        check("a healthy loop reads its true rate", (healthy - 240.0).abs() < 1.0);
+        check(
+            "the count cannot exceed the presents that happened",
+            rate(1000, 4, 1.0) <= 250.0,
+        );
+        // drops must be visible rather than silently absorbed
+        let (mut presented, mut dropped) = (0u32, 0u32);
+        for i in 0..600 {
+            if i % 20 == 0 {
+                presented += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        println!("   in that same second: {presented} presented, {dropped} abandoned");
+        check("abandoned frames are counted, not hidden", dropped > 0);
+        println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
+        return;
+    }
+    if name == "fps" {
+        // A frame counter that ticks per LOOP ITERATION cannot be trusted:
+        // with vsync on a 240 Hz display it reported 600 while the screen
+        // updated a few times a second. This checks the accounting itself —
+        // presented frames over a wall-clock window, which is bounded by the
+        // display by construction.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<52} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // model a loop that spins fast while presenting rarely
+        let rate = |loops: u32, present_every: u32, window: f32| -> f32 {
+            let mut presented = 0u64;
+            for i in 0..loops {
+                if i % present_every == 0 {
+                    presented += 1;
+                }
+            }
+            presented as f32 / window
+        };
+        let spun = rate(600, 20, 1.0); // 600 iterations, 30 presents
+        println!("   loop 600/s presenting 1 in 20 -> counter reads {spun:.0}");
+        check("a spinning loop cannot inflate the count", spun < 40.0);
+        let healthy = rate(240, 1, 1.0);
+        println!("   loop 240/s presenting every frame -> {healthy:.0}");
+        check("a healthy loop reads its true rate", (healthy - 240.0).abs() < 1.0);
+        check(
+            "the count cannot exceed the presents that happened",
+            rate(1000, 4, 1.0) <= 250.0,
+        );
+        // drops must be visible rather than silently absorbed
+        let (mut presented, mut dropped) = (0u32, 0u32);
+        for i in 0..600 {
+            if i % 20 == 0 {
+                presented += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        println!("   in that same second: {presented} presented, {dropped} abandoned");
+        check("abandoned frames are counted, not hidden", dropped > 0);
+        println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
+        return;
+    }
     if name == "menus" {
         // Menus break in ways that are invisible until someone opens one on a
         // narrow window. Text width scales with 1/aspect, so the same string

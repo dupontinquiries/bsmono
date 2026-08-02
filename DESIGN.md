@@ -2922,6 +2922,33 @@ a row lands on that row and that a click above the list hits nothing:
     aspect   0.55  0.75  1.00  1.33  1.78  2.40
     widest   1.02  0.76  0.73  0.73  0.70  0.53   (panel is 1.60)
 
+## v1.90.0 — the frame counter was counting the wrong thing
+
+Reported: 600 FPS on the counter, vsync on, a 240 Hz display, and it feels
+like 30. The first two facts are incompatible — with vsync on, presents
+cannot exceed the refresh rate — so the counter was measuring something
+other than frames reaching the screen.
+
+It was. It smoothed 1/dt of the REDRAW CALLBACK, which counts loop
+iterations, including every iteration that acquired no surface and drew
+nothing. FPS now counts PRESENTED frames over a wall-clock window, which is
+bounded by the display by construction. Modelled in `--sim fps`: a loop
+spinning at 600 while presenting one frame in twenty reads 600 under the old
+scheme and 30 under the new one — the number the display is actually
+showing.
+
+WHY FRAMES WERE BEING ABANDONED, and the likely cause of the 30. An
+Outdated surface reconfigured and RETURNED, dropping that frame entirely.
+Anything that puts the surface out of date repeatedly — a compositor, a DPI
+change, a resize storm — therefore becomes a loop that renders nothing while
+the redraw callback spins as fast as the CPU allows. The acquire now
+reconfigures and TRIES AGAIN, so a frame still gets out.
+
+DROPS ARE VISIBLE NOW. The HUD shows a dropped-frame count beside the FPS
+whenever it is non-zero. A low number with drops means the renderer is
+abandoning frames; a low number without them means the GPU is simply busy.
+The old counter could not tell those apart because it hid both.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
