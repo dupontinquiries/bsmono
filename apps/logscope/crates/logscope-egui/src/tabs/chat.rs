@@ -934,6 +934,15 @@ pub struct Chat {
     auto_continue: bool,                    // decode a fresh reply continuously up to the reply ceiling
     stepwise: bool,                         // checkpoint mode: model pauses at ⏸ STEP k/n markers, harness auto-continues
     patch_mode: bool,
+    /// The model actually running, as reported by a successful load.
+    last_loaded: Option<String>,
+    /// What the picker was asked for, so a failure can tell a switch from a reload.
+    last_picked: Option<String>,
+    /// Set on failure; the app applies it to the picker on the next frame. Some(None) means clear.
+    ///
+    /// Deferred rather than applied here because the picker lives in the app and this is the chat
+    /// tab — reaching across would be a second writer to the same state, which is the bug _290 fixed.
+    revert_picker: Option<Option<String>>,
     /// Measured decode rate, for revealpace. None until a generation has been timed — which starts
     /// the reveal in token mode, the safe default on an unknown model.
     last_tok_per_s: Option<f32>,
@@ -1067,7 +1076,8 @@ impl Default for Chat {
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
             auto_continue: true, stepwise: false, patch_mode: false, panel_mode: false,
-            last_tok_per_s: None, reveal_held_ms: 0, reveal_shown_len: 0, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
+            last_tok_per_s: None, reveal_held_ms: 0, reveal_shown_len: 0,
+            last_loaded: None, last_picked: None, revert_picker: None, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
             step_verifier: crate::stepverify::Verifier::new(),
             step_open: Default::default(),
@@ -1495,10 +1505,30 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 self.stream = None;
                 self.rep_monitor.reset();
             }
-            Evt::Loaded(Ok(info)) => { self.template = info.template; }
-            Evt::Loaded(Err(_)) => {}
+            Evt::Loaded(Ok(info)) => {
+                self.template = info.template;
+                // Remember what is ACTUALLY running, so a later failure has something to revert to.
+                // Without this the picker is the only record of the model, and it is the record that
+                // is wrong after a failure.
+                self.last_loaded = Some(info.path.clone());
+            }
+            Evt::Loaded(Err(_)) => {
+                // The picker was set optimistically when the load STARTED, so a failure leaves it
+                // naming a model that is not running — and the menu then asserts the wrong model is
+                // loaded. A name in the active slot is the one piece of state nobody re-checks.
+                self.revert_picker =
+                    Some(logscope::activemodel::on_load_failed(
+                        self.last_picked.as_deref(), self.last_loaded.as_deref()));
+            }
         }
     }
+
+    /// Hand the pending revert to the app, once.
+    ///
+    /// The chat tab observes the failure and the app owns the picker; passing the decision across
+    /// rather than writing it directly keeps a single writer, which is what _290 had to restore after
+    /// two of them disagreed.
+    pub fn take_revert_picker(&mut self) -> Option<Option<String>> { self.revert_picker.take() }
 
     fn params(&self) -> GenParams {
         // Auto-continue → decode a fresh reply continuously up to N chunks in one session; the slider
