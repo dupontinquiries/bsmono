@@ -840,6 +840,77 @@ pub fn run(args: &[String]) {
             if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
         return;
     }
+    if name == "academy" {
+        // The teaching layer. The point of interest is that a lesson is
+        // VERIFIED by the same detectors the replays use, so these checks
+        // are really asking: can the game tell when you did the thing?
+        use crate::academy::{progress, Passed, Skill, LESSONS};
+        use crate::replay::Trick;
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("there are lessons", LESSONS.len() >= 8);
+        check(
+            "every lesson names a real map",
+            LESSONS.iter().all(|l| l.map < crate::world::STYLE_COUNT),
+        );
+        check(
+            "every lesson has an instruction and a nudge",
+            LESSONS.iter().all(|l| l.hint.len() > 12 && l.nudge.len() > 12),
+        );
+        // the skills taught should cover what the game actually rewards
+        let taught: Vec<Trick> = LESSONS
+            .iter()
+            .filter_map(|l| match l.skill {
+                Skill::Do(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        println!("   teaches: {}", taught.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "));
+        check("the hardest tricks are taught", taught.contains(&Trick::FlipReset) && taught.contains(&Trick::AirDribble));
+        check("no two lessons verify the same trick", {
+            let mut u = taught.clone();
+            u.sort_by_key(|t| t.name());
+            u.dedup();
+            u.len() == taught.len()
+        });
+        // progress must come from the detector, not from time passing
+        check(
+            "a trick lesson is only passed when the trick lands",
+            progress(Skill::Do(Trick::FlipReset), 99.0, 99.0, 99, false) == 0.0
+                && progress(Skill::Do(Trick::FlipReset), 0.0, 0.0, 0, true) == 1.0,
+        );
+        check(
+            "measured lessons scale with the measurement",
+            (progress(Skill::BallSpeed(20.0), 10.0, 0.0, 0, false) - 0.5).abs() < 1e-5
+                && progress(Skill::BallSpeed(20.0), 40.0, 0.0, 0, false) == 1.0,
+        );
+        check(
+            "height and combo lessons work the same way",
+            (progress(Skill::Height(20.0), 0.0, 5.0, 0, false) - 0.25).abs() < 1e-5
+                && (progress(Skill::Combo(4), 0.0, 0.0, 2, false) - 0.5).abs() < 1e-5,
+        );
+        // the board must be set so the trick is possible at all
+        check(
+            "lessons that need the ball up put it up",
+            LESSONS
+                .iter()
+                .filter(|l| matches!(l.skill, Skill::Do(Trick::FlipReset) | Skill::Do(Trick::AirDribble)))
+                .all(|l| l.setup.up > 2.0 || l.setup.vel.y > 2.0),
+        );
+        // progress persists
+        let mut p = Passed::default();
+        check("nothing is learned to begin with", p.count() == 0);
+        p.set(0);
+        p.set(7);
+        check("passing sticks", p.has(0) && p.has(7) && !p.has(3));
+        let round = Passed::decode(&p.encode());
+        check("it survives the save file", round.has(0) && round.has(7) && round.count() == 2);
+        println!("{}", if pass { "ACADEMY: PASS" } else { "ACADEMY: FAIL" });
+        return;
+    }
     if name == "replay" {
         // The replay layer: a fixed ring buffer, trick recognition that only
         // ever reports what the physics reported, and a camera that frames

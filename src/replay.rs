@@ -31,6 +31,8 @@ pub struct Frame {
 /// What the player did, in the order they did it.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Trick {
+    /// a plain dodge in the air — the first thing anyone learns
+    Flip,
     Aerial,
     AirDribble,
     FlipReset,
@@ -45,6 +47,7 @@ pub enum Trick {
 impl Trick {
     pub fn name(self) -> &'static str {
         match self {
+            Trick::Flip => "FLIP",
             Trick::Aerial => "AERIAL",
             Trick::AirDribble => "AIR DRIBBLE",
             Trick::FlipReset => "FLIP RESET",
@@ -59,6 +62,7 @@ impl Trick {
     /// Rarity, used to pick which tricks get named and to score the moment.
     pub fn weight(self) -> u32 {
         match self {
+            Trick::Flip => 1,
             Trick::Aerial => 1,
             Trick::WaveDash => 2,
             Trick::Redirect => 3,

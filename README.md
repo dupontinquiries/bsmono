@@ -427,3 +427,5 @@ KUIPER runs live sky events: a world collapses into a black hole every five minu
 TRIALS: fifteen challenges across eleven maps, with ghost replays of your best runs. `--sim trials` verifies the logic.
 
 Goals are replayed and NAMED from what the physics saw — press R to rewatch. `--sim replay` verifies the recorder, the trick recognition and the camera.
+
+ACADEMY: ten lessons that the game verifies with the same detectors that name your replays. `--sim academy` checks the teaching layer.

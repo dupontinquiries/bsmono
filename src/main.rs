@@ -11,6 +11,7 @@ mod gamepad;
 mod gyro;
 mod trials;
 mod replay;
+mod academy;
 mod stream;
 mod hud;
 mod input;
@@ -52,6 +53,7 @@ const COMBO_WINDOW: f32 = 7.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
+    Academy { sel: usize },
     Trials { sel: usize },
     Splash,
     Play,
@@ -82,6 +84,7 @@ enum Row {
     Link(u8),
     Controls,
     Trials,
+    Academy,
     Fullscreen,
     Header,
     GameMode(u8), // 0 free, 1 sparta 50v50, 2 sparta 300
@@ -277,6 +280,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("BACK", Back),
         ],
         _ => vec![
+            ("ACADEMY - LEARN THE TRICKS", Academy),
             ("TRIALS", Trials),
             ("CONTROLS + KEY BINDINGS", Controls),
             ("GAME MODES", Link(6)),
@@ -325,7 +329,7 @@ fn row_value(cfg: &Config, row: &Row) -> (String, Option<f32>) {
         }
         Row::Toggle { get, .. } => ((if get(cfg) { "ON" } else { "OFF" }).into(), None),
         Row::Preset => (PRESETS[cfg.preset % PRESETS.len()].into(), None),
-        Row::Link(_) | Row::Controls | Row::Trials | Row::GameMode(_) => (String::new(), None),
+        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::GameMode(_) => (String::new(), None),
         Row::CarPick => ("<see below>".into(), None),
         Row::Fullscreen => ("TOGGLE".into(), None),
         Row::Header | Row::Back => (String::new(), None),
@@ -452,6 +456,12 @@ struct Game {
     gyro: gyro::Gyro,
     /// bounding spheres of the terrain chunks, for culling the ground
     tchunks: Vec<(Vec3, f32)>,
+    /// the academy lesson in progress, and which have been passed
+    lesson: Option<academy::Session>,
+    passed: academy::Passed,
+    lesson_sel: usize,
+    /// tricks noted since the lesson began (the verifier)
+    lesson_tricks: Vec<replay::Trick>,
     /// always-on replay buffer, plus the moments worth keeping
     rec: replay::Recorder,
     moments: Vec<replay::Moment>,
@@ -869,6 +879,7 @@ fn main() {
     let rs0 = cfg.video.render_scale;
     let gyro_on0 = cfg.gyro.on;
     let trials_bests0 = trials::Bests::decode(&sv.trials);
+    let academy_passed0 = academy::Passed::decode(&sv.academy);
     let mut game = Game {
         gpu,
         world,
@@ -907,6 +918,10 @@ fn main() {
         tap_drive: (0.0, 0.0),
         gyro: gyro::Gyro::new(gyro_on0),
         tchunks,
+        lesson: None,
+        passed: academy_passed0,
+        lesson_sel: 0,
+        lesson_tricks: Vec::new(),
         rec: replay::Recorder::default(),
         moments: Vec::new(),
         watching: None,
@@ -1299,6 +1314,15 @@ impl Game {
         let esc = Key::Named(NamedKey::Escape);
         let enter = Key::Named(NamedKey::Enter);
         match self.mode {
+            Mode::Academy { sel } => {
+                if let Some(i) = self.hover_row() {
+                    if i == sel {
+                        self.start_lesson(i);
+                    } else {
+                        self.mode = Mode::Academy { sel: i };
+                    }
+                }
+            }
             Mode::Trials { sel } => {
                 if let Some(i) = self.hover_row() {
                     if i == sel {
@@ -1579,6 +1603,101 @@ impl Game {
         };
     }
 
+    /// Set the board for a lesson: the car here, the ball there and moving,
+    /// so the trick is possible on the first attempt rather than needing a
+    /// lucky bounce.
+    fn arm_lesson(&mut self) {
+        let Some(sess) = self.lesson.as_ref() else { return };
+        let st = sess.lesson().setup;
+        self.car.reset(&self.world);
+        if st.car_up > 0.0 {
+            self.car.pos += Vec3::Y * st.car_up;
+            self.car.vel = Vec3::ZERO;
+        }
+        let f = self.car.forward();
+        self.ball.pos = self.car.pos + f * st.ahead + Vec3::Y * (st.up + self.ball.r);
+        self.ball.vel = self.car.rot * st.vel;
+        self.ball.ang = Vec3::ZERO;
+        self.ball.prev = self.ball.pos;
+        self.combo = 0;
+        self.air_t = 0.0;
+        self.lesson_tricks.clear();
+    }
+
+    fn start_lesson(&mut self, i: usize) {
+        let l = &academy::LESSONS[i.min(academy::LESSONS.len() - 1)];
+        if self.save.map != l.map {
+            self.load_map(l.map, self.save.seed);
+        }
+        self.lesson = Some(academy::Session::new(i));
+        self.lesson_sel = i;
+        self.arm_lesson();
+        self.mode = Mode::Play;
+        self.toastf(&format!("{} - {}", l.name, l.hint));
+    }
+
+    /// Watch the lesson: progress comes from the same detectors the replays
+    /// use, so passing one means the game genuinely saw the trick.
+    fn tick_lesson(&mut self, dt: f32) {
+        let Some(mut sess) = self.lesson.take() else { return };
+        sess.t += dt;
+        let l = sess.lesson();
+        let hit = matches!(l.skill, academy::Skill::Do(t) if self.lesson_tricks.contains(&t));
+        let gy = self.world.ground_h(self.car.pos.x, self.car.pos.z);
+        let p = academy::progress(
+            l.skill,
+            self.ball.vel.length(),
+            self.car.pos.y - gy,
+            self.combo,
+            hit,
+        );
+        sess.best = sess.best.max(p);
+        if p >= 1.0 {
+            let first = !self.passed.has(sess.idx);
+            self.passed.set(sess.idx);
+            self.save.academy = self.passed.encode();
+            self.toastf(&if first {
+                format!("{} - PASSED", l.name)
+            } else {
+                format!("{} - again, cleanly", l.name)
+            });
+            // the moment is its own demonstration
+            let (title, score) = self.rec.moment(6.0);
+            let frames = self.rec.frames();
+            if frames.len() > 20 && score > 0 {
+                self.moments.push(replay::Moment { title, score, frames });
+                self.moments.sort_by(|a, b| b.score.cmp(&a.score));
+                self.moments.truncate(6);
+                self.watching = Some((0, 0.0));
+            }
+            self.lesson = None;
+            return;
+        }
+        // the coach speaks once, when you have clearly tried and missed
+        if !sess.nudged && sess.t > 12.0 && sess.best > 0.15 {
+            sess.nudged = true;
+            self.toastf(l.nudge);
+        }
+        // re-arm when the ball has settled and nothing is happening
+        let ball_rest = self.ball.vel.length() < 1.2 && self.world.sdf(self.ball.pos) < self.ball.r + 0.4;
+        if ball_rest && self.car.on_ground {
+            sess.idle += dt;
+        } else {
+            sess.idle = 0.0;
+        }
+        if sess.idle > 2.5 || sess.t > l.limit {
+            sess.idle = 0.0;
+            if sess.t > l.limit {
+                sess.t = 0.0;
+                sess.nudged = false;
+            }
+            self.lesson = Some(sess);
+            self.arm_lesson();
+            return;
+        }
+        self.lesson = Some(sess);
+    }
+
     /// Load a trial's map and start the clock. The ghost of your best run
     /// on this trial (if any) rides along.
     fn start_trial(&mut self, i: usize) {
@@ -1690,7 +1809,7 @@ impl Game {
             Row::Preset | Row::CarPick => {
                 self.tweaks_key(&Key::Named(NamedKey::ArrowRight), menu, i, win);
             }
-            Row::Link(_) | Row::Controls | Row::Trials => {
+            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy => {
                 self.mscroll = 0.0;
                 self.mfling = 0.0;
                 self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
@@ -1733,6 +1852,22 @@ impl Game {
             _ => "",
         };
         match self.mode {
+            Mode::Academy { sel } => {
+                let n = academy::LESSONS.len();
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Academy { sel: (sel + n - 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Academy { sel: (sel + 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::Enter), _) => self.start_lesson(sel),
+                    _ => {}
+                }
+            }
             Mode::Trials { sel } => {
                 let n = trials::TRIALS.len();
                 match (&key, ch) {
@@ -1983,6 +2118,10 @@ impl Game {
             Row::Trials => {
                 self.mscroll = 0.0;
                 self.mode = Mode::Trials { sel: self.trial_sel };
+            }
+            Row::Academy => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Academy { sel: self.lesson_sel };
             }
             Row::Fullscreen => {
                 if matches!(key, Key::Named(NamedKey::Enter)) || dir != 0 {
@@ -2628,6 +2767,14 @@ impl Game {
         let mut ui: Vec<UiVert> = Vec::new();
         self.peer_tags(&mut ui, vp, aspect);
         match self.mode {
+            Mode::Academy { sel } => hud::academy_menu(
+                &mut ui,
+                aspect,
+                sel,
+                &self.passed,
+                self.mscroll.max(0.0) as usize,
+                self.cursor,
+            ),
             Mode::Trials { sel } => hud::trials_menu(
                 &mut ui,
                 aspect,
@@ -2842,21 +2989,29 @@ impl Game {
             let ball_air = self.world.sdf(self.ball.pos) > self.ball.r + 0.25;
             if ev.flip_reset.is_some() {
                 self.rec.note(replay::Trick::FlipReset);
+                self.lesson_tricks.push(replay::Trick::FlipReset);
             }
             if ev.pinched {
                 self.rec.note(replay::Trick::Pinch);
+                self.lesson_tricks.push(replay::Trick::Pinch);
             }
-            if ev.dodged && self.car.on_ground {
-                self.rec.note(replay::Trick::WaveDash);
+            if ev.dodged {
+                // landing mid-dodge is a wave dash; anywhere else it is just
+                // a flip — and the academy teaches them in that order
+                let t = if self.car.on_ground { replay::Trick::WaveDash } else { replay::Trick::Flip };
+                self.rec.note(t);
+                self.lesson_tricks.push(t);
             }
             if !ev.touches.is_empty() && !self.car.on_ground {
                 self.rec.note(replay::Trick::Aerial);
+                self.lesson_tricks.push(replay::Trick::Aerial);
                 if ball_air {
                     // a touch on a ball that is already up, while up: that is
                     // the air dribble, and the air-link timer proves it is a
                     // continuation rather than a one-off
                     if self.air_t > 0.6 {
                         self.rec.note(replay::Trick::AirDribble);
+                        self.lesson_tricks.push(replay::Trick::AirDribble);
                     }
                     if self.car.pos.y - self.world.ground_h(self.car.pos.x, self.car.pos.z) > 26.0 {
                         self.rec.note(replay::Trick::Ceiling);
@@ -2973,6 +3128,7 @@ impl Game {
                 }
             }
         }
+        self.tick_lesson(dt);
         self.tick_trial(dt);
         if ball_air && self.air_link > 0.0 {
             self.air_t += dt;
@@ -3040,6 +3196,13 @@ impl Game {
         }
         // TRIAL BANNER: what you are attempting, the clock, and a bar that
         // fills as you get there — plus the target to beat if you have one.
+        if let Some(sess) = self.lesson.as_ref() {
+            let l = sess.lesson();
+            let gy = self.world.ground_h(self.car.pos.x, self.car.pos.z);
+            let hit = matches!(l.skill, academy::Skill::Do(t) if self.lesson_tricks.contains(&t));
+            let p = academy::progress(l.skill, self.ball.vel.length(), self.car.pos.y - gy, self.combo, hit);
+            hud::lesson_banner(ui, aspect, l.name, l.hint, p.max(sess.best), self.passed.has(sess.idx));
+        }
         if let Some(run) = self.trial.as_ref() {
             let t = run.trial();
             let best = self.bests.get(run.idx);

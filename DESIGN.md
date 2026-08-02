@@ -1962,6 +1962,39 @@ stale tricks leave the window, the camera keeps its distance and orbits and
 closes in, and playback interpolates between samples and clamps past the
 end.
 
+## v1.61.0 — the ACADEMY: the game already knew, so let it teach
+
+Skydribble grew a lot of depth — air dribbles, flip resets, wave dashes,
+pinches, portal flings — and never explained any of it. The replay system
+had already solved the hard half of a tutorial without meaning to: it
+recognises tricks from physics events. That makes "do a wave dash" a real
+instruction, because the game can tell whether you did one.
+
+TEN LESSONS, in the order you would actually learn them: the flip, the wave
+dash, the power shot, the aerial, going up, keepy uppy, the air dribble, the
+flip reset, the pinch, the fling. Each one SETS THE BOARD — car here, ball
+there, moving like this — so the trick is possible on the first attempt
+instead of needing a lucky bounce. The board re-arms itself when the ball
+settles, so practice is continuous.
+
+VERIFICATION IS THE POINT. A lesson passes when the same detector that
+names your replays fires, not when a timer runs out. Pass one and the
+moment replays itself, which is both the reward and the demonstration for
+next time. There is also a coach: if you have clearly tried and missed for
+twelve seconds, it says the one thing most likely to fix it — "flip later,
+you want to be landing as the flip fires".
+
+The sim caught a real design flaw here. THE FLIP and THE WAVE DASH were
+both verified by the same detector, so the first lesson would pass on a
+wave dash — teaching nothing. Trick gained a plain FLIP (a dodge in the
+air) distinct from WAVE DASH (a dodge into the ground on landing), and
+`--sim academy` now asserts that no two lessons verify the same trick.
+
+Thirteen checks in all: lessons name real maps, carry an instruction and a
+nudge, teach the hardest tricks, verify only on the detector rather than on
+time, scale measured goals correctly, set the ball up when the trick needs
+it up, and record progress that survives a save.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
