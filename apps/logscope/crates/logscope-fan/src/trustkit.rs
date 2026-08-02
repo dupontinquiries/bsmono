@@ -278,3 +278,113 @@ mod tests {
         assert_eq!(r.level("m"), Trust::Unknown, "revocation hits the only entry");
     }
 }
+
+/// Read and write the registry as a small text file.
+///
+/// A trust list that vanishes on restart defeats the point of a set-once setting — and worse, it does
+/// so invisibly: the peer is simply absent next time, which reads as a discovery failure rather than
+/// as forgotten state.
+///
+/// One line per machine, `level id [key-hex]`. Text rather than a binary format because it is a file a
+/// person may reasonably want to read, diff, or hand-edit when a machine is decommissioned.
+impl Registry {
+    pub fn to_text(&self) -> String {
+        let mut s = String::from("# logscope trusted machines — one per line: level id [key-hex]\n");
+        for (id, level, key) in &self.entries {
+            if *level == Trust::Unknown { continue; }   // revoked entries are not written back
+            s.push_str(&format!("{level:?} {id}"));
+            if let Some(k) = key {
+                s.push(' ');
+                for b in k { s.push_str(&format!("{b:02x}")); }
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    /// Parse, skipping blank and comment lines.
+    ///
+    /// A malformed line is SKIPPED rather than failing the whole file: one bad entry should not
+    /// silently drop every other machine an operator registered, and losing the file is the failure
+    /// this persistence exists to prevent.
+    pub fn from_text(text: &str) -> (Registry, Vec<String>) {
+        let mut r = Registry::new();
+        let mut bad = Vec::new();
+        for (n, line) in text.lines().enumerate() {
+            let t = line.trim();
+            if t.is_empty() || t.starts_with('#') { continue; }
+            let mut f = t.split_whitespace();
+            let (lvl, id) = match (f.next(), f.next()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => { bad.push(format!("line {}: expected `level id`", n + 1)); continue; }
+            };
+            let level = match lvl {
+                "Build" => Trust::Build,
+                "Compute" => Trust::Compute,
+                "Handoff" => Trust::Handoff,
+                other => { bad.push(format!("line {}: unknown level {other:?}", n + 1)); continue; }
+            };
+            match f.next() {
+                Some(hex) if hex.len() % 2 == 0 => {
+                    let key: Option<Vec<u8>> = (0..hex.len() / 2)
+                        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect();
+                    match key {
+                        Some(k) => r.register_keyed(id, level, k),
+                        None => { bad.push(format!("line {}: key is not hex", n + 1)); continue; }
+                    }
+                }
+                Some(_) => { bad.push(format!("line {}: key has an odd length", n + 1)); continue; }
+                None => r.register(id, level),
+            }
+        }
+        (r, bad)
+    }
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    #[test]
+    fn a_registry_round_trips() {
+        let mut r = Registry::new();
+        r.register_keyed("m2", Trust::Handoff, vec![0xde, 0xad, 0xbe, 0xef]);
+        r.register("ci", Trust::Build);
+        let (back, bad) = Registry::from_text(&r.to_text());
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(back.level("m2"), Trust::Handoff);
+        assert_eq!(back.key("m2"), Some(&[0xde, 0xad, 0xbe, 0xef][..]));
+        assert_eq!(back.level("ci"), Trust::Build);
+        assert!(back.key("ci").is_none(), "a keyless entry stays keyless");
+    }
+
+    #[test]
+    fn a_REVOKED_machine_is_not_written_back() {
+        // Otherwise a revocation would be undone by the next restart, which is the worst possible
+        // moment for it: the operator revoked deliberately and would not check again.
+        let mut r = Registry::new();
+        r.register_keyed("gone", Trust::Handoff, vec![1]);
+        r.revoke("gone");
+        let (back, _) = Registry::from_text(&r.to_text());
+        assert_eq!(back.level("gone"), Trust::Unknown);
+    }
+
+    #[test]
+    fn one_bad_line_does_not_drop_the_others() {
+        // A file that fails to parse as a whole loses every machine an operator registered — the exact
+        // failure this persistence exists to prevent, arriving through the fix for it.
+        let text = "Handoff good aabb\nNonsense bad\nBuild also-good\n";
+        let (r, bad) = Registry::from_text(text);
+        assert_eq!(r.level("good"), Trust::Handoff);
+        assert_eq!(r.level("also-good"), Trust::Build);
+        assert_eq!(bad.len(), 1, "the bad line is REPORTED, not silently dropped: {bad:?}");
+    }
+
+    #[test]
+    fn comments_and_blanks_are_ignored() {
+        // It is a file a person may hand-edit when a machine is decommissioned.
+        let (r, bad) = Registry::from_text("# header\n\n  \nCompute m1\n");
+        assert!(bad.is_empty());
+        assert_eq!(r.level("m1"), Trust::Compute);
+    }
+}
