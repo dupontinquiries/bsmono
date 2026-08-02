@@ -288,6 +288,17 @@ mod tests {
 /// One line per machine, `level id [key-hex]`. Text rather than a binary format because it is a file a
 /// person may reasonably want to read, diff, or hand-edit when a machine is decommissioned.
 impl Registry {
+    /// Entries a UI should show: `(id, level, has_key)`.
+    ///
+    /// Revoked entries are omitted, matching `to_text` — a list that showed them would imply a
+    /// revocation had not taken effect.
+    pub fn entries_for_display(&self) -> Vec<(String, Trust, bool)> {
+        self.entries.iter()
+            .filter(|(_, l, _)| *l != Trust::Unknown)
+            .map(|(id, l, k)| (id.clone(), *l, k.is_some()))
+            .collect()
+    }
+
     pub fn to_text(&self) -> String {
         let mut s = String::from("# logscope trusted machines — one per line: level id [key-hex]\n");
         for (id, level, key) in &self.entries {
@@ -487,5 +498,34 @@ mod registry_io_tests {
         assert_eq!(back.level("gone"), Trust::Unknown);
         assert_eq!(back.level("stays"), Trust::Compute);
         let _ = std::fs::remove_file(&p);
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    #[test]
+    fn the_display_list_marks_which_entries_can_be_AUTHENTICATED() {
+        // The verified/unverified split is the point of showing the list at all: an entry with no key
+        // cannot be authenticated, so it is listed and cannot be acted on. A list that hid the
+        // distinction would imply a working link that does not exist.
+        let mut r = Registry::new();
+        r.register("typed-only", Trust::Compute);
+        r.register_keyed("has-key", Trust::Handoff, vec![1, 2]);
+        let d = r.entries_for_display();
+        assert_eq!(d.len(), 2);
+        assert!(!d.iter().find(|(id, _, _)| id == "typed-only").unwrap().2, "no key: unverified");
+        assert!(d.iter().find(|(id, _, _)| id == "has-key").unwrap().2, "key on file: verified");
+    }
+
+    #[test]
+    fn a_revoked_entry_is_not_DISPLAYED() {
+        // Matching to_text, so the list and the file agree. Showing a revoked machine would imply the
+        // revocation had not taken effect.
+        let mut r = Registry::new();
+        r.register_keyed("gone", Trust::Handoff, vec![1]);
+        r.revoke("gone");
+        assert!(r.entries_for_display().is_empty());
     }
 }
