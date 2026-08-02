@@ -1,13 +1,15 @@
 //! Offscreen render of an asset loaded by skydribble's own loader, through a
 //! minimal wgpu pipeline (the game's swapchain path needs a window; this
 //! harness needs only an adapter). Writes a PNG.
+include!("shim.rs");
+
 use std::path::PathBuf;
 use wgpu::util::DeviceExt;
 
 fn main() {
     let dir = PathBuf::from(std::env::args().nth(1).expect("usage: botshot <asset dir> <out.png>"));
     let out = PathBuf::from(std::env::args().nth(2).unwrap_or("botshot.png".into()));
-    let (raws, half) = skydribble::model::load_raw(&dir, 4.2);
+    let (raws, half) = model::load_raw(&dir, 4.2);
 
     let instance = wgpu::Instance::default();
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

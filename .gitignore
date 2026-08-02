@@ -1,1 +1,4 @@
-target/
+/target/
+vendor/*/target/
+skydribble.save
+*.zip

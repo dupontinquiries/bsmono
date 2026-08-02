@@ -1,7 +1,10 @@
 [package]
 name = "skydribble"
-version = "1.41.0"
+version = "1.93.0"
 edition = "2021"
+# examples/shim.rs is an include! fragment, not a binary — declare the two
+# harnesses by hand so cargo does not try to build it as one.
+autoexamples = false
 description = "Rocket-League-inspired open-world air-dribble playground: Rust + wgpu, SDF-generated playful shapes, real RL car/ball models."
 
 [features]
@@ -46,3 +49,11 @@ debug = "line-tables-only"
 [profile.release]
 opt-level = 3
 lto = "thin"
+
+[[example]]
+name = "botcheck"
+path = "examples/botcheck.rs"
+
+[[example]]
+name = "botshot"
+path = "examples/botshot.rs"

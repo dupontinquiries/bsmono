@@ -98,6 +98,12 @@ impl Profile {
     /// save file existed OR the user asked to re-apply, so a player who tunes
     /// their phone's settings keeps them.
     pub fn apply(self, cfg: &mut crate::config::Config) {
+        // GYRO FLYING on a handheld: motion controls are the natural way to
+        // fly a car you cannot get a second thumb onto, so they arrive on,
+        // gated to the air where they help and cannot upset your driving.
+        cfg.gyro.on = true;
+        cfg.gyro.gate = 2;
+        cfg.gyro.air_mode = 0;
         if self != Profile::Handheld {
             return;
         }

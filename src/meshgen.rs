@@ -250,18 +250,53 @@ pub fn hex_prism() -> MeshData {
     m
 }
 
+/// The chamfered lip of a tube MOUTH: a tapered band joining the outer wall
+/// to the inner one, so an opening shows the wall's thickness instead of a
+/// zero-width edge. Unit radius, sitting in the z=0 plane and facing -Z.
+pub fn tube_rim(seg: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let n = seg.max(12);
+    let (ro, ri) = (1.0f32, 0.86f32);
+    let cham = (ro - ri) * 0.9;
+    let base = m.verts.len() as u32;
+    for i in 0..=n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        let (c, sn) = (a.cos(), a.sin());
+        let nrm = [c * 0.7, sn * 0.7, -0.71];
+        m.push(Vec3::new(c * ro, sn * ro, 0.0), Vec3::from_array(nrm), Vec2::new(i as f32 / n as f32, 0.0));
+        m.push(Vec3::new(c * ri, sn * ri, cham), Vec3::from_array(nrm), Vec2::new(i as f32 / n as f32, 1.0));
+    }
+    for i in 0..n {
+        let k = base + i * 2;
+        m.idx.extend_from_slice(&[k, k + 1, k + 2, k + 1, k + 3, k + 2]);
+    }
+    m
+}
+
 pub fn tube_open(seg: u32) -> MeshData {
     let mut m = MeshData::new();
     let n = seg.max(8);
-    let (ro, ri) = (1.0f32, 0.9f32);
+    let (ro, ri) = (1.0f32, 0.86f32);
+    // FLUTES: a perfectly smooth cylinder of translucent glass has nothing
+    // for the light to catch, which is why the tubes kept reading flat. A
+    // shallow ribbing around the circumference gives the wall form — the
+    // highlight now runs along the flutes and the pipe looks round.
+    let flutes = 12.0f32;
     let mut ring = |r: f32, inward: bool| {
         let base = m.verts.len() as u32;
         for i in 0..=n {
             let a = i as f32 / n as f32 * std::f32::consts::TAU;
             let (c, sn) = (a.cos(), a.sin());
-            let nrm = if inward { [-c, 0.0, -sn] } else { [c, 0.0, sn] };
+            let rib = 1.0 + (a * flutes).cos() * if inward { 0.012 } else { 0.028 };
+            let rr = r * rib;
+            // tilt the normal with the flute so it shades as a ridge
+            let dt = -(a * flutes).sin() * flutes * 0.028;
+            let tang = [-sn + c * dt, 0.0, c + sn * dt];
+            let len = (tang[0] * tang[0] + tang[2] * tang[2]).sqrt().max(1e-5);
+            let nb = [tang[2] / len, 0.0, -tang[0] / len];
+            let nrm = if inward { [-nb[0], 0.0, -nb[2]] } else { nb };
             for y in [-1.0f32, 1.0] {
-                m.verts.push(Vertex { pos: [c * r, y, sn * r], nrm, uv: [i as f32 / n as f32, y * 0.5 + 0.5] });
+                m.verts.push(Vertex { pos: [c * rr, y, sn * rr], nrm, uv: [i as f32 / n as f32 * flutes * 0.25, y * 0.5 + 0.5] });
             }
         }
         for i in 0..n {
@@ -276,6 +311,238 @@ pub fn tube_open(seg: u32) -> MeshData {
     };
     ring(ro, false);
     ring(ri, true);
+    // NO RIM HERE. A chamfer on every segment draws a ring at both ends of
+    // every one of them — and a tube is dozens of overlapping segments, so
+    // the bore filled with concentric circles that appear and vanish as the
+    // view angle changes. The chamfer belongs only at a real MOUTH, so it
+    // is its own mesh now (`tube_rim`), placed by the generator at the two
+    // ends of a run rather than baked into every link.
+    m
+}
+
+/// A CHAMFERED BOX. The procedural cars were built from hard-edged boxes,
+/// which is what made them read as blocks rather than vehicles: a real body
+/// catches a highlight along every edge. `bevel` is in unit-box space.
+pub fn cbox(bevel: f32) -> MeshData {
+    let b = bevel.clamp(0.02, 0.45);
+    let i = 1.0 - b;
+    let mut m = MeshData::new();
+    // eight face quads (inset) plus the bevel bands between them
+    let faces: [(Vec3, Vec3, Vec3); 6] = [
+        (Vec3::X, Vec3::Y, Vec3::Z),
+        (Vec3::NEG_X, Vec3::Y, Vec3::NEG_Z),
+        (Vec3::Y, Vec3::NEG_Z, Vec3::X),
+        (Vec3::NEG_Y, Vec3::Z, Vec3::X),
+        (Vec3::Z, Vec3::Y, Vec3::NEG_X),
+        (Vec3::NEG_Z, Vec3::Y, Vec3::X),
+    ];
+    for (n, u, v) in faces {
+        let c = n;
+        let base = m.verts.len() as u32;
+        for (su, sv) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let p = c + u * (su * i) + v * (sv * i);
+            m.push(p, n, Vec2::new(su * 0.5 + 0.5, sv * 0.5 + 0.5));
+        }
+        m.idx.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+    // bevel strips: join each face edge to its neighbour with a slanted quad
+    for (n, u, v) in faces {
+        for (eu, ev) in [(1.0f32, 0.0f32), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0)] {
+            let e = u * eu + v * ev; // the edge direction on this face
+            let t = u * ev + v * eu; // along the edge
+            let base = m.verts.len() as u32;
+            let nrm = (n + e).normalize();
+            for st in [-1.0f32, 1.0] {
+                m.push(n + e * i + t * (st * i), nrm, Vec2::new(st * 0.5 + 0.5, 0.0));
+                m.push(n * i + e + t * (st * i), nrm, Vec2::new(st * 0.5 + 0.5, 1.0));
+            }
+            m.idx.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+        }
+    }
+    m
+}
+
+/// A RIM in one of the garage's styles, as a unit-radius disc facing X.
+///
+/// This is drawn OVER whatever wheel a car already has, at the wheel's own
+/// pivot and with its own spin, so a style applies to every car in the game
+/// — the imported bodies included — without touching their meshes.
+/// `spokes` of 0 means a solid disc; `dish` is how far the face is inset.
+pub fn rim(spokes: u32, dish: f32, seg: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let n = seg.max(16);
+    let x = 0.30 - dish * 0.5; // the face plane, inset by the dish
+    // the outer lip: a short cylinder so the rim has depth against the tyre
+    for i in 0..=n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        let (c, s2) = (a.cos(), a.sin());
+        for xx in [x, 0.30] {
+            m.push(Vec3::new(xx, c * 0.94, s2 * 0.94), Vec3::new(0.0, c, s2), Vec2::new(i as f32 / n as f32, 0.0));
+        }
+    }
+    for i in 0..n {
+        let k = i * 2;
+        m.idx.extend_from_slice(&[k, k + 1, k + 2, k + 1, k + 3, k + 2]);
+    }
+    // the face: a hub, plus either a solid disc or a set of spokes
+    let base = m.verts.len() as u32;
+    let nx = Vec3::new(1.0, 0.0, 0.0);
+    m.push(Vec3::new(x, 0.0, 0.0), nx, Vec2::new(0.5, 0.5));
+    let hub = if spokes == 0 { 0.94 } else { 0.30 };
+    for i in 0..=n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        m.push(Vec3::new(x, a.cos() * hub, a.sin() * hub), nx, Vec2::new(0.5, 0.5));
+    }
+    for i in 0..n {
+        m.idx.extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
+    }
+    // spokes: flat bars from the hub to the lip, each a quad
+    if spokes > 0 {
+        let w = (0.9 / spokes as f32).clamp(0.03, 0.16);
+        for k in 0..spokes {
+            let a = k as f32 / spokes as f32 * std::f32::consts::TAU;
+            let (ca, sa) = (a.cos(), a.sin());
+            let (px, py) = (-sa * w, ca * w); // across the spoke
+            let b2 = m.verts.len() as u32;
+            for (r, sgn) in [(0.28f32, 1.0f32), (0.28, -1.0), (0.93, 1.0), (0.93, -1.0)] {
+                m.push(
+                    Vec3::new(x, ca * r + px * sgn, sa * r + py * sgn),
+                    nx,
+                    Vec2::new(0.5, 0.5),
+                );
+            }
+            m.idx.extend_from_slice(&[b2, b2 + 1, b2 + 2, b2 + 1, b2 + 3, b2 + 2]);
+        }
+    }
+    m
+}
+
+/// A LOFTED HULL — the real answer to "these look like stacked boxes".
+///
+/// Takes cross-sections along Z (nose to tail) and skins between them, so a
+/// body can taper into its nose, swell over the wheel arches and pinch at
+/// the tail the way a car actually does. Each section is (z, half_width,
+/// bottom_y, top_y, corner) and the corner value rounds the section from a
+/// rectangle (0) toward an ellipse (1), which is what gives a shoulder line
+/// instead of an edge.
+pub fn loft(sections: &[(f32, f32, f32, f32, f32)], ring: u32) -> MeshData {
+    let mut m = MeshData::new();
+    if sections.len() < 2 {
+        return m;
+    }
+    let n = ring.max(8);
+    // a rounded-rectangle ring in the section's own space
+    let ring_pt = |hw: f32, y0: f32, y1: f32, corner: f32, t: f32| -> Vec3 {
+        let a = t * std::f32::consts::TAU;
+        let (ca, sa) = (a.cos(), a.sin());
+        let (cy, hy) = ((y0 + y1) * 0.5, (y1 - y0) * 0.5);
+        // blend between a box outline and an ellipse
+        let bx = ca.signum() * (ca.abs().powf(0.35));
+        let by = sa.signum() * (sa.abs().powf(0.35));
+        Vec3::new(
+            hw * (bx * (1.0 - corner) + ca * corner),
+            cy + hy * (by * (1.0 - corner) + sa * corner),
+            0.0,
+        )
+    };
+    let stride = n + 1;
+    for (si, &(z, hw, y0, y1, corner)) in sections.iter().enumerate() {
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            let p = ring_pt(hw, y0, y1, corner, t);
+            // normal from neighbouring sections, so the skin shades smoothly
+            let (zp, zn) = (
+                sections[si.saturating_sub(1)],
+                sections[(si + 1).min(sections.len() - 1)],
+            );
+            let a = ring_pt(zp.1, zp.2, zp.3, zp.4, t) + Vec3::new(0.0, 0.0, zp.0);
+            let b = ring_pt(zn.1, zn.2, zn.3, zn.4, t) + Vec3::new(0.0, 0.0, zn.0);
+            let along = (b - a).normalize_or(Vec3::Z);
+            let t2 = (i as f32 + 0.25) / n as f32;
+            let q = ring_pt(hw, y0, y1, corner, t2);
+            let tang = (q - p).normalize_or(Vec3::X);
+            let nrm = tang.cross(along).normalize_or(Vec3::Y);
+            m.push(Vec3::new(p.x, p.y, z), nrm, Vec2::new(t, si as f32 / sections.len() as f32));
+        }
+    }
+    for si in 0..sections.len() - 1 {
+        for i in 0..n {
+            let a = (si as u32) * stride + i;
+            let b = a + 1;
+            let c = a + stride;
+            let d = c + 1;
+            m.idx.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    // cap the ends so the hull is closed
+    for (end, si) in [(0usize, 0u32), (sections.len() - 1, (sections.len() - 1) as u32)] {
+        let (z, hw, y0, y1, corner) = sections[end];
+        let base = m.verts.len() as u32;
+        let nz = if end == 0 { -1.0 } else { 1.0 };
+        m.push(Vec3::new(0.0, (y0 + y1) * 0.5, z), Vec3::new(0.0, 0.0, nz), Vec2::new(0.5, 0.5));
+        for i in 0..=n {
+            let p = ring_pt(hw, y0, y1, corner, i as f32 / n as f32);
+            m.push(Vec3::new(p.x, p.y, z), Vec3::new(0.0, 0.0, nz), Vec2::new(0.5, 0.5));
+        }
+        let _ = si;
+        for i in 0..n {
+            if nz > 0.0 {
+                m.idx.extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
+            } else {
+                m.idx.extend_from_slice(&[base, base + 2 + i, base + 1 + i]);
+            }
+        }
+    }
+    m
+}
+
+/// A WHEEL: a tyre torus with a rim disc, instead of a squashed sphere.
+/// Unit radius 1 in Y/Z, `width` along X.
+pub fn wheel(width: f32, seg: u32) -> MeshData {
+    let mut m = MeshData::new();
+    let n = seg.max(12);
+    let tube = 0.30f32;
+    let ring = 1.0 - tube;
+    // tyre
+    for i in 0..=n {
+        let a = i as f32 / n as f32 * std::f32::consts::TAU;
+        let (ca, sa) = (a.cos(), a.sin());
+        for j in 0..=8u32 {
+            let b = j as f32 / 8.0 * std::f32::consts::TAU;
+            let (cb, sb) = (b.cos(), b.sin());
+            let r = ring + tube * cb;
+            let p = Vec3::new(sb * tube * width, ca * r, sa * r);
+            let nr = Vec3::new(sb, ca * cb, sa * cb).normalize();
+            m.push(p, nr, Vec2::new(i as f32 / n as f32, j as f32 / 8.0));
+        }
+    }
+    let stride = 9u32;
+    for i in 0..n {
+        for j in 0..8 {
+            let k = i * stride + j;
+            m.idx.extend_from_slice(&[k, k + stride, k + 1, k + 1, k + stride, k + stride + 1]);
+        }
+    }
+    // rim faces, so the wheel is not hollow when you see it side-on
+    for sx in [-1.0f32, 1.0] {
+        let base = m.verts.len() as u32;
+        m.push(Vec3::new(sx * tube * width * 0.9, 0.0, 0.0), Vec3::new(sx, 0.0, 0.0), Vec2::new(0.5, 0.5));
+        for i in 0..=n {
+            let a = i as f32 / n as f32 * std::f32::consts::TAU;
+            m.push(
+                Vec3::new(sx * tube * width * 0.9, a.cos() * ring, a.sin() * ring),
+                Vec3::new(sx, 0.0, 0.0),
+                Vec2::new(a.cos() * 0.5 + 0.5, a.sin() * 0.5 + 0.5),
+            );
+        }
+        for i in 0..n {
+            if sx > 0.0 {
+                m.idx.extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
+            } else {
+                m.idx.extend_from_slice(&[base, base + 2 + i, base + 1 + i]);
+            }
+        }
+    }
     m
 }
 
@@ -436,6 +703,55 @@ pub fn pad_disc(cols: u32) -> MeshData {
 /// Terrain disk: radius `radius`, `n` cells across, displaced by `h(x, z)`.
 /// Normals from central differences of the same height function, so lighting
 /// matches the physics SDF exactly.
+/// One CHUNK of the terrain grid: the same nodes as `terrain`, but only the
+/// cells in [i0,i1) x [j0,j1). Splitting the ground into chunks is what
+/// makes it cullable — as one 97k-triangle mesh, every blade of it was
+/// drawn every frame no matter where you looked. Returns the mesh and its
+/// bounding sphere (centre, radius).
+pub fn terrain_chunk<F: Fn(f32, f32) -> f32>(
+    radius: f32,
+    n: u32,
+    i0: u32,
+    i1: u32,
+    j0: u32,
+    j1: u32,
+    h: &F,
+) -> (MeshData, Vec3, f32) {
+    let mut m = MeshData::new();
+    let step = radius * 2.0 / n as f32;
+    let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+    let w = i1 - i0 + 1;
+    for j in j0..=j1 {
+        for i in i0..=i1 {
+            let x = -radius + i as f32 * step;
+            let z = -radius + j as f32 * step;
+            let y = h(x, z);
+            lo = lo.min(y);
+            hi = hi.max(y);
+            let e = 0.6;
+            let nx = h(x - e, z) - h(x + e, z);
+            let nz = h(x, z - e) - h(x, z + e);
+            let nrm = Vec3::new(nx, 2.0 * e, nz).normalize();
+            m.push(Vec3::new(x, y, z), nrm, Vec2::new(x, z));
+        }
+    }
+    for j in 0..(j1 - j0) {
+        for i in 0..(i1 - i0) {
+            let a = j * w + i;
+            let b = a + 1;
+            let c = a + w;
+            let d = c + 1;
+            m.idx.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    let cx = -radius + (i0 + i1) as f32 * 0.5 * step;
+    let cz = -radius + (j0 + j1) as f32 * 0.5 * step;
+    let cy = (lo + hi) * 0.5;
+    let half_xz = (i1 - i0) as f32 * step * 0.5;
+    let r = (half_xz * half_xz * 2.0 + ((hi - lo) * 0.5).powi(2)).sqrt() + step;
+    (m, Vec3::new(cx, cy, cz), r)
+}
+
 pub fn terrain<F: Fn(f32, f32) -> f32>(radius: f32, n: u32, h: F) -> MeshData {
     let mut m = MeshData::new();
     let step = radius * 2.0 / n as f32;

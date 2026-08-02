@@ -411,3 +411,49 @@ KUIPER runs live sky events: a world collapses into a black hole every five minu
 `--sim spawn` audits every map's spawn point: clearance, settling, and final attitude.
 
 `--sim dribble` checks the input-to-rotation mapping and how long the ball rides the hood.
+
+`--sim drive` drives a car through every tube route and reports traversal and escapes.
+
+`--sim platform` checks that cars ride moving decks; `--sim learn` measures whether the bots improve mid-match.
+
+`--sim stream` measures the LAN render-assist split: transport, bitrate, ray-step saving and accuracy.
+
+`--sim portal` verifies the portal transform: speed conservation, exit alignment, the fling, and no ping-pong.
+
+`--sim ballspin` checks that spin does what it should: curve, topspin, backspin, slide-to-roll.
+
+`--sim render` reports how much of each map survives culling, and the LOD triangle budget.
+
+TRIALS: fifteen challenges across eleven maps, with ghost replays of your best runs. `--sim trials` verifies the logic.
+
+Goals are replayed and NAMED from what the physics saw — press R to rewatch. `--sim replay` verifies the recorder, the trick recognition and the camera.
+
+ACADEMY: ten lessons that the game verifies with the same detectors that name your replays. `--sim academy` checks the teaching layer.
+
+`--sim march` counts the ray marcher's exact SDF evaluations saved by bounding-sphere rejection.
+
+`--sim flick` measures flick pace, launch angle and carry for five dodge directions.
+
+`--sim routecheck` reads the world SDF along every route, showing whether a line threads a real bore or open air.
+
+`--sim drive` reports tube navigability: how much of a run is spent inside a bore and how much with wheels on a surface.
+
+`--sim perf` times worldgen, SDF throughput, the physics step and the per-call cost of the hot functions.
+
+Twelve cars now, including three EVs that pull harder off the line and top out lower. `--sim cars` measures the drivetrain difference.
+
+`--sim hits` sweeps contact points and checks the ball's exit direction is continuous.
+
+VIPERA and AEGIS are built from a written specification, hardpoints first — see `procars.rs`.
+
+Drop a car in as `assets/cars/<name>.glb` and it loads; `--sim glb` verifies it. Every car has an EV variant with an ion thruster.
+
+GARAGE: ten animated skins, seven wheels, six trails, six goal explosions. `--sim garage` verifies the data.
+
+`--sim menus` checks menu layout across window shapes and verifies rows are hit-testable where they are drawn.
+
+The FPS readout counts frames that reached the screen, and shows dropped frames when the surface is abandoning them.
+
+Five cars are assembled from mined vehicle part layouts; `--sim parts` checks the donors stay distinct.
+
+Six hovercars: a cushion instead of wheels, momentum instead of grip, and a repulsor field that herds the ball. `--sim hover` verifies all three.

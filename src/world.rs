@@ -29,10 +29,21 @@ pub const M_SHELL_OPEN_LO: usize = 11; // ...and its far-field LOD
 pub const M_TORUS_TUBE: usize = 12; // hollow torus: a seamless loop of pipe
 pub const M_RING_DECK: usize = 13; // flat annulus: a drivable planetary ring
 pub const M_HEX: usize = 12; // hexagonal tile prism
+pub const TERRAIN_CHUNKS: u32 = 6; // 6x6 cullable ground tiles
+pub const M_TERRAIN_0: usize = 25; // after the wheel rims and the tube rim // first of TERRAIN_CHUNKS^2 chunk meshes
+pub const M_SPHERE_LO: usize = 15; // far-field sphere: a fifth of the triangles
+pub const M_CAP_TALL_LO: usize = 16;
+/// the seven garage rim styles, registered right after the car LODs
+/// the chamfered lip drawn at a tube's real mouths (not at every segment)
+pub const M_TUBE_RIM: usize = 24;
+pub const M_RIM_0: usize = 17; // far-field capsule
 /// Terrain ground-truth grid: physics, placement, the render mesh and the
 /// ray-marched shadows all sample THESE nodes, so the floor you see is the
 /// floor you drive on (the analytic fbm is only sampled once, node-wise).
 pub const TG_N: usize = 221; // 220 cells, matching meshgen::terrain(_, 220, _)
+/// cell size of the gravity index
+const GCELL: f32 = 18.0;
+
 pub const TG_HALF: f32 = 1300.0;
 
 pub const CAP_SHORT_HH: f32 = 1.5;
@@ -66,6 +77,10 @@ pub struct Shape {
     pub color: [f32; 4],
     pub emissive: f32,
     pub flash: f32,
+    /// world-space linear velocity of this shape (animated shapes only)
+    pub vel: Vec3,
+    /// world-space angular velocity — a spinner drags riders around too
+    pub omega: Vec3,
     pub spec: f32,
     /// CSG cutter: subtracts from the union (carves holes) and is not drawn
     pub cut: bool,
@@ -98,6 +113,9 @@ pub enum Anim {
     Orbit { shape: usize, center: Vec3, axis: Vec3, r: f32, rate: f32, phase: f32, rot: Quat, scale: Vec3 },
     /// shuttles along dir (a moving stepping-stone)
     Slide { shape: usize, base: Vec3, dir: Vec3, amp: f32, rate: f32, phase: f32, rot: Quat, scale: Vec3 },
+    /// swings from a pivot like something hung on a rope — a true pendulum,
+    /// so a log bridge tilts as it swings and you have to time the crossing
+    Swing { shape: usize, pivot: Vec3, axis: Vec3, len: f32, amp: f32, rate: f32, phase: f32, rot: Quat, scale: Vec3 },
 }
 
 /// Field zones, pinball-machine style.
@@ -159,6 +177,81 @@ pub struct Body {
     pub sq_dir: Vec3,
     /// phase of the jelly wobble, so it springs back past round and settles
     pub sq_t: f32,
+    /// drawn size and attitude: a leaf is a wide flat blade, not a ball
+    pub scale: Vec3,
+    pub rot: Quat,
+    pub spin: Vec3,
+    /// air drag — a leaf flutters and settles, a rock coasts
+    pub drag: f32,
+}
+
+/// A PORTAL. Two of these are linked: anything crossing one's face comes
+/// out of the other, rotated by the transform between them and carrying its
+/// speed. "Speedy thing goes in, speedy thing comes out."
+pub struct Portal {
+    pub pos: Vec3,
+    /// orientation: rot * Z is the face normal, rot * Y is the portal's up
+    pub rot: Quat,
+    pub r: f32,
+    /// index of the portal this one exits from
+    pub link: usize,
+    pub shape: usize,
+    /// pair colour: every pair has its own hue, and the two ends differ in
+    /// shade, so a glance tells you which mouth you are looking at and
+    /// which one it feeds
+    pub tint: [f32; 4],
+    /// ride an animated shape: pos and rot re-sync from it every update
+    pub follow: Option<usize>,
+    /// the cutter shapes that carve this mouth open, with their offsets in
+    /// the mount's frame — a moving portal has to carry its HOLE with it,
+    /// or it rides away and leaves you embedded in solid geometry
+    pub cuts: Vec<(usize, Vec3)>,
+}
+
+/// One giant chess piece: a body plus whatever rides on it (ramps, a
+/// launcher ring), sliding square to square under its own power.
+pub struct ChessPiece {
+    /// every shape that travels with this piece, and its offset from the
+    /// piece origin — a piece is a little vehicle carrying its own furniture
+    pub parts: Vec<(usize, Vec3)>,
+    pub launcher: Option<usize>,
+    pub sq: (i32, i32),
+    pub from: Vec3,
+    pub to: Vec3,
+    pub t: f32,
+    pub dur: f32,
+    pub moving: bool,
+    pub vel: Vec3,
+    pub gone: bool,
+}
+
+/// The board plays a real game, move by move, and gets wilder as the score
+/// climbs: the interval shortens and pieces start moving in pairs.
+pub struct Chess {
+    pub pieces: Vec<ChessPiece>,
+    pub moves: Vec<((i32, i32), (i32, i32))>,
+    pub next: usize,
+    pub timer: f32,
+    pub square: f32,
+    pub origin: Vec3,
+    pub fury: f32,
+}
+
+/// A standing current: water moving through a place, carrying whatever is
+/// in it. Reuses the floodwater force path in the physics step.
+pub struct Flow {
+    pub pos: Vec3,
+    pub r: f32,
+    pub vel: Vec3,
+}
+
+/// An arcade ball-hitter: a paddle that fires when the ball comes near.
+pub struct Hitter {
+    pub pos: Vec3,
+    pub r: f32,
+    pub power: f32,
+    pub timer: f32,
+    pub shape: usize,
 }
 
 pub struct GravNode {
@@ -205,8 +298,26 @@ pub struct Pad {
 
 pub struct World {
     pub grav: Vec<GravNode>,
+    /// XZ spatial hash over gravity nodes. Finding the nearest two used to
+    /// scan every node — 705 of them on PERPLEXUS, for every car and the
+    /// ball, every frame, at five microseconds a call. That was the single
+    /// most expensive thing the CPU did.
+    ggrid: Vec<Vec<u16>>,
+    gdim: i32,
+    /// nodes that MOVE (they ride animated shapes) stay out of the grid
+    gdyn: Vec<u16>,
+    /// Movers, bucketed by cell and rebuilt every update. They cannot live
+    /// in the static shape grid (they travel out of their cell), but walking
+    /// ALL of them on every SDF query is what made CHAMBER's 190 chess parts
+    /// cost more than the other 180 shapes put together.
+    mgrid: Vec<Vec<u16>>,
     /// XZ spatial hash over shapes: sdf() walks one cell, not the world
     sgrid: Vec<Vec<u16>>,
+    /// ANIMATED shapes are never in the grid — they travel far outside the
+    /// cell they were baked into (an orbiting carriage leaves it entirely
+    /// and simply vanished from the physics world). They are few, so every
+    /// query walks them directly.
+    dyn_shapes: Vec<u16>,
     scell: f32,
     sdim: i32,
     /// drivable tube routes for bot pathing: (waypoints, radius)
@@ -219,6 +330,10 @@ pub struct World {
     /// active floods: (route, age, duration)
     pub floods: Vec<(usize, f32, f32)>,
     pub tiles: Vec<Tile>,
+    pub hitters: Vec<Hitter>,
+    pub flows: Vec<Flow>,
+    pub chess: Option<Chess>,
+    pub portals: Vec<Portal>,
     pub bodies: Vec<Body>,
     /// KUIPER: which grav node is collapsing, and how long it has left
     pub bh: Option<(usize, f32)>,
@@ -257,6 +372,26 @@ pub struct World {
 }
 
 // ------------------------------------------------------------- random ----
+fn smoothstep01(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Bounding reach of a shape — used by the mover index and the broad phase.
+pub fn shape_reach(sdf: &Sdf) -> f32 {
+    match *sdf {
+        Sdf::None => 0.0,
+        Sdf::Sphere { r } => r,
+        Sdf::Torus { big, tube } => big + tube,
+        Sdf::Capsule { r, half } => r + half,
+        Sdf::Hex { r, h } => (r * r + h * h).sqrt(),
+        Sdf::RBox { half, .. } => half.length(),
+        Sdf::Shell { r, half, thick } => ((r + thick) * (r + thick) + half * half).sqrt(),
+        Sdf::TubeTorus { big, tube, thick } => big + tube + thick,
+        Sdf::RingDeck { big, wide, .. } => big + wide,
+    }
+}
+
 /// polynomial smooth-min: the SDF fillet
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     let h = (0.5 + 0.5 * (b - a) / k).clamp(0.0, 1.0);
@@ -397,7 +532,7 @@ pub struct MapStyle {
     pub focal: u8,
 }
 
-pub const STYLE_COUNT: usize = 30;
+pub const STYLE_COUNT: usize = 36;
 
 /// Adapted from logscope scene3d's ROOMS table — same sixteen names, each
 /// translated from an indoor room into an open-world mood.
@@ -440,6 +575,12 @@ pub fn styles() -> &'static [MapStyle; STYLE_COUNT] {
             MapStyle { name: "GATEWORKS", grass: g(0x33302A), zenith: rgb3(0xC9B98F), fog: rgb3(0xD9CBA5), fog_d: 0.0012, sun: [0.5, 0.6, 0.2], accent: g(0x74E0B0), pal_mix: 0.45, amp: 0.15, freq: 1.0, wet: 0.18, glow: 0.35, rings: 4, halos: 2, balloons: 0, domes: 0, ramps: 4, platforms: 4, trees: 0, small_pads: 28, nets: 2, focal: 16 },
             MapStyle { name: "KUIPER", grass: g(0x0A0C14), zenith: rgb3(0x05060C), fog: rgb3(0x10142A), fog_d: 0.0010, sun: [-0.5, 0.4, 0.5], accent: g(0x9FD4FF), pal_mix: 0.65, amp: 0.15, freq: 0.6, wet: 0.05, glow: 0.6, rings: 6, halos: 6, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 24, nets: 2, focal: 17 },
             MapStyle { name: "ZOETROPE", grass: g(0x2A2432), zenith: rgb3(0x1A1526), fog: rgb3(0x352B4A), fog_d: 0.0014, sun: [0.3, 0.5, 0.4], accent: g(0xFFC24D), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.28, glow: 0.5, rings: 0, halos: 3, balloons: 0, domes: 0, ramps: 0, platforms: 0, trees: 0, small_pads: 26, nets: 1, focal: 18 },
+            MapStyle { name: "CLOCKWORK", grass: g(0x2E2A38), zenith: rgb3(0x1B2436), fog: rgb3(0x33405C), fog_d: 0.0011, sun: [0.4, 0.6, 0.3], accent: g(0x6FE3C4), pal_mix: 0.5, amp: 0.1, freq: 1.0, wet: 0.26, glow: 0.45, rings: 3, halos: 3, balloons: 0, domes: 0, ramps: 3, platforms: 6, trees: 0, small_pads: 30, nets: 2, focal: 19 },
+            MapStyle { name: "APERTURE", grass: g(0x9A9384), zenith: rgb3(0xBFCBD6), fog: rgb3(0xD7DEE4), fog_d: 0.0010, sun: [0.3, 0.75, 0.35], accent: g(0x35C8FF), pal_mix: 0.4, amp: 0.0, freq: 1.0, wet: 0.34, glow: 0.4, rings: 2, halos: 2, balloons: 0, domes: 0, ramps: 4, platforms: 6, trees: 0, small_pads: 22, nets: 2, focal: 20 },
+            MapStyle { name: "TURNSTILE", grass: g(0x6E6A62), zenith: rgb3(0x2A3446), fog: rgb3(0x8A93A2), fog_d: 0.0012, sun: [-0.3, 0.7, 0.4], accent: g(0xFFC24D), pal_mix: 0.45, amp: 0.0, freq: 1.0, wet: 0.30, glow: 0.5, rings: 3, halos: 3, balloons: 0, domes: 0, ramps: 3, platforms: 6, trees: 0, small_pads: 24, nets: 2, focal: 21 },
+            MapStyle { name: "WYRMFIRE", grass: g(0x2A1410), zenith: rgb3(0x2A0E12), fog: rgb3(0x6E2412), fog_d: 0.0016, sun: [0.4, 0.5, -0.3], accent: g(0xFF7A18), pal_mix: 0.6, amp: 0.35, freq: 1.2, wet: 0.22, glow: 0.75, rings: 4, halos: 4, balloons: 0, domes: 0, ramps: 5, platforms: 6, trees: 0, small_pads: 26, nets: 2, focal: 22 },
+            MapStyle { name: "BREAKWATER", grass: g(0x8C8A84), zenith: rgb3(0x7FB4D8), fog: rgb3(0xC6D8E2), fog_d: 0.0011, sun: [0.5, 0.7, 0.2], accent: g(0x2FBFA6), pal_mix: 0.4, amp: 0.05, freq: 1.0, wet: 0.55, glow: 0.3, rings: 3, halos: 2, balloons: 0, domes: 0, ramps: 5, platforms: 8, trees: 0, small_pads: 28, nets: 2, focal: 23 },
+            MapStyle { name: "CHAMBER", grass: g(0x1E1C26), zenith: rgb3(0x0E1018), fog: rgb3(0x2A2636), fog_d: 0.0013, sun: [-0.35, 0.7, 0.25], accent: g(0x9FE3FF), pal_mix: 0.45, amp: 0.0, freq: 1.0, wet: 0.42, glow: 0.55, rings: 2, halos: 3, balloons: 0, domes: 0, ramps: 4, platforms: 6, trees: 0, small_pads: 24, nets: 2, focal: 24 },
         ]
     })
 }
@@ -456,6 +597,10 @@ impl World {
         let mut route_shapes: Vec<Vec<u32>> = Vec::new();
         let mut floodable: Vec<usize> = Vec::new();
         let mut tiles: Vec<Tile> = Vec::new();
+        let mut hitters: Vec<Hitter> = Vec::new();
+        let mut flows: Vec<Flow> = Vec::new();
+        let mut chess: Option<Chess> = None;
+        let mut portals: Vec<Portal> = Vec::new();
         let mut bodies: Vec<Body> = Vec::new();
         let mut drop_pit: Option<f32> = None;
         let mut spawn_hint: Option<Vec3> = None;
@@ -518,6 +663,8 @@ impl World {
             sdf,
             Sdf::Shell { .. } | Sdf::RBox { .. } | Sdf::Capsule { .. } | Sdf::TubeTorus { .. } | Sdf::RingDeck { .. }
         ),
+        vel: Vec3::ZERO,
+        omega: Vec3::ZERO,
         cut: false,
         });
             shapes.len() - 1
@@ -740,21 +887,34 @@ impl World {
                                 glow: f32| {
                     let mid = (a + b) * 0.5;
                     let axis = (b - a).normalize_or(Vec3::Z);
-                    let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
+                    let half = (b - a).length() * 0.92; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
-                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: r * 0.035 }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.88);
                     shapes[si].blend = true;
-                    // BEVEL COLLARS: a fillet torus at each mouth eases the
-                    // transition (and hides the seam where the bore opens)
-                    for (ep, ea) in [(a, axis), (b, axis)] {
-                        let brot = Quat::from_rotation_arc(Vec3::Y, ea) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                        // the collar is a VISUAL fillet: as a solid it sat
-                        // exactly on the bore wall and, blended, thickened it
-                        // inward at every single joint
-                        push(shapes, M_TORUS_THIN, ep, brot, Vec3::splat(r * 1.0), Sdf::None, [col[0], col[1], col[2], 0.5], glow * 0.6 + 0.1, 0.45);
-                    }
-                    for t in [0.2f32, 0.5, 0.8] {
-                        grav.push(GravNode { pos: a.lerp(b, t), down: Vec3::NEG_Y, r: r * 1.55, tube: true, inward: false, g: 1.0, surf: false, follow: None });
+
+                    // A node every ~5 m with generous reach, following the
+                    // SDF gradient. Sparse nodes left the middle of a long
+                    // segment reverting toward world-down, so a car climbing
+                    // a steep pipe simply lost the wall and fell out.
+                    let seg_len = a.distance(b).max(0.01);
+                    let steps = ((seg_len / 5.0).ceil() as usize).clamp(2, 40);
+                    for k in 0..=steps {
+                        let t = k as f32 / steps as f32;
+                        grav.push(GravNode {
+                            pos: a.lerp(b, t),
+                            down: Vec3::NEG_Y,
+                            r: r * 1.45,
+                            tube: true,
+                            inward: false,
+                            // Scale with the BORE: a narrow pipe holds you
+                            // by geometry (and stronger pull there slammed
+                            // cars into walls, 21/24 -> 17/24), but in a
+                            // 12 m bore a boosting car flies up the middle
+                            // and never touches a wall at all.
+                            g: (r / 12.0).clamp(0.45, 1.15),
+                            surf: true,
+                            follow: None,
+                        });
                     }
                 };
                 let cut_s = |shapes: &mut Vec<Shape>, p: Vec3, r: f32| {
@@ -873,9 +1033,14 @@ impl World {
                 // ---- jungle-gym lattice: a tall random tube network with
                 // switchbacks, drops and knuckle joints everywhere ----
                 let mut anchors: Vec<Vec3> = Vec::new();
-                for k in 0..32 {
+                // FEWER, BETTER SPACED. At 32 anchors with four links each the
+                // lattice was a thicket: tubes crossed constantly, junction
+                // rooms piled into one another and the sculpture stopped
+                // reading as a structure. Twenty-two anchors on a wider ring
+                // gives the same three-tier shape with room to see it.
+                for k in 0..22 {
                     let a = rng.range(0.0, std::f32::consts::TAU);
-                    let rr = rng.range(34.0, 150.0) * ws;
+                    let rr = rng.range(48.0, 165.0) * ws;
                     // SKY HIGH: three tiers, the top one well above the old
                     // ceiling, so the sculpture climbs instead of sprawling
                     let y = match k % 3 {
@@ -894,8 +1059,11 @@ impl World {
                         .map(|j| (anchors[i].distance(anchors[j]), j))
                         .collect();
                     near.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    for &(d, j) in near.iter().take(4) {
-                        if j < i || d > 105.0 {
+                    // three links, and a minimum span: very short links were
+                    // the ones that tangled, since two anchors a few metres
+                    // apart still get a full-width pipe and a junction room
+                    for &(d, j) in near.iter().take(3) {
+                        if j < i || d > 105.0 || d < 26.0 {
                             continue;
                         }
                         // no cramped links: the thin end of the range was
@@ -940,7 +1108,10 @@ impl World {
                         for hoop in [Quat::IDENTITY, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)] {
                             push(&mut shapes, M_TORUS_THIN, anchors[i], hoop, Vec3::splat(cr * 0.99), Sdf::Torus { big: cr * 0.99, tube: (cr * 0.05).max(0.16) }, mix4(acc, [1.0; 4], 0.25), 0.55, 0.4);
                         }
-                        cut_s(&mut shapes, anchors[i], cr - 0.9);
+                        // the chamber shell was thick enough to be a plug at
+                        // every joint: carve nearly to the skin so the room
+                        // inside is genuinely open
+                        cut_s(&mut shapes, anchors[i], cr - 0.4);
                         grav.push(GravNode { pos: anchors[i], down: Vec3::NEG_Y, r: cr * 1.8, tube: true, inward: false, g: 1.0, surf: false, follow: None });
                     }
                 }
@@ -951,17 +1122,20 @@ impl World {
                     let a = anchors[i] + dir * (knuckle_r[i] * 0.94);
                     let b = anchors[j] - dir * (knuckle_r[j] * 0.94);
                     tube(&mut shapes, &mut grav, a, b, r, mix4(*rng.pick(&pal), acc, 0.25), glow);
-                    cut_s(&mut shapes, anchors[i] + dir * knuckle_r[i], r * 1.12);
-                    cut_s(&mut shapes, anchors[j] - dir * knuckle_r[j], r * 1.12);
+                    cut_s(&mut shapes, anchors[i] + dir * knuckle_r[i], r * 1.45);
+                    cut_s(&mut shapes, anchors[j] - dir * knuckle_r[j], r * 1.45);
                     if r >= 5.0 {
                         let len = a.distance(b);
                         let n = (len / 20.0) as i32;
                         let hrot = Quat::from_rotation_arc(Vec3::Y, dir) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
                         for k in 1..n {
                             let p = a.lerp(b, k as f32 / n as f32);
-                            // glowing guide rings: drawn only. As collision
-                            // they pinched the bore they were meant to light.
-                            push(&mut shapes, M_TORUS_THIN, p, hrot, Vec3::splat(r * 0.88), Sdf::None, mix4(acc, [1.0; 4], 0.3), 0.75, 0.4);
+                            // A LIGHT LINE, NOT A RING. Hoops every 20 m read
+                            // as clutter filling the pipe; a short glowing
+                            // strip laid along the bore wall lights the way
+                            // without standing in it.
+                            let strip = Vec3::new(r * 0.05, 0.05, 3.2);
+                            push(&mut shapes, M_BOX, p - Vec3::Y * (r * 0.82), hrot, strip, Sdf::None, mix4(acc, [1.0; 4], 0.35), 0.85, 0.4);
                         }
                     }
                     spine_pads.push(a.lerp(b, 0.5) - Vec3::Y * (r * 0.8));
@@ -1439,21 +1613,34 @@ impl World {
                 let tube = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, a: Vec3, b: Vec3, r: f32, col: [f32; 4], glow: f32| {
                     let mid = (a + b) * 0.5;
                     let axis = (b - a).normalize_or(Vec3::Z);
-                    let half = (b - a).length() * 0.78; // overlap: bends read as one pipe
+                    let half = (b - a).length() * 0.92; // overlap: bends read as one pipe
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
-                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: r * 0.035 }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.88);
                     shapes[si].blend = true;
-                    // BEVEL COLLARS: a fillet torus at each mouth eases the
-                    // transition (and hides the seam where the bore opens)
-                    for (ep, ea) in [(a, axis), (b, axis)] {
-                        let brot = Quat::from_rotation_arc(Vec3::Y, ea) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                        // the collar is a VISUAL fillet: as a solid it sat
-                        // exactly on the bore wall and, blended, thickened it
-                        // inward at every single joint
-                        push(shapes, M_TORUS_THIN, ep, brot, Vec3::splat(r * 1.0), Sdf::None, [col[0], col[1], col[2], 0.5], glow * 0.6 + 0.1, 0.45);
-                    }
-                    for t in [0.25f32, 0.75] {
-                        grav.push(GravNode { pos: a.lerp(b, t), down: Vec3::NEG_Y, r: r * 1.55, tube: true, inward: false, g: 1.0, surf: false, follow: None });
+
+                    // A node every ~5 m with generous reach, following the
+                    // SDF gradient. Sparse nodes left the middle of a long
+                    // segment reverting toward world-down, so a car climbing
+                    // a steep pipe simply lost the wall and fell out.
+                    let seg_len = a.distance(b).max(0.01);
+                    let steps = ((seg_len / 5.0).ceil() as usize).clamp(2, 40);
+                    for k in 0..=steps {
+                        let t = k as f32 / steps as f32;
+                        grav.push(GravNode {
+                            pos: a.lerp(b, t),
+                            down: Vec3::NEG_Y,
+                            r: r * 1.45,
+                            tube: true,
+                            inward: false,
+                            // Scale with the BORE: a narrow pipe holds you
+                            // by geometry (and stronger pull there slammed
+                            // cars into walls, 21/24 -> 17/24), but in a
+                            // 12 m bore a boosting car flies up the middle
+                            // and never touches a wall at all.
+                            g: (r / 12.0).clamp(0.45, 1.15),
+                            surf: true,
+                            follow: None,
+                        });
                     }
                 };
                 let cut_s = |shapes: &mut Vec<Shape>, p: Vec3, r: f32| {
@@ -1486,7 +1673,7 @@ impl World {
                 let loop_ring = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, wp: &mut Vec<Vec3>, c: Vec3, axis: Vec3, r: f32, col: [f32; 4], glow: f32| -> f32 {
                     let big = r / crate::meshgen::TT_R;
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis.normalize_or(Vec3::Y));
-                    let i = push(shapes, M_TORUS_TUBE, c, rot, Vec3::splat(big), Sdf::TubeTorus { big, tube: r, thick: big * crate::meshgen::TT_T }, [col[0], col[1], col[2], 0.55], glow, 0.45);
+                    let i = push(shapes, M_TORUS_TUBE, c, rot, Vec3::splat(big), Sdf::TubeTorus { big, tube: r, thick: big * crate::meshgen::TT_T }, [col[0], col[1], col[2], 0.55], glow, 0.88);
                     shapes[i].blend = true;
                     let (u, v) = (rot * Vec3::X, rot * Vec3::Z);
                     // 28 waypoints, not 12: at 12 the straight CHORD between
@@ -1518,6 +1705,191 @@ impl World {
                     wp.push(at(n));
                 };
 
+                // ---- THE GIANTS: avatar-scale trees you drive INTO ----
+                // A handful of enormous trunks with a road spiralling up
+                // through the wood, smooth hollows opening off it, and
+                // giant vines strung between them at windscreen height.
+                {
+                    let bark_g = mix4(PLINTH, [0.26, 0.17, 0.10, 1.0], 0.75);
+                    let mut giant_tops: Vec<(Vec3, f32)> = Vec::new();
+                    for k in 0..4usize {
+                        let a = k as f32 * 1.5707 + 0.6;
+                        let rr = rng.range(120.0, 190.0) * ws;
+                        let (x, z) = (a.cos() * rr, a.sin() * rr);
+                        let g = th(x, z);
+                        let tr = rng.range(15.0, 26.0);
+                        let hgt = rng.range(95.0, 165.0);
+                        let half = hgt * 0.5;
+                        let base = Vec3::new(x, g + half, z);
+                        let ti = push(&mut shapes, M_CAP_TALL, base, Quat::IDENTITY, Vec3::new(tr, half / CAP_TALL_HH.max(1.0), tr), Sdf::Capsule { r: tr, half }, bark_g, 0.0, 0.25);
+                        shapes[ti].blend = true;
+                        giant_tops.push((Vec3::new(x, g + hgt, z), tr));
+
+                        // THE SPIRAL ROAD: a bore winding up through the
+                        // trunk, carved rather than built, so the wood itself
+                        // is the tunnel. Registered as a route, which is what
+                        // keeps the clearance pass opening it.
+                        let road_r = (tr * 0.30).clamp(4.5, 7.5);
+                        // The helix is derived from a DRIVABLE SLOPE, not a
+                        // turn count: a fixed 2-3 turns made the first stretch
+                        // a 60-degree shaft (the drive test stalled at 4% of
+                        // the route). Hug the bark at constant radius and take
+                        // as many turns as a ~1:3 climb needs.
+                        let rad = (tr - road_r * 1.05).max(4.0);
+                        let climb = hgt - 12.0;
+                        let turns = (climb / (0.34 * std::f32::consts::TAU * rad)).clamp(1.5, 7.0);
+                        let arc = turns * std::f32::consts::TAU * rad;
+                        let steps = ((arc / (road_r * 0.75)).ceil() as usize).clamp(40, 220);
+                        let mut way: Vec<Vec3> = Vec::new();
+                        for t in 0..=steps {
+                            let f = t as f32 / steps as f32;
+                            let ang = f * turns * std::f32::consts::TAU;
+                            let p = Vec3::new(x + ang.cos() * rad, g + 3.0 + f * climb, z + ang.sin() * rad);
+                            cut_s(&mut shapes, p, road_r);
+                            if t % 3 == 0 {
+                                way.push(p);
+                                grav.push(GravNode { pos: p, down: Vec3::NEG_Y, r: road_r * 2.2, tube: true, inward: false, g: 1.0, surf: true, follow: None });
+                            }
+                        }
+                        // the entrance: carve out through the bark at ground
+                        let ent = Vec3::new(x + (rad + tr) * 0.5 + tr * 0.75, g + 3.0, z);
+                        for t in 0..8 {
+                            let f = t as f32 / 7.0;
+                            cut_s(&mut shapes, ent.lerp(way[0], f), road_r * (1.25 - 0.25 * f));
+                        }
+                        let mut full = vec![ent];
+                        full.extend(way.iter().copied());
+                        routes.push((full, road_r));
+                        rim(&mut shapes, ent, Vec3::NEG_X, road_r, mix4(acc, [1.0; 4], 0.3));
+
+                        // SMOOTH HOLLOWS: bulb chambers opening off the road,
+                        // big enough to race up into and turn around in
+                        for h in 0..3usize {
+                            let f = 0.28 + h as f32 * 0.24;
+                            let ang = f * turns * std::f32::consts::TAU;
+                            let c = Vec3::new(x + ang.cos() * rad, g + 3.0 + f * climb, z + ang.sin() * rad);
+                            let hr = road_r * rng.range(1.7, 2.4);
+                            cut_s(&mut shapes, c, hr);
+                            zones.push(Zone { pos: c, r: hr * 0.7, kind: ZoneKind::Boost });
+                            grav.push(GravNode { pos: c, down: Vec3::NEG_Y, r: hr * 2.0, tube: true, inward: false, g: 1.0, surf: true, follow: None });
+                        }
+                        // a canopy mouth: the road surfaces at the top
+                        cut_s(&mut shapes, Vec3::new(x, g + hgt - 6.0, z), road_r * 1.6);
+                        // crown foliage (drawn only — never blocks the exit)
+                        for c in 0..4u32 {
+                            let ca = c as f32 * 1.6 + k as f32;
+                            let cr = tr * rng.range(1.4, 2.1);
+                            let cp = Vec3::new(x + ca.cos() * tr * 0.7, g + hgt + rng.range(2.0, 14.0), z + ca.sin() * tr * 0.7);
+                            push(&mut shapes, M_SPHERE, cp, Quat::IDENTITY, Vec3::splat(cr), Sdf::None, mix4([0.14, 0.30, 0.13, 1.0], acc, 0.06 * c as f32), 0.02, 0.15);
+                        }
+                    }
+                    // BROKEN LOG BRIDGES: fallen trunks hung in the vines,
+                    // swinging on their ropes. Platform riding makes them
+                    // real bridges — drive across while they sway, or wait
+                    // for the swing to bring one to you.
+                    for k in 0..giant_tops.len() {
+                        let (a0, _) = giant_tops[k];
+                        let (b0, _) = giant_tops[(k + 1) % giant_tops.len()];
+                        let span = a0.distance(b0);
+                        let logs = 3;
+                        for j in 0..logs {
+                            let f = (j as f32 + 1.0) / (logs as f32 + 1.0);
+                            let mid = a0.lerp(b0, f);
+                            let along = (b0 - a0).normalize_or(Vec3::X);
+                            let rope = 12.0 + (j % 2) as f32 * 6.0;
+                            let pivot = Vec3::new(mid.x, mid.y - 6.0, mid.z);
+                            let half = (span / logs as f32) * 0.30;
+                            let lr = 2.4;
+                            // the log lies ACROSS the gap; the swing axis is
+                            // the span direction, so it sways sideways
+                            let lie = Quat::from_rotation_arc(Vec3::Y, along);
+                            let li = push(&mut shapes, M_CAP_TALL, pivot - Vec3::Y * rope, lie, Vec3::new(lr, half / CAP_TALL_HH.max(1.0), lr), Sdf::Capsule { r: lr, half }, mix4(PLINTH, [0.30, 0.21, 0.13, 1.0], 0.7), 0.0, 0.3);
+                            shapes[li].blend = true;
+                            anims.push(Anim::Swing {
+                                shape: li,
+                                pivot,
+                                axis: along,
+                                len: rope,
+                                amp: 0.28 + (j % 3) as f32 * 0.09,
+                                rate: 0.55 + (j % 3) as f32 * 0.12,
+                                phase: k as f32 * 1.3 + j as f32 * 0.8,
+                                rot: lie,
+                                scale: Vec3::new(lr, half / CAP_TALL_HH.max(1.0), lr),
+                            });
+                            // the rope it hangs from, so the swing reads
+                            push(&mut shapes, M_CAP_TALL, pivot - Vec3::Y * (rope * 0.5), Quat::IDENTITY, Vec3::new(0.28, rope * 0.5 / CAP_TALL_HH.max(1.0), 0.28), Sdf::None, mix4([0.20, 0.32, 0.16, 1.0], acc, 0.15), 0.05, 0.3);
+                        }
+                    }
+
+                    // BIG LEAVES: broad blades adrift in the canopy air —
+                    // light enough that a car shoves them aside, heavy enough
+                    // to knock the ball off line
+                    for k in 0..10usize {
+                        let a = k as f32 * 0.9 + 0.3;
+                        let rr = rng.range(60.0, 200.0) * ws;
+                        let lp = Vec3::new(a.cos() * rr, rng.range(24.0, 90.0), a.sin() * rr);
+                        let lr = rng.range(3.2, 6.0);
+                        let col = mix4([0.20, 0.44, 0.17, 1.0], acc, rng.range(0.0, 0.25));
+                        let sc = Vec3::new(lr, lr * 0.10, lr * 1.5);
+                        let li = push(&mut shapes, M_BOX, lp, Quat::IDENTITY, sc, Sdf::None, col, 0.03, 0.3);
+                        bodies.push(Body {
+                            shape: li,
+                            pos: lp,
+                            vel: Vec3::new(a.sin(), 0.0, -a.cos()) * rng.range(0.5, 1.8),
+                            r: lr * 0.62,
+                            mass: 0.8,
+                            bouncy: false,
+                            squash: 0.0,
+                            sq_dir: Vec3::Y,
+                            sq_t: 0.0,
+                            scale: sc,
+                            rot: Quat::from_rotation_z(rng.range(-0.5, 0.5)),
+                            spin: Vec3::new(rng.range(-0.3, 0.3), rng.range(-0.6, 0.6), rng.range(-0.3, 0.3)),
+                            drag: 0.9, // flutters and settles instead of coasting
+                        });
+                    }
+
+                    // ARCADE POWER HITTERS: totem paddles that whack the ball
+                    // skyward on contact, then recharge
+                    for k in 0..5usize {
+                        let a = k as f32 * 1.257 + 0.4;
+                        let rr = rng.range(50.0, 150.0) * ws;
+                        let (x, z) = (a.cos() * rr, a.sin() * rr);
+                        let g = th(x, z);
+                        let hp = Vec3::new(x, g + 6.0, z);
+                        push(&mut shapes, M_CAP_TALL, Vec3::new(x, g + 3.0, z), Quat::IDENTITY, Vec3::new(1.1, 3.0 / CAP_TALL_HH.max(1.0), 1.1), Sdf::Capsule { r: 1.1, half: 3.0 }, mix4(PLINTH, acc, 0.4), 0.1, 0.4);
+                        let hi = push(&mut shapes, M_TORUS_FAT, hp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(4.2), Sdf::Torus { big: 4.2, tube: 0.75 }, mix4(acc, [1.0, 0.85, 0.3, 1.0], 0.5), 0.85, 0.5);
+                        hitters.push(Hitter { pos: hp, r: 5.4, power: 46.0, timer: 0.0, shape: hi });
+                    }
+
+                    // GIANT VINES: thick ropes slung between the giants at
+                    // driving height — solid, so you smack into them
+                    for k in 0..giant_tops.len() {
+                        let (a0, _) = giant_tops[k];
+                        let (b0, _) = giant_tops[(k + 1) % giant_tops.len()];
+                        for v in 0..2u32 {
+                            let sag = 18.0 + v as f32 * 26.0;
+                            let a1 = a0 - Vec3::Y * (12.0 + v as f32 * 22.0);
+                            let b1 = b0 - Vec3::Y * (12.0 + v as f32 * 22.0);
+                            let n = 7;
+                            for t in 0..n {
+                                let (f0, f1) = (t as f32 / n as f32, (t + 1) as f32 / n as f32);
+                                let bez = |f: f32| {
+                                    let m = a1.lerp(b1, f);
+                                    m - Vec3::Y * (sag * (4.0 * f * (1.0 - f)))
+                                };
+                                let (p0, p1) = (bez(f0), bez(f1));
+                                let mid = (p0 + p1) * 0.5;
+                                let axis = (p1 - p0).normalize_or(Vec3::X);
+                                let half = p0.distance(p1) * 0.5;
+                                let vr = 1.6 + v as f32 * 0.7;
+                                let vi = push(&mut shapes, M_CAP_TALL, mid, Quat::from_rotation_arc(Vec3::Y, axis), Vec3::new(vr, half / CAP_TALL_HH.max(1.0), vr), Sdf::Capsule { r: vr, half }, mix4([0.18, 0.34, 0.16, 1.0], acc, 0.2), 0.05, 0.35);
+                                shapes[vi].blend = true;
+                            }
+                        }
+                    }
+                }
+
                 // ---- the forest giants ----
                 let bark = mix4(PLINTH, [0.30, 0.20, 0.12, 1.0], 0.7);
                 let leaf = [0.16, 0.34, 0.14, 1.0];
@@ -1544,8 +1916,12 @@ impl World {
                         push(&mut shapes, M_SPHERE, cp, Quat::IDENTITY, Vec3::splat(cr), Sdf::None, mix4(leaf, acc, 0.08 * c as f32), 0.02, 0.15);
                     }
                     if k % 2 == 0 {
-                        // treehouse: a hollow room in the canopy
-                        let hr = 8.0;
+                        // treehouse: a hollow room in the canopy. It must be
+                        // WIDER than the lines that meet it — at 8 m it was
+                        // narrower than the 12.5 m bore feeding it, so the
+                        // biggest vine line ran into a wall at its own
+                        // junction (the drive test stalled every run there).
+                        let hr = 22.0;
                         let hc = top + Vec3::new(0.0, 4.0, 0.0);
                         let hi2 = push(&mut shapes, M_SPHERE, hc, Quat::IDENTITY, Vec3::splat(hr), Sdf::Sphere { r: hr }, [acc[0], acc[1], acc[2], 0.18], 0.10, 0.5);
                         shapes[hi2].blend = true;
@@ -1572,7 +1948,12 @@ impl World {
                     let col = mix4(*rng.pick(&pal), acc, 0.35);
                     // root mouth: ground entrance + slingshot up the first climb
                     let base = ttop[seq[0]];
-                    let gm = Vec3::new(base.x + 20.0, th(base.x + 20.0, base.z) + r * 1.05, base.z + 14.0);
+                    // The root ramp used to gain ~45 m of canopy height in
+                    // 25 m of run — near vertical. A car entering at speed
+                    // stalled, slid back and spat out of the mouth (the
+                    // drive test lost every vine line right here). Start it
+                    // much further out so the climb is a ramp, not a shaft.
+                    let gm = Vec3::new(base.x + 62.0, th(base.x + 62.0, base.z) + r * 1.05, base.z + 44.0);
                     let mut cur = if house_r[seq[0]] > 0.0 {
                         house_c[seq[0]] + (gm - house_c[seq[0]]).normalize_or(Vec3::Y) * (house_r[seq[0]] - 0.5)
                     } else {
@@ -1594,7 +1975,7 @@ impl World {
                     // canopy to canopy, banking alternately
                     for (si, wpair) in seq.windows(2).enumerate() {
                         let (ta, tb) = (wpair[0], wpair[1]);
-                        let side = if si % 2 == 0 { 0.17 } else { -0.17 };
+                        let side = if si % 2 == 0 { 0.075 } else { -0.075 };
                         let from = if house_r[ta] > 0.0 { house_c[ta] } else { ttop[ta] + Vec3::Y * 3.0 };
                         let mut to = if house_r[tb] > 0.0 {
                             house_c[tb] + (from - house_c[tb]).normalize_or(Vec3::X) * (house_r[tb] - 0.5)
@@ -1604,9 +1985,9 @@ impl World {
                         if house_r[ta] > 0.0 {
                             let exit = house_c[ta] + (to - house_c[ta]).normalize_or(Vec3::X) * (house_r[ta] - 0.5);
                             cut_s(&mut shapes, house_c[ta] + (to - house_c[ta]).normalize_or(Vec3::X) * house_r[ta], r * 1.12);
-                            swoop(&mut shapes, &mut grav, &mut wp, exit, to, side, -0.10, r, col, 0.16);
+                            swoop(&mut shapes, &mut grav, &mut wp, exit, to, side, -0.045, r, col, 0.16);
                         } else {
-                            swoop(&mut shapes, &mut grav, &mut wp, from, to, side, -0.10, r, col, 0.16);
+                            swoop(&mut shapes, &mut grav, &mut wp, from, to, side, -0.045, r, col, 0.16);
                         }
                         if house_r[tb] > 0.0 {
                             cut_s(&mut shapes, house_c[tb] + (from - house_c[tb]).normalize_or(Vec3::X) * house_r[tb], r * 1.12);
@@ -1678,7 +2059,8 @@ impl World {
                 // group, so every wall-floor seam FILLETS into a drivable
                 // quarter-pipe transition. 300 sparta cars stay IN.
                 let g0 = th(0.0, 0.0);
-                let (hx, hz, wh) = (56.0f32, 52.0f32, 13.0f32);
+                // headroom: a 13 m lid made every aerial feel clipped
+                let (hx, hz, wh) = (64.0f32, 58.0f32, 26.0f32);
                 let wallc = mix4(PLINTH, acc, 0.18);
                 let mut wall = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4], al: f32| {
                     let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.4 }, [col[0], col[1], col[2], al], 0.05, 0.4);
@@ -1717,10 +2099,10 @@ impl World {
                 // start ON the deck, not in the catch basin under it
                 spawn_hint = Some(Vec3::new(0.0, py + 0.55, 19.0));
                 // the basin below: dark catch floor + glow ribs
-                push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.4, 0.0), Quat::IDENTITY, Vec3::new(30.0, 0.6, 30.0), Sdf::RBox { half: Vec3::new(30.0, 0.6, 30.0), round: 0.3 }, [0.06, 0.05, 0.10, 1.0], 0.05, 0.3);
-                for k in 0..6 {
-                    let z = -25.0 + k as f32 * 10.0;
-                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.9, z), Quat::IDENTITY, Vec3::new(28.0, 0.12, 0.35), Sdf::RBox { half: Vec3::new(28.0, 0.12, 0.35), round: 0.05 }, mix4(acc, [1.0; 4], 0.3), 0.8, 0.4);
+                push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.4, 0.0), Quat::IDENTITY, Vec3::new(74.0, 0.6, 50.0), Sdf::RBox { half: Vec3::new(74.0, 0.6, 50.0), round: 0.3 }, [0.06, 0.05, 0.10, 1.0], 0.05, 0.3);
+                for k in 0..10 {
+                    let z = -45.0 + k as f32 * 10.0;
+                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.9, z), Quat::IDENTITY, Vec3::new(70.0, 0.12, 0.35), Sdf::RBox { half: Vec3::new(70.0, 0.12, 0.35), round: 0.05 }, mix4(acc, [1.0; 4], 0.3), 0.8, 0.4);
                 }
                 // HEX DECK: flat-top hexagons on a proper staggered grid.
                 // Each tile is a muted base plus an inset panel that ENERGIZES
@@ -1729,11 +2111,11 @@ impl World {
                 let hr = 4.15f32; // circumradius
                 let px = hr * 1.5; // column pitch (flat-top hex)
                 let pz = hr * 1.7320508; // row pitch
-                for iz in -3i32..=3 {
-                    for ix in -6i32..=6 {
+                for iz in -5i32..=5 {
+                    for ix in -9i32..=9 {
                         let x = ix as f32 * px;
                         let z = iz as f32 * pz + if ix % 2 == 0 { 0.0 } else { pz * 0.5 };
-                        if x.abs() > 46.0 || z.abs() > 24.0 {
+                        if x.abs() > 62.0 || z.abs() > 40.0 {
                             continue;
                         }
                         let team_col = if z < -1.0 {
@@ -1743,7 +2125,7 @@ impl World {
                         } else {
                             [0.34, 0.34, 0.40, 1.0]
                         };
-                        let hp = if iz == 0 { 1 } else if iz.abs() == 1 { 2 } else { 3 };
+                        let hp = if iz == 0 { 1 } else if iz.abs() <= 2 { 2 } else { 3 };
                         let pos = Vec3::new(x, py, z);
                         let sdf = Sdf::Hex { r: hr, h: 0.5 };
                         // muted base: dark, low spec, barely lit
@@ -1777,17 +2159,76 @@ impl World {
                         });
                     }
                 }
-                // glass rails keep the ball over the deck; open ends for cars
+                // ---- RAMP WALLS: the bowl. A flat glass rail gives you a
+                // wall to bounce off; a RAMP gives you a wall to drive, and
+                // that is where Dropshot's verticality lives — carry up the
+                // side, turn over the deck, come down on a weak tile. Every
+                // ramp is in the blend group, so the deck-to-ramp seam
+                // fillets into a drivable transition instead of a lip.
+                let (hx, hz) = (64.0f32, 42.0f32); // deck edges
+                let lean = 0.62f32; // ~36 degrees: steep, still climbable
+                let rw = 17.0f32; // ramp length up the slope
+                let (cs, sn) = (lean.cos(), lean.sin());
+                let wall_col = mix4(PLINTH, acc, 0.18);
+                let mut ramp = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, rot: Quat| {
+                    let i = push(shapes, M_BOX, pos, rot, half, Sdf::RBox { half, round: 0.35 }, wall_col, 0.04, 0.45);
+                    shapes[i].blend = true;
+                };
+                // The toe is buried UNDER the deck: left flush with the edge,
+                // a car drove into the ramp's blunt end face and stopped dead
+                // (0.7 m of "climb" in the mech sim). Overlapping inward means
+                // the only surface you can meet is the slope itself.
+                let toe = 11.0f32;
                 for sx in [-1.0f32, 1.0] {
-                    push(&mut shapes, M_BOX, Vec3::new(sx * 51.5, py + 3.4, 0.0), Quat::IDENTITY, Vec3::new(0.5, 3.6, 26.0), Sdf::RBox { half: Vec3::new(0.5, 3.6, 26.0), round: 0.2 }, [acc[0], acc[1], acc[2], 0.30], 0.12, 0.5);
+                    ramp(
+                        &mut shapes,
+                        Vec3::new(sx * (hx - toe + rw * cs * 0.5), py - 0.25 + rw * sn * 0.5, 0.0),
+                        Vec3::new(rw * 0.5, 0.7, hz + rw * cs),
+                        Quat::from_rotation_z(sx * lean),
+                    );
                 }
                 for sz in [-1.0f32, 1.0] {
-                    push(&mut shapes, M_BOX, Vec3::new(0.0, py + 3.4, sz * 26.0), Quat::IDENTITY, Vec3::new(51.5, 3.6, 0.5), Sdf::RBox { half: Vec3::new(51.5, 3.6, 0.5), round: 0.2 }, [acc[0], acc[1], acc[2], 0.30], 0.12, 0.5);
-                    // entry ramps up from the plain at both ends
-                    let rz = sz * 34.0;
-                    let rot = Quat::from_rotation_x(-sz * 0.42);
-                    let half = Vec3::new(9.0, 0.5, 9.5);
-                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 3.2, rz), rot, half, Sdf::RBox { half, round: 0.2 }, mix4(PLINTH, acc, 0.2), 0.05, 0.4);
+                    ramp(
+                        &mut shapes,
+                        Vec3::new(0.0, py - 0.25 + rw * sn * 0.5, sz * (hz - toe + rw * cs * 0.5)),
+                        Vec3::new(hx + rw * cs, 0.7, rw * 0.5),
+                        Quat::from_rotation_x(-sz * lean),
+                    );
+                }
+                // corner ramps, turned 45 degrees in plan so the bowl closes
+                for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                    let yaw = f32::atan2(sx, sz);
+                    let c = Vec3::new(sx * (hx - toe * 0.7 + rw * cs * 0.35), py - 0.25 + rw * sn * 0.5, sz * (hz - toe * 0.7 + rw * cs * 0.35));
+                    ramp(
+                        &mut shapes,
+                        c,
+                        Vec3::new(rw * 0.75, 0.7, rw * 0.75),
+                        Quat::from_rotation_y(yaw) * Quat::from_rotation_x(lean * 0.85),
+                    );
+                }
+                // a glass lip above the ramp crest keeps the ball in play
+                let crest = py + rw * sn;
+                for sx in [-1.0f32, 1.0] {
+                    let h = Vec3::new(0.5, 3.2, hz + rw * cs + 2.0);
+                    push(&mut shapes, M_BOX, Vec3::new(sx * (hx + rw * cs + 0.5), crest + 3.2, 0.0), Quat::IDENTITY, h, Sdf::RBox { half: h, round: 0.2 }, [acc[0], acc[1], acc[2], 0.26], 0.12, 0.5);
+                }
+                for sz in [-1.0f32, 1.0] {
+                    let h = Vec3::new(hx + rw * cs + 2.0, 3.2, 0.5);
+                    push(&mut shapes, M_BOX, Vec3::new(0.0, crest + 3.2, sz * (hz + rw * cs + 0.5)), Quat::IDENTITY, h, Sdf::RBox { half: h, round: 0.2 }, [acc[0], acc[1], acc[2], 0.26], 0.12, 0.5);
+                }
+                // light strips tracing the crest, so the bowl edge reads
+                for k in 0..12 {
+                    let a2 = k as f32 / 12.0 * std::f32::consts::TAU;
+                    let p = Vec3::new(a2.cos() * (hx + rw * cs), crest + 0.3, a2.sin() * (hz + rw * cs));
+                    push(&mut shapes, M_BOX, p, Quat::from_rotation_y(-a2), Vec3::new(2.4, 0.10, 0.10), Sdf::None, mix4(acc, [1.0; 4], 0.4), 0.9, 0.4);
+                }
+                // entry ramps from the plain up to the crest at both ends
+                for sz in [-1.0f32, 1.0] {
+                    let rz = sz * (hz + rw * cs + 14.0);
+                    let rot = Quat::from_rotation_x(-sz * 0.34);
+                    let half = Vec3::new(11.0, 0.6, 15.0);
+                    let i = push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + (crest - g0) * 0.45, rz), rot, half, Sdf::RBox { half, round: 0.25 }, mix4(PLINTH, acc, 0.2), 0.05, 0.4);
+                    shapes[i].blend = true;
                 }
             }
             16 => {
@@ -1951,6 +2392,10 @@ impl World {
                     let col = mix4(mix4(rock, *rng.pick(&pal), 0.45), [1.0; 4], 0.12);
                     let i = push(&mut shapes, M_SPHERE, pos, Quat::IDENTITY, Vec3::splat(pr), Sdf::None, col, 0.05, 0.35);
                     bodies.push(Body {
+                        scale: Vec3::splat(pr),
+                        rot: Quat::IDENTITY,
+                        spin: Vec3::ZERO,
+                        drag: 0.0,
                         shape: i,
                         pos,
                         vel: Vec3::new(a.sin() * rng.range(3.0, 7.0), 0.0, -a.cos() * rng.range(3.0, 7.0)),
@@ -1990,7 +2435,7 @@ impl World {
                         a.sin() * rng.range(30.0, 120.0),
                     );
                     let i = push(&mut shapes, M_SPHERE, pos, Quat::IDENTITY, Vec3::splat(r), Sdf::None, mix4(rock, [1.0, 0.9, 0.75, 1.0], 0.15), 0.03, 0.35);
-                    bodies.push(Body { shape: i, pos, vel: Vec3::new(a.sin(), 0.0, -a.cos()) * rng.range(0.4, 1.6), r, mass, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0 });
+                    bodies.push(Body { shape: i, pos, vel: Vec3::new(a.sin(), 0.0, -a.cos()) * rng.range(0.4, 1.6), r, mass, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0, scale: Vec3::splat(r), rot: Quat::IDENTITY, spin: Vec3::ZERO, drag: 0.02 });
                     if r > 8.0 {
                         // a roaming moon carries its own well (follow syncs it)
                         grav.push(GravNode { pos, down: Vec3::NEG_Y, r: r * 2.6, tube: false, inward: true, g: 1.1, surf: true, follow: Some(i) });
@@ -2038,6 +2483,692 @@ impl World {
                 // the prize core: emissive column + a vibe pocket
                 push(&mut shapes, M_CAP_TALL, Vec3::new(0.0, g0 + 5.0, 0.0), Quat::IDENTITY, Vec3::new(1.2, 5.0 / CAP_TALL_HH.max(1.0), 1.2), Sdf::Capsule { r: 1.2, half: 5.0 }, mix4(acc, [1.0; 4], 0.4), 0.9, 0.4);
                 zones.push(Zone { pos: Vec3::new(0.0, g0 + 2.0, 0.0), r: 9.0, kind: ZoneKind::Boost });
+            }
+            19 => {
+                // ========== CLOCKWORK: everything is moving ==========
+                // A machine you play inside: shuttling decks, orbiting
+                // carriages, spinning turntables, a paternoster of rising
+                // steps, and long sweeper arms. Every surface here CARRIES
+                // you (physics::platform riding), so timing a landing means
+                // matching the platform, and jumping off inherits its speed.
+                let g0 = th(0.0, 0.0);
+                let deck = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4], glow: f32| -> usize {
+                    let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.25 }, col, glow, 0.45);
+                    shapes[i].blend = true;
+                    i
+                };
+                // the hub: a wide static landing you always come back to
+                deck(&mut shapes, Vec3::new(0.0, g0 + 1.0, 0.0), Vec3::new(15.0, 1.0, 15.0), mix4(PLINTH, acc, 0.25), 0.05);
+                for k in 0..4 {
+                    let a = k as f32 * 1.5707;
+                    zones.push(Zone { pos: Vec3::new(a.cos() * 10.0, g0 + 2.2, a.sin() * 10.0), r: 3.0, kind: ZoneKind::Boost });
+                }
+                // SHUTTLES: long decks sliding across the yard, generous
+                // enough to actually land on (the small fast ones are the
+                // hard mode, and they come later)
+                for k in 0..6u32 {
+                    let a = k as f32 * 1.047;
+                    let base = Vec3::new(a.cos() * 46.0, g0 + 6.0 + (k % 3) as f32 * 7.0, a.sin() * 46.0);
+                    let half = Vec3::new(9.0 - (k % 3) as f32 * 1.6, 0.55, 5.0);
+                    let col = mix4(*rng.pick(&pal), acc, 0.3);
+                    let i = deck(&mut shapes, base, half, col, 0.12);
+                    let dir = Vec3::new(-a.sin(), 0.0, a.cos());
+                    anims.push(Anim::Slide { shape: i, base, dir, amp: 26.0 + k as f32 * 4.0, rate: 0.22 + k as f32 * 0.035, phase: k as f32 * 0.9, rot: Quat::IDENTITY, scale: half });
+                    pads.push(Pad { pos: base + Vec3::Y * 1.2, big: false, timer: 0.0, phase: k as f32 * 0.3 });
+                }
+                // CARRIAGES: decks orbiting the hub at three radii, the
+                // classic "ride one, hop to the next" ladder
+                for ring in 0..3u32 {
+                    let rr = 26.0 + ring as f32 * 22.0;
+                    // clear of the sweeper arms below: at the old heights a
+                    // 30 m sweeper swept straight through the inner carriage
+                    // ring, and a rider was grabbed by whichever platform
+                    // happened to be nearest (0% grounded in the sim)
+                    let y = g0 + 18.0 + ring as f32 * 13.0;
+                    let cnt = 3 + ring;
+                    for k in 0..cnt {
+                        let ph = k as f32 / cnt as f32 * std::f32::consts::TAU;
+                        // BIG decks: the outer rings used to shrink, which is
+                        // backwards — a faster carriage needs MORE landing
+                        // area, not less
+                        let half = Vec3::new(9.0 + ring as f32 * 1.5, 0.5, 6.0 + ring as f32 * 0.8);
+                        let col = mix4(*rng.pick(&pal), acc, 0.25 + ring as f32 * 0.12);
+                        let i = deck(&mut shapes, Vec3::new(rr, y, 0.0), half, col, 0.15);
+                        anims.push(Anim::Orbit {
+                            shape: i,
+                            center: Vec3::new(0.0, y, 0.0),
+                            axis: Vec3::Y,
+                            r: rr,
+                            // constant RIM SPEED (~5 m/s), not constant
+                            // angular rate: at a fixed rate the outer ring
+                            // hit 18 m/s, which no landing survives and the
+                            // platform sim caught as a 15%-grounded ride
+                            rate: (5.0 / rr) * if ring == 1 { -1.0 } else { 1.0 },
+                            phase: ph,
+                            rot: Quat::IDENTITY,
+                            scale: half,
+                        });
+                    }
+                }
+                // TURNTABLES: spinning discs — stand near the rim and the
+                // spin throws you further when you leave
+                for k in 0..3u32 {
+                    let a = k as f32 * 2.1 + 0.5;
+                    let c = Vec3::new(a.cos() * 70.0, g0 + 4.0 + k as f32 * 6.0, a.sin() * 70.0);
+                    let big = 13.0;
+                    let i = push(&mut shapes, M_RING_DECK, c, Quat::IDENTITY, Vec3::splat(big), Sdf::RingDeck { big: big * 0.55, wide: big * 0.45, half_h: 0.6 }, mix4(acc, [1.0; 4], 0.2), 0.3, 0.45);
+                    shapes[i].blend = true;
+                    anims.push(Anim::Spin { shape: i, pos: c, scale: Vec3::splat(big), base: Quat::IDENTITY, axis: Vec3::Y, rate: 0.55 + k as f32 * 0.25 });
+                    zones.push(Zone { pos: c + Vec3::Y * 1.2, r: 5.0, kind: ZoneKind::Boost });
+                }
+                // PATERNOSTER: a column of steps rising and falling, the
+                // vertical route to the top deck
+                for k in 0..7u32 {
+                    let base = Vec3::new(-96.0, g0 + 5.0 + k as f32 * 8.0, 0.0);
+                    let half = Vec3::new(5.5, 0.5, 5.5);
+                    let i = deck(&mut shapes, base, half, mix4(PLINTH, acc, 0.35), 0.1);
+                    anims.push(Anim::Slide { shape: i, base, dir: Vec3::Y, amp: 7.0, rate: 0.42, phase: k as f32 * 0.9, rot: Quat::IDENTITY, scale: half });
+                }
+                // SWEEPERS: long arms turning at head height — duck, jump,
+                // or ride the end
+                for k in 0..2u32 {
+                    let c = Vec3::new(0.0, g0 + 3.4 + k as f32 * 6.2, 0.0);
+                    let half = Vec3::new(22.0, 0.45, 2.2);
+                    let i = deck(&mut shapes, c, half, mix4(acc, [1.0; 4], 0.15), 0.35);
+                    anims.push(Anim::Spin { shape: i, pos: c, scale: half, base: Quat::IDENTITY, axis: Vec3::Y, rate: if k == 0 { 0.45 } else { -0.30 } });
+                }
+                // the prize: a high platform reachable only by riding up
+                deck(&mut shapes, Vec3::new(-96.0, g0 + 72.0, 0.0), Vec3::new(11.0, 1.0, 11.0), mix4(acc, [1.0; 4], 0.3), 0.5);
+                zones.push(Zone { pos: Vec3::new(-96.0, g0 + 74.0, 0.0), r: 8.0, kind: ZoneKind::Boost });
+            }
+            20 => {
+                // ============== APERTURE: the portal chambers ==============
+                // Clean white test rooms with linked portal pairs, playing by
+                // Portal's rules: what goes in comes out with its speed
+                // intact and its direction rotated. A long fall into a floor
+                // portal therefore becomes a horizontal launch out of a wall
+                // — the FLING — and the rewards are placed where only a
+                // fling can reach.
+                let g0 = th(0.0, 0.0);
+                let white = mix4(PLINTH, [1.0; 4], 0.55);
+                let trim = mix4(acc, [1.0; 4], 0.2);
+                let panel = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4]| {
+                    let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.2 }, col, 0.03, 0.5);
+                    shapes[i].blend = true;
+                };
+                panel(&mut shapes, Vec3::new(0.0, g0 + 0.6, 0.0), Vec3::new(64.0, 0.8, 58.0), white);
+                for (px, pz, hx, hz) in [
+                    (-64.0f32, 0.0f32, 1.2f32, 58.0f32),
+                    (64.0, 0.0, 1.2, 58.0),
+                    (0.0, -58.0, 64.0, 1.2),
+                    (0.0, 58.0, 64.0, 1.2),
+                ] {
+                    panel(&mut shapes, Vec3::new(px, g0 + 12.0, pz), Vec3::new(hx, 12.0, hz), white);
+                }
+                let mut mk_portal = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool| -> usize {
+                    let n = normal.normalize_or(Vec3::Z);
+                    let u = (up - n * up.dot(n)).normalize_or(Vec3::Y);
+                    let right = u.cross(n).normalize_or(Vec3::X);
+                    let rot = Quat::from_mat3(&glam::Mat3::from_cols(right, u, n));
+                    // pair hue, entry/exit shade: pair 0 blue/orange (the
+                    // classic), then green, then violet — and within a pair
+                    // the exit end is the paler shade
+                    let hue = [
+                        ([0.16, 0.62, 1.00, 1.0], [1.00, 0.55, 0.12, 1.0]),
+                        ([0.20, 0.90, 0.45, 1.0], [0.85, 0.95, 0.20, 1.0]),
+                        ([0.66, 0.35, 1.00, 1.0], [1.00, 0.35, 0.80, 1.0]),
+                        ([0.20, 0.85, 0.90, 1.0], [1.00, 0.80, 0.30, 1.0]),
+                    ][(portals.len() / 2).min(3)];
+                    let base = if warm { hue.1 } else { hue.0 };
+                    let col = if warm { mix4(base, [1.0; 4], 0.22) } else { base };
+                    push(shapes, M_TORUS_FAT, pos, rot * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(r), Sdf::Torus { big: r, tube: r * 0.10 }, col, 0.95, 0.5);
+                    // A PORTAL IS A HOLE. The face is drawn but never solid,
+                    // and the surface it sits in is carved away behind it —
+                    // without this the floor portal was sealed under the
+                    // floor panel and nothing could fall through (the portal
+                    // sim caught exactly that: 4/4 on the transform maths and
+                    // zero teleports).
+                    for t in 0..5 {
+                        let d = t as f32 * 0.55;
+                        let ci = push(shapes, M_SPHERE, pos - n * d, Quat::IDENTITY, Vec3::splat(r * 0.94), Sdf::Sphere { r: r * 0.94 }, [0.0; 4], 0.0, 0.0);
+                        shapes[ci].cut = true;
+                    }
+                    let fi = push(shapes, M_SPHERE, pos, rot, Vec3::new(r * 0.94, r * 0.94, 0.06), Sdf::None, [col[0], col[1], col[2], 0.5], 0.75, 0.5);
+                    portals.push(Portal { pos, rot, r: r * 0.94, link: 0, shape: fi, tint: col, follow: None, cuts: Vec::new() });
+                    portals.len() - 1
+                };
+                // CHAMBER 1 — the fling: climb the tower, drop into the floor
+                // portal, come out of the far wall at speed.
+                for k in 0..5 {
+                    let y = g0 + 8.0 + k as f32 * 9.0;
+                    // the climb stands BESIDE the shaft, not over it: steps
+                    // above a floor portal are a lid on the drop
+                    panel(&mut shapes, Vec3::new(-25.0 + (k % 2) as f32 * 5.0, y, -34.0), Vec3::new(5.5, 0.5, 5.5), mix4(white, acc, 0.1));
+                }
+                let p_floor = mk_portal(&mut shapes, &mut portals, Vec3::new(-38.0, g0 + 1.5, -34.0), Vec3::Y, Vec3::NEG_Z, 6.0, false);
+                let p_wall = mk_portal(&mut shapes, &mut portals, Vec3::new(-62.6, g0 + 7.0, 10.0), Vec3::X, Vec3::Y, 6.0, true);
+                portals[p_floor].link = p_wall;
+                portals[p_wall].link = p_floor;
+                zones.push(Zone { pos: Vec3::new(-38.0, g0 + 47.0, -34.0), r: 5.0, kind: ZoneKind::Boost });
+                panel(&mut shapes, Vec3::new(6.0, g0 + 7.0, 12.0), Vec3::new(9.0, 0.7, 9.0), mix4(white, acc, 0.2));
+                zones.push(Zone { pos: Vec3::new(6.0, g0 + 8.4, 12.0), r: 6.0, kind: ZoneKind::Boost });
+                // CHAMBER 2 — the loop: floor and ceiling portals facing each
+                // other, so a fall never ends until you steer out of it.
+                let l_a = mk_portal(&mut shapes, &mut portals, Vec3::new(34.0, g0 + 1.5, -30.0), Vec3::Y, Vec3::Z, 5.5, false);
+                let l_b = mk_portal(&mut shapes, &mut portals, Vec3::new(34.0, g0 + 34.0, -30.0), Vec3::NEG_Y, Vec3::Z, 5.5, true);
+                portals[l_a].link = l_b;
+                portals[l_b].link = l_a;
+                for k in 0..4 {
+                    let a2 = k as f32 * 1.5707;
+                    panel(&mut shapes, Vec3::new(34.0 + a2.cos() * 9.0, g0 + 17.0, -30.0 + a2.sin() * 9.0), Vec3::new(3.2, 0.4, 3.2), trim);
+                }
+                // CHAMBER 3 — the crosswalk: wall to wall at driving height.
+                let c_a = mk_portal(&mut shapes, &mut portals, Vec3::new(0.0, g0 + 4.6, -56.6), Vec3::Z, Vec3::Y, 5.0, false);
+                let c_b = mk_portal(&mut shapes, &mut portals, Vec3::new(0.0, g0 + 4.6, 56.6), Vec3::NEG_Z, Vec3::Y, 5.0, true);
+                portals[c_a].link = c_b;
+                portals[c_b].link = c_a;
+                for sz in [-1.0f32, 1.0] {
+                    let rot = Quat::from_rotation_x(sz * 0.30);
+                    let half = Vec3::new(7.0, 0.5, 12.0);
+                    push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 3.0, sz * 44.0), rot, half, Sdf::RBox { half, round: 0.2 }, white, 0.03, 0.5);
+                }
+                for k in 0..6 {
+                    let a2 = k as f32 * 1.047;
+                    let gl = Vec3::new(7.0, 4.0, 0.3);
+                    push(&mut shapes, M_BOX, Vec3::new(a2.cos() * 50.0, g0 + 23.0, a2.sin() * 44.0), Quat::from_rotation_y(a2), gl, Sdf::RBox { half: gl, round: 0.1 }, [0.6, 0.8, 0.95, 0.30], 0.15, 0.6);
+                    let st = Vec3::new(6.0, 0.12, 0.12);
+                    push(&mut shapes, M_BOX, Vec3::new(a2.cos() * 40.0, g0 + 23.6, a2.sin() * 36.0), Quat::from_rotation_y(a2), st, Sdf::RBox { half: st, round: 0.05 }, trim, 0.9, 0.4);
+                }
+            }
+            21 => {
+                // ========= TURNSTILE: the portals themselves move =========
+                // Every portal here is bolted to something turning. Where a
+                // mouth sends you depends on WHEN you enter it, so the aim is
+                // no longer "find the portal" but "read the machine": a drum
+                // whose faces sweep past, carriages carrying a mouth around
+                // the room, and a lift that raises its portal as it climbs.
+                let g0 = th(0.0, 0.0);
+                let deck = mix4(PLINTH, [1.0; 4], 0.35);
+                let trim = mix4(acc, [1.0; 4], 0.25);
+                let mut slab = |shapes: &mut Vec<Shape>, pos: Vec3, half: Vec3, col: [f32; 4]| -> usize {
+                    let i = push(shapes, M_BOX, pos, Quat::IDENTITY, half, Sdf::RBox { half, round: 0.25 }, col, 0.04, 0.5);
+                    shapes[i].blend = true;
+                    i
+                };
+                slab(&mut shapes, Vec3::new(0.0, g0 + 0.7, 0.0), Vec3::new(70.0, 0.9, 62.0), deck);
+                for (px, pz, hx, hz) in [(-70.0f32, 0.0f32, 1.2f32, 62.0f32), (70.0, 0.0, 1.2, 62.0), (0.0, -62.0, 70.0, 1.2), (0.0, 62.0, 70.0, 1.2)] {
+                    slab(&mut shapes, Vec3::new(px, g0 + 20.0, pz), Vec3::new(hx, 20.0, hz), deck);
+                }
+                // one portal maker, shared: `mount` is the shape it rides
+                let mut mk = |shapes: &mut Vec<Shape>, portals: &mut Vec<Portal>, pos: Vec3, normal: Vec3, up: Vec3, r: f32, warm: bool, mount: Option<usize>| -> usize {
+                    let n = normal.normalize_or(Vec3::Z);
+                    let u = (up - n * up.dot(n)).normalize_or(Vec3::Y);
+                    let right = u.cross(n).normalize_or(Vec3::X);
+                    let rot = Quat::from_mat3(&glam::Mat3::from_cols(right, u, n));
+                    let hue = [
+                        ([0.16, 0.62, 1.00, 1.0], [1.00, 0.55, 0.12, 1.0]),
+                        ([0.20, 0.90, 0.45, 1.0], [0.85, 0.95, 0.20, 1.0]),
+                        ([0.66, 0.35, 1.00, 1.0], [1.00, 0.35, 0.80, 1.0]),
+                        ([0.20, 0.85, 0.90, 1.0], [1.00, 0.80, 0.30, 1.0]),
+                    ][(portals.len() / 2).min(3)];
+                    let base = if warm { hue.1 } else { hue.0 };
+                    let col = if warm { mix4(base, [1.0; 4], 0.22) } else { base };
+                    push(shapes, M_TORUS_FAT, pos, rot * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(r), Sdf::Torus { big: r, tube: r * 0.10 }, col, 0.95, 0.5);
+                    let mut cuts: Vec<(usize, Vec3)> = Vec::new();
+                    for t in 0..7 {
+                        let d = t as f32 * 0.55;
+                        let cp = pos - n * d;
+                        let ci = push(shapes, M_SPHERE, cp, Quat::IDENTITY, Vec3::splat(r * 1.02), Sdf::Sphere { r: r * 1.02 }, [0.0; 4], 0.0, 0.0);
+                        shapes[ci].cut = true;
+                        // offset in the MOUNT's frame, so it can be replayed
+                        if let Some(mi) = mount {
+                            let inv = shapes[mi].inv_rot;
+                            cuts.push((ci, inv * (cp - shapes[mi].pos)));
+                        }
+                    }
+                    let fi = push(shapes, M_SPHERE, pos, rot, Vec3::new(r * 0.94, r * 0.94, 0.06), Sdf::None, [col[0], col[1], col[2], 0.5], 0.75, 0.5);
+                    portals.push(Portal { pos, rot, r: r * 0.94, link: 0, shape: fi, tint: col, follow: mount, cuts });
+                    portals.len() - 1
+                };
+                // ---- THE DRUM: a turning cylinder with a mouth in its side.
+                // It comes around to face you; go through and you leave from
+                // wherever its partner happens to be pointing.
+                let drum_c = Vec3::new(-40.0, g0 + 10.0, 0.0);
+                let drum_half = Vec3::new(9.0, 8.0, 9.0);
+                let di = push(&mut shapes, M_BOX, drum_c, Quat::IDENTITY, drum_half, Sdf::RBox { half: drum_half, round: 1.6 }, mix4(deck, acc, 0.15), 0.06, 0.5);
+                shapes[di].blend = true;
+                anims.push(Anim::Spin { shape: di, pos: drum_c, scale: drum_half, base: Quat::IDENTITY, axis: Vec3::Y, rate: 0.42 });
+                let d_face = mk(&mut shapes, &mut portals, drum_c + Vec3::X * 9.2, Vec3::X, Vec3::Y, 5.0, false, Some(di));
+                // its partner sits still, high on the far wall
+                let d_out = mk(&mut shapes, &mut portals, Vec3::new(68.6, g0 + 16.0, 0.0), Vec3::NEG_X, Vec3::Y, 5.0, true, None);
+                portals[d_face].link = d_out;
+                portals[d_out].link = d_face;
+
+                // ---- THE CARRIAGES: two decks orbiting the room, each with
+                // a portal lying face-up on it. Drop into one, come out of
+                // the other — wherever it has got to.
+                for k in 0..2usize {
+                    let y = g0 + 14.0 + k as f32 * 9.0;
+                    let rr = 30.0 + k as f32 * 14.0;
+                    let half = Vec3::new(8.0, 0.6, 8.0);
+                    let ci = push(&mut shapes, M_BOX, Vec3::new(rr, y, 0.0), Quat::IDENTITY, half, Sdf::RBox { half, round: 0.3 }, trim, 0.08, 0.5);
+                    shapes[ci].blend = true;
+                    anims.push(Anim::Orbit {
+                        shape: ci,
+                        center: Vec3::new(0.0, y, 0.0),
+                        axis: Vec3::Y,
+                        r: rr,
+                        rate: (5.0 / rr) * if k == 0 { 1.0 } else { -1.0 },
+                        phase: k as f32 * 2.4,
+                        rot: Quat::IDENTITY,
+                        scale: half,
+                    });
+                    let _ = ci;
+                }
+                let c0 = mk(&mut shapes, &mut portals, Vec3::new(30.0, g0 + 15.0, 0.0), Vec3::Y, Vec3::Z, 4.6, false, None);
+                let c1 = mk(&mut shapes, &mut portals, Vec3::new(-44.0, g0 + 24.0, 0.0), Vec3::Y, Vec3::Z, 4.6, true, None);
+                portals[c0].link = c1;
+                portals[c1].link = c0;
+
+                // ---- THE LIFT: a portal that climbs. Enter at the bottom of
+                // its travel and you exit low; catch it at the top and the
+                // same mouth throws you across the room.
+                let lift_base = Vec3::new(0.0, g0 + 8.0, -46.0);
+                let lhalf = Vec3::new(7.0, 0.6, 7.0);
+                let li = push(&mut shapes, M_BOX, lift_base, Quat::IDENTITY, lhalf, Sdf::RBox { half: lhalf, round: 0.3 }, trim, 0.08, 0.5);
+                shapes[li].blend = true;
+                anims.push(Anim::Slide { shape: li, base: lift_base, dir: Vec3::Y, amp: 16.0, rate: 0.35, phase: 0.0, rot: Quat::IDENTITY, scale: lhalf });
+                let l_in = mk(&mut shapes, &mut portals, lift_base + Vec3::Y * 0.7, Vec3::Y, Vec3::Z, 4.4, false, Some(li));
+                let l_out = mk(&mut shapes, &mut portals, Vec3::new(0.0, g0 + 5.0, 56.0), Vec3::NEG_Z, Vec3::Y, 4.4, true, None);
+                portals[l_in].link = l_out;
+                portals[l_out].link = l_in;
+
+                // approach ramps and a boost ring, so there is speed to carry
+                for (sx, sz) in [(-1.0f32, 1.0f32), (1.0, 1.0)] {
+                    let rot = Quat::from_rotation_x(-0.30);
+                    let half = Vec3::new(8.0, 0.5, 12.0);
+                    let i = push(&mut shapes, M_BOX, Vec3::new(sx * 26.0, g0 + 4.0, sz * 40.0), rot, half, Sdf::RBox { half, round: 0.25 }, deck, 0.04, 0.5);
+                    shapes[i].blend = true;
+                }
+                for k in 0..4 {
+                    let a2 = k as f32 * 1.5707 + 0.78;
+                    zones.push(Zone { pos: Vec3::new(a2.cos() * 20.0, g0 + 2.4, a2.sin() * 20.0), r: 4.0, kind: ZoneKind::Boost });
+                }
+            }
+            22 => {
+                // ============ WYRMFIRE: the dragon's back ============
+                // A lava caldera with a sleeping wyrm coiled through it: you
+                // drive the ridged spine, jump the gaps between vertebrae,
+                // and duck the fire jets that vent along its flanks. The
+                // lava itself flows — it will carry you to the drain.
+                let g0 = th(0.0, 0.0);
+                let stone = mix4(PLINTH, [0.22, 0.13, 0.11, 1.0], 0.7);
+                let ember = [1.0, 0.42, 0.10, 1.0];
+                // the caldera floor and its rim
+                let fl = Vec3::new(80.0, 1.0, 70.0);
+                let fi2 = push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.8, 0.0), Quat::IDENTITY, fl, Sdf::RBox { half: fl, round: 0.6 }, stone, 0.02, 0.35);
+                shapes[fi2].blend = true;
+                for k in 0..14 {
+                    let a2 = k as f32 / 14.0 * std::f32::consts::TAU;
+                    let (x, z) = (a2.cos() * 86.0, a2.sin() * 74.0);
+                    let h = 9.0 + ((k * 7) % 5) as f32 * 3.0;
+                    let half = Vec3::new(13.0, h, 6.0);
+                    let i = push(&mut shapes, M_BOX, Vec3::new(x, g0 + h * 0.6, z), Quat::from_rotation_y(-a2) * Quat::from_rotation_z(0.16), half, Sdf::RBox { half, round: 1.2 }, mix4(stone, ember, 0.10), 0.03, 0.4);
+                    shapes[i].blend = true;
+                }
+                // LAVA: glowing pools that pull you toward the drain
+                for k in 0..5 {
+                    let a2 = k as f32 * 1.257 + 0.4;
+                    let c = Vec3::new(a2.cos() * 46.0, g0 + 1.4, a2.sin() * 40.0);
+                    push(&mut shapes, M_RING_DECK, c, Quat::IDENTITY, Vec3::splat(15.0), Sdf::None, mix4(ember, [1.0, 0.9, 0.4, 1.0], 0.35), 0.95, 0.3);
+                    flows.push(Flow { pos: c, r: 15.0, vel: (Vec3::ZERO - c).normalize_or(Vec3::X) * 9.0 + Vec3::Y * 1.5 });
+                    zones.push(Zone { pos: c, r: 12.0, kind: ZoneKind::Slip });
+                }
+                // THE WYRM: a coiled spine of vertebrae you can drive along
+                let coils = 34;
+                let mut spine: Vec<Vec3> = Vec::new();
+                for k in 0..=coils {
+                    let f = k as f32 / coils as f32;
+                    let a2 = f * std::f32::consts::TAU * 1.35;
+                    let rr = 62.0 - f * 34.0;
+                    let y = g0 + 5.0 + (f * std::f32::consts::PI * 2.0).sin() * 11.0 + f * 16.0;
+                    spine.push(Vec3::new(a2.cos() * rr, y, a2.sin() * rr * 0.86));
+                }
+                for k in 0..spine.len() {
+                    let p = spine[k];
+                    let nx = spine[(k + 1).min(spine.len() - 1)];
+                    let ax = (nx - p).normalize_or(Vec3::X);
+                    let rot = Quat::from_rotation_arc(Vec3::Y, ax);
+                    let seg = if k == spine.len() - 1 { 3.2 } else { p.distance(nx) * 0.62 };
+                    let rad = 4.6 - (k as f32 / coils as f32) * 1.6;
+                    let i = push(&mut shapes, M_CAP_TALL, p, rot, Vec3::new(rad, seg / CAP_TALL_HH.max(1.0), rad), Sdf::Capsule { r: rad, half: seg }, mix4(stone, [0.30, 0.18, 0.22, 1.0], 0.5), 0.02, 0.45);
+                    shapes[i].blend = true;
+                    // dorsal ridge: a fin every third vertebra, and a fire
+                    // vent every seventh that fires the ball skyward
+                    if k % 3 == 0 {
+                        let fh = Vec3::new(0.35, 2.6, 1.8);
+                        let j = push(&mut shapes, M_BOX, p + Vec3::Y * (rad + 1.6), rot, fh, Sdf::RBox { half: fh, round: 0.2 }, mix4(ember, stone, 0.4), 0.25, 0.4);
+                        shapes[j].blend = true;
+                    }
+                    if k % 7 == 3 {
+                        let hp = p + Vec3::Y * (rad + 3.2);
+                        let hi = push(&mut shapes, M_TORUS_FAT, hp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(3.4), Sdf::Torus { big: 3.4, tube: 0.6 }, mix4(ember, [1.0, 0.95, 0.5, 1.0], 0.4), 1.0, 0.5);
+                        hitters.push(Hitter { pos: hp, r: 4.6, power: 52.0, timer: 0.0, shape: hi });
+                        launchers.push(Launcher { pos: hp, dir: Vec3::Y, power: 34.0, timer: 0.0, shape: hi });
+                    }
+                }
+                // the head: a broad plate you can land on, jaws agape
+                let head = spine[spine.len() - 1] + Vec3::Y * 3.0;
+                let hh = Vec3::new(7.0, 1.2, 9.0);
+                let hi2 = push(&mut shapes, M_BOX, head, Quat::IDENTITY, hh, Sdf::RBox { half: hh, round: 1.0 }, mix4(stone, ember, 0.18), 0.06, 0.5);
+                shapes[hi2].blend = true;
+                for sx in [-1.0f32, 1.0] {
+                    let hn = Vec3::new(0.7, 3.4, 0.7);
+                    push(&mut shapes, M_BOX, head + Vec3::new(sx * 4.6, 3.2, -5.0), Quat::from_rotation_z(sx * 0.3), hn, Sdf::RBox { half: hn, round: 0.3 }, mix4(ember, stone, 0.35), 0.4, 0.5);
+                }
+                zones.push(Zone { pos: head + Vec3::Y * 2.4, r: 7.0, kind: ZoneKind::Boost });
+                // fire columns rising from the caldera, hot enough to shove
+                for k in 0..6 {
+                    let a2 = k as f32 * 1.047 + 0.3;
+                    let c = Vec3::new(a2.cos() * 30.0, g0 + 12.0, a2.sin() * 26.0);
+                    push(&mut shapes, M_CAP_TALL, c, Quat::IDENTITY, Vec3::new(1.6, 12.0 / CAP_TALL_HH.max(1.0), 1.6), Sdf::None, mix4(ember, [1.0, 0.9, 0.35, 1.0], 0.5), 1.0, 0.3);
+                    flows.push(Flow { pos: c, r: 6.0, vel: Vec3::Y * 26.0 });
+                }
+            }
+            23 => {
+                // ========== BREAKWATER: the wave and the drain ==========
+                // A concrete arena with rolling swell: giant wave walls sweep
+                // the floor and CARRY you (they are platforms), the wash
+                // pushes ball and car along, and everything eventually finds
+                // the drains — big pipes that run under the deck and spit you
+                // out somewhere else entirely.
+                let g0 = th(0.0, 0.0);
+                let conc = mix4(PLINTH, [0.62, 0.62, 0.58, 1.0], 0.55);
+                let sea = [0.16, 0.55, 0.62, 1.0];
+                let fl = Vec3::new(78.0, 1.0, 60.0);
+                let fi3 = push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.8, 0.0), Quat::IDENTITY, fl, Sdf::RBox { half: fl, round: 0.5 }, conc, 0.02, 0.55);
+                shapes[fi3].blend = true;
+                // stepped sea wall around three sides, drivable
+                for (px, pz, hx, hz, yaw) in [(-80.0f32, 0.0f32, 5.0f32, 60.0f32, 0.0f32), (80.0, 0.0, 5.0, 60.0, 0.0), (0.0, -62.0, 78.0, 5.0, 0.0)] {
+                    for t in 0..3 {
+                        let h = 3.0 + t as f32 * 3.0;
+                        let inset = t as f32 * 3.4;
+                        let half = Vec3::new((hx - inset).max(1.0), h * 0.5, (hz - inset).max(1.0));
+                        let sx = if px != 0.0 { px.signum() * inset } else { 0.0 };
+                        let sz = if pz != 0.0 { pz.signum() * inset } else { 0.0 };
+                        let i = push(&mut shapes, M_BOX, Vec3::new(px - sx, g0 + h * 0.5, pz - sz), Quat::from_rotation_y(yaw), half, Sdf::RBox { half, round: 0.4 }, mix4(conc, sea, 0.06 * t as f32), 0.02, 0.5);
+                        shapes[i].blend = true;
+                    }
+                }
+                // THE SWELL: three wave walls sweeping the arena. Each is a
+                // long curved crest that carries whatever is on it.
+                for k in 0..3usize {
+                    let base = Vec3::new(0.0, g0 + 3.4, -40.0 + k as f32 * 30.0);
+                    let half = Vec3::new(66.0, 3.0, 5.0);
+                    let i = push(&mut shapes, M_BOX, base, Quat::from_rotation_x(-0.35), half, Sdf::RBox { half, round: 2.6 }, [sea[0], sea[1], sea[2], 0.72], 0.12, 0.85);
+                    shapes[i].blend = true;
+                    anims.push(Anim::Slide {
+                        shape: i,
+                        base,
+                        dir: Vec3::Z,
+                        amp: 44.0,
+                        rate: 0.19 + k as f32 * 0.035,
+                        phase: k as f32 * 2.1,
+                        rot: Quat::from_rotation_x(-0.35),
+                        scale: half,
+                    });
+                    // the wash in front of the crest pushes everything along
+                    flows.push(Flow { pos: base + Vec3::Z * 7.0, r: 16.0, vel: Vec3::new(0.0, 1.5, 12.0) });
+                }
+                // DRAINS: mouths in the deck feeding pipes that run under it
+                let mut drain = |shapes: &mut Vec<Shape>, grav: &mut Vec<GravNode>, flows: &mut Vec<Flow>, from: Vec3, to: Vec3, r: f32| {
+                    for (p, dir) in [(from, Vec3::NEG_Y), (to, Vec3::Y)] {
+                        for t in 0..5 {
+                            let ci = push(shapes, M_SPHERE, p + dir * (t as f32 * 0.6), Quat::IDENTITY, Vec3::splat(r), Sdf::Sphere { r }, [0.0; 4], 0.0, 0.0);
+                            shapes[ci].cut = true;
+                        }
+                        push(shapes, M_TORUS_FAT, p, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(r * 1.1), Sdf::Torus { big: r * 1.1, tube: r * 0.14 }, mix4(acc, [1.0; 4], 0.3), 0.5, 0.5);
+                    }
+                    // the pipe itself, under the deck
+                    let a2 = from - Vec3::Y * 7.0;
+                    let b2 = to - Vec3::Y * 7.0;
+                    for (p0, p1) in [(from - Vec3::Y * 1.0, a2), (a2, b2), (b2, to - Vec3::Y * 1.0)] {
+                        let mid = (p0 + p1) * 0.5;
+                        let axis = (p1 - p0).normalize_or(Vec3::Y);
+                        let half = p0.distance(p1) * 0.62;
+                        let rot = Quat::from_rotation_arc(Vec3::Y, axis);
+                        let i = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [sea[0], sea[1], sea[2], 0.55], 0.15, 0.88);
+                        shapes[i].blend = true;
+                        let steps = ((p0.distance(p1) / 5.0).ceil() as usize).clamp(2, 24);
+                        for t in 0..=steps {
+                            let q = p0.lerp(p1, t as f32 / steps as f32);
+                            grav.push(GravNode { pos: q, down: Vec3::NEG_Y, r: r * 1.45, tube: true, inward: false, g: (r / 12.0).clamp(0.45, 1.15), surf: true, follow: None });
+                            flows.push(Flow { pos: q, r: r * 0.95, vel: (p1 - p0).normalize_or(Vec3::Y) * 20.0 });
+                        }
+                    }
+                };
+                drain(&mut shapes, &mut grav, &mut flows, Vec3::new(-46.0, g0 + 1.6, 26.0), Vec3::new(38.0, g0 + 1.6, -30.0), 5.5);
+                drain(&mut shapes, &mut grav, &mut flows, Vec3::new(44.0, g0 + 1.6, 30.0), Vec3::new(-36.0, g0 + 1.6, -24.0), 5.0);
+                // a pier and a boost line along the open side
+                for k in 0..7 {
+                    let x = -54.0 + k as f32 * 18.0;
+                    let half = Vec3::new(4.0, 3.0, 4.0);
+                    let i = push(&mut shapes, M_BOX, Vec3::new(x, g0 + 3.0, 58.0), Quat::IDENTITY, half, Sdf::RBox { half, round: 0.5 }, conc, 0.02, 0.5);
+                    shapes[i].blend = true;
+                    zones.push(Zone { pos: Vec3::new(x, g0 + 6.6, 58.0), r: 3.4, kind: ZoneKind::Boost });
+                }
+            }
+            24 => {
+                // ====== CHAMBER: the board plays, you play on the board ======
+                // A giant chess set in a dark hall. The pieces move
+                // themselves, working through a real game (Morphy's Opera
+                // Game, 1858), and every goal you score winds the machine
+                // tighter — moves come faster and start overlapping. Each
+                // piece is drivable: rooks carry ramps, knights carry
+                // launchers, the queen is a landing deck.
+                let g0 = th(0.0, 0.0);
+                let sq = 26.0f32; // square pitch — a piece is a building
+                let origin = Vec3::new(-3.5 * sq, g0 + 1.4, -3.5 * sq);
+                let light = mix4(PLINTH, [0.90, 0.88, 0.82, 1.0], 0.65);
+                let dark = mix4(PLINTH, [0.14, 0.13, 0.20, 1.0], 0.75);
+                // the floor: 64 squares, plus a hall around them
+                let fl = Vec3::new(sq * 5.4, 1.0, sq * 5.4);
+                let fi4 = push(&mut shapes, M_BOX, Vec3::new(0.0, g0 + 0.5, 0.0), Quat::IDENTITY, fl, Sdf::RBox { half: fl, round: 0.8 }, dark, 0.02, 0.55);
+                shapes[fi4].blend = true;
+                for r in 0..8 {
+                    for f in 0..8 {
+                        if (r + f) % 2 == 0 {
+                            continue;
+                        }
+                        let c = origin + Vec3::new(f as f32 * sq, 0.75, r as f32 * sq);
+                        let half = Vec3::new(sq * 0.47, 0.28, sq * 0.47);
+                        push(&mut shapes, M_BOX, c, Quat::IDENTITY, half, Sdf::None, light, 0.06, 0.6);
+                    }
+                }
+                // hall walls with high arches, so aerials have room
+                for (px, pz, hx, hz) in [(-sq * 5.6, 0.0f32, 1.4f32, sq * 5.6), (sq * 5.6, 0.0, 1.4, sq * 5.6), (0.0, -sq * 5.6, sq * 5.6, 1.4), (0.0, sq * 5.6, sq * 5.6, 1.4)] {
+                    let i = push(&mut shapes, M_BOX, Vec3::new(px, g0 + 30.0, pz), Quat::IDENTITY, Vec3::new(hx, 30.0, hz), Sdf::RBox { half: Vec3::new(hx, 30.0, hz), round: 1.0 }, mix4(dark, acc, 0.08), 0.02, 0.5);
+                    shapes[i].blend = true;
+                }
+                // ---- piece builder: body + the furniture that rides it ----
+                let mut pieces: Vec<ChessPiece> = Vec::new();
+                let mut mk_piece = |shapes: &mut Vec<Shape>, launchers: &mut Vec<Launcher>, zones: &mut Vec<Zone>, kind: u8, file: i32, rank: i32, white: bool| {
+                    let base = origin + Vec3::new(file as f32 * sq, 0.0, rank as f32 * sq);
+                    let col = if white { mix4(light, acc, 0.10) } else { mix4(dark, acc, 0.18) };
+                    let hot = mix4(col, acc, 0.45);
+                    // BLACK IS MIRRORED. Every piece is designed facing "out"
+                    // from the white side; turning the black ones through half
+                    // a turn puts their ramps, kickers and chutes facing out
+                    // of THEIR side instead of into the board.
+                    let spin = if white { Quat::IDENTITY } else { Quat::from_rotation_y(std::f32::consts::PI) };
+                    let mut parts: Vec<(usize, Vec3)> = Vec::new();
+                    let mut launcher = None;
+                    // one builder for both solid parts and carves: two
+                    // closures cannot each hold `parts` mutably
+                    let mut add = |shapes: &mut Vec<Shape>, cut: bool, off: Vec3, half: Vec3, rot: Quat, sdf: Sdf, c: [f32; 4], glow: f32| {
+                        let o = spin * off;
+                        let mesh = if cut { M_SPHERE } else { M_BOX };
+                        let i = push(shapes, mesh, base + o, spin * rot, half, sdf, c, glow, 0.5);
+                        if cut {
+                            shapes[i].cut = true;
+                        } else {
+                            shapes[i].blend = true;
+                        }
+                        parts.push((i, o));
+                    };
+                    match kind {
+                        // PAWN — a kicker. Small, and the ramp always faces
+                        // out of its own side, so the front rank is a row of
+                        // take-offs pointing down the board.
+                        0 => {
+                            let h = Vec3::new(4.6, 2.4, 3.4);
+                            add(shapes, false, Vec3::new(0.0, 2.4, -1.6), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.0 }, col, 0.03);
+                            let rh = Vec3::new(4.4, 0.5, 6.4);
+                            add(shapes, false, Vec3::new(0.0, 2.6, 5.4), rh, Quat::from_rotation_x(-0.44), Sdf::RBox { half: rh, round: 0.35 }, hot, 0.12);
+                        }
+                        // ROOK — a castle you drive INSIDE. A doorway at the
+                        // foot, a spiral bore up through the tower, and a
+                        // battlement to be flung off at the top.
+                        1 => {
+                            let h = Vec3::new(6.2, 10.0, 6.2);
+                            add(shapes, false, Vec3::new(0.0, 10.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.0 }, col, 0.03);
+                            // the way in, and the helix up the inside
+                            add(shapes, true, Vec3::new(0.0, 3.0, 6.0), Vec3::splat(3.4), Quat::IDENTITY, Sdf::Sphere { r: 3.4 }, [0.0; 4], 0.0);
+                            let turns = 1.6f32;
+                            for t in 0..=26 {
+                                let f = t as f32 / 26.0;
+                                let a2 = f * turns * std::f32::consts::TAU;
+                                add(shapes, true, Vec3::new(a2.sin() * 3.0, 3.0 + f * 14.0, a2.cos() * 3.0), Vec3::splat(3.3), Quat::IDENTITY, Sdf::Sphere { r: 3.3 }, [0.0; 4], 0.0);
+                            }
+                            // crenellations, with gaps you can drive out of
+                            for k in 0..4 {
+                                let a2 = k as f32 * 1.5707 + 0.785;
+                                let ch = Vec3::new(1.6, 1.6, 1.6);
+                                add(shapes, false, Vec3::new(a2.cos() * 4.8, 20.6, a2.sin() * 4.8), ch, Quat::IDENTITY, Sdf::RBox { half: ch, round: 0.3 }, hot, 0.2);
+                            }
+                            zones.push(Zone { pos: base + Vec3::Y * 21.0, r: 5.0, kind: ZoneKind::Boost });
+                        }
+                        // KNIGHT — the kicker. An arched neck built as a
+                        // curved quarter-pipe: ride up the inside of the arch
+                        // and it throws you, with a launch ring at the lip.
+                        2 => {
+                            let h = Vec3::new(5.0, 2.6, 5.0);
+                            add(shapes, false, Vec3::new(0.0, 2.6, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.2 }, col, 0.03);
+                            for t in 0..7 {
+                                let f = t as f32 / 6.0;
+                                let ang = f * 1.15;
+                                let rr = 9.0;
+                                let p = Vec3::new(0.0, 4.4 + rr * (1.0 - ang.cos()) * 0.9, -1.0 - rr * ang.sin() * 0.55);
+                                let seg = Vec3::new(4.4, 0.55, 2.4);
+                                add(shapes, false, p, seg, Quat::from_rotation_x(-ang), Sdf::RBox { half: seg, round: 0.3 }, mix4(col, acc, 0.12 + f * 0.3), 0.05 + f * 0.2);
+                            }
+                            let lp = base + spin * Vec3::new(0.0, 13.6, -6.0);
+                            let li = push(shapes, M_TORUS_FAT, lp, Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::splat(3.2), Sdf::Torus { big: 3.2, tube: 0.5 }, mix4(acc, [1.0; 4], 0.45), 1.0, 0.5);
+                            parts.push((li, spin * Vec3::new(0.0, 13.6, -6.0)));
+                            launchers.push(Launcher { pos: lp, dir: spin * Vec3::new(0.0, 0.85, -0.53).normalize(), power: 36.0, timer: 0.0, shape: li });
+                            launcher = Some(launchers.len() - 1);
+                        }
+                        // BISHOP — a diagonal chute, because that is how a
+                        // bishop moves. A long banked slide running corner to
+                        // corner, open at both ends.
+                        3 => {
+                            let h = Vec3::new(3.0, 5.0, 3.0);
+                            add(shapes, false, Vec3::new(0.0, 5.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.4 }, col, 0.03);
+                            let ch = Vec3::new(4.2, 0.5, 11.0);
+                            add(shapes, false, Vec3::new(0.0, 7.4, 0.0), ch, Quat::from_rotation_y(0.785) * Quat::from_rotation_x(0.5), Sdf::RBox { half: ch, round: 0.4 }, hot, 0.15);
+                            // banked lips so the chute holds you in
+                            for sxx in [-1.0f32, 1.0] {
+                                let lh = Vec3::new(0.5, 1.5, 11.0);
+                                add(shapes, false, Vec3::new(sxx * 4.0, 8.4, 0.0), lh, Quat::from_rotation_y(0.785) * Quat::from_rotation_x(0.5) * Quat::from_rotation_z(sxx * 0.5), Sdf::RBox { half: lh, round: 0.3 }, mix4(col, acc, 0.3), 0.25);
+                            }
+                        }
+                        // QUEEN — the hub. A spire with a ramp spiralling up
+                        // the OUTSIDE to a wide deck: she reaches everywhere,
+                        // so you can leave her in any direction.
+                        4 => {
+                            let h = Vec3::new(4.6, 9.0, 4.6);
+                            add(shapes, false, Vec3::new(0.0, 9.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 1.8 }, col, 0.05);
+                            for t in 0..12 {
+                                let f = t as f32 / 11.0;
+                                let a2 = f * std::f32::consts::TAU * 1.25;
+                                let seg = Vec3::new(3.6, 0.5, 3.0);
+                                add(
+                                    shapes,
+                                    false,
+                                    Vec3::new(a2.cos() * 7.6, 2.0 + f * 14.0, a2.sin() * 7.6),
+                                    seg,
+                                    Quat::from_rotation_y(-a2) * Quat::from_rotation_z(0.30),
+                                    Sdf::RBox { half: seg, round: 0.3 },
+                                    mix4(col, acc, 0.2 + f * 0.3),
+                                    0.06 + f * 0.2,
+                                );
+                            }
+                            let deck = Vec3::new(9.5, 0.6, 9.5);
+                            add(shapes, false, Vec3::new(0.0, 18.6, 0.0), deck, Quat::IDENTITY, Sdf::RBox { half: deck, round: 0.8 }, hot, 0.25);
+                            zones.push(Zone { pos: base + Vec3::Y * 20.0, r: 7.0, kind: ZoneKind::Boost });
+                        }
+                        // KING — a bowl. Slow and short, so he is the skate
+                        // park of the set: a sunken court with banked walls
+                        // you can carve around and pop out of.
+                        _ => {
+                            let h = Vec3::new(8.0, 4.0, 8.0);
+                            add(shapes, false, Vec3::new(0.0, 4.0, 0.0), h, Quat::IDENTITY, Sdf::RBox { half: h, round: 2.4 }, col, 0.05);
+                            add(shapes, true, Vec3::new(0.0, 9.0, 0.0), Vec3::splat(6.6), Quat::IDENTITY, Sdf::Sphere { r: 6.6 }, [0.0; 4], 0.0);
+                            for k in 0..8 {
+                                let a2 = k as f32 * 0.785;
+                                let ph = Vec3::new(0.6, 2.6, 0.6);
+                                add(shapes, false, Vec3::new(a2.cos() * 7.2, 9.4, a2.sin() * 7.2), ph, Quat::IDENTITY, Sdf::RBox { half: ph, round: 0.25 }, hot, 0.4);
+                            }
+                            zones.push(Zone { pos: base + Vec3::Y * 6.0, r: 5.0, kind: ZoneKind::Boost });
+                        }
+                    }
+                    pieces.push(ChessPiece {
+                        parts,
+                        launcher,
+                        sq: (file, rank),
+                        from: base,
+                        to: base,
+                        t: 1.0,
+                        dur: 1.0,
+                        moving: false,
+                        vel: Vec3::ZERO,
+                        gone: false,
+                    });
+                };
+                // ---- the opening position ----
+                let back = [1u8, 2, 3, 4, 5, 3, 2, 1];
+                for f in 0..8i32 {
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, back[f as usize], f, 0, true);
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, 0, f, 1, true);
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, 0, f, 6, false);
+                    mk_piece(&mut shapes, &mut launchers, &mut zones, back[f as usize], f, 7, false);
+                }
+                // ---- Morphy vs Duke Karl & Count Isouard, Paris 1858 ----
+                // (the Opera Game) in board coordinates, file 0 = a
+                let alg = |t: &str| -> ((i32, i32), (i32, i32)) {
+                    let b = t.as_bytes();
+                    (
+                        ((b[0] - b'a') as i32, (b[1] - b'1') as i32),
+                        ((b[2] - b'a') as i32, (b[3] - b'1') as i32),
+                    )
+                };
+                let moves: Vec<((i32, i32), (i32, i32))> = [
+                    "e2e4", "e7e5", "g1f3", "d7d6", "d2d4", "c8g4", "d4e5", "g4f3", "d1f3", "d6e5",
+                    "f1c4", "g8f6", "f3b3", "d8e7", "b1c3", "c7c6", "c1g5", "b7b5", "c3b5", "c6b5",
+                    "c4b5", "b8d7", "e1c1", "a8d8", "d1d7", "d8d7", "h1d1", "e7e6", "b5d7", "f6d7",
+                    "b3b8", "d7b8", "d1d8",
+                ]
+                .iter()
+                .map(|m| alg(m))
+                .collect();
+                chess = Some(Chess { pieces, moves, next: 0, timer: 3.0, square: sq, origin, fury: 0.0 });
+                // braziers around the hall, and a boost ring at the centre
+                for k in 0..8 {
+                    let a2 = k as f32 * 0.785;
+                    let p = Vec3::new(a2.cos() * sq * 5.0, g0 + 3.0, a2.sin() * sq * 5.0);
+                    push(&mut shapes, M_CAP_TALL, p, Quat::IDENTITY, Vec3::new(1.0, 3.0 / CAP_TALL_HH.max(1.0), 1.0), Sdf::Capsule { r: 1.0, half: 3.0 }, mix4(acc, [1.0; 4], 0.4), 0.9, 0.4);
+                }
+                zones.push(Zone { pos: Vec3::new(0.0, g0 + 2.0, 0.0), r: 10.0, kind: ZoneKind::Boost });
             }
             _ => {}
         }
@@ -2264,6 +3395,114 @@ impl World {
             }
         }
 
+        // ---- TUBE CROSSINGS ----------------------------------------------
+        // Where two pipes cross, the union keeps BOTH sets of walls, so the
+        // bores stay sealed from one another and there is no way to pass
+        // between them — the junction looks open and is not.
+        //
+        // A tube segment is exactly a Shell shape, so they can be read back
+        // out of the world rather than threaded through the generators. For
+        // every pair whose axes come close enough to overlap, carve a sphere
+        // at the closest approach: that removes both inner walls at once and
+        // leaves a genuine opening.
+        {
+            let tubes: Vec<(usize, Vec3, Vec3, f32, f32)> = shapes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, sh)| match sh.sdf {
+                    Sdf::Shell { r, half, .. } => {
+                        let axis = sh.inv_rot.inverse() * Vec3::Y;
+                        Some((i, sh.pos, axis, half, r))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut opened: Vec<(Vec3, f32)> = Vec::new();
+            for a in 0..tubes.len() {
+                for b in (a + 1)..tubes.len() {
+                    let (_, pa, aa, ha, ra) = tubes[a];
+                    let (_, pb, ab, hb, rb) = tubes[b];
+                    // segments of the same run overlap by design; only open
+                    // where two DIFFERENT pipes meet at an angle
+                    if aa.dot(ab).abs() > 0.94 {
+                        continue;
+                    }
+                    let reach = (ha + ra).max(hb + rb);
+                    if pa.distance(pb) > reach * 1.15 {
+                        continue;
+                    }
+                    // closest approach between the two axes
+                    let w0 = pa - pb;
+                    let (d1, d2, d3) = (aa.dot(ab), aa.dot(w0), ab.dot(w0));
+                    let den = 1.0 - d1 * d1;
+                    if den.abs() < 1e-4 {
+                        continue;
+                    }
+                    let ta = ((d1 * d3 - d2) / den).clamp(-ha, ha);
+                    let tb = ((d3 - d1 * d2) / den).clamp(-hb, hb);
+                    let ca = pa + aa * ta;
+                    let cb = pb + ab * tb;
+                    let gap = ca.distance(cb);
+                    if gap > (ra + rb) * 0.85 {
+                        continue; // they pass, they do not meet
+                    }
+                    let at = (ca + cb) * 0.5;
+                    let cut_r = ra.min(rb) * 0.92;
+                    if opened.iter().any(|(p, r)| p.distance(at) < (r + cut_r) * 0.5) {
+                        continue; // one opening per junction
+                    }
+                    opened.push((at, cut_r));
+                }
+            }
+            for (at, r) in opened {
+                let ci = push(&mut shapes, M_SPHERE, at, Quat::IDENTITY, Vec3::splat(r), Sdf::Sphere { r }, [0.0; 4], 0.0, 0.0);
+                shapes[ci].cut = true;
+            }
+
+            // ---- MOUTHS ----
+            // A chamfer belongs at an OPENING, not at every segment join —
+            // baked into the mesh it drew a ring at both ends of every link,
+            // and a tube is dozens of links, so the bore filled with
+            // concentric circles that flickered in and out with the view
+            // angle. An end is a real mouth only if no other tube continues
+            // the bore there, which the segment list can answer.
+            let mut mouths: Vec<(Vec3, Vec3, f32, [f32; 4])> = Vec::new();
+            for (i, pa, aa, ha, ra) in tubes.iter().copied() {
+                for sgn in [-1.0f32, 1.0] {
+                    let end = pa + aa * (ha * sgn);
+                    let continued = tubes.iter().any(|(j, pb, ab, hb, rb)| {
+                        if *j == i {
+                            return false;
+                        }
+                        // does another tube's bore contain this end point?
+                        let d = end - *pb;
+                        let along = d.dot(*ab).clamp(-hb, *hb);
+                        (d - *ab * along).length() < rb * 0.9 && along.abs() < hb * 0.98
+                    });
+                    // ...and an end buried inside a junction room is not a
+                    // mouth either: the room covers it, so a ring there is
+                    // just another circle floating in the geometry. Most of
+                    // PERPLEXUS's links end this way, which is why counting
+                    // only "no tube continues it" still produced a ring per
+                    // segment.
+                    let buried = shapes.iter().enumerate().any(|(j, sh)| {
+                        if j == i || sh.cut || matches!(sh.sdf, Sdf::None | Sdf::Shell { .. }) {
+                            return false;
+                        }
+                        sh.pos.distance(end) < shape_reach(&sh.sdf) * 0.9
+                    });
+                    if !continued && !buried {
+                        mouths.push((end, aa * sgn, ra, shapes[i].color));
+                    }
+                }
+            }
+            for (at, dir, r, col) in mouths {
+                let rot = Quat::from_rotation_arc(Vec3::NEG_Z, dir.normalize_or(Vec3::Z));
+                let mi = push(&mut shapes, M_TUBE_RIM, at, rot, Vec3::splat(r), Sdf::None, col, 0.10, 0.85);
+                shapes[mi].blend = false;
+            }
+        }
+
         // ---- ROUTE CLEARANCE PASS ----------------------------------------
         // Where two hollow pipes cross, each one's WALL runs through the
         // other's bore: the union keeps both, so every crossing has a
@@ -2320,7 +3559,7 @@ impl World {
                     }
                 }
                 if db < 1.0e8 {
-                    d = smin(d, db, 0.8);
+                    d = smin(d, db, 0.25);
                 }
                 if dcut < 1.0e8 {
                     d = d.max(-dcut);
@@ -2359,7 +3598,32 @@ impl World {
         let scell = 56.0f32;
         let sdim = ((TG_HALF * 2.0) / scell).ceil() as i32 + 2;
         let mut sgrid: Vec<Vec<u16>> = vec![Vec::new(); (sdim * sdim) as usize];
+        let mut dyn_shapes: Vec<u16> = Vec::new();
+        for a in &anims {
+            let si = match *a {
+                Anim::Spin { shape, .. }
+                | Anim::Door { shape, .. }
+                | Anim::Orbit { shape, .. }
+                | Anim::Slide { shape, .. }
+                | Anim::Swing { shape, .. } => shape,
+            };
+            if !dyn_shapes.contains(&(si as u16)) {
+                dyn_shapes.push(si as u16);
+            }
+        }
+        if let Some(ch) = &chess {
+            for pc in &ch.pieces {
+                for (si, _) in &pc.parts {
+                    if !dyn_shapes.contains(&(*si as u16)) {
+                        dyn_shapes.push(*si as u16);
+                    }
+                }
+            }
+        }
         for (i, s) in shapes.iter().enumerate() {
+            if dyn_shapes.contains(&(i as u16)) {
+                continue; // movers are queried directly, not through the grid
+            }
             let reach = match s.sdf {
                 Sdf::None => continue,
                 Sdf::Sphere { r } => r + 4.0,
@@ -2394,12 +3658,41 @@ impl World {
             }
             grav = kept;
         }
+        // The grid is built AFTER the thinning: that pass renumbers the
+        // nodes, so an index taken before it points at the wrong one (or
+        // past the end).
+        // gravity nodes: same trick as the shape grid, one cell per query
+        // finer cells than the shape grid: gravity nodes cluster along the
+        // tubes, and a 56 m cell put most of a lattice in one bucket
+        let gdim = ((TG_HALF * 2.0) / GCELL).ceil() as i32 + 2;
+        let mut ggrid: Vec<Vec<u16>> = vec![Vec::new(); (gdim * gdim) as usize];
+        let mut gdyn: Vec<u16> = Vec::new();
+        for (i, n) in grav.iter().enumerate() {
+            if n.follow.is_some() {
+                gdyn.push(i as u16);
+                continue;
+            }
+            // a node reaches `r`, so it must appear in every cell it touches
+            let c0x = (((n.pos.x - n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            let c1x = (((n.pos.x + n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            let c0z = (((n.pos.z - n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            let c1z = (((n.pos.z + n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            for cz in c0z..=c1z {
+                for cx in c0x..=c1x {
+                    ggrid[(cz * gdim + cx) as usize].push(i as u16);
+                }
+            }
+        }
+
 
         while route_names.len() < routes.len() {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        World { grav, sgrid, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
+        let mut w = World { grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
+        // prime the mover index so the very first frame is already fast
+        w.rebuild_movers();
+        w
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.
@@ -2407,7 +3700,57 @@ impl World {
         self.zones.iter().find(|z| z.pos.distance_squared(p) < z.r * z.r).map(|z| z.kind)
     }
 
+    /// Surface velocity of any animated platform at `p` — what a car
+    /// standing there is being carried by. Only animated shapes are
+    /// considered, so this is a walk of a couple of dozen entries.
+    pub fn platform_vel(&self, p: Vec3, reach: f32) -> Option<Vec3> {
+        let mut best: Option<(f32, Vec3)> = None;
+        // a chess piece under way carries whatever is standing on it
+        if let Some(ch) = &self.chess {
+            for pc in &ch.pieces {
+                if !pc.moving {
+                    continue;
+                }
+                for (si, _) in &pc.parts {
+                    let d = self.shape_sdf_at(*si, p);
+                    if d < reach && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                        best = Some((d, pc.vel));
+                    }
+                }
+            }
+        }
+        for a in &self.anims {
+            let si = match *a {
+                Anim::Spin { shape, .. }
+                | Anim::Door { shape, .. }
+                | Anim::Orbit { shape, .. }
+                | Anim::Slide { shape, .. }
+                | Anim::Swing { shape, .. } => shape,
+            };
+            let sh = &self.shapes[si];
+            if sh.vel.length_squared() < 1e-6 && sh.omega.length_squared() < 1e-6 {
+                continue;
+            }
+            let d = self.shape_sdf_at(si, p);
+            if d < reach && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                best = Some((d, sh.vel + sh.omega.cross(p - sh.pos)));
+            }
+        }
+        best.map(|(_, v)| v)
+    }
+
     pub fn update(&mut self, dt: f32) {
+        let mut prev_pos: std::collections::HashMap<usize, Vec3> = std::collections::HashMap::new();
+        for a in &self.anims {
+            let si = match *a {
+                Anim::Spin { shape, .. }
+                | Anim::Door { shape, .. }
+                | Anim::Orbit { shape, .. }
+                | Anim::Slide { shape, .. }
+                | Anim::Swing { shape, .. } => shape,
+            };
+            prev_pos.insert(si, self.shapes[si].pos);
+        }
         self.time += dt;
         let t = self.time;
         for a in &self.anims {
@@ -2436,12 +3779,138 @@ impl World {
                     sh.inv_rot = spin.inverse();
                     sh.mat = glam::Mat4::from_scale_rotation_translation(scale, spin, p);
                 }
+                Anim::Swing { shape, pivot, axis, len, amp, rate, phase, rot, scale } => {
+                    let ax = axis.normalize_or(Vec3::Z);
+                    let ang = amp * (t * rate + phase).sin();
+                    let q = Quat::from_axis_angle(ax, ang);
+                    let p = pivot + q * (Vec3::NEG_Y * len);
+                    let orient = q * rot;
+                    let sh = &mut self.shapes[shape];
+                    sh.pos = p;
+                    sh.inv_rot = orient.inverse();
+                    sh.mat = glam::Mat4::from_scale_rotation_translation(scale, orient, p);
+                }
                 Anim::Slide { shape, base, dir, amp, rate, phase, rot, scale } => {
                     let p = base + dir * ((t * rate + phase).sin() * amp);
                     let sh = &mut self.shapes[shape];
                     sh.pos = p;
                     sh.mat = glam::Mat4::from_scale_rotation_translation(scale, rot, p);
                 }
+            }
+        }
+        // platform motion, measured from what actually moved: any rider
+        // standing on one of these inherits it (see physics::step_car)
+        for a in &self.anims {
+            let (si, om) = match *a {
+                Anim::Spin { shape, axis, rate, .. } => (shape, axis.normalize_or(Vec3::Y) * rate),
+                Anim::Orbit { shape, axis, rate, .. } => (shape, axis.normalize_or(Vec3::Y) * rate),
+                Anim::Door { shape, .. } | Anim::Slide { shape, .. } => (shape, Vec3::ZERO),
+                Anim::Swing { shape, axis, amp, rate, phase, .. } => (
+                    shape,
+                    axis.normalize_or(Vec3::Z) * (amp * rate * (self.time * rate + phase).cos()),
+                ),
+            };
+            let prev = prev_pos[&si];
+            let sh = &mut self.shapes[si];
+            sh.vel = if dt > 1e-5 { (sh.pos - prev) / dt } else { Vec3::ZERO };
+            sh.omega = om;
+        }
+        // rebuild the mover index now that everything has been placed
+        self.rebuild_movers();
+
+        // ---- THE GAME PLAYS ITSELF ----
+        if let Some(mut ch) = self.chess.take() {
+            let sq = ch.square;
+            let org = ch.origin;
+            for p in ch.pieces.iter_mut() {
+                if !p.moving {
+                    p.vel = Vec3::ZERO;
+                    continue;
+                }
+                let prev = p.from.lerp(p.to, smoothstep01(p.t));
+                p.t = (p.t + dt / p.dur.max(0.01)).min(1.0);
+                let now = p.from.lerp(p.to, smoothstep01(p.t));
+                p.vel = if dt > 1e-5 { (now - prev) / dt } else { Vec3::ZERO };
+                for (si, off) in &p.parts {
+                    let np = now + *off;
+                    let (scale, rot, _) = self.shapes[*si].mat.to_scale_rotation_translation();
+                    let sh = &mut self.shapes[*si];
+                    sh.pos = np;
+                    sh.mat = glam::Mat4::from_scale_rotation_translation(scale, rot, np);
+                }
+                if let Some(li) = p.launcher {
+                    self.launchers[li].pos = now + Vec3::Y * 6.0;
+                }
+                if p.t >= 1.0 {
+                    p.moving = false;
+                    p.from = p.to;
+                }
+            }
+            ch.timer -= dt;
+            if ch.timer <= 0.0 && !ch.moves.is_empty() {
+                let starts = 1 + (ch.fury / 3.0).floor() as usize;
+                for _ in 0..starts.min(3) {
+                    if ch.next >= ch.moves.len() {
+                        ch.next = 0;
+                        break;
+                    }
+                    let (fsq, tsq) = ch.moves[ch.next];
+                    ch.next += 1;
+                    let dur = (2.4 / (1.0 + ch.fury * 0.35)).max(0.45);
+                    let mover = ch.pieces.iter().position(|p| !p.gone && !p.moving && p.sq == fsq);
+                    let Some(mi) = mover else { continue };
+                    if let Some(ci) = ch.pieces.iter().position(|p| !p.gone && p.sq == tsq) {
+                        let away = ch.pieces[ci].to + Vec3::new(sq * 5.0, -16.0, 0.0);
+                        let cp = &mut ch.pieces[ci];
+                        cp.from = cp.to;
+                        cp.to = away;
+                        cp.t = 0.0;
+                        cp.dur = dur * 1.6;
+                        cp.moving = true;
+                        cp.gone = true;
+                        cp.sq = (99, 99);
+                    }
+                    let p = &mut ch.pieces[mi];
+                    p.from = p.to;
+                    p.to = org + Vec3::new(tsq.0 as f32 * sq, 0.0, tsq.1 as f32 * sq);
+                    p.t = 0.0;
+                    p.dur = dur;
+                    p.moving = true;
+                    p.sq = tsq;
+                }
+                ch.timer = (3.4 / (1.0 + ch.fury * 0.4)).max(0.7);
+            }
+            self.chess = Some(ch);
+        }
+
+        // MOVING PORTALS: a portal bolted to a carriage or a drum takes its
+        // transform from that shape every frame, so where it sends you keeps
+        // changing — timing the entry is the whole mechanic.
+        for pi in 0..self.portals.len() {
+            if let Some(fi) = self.portals[pi].follow {
+                let (spos, sinv) = (self.shapes[fi].pos, self.shapes[fi].inv_rot);
+                let rot = sinv.inverse();
+                self.portals[pi].pos = spos;
+                self.portals[pi].rot = rot;
+                // carry the carved hole along with the mouth
+                for k in 0..self.portals[pi].cuts.len() {
+                    let (ci, off) = self.portals[pi].cuts[k];
+                    let cp = spos + rot * off;
+                    let cr = self.shapes[ci].pos.distance(cp);
+                    let _ = cr;
+                    let scale = match self.shapes[ci].sdf {
+                        Sdf::Sphere { r } => Vec3::splat(r),
+                        _ => Vec3::ONE,
+                    };
+                    self.shapes[ci].pos = cp;
+                    self.shapes[ci].mat = glam::Mat4::from_scale_rotation_translation(scale, rot, cp);
+                }
+                let face = self.portals[pi].shape;
+                let r = self.portals[pi].r;
+                let sc = Vec3::new(r, r, 0.06);
+                self.shapes[face].pos = spos;
+                self.shapes[face].inv_rot = sinv;
+                self.shapes[face].mat = glam::Mat4::from_scale_rotation_translation(sc, rot, spos);
             }
         }
         // gravity nodes riding on animated shapes (the roaming moon)
@@ -2521,6 +3990,8 @@ impl World {
                 let col = [0.55, 0.42, 0.34, 1.0];
                 let si = self.shapes.len();
                 self.shapes.push(Shape {
+                    vel: Vec3::ZERO,
+                    omega: Vec3::ZERO,
                     mesh: M_SPHERE,
                     pos,
                     inv_rot: Quat::IDENTITY,
@@ -2533,7 +4004,7 @@ impl World {
                     cut: false,
                     blend: false,
                 });
-                self.bodies.push(Body { shape: si, pos, vel: Vec3::new(0.0, -46.0, 0.0), r, mass: r * r * 1.4, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0 });
+                self.bodies.push(Body { shape: si, pos, vel: Vec3::new(0.0, -46.0, 0.0), r, mass: r * r * 1.4, bouncy: false, squash: 0.0, sq_dir: Vec3::Y, sq_t: 0.0, scale: Vec3::splat(r), rot: Quat::IDENTITY, spin: Vec3::ZERO, drag: 0.02 });
                 self.grav.push(GravNode { pos, down: Vec3::NEG_Y, r: r * 2.6, tube: false, inward: true, g: 1.2, surf: true, follow: Some(si) });
                 self.sky_news = Some(2);
             }
@@ -2578,13 +4049,59 @@ impl World {
     }
 
     // ------------------------------------------------------------ SDF ----
+    /// Bucket the movers by cell. Rebuilt every update because they travel,
+    /// and primed at generation so the very first frame is already fast.
+    /// Bucket the movers by cell. Rebuilt every update because they travel,
+    /// and primed at generation so the very first frame is already fast.
+    pub fn rebuild_movers(&mut self) {
+        let cells = (self.gdim * self.gdim) as usize;
+        if self.mgrid.len() != cells {
+            self.mgrid = vec![Vec::new(); cells];
+        }
+        for c in self.mgrid.iter_mut() {
+            c.clear();
+        }
+        for k in 0..self.dyn_shapes.len() {
+            let si = self.dyn_shapes[k];
+            let sh = &self.shapes[si as usize];
+            if matches!(sh.sdf, Sdf::None) {
+                continue;
+            }
+            let reach = shape_reach(&sh.sdf) + 4.0;
+            let (px, pz) = (sh.pos.x, sh.pos.z);
+            let c0x = (((px - reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let c1x = (((px + reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let c0z = (((pz - reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let c1z = (((pz + reach + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            for cz in c0z..=c1z {
+                for cx in c0x..=c1x {
+                    self.mgrid[(cz * self.gdim + cx) as usize].push(si);
+                }
+            }
+        }
+    }
+
+    /// The movers whose reach could touch `p` — one cell, exactly like the
+    /// gravity index, so an empty cell proves nothing near is moving.
+    fn movers_at(&self, p: Vec3) -> &[u16] {
+        if self.mgrid.is_empty() {
+            return &self.dyn_shapes;
+        }
+        let cx = (((p.x + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+        let cz = (((p.z + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+        &self.mgrid[(cz * self.gdim + cx) as usize]
+    }
+
     pub fn sdf(&self, p: Vec3) -> f32 {
         let mut d = p.y - grid_h(&self.tgrid, p.x, p.z);
         let mut dcut = f32::MAX; // CSG: solid = max(union, -nearest cutter)
         let mut db = f32::MAX; // blend group accumulates through smin
         let cx = (((p.x + TG_HALF) / self.scell).floor() as i32).clamp(0, self.sdim - 1);
         let cz = (((p.z + TG_HALF) / self.scell).floor() as i32).clamp(0, self.sdim - 1);
-        for &si in &self.sgrid[(cz * self.sdim + cx) as usize] {
+        for &si in self.sgrid[(cz * self.sdim + cx) as usize]
+            .iter()
+            .chain(self.movers_at(p).iter())
+        {
             let s = &self.shapes[si as usize];
             // cheap broad-phase: skip shapes far away
             let rel = p - s.pos;
@@ -2661,7 +4178,7 @@ impl World {
             // TIGHTER radius than shape-to-shape: measured against the
             // route bores, 1.8 here was quietly narrowing every pipe that
             // ran near the ground.
-            d = smin(d, db, 0.8);
+            d = smin(d, db, 0.25);
         }
         if dcut < 1.0e8 {
             d = d.max(-dcut);
@@ -2686,6 +4203,67 @@ impl World {
         self.kuiper = true;
         self.drop_cd = 0.0;
         self.update(0.001);
+    }
+
+    /// The rotation that takes anything travelling INTO portal `i` and
+    /// turns it to leave portal `i`'s partner: partner_rot * (180 deg about
+    /// the portal's own up) * inverse(entry_rot). The half turn is what
+    /// makes you come OUT of the far portal instead of reversing back into
+    /// it, and it is the whole of Portal's momentum rule.
+    pub fn portal_rot(&self, i: usize) -> Quat {
+        let a = &self.portals[i];
+        let b = &self.portals[a.link];
+        (b.rot * Quat::from_rotation_y(std::f32::consts::PI) * a.rot.inverse()).normalize()
+    }
+
+    /// Map a world point through portal `i` to its partner.
+    pub fn portal_point(&self, i: usize, p: Vec3) -> Vec3 {
+        let r = self.portal_rot(i);
+        self.portals[self.portals[i].link].pos + r * (p - self.portals[i].pos)
+    }
+
+    /// Which portal (if any) does the segment `prev -> now` cross, entering
+    /// from the front? Returns the portal index.
+    pub fn portal_crossed(&self, prev: Vec3, now: Vec3) -> Option<usize> {
+        for (i, pt) in self.portals.iter().enumerate() {
+            let n = pt.rot * Vec3::Z;
+            let (d0, d1) = ((prev - pt.pos).dot(n), (now - pt.pos).dot(n));
+            // front to back, this step
+            if d0 <= 0.0 || d1 > 0.0 {
+                continue;
+            }
+            let t = (d0 / (d0 - d1)).clamp(0.0, 1.0);
+            let hit = prev.lerp(now, t);
+            if (hit - pt.pos).length() < pt.r {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Arcade bumpers: if the ball is inside a charged hitter, fire it away
+    /// hard and start its cooldown. Returns the launch velocity.
+    pub fn bump_ball(&mut self, ball_pos: Vec3, dt: f32) -> Option<Vec3> {
+        let mut out = None;
+        for i in 0..self.hitters.len() {
+            let (fire, power, shape) = {
+                let h = &mut self.hitters[i];
+                h.timer = (h.timer - dt).max(0.0);
+                let fire = out.is_none() && h.timer <= 0.0 && h.pos.distance(ball_pos) < h.r;
+                if fire {
+                    h.timer = 1.1;
+                }
+                (fire, h.power, h.shape)
+            };
+            if !fire {
+                continue;
+            }
+            let dir = (ball_pos - self.hitters[i].pos).normalize_or(Vec3::Y);
+            let launch = (Vec3::new(dir.x, 0.0, dir.z).normalize_or(Vec3::X) * 0.75 + Vec3::Y * 0.66).normalize();
+            self.shapes[shape].flash = 1.0;
+            out = Some(launch * power);
+        }
+        out
     }
 
     /// A ball strike at `p` with impact `power`: damage/open any tile there.
@@ -2760,6 +4338,15 @@ impl World {
     /// Floodwater current at p: a strong downstream drag while a flooded
     /// route contains the point (tubes take ~1 s to fill first).
     pub fn current(&self, p: Vec3) -> Option<Vec3> {
+        // standing flows first: drains, sluices and the wash off a wave
+        for f in &self.flows {
+            let d = f.pos.distance(p);
+            if d < f.r {
+                // softer at the edges so you can fight your way out
+                let w = 1.0 - (d / f.r).powi(2);
+                return Some(f.vel * w);
+            }
+        }
         for &(ri, age, dur) in &self.floods {
             if age < 1.1 || age > dur {
                 continue;
@@ -2795,6 +4382,49 @@ impl World {
         None
     }
 
+    /// Is this shape animated (a platform, a chess piece, a spinner)? Those
+    /// travel, so they must never be baked into the static candidate grid —
+    /// their reflections would be stuck wherever they started.
+    pub fn is_mover(&self, i: usize) -> bool {
+        self.dyn_shapes.contains(&(i as u16))
+    }
+
+    /// Distance to ONE shape (platform queries: which deck am I on?)
+    pub fn shape_sdf_at(&self, i: usize, p: Vec3) -> f32 {
+        let sh = &self.shapes[i];
+        let q = sh.inv_rot * (p - sh.pos);
+        match sh.sdf {
+            Sdf::None => f32::MAX,
+            Sdf::Sphere { r } => q.length() - r,
+            Sdf::Torus { big, tube } => {
+                let ring = Vec2::new(Vec2::new(q.x, q.z).length() - big, q.y);
+                ring.length() - tube
+            }
+            Sdf::Capsule { r, half } => {
+                let y = q.y.clamp(-half, half);
+                (q - Vec3::new(0.0, y, 0.0)).length() - r
+            }
+            Sdf::Hex { r, h } => (Vec2::new(q.x, q.z).length() - r).max(q.y.abs() - h),
+            Sdf::RBox { half, round } => {
+                let d3 = q.abs() - half + Vec3::splat(round);
+                d3.max(Vec3::ZERO).length() + d3.max_element().min(0.0) - round
+            }
+            Sdf::Shell { r, half, thick } => {
+                let ring = (Vec2::new(q.x, q.z).length() - r).abs() - thick;
+                ring.max(q.y.abs() - half)
+            }
+            Sdf::TubeTorus { big, tube, thick } => {
+                let ring = Vec2::new(Vec2::new(q.x, q.z).length() - big, q.y);
+                (ring.length() - tube).abs() - thick
+            }
+            Sdf::RingDeck { big, wide, half_h } => {
+                let radial = (Vec2::new(q.x, q.z).length() - big).abs() - wide;
+                let vert = q.y.abs() - half_h;
+                radial.max(vert).min(0.0) + Vec2::new(radial.max(0.0), vert.max(0.0)).length() - 0.12
+            }
+        }
+    }
+
     pub fn normal(&self, p: Vec3) -> Vec3 {
         let e = 0.07;
         let k0 = Vec3::new(1.0, -1.0, -1.0);
@@ -2827,6 +4457,19 @@ impl World {
             let t = best.0 / n.r.max(0.01);
             let w = ((1.5 - t) / 0.75).clamp(0.0, 1.0);
             g = 1.0 + (n.g - 1.0) * w;
+            // INSIDE A TUBE the pull is strongest at the AXIS and eases off
+            // as you reach the wall. A flat pull cannot satisfy both ends:
+            // weak enough not to pin you to the bore (which is what it felt
+            // like) is too weak to plant you in the first place, so a car
+            // flung into a wide pipe simply flew up the middle at constant
+            // speed, never touching anything, until a bend lost it. This
+            // shape plants you quickly and then lets go.
+            if n.tube {
+                let axis_frac = (best.0 / (n.r / 1.45).max(0.01)).clamp(0.0, 1.0);
+                // still strongest at the axis so a car entering a wide bore
+                // gets planted, but the peak comes down: at 1.7x it pinned
+                g *= 0.50 + 0.95 * (1.0 - axis_frac);
+            }
             // a collapsing node hauls on everything in reach
             if let Some((bi, _)) = self.bh {
                 let b = &self.grav[bi.min(self.grav.len() - 1)];
@@ -2844,14 +4487,36 @@ impl World {
             return Vec3::NEG_Y;
         }
         let (mut b0, mut b1): (Option<(f32, usize)>, Option<(f32, usize)>) = (None, None);
-        for (i, n) in self.grav.iter().enumerate() {
-            let d = n.pos.distance(p);
-            if b0.map_or(true, |(bd, _)| d < bd) {
-                b1 = b0;
-                b0 = Some((d, i));
-            } else if b1.map_or(true, |(bd, _)| d < bd) {
-                b1 = Some((d, i));
+        {
+            let mut consider = |i: usize, b0: &mut Option<(f32, usize)>, b1: &mut Option<(f32, usize)>| {
+                let d = self.grav[i].pos.distance(p);
+                if b0.map_or(true, |(bd, _)| d < bd) {
+                    *b1 = *b0;
+                    *b0 = Some((d, i));
+                } else if b1.map_or(true, |(bd, _)| d < bd) {
+                    *b1 = Some((d, i));
+                }
+            };
+            // ONE cell. The neighbourhood scan was nine times redundant:
+            // a node is stored in every cell its reach touches, so anything
+            // that can affect p is already in p's own cell.
+            let cx = (((p.x + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let cz = (((p.z + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            for &i in &self.ggrid[(cz * self.gdim + cx) as usize] {
+                consider(i as usize, &mut b0, &mut b1);
             }
+            // movers are few and travel, so they are always considered
+            for &i in &self.gdyn {
+                consider(i as usize, &mut b0, &mut b1);
+            }
+            // No fallback scan, and it is not an approximation: a node is
+            // inserted into EVERY cell its reach touches, so an empty
+            // neighbourhood proves no node reaches this point and the field
+            // is simply world-down. The scan was firing on every query made
+            // out in the open, which is most of them.
+        }
+        if b0.is_none() {
+            return Vec3::NEG_Y;
         }
         let dir_of = |i: usize| {
             let n = &self.grav[i];

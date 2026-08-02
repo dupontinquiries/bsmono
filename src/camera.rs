@@ -12,6 +12,8 @@ use crate::physics::{Ball, Car};
 use crate::world::World;
 
 pub struct Camera {
+    /// smoothed velocity of the platform under the car (bend)
+    plat_lag: Vec3,
     pub pos: Vec3,
     pub look: Vec3,
     pub up: Vec3, // smoothed local up used for the view basis
@@ -25,6 +27,7 @@ pub struct Camera {
 impl Camera {
     pub fn new() -> Camera {
         Camera {
+            plat_lag: Vec3::ZERO,
             pos: Vec3::new(0.0, 3.0, 34.0),
             look: Vec3::ZERO,
             up: Vec3::Y,
@@ -34,6 +37,11 @@ impl Camera {
             shake: 0.0,
             shake_t: 0.0,
         }
+    }
+
+    /// Current shake, for the SHIVER rig (parts jolt when the car is hit).
+    pub fn shake_amt(&self) -> f32 {
+        self.shake.clamp(0.0, 1.0)
     }
 
     pub fn add_shake(&mut self, amt: f32) {
@@ -88,8 +96,15 @@ impl Camera {
     ) {
         // ---- gravity-aware up basis: smoothed, rate-capped, blendable ----
         let g = world.gravity_dir(car.pos);
-        let want_up = (Vec3::Y * (1.0 - cfg.grav_follow) + (-g) * cfg.grav_follow).normalize_or(Vec3::Y);
-        self.up = Self::rotate_toward(self.up, want_up, 2.4 * dt);
+        // The horizon leans toward local gravity, but not all the way and
+        // not quickly: at full follow and 2.4 rad/s the world rolled out
+        // from under you every time a tube's "down" swung round, which is
+        // disorienting rather than dramatic. Two thirds of the way, at half
+        // the rate, keeps the sense of being inside a pipe without the room
+        // spinning.
+        let follow = cfg.grav_follow * 0.68;
+        let want_up = (Vec3::Y * (1.0 - follow) + (-g) * follow).normalize_or(Vec3::Y);
+        self.up = Self::rotate_toward(self.up, want_up, 1.15 * dt);
 
         self.update_heading(car, flipping, dt);
 
@@ -111,7 +126,21 @@ impl Camera {
         // height and angle settings whole — the cam sim caught boom_up
         // pinned at the floor regardless of cfg). Only the LOOK tilts up.
         let dir_flat = (dir - self.up * dir.dot(self.up)).normalize_or(self.heading);
+        // MOVING-PLATFORM BEND: while you are near a fast deck, the camera
+        // adopts a slice of its motion. The platform then reads as (nearly)
+        // still and only your own approach moves — which is what makes a
+        // small, rapidly moving target landable.
         let mut want = car.pos - dir_flat * cfg.dist + self.up * cfg.height;
+        if cfg.plat_bend > 0.01 {
+            if let Some(pv) = world.platform_vel(car.pos, 6.0) {
+                self.plat_lag += (pv - self.plat_lag) * (1.0 - (-3.0 * dt).exp());
+            } else {
+                self.plat_lag *= (-2.0 * dt).exp();
+            }
+            // lead the camera along the platform's travel, capped so a
+            // spinner's rim speed cannot fling the view
+            want += (self.plat_lag * cfg.plat_bend * 0.22).clamp_length_max(3.0);
+        }
         // terrain clamp only makes sense while up is world-ish
         if self.up.y > 0.7 {
             let floor = world.ground_h(want.x, want.z) + 0.35;

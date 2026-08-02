@@ -19,6 +19,8 @@ struct Globals {
     gcol: vec4<f32>,       // rgb terrain base color, w shape count
     cine: vec4<f32>,       // x exposure, y vignette, z grain, w filmic tonemap
     post: vec4<f32>,       // x bloom strength, y bloom threshold, zw spare
+    pcount: vec4<f32>,     // x = live portal count (max 4)
+    portals: array<vec4<f32>, 16>, // per portal: [pos.xyz, r], then face quat
 };
 @group(0) @binding(0) var<uniform> G: Globals;
 
@@ -196,8 +198,13 @@ fn shape_sdf(i: u32, p: vec3<f32>) -> f32 {
 // the survivors. 16 nearest is plenty for a playfield this sparse.
 const KMAX: u32 = 16u;
 struct Cands {
+    id: array<u32, KMAX>,
+    // where the ray enters and leaves each candidate's bounding sphere:
+    // entry orders the list, exit lets the march retire candidates it has
+    // already gone past
+    t0: array<f32, KMAX>,
+    t1: array<f32, KMAX>,
     n: u32,
-    id: array<u32, 16>,
 };
 
 fn gather_try(c: ptr<function, Cands>, i: u32, ro: vec3<f32>, rd: vec3<f32>, tmax: f32, skip: i32) {
@@ -210,8 +217,41 @@ fn gather_try(c: ptr<function, Cands>, i: u32, ro: vec3<f32>, rd: vec3<f32>, tma
     if (disc <= 0.0) { return; }
     let sq = sqrt(disc);
     if (-b + sq < 0.0 || -b - sq > tmax) { return; }
-    if ((*c).n < KMAX) {
-        (*c).id[(*c).n] = i;
+    // low quality gathers fewer candidates: the marcher's cost is
+    // (candidates x steps), so this is the cheapest knob there is
+    let kcap = max(4u, u32(4.0 + 12.0 * clamp(G.rt.y, 0.0, 1.0)));
+    let cap = min(KMAX, kcap);
+    let e0 = -b - sq;
+    let e1 = -b + sq;
+    // KEEP THE NEAREST, NOT THE FIRST.
+    //
+    // A full list used to drop everything that arrived afterwards, so which
+    // shapes a ray saw depended on the order the cell happened to store
+    // them. That is wrong as well as slow: a nearer shape found late was
+    // discarded in favour of a farther one found early, and on a busy cell
+    // the ray could miss the very thing it was about to hit.
+    //
+    // Now a full list rejects on a SINGLE COMPARE when the newcomer is
+    // farther than the current worst — which is the common case, so the
+    // insertion sort below only runs when it is actually going to change
+    // the answer.
+    if ((*c).n >= cap) {
+        if (e0 >= (*c).t0[cap - 1u]) { return; }
+        (*c).n = cap - 1u; // drop the worst, then insert normally
+    }
+    {
+        var k = (*c).n;
+        loop {
+            if (k == 0u) { break; }
+            if ((*c).t0[k - 1u] <= e0) { break; }
+            (*c).id[k] = (*c).id[k - 1u];
+            (*c).t0[k] = (*c).t0[k - 1u];
+            (*c).t1[k] = (*c).t1[k - 1u];
+            k = k - 1u;
+        }
+        (*c).id[k] = i;
+        (*c).t0[k] = e0;
+        (*c).t1[k] = e1;
         (*c).n = (*c).n + 1u;
     }
 }
@@ -239,23 +279,269 @@ fn gather(ro: vec3<f32>, rd: vec3<f32>, tmax: f32, skip: i32) -> Cands {
     return c;
 }
 
-fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
+fn qconj(q: vec4<f32>) -> vec4<f32> {
+    return vec4(-q.x, -q.y, -q.z, q.w);
+}
+
+/// Did the segment a->b cross a portal face from the front? If so, return
+/// the teleported point and direction. This is what lets a ray SEE THROUGH
+/// a portal: it does not stop at the face, it comes out of the partner and
+/// keeps marching, so reflections and shadows carry through the pair too.
+fn portal_hop(a: vec3<f32>, b: vec3<f32>, rd: vec3<f32>, out_p: ptr<function, vec3<f32>>, out_d: ptr<function, vec3<f32>>) -> bool {
+    let n = i32(G.pcount.x);
+    if (n == 0) { return false; }
+    for (var i = 0; i < n; i = i + 1) {
+        let base = u32(i) * 2u;
+        let pa = G.portals[base].xyz;
+        let ra = G.portals[base].w;
+        let qa = G.portals[base + 1u];
+        // partner is the paired index: 0<->1, 2<->3
+        let j = select(i - 1, i + 1, (i % 2) == 0);
+        if (j < 0 || j >= n) { continue; }
+        let pb = G.portals[u32(j) * 2u].xyz;
+        let qb = G.portals[u32(j) * 2u + 1u];
+        let na = qrot(qa, vec3(0.0, 0.0, 1.0));
+        let d0 = dot(a - pa, na);
+        let d1 = dot(b - pa, na);
+        if (d0 <= 0.0 || d1 > 0.0) { continue; }
+        let t = clamp(d0 / (d0 - d1), 0.0, 1.0);
+        let hit = mix(a, b, t);
+        if (length(hit - pa) > ra) { continue; }
+        // local = inverse(qa) * (hit - pa); half turn about the portal up;
+        // then out through the partner's frame
+        var loc = qrot(qconj(qa), hit - pa);
+        var ldir = qrot(qconj(qa), rd);
+        loc = vec3(-loc.x, loc.y, -loc.z);
+        ldir = vec3(-ldir.x, ldir.y, -ldir.z);
+        *out_p = pb + qrot(qb, loc) + qrot(qb, vec3(0.0, 0.0, 1.0)) * 0.05;
+        *out_d = normalize(qrot(qb, ldir));
+        return true;
+    }
+    return false;
+}
+
+/// ---- SKINS -------------------------------------------------------------
+/// A finish gets the surface point, its normal, the view direction, the
+/// clock and the car's speed, and returns a modified albedo plus an
+/// emissive boost and a spec boost. Because it sees the view direction it
+/// can respond to HOW YOU ARE LOOKING at the car, which is what separates
+/// these from a scrolling texture — and because spec feeds the reflection
+/// march, a skin can hand itself over to the ray tracer entirely.
+struct SkinOut {
+    albedo: vec3<f32>,
+    emissive: f32,
+    spec: f32,
+}
+
+fn hue_shift(c: vec3<f32>, a: f32) -> vec3<f32> {
+    // rotate around the grey axis: cheap, and keeps luminance sane
+    let k = vec3(0.57735, 0.57735, 0.57735);
+    let cosa = cos(a);
+    return c * cosa + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - cosa);
+}
+
+fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, pw: vec3<f32>, n: vec3<f32>, v: vec3<f32>, t: f32, speed: f32, phase: f32, ball: vec3<f32>, boost: f32, hit: vec4<f32>, combo: f32) -> SkinOut {
+    var o: SkinOut;
+    o.albedo = base;
+    o.emissive = 0.0;
+    o.spec = 0.0;
+    let facing = clamp(dot(n, v), 0.0, 1.0);
+    let graze = 1.0 - facing;
+    if (id == 1) {
+        // IRIDESCENT: hue follows the viewing angle, so a curved flank shows
+        // a whole spectrum at once and it MOVES as you orbit
+        o.albedo = hue_shift(base, graze * 4.2 + t * 0.35 + phase);
+        o.spec = 0.35 * graze;
+        o.emissive = 0.10 * graze;
+    } else if (id == 2) {
+        // ENERGY FLOW: bands running nose to tail along the body's own axis
+        let band = sin(p.z * 6.0 - t * 5.0 + phase);
+        let hot = smoothstep(0.55, 1.0, band);
+        o.albedo = mix(base, vec3(0.55, 0.95, 1.0), hot * 0.7);
+        o.emissive = hot * 0.9;
+    } else if (id == 3) {
+        // BREATHING: a slow cycle, with the seams (steep normals) brightest
+        // on the rise — a machine idling rather than a decal
+        let breath = 0.5 + 0.5 * sin(t * 1.15 + phase);
+        let seam = pow(graze, 3.0);
+        o.emissive = breath * (0.25 + seam * 1.5);
+        o.albedo = mix(base, base * 1.35, breath * 0.5);
+    } else if (id == 4) {
+        // LIQUID CHROME: almost no colour of its own, all reflection
+        o.albedo = base * 0.10 + vec3(0.06);
+        o.spec = 0.95;
+    } else if (id == 5) {
+        // SCANLINE: a sweep that traces the bodywork, brightest where the
+        // surface turns away — so the sweep draws the car's shape
+        let sweep = fract(p.y * 3.0 - t * 0.9 + phase);
+        let line = smoothstep(0.94, 1.0, sweep) + smoothstep(0.04, 0.0, sweep);
+        o.emissive = line * (0.4 + graze);
+        o.albedo = mix(base, vec3(0.7, 0.9, 1.0), line * 0.5);
+        o.spec = 0.25;
+    } else if (id == 6) {
+        // PLASMA: drifting cell noise in the BODY's space, so the slick
+        // belongs to the car instead of sliding over it
+        let q = p * 5.0 + vec3(t * 0.35, t * 0.2, -t * 0.3);
+        let a1 = sin(q.x) * sin(q.y * 1.3) * sin(q.z * 0.8);
+        let a2 = sin(q.x * 1.7 + 1.3) * sin(q.z * 1.1);
+        let m = 0.5 + 0.5 * (a1 * 0.6 + a2 * 0.4);
+        o.albedo = hue_shift(base, m * 3.0 + phase);
+        o.emissive = pow(m, 3.0) * 0.6;
+        o.spec = 0.4;
+    } else if (id == 7) {
+        // CIRCUIT: a lattice of traces with pulses travelling along them
+        let g = abs(fract(p.xz * 7.0) - 0.5);
+        let trace = smoothstep(0.46, 0.5, max(g.x, g.y));
+        let pulse = smoothstep(0.7, 1.0, sin(p.x * 4.0 + p.z * 3.0 - t * 4.0 + phase));
+        o.albedo = mix(base * 0.55, vec3(0.25, 1.0, 0.75), trace * 0.8);
+        o.emissive = trace * (0.25 + pulse * 1.3);
+    } else if (id == 8) {
+        // FORGE: heat driven by SPEED rather than time — the leading edges
+        // glow the harder you drive
+        let lead = clamp(-dot(n, vec3(0.0, 0.0, 1.0)), 0.0, 1.0);
+        let heat = clamp(speed * (0.35 + lead), 0.0, 1.0);
+        o.albedo = mix(base * 0.5, vec3(1.0, 0.42, 0.10), heat);
+        o.emissive = heat * heat * 1.6;
+    } else if (id == 10) {
+        // HUNTER: brightest on the side facing the ball. A finish that
+        // knows where the play is — the car glows toward it as you turn,
+        // which no texture can do because a texture has no idea.
+        let toward = clamp(dot(n, normalize(ball)), 0.0, 1.0);
+        let hot = pow(toward, 2.5);
+        o.albedo = mix(base * 0.6, vec3(1.0, 0.35, 0.15), hot);
+        o.emissive = hot * 1.4;
+        o.spec = 0.3;
+    } else if (id == 11) {
+        // AFTERBURNER: dark at rest, and the panels light from the tail
+        // forward as boost comes on — the car itself is the boost meter
+        let along = clamp((p.z + 0.6) * 0.9, 0.0, 1.0);
+        let lit = clamp(boost * 1.6 - along, 0.0, 1.0);
+        o.albedo = mix(base * 0.45, vec3(0.30, 0.75, 1.0), lit);
+        o.emissive = lit * 1.8;
+        o.spec = 0.2 + 0.4 * lit;
+    } else if (id == 12) {
+        // GHOST: solid when you are working, translucent when you coast.
+        // The fresnel keeps the silhouette readable, so it fades without
+        // disappearing — you can still tell where the car is.
+        let effort = clamp(max(boost, speed), 0.0, 1.0);
+        let rim = pow(graze, 2.0);
+        o.albedo = mix(vec3(0.55, 0.85, 1.0) * (0.25 + rim), base, effort);
+        o.emissive = rim * (1.1 - effort * 0.7);
+        o.spec = 0.55;
+    } else if (id == 13) {
+        // THERMAL: false colour by how square the surface is to the way you
+        // are travelling — the parts pushing air go white, the rest stay
+        // cold. Reads the car's own aerodynamics.
+        let bite = clamp(dot(n, normalize(vec3(0.0, 0.0, -1.0))), 0.0, 1.0) * speed;
+        let cold = vec3(0.05, 0.10, 0.35);
+        let warm = vec3(1.0, 0.45, 0.05);
+        let hot = vec3(1.0, 1.0, 0.92);
+        var c = mix(cold, warm, clamp(bite * 1.8, 0.0, 1.0));
+        c = mix(c, hot, clamp(bite * 2.6 - 1.0, 0.0, 1.0));
+        o.albedo = c;
+        o.emissive = clamp(bite * 1.4 - 0.2, 0.0, 1.0);
+    } else if (id == 14) {
+        // AURORA: curtains that hang in the air rather than on the paint —
+        // driven by world height, so they drift past as the car rises
+        let curtain = sin(pw.y * 2.2 + t * 0.8 + sin(pw.x * 0.5 + t * 0.3) * 1.6);
+        let band = smoothstep(0.2, 1.0, curtain);
+        o.albedo = mix(base * 0.5, hue_shift(vec3(0.2, 1.0, 0.6), pw.y * 0.4 + t * 0.2), band * 0.85);
+        o.emissive = band * 0.9;
+        o.spec = 0.25;
+    } else if (id == 15) {
+        // CRYSTAL: the surface refracts. The reflection is offset along the
+        // normal's own tangent, so the world seen in the paint is displaced
+        // from the world behind it — a lens rather than a mirror.
+        o.albedo = base * 0.25 + vec3(0.05, 0.06, 0.09);
+        o.spec = 0.85;
+        let facet = sin(p.x * 14.0) * sin(p.y * 13.0) * sin(p.z * 12.0);
+        o.emissive = smoothstep(0.75, 1.0, abs(facet)) * 0.5;
+    } else if (id == 16) {
+        // MOMENTUM: the paint keeps score. `phase2` carries the combo, so
+        // the car gets hotter the longer you keep the ball alive and cools
+        // the moment you drop it — a finish that is a running commentary.
+        let heat = clamp(combo, 0.0, 1.0);
+        o.albedo = mix(base * 0.7, hue_shift(vec3(1.0, 0.55, 0.1), heat * 2.4), heat);
+        o.emissive = heat * heat * 1.5;
+        o.spec = 0.2 + 0.4 * heat;
+    } else if (id == 17) {
+        // IMPACT: rings spreading from wherever the car last hit something.
+        // The wave travels outward in BODY space from the contact point, so
+        // it rolls across the panels that actually took the blow.
+        let d = length(p - hit.xyz);
+        let age = hit.w;
+        let front = age * 3.2;
+        let ring = smoothstep(0.25, 0.0, abs(d - front)) * clamp(1.0 - age * 0.8, 0.0, 1.0);
+        o.albedo = mix(base, vec3(1.0, 0.95, 0.85), ring * 0.8);
+        o.emissive = ring * 2.0;
+        o.spec = 0.3;
+    } else if (id == 18) {
+        // CONSTELLATION: stars fixed in the WORLD, not on the paint. The
+        // body moves through the field, so points appear and pass over it
+        // like light through a window rather than a texture riding along.
+        let g = fract(pw * 1.7) - 0.5;
+        let star = smoothstep(0.42, 0.5, 0.5 - length(g));
+        let twinkle = 0.6 + 0.4 * sin(t * 3.0 + pw.x * 4.0 + pw.z * 3.0);
+        o.albedo = mix(base * 0.35, vec3(0.85, 0.90, 1.0), star * twinkle);
+        o.emissive = star * twinkle * 1.6;
+        o.spec = 0.35;
+    } else if (id == 19) {
+        // MIRAGE: the paint will not hold still. The surface normal is bent
+        // by a travelling wave before anything is shaded with it, so the
+        // reflection swims and the highlights slide across the panels.
+        let w1 = sin(p.z * 9.0 - t * 2.2) * sin(p.y * 7.0 + t * 1.3);
+        o.albedo = hue_shift(base, w1 * 0.7 + graze * 1.2);
+        o.emissive = smoothstep(0.6, 1.0, abs(w1)) * 0.35;
+        o.spec = 0.45 + 0.35 * graze;
+    } else if (id == 9) {
+        // MOIRE: two lattices at slightly different scales, so the
+        // interference pattern shifts with both angle and time
+        let s1 = sin(p.x * 22.0 + t * 0.7);
+        let s2 = sin(p.x * 23.4 - t * 0.5 + graze * 6.0);
+        let m = 0.5 + 0.5 * s1 * s2;
+        o.albedo = hue_shift(base, m * 2.2 + graze * 2.0);
+        o.emissive = pow(m, 6.0) * 0.8;
+        o.spec = 0.5 * m;
+    }
+    return o;
+}
+
+fn map_d_from(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool, first: u32) -> f32 {
     var d = 1e6;
     var db = 1e6; // fillet group: tubes + junction rooms smooth-union
     if (!skip_ter) {
         d = p.y - terrain_h(p.x, p.z);
     }
-    for (var j = 0u; j < (*c).n; j = j + 1u) {
+    for (var j = first; j < (*c).n; j = j + 1u) {
         let id = (*c).id[j];
+        let s = RTS[id];
+        // BOUNDING-SPHERE REJECTION. a.w is the shape's bounding radius, so
+        // this is a true lower bound on its distance — and it costs one
+        // length() against a full rotate-and-evaluate. A candidate that
+        // cannot beat the running minimum is skipped outright, and because
+        // `d` shrinks as the loop proceeds, later candidates are rejected
+        // more and more often.
+        let bd = length(p - s.a.xyz) - s.a.w;
+        let blended = s.e.y >= 16.0;
+        if (blended) {
+            // the smooth-min still pulls from a little beyond the surface
+            if (bd >= db + 1.8) { continue; }
+        } else if (bd >= d + 0.25) {
+            continue;
+        }
         let sd = shape_sdf(id, p);
-        if (RTS[id].e.y >= 16.0) {
+        if (blended) {
             db = smin(db, sd, 1.8);
         } else {
             d = min(d, sd);
         }
     }
-    d = smin(d, db, 1.8); // built form fillets into the terrain as well
+    d = smin(d, db, 0.25); // match physics: the raster has no fillet // built form fillets into the terrain as well
     return d;
+}
+
+fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
+    return map_d_from(p, c, skip_ter, 0u);
 }
 
 /// Which surface is at p (after a hit): -1 terrain, else shape index.
@@ -296,8 +582,17 @@ fn soft_shadow(p: vec3<f32>, l: vec3<f32>, pdist: f32) -> f32 {
     let lod = clamp(pdist / 150.0, 0.0, 1.0);
     let steps = i32(mix(20.0 + 14.0 * G.rt.y, 9.0, lod));
     let skip_ter = p.y > 17.0 && l.y > 0.05;
+    // The shadow march is monotonic in t, exactly like the reflection, so it
+    // can retire candidates it has already gone past. It never did — the
+    // machinery was written for reflections and the other two ray systems
+    // were left walking the whole list at every step.
+    var first = 0u;
     for (var i = 0; i < steps; i = i + 1) {
-        let d = map_d(p + l * t, &c, skip_ter);
+        loop {
+            if (first >= c.n || c.t1[first] > t) { break; }
+            first = first + 1u;
+        }
+        let d = map_d_from(p + l * t, &c, skip_ter, first);
         res = min(res, 9.0 * d / t);
         t = t + clamp(d, 0.06 + lod * 0.2, 8.0);
         if (res < 0.015 || t > tmax) { break; }
@@ -310,6 +605,9 @@ fn calc_ao(p: vec3<f32>, n: vec3<f32>, pdist: f32) -> f32 {
     // AO is the first ray system to go at low quality
     if (pdist > 120.0 || G.rt.y < 0.45) { return 1.0; }
     var c = gather(p, n, 3.0, -1);
+    // nothing within reach and well clear of the ground: nothing to occlude
+    // by, so skip four map_d calls that can only return "no occlusion"
+    if (c.n == 0u && p.y > terrain_h(p.x, p.z) + 3.0) { return 1.0; }
     var occ = 0.0;
     var w = 1.0;
     for (var i = 1; i <= 4; i = i + 1) {
@@ -324,26 +622,78 @@ fn calc_ao(p: vec3<f32>, n: vec3<f32>, pdist: f32) -> f32 {
 /// One real reflection bounce: march the world, shade the hit with the same
 /// sun/fog/emissive model, fall back to the sky.
 fn trace_reflection(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32) -> vec3<f32> {
+    return trace_reflection_w(ro, rd, skip, base_dist, 1.0);
+}
+
+/// `weight` is how much of the result will actually survive the blend. A
+/// reflection contributing a tenth of the pixel does not deserve a full
+/// 260 m march — the far end of it is fog-tinted sky either way.
+fn trace_reflection_w(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32, weight: f32) -> vec3<f32> {
     let qn = clamp(G.rt.y, 0.0, 1.0);
     if (qn < 0.35 && base_dist > 70.0) { return sky_color(rd); }
     let lod = clamp(base_dist / 150.0, 0.0, 1.0);
-    let tmax = mix(260.0, 90.0, lod) * mix(0.4, 1.0, qn);
-    var c = gather(ro, rd, tmax, skip);
+    let tmax = mix(260.0, 90.0, lod) * mix(0.4, 1.0, qn) * mix(0.35, 1.0, clamp(weight * 2.2, 0.0, 1.0));
+    // PORTAL-AWARE MARCH: the ray walks in its own frame (ro2/rd2) so that
+    // when a step crosses a portal face the ray is teleported and simply
+    // keeps going — the far side is then genuinely visible THROUGH the
+    // portal in reflections and in the portal's own surface. Two hops, so a
+    // pair facing each other terminates instead of recursing forever.
+    var ro2 = ro;
+    var rd2 = rd;
+    // one bounds test up front: if no portal mouth is within reach of this
+    // ray at all, the per-step hop check is skipped entirely. That test was
+    // eight quaternion transforms EVERY march step on portal maps.
+    var near_portal = false;
+    {
+        let np = i32(G.pcount.x);
+        for (var i = 0; i < np; i = i + 1) {
+            let pp = G.portals[u32(i) * 2u];
+            let to = pp.xyz - ro;
+            let along = clamp(dot(to, rd), 0.0, tmax);
+            if (length(to - rd * along) < pp.w + 3.0) {
+                near_portal = true;
+                break;
+            }
+        }
+    }
+    var c = gather(ro2, rd2, tmax, skip);
     var t = 0.06;
     var hit = false;
+    var hops = 0;
     let steps = i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn));
     let skip_ter = ro.y > 17.0 && rd.y > 0.05;
+    var first = 0u;
     for (var i = 0; i < steps; i = i + 1) {
-        let p = ro + rd * t;
-        let d = map_d(p, &c, skip_ter);
+        let p = ro2 + rd2 * t;
+        // retire candidates the ray has already gone past: their bounding
+        // spheres are behind us and can never be hit again
+        loop {
+            if (first >= c.n || c.t1[first] > t) { break; }
+            first = first + 1u;
+        }
+        let d = map_d_from(p, &c, skip_ter, first);
         if (d < 0.004 * t + 0.006) { hit = true; break; }
-        t = t + d * 0.96;
+        let nt = t + d * 0.96;
+        if (hops < 2 && near_portal) {
+            var np = vec3(0.0);
+            var nd = vec3(0.0);
+            if (portal_hop(p, ro2 + rd2 * nt, rd2, &np, &nd)) {
+                ro2 = np;
+                rd2 = nd;
+                t = 0.06;
+                hops = hops + 1;
+                c = gather(ro2, rd2, tmax, skip);
+                first = 0u;
+                continue;
+            }
+        }
+        t = nt;
         if (t > tmax) { break; }
     }
     if (!hit) {
-        return sky_color(rd);
+        return sky_color(rd2);
     }
-    let p = ro + rd * t;
+    let p = ro2 + rd2 * t;
     let id = map_id(p, &c);
     var alb = G.gcol.rgb;
     var em = 0.0;
@@ -377,7 +727,11 @@ struct Object {
     model: mat4x4<f32>,
     nrm: mat4x4<f32>,
     color: vec4<f32>,      // base color factor (linear), a = alpha
-    params: vec4<f32>,     // x mode (0 plain, 1 terrain grid), y emissive, z spec, w rt self id + 1
+    params: vec4<f32>,
+    // x mode (0 plain, 1 terrain grid), y emissive, z spec, w rt self id + 1
+    skin: vec4<f32>,       // x id, y phase, z intensity, w speed 0..1
+    skin2: vec4<f32>,      // xyz ball direction in body space, w boost 0..1
+    skin3: vec4<f32>,      // xyz last contact in body space, w seconds since
 };
 @group(1) @binding(0) var<uniform> O: Object;
 @group(2) @binding(0) var t_col: texture_2d<f32>;
@@ -451,32 +805,123 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         }
     }
 
+    // ---- SKIN ----------------------------------------------------------
+    // Applied before lighting, so a finish changes what the light falls on
+    // rather than being painted over the top of it. Skins may also raise the
+    // spec, which feeds the reflection march below — that is how LIQUID
+    // CHROME becomes nothing but what the ray tracer sees.
+    var skin_em = 0.0;
+    var skin_spec = 0.0;
+    let skin_id = i32(O.skin.x);
+    if (skin_id > 0) {
+        // in the BODY's own space, so a moving car carries its finish
+        let lp = (in.wpos - O.model[3].xyz);
+        let sk = apply_skin(skin_id, base, lp, in.wpos, n, v, G.cam.w, O.skin.w, O.skin.y, O.skin2.xyz, O.skin2.w, O.skin3, O.skin.z);
+        base = sk.albedo;
+        skin_em = sk.emissive * O.skin.z;
+        skin_spec = sk.spec;
+    }
+
     let dif = max(dot(n, l), 0.0);
     // hemisphere ambient: cool sky from above, warm ground bounce from below
     let amb = mix(vec3(0.42, 0.37, 0.34), vec3(0.55, 0.62, 0.74), n.y * 0.5 + 0.5);
     let h = normalize(l + v);
-    let spec = pow(max(dot(n, h), 0.0), 42.0) * (0.18 + O.params.z * 0.6);
+    let spec = pow(max(dot(n, h), 0.0), 42.0) * (0.18 + max(O.params.z, skin_spec) * 0.6);
 
     var col = base * (amb * ao + vec3(1.0, 0.97, 0.90) * dif * 0.95 * shadow)
         + vec3(spec) * (0.25 + 0.75 * shadow);
-    col = mix(col, base * 1.7 + vec3(0.12), clamp(O.params.y, 0.0, 1.0)); // emissive pop
+    col = mix(col, base * 1.7 + vec3(0.12), clamp(max(O.params.y, skin_em), 0.0, 1.0)); // emissive pop
 
     // real mirror reflections where the material (or a wet map floor) wants
     // them - and only inside reflection range (fog owns the far field)
     if (rays && O.params.y < 0.35 && dist0 < 150.0) {
-            var f0 = O.params.z * 0.55;
+            var f0 = max(O.params.z, skin_spec) * 0.55;
         if (is_terrain) { f0 = G.rt.w; }
+        // ROUGH GLASS (tubes, junction rooms): a strong grazing reflection
+        // that scatters. The mirror-smooth version read as coloured film;
+        // jittering the reflected ray per-fragment and lifting the fresnel
+        // is what makes it look like thick, slightly frosted glass.
+        let glassy = O.params.x > 0.5 && O.params.x < 1.5;
+    // ---- THE VIEW THROUGH A PORTAL ----------------------------------
+    // A portal face shows what is on the far side, live: take the view ray,
+    // carry it through the pair transform, and march the world from the
+    // partner's mouth. Cars and the ball are in the marcher's shape list,
+    // so they appear through it too — which is the point, you can read an
+    // attack coming before it arrives. Three jittered samples soften the
+    // result just enough to read as a portal rather than a window.
+    if (O.params.x >= 1.5 && rays) {
+        let pi = u32(O.params.x - 2.0) * 2u;
+        let pa = G.portals[pi].xyz;
+        let qa = G.portals[pi + 1u];
+        let j = select(i32(pi / 2u) - 1, i32(pi / 2u) + 1, (pi / 2u) % 2u == 0u);
+        let jb = u32(max(j, 0)) * 2u;
+        let pb = G.portals[jb].xyz;
+        let qb = G.portals[jb + 1u];
+        let vd = normalize(in.wpos - G.cam.xyz);
+        var loc = qrot(qconj(qa), in.wpos - pa);
+        var ldir = qrot(qconj(qa), vd);
+        loc = vec3(-loc.x, loc.y, -loc.z);
+        ldir = vec3(-ldir.x, ldir.y, -ldir.z);
+        let ro2 = pb + qrot(qb, loc) + qrot(qb, vec3(0.0, 0.0, 1.0)) * 0.25;
+        let rd0 = normalize(qrot(qb, ldir));
+        var acc3 = vec3(0.0);
+        for (var k = 0; k < 2; k = k + 1) {
+            // a smooth offset per sample rather than a hash: two rays that
+            // differ by a fixed small angle soften the image without the
+            // salt-and-pepper a random direction gives
+            let ang = f32(k) * 2.399 + in.wpos.x * 0.7 + in.wpos.z * 0.5;
+            let jit = vec3(cos(ang), sin(ang), cos(ang * 1.7)) * 0.022;
+            // base_dist 0 so the low-quality early-out cannot turn the view
+            // into flat sky — a portal you cannot see through is just a wall
+            acc3 = acc3 + trace_reflection(ro2, normalize(rd0 + jit), -1, 0.0);
+        }
+        // lift it: the far side is lit by its own scene, and a portal reads
+        // as a hole in the world only if it is at least as bright as one
+        var pcol = (acc3 / 2.0) * 1.35;
+        pcol = mix(pcol, O.color.rgb, 0.09); // just enough tint to tell pairs apart
+        let edge = pow(1.0 - max(dot(n, v), 0.0), 3.0);
+        pcol = pcol + O.color.rgb * edge * 0.55;
+        return vec4(pcol, 1.0);
+    }
+        if (glassy) {
+            // Glass raised f0 as high as 0.92, which sent nearly every glass
+            // fragment down the FULL reflection march — and on a map like
+            // PERPLEXUS half the screen is glass. Grazing angles still get a
+            // strong reflection, but the ceiling comes down and the falloff
+            // is gentler, so a face-on pane takes the cheap path.
+            let fres = pow(1.0 - max(dot(n, v), 0.0), 4.0);
+            f0 = mix(0.10, 0.72, fres);
+        }
         // low-spec objects trade the full reflection march for a sky-tinted
         // sheen: visually a whisper, computationally half the glass bill
         let cheap_refl = !is_terrain && f0 < 0.14;
         let fres = f0 + (1.0 - f0) * pow(1.0 - max(dot(n, v), 0.0), 5.0);
         let amount = clamp(fres, 0.0, 0.85) * step(0.06, f0);
         if (amount > 0.03) {
-            let rr = reflect(-v, n);
+            var rr = reflect(-v, n);
+            if (glassy) {
+                // FROSTED, NOT TILED. This used to hash floor(wpos * 7),
+                // which quantises the world into 14 cm cells — every
+                // fragment inside a cell got the SAME jitter, so the glass
+                // came out in visible blocks. A hash cannot be the answer
+                // here anyway: without temporal accumulation a per-pixel
+                // random direction is just static.
+                //
+                // A continuous ripple is both cheaper and correct: three
+                // sines across the surface wobble the reflection smoothly,
+                // which is what slightly imperfect glass actually does.
+                let w = in.wpos * 2.9;
+                let rip = vec3(
+                    sin(w.y * 2.3 + w.z * 1.7),
+                    sin(w.z * 2.1 + w.x * 1.9),
+                    sin(w.x * 2.7 + w.y * 1.3)
+                );
+                rr = normalize(rr + rip * 0.055);
+            }
             if (cheap_refl) {
                 col = mix(col, sky_color(rr), amount * 0.8);
             } else {
-                let rc = trace_reflection(in.wpos + n * 0.05, rr, self_id, dist0);
+                let rc = trace_reflection_w(in.wpos + n * 0.05, rr, self_id, dist0, amount);
                 col = mix(col, rc, amount);
             }
         }

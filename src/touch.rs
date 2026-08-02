@@ -31,11 +31,13 @@ const DEAD: f32 = 0.12; // fraction of STICK_R ignored at the centre
 pub struct Buttons {
     pub boost: Vec2,
     pub jump: Vec2,
+    /// small button top-left: opens the menu without a keyboard
+    pub menu: Vec2,
 }
 
 /// Where the fixed buttons sit for a given aspect (normalized coords).
 pub fn buttons() -> Buttons {
-    Buttons { boost: Vec2::new(0.885, 0.80), jump: Vec2::new(0.70, 0.855) }
+    Buttons { boost: Vec2::new(0.885, 0.80), jump: Vec2::new(0.70, 0.855), menu: Vec2::new(0.055, 0.055) }
 }
 
 #[derive(Clone, Copy)]
@@ -53,6 +55,8 @@ pub struct TouchPad {
     stick: Option<Finger>,
     boost_id: Option<u64>,
     jump_id: Option<u64>,
+    menu_id: Option<u64>,
+    menu_hit: bool,
     /// Filled for exactly one frame when a flick or button press fires.
     pub jump_edge: bool,
     /// Dodge direction for the frame a flick lands (screen space, y up).
@@ -83,6 +87,8 @@ impl TouchPad {
             stick: None,
             boost_id: None,
             jump_id: None,
+            menu_id: None,
+            menu_hit: false,
             jump_edge: false,
             flick: None,
             flick_hold: 0.0,
@@ -99,6 +105,11 @@ impl TouchPad {
 
     /// A finger touched down at `p` (normalized, y down).
     pub fn down(&mut self, id: u64, p: Vec2) {
+        if (p - buttons().menu).length() < BTN_R * 0.8 {
+            self.menu_id = Some(id);
+            self.menu_hit = true;
+            return;
+        }
         let b = buttons();
         if Self::hits(p, b.boost) {
             self.boost_id = Some(id);
@@ -130,6 +141,9 @@ impl TouchPad {
     }
 
     pub fn up(&mut self, id: u64) {
+        if self.menu_id == Some(id) {
+            self.menu_id = None;
+        }
         self.fingers.retain(|f| f.id != id);
         if self.stick.map(|s| s.id == id).unwrap_or(false) {
             self.stick = None;
@@ -214,6 +228,13 @@ impl TouchPad {
     }
     pub fn jump_down(&self) -> bool {
         self.jump_id.is_some()
+    }
+
+    /// Did the player tap the on-screen MENU button? Consumed on read.
+    pub fn menu_tapped(&mut self) -> bool {
+        let hit = self.menu_hit;
+        self.menu_hit = false;
+        hit
     }
 
     /// True while a drive-to target is being followed.

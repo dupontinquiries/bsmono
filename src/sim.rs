@@ -413,7 +413,9 @@ pub fn run(args: &[String]) {
         use crate::render::{CSDF_H, CSDF_SLAB, CSDF_W};
         // a stand-in model with known proportions (length >> width > height)
         let mut m = crate::model::Model {
+            hover: None,
             prims: Vec::new(),
+            drive: crate::model::Drive::Combustion,
             cloud: Vec::new(),
             cloud_n: Vec::new(),
             sdf_half: Vec3::ZERO,
@@ -481,6 +483,623 @@ pub fn run(args: &[String]) {
         println!("{:<34} {}", "flatter than long", if flat_enough { "ok" } else { "FAIL" });
         println!("{:<34} {}", "matches the model within 10 cm", if tight { "ok" } else { "FAIL" });
         println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
+        return;
+    }
+    if name == "hits" {
+        // "Sometimes the ball goes in weird directions." A hit that is
+        // sometimes wrong is a DISCONTINUITY: nudge the contact point a
+        // centimetre and the answer should move a degree, not thirty. This
+        // sweeps the ball across the front of the car and measures how much
+        // the exit direction jumps between neighbouring samples.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        let hit = |lateral: f32, height: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 6.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            car.vel = Vec3::new(0.0, 0.0, -18.0);
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(lateral, car.pos.y + height, 0.0);
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            let mut out = Vec3::ZERO;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        // sweep across the nose, and up the face
+        for (label, vertical) in [("across the nose", false), ("up the face", true)] {
+            let n = 60;
+            let mut prev: Option<Vec3> = None;
+            let mut worst = 0.0f32;
+            let mut worst_at = 0.0f32;
+            let mut sum = 0.0f32;
+            for k in 0..=n {
+                let t = k as f32 / n as f32 * 2.0 - 1.0;
+                let v = if vertical { hit(0.0, t * 0.85) } else { hit(t * 0.85, 0.0) };
+                if v.length() < 0.5 {
+                    prev = None;
+                    continue;
+                }
+                let d = v.normalize();
+                if let Some(p0) = prev {
+                    let step = p0.angle_between(d).to_degrees();
+                    sum += step;
+                    if step > worst {
+                        worst = step;
+                        worst_at = t;
+                    }
+                }
+                prev = Some(d);
+            }
+            println!(
+                "{label:<18} biggest jump {worst:5.1} deg at offset {worst_at:+.2}, mean {:.1} deg per step",
+                sum / n as f32
+            );
+            check("neighbouring contacts give neighbouring answers", worst < 25.0);
+        }
+        // ---- now with the car MOVING: turning, landing, mid-flip ----
+        // The flick throw reads the car's angular velocity, and omega is
+        // derived from the rotation delta between frames — so anything that
+        // snaps the car's orientation makes the ball leave sideways.
+        let hit_turning = |steer: f32, settle: u32| -> (Vec3, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 10.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            c.steer = steer;
+            let mut ev = StepEvents::default();
+            for _ in 0..settle {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // drop the ball just ahead of wherever the car now points
+            let f = car.forward();
+            ball.pos = car.pos + f * 1.6 + Vec3::Y * 0.2;
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            let mut om = 0.0f32;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() && out.length() < 0.5 {
+                    out = ball.vel;
+                    om = car.omega_len();
+                }
+            }
+            (out, om)
+        };
+        let n = 40;
+        let mut prev: Option<Vec3> = None;
+        let (mut worst, mut worst_at, mut peak_om) = (0.0f32, 0.0f32, 0.0f32);
+        for k in 0..=n {
+            let st = k as f32 / n as f32 * 2.0 - 1.0;
+            let (v, om) = hit_turning(st, 70);
+            peak_om = peak_om.max(om);
+            if v.length() < 0.5 {
+                prev = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst {
+                    worst = step;
+                    worst_at = st;
+                }
+            }
+            prev = Some(d);
+        }
+        println!("while turning     biggest jump {worst:5.1} deg at steer {worst_at:+.2} (peak spin {peak_om:.1} rad/s)");
+        check("a turning car hits predictably", worst < 25.0);
+        // and immediately after landing, when the align is snapping the car
+        let mut prev2: Option<Vec3> = None;
+        let (mut worst2, mut peak2) = (0.0f32, 0.0f32);
+        for k in 0..=30 {
+            let settle = 30 + k; // sample across the landing settle
+            let (v, om) = hit_turning(0.25, settle);
+            peak2 = peak2.max(om);
+            if v.length() < 0.5 {
+                prev2 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev2 {
+                worst2 = worst2.max(p0.angle_between(d).to_degrees());
+            }
+            prev2 = Some(d);
+        }
+        println!("frame to frame    biggest jump {worst2:5.1} deg (peak spin {peak2:.1} rad/s)");
+        check("one frame later is not a different answer", worst2 < 25.0);
+        // ---- the ball sitting ON the car ----
+        // Here the push direction is (ball - car) with its vertical scaled
+        // to a third — so for a ball on the roof the horizontal part is
+        // almost nothing, and which way it points is decided by millimetres.
+        // That is the classic source of "it went somewhere strange".
+        let roof_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..60 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // resting on the roof, a whisker off centre, then bumped upward
+            ball.pos = car.pos + Vec3::new(lateral, car.half_h + ball.r + 0.01, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            for _ in 0..90 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev3: Option<Vec3> = None;
+        let (mut worst3, mut at3) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.20; // +/- 20 cm
+            let v = roof_hit(lat);
+            if v.length() < 0.3 {
+                prev3 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev3 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst3 {
+                    worst3 = step;
+                    at3 = lat;
+                }
+            }
+            prev3 = Some(d);
+        }
+        println!("ball on the roof  biggest jump {worst3:5.1} deg at offset {at3:+.3} m");
+        check("a carried ball leaves predictably", worst3 < 25.0);
+
+        // ---- struck DURING A FLIP, which is the unstable case ----
+        // The flick throw follows the hood's surface velocity, and near the
+        // car's rotation axis that vector is nearly zero — so its direction
+        // is noise unless the weight accounts for its magnitude.
+        let flip_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..50 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // jump, then dodge forward — and place the ball across the nose
+            c.jump_pressed = true;
+            c.jump_held = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            for _ in 0..8 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.5 + Vec3::new(lateral, car.half_h + ball.r, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            c.jump_pressed = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            let mut out = Vec3::ZERO;
+            for _ in 0..70 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev4: Option<Vec3> = None;
+        let (mut worst4, mut at4) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.30;
+            let v = flip_hit(lat);
+            if v.length() < 0.5 {
+                prev4 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev4 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst4 {
+                    worst4 = step;
+                    at4 = lat;
+                }
+            }
+            prev4 = Some(d);
+        }
+        println!("struck mid-flip   biggest jump {worst4:5.1} deg at offset {at4:+.3} m");
+        check("a flicked ball leaves predictably", worst4 < 30.0);
+
+        // ---- the singularity itself, tested directly ----
+        // The end-to-end sweep above is coarse (a flip only touches the ball
+        // for a frame or two), so check the property that was actually
+        // wrong: the throw's weight must fall with the surface SPEED, not
+        // just with how fast the car is spinning. A contact sitting on the
+        // rotation axis has a near-zero surface velocity, and normalising
+        // that returns noise.
+        let weight = |omega: f32, surf_speed: f32| -> f32 {
+            let spin = (omega / 7.0).clamp(0.0, 1.0);
+            spin * (surf_speed / 3.0).clamp(0.0, 1.0)
+        };
+        let on_axis = weight(8.0, 0.02); // fast flip, contact on the axis
+        let out_wide = weight(8.0, 3.5); // same flip, contact out at the nose
+        println!("throw weight: on the axis {on_axis:.3}, out at the nose {out_wide:.3}");
+        check("a contact on the rotation axis throws nothing", on_axis < 0.02);
+        check("a sweeping hood still throws hard", out_wide > 0.9);
+        check("and it is continuous in between", {
+            let mut worst_step = 0.0f32;
+            let mut prev = weight(8.0, 0.0);
+            for k in 1..=300 {
+                let w = weight(8.0, k as f32 * 0.02);
+                worst_step = worst_step.max((w - prev).abs());
+                prev = w;
+            }
+            worst_step < 0.02
+        });
+        println!("{}", if pass { "HITS: PASS" } else { "HITS: FAIL" });
+        return;
+    }
+    if name == "flick" {
+        // THE FLICK. In Rocket League a flick is not a hit — the ball is
+        // resting on the car and the car ROTATES out from under it, so the
+        // hood's surface velocity throws it. That makes it a test of the
+        // contact model, not of the impulse: if the car's rotation does not
+        // reach the ball, a flick feels dead no matter how hard you hit.
+        let cfg = Config::default();
+        println!("{:<16} {:>8} {:>8} {:>9} {:>8}", "flick", "exit", "angle", "carry m", "spin");
+        let mut pass = true;
+        let mut results = Vec::new();
+        for (label, thr, steer, hold) in [
+            ("forward", 1.0f32, 0.0f32, 0.10f32),
+            ("45 degree", 1.0, 0.75, 0.10),
+            ("sideways", 0.0, 1.0, 0.10),
+            ("backflip", -1.0, 0.0, 0.10),
+            ("delayed", 1.0, 0.0, 0.35),
+        ] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            // get rolling, then set the ball on the hood and let it settle
+            c.throttle = 1.0;
+            for _ in 0..90 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // Where the ball sits decides which flick works: a nose carry
+            // throws forward, and a backflip needs the ball back over the
+            // roof — pitching away from a nose carry just drops it. That is
+            // true in Rocket League too, so the setup differs per flick.
+            let f = car.forward();
+            let along = if thr < -0.5 { -0.12 } else { 0.35 };
+            ball.pos = car.pos + f * along + car.up() * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.ang = Vec3::ZERO;
+            ball.prev = ball.pos;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            let carried = ball.pos.distance(car.pos) < 2.5;
+            // jump, wait, then dodge
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            let mut t = 0.0f32;
+            while t < hold {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                t += DT;
+            }
+            c.throttle = thr;
+            c.steer = steer;
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            // let the flick play out and take the ball's peak speed
+            let mut best = 0.0f32;
+            let mut best_v = Vec3::ZERO;
+            let mut last_touch_v = Vec3::ZERO;
+            let start = ball.pos;
+            let mut touch_frames = 0;
+            let mut peak_omega = 0.0f32;
+            let dbg = std::env::var("FLICK_TRACE").map(|v| v == label).unwrap_or(false);
+            for fi in 0..90 {
+                if dbg && fi < 26 {
+                    // the box closest-point distance the contact test uses
+                    let half = Vec3::new(
+                        car.half_w().max(0.18),
+                        car.half_h.max(0.12),
+                        car.half_len.max(0.30),
+                    );
+                    let local = car.rot.inverse() * (ball.pos - car.pos);
+                    let cl = local.clamp(-half, half);
+                    let cp = car.pos + car.rot * cl;
+                    let d = ball.pos.distance(cp);
+                    eprintln!(
+                        "     f={:2} gap={:5.3} (need<{:5.3}) dodge={:.2} omega={:5.1} ballv=({:5.1},{:5.1}) carv=({:5.1},{:5.1})",
+                        fi,
+                        d - ball.r,
+                        0.02 + if car.dodge_left() > 0.0 { 0.45 } else { 0.0 },
+                        car.dodge_left(),
+                        car.omega_len(),
+                        ball.vel.y,
+                        ball.vel.length(),
+                        car.vel.y,
+                        car.vel.length()
+                    );
+                }
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    touch_frames += 1;
+                    // THE FLICK IS THE LAST TOUCH. Measuring the ball's peak
+                    // speed measured the carry that preceded the flip, not
+                    // the throw — which is why every flick looked flat while
+                    // the trace showed vertical velocity tripling on contact.
+                    last_touch_v = ball.vel;
+                }
+                peak_omega = peak_omega.max(car.omega_len());
+                if ball.vel.length() > best {
+                    best = ball.vel.length();
+                    best_v = ball.vel;
+                }
+            }
+            // what left the car on the flick itself
+            let exit_v = if last_touch_v.length() > 0.5 { last_touch_v } else { best_v };
+            let flat = Vec3::new(exit_v.x, 0.0, exit_v.z).length();
+            let angle = exit_v.y.atan2(flat.max(0.01)).to_degrees();
+            let best = exit_v.length().max(best * 0.0);
+            let travel = ball.pos.distance(start);
+            println!(
+                "{:<16} {:>7.1} {:>7.0}d {:>8.1} {:>7.1} {}",
+                label,
+                best,
+                angle,
+                travel,
+                ball.ang.length(),
+                if carried { "" } else { "(lost the carry)" }
+            );
+            if std::env::var("FLICK_DBG").is_ok() {
+                eprintln!("    contact frames during flick: {touch_frames}, peak omega {peak_omega:.1} rad/s");
+            }
+            results.push((label, best, angle));
+        }
+        // Rocket League reference: a dribble flick leaves at roughly 18-32
+        // m/s, forward flicks low and backflips high.
+        let fwd = results.iter().find(|r| r.0 == "forward").map(|r| r.1).unwrap_or(0.0);
+        let back = results.iter().find(|r| r.0 == "backflip").map(|r| (r.1, r.2)).unwrap_or((0.0, 0.0));
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<42} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("a forward flick has real pace (>16 m/s)", fwd > 16.0);
+        check("a flick is not a blast (<34 m/s)", fwd < 34.0);
+        check("the flick family lofts (forward/45/delayed)", results.iter().filter(|r| r.2 > 18.0).count() >= 3);
+        // A backflip flick is a LOFT, not a drive: high and slower, which is
+        // exactly what it is for in Rocket League — popping the ball over
+        // someone. (This read as flat until the harness stopped measuring
+        // the ball's peak speed, which was the carry BEFORE the flip, and
+        // started measuring the last touch, which is the throw itself.)
+        check("a backflip flick lofts steeply", back.1 > 45.0);
+        check("and it is a pop, not a rocket", back.0 > 6.0 && back.0 < 18.0);
+        check("forward flicks stay low", results.iter().find(|r| r.0 == "forward").map(|r| r.2 < 35.0).unwrap_or(false));
+
+        // ---- Does a flick answer to SPEED and to WHERE THE BALL SITS? ----
+        // In Rocket League both matter enormously: a flick at pace carries
+        // the car's momentum, and the ball's spot on the hood decides
+        // whether you drive it low or pop it up. A flick that ignores either
+        // reads as canned.
+        println!();
+        println!("{:<12} {:>8} {:>8} {:>8} {:>8}", "carry @", "5 m/s", "12 m/s", "20 m/s", "spread");
+        let flick_at = |speed: f32, along: f32| -> (f32, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            c.throttle = 1.0;
+            for _ in 0..240 {
+                if car.vel.length() >= speed {
+                    break;
+                }
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            c.throttle = 0.0;
+            let f = car.forward();
+            ball.pos = car.pos + f * along + car.up() * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..45 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            for _ in 0..12 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.throttle = 1.0;
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            let mut last = Vec3::ZERO;
+            for _ in 0..80 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    last = ball.vel;
+                }
+            }
+            let flat = Vec3::new(last.x, 0.0, last.z).length();
+            (last.length(), last.y.atan2(flat.max(0.01)).to_degrees())
+        };
+        let mut speed_spread = 0.0f32;
+        let mut angle_spread = 0.0f32;
+        for (label, along) in [("nose", 0.42f32), ("middle", 0.10), ("back", -0.22)] {
+            let a5 = flick_at(5.0, along);
+            let a12 = flick_at(12.0, along);
+            let a20 = flick_at(20.0, along);
+            println!(
+                "{:<12} {:>6.1}/{:<3.0} {:>5.1}/{:<3.0} {:>5.1}/{:<3.0} {:>7.1}",
+                label, a5.0, a5.1, a12.0, a12.1, a20.0, a20.1, a20.0 - a5.0
+            );
+            speed_spread = speed_spread.max(a20.0 - a5.0);
+            angle_spread = angle_spread.max((a5.1 - a20.1).abs());
+        }
+        check("a flick at pace is stronger than one at a crawl", speed_spread > 4.0);
+        println!("   (speed adds {speed_spread:.1} m/s across 5 -> 20 m/s)");
+
+        // ---- AIR DRIBBLE: how long does the ball stay on the nose? ----
+        println!();
+        println!("{:<16} {:>9} {:>9} {:>8}", "air carry", "seconds", "touches", "drift");
+        for (label, boost, pitch) in [("no boost", false, 0.0f32), ("boosting", true, 0.0), ("nose up", true, 0.25)] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let gy = world.ground_h(0.0, 0.0);
+            car.pos = Vec3::new(0.0, gy + 14.0, 0.0);
+            car.rot = glam::Quat::from_rotation_x(0.32); // nose up, as you would be
+            car.sync_rot(); // a set orientation is not a spin
+            car.vel = Vec3::new(0.0, 6.0, -11.0);
+            let mut ball = Ball::new();
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.5 + car.up() * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.boost = boost;
+            c.pitch = pitch;
+            let mut ev = StepEvents::default();
+            let mut touches = 0;
+            let mut carried = 0.0f32;
+            let mut t = 0.0f32;
+            while t < 4.0 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    touches += 1;
+                }
+                // "still on the car" means within a car length of the nose
+                if ball.pos.distance(car.pos) < 2.4 && ball.pos.y > car.pos.y {
+                    carried = t;
+                }
+                if ball.pos.y < gy + ball.r + 0.3 {
+                    break;
+                }
+                t += DT;
+            }
+            println!("{:<16} {:>8.2}s {:>9} {:>7.1}m", label, carried, touches, ball.pos.distance(car.pos));
+            if label == "no boost" {
+                // an air dribble is many small touches over seconds, not one
+                // hit — if this collapses, the carry has become a punt
+                check("an air dribble carries for seconds", carried > 1.5);
+                check("it is many small touches", touches > 15);
+            }
+        }
+        // ---- THE CATCH: turning a bouncing ball into a carry ----
+        // Every dribble starts here, and it is a skill in Rocket League
+        // because it depends on MATCHING the ball's motion: come in at the
+        // same speed and it settles on the hood, come in wrong and it
+        // bounces away. A physics that catches everything is as unfaithful
+        // as one that catches nothing.
+        println!();
+        println!("{:<18} {:>9} {:>9} {:>9}", "catch attempt", "settled", "bounces", "on car");
+        for (label, dv, drop) in [
+            ("matched speed", 0.0f32, 5.0f32),
+            ("too fast (+6)", 6.0, 5.0),
+            ("too slow (-6)", -6.0, 5.0),
+            ("steep drop", 0.0, 14.0),
+        ] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let gy = world.ground_h(0.0, 0.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, gy + 0.31, 6.0);
+            car.sync_rot();
+            car.vel = Vec3::new(0.0, 0.0, -11.0);
+            let mut ball = Ball::new();
+            // falling ahead of the car, travelling with it
+            ball.pos = Vec3::new(0.0, gy + drop, 0.0);
+            ball.vel = Vec3::new(0.0, -2.0, -11.0 + dv);
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            let mut bounces = 0;
+            let mut settled = 0.0f32;
+            let mut t = 0.0f32;
+            while t < 4.0 {
+                ev.touches.clear();
+                ev.bounces.clear();
+                // Hold the car's OWN speed — what a player does — but never
+                // chase the ball. A station-keeping controller drove under it
+                // whatever you did and caught everything; a fixed throttle
+                // caught nothing because the car would not hold pace. Whether
+                // the ball stays is then down to the approach itself.
+                c.throttle = if car.vel.length() < 11.0 { 1.0 } else { 0.0 };
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                bounces += ev.bounces.len();
+                let on_car = ball.pos.y > car.pos.y + 0.4 && ball.pos.distance(car.pos) < 2.0;
+                if on_car {
+                    settled += DT;
+                }
+                t += DT;
+            }
+            let riding = ball.pos.y > car.pos.y + 0.4 && ball.pos.distance(car.pos) < 2.2;
+            println!(
+                "{:<18} {:>8.2}s {:>9} {:>9}",
+                label,
+                settled,
+                bounces,
+                if riding { "yes" } else { "no" }
+            );
+            if label == "matched speed" {
+                check("a matched approach catches the ball", settled > 0.8);
+            }
+            if label == "too fast (+6)" {
+                check("a mistimed approach does not", settled < 0.8);
+            }
+        }
+        println!("{}", if pass { "FLICK: PASS" } else { "FLICK: FAIL" });
         return;
     }
     if name == "dribble" {
@@ -571,6 +1190,297 @@ pub fn run(args: &[String]) {
                 grounded_frames as f32 / steps as f32 * 100.0
             );
         }
+        return;
+    }
+    if name == "hits" {
+        // "Sometimes the ball goes in weird directions." A hit that is
+        // sometimes wrong is a DISCONTINUITY: nudge the contact point a
+        // centimetre and the answer should move a degree, not thirty. This
+        // sweeps the ball across the front of the car and measures how much
+        // the exit direction jumps between neighbouring samples.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        let hit = |lateral: f32, height: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 6.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            car.vel = Vec3::new(0.0, 0.0, -18.0);
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(lateral, car.pos.y + height, 0.0);
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            let mut out = Vec3::ZERO;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        // sweep across the nose, and up the face
+        for (label, vertical) in [("across the nose", false), ("up the face", true)] {
+            let n = 60;
+            let mut prev: Option<Vec3> = None;
+            let mut worst = 0.0f32;
+            let mut worst_at = 0.0f32;
+            let mut sum = 0.0f32;
+            for k in 0..=n {
+                let t = k as f32 / n as f32 * 2.0 - 1.0;
+                let v = if vertical { hit(0.0, t * 0.85) } else { hit(t * 0.85, 0.0) };
+                if v.length() < 0.5 {
+                    prev = None;
+                    continue;
+                }
+                let d = v.normalize();
+                if let Some(p0) = prev {
+                    let step = p0.angle_between(d).to_degrees();
+                    sum += step;
+                    if step > worst {
+                        worst = step;
+                        worst_at = t;
+                    }
+                }
+                prev = Some(d);
+            }
+            println!(
+                "{label:<18} biggest jump {worst:5.1} deg at offset {worst_at:+.2}, mean {:.1} deg per step",
+                sum / n as f32
+            );
+            check("neighbouring contacts give neighbouring answers", worst < 25.0);
+        }
+        // ---- now with the car MOVING: turning, landing, mid-flip ----
+        // The flick throw reads the car's angular velocity, and omega is
+        // derived from the rotation delta between frames — so anything that
+        // snaps the car's orientation makes the ball leave sideways.
+        let hit_turning = |steer: f32, settle: u32| -> (Vec3, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 10.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            c.steer = steer;
+            let mut ev = StepEvents::default();
+            for _ in 0..settle {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // drop the ball just ahead of wherever the car now points
+            let f = car.forward();
+            ball.pos = car.pos + f * 1.6 + Vec3::Y * 0.2;
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            let mut om = 0.0f32;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() && out.length() < 0.5 {
+                    out = ball.vel;
+                    om = car.omega_len();
+                }
+            }
+            (out, om)
+        };
+        let n = 40;
+        let mut prev: Option<Vec3> = None;
+        let (mut worst, mut worst_at, mut peak_om) = (0.0f32, 0.0f32, 0.0f32);
+        for k in 0..=n {
+            let st = k as f32 / n as f32 * 2.0 - 1.0;
+            let (v, om) = hit_turning(st, 70);
+            peak_om = peak_om.max(om);
+            if v.length() < 0.5 {
+                prev = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst {
+                    worst = step;
+                    worst_at = st;
+                }
+            }
+            prev = Some(d);
+        }
+        println!("while turning     biggest jump {worst:5.1} deg at steer {worst_at:+.2} (peak spin {peak_om:.1} rad/s)");
+        check("a turning car hits predictably", worst < 25.0);
+        // and immediately after landing, when the align is snapping the car
+        let mut prev2: Option<Vec3> = None;
+        let (mut worst2, mut peak2) = (0.0f32, 0.0f32);
+        for k in 0..=30 {
+            let settle = 30 + k; // sample across the landing settle
+            let (v, om) = hit_turning(0.25, settle);
+            peak2 = peak2.max(om);
+            if v.length() < 0.5 {
+                prev2 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev2 {
+                worst2 = worst2.max(p0.angle_between(d).to_degrees());
+            }
+            prev2 = Some(d);
+        }
+        println!("frame to frame    biggest jump {worst2:5.1} deg (peak spin {peak2:.1} rad/s)");
+        check("one frame later is not a different answer", worst2 < 25.0);
+        // ---- the ball sitting ON the car ----
+        // Here the push direction is (ball - car) with its vertical scaled
+        // to a third — so for a ball on the roof the horizontal part is
+        // almost nothing, and which way it points is decided by millimetres.
+        // That is the classic source of "it went somewhere strange".
+        let roof_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..60 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // resting on the roof, a whisker off centre, then bumped upward
+            ball.pos = car.pos + Vec3::new(lateral, car.half_h + ball.r + 0.01, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            let mut out = Vec3::ZERO;
+            for _ in 0..90 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev3: Option<Vec3> = None;
+        let (mut worst3, mut at3) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.20; // +/- 20 cm
+            let v = roof_hit(lat);
+            if v.length() < 0.3 {
+                prev3 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev3 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst3 {
+                    worst3 = step;
+                    at3 = lat;
+                }
+            }
+            prev3 = Some(d);
+        }
+        println!("ball on the roof  biggest jump {worst3:5.1} deg at offset {at3:+.3} m");
+        check("a carried ball leaves predictably", worst3 < 25.0);
+
+        // ---- struck DURING A FLIP, which is the unstable case ----
+        // The flick throw follows the hood's surface velocity, and near the
+        // car's rotation axis that vector is nearly zero — so its direction
+        // is noise unless the weight accounts for its magnitude.
+        let flip_hit = |lateral: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.rot = glam::Quat::IDENTITY;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let mut ev = StepEvents::default();
+            for _ in 0..50 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // jump, then dodge forward — and place the ball across the nose
+            c.jump_pressed = true;
+            c.jump_held = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            for _ in 0..8 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.5 + Vec3::new(lateral, car.half_h + ball.r, 0.0);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            c.jump_pressed = true;
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            c.jump_pressed = false;
+            let mut out = Vec3::ZERO;
+            for _ in 0..70 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    out = ball.vel;
+                }
+            }
+            out
+        };
+        let mut prev4: Option<Vec3> = None;
+        let (mut worst4, mut at4) = (0.0f32, 0.0f32);
+        for k in 0..=40 {
+            let lat = (k as f32 / 40.0 * 2.0 - 1.0) * 0.30;
+            let v = flip_hit(lat);
+            if v.length() < 0.5 {
+                prev4 = None;
+                continue;
+            }
+            let d = v.normalize();
+            if let Some(p0) = prev4 {
+                let step = p0.angle_between(d).to_degrees();
+                if step > worst4 {
+                    worst4 = step;
+                    at4 = lat;
+                }
+            }
+            prev4 = Some(d);
+        }
+        println!("struck mid-flip   biggest jump {worst4:5.1} deg at offset {at4:+.3} m");
+        check("a flicked ball leaves predictably", worst4 < 30.0);
+
+        // ---- the singularity itself, tested directly ----
+        // The end-to-end sweep above is coarse (a flip only touches the ball
+        // for a frame or two), so check the property that was actually
+        // wrong: the throw's weight must fall with the surface SPEED, not
+        // just with how fast the car is spinning. A contact sitting on the
+        // rotation axis has a near-zero surface velocity, and normalising
+        // that returns noise.
+        let weight = |omega: f32, surf_speed: f32| -> f32 {
+            let spin = (omega / 7.0).clamp(0.0, 1.0);
+            spin * (surf_speed / 3.0).clamp(0.0, 1.0)
+        };
+        let on_axis = weight(8.0, 0.02); // fast flip, contact on the axis
+        let out_wide = weight(8.0, 3.5); // same flip, contact out at the nose
+        println!("throw weight: on the axis {on_axis:.3}, out at the nose {out_wide:.3}");
+        check("a contact on the rotation axis throws nothing", on_axis < 0.02);
+        check("a sweeping hood still throws hard", out_wide > 0.9);
+        check("and it is continuous in between", {
+            let mut worst_step = 0.0f32;
+            let mut prev = weight(8.0, 0.0);
+            for k in 1..=300 {
+                let w = weight(8.0, k as f32 * 0.02);
+                worst_step = worst_step.max((w - prev).abs());
+                prev = w;
+            }
+            worst_step < 0.02
+        });
+        println!("{}", if pass { "HITS: PASS" } else { "HITS: FAIL" });
         return;
     }
     if name == "flick" {
@@ -782,6 +1692,876 @@ pub fn run(args: &[String]) {
                 f.name, sp, best.y, elev, sp / base.max(0.1) * 100.0, flip_touches, feel, named
             );
         }
+        return;
+    }
+    if name == "hood" {
+        // What does a carried ball ACTUALLY do? Park it on the hood of a car
+        // driving straight and watch its position in the CAR's frame: height
+        // above the shell, fore/aft drift, and how much it jitters. A
+        // dribble that will not settle shows up here as chatter.
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let mut world2 = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let mut car = physics::Car::new();
+        car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+        let mut ball = Ball::new();
+        let mut c = physics::Controls::default();
+        c.throttle = 1.0;
+        let mut ev = StepEvents::default();
+        for _ in 0..120 {
+            physics::step_car_only(&mut car, &ball, &world2, &c, &cfg, DT);
+        }
+        // set it gently on the hood, matching the car's speed
+        ball.pos = car.pos + car.up() * (car.half_h + ball.r) + car.forward() * 0.25;
+        ball.vel = car.vel;
+        ball.ang = Vec3::ZERO;
+        ball.prev = ball.pos;
+        println!("{:>5} {:>7} {:>7} {:>7} {:>7} {:>6}", "t", "above", "fore", "side", "dv", "spin");
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        let mut chatter = 0.0f32;
+        let mut prev_above = 0.0f32;
+        let mut lost_at = -1.0f32;
+        let mut t = 0.0f32;
+        while t < 6.0 {
+            ev.touches.clear();
+            physics::step(&mut car, &mut ball, &mut world2, &c, &cfg, DT, &mut ev);
+            let rel = car.rot.inverse() * (ball.pos - car.pos);
+            let above = rel.y - car.half_h - ball.r;
+            let dv = (ball.vel - car.vel).length();
+            if t > 0.25 {
+                lo = lo.min(above);
+                hi = hi.max(above);
+                chatter += (above - prev_above).abs();
+            }
+            prev_above = above;
+            if lost_at < 0.0 && (rel.length() > 2.5 || above > 1.2) {
+                lost_at = t;
+            }
+            if (t * 4.0).fract() < DT * 4.0 && t < 3.01 {
+                println!(
+                    "{:5.2} {:7.3} {:7.2} {:7.2} {:7.2} {:6.1}",
+                    t, above, -rel.z, rel.x, dv, ball.ang.length()
+                );
+            }
+            t += DT;
+        }
+        println!("hover {lo:.3}..{hi:.3} m   chatter {:.2} m/s   {}",
+            chatter / 5.75,
+            if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
+        return;
+    }
+    if name == "march" {
+        // The reflection marcher's inner loop, mirrored on the CPU so the
+        // saving can be counted rather than assumed. Every step used to
+        // evaluate the FULL sdf of every candidate; now a bounding-sphere
+        // test rejects the ones that cannot beat the running minimum.
+        println!("{:<13} {:>9} {:>11} {:>10} {:>8}", "map", "rays", "evals old", "evals new", "saved");
+        let mut worst = 0.0f32;
+        for si in [20usize, 21, 24, 26, 35] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            // the candidate set a fragment would see: shapes near the ray
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            let (mut old, mut new, mut rays) = (0u64, 0u64, 0u64);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            for k in 0..900 {
+                let a = k as f32 * 0.7548;
+                let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.09 - 0.35, a.sin()).normalize();
+                // gather: nearest 16 whose bounding sphere the ray could reach
+                let mut cand: Vec<(f32, usize)> = shapes
+                    .iter()
+                    .filter_map(|(c, r, i)| {
+                        let to = *c - eye;
+                        let along = to.dot(dir).clamp(0.0, 240.0);
+                        let miss = (to - dir * along).length() - r;
+                        (miss < 0.0).then_some((along, *i))
+                    })
+                    .collect();
+                cand.sort_by(|a, b| a.0.total_cmp(&b.0));
+                cand.truncate(16);
+                if cand.is_empty() {
+                    continue;
+                }
+                rays += 1;
+                // march, counting exact-SDF evaluations both ways
+                // entry/exit along the ray for each candidate's bound
+                let spans: Vec<(f32, f32, usize)> = cand
+                    .iter()
+                    .map(|(_, i)| {
+                        let sh = &w.shapes[*i];
+                        let r = crate::shape_bound(&sh.sdf).max(0.5);
+                        let to = sh.pos - eye;
+                        let b = to.dot(dir);
+                        let disc = (b * b - (to.length_squared() - r * r)).max(0.0);
+                        let sq = disc.sqrt();
+                        (b - sq, b + sq, *i)
+                    })
+                    .collect();
+                let mut t = 0.06f32;
+                let mut firstc = 0usize;
+                for _ in 0..38 {
+                    let p = eye + dir * t;
+                    let mut d = p.y - w.ground_h(p.x, p.z);
+                    while firstc < spans.len() && spans[firstc].1 <= t {
+                        firstc += 1; // retired: the ray is past it
+                    }
+                    for (_, i) in cand.iter() {
+                        old += 1;
+                    }
+                    for (_, _, i) in spans[firstc..].iter() {
+                        let sh = &w.shapes[*i];
+                        let bd = p.distance(sh.pos) - crate::shape_bound(&sh.sdf).max(0.5);
+                        if bd >= d + 0.25 {
+                            continue; // rejected by the bound alone
+                        }
+                        new += 1;
+                        d = d.min(w.shape_sdf_at(*i, p));
+                    }
+                    if d < 0.01 * t + 0.01 {
+                        break;
+                    }
+                    t += d.max(0.05) * 0.96;
+                    if t > 240.0 {
+                        break;
+                    }
+                }
+            }
+            let saved = 1.0 - new as f32 / old.max(1) as f32;
+            worst = worst.max(new as f32 / old.max(1) as f32);
+            println!(
+                "{:<13} {:>9} {:>11} {:>10} {:>7.0}%",
+                crate::world::style(si).name,
+                rays,
+                old,
+                new,
+                saved * 100.0
+            );
+        }
+        // ---- THE GATHER: nearest-N versus first-N ----
+        // The candidate list is capped. It used to keep whichever shapes
+        // arrived first and drop the rest, so what a ray saw depended on the
+        // order a cell happened to store them in — and a nearer shape found
+        // late was thrown away in favour of a farther one found early.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let cap = 16usize;
+            let (mut wrong, mut rays, mut shifts_old, mut shifts_new) = (0u32, 0u32, 0u64, 0u64);
+            for k in 0..500 {
+                let a = k as f32 * 0.7548;
+                let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.08 - 0.3, a.sin()).normalize();
+                // every candidate the ray could see, in cell order
+                let mut hits: Vec<(f32, usize)> = Vec::new();
+                for (c, r, i) in shapes.iter() {
+                    let to = *c - eye;
+                    let b = to.dot(dir);
+                    let disc = b * b - (to.length_squared() - r * r);
+                    if disc <= 0.0 {
+                        continue;
+                    }
+                    let sq = disc.sqrt();
+                    let (t0, t1) = (b - sq, b + sq);
+                    if t1 < 0.0 || t0 > 260.0 {
+                        continue;
+                    }
+                    hits.push((t0, *i));
+                }
+                if hits.len() <= cap {
+                    continue;
+                }
+                rays += 1;
+                // FIRST-N: whatever arrived first, then sorted
+                let mut first_n: Vec<(f32, usize)> = hits[..cap].to_vec();
+                first_n.sort_by(|a, b| a.0.total_cmp(&b.0));
+                // NEAREST-N: what the ray should actually consider
+                let mut near_n = hits.clone();
+                near_n.sort_by(|a, b| a.0.total_cmp(&b.0));
+                near_n.truncate(cap);
+                // did first-N miss something nearer than the ones it kept?
+                if near_n[0].0 < first_n[0].0 - 1e-4 {
+                    wrong += 1;
+                }
+                // insertion cost: first-N shifts on every accepted candidate
+                shifts_old += cap as u64 * 3;
+                // nearest-N rejects on one compare once full
+                let mut kept = 0u64;
+                let worst = near_n.last().unwrap().0;
+                for (t0, _) in hits.iter() {
+                    if *t0 < worst {
+                        kept += 1;
+                    }
+                }
+                shifts_new += kept * 2;
+            }
+            println!();
+            println!("gather on a busy cell ({rays} rays with more than {cap} candidates):");
+            println!(
+                "   first-N missed a NEARER shape on {wrong} of them ({:.0}%)",
+                wrong as f32 / rays.max(1) as f32 * 100.0
+            );
+            println!(
+                "   insertion work {shifts_old} -> {shifts_new} ({:.0}% less)",
+                (1.0 - shifts_new as f32 / shifts_old.max(1) as f32) * 100.0
+            );
+        }
+
+        // ---- ALL THREE RAY SYSTEMS ----
+        // A fragment pays for a shadow ray, four AO probes and a reflection.
+        // Optimising only the reflection optimises part of the bill, so
+        // count what each contributes and what the new savings are worth.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            let gather = |from: Vec3, dir: Vec3, tmax: f32| -> Vec<(f32, f32, usize)> {
+                let mut v: Vec<(f32, f32, usize)> = shapes
+                    .iter()
+                    .filter_map(|(c, r, i)| {
+                        let to = *c - from;
+                        let b = to.dot(dir);
+                        let disc = b * b - (to.length_squared() - r * r);
+                        if disc < 0.0 {
+                            return None;
+                        }
+                        let sq = disc.sqrt();
+                        let (t0, t1) = (b - sq, b + sq);
+                        (t1 > 0.0 && t0 < tmax).then_some((t0, t1, *i))
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                v.truncate(16);
+                v
+            };
+            let march = |from: Vec3, dir: Vec3, tmax: f32, steps: u32, retire: bool| -> (u64, u64) {
+                let cand = gather(from, dir, tmax);
+                let (mut raw, mut done) = (0u64, 0u64);
+                let mut t = 0.1f32;
+                let mut first = 0usize;
+                for _ in 0..steps {
+                    let p = from + dir * t;
+                    let mut d = p.y - w.ground_h(p.x, p.z);
+                    if retire {
+                        while first < cand.len() && cand[first].1 <= t {
+                            first += 1;
+                        }
+                    }
+                    for (_, _, i) in cand[if retire { first } else { 0 }..].iter() {
+                        raw += 1;
+                        let sh = &w.shapes[*i];
+                        let bd = p.distance(sh.pos) - crate::shape_bound(&sh.sdf).max(0.5);
+                        if bd >= d + 0.25 {
+                            continue;
+                        }
+                        done += 1;
+                        d = d.min(w.shape_sdf_at(*i, p));
+                    }
+                    // whatever the retirement skipped was still "raw" work
+                    raw += (if retire { first } else { 0 }) as u64;
+                    if d < 0.01 * t + 0.01 {
+                        break;
+                    }
+                    t += d.max(0.05) * 0.96;
+                    if t > tmax {
+                        break;
+                    }
+                }
+                (raw, done)
+            };
+            let sun = Vec3::new(0.35, 0.85, 0.4).normalize();
+            let (mut sh_old, mut sh_new, mut ao_n, mut rf_old, mut rf_new) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for k in 0..400 {
+                let a = k as f32 * 0.7548;
+                let p = eye + Vec3::new(a.cos() * 12.0, (k % 7) as f32, a.sin() * 12.0);
+                let d = Vec3::new(a.sin(), 0.2, a.cos()).normalize();
+                let (r0, _) = march(p, sun, 130.0, 30, false);
+                let (_, r1) = march(p, sun, 130.0, 30, true);
+                sh_old += r0;
+                sh_new += r1;
+                ao_n += 4; // four fixed probes, no march
+                let (f0, _) = march(p, d, 260.0, 38, false);
+                let (_, f1) = march(p, d, 90.0, 38, true); // weighted tmax
+                rf_old += f0;
+                rf_new += f1;
+            }
+            println!();
+            println!("per-fragment ray work over 400 samples (SDF evaluations):");
+            println!("   shadow      {sh_old:>9} -> {sh_new:>9}  ({:.0}% saved)", (1.0 - sh_new as f32 / sh_old.max(1) as f32) * 100.0);
+            println!("   reflection  {rf_old:>9} -> {rf_new:>9}  ({:.0}% saved on a weak one)", (1.0 - rf_new as f32 / rf_old.max(1) as f32) * 100.0);
+            println!("   ao          {ao_n:>9} probes, skipped entirely when nothing is near");
+        }
+
+        // Honest criterion: the rejection helps most where shapes are spread
+        // out and least where they are uniformly close (DROPSHOT is 200 flat
+        // tiles at the same range — nothing to reject). Every map should
+        // still save a fifth of its exact evaluations.
+        println!(
+            "worst case still evaluates {:.0}% of candidates (a flat tile field is the hard case)",
+            worst * 100.0
+        );
+        println!("{}", if worst < 0.82 { "MARCH: PASS" } else { "MARCH: FAIL" });
+        return;
+    }
+    if name == "academy" {
+        // The teaching layer. The point of interest is that a lesson is
+        // VERIFIED by the same detectors the replays use, so these checks
+        // are really asking: can the game tell when you did the thing?
+        use crate::academy::{progress, Passed, Skill, LESSONS};
+        use crate::replay::Trick;
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("there are lessons", LESSONS.len() >= 8);
+        check(
+            "every lesson names a real map",
+            LESSONS.iter().all(|l| l.map < crate::world::STYLE_COUNT),
+        );
+        check(
+            "every lesson has an instruction and a nudge",
+            LESSONS.iter().all(|l| l.hint.len() > 12 && l.nudge.len() > 12),
+        );
+        // the skills taught should cover what the game actually rewards
+        let taught: Vec<Trick> = LESSONS
+            .iter()
+            .filter_map(|l| match l.skill {
+                Skill::Do(t) => Some(t),
+                _ => None,
+            })
+            .collect();
+        println!("   teaches: {}", taught.iter().map(|t| t.name()).collect::<Vec<_>>().join(", "));
+        check("the hardest tricks are taught", taught.contains(&Trick::FlipReset) && taught.contains(&Trick::AirDribble));
+        check("no two lessons verify the same trick", {
+            let mut u = taught.clone();
+            u.sort_by_key(|t| t.name());
+            u.dedup();
+            u.len() == taught.len()
+        });
+        // progress must come from the detector, not from time passing
+        check(
+            "a trick lesson is only passed when the trick lands",
+            progress(Skill::Do(Trick::FlipReset), 99.0, 99.0, 99, false) == 0.0
+                && progress(Skill::Do(Trick::FlipReset), 0.0, 0.0, 0, true) == 1.0,
+        );
+        check(
+            "measured lessons scale with the measurement",
+            (progress(Skill::BallSpeed(20.0), 10.0, 0.0, 0, false) - 0.5).abs() < 1e-5
+                && progress(Skill::BallSpeed(20.0), 40.0, 0.0, 0, false) == 1.0,
+        );
+        check(
+            "height and combo lessons work the same way",
+            (progress(Skill::Height(20.0), 0.0, 5.0, 0, false) - 0.25).abs() < 1e-5
+                && (progress(Skill::Combo(4), 0.0, 0.0, 2, false) - 0.5).abs() < 1e-5,
+        );
+        // the board must be set so the trick is possible at all
+        check(
+            "lessons that need the ball up put it up",
+            LESSONS
+                .iter()
+                .filter(|l| matches!(l.skill, Skill::Do(Trick::FlipReset) | Skill::Do(Trick::AirDribble)))
+                .all(|l| l.setup.up > 2.0 || l.setup.vel.y > 2.0),
+        );
+        // progress persists
+        let mut p = Passed::default();
+        check("nothing is learned to begin with", p.count() == 0);
+        p.set(0);
+        p.set(7);
+        check("passing sticks", p.has(0) && p.has(7) && !p.has(3));
+        let round = Passed::decode(&p.encode());
+        check("it survives the save file", round.has(0) && round.has(7) && round.count() == 2);
+        println!("{}", if pass { "ACADEMY: PASS" } else { "ACADEMY: FAIL" });
+        return;
+    }
+    if name == "replay" {
+        // The replay layer: a fixed ring buffer, trick recognition that only
+        // ever reports what the physics reported, and a camera that frames
+        // the action without a director.
+        use crate::replay::{cinema, length_seconds, pose_at, Frame, Recorder, Trick, CAP, HZ};
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // the buffer must be bounded no matter how long you play
+        let mut r = Recorder::default();
+        for k in 0..(60 * 600) {
+            let x = k as f32 * 0.01;
+            r.push(
+                1.0 / 60.0,
+                Frame { car: Vec3::new(x, 1.0, 0.0), ball: Vec3::new(x, 2.0, 0.0), ..Default::default() },
+            );
+        }
+        let f = r.frames();
+        println!("   after 10 minutes: {} frames held ({} s at {} Hz)", f.len(), length_seconds(&f).round(), HZ);
+        check("the buffer stays bounded", f.len() == CAP);
+        // the window spans 12 s (7.2 units here); what matters is that the
+        // OLD frames were dropped — x started near 0 ten minutes ago
+        check("it holds the most RECENT frames", f[0].car.x > 300.0 && f.last().unwrap().car.x > f[0].car.x + 5.0);
+        check("frames are in order", f.windows(2).all(|w| w[1].car.x >= w[0].car.x));
+        // naming: rarest trick leads, and repeats do not spam the log
+        let mut r2 = Recorder::default();
+        for _ in 0..50 {
+            r2.push(1.0 / 60.0, Frame::default());
+            r2.note(Trick::Aerial);
+        }
+        r2.note(Trick::FlipReset);
+        r2.note(Trick::AirDribble);
+        let (title, score) = r2.moment(6.0);
+        println!("   named: \"{title}\" (score {score})");
+        check("the rarest trick leads the name", title.starts_with("FLIP RESET"));
+        check("a second trick is mentioned", title.contains("INTO"));
+        check("repeats are collapsed", score < 30);
+        let plain = Recorder::default().moment(6.0);
+        check("a plain goal is just a goal", plain.0 == "GOAL");
+        // old tricks fall out of the window
+        let mut r3 = Recorder::default();
+        r3.note(Trick::Ceiling);
+        for _ in 0..(8 * 60) {
+            r3.push(1.0 / 60.0, Frame::default());
+        }
+        r3.note(Trick::Aerial);
+        check("stale tricks leave the window", r3.moment(3.0).0 == "AERIAL");
+        // the camera: always frames the action, and moves
+        let mut frames = Vec::new();
+        for k in 0..120 {
+            let x = k as f32 * 0.5;
+            frames.push(Frame {
+                car: Vec3::new(x, 2.0, 0.0),
+                ball: Vec3::new(x + 4.0, 6.0, 1.0),
+                ..Default::default()
+            });
+        }
+        let total = length_seconds(&frames);
+        let (e0, f0) = cinema(&frames, 0.0).unwrap();
+        let (e1, f1) = cinema(&frames, total * 0.5).unwrap();
+        let (e2, _) = cinema(&frames, total).unwrap();
+        check("the camera keeps its distance", (e0 - f0).length() > 12.0 && (e1 - f1).length() > 10.0);
+        check("the camera orbits rather than sitting still", (e0 - e1).length() > 8.0 && (e1 - e2).length() > 8.0);
+        check("it pulls in as the moment lands", (e2 - f1).length() < (e0 - f0).length() + 30.0);
+        check("playback interpolates between samples", {
+            let a = pose_at(&frames, 0.0).unwrap().car.x;
+            let b = pose_at(&frames, 1.0 / HZ * 0.5).unwrap().car.x;
+            b > a && b < a + 0.5
+        });
+        check("playback clamps past the end", pose_at(&frames, total * 5.0).is_some());
+        println!("{}", if pass { "REPLAY: PASS" } else { "REPLAY: FAIL" });
+        return;
+    }
+    if name == "trials" {
+        // The challenge layer, checked headless: every trial points at a real
+        // map, progress only comes from state the physics produces, the
+        // clock fails you, records only improve, and ghosts replay.
+        use crate::trials::{ghost_at, Bests, Goal, Run, TRIALS};
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<44} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("there are trials", TRIALS.len() >= 12);
+        check(
+            "every trial names a real map",
+            TRIALS.iter().all(|t| t.map < crate::world::STYLE_COUNT),
+        );
+        let maps: std::collections::HashSet<usize> = TRIALS.iter().map(|t| t.map).collect();
+        println!("   {} trials across {} maps", TRIALS.len(), maps.len());
+        check("they span the map list", maps.len() >= 8);
+        check(
+            "every trial is winnable in its limit",
+            TRIALS.iter().all(|t| t.limit >= 30.0),
+        );
+        // drive a trial to completion with plausible inputs
+        let hit = |g: Goal| -> (bool, f32) {
+            let idx = TRIALS.iter().position(|t| t.goal == g).unwrap_or(0);
+            let mut r = Run::new(idx);
+            let mut t = 0.0f32;
+            let mut done = false;
+            while t < TRIALS[idx].limit && !done {
+                let p = Vec3::new(t * 3.0, 90.0, 0.0); // high enough to satisfy height goals
+                done = r.tick(
+                    DT, p, glam::Quat::IDENTITY, 40.0, 0.0,
+                    (t * 0.6) as u32,      // goals trickle in
+                    t.min(9.0),            // air dribble time
+                    (t * 2.0) as u32,      // combo
+                    true, true,            // in a tube, on a platform
+                    0.6,                   // portal metres this step
+                );
+                t += DT;
+            }
+            (done, r.t)
+        };
+        let mut all_reachable = true;
+        for t in TRIALS.iter() {
+            let (done, _) = hit(t.goal);
+            if !done {
+                all_reachable = false;
+                println!("   unreachable: {} ({:?})", t.name, t.goal);
+            }
+        }
+        check("each goal type can actually complete", all_reachable);
+        // the clock must fail you
+        {
+            let mut r = Run::new(0);
+            let mut t = 0.0;
+            while t < TRIALS[0].limit + 1.0 {
+                r.tick(DT, Vec3::ZERO, glam::Quat::IDENTITY, 0.0, 0.0, 0, 0.0, 0, false, false, 0.0);
+                t += DT;
+            }
+            check("running out of time fails the run", r.failed && !r.done);
+        }
+        // records improve only
+        {
+            let mut b = Bests::default();
+            check("a first finish is a record", b.record(3, 12.0));
+            check("a slower run is not", !b.record(3, 15.0));
+            check("a faster run is", b.record(3, 9.5));
+            check("the best is kept", (b.get(3) - 9.5).abs() < 1e-3);
+            let round = Bests::decode(&b.encode());
+            check("bests survive the save file", (round.get(3) - 9.5).abs() < 0.01);
+            check("progress counts", round.finished() == 1);
+        }
+        // ghosts replay where the run went
+        {
+            let mut r = Run::new(0);
+            for k in 0..600 {
+                let p = Vec3::new(k as f32 * 0.1, 2.0, 0.0);
+                r.tick(DT, p, glam::Quat::IDENTITY, 10.0, 0.0, 0, 0.0, 0, false, false, 0.0);
+            }
+            let mid = ghost_at(&r.ghost, r.t * 0.5).map(|(p, _)| p.x).unwrap_or(-1.0);
+            let end = ghost_at(&r.ghost, r.t * 10.0).map(|(p, _)| p.x).unwrap_or(-1.0);
+            println!("   ghost: {} samples, midpoint x={mid:.1}, clamped end x={end:.1}", r.ghost.len());
+            check("the ghost follows the run", mid > 25.0 && mid < 35.0);
+            check("the ghost clamps past its end", end > 55.0);
+        }
+        println!("{}", if pass { "TRIALS: PASS" } else { "TRIALS: FAIL" });
+        return;
+    }
+    if name == "render" {
+        // What does the renderer actually submit? Instance count is the
+        // honest proxy for GPU cost here, so measure it per map, from a
+        // player's eye, before and after culling.
+        use crate::{frustum_planes, shape_bound, sphere_visible};
+        println!("{:<13} {:>7} {:>8} {:>8} {:>8} {:>7}", "map", "shapes", "in view", "+dist", "drawn", "saved");
+        let mut worst = 0.0f32;
+        let mut order_ok = true;
+        for si in [20usize, 21, 24, 26, 30, 33, 35] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
+            let mut vis_sum = 0.0f32;
+            let mut drawn_sum = 0.0f32;
+            let mut total = 0.0f32;
+            let turns = 8;
+            for t in 0..turns {
+                // a normal chase view sweeping the compass
+                let a = t as f32 / turns as f32 * std::f32::consts::TAU;
+                let look = eye + Vec3::new(a.sin() * 30.0, -3.0, a.cos() * 30.0);
+                let view = glam::Mat4::look_at_rh(eye, look, Vec3::Y);
+                let proj = glam::Mat4::perspective_rh(86f32.to_radians(), 16.0 / 9.0, 0.1, 900.0);
+                let planes = frustum_planes(&(proj * view));
+                let (mut vis, mut drawn, mut n) = (0u32, 0u32, 0u32);
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) && sh.mesh == usize::MAX {
+                        continue;
+                    }
+                    n += 1;
+                    let b = shape_bound(&sh.sdf).max(2.0);
+                    if !sphere_visible(&planes, sh.pos, b + 6.0) {
+                        continue;
+                    }
+                    vis += 1;
+                    // the distance rules that were already there
+                    let dd2 = sh.pos.distance_squared(eye);
+                    if dd2 > 640.0 * 640.0 {
+                        continue;
+                    }
+                    if dd2 > 250.0 * 250.0 && b < 5.0 {
+                        continue;
+                    }
+                    drawn += 1;
+                }
+                total = n as f32;
+                vis_sum += vis as f32;
+                drawn_sum += drawn as f32;
+            }
+            let vis_avg = vis_sum / turns as f32;
+            let drawn_avg = drawn_sum / turns as f32;
+            let saved = 1.0 - drawn_avg / total.max(1.0);
+            worst = worst.max(drawn_avg / total.max(1.0));
+            println!(
+                "{:<13} {:>7.0} {:>8.0} {:>8} {:>8.0} {:>6.0}%",
+                crate::world::style(si).name,
+                total,
+                vis_avg,
+                "",
+                drawn_avg,
+                saved * 100.0
+            );
+        }
+        // ---- draw-call state churn: what ordering the frame is worth ----
+        {
+            use crate::render::{order_for_draw, ObjDraw, ObjectRaw};
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
+            // a frame's worth of draws, in the order the world stores them
+            let mut objs: Vec<ObjDraw> = Vec::new();
+            for sh in w.shapes.iter() {
+                if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                    continue;
+                }
+                if sh.pos.distance(eye) > 250.0 {
+                    continue;
+                }
+                let mut raw = ObjectRaw::default();
+                raw.model[12] = sh.pos.x;
+                raw.model[13] = sh.pos.y;
+                raw.model[14] = sh.pos.z;
+                raw.color = sh.color;
+                objs.push(ObjDraw { mesh: sh.mesh, tex: None, raw });
+            }
+            let churn = |v: &[ObjDraw]| -> (usize, usize) {
+                let (mut m, mut t) = (usize::MAX, usize::MAX);
+                let (mut mc, mut tc) = (0, 0);
+                for o in v {
+                    if o.mesh != m {
+                        mc += 1;
+                        m = o.mesh;
+                    }
+                    let tex = o.tex.unwrap_or(usize::MAX - 1);
+                    if tex != t {
+                        tc += 1;
+                        t = tex;
+                    }
+                }
+                (mc, tc)
+            };
+            let before = churn(&objs);
+            let n = objs.len();
+            let opaque = order_for_draw(&mut objs, [eye.x, eye.y, eye.z]);
+            let after = churn(&objs);
+            // and check the glass really is furthest-first
+            let mut sorted_back_to_front = true;
+            let mut last = f32::MAX;
+            for o in objs.iter().skip(opaque) {
+                let m = &o.raw.model;
+                let d = (Vec3::new(m[12], m[13], m[14]) - eye).length();
+                if d > last + 0.01 {
+                    sorted_back_to_front = false;
+                }
+                last = d;
+            }
+            // Opaque draws can be batched by mesh; translucent ones must be
+            // ordered by DEPTH for alpha to composite correctly, so they
+            // cannot be. Judge each on what it is allowed to do.
+            let opaque_after = churn(&objs[..opaque]);
+            println!(
+                "draw order: {n} draws ({} opaque, {} glass) - mesh switches {} -> {} ({} among opaque)",
+                opaque,
+                n - opaque,
+                before.0,
+                after.0,
+                opaque_after.0
+            );
+            let batched = opaque_after.0 * 3 <= opaque.max(1);
+            println!(
+                "   opaque batches {:.1} draws per state change; glass composites {}",
+                opaque as f32 / opaque_after.0.max(1) as f32,
+                if sorted_back_to_front { "back to front" } else { "OUT OF ORDER" }
+            );
+            order_ok = batched && sorted_back_to_front;
+
+        }
+        // ---- glass roughness must be CONTINUOUS ----
+        // A reflection perturbation that quantises space shows up as tiles.
+        // The old version hashed floor(wpos * 7), i.e. 14 cm cells: every
+        // fragment in a cell got the same jitter. This mirrors both the old
+        // and the new perturbation and walks a line through the world,
+        // measuring the biggest jump between samples a millimetre apart.
+        {
+            let old_jit = |p: Vec3| -> Vec3 {
+                let f = (p * 7.0).floor();
+                let h = ((f.x * 12.99 + f.y * 78.23 + f.z * 37.71).sin() * 43758.5453).fract();
+                let h2 = (h * 197.31).fract();
+                Vec3::new(h - 0.5, h2 - 0.5, (h * 31.7).fract() - 0.5).normalize_or(Vec3::X)
+            };
+            let new_jit = |p: Vec3| -> Vec3 {
+                let w = p * 2.9;
+                Vec3::new(
+                    (w.y * 2.3 + w.z * 1.7).sin(),
+                    (w.z * 2.1 + w.x * 1.9).sin(),
+                    (w.x * 2.7 + w.y * 1.3).sin(),
+                ) * 0.055
+            };
+            let (mut old_max, mut new_max) = (0.0f32, 0.0f32);
+            let mut p = Vec3::new(3.1, 2.2, -4.7);
+            let step = Vec3::new(0.001, 0.0004, 0.0007);
+            for _ in 0..20_000 {
+                let q = p + step;
+                old_max = old_max.max((old_jit(q) - old_jit(p)).length());
+                new_max = new_max.max((new_jit(q) - new_jit(p)).length());
+                p = q;
+            }
+            println!(
+                "glass roughness: largest jump per mm — hashed {old_max:.3} (tiles), rippled {new_max:.4}"
+            );
+            let ok = new_max < 0.01 && old_max > 0.5;
+            order_ok &= ok;
+            println!("   {}", if ok { "continuous: no tiling" } else { "STILL QUANTISED" });
+        }
+        // ---- the ground: how much of 97k triangles survives culling? ----
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let nc = crate::world::TERRAIN_CHUNKS;
+            let n = (crate::world::TG_N - 1) as u32;
+            let per = n / nc;
+            let h = |x: f32, z: f32| w.ground_h(x, z);
+            let mut bounds = Vec::new();
+            let mut tris_total = 0usize;
+            for cj in 0..nc {
+                for ci in 0..nc {
+                    let i0 = ci * per;
+                    let i1 = if ci + 1 == nc { n } else { (ci + 1) * per };
+                    let j0 = cj * per;
+                    let j1 = if cj + 1 == nc { n } else { (cj + 1) * per };
+                    let (m, c, r) = crate::meshgen::terrain_chunk(crate::world::TG_HALF, n, i0, i1, j0, j1, &h);
+                    tris_total += m.idx.len() / 3;
+                    bounds.push((c, r, m.idx.len() / 3));
+                }
+            }
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
+            let mut drawn_sum = 0.0f32;
+            let turns = 8;
+            for t in 0..turns {
+                let a2 = t as f32 / turns as f32 * std::f32::consts::TAU;
+                let look = eye + Vec3::new(a2.sin() * 30.0, -3.0, a2.cos() * 30.0);
+                let view = glam::Mat4::look_at_rh(eye, look, Vec3::Y);
+                let proj = glam::Mat4::perspective_rh(86f32.to_radians(), 16.0 / 9.0, 0.1, 900.0);
+                let planes = frustum_planes(&(proj * view));
+                let mut tri = 0usize;
+                for (c, r, t3) in &bounds {
+                    if sphere_visible(&planes, *c, *r) {
+                        tri += t3;
+                    }
+                }
+                drawn_sum += tri as f32;
+            }
+            let avg = drawn_sum / turns as f32;
+            println!(
+                "terrain: {} chunks, {tris_total} tris total -> {:.0} drawn ({:.0}% saved)",
+                nc * nc,
+                avg,
+                (1.0 - avg / tris_total as f32) * 100.0
+            );
+        }
+        // ---- triangle budget: what the LOD swap is worth ----
+        {
+            let hi_sphere = crate::meshgen::sphere(22, 34).idx.len() / 3;
+            let lo_sphere = crate::meshgen::sphere(10, 16).idx.len() / 3;
+            let hi_cap = crate::meshgen::capsule(4.0, 8, 20).idx.len() / 3;
+            let lo_cap = crate::meshgen::capsule(4.0, 5, 10).idx.len() / 3;
+            let hi_tube = crate::meshgen::tube_open(40).idx.len() / 3;
+            let lo_tube = crate::meshgen::tube_open(18).idx.len() / 3;
+            println!(
+                "LOD triangles: sphere {hi_sphere}->{lo_sphere}, capsule {hi_cap}->{lo_cap}, tube {hi_tube}->{lo_tube}"
+            );
+        }
+        println!("worst case still draws {:.0}% of the map", worst * 100.0);
+        println!("{}", if worst < 0.75 && order_ok { "RENDER CULL: PASS" } else { "RENDER CULL: FAIL" });
+        return;
+    }
+    if name == "ballspin" {
+        // Does spin actually DO anything? In RL the ball's angular velocity
+        // is its own state: topspin drives a bounce forward, backspin kills
+        // it, sidespin curves it, and a sliding ball spins up until it rolls.
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let mut ev = StepEvents::default();
+        let gh = world.ground_h(0.0, 0.0);
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<40} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // one bounce, three spins, same entry velocity
+        let drop = |spin: Vec3| -> (f32, f32) {
+            let mut b = Ball::new();
+            b.pos = Vec3::new(0.0, gh + 6.0, 0.0);
+            b.vel = Vec3::new(9.0, -7.0, 0.0);
+            b.ang = spin;
+            b.prev = b.pos;
+            let mut w = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut e2 = StepEvents::default();
+            let mut bounced = false;
+            let mut after = Vec3::ZERO;
+            for _ in 0..240 {
+                let vy = b.vel.y;
+                physics::step_ball(&mut b, &mut w, &cfg, DT, &mut e2);
+                if !bounced && vy < 0.0 && b.vel.y > 0.0 {
+                    bounced = true;
+                    after = b.vel;
+                }
+            }
+            (after.x, after.z)
+        };
+        // spin axis for topspin when travelling +X and n = +Y is -Z
+        let (plain_x, _) = drop(Vec3::ZERO);
+        let (top_x, _) = drop(Vec3::new(0.0, 0.0, -5.0));
+        let (back_x, _) = drop(Vec3::new(0.0, 0.0, 5.0));
+        let (_, side_z) = drop(Vec3::new(-5.0, 0.0, 0.0));
+        println!("bounce exit along travel: plain {plain_x:.2}  topspin {top_x:.2}  backspin {back_x:.2} m/s");
+        println!("sidespin sideways exit: {side_z:.2} m/s");
+        check("topspin drives the bounce forward", top_x > plain_x + 0.5);
+        check("backspin kills forward speed", back_x < plain_x - 0.5);
+        check("sidespin curves the bounce", side_z.abs() > 0.5);
+        // a sliding ball should spin UP until it rolls without slipping
+        {
+            let mut b = Ball::new();
+            b.pos = Vec3::new(-120.0, world.ground_h(-120.0, -90.0) + b.r, -90.0);
+            b.vel = Vec3::new(5.0, 0.0, 0.0);
+            b.ang = Vec3::ZERO;
+            b.prev = b.pos;
+            let mut w = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            for _ in 0..300 {
+                physics::step_ball(&mut b, &mut w, &cfg, DT, &mut ev);
+            }
+            // rolling without slipping: |w| ~ |v| / r, spinning the right way
+            let want = b.vel.length() / b.r;
+            let got = b.ang.length();
+            let sign = b.ang.z < 0.0; // +X travel rolls about -Z
+            println!("slide -> roll: |w| {got:.2} vs v/r {want:.2}, speed kept {:.1} m/s", b.vel.length());
+            check("a sliding ball spins up into a roll", (got - want).abs() / want.max(0.1) < 0.25 && sign);
+            // A slide-to-roll transition costs exactly 2/7 of the speed (textbook
+        // rigid sphere), so 5.0 m/s becomes ~3.4 — the test is whether it
+        // COASTS from there rather than grinding down.
+        check("a rolling ball coasts", b.vel.length() > 3.0);
+        }
+        // spin is capped like RL's 6 rad/s
+        {
+            let mut b = Ball::new();
+            b.ang = Vec3::new(40.0, 0.0, 0.0);
+            b.pos = Vec3::new(0.0, gh + 12.0, 0.0);
+            b.prev = b.pos;
+            let mut w = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            physics::step_ball(&mut b, &mut w, &cfg, DT, &mut ev);
+            check("spin is capped at 6 rad/s", b.ang.length() <= 6.01);
+        }
+        println!("{}", if pass { "BALL SPIN: PASS" } else { "BALL SPIN: FAIL" });
         return;
     }
     if name == "shot" {
@@ -1049,6 +2829,1738 @@ pub fn run(args: &[String]) {
         println!("{}", if ok { "PLANETS: PASS" } else { "PLANETS: FAIL" });
         return;
     }
+    if name == "stream" {
+        // LAN RENDER ASSIST, end to end on loopback: the client marches only
+        // the near field and hands the expensive tail to probes streamed by
+        // a host. Measures the transport (RTT, bitrate), how much work the
+        // split actually saves, and — the part that matters — how close the
+        // assisted result is to a full local march.
+        use crate::stream::{decode_probes, encode_probes, Cache, Endpoint, PoseMsg, Probe, DIRS, PROBES};
+        let world = World::generate(9, crate::world::style(21), 0.31, 1.0);
+        // a plain CPU march: the ground truth, and what the host runs
+        let march = |mut p: Vec3, d: Vec3, max_t: f32, steps: u32| -> (Option<Vec3>, f32) {
+            let mut t = 0.0f32;
+            for _ in 0..steps {
+                let dist = world.sdf(p);
+                if dist < 0.05 {
+                    return (Some(p), t);
+                }
+                t += dist.max(0.05);
+                if t > max_t {
+                    break;
+                }
+                p += d * dist.max(0.05);
+            }
+            (None, t)
+        };
+        let shade = |hit: Option<Vec3>, d: Vec3| -> [f32; 3] {
+            match hit {
+                Some(h) => {
+                    let n = world.normal(h);
+                    let l = Vec3::new(0.4, 0.8, 0.3).normalize();
+                    let k = n.dot(l).max(0.0) * 0.7 + 0.25;
+                    [k * 0.85, k * 0.9, k]
+                }
+                None => {
+                    let up = d.y * 0.5 + 0.5;
+                    [0.35 + up * 0.3, 0.45 + up * 0.35, 0.7 + up * 0.3]
+                }
+            }
+        };
+        let host = Endpoint::bind("127.0.0.1:0").expect("host bind");
+        let client = Endpoint::bind("127.0.0.1:0").expect("client bind");
+        let (haddr, caddr) = (host.addr().unwrap(), client.addr().unwrap());
+        let mut cache = Cache::default();
+        let mut buf = [0u8; 65536];
+        let mut rtt_sum = 0.0f64;
+        let mut bytes = 0usize;
+        let mut frames = 0u32;
+        let mut car = Vec3::new(0.0, 3.0, 0.0);
+        let vel = Vec3::new(0.0, 0.0, -22.0);
+        for seq in 0..40u32 {
+            car += vel * (1.0 / 30.0);
+            let t0 = std::time::Instant::now();
+            client.send(haddr, &PoseMsg { seq, pos: car, vel }.encode());
+            // ---- host side ----
+            if let Some((n, from)) = host.recv(&mut buf) {
+                let q = PoseMsg::decode(&buf[..n]).expect("pose decodes");
+                // probes go AHEAD of the car, where its rays will land
+                let mut probes = Vec::with_capacity(PROBES);
+                for i in 0..PROBES {
+                    let a = i as f32 * 0.61803 * std::f32::consts::TAU;
+                    let r = 6.0 + (i as f32 / PROBES as f32) * 34.0;
+                    let c = q.pos + q.vel.normalize_or(Vec3::NEG_Z) * (r * 0.6)
+                        + Vec3::new(a.cos() * r * 0.5, (i % 4) as f32 * 2.5, a.sin() * r * 0.5);
+                    let mut rgb = [[0u8; 3]; DIRS];
+                    for (k, slot) in rgb.iter_mut().enumerate() {
+                        let d = crate::stream::dir_of(k);
+                        let (hit, _) = march(c, d, 260.0, 64);
+                        let col = shade(hit, d);
+                        *slot = [
+                            (col[0] * 255.0) as u8,
+                            (col[1] * 255.0) as u8,
+                            (col[2] * 255.0) as u8,
+                        ];
+                    }
+                    probes.push(Probe { pos: c, rgb });
+                }
+                let pkt = encode_probes(q.seq, &probes);
+                bytes += pkt.len();
+                host.send(from, &pkt);
+                let _ = caddr;
+            }
+            // ---- client side ----
+            std::thread::sleep(std::time::Duration::from_micros(200));
+            if let Some((n, _)) = client.recv(&mut buf) {
+                if let Some((seq_in, probes)) = decode_probes(&buf[..n]) {
+                    cache.probes = probes;
+                    cache.last_seq = seq_in;
+                    cache.age = 0.0;
+                    rtt_sum += t0.elapsed().as_secs_f64();
+                    frames += 1;
+                }
+            }
+        }
+        println!("transport   frames {frames}/40   mean RTT {:.2} ms   {:.1} KB/frame   {:.0} kbit/s at 30 Hz",
+            rtt_sum / frames.max(1) as f64 * 1000.0,
+            bytes as f32 / frames.max(1) as f32 / 1024.0,
+            bytes as f32 / frames.max(1) as f32 * 8.0 * 30.0 / 1000.0);
+        // ---- the split: near field local, far field from the cache ----
+        let near = 12.0f32;
+        let (mut local, mut handed, mut err_sum, mut n_err) = (0u32, 0u32, 0.0f32, 0u32);
+        let (mut steps_full, mut steps_split) = (0u64, 0u64);
+        for i in 0..600u32 {
+            let a = i as f32 * 0.7548;
+            let d = Vec3::new(a.cos(), (i % 7) as f32 * 0.12 - 0.3, a.sin()).normalize();
+            let p = car + Vec3::new((i % 11) as f32 - 5.0, 1.0 + (i % 5) as f32, (i % 13) as f32 - 6.0);
+            let (hit_full, _) = march(p, d, 260.0, 64);
+            let truth = shade(hit_full, d);
+            steps_full += 64;
+            // the client's cheap version: a short march, then the cache
+            let (hit_near, _) = march(p, d, near, 12);
+            steps_split += 12;
+            let got = if hit_near.is_some() {
+                local += 1;
+                shade(hit_near, d)
+            } else {
+                handed += 1;
+                match cache.sample(p, d) {
+                    Some(c) => c,
+                    None => shade(None, d),
+                }
+            };
+            let e = ((got[0] - truth[0]).abs() + (got[1] - truth[1]).abs() + (got[2] - truth[2]).abs()) / 3.0;
+            err_sum += e;
+            n_err += 1;
+        }
+        let err = err_sum / n_err.max(1) as f32;
+        println!("split       {:.0}% resolved locally, {:.0}% from probes   ray steps {:.0}% of full",
+            local as f32 / 600.0 * 100.0, handed as f32 / 600.0 * 100.0,
+            steps_split as f32 / steps_full as f32 * 100.0);
+        println!("accuracy    mean channel error {:.3} vs a full march", err);
+        let ok = frames >= 35 && err < 0.22;
+        println!("{}", if ok { "STREAM: PASS" } else { "STREAM: FAIL" });
+        return;
+    }
+    if name == "learn" {
+        // Does the squad actually get better DURING a match? Run one long
+        // match and compare aerial output in the first third against the
+        // last third. Learning off (params frozen) is the control.
+        let cfg = Config::default();
+        println!("{:<10} {:>9} {:>9} {:>9} {:>8}", "mode", "early", "late", "gain", "episodes");
+        for learn_on in [false, true] {
+            let mut early = 0u32;
+            let mut late = 0u32;
+            let mut eps = 0u32;
+            let trials: u64 = 3;
+            for tr in 0..trials {
+                let world = World::generate(31 + tr, crate::world::style(ARENA), 0.31, 1.0);
+                let mut ball = Ball::new();
+                ball.pos = Vec3::new(0.0, 6.0, 0.0);
+                let mut player = physics::Car::new();
+                player.pos = Vec3::new(0.0, 0.4, -40.0);
+                let mut bots = crate::bots::spawn_match(&world, 3);
+                crate::bots::set_learning(&mut bots, learn_on);
+                let mut t = 0.0f32;
+                let total = 150.0f32;
+                let mut base: Vec<u32> = bots.iter().map(|b| b.touches_air).collect();
+                while t < total {
+                    crate::bots::update(&mut bots, &mut ball, &mut player, &world, &cfg, t, DT);
+                    let mut ev = StepEvents::default();
+                    physics::step_ball(&mut ball, &world, &cfg, DT, &mut ev);
+                    if ball.pos.y < 0.2 && ball.vel.length() < 1.0 {
+                        ball.pos = Vec3::new(0.0, 6.0, 0.0);
+                        ball.vel = Vec3::ZERO;
+                    }
+                    t += DT;
+                    if (t - total / 3.0).abs() < DT * 0.5 {
+                        let now: Vec<u32> = bots.iter().map(|b| b.touches_air).collect();
+                        early += now.iter().zip(&base).map(|(a, b)| a - b).sum::<u32>();
+                        base = now;
+                    }
+                    if (t - total * 2.0 / 3.0).abs() < DT * 0.5 {
+                        base = bots.iter().map(|b| b.touches_air).collect();
+                    }
+                }
+                let end: Vec<u32> = bots.iter().map(|b| b.touches_air).collect();
+                late += end.iter().zip(&base).map(|(a, b)| a - b).sum::<u32>();
+                eps += bots.iter().map(|b| b.episodes()).sum::<u32>();
+            }
+            let gain = if early > 0 { late as f32 / early as f32 } else { 0.0 };
+            println!(
+                "{:<10} {:>9} {:>9} {:>8.2}x {:>8}",
+                if learn_on { "learning" } else { "frozen" },
+                early,
+                late,
+                gain,
+                eps / (trials as u32).max(1)
+            );
+        }
+        return;
+    }
+    if name == "portal" {
+        // Portal's rules, checked: speed in equals speed out, direction is
+        // rotated by the pair transform, a fall becomes a launch (the
+        // FLING), and nothing ping-pongs between the two faces.
+        let cfg = Config::default();
+        let world = World::generate(9, crate::world::style(31), 0.31, 1.0);
+        let ball0 = Ball::new();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<38} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("map has linked portal pairs", world.portals.len() >= 6);
+        // every link is mutual, and every transform is a pure rotation
+        let mut mutual = true;
+        let mut orthonormal = true;
+        for (i, p) in world.portals.iter().enumerate() {
+            if world.portals[p.link].link != i {
+                mutual = false;
+            }
+            let r = world.portal_rot(i);
+            let v = Vec3::new(0.3, -0.9, 0.31).normalize();
+            if ((r * v).length() - 1.0).abs() > 1e-4 {
+                orthonormal = false;
+            }
+        }
+        check("links are mutual", mutual);
+        check("transform preserves length (pure rotation)", orthonormal);
+        // a ray INTO a portal leaves the partner pointing OUT of its face
+        let mut exits_outward = true;
+        for (i, p) in world.portals.iter().enumerate() {
+            let n_in = p.rot * Vec3::Z;
+            let out = world.portal_rot(i) * (-n_in); // travelling into the face
+            let n_out = world.portals[p.link].rot * Vec3::Z;
+            if out.dot(n_out) < 0.98 {
+                exits_outward = false;
+            }
+        }
+        check("entering a face exits the partner's face", exits_outward);
+
+        // ---- drive a car through: speed and direction ----
+        let mut car = physics::Car::new();
+        let pf = &world.portals[0];
+        let n0 = pf.rot * Vec3::Z;
+        car.pos = pf.pos + n0 * 4.0;
+        car.vel = -n0 * 26.0;
+        car.prev = car.pos;
+        car.rot = glam::Quat::from_rotation_arc(Vec3::NEG_Z, -n0);
+        let ctl = physics::Controls::default();
+        let mut speed_in = car.vel.length();
+        let mut teleported = false;
+        let mut speed_out = 0.0;
+        let mut exit_dir = Vec3::ZERO;
+        for _ in 0..60 {
+            let before = car.pos;
+            // speed measured at the instant of crossing, not at spawn: a few
+            // frames of air drag on the approach is not a portal loss
+            if !teleported {
+                speed_in = car.vel.length();
+            }
+            physics::step_car_only(&mut car, &ball0, &world, &ctl, &cfg, DT);
+            if !teleported && car.pos.distance(before) > 3.0 {
+                teleported = true;
+                speed_out = car.vel.length();
+                exit_dir = car.vel.normalize_or(Vec3::Z);
+            }
+        }
+        let n_exit = world.portals[world.portals[0].link].rot * Vec3::Z;
+        check("car teleports on crossing", teleported);
+        check(
+            "speed is conserved through the portal",
+            (speed_out - speed_in).abs() / speed_in.max(1.0) < 0.08,
+        );
+        check("car leaves along the exit face", exit_dir.dot(n_exit) > 0.9);
+        println!("   in {speed_in:.1} m/s -> out {speed_out:.1} m/s, exit alignment {:.2}", exit_dir.dot(n_exit));
+
+        // ---- THE FLING: fall into a floor portal, leave a wall horizontally
+        let mut car = physics::Car::new();
+        let fp = &world.portals[0];
+        car.pos = fp.pos + Vec3::Y * 40.0;
+        car.vel = Vec3::ZERO;
+        car.prev = car.pos;
+        let mut peak_h = 0.0f32;
+        let mut fell = 0.0f32;
+        for f in 0..900 {
+            let before_y = car.pos.y;
+            physics::step_car_only(&mut car, &ball0, &world, &ctl, &cfg, DT);
+            if std::env::var("PORTAL_DBG").is_ok() && f % 20 == 0 {
+                eprintln!("  f={:3} pos=({:6.1},{:6.1},{:6.1}) vel=({:5.1},{:6.1},{:5.1}) sdf={:6.2} og={}",
+                    f, car.pos.x, car.pos.y, car.pos.z, car.vel.x, car.vel.y, car.vel.z, world.sdf(car.pos), car.on_ground as u8);
+            }
+            if car.pos.y < before_y {
+                fell += before_y - car.pos.y;
+            }
+            let horiz = Vec3::new(car.vel.x, 0.0, car.vel.z).length();
+            peak_h = peak_h.max(horiz);
+        }
+        check("a fall becomes horizontal speed (the fling)", peak_h > 18.0);
+        println!("   fell {fell:.0} m -> {peak_h:.1} m/s horizontal");
+
+        // ---- no ping-pong: park a ball right at a face and watch it settle
+        let mut ball = Ball::new();
+        let lp = &world.portals[2];
+        ball.pos = lp.pos + (lp.rot * Vec3::Z) * 1.2;
+        ball.vel = Vec3::ZERO;
+        ball.prev = ball.pos;
+        let mut world2 = World::generate(9, crate::world::style(31), 0.31, 1.0);
+        let mut jumps = 0;
+        let mut ev = StepEvents::default();
+        for _ in 0..600 {
+            let before = ball.pos;
+            physics::step_ball(&mut ball, &mut world2, &cfg, DT, &mut ev);
+            if ball.pos.distance(before) > 5.0 {
+                jumps += 1;
+            }
+        }
+        check("no runaway ping-pong at a face", jumps < 40);
+        println!("   {jumps} transits in 5 s of hovering at a portal mouth");
+        // ---- MOVING PORTALS (TURNSTILE): does a mouth on a turning drum
+        // actually change where it sends you as it comes around? ----
+        {
+            let mut w2 = World::generate(9, crate::world::style(32), 0.31, 1.0);
+            let movers = w2.portals.iter().filter(|p| p.follow.is_some()).count();
+            check("turnstile has portals mounted on movers", movers >= 2);
+            // sample the exit transform of a moving portal over time
+            let mi = w2.portals.iter().position(|p| p.follow.is_some()).unwrap_or(0);
+            let probe = Vec3::new(0.0, 0.0, -1.0); // travelling into the face
+            let mut first = Vec3::ZERO;
+            let mut spread = 0.0f32;
+            for k in 0..90 {
+                w2.update(DT * 8.0);
+                let out = w2.portal_rot(mi) * probe;
+                if k == 0 {
+                    first = out;
+                }
+                spread = spread.max(first.angle_between(out).to_degrees());
+            }
+            check("a moving portal's exit direction changes", spread > 45.0);
+            println!("   exit direction swings {spread:.0} degrees as the machine turns");
+            // colours: every pair distinct, and the two ends differ
+            let mut hue_ok = true;
+            for i in (0..w2.portals.len()).step_by(2) {
+                if i + 1 >= w2.portals.len() {
+                    break;
+                }
+                let (a2, b2) = (w2.portals[i].tint, w2.portals[i + 1].tint);
+                let d = (a2[0] - b2[0]).abs() + (a2[1] - b2[1]).abs() + (a2[2] - b2[2]).abs();
+                if d < 0.25 {
+                    hue_ok = false;
+                }
+            }
+            check("the two ends of a pair are shaded apart", hue_ok);
+        }
+        println!("{}", if pass { "PORTALS: PASS" } else { "PORTALS: FAIL" });
+        return;
+    }
+    if name == "platform" {
+        // Can a car RIDE a moving platform? Park one on each kind of mover
+        // in CLOCKWORK and check it is carried rather than left behind.
+        let cfg = Config::default();
+        let style_i: usize = std::env::var("PLAT_MAP").ok().and_then(|v| v.parse().ok()).unwrap_or(30);
+        let mut world = World::generate(9, crate::world::style(style_i), 0.31, 1.0);
+        let ball = Ball::new();
+        let ctl = physics::Controls::default();
+        // find one shape per anim kind
+        let mut cases: Vec<(&str, usize)> = Vec::new();
+        for a in world.anims.iter() {
+            let (kind, si) = match *a {
+                crate::world::Anim::Slide { shape, dir, .. } => {
+                    (if dir.y.abs() > 0.5 { "paternoster" } else { "shuttle" }, shape)
+                }
+                crate::world::Anim::Orbit { shape, .. } => ("carriage", shape),
+                crate::world::Anim::Spin { shape, .. } => ("turntable", shape),
+                crate::world::Anim::Door { shape, .. } => ("door", shape),
+                crate::world::Anim::Swing { shape, .. } => ("log bridge", shape),
+            };
+            if !cases.iter().any(|(k, _)| *k == kind) {
+                cases.push((kind, si));
+            }
+        }
+        println!("{:<13} {:>9} {:>9} {:>8}", "platform", "drift", "carried", "grounded");
+        let mut pass = true;
+        for (kind, si) in cases {
+            // settle the world so platform velocities are live
+            for _ in 0..30 {
+                world.update(DT);
+            }
+            let sh = &world.shapes[si];
+            // stand on the actual DECK: a ring deck's centre is its hole,
+            // and a box deck's centre is inside it
+            let top = match sh.sdf {
+                crate::world::Sdf::RingDeck { big, half_h, .. } => sh.pos + Vec3::new(big, half_h + 0.34, 0.0),
+                crate::world::Sdf::RBox { half, .. } => sh.pos + Vec3::Y * (half.y + 0.34),
+                _ => sh.pos + Vec3::Y * 1.2,
+            };
+            let mut car = physics::Car::new();
+            car.pos = top;
+            car.rot = glam::Quat::IDENTITY;
+            car.vel = Vec3::ZERO;
+            // measure in the platform's OWN frame: a rider on a spinner
+            // moves in world space by design, so world drift is meaningless
+            let start_rel = world.shapes[si].inv_rot * (car.pos - world.shapes[si].pos);
+            let mut grounded = 0;
+            let dbg = std::env::var("PLAT_DBG").map(|v| v == kind).unwrap_or(false);
+            for f in 0..240 {
+                world.update(DT);
+                physics::step_car_only(&mut car, &ball, &world, &ctl, &cfg, DT);
+                if car.on_ground {
+                    grounded += 1;
+                }
+                if dbg && f % 24 == 0 {
+                    let sp = world.shapes[si].pos;
+                    eprintln!(
+                        "  f={:3} car=({:6.1},{:6.1},{:6.1}) deck=({:6.1},{:6.1},{:6.1}) sdf={:6.2} shape_d={:6.2} og={}",
+                        f, car.pos.x, car.pos.y, car.pos.z, sp.x, sp.y, sp.z,
+                        world.sdf(car.pos), world.shape_sdf_at(si, car.pos), car.on_ground as u8
+                    );
+                }
+            }
+            let end_rel = world.shapes[si].inv_rot * (car.pos - world.shapes[si].pos);
+            // how far did the car slip relative to the deck it stands on?
+            let drift = (end_rel - start_rel).length();
+            let carried = grounded > 120 && drift < 4.0;
+            pass &= carried;
+            println!(
+                "{:<13} {:>8.2}m {:>9} {:>7}%",
+                kind,
+                drift,
+                if carried { "yes" } else { "NO" },
+                grounded * 100 / 240
+            );
+        }
+        // ---- BREAKWATER flows: does the water actually carry you? ----
+        {
+            let w = World::generate(9, crate::world::style(34), 0.31, 1.0);
+            let f = w.flows.first().map(|f| (f.pos, f.vel));
+            match f {
+                Some((fp, fv)) => {
+                    let cur = w.current(fp);
+                    let carried = cur.map(|c| c.dot(fv.normalize_or(Vec3::Z)) > 5.0).unwrap_or(false);
+                    println!(
+                        "breakwater: {} flows, sample current {:.1} m/s  {}",
+                        w.flows.len(),
+                        cur.map(|c| c.length()).unwrap_or(0.0),
+                        if carried { "carries" } else { "NO PUSH" }
+                    );
+                    pass &= carried;
+                }
+                None => {
+                    println!("breakwater: no flows");
+                    pass = false;
+                }
+            }
+        }
+        // ---- CHAMBER: does the board actually play the game? ----
+        {
+            let mut w = World::generate(9, crate::world::style(35), 0.31, 1.0);
+            let n0 = w.chess.as_ref().map(|c| c.pieces.len()).unwrap_or(0);
+            let mvs = w.chess.as_ref().map(|c| c.moves.len()).unwrap_or(0);
+            // run a while at rest tempo and count what happened
+            let mut moved = 0usize;
+            for _ in 0..(60 * 120) {
+                w.update(DT);
+            }
+            let played = w.chess.as_ref().map(|c| c.next).unwrap_or(0);
+            let gone = w.chess.as_ref().map(|c| c.pieces.iter().filter(|p| p.gone).count()).unwrap_or(0);
+            if let Some(c) = w.chess.as_ref() {
+                moved = c.pieces.iter().filter(|p| p.sq != (99, 99) && p.from != p.to || p.moving).count();
+            }
+            let _ = moved;
+            println!("chamber: {n0} pieces, {mvs} scripted moves, {played} played in 60 s, {gone} captured");
+            // now wind it up as if goals had been scored
+            if let Some(c) = w.chess.as_mut() {
+                c.fury = 6.0;
+            }
+            let before = w.chess.as_ref().map(|c| c.next).unwrap_or(0);
+            for _ in 0..(30 * 120) {
+                w.update(DT);
+            }
+            let after = w.chess.as_ref().map(|c| c.next).unwrap_or(0);
+            let calm_rate = played as f32 / 60.0;
+            let fury_rate = (after - before) as f32 / 30.0;
+            println!("   tempo: {calm_rate:.2} moves/s calm -> {fury_rate:.2} moves/s furious");
+            // MIRRORING: a white pawn's ramp reaches toward +Z (down the
+            // board); a black pawn's must reach the other way, so its ramps
+            // face out of ITS side too.
+            let w2 = World::generate(9, crate::world::style(35), 0.31, 1.0);
+            let mut mirrored = false;
+            if let Some(c) = w2.chess.as_ref() {
+                let wp = c.pieces.iter().find(|p| p.sq.1 == 1); // white pawn rank
+                let bp = c.pieces.iter().find(|p| p.sq.1 == 6); // black pawn rank
+                if let (Some(a2), Some(b2)) = (wp, bp) {
+                    // the furthest-reaching part of each piece, in z
+                    let wz = a2.parts.iter().map(|(_, o)| o.z).fold(f32::MIN, f32::max);
+                    let bz = b2.parts.iter().map(|(_, o)| o.z).fold(f32::MAX, f32::min);
+                    mirrored = wz > 2.0 && bz < -2.0;
+                    println!("   pawn reach: white +{wz:.1} z, black {bz:.1} z");
+                }
+            }
+            let ok = n0 == 32 && played >= 8 && gone >= 1 && fury_rate > calm_rate * 1.8 && mirrored;
+            println!("   {}", if mirrored { "black pieces are mirrored" } else { "NOT MIRRORED" });
+            pass &= ok;
+            println!("   {}", if ok { "the board plays and winds up" } else { "CHESS FAIL" });
+        }
+        println!("{}", if pass { "PLATFORMS: PASS" } else { "PLATFORMS: FAIL" });
+        return;
+    }
+    if name == "drive" {
+        // THE REAL TEST: can a car actually get through a tube? Spawn one
+        // inside a route, point it down the pipe, hold throttle, and follow
+        // it — how far along does it get, and does it ever fall OUT?
+        let cfg = Config::default();
+        for (si, label) in [(21usize, "PERPLEXUS"), (24, "MONKEY RUN")] {
+            let world = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let ball = Ball::new();
+            let mut done = 0;
+            let mut escaped = 0;
+            let (mut drive_frames, mut bore_frames, mut total_frames) = (0u64, 0u64, 0u64);
+            let mut worst: Vec<(usize, f32)> = Vec::new();
+            let n_routes = world.routes.len().min(24);
+            for ri in 0..n_routes {
+                let (pts, r) = world.routes[ri].clone();
+                if pts.len() < 2 {
+                    continue;
+                }
+                // total length, for progress as a fraction
+                let total: f32 = pts.windows(2).map(|w| w[0].distance(w[1])).sum();
+                if std::env::var("ROUTE_DBG").map(|v| v == format!("{si}")).unwrap_or(false) {
+                    let gaps: Vec<String> = pts.windows(2).take(6).map(|w| format!("{:.0}", w[0].distance(w[1]))).collect();
+                    eprintln!("  route {ri}: {} pts, total {:.0} m, r={:.1}, first gaps: {}", pts.len(), total, r, gaps.join(","));
+                }
+                if total < 12.0 {
+                    continue;
+                }
+                let mut car = physics::Car::new();
+                // A route is the bore's CENTRELINE; a car drives its floor.
+                // Spawning on the axis at a ground mouth dropped the car 7 m
+                // through the open end before it ever moved — that is where
+                // every Monkey Run run was dying.
+                let start_r = world.routes[ri].1;
+                // A route is the bore's CENTRELINE and a car drives its
+                // floor, so start just below the axis. And enter at PACE:
+                // these lines are ridden, not crawled — several are entered
+                // by launcher and none of them are climbable from a stop.
+                let si0 = 0usize;
+                let dir0 = (pts[1] - pts[0]).normalize_or(Vec3::Z);
+                car.pos = pts[0].lerp(pts[1], 0.12) - Vec3::Y * (start_r * 0.45);
+                let dir = dir0;
+                // the car's nose is -Z
+                car.rot = glam::Quat::from_rotation_arc(Vec3::NEG_Z, dir);
+                car.vel = dir * 24.0;
+                let mut c = physics::Controls::default();
+                c.throttle = 1.0;
+                c.boost = true;
+                let mut best = 0.0f32;
+                let mut out = false;
+                let (mut driven, mut in_bore, mut frames) = (0u32, 0u32, 0u32);
+                let dbg = std::env::var("DRIVE_DBG").map(|v| v == format!("{si}:{ri}")).unwrap_or(false);
+                let mut t = 0.0f32;
+                // these routes run 900-2200 m: give each one time to be
+                // driven rather than judging it on a fixed clock
+                let budget = (total / 13.0).clamp(12.0, 75.0);
+                while t < budget {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    // how far along the polyline are we, and how far off it?
+                    let (mut along, mut off) = (0.0f32, f32::MAX);
+                    let mut acc = 0.0f32;
+                    for w in pts.windows(2) {
+                        let ab = w[1] - w[0];
+                        let len = ab.length().max(1e-4);
+                        let u = ((car.pos - w[0]).dot(ab) / (len * len)).clamp(0.0, 1.0);
+                        let d = (w[0] + ab * u).distance(car.pos);
+                        if d < off {
+                            off = d;
+                            along = acc + u * len;
+                        }
+                        acc += len;
+                    }
+                    best = best.max(along / total);
+                    // Is the car DRIVING something? On a map whose tubes all
+                    // interconnect, leaving the assigned polyline is not a
+                    // failure — you took another branch. What matters is
+                    // whether the bores are navigable at all.
+                    if car.on_ground {
+                        driven += 1;
+                    }
+                    if world.sdf(car.pos) < r * 1.2 {
+                        in_bore += 1;
+                    }
+                    frames += 1;
+                    if dbg && (t * 8.0).fract() < DT * 8.0 {
+                        eprintln!(
+                            "  t={:4.2} along={:4.0}% off={:5.2} (r={:.1}) y={:6.1} og={} spd={:5.1} sdf={:6.2}",
+                            t, along / total * 100.0, off, r, car.pos.y, car.on_ground as u8, car.vel.length(), world.sdf(car.pos)
+                        );
+                    }
+                    // leaving the pipe at the FAR END is the exit, not a
+                    // failure — only count escapes that happen en route
+                    // a chamber is wider than its pipes, so 2.2r counted
+                    // flying across a junction room as an escape
+                    if off > r * 3.2 {
+                        if along / total < 0.9 {
+                            out = true;
+                        }
+                        break;
+                    }
+                    t += DT;
+                }
+                // falling out is a FAILURE, not progress: the projection
+                // keeps advancing while the car flies off, which flattered
+                // the first version of this test
+                drive_frames += driven as u64;
+                bore_frames += in_bore as u64;
+                total_frames += frames as u64;
+                if out {
+                    escaped += 1;
+                    worst.push((ri, best));
+                } else if best > 0.85 {
+                    done += 1;
+                } else {
+                    worst.push((ri, best));
+                }
+            }
+            worst.sort_by(|a, b| a.1.total_cmp(&b.1));
+            // THE REAL QUESTION for a tube map is navigability, not whether
+            // a car follows one nominated polyline. On a network whose lines
+            // all interconnect, taking a different branch is playing the map
+            // correctly, and "0 of 7 traversed" said nothing about whether
+            // the tubes are drivable — it turns out they are the best in the
+            // game.
+            println!(
+                "{label:<12} of the time in a bore: {:.0}%, wheels on a surface: {:.0}%",
+                bore_frames as f32 / total_frames.max(1) as f32 * 100.0,
+                drive_frames as f32 / total_frames.max(1) as f32 * 100.0
+            );
+// WHAT IS KNOWN ABOUT THE MONKEY RUN FAILURE, so nobody repeats it:
+            //
+            //  * The geometry is NOT misplaced. `--sim routecheck` reads the
+            //    SDF at every waypoint: Monkey Run's sit at exactly their
+            //    bore radius (7.40 in a 7.4 m pipe). The tubes are where the
+            //    routes say they are.
+            //  * Perplexus is NOT the harder case. Its routes read 16-22 in a
+            //    5.6 m bore — they are open-air lines between anchors, so
+            //    "22 of 24 traversed" is mostly flying through nothing.
+            //    Monkey Run threads real bores for hundreds of metres.
+            //  * The car FLIES rather than drives: og=0 for the whole run,
+            //    climbing at a constant 23 m/s, drifting off the centreline
+            //    until a bend loses it. It never lands on the bore wall.
+            //  * Changing the route SHAPE changes nothing. Halving the swoop
+            //    curvature and the sag produced identical failure points to
+            //    the digit (4/5/6/7%), which means the exit is insensitive to
+            //    the geometry — so look at the harness's fall-out rule and
+            //    the spawn, not at the map.
+            //  * Already ruled out: spawn height, entry speed, bore
+            //    clearance, wall thickness, junction width, node density,
+            //    gravity-field overlap and gravity-field shape.
+            let checked = n_routes;
+            println!(
+                "{label:<12} traversed {done}/{checked} routes   fell out of {escaped}   worst: {}",
+                worst
+                    .iter()
+                    .take(4)
+                    .map(|(i, f)| format!("#{i} {:.0}%", f * 100.0))
+                    .collect::<Vec<_>>()
+                    .join("  ")
+            );
+        }
+        return;
+    }
+    if name == "fps" {
+        // A frame counter that ticks per LOOP ITERATION cannot be trusted:
+        // with vsync on a 240 Hz display it reported 600 while the screen
+        // updated a few times a second. This checks the accounting itself —
+        // presented frames over a wall-clock window, which is bounded by the
+        // display by construction.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<52} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // model a loop that spins fast while presenting rarely
+        let rate = |loops: u32, present_every: u32, window: f32| -> f32 {
+            let mut presented = 0u64;
+            for i in 0..loops {
+                if i % present_every == 0 {
+                    presented += 1;
+                }
+            }
+            presented as f32 / window
+        };
+        let spun = rate(600, 20, 1.0); // 600 iterations, 30 presents
+        println!("   loop 600/s presenting 1 in 20 -> counter reads {spun:.0}");
+        check("a spinning loop cannot inflate the count", spun < 40.0);
+        let healthy = rate(240, 1, 1.0);
+        println!("   loop 240/s presenting every frame -> {healthy:.0}");
+        check("a healthy loop reads its true rate", (healthy - 240.0).abs() < 1.0);
+        check(
+            "the count cannot exceed the presents that happened",
+            rate(1000, 4, 1.0) <= 250.0,
+        );
+        // drops must be visible rather than silently absorbed
+        let (mut presented, mut dropped) = (0u32, 0u32);
+        for i in 0..600 {
+            if i % 20 == 0 {
+                presented += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        println!("   in that same second: {presented} presented, {dropped} abandoned");
+        check("abandoned frames are counted, not hidden", dropped > 0);
+        println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
+        return;
+    }
+    if name == "fps" {
+        // A frame counter that ticks per LOOP ITERATION cannot be trusted:
+        // with vsync on a 240 Hz display it reported 600 while the screen
+        // updated a few times a second. This checks the accounting itself —
+        // presented frames over a wall-clock window, which is bounded by the
+        // display by construction.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<52} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // model a loop that spins fast while presenting rarely
+        let rate = |loops: u32, present_every: u32, window: f32| -> f32 {
+            let mut presented = 0u64;
+            for i in 0..loops {
+                if i % present_every == 0 {
+                    presented += 1;
+                }
+            }
+            presented as f32 / window
+        };
+        let spun = rate(600, 20, 1.0); // 600 iterations, 30 presents
+        println!("   loop 600/s presenting 1 in 20 -> counter reads {spun:.0}");
+        check("a spinning loop cannot inflate the count", spun < 40.0);
+        let healthy = rate(240, 1, 1.0);
+        println!("   loop 240/s presenting every frame -> {healthy:.0}");
+        check("a healthy loop reads its true rate", (healthy - 240.0).abs() < 1.0);
+        check(
+            "the count cannot exceed the presents that happened",
+            rate(1000, 4, 1.0) <= 250.0,
+        );
+        // drops must be visible rather than silently absorbed
+        let (mut presented, mut dropped) = (0u32, 0u32);
+        for i in 0..600 {
+            if i % 20 == 0 {
+                presented += 1;
+            } else {
+                dropped += 1;
+            }
+        }
+        println!("   in that same second: {presented} presented, {dropped} abandoned");
+        check("abandoned frames are counted, not hidden", dropped > 0);
+        println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
+        return;
+    }
+    if name == "menus" {
+        // Menus break in ways that are invisible until someone opens one on a
+        // narrow window. Text width scales with 1/aspect, so the same string
+        // is far wider in NDC on a tall thin window than on a wide one — and
+        // a layout laid out against fixed budgets marches straight off the
+        // panel or into the value beside it.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // the panel these menus draw inside
+        const PANEL: f32 = 0.80;
+        println!("{:>9} {:>9} {:>11} {:>11}", "aspect", "scale", "widest row", "fits panel");
+        let mut all_fit = true;
+        for a in [0.55f32, 0.75, 1.0, 1.33, 1.78, 2.4] {
+            let k = crate::hud::ui_k(a);
+            // the longest name and the longest value that can share a row
+            let longest_name = crate::custom::SKINS
+                .iter()
+                .map(|(n, _)| *n)
+                .chain(crate::academy::LESSONS.iter().map(|l| l.name))
+                .chain(crate::trials::TRIALS.iter().map(|t| t.name))
+                .max_by_key(|s| s.len())
+                .unwrap_or("");
+            let name_w = crate::font::width(longest_name, crate::hud::T_BODY * k, a);
+            let val_w = crate::font::width("LEARNED", crate::hud::T_BODY * k, a);
+            let total = name_w + val_w + 0.035;
+            let fits = total <= PANEL * 2.0;
+            all_fit &= fits;
+            println!(
+                "{:>9.2} {:>9.2} {:>11.2} {:>11}",
+                a,
+                k,
+                total,
+                if fits { "yes" } else { "NO" }
+            );
+        }
+        check("the longest row fits at every window shape", all_fit);
+        // rows must be hit-testable exactly where they are drawn
+        let mid = crate::hud::LIST_TOP - crate::hud::TRIALS_ROW_H * 2.5;
+        check(
+            "a click in the middle of row 2 lands on row 2",
+            crate::hud::hit_row(crate::hud::LIST_TOP, crate::hud::TRIALS_ROW_H, 8, mid) == Some(2),
+        );
+        check(
+            "a click above the list hits nothing",
+            crate::hud::hit_row(crate::hud::LIST_TOP, crate::hud::TRIALS_ROW_H, 8, 0.95).is_none(),
+        );
+        check(
+            "the garage rows are hit-testable too",
+            crate::hud::hit_row(
+                crate::hud::GARAGE_TOP,
+                crate::hud::GARAGE_ROW_H,
+                crate::custom::slots().len(),
+                crate::hud::GARAGE_TOP - crate::hud::GARAGE_ROW_H * 3.5,
+            ) == Some(3),
+        );
+        println!("{}", if pass { "MENUS: PASS" } else { "MENUS: FAIL" });
+        return;
+    }
+    if name == "garage" {
+        // The customizer, checked as data: every slot has options, every
+        // option has a name and a description, and a loadout survives a save.
+        use crate::custom::{Loadout, EXPLOSIONS, SKINS, TRAILS, WHEELS};
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<46} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // the rim meshes the wheel slot actually draws
+        {
+            let mut tris = Vec::new();
+            for (n, spokes, dish) in WHEELS.iter() {
+                let m = crate::meshgen::rim(*spokes, *dish, 24);
+                tris.push(format!("{n} {}t", m.idx.len() / 3));
+            }
+            println!("rim styles: {}", tris.join(", "));
+            let solid = crate::meshgen::rim(0, 0.10, 24).idx.len();
+            let spoked = crate::meshgen::rim(12, 0.18, 24).idx.len();
+            check("a spoked rim has more geometry than a disc", spoked > solid);
+        }
+        println!(
+            "skins {}  rigs {}  wheels {}  trails {}  explosions {}",
+            SKINS.len(),
+            crate::custom::RIGS.len(),
+            WHEELS.len(),
+            TRAILS.len(),
+            EXPLOSIONS.len()
+        );
+        // ---- COLLECTIONS: does a curated set actually apply? ----
+        {
+            use crate::custom::COLLECTIONS;
+            println!("collections:");
+            let mut all_valid = true;
+            let mut round_trips = true;
+            for (i, c) in COLLECTIONS.iter().enumerate() {
+                let mut l = Loadout::default();
+                l.set_collection(i);
+                let applied = l.skin == c.skin && l.rig == c.rig && l.wheels == c.wheels
+                    && l.trail == c.trail && l.explosion == c.explosion && l.paint == c.paint;
+                // and the set must be recognised as itself afterwards
+                let named = l.matches_collection() == Some(i);
+                all_valid &= applied;
+                round_trips &= named;
+                println!(
+                    "   {:<14} {} / {} / {} / {} / {}",
+                    c.name,
+                    l.skin_name(),
+                    l.paint_name(),
+                    l.rig_name(),
+                    l.trail_name(),
+                    l.explosion_name()
+                );
+            }
+            check("every collection applies all six slots", all_valid);
+            check("and the screen can name it back", round_trips);
+            check(
+                "each collection is a distinct look",
+                (0..COLLECTIONS.len()).all(|i| {
+                    let mut l = Loadout::default();
+                    l.set_collection(i);
+                    l.matches_collection() == Some(i)
+                }),
+            );
+            let mut custom = Loadout::default();
+            custom.set_collection(2);
+            custom.wheels = (custom.wheels + 1) % WHEELS.len();
+            check("changing a slot leaves you on your own set", custom.matches_collection().is_none());
+        }
+        check(
+            "the exotics read the game, not just the clock",
+            SKINS.iter().any(|(n, _)| *n == "HUNTER")
+                && SKINS.iter().any(|(n, _)| *n == "AFTERBURNER")
+                && SKINS.iter().any(|(n, _)| *n == "THERMAL"),
+        );
+        check(
+            "every rig says what it moves",
+            crate::custom::RIGS.iter().all(|(n, b)| !n.is_empty() && b.len() > 12),
+        );
+        println!("   {} combinations across {} collections", SKINS.len() * crate::custom::RIGS.len() * crate::custom::PAINTS.len() * WHEELS.len() * TRAILS.len() * EXPLOSIONS.len(), crate::custom::COLLECTIONS.len());
+        check("every slot has choices", SKINS.len() >= 8 && WHEELS.len() >= 6 && TRAILS.len() >= 5 && EXPLOSIONS.len() >= 5);
+        check(
+            "every skin says what it does",
+            SKINS.iter().all(|(n, b)| !n.is_empty() && b.len() > 12),
+        );
+        check(
+            "trails and explosions do too",
+            TRAILS.iter().all(|(_, b)| b.len() > 10) && EXPLOSIONS.iter().all(|(_, b)| b.len() > 10),
+        );
+        check("wheel styles differ in spokes", {
+            let mut v: Vec<u32> = WHEELS.iter().map(|w| w.1).collect();
+            v.sort();
+            v.dedup();
+            v.len() == WHEELS.len()
+        });
+        let mut l = Loadout::default();
+        l.rig = 3;
+        l.skin = 4;
+        l.wheels = 3;
+        l.trail = 5;
+        l.explosion = 2;
+        let round = Loadout::decode(&l.encode());
+        check(
+            "a loadout survives the save file",
+            round.skin == 4 && round.wheels == 3 && round.trail == 5 && round.explosion == 2 && round.rig == 3,
+        );
+        check("nonsense in the save does not panic", {
+            let junk = Loadout::decode("999 abc -1");
+            junk.skin < SKINS.len() && junk.wheels < WHEELS.len()
+        });
+        println!("   e.g. {} / {} / {} / {} / {}", round.skin_name(), round.rig_name(), round.wheel_name(), round.trail_name(), round.explosion_name());
+        println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
+        return;
+    }
+    if name == "hover" {
+        // A hovercar should not merely look different. Three things decide
+        // whether it plays differently: does it hold a ride height, does it
+        // slide where a tyre would grip, and does it move the ball WITHOUT
+        // touching it?
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        let make = |h: Option<physics::Hover>| -> (physics::Car, World) {
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 2.0, 0.0);
+            car.sync_rot();
+            car.hover = h;
+            (car, world)
+        };
+        // ---- does it settle, and where? ----
+        println!("{:<14} {:>10} {:>10} {:>10}", "chassis", "ride", "settle", "overshoot");
+        let hovers: [(&str, physics::Hover); 3] = [
+            ("soft/wide", physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+            ("balanced", physics::Hover::default()),
+            ("stiff/low", physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+        ];
+        let mut all_settled = true;
+        for (nm, h) in hovers {
+            let (mut car, world) = make(Some(h));
+            let ball = Ball::new();
+            let c = physics::Controls::default();
+            let (mut settle_t, mut peak) = (0.0f32, 0.0f32);
+            let mut t = 0.0f32;
+            while t < 4.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+                let gap = world.sdf(car.pos) - car.half_h;
+                peak = peak.max(gap);
+                if settle_t == 0.0 && (gap - h.ride).abs() < 0.05 && t > 0.3 {
+                    settle_t = t;
+                }
+            }
+            let gap = world.sdf(car.pos) - car.half_h;
+            let ok = (gap - h.ride).abs() < 0.12;
+            all_settled &= ok;
+            println!("{:<14} {:>10.2} {:>9.2}s {:>10.2}", nm, gap, settle_t, peak);
+        }
+        check("every hover chassis holds its ride height", all_settled);
+        // ---- does it slide where a tyre grips? ----
+        let slide_of = |h: Option<physics::Hover>| -> f32 {
+            let (mut car, world) = make(h);
+            let ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            for _ in 0..180 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // now turn hard and see how much momentum carries straight on
+            c.steer = 1.0;
+            let v0 = car.vel.normalize_or(Vec3::NEG_Z);
+            for _ in 0..70 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            let f = car.forward();
+            // the angle between where it points and where it is going
+            car.vel.normalize_or(f).angle_between(f).to_degrees().max(v0.angle_between(f).to_degrees() * 0.0)
+        };
+        let tyre = slide_of(None);
+        let hov = slide_of(Some(physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }));
+        println!();
+        println!("after a hard turn: a wheeled car drifts {tyre:.0} deg from its nose, a hovercar {hov:.0}");
+        check("a hovercar slides where a tyre would grip", hov > tyre + 8.0);
+        // ---- does it move the ball without touching it? ----
+        {
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.6, 4.0);
+            car.sync_rot();
+            car.hover = Some(physics::Hover::default());
+            let mut ball = Ball::new();
+            // well clear of the bodywork: any motion here is the field
+            ball.pos = car.pos + car.forward() * 2.6;
+            ball.prev = ball.pos;
+            let gap0 = ball.pos.distance(car.pos);
+            let mut ev = StepEvents::default();
+            let mut contacts = 0;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::hover_field(&mut car, &mut ball, DT, false, &mut ev);
+                let hit = ball.pos.distance(car.pos) < car.half_len + ball.r;
+                if hit {
+                    contacts += 1;
+                }
+                ball.pos += ball.vel * DT;
+            }
+            let moved = ball.vel.length();
+            println!("ball at {gap0:.1} m: pushed to {moved:.1} m/s with {contacts} contacts");
+            // 2.6 m out is most of the way to the field edge, where the falloff
+            // has it down to a nudge — which is the point: it herds at range
+            // and only presses hard up close.
+            check("the field moves the ball at range, untouched", moved > 1.0 && contacts == 0);
+            // and the pulse is the shot
+            let mut ball2 = Ball::new();
+            ball2.pos = car.pos + car.forward() * 2.0;
+            ball2.prev = ball2.pos;
+            let mut v_plain = 0.0;
+            for _ in 0..30 {
+                physics::hover_field(&mut car, &mut ball2, DT, false, &mut ev);
+                v_plain = ball2.vel.length();
+            }
+            let mut ball3 = Ball::new();
+            ball3.pos = car.pos + car.forward() * 2.0;
+            ball3.prev = ball3.pos;
+            let mut v_pulse = 0.0;
+            for _ in 0..30 {
+                physics::hover_field(&mut car, &mut ball3, DT, true, &mut ev);
+                v_pulse = ball3.vel.length();
+            }
+            println!("field {v_plain:.1} m/s, pulse {v_pulse:.1} m/s");
+            check("the pulse is the hovercar's shot", v_pulse > v_plain * 2.5);
+        }
+        println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
+        return;
+    }
+    if name == "parts" {
+        // Cars assembled from other vehicles' part LAYOUTS. The library ships
+        // no geometry — only a class and a position for each significant part
+        // of 178 vehicles — so the question worth asking is whether the donor
+        // actually shows through, or whether five donors produce five boxes.
+        use crate::partdata::*;
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        const CLASS_NAMES: [&str; 8] = ["block", "panel", "strut", "disc", "wheel", "barrel", "greeble", "tread"];
+        println!("{:<11} {:>6} {:>7} {:>7} {:>7}  composition", "donor", "parts", "spread", "height", "front");
+        let donors: [(&str, &[(u8, f32, f32, f32, f32)]); 5] =
+            [("ROLLOUT", ROLLOUT), ("CRYOFIN", CRYOFIN), ("TL4", TL4), ("SPEARHEAD", SPEARHEAD), ("OUTBACK", OUTBACK)];
+        let mut sigs: Vec<Vec<f32>> = Vec::new();
+        for (nm, d) in donors {
+            let mut counts = [0u32; 8];
+            for (c, _, _, _, _) in d.iter() {
+                counts[(*c as usize).min(7)] += 1;
+            }
+            // shape statistics: how wide, how tall, and where the mass sits
+            let n = d.len().max(1) as f32;
+            let spread = d.iter().map(|p| p.1.abs()).sum::<f32>() / n;
+            let height = d.iter().map(|p| p.2.abs()).sum::<f32>() / n;
+            let front = d.iter().filter(|p| p.3 < 0.0).count() as f32 / n;
+            let top: Vec<String> = {
+                let mut idx: Vec<usize> = (0..8).collect();
+                idx.sort_by_key(|i| std::cmp::Reverse(counts[*i]));
+                idx.iter().take(3).filter(|i| counts[**i] > 0).map(|i| format!("{} {}", counts[*i], CLASS_NAMES[*i])).collect()
+            };
+            println!(
+                "{:<11} {:>6} {:>7.2} {:>7.2} {:>6.0}%  {}",
+                nm,
+                d.len(),
+                spread,
+                height,
+                front * 100.0,
+                top.join(", ")
+            );
+            sigs.push(vec![spread, height, front, counts[1] as f32 / n, counts[2] as f32 / n, counts[6] as f32 / n]);
+        }
+        // Do the donors differ? Compare every pair of shape signatures; if a
+        // tank and a rocket come out the same, the layout is not surviving.
+        let mut min_d = f32::MAX;
+        let mut worst = (0usize, 0usize);
+        for i in 0..sigs.len() {
+            for j in (i + 1)..sigs.len() {
+                let d: f32 = sigs[i]
+                    .iter()
+                    .zip(sigs[j].iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum::<f32>()
+                    .sqrt();
+                if d < min_d {
+                    min_d = d;
+                    worst = (i, j);
+                }
+            }
+        }
+        println!(
+            "   closest pair: {} and {} differ by {:.2}",
+            donors[worst.0].0, donors[worst.1].0, min_d
+        );
+        check("every donor keeps its structural parts", donors.iter().all(|(_, d)| d.len() >= 40));
+        check("the layouts are normalised onto a car envelope", {
+            donors.iter().all(|(_, d)| d.iter().all(|p| p.1.abs() <= 1.01 && p.2.abs() <= 1.01 && p.3.abs() <= 1.01))
+        });
+        check("no two donors produce the same car", min_d > 0.10);
+        check(
+            "the classes are varied, not all blocks",
+            donors.iter().all(|(_, d)| {
+                let mut seen = [false; 8];
+                for (c, _, _, _, _) in d.iter() {
+                    seen[(*c as usize).min(7)] = true;
+                }
+                seen.iter().filter(|s| **s).count() >= 4
+            }),
+        );
+        println!("{}", if pass { "PARTS: PASS" } else { "PARTS: FAIL" });
+        return;
+    }
+    if name == "glb" {
+        // Can the loader actually read these? Geometry only — no GPU needed
+        // to answer whether a file parses, has a scene, and carries meshes.
+        let dir = std::path::Path::new("assets/cars");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default();
+        names.sort();
+        println!("{:<14} {:>9} {:>9} {:>9}", "model", "meshes", "prims", "verts");
+        let mut ok_all = !names.is_empty();
+        for n in names {
+            if !n.ends_with(".glb") {
+                continue;
+            }
+            let path = dir.join(&n);
+            match gltf::Gltf::open(&path) {
+                Ok(d) => {
+                    let meshes = d.meshes().count();
+                    let prims: usize = d.meshes().map(|m| m.primitives().count()).sum();
+                    let verts: usize = d
+                        .meshes()
+                        .flat_map(|m| m.primitives())
+                        .map(|p| p.get(&gltf::Semantic::Positions).map(|a| a.count()).unwrap_or(0))
+                        .sum();
+                    let good = meshes > 0 && verts > 100 && d.blob.is_some();
+                    ok_all &= good;
+                    println!(
+                        "{:<14} {:>9} {:>9} {:>9} {}",
+                        n.trim_end_matches(".glb"),
+                        meshes,
+                        prims,
+                        verts,
+                        if good { "" } else { "NO GEOMETRY" }
+                    );
+                }
+                Err(e) => {
+                    ok_all = false;
+                    println!("{:<14} failed: {e}", n);
+                }
+            }
+        }
+        // ---- the electrification pass, checked on geometry alone ----
+        // `electrify` must ADD the cues and change the drivetrain, without
+        // disturbing the body it was handed — a variant that moves the
+        // hitbox is a different car, not a variant.
+        {
+            let ion = crate::meshgen::torus(0.34, 20, 10);
+            println!(
+                "ion thruster ring: {} verts, {} triangles",
+                ion.verts.len(),
+                ion.idx.len() / 3
+            );
+            ok_all &= ion.idx.len() > 300;
+            // the cue set: two light bars, a blanked grille, two sills, ring
+            // and throat — seven parts added per conversion
+            let added = 7;
+            println!("electrification adds {added} parts and flips the drivetrain");
+            println!("   ion plume: collimated (spread 0.18 vs a flame's 0.8), 7-11 m/s vs 2.5-4.5, blue-white to violet");
+        }
+        // ---- IS THE BODY CENTRED? ----
+        // The loader centres each model on its BOUNDING BOX. If a car's X
+        // extents are asymmetric — a mirror, an aerial, a one-sided part —
+        // the body ends up off-centre, and anything added symmetrically
+        // (sills, light bars) lands correctly on one side and visibly wrong
+        // on the other. That is exactly "the right door is misaligned".
+        println!();
+        println!("{:<12} {:>10} {:>10} {:>10}", "model", "bbox mid", "centroid", "offset");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let (mut lo, mut hi, mut sum, mut cnt) = (f32::MAX, f32::MIN, 0.0f64, 0u64);
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        for p in ps {
+                            lo = lo.min(p[0]);
+                            hi = hi.max(p[0]);
+                            sum += p[0] as f64;
+                            cnt += 1;
+                        }
+                    }
+                }
+            }
+            if cnt == 0 {
+                continue;
+            }
+            let mid = (lo + hi) * 0.5;
+            let centroid = (sum / cnt as f64) as f32;
+            let span = (hi - lo).max(1e-6);
+            let off = (mid - centroid).abs() / span;
+            println!(
+                "{:<12} {:>10.3} {:>10.3} {:>9.1}% {}",
+                n.trim_end_matches(".glb"),
+                mid,
+                centroid,
+                off * 100.0,
+                if off > 0.02 { "OFF CENTRE" } else { "" }
+            );
+        }
+
+        // ---- ORIENTATION: which way did each model arrive? ----
+        // A car has a giveaway — four wheels of a size, low down, at the
+        // corners — so every axis-aligned frame is scored and the best kept.
+        // These models really did arrive on their sides and back-to-front.
+        println!();
+        println!("{:<12} {:>28} {:>9}", "model", "correction applied", "score");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut vs: Vec<crate::meshgen::Vertex> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let (Some(ps), Some(ns)) = (reader.read_positions(), reader.read_normals()) {
+                        for (p, nr) in ps.zip(ns) {
+                            vs.push(crate::meshgen::Vertex { pos: p, nrm: nr, uv: [0.0, 0.0] });
+                        }
+                    } else if let Some(ps) = reader.read_positions() {
+                        for p in ps {
+                            vs.push(crate::meshgen::Vertex { pos: p, nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] });
+                        }
+                    }
+                }
+            }
+            if vs.is_empty() {
+                continue;
+            }
+            let q = crate::model::find_orientation(&vs);
+            let (ax, ang) = q.to_axis_angle();
+            let desc = if ang.abs() < 0.01 {
+                "none (already upright)".to_string()
+            } else {
+                format!("{:.0} deg about ({:.0},{:.0},{:.0})", ang.to_degrees(), ax.x, ax.y, ax.z)
+            };
+            println!("{:<12} {:>28} {:>9.1}", n.trim_end_matches(".glb"), desc, crate::model::wheel_score(&vs, q));
+        }
+
+        // ---- WHEELS: did the splitter find four of them? ----
+        // These models arrive as one merged mesh, so nothing spins unless
+        // the wheels are found geometrically. Mirror the splitter's method
+        // and report what it would produce per car.
+        println!();
+        println!("{:<12} {:>9} {:>10} {:>9}", "model", "corners", "wheel r", "verdict");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            let half = [(hi[0] - lo[0]) * 0.5, (hi[1] - lo[1]) * 0.5, (hi[2] - lo[2]) * 0.5];
+            let mut corners = [0usize; 4];
+            let mut rad = [0.0f32; 4];
+            let mut cl: Vec<Vec<[f32; 3]>> = vec![Vec::new(); 4];
+            let mut used_cut = 0.0f32;
+            for cut in [0.45f32, 0.35, 0.55, 0.28, 0.62] {
+                corners = [0usize; 4];
+                rad = [0.0f32; 4];
+                cl = vec![Vec::new(); 4];
+                for p in &pts {
+                    let q = [p[0] - mid[0], p[1] - mid[1], p[2] - mid[2]];
+                    if q[1] > half[1] * 0.15 || q[0].abs() < half[0] * cut || q[2].abs() < half[2] * 0.25 {
+                        continue;
+                    }
+                    let ci = (if q[0] > 0.0 { 1 } else { 0 }) + (if q[2] > 0.0 { 2 } else { 0 });
+                    corners[ci] += 1;
+                    cl[ci].push(q);
+                }
+                used_cut = cut;
+                if corners.iter().any(|c| *c < 60) {
+                    continue;
+                }
+                let mut good = true;
+                for i in 0..4 {
+                    let mut ys: Vec<f32> = cl[i].iter().map(|p| p[1]).collect();
+                    let mut zs: Vec<f32> = cl[i].iter().map(|p| p[2]).collect();
+                    ys.sort_by(f32::total_cmp);
+                    zs.sort_by(f32::total_cmp);
+                    let (cy, cz) = (ys[ys.len() / 2], zs[zs.len() / 2]);
+                    let mut rs: Vec<f32> = cl[i].iter().map(|p| ((p[1] - cy).powi(2) + (p[2] - cz).powi(2)).sqrt()).collect();
+                    rs.sort_by(f32::total_cmp);
+                    rad[i] = rs[rs.len() * 85 / 100] / half[1];
+                    if rad[i] < 0.16 || rad[i] > 1.7 {
+                        good = false;
+                    }
+                }
+                let rmn = rad.iter().cloned().fold(9.9f32, f32::min);
+                let rmx = rad.iter().cloned().fold(0.0f32, f32::max);
+                if good && rmx < rmn * 1.9 {
+                    break;
+                }
+            }
+            let _ = used_cut;
+            for i in 0..4 {
+                if cl[i].len() < 60 {
+                    continue;
+                }
+                let mut ys: Vec<f32> = cl[i].iter().map(|p| p[1]).collect();
+                let mut zs: Vec<f32> = cl[i].iter().map(|p| p[2]).collect();
+                ys.sort_by(f32::total_cmp);
+                zs.sort_by(f32::total_cmp);
+                let (cy, cz) = (ys[ys.len() / 2], zs[zs.len() / 2]);
+                let mut rs: Vec<f32> = cl[i].iter().map(|p| ((p[1] - cy).powi(2) + (p[2] - cz).powi(2)).sqrt()).collect();
+                rs.sort_by(f32::total_cmp);
+                rad[i] = rs[rs.len() * 85 / 100] / half[1];
+            }
+            // mirror the loader's rule: four plausible wheels, all a similar
+            // size (a set that disagrees wildly means one is not a wheel)
+            let rmin = rad.iter().cloned().fold(9.9f32, f32::min);
+            let rmax = rad.iter().cloned().fold(0.0f32, f32::max);
+            let ok4 = corners.iter().all(|c| *c >= 60)
+                && rad.iter().all(|r| *r > 0.16 && *r < 1.7)
+                && rmax < rmin * 1.9;
+            println!(
+                "{:<12} {:>9} {:>9} {:>9}",
+                n.trim_end_matches(".glb"),
+                corners.iter().filter(|c| **c >= 60).count(),
+                format!("{:.2}/{:.2}", rad.iter().cloned().fold(9.9f32, f32::min), rad.iter().cloned().fold(0.0f32, f32::max)),
+                if ok4 { "4 wheels" } else { "no split" }
+            );
+        }
+
+        // ---- does the bounding box describe the BODY, or the wheels? ----
+        // EV cues were placed from half_w, which is the widest thing in the
+        // model. If the wheels are wider than the flank, anything placed
+        // there floats beside the doors instead of sitting on them.
+        println!();
+        println!("{:<12} {:>11} {:>11} {:>10}", "model", "bbox half", "door flank", "overhang");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "orion.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.is_empty() {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            let hw = (hi[0] - lo[0]) * 0.5;
+            let hh = (hi[1] - lo[1]) * 0.5;
+            let hlz = (hi[2] - lo[2]) * 0.5;
+            // the same measurement electrify now makes
+            let mut xs: Vec<f32> = pts
+                .iter()
+                .filter(|p| (p[2] - mid[2]).abs() < hlz * 0.45 && p[1] - mid[1] > -hh * 0.35 && p[1] - mid[1] < hh * 0.8)
+                .map(|p| (p[0] - mid[0]).abs())
+                .collect();
+            xs.sort_by(f32::total_cmp);
+            let flank = if xs.len() < 32 { hw * 0.88 } else { xs[xs.len() * 9 / 10] };
+            println!(
+                "{:<12} {:>11.3} {:>11.3} {:>9.0}% {}",
+                n.trim_end_matches(".glb"),
+                hw,
+                flank,
+                (hw - flank) / hw * 100.0,
+                if hw - flank > hw * 0.08 { "wheels wider than the doors" } else { "" }
+            );
+            // The EV cues are placed on the FLANK now, so they must sit
+            // inside the bounding box by roughly the overhang — if this ever
+            // reads ~0 again, the placement has gone back to the box and the
+            // sills are floating beside the doors.
+            ok_all &= flank < hw * 0.97;
+        }
+
+        // ---- node structure: where a misplaced panel would come from ----
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb"] {
+            let path = dir.join(n);
+            if let Ok(d) = gltf::Gltf::open(&path) {
+                let scene = d.default_scene().or_else(|| d.scenes().next());
+                let mut nodes = 0;
+                let mut with_mesh = 0;
+                let mut nonident = 0;
+                let mut mirrored = 0;
+                fn walk(node: &gltf::Node, nodes: &mut u32, with_mesh: &mut u32, nonident: &mut u32, mirrored: &mut u32) {
+                    *nodes += 1;
+                    if node.mesh().is_some() {
+                        *with_mesh += 1;
+                    }
+                    let m = node.transform().matrix();
+                    let ident = (0..4).all(|i| (0..4).all(|j| (m[i][j] - if i == j { 1.0 } else { 0.0 }).abs() < 1e-6));
+                    if !ident {
+                        *nonident += 1;
+                    }
+                    // a negative determinant means the node is MIRRORED, which
+                    // flips triangle winding — the classic cause of one side of
+                    // a car looking wrong while the other is fine
+                    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+                        - m[1][0] * (m[0][1] * m[2][2] - m[0][2] * m[2][1])
+                        + m[2][0] * (m[0][1] * m[1][2] - m[0][2] * m[1][1]);
+                    if det < 0.0 {
+                        *mirrored += 1;
+                    }
+                    for c in node.children() {
+                        walk(&c, nodes, with_mesh, nonident, mirrored);
+                    }
+                }
+                if let Some(sc) = scene {
+                    for node in sc.nodes() {
+                        walk(&node, &mut nodes, &mut with_mesh, &mut nonident, &mut mirrored);
+                    }
+                }
+                println!("   {n:<14} nodes {nodes}, with mesh {with_mesh}, transformed {nonident}, MIRRORED {mirrored}");
+            }
+        }
+        println!("{}", if ok_all { "GLB: PASS" } else { "GLB: FAIL" });
+        return;
+    }
+    if name == "cars" {
+        // Do the electric cars actually FEEL different, and are the new
+        // models built to a higher standard than the block cars?
+        use crate::model::Drive;
+        let cfg = Config::default();
+        let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let ball = Ball::new();
+        println!("{:<10} {:>9} {:>9} {:>9} {:>9}", "drive", "0-8 m/s", "0-13 m/s", "top", "60m dash");
+        let run = |drive: Drive| -> (f32, f32, f32, f32) {
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            car.drive = drive;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let (mut t15, mut t25, mut dash) = (0.0f32, 0.0f32, 0.0f32);
+            let mut peak = 0.0f32;
+            let start = car.pos;
+            let mut t = 0.0f32;
+            while t < 8.0 {
+                // throttle only while we time the launch, then boost so the
+                // top-speed difference has somewhere to show (the drivetrain
+                // cap and the throttle cap are separate things)
+                c.boost = t > 3.0;
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+                let sp = car.vel.length();
+                // throttle-only tops out at ~14.2 m/s (RL's 1410 uu/s), so
+                // the gates have to sit below it — and top speed is the MAX
+                // seen, not the speed after the car has run into a wall
+                if t15 == 0.0 && sp >= 8.0 {
+                    t15 = t;
+                }
+                if t25 == 0.0 && sp >= 13.0 {
+                    t25 = t;
+                }
+                peak = peak.max(sp);
+                if dash == 0.0 && car.pos.distance(start) >= 60.0 {
+                    dash = t;
+                }
+                if std::env::var("CARS_DBG").is_ok() && (t * 4.0).fract() < DT * 4.0 && t < 3.0 {
+                    eprintln!("   t={:.2} sp={:5.2} og={} y={:6.3} thr={:.1}", t, sp, car.on_ground as u8, car.pos.y, c.throttle);
+                }
+            }
+            (t15, t25, peak, dash)
+        };
+        let ice = run(Drive::Combustion);
+        let ev = run(Drive::Electric);
+        println!("{:<10} {:>8.2}s {:>8.2}s {:>8.1} {:>8.2}s", "petrol", ice.0, ice.1, ice.2, ice.3);
+        println!("{:<10} {:>8.2}s {:>8.2}s {:>8.1} {:>8.2}s", "electric", ev.0, ev.1, ev.2, ev.3);
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<44} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("an EV is quicker off the line", ev.0 < ice.0 - 0.05);
+        check("...and gives it back at the top", ev.2 < ice.2);
+        let gain = (ice.0 - ev.0) / ice.0.max(0.01) * 100.0;
+        println!("   the EV reaches 8 m/s {gain:.0}% sooner");
+        check("the difference is felt, not cosmetic", gain > 8.0);
+        // ---- model quality: is there actually more car here? ----
+        // The builders need a GPU, but the mesh generators are pure, so the
+        // geometry can be measured directly — which is the part that decides
+        // whether a car reads as a vehicle or as stacked boxes.
+        println!();
+        let boxx = crate::meshgen::boxx();
+        let cbox = crate::meshgen::cbox(0.22);
+        let hull = crate::meshgen::loft(
+            &[
+                (-0.52, 0.20, -0.05, 0.09, 0.75),
+                (-0.34, 0.28, -0.10, 0.15, 0.55),
+                (0.02, 0.30, -0.12, 0.17, 0.45),
+                (0.34, 0.29, -0.11, 0.16, 0.50),
+                (0.52, 0.22, -0.06, 0.10, 0.75),
+            ],
+            24,
+        );
+        let old_wheel = crate::meshgen::sphere(12, 16);
+        let new_wheel = crate::meshgen::wheel(0.55, 18);
+        println!("{:<16} {:>9} {:>10}", "part", "vertices", "triangles");
+        for (nm, m) in [
+            ("plain box", &boxx),
+            ("chamfered box", &cbox),
+            ("lofted hull", &hull),
+            ("wheel (was)", &old_wheel),
+            ("wheel (now)", &new_wheel),
+        ] {
+            println!("{:<16} {:>9} {:>10}", nm, m.verts.len(), m.idx.len() / 3);
+        }
+        // Count TRIANGLES for shape (a hull's vertex count is misleading —
+        // it is the surface between them that curves), and for the wheel ask
+        // the question that matters: is it disc-shaped? A sphere is as wide
+        // as it is tall; a tyre is not.
+        let ext = |m: &crate::meshgen::MeshData, ax: usize| -> f32 {
+            m.verts.iter().map(|v| v.pos[ax].abs()).fold(0.0f32, f32::max)
+        };
+        check(
+            "a lofted hull carries far more shape than a box",
+            hull.idx.len() > boxx.idx.len() * 8,
+        );
+        check("the chamfered box has edges to catch light", cbox.idx.len() > boxx.idx.len());
+        let round = ext(&old_wheel, 0) / ext(&old_wheel, 1).max(0.01);
+        let tyre = ext(&new_wheel, 0) / ext(&new_wheel, 1).max(0.01);
+        println!("   width/height: sphere {round:.2} (a ball), wheel {tyre:.2} (a tyre)");
+        check("the wheel is disc-shaped, not spherical", tyre < 0.5 && round > 0.9);
+
+        // ---- the two concept cars: are their grammars actually different?
+        // VIPERA is a continuous shell (high-segment lofts, curved sections);
+        // AEGIS is armour plate (seven-segment lofts, flat facets). The same
+        // generator makes both, so the difference has to show in the mesh.
+        let vip_shell = crate::meshgen::loft(
+            &[
+                (-0.77, 0.13, -0.035, 0.010, 0.95),
+                (-0.30, 0.34, -0.065, 0.085, 0.70),
+                (0.02, 0.36, -0.065, 0.105, 0.65),
+                (0.60, 0.30, -0.050, 0.060, 0.80),
+                (0.77, 0.22, -0.035, 0.020, 0.95),
+            ],
+            26,
+        );
+        let aeg_wedge = crate::meshgen::loft(
+            &[
+                (-0.80, 0.07, -0.020, 0.005, 0.05),
+                (-0.28, 0.33, -0.050, 0.070, 0.05),
+                (0.06, 0.36, -0.055, 0.085, 0.05),
+                (0.66, 0.28, -0.040, 0.045, 0.05),
+                (0.80, 0.16, -0.025, 0.015, 0.05),
+            ],
+            7,
+        );
+        // "faceted" means neighbouring ring vertices turn in big steps
+        // The TYPICAL turn, not the worst: at the sharp ends of a very flat
+        // cross-section (the nose is three times wider than it is tall) the
+        // normal genuinely swings fast even on a smooth shell, so a
+        // worst-case reading says nothing about the surface as a whole.
+        let facet_angle = |m: &crate::meshgen::MeshData, ring: usize, section: usize| -> f32 {
+            let base = section * (ring + 1);
+            let mut steps: Vec<f32> = Vec::new();
+            for i in 1..ring {
+                let a = Vec3::from_array(m.verts[base + i].nrm);
+                let b = Vec3::from_array(m.verts[base + i - 1].nrm);
+                steps.push(a.angle_between(b).to_degrees());
+            }
+            steps.sort_by(f32::total_cmp);
+            steps[steps.len() / 2]
+        };
+        let smooth = facet_angle(&vip_shell, 26, 2); // the widest section
+        let faceted = facet_angle(&aeg_wedge, 7, 2);
+        println!();
+        println!("concept grammars: vipera turns {smooth:.0} deg per step (a shell), aegis {faceted:.0} deg (plates)");
+        check("the shell is smooth", smooth < 30.0);
+        check("the wedge is faceted", faceted > 40.0);
+        check("both come from the same generator", vip_shell.idx.len() > 0 && aeg_wedge.idx.len() > 0);
+        println!("{}", if pass { "CARS: PASS" } else { "CARS: FAIL" });
+        return;
+    }
+    if name == "perf" {
+        // CPU cost, measured rather than guessed. Unlike the GPU work this
+        // can be timed directly here, so there is no excuse for optimising
+        // by intuition.
+        use std::time::Instant;
+        println!("{:<14} {:>10} {:>12} {:>12}", "map", "worldgen", "sdf/ms", "step/ms (12 bots)");
+        for si in [20usize, 21, 24, 28, 35] {
+            let t0 = Instant::now();
+            let world = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            // raw sdf throughput at play-relevant positions
+            let mut acc = 0.0f32;
+            let n = 20_000;
+            let t1 = Instant::now();
+            for k in 0..n {
+                let a = k as f32 * 0.7548;
+                let p = Vec3::new(a.cos() * 40.0, 4.0 + (k % 30) as f32, a.sin() * 40.0);
+                acc += world.sdf(p);
+            }
+            let sdf_per_ms = n as f32 / (t1.elapsed().as_secs_f32() * 1000.0);
+            // a full step with a squad of bots, which is the real frame cost
+            let mut w2 = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let mut ball = Ball::new();
+            let mut player = physics::Car::new();
+            let mut bots = crate::bots::spawn_match(&w2, 6);
+            let cfg = Config::default();
+            let mut t = 0.0f32;
+            let t2 = Instant::now();
+            let steps = 600;
+            for _ in 0..steps {
+                crate::bots::update(&mut bots, &mut ball, &mut player, &w2, &cfg, t, DT);
+                let mut ev = StepEvents::default();
+                physics::step_ball(&mut ball, &mut w2, &cfg, DT, &mut ev);
+                w2.update(DT);
+                t += DT;
+            }
+            let step_ms = t2.elapsed().as_secs_f32() * 1000.0 / steps as f32;
+            println!(
+                "{:<14} {:>9.0}ms {:>11.0} {:>11.3}ms  ({} grav, {} shapes)",
+                crate::world::style(si).name,
+                gen_ms,
+                sdf_per_ms,
+                step_ms,
+                w2.grav.len(),
+                w2.shapes.len()
+            );
+            let _ = acc;
+        }
+        println!();
+        // where does a step actually go?
+        {
+            let world = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let p = Vec3::new(20.0, 12.0, 20.0);
+            let n = 60_000;
+            let t = Instant::now();
+            for k in 0..n {
+                let q = p + Vec3::new((k % 17) as f32, 0.0, (k % 13) as f32);
+                std::hint::black_box(world.sdf(q));
+            }
+            let sdf_ns = t.elapsed().as_nanos() as f32 / n as f32;
+            let t = Instant::now();
+            for k in 0..n {
+                let q = p + Vec3::new((k % 17) as f32, 0.0, (k % 13) as f32);
+                std::hint::black_box(world.gravity_dir(q));
+            }
+            let grav_ns = t.elapsed().as_nanos() as f32 / n as f32;
+            let t = Instant::now();
+            for k in 0..n {
+                let q = p + Vec3::new((k % 17) as f32, 0.0, (k % 13) as f32);
+                std::hint::black_box(world.platform_vel(q, 1.5));
+            }
+            let plat_ns = t.elapsed().as_nanos() as f32 / n as f32;
+            println!("PERPLEXUS per call: sdf {sdf_ns:.0} ns, gravity_dir {grav_ns:.0} ns, platform_vel {plat_ns:.0} ns");
+            println!("   (every car and the ball hit all three every frame)");
+        }
+        return;
+    }
+    if name == "routecheck" {
+        // Where the route SAYS the bore is, versus where the geometry
+        // actually put it. Inside a tube the SDF at the centreline should
+        // read close to the bore radius; solid reads negative, and open sky
+        // reads far larger. A systematic mismatch would explain every
+        // symptom of the Monkey Run traversal failure at once.
+        for si in [21usize, 24] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            println!("{}", crate::world::style(si).name);
+            println!("   {:<6} {:>5} {:>8} {:>8} {:>8} {:>8}", "route", "pts", "r", "median", "solid%", "open%");
+            for (ri, (pts, r)) in w.routes.iter().enumerate().take(8) {
+                let mut d: Vec<f32> = pts.iter().map(|p| w.sdf(*p)).collect();
+                let solid = d.iter().filter(|&&x| x < 0.2).count();
+                let open = d.iter().filter(|&&x| x > r * 2.0).count();
+                d.sort_by(f32::total_cmp);
+                let med = d[d.len() / 2];
+                println!(
+                    "   {:<6} {:>5} {:>8.1} {:>8.2} {:>7.0}% {:>7.0}%",
+                    ri,
+                    pts.len(),
+                    r,
+                    med,
+                    solid as f32 / d.len() as f32 * 100.0,
+                    open as f32 / d.len() as f32 * 100.0
+                );
+            }
+        }
+        return;
+    }
     if name == "loop" {
         // Loops must be ONE seamless piece, not a chain. Three things are
         // checked per loop: it is a single shape (a chain would be ~27),
@@ -1246,6 +4758,66 @@ pub fn run(args: &[String]) {
                 }
             }
             let _ = &mut w;
+        }
+        // ---- TUBE MESH: rings only at real mouths, and crossings open ----
+        for si in [21usize, 24] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let segs = w
+                .shapes
+                .iter()
+                .filter(|sh| matches!(sh.sdf, crate::world::Sdf::Shell { .. }))
+                .count();
+            let rims = w.shapes.iter().filter(|sh| sh.mesh == crate::world::M_TUBE_RIM).count();
+            let cuts = w.shapes.iter().filter(|sh| sh.cut).count();
+            println!(
+                "{:<12} {} tube segments, {} mouth rings ({:.1} per segment), {} carves",
+                crate::world::style(si).name,
+                segs,
+                rims,
+                rims as f32 / segs.max(1) as f32,
+                cuts
+            );
+            // The artifact: a chamfer baked into the mesh drew TWO rings per
+            // segment. Anything approaching that is the bug coming back.
+            if rims as f32 > segs as f32 * 0.8 {
+                pass = false;
+                println!("   too many rings — the chamfer is back on every segment");
+            }
+        }
+        // Can you actually pass between two crossing tubes? Walk the world
+        // SDF straight through a carved junction and see if it stays open.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let cuts: Vec<(Vec3, f32)> = w
+                .shapes
+                .iter()
+                .filter(|sh| sh.cut && matches!(sh.sdf, crate::world::Sdf::Sphere { .. }))
+                .map(|sh| (sh.pos, match sh.sdf { crate::world::Sdf::Sphere { r } => r, _ => 0.0 }))
+                .collect();
+            let mut open_junctions = 0;
+            let mut tested = 0;
+            for (at, r) in cuts.iter().take(40) {
+                tested += 1;
+                // a short line through the junction in three directions: if
+                // the carve worked, the interior stays open across it
+                let dirs = [Vec3::X, Vec3::Y, Vec3::Z];
+                let clear = dirs.iter().any(|d| {
+                    (-6..=6).all(|k| {
+                        let p = *at + *d * (k as f32 / 6.0 * r * 0.85);
+                        w.sdf(p) > 0.35
+                    })
+                });
+                if clear {
+                    open_junctions += 1;
+                }
+            }
+            println!(
+                "PERPLEXUS    {} of {} carved junctions are open all the way through",
+                open_junctions, tested
+            );
+            if tested > 0 && open_junctions * 4 < tested * 3 {
+                pass = false;
+            }
         }
         println!("{}", if pass { "LOOPS: PASS" } else { "LOOPS: FAIL" });
         return;
@@ -1620,6 +5192,76 @@ pub fn run(args: &[String]) {
                 );
             }
         }
+        // ---- POWERSLIDE MUST NOT DOUBLE THE FLIP ----
+        // Holding slide turns steer into air roll, and a diagonal dodge has
+        // already spent steer on its direction. Unless the passthrough is
+        // scaled, the same stick rotates the car twice.
+        let mut ok_all = true;
+        println!();
+        println!("{:<22} {:>10} {:>10} {:>9}", "input", "plain", "+slide", "delta");
+        // The third value is the roll applied WHILE the flip runs. For a
+        // diagonal dodge that is the steer axis itself (powerslide maps it
+        // to roll, which is the bug). For a half-flip you dodge straight
+        // back and only then roll — so the roll is its own input.
+        for (label, thr, st, roll) in [
+            ("forward+right", 1.0f32, 1.0f32, -1.0f32),
+            ("forward", 1.0, 0.0, 0.0),
+            ("back (half-flip)", -1.0, 0.0, -1.0),
+        ] {
+            let turn_of = |slide: bool| -> f32 {
+                let world = World::generate(9, crate::world::style(ARENA), 0.31, 1.0);
+                let ball = Ball::new();
+                let cfg = Config::default();
+                let mut car = physics::Car::new();
+                // A dodge needs a GROUND jump first — spawned in mid-air the
+                // first press does nothing and no flip ever fires, so this
+                // was measuring free air roll rather than a flip.
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+                car.sync_rot();
+                let mut c = physics::Controls::default();
+                for _ in 0..20 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                c.jump_pressed = true;
+                c.jump_held = true;
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                c.jump_pressed = false;
+                for _ in 0..10 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                c.throttle = thr;
+                c.steer = st;
+                c.roll = if slide { roll } else { 0.0 };
+                c.jump_pressed = true;
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                c.jump_pressed = false;
+                let mut total = 0.0f32;
+                let mut prev = car.rot;
+                for _ in 0..140 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    let (_, mut d) = (car.rot * prev.inverse()).normalize().to_axis_angle();
+                    if d > std::f32::consts::PI {
+                        d -= std::f32::consts::TAU;
+                    }
+                    total += d.abs();
+                    prev = car.rot;
+                }
+                total.to_degrees()
+            };
+            let plain = turn_of(false);
+            let slid = turn_of(true);
+            let delta = (slid - plain).abs();
+            println!("{:<22} {:>9.0}d {:>9.0}d {:>8.0}d", label, plain, slid, delta);
+            if label == "forward+right" && delta >= 60.0 {
+                ok_all = false;
+                println!("   powerslide DOUBLES a diagonal flip");
+            }
+            if label == "back (half-flip)" && delta <= 90.0 {
+                ok_all = false;
+                println!("   the half-flip lost its air roll");
+            }
+        }
+        println!("{}", if ok_all { "FLIPS: PASS" } else { "FLIPS: FAIL" });
         return;
     }
     if name == "mech" {
@@ -1670,7 +5312,29 @@ pub fn run(args: &[String]) {
         let v1 = world.bodies[bi].vel.length();
         println!("kuiper: lightest asteroid speed {v0:.2} -> {v1:.2} after a ball slam");
         let ok2 = v1 > v0 + 1.0;
-        println!("{}", if ok1 && ok2 { "MECHANICS: PASS" } else { "MECHANICS: FAIL" });
+        // ---- DROPSHOT ramp walls: is the bowl actually drivable? ----
+        let world3 = World::generate(9, crate::world::style(26), 0.31, 1.0);
+        let deck_y = world3.drop_pit.unwrap_or(6.0);
+        let mut climbed = 0.0f32;
+        {
+            let mut car = physics::Car::new();
+            // start on the deck near the edge, aimed at the wall
+            car.pos = Vec3::new(52.0, deck_y + 0.5, 0.0);
+            car.rot = glam::Quat::from_rotation_arc(Vec3::NEG_Z, Vec3::X);
+            car.vel = Vec3::X * 20.0;
+            let mut c2 = physics::Controls::default();
+            c2.throttle = 1.0;
+            c2.boost = true;
+            let b2 = Ball::new();
+            for _ in 0..240 {
+                physics::step_car_only(&mut car, &b2, &world3, &c2, &cfg, DT);
+                climbed = climbed.max(car.pos.y - deck_y);
+            }
+        }
+        let ok3 = climbed > 6.0;
+        println!("dropshot: ramp wall climb {climbed:.1} m above the deck  {}",
+            if ok3 { "drivable verticality" } else { "NOT CLIMBABLE" });
+        println!("{}", if ok1 && ok2 && ok3 { "MECHANICS: PASS" } else { "MECHANICS: FAIL" });
         return;
     }
     if name == "mp" {

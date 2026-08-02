@@ -9,6 +9,13 @@ mod font;
 mod fx;
 mod gamepad;
 mod gyro;
+mod custom;
+mod partcars;
+mod partdata;
+mod trials;
+mod replay;
+mod academy;
+mod stream;
 mod hud;
 mod input;
 mod meshgen;
@@ -49,6 +56,9 @@ const COMBO_WINDOW: f32 = 7.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
+    Garage { sel: usize },
+    Academy { sel: usize },
+    Trials { sel: usize },
     Splash,
     Play,
     Pause,
@@ -77,6 +87,9 @@ enum Row {
     Preset,
     Link(u8),
     Controls,
+    Trials,
+    Academy,
+    Garage,
     Fullscreen,
     Header,
     GameMode(u8), // 0 free, 1 sparta 50v50, 2 sparta 300
@@ -91,6 +104,57 @@ fn nav_here(menu: u8) -> usize {
         3 | 4 | 7 => 1, // CAR SETUP / FLIPS / MOTION live under SETUP
         _ => 1,
     }
+}
+
+/// Bounding radius of a shape, for culling.
+pub fn shape_bound(sdf: &world::Sdf) -> f32 {
+    match *sdf {
+        world::Sdf::None => 0.0,
+        world::Sdf::Sphere { r } => r,
+        world::Sdf::Torus { big, tube } => big + tube,
+        world::Sdf::Capsule { r, half } => r + half,
+        world::Sdf::Hex { r, h } => (r * r + h * h).sqrt(),
+        world::Sdf::RBox { half, .. } => half.length(),
+        world::Sdf::Shell { r, half, thick } => ((r + thick) * (r + thick) + half * half).sqrt(),
+        world::Sdf::TubeTorus { big, tube, thick } => big + tube + thick,
+        world::Sdf::RingDeck { big, wide, .. } => big + wide,
+    }
+}
+
+/// The six frustum planes of a view-projection, as (normal, d) in world
+/// space. A plane is stored so that `dot(n, p) + d > -r` means "inside".
+pub fn frustum_planes(vp: &Mat4) -> [[f32; 4]; 6] {
+    let m = vp.to_cols_array_2d(); // column-major: m[col][row]
+    let row = |r: usize| [m[0][r], m[1][r], m[2][r], m[3][r]];
+    let (rx, ry, rz, rw) = (row(0), row(1), row(2), row(3));
+    let mk = |a: [f32; 4], b: [f32; 4], sign: f32| {
+        let p = [
+            b[0] + sign * a[0],
+            b[1] + sign * a[1],
+            b[2] + sign * a[2],
+            b[3] + sign * a[3],
+        ];
+        let len = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-6);
+        [p[0] / len, p[1] / len, p[2] / len, p[3] / len]
+    };
+    [
+        mk(rx, rw, 1.0),  // left
+        mk(rx, rw, -1.0), // right
+        mk(ry, rw, 1.0),  // bottom
+        mk(ry, rw, -1.0), // top
+        mk(rz, rw, 1.0),  // near
+        mk(rz, rw, -1.0), // far
+    ]
+}
+
+/// Is a bounding sphere at all visible in this frustum?
+pub fn sphere_visible(planes: &[[f32; 4]; 6], c: Vec3, r: f32) -> bool {
+    for p in planes.iter() {
+        if p[0] * c.x + p[1] * c.y + p[2] * c.z + p[3] < -r {
+            return false;
+        }
+    }
+    true
 }
 
 fn menu_title(menu: u8) -> &'static str {
@@ -113,13 +177,14 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
     };
     match menu {
         1 => vec![
-            ("FIELD OF VIEW", Slider { get: |c| c.cam.fov_deg, set: |c, v| c.cam.fov_deg = v, min: 50.0, max: 115.0, step: 1.0, def: 76.0, fmt: 2 }),
+            ("FIELD OF VIEW", Slider { get: |c| c.cam.fov_deg, set: |c, v| c.cam.fov_deg = v, min: 50.0, max: 200.0, step: 1.0, def: 86.0, fmt: 2 }),
             ("DISTANCE", Slider { get: |c| c.cam.dist, set: |c, v| c.cam.dist = v, min: 2.5, max: 9.0, step: 0.1, def: 4.9, fmt: 1 }),
-            ("HEIGHT", Slider { get: |c| c.cam.height, set: |c, v| c.cam.height = v, min: 0.4, max: 3.2, step: 0.05, def: 1.35, fmt: 1 }),
-            ("ANGLE", Slider { get: |c| c.cam.angle_deg, set: |c, v| c.cam.angle_deg = v, min: -15.0, max: 15.0, step: 1.0, def: -3.0, fmt: 2 }),
-            ("STIFFNESS", pct(|c| c.cam.stiffness, |c, v| c.cam.stiffness = v, 0.25, 2.2)),
+            ("HEIGHT", Slider { get: |c| c.cam.height, set: |c, v| c.cam.height = v, min: 0.4, max: 24.0, step: 0.05, def: 1.21, fmt: 1 }),
+            ("ANGLE", Slider { get: |c| c.cam.angle_deg, set: |c, v| c.cam.angle_deg = v, min: -25.0, max: 25.0, step: 1.0, def: 20.0, fmt: 2 }),
+            ("STIFFNESS", pct(|c| c.cam.stiffness, |c, v| c.cam.stiffness = v, 0.15, 3.2)),
             ("SHAKE", pct(|c| c.cam.shake, |c, v| c.cam.shake = v, 0.0, 1.5)),
             ("GRAVITY CAMERA (TUBES)", pct(|c| c.cam.grav_follow, |c, v| c.cam.grav_follow = v, 0.0, 1.0)),
+            ("MOVING PLATFORM BEND", Slider { get: |c| c.cam.plat_bend, set: |c, v| c.cam.plat_bend = v, min: 0.0, max: 1.0, step: 0.05, def: 0.55, fmt: 0 }),
             ("BACK", Back),
         ],
         2 => vec![
@@ -129,12 +194,12 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("GRAVITY", pct(|c| c.arena.gravity, |c, v| c.arena.gravity = v, 0.0, 2.6)),
             ("ARENA BOUNCINESS", pct(|c| c.arena.bounce, |c, v| c.arena.bounce = v, 0.2, 2.0)),
             ("ARENA FRICTION", pct(|c| c.arena.friction, |c, v| c.arena.friction = v, 0.1, 2.5)),
-            ("WORLD SIZE (REBUILDS)", pct(|c| c.arena.scale, |c, v| c.arena.scale = v, 0.55, 1.6)),
+            ("WORLD SIZE (REBUILDS)", pct(|c| c.arena.scale, |c, v| c.arena.scale = v, 0.55, 10.6)),
             ("BALL", Header),
-            ("BALL SIZE", pct(|c| c.ball.size, |c, v| c.ball.size = v, 0.35, 3.0)),
-            ("BALL BOUNCINESS", pct(|c| c.ball.bounce, |c, v| c.ball.bounce = v, 0.2, 2.0)),
+            ("BALL SIZE", pct(|c| c.ball.size, |c, v| c.ball.size = v, 0.35, 30.0)),
+            ("BALL BOUNCINESS", pct(|c| c.ball.bounce, |c, v| c.ball.bounce = v, 0.2, 3.0)),
             ("BALL FRICTION", pct(|c| c.ball.friction, |c, v| c.ball.friction = v, 0.0, 2.5)),
-            ("BALL WEIGHT", pct(|c| c.ball.weight, |c, v| c.ball.weight = v, 0.25, 3.0)),
+            ("BALL WEIGHT", pct(|c| c.ball.weight, |c, v| c.ball.weight = v, 0.25, 6.0)),
             ("BACK", Back),
         ],
         3 => vec![
@@ -143,8 +208,8 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("CAR SIZE", pct(|c| c.car.size, |c, v| c.car.size = v, 0.55, 2.0)),
             ("TIRE GRIP", pct(|c| c.car.grip, |c, v| c.car.grip = v, 0.3, 2.5)),
             ("POWER", Header),
-            ("TOP SPEED", pct(|c| c.car.top_speed, |c, v| c.car.top_speed = v, 0.5, 1.9)),
-            ("ACCELERATION", pct(|c| c.car.accel, |c, v| c.car.accel = v, 0.4, 2.6)),
+            ("TOP SPEED", pct(|c| c.car.top_speed, |c, v| c.car.top_speed = v, 0.5, 10.0)),
+            ("ACCELERATION", pct(|c| c.car.accel, |c, v| c.car.accel = v, 0.4, 6.0)),
             ("JUMP STRENGTH", pct(|c| c.car.jump, |c, v| c.car.jump = v, 0.5, 2.2)),
             ("BOOST", Header),
             ("BOOST POWER", pct(|c| c.car.boost, |c, v| c.car.boost = v, 0.4, 2.6)),
@@ -220,6 +285,9 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("BACK", Back),
         ],
         _ => vec![
+            ("GARAGE - SKINS, WHEELS, TRAILS", Garage),
+            ("ACADEMY - LEARN THE TRICKS", Academy),
+            ("TRIALS", Trials),
             ("CONTROLS + KEY BINDINGS", Controls),
             ("GAME MODES", Link(6)),
             ("CAMERA", Link(1)),
@@ -267,7 +335,7 @@ fn row_value(cfg: &Config, row: &Row) -> (String, Option<f32>) {
         }
         Row::Toggle { get, .. } => ((if get(cfg) { "ON" } else { "OFF" }).into(), None),
         Row::Preset => (PRESETS[cfg.preset % PRESETS.len()].into(), None),
-        Row::Link(_) | Row::Controls | Row::GameMode(_) => (String::new(), None),
+        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::GameMode(_) => (String::new(), None),
         Row::CarPick => ("<see below>".into(), None),
         Row::Fullscreen => ("TOGGLE".into(), None),
         Row::Header | Row::Back => (String::new(), None),
@@ -392,6 +460,32 @@ struct Game {
     last_scale: f32,      // render-scale watcher
     tap_drive: (f32, f32), // throttle/steer from the drive-to target
     gyro: gyro::Gyro,
+    /// bounding spheres of the terrain chunks, for culling the ground
+    tchunks: Vec<(Vec3, f32)>,
+    /// the academy lesson in progress, and which have been passed
+    lesson: Option<academy::Session>,
+    passed: academy::Passed,
+    lesson_sel: usize,
+    /// tricks noted since the lesson began (the verifier)
+    lesson_tricks: Vec<replay::Trick>,
+    /// always-on replay buffer, plus the moments worth keeping
+    rec: replay::Recorder,
+    moments: Vec<replay::Moment>,
+    /// playing a replay: (which moment, time into it)
+    watching: Option<(usize, f32)>,
+    /// where the car last hit something, in its own frame, and how long ago
+    last_hit: (Vec3, f32),
+    /// the garage: skin, wheels, trail, goal explosion
+    look: custom::Loadout,
+    look_sel: usize,
+    /// the trial being attempted, if any
+    trial: Option<trials::Run>,
+    /// best times, and the ghost of the best run for the current trial
+    bests: trials::Bests,
+    ghost: Vec<(Vec3, Quat)>,
+    trial_sel: usize,
+    /// distance travelled through portals this run (a trial metric)
+    portal_m: f32,
     style: style::Analyzer,
     // touch menu gesture state: where the finger went down, which row it
     // grabbed, whether it has moved far enough to count as a drag
@@ -421,6 +515,11 @@ struct Game {
     time: f32,
     acc: f32,
     fps: f32,
+    /// present-rate accounting: window, last counts, and drops in that window
+    fps_win: f32,
+    fps_presented: u64,
+    fps_dropped: u64,
+    frame_drops: u32,
     // session stats
     rings: u64,
     car_rings: u64,
@@ -573,6 +672,7 @@ fn bake_rcells(world: &world::World) -> Vec<u32> {
             world::Anim::Slide { shape, amp, .. } => travel[shape] = amp + 6.0,
             world::Anim::Door { shape, amp, .. } => travel[shape] = amp + 4.0,
             world::Anim::Spin { shape, scale, .. } => travel[shape] = scale.max_element() + 4.0,
+            world::Anim::Swing { shape, len, amp, .. } => travel[shape] = len * amp.sin().abs() + 6.0,
         }
     }
     let span = world::TG_HALF * 2.0;
@@ -589,8 +689,8 @@ fn bake_rcells(world: &world::World) -> Vec<u32> {
             cand.clear();
             let mut si = 0u32;
             for (wi, sh) in world.shapes.iter().enumerate() {
-                if sh.cut {
-                    continue;
+                if sh.cut || world.is_mover(wi) {
+                    continue; // movers live in the dynamic suffix instead
                 }
                 let bound = match sh.sdf {
                     world::Sdf::None => 0.0,
@@ -633,6 +733,27 @@ fn bake_heightmap(gpu: &render::Gpu, seed: u64, style: &world::MapStyle) {
         }
     }
     gpu.set_heightmap(&data);
+}
+
+/// Rebuild every terrain chunk and hand back their bounding spheres.
+fn terrain_chunks(gpu: &mut render::Gpu, w: &world::World) -> Vec<(Vec3, f32)> {
+    let nc = world::TERRAIN_CHUNKS;
+    let n = (world::TG_N - 1) as u32;
+    let per = n / nc;
+    let h = |x: f32, z: f32| w.ground_h(x, z);
+    let mut bounds = Vec::with_capacity((nc * nc) as usize);
+    for cj in 0..nc {
+        for ci in 0..nc {
+            let i0 = ci * per;
+            let i1 = if ci + 1 == nc { n } else { (ci + 1) * per };
+            let j0 = cj * per;
+            let j1 = if cj + 1 == nc { n } else { (cj + 1) * per };
+            let (m, c, r) = meshgen::terrain_chunk(world::TG_HALF, n, i0, i1, j0, j1, &h);
+            gpu.replace_mesh(world::M_TERRAIN_0 + (cj * nc + ci) as usize, &m);
+            bounds.push((c, r));
+        }
+    }
+    bounds
 }
 
 fn terrain_mesh(w: &world::World) -> meshgen::MeshData {
@@ -711,15 +832,27 @@ fn main() {
         gpu.add_mesh(&meshgen::capsule(world::CAP_TALL_HH, 8, 20)),
         gpu.add_mesh(&meshgen::pad_disc(28)),
         gpu.add_mesh(&meshgen::terrain(world::TG_HALF, 2, |_, _| 0.0)), // real one lands post-generate
-        gpu.add_mesh(&meshgen::tube(28)),
+        gpu.add_mesh(&meshgen::tube(40)),
         gpu.add_mesh(&meshgen::tube(10)), // M_SHELL_LO: far-field tube
-        gpu.add_mesh(&meshgen::tube_open(28)), // M_SHELL_OPEN: no cap rings
-        gpu.add_mesh(&meshgen::tube_open(10)), // M_SHELL_OPEN_LO
+        gpu.add_mesh(&meshgen::tube_open(40)), // M_SHELL_OPEN: no cap rings
+        gpu.add_mesh(&meshgen::tube_open(18)), // M_SHELL_OPEN_LO
         gpu.add_mesh(&meshgen::torus_tube(64, 20)), // M_TORUS_TUBE: seamless loop
         gpu.add_mesh(&meshgen::ring_deck(72)), // M_RING_DECK: drivable ring
         gpu.add_mesh(&meshgen::hex_prism()),   // M_HEX: dropshot tiles
-    ];
+            gpu.add_mesh(&meshgen::sphere(10, 16)),  // M_SPHERE_LO
+        gpu.add_mesh(&meshgen::capsule(world::CAP_TALL_HH, 5, 10)), // M_CAP_TALL_LO
+];
     assert_eq!(ids[world::M_TERRAIN], world::M_TERRAIN);
+    // the garage's rim styles, one mesh each
+    for (_, spokes, dish) in custom::WHEELS.iter() {
+        gpu.add_mesh(&meshgen::rim(*spokes, *dish, 24));
+    }
+    gpu.add_mesh(&meshgen::tube_rim(40)); // M_TUBE_RIM
+    // the ground, split into cullable chunks (placeholders until generate)
+    let nc = world::TERRAIN_CHUNKS;
+    for _ in 0..(nc * nc) {
+        gpu.add_mesh(&meshgen::MeshData::new());
+    }
     bake_heightmap(&gpu, seed, style0);
 
     // ---- models -----------------------------------------------------------
@@ -739,11 +872,95 @@ fn main() {
     let longboy = procars::longboy(&mut gpu);
     let cube = procars::cube(&mut gpu);
     let shark = procars::shark(&mut gpu);
+    let volt = procars::volt(&mut gpu);
+    let axion = procars::axion(&mut gpu);
+    let hauler = procars::hauler(&mut gpu);
+    let pulse = procars::pulse(&mut gpu);
+    let tram = procars::tram(&mut gpu);
+    let vipera = procars::vipera(&mut gpu);
+    let aegis = procars::aegis(&mut gpu);
+    // assembled from mined part layouts (a tank, a racer, a mech, a rocket, a jeep)
+    let rollout = partcars::rollout(&mut gpu);
+    let cryofin = partcars::cryofin(&mut gpu);
+    let tl4 = partcars::tl4(&mut gpu);
+    let spearhead = partcars::spearhead(&mut gpu);
+    let outback = partcars::outback(&mut gpu);
+    // ---- HOVERCARS ----
+    // Six of them, and the numbers are the design: ride height, cushion
+    // stiffness, how much sideways motion they hold, and the reach and force
+    // of the repulsor field. A stiff, low, tight-fielded machine darts and
+    // pokes; a soft, high, wide-fielded one wallows and shepherds.
+    let hover_defs: [(&str, f32, physics::Hover); 6] = [
+        // BRUTIS: a hover tank. Heavy, slow to settle, enormous soft field —
+        // it does not shoot so much as lean on the ball.
+        ("brutis", 1.36, physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+        // AKIMBO: sleek and stiff. Almost no lateral hold, so it slides like
+        // a puck and has to be flown rather than driven.
+        ("akimbo", 1.28, physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }),
+        // MATRIS: the balanced one, and the place to start.
+        ("matris", 1.30, physics::Hover { ride: 0.52, stiff: 44.0, hold: 0.20, field_r: 3.2, field_k: 26.0 }),
+        // VECTORZOID: shielded — the strongest field in the game, at the
+        // cost of a soft cushion that pitches under its own thrust.
+        ("vectorzoid", 1.30, physics::Hover { ride: 0.58, stiff: 34.0, hold: 0.16, field_r: 4.0, field_k: 36.0 }),
+        // TEMPEST: a hovertank. Rides high enough to clear things, and holds
+        // enough to actually turn.
+        ("tempest", 1.40, physics::Hover { ride: 0.72, stiff: 36.0, hold: 0.26, field_r: 3.8, field_k: 24.0 }),
+        // CONTINGENCY: motorcycle-sized. Stiff, low, and a lance of a field —
+        // it pokes the ball rather than pushing it.
+        ("contingency", 1.10, physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+    ];
+    let hover_dir = dir.join("hover");
+    let mut hovercars: Vec<model::Model> = Vec::new();
+    for (name, len, h) in hover_defs.iter() {
+        let mut m = model::load(&hover_dir.join(name), &mut gpu, *len);
+        m.hover = Some(*h);
+        m.drive = model::Drive::Electric; // nothing here burns fuel
+        hovercars.push(m);
+    }
+    // imported bodies (single-file .glb, geometry and materials inline)
+    let cars_dir = dir.join("cars");
+    let backfire = model::load(&cars_dir.join("backfire"), &mut gpu, 1.28);
+    let breakout = model::load(&cars_dir.join("breakout"), &mut gpu, 1.30);
+    let assael = model::load(&cars_dir.join("assael"), &mut gpu, 1.34);
+    let guardian = model::load(&cars_dir.join("guardian"), &mut gpu, 1.30); // orientation is detected now
+    let orion = model::load(&cars_dir.join("orion"), &mut gpu, 1.32);
+    let vulcan = model::load(&cars_dir.join("vulcan"), &mut gpu, 1.30);
+    let xdevil = model::load(&cars_dir.join("xdevil"), &mut gpu, 1.32);
     let mut cars = CarModels {
-        models: vec![octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark],
-        names: vec!["Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark"],
-        active: sv.car.min(8),
+        models: vec![
+            octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark,
+            volt, axion, hauler, pulse, tram, vipera, aegis,
+            backfire, breakout, assael, guardian, orion, vulcan, xdevil,
+            rollout, cryofin, tl4, spearhead, outback,
+        ],
+        names: vec![
+            "Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark",
+            "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV", "Vipera", "Aegis",
+            "Backfire", "Breakout", "Assael", "Guardian", "Orion", "Vulcan", "X-Devil",
+            "Rollout", "Cryofin", "TL-4", "Spearhead", "Outback",
+        ],
+        active: 0,
     };
+    for (i, m) in hovercars.into_iter().enumerate() {
+        cars.models.push(m);
+        cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency"][i]);
+    }
+    // EVERY car gets an electric variant. Rather than model them twice, the
+    // petrol body is converted: light bars, blanked grille, battery sills and
+    // an ion thruster, plus the electric torque curve.
+    {
+        let n = cars.models.len();
+        for i in 0..n {
+            if cars.models[i].drive == model::Drive::Electric {
+                continue; // already electric
+            }
+            let accent = [0.30, 0.82, 1.0, 1.0];
+            let ev = procars::electrify(&mut gpu, &cars.models[i], accent);
+            cars.models.push(ev);
+            cars.names.push(Box::leak(format!("{} EV", cars.names[i]).into_boxed_str()));
+        }
+        cars.active = sv.car.min(cars.models.len() - 1);
+    }
     gpu.set_car_sdfs(&bake_car_sdfs(&mut cars.models));
     let cars = cars;
 
@@ -751,7 +968,8 @@ fn main() {
     let mut car = Car::new();
     apply_car_dims(&mut car, &cars.models[cars.active], cfg.car.size);
     let world = World::generate(seed, style0, cars.models[cars.active].half_h, cfg.arena.scale);
-    gpu.replace_mesh(world::M_TERRAIN, &terrain_mesh(&world));
+    gpu.replace_mesh(world::M_TERRAIN, &meshgen::MeshData::new()); // chunks draw it now
+    let tchunks = terrain_chunks(&mut gpu, &world);
     gpu.set_rcells(&bake_rcells(&world));
     car.reset(&world);
     let mut ball = Ball::new();
@@ -765,6 +983,9 @@ fn main() {
     let vs0 = cfg.video.vsync;
     let rs0 = cfg.video.render_scale;
     let gyro_on0 = cfg.gyro.on;
+    let trials_bests0 = trials::Bests::decode(&sv.trials);
+    let look0 = custom::Loadout::decode(&sv.look);
+    let academy_passed0 = academy::Passed::decode(&sv.academy);
     let mut game = Game {
         gpu,
         world,
@@ -802,6 +1023,22 @@ fn main() {
         last_scale: rs0,
         tap_drive: (0.0, 0.0),
         gyro: gyro::Gyro::new(gyro_on0),
+        tchunks,
+        lesson: None,
+        passed: academy_passed0,
+        lesson_sel: 0,
+        lesson_tricks: Vec::new(),
+        rec: replay::Recorder::default(),
+        moments: Vec::new(),
+        watching: None,
+        last_hit: (Vec3::ZERO, 9.0),
+        look: look0,
+        look_sel: 0,
+        trial: None,
+        bests: trials_bests0,
+        ghost: Vec::new(),
+        trial_sel: 0,
+        portal_m: 0.0,
         style: style::Analyzer::new(),
         mscroll: 0.0,
         mfling: 0.0,
@@ -828,6 +1065,10 @@ fn main() {
         time: 0.0,
         acc: 0.0,
         fps: 60.0,
+        fps_win: 0.0,
+        fps_presented: 0,
+        fps_dropped: 0,
+        frame_drops: 0,
         rings: 0,
         car_rings: 0,
         combo: 0,
@@ -971,6 +1212,8 @@ fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.half_h = (m.half_h * size).max(0.10);
     car.half_w = (m.half_w * size).max(0.12);
     car.wheel_r = (m.wheel_r * size).max(0.05);
+    car.drive = m.drive;
+    car.hover = m.hover;
 }
 
 impl Game {
@@ -1004,7 +1247,7 @@ impl Game {
         let style = world::style(self.save.map);
         self.world = World::generate(seed, style, self.cars.models[self.cars.active].half_h, self.cfg.arena.scale);
         self.applied_scale = self.cfg.arena.scale;
-        self.gpu.replace_mesh(world::M_TERRAIN, &terrain_mesh(&self.world));
+        self.tchunks = terrain_chunks(&mut self.gpu, &self.world);
         self.gpu.set_rcells(&bake_rcells(&self.world));
         bake_heightmap(&self.gpu, seed, style);
         let dims_i = self.cars.active;
@@ -1186,6 +1429,50 @@ impl Game {
         let esc = Key::Named(NamedKey::Escape);
         let enter = Key::Named(NamedKey::Enter);
         match self.mode {
+            Mode::Garage { .. } => {
+                if let Some(i) = self.hover_row() {
+                    self.mode = Mode::Garage { sel: i };
+                    self.look_sel = i;
+                    // left half steps back, right half steps forward: a list
+                    // whose rows cycle needs a direction, and a click has one
+                    let fwd = self.cursor.0 >= 0.0;
+                    let n = custom::slots()[i].1;
+                    if i == 0 {
+                        let c = self.look.matches_collection().unwrap_or(0);
+                        let m = custom::COLLECTIONS.len();
+                        self.look.set_collection(if fwd { (c + 1) % m } else { (c + m - 1) % m });
+                    } else {
+                        let cur = match i {
+                            1 => &mut self.look.skin,
+                            2 => &mut self.look.paint,
+                            3 => &mut self.look.rig,
+                            4 => &mut self.look.wheels,
+                            5 => &mut self.look.trail,
+                            _ => &mut self.look.explosion,
+                        };
+                        *cur = if fwd { (*cur + 1) % n } else { (*cur + n - 1) % n };
+                    }
+                    self.save.look = self.look.encode();
+                }
+            }
+            Mode::Academy { sel } => {
+                if let Some(i) = self.hover_row() {
+                    if i == sel {
+                        self.start_lesson(i);
+                    } else {
+                        self.mode = Mode::Academy { sel: i };
+                    }
+                }
+            }
+            Mode::Trials { sel } => {
+                if let Some(i) = self.hover_row() {
+                    if i == sel {
+                        self.start_trial(i);
+                    } else {
+                        self.mode = Mode::Trials { sel: i };
+                    }
+                }
+            }
             Mode::Play => {
                 if let Some(a) = self.action_for_mouse(b) {
                     self.one_shot(a);
@@ -1457,6 +1744,164 @@ impl Game {
         };
     }
 
+    /// Set the board for a lesson: the car here, the ball there and moving,
+    /// so the trick is possible on the first attempt rather than needing a
+    /// lucky bounce.
+    fn arm_lesson(&mut self) {
+        let Some(sess) = self.lesson.as_ref() else { return };
+        let st = sess.lesson().setup;
+        self.car.reset(&self.world);
+        if st.car_up > 0.0 {
+            self.car.pos += Vec3::Y * st.car_up;
+            self.car.vel = Vec3::ZERO;
+        }
+        let f = self.car.forward();
+        self.ball.pos = self.car.pos + f * st.ahead + Vec3::Y * (st.up + self.ball.r);
+        self.ball.vel = self.car.rot * st.vel;
+        self.ball.ang = Vec3::ZERO;
+        self.ball.prev = self.ball.pos;
+        self.combo = 0;
+        self.air_t = 0.0;
+        self.lesson_tricks.clear();
+    }
+
+    fn start_lesson(&mut self, i: usize) {
+        let l = &academy::LESSONS[i.min(academy::LESSONS.len() - 1)];
+        if self.save.map != l.map {
+            self.load_map(l.map, self.save.seed);
+        }
+        self.lesson = Some(academy::Session::new(i));
+        self.lesson_sel = i;
+        self.arm_lesson();
+        self.mode = Mode::Play;
+        self.toastf(&format!("{} - {}", l.name, l.hint));
+    }
+
+    /// Watch the lesson: progress comes from the same detectors the replays
+    /// use, so passing one means the game genuinely saw the trick.
+    fn tick_lesson(&mut self, dt: f32) {
+        let Some(mut sess) = self.lesson.take() else { return };
+        sess.t += dt;
+        let l = sess.lesson();
+        let hit = matches!(l.skill, academy::Skill::Do(t) if self.lesson_tricks.contains(&t));
+        let gy = self.world.ground_h(self.car.pos.x, self.car.pos.z);
+        let p = academy::progress(
+            l.skill,
+            self.ball.vel.length(),
+            self.car.pos.y - gy,
+            self.combo,
+            hit,
+        );
+        sess.best = sess.best.max(p);
+        if p >= 1.0 {
+            let first = !self.passed.has(sess.idx);
+            self.passed.set(sess.idx);
+            self.save.academy = self.passed.encode();
+            self.toastf(&if first {
+                format!("{} - PASSED", l.name)
+            } else {
+                format!("{} - again, cleanly", l.name)
+            });
+            // the moment is its own demonstration
+            let (title, score) = self.rec.moment(6.0);
+            let frames = self.rec.frames();
+            if frames.len() > 20 && score > 0 {
+                self.moments.push(replay::Moment { title, score, frames });
+                self.moments.sort_by(|a, b| b.score.cmp(&a.score));
+                self.moments.truncate(6);
+                self.watching = Some((0, 0.0));
+            }
+            self.lesson = None;
+            return;
+        }
+        // the coach speaks once, when you have clearly tried and missed
+        if !sess.nudged && sess.t > 12.0 && sess.best > 0.15 {
+            sess.nudged = true;
+            self.toastf(l.nudge);
+        }
+        // re-arm when the ball has settled and nothing is happening
+        let ball_rest = self.ball.vel.length() < 1.2 && self.world.sdf(self.ball.pos) < self.ball.r + 0.4;
+        if ball_rest && self.car.on_ground {
+            sess.idle += dt;
+        } else {
+            sess.idle = 0.0;
+        }
+        if sess.idle > 2.5 || sess.t > l.limit {
+            sess.idle = 0.0;
+            if sess.t > l.limit {
+                sess.t = 0.0;
+                sess.nudged = false;
+            }
+            self.lesson = Some(sess);
+            self.arm_lesson();
+            return;
+        }
+        self.lesson = Some(sess);
+    }
+
+    /// Load a trial's map and start the clock. The ghost of your best run
+    /// on this trial (if any) rides along.
+    fn start_trial(&mut self, i: usize) {
+        let t = &trials::TRIALS[i.min(trials::TRIALS.len() - 1)];
+        if self.save.map != t.map {
+            self.load_map(t.map, self.save.seed);
+        }
+        self.car.reset(&self.world);
+        self.ball.reset_in_front(&self.car);
+        self.scores = [0, 0];
+        self.portal_m = 0.0;
+        self.air_t = 0.0;
+        self.trial = Some(trials::Run::new(i));
+        self.trial_sel = i;
+        self.mode = Mode::Play;
+        self.toastf(&format!("{} - {}", t.name, t.blurb));
+    }
+
+    /// One frame of trial progress, fed entirely from live physics state.
+    fn tick_trial(&mut self, dt: f32) {
+        let Some(mut run) = self.trial.take() else { return };
+        let gy = self.world.ground_h(self.car.pos.x, self.car.pos.z);
+        let in_tube = self.world.route_locate(self.car.pos).is_some();
+        let on_plat = self
+            .world
+            .platform_vel(self.car.pos - Vec3::Y * (self.car.half_h + 0.1), 1.2)
+            .map(|v| v.length() > 0.5)
+            .unwrap_or(false);
+        let done = run.tick(
+            dt,
+            self.car.pos,
+            self.car.rot,
+            self.car.vel.length(),
+            gy,
+            self.scores[0],
+            self.air_t,
+            self.combo,
+            in_tube,
+            on_plat,
+            std::mem::take(&mut self.portal_m),
+        );
+        if done {
+            let t = run.t;
+            let idx = run.idx;
+            let rec = self.bests.record(idx, t);
+            self.ghost = std::mem::take(&mut run.ghost);
+            self.save.trials = self.bests.encode();
+            self.toastf(&if rec {
+                format!("{} COMPLETE - {:.1}s  NEW BEST", trials::TRIALS[idx].name, t)
+            } else {
+                format!("{} COMPLETE - {:.1}s (best {:.1}s)", trials::TRIALS[idx].name, t, self.bests.get(idx))
+            });
+            self.trial = None;
+            return;
+        }
+        if run.failed {
+            self.toastf(&format!("{} - OUT OF TIME", run.trial().name));
+            self.trial = None;
+            return;
+        }
+        self.trial = Some(run);
+    }
+
     fn hover_row(&self) -> Option<usize> {
         let y = self.cursor.1;
         match self.mode {
@@ -1480,6 +1925,21 @@ impl Game {
                 hud::hit_row_scrolled(hud::MAPS_TOP, hud::maps_row_h(), n, vis, start, y)
             }
             Mode::Online { .. } => hud::hit_row(hud::ONL_TOP, hud::ONL_ROW_H, hud::ONLINE_ROWS, y),
+            // These three had no arm at all, so `hover_row` returned None and
+            // every click on them did nothing.
+            Mode::Trials { .. } => {
+                let n = trials::TRIALS.len();
+                let vis = hud::vis_rows(hud::TRIALS_ROW_H, hud::LIST_TOP, hud::TW_BOTTOM);
+                let start = self.mscroll.max(0.0) as usize;
+                hud::hit_row_scrolled(hud::LIST_TOP, hud::TRIALS_ROW_H, n, vis, start, y)
+            }
+            Mode::Academy { .. } => {
+                let n = academy::LESSONS.len();
+                let vis = hud::vis_rows(hud::ACADEMY_ROW_H, hud::LIST_TOP, hud::TW_BOTTOM);
+                let start = self.mscroll.max(0.0) as usize;
+                hud::hit_row_scrolled(hud::LIST_TOP, hud::ACADEMY_ROW_H, n, vis, start, y)
+            }
+            Mode::Garage { .. } => hud::hit_row(hud::GARAGE_TOP, hud::GARAGE_ROW_H, custom::slots().len(), y),
             _ => None,
         }
     }
@@ -1505,7 +1965,7 @@ impl Game {
             Row::Preset | Row::CarPick => {
                 self.tweaks_key(&Key::Named(NamedKey::ArrowRight), menu, i, win);
             }
-            Row::Link(_) | Row::Controls => {
+            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage => {
                 self.mscroll = 0.0;
                 self.mfling = 0.0;
                 self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
@@ -1548,6 +2008,75 @@ impl Game {
             _ => "",
         };
         match self.mode {
+            Mode::Garage { sel } => {
+                let slots = custom::slots();
+                let n = slots.len();
+                let cnt = slots[sel.min(n - 1)].1;
+                // the collection row writes every other slot at once
+                if sel == 0 {
+                    let n = custom::COLLECTIONS.len();
+                    let curc = self.look.matches_collection().unwrap_or(0);
+                    match (&key, ch) {
+                        (Key::Named(NamedKey::ArrowLeft), _) | (_, "a") => self.look.set_collection((curc + n - 1) % n),
+                        (Key::Named(NamedKey::ArrowRight), _) | (_, "d") => self.look.set_collection((curc + 1) % n),
+                        _ => {}
+                    }
+                }
+                let cur = match sel {
+                    0 => &mut self.look.skin, // handled above; keeps the borrow simple
+                    1 => &mut self.look.skin,
+                    2 => &mut self.look.paint,
+                    3 => &mut self.look.rig,
+                    4 => &mut self.look.wheels,
+                    5 => &mut self.look.trail,
+                    _ => &mut self.look.explosion,
+                };
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowLeft), _) | (_, "a") if sel > 0 => *cur = (*cur + cnt - 1) % cnt,
+                    (Key::Named(NamedKey::ArrowRight), _) | (_, "d") if sel > 0 => *cur = (*cur + 1) % cnt,
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Garage { sel: (sel + n - 1) % n }
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Garage { sel: (sel + 1) % n }
+                    }
+                    _ => {}
+                }
+                self.save.look = self.look.encode();
+            }
+            Mode::Academy { sel } => {
+                let n = academy::LESSONS.len();
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Academy { sel: (sel + n - 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Academy { sel: (sel + 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::Enter), _) => self.start_lesson(sel),
+                    _ => {}
+                }
+            }
+            Mode::Trials { sel } => {
+                let n = trials::TRIALS.len();
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Trials { sel: (sel + n - 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Trials { sel: (sel + 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::Enter), _) => self.start_trial(sel),
+                    _ => {}
+                }
+            }
             Mode::Splash => match (&key, ch) {
                 (Key::Named(NamedKey::Escape), _) => {
                     self.net.leave();
@@ -1579,11 +2108,22 @@ impl Game {
             Mode::Play => {
                 match &key {
                     Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Tab) => {
+                        if self.watching.is_some() {
+                            self.watching = None; // skip the replay
+                            return;
+                        }
                         self.mode = Mode::Pause;
                         self.persist(); // checkpoint whenever the player pauses
                         return;
                     }
                     _ => {}
+                }
+                // R: watch the best moment you have (again)
+                if ch == "r" && !self.moments.is_empty() {
+                    self.watching = Some((0, 0.0));
+                    let m = &self.moments[0];
+                    self.toastf(&format!("REPLAY - {}", m.title));
+                    return;
                 }
                 if let Some(a) = self.action_for_key(&key) {
                     self.one_shot(a);
@@ -1767,6 +2307,18 @@ impl Game {
                     self.binds_to_settings = true;
                     self.mode = Mode::Binds { sel: 0, capturing: false };
                 }
+            }
+            Row::Trials => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Trials { sel: self.trial_sel };
+            }
+            Row::Academy => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Academy { sel: self.lesson_sel };
+            }
+            Row::Garage => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Garage { sel: self.look_sel };
             }
             Row::Fullscreen => {
                 if matches!(key, Key::Named(NamedKey::Enter)) || dir != 0 {
@@ -1980,10 +2532,17 @@ impl Game {
         let roll_extra = -steer_axis * roll_mix;
         // ---- on-screen controls fold in as another input source ----
         let (mut t_thr, mut t_steer, mut t_boost, mut t_jump) = (0.0f32, 0.0f32, false, false);
+        let mut t_air: Option<glam::Vec2> = None;
         if self.tpad.enabled {
             let sv = self.tpad.stick_vec();
             t_thr = sv.y;
             t_steer = sv.x;
+            // AIR ROTATION: off the ground the same thumb flies the car —
+            // push/pull pitches, left/right rolls (or yaws with the slide
+            // modifier), exactly like a stick in the air on a pad
+            if !self.car.on_ground {
+                t_air = Some(sv);
+            }
             t_boost = self.tpad.boost_down();
             t_jump = self.tpad.jump_down();
             if self.tpad.has_target() {
@@ -2004,9 +2563,9 @@ impl Game {
         Controls {
             throttle: (fwd - rev + ps.throttle + t_thr).clamp(-1.0, 1.0),
             steer,
-            pitch: (rev - fwd - ps.stick_y).clamp(-1.0, 1.0),
-            yaw: (-yaw_src).clamp(-1.0, 1.0),
-            roll: (rl - rr + roll_extra).clamp(-1.0, 1.0),
+            pitch: (rev - fwd - ps.stick_y + t_air.map(|v| -v.y).unwrap_or(0.0)).clamp(-1.0, 1.0),
+            yaw: ((-yaw_src).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * roll_mix).clamp(-1.0, 1.0),
+            roll: ((rl - rr + roll_extra).clamp(-1.0, 1.0) + t_air.map(|v| v.x).unwrap_or(0.0) * (1.0 - roll_mix)).clamp(-1.0, 1.0),
             boost: self.action_down(Action::Boost) || t_boost,
             jump_held: self.action_down(Action::Jump) || t_jump,
             jump_pressed: false,
@@ -2086,8 +2645,25 @@ impl Game {
                 }
             }
         }
-        if dt > 1e-5 {
-            self.fps += (1.0 / dt - self.fps) * 0.06;
+        // FPS MEANS FRAMES THAT REACHED THE SCREEN.
+        //
+        // This used to smooth 1/dt of the redraw callback, which counts loop
+        // iterations — including every iteration that acquired nothing and
+        // drew nothing. With vsync on a 240 Hz panel it happily reported 600.
+        // Counting real presents over a wall-clock window cannot do that:
+        // the number is now bounded by the display, and if it reads 30 while
+        // the loop spins, that is the truth rather than a hidden failure.
+        {
+            let (pres, recfg, drop) = self.gpu.present_stats();
+            self.fps_win += dt;
+            if self.fps_win >= 0.5 {
+                let shown = (pres - self.fps_presented) as f32 / self.fps_win;
+                self.fps = shown;
+                self.frame_drops = (drop + recfg - self.fps_dropped) as u32;
+                self.fps_presented = pres;
+                self.fps_dropped = drop + recfg;
+                self.fps_win = 0.0;
+            }
         }
         self.toast_t = (self.toast_t - dt).max(0.0);
         if self.toast_t <= 0.0 {
@@ -2148,6 +2724,11 @@ impl Game {
             // slight temporal buildup into turns and rolls: ~55 ms attack
             // (x INPUT EASE) with a whisper of center-softening — the
             // detent. Player only; bots keep raw controls.
+            // the on-screen MENU button: a phone has no Escape key
+            if self.tpad.enabled && self.tpad.menu_tapped() {
+                self.mode = Mode::Pause;
+                self.mscroll = 0.0;
+            }
             // GYRO DRIVE: device motion folded in beside the sticks
             self.gyro.update(dt, &self.cfg.gyro);
             if self.cfg.gyro.on {
@@ -2280,7 +2861,16 @@ impl Game {
             if boosting {
                 let back = -self.car.forward();
                 let tail = self.car.pos + back * (self.car.half_len + 0.12);
-                self.fx.boost_trail(tail, back, self.car.vel);
+                // the garage's trail wins; failing that, an electric car
+                // runs an ion thruster and everything else burns fuel
+                let kind = if self.look.trail > 0 {
+                    self.look.trail
+                } else if self.cars.models[self.cars.active].drive == model::Drive::Electric {
+                    1
+                } else {
+                    0
+                };
+                self.fx.trail_of(kind, tail, back, self.car.vel);
             }
 
             // ---- adaptive-audio sense: measure, then hand to the mixer ----
@@ -2387,16 +2977,39 @@ impl Game {
         let rc = (rc.0 - rc.1 * Vec3::Y * (self.car.susp * 0.045), rc.1);
         let (rts, rt_ids) = self.build_rt_shapes(rc, rb);
         self.gpu.set_rt_shapes(&rts);
-        let mut objs = self.build_scene(&rt_ids, rc, rb);
-        self.fx.draw(&mut objs);
-
         let aspect = self.gpu.aspect();
         let (vp, ivp) = self.cam.view_proj(&self.cfg.cam, aspect);
+        let planes = frustum_planes(&vp);
+        let mut objs = self.build_scene(&rt_ids, rc, rb, &planes);
+        self.fx.draw(&mut objs);
+        // order the frame: opaque batched by mesh, glass last and back to front
+        let eye = self.cam.pos;
+        let _opaque = render::order_for_draw(&mut objs, [eye.x, eye.y, eye.z]);
+
+        // (view-projection and aspect computed above, before the scene build)
+        
         self.last_ivp = ivp;
 
         let mut ui: Vec<UiVert> = Vec::new();
         self.peer_tags(&mut ui, vp, aspect);
         match self.mode {
+            Mode::Garage { sel } => hud::garage_menu(&mut ui, aspect, sel, &self.look, self.cursor),
+            Mode::Academy { sel } => hud::academy_menu(
+                &mut ui,
+                aspect,
+                sel,
+                &self.passed,
+                self.mscroll.max(0.0) as usize,
+                self.cursor,
+            ),
+            Mode::Trials { sel } => hud::trials_menu(
+                &mut ui,
+                aspect,
+                sel,
+                &self.bests,
+                self.mscroll.max(0.0) as usize,
+                self.cursor,
+            ),
             Mode::Splash => hud::splash(&mut ui, aspect, self.time, self.style().name),
             Mode::Play => {
                 self.draw_hud(&mut ui, aspect);
@@ -2493,6 +3106,18 @@ impl Game {
             ],
             misc: [st.zenith[0], st.zenith[1], st.zenith[2], 0.0],
             rt: [if self.cfg.video.rays { 1.0 } else { 0.0 }, self.cfg.video.quality, rt_ids.static_n as f32, st.wet.max(wx_wet)],
+            pcount: [self.world.portals.len().min(8) as f32, 0.0, 0.0, 0.0],
+            portals: {
+                // up to four portals for the marcher; pairs are adjacent, so
+                // the shader's partner rule (0<->1, 2<->3) matches the map's
+                let mut out = [[0.0f32; 4]; 16];
+                for (i, p) in self.world.portals.iter().take(8).enumerate() {
+                    out[i * 2] = [p.pos.x, p.pos.y, p.pos.z, p.r];
+                    let q = p.rot;
+                    out[i * 2 + 1] = [q.x, q.y, q.z, q.w];
+                }
+                out
+            },
             hmap: [
                 render::HMAP_HALF,
                 render::HMAP_SIZE as f32,
@@ -2585,6 +3210,61 @@ impl Game {
         if ev.jumped {
             self.snd.fire(Sfx::Jump);
         }
+        // the IMPACT skin spreads its rings from here
+        self.last_hit.1 += dt;
+        if let Some(t0) = ev.touches.first() {
+            self.last_hit = (self.car.rot.inverse() * (t0.0 - self.car.pos), 0.0);
+        }
+        // ---- REPLAY: keep the last twelve seconds, and watch for tricks ----
+        {
+            let ground = self.world.sdf(self.car.pos);
+            let ball_air = self.world.sdf(self.ball.pos) > self.ball.r + 0.25;
+            if ev.flip_reset.is_some() {
+                self.rec.note(replay::Trick::FlipReset);
+                self.lesson_tricks.push(replay::Trick::FlipReset);
+            }
+            if ev.pinched {
+                self.rec.note(replay::Trick::Pinch);
+                self.lesson_tricks.push(replay::Trick::Pinch);
+            }
+            if ev.dodged {
+                // landing mid-dodge is a wave dash; anywhere else it is just
+                // a flip — and the academy teaches them in that order
+                let t = if self.car.on_ground { replay::Trick::WaveDash } else { replay::Trick::Flip };
+                self.rec.note(t);
+                self.lesson_tricks.push(t);
+            }
+            if !ev.touches.is_empty() && !self.car.on_ground {
+                self.rec.note(replay::Trick::Aerial);
+                self.lesson_tricks.push(replay::Trick::Aerial);
+                if ball_air {
+                    // a touch on a ball that is already up, while up: that is
+                    // the air dribble, and the air-link timer proves it is a
+                    // continuation rather than a one-off
+                    if self.air_t > 0.6 {
+                        self.rec.note(replay::Trick::AirDribble);
+                        self.lesson_tricks.push(replay::Trick::AirDribble);
+                    }
+                    if self.car.pos.y - self.world.ground_h(self.car.pos.x, self.car.pos.z) > 26.0 {
+                        self.rec.note(replay::Trick::Ceiling);
+                    }
+                    if self.ball.vel.length() > 26.0 {
+                        self.rec.note(replay::Trick::Redirect);
+                    }
+                }
+            }
+            let _ = ground;
+            self.rec.push(
+                dt,
+                replay::Frame {
+                    car: self.car.pos,
+                    car_rot: self.car.rot,
+                    ball: self.ball.pos,
+                    ball_rot: self.ball.rot,
+                    boosting: self.car.boost > 0.02 && self.car.vel.length() > 6.0,
+                },
+            );
+        }
         if ev.dodged {
             self.snd.fire(Sfx::Dodge);
             self.fx.dust(self.car.pos, self.car.up(), 3.0);
@@ -2592,8 +3272,32 @@ impl Game {
         for &(gp, who) in &ev.goals {
             self.cam.add_shake(0.45);
             self.fx.ring_burst(gp, [0.45, 1.0, 0.55, 1.0], true);
+            if who == physics::WHO_PLAYER {
+                self.fx.explosion_of(self.look.explosion, gp);
+            }
             self.fx.pad_sparkle(gp, true);
             if who == physics::WHO_PLAYER {
+                // how far the shot travelled decides a couple of the names
+                if self.car.pos.distance(gp) > 55.0 {
+                    self.rec.note(replay::Trick::LongShot);
+                }
+                let (title, score) = self.rec.moment(6.0);
+                self.toastf(&format!("{title}!"));
+                let frames = self.rec.frames();
+                if frames.len() > 20 {
+                    self.moments.push(replay::Moment { title, score, frames });
+                    // keep the best handful, rarest first
+                    self.moments.sort_by(|a, b| b.score.cmp(&a.score));
+                    self.moments.truncate(6);
+                    // watch it immediately if it was a good one — the whole
+                    // point is the beat after the goal
+                    if let Some(best) = self.moments.iter().position(|m| m.score >= 6) {
+                        if self.trial.is_none() && self.moments[best].score >= 6 {
+                            self.watching = Some((best, 0.0));
+                        }
+                    }
+                }
+                self.rec.clear_log();
                 self.goals += 1;
                 self.save.total_goals += 1;
                 self.combo = self.combo.max(1) + 2; // goals feed the combo hard
@@ -2642,6 +3346,25 @@ impl Game {
         if aerial_touch {
             self.air_link = 1.7;
         }
+        // ---- REPLAY PLAYBACK: the game steps aside and shows you ----
+        if let Some((mi, t)) = self.watching {
+            let t2 = t + dt;
+            let frames_len = self.moments.get(mi).map(|m| replay::length_seconds(&m.frames)).unwrap_or(0.0);
+            if t2 >= frames_len {
+                self.watching = None;
+            } else {
+                self.watching = Some((mi, t2));
+                if let Some(m) = self.moments.get(mi) {
+                    if let Some((eye, focus)) = replay::cinema(&m.frames, t2) {
+                        self.cam.pos = eye;
+                        self.cam.look = focus;
+                        self.cam.up = Vec3::Y;
+                    }
+                }
+            }
+        }
+        self.tick_lesson(dt);
+        self.tick_trial(dt);
         if ball_air && self.air_link > 0.0 {
             self.air_t += dt;
             self.air_link -= dt;
@@ -2699,6 +3422,36 @@ impl Game {
     }
 
     fn draw_hud(&self, ui: &mut Vec<UiVert>, aspect: f32) {
+        // a replay owns the screen while it plays
+        if let Some((mi, t)) = self.watching {
+            if let Some(m) = self.moments.get(mi) {
+                hud::replay_banner(ui, aspect, &m.title, t, replay::length_seconds(&m.frames));
+                return;
+            }
+        }
+        // TRIAL BANNER: what you are attempting, the clock, and a bar that
+        // fills as you get there — plus the target to beat if you have one.
+        if let Some(sess) = self.lesson.as_ref() {
+            let l = sess.lesson();
+            let gy = self.world.ground_h(self.car.pos.x, self.car.pos.z);
+            let hit = matches!(l.skill, academy::Skill::Do(t) if self.lesson_tricks.contains(&t));
+            let p = academy::progress(l.skill, self.ball.vel.length(), self.car.pos.y - gy, self.combo, hit);
+            hud::lesson_banner(ui, aspect, l.name, l.hint, p.max(sess.best), self.passed.has(sess.idx));
+        }
+        if let Some(run) = self.trial.as_ref() {
+            let t = run.trial();
+            let best = self.bests.get(run.idx);
+            hud::trial_banner(
+                ui,
+                aspect,
+                t.name,
+                run.t,
+                t.limit,
+                run.progress(),
+                best,
+                !self.ghost.is_empty(),
+            );
+        }
         let online = if self.net.online() {
             Some((
                 self.net.player_count(),
@@ -2725,6 +3478,7 @@ impl Game {
             air_t: self.air_t,
             best_air: self.save.best_air,
             fps: self.fps,
+            frame_drops: self.frame_drops,
             car_name: self.cars.names[self.cars.active],
             ball_cam: self.cam.ball_cam,
             scores: if matches!(self.game_mode, 1 | 3..=7) { Some((self.scores[0], self.scores[1])) } else { None },
@@ -2835,9 +3589,12 @@ impl Game {
             });
         };
 
-        for s in &self.world.shapes {
+        for (wi, s) in self.world.shapes.iter().enumerate() {
             if s.cut {
                 continue; // CSG cutters carve the SDF; they are not drawn
+            }
+            if self.world.is_mover(wi) {
+                continue; // appended below, after static_n
             }
             // statics come first in STABLE shape order: the baked candidate
             // cells index into this prefix, per-frame culls would shift it
@@ -2886,6 +3643,41 @@ impl Game {
             }
         }
         let static_n = v.len();
+        // ---- MOVERS, as dynamics ----
+        // A platform baked into the static grid reflects wherever it was
+        // when the map loaded, which on CHAMBER is 190 chess parts sitting
+        // in the wrong squares. They go in the dynamic suffix instead, which
+        // is scanned live — capped and distance-sorted, because that scan is
+        // per-fragment and CHAMBER would otherwise put 190 spheres in it.
+        {
+            let mut movers: Vec<(f32, usize)> = self
+                .world
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(wi, sh)| !sh.cut && self.world.is_mover(*wi) && !matches!(sh.sdf, Sdf::None))
+                .map(|(wi, sh)| (sh.pos.distance_squared(rc.0), wi))
+                .filter(|(d2, _)| *d2 < 190.0 * 190.0)
+                .collect();
+            movers.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, wi) in movers.into_iter().take(28) {
+                let s = &self.world.shapes[wi];
+                let em = (s.emissive + s.flash * 1.1).min(1.0);
+                let kb = if s.blend { 16.0 } else { 0.0 };
+                match s.sdf {
+                    Sdf::Sphere { r } => push(&mut v, kb, s.pos, r + 0.1, [r, 0.0, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Torus { big, tube } => push(&mut v, 1.0 + kb, s.pos, big + tube + 0.1, [big, tube, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Capsule { r, half } => push(&mut v, 2.0 + kb, s.pos, r + half + 0.1, [r, half, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::RBox { half, round } => push(&mut v, 3.0 + kb, s.pos, half.length() + 0.1, [half.x, half.y, half.z, round], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Hex { r, h } => push(&mut v, 6.0 + kb, s.pos, (r * r + h * h).sqrt() + 0.1, [r, h, 0.0, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::Shell { r, half, thick } => push(&mut v, 5.0 + kb, s.pos, ((r + thick) * (r + thick) + half * half).sqrt() + 0.1, [r, half, thick, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::TubeTorus { big, tube, thick } => push(&mut v, 9.0 + kb, s.pos, big + tube + thick + 0.1, [big, tube, thick, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::RingDeck { big, wide, half_h } => push(&mut v, 10.0 + kb, s.pos, big + wide + 0.2, [big, wide, half_h, 0.0], s.inv_rot, s.color, em, s.spec),
+                    Sdf::None => {}
+                }
+            }
+        }
+
 
         // live pad orbs, gold and glowing (bob matches build_scene)
         for p in self.world.pads.iter().filter(|p| p.timer <= 0.0) {
@@ -2971,7 +3763,7 @@ impl Game {
         (v, RtIds { ball: ball_id, car: car_id, decor0, remote0, static_n })
     }
 
-    fn build_scene(&self, ids: &RtIds, rc: (Vec3, Quat), rb: (Vec3, Quat)) -> Vec<ObjDraw> {
+    fn build_scene(&self, ids: &RtIds, rc: (Vec3, Quat), rb: (Vec3, Quat), planes: &[[f32; 4]; 6]) -> Vec<ObjDraw> {
         let mut objs: Vec<ObjDraw> = Vec::with_capacity(self.world.shapes.len() + 1024);
 
         let push = |objs: &mut Vec<ObjDraw>,
@@ -2989,24 +3781,36 @@ impl Game {
             objs.push(ObjDraw { mesh, tex, raw });
         };
 
-        // terrain
-        push(
-            &mut objs,
-            world::M_TERRAIN,
-            None,
-            Mat4::IDENTITY,
-            self.style().grass,
-            [1.0, 0.0, 0.04, 0.0],
-        );
+        // terrain, chunk by chunk — the ground is 97k triangles and used to
+        // be a single mesh, so all of it drew every frame regardless of
+        // where you were looking
+        for (ci, (c, r)) in self.tchunks.iter().enumerate() {
+            if !sphere_visible(planes, *c, *r) {
+                continue;
+            }
+            push(
+                &mut objs,
+                world::M_TERRAIN_0 + ci,
+                None,
+                Mat4::IDENTITY,
+                self.style().grass,
+                [1.0, 0.0, 0.04, 0.0],
+            );
+        }
 
         // playful shapes
-        for s in &self.world.shapes {
+        for (si, s) in self.world.shapes.iter().enumerate() {
             if s.cut {
                 continue; // CSG cutters carve the SDF; they are not drawn
             }
             let em = (s.emissive + s.flash * 1.1).min(1.0);
-            // small far shapes don't earn their draw call (monkey run is
-            // 775 instances otherwise, hoops and vines included)
+            // OFF-SCREEN SHAPES COST NOTHING TO SKIP. The renderer had a
+            // distance cull but never a frustum one, so on a big map most of
+            // what it submitted was behind the camera.
+            let bound = shape_bound(&s.sdf).max(2.0);
+            if !sphere_visible(planes, s.pos, bound + 6.0) {
+                continue;
+            }
             let dd2 = s.pos.distance_squared(rc.0);
             if dd2 > 640.0 * 640.0 {
                 continue;
@@ -3028,13 +3832,82 @@ impl Game {
                 }
             }
             // tube LOD: far shells swap to the 10-segment mesh (same SDF)
-            let far = s.pos.distance_squared(rc.0) > 140.0 * 140.0;
-            let mesh = match (s.mesh, far) {
-                (world::M_SHELL, true) => world::M_SHELL_LO,
-                (world::M_SHELL_OPEN, true) => world::M_SHELL_OPEN_LO,
+            // LOD: distant primitives swap to low-poly meshes. Spheres and
+            // capsules are the most-used shapes in the game (foliage, rocks,
+            // pillars, orbs) and the full-fat sphere is ~750 triangles.
+            let d2 = s.pos.distance_squared(rc.0);
+            let far = d2 > 140.0 * 140.0;
+            let vfar = d2 > 90.0 * 90.0;
+            let mesh = match (s.mesh, far, vfar) {
+                (world::M_SHELL, true, _) => world::M_SHELL_LO,
+                (world::M_SHELL_OPEN, true, _) => world::M_SHELL_OPEN_LO,
+                (world::M_SPHERE, _, true) => world::M_SPHERE_LO,
+                (world::M_CAP_TALL, _, true) => world::M_CAP_TALL_LO,
                 _ => s.mesh,
             };
-            push(&mut objs, mesh, None, s.mat, s.color, [0.0, em, s.spec, 0.0]);
+            // params.x flags ROUGH GLASS: tubes and junction rooms get a
+            // frosted, scattering reflection instead of a mirror finish
+            let glassy = matches!(
+                s.mesh,
+                world::M_SHELL | world::M_SHELL_LO | world::M_SHELL_OPEN | world::M_SHELL_OPEN_LO | world::M_TORUS_TUBE
+            );
+            // a portal FACE carries its index, so the shader can march the
+            // world from the far mouth and show what is actually over there
+            let pflag = self
+                .world
+                .portals
+                .iter()
+                .take(8)
+                .position(|p| p.shape == si)
+                .map(|k| 2.0 + k as f32);
+            let px = pflag.unwrap_or(if glassy { 1.0 } else { 0.0 });
+            push(&mut objs, mesh, None, s.mat, s.color, [px, em, s.spec, 0.0]);
+        }
+
+        // ---- REPLAY: draw the recorded car and ball ----
+        if let Some((mi, t)) = self.watching {
+            if let Some(m) = self.moments.get(mi) {
+                if let Some(f) = replay::pose_at(&m.frames, t) {
+                    let cm = &self.cars.models[self.cars.active];
+                    let base = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(self.cfg.car.size),
+                        f.car_rot,
+                        f.car,
+                    );
+                    for p in cm.prims.iter() {
+                        push(&mut objs, p.mesh_id, p.tex_id, base, p.color, [0.0, 0.0, 0.5, 0.0]);
+                    }
+                    let bm = Mat4::from_scale_rotation_translation(
+                        Vec3::splat(self.ball.r),
+                        f.ball_rot,
+                        f.ball,
+                    );
+                    push(&mut objs, world::M_SPHERE, None, bm, [0.93, 0.93, 0.96, 1.0], [0.0, 0.03, 0.55, 0.0]);
+                }
+            }
+        }
+
+        // ---- GHOST: your best run on this trial, racing alongside ----
+        if let (Some(run), false) = (self.trial.as_ref(), self.ghost.is_empty()) {
+            if let Some((gp, gr)) = trials::ghost_at(&self.ghost, run.t) {
+                let m = &self.cars.models[self.cars.active];
+                let base = Mat4::from_scale_rotation_translation(
+                    Vec3::splat(self.cfg.car.size),
+                    gr,
+                    gp,
+                );
+                for p in m.prims.iter() {
+                    let model = base;
+                    push(
+                        &mut objs,
+                        p.mesh_id,
+                        None,
+                        model,
+                        [0.45, 0.85, 1.0, 0.28],
+                        [0.0, 0.35, 0.1, 0.0],
+                    );
+                }
+            }
         }
 
         // ---- rain: instanced streaks around the car (MONKEY RUN) ----
@@ -3108,11 +3981,11 @@ impl Game {
             self.cfg.car.size,
             None,
             true,
-        );
+            self.skin_params(),);
         // remote cars + their boost flames
         for (i, p) in self.net.peers().enumerate() {
             self.push_car(&mut objs, p.car.min(self.cars.models.len() - 1), p.shown, p.rot, p.flip, p.wheel_spin, p.steer_vis,
-                (ids.remote0 + i + 1) as f32, 1.0, None, true);
+                (ids.remote0 + i + 1) as f32, 1.0, None, true, [0.0; 4],);
             if p.boosting {
                 let fwd = p.rot * Vec3::NEG_Z;
                 let tail = p.shown - fwd * (self.cars.models[p.car.min(2)].half_len + 0.12);
@@ -3139,8 +4012,7 @@ impl Game {
                 0.0,
                 1.0,
                 Some(bots::team_tint(b.team)),
-                d2 < 60.0 * 60.0,
-            );
+                d2 < 60.0 * 60.0, [0.0; 4],);
         }
 
         // local boost flame
@@ -3156,6 +4028,33 @@ impl Game {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The garage skin as shader inputs: id, a phase so two cars with the
+    /// same finish are not in lockstep, intensity, and the car's speed
+    /// (FORGE heats with it).
+    /// The exotic skins' second input: where the ball is, in the CAR's own
+    /// frame (so a finish can face the play as you turn), and whether boost
+    /// is running. A texture has neither of these.
+    fn skin_params2(&self) -> [f32; 4] {
+        let to_ball = self.car.rot.inverse() * (self.ball.pos - self.car.pos);
+        let d = to_ball.normalize_or(Vec3::NEG_Z);
+        let boosting = self.action_down(Action::Boost) && self.car.boost > 0.0;
+        [d.x, d.y, d.z, if boosting { 1.0 } else { 0.0 }]
+    }
+
+    /// The third input: the last contact point in the car's own frame, and
+    /// how long ago, so IMPACT can roll a wave out from where it was hit.
+    fn skin_params3(&self) -> [f32; 4] {
+        let h = self.last_hit.0;
+        [h.x, h.y, h.z, self.last_hit.1]
+    }
+
+    fn skin_params(&self) -> [f32; 4] {
+        let sp = (self.car.vel.length() / 25.0).clamp(0.0, 1.0);
+        // z doubles as the MOMENTUM input: how hot the current combo is
+        let combo = (self.combo as f32 / 8.0).clamp(0.0, 1.0);
+        [self.look.skin as f32, (self.save.car as f32) * 1.7, combo.max(0.35), sp]
+    }
+
     fn push_car(
         &self,
         objs: &mut Vec<ObjDraw>,
@@ -3169,7 +4068,44 @@ impl Game {
         scale: f32,
         tint: Option<[f32; 3]>,
         wheels: bool,
+        // [id, phase, intensity, speed] — the garage skin, or zeros
+        skin: [f32; 4],
     ) {
+        let push_skinned = |objs: &mut Vec<ObjDraw>,
+                    mesh: usize,
+                    tex: Option<usize>,
+                    model: Mat4,
+                    color: [f32; 4],
+                    params: [f32; 4],
+                    skin: [f32; 4],
+                    skin2: [f32; 4],
+                    skin3: [f32; 4]| {
+            let nrm3 = Mat3::from_mat4(model).inverse().transpose();
+            let mut raw = ObjectRaw::default();
+            raw.model = model.to_cols_array();
+            raw.nrm = Mat4::from_mat3(nrm3).to_cols_array();
+            raw.color = color;
+            raw.params = params;
+            raw.skin = skin;
+            raw.skin2 = skin2;
+            raw.skin3 = skin3;
+            objs.push(ObjDraw { mesh, tex, raw });
+        };
+        // one rim per wheel position: a split wheel can be several prims
+        fn pivot_key(p: Vec3) -> [i32; 3] {
+            [(p.x * 400.0) as i32, (p.y * 400.0) as i32, (p.z * 400.0) as i32]
+        }
+        let mut seen_pivots: Vec<[i32; 3]> = Vec::new();
+        let rim_style = if rt_slot > 0.5 { self.look.wheels } else { 0 };
+        let rig = if rt_slot > 0.5 { self.look.rig } else { 0 };
+        let skin2 = if rt_slot > 0.5 { self.skin_params2() } else { [0.0; 4] };
+        let skin3 = if rt_slot > 0.5 { self.skin_params3() } else { [0.0; 4] };
+        // PAINT multiplies the body's own colour, so a finish is a behaviour
+        // and the paint is whose car it is
+        let paint = if rt_slot > 0.5 { self.look.paint_rgb() } else { [1.0; 3] };
+        let wheel_r = self.cars.models[model_i].wheel_r * scale;
+        let rim_col = [0.72, 0.75, 0.80, 1.0];
+        #[allow(unused)]
         let push = |objs: &mut Vec<ObjDraw>,
                     mesh: usize,
                     tex: Option<usize>,
@@ -3197,9 +4133,60 @@ impl Game {
                 continue;
             }
             let mut color = prim.color;
+            if matches!(prim.tag, model::Tag::Body) && self.look.paint > 0 {
+                color = [color[0] * paint[0], color[1] * paint[1], color[2] * paint[2], color[3]];
+            }
             if let Some(t) = tint {
                 color = [color[0] * t[0], color[1] * t[1], color[2] * t[2], color[3]];
             }
+            // THE RIG: displace this part before it is drawn. Each prim gets
+            // its own phase from its position, so panels move out of step
+            // with one another the way real machinery does — a car where
+            // everything moves together reads as one wobbling object.
+            let base = if rig > 0 {
+                let seed = prim.pivot.x * 3.1 + prim.pivot.z * 2.3 + prim.mesh_id as f32 * 0.37;
+                let t = self.time;
+                let d = match rig {
+                    // BREATHING: a slow rise and settle
+                    1 => Vec3::Y * ((t * 1.3 + seed).sin() * 0.012),
+                    // FLUTTER: fast, and strongest away from the centre
+                    2 => {
+                        let reach = (prim.pivot.length() + 0.2).min(1.0);
+                        Vec3::new((t * 17.0 + seed).sin(), (t * 15.0 + seed * 1.7).sin(), 0.0)
+                            * 0.004
+                            * reach
+                    }
+                    // UNFOLD: plates lift away under boost, close when you lift
+                    3 => {
+                        // boost tank falling = boost being used
+                        // boost in the tank draining = boost being used
+                        // a full tank sits at 1.0; using boost drains it, so
+                        // the plates open as the reserve falls under power
+                        let open = if self.car.boost < 0.995 { 1.0 } else { 0.0 };
+                        Vec3::new(prim.pivot.x.signum() * 0.6, 0.5, 0.0).normalize_or(Vec3::Y)
+                            * (0.030 * open)
+                    }
+                    // HOVER: the body floats and leans into the turn
+                    4 => {
+                        if matches!(prim.tag, model::Tag::Body) {
+                            Vec3::Y * (0.020 + (t * 0.9).sin() * 0.006)
+                                + Vec3::X * (self.car.ang.y * -0.02)
+                        } else {
+                            Vec3::ZERO
+                        }
+                    }
+                    // SHIVER: a jolt on contact that damps out
+                    _ => {
+                        let k = self.cam.shake_amt();
+                        Vec3::new((t * 41.0 + seed).sin(), (t * 37.0 + seed).sin(), (t * 43.0 + seed).sin())
+                            * 0.012
+                            * k
+                    }
+                };
+                base * Mat4::from_translation(d)
+            } else {
+                base
+            };
             let m = match prim.tag {
                 model::Tag::Body => base,
                 model::Tag::WheelFront => {
@@ -3215,7 +4202,21 @@ impl Game {
                 }
             };
             let spec = if matches!(prim.tag, model::Tag::Body) { 0.6 } else { 0.15 };
-            push(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot]);
+            // the skin rides on the BODY only — wheels keep their own look
+            let sk = if matches!(prim.tag, model::Tag::Body) { skin } else { [0.0; 4] };
+            push_skinned(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot], sk, skin2, skin3);
+            // THE GARAGE RIM, drawn over whatever wheel the car already has.
+            // Because it rides the wheel's own pivot and transform, a style
+            // applies to every car in the game — the imported bodies too —
+            // without touching a single one of their meshes.
+            if rim_style > 0 && !matches!(prim.tag, model::Tag::Body) && !seen_pivots.contains(&pivot_key(prim.pivot)) {
+                seen_pivots.push(pivot_key(prim.pivot));
+                let side = if prim.pivot.x >= 0.0 { 1.0 } else { -1.0 };
+                let rm = m
+                    * Mat4::from_translation(prim.pivot)
+                    * Mat4::from_scale(Vec3::new(side * wheel_r * 1.02, wheel_r * 1.02, wheel_r * 1.02));
+                push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]);
+            }
         }
     }
 }

@@ -29,6 +29,10 @@ pub struct Globals {
     pub gcol: [f32; 4], // rgb terrain base color, w rt shape count
     pub cine: [f32; 4], // x exposure, y vignette, z grain, w filmic
     pub post: [f32; 4], // x bloom strength, y bloom threshold, zw spare
+    /// Up to 4 portals for the ray marcher: per portal, [pos.xyz, radius]
+    /// then the face quaternion. `pcount.x` is how many are live.
+    pub pcount: [f32; 4],
+    pub portals: [[f32; 4]; 16],
 }
 
 /// Ray-marchable shape record for the shader (mirrors world::Shape plus the
@@ -68,7 +72,16 @@ pub struct ObjectRaw {
     pub nrm: [f32; 16],
     pub color: [f32; 4],
     pub params: [f32; 4], // x mode, y emissive, z spec, w rt self id + 1
-    pub _pad: [f32; 24],
+    /// x skin id, y phase, z intensity, w speed (0..1) — the skin's inputs
+    pub skin: [f32; 4],
+    /// xyz: direction to the ball in the BODY's own frame; w: boost 0..1.
+    /// Skins that read these can do things a texture cannot — face the play,
+    /// open under power, know how high they are.
+    pub skin2: [f32; 4],
+    /// xyz: the last contact point in the BODY's frame; w: seconds since.
+    /// A finish can then spread rings from where you actually hit something.
+    pub skin3: [f32; 4],
+    pub _pad: [f32; 12],
 }
 
 impl Default for ObjectRaw {
@@ -78,7 +91,7 @@ impl Default for ObjectRaw {
             nrm: [0.0; 16],
             color: [1.0; 4],
             params: [0.0; 4],
-            _pad: [0.0; 24],
+            skin: [0.0; 4], skin2: [0.0; 4], skin3: [0.0; 4], _pad: [0.0; 12],
         }
     }
 }
@@ -96,6 +109,37 @@ pub struct ObjDraw {
     pub raw: ObjectRaw,
 }
 
+/// Order the frame for the GPU rather than for the code that built it.
+///
+/// Two things happen here. OPAQUE geometry is grouped by (mesh, texture) so
+/// consecutive draws share state and the buffer/bind-group churn collapses —
+/// with a draw call per object, that churn was most of the cost. TRANSLUCENT
+/// geometry is then drawn afterwards, sorted BACK TO FRONT, which is also
+/// the only order in which alpha blending is actually correct: the glass
+/// tubes used to composite in whatever order the world happened to store
+/// them in.
+pub fn order_for_draw(objs: &mut [ObjDraw], eye: [f32; 3]) -> usize {
+    let depth = |o: &ObjDraw| -> f32 {
+        let m = &o.raw.model;
+        let (dx, dy, dz) = (m[12] - eye[0], m[13] - eye[1], m[14] - eye[2]);
+        dx * dx + dy * dy + dz * dz
+    };
+    let solid = |o: &ObjDraw| o.raw.color[3] >= 0.985;
+    objs.sort_by(|a, b| {
+        match (solid(a), solid(b)) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            (true, true) => a
+                .mesh
+                .cmp(&b.mesh)
+                .then(a.tex.cmp(&b.tex)),
+            // translucent: furthest first
+            (false, false) => depth(b).total_cmp(&depth(a)),
+        }
+    });
+    objs.iter().filter(|o| solid(o)).count()
+}
+
 struct GpuMesh {
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
@@ -103,6 +147,12 @@ struct GpuMesh {
 }
 
 pub struct Gpu {
+    /// Present accounting. The frame counter used to tick once per loop
+    /// iteration whether or not anything reached the screen, which reads as
+    /// hundreds of FPS while the display updates a few times a second.
+    pub presented: u64,
+    pub reconfigures: u64,
+    pub dropped: u64,
     surface: wgpu::Surface<'static>,
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -620,6 +670,9 @@ impl Gpu {
         let pp_comp = mk_pbuf();
 
         let mut gpu = Gpu {
+            presented: 0,
+            reconfigures: 0,
+            dropped: 0,
             surface,
             device,
             queue,
@@ -667,6 +720,12 @@ impl Gpu {
     }
 
     /// Live vsync switch: Fifo (vsync) vs AutoNoVsync (tear-or-mailbox).
+    /// Frames that actually reached the screen, surfaces reconfigured, and
+    /// frames abandoned. The first is the only honest thing to call FPS.
+    pub fn present_stats(&self) -> (u64, u64, u64) {
+        (self.presented, self.reconfigures, self.dropped)
+    }
+
     pub fn set_vsync(&mut self, on: bool) {
         self.config.present_mode = if on {
             wgpu::PresentMode::Fifo
@@ -956,13 +1015,25 @@ impl Gpu {
 
             rp.set_pipeline(&self.scene_pipe);
             rp.set_bind_group(0, &self.globals_bg, &[]);
+            // With the draws ordered by (mesh, texture), the state only
+            // changes when it genuinely has to — the vertex and index
+            // buffers and the texture bind group are re-bound on a run
+            // boundary instead of on every single object.
+            let mut cur_mesh = usize::MAX;
+            let mut cur_tex = usize::MAX;
             for (i, o) in objs.iter().take(n).enumerate() {
                 let mesh = &self.meshes[o.mesh];
                 let tex = o.tex.unwrap_or(self.white_tex);
                 rp.set_bind_group(1, &self.obj_bg, &[(i as u64 * OBJ_STRIDE) as u32]);
-                rp.set_bind_group(2, &self.tex_bgs[tex], &[]);
-                rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
-                rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                if tex != cur_tex {
+                    rp.set_bind_group(2, &self.tex_bgs[tex], &[]);
+                    cur_tex = tex;
+                }
+                if o.mesh != cur_mesh {
+                    rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                    rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                    cur_mesh = o.mesh;
+                }
                 rp.draw_indexed(0..mesh.icount, 0, 0..1);
             }
         }

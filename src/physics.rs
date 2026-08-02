@@ -52,11 +52,21 @@ pub struct Car {
     pub half_h: f32,
     pub half_w: f32,
     pub susp: f32, // suspension compression 0..1 (renderer bobs the body)
+    /// where we were last step, for portal plane crossing
+    pub prev: Vec3,
+    /// brief lockout so an exit cannot immediately re-enter its own partner
+    pub tp_cd: f32,
     /// world-space angular velocity INCLUDING the grounded steering yaw,
     /// which is applied straight to the rotation and never enters `ang`
     pub omega: Vec3,
     prev_rot: Quat,
     pub wheel_r: f32,
+    /// drivetrain: an electric car pulls harder from a standstill
+    pub drive: crate::model::Drive,
+    /// HOVER CHASSIS. A hovercar has no tyres, so most of what the wheeled
+    /// car does is wrong for it: it does not sit ON the ground, it does not
+    /// grip sideways, and it does not strike the ball with its bodywork.
+    pub hover: Option<Hover>,
     pub wheel_spin: f32,
     pub steer_vis: f32,
     // jump / dodge state
@@ -72,10 +82,29 @@ pub struct Car {
     dodge_start: Quat,
     dodge_len: f32,
     dodge_roll: f32,
+    /// how much STEER went into choosing this dodge's direction
+    dodge_steer: f32,
     dodge_turn: f32,
     dodge_cancel: bool,
     reset_cd: f32,
     pub supersonic: bool,
+}
+
+/// A hovercar's character, in five numbers.
+#[derive(Clone, Copy)]
+pub struct Hover {
+    pub ride: f32,
+    pub stiff: f32,
+    /// lateral hold, 0..1 — a tyre is effectively 1, a cushion is not
+    pub hold: f32,
+    pub field_r: f32,
+    pub field_k: f32,
+}
+
+impl Default for Hover {
+    fn default() -> Hover {
+        Hover { ride: 0.55, stiff: 42.0, hold: 0.18, field_r: 3.2, field_k: 26.0 }
+    }
 }
 
 impl Car {
@@ -91,8 +120,12 @@ impl Car {
             half_len: 0.62,
             half_h: 0.19,
             wheel_r: 0.11,
+            drive: crate::model::Drive::Combustion,
+            hover: None,
             half_w: 0.32,
             susp: 0.0,
+            prev: Vec3::ZERO,
+            tp_cd: 0.0,
             omega: Vec3::ZERO,
             prev_rot: Quat::IDENTITY,
             wheel_spin: 0.0,
@@ -107,6 +140,7 @@ impl Car {
             dodge_start: Quat::IDENTITY,
             dodge_len: 0.62,
             dodge_roll: 0.0,
+            dodge_steer: 0.0,
             dodge_turn: 0.0,
             dodge_cancel: false,
             reset_cd: 0.0,
@@ -149,6 +183,28 @@ impl Car {
     pub fn flip_turn(&self) -> f32 {
         self.dodge_turn
     }
+    /// Call after setting `rot` directly (a reset, a respawn, a portal).
+    /// Angular velocity is derived from the rotation delta between frames,
+    /// so a teleport that changes orientation instantly reads as an enormous
+    /// spin for one frame — and now that flicks throw the ball with the
+    /// car's spin, that one frame would fling the ball across the pitch.
+    pub fn sync_rot(&mut self) {
+        self.prev_rot = self.rot;
+        self.omega = Vec3::ZERO;
+    }
+
+    /// Half width, for the flick harness.
+    pub fn half_w(&self) -> f32 {
+        self.half_w
+    }
+    /// Time left in the current dodge (flick harness).
+    pub fn dodge_left(&self) -> f32 {
+        self.dodge_timer
+    }
+    /// Angular speed, for the flick harness.
+    pub fn omega_len(&self) -> f32 {
+        self.omega.length()
+    }
     /// A jump/flip is banked (restoration probe for the landing sim).
     pub fn has_flip(&self) -> bool {
         self.has_dodge
@@ -175,6 +231,8 @@ impl Car {
             pos: p,
             ..Car::new()
         };
+        self.prev_rot = self.rot;
+        self.omega = Vec3::ZERO;
     }
 }
 
@@ -185,12 +243,14 @@ pub struct Ball {
     pub ang: Vec3,
     pub r: f32,
     pub last_touch: u8, // WHO_* code of the last car to touch the ball
+    pub prev: Vec3,
+    pub tp_cd: f32,
     pinch_cd: f32,
 }
 
 impl Ball {
     pub fn new() -> Ball {
-        Ball { pos: Vec3::new(0.0, BALL_R + 4.0, 14.0), vel: Vec3::ZERO, rot: Quat::IDENTITY, ang: Vec3::ZERO, r: BALL_R, last_touch: WHO_NONE, pinch_cd: 0.0 }
+        Ball { pos: Vec3::new(0.0, BALL_R + 4.0, 14.0), vel: Vec3::ZERO, rot: Quat::IDENTITY, ang: Vec3::ZERO, r: BALL_R, last_touch: WHO_NONE, pinch_cd: 0.0, prev: Vec3::ZERO, tp_cd: 0.0 }
     }
     pub fn reset_in_front(&mut self, car: &Car) {
         self.pos = car.pos + car.forward() * 4.0 + Vec3::Y * (0.6 + self.r);
@@ -245,6 +305,11 @@ pub fn step(
 
     step_car(car, ball, world, c, cfg, dt, ev);
     step_ball(ball, world, cfg, dt, ev);
+    // arcade bumpers fire the ball on contact
+    if let Some(imp) = world.bump_ball(ball.pos, dt) {
+        ball.vel = imp;
+        ball.ang *= 0.4;
+    }
     // ball strikes open tiles (DROPSHOT panels, GATEWORKS doors)
     if let Some((bp, pow)) = ev.ball_bounce.take() {
         if pow > 3.0 && !world.tiles.is_empty() {
@@ -278,6 +343,7 @@ pub fn step(
     }
     step_bodies(world, car, ball, dt, cfg.arena.gravity);
     collide_car_ball(car, ball, cfg, WHO_PLAYER, ev);
+    hover_field(car, ball, dt, c.boost, ev);
 
     // blast-off launchers: anything on the ring gets the arrow
     for i in 0..world.launchers.len() {
@@ -391,7 +457,7 @@ fn step_bodies(world: &mut World, car: &mut Car, ball: &mut Ball, dt: f32, cfg_g
             vel += world.gravity_dir(pos) * GRAV * cfg_gravity * dt;
         }
         if !bouncy {
-            vel *= (-0.02 * dt).exp(); // the faintest drag: space, but playable
+            vel *= (-world.bodies[i].drag * dt).exp(); // leaves flutter, rocks coast
         }
         pos += vel * dt;
         // world surfaces
@@ -534,6 +600,12 @@ pub fn ball_goal_check(ball: &Ball, ball_prev: Vec3, world: &mut World, ev: &mut
             }
         }
     }
+    // every goal winds the chess board tighter
+    if !ev.goals.is_empty() {
+        if let Some(ch) = world.chess.as_mut() {
+            ch.fury = (ch.fury + 1.0).min(9.0);
+        }
+    }
 }
 
 fn crossed(ring: &crate::world::Ring, a: Vec3, b: Vec3) -> bool {
@@ -549,6 +621,27 @@ fn crossed(ring: &crate::world::Ring, a: Vec3, b: Vec3) -> bool {
 
 // ---------------------------------------------------------------- car ----
 fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Config, dt: f32, ev: &mut StepEvents) {
+    // ---- THE CUSHION ----
+    // A wheeled car is held ON the surface; a hovercar is held ABOVE it by a
+    // spring along the surface normal, damped so it settles rather than
+    // bouncing. It runs before and independently of the grounded test,
+    // because a hovercar is never "grounded" in the wheeled sense — the
+    // cushion IS its ground.
+    if let Some(h) = car.hover {
+        let gap = world.sdf(car.pos);
+        let want = car.half_h + h.ride;
+        if gap < want * 3.0 {
+            let n = world.normal(car.pos);
+            let err = want - gap;
+            let closing = -car.vel.dot(n);
+            // A proportional spring alone balances gravity at an OFFSET —
+            // every chassis floated a fixed distance below its ride height,
+            // by exactly g/stiffness. Carrying the car's weight explicitly
+            // leaves the spring to do only what it is for: correcting error.
+            let push = err * h.stiff + closing * (h.stiff * 0.22).sqrt() * 2.0 + GRAV;
+            car.vel += n * push.clamp(-30.0, 70.0) * dt;
+        }
+    }
     let d = world.sdf(car.pos);
     let n = world.normal(car.pos);
     let clearance = car.half_h;
@@ -634,7 +727,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         _ => {}
     }
 
-    let top = CAR_MAX * cfg.car.top_speed;
+    let top = CAR_MAX * cfg.car.top_speed * car.drive.top();
     let drive_max = DRIVE_MAX * cfg.car.top_speed;
 
     if grounded {
@@ -682,7 +775,11 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         car.steer_vis += (c.steer * 0.42 - car.steer_vis) * (1.0 - (-16.0 * dt).exp());
 
         // throttle / brake / coast
-        let acc = 16.5 * cfg.car.accel;
+        // ELECTRIC TORQUE: full pull from zero, fading to parity with pace.
+        // This is the whole character difference — an EV wins the first two
+        // car-lengths off a kickoff and gives it back on a long straight.
+        let speed_frac = (vf.abs() / drive_max.max(1.0)).clamp(0.0, 1.0);
+        let acc = 16.5 * cfg.car.accel * car.drive.torque(speed_frac);
         let mut a = 0.0;
         if c.throttle > 0.05 {
             a = if vf < -0.3 { 35.0 * cfg.car.accel } else if vf < drive_max { acc * c.throttle } else { 0.0 };
@@ -696,11 +793,29 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // lateral grip (loosened by powerslide)
         let grip_k = cfg.car.grip * cfg.arena.friction;
         // slide grip near-zero so the rear swings: hairpins on a dime
-        let grip = if c.powerslide { 1.3 * grip_k.sqrt() } else { 11.0 * grip_k };
+        // A HOVERCAR BARELY HOLDS: it keeps its momentum while the nose
+        // points elsewhere, so you steer by pointing and thrusting.
+        let grip = match car.hover {
+            Some(h) => 11.0 * grip_k * h.hold,
+            None if c.powerslide => 1.3 * grip_k.sqrt(),
+            None => 11.0 * grip_k,
+        };
         car.vel -= side * vs * (1.0 - (-grip * dt).exp());
 
         // keep the car pressed onto the surface
         let vn = car.vel.dot(n);
+        // MOVING FRAME. Everything below — grip, braking, steering, the
+        // suspension — is written for ground that stands still. On a moving
+        // deck that same code was braking the car to a stop in WORLD space
+        // while the deck slid out from under it. So we step into the
+        // platform's frame, run the ordinary ground solve there, and step
+        // back out at the end: riding a deck then feels exactly like driving
+        // on the floor, and leaving one hands you its momentum for free.
+        let plat_v = world
+            .platform_vel(car.pos - n * (clearance * 0.9), clearance * 3.0)
+            .unwrap_or(Vec3::ZERO);
+        car.vel -= plat_v;
+
         // WHEEL SUSPENSION: a spring-damper ride instead of a rigid snap.
         // The bottom 45% of clearance is the compression zone — landings
         // sink in and rebound, bumps stay glued, contact reads SOLID.
@@ -720,15 +835,23 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             // car clean off the ground again — you cannot dribble on a
             // trampoline. Compression stays soft; the way back is firm.
             let cdamp = if vn < 0.0 { 24.0 } else { 19.0 };
-            car.vel += n * (e * 58.0 - vn * cdamp) * dt;
+            if car.hover.is_none() {
+                car.vel += n * (e * 58.0 - vn * cdamp) * dt;
+            }
         } else {
             // stick to the surface: gentle over crests on the floor, strong
             // magnetic grip on walls and ceilings (the RL wall-drive feel)
             // stickier on a heavy world: the surface holds you through the
             // curve instead of letting you drift off the horizon
             let stick = if steep { 22.0 } else { 2.4 } * gmul.clamp(1.0, 3.2);
-            car.vel -= n * stick * dt;
+            if car.hover.is_none() {
+                car.vel -= n * stick * dt;
+            }
         }
+        // PLATFORM RIDING: a car standing on a moving deck is carried by
+        // it — position follows exactly (so a fast platform cannot slide out
+        // from under you) and velocity is dragged toward the surface, which
+        // is what lets you inherit its momentum when you jump off.
         let starget = ((clearance - d) / zone).clamp(0.0, 1.0);
         car.susp += (starget - car.susp) * (1.0 - (-14.0 * dt).exp());
 
@@ -745,7 +868,19 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             car.pos += n * 0.04;
             car.on_ground = false;
         }
+        // ...and back out of the platform frame
+        car.vel += plat_v;
+        car.pos += plat_v * dt;
     } else {
+        // A fast deck can outrun the frame in which contact is lost: keep
+        // carrying while the car is still within a whisker of one, so a
+        // 18 m/s carriage does not leave you standing in the air.
+        let probe = car.pos - Vec3::Y * (car.half_h + 0.12);
+        if let Some(pv) = world.platform_vel(probe, 0.9) {
+            car.pos += pv * dt;
+            let rel = car.vel - pv;
+            car.vel -= (rel - Vec3::Y * rel.y) * (1.0 - (-8.0 * dt).exp()) * 0.6;
+        }
         // ---------------- airborne / body contact ----------------
         // TRUE landing physics (separate from the learnable land-assist):
         //
@@ -805,7 +940,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                         car.ang += tau_b * 15.0 * w * dt;
                     }
                 }
-                if dp < rim {
+                if dp < rim && car.hover.is_none() {
                     let np = world.normal(pt);
                     car.pos += np * (rim - dp) * 0.55;
                     let vn = car.vel.dot(np);
@@ -920,11 +1055,13 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                 // CARDINAL SNAP (Rocket League): any key combination sharing
                 // a dominant direction flips in THAT axis — no half-diagonal
                 // tumbles. Ties break toward pitch, as in RL.
-                let dn = if c.throttle.abs() >= c.steer.abs() {
-                    Vec3::new(0.0, 0.0, -c.throttle.signum())
-                } else {
-                    Vec3::new(c.steer.signum(), 0.0, 0.0)
-                };
+                // DIAGONAL FLIPS (your tuning). RL dodges along the input
+                // VECTOR, not a snapped cardinal — W+A is a diagonal flip,
+                // not a left one. Normalising keeps the flip's power constant
+                // regardless of how far the stick is pushed, while the
+                // direction stays exactly what you asked for.
+                let mut dn = Vec3::new(c.steer, 0.0, -c.throttle);
+                dn = if dn.length_squared() > 1e-6 { dn.normalize() } else { Vec3::Z };
                 // flip: burst of body-frame spin + a velocity kick along the dodge
                 // toned from 8.4: full-rate spin read too violent, and the
                 // FLIP SPIN dial rides on top for +-50% in 5% steps
@@ -935,6 +1072,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                 car.dodge_timer = car.dodge_len;
                 car.dodge_start = car.rot;
                 car.dodge_roll = 0.0;
+                car.dodge_steer = c.steer.abs().min(1.0);
                 car.dodge_turn = 0.0;
                 car.dodge_cancel = false;
                 let yaw_only = yaw_quat(car.rot);
@@ -991,7 +1129,19 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             }
             // air roll layers ON TOP (the half-flip's 180) without stealing
             // from the flip's own rotation
-            car.dodge_roll += c.roll * 5.0 * dt;
+            // ONE INPUT, ONE ROTATION. With powerslide held, steer is also
+            // the air-roll axis — so a forward-right flip spent the same
+            // stick twice: once choosing the dodge's diagonal direction and
+            // again as barrel roll layered on top, which over a 0.78 s dodge
+            // is another 220 degrees. It read as flipping twice.
+            //
+            // The roll passthrough is now scaled down by however much steer
+            // went into the dodge itself. A diagonal dodge consumed the
+            // steer axis and gets no roll from it; a straight forward or
+            // back dodge did not, so it keeps the full passthrough — which
+            // is what the half-flip needs.
+            let roll_share = (1.0 - car.dodge_steer).clamp(0.0, 1.0);
+            car.dodge_roll += c.roll * 5.0 * dt * roll_share;
             car.rot = (car.dodge_start
                 * Quat::from_axis_angle(car.dodge_axis, car.dodge_turn)
                 * Quat::from_rotation_z(car.dodge_roll))
@@ -1097,6 +1247,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     if !car.on_ground {
         // (omega measured after the rotation integration)
     }
+    portal_car(car, world, dt);
     if car.ang.length_squared() > 1e-8 {
         car.rot = (car.rot * Quat::from_scaled_axis(car.ang * dt)).normalize();
     }
@@ -1111,7 +1262,10 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         if angle > std::f32::consts::PI {
             angle -= std::f32::consts::TAU;
         }
-        car.omega = ax * (angle / dt.max(1e-5));
+        // a wrapped quaternion delta can read as a huge spin (the flick sim
+        // caught 144 rad/s on a side dodge); a car cannot turn faster than
+        // its own flip, so clamp to something physical
+        car.omega = (ax * (angle / dt.max(1e-5))).clamp_length_max(14.0);
         car.prev_rot = car.rot;
     }
 
@@ -1179,8 +1333,57 @@ fn yaw_quat(q: Quat) -> Quat {
 
 // --------------------------------------------------------------- ball ----
 /// Public for the sim harness: the ball vs world, no car required.
+/// Teleport a car through any portal its motion crossed this step. Position,
+/// velocity, orientation and spin all take the same rotation, so momentum is
+/// preserved exactly and a fall becomes a launch.
+pub fn portal_car(car: &mut Car, world: &World, dt: f32) -> bool {
+    car.tp_cd = (car.tp_cd - dt).max(0.0);
+    if world.portals.is_empty() || car.tp_cd > 0.0 {
+        car.prev = car.pos;
+        return false;
+    }
+    if let Some(i) = world.portal_crossed(car.prev, car.pos) {
+        let r = world.portal_rot(i);
+        car.pos = world.portal_point(i, car.pos);
+        car.vel = r * car.vel;
+        car.rot = (r * car.rot).normalize();
+        car.sync_rot();
+        car.ang = r * car.ang;
+        // Clear of the exit face — and if the far side is tight (a moving
+        // mouth can swing into its own mount), push out along the surface
+        // normal until we are actually in open air. Getting parked inside
+        // the drum was the worst bug in TURNSTILE.
+        car.pos += (r * Vec3::Z) * 1.2;
+        for _ in 0..8 {
+            let d = world.sdf(car.pos);
+            if d > car.half_h + 0.15 {
+                break;
+            }
+            car.pos += world.normal(car.pos) * (car.half_h + 0.25 - d).max(0.15);
+        }
+        car.tp_cd = 0.12;
+        car.prev = car.pos;
+        return true;
+    }
+    car.prev = car.pos;
+    false
+}
+
 pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut StepEvents) {
     ball.pinch_cd = (ball.pinch_cd - dt).max(0.0);
+    // the ball goes through portals too — half the play depends on it
+    ball.tp_cd = (ball.tp_cd - dt).max(0.0);
+    if !world.portals.is_empty() && ball.tp_cd <= 0.0 {
+        if let Some(i) = world.portal_crossed(ball.prev, ball.pos) {
+            let r = world.portal_rot(i);
+            ball.pos = world.portal_point(i, ball.pos);
+            ball.vel = r * ball.vel;
+            ball.ang = r * ball.ang;
+            ball.pos += (r * Vec3::Z) * 0.2;
+            ball.tp_cd = 0.12;
+        }
+    }
+    ball.prev = ball.pos;
     let (bdir, bmul) = world.gravity_field(ball.pos);
     ball.vel += bdir * GRAV * bmul * cfg.arena.gravity * dt;
     if let Some(cv) = world.current(ball.pos) {
@@ -1201,10 +1404,34 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 if -vn > 2.0 {
                     ev.ball_bounce = Some((ball.pos, -vn));
                 }
-                // keep most of the tangential speed through a bounce (0.714
-                // scrubbed 29% per landing, so any driven shot died on its
-                // first touchdown); the roll friction below still settles it
-                ball.vel = vt * 0.88 - n * vn * e;
+                // ---- RIGID-SPHERE CONTACT (the Rocket League bounce) ----
+                // Spin used to be a SLAVE to velocity: recomputed from it
+                // after every bounce, so it could never change where the ball
+                // went. In RL the angular velocity is its own state and the
+                // two trade through friction at the contact point, which is
+                // where curve, backspin and topspin all come from.
+                //
+                //   contact point sits at -n*r from the centre
+                //   its material velocity is v + w x r_c
+                //   friction acts on the SLIP of that point, Coulomb-limited
+                //   by the normal impulse, and it torques the ball in return.
+                let rc = -n * ball.r;
+                let u = ball.vel + ball.ang.cross(rc);
+                let slip = u - n * u.dot(n);
+                let jn = -(1.0 + e) * vn; // per unit mass
+                // solid sphere: I = 0.4 m r^2, so the tangential effective
+                // mass at the contact is m / 3.5
+                let inertia = 0.4 * ball.r * ball.r;
+                let m_t = 1.0 / (1.0 + ball.r * ball.r / inertia);
+                let want = -slip * m_t;
+                let mu_b = 0.36 * cfg.ball.friction;
+                let jt = if want.length() > mu_b * jn {
+                    want.normalize_or(Vec3::ZERO) * (mu_b * jn)
+                } else {
+                    want
+                };
+                ball.vel += n * jn + jt;
+                ball.ang += rc.cross(jt) / inertia;
                 ev.bounces.push((ball.pos, n, -vn));
             } else {
                 // Rolling friction turned out NOT to be the shot killer (a
@@ -1212,16 +1439,59 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
                 // measured identical travel from 0.42 to 1.8). It IS what
                 // lets a ball settle for a dribble, so it stays high — 1.5
                 // scored best across the bot air-dribble runs.
-                let roll = 1.5 * cfg.ball.friction * cfg.arena.friction;
-                ball.vel = vt * (1.0 - (roll * dt).min(1.0)); // rolling friction
+                // ---- RESTING / ROLLING CONTACT ----
+                // The same slip model, run continuously: a ball dropped with
+                // topspin drives itself forward, a sliding ball spins up
+                // until it rolls, and once it IS rolling the slip is zero so
+                // nothing fights it — that is why a rolling ball keeps going.
+                let rc = -n * ball.r;
+                let u = ball.vel + ball.ang.cross(rc);
+                let slip = u - n * u.dot(n);
+                let inertia = 0.4 * ball.r * ball.r;
+                let m_t = 1.0 / (1.0 + ball.r * ball.r / inertia);
+                // available friction from the weight it is resting under
+                // Coulomb friction from the ball's own weight. RL's ball
+                // friction is low (~0.35) and its spin caps at 6 rad/s, so a
+                // ball faster than about 5.5 m/s SLIDES rather than rolls —
+                // true in RL as well. At 0.7 that slide was a brake that
+                // stopped a 12 m/s ball dead in two seconds.
+                let load = GRAV * cfg.arena.gravity * dt;
+                let mu_b = 0.33 * cfg.ball.friction * cfg.arena.friction;
+                let want = -slip * m_t;
+                let jt = if want.length() > mu_b * load {
+                    want.normalize_or(Vec3::ZERO) * (mu_b * load)
+                } else {
+                    want
+                };
+                ball.vel += jt;
+                ball.ang += rc.cross(jt) / inertia;
+                // rolling resistance: a real ball on turf does eventually
+                // stop, but far more gently than a velocity haircut
+                let rr = 0.02 * cfg.ball.friction * cfg.arena.friction;
+                let vt2 = ball.vel - n * ball.vel.dot(n);
+                ball.vel -= vt2 * (rr * dt).min(0.4);
+                ball.ang *= 1.0 - (rr * 0.5 * dt).min(0.3);
+                // rest ON the surface: cancel what little downward velocity
+                // gravity added this step. (This line used to subtract HALF
+                // of a negative — an upward ratchet that launched a rolling
+                // ball a metre into the air every second.)
+                let vn2 = ball.vel.dot(n);
+                if vn2 < 0.0 {
+                    ball.vel -= n * vn2;
+                }
             }
-            ball.ang = n.cross(ball.vel) / ball.r;
         }
     }
 
     let sp = ball.vel.length();
     if sp > BALL_MAX {
         ball.vel *= BALL_MAX / sp;
+    }
+    // RL caps ball spin at 6 rad/s — without it a hard pinch can leave the
+    // ball spinning fast enough to drive itself across the pitch
+    let asp = ball.ang.length();
+    if asp > 6.0 {
+        ball.ang *= 6.0 / asp;
     }
     if ball.ang.length_squared() > 1e-8 {
         ball.rot = (Quat::from_scaled_axis(ball.ang * dt) * ball.rot).normalize();
@@ -1233,6 +1503,39 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
 }
 
 // ---------------------------------------------------- car <-> ball -------
+/// THE REPULSOR FIELD. A hovercar has no bodywork worth hitting a ball
+/// with — it is held up by pressure and it moves the ball the same way. A
+/// cone in front of the nose pushes the ball away, hardest straight ahead
+/// and falling off with distance, so the ball is never STRUCK, it is HERDED:
+/// held ahead of you at range, steered round a corner untouched. Power has
+/// to come from a PULSE rather than from driving hard.
+pub fn hover_field(car: &mut Car, ball: &mut Ball, dt: f32, boost: bool, ev: &mut StepEvents) {
+    let Some(h) = car.hover else { return };
+    let to = ball.pos - car.pos;
+    let dist = to.length();
+    if dist > h.field_r + ball.r || dist < 1e-4 {
+        return;
+    }
+    let dir = to / dist;
+    let aim = dir.dot(car.forward()).max(0.0);
+    let cone = aim * aim;
+    if cone < 0.02 {
+        return;
+    }
+    let reach = (1.0 - (dist / (h.field_r + ball.r)).clamp(0.0, 1.0)).powi(2);
+    let mut push = h.field_k * cone * reach;
+    if boost {
+        push *= 3.4; // the pulse: the hovercar's shot
+    }
+    ball.vel += dir * push * dt;
+    // the ball presses back, so the field is not a free tractor beam
+    car.vel -= dir * push * dt * 0.16;
+    ball.ang += dir.cross(Vec3::Y) * push * dt * 0.05;
+    if push > 4.0 {
+        ev.touches.push((ball.pos - dir * ball.r, push.min(40.0)));
+    }
+}
+
 pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, ev: &mut StepEvents) {
     // THE HITBOX IS A BOX. A capsule is round on top, so a ball resting on
     // it had barely a hand's width of contact before separating — which is
@@ -1256,7 +1559,9 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
     // the earlier max()+0.08 raised the ball's ride 11 cm and the striker
     // carry pipeline fell apart (air1 touches went to zero in the sim)
     // skin over the box: a little give, plus a lunge margin mid-dodge
-    let body = 0.06;
+    // contact skin: 6 cm held the ball visibly clear of the shell, so a
+    // carried ball looked like it was floating. 2 cm reads as resting on it.
+    let body = 0.02;
     let lunge = if car.dodge_timer > 0.0 { 0.45 } else { 0.0 };
     let radius = ball.r + body + lunge;
     if dist >= radius || dist < 1e-5 {
@@ -1280,6 +1585,13 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // of pinging off the hood), hard hits keep full restitution
         let soft = ((-vn) / 8.0).clamp(0.0, 1.0);
         let e = (0.10 + 0.25 * soft) * cfg.ball.bounce.sqrt();
+        // A ball RESTING on the hood must not bounce off it. At full
+        // restitution the jump alone threw the ball clear — the flick sim
+        // measured zero contact frames during the flip, which means every
+        // "flick" was really just the jump. Gentle contacts are now nearly
+        // inelastic, so the ball rides the car up and is still there when
+        // the car rotates out from under it; hard hits keep their bounce.
+        let e = e * (0.18 + 0.82 * soft);
         // A car meets a grounded ball from below-behind, so the contact
         // normal points steeply UP and every shot ballooned. Hard hits now
         // drive THROUGH: the impulse normal flattens toward horizontal as
@@ -1303,7 +1615,7 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // frame — the assist that makes carries balanceable was quietly
         // capping every shot.
         if n.y > 0.30 && -vn < 6.0 {
-            let w = 0.07 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
+            let w = 0.012 * (1.0 - (-vn / 6.0).clamp(0.0, 1.0));
             let dvx = car.vel.x - ball.vel.x;
             let dvz = car.vel.z - ball.vel.z;
             ball.vel.x += dvx * w;
@@ -1328,8 +1640,17 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // the ball rides the nose through small touches, and stripping the
             // grip there kills air dribbles outright (the bots lost two thirds
             // of their air touches when this was one number for both).
-            let mu = if car.on_ground { 0.16 } else { 0.34 };
-            ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.8 } else { 1.5 });
+            // A dribble is a BALANCING ACT, not a magnet. Ground grip is
+            // now light enough that the ball keeps its own momentum: boost
+            // ahead and it rolls back down the hood toward you, brake and it
+            // runs away in front, and you recover it by scooping under from
+            // the far side. Air carries keep more grip — that touch is the
+            // whole move and there is no ground to catch a mistake.
+            // Barely any grip on the ground: the ball keeps its own
+            // momentum and WILL leave the roof when you turn or brake. Air
+            // carries keep theirs — that touch is the whole move.
+            let mu = if car.on_ground { 0.018 } else { 0.30 };
+            ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.35 } else { 1.4 });
             // and the hood is dished, so the ball rolls back to the middle
             let side = car.rot * Vec3::X;
             let off = (ball.pos - car.pos).dot(side);
@@ -1338,7 +1659,28 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // the dish is a HINT toward the centre line, not a magnet: it
             // only bites near the sweet spot, so a ball already sliding off
             // keeps going
-            ball.vel -= side * (off.signum() * off.abs().min(reach) * hold * 1.5 * w);
+            // the dish only whispers now: enough that a centred ball stays
+            // centred, not enough to drag a sliding one back
+            // THE DISH is what makes a dribble a skill rather than a coin
+            // flip. Near the sweet spot the hood cradles the ball firmly, so
+            // small errors self-correct and you can hold a line; past about
+            // two thirds of the way out the cradle falls away to nothing and
+            // the ball is gone. That gradient IS the balance point — uniform
+            // grip (what this was) gives you either a magnet or a marble,
+            // and neither of those is dribbling.
+            let f = (off.abs() / reach).clamp(0.0, 1.0);
+            let well = if f < 0.66 { (1.0 - f / 0.66).powi(2) } else { 0.0 };
+            // NO DISH. A hood that pulls the ball back to its centre line
+            // is what made carries feel magnetic. Keeping the ball is your
+            // steering now, not the car's shape.
+            // fore/aft is deliberately looser: that axis is where you PLAY —
+            // push the ball out front, boost past it, catch it up again
+            let fwd = car.forward();
+            let foff = (ball.pos - car.pos).dot(fwd);
+            let freach = car.half_len + ball.r;
+            let ff = (foff.abs() / freach).clamp(0.0, 1.0);
+            let fwell = if ff < 0.7 { (1.0 - ff / 0.7).powi(2) } else { 0.0 };
+            ball.vel -= fwd * (foff.signum() * foff.abs().min(freach) * fwell * 0.9 * w);
         }
 
         // the "psyonix impulse": extra push that scales with the hit, biased
@@ -1357,9 +1699,51 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             let flat = Vec3::new(f.x, f.y * 0.35, f.z).normalize_or(dir_n);
             flat
         };
-        let dir = dir_n.lerp(aim, 0.65 * soft).normalize_or(dir_n);
+        // THE FLICK. Flattening the push direction stops shots ballooning,
+        // but it also flattened the one touch whose whole point is vertical:
+        // a flick throws the ball because the car ROTATES out from under it,
+        // and the direction that throw wants is the contact point's own
+        // surface velocity. The faster the car is spinning, the more the
+        // push follows that instead of the flattened line — so a backflip
+        // lofts the ball and a forward flick stays low, which is exactly the
+        // difference between the two in Rocket League.
+        // THE THROW DIRECTION MUST EARN ITS WEIGHT.
+        //
+        // `v_surf - car.vel` is how fast the hood is moving under the ball
+        // from the car's own rotation. Near the rotation axis that vector is
+        // almost zero — and the DIRECTION of an almost-zero vector is
+        // arbitrary, so normalising it hands back noise. Blending toward it
+        // on spin alone meant a fast flip could throw the ball somewhere
+        // unrelated to the contact, which is exactly "sometimes it goes in a
+        // weird direction".
+        //
+        // Weight it by the surface speed as well: a hood that is genuinely
+        // sweeping throws the ball, a contact sitting on the axis does not.
+        let surf = v_surf - car.vel;
+        let surf_speed = surf.length();
+        let spin = (car.omega.length() / 7.0).clamp(0.0, 1.0);
+        let throw_w = spin * (surf_speed / 3.0).clamp(0.0, 1.0);
+        let throw_dir = surf.normalize_or(Vec3::ZERO);
+        let dir = dir_n
+            .lerp(aim, 0.65 * soft)
+            .normalize_or(dir_n)
+            .lerp(throw_dir, 0.62 * throw_w)
+            .normalize_or(dir_n);
         let strength = (-vn).min(23.0) * 0.38 / cfg.ball.weight.sqrt();
-        ball.vel += dir * strength;
+        // The extra "psyonix" push on top of the elastic impulse was doing
+        // most of the work, which is why touches felt like blasts. At a tenth
+        // it shapes the hit instead of dominating it. (Your tuning.)
+        // A flat tenth killed power shots along with the blasting: a soft
+        // touch and a committed 22 m/s strike got the same treatment. Scale
+        // it with the hit — dribble touches stay gentle, real shots punch.
+        ball.vel += dir * strength * (0.06 + 0.55 * soft);
+        // ...and the hood's own motion carries the ball with it. Without
+        // this a flick is only ever as strong as the collision, when in
+        // truth the car is throwing the ball, not hitting it.
+        if throw_w > 0.05 {
+            let carry = surf_speed.min(9.0);
+            ball.vel += throw_dir * carry * 0.85 * throw_w;
+        }
         // SPIN: a gentle touch rolls the ball (dribbles need that), a hard
         // hit drives THROUGH it. Spin used to scale up with the impact,
         // which is what made shots knuckle off at odd angles.
