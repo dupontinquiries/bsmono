@@ -59,3 +59,49 @@ missing-inscription problem and partly scale. A control sized for a finger in **
 a boulder in **world** space when the camera is close. The `mobilelayout` touch minimum (44pt) is a
 2-D rule and does not transfer — a world-space control needs its size derived from its distance to the
 camera, so it subtends a constant angle rather than occupying constant world volume.
+
+---
+
+# The touch response is dead code that runs every frame
+
+`gpuscene.rs` declares `uniform vec4 u_touch` and a `touch_response()` helper: a proximity falloff
+around the last touch point in world space, with `u_touch.w` carrying age so the response fades.
+
+`glow_scene.rs` uploads it:
+
+```rust
+let tch = u.touch.unwrap_or([0.0, 0.0, 0.0, -1.0]);
+gl.uniform_4_f32(loc("u_touch").as_ref(), tch[0], tch[1], tch[2], tch[3]);
+```
+
+**Nothing ever sets `u.touch`.** It is `None` on every frame, so the uniform is always
+`(0,0,0,-1)` — and the first line of the shader helper is `if (u_touch.w < 0.0) return 0.0;`.
+
+So the branch taken every frame, on every fragment, is the one that returns immediately. The feature is
+wired end to end except for the one assignment that would make it do something, and because the
+fallback is silent it looks exactly like a scene that has no touch response by design.
+
+## Why it is worth fixing rather than deleting
+
+The physical-UI premise is that the scene is a real object — a plaque is clickable, a right-click opens
+a context menu on the turn it belongs to. Touching a surface and having it respond is the cheapest
+possible confirmation of that premise, and it is the one thing currently missing from a surface that
+already has caustics, rain-stain, triplanar mapping and defocus.
+
+## What the wiring needs
+
+A world-space point and an age. The click already exists — `ui.interact(pr, Id::new("scene_reader"),
+Sense::click())` — and returns the plaque's **screen** rect. What is not obviously in scope at that
+site is the plaque's world position, which is what `u_touch.xyz` wants; the projection that produced
+`pr` knows it, so the value exists somewhere upstream of the rect.
+
+`u_touch.w` should be seconds since the touch, advanced by the frame delta rather than a wall-clock
+read — `exp(-u_touch.w * 0.7)` is the fade, and a frame-counted age paces differently on a 60 Hz phone
+and a 120 Hz desktop. That is the same frame-rate independence `micresponse::step` and the reveal-pace
+clock both needed.
+
+## Related, and the same shape
+
+`micresponse` is complete and has no audio source. Two physical-UI features are finished models waiting
+on one input each — a world point and a level — which is a different problem from either being
+unbuilt.
