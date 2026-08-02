@@ -544,21 +544,57 @@ pub fn run(args: &[String]) {
             // let the flick play out and take the ball's peak speed
             let mut best = 0.0f32;
             let mut best_v = Vec3::ZERO;
+            let mut last_touch_v = Vec3::ZERO;
             let start = ball.pos;
             let mut touch_frames = 0;
             let mut peak_omega = 0.0f32;
-            for _ in 0..90 {
+            let dbg = std::env::var("FLICK_TRACE").map(|v| v == label).unwrap_or(false);
+            for fi in 0..90 {
+                if dbg && fi < 26 {
+                    // the box closest-point distance the contact test uses
+                    let half = Vec3::new(
+                        car.half_w().max(0.18),
+                        car.half_h.max(0.12),
+                        car.half_len.max(0.30),
+                    );
+                    let local = car.rot.inverse() * (ball.pos - car.pos);
+                    let cl = local.clamp(-half, half);
+                    let cp = car.pos + car.rot * cl;
+                    let d = ball.pos.distance(cp);
+                    eprintln!(
+                        "     f={:2} gap={:5.3} (need<{:5.3}) dodge={:.2} omega={:5.1} ballv=({:5.1},{:5.1}) carv=({:5.1},{:5.1})",
+                        fi,
+                        d - ball.r,
+                        0.02 + if car.dodge_left() > 0.0 { 0.45 } else { 0.0 },
+                        car.dodge_left(),
+                        car.omega_len(),
+                        ball.vel.y,
+                        ball.vel.length(),
+                        car.vel.y,
+                        car.vel.length()
+                    );
+                }
                 ev.touches.clear();
                 physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
-                if !ev.touches.is_empty() { touch_frames += 1; }
+                if !ev.touches.is_empty() {
+                    touch_frames += 1;
+                    // THE FLICK IS THE LAST TOUCH. Measuring the ball's peak
+                    // speed measured the carry that preceded the flip, not
+                    // the throw — which is why every flick looked flat while
+                    // the trace showed vertical velocity tripling on contact.
+                    last_touch_v = ball.vel;
+                }
                 peak_omega = peak_omega.max(car.omega_len());
                 if ball.vel.length() > best {
                     best = ball.vel.length();
                     best_v = ball.vel;
                 }
             }
-            let flat = Vec3::new(best_v.x, 0.0, best_v.z).length();
-            let angle = best_v.y.atan2(flat.max(0.01)).to_degrees();
+            // what left the car on the flick itself
+            let exit_v = if last_touch_v.length() > 0.5 { last_touch_v } else { best_v };
+            let flat = Vec3::new(exit_v.x, 0.0, exit_v.z).length();
+            let angle = exit_v.y.atan2(flat.max(0.01)).to_degrees();
+            let best = exit_v.length().max(best * 0.0);
             let travel = ball.pos.distance(start);
             println!(
                 "{:<16} {:>7.1} {:>7.0}d {:>8.1} {:>7.1} {}",
@@ -584,17 +620,62 @@ pub fn run(args: &[String]) {
         };
         check("a forward flick has real pace (>16 m/s)", fwd > 16.0);
         check("a flick is not a blast (<34 m/s)", fwd < 34.0);
-        // KNOWN GAP, stated rather than hidden: the forward family lofts
-        // correctly (19-25 deg) but a backflip flick still leaves flat. The
-        // instrumented cause is contact — the ball is only in touch for 0-2
-        // frames once the flip fires, so the rotation never reaches it, and
-        // a backflip retreats from the ball besides. Asserting the flicks
-        // that DO work rather than pretending this one does.
         check("the flick family lofts (forward/45/delayed)", results.iter().filter(|r| r.2 > 18.0).count() >= 3);
-        println!(
-            "   open: backflip flick leaves at {:.0} deg, {:.1} m/s - wants more contact through the rotation",
-            back.1, back.0
-        );
+        // A backflip flick is a LOFT, not a drive: high and slower, which is
+        // exactly what it is for in Rocket League — popping the ball over
+        // someone. (This read as flat until the harness stopped measuring
+        // the ball's peak speed, which was the carry BEFORE the flip, and
+        // started measuring the last touch, which is the throw itself.)
+        check("a backflip flick lofts steeply", back.1 > 45.0);
+        check("and it is a pop, not a rocket", back.0 > 6.0 && back.0 < 18.0);
+        check("forward flicks stay low", results.iter().find(|r| r.0 == "forward").map(|r| r.2 < 35.0).unwrap_or(false));
+
+        // ---- AIR DRIBBLE: how long does the ball stay on the nose? ----
+        println!();
+        println!("{:<16} {:>9} {:>9} {:>8}", "air carry", "seconds", "touches", "drift");
+        for (label, boost, pitch) in [("no boost", false, 0.0f32), ("boosting", true, 0.0), ("nose up", true, 0.25)] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let gy = world.ground_h(0.0, 0.0);
+            car.pos = Vec3::new(0.0, gy + 14.0, 0.0);
+            car.rot = glam::Quat::from_rotation_x(0.32); // nose up, as you would be
+            car.sync_rot(); // a set orientation is not a spin
+            car.vel = Vec3::new(0.0, 6.0, -11.0);
+            let mut ball = Ball::new();
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.5 + car.up() * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.boost = boost;
+            c.pitch = pitch;
+            let mut ev = StepEvents::default();
+            let mut touches = 0;
+            let mut carried = 0.0f32;
+            let mut t = 0.0f32;
+            while t < 4.0 {
+                ev.touches.clear();
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if !ev.touches.is_empty() {
+                    touches += 1;
+                }
+                // "still on the car" means within a car length of the nose
+                if ball.pos.distance(car.pos) < 2.4 && ball.pos.y > car.pos.y {
+                    carried = t;
+                }
+                if ball.pos.y < gy + ball.r + 0.3 {
+                    break;
+                }
+                t += DT;
+            }
+            println!("{:<16} {:>8.2}s {:>9} {:>7.1}m", label, carried, touches, ball.pos.distance(car.pos));
+            if label == "no boost" {
+                // an air dribble is many small touches over seconds, not one
+                // hit — if this collapses, the carry has become a punt
+                check("an air dribble carries for seconds", carried > 1.5);
+                check("it is many small touches", touches > 15);
+            }
+        }
         println!("{}", if pass { "FLICK: PASS" } else { "FLICK: FAIL" });
         return;
     }

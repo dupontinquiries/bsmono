@@ -155,6 +155,24 @@ impl Car {
     pub fn flip_turn(&self) -> f32 {
         self.dodge_turn
     }
+    /// Call after setting `rot` directly (a reset, a respawn, a portal).
+    /// Angular velocity is derived from the rotation delta between frames,
+    /// so a teleport that changes orientation instantly reads as an enormous
+    /// spin for one frame — and now that flicks throw the ball with the
+    /// car's spin, that one frame would fling the ball across the pitch.
+    pub fn sync_rot(&mut self) {
+        self.prev_rot = self.rot;
+        self.omega = Vec3::ZERO;
+    }
+
+    /// Half width, for the flick harness.
+    pub fn half_w(&self) -> f32 {
+        self.half_w
+    }
+    /// Time left in the current dodge (flick harness).
+    pub fn dodge_left(&self) -> f32 {
+        self.dodge_timer
+    }
     /// Angular speed, for the flick harness.
     pub fn omega_len(&self) -> f32 {
         self.omega.length()
@@ -185,6 +203,8 @@ impl Car {
             pos: p,
             ..Car::new()
         };
+        self.prev_rot = self.rot;
+        self.omega = Vec3::ZERO;
     }
 }
 
@@ -1250,6 +1270,7 @@ pub fn portal_car(car: &mut Car, world: &World, dt: f32) -> bool {
         car.pos = world.portal_point(i, car.pos);
         car.vel = r * car.vel;
         car.rot = (r * car.rot).normalize();
+        car.sync_rot();
         car.ang = r * car.ang;
         // Clear of the exit face — and if the far side is tight (a moving
         // mouth can swing into its own mount), push out along the surface

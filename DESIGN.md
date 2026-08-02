@@ -2098,6 +2098,40 @@ an open item, so it cannot quietly regress or be forgotten.
 Dribbling improved as a side effect of the softer carry contact: a steady
 turn now holds 40% of the run (was 33) and a turn after landing 52%.
 
+## v1.65.0 — the backflip flick was fine; the ruler was wrong
+
+Last version left the backflip flick as an open item: 8 degrees and flat,
+when it should loft. Tracing the contact frame by frame settled it, and the
+answer was embarrassing in the best way — the PHYSICS WAS RIGHT and the
+measurement was not. The harness reported the ball's peak speed, which
+happens during the carry BEFORE the flip; the throw itself is the LAST
+touch. Measured there, a backflip flick leaves at 76 degrees and 9.6 m/s: a
+high, slow pop, which is exactly what the move is for.
+
+A lesson worth writing down: an instrument that measures the wrong instant
+will make correct physics look broken, and three plausible "fixes" had
+already been tried against a number that was never going to move.
+
+The flick family now reads faithfully — forward 17.8 m/s at 21 degrees, 45
+degree 17.0 at 19, sideways 15.9 at 20, delayed 18.1 at 25, backflip 9.6 at
+76 — and all of it is asserted, including that forward flicks stay LOW and
+the backflip stays high.
+
+A REAL BUG fell out of the air-dribble work. Angular velocity is derived
+from the rotation delta between frames, so setting the car's orientation
+INSTANTLY — a reset, a respawn, a portal — read as an enormous spin for one
+frame. That was harmless until flicks began throwing the ball with the
+car's spin; now it meant a ball near a portal exit could be flung across
+the pitch. `Car::sync_rot()` clears the delta, and reset and portal travel
+both call it.
+
+AIR DRIBBLES are now measured too, and they behave: with the ball on the
+nose and no boost, 3.21 seconds of carry over 46 small touches with the
+ball ending 1.4 m from the car; boosting, 2.78 s and 130 touches; and
+over-pitching loses it at 0.91 s, which is the correct failure mode. Both
+the duration and the touch count are asserted, so a future change that
+turns the carry back into a punt will say so.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
