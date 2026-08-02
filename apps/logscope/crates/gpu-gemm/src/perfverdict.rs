@@ -440,3 +440,93 @@ mod self_relative_tests {
         assert_eq!(self_relative(12.0, 0.0, 512, 256), SelfRelative::NotEnoughData);
     }
 }
+
+/// Does the profile's own arithmetic hold together?
+///
+/// A profile line that contradicts itself is worse than no profile: every number in it gets used to
+/// reason about where time goes, and one that cannot be true poisons the conclusions drawn from the
+/// rest.
+///
+/// Observed in a real run, in one line:
+///
+/// ```text
+/// 1625 submits (15/tok), 1 polls | setup 49ms vs sync 0ms of 19860ms
+/// submit causes — ... download 141 ...
+/// ```
+///
+/// **141 downloads and 1 poll.** Every buffer download must poll to map, so the two cannot both be
+/// right. And `sync 0ms` in a run whose separate phase breakdown reported 15.5% sync says the same
+/// thing from the other side: either the CPU never waited, or the waiting is not being measured where
+/// it happens.
+///
+/// This does not decide which is wrong. It refuses to present numbers that cannot coexist as though
+/// they describe one run.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ProfileDoubt {
+    /// Fewer polls than downloads: a download maps a buffer, and mapping requires a poll.
+    FewerPollsThanDownloads { polls: u64, downloads: u64 },
+    /// The CPU reportedly never waited across a multi-second run.
+    NoSyncOverALongRun { wall_ms: f64 },
+}
+
+impl ProfileDoubt {
+    pub fn explain(&self) -> String {
+        match self {
+            ProfileDoubt::FewerPollsThanDownloads { polls, downloads } => format!(
+                "{polls} polls against {downloads} downloads — every download maps a buffer and every \
+map requires a poll, so one of these counters is not measuring what its name says. Until that is \
+settled, neither the poll count nor the sync total supports a conclusion about where time went"),
+            ProfileDoubt::NoSyncOverALongRun { wall_ms } => format!(
+                "sync is 0 ms across {wall_ms:.0} ms of wall time. Either the CPU genuinely never \
+waited on the GPU — in which case the work is not where the profile is looking — or the wait is \
+happening somewhere GPU_SYNC_NS is not wrapped around"),
+        }
+    }
+}
+
+/// Check a profile against itself. Empty means the numbers can coexist.
+pub fn profile_doubts(polls: u64, downloads: u64, sync_ms: f64, wall_ms: f64) -> Vec<ProfileDoubt> {
+    let mut v = Vec::new();
+    if downloads > 0 && polls < downloads {
+        v.push(ProfileDoubt::FewerPollsThanDownloads { polls, downloads });
+    }
+    // A second of wall time with no measured wait is not a fast run, it is an unmeasured one.
+    if sync_ms == 0.0 && wall_ms > 1000.0 {
+        v.push(ProfileDoubt::NoSyncOverALongRun { wall_ms });
+    }
+    v
+}
+
+#[cfg(test)]
+mod doubt_tests {
+    use super::*;
+
+    #[test]
+    fn the_REAL_run_that_prompted_this_is_flagged_twice() {
+        // 1625 submits, 1 poll, 141 downloads, sync 0 ms of 19860 ms.
+        let d = profile_doubts(1, 141, 0.0, 19860.0);
+        assert_eq!(d.len(), 2, "both contradictions, not just the louder one: {d:?}");
+        assert!(d[0].explain().contains("every map requires a poll"));
+        assert!(d[1].explain().contains("not where the profile is looking"));
+    }
+
+    #[test]
+    fn a_consistent_profile_raises_NOTHING() {
+        // The check must be silent when the numbers hold, or it becomes another line nobody reads.
+        assert!(profile_doubts(200, 141, 340.0, 19860.0).is_empty());
+    }
+
+    #[test]
+    fn a_short_run_with_no_sync_is_not_suspicious() {
+        // Sub-second work can genuinely complete without the CPU blocking; the doubt is about a
+        // multi-second run reporting zero.
+        assert!(profile_doubts(5, 2, 0.0, 40.0).is_empty());
+    }
+
+    #[test]
+    fn a_run_with_no_downloads_does_not_demand_polls() {
+        // Not every workload maps a buffer, and demanding a poll from one that never downloads would
+        // fire the warning on every profile that is fine.
+        assert!(profile_doubts(0, 0, 500.0, 5000.0).is_empty());
+    }
+}
