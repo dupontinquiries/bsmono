@@ -26,6 +26,9 @@ peermux-core = { path = "../../../shared/peermux-core" }
 # Gesture recognition EXTRACTED FROM SNAPCLONE — its own description says so —
 # while the composer hand-rolled a swipe threshold.
 touchkit = { path = "../../../shared/touchkit" }
+# XDG paths + a flat [section] key=value store. The settings page has a Save
+# button that persisted nothing.
+config-kit = { path = "../../../shared/config-kit" }
 device-kit = { path = "../../../shared/device-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
