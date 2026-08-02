@@ -3553,6 +3553,25 @@ everywhere: it looks like a hardware problem"
         // THE INDEX ITSELF. The correct set is 0..3, 16..19, 32..35, 48..51 — four consecutive values
         // every sixteen, which is an invocation-id shape, not a memory shape. This writes dst[i] = i
         // with no source buffer touched at all.
+        // SIZE SWEEP. Everything on our side checks out — upload byte-exact, invocation index
+        // correct, binding the whole buffer, layout standard — and the storage read still returns
+        // zero for 12 of every 16 bytes. The one property never questioned is the probe's own size:
+        // its source buffer is 64 bytes, while every real tensor is megabytes.
+        //
+        // A 64-byte storage buffer is small enough to hit driver minimum-size or alignment handling.
+        // If the 4-of-16 pattern is an artifact of that, it disappears as the buffer grows — and the
+        // real kernels, which work, would be explained. If it persists at 64 KiB, the fault is real
+        // and size-independent.
+        println!("  --- size sweep: is the 4-of-16 pattern a small-buffer artifact? ---");
+        for sz in [64usize, 256, 4096, 65536] {
+            let big: Vec<u8> = (0..sz).map(|i| (i % 251) as u8).collect();
+            let got = gpu.byte_probe(&big);
+            let ok = got.iter().enumerate().take(sz).all(|(i, v)| *v as u8 == big[i]);
+            let correct = got.iter().enumerate().take(64.min(sz))
+                .filter(|(i, v)| **v as u8 == big[*i]).count();
+            println!("    {sz:>6} bytes: {} ({correct} of the first {} correct)",
+                if ok { "CORRECT" } else { "wrong" }, 64.min(sz));
+        }
         let ids = gpu.id_probe(n);
         let id_ok = ids.iter().enumerate().all(|(i, v)| *v as usize == i);
         println!("  id_probe dst[i]=i  : {:?}",
