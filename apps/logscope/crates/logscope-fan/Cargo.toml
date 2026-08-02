@@ -8,6 +8,8 @@ description = "logscope's egui-free orchestration core: the coordinator fan-out,
 # extraction: editing orchestration logic recompiles this crate in seconds, not the 37k-line
 # egui app), and any new dep should be looked at hard before it lands.
 [dependencies]
+# Ed25519 for the machine identity — see machineid.rs. The id IS the key fingerprint, so
+# generating this is what turns a placeholder into something a second device can pair with.
+crypto-kit = { path = "../../../../shared/crypto-kit" }
 # Ed25519 for the machine identity: the id an operator pastes IS a fingerprint of this key,
 # so without it the id is stable and not actually anyone's.
-crypto-kit = { path = "../../../../shared/crypto-kit" }
