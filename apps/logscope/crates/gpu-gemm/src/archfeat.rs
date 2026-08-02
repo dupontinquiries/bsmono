@@ -548,7 +548,8 @@ mod tests {
     fn a_fully_supported_architecture_reports_no_gaps() {
         assert!(gaps("qwen3moe", 0).is_empty(), "qwen3moe should be fully covered");
     }
-}    fn qk_norm_is_a_VARIANT_property_not_an_expert_count() {
+    #[test]
+    fn qk_norm_is_a_VARIANT_property_not_an_expert_count() {
         // The loader read `expert_count != 128`, using "has 128 experts" as a stand-in for "is
         // Maverick" — the variant that disables post-rope Q/K norm. Scout has 16 and gets it.
         //
@@ -567,3 +568,4 @@ mod tests {
         assert!(decide(Some(1), 128), "a 128-expert model that declares qk-norm keeps it");
         assert!(!decide(Some(0), 16), "and a 16-expert model that declares none does not");
     }
+}
