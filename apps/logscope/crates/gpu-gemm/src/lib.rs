@@ -8028,7 +8028,18 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     } else { None };
                     drop(gsrc); drop(usrc);
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
-                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0,
+                        // SHARED EXPERT COUNT FROM METADATA. This was a literal 0, and it worked for
+                        // Scout only because moe_config rescues an arch that declares
+                        // `moe_shared_expert` with `.max(1)`. Correct by accident: an architecture
+                        // with two shared experts, or one whose flag disagrees with its file, loses
+                        // them silently — and a missing always-on expert degrades output without
+                        // breaking a shape, which is the failure mode Scout has been showing.
+                        //
+                        // Fifth value this session that the file carries and the loader took from a
+                        // constant, after the NoPE interval, the attention temperature, qk-norm and
+                        // expert_weights_scale.
+                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32,
+                            g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(0),
                             g.get_f32(&format!("{}.expert_weights_scale", acfg.prefix)),
                             g.get_u32(&format!("{}.expert_weights_norm", acfg.prefix)).map(|v| v != 0)) }))
                 } else { None },
