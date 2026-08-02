@@ -16,6 +16,7 @@ pub mod peer_source;
 pub mod contacts;
 pub mod conversation;
 pub mod composer;
+pub mod outbox;
 pub mod group_voice;
 pub mod settings_page;
 pub mod settings_store;
@@ -203,6 +204,10 @@ impl Snapclone {
             ui.text_edit_singleline(&mut self.composer.caption);
             if ui.button("colour").clicked() { self.composer.cycle_color(); }
             let d = self.composer.duration;
+            // Say what the timer MEANS before the snap is sent, not after. The
+            // difference between a replicated durable snap and an ephemeral one
+            // is invisible otherwise, and it is the difference that matters.
+            let delivery = crate::outbox::Delivery::of(d);
             if ui.button(d.label()).clicked() {
                 use crate::composer::Duration;
                 self.composer.duration = match d {
@@ -212,6 +217,12 @@ impl Snapclone {
                 };
             }
         });
+        // Recomputed here rather than captured: the button above may have just
+        // changed the duration, and showing the PREVIOUS delivery would tell
+        // the user the opposite of what pressing send will do.
+        let delivery = crate::outbox::Delivery::of(self.composer.duration);
+        ui.label(egui::RichText::new(delivery.explain())
+            .color(if delivery.replicates() { c.warning } else { c.text_weak }).small());
     }
 
     fn peers_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
