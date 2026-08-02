@@ -29,6 +29,7 @@
 #[allow(dead_code)] pub mod ollama;
 #[allow(dead_code)] pub mod quest;
 #[allow(dead_code)] pub mod stepwise;
+#[allow(dead_code)] pub mod discovery;
 #[allow(dead_code)] pub mod lanwire;
 #[allow(dead_code)] pub mod announce;
 #[allow(dead_code)] pub mod machineid;
