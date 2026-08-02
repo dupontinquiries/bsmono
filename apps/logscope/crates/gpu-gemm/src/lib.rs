@@ -2954,6 +2954,21 @@ impl Gpu {
         }
         let mut bg_entries = Vec::new();
         for (i, t) in inputs.iter().enumerate() {
+            // LOCALISE THE SHORT BINDING. --gate-bytes showed reads past the first u32 returning zero
+            // on real hardware, and the two candidates are indistinguishable from source: a view
+            // arriving where none should, or the dims uniform cutting the shader's loop short.
+            //
+            // This prints what is ACTUALLY bound, which separates them in one run: a view line here
+            // means the tensor carried one; no view line plus a short result means dims.
+            if std::env::var_os("LOGSCOPE_TRACE_BIND").is_some() {
+                let sz = t.buf.size();
+                match t.view {
+                    None => eprintln!("  bind[{i}] whole buffer, {sz} bytes ({} u32)", sz / 4),
+                    Some((off, len)) => eprintln!(
+                        "  bind[{i}] VIEW offset {off} len {len} of a {sz}-byte buffer ({} u32) \
+— if this input should be whole, the view is the fault", len / 4),
+                }
+            }
             let resource = match t.view {
                 None => t.buf.as_entire_binding(),
                 Some((off, len)) => wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &t.buf, offset: off, size: std::num::NonZeroU64::new(len) }),
