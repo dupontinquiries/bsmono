@@ -3542,7 +3542,26 @@ everywhere: it looks like a hardware problem"
         let correct: Vec<usize> = got.iter().enumerate()
             .filter(|(i, v)| **v as u8 == raw[*i]).map(|(i, _)| i).collect();
         println!("  CORRECT indices    : {correct:?}");
-        let exact = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        // THE STRIDE TEST. Your M2 Ultra returned correct bytes at exactly i % 16 < 4 — only every
+        // fourth u32 reachable, which is a 16-byte stride on an array<u32>: std140 scalar padding on a
+        // buffer that should be std430. Reading the same bytes through array<vec4<u32>> either fixes
+        // it (layout confirmed) or does not (theory wrong), and one run settles which.
+        let v4 = gpu.byte_probe_vec4(&raw);
+        let v4_ok = v4.iter().enumerate().all(|(i, x)| *x as u8 == raw[i]);
+        let scalar_ok = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        println!("  vec4 byte_at 0..16 : {:?}",
+            v4.iter().take(16).map(|x| *x as u8).collect::<Vec<_>>());
+        println!("gate-bytes: scalar array<u32> {} | vec4 array<vec4<u32>> {}",
+            if scalar_ok { "OK" } else { "WRONG" }, if v4_ok { "OK" } else { "WRONG" });
+        if !scalar_ok && v4_ok {
+            println!("  => CONFIRMED: array<u32> is laid out with a 16-byte stride (std140 padding). \
+Every u32 storage binding must become array<vec4<u32>> with the component selected by hand. This is \
+the root cause of gate-q6k, gate-q4k AND the disabled subgroup decode kernel.");
+        } else if !scalar_ok && !v4_ok {
+            println!("  => the stride theory is WRONG: both layouts fail, so the fault is not the \
+element size. Paste both rows above.");
+        }
+        let exact = scalar_ok;
         if exact {
             println!("gate-bytes: byte_at is CORRECT — the fault is in the dequantizers, not the reader \u{2713}");
         } else {
