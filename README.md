@@ -461,3 +461,5 @@ Six hovercars: a cushion instead of wheels, momentum instead of grip, and a repu
 `[` and `]` cycle cars in singleplayer, on QWERTY and Dvorak alike.
 
 Hovercars run a fast-regenerating base thrust plus stronger pad charge, and pulse instead of jumping.
+
+`--sim carry` measures what the ball does when you turn with it on the hood.

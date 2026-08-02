@@ -3265,6 +3265,39 @@ model is not shrunk by more than a third.
 All three are asserted by `--sim glb` against the source, so none of them
 can quietly come undone.
 
+## v1.100.0 — the nose was a bat, not a tool
+
+Reported: turning with the ball on the hood YANKS it, instead of the nose
+being something you use to work around to the outside of the ball.
+
+New `--sim carry` measures the thing being described, which took two goes to
+get right. The first measurement asked whether the ball was DRAGGED round
+with the nose — it was not: over a turn it inherits only 12-26% of the car's
+heading change, so it does keep its own line. The fault was the opposite of
+dragging. The ball was being EJECTED: bearing shooting past the outside to
+120-130 degrees and gone within a second at any real steering angle. You
+cannot use the nose to work around the outside of a ball that is already
+behind you.
+
+Two causes, and I was wrong about which mattered:
+
+  * THE FLICK THROW read any rotation at all. A flick works because the car
+    rotates out from under the ball — but simply turning spins the car 2
+    rad/s, which triggered it on every contact frame of a dribble. Measured
+    the actual rates (full steer 2.1 rad/s, a dodge 8.0) and gated it to
+    start at 3 and reach full by 6, clear of both. This was my prime suspect
+    and it turned out to be a small part of it.
+  * LATERAL RETENTION was almost nothing. At a friction coefficient of 0.018
+    the hood had nothing holding the ball sideways, so a turn slid it
+    straight off. It is 0.034 now — still far from a dish, because a ball on
+    a hood SHOULD be unstable, but there is something to fight with.
+
+A gentle turn now keeps the ball where it used to lose it. Flicks came out
+of it better rather than worse: forward 22.3 m/s at 23 degrees (was 17.8 at
+21), backflip 52 degrees, and the loft check passes with more pace than
+before. The tuning is a genuine trade — at 0.048 the carry was better still
+and flicks went flat at 16 degrees, so 0.034 is where both hold.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

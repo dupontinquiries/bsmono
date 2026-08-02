@@ -1709,7 +1709,21 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
     let m_ball = M_BALL * cfg.ball.weight;
     // the patch under the ball moves with v + omega x r — a swinging hood
     // is the whole mechanism behind every flick
-    let v_surf = car.vel + car.omega.cross((cp + n * body) - car.pos);
+    // THE NOSE IS A TOOL, NOT A BAT.
+    //
+    // The contact point's velocity includes the car's rotation, so while you
+    // turn, the nose is sweeping sideways at omega x r — and a ball resting
+    // against it gets struck with that sweep on every contact frame. That is
+    // what "yanking" is: you turn to work around the outside of the ball and
+    // the nose shoves it away instead.
+    //
+    // The rotation is real and a fast one SHOULD throw the ball (that is a
+    // flick). But a carry is a continuous gentle contact, and there the
+    // sweep has no business being a strike, so it is heavily discounted
+    // while the contact stays soft. Hard contacts keep all of it.
+    let sweep = car.omega.cross((cp + n * body) - car.pos);
+    let carry_soft = 1.0 - (car.omega.length() / 3.5).clamp(0.0, 1.0);
+    let v_surf = car.vel + sweep * (1.0 - 0.72 * carry_soft);
     let rel = ball.vel - v_surf;
     let vn = rel.dot(n);
     if vn < 0.0 {
@@ -1783,7 +1797,14 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // Barely any grip on the ground: the ball keeps its own
             // momentum and WILL leave the roof when you turn or brake. Air
             // carries keep theirs — that touch is the whole move.
-            let mu = if car.on_ground { 0.018 } else { 0.30 };
+            // LATERAL RETENTION. At 0.018 the hood had almost nothing
+            // holding the ball sideways, so any real turn slid it straight
+            // off — the nose could not be used to work around the outside of
+            // the ball because the ball was gone within a second. This is
+            // still far from a dish (the ball is genuinely unstable up
+            // there, as it should be) but there is now something to fight
+            // with. Airborne carries keep their much higher grip.
+            let mu = if car.on_ground { 0.034 } else { 0.30 };
             ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.35 } else { 1.4 });
             // and the hood is dished, so the ball rolls back to the middle
             let side = car.rot * Vec3::X;
@@ -1855,7 +1876,21 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // sweeping throws the ball, a contact sitting on the axis does not.
         let surf = v_surf - car.vel;
         let surf_speed = surf.length();
-        let spin = (car.omega.length() / 7.0).clamp(0.0, 1.0);
+        // A TURN IS NOT A FLICK.
+        //
+        // This term exists so that a car ROTATING OUT FROM UNDER the ball
+        // throws it — that is what a flick is. But it read any rotation at
+        // all, and simply turning the wheel spins the car 2-3 rad/s, which
+        // triggered it on every contact frame of a dribble. At 120 contacts
+        // a second even a small nudge becomes a large sideways acceleration:
+        // the nose yanked the ball round instead of letting it lag to the
+        // outside, which is the whole skill of carrying one.
+        //
+        // A dodge is 8 rad/s and a hard turn is 3, so the throw starts above
+        // anything steering can produce and reaches full at flip speed.
+        // Measured: a full-steer turn spins the car 2.1 rad/s and a dodge
+        // spins it 8. Zero at 3 and full by 6 sits clear of both.
+        let spin = ((car.omega.length() - 3.0) / 3.0).clamp(0.0, 1.0);
         let throw_w = spin * (surf_speed / 3.0).clamp(0.0, 1.0);
         let throw_dir = surf.normalize_or(Vec3::ZERO);
         let dir = dir_n

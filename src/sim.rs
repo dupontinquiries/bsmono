@@ -485,6 +485,121 @@ pub fn run(args: &[String]) {
         println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
         return;
     }
+    if name == "carry" {
+        // TURNING WITH THE BALL ON THE HOOD.
+        //
+        // What should happen: the ball has its own momentum, so when the car
+        // turns the ball LAGS toward the outside of the turn. That lag is the
+        // whole skill — you work around to the outside of the ball and use
+        // the nose to hold it, steering it by where you place the car.
+        //
+        // What "yanking" means: the nose drags the ball round with it, so
+        // the ball stays pinned dead ahead however hard you turn and there is
+        // nothing to work with.
+        //
+        // So measure the BEARING of the ball from the car's nose over a turn.
+        // Pinned at zero is the fault; a bearing that opens to the outside is
+        // the behaviour.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        println!("{:<14} {:>10} {:>11} {:>10}", "steer", "bearing", "lateral", "kept");
+        let mut bearings = Vec::new();
+        let mut inherit: Vec<f32> = Vec::new();
+        for steer in [0.35f32, 0.7, 1.0] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            c.throttle = 1.0;
+            for _ in 0..110 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // set it on the hood and let it settle straight
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..40 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            // now turn, and watch where the ball goes relative to the nose
+            c.steer = steer;
+            let mut peak = 0.0f32;
+            let mut lat = 0.0f32;
+            let mut kept = true;
+            for _ in 0..120 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                let rel = car.rot.inverse() * (ball.pos - car.pos);
+                if rel.length() > 3.0 {
+                    kept = false;
+                    break;
+                }
+                // bearing from straight ahead, signed toward the outside
+                let b = rel.x.atan2(-rel.z).to_degrees() * -steer.signum();
+                if b > peak {
+                    peak = b;
+                    lat = rel.x.abs();
+                }
+            }
+            println!("{:<14.2} {:>9.1}d {:>10.2}m {:>10}", steer, peak, lat, if kept { "yes" } else { "lost" });
+            bearings.push(peak);
+            // HOW MUCH OF THE CAR'S TURN DID THE BALL INHERIT?
+            // A ball with its own momentum turns LESS than the car under it —
+            // that difference is the lag you steer around. If it turns as
+            // much as the car, the nose is carrying it round: the yank.
+            {
+                let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+                let mut car = physics::Car::new();
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+                car.sync_rot();
+                let mut ball = Ball::new();
+                let mut c = physics::Controls::default();
+                let mut ev = StepEvents::default();
+                c.throttle = 1.0;
+                for _ in 0..110 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                let f = car.forward();
+                ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+                ball.vel = car.vel;
+                ball.prev = ball.pos;
+                for _ in 0..40 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let heading = |v: Vec3| v.z.atan2(v.x).to_degrees();
+                let c0 = heading(car.forward());
+                let b0 = heading(ball.vel);
+                c.steer = steer;
+                for _ in 0..36 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let dc = (heading(car.forward()) - c0).abs();
+                let db = (heading(ball.vel) - b0).abs();
+                println!(
+                    "   over 0.3s: car turned {dc:.1}d, ball turned {db:.1}d ({:.0}% inherited)",
+                    db / dc.max(0.01) * 100.0
+                );
+                inherit.push(db / dc.max(0.01));
+            }
+        }
+        // the ball must move to the OUTSIDE, and more so the harder you turn
+        // Rocket League's carry: the ball keeps most of its own line, and
+        // you steer by moving the car around it. Inheriting nearly all of
+        // the car's turn is the yank.
+        let worst = inherit.iter().cloned().fold(0.0f32, f32::max);
+        check("the ball keeps its own line through a turn", worst < 0.75);
+        check("the ball lags to the outside of the turn", bearings.iter().all(|b| *b > 8.0));
+        check("and lags further the harder you turn", bearings[2] > bearings[0] + 4.0);
+        println!("{}", if pass { "CARRY: PASS" } else { "CARRY: FAIL" });
+        return;
+    }
     if name == "hits" {
         // "Sometimes the ball goes in weird directions." A hit that is
         // sometimes wrong is a DISCONTINUITY: nudge the contact point a
@@ -1190,6 +1305,121 @@ pub fn run(args: &[String]) {
                 grounded_frames as f32 / steps as f32 * 100.0
             );
         }
+        return;
+    }
+    if name == "carry" {
+        // TURNING WITH THE BALL ON THE HOOD.
+        //
+        // What should happen: the ball has its own momentum, so when the car
+        // turns the ball LAGS toward the outside of the turn. That lag is the
+        // whole skill — you work around to the outside of the ball and use
+        // the nose to hold it, steering it by where you place the car.
+        //
+        // What "yanking" means: the nose drags the ball round with it, so
+        // the ball stays pinned dead ahead however hard you turn and there is
+        // nothing to work with.
+        //
+        // So measure the BEARING of the ball from the car's nose over a turn.
+        // Pinned at zero is the fault; a bearing that opens to the outside is
+        // the behaviour.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        println!("{:<14} {:>10} {:>11} {:>10}", "steer", "bearing", "lateral", "kept");
+        let mut bearings = Vec::new();
+        let mut inherit: Vec<f32> = Vec::new();
+        for steer in [0.35f32, 0.7, 1.0] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            c.throttle = 1.0;
+            for _ in 0..110 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // set it on the hood and let it settle straight
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..40 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            // now turn, and watch where the ball goes relative to the nose
+            c.steer = steer;
+            let mut peak = 0.0f32;
+            let mut lat = 0.0f32;
+            let mut kept = true;
+            for _ in 0..120 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                let rel = car.rot.inverse() * (ball.pos - car.pos);
+                if rel.length() > 3.0 {
+                    kept = false;
+                    break;
+                }
+                // bearing from straight ahead, signed toward the outside
+                let b = rel.x.atan2(-rel.z).to_degrees() * -steer.signum();
+                if b > peak {
+                    peak = b;
+                    lat = rel.x.abs();
+                }
+            }
+            println!("{:<14.2} {:>9.1}d {:>10.2}m {:>10}", steer, peak, lat, if kept { "yes" } else { "lost" });
+            bearings.push(peak);
+            // HOW MUCH OF THE CAR'S TURN DID THE BALL INHERIT?
+            // A ball with its own momentum turns LESS than the car under it —
+            // that difference is the lag you steer around. If it turns as
+            // much as the car, the nose is carrying it round: the yank.
+            {
+                let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+                let mut car = physics::Car::new();
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+                car.sync_rot();
+                let mut ball = Ball::new();
+                let mut c = physics::Controls::default();
+                let mut ev = StepEvents::default();
+                c.throttle = 1.0;
+                for _ in 0..110 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                let f = car.forward();
+                ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+                ball.vel = car.vel;
+                ball.prev = ball.pos;
+                for _ in 0..40 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let heading = |v: Vec3| v.z.atan2(v.x).to_degrees();
+                let c0 = heading(car.forward());
+                let b0 = heading(ball.vel);
+                c.steer = steer;
+                for _ in 0..36 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let dc = (heading(car.forward()) - c0).abs();
+                let db = (heading(ball.vel) - b0).abs();
+                println!(
+                    "   over 0.3s: car turned {dc:.1}d, ball turned {db:.1}d ({:.0}% inherited)",
+                    db / dc.max(0.01) * 100.0
+                );
+                inherit.push(db / dc.max(0.01));
+            }
+        }
+        // the ball must move to the OUTSIDE, and more so the harder you turn
+        // Rocket League's carry: the ball keeps most of its own line, and
+        // you steer by moving the car around it. Inheriting nearly all of
+        // the car's turn is the yank.
+        let worst = inherit.iter().cloned().fold(0.0f32, f32::max);
+        check("the ball keeps its own line through a turn", worst < 0.75);
+        check("the ball lags to the outside of the turn", bearings.iter().all(|b| *b > 8.0));
+        check("and lags further the harder you turn", bearings[2] > bearings[0] + 4.0);
+        println!("{}", if pass { "CARRY: PASS" } else { "CARRY: FAIL" });
         return;
     }
     if name == "hits" {
