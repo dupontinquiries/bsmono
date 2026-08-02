@@ -324,6 +324,27 @@ pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic:
 /// path reads as an unexplained one, so the remaining unmeasured path is worth closing before drawing
 /// any more conclusions from the split.
 pub static GPU_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Nanoseconds in host-side sampling: logits post-processing, penalties, top-k/p, argmax.
+///
+/// The fourth thing a generation does, and the last one nothing timed. With a 128k vocabulary this is
+/// half a megabyte of logits per token walked on the CPU, and none of it appears in setup, submit or
+/// sync — so it would land in the same unaccounted bucket that three commits have now been spent
+/// emptying.
+///
+/// Counted here rather than in the caller so every sampling path shares one definition; a timer per
+/// call site is how two of them end up measuring different spans.
+pub static SAMPLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Time a host-side sampling step.
+#[inline]
+pub fn timed_sample<T>(f: impl FnOnce() -> T) -> T {
+    let t = std::time::Instant::now();
+    let r = f();
+    SAMPLE_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+pub fn sample_ns() -> u64 { SAMPLE_NS.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// One line attributing every submit to its cause, for the profile report.
 /// A snapshot of the submit-cause counters, for reporting a DELTA rather than a lifetime total.
@@ -522,7 +543,8 @@ pub fn gpu_counters_reset() {
     for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS,
               &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES,
               &SUBMIT_BY_PASSES, &SUBMIT_BY_RETAIN, &SUBMIT_BY_DOWNLOAD,
-              &SUBMIT_BY_DIMS_WRAP, &SUBMIT_BY_END_FRAME, &SUBMIT_BY_NO_FRAME, &GPU_SUBMIT_NS] {
+              &SUBMIT_BY_DIMS_WRAP, &SUBMIT_BY_END_FRAME, &SUBMIT_BY_NO_FRAME, &GPU_SUBMIT_NS,
+              &SAMPLE_NS] {
         c.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -12091,7 +12113,11 @@ impl KvSession for Session {
     }
     fn prefill_chunk(&mut self, gpu: &Gpu, m: &Model, chunk: &[u32]) { gpu.session_prefill(m, self, chunk); }
     fn sample_next(&mut self, sp: &SamplerParams) -> u32 {
-        if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) }
+        // TIMED. Host-side sampling is the fourth thing a generation does and the last one
+        // nothing measured — half a megabyte of logits walked per token at a 128k vocabulary,
+        // appearing in neither setup, submit nor sync. It would have landed in the same
+        // unaccounted bucket three commits have been spent emptying.
+        crate::timed_sample(|| if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) } )
     }
     fn decode_batch(gpu: &Gpu, m: &Model, sess: &mut [Session], toks: &[u32]) { gpu.decode_batched(m, sess, toks); }
 }
@@ -12111,7 +12137,11 @@ impl KvSession for SessionQ8 {
     }
     fn prefill_chunk(&mut self, gpu: &Gpu, m: &Model, chunk: &[u32]) { gpu.session_q8_prefill(m, self, chunk); }
     fn sample_next(&mut self, sp: &SamplerParams) -> u32 {
-        if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) }
+        // TIMED. Host-side sampling is the fourth thing a generation does and the last one
+        // nothing measured — half a megabyte of logits walked per token at a 128k vocabulary,
+        // appearing in neither setup, submit nor sync. It would have landed in the same
+        // unaccounted bucket three commits have been spent emptying.
+        crate::timed_sample(|| if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) } )
     }
     fn decode_batch(gpu: &Gpu, m: &Model, sess: &mut [SessionQ8], toks: &[u32]) { gpu.decode_batched_q8(m, sess, toks); }
 }
