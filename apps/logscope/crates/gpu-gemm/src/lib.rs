@@ -313,6 +313,17 @@ pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// one and it was the only path left untagged — a run showed 4256 submits against 729 attributed, and
 /// the missing 3500 had to be here.
 pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Nanoseconds inside `queue.submit` — encoder finish plus the driver handoff.
+///
+/// The profile split wall time into setup (bind groups) and sync (waiting), and SUBMIT ITSELF WAS
+/// NEITHER. At 15 submits per token over thousands of tokens that is a third bucket, and on a driver
+/// whose completion callbacks are slow enough to disable the governor — your log reports "submit
+/// stalled 739ms" — it is exactly where time would hide.
+///
+/// Added after finding that 16 of 17 polls were uncounted: the lesson there was that an unmeasured
+/// path reads as an unexplained one, so the remaining unmeasured path is worth closing before drawing
+/// any more conclusions from the split.
+pub static GPU_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One line attributing every submit to its cause, for the profile report.
 /// A snapshot of the submit-cause counters, for reporting a DELTA rather than a lifetime total.
@@ -473,6 +484,9 @@ pub fn pool_hits() -> u64 { POOL_HITS.load(std::sync::atomic::Ordering::Relaxed)
 pub fn pool_misses() -> u64 { POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_submits() -> u64 { GPU_SUBMITS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_polls() -> u64 { GPU_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
+/// Nanoseconds spent inside queue.submit this run.
+pub fn gpu_submit_ns() -> u64 { GPU_SUBMIT_NS.load(std::sync::atomic::Ordering::Relaxed) }
+
 pub fn gpu_setup_ns() -> u64 { GPU_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Relaxed) }
 /// Reset every per-run counter.
@@ -508,7 +522,7 @@ pub fn gpu_counters_reset() {
     for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS,
               &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES,
               &SUBMIT_BY_PASSES, &SUBMIT_BY_RETAIN, &SUBMIT_BY_DOWNLOAD,
-              &SUBMIT_BY_DIMS_WRAP, &SUBMIT_BY_END_FRAME, &SUBMIT_BY_NO_FRAME] {
+              &SUBMIT_BY_DIMS_WRAP, &SUBMIT_BY_END_FRAME, &SUBMIT_BY_NO_FRAME, &GPU_SUBMIT_NS] {
         c.store(0, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -2911,7 +2925,10 @@ impl Gpu {
     fn submit(&self, enc: wgpu::CommandEncoder) {
         use std::sync::atomic::Ordering::Relaxed;
         GPU_SUBMITS.fetch_add(1, Relaxed);
+        let t_sub = std::time::Instant::now();
         self.queue.submit([enc.finish()]);
+        GPU_SUBMIT_NS.fetch_add(t_sub.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed);
         // SUBMIT GOVERNOR (see `inflight_cap`): bound queue depth so a display sharing this GPU is
         // serviced between submits. flush_every already bounds each submit's duration; without a depth
         // bound the encoder outruns the GPU and stacks hundreds of ms of compute in front of the
