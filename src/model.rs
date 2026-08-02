@@ -44,12 +44,12 @@ pub struct Model {
     pub wheel_r: f32,
 }
 
-struct RawPrim {
-    verts: Vec<Vertex>,
-    idx: Vec<u32>,
-    color: [f32; 4],
-    tex_uri: Option<String>,
-    tag: Tag,
+pub struct RawPrim {
+    pub verts: Vec<Vertex>,
+    pub idx: Vec<u32>,
+    pub color: [f32; 4],
+    pub tex_uri: Option<String>,
+    pub tag: Tag,
 }
 
 fn detect_tag(name: Option<&str>) -> Option<Tag> {
@@ -135,7 +135,10 @@ fn collect_node(
 /// Load a model folder (scene.gltf + scene.bin + textures/), normalized so its
 /// longest run (nose axis if wheels exist) spans `target_len` along Z with the
 /// nose at -Z, centered at the origin.
-pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
+/// Everything `load` does before touching the GPU: parse, bake node
+/// transforms, tag wheels, orient, center, scale. Harnesses and tools can
+/// accept an asset exactly the way the engine does, with no device.
+pub fn load_raw(dir: &Path, target_len: f32) -> (Vec<RawPrim>, Vec3) {
     let doc = gltf::Gltf::open(dir.join("scene.gltf"))
         .unwrap_or_else(|e| panic!("open {:?}: {e}", dir));
     let buffer_uri = doc
@@ -217,6 +220,12 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
         }
     }
 
+    let half = ext * s * 0.5;
+    (raws, half)
+}
+
+pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
+    let (raws, half) = load_raw(dir, target_len);
     // ---- upload: dedupe textures per model, build prims ----
     let mut tex_cache: HashMap<String, usize> = HashMap::new();
     let mut prims = Vec::new();
@@ -253,7 +262,6 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
         prims.push(Prim { mesh_id, tex_id, color: r.color, tag: r.tag, pivot });
     }
 
-    let half = ext * s * 0.5;
     let wheel_r = if wheel_bottom < wheel_top {
         (wheel_top - wheel_bottom) * 0.5
     } else {
