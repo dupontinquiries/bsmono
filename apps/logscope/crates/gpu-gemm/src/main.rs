@@ -3550,6 +3550,18 @@ everywhere: it looks like a hardware problem"
         // points at the buffer: if only 4 of every 16 bytes ever arrived, both shaders are reading
         // correctly and reporting what is there. A round trip through upload_bytes and back settles
         // which side of the boundary the fault is on.
+        // THE INDEX ITSELF. The correct set is 0..3, 16..19, 32..35, 48..51 — four consecutive values
+        // every sixteen, which is an invocation-id shape, not a memory shape. This writes dst[i] = i
+        // with no source buffer touched at all.
+        let ids = gpu.id_probe(n);
+        let id_ok = ids.iter().enumerate().all(|(i, v)| *v as usize == i);
+        println!("  id_probe dst[i]=i  : {:?}",
+            ids.iter().take(16).map(|v| *v as u32).collect::<Vec<_>>());
+        if !id_ok {
+            println!("  => THE INVOCATION INDEX IS WRONG, with no memory read involved. Every kernel \
+that indexes by global_invocation_id is affected — which is all of them — and no amount of work on \
+byte_at or on any quantization can fix it.");
+        }
         let back = gpu.upload_readback_probe(&raw);
         let upload_ok = back == raw;
         println!("  upload+readback    : {:?}", &back[..16.min(back.len())]);
