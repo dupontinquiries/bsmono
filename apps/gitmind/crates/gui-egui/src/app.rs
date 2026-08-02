@@ -14,11 +14,12 @@ pub enum Tab {
     Branches,
     Files,
     Timeline,
+    Artifacts,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 9] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Timeline, Tab::Settings];
+    pub const ALL: [Tab; 10] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Fleet => "Fleet",
@@ -28,6 +29,7 @@ impl Tab {
             Tab::Import => "Import",
             Tab::Branches => "Branches",
             Tab::Files => "Files",
+            Tab::Artifacts => "Artifacts",
             Tab::Timeline => "Timeline",
             Tab::Settings => "Settings",
         }
@@ -43,6 +45,7 @@ impl Tab {
             Tab::Import => "📥",
             Tab::Branches => "🌿",
             Tab::Files => "📁",
+            Tab::Artifacts => "🧹",
             Tab::Timeline => "🕘",
             Tab::Settings => "⚙",
         }
@@ -57,6 +60,7 @@ pub struct App {
     pub fleet: pages::fleet::State,
     pub push: pages::push::State,
     pub apps: pages::apps::State,
+    pub artifacts: pages::artifacts::State,
     pub timeline: pages::timeline::State,
     pub import: pages::import::State,
     pub branches: pages::branches::State,
@@ -69,6 +73,7 @@ pub struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
+            artifacts: Default::default(),
             tab: Tab::Network,
             prefs: {
                 // System palette: the minimal neutral-dark "system utilities" theme, shared with
@@ -150,6 +155,7 @@ impl App {
                 Tab::Import => pages::import::ui(self, ui),
                 Tab::Branches => pages::branches::ui(self, ui),
                 Tab::Files => pages::files::ui(self, ui),
+            Tab::Artifacts => pages::artifacts::ui(self, ui),
                 Tab::Timeline => pages::timeline::ui(self, ui),
                 Tab::Fleet => pages::fleet::ui(self, ui),
                 Tab::Push => pages::push::ui(self, ui),
