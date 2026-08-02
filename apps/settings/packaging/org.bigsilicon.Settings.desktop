@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Settings
+GenericName=System Settings
+Comment=Edit the shared preferences every BigSilicon app reads
+Exec=settings-egui
+Icon=org.bigsilicon.Settings
+Terminal=false
+Categories=Settings;DesktopSettings;
+Keywords=settings;preferences;configuration;
+StartupNotify=true
+StartupWMClass=org.bigsilicon.Settings

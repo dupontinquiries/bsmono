@@ -1,5 +1,12 @@
+/// Must match packaging/org.faocodec.FaoCodec.desktop exactly — a mismatch fails
+/// silently, leaving a working app with no icon.
+const APP_ID: &str = "org.faocodec.FaoCodec";
+
 fn main() -> eframe::Result<()> {
-    let opts = eframe::NativeOptions::default();
+    let opts = eframe::NativeOptions {
+        viewport: uikit_egui::desktop::viewport(APP_ID, "FAO Codec", [900.0, 700.0]),
+        ..Default::default()
+    };
     eframe::run_native("fao codec", opts, Box::new(|_| Ok(Box::new(Shell::default()))))
 }
 #[derive(Default)]

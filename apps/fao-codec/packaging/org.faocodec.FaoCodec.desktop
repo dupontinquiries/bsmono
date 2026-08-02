@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=FAO Codec
+GenericName=Media Codec Tool
+Comment=Encode and inspect FAO media streams
+Exec=fao-codec-egui
+Icon=org.faocodec.FaoCodec
+Terminal=false
+Categories=AudioVideo;Utility;
+Keywords=codec;encode;media;video;
+StartupNotify=true
+StartupWMClass=org.faocodec.FaoCodec
