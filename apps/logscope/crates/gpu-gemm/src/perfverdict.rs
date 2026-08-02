@@ -63,7 +63,24 @@ impl Sample {
     pub fn sync_per_submit_ms(&self) -> f64 {
         if self.submits == 0 { 0.0 } else { self.sync_ms / self.submits as f64 }
     }
-    fn compute_ms(&self) -> f64 { (self.wall_ms - self.setup_ms - self.sync_ms).max(0.0) }
+    /// Wall time neither setup nor sync accounts for.
+    ///
+    /// Went dead when `Underfed` became `FewSubmitsStillSlow` — the old branch tested
+    /// `compute_ms() < sync_ms` and the new one does not. Kept and made public rather than deleted,
+    /// because it is the term that matters most and the one the profile CANNOT see into: on every run
+    /// measured it is 99%+ of wall time, and calling that "GPU execution" was the overstatement fixed
+    /// in _399.
+    ///
+    /// Naming it `unaccounted_ms` rather than `compute_ms` is the point. The old name asserted what the
+    /// time was spent on; the new one says only that we do not know, which is the truth and is what
+    /// stops the next reader concluding the GPU was busy.
+    pub fn unaccounted_ms(&self) -> f64 { (self.wall_ms - self.setup_ms - self.sync_ms).max(0.0) }
+
+    /// Fraction of wall time nothing accounts for, 0..1.
+    pub fn unaccounted_share(&self) -> f64 {
+        if self.wall_ms <= 0.0 { return 0.0; }
+        self.unaccounted_ms() / self.wall_ms
+    }
 }
 
 /// What is actually limiting this run.
@@ -152,6 +169,24 @@ mod tests {
     fn s(tokens: u64, wall: f64, setup: f64, sync: f64, submits: u64, active_gib: f64) -> Sample {
         Sample { tokens, wall_ms: wall, setup_ms: setup, sync_ms: sync, submits,
                  active_bytes: (active_gib * (1u64 << 30) as f64) as u64, gib_per_s: 258.1 }
+    }
+
+    #[test]
+    fn the_unaccounted_share_is_the_number_that_MATTERS() {
+        // Every run measured this session put 99%+ of wall time here — setup 19ms and sync 0ms of
+        // 18292ms on DeepSeek-8B. Calling that "GPU-execution-bound" was the overstatement fixed in
+        // _399, and the honest reading is that nothing in the profile can see where the time went.
+        let s = Sample { tokens: 81, wall_ms: 18292.0, setup_ms: 19.0, sync_ms: 0.0,
+                         submits: 610, active_bytes: 0, gib_per_s: 0.0 };
+        assert!(s.unaccounted_share() > 0.99, "got {:.4}", s.unaccounted_share());
+        assert!((s.unaccounted_ms() - 18273.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn a_zero_length_run_reports_no_share_rather_than_dividing() {
+        let s = Sample { tokens: 0, wall_ms: 0.0, setup_ms: 0.0, sync_ms: 0.0,
+                         submits: 0, active_bytes: 0, gib_per_s: 0.0 };
+        assert_eq!(s.unaccounted_share(), 0.0);
     }
 
     #[test]
