@@ -7490,8 +7490,24 @@ resident weights that share the SAME memory on this unified-memory machine, plus
 ~{:.1} GiB of page cache for the file, against {:.1} GiB of system RAM — this would be OOM-killed partway \
 through the load. The engine requantizes every expert to its own q4 layout on load, which is the cost here. \
 Options: run a smaller checkpoint, use the llama.cpp backend (which reads the file's native Q4_K blocks \
-directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the resident-fit error instead.",
-                                        gib(host_store), gib(uma_resident), gib(set_data_len), gib(ram)));
+directly and needs no host copy){}.",
+                                        gib(host_store), gib(uma_resident), gib(set_data_len), gib(ram),
+                                        // NAME THE ESCAPE ONLY WHEN IT WORKS. This said "set
+                                        // LOGSCOPE_MOE_STREAM=0 to see the resident-fit error
+                                        // instead", which offers a flag as a way to reach a DIFFERENT
+                                        // error — so nobody tries it. When the model fits resident it
+                                        // is not an escape to another failure, it is the answer.
+                                        if full_resident <= gpu_budget {
+                                            format!(", or set LOGSCOPE_MOE_STREAM=0 — this model DOES \
+fit fully resident ({:.1} GiB against a {:.1} GiB budget), so streaming is not needed at all and \
+turning it off avoids the host copy entirely",
+                                                gib(full_resident), gib(gpu_budget))
+                                        } else {
+                                            format!(", or set LOGSCOPE_MOE_STREAM=0 to see the \
+resident-fit error instead — though at {:.1} GiB against a {:.1} GiB budget it will not fit that way \
+either",
+                                                gib(full_resident), gib(gpu_budget))
+                                        }));
                                 }
                                 auto_q4 = true;
                                 moe_stream_pin = Some(pin);
