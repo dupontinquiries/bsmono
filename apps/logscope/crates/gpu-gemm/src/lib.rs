@@ -8697,6 +8697,23 @@ different metadata keys and disagree here; output will be degraded rather than b
                 let v_head = g.get_u32(&format!("{pfx}.attention.value_length_mla")).map(|v| v as usize)
                     .or_else(|| g.get_u32(&format!("{pfx}.attention.value_length")).map(|v| v as usize))
                     .unwrap_or(qk_nope);
+                // CROSS-CHECK THE FIVE INTERLOCKING DIMS AGAINST THE TENSORS. Each is redundant with a
+                // shape in the file, and MLA is the architecture where reading one wrong still multiplies
+                // out — the model runs on the wrong geometry and produces text rather than an error.
+                // Agreement is evidence; disagreement localises the fault to a single hparam.
+                {
+                    let dims_of = |n: &str| g.tensor(&format!("blk.0.{n}.weight")).map(|t| t.dims.clone());
+                    let q_b_w = dims_of("attn_q_b").and_then(|d| d.get(1).copied()).unwrap_or(0) as usize;
+                    let out_w = dims_of("attn_output").map(|d| d[0] as usize).unwrap_or(0);
+                    let n_head = g.get_u32(&format!("{pfx}.attention.head_count")).unwrap_or(0) as usize;
+                    if n_head > 0 && q_b_w > 0 && out_w > 0 {
+                        let (kb, vb) = (dims_of("attn_k_b"), dims_of("attn_v_b"));
+                        for d in crate::mla::check_shapes(q_b_w, out_w, kb.as_deref(), vb.as_deref(),
+                                                          n_head, qk_nope, qk_rope, kv_lora, v_head) {
+                            eprintln!("loader: MLA SHAPE DISAGREEMENT — {}", d.explain());
+                        }
+                    }
+                }
                 // sanity-bound the MLA ranks (cf. the hostile-dim guard) before they size the latent cache
                 for (name, val, max) in [("kv_lora_rank", kv_lora, 65_536usize), ("q_lora_rank", q_lora, 65_536),
                                          ("qk_rope", qk_rope, 4_096), ("qk_nope", qk_nope, 4_096), ("v_head", v_head, 4_096)] {
