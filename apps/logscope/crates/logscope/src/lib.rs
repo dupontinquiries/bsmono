@@ -56,6 +56,7 @@ pub mod hybridsplit;
 pub mod tensorplace;
 pub mod coresidency;
 pub mod loadadvice;
+pub mod rolequant_hint;
 pub mod deliberate;
 pub mod panelmode;
 pub mod panelvoice;
