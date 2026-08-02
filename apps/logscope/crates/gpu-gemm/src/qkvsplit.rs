@@ -425,3 +425,86 @@ mod axis_tests {
         assert_eq!(v.1, rows * row_bytes, "the last part ends at the tensor's end");
     }
 }
+
+/// Rows and per-row bytes from a GGUF tensor's dims.
+///
+/// **This is where the axis bug was.** GGUF stores dims fastest-varying first, so for
+/// `attn_qkv [4096, 8192]` on a d=4096 model, `dims[0]` is the INPUT WIDTH and `dims[1..]` are the
+/// output rows. Getting it backwards is self-consistent arithmetic about the wrong axis: `split`
+/// compares head counts against the number it is handed and cannot know which dimension that was.
+///
+/// Extracted from the loader closure precisely because the bug lived in the derivation and the
+/// derivation was untestable there — every gate and test passed while it was wrong, because they all
+/// exercise dense tensors and none passes through here.
+///
+/// `nbytes` is the caller's `type_nbytes` — passed in rather than imported so this stays free of the
+/// gguf module and can be tested with a stub.
+pub fn dims_to_rows_and_stride(
+    dims: &[u64],
+    nbytes: impl Fn(usize) -> Option<usize>,
+) -> Option<(usize, usize)> {
+    if dims.len() < 2 { return None; }          // a vector has no rows to split
+    let width = dims[0] as usize;
+    let rows = dims.iter().skip(1).product::<u64>() as usize;
+    if width == 0 || rows == 0 { return None; }
+    // None here means the row is not a whole number of quantization blocks — see
+    // `rows_are_block_aligned`. Refused rather than rounded.
+    let stride = nbytes(width)?;
+    Some((rows, stride))
+}
+
+#[cfg(test)]
+mod dims_tests {
+    use super::*;
+
+    /// Q4_K: 144 bytes per 256 weights, None when not a whole number of blocks.
+    fn q4k(n: usize) -> Option<usize> {
+        if n % 256 == 0 { Some(n / 256 * 144) } else { None }
+    }
+
+    #[test]
+    fn the_reported_shape_yields_ROWS_from_the_second_axis() {
+        // attn_qkv [4096, 8192]: 8192 rows of 4096 weights each. Getting this backwards is what _465
+        // fixed, and it is the whole reason this function exists as a named unit.
+        let (rows, stride) = dims_to_rows_and_stride(&[4096, 8192], q4k).unwrap();
+        assert_eq!(rows, 8192, "rows come from dims[1..], not dims[0]");
+        assert_eq!(stride, 4096 / 256 * 144, "and the stride from the INPUT width");
+    }
+
+    #[test]
+    fn a_swapped_reading_would_give_DIFFERENT_numbers_and_still_look_fine() {
+        // The property that made the bug quiet: both readings produce plausible values, so nothing
+        // downstream can tell which axis it was handed.
+        let right = dims_to_rows_and_stride(&[4096, 8192], q4k).unwrap();
+        let swapped = dims_to_rows_and_stride(&[8192, 4096], q4k).unwrap();
+        assert_ne!(right, swapped);
+        assert!(swapped.0 > 0 && swapped.1 > 0, "both are self-consistent — that is the danger");
+    }
+
+    #[test]
+    fn a_1D_tensor_has_no_rows_to_split() {
+        // attn_norm is [4096]. Returning a guess would have the shim cut a normalization vector.
+        assert!(dims_to_rows_and_stride(&[4096], q4k).is_none());
+    }
+
+    #[test]
+    fn a_width_that_is_not_a_whole_number_of_BLOCKS_is_refused() {
+        // Slicing at a row boundary would then cut a quantization block in half.
+        assert!(dims_to_rows_and_stride(&[1000, 8192], q4k).is_none());
+    }
+
+    #[test]
+    fn a_zero_dimension_is_refused_rather_than_producing_an_empty_slice() {
+        // An empty span reads as a tensor of zeros — plausible weights again.
+        assert!(dims_to_rows_and_stride(&[0, 8192], q4k).is_none());
+        assert!(dims_to_rows_and_stride(&[4096, 0], q4k).is_none());
+    }
+
+    #[test]
+    fn a_3D_tensor_multiplies_the_trailing_axes() {
+        // Expert tensors are [in, out, n_expert]. Not splittable in practice, but the row count must
+        // still be the product of everything past the width rather than just dims[1].
+        let (rows, _) = dims_to_rows_and_stride(&[4096, 1024, 8], q4k).unwrap();
+        assert_eq!(rows, 8192);
+    }
+}
