@@ -2700,6 +2700,83 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "perf" {
+        // CPU cost, measured rather than guessed. Unlike the GPU work this
+        // can be timed directly here, so there is no excuse for optimising
+        // by intuition.
+        use std::time::Instant;
+        println!("{:<14} {:>10} {:>12} {:>12}", "map", "worldgen", "sdf/ms", "step/ms (12 bots)");
+        for si in [20usize, 21, 24, 28, 35] {
+            let t0 = Instant::now();
+            let world = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let gen_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            // raw sdf throughput at play-relevant positions
+            let mut acc = 0.0f32;
+            let n = 20_000;
+            let t1 = Instant::now();
+            for k in 0..n {
+                let a = k as f32 * 0.7548;
+                let p = Vec3::new(a.cos() * 40.0, 4.0 + (k % 30) as f32, a.sin() * 40.0);
+                acc += world.sdf(p);
+            }
+            let sdf_per_ms = n as f32 / (t1.elapsed().as_secs_f32() * 1000.0);
+            // a full step with a squad of bots, which is the real frame cost
+            let mut w2 = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let mut ball = Ball::new();
+            let mut player = physics::Car::new();
+            let mut bots = crate::bots::spawn_match(&w2, 6);
+            let cfg = Config::default();
+            let mut t = 0.0f32;
+            let t2 = Instant::now();
+            let steps = 600;
+            for _ in 0..steps {
+                crate::bots::update(&mut bots, &mut ball, &mut player, &w2, &cfg, t, DT);
+                let mut ev = StepEvents::default();
+                physics::step_ball(&mut ball, &mut w2, &cfg, DT, &mut ev);
+                w2.update(DT);
+                t += DT;
+            }
+            let step_ms = t2.elapsed().as_secs_f32() * 1000.0 / steps as f32;
+            println!(
+                "{:<14} {:>9.0}ms {:>11.0} {:>11.3}ms  ({} grav, {} shapes)",
+                crate::world::style(si).name,
+                gen_ms,
+                sdf_per_ms,
+                step_ms,
+                w2.grav.len(),
+                w2.shapes.len()
+            );
+            let _ = acc;
+        }
+        println!();
+        // where does a step actually go?
+        {
+            let world = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let p = Vec3::new(20.0, 12.0, 20.0);
+            let n = 60_000;
+            let t = Instant::now();
+            for k in 0..n {
+                let q = p + Vec3::new((k % 17) as f32, 0.0, (k % 13) as f32);
+                std::hint::black_box(world.sdf(q));
+            }
+            let sdf_ns = t.elapsed().as_nanos() as f32 / n as f32;
+            let t = Instant::now();
+            for k in 0..n {
+                let q = p + Vec3::new((k % 17) as f32, 0.0, (k % 13) as f32);
+                std::hint::black_box(world.gravity_dir(q));
+            }
+            let grav_ns = t.elapsed().as_nanos() as f32 / n as f32;
+            let t = Instant::now();
+            for k in 0..n {
+                let q = p + Vec3::new((k % 17) as f32, 0.0, (k % 13) as f32);
+                std::hint::black_box(world.platform_vel(q, 1.5));
+            }
+            let plat_ns = t.elapsed().as_nanos() as f32 / n as f32;
+            println!("PERPLEXUS per call: sdf {sdf_ns:.0} ns, gravity_dir {grav_ns:.0} ns, platform_vel {plat_ns:.0} ns");
+            println!("   (every car and the ball hit all three every frame)");
+        }
+        return;
+    }
     if name == "routecheck" {
         // Where the route SAYS the bore is, versus where the geometry
         // actually put it. Inside a tube the SDF at the centreline should

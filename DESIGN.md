@@ -2257,6 +2257,42 @@ metric that measures the wrong thing will indict working code for as long
 as you let it, and the fix is to ask what the player actually experiences —
 "can I drive these tubes?" — rather than what is easy to count.
 
+## v1.70.0 — the CPU, measured
+
+Every optimisation so far has been on the GPU side, where the numbers had
+to be inferred. The CPU can be TIMED, so new `--sim perf` does: worldgen,
+raw SDF throughput, a full step with a squad of bots, and the per-call cost
+of the three functions every car and the ball hit every frame.
+
+The first run named the culprit immediately:
+
+    PERPLEXUS per call: sdf 791 ns, gravity_dir 4975 ns, platform_vel 78 ns
+
+`gravity_dir` cost SIX TIMES an SDF query, and it is called for every car,
+every ball, every frame — with 300 sparta bots that is a millisecond and a
+half of frame time in one function. It scanned all 705 gravity nodes to
+find the nearest two.
+
+It has a spatial index now, and getting it right took three passes worth
+recording:
+
+  * Built BEFORE the node-thinning pass, so its indices pointed past the
+    end of the thinned list. Panic, immediately.
+  * A full-scan fallback "for safety" when no node was nearby — which fired
+    on every query made in the open, i.e. most of them, so the index bought
+    nothing. It is not needed: a node is inserted into every cell its reach
+    touches, so an empty cell PROVES no node reaches that point and the
+    field is simply world-down.
+  * Scanning a 3x3 neighbourhood, which was nine times redundant for the
+    same reason — one cell is already exact — on cells so coarse (56 m) that
+    a whole lattice landed in one bucket. One cell now, on an 18 m grid.
+
+Result: gravity_dir 4975 -> 3731 ns, and the frame step with twelve bots
+0.347 -> 0.202 ms on PERPLEXUS and 0.130 -> 0.098 ms on MONKEY RUN, a 42%
+and 25% saving on the whole simulation step. KUIPER's planet field still
+reads dot 1.00 attractive and every physics harness passes, so the index is
+transparent to the game.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

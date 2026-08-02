@@ -37,6 +37,9 @@ pub const M_CAP_TALL_LO: usize = 16; // far-field capsule
 /// ray-marched shadows all sample THESE nodes, so the floor you see is the
 /// floor you drive on (the analytic fbm is only sampled once, node-wise).
 pub const TG_N: usize = 221; // 220 cells, matching meshgen::terrain(_, 220, _)
+/// cell size of the gravity index
+const GCELL: f32 = 18.0;
+
 pub const TG_HALF: f32 = 1300.0;
 
 pub const CAP_SHORT_HH: f32 = 1.5;
@@ -291,6 +294,14 @@ pub struct Pad {
 
 pub struct World {
     pub grav: Vec<GravNode>,
+    /// XZ spatial hash over gravity nodes. Finding the nearest two used to
+    /// scan every node — 705 of them on PERPLEXUS, for every car and the
+    /// ball, every frame, at five microseconds a call. That was the single
+    /// most expensive thing the CPU did.
+    ggrid: Vec<Vec<u16>>,
+    gdim: i32,
+    /// nodes that MOVE (they ride animated shapes) stay out of the grid
+    gdyn: Vec<u16>,
     /// XZ spatial hash over shapes: sdf() walks one cell, not the world
     sgrid: Vec<Vec<u16>>,
     /// ANIMATED shapes are never in the grid — they travel far outside the
@@ -3521,12 +3532,38 @@ impl World {
             }
             grav = kept;
         }
+        // The grid is built AFTER the thinning: that pass renumbers the
+        // nodes, so an index taken before it points at the wrong one (or
+        // past the end).
+        // gravity nodes: same trick as the shape grid, one cell per query
+        // finer cells than the shape grid: gravity nodes cluster along the
+        // tubes, and a 56 m cell put most of a lattice in one bucket
+        let gdim = ((TG_HALF * 2.0) / GCELL).ceil() as i32 + 2;
+        let mut ggrid: Vec<Vec<u16>> = vec![Vec::new(); (gdim * gdim) as usize];
+        let mut gdyn: Vec<u16> = Vec::new();
+        for (i, n) in grav.iter().enumerate() {
+            if n.follow.is_some() {
+                gdyn.push(i as u16);
+                continue;
+            }
+            // a node reaches `r`, so it must appear in every cell it touches
+            let c0x = (((n.pos.x - n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            let c1x = (((n.pos.x + n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            let c0z = (((n.pos.z - n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            let c1z = (((n.pos.z + n.r + TG_HALF) / GCELL).floor() as i32).clamp(0, gdim - 1);
+            for cz in c0z..=c1z {
+                for cx in c0x..=c1x {
+                    ggrid[(cz * gdim + cx) as usize].push(i as u16);
+                }
+            }
+        }
+
 
         while route_names.len() < routes.len() {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        World { grav, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
+        World { grav, ggrid, gdim, gdyn, sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq }
     }
 
     /// Grip multiplier / boost / vibe queries for the pinball zones.
@@ -4273,14 +4310,36 @@ impl World {
             return Vec3::NEG_Y;
         }
         let (mut b0, mut b1): (Option<(f32, usize)>, Option<(f32, usize)>) = (None, None);
-        for (i, n) in self.grav.iter().enumerate() {
-            let d = n.pos.distance(p);
-            if b0.map_or(true, |(bd, _)| d < bd) {
-                b1 = b0;
-                b0 = Some((d, i));
-            } else if b1.map_or(true, |(bd, _)| d < bd) {
-                b1 = Some((d, i));
+        {
+            let mut consider = |i: usize, b0: &mut Option<(f32, usize)>, b1: &mut Option<(f32, usize)>| {
+                let d = self.grav[i].pos.distance(p);
+                if b0.map_or(true, |(bd, _)| d < bd) {
+                    *b1 = *b0;
+                    *b0 = Some((d, i));
+                } else if b1.map_or(true, |(bd, _)| d < bd) {
+                    *b1 = Some((d, i));
+                }
+            };
+            // ONE cell. The neighbourhood scan was nine times redundant:
+            // a node is stored in every cell its reach touches, so anything
+            // that can affect p is already in p's own cell.
+            let cx = (((p.x + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            let cz = (((p.z + TG_HALF) / GCELL).floor() as i32).clamp(0, self.gdim - 1);
+            for &i in &self.ggrid[(cz * self.gdim + cx) as usize] {
+                consider(i as usize, &mut b0, &mut b1);
             }
+            // movers are few and travel, so they are always considered
+            for &i in &self.gdyn {
+                consider(i as usize, &mut b0, &mut b1);
+            }
+            // No fallback scan, and it is not an approximation: a node is
+            // inserted into EVERY cell its reach touches, so an empty
+            // neighbourhood proves no node reaches this point and the field
+            // is simply world-down. The scan was firing on every query made
+            // out in the open, which is most of them.
+        }
+        if b0.is_none() {
+            return Vec3::NEG_Y;
         }
         let dir_of = |i: usize| {
             let n = &self.grav[i];
