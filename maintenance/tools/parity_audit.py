@@ -99,6 +99,13 @@ def surfaces(app_dir):
         'QStackedWidget', 'QListWidget', 'QGraphicsView', 'QOpenGLWidget',
         'QQuickItem', 'QQuickPaintedItem',
     }
+    # Qt's own classes are not surfaces of this app. They arrive via the suffix
+    # rule (QWidget, QDialog, QProgressBar, QStackedWidget all end in one of the
+    # magic words) and pad the denominator with seven things no port can ever
+    # cover. The convention is Q followed by an uppercase letter, which
+    # correctly spares snapclone's own QrScanDialog.
+    found = {n for n in found if not re.match(r'^Q[A-Z]', n)}
+
     frontier = [b for b in QT_UI_BASES if b in inherits]
     seen_bases = set()
     while frontier:
