@@ -433,6 +433,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "core-kit"
+version = "0.1.0"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2371,6 +2375,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "share-kit"
+version = "0.1.0"
+dependencies = [
+ "core-kit",
+ "crypto-kit",
+ "sha2",
+ "snapcore",
+]
+
+[[package]]
 name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2520,6 +2534,7 @@ dependencies = [
  "egui",
  "peermux-core",
  "settings-kit",
+ "share-kit",
  "snapclone-theme",
  "touchkit",
  "uikit-egui",
@@ -2532,6 +2547,10 @@ version = "0.1.0"
 dependencies = [
  "serde",
 ]
+
+[[package]]
+name = "snapcore"
+version = "0.1.0"
 
 [[package]]
 name = "spki"

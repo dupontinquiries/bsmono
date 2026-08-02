@@ -29,6 +29,9 @@ touchkit = { path = "../../../shared/touchkit" }
 # XDG paths + a flat [section] key=value store. The settings page has a Save
 # button that persisted nothing.
 config-kit = { path = "../../../shared/config-kit" }
+# The shared mailbox: content-addressed postings with a Lifetime/TTL that is
+# exactly a disappearing snap, modelled in isolation until now.
+share-kit = { path = "../../../shared/share-kit" }
 device-kit = { path = "../../../shared/device-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
