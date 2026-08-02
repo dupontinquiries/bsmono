@@ -198,8 +198,13 @@ fn shape_sdf(i: u32, p: vec3<f32>) -> f32 {
 // the survivors. 16 nearest is plenty for a playfield this sparse.
 const KMAX: u32 = 16u;
 struct Cands {
+    id: array<u32, KMAX>,
+    // where the ray enters and leaves each candidate's bounding sphere:
+    // entry orders the list, exit lets the march retire candidates it has
+    // already gone past
+    t0: array<f32, KMAX>,
+    t1: array<f32, KMAX>,
     n: u32,
-    id: array<u32, 16>,
 };
 
 fn gather_try(c: ptr<function, Cands>, i: u32, ro: vec3<f32>, rd: vec3<f32>, tmax: f32, skip: i32) {
@@ -212,8 +217,27 @@ fn gather_try(c: ptr<function, Cands>, i: u32, ro: vec3<f32>, rd: vec3<f32>, tma
     if (disc <= 0.0) { return; }
     let sq = sqrt(disc);
     if (-b + sq < 0.0 || -b - sq > tmax) { return; }
-    if ((*c).n < KMAX) {
-        (*c).id[(*c).n] = i;
+    // low quality gathers fewer candidates: the marcher's cost is
+    // (candidates x steps), so this is the cheapest knob there is
+    let kcap = max(4u, u32(4.0 + 12.0 * clamp(G.rt.y, 0.0, 1.0)));
+    if ((*c).n < min(KMAX, kcap)) {
+        // SORTED INSERT by entry distance. The nearest candidate is tested
+        // first, so the running minimum drops immediately and everything
+        // behind it gets rejected by the bound — order is most of the win.
+        let e0 = -b - sq;
+        let e1 = -b + sq;
+        var k = (*c).n;
+        loop {
+            if (k == 0u) { break; }
+            if ((*c).t0[k - 1u] <= e0) { break; }
+            (*c).id[k] = (*c).id[k - 1u];
+            (*c).t0[k] = (*c).t0[k - 1u];
+            (*c).t1[k] = (*c).t1[k - 1u];
+            k = k - 1u;
+        }
+        (*c).id[k] = i;
+        (*c).t0[k] = e0;
+        (*c).t1[k] = e1;
         (*c).n = (*c).n + 1u;
     }
 }
@@ -282,16 +306,31 @@ fn portal_hop(a: vec3<f32>, b: vec3<f32>, rd: vec3<f32>, out_p: ptr<function, ve
     return false;
 }
 
-fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
+fn map_d_from(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool, first: u32) -> f32 {
     var d = 1e6;
     var db = 1e6; // fillet group: tubes + junction rooms smooth-union
     if (!skip_ter) {
         d = p.y - terrain_h(p.x, p.z);
     }
-    for (var j = 0u; j < (*c).n; j = j + 1u) {
+    for (var j = first; j < (*c).n; j = j + 1u) {
         let id = (*c).id[j];
+        let s = RTS[id];
+        // BOUNDING-SPHERE REJECTION. a.w is the shape's bounding radius, so
+        // this is a true lower bound on its distance — and it costs one
+        // length() against a full rotate-and-evaluate. A candidate that
+        // cannot beat the running minimum is skipped outright, and because
+        // `d` shrinks as the loop proceeds, later candidates are rejected
+        // more and more often.
+        let bd = length(p - s.a.xyz) - s.a.w;
+        let blended = s.e.y >= 16.0;
+        if (blended) {
+            // the smooth-min still pulls from a little beyond the surface
+            if (bd >= db + 1.8) { continue; }
+        } else if (bd >= d + 0.25) {
+            continue;
+        }
         let sd = shape_sdf(id, p);
-        if (RTS[id].e.y >= 16.0) {
+        if (blended) {
             db = smin(db, sd, 1.8);
         } else {
             d = min(d, sd);
@@ -299,6 +338,10 @@ fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
     }
     d = smin(d, db, 0.25); // match physics: the raster has no fillet // built form fillets into the terrain as well
     return d;
+}
+
+fn map_d(p: vec3<f32>, c: ptr<function, Cands>, skip_ter: bool) -> f32 {
+    return map_d_from(p, c, skip_ter, 0u);
 }
 
 /// Which surface is at p (after a hit): -1 terrain, else shape index.
@@ -400,9 +443,16 @@ fn trace_reflection(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32) -> 
     var hops = 0;
     let steps = i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn));
     let skip_ter = ro.y > 17.0 && rd.y > 0.05;
+    var first = 0u;
     for (var i = 0; i < steps; i = i + 1) {
         let p = ro2 + rd2 * t;
-        let d = map_d(p, &c, skip_ter);
+        // retire candidates the ray has already gone past: their bounding
+        // spheres are behind us and can never be hit again
+        loop {
+            if (first >= c.n || c.t1[first] > t) { break; }
+            first = first + 1u;
+        }
+        let d = map_d_from(p, &c, skip_ter, first);
         if (d < 0.004 * t + 0.006) { hit = true; break; }
         let nt = t + d * 0.96;
         if (hops < 2 && near_portal) {
@@ -414,6 +464,7 @@ fn trace_reflection(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32) -> 
                 t = 0.06;
                 hops = hops + 1;
                 c = gather(ro2, rd2, tmax, skip);
+                first = 0u;
                 continue;
             }
         }

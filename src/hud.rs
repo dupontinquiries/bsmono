@@ -976,5 +976,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.61    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.62    ESC QUITS FROM THIS SCREEN");
 }

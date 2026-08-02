@@ -1995,6 +1995,45 @@ nudge, teach the hardest tricks, verify only on the detector rather than on
 time, scale measured goals correctly, set the ball up when the trick needs
 it up, and record progress that survives a save.
 
+## v1.62.0 — the marcher stops doing pointless arithmetic
+
+With culling and LOD done, the dominant GPU cost is the ray march itself:
+every step evaluated the FULL signed distance of every candidate — a
+quaternion rotate and shape maths each — whether or not that shape could
+possibly be the nearest thing. Three changes, all inside the inner loop:
+
+BOUNDING-SPHERE REJECTION. The shape's bounding radius is already in the
+buffer, so `length(p - centre) - radius` is a true lower bound on its
+distance, at the cost of one length() against a full evaluate. A candidate
+that cannot beat the running minimum is skipped outright.
+
+SORTED CANDIDATES, which is most of the win. The rejection only helps if
+the minimum is already small, so the gather now inserts candidates in order
+of where the ray ENTERS their bounding sphere. The nearest is tested first,
+the minimum drops immediately, and everything behind it falls to the bound.
+
+RETIREMENT. Candidates also record where the ray LEAVES their bound, so as
+the march advances it walks a start index forward and stops considering
+shapes it has already gone past entirely.
+
+Plus a quality knob with real teeth: the number of candidates gathered now
+scales with ray quality (4 at the bottom, 16 at the top), and the marcher's
+cost is candidates x steps.
+
+New `--sim march` mirrors the shader's inner loop on the CPU and counts
+exact evaluations with and without the changes, across five maps:
+
+    ARENA CLASSIC  132,110 -> 71,238   46% saved
+    PERPLEXUS      218,477 -> 149,550  32% saved
+    MONKEY RUN     126,273 -> 90,586   28% saved
+    CHAMBER         69,688 -> 50,855   27% saved
+    DROPSHOT       278,556 -> 223,111  20% saved
+
+DROPSHOT is the honest hard case and worth naming: 200 flat tiles at the
+same range means the bounding spheres genuinely overlap, so there is little
+to reject. The optimisation helps most where geometry is spread out, which
+is also where there is most of it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

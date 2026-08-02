@@ -840,6 +840,109 @@ pub fn run(args: &[String]) {
             if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
         return;
     }
+    if name == "march" {
+        // The reflection marcher's inner loop, mirrored on the CPU so the
+        // saving can be counted rather than assumed. Every step used to
+        // evaluate the FULL sdf of every candidate; now a bounding-sphere
+        // test rejects the ones that cannot beat the running minimum.
+        println!("{:<13} {:>9} {:>11} {:>10} {:>8}", "map", "rays", "evals old", "evals new", "saved");
+        let mut worst = 0.0f32;
+        for si in [20usize, 21, 24, 26, 35] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            // the candidate set a fragment would see: shapes near the ray
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            let (mut old, mut new, mut rays) = (0u64, 0u64, 0u64);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            for k in 0..900 {
+                let a = k as f32 * 0.7548;
+                let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.09 - 0.35, a.sin()).normalize();
+                // gather: nearest 16 whose bounding sphere the ray could reach
+                let mut cand: Vec<(f32, usize)> = shapes
+                    .iter()
+                    .filter_map(|(c, r, i)| {
+                        let to = *c - eye;
+                        let along = to.dot(dir).clamp(0.0, 240.0);
+                        let miss = (to - dir * along).length() - r;
+                        (miss < 0.0).then_some((along, *i))
+                    })
+                    .collect();
+                cand.sort_by(|a, b| a.0.total_cmp(&b.0));
+                cand.truncate(16);
+                if cand.is_empty() {
+                    continue;
+                }
+                rays += 1;
+                // march, counting exact-SDF evaluations both ways
+                // entry/exit along the ray for each candidate's bound
+                let spans: Vec<(f32, f32, usize)> = cand
+                    .iter()
+                    .map(|(_, i)| {
+                        let sh = &w.shapes[*i];
+                        let r = crate::shape_bound(&sh.sdf).max(0.5);
+                        let to = sh.pos - eye;
+                        let b = to.dot(dir);
+                        let disc = (b * b - (to.length_squared() - r * r)).max(0.0);
+                        let sq = disc.sqrt();
+                        (b - sq, b + sq, *i)
+                    })
+                    .collect();
+                let mut t = 0.06f32;
+                let mut firstc = 0usize;
+                for _ in 0..38 {
+                    let p = eye + dir * t;
+                    let mut d = p.y - w.ground_h(p.x, p.z);
+                    while firstc < spans.len() && spans[firstc].1 <= t {
+                        firstc += 1; // retired: the ray is past it
+                    }
+                    for (_, i) in cand.iter() {
+                        old += 1;
+                    }
+                    for (_, _, i) in spans[firstc..].iter() {
+                        let sh = &w.shapes[*i];
+                        let bd = p.distance(sh.pos) - crate::shape_bound(&sh.sdf).max(0.5);
+                        if bd >= d + 0.25 {
+                            continue; // rejected by the bound alone
+                        }
+                        new += 1;
+                        d = d.min(w.shape_sdf_at(*i, p));
+                    }
+                    if d < 0.01 * t + 0.01 {
+                        break;
+                    }
+                    t += d.max(0.05) * 0.96;
+                    if t > 240.0 {
+                        break;
+                    }
+                }
+            }
+            let saved = 1.0 - new as f32 / old.max(1) as f32;
+            worst = worst.max(new as f32 / old.max(1) as f32);
+            println!(
+                "{:<13} {:>9} {:>11} {:>10} {:>7.0}%",
+                crate::world::style(si).name,
+                rays,
+                old,
+                new,
+                saved * 100.0
+            );
+        }
+        // Honest criterion: the rejection helps most where shapes are spread
+        // out and least where they are uniformly close (DROPSHOT is 200 flat
+        // tiles at the same range — nothing to reject). Every map should
+        // still save a fifth of its exact evaluations.
+        println!(
+            "worst case still evaluates {:.0}% of candidates (a flat tile field is the hard case)",
+            worst * 100.0
+        );
+        println!("{}", if worst < 0.82 { "MARCH: PASS" } else { "MARCH: FAIL" });
+        return;
+    }
     if name == "academy" {
         // The teaching layer. The point of interest is that a lesson is
         // VERIFIED by the same detectors the replays use, so these checks

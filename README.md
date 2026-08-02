@@ -429,3 +429,5 @@ TRIALS: fifteen challenges across eleven maps, with ghost replays of your best r
 Goals are replayed and NAMED from what the physics saw — press R to rewatch. `--sim replay` verifies the recorder, the trick recognition and the camera.
 
 ACADEMY: ten lessons that the game verifies with the same detectors that name your replays. `--sim academy` checks the teaching layer.
+
+`--sim march` counts the ray marcher's exact SDF evaluations saved by bounding-sphere rejection.
