@@ -91,7 +91,24 @@ def snake(name):
 
 def covered(name, text):
     """Does the port mention this surface? CamelCase or snake_case, since a
-    ported widget usually keeps its name in one form or the other."""
+    ported widget usually keeps its name in one form or the other.
+
+    Both error directions are real and neither is fixable by name matching:
+
+      * FALSE NEGATIVE. snapclone's contacts.rs had ContactPickerDialog and
+        ContactEditorDialog fully ported, with tests, under Rust names
+        (`Picker`, `Editor`). The audit called both pending for months. A port
+        that renames things idiomatically -- which is the right thing to do --
+        scores worse than one that transliterates.
+      * FALSE POSITIVE. A doc comment saying "unlike CameraWidget" is a match.
+        The number is therefore a floor on what has been NAMED, not a measure
+        of what works.
+
+    So read the percentage as a worklist, not a score, and read the tests to
+    find out whether a surface actually behaves. The next revision should look
+    for a surface's name in a `fn *_ui`/`draw` signature or a test name rather
+    than anywhere in the file, which would kill most false positives without
+    reintroducing the transliteration bias."""
     return name in text or snake(name) in text
 
 def manifest_state(app_id):

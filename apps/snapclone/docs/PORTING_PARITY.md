@@ -23,15 +23,15 @@ starts hidden with the auto-login ordering rule.
 | CameraWidget | pending |  |
 | ChevronConfirm | pending |  |
 | ComponentTestWindow | pending |  |
-| ContactCard | pending |  |
-| ContactEditorDialog | pending |  |
-| ContactPickerDialog | pending |  |
+| ContactCard | ported | friends.rs `Card`/`Accordion`/`Gesture` — 180ms OutCubic reveal, one open at a time, tap/scroll/swipe-close contract |
+| ContactEditorDialog | ported | contacts.rs `Editor` — edits the NICKNAME and notes; the advertised displayName stays read-only |
+| ContactPickerDialog | ported | contacts.rs `Picker` — single vs multi-select, empty-confirm refused |
 | ContactsPage | pending |  |
 | ConversationDetailDialog | pending |  |
 | ConversationSecurityBar | pending |  |
 | DiagnosticsDialog | pending |  |
 | ExportReminderCard | pending |  |
-| FriendListWidget | pending |  |
+| FriendListWidget | ported | friends.rs `Roster` + `AddForm` — dedupe by id, empty state, three address formats |
 | GroupVoiceBar | pending |  |
 | GroupVoiceCoordinator | pending |  |
 | GroupVoiceRoster | pending |  |
