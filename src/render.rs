@@ -74,7 +74,11 @@ pub struct ObjectRaw {
     pub params: [f32; 4], // x mode, y emissive, z spec, w rt self id + 1
     /// x skin id, y phase, z intensity, w speed (0..1) — the skin's inputs
     pub skin: [f32; 4],
-    pub _pad: [f32; 20],
+    /// xyz: direction to the ball in the BODY's own frame; w: boost 0..1.
+    /// Skins that read these can do things a texture cannot — face the play,
+    /// open under power, know how high they are.
+    pub skin2: [f32; 4],
+    pub _pad: [f32; 16],
 }
 
 impl Default for ObjectRaw {
@@ -84,7 +88,7 @@ impl Default for ObjectRaw {
             nrm: [0.0; 16],
             color: [1.0; 4],
             params: [0.0; 4],
-            skin: [0.0; 4], _pad: [0.0; 20],
+            skin: [0.0; 4], skin2: [0.0; 4], _pad: [0.0; 16],
         }
     }
 }

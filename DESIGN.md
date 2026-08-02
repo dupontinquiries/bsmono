@@ -2780,6 +2780,45 @@ VULCAN still declines, at every threshold — its corners genuinely do not
 hold four similar wheels. It keeps a correct static body rather than a
 spinning door, which is the right answer, and `--sim glb` names it.
 
+## v1.86.0 — skins that read the game, and parts that move
+
+SIX EXOTICS. The first ten finishes read the surface, the view angle and the
+clock. These read the GAME, which is the thing a texture cannot do however
+well it is animated:
+
+  HUNTER       glows on the side facing the BALL, so the car turns its light
+               toward the play as you turn
+  AFTERBURNER  lights from the tail forward as boost comes on — the car is
+               its own boost meter
+  GHOST        translucent when you coast, solid when you work; the fresnel
+               keeps the silhouette readable so it fades without vanishing
+  THERMAL      false colour by how square each panel is to the way you are
+               travelling: the parts pushing air go white
+  AURORA       curtains driven by world height, so they hang in the air and
+               drift past as you climb
+  CRYSTAL      a lens rather than a mirror — the reflection is displaced
+               from the world behind it
+
+They needed a second input block: the direction to the ball IN THE CAR'S
+OWN FRAME, and whether boost is running.
+
+RIGS — a new slot, and the answer to "breathing robotic car parts". Skins
+change what a surface looks like; a rig changes WHERE IT IS. The body is
+already split into prims (hull, canopy, fenders, spoiler, four wheels), so
+each is displaced independently by a function of its own position and the
+clock — and each gets a phase from that position, because a car whose parts
+all move together reads as one wobbling object rather than as machinery.
+
+  BREATHING  panels rise and settle, slightly out of step
+  FLUTTER    a fast tremor, strongest at the extremities
+  UNFOLD     plates lift away from the body under boost and close when you
+             lift off
+  HOVER      the body floats free of its wheels and leans into the turn
+  SHIVER     parts jolt on impact and damp back down
+
+Sixteen skins, six rigs, seven wheels, six trails, six explosions: 24,192
+combinations, all cosmetic, all saved.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

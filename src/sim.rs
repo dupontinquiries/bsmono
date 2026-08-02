@@ -3507,8 +3507,25 @@ pub fn run(args: &[String]) {
             let spoked = crate::meshgen::rim(12, 0.18, 24).idx.len();
             check("a spoked rim has more geometry than a disc", spoked > solid);
         }
-        println!("skins {}  wheels {}  trails {}  explosions {}", SKINS.len(), WHEELS.len(), TRAILS.len(), EXPLOSIONS.len());
-        println!("   {} combinations", SKINS.len() * WHEELS.len() * TRAILS.len() * EXPLOSIONS.len());
+        println!(
+            "skins {}  rigs {}  wheels {}  trails {}  explosions {}",
+            SKINS.len(),
+            crate::custom::RIGS.len(),
+            WHEELS.len(),
+            TRAILS.len(),
+            EXPLOSIONS.len()
+        );
+        check(
+            "the exotics read the game, not just the clock",
+            SKINS.iter().any(|(n, _)| *n == "HUNTER")
+                && SKINS.iter().any(|(n, _)| *n == "AFTERBURNER")
+                && SKINS.iter().any(|(n, _)| *n == "THERMAL"),
+        );
+        check(
+            "every rig says what it moves",
+            crate::custom::RIGS.iter().all(|(n, b)| !n.is_empty() && b.len() > 12),
+        );
+        println!("   {} combinations", SKINS.len() * crate::custom::RIGS.len() * WHEELS.len() * TRAILS.len() * EXPLOSIONS.len());
         check("every slot has choices", SKINS.len() >= 8 && WHEELS.len() >= 6 && TRAILS.len() >= 5 && EXPLOSIONS.len() >= 5);
         check(
             "every skin says what it does",
@@ -3525,6 +3542,7 @@ pub fn run(args: &[String]) {
             v.len() == WHEELS.len()
         });
         let mut l = Loadout::default();
+        l.rig = 3;
         l.skin = 4;
         l.wheels = 3;
         l.trail = 5;
@@ -3532,13 +3550,13 @@ pub fn run(args: &[String]) {
         let round = Loadout::decode(&l.encode());
         check(
             "a loadout survives the save file",
-            round.skin == 4 && round.wheels == 3 && round.trail == 5 && round.explosion == 2,
+            round.skin == 4 && round.wheels == 3 && round.trail == 5 && round.explosion == 2 && round.rig == 3,
         );
         check("nonsense in the save does not panic", {
             let junk = Loadout::decode("999 abc -1");
             junk.skin < SKINS.len() && junk.wheels < WHEELS.len()
         });
-        println!("   e.g. {} / {} / {} / {}", round.skin_name(), round.wheel_name(), round.trail_name(), round.explosion_name());
+        println!("   e.g. {} / {} / {} / {} / {}", round.skin_name(), round.rig_name(), round.wheel_name(), round.trail_name(), round.explosion_name());
         println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
         return;
     }

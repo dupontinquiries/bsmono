@@ -39,6 +39,11 @@ impl Camera {
         }
     }
 
+    /// Current shake, for the SHIVER rig (parts jolt when the car is hit).
+    pub fn shake_amt(&self) -> f32 {
+        self.shake.clamp(0.0, 1.0)
+    }
+
     pub fn add_shake(&mut self, amt: f32) {
         self.shake = (self.shake + amt).min(1.2);
     }

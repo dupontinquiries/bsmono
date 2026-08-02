@@ -340,7 +340,7 @@ fn hue_shift(c: vec3<f32>, a: f32) -> vec3<f32> {
     return c * cosa + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - cosa);
 }
 
-fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>, t: f32, speed: f32, phase: f32) -> SkinOut {
+fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, pw: vec3<f32>, n: vec3<f32>, v: vec3<f32>, t: f32, speed: f32, phase: f32, ball: vec3<f32>, boost: f32) -> SkinOut {
     var o: SkinOut;
     o.albedo = base;
     o.emissive = 0.0;
@@ -402,6 +402,60 @@ fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, n: vec3<f32>, v: vec3<f32>
         let heat = clamp(speed * (0.35 + lead), 0.0, 1.0);
         o.albedo = mix(base * 0.5, vec3(1.0, 0.42, 0.10), heat);
         o.emissive = heat * heat * 1.6;
+    } else if (id == 10) {
+        // HUNTER: brightest on the side facing the ball. A finish that
+        // knows where the play is — the car glows toward it as you turn,
+        // which no texture can do because a texture has no idea.
+        let toward = clamp(dot(n, normalize(ball)), 0.0, 1.0);
+        let hot = pow(toward, 2.5);
+        o.albedo = mix(base * 0.6, vec3(1.0, 0.35, 0.15), hot);
+        o.emissive = hot * 1.4;
+        o.spec = 0.3;
+    } else if (id == 11) {
+        // AFTERBURNER: dark at rest, and the panels light from the tail
+        // forward as boost comes on — the car itself is the boost meter
+        let along = clamp((p.z + 0.6) * 0.9, 0.0, 1.0);
+        let lit = clamp(boost * 1.6 - along, 0.0, 1.0);
+        o.albedo = mix(base * 0.45, vec3(0.30, 0.75, 1.0), lit);
+        o.emissive = lit * 1.8;
+        o.spec = 0.2 + 0.4 * lit;
+    } else if (id == 12) {
+        // GHOST: solid when you are working, translucent when you coast.
+        // The fresnel keeps the silhouette readable, so it fades without
+        // disappearing — you can still tell where the car is.
+        let effort = clamp(max(boost, speed), 0.0, 1.0);
+        let rim = pow(graze, 2.0);
+        o.albedo = mix(vec3(0.55, 0.85, 1.0) * (0.25 + rim), base, effort);
+        o.emissive = rim * (1.1 - effort * 0.7);
+        o.spec = 0.55;
+    } else if (id == 13) {
+        // THERMAL: false colour by how square the surface is to the way you
+        // are travelling — the parts pushing air go white, the rest stay
+        // cold. Reads the car's own aerodynamics.
+        let bite = clamp(dot(n, normalize(vec3(0.0, 0.0, -1.0))), 0.0, 1.0) * speed;
+        let cold = vec3(0.05, 0.10, 0.35);
+        let warm = vec3(1.0, 0.45, 0.05);
+        let hot = vec3(1.0, 1.0, 0.92);
+        var c = mix(cold, warm, clamp(bite * 1.8, 0.0, 1.0));
+        c = mix(c, hot, clamp(bite * 2.6 - 1.0, 0.0, 1.0));
+        o.albedo = c;
+        o.emissive = clamp(bite * 1.4 - 0.2, 0.0, 1.0);
+    } else if (id == 14) {
+        // AURORA: curtains that hang in the air rather than on the paint —
+        // driven by world height, so they drift past as the car rises
+        let curtain = sin(pw.y * 2.2 + t * 0.8 + sin(pw.x * 0.5 + t * 0.3) * 1.6);
+        let band = smoothstep(0.2, 1.0, curtain);
+        o.albedo = mix(base * 0.5, hue_shift(vec3(0.2, 1.0, 0.6), pw.y * 0.4 + t * 0.2), band * 0.85);
+        o.emissive = band * 0.9;
+        o.spec = 0.25;
+    } else if (id == 15) {
+        // CRYSTAL: the surface refracts. The reflection is offset along the
+        // normal's own tangent, so the world seen in the paint is displaced
+        // from the world behind it — a lens rather than a mirror.
+        o.albedo = base * 0.25 + vec3(0.05, 0.06, 0.09);
+        o.spec = 0.85;
+        let facet = sin(p.x * 14.0) * sin(p.y * 13.0) * sin(p.z * 12.0);
+        o.emissive = smoothstep(0.75, 1.0, abs(facet)) * 0.5;
     } else if (id == 9) {
         // MOIRE: two lattices at slightly different scales, so the
         // interference pattern shifts with both angle and time
@@ -639,6 +693,7 @@ struct Object {
     params: vec4<f32>,
     // x mode (0 plain, 1 terrain grid), y emissive, z spec, w rt self id + 1
     skin: vec4<f32>,       // x id, y phase, z intensity, w speed 0..1
+    skin2: vec4<f32>,      // xyz ball direction in body space, w boost 0..1
 };
 @group(1) @binding(0) var<uniform> O: Object;
 @group(2) @binding(0) var t_col: texture_2d<f32>;
@@ -723,7 +778,7 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
     if (skin_id > 0) {
         // in the BODY's own space, so a moving car carries its finish
         let lp = (in.wpos - O.model[3].xyz);
-        let sk = apply_skin(skin_id, base, lp, n, v, G.cam.w, O.skin.w, O.skin.y);
+        let sk = apply_skin(skin_id, base, lp, in.wpos, n, v, G.cam.w, O.skin.w, O.skin.y, O.skin2.xyz, O.skin2.w);
         base = sk.albedo;
         skin_em = sk.emissive * O.skin.z;
         skin_spec = sk.spec;

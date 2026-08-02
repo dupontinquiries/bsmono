@@ -371,14 +371,15 @@ pub fn garage_menu(
     label_c(ui, 0.885, T_TITLE, a, PAPER, "GARAGE");
     label_c(ui, 0.828, T_HINT, a, DIM, "LEFT / RIGHT TO CHANGE - EVERYTHING HERE IS COSMETIC");
     let k = ui_k(a);
-    let rows: [(&str, String, usize, usize); 4] = [
+    let rows: [(&str, String, usize, usize); 5] = [
         ("SKIN", look.skin_name().to_string(), look.skin, crate::custom::SKINS.len()),
+        ("RIG", look.rig_name().to_string(), look.rig, crate::custom::RIGS.len()),
         ("WHEELS", look.wheel_name().to_string(), look.wheels, crate::custom::WHEELS.len()),
         ("BOOST TRAIL", look.trail_name().to_string(), look.trail, crate::custom::TRAILS.len()),
         ("GOAL EXPLOSION", look.explosion_name().to_string(), look.explosion, crate::custom::EXPLOSIONS.len()),
     ];
-    let top = 0.62;
-    let row_h = 0.115;
+    let top = 0.64;
+    let row_h = 0.098;
     for (i, (name, val, idx, n)) in rows.iter().enumerate() {
         let y = top - i as f32 * row_h;
         if i == sel {
@@ -399,11 +400,12 @@ pub fn garage_menu(
     // what the current pick actually does
     let blurb = match sel {
         0 => look.skin_blurb().to_string(),
-        1 => format!("{} spokes", crate::custom::WHEELS[look.wheels].1),
-        2 => crate::custom::TRAILS[look.trail].1.to_string(),
+        1 => look.rig_blurb().to_string(),
+        2 => format!("{} spokes", crate::custom::WHEELS[look.wheels].1),
+        3 => crate::custom::TRAILS[look.trail].1.to_string(),
         _ => crate::custom::EXPLOSIONS[look.explosion].1.to_string(),
     };
-    label_c(ui, top - 4.0 * row_h - 0.04, T_HINT * k, a, DIM, &fit(&blurb, 1.5, T_HINT * k, a));
+    label_c(ui, top - 5.0 * row_h - 0.04, T_HINT * k, a, DIM, &fit(&blurb, 1.5, T_HINT * k, a));
     nav_strip(ui, a, cur, 0);
     legend(ui, -0.93, a, T_HINT, &[("LEFT/RIGHT", "CHANGE"), ("ESC", "BACK")]);
 }
@@ -1027,5 +1029,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.85    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.86    ESC QUITS FROM THIS SCREEN");
 }

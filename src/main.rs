@@ -1914,8 +1914,9 @@ impl Game {
                 let cnt = slots[sel.min(n - 1)].1;
                 let cur = match sel {
                     0 => &mut self.look.skin,
-                    1 => &mut self.look.wheels,
-                    2 => &mut self.look.trail,
+                    1 => &mut self.look.rig,
+                    2 => &mut self.look.wheels,
+                    3 => &mut self.look.trail,
                     _ => &mut self.look.explosion,
                 };
                 match (&key, ch) {
@@ -3895,6 +3896,16 @@ impl Game {
     /// The garage skin as shader inputs: id, a phase so two cars with the
     /// same finish are not in lockstep, intensity, and the car's speed
     /// (FORGE heats with it).
+    /// The exotic skins' second input: where the ball is, in the CAR's own
+    /// frame (so a finish can face the play as you turn), and whether boost
+    /// is running. A texture has neither of these.
+    fn skin_params2(&self) -> [f32; 4] {
+        let to_ball = self.car.rot.inverse() * (self.ball.pos - self.car.pos);
+        let d = to_ball.normalize_or(Vec3::NEG_Z);
+        let boosting = self.action_down(Action::Boost) && self.car.boost > 0.0;
+        [d.x, d.y, d.z, if boosting { 1.0 } else { 0.0 }]
+    }
+
     fn skin_params(&self) -> [f32; 4] {
         let sp = (self.car.vel.length() / 25.0).clamp(0.0, 1.0);
         [self.look.skin as f32, (self.save.car as f32) * 1.7, 1.0, sp]
@@ -3922,7 +3933,8 @@ impl Game {
                     model: Mat4,
                     color: [f32; 4],
                     params: [f32; 4],
-                    skin: [f32; 4]| {
+                    skin: [f32; 4],
+                    skin2: [f32; 4]| {
             let nrm3 = Mat3::from_mat4(model).inverse().transpose();
             let mut raw = ObjectRaw::default();
             raw.model = model.to_cols_array();
@@ -3930,6 +3942,7 @@ impl Game {
             raw.color = color;
             raw.params = params;
             raw.skin = skin;
+            raw.skin2 = skin2;
             objs.push(ObjDraw { mesh, tex, raw });
         };
         // one rim per wheel position: a split wheel can be several prims
@@ -3938,6 +3951,8 @@ impl Game {
         }
         let mut seen_pivots: Vec<[i32; 3]> = Vec::new();
         let rim_style = if rt_slot > 0.5 { self.look.wheels } else { 0 };
+        let rig = if rt_slot > 0.5 { self.look.rig } else { 0 };
+        let skin2 = if rt_slot > 0.5 { self.skin_params2() } else { [0.0; 4] };
         let wheel_r = self.cars.models[model_i].wheel_r * scale;
         let rim_col = [0.72, 0.75, 0.80, 1.0];
         #[allow(unused)]
@@ -3971,6 +3986,54 @@ impl Game {
             if let Some(t) = tint {
                 color = [color[0] * t[0], color[1] * t[1], color[2] * t[2], color[3]];
             }
+            // THE RIG: displace this part before it is drawn. Each prim gets
+            // its own phase from its position, so panels move out of step
+            // with one another the way real machinery does — a car where
+            // everything moves together reads as one wobbling object.
+            let base = if rig > 0 {
+                let seed = prim.pivot.x * 3.1 + prim.pivot.z * 2.3 + prim.mesh_id as f32 * 0.37;
+                let t = self.time;
+                let d = match rig {
+                    // BREATHING: a slow rise and settle
+                    1 => Vec3::Y * ((t * 1.3 + seed).sin() * 0.012),
+                    // FLUTTER: fast, and strongest away from the centre
+                    2 => {
+                        let reach = (prim.pivot.length() + 0.2).min(1.0);
+                        Vec3::new((t * 17.0 + seed).sin(), (t * 15.0 + seed * 1.7).sin(), 0.0)
+                            * 0.004
+                            * reach
+                    }
+                    // UNFOLD: plates lift away under boost, close when you lift
+                    3 => {
+                        // boost tank falling = boost being used
+                        // boost in the tank draining = boost being used
+                        // a full tank sits at 1.0; using boost drains it, so
+                        // the plates open as the reserve falls under power
+                        let open = if self.car.boost < 0.995 { 1.0 } else { 0.0 };
+                        Vec3::new(prim.pivot.x.signum() * 0.6, 0.5, 0.0).normalize_or(Vec3::Y)
+                            * (0.030 * open)
+                    }
+                    // HOVER: the body floats and leans into the turn
+                    4 => {
+                        if matches!(prim.tag, model::Tag::Body) {
+                            Vec3::Y * (0.020 + (t * 0.9).sin() * 0.006)
+                                + Vec3::X * (self.car.ang.y * -0.02)
+                        } else {
+                            Vec3::ZERO
+                        }
+                    }
+                    // SHIVER: a jolt on contact that damps out
+                    _ => {
+                        let k = self.cam.shake_amt();
+                        Vec3::new((t * 41.0 + seed).sin(), (t * 37.0 + seed).sin(), (t * 43.0 + seed).sin())
+                            * 0.012
+                            * k
+                    }
+                };
+                base * Mat4::from_translation(d)
+            } else {
+                base
+            };
             let m = match prim.tag {
                 model::Tag::Body => base,
                 model::Tag::WheelFront => {
@@ -3988,7 +4051,7 @@ impl Game {
             let spec = if matches!(prim.tag, model::Tag::Body) { 0.6 } else { 0.15 };
             // the skin rides on the BODY only — wheels keep their own look
             let sk = if matches!(prim.tag, model::Tag::Body) { skin } else { [0.0; 4] };
-            push_skinned(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot], sk);
+            push_skinned(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot], sk, skin2);
             // THE GARAGE RIM, drawn over whatever wheel the car already has.
             // Because it rides the wheel's own pivot and transform, a style
             // applies to every car in the game — the imported bodies too —
@@ -3999,7 +4062,7 @@ impl Game {
                 let rm = m
                     * Mat4::from_translation(prim.pivot)
                     * Mat4::from_scale(Vec3::new(side * wheel_r * 1.02, wheel_r * 1.02, wheel_r * 1.02));
-                push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4]);
+                push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4], [0.0; 4]);
             }
         }
     }

@@ -46,6 +46,27 @@ pub const SKINS: &[(&str, &str)] = &[
     // interference bands that shift with both angle and time — the closest
     // thing here to a black-market finish
     ("MOIRE", "interference that shifts as you move"),
+    // ---- the exotics: these read the GAME, not just the clock ----
+    ("HUNTER", "glows on the side facing the ball"),
+    ("AFTERBURNER", "lights from the tail forward as boost comes on"),
+    ("GHOST", "translucent when you coast, solid when you work"),
+    ("THERMAL", "false colour by the air the bodywork is pushing"),
+    ("AURORA", "curtains that hang in the air as you climb"),
+    ("CRYSTAL", "a lens rather than a mirror"),
+];
+
+/// RIGS — how the car's parts MOVE. Skins change what a surface looks like;
+/// a rig changes where it is. The body is split into prims already (a hull,
+/// a canopy, fenders, a spoiler, four wheels), so each one can be displaced
+/// independently by a function of its own position and the clock. That is
+/// what makes a car feel mechanical rather than painted.
+pub const RIGS: &[(&str, &str)] = &[
+    ("RIGID", "the car as built"),
+    ("BREATHING", "panels rise and settle, slightly out of step with each other"),
+    ("FLUTTER", "a fast tremor, strongest at the extremities"),
+    ("UNFOLD", "plates lift away from the body under boost, and close when you lift off"),
+    ("HOVER", "the body floats free of its wheels and leans into the turn"),
+    ("SHIVER", "parts jolt on impact and settle back"),
 ];
 
 pub const WHEELS: &[(&str, u32, f32)] = &[
@@ -81,6 +102,7 @@ pub const EXPLOSIONS: &[(&str, &str)] = &[
 #[derive(Clone, Copy)]
 pub struct Loadout {
     pub skin: usize,
+    pub rig: usize,
     pub wheels: usize,
     pub trail: usize,
     pub explosion: usize,
@@ -88,11 +110,17 @@ pub struct Loadout {
 
 impl Default for Loadout {
     fn default() -> Loadout {
-        Loadout { skin: 0, wheels: 0, trail: 0, explosion: 0 }
+        Loadout { skin: 0, rig: 0, wheels: 0, trail: 0, explosion: 0 }
     }
 }
 
 impl Loadout {
+    pub fn rig_name(&self) -> &'static str {
+        RIGS[self.rig.min(RIGS.len() - 1)].0
+    }
+    pub fn rig_blurb(&self) -> &'static str {
+        RIGS[self.rig.min(RIGS.len() - 1)].1
+    }
     pub fn skin_name(&self) -> &'static str {
         SKINS[self.skin.min(SKINS.len() - 1)].0
     }
@@ -109,7 +137,7 @@ impl Loadout {
         EXPLOSIONS[self.explosion.min(EXPLOSIONS.len() - 1)].0
     }
     pub fn encode(&self) -> String {
-        format!("{} {} {} {}", self.skin, self.wheels, self.trail, self.explosion)
+        format!("{} {} {} {} {}", self.skin, self.wheels, self.trail, self.explosion, self.rig)
     }
     pub fn decode(s: &str) -> Loadout {
         let v: Vec<usize> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
@@ -118,14 +146,16 @@ impl Loadout {
             wheels: v.get(1).copied().unwrap_or(0).min(WHEELS.len() - 1),
             trail: v.get(2).copied().unwrap_or(0).min(TRAILS.len() - 1),
             explosion: v.get(3).copied().unwrap_or(0).min(EXPLOSIONS.len() - 1),
+            rig: v.get(4).copied().unwrap_or(0).min(RIGS.len() - 1),
         }
     }
 }
 
 /// The four rows the customizer screen shows.
-pub fn slots() -> [(&'static str, usize); 4] {
+pub fn slots() -> [(&'static str, usize); 5] {
     [
         ("SKIN", SKINS.len()),
+        ("RIG", RIGS.len()),
         ("WHEELS", WHEELS.len()),
         ("BOOST TRAIL", TRAILS.len()),
         ("GOAL EXPLOSION", EXPLOSIONS.len()),
