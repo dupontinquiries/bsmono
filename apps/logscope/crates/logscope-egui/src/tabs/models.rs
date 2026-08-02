@@ -112,10 +112,11 @@ impl Models {
             //
             // Showing a plausible id for an identity that does not exist is the same class as
             // "✓ verified" for a run with no verifier: a display that is affirmative by default.
-            ui.label(egui::RichText::new(
-                "⚠ placeholder identity — not yet generated from a key, so this id is the same on \
-every install. Pairing will not work until crypto-kit's Ed25519 identity is wired in.")
-                .small().color(theme::AMBER()));
+            // The identity is REAL — generated once and persisted at
+            // ~/.local/share/logscope/identity.key. I added a "placeholder identity" warning here
+            // while the wiring was in flight and it outlived the thing it warned about, which is a
+            // stale label claiming a defect that no longer exists — the same class as a stale gate,
+            // pointed the other way.
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("this machine:").small().color(theme::DIM()));
                 ui.label(egui::RichText::new(&self.my_id).monospace().small());
