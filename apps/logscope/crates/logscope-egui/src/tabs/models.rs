@@ -94,6 +94,17 @@ impl Models {
             // THIS machine's id, shown so it can be read off and typed into another. It is a
             // fingerprint of the public key, not a name — so pasting it IS the key exchange, and there
             // is no second step to forget.
+            // NOT YET A REAL IDENTITY, and the UI must say so. The id derives from a fixed
+            // placeholder string, so it is stable, well-formed, and THE SAME ON EVERY MACHINE — an
+            // operator who copies it to a second device would register the first device's twin and
+            // wonder why nothing connects.
+            //
+            // Showing a plausible id for an identity that does not exist is the same class as
+            // "✓ verified" for a run with no verifier: a display that is affirmative by default.
+            ui.label(egui::RichText::new(
+                "⚠ placeholder identity — not yet generated from a key, so this id is the same on \
+every install. Pairing will not work until crypto-kit's Ed25519 identity is wired in.")
+                .small().color(theme::AMBER()));
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new("this machine:").small().color(theme::DIM()));
                 ui.label(egui::RichText::new(&self.my_id).monospace().small());
