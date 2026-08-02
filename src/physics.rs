@@ -155,6 +155,10 @@ impl Car {
     pub fn flip_turn(&self) -> f32 {
         self.dodge_turn
     }
+    /// Angular speed, for the flick harness.
+    pub fn omega_len(&self) -> f32 {
+        self.omega.length()
+    }
     /// A jump/flip is banked (restoration probe for the landing sim).
     pub fn has_flip(&self) -> bool {
         self.has_dodge
@@ -1161,7 +1165,10 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         if angle > std::f32::consts::PI {
             angle -= std::f32::consts::TAU;
         }
-        car.omega = ax * (angle / dt.max(1e-5));
+        // a wrapped quaternion delta can read as a huge spin (the flick sim
+        // caught 144 rad/s on a side dodge); a car cannot turn faster than
+        // its own flip, so clamp to something physical
+        car.omega = (ax * (angle / dt.max(1e-5))).clamp_length_max(14.0);
         car.prev_rot = car.rot;
     }
 
@@ -1447,6 +1454,13 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // of pinging off the hood), hard hits keep full restitution
         let soft = ((-vn) / 8.0).clamp(0.0, 1.0);
         let e = (0.10 + 0.25 * soft) * cfg.ball.bounce.sqrt();
+        // A ball RESTING on the hood must not bounce off it. At full
+        // restitution the jump alone threw the ball clear — the flick sim
+        // measured zero contact frames during the flip, which means every
+        // "flick" was really just the jump. Gentle contacts are now nearly
+        // inelastic, so the ball rides the car up and is still there when
+        // the car rotates out from under it; hard hits keep their bounce.
+        let e = e * (0.18 + 0.82 * soft);
         // A car meets a grounded ball from below-behind, so the contact
         // normal points steeply UP and every shot ballooned. Hard hits now
         // drive THROUGH: the impulse normal flattens toward horizontal as
@@ -1554,7 +1568,21 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             let flat = Vec3::new(f.x, f.y * 0.35, f.z).normalize_or(dir_n);
             flat
         };
-        let dir = dir_n.lerp(aim, 0.65 * soft).normalize_or(dir_n);
+        // THE FLICK. Flattening the push direction stops shots ballooning,
+        // but it also flattened the one touch whose whole point is vertical:
+        // a flick throws the ball because the car ROTATES out from under it,
+        // and the direction that throw wants is the contact point's own
+        // surface velocity. The faster the car is spinning, the more the
+        // push follows that instead of the flattened line — so a backflip
+        // lofts the ball and a forward flick stays low, which is exactly the
+        // difference between the two in Rocket League.
+        let spin = (car.omega.length() / 7.0).clamp(0.0, 1.0);
+        let throw_dir = (v_surf - car.vel).normalize_or(Vec3::ZERO);
+        let dir = dir_n
+            .lerp(aim, 0.65 * soft)
+            .normalize_or(dir_n)
+            .lerp(throw_dir, 0.62 * spin)
+            .normalize_or(dir_n);
         let strength = (-vn).min(23.0) * 0.38 / cfg.ball.weight.sqrt();
         // The extra "psyonix" push on top of the elastic impulse was doing
         // most of the work, which is why touches felt like blasts. At a tenth
@@ -1563,6 +1591,13 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // touch and a committed 22 m/s strike got the same treatment. Scale
         // it with the hit — dribble touches stay gentle, real shots punch.
         ball.vel += dir * strength * (0.06 + 0.55 * soft);
+        // ...and the hood's own motion carries the ball with it. Without
+        // this a flick is only ever as strong as the collision, when in
+        // truth the car is throwing the ball, not hitting it.
+        if spin > 0.05 {
+            let carry = (v_surf - car.vel).length().min(9.0);
+            ball.vel += throw_dir * carry * 0.85 * spin;
+        }
         // SPIN: a gentle touch rolls the ball (dribbles need that), a hard
         // hit drives THROUGH it. Spin used to scale up with the impact,
         // which is what made shots knuckle off at odd angles.

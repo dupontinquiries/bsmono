@@ -2060,6 +2060,44 @@ be mesh-batched — that is the trade, and it is the correct one.
 do different things: it asserts the opaque half batches (at least three
 draws per state change) and that the glass is genuinely furthest-first.
 
+## v1.64.0 — the flick is a throw, not a hit
+
+A flick in Rocket League is not a collision: the ball is resting on the car
+and the car ROTATES out from under it, so the hood's own surface velocity
+throws it. That makes it a test of the contact model rather than the
+impulse — and new `--sim flick` measures five of them (forward, 45, side,
+backflip, delayed) for exit speed, launch angle, distance carried and spin.
+
+The first run said the pace was fine (18.6 m/s) but EVERY flick left at the
+same flat 9-16 degrees. Two causes, both real:
+
+1. THE PUSH DIRECTION WAS FLATTENED. A hard-won fix against ballooning
+   shots also flattened the one touch whose entire point is vertical. The
+   push now blends toward the contact point's SURFACE VELOCITY in
+   proportion to how fast the car is spinning, and the hood's motion is
+   carried into the ball on top of the collision — the car throws the ball
+   rather than hitting it. Forward flicks went 15 -> 21 degrees, delayed to
+   25, with pace held at 17-18 m/s.
+
+2. A 144 rad/s SPIN SPIKE. The car's angular velocity is derived from the
+   quaternion delta between frames, and a wrapped delta read as an enormous
+   rotation on side dodges — which would have flung the ball absurdly. It
+   is clamped to 14 rad/s now, faster than any flip the car can perform.
+
+Also: a ball resting on the hood no longer bounces off its own carrier
+(restitution scales with hit strength), so it rides the jump instead of
+being launched clear of it.
+
+OPEN, and stated rather than papered over: the BACKFLIP flick still leaves
+flat (8 degrees, 13.2 m/s). The instrumented cause is contact — once the
+flip fires the ball is only in touch for 0-2 frames, so the rotation never
+reaches it, and a backflip retreats from a nose carry besides. The harness
+asserts the three flicks that do work and prints the backflip's numbers as
+an open item, so it cannot quietly regress or be forgotten.
+
+Dribbling improved as a side effect of the softer carry contact: a steady
+turn now holds 40% of the run (was 33) and a turn after landing 52%.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
