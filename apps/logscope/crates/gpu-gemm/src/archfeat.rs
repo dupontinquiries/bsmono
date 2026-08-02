@@ -118,6 +118,20 @@ impl Feature {
     }
 
     /// Does this engine implement it? Promoted to true only when a gate proves the behaviour.
+    /// Does a run at this context length actually need the sparse-attention indexer?
+    ///
+    /// Colibri's glm.c states it directly: the indexer is a NO-OP for `seq <= index_topk`, because
+    /// top-k of everything is everything. Below that bound dense causal attention is not an
+    /// approximation of the sparse path — it is the same computation, validated there against a
+    /// transformers oracle.
+    ///
+    /// So "unsupported architecture" is the wrong verdict for a short-context run, and a hard refusal
+    /// costs a model that would work. Above the bound the model degrades rather than breaking, which
+    /// is a warning rather than a gate.
+    pub fn indexer_needed_at(seq_len: usize, index_topk: usize) -> bool {
+        index_topk > 0 && seq_len > index_topk
+    }
+
     pub fn implemented(self) -> bool {
         match self {
             Feature::NoPe => true,           // BlockWeights::nope
@@ -159,9 +173,20 @@ impl Feature {
             Feature::EmbeddingScale => true,     // Model::embed_scale, set from the arch at load
             Feature::PerLayerRopeBase => true,   // BlockWeights::rope_base, from rope.freq_base_swa
             Feature::AttentionScaleHparam => false, // 1/sqrt(head_dim) is hardcoded in the kernels
-            Feature::ExpertWeightsScale => false,   // the key is never read; effectively hardcoded to 1
-            Feature::ExpertWeightsNorm => false,    // moe::route normalizes for softmax only
-            Feature::SparseAttentionIndexer => false, // no indexer exists
+            // IMPLEMENTED in _369/_370, and this table did not learn — the exact stale-flag shape the
+            // Q6_K file-view gate had. `{arch}.expert_weights_scale` is read from metadata and applied
+            // in moe::route AFTER normalization (order is load-bearing: scaling first cancels against
+            // the divide, and the model would run with the factor silently doing nothing).
+            Feature::ExpertWeightsScale => true,
+            // Also metadata-driven now, with the arch as fallback — and Llama-4 VETOES it, because its
+            // raw-sigmoid gate multiplies the expert's input and a normalized weight there is a
+            // different forward pass rather than the same one scaled.
+            Feature::ExpertWeightsNorm => true,
+            // Still absent, and still the only real blocker — but NOT unconditionally. Colibri's
+            // glm.c: the DSA indexer is a no-op for seq <= index_topk, where top-k IS every key, so
+            // dense causal attention is the same computation rather than an approximation of it.
+            // GLM-5.2's index_topk is 2048. See `indexer_needed_at`.
+            Feature::SparseAttentionIndexer => false
         }
     }
 
@@ -436,16 +461,39 @@ mod tests {
     }
 
     #[test]
+    fn the_indexer_is_NOT_needed_below_index_topk() {
+        // Colibri's glm.c, stated directly: the DSA indexer is a no-op for seq <= index_topk, because
+        // top-k of everything IS everything. Below that bound dense causal attention is not an
+        // approximation of the sparse path — it is the same computation, validated there against a
+        // transformers oracle.
+        //
+        // GLM-5.2's index_topk is 2048. So "unsupported architecture" is the wrong verdict for a
+        // short-context run, and a hard refusal costs a model that would have worked.
+        assert!(!indexer_needed_at(1, 2048));
+        assert!(!indexer_needed_at(2048, 2048), "exactly at the bound: still every key");
+        assert!(indexer_needed_at(2049, 2048), "past it, the indexer selects a subset");
+        // A model that declares no index_topk cannot be reasoned about this way.
+        assert!(!indexer_needed_at(100_000, 0));
+    }
+
+    #[test]
     fn glm52_requirements_come_from_its_shipped_metadata() {
         // Transcribed from GLM-5_2-UD-IQ1_S-00001-of-00006.gguf, not inferred from the family name.
         // glm-dsa is NOT glm4moe: it adds a sparse-attention indexer and two expert-weighting knobs that
         // the GLM-4 line does not have, and treating them as one architecture would silently apply the
         // wrong forward pass.
-        let g = gaps("glm-dsa", 0);
+        // All three are REQUIRED by the file — that has not changed and is the point of the test.
         for f in [Feature::SparseAttentionIndexer, Feature::ExpertWeightsScale, Feature::ExpertWeightsNorm] {
-            assert!(g.contains(&f), "glm-dsa needs {f:?}");
+            assert!(required("glm-dsa", 0).contains(&f), "glm-dsa requires {f:?}");
             assert!(!required("glm4moe", 0).contains(&f), "glm4moe does NOT — they are different archs");
         }
+        // But two are now IMPLEMENTED (_369/_370), so only one remains a GAP. This test asserted all
+        // three were gaps and would have kept saying so forever — the same shape as the Llama-4 veto,
+        // where the behaviour was tested, the test passed, and the test was wrong.
+        let g = gaps("glm-dsa", 0);
+        assert!(g.contains(&Feature::SparseAttentionIndexer), "the indexer is the remaining blocker");
+        assert!(!g.contains(&Feature::ExpertWeightsScale), "scale is read from metadata and applied");
+        assert!(!g.contains(&Feature::ExpertWeightsNorm), "norm is metadata-driven with an arch fallback");
         // MLA is shared and already implemented, so it must not appear as a gap for either
         assert!(!g.contains(&Feature::Mla));
 
