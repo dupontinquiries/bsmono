@@ -3246,6 +3246,30 @@ impl Gpu {
                         else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
                 usage, mapped_at_creation: a.mapped });
+            // A FAILED ALLOCATION MUST NOT BE MAPPED. create_buffer returns a Buffer even when the
+            // driver could not back it — the failure arrives through the uncaptured-error handler and
+            // the buffer is INVALID. Mapping an invalid buffer panics inside wgpu:
+            //
+            //   Failed to allocate BO VMA / BO creation failed
+            //   panicked at wgpu_core.rs: Error in Buffer::get_mapped_range
+            //   Caused by: Buffer with 'arena-slab' label is invalid
+            //
+            // That is a Llama-3.3-70B load on a 48 GiB budget, and a crash is the worst possible
+            // outcome for a condition the memory planner exists to report. Polling flushes the
+            // pending device error so oom_flag is set before anything touches the buffer.
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            if self.oom_backoff() {
+                // Leave the slab out of the arena and hand back a tensor over a minimal buffer. The
+                // OOM flag is already set, so the enclosing load discards this and reports device OOM
+                // through the path built for it — rather than aborting the process here.
+                eprintln!("wgpu-engine: arena slab allocation FAILED ({} MiB) — the driver could not \
+back it. Reporting device OOM rather than mapping an invalid buffer",
+                    a.slab_size / (1 << 20));
+                let dummy = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("arena-slab-oom"), size: 4, usage,
+                    mapped_at_creation: false });
+                return Tensor { buf: dummy, rows, cols, pool: None, view: None };
+            }
             a.slabs.push(slab);
             a.used = 0;
             off = 0;
@@ -7215,7 +7239,24 @@ a '{declared}'");
         let arch_is_mla_family = matches!(acfg.arch, crate::archcfg::Arch::DeepseekV3 | crate::archcfg::Arch::Glm4Moe);
         // If an MLA-family checkpoint actually ships MLA projection tensors, we can't run it yet (MLA
         // forward unwired) — refuse clearly. If it has standard attention tensors instead, proceed.
-        if arch_is_mla_family && has_mla_tensors {
+        // THE TENSORS DECIDE, NOT THE ARCH NAME. This required BOTH, so a checkpoint shipping MLA
+        // projections under an architecture the table calls standard-attention fell through to the
+        // dense loader and failed on a missing attn_q — which is what GLM-4.7 Flash does:
+        //
+        //   blk.0 is Multi-head Latent Attention (attn_q_a / attn_kv_a_mqa present, attn_q absent)
+        //   and the MLA path did not engage, so the dense loader ran instead.
+        //
+        // A family list is a prediction about which architectures use MLA; `has_mla_tensors` is an
+        // observation of what this file contains. When they disagree the file is right — the same
+        // principle as deriving the latent dims from shapes rather than trusting metadata.
+        //
+        // Kept in the condition so the arch list still explains WHY when it is the surprising case.
+        if has_mla_tensors {
+            if !arch_is_mla_family {
+                eprintln!("loader: '{arch}' is not in the MLA family list, and this checkpoint ships \
+MLA projections anyway — taking the MLA path because the tensors are what the forward pass has to \
+match. The family list is a prediction; the file is an observation");
+            }
             // No longer a blanket refusal. The MLA forward, the compressed cache, the per-layer
             // projections, the decode block and the per-layer routing are all in place and checked
             // (--gate-mla-block plus the kernel-validation suite). What is still worth refusing is a
