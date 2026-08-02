@@ -3994,15 +3994,27 @@ pub fn run(args: &[String]) {
             }
             spent = t;
             c.boost = false;
+            // TIME TO USABLE, not time to full. With a large reserve, waiting
+            // for the whole tank is not the property that matters — you can
+            // spend it as it returns, so what counts is how soon there is
+            // enough for a correction (half a second of thrust).
+            let usable = physics::BOOST_DRAIN * 0.5;
+            let mut ready = 0.0f32;
             let mut back = 0.0f32;
-            while car.boost < h.base_tank * 0.95 && back < 10.0 {
+            while back < 10.0 {
                 physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
                 back += DT;
+                if ready == 0.0 && car.boost >= usable {
+                    ready = back;
+                }
+                if car.boost >= h.base_tank * 0.95 {
+                    break;
+                }
             }
             println!();
-            println!("base reserve: {spent:.2}s of thrust, back in {back:.2}s");
-            check("the base reserve refills faster than it drains", back < spent * 1.2);
-            check("and it is available again within about a second", back < 1.5);
+            println!("base reserve: {spent:.2}s of thrust, usable again in {ready:.2}s, full in {back:.2}s");
+            check("the reserve refills faster than it drains", back < spent * 1.2);
+            check("a correction is available again almost at once", ready < 0.35);
         }
         // pad charge must actually be an upgrade
         {
@@ -4287,6 +4299,104 @@ pub fn run(args: &[String]) {
                 off * 100.0,
                 if off > 0.02 { "OFF CENTRE" } else { "" }
             );
+        }
+
+        // ---- MODEL HEALTH ----
+        // "Missing triangles", "strange shapes" and "overbounded" are three
+        // different faults and want three different measurements:
+        //   * a mesh whose triangle WINDING is inconsistent renders with
+        //     holes under backface culling — the triangles are there, they
+        //     are simply facing away
+        //   * DEGENERATE triangles (zero area) are authoring debris
+        //   * a bounding box driven by a handful of STRAY vertices makes the
+        //     hitbox far bigger than the car, which reads as a wrong shape
+        println!();
+        println!("{:<12} {:>8} {:>9} {:>10} {:>11}", "model", "tris", "degen", "open edges", "bbox/p98");
+        let mut worst_slack = 0.0f32;
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            let mut idx: Vec<u32> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let base = pts.len() as u32;
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                    if let Some(is) = reader.read_indices() {
+                        idx.extend(is.into_u32().map(|i| i + base));
+                    }
+                }
+            }
+            if pts.is_empty() || idx.is_empty() {
+                continue;
+            }
+            let tris = idx.len() / 3;
+            // degenerate: two indices equal, or zero area
+            let mut degen = 0usize;
+            let mut edges: std::collections::HashMap<(u32, u32), i32> = std::collections::HashMap::new();
+            for t in idx.chunks_exact(3) {
+                if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                    degen += 1;
+                    continue;
+                }
+                let (a, b, c) = (
+                    Vec3::from_array(pts[t[0] as usize]),
+                    Vec3::from_array(pts[t[1] as usize]),
+                    Vec3::from_array(pts[t[2] as usize]),
+                );
+                if (b - a).cross(c - a).length() < 1e-12 {
+                    degen += 1;
+                    continue;
+                }
+                // an edge shared by two correctly wound triangles is seen
+                // once in each direction; anything else is a hole or a flip
+                for (u, v) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let key = (u.min(v), u.max(v));
+                    *edges.entry(key).or_insert(0) += if u < v { 1 } else { -1 };
+                }
+            }
+            let open = edges.values().filter(|v| **v != 0).count();
+            // how much bigger is the box than the body it contains?
+            let mut slack = 0.0f32;
+            for ax in 0..3 {
+                let mut v: Vec<f32> = pts.iter().map(|p| p[ax]).collect();
+                v.sort_by(f32::total_cmp);
+                let lo = v[0];
+                let hi = v[v.len() - 1];
+                let p1 = v[v.len() / 100];
+                let p99 = v[v.len() * 99 / 100];
+                let full = (hi - lo).max(1e-6);
+                let inner = (p99 - p1).max(1e-6);
+                slack = slack.max(full / inner);
+            }
+            worst_slack = worst_slack.max(slack);
+            println!(
+                "{:<12} {:>8} {:>9} {:>10} {:>10.2}x {}",
+                n.trim_end_matches(".glb"),
+                tris,
+                degen,
+                open,
+                slack,
+                if open * 20 > tris { "OPEN SHELL" } else if slack > 1.5 { "stray verts" } else { "" }
+            );
+        }
+        println!("   (open edges are why triangles look missing: they face away, so culling hides them)");
+        // the two fixes, stated as the numbers they change
+        {
+            let src = include_str!("render.rs");
+            let double_sided = src.contains("cull_mode: None,\n                front_face");
+            let ldr = include_str!("model.rs");
+            let scrubs = ldr.contains("cross(c - a).length_squared() < 1e-20");
+            let p99 = ldr.contains("half_p99_raw");
+            println!(
+                "   car pipeline draws both sides: {}, loader drops degenerates: {}, hitbox uses p99: {}",
+                double_sided, scrubs, p99
+            );
+            ok_all &= double_sided && scrubs && p99;
         }
 
         // ---- ORIENTATION: which way did each model arrive? ----

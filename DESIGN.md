@@ -3228,6 +3228,43 @@ That count is now reported by `--sim perf` as a stable measure of physics
 cost, which is a better instrument than the timings for exactly the reason
 this session demonstrates.
 
+## v1.99.0 — five times the reserve, and why the models looked broken
+
+THE BASE RESERVE IS 5x. At 30 it lasted under a second: enough to prove the
+idea, not enough to play with, so a hovercar between pads was still mostly a
+passenger. At 150 it carries four and a half seconds of continuous low
+thrust — a whole approach and a recovery — with the refill scaled to match.
+
+The harness needed rethinking with it. It measured time to a FULL tank,
+which is not the property that matters once the tank is large: you spend the
+reserve as it returns, so what counts is how soon there is enough for a
+correction. Half a second of thrust is back in 0.24 s.
+
+WHY THE MODELS LOOKED BROKEN — three complaints, three different faults, and
+measuring them separately is what made them fixable.
+
+MISSING TRIANGLES ARE NOT MISSING. Every imported mesh has thousands of OPEN
+EDGES: the triangles are present but wound inconsistently, so back-face
+culling hides them and the model reads as full of holes. Measured: 10,694
+open edges on VULCAN, 11,341 on ORION, 26,253 on ASSAEL. The car pipeline
+draws both sides now. Culling is a saving that only pays out on closed,
+consistently wound geometry, and this is not that.
+
+STRANGE SHAPES ARE OFTEN DEBRIS. These exports are up to 39% DEGENERATE
+triangles — zero-area triangles that cost index bandwidth and vertex work
+and cannot draw a pixel, while still poisoning any normal smoothing that
+touches them. BACKFIRE is 6,672 of 19,533; BREAKOUT 28,853 of 73,511;
+ASSAEL 29,707 of 87,550. They are dropped at load.
+
+OVERBOUNDED IS OUTLIERS. A bounding box is set by its single most extreme
+vertex, so one stray point makes the car COLLIDE bigger than it looks. The
+hitbox now takes the 99th percentile of each axis, which ignores a handful
+of strays and still contains the car, with a floor so a legitimately spiky
+model is not shrunk by more than a third.
+
+All three are asserted by `--sim glb` against the source, so none of them
+can quietly come undone.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -530,7 +530,15 @@ impl Gpu {
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
+                // DOUBLE-SIDED, and it is not a stylistic choice. Every
+                // imported car mesh has thousands of open edges — the
+                // triangles are present but wound inconsistently, so back
+                // face culling HIDES them and the model looks like it has
+                // holes punched in it. Measured: 10,694 open edges on
+                // VULCAN, 26,253 on ASSAEL. Culling is a saving that only
+                // pays out on closed, consistently wound geometry, and this
+                // is not that.
+                cull_mode: None,
                 front_face: wgpu::FrontFace::Ccw,
                 ..Default::default()
             },

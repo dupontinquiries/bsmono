@@ -913,7 +913,7 @@ fn main() {
         ("blackstar", 1.22, physics::Hover { ride: 0.40, stiff: 60.0, hold: 0.10, field_r: 2.8, field_k: 30.0, pulse_cd: 1.05, pulse_k: 13.0, ..physics::Hover::default() }),
         // ELEGANCE: long and floaty, with a generous base reserve — it is
         // never quite out of thrust, which suits its complete lack of grip.
-        ("elegance", 1.34, physics::Hover { ride: 0.56, stiff: 38.0, hold: 0.12, field_r: 3.4, field_k: 25.0, base_tank: 40.0, base_regen: 50.0, ..physics::Hover::default() }),
+        ("elegance", 1.34, physics::Hover { ride: 0.56, stiff: 38.0, hold: 0.12, field_r: 3.4, field_k: 25.0, base_tank: 200.0, base_regen: 82.0, ..physics::Hover::default() }),
         // TRIFANG: three-pronged and stiff. A narrow, hard field: it stabs.
         ("trifang", 1.26, physics::Hover { ride: 0.44, stiff: 62.0, hold: 0.11, field_r: 2.4, field_k: 38.0, ..physics::Hover::default() }),
         // ECHOTRON: a civilian runabout. The most forgiving of them — real

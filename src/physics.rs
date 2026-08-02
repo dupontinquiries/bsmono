@@ -137,11 +137,20 @@ impl Default for Hover {
             hold: 0.18,
             field_r: 3.2,
             field_k: 26.0,
-            base_tank: 30.0,
+            // FIVE TIMES THE RESERVE. At 30 the base tier lasted under a
+            // second — enough to prove the idea and not enough to play with,
+            // so a hovercar between pads was still mostly a passenger. At
+            // 150 it carries about four and a half seconds of continuous
+            // low thrust, which is a whole approach and a recovery.
+            base_tank: 150.0,
             // Faster than it drains, deliberately. A hovercar that has to
             // WAIT for thrust is a hovercar that cannot steer, so the base
             // tier is designed to be back before you miss it.
-            base_regen: 44.0,
+            // ...and the refill scales with it, so the reserve still comes
+            // back faster than it drains (33/s out, 70/s in). The property
+            // that matters is not the size of the tank but that waiting for
+            // it is never the reason you lost the ball.
+            base_regen: 70.0,
             base_power: 0.55,
             charge_power: 1.25,
             pulse_cd: 1.6,

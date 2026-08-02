@@ -630,6 +630,57 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let long = ext.z.max(ext.x).max(ext.y).max(1e-6);
     let s = target_len / long;
     let yaw = if flip { std::f32::consts::PI } else { 0.0 };
+    // ---- SCRUB THE GEOMETRY ----
+    // These exports carry a lot of debris. BACKFIRE is 34% degenerate
+    // triangles, BREAKOUT 39%, ASSAEL 34% — zero-area triangles that cost
+    // index bandwidth and vertex work and cannot draw a single pixel. They
+    // are also the usual reason a mesh looks subtly wrong: a degenerate
+    // triangle still contributes a normal of nothing to any smoothing.
+    for r in raws.iter_mut() {
+        let before = r.idx.len() / 3;
+        let mut kept: Vec<u32> = Vec::with_capacity(r.idx.len());
+        for t in r.idx.chunks_exact(3) {
+            if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                continue;
+            }
+            let (a, b, c) = (
+                Vec3::from_array(r.verts[t[0] as usize].pos),
+                Vec3::from_array(r.verts[t[1] as usize].pos),
+                Vec3::from_array(r.verts[t[2] as usize].pos),
+            );
+            if (b - a).cross(c - a).length_squared() < 1e-20 {
+                continue;
+            }
+            kept.extend_from_slice(t);
+        }
+        let _ = before;
+        r.idx = kept;
+    }
+
+    // THE HITBOX FOLLOWS THE BODY, NOT THE OUTLIERS. A bounding box is set
+    // by its most extreme vertex, so one stray point — an aerial, a decal
+    // plane, a forgotten helper — makes the car collide bigger than it
+    // looks. Take the 99th percentile of each axis instead, which ignores a
+    // handful of strays and still contains the car.
+    let half_p99_raw = {
+        let mut ax: [f32; 3] = [0.0; 3];
+        for k in 0..3 {
+            let mut v: Vec<f32> = raws
+                .iter()
+                .flat_map(|r| r.verts.iter().map(move |q| q.pos[k]))
+                .collect();
+            if v.len() < 200 {
+                ax[k] = 0.0; // fall back to the box below
+                continue;
+            }
+            v.sort_by(f32::total_cmp);
+            let lo = v[v.len() / 100];
+            let hi = v[v.len() * 99 / 100];
+            ax[k] = (hi - lo) * 0.5; // model units; scaled once `s` is known
+        }
+        Vec3::new(ax[0], ax[1], ax[2])
+    };
+
     // ---- ORIENT FIRST ----
     // Everything downstream — the wheel split, the hitbox, the nose — assumes
     // an upright car facing -Z. Several of these models do not arrive that
@@ -705,7 +756,19 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
         prims.push(Prim { mesh_id, tex_id, color: r.color, tag: r.tag, pivot });
     }
 
-    let half = ext * s * 0.5;
+    // scale the percentile extents, and never let them shrink the car by
+    // more than a third of its box — a legitimately spiky model should still
+    // collide roughly like it looks
+    let half = {
+        let boxed = ext * s * 0.5;
+        let p99 = half_p99_raw * s;
+        Vec3::new(
+            if p99.x > 1e-4 { p99.x.max(boxed.x * 0.7) } else { boxed.x },
+            if p99.y > 1e-4 { p99.y.max(boxed.y * 0.7) } else { boxed.y },
+            if p99.z > 1e-4 { p99.z.max(boxed.z * 0.7) } else { boxed.z },
+        )
+    };
+
     let wheel_r = if wheel_bottom < wheel_top {
         (wheel_top - wheel_bottom) * 0.5
     } else {
