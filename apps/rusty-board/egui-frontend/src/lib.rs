@@ -12,6 +12,7 @@ use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 
 pub mod real_layout;
 pub mod dictation;
+pub mod microterm;
 pub mod voice;
 pub mod settings;
 // config/mod.rs refers to `crate::util`, so the port re-exports it at the root.
