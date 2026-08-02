@@ -1989,7 +1989,13 @@ impl Game {
                 let start = self.mscroll.max(0.0) as usize;
                 hud::hit_row_scrolled(hud::LIST_TOP, hud::ACADEMY_ROW_H, n, vis, start, y)
             }
-            Mode::Garage { .. } => hud::hit_row(hud::GARAGE_TOP, hud::GARAGE_ROW_H, custom::slots().len(), y),
+            Mode::Garage { .. } => {
+                // the panel drops below the stage on a tall window, so the
+                // rows are somewhere else and hit-testing has to know
+                let a = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
+                let top = if a > 1.25 { hud::GARAGE_TOP } else { hud::GARAGE_TOP_TALL };
+                hud::hit_row(top, hud::GARAGE_ROW_H, custom::slots().len(), y)
+            }
             _ => None,
         }
     }
@@ -4032,6 +4038,51 @@ impl Game {
             None,
             true,
             self.skin_params(),);
+        // ---- GARAGE LIVE VIEW ----
+        // The customizer used to describe a car in words while the car
+        // itself sat behind the panel. So put it on stage: the SAME model,
+        // pushed into the scene near the camera, which means it gets the
+        // real skin, the real rig motion, the real reflections and the real
+        // lighting rather than a flat thumbnail that would have to be kept
+        // in sync with all four.
+        if let Mode::Garage { .. } = self.mode {
+            let aspect = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
+            // camera basis, so the stand follows wherever you are looking
+            let fwd = (self.cam.look - self.cam.pos).normalize_or(Vec3::NEG_Z);
+            let right = fwd.cross(self.cam.up).normalize_or(Vec3::X);
+            let up = right.cross(fwd).normalize_or(Vec3::Y);
+            // WIDE SCREENS PUT IT BESIDE THE PANEL, TALL ONES ABOVE IT.
+            // On a wide window there is room to the right and none above; on
+            // a tall or square one the reverse. The panel narrows to match
+            // (see `garage_menu`), so the two never overlap.
+            let wide = aspect > 1.25;
+            let dist = 4.2;
+            let off = if wide {
+                right * (dist * 0.40) + up * (dist * 0.02)
+            } else {
+                up * (dist * 0.30)
+            };
+            let at = self.cam.pos + fwd * dist + off;
+            // a slow turntable, so you see the whole car without touching it
+            let spin = Quat::from_rotation_y(self.time * 0.5);
+            // stand it upright in the world, not in the camera's frame: a
+            // car leaning with the camera reads as broken
+            self.push_car(
+                &mut objs,
+                self.cars.active,
+                at,
+                spin,
+                false,
+                self.time * 2.2,
+                0.0,
+                0.0,
+                self.cfg.car.size * 1.35,
+                None,
+                true,
+                self.skin_params(),
+            );
+        }
+
         // remote cars + their boost flames
         for (i, p) in self.net.peers().enumerate() {
             self.push_car(&mut objs, p.car.min(self.cars.models.len() - 1), p.shown, p.rot, p.flip, p.wheel_spin, p.steer_vis,

@@ -3626,6 +3626,20 @@ pub fn run(args: &[String]) {
             "a click above the list hits nothing",
             crate::hud::hit_row(crate::hud::LIST_TOP, crate::hud::TRIALS_ROW_H, 8, 0.95).is_none(),
         );
+        // the garage moves its panel to make room for the live view, so the
+        // rows are in a different place on a tall window than a wide one —
+        // and hit-testing has to follow, or clicks land on the wrong row
+        let mut layouts_ok = true;
+        for (label, aspect, top) in [
+            ("wide", 1.78f32, crate::hud::GARAGE_TOP),
+            ("tall", 0.75, crate::hud::GARAGE_TOP_TALL),
+        ] {
+            let mid = top - crate::hud::GARAGE_ROW_H * 3.5;
+            let hit = crate::hud::hit_row(top, crate::hud::GARAGE_ROW_H, crate::custom::slots().len(), mid);
+            println!("   {label} window (aspect {aspect}): row under the cursor is {hit:?}");
+            layouts_ok &= hit == Some(3);
+        }
+        check("both garage layouts hit-test where they draw", layouts_ok);
         check(
             "the garage rows are hit-testable too",
             crate::hud::hit_row(

@@ -393,6 +393,10 @@ pub fn lesson_banner(ui: &mut Vec<UiVert>, a: f32, name: &str, hint: &str, progr
 
 /// The garage. Four slots, the current pick, and what it does — the blurb
 /// matters here because "MOIRE" tells you nothing on its own.
+/// The garage. The car itself is on stage beside (or above) this panel —
+/// see the live view in `main.rs` — so the panel deliberately does NOT fill
+/// the screen: it takes the left half on a wide window and the lower part of
+/// a tall one, leaving the stage clear.
 pub fn garage_menu(
     ui: &mut Vec<UiVert>,
     a: f32,
@@ -400,10 +404,24 @@ pub fn garage_menu(
     look: &crate::custom::Loadout,
     cur: (f32, f32),
 ) {
-    quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
-    panel(ui, a, -0.86, -0.985, 0.86, 0.955);
-    label_c(ui, 0.885, T_TITLE * ui_k(a), a, PAPER, "GARAGE");
-    label_c(ui, 0.828, T_HINT * ui_k(a), a, DIM, &fit("LEFT / RIGHT TO CHANGE - ALL COSMETIC", 1.62, T_HINT * ui_k(a), a));
+    let wide = a > 1.25;
+    // the panel's own bounds, and the x range its rows live in
+    let (px0, px1, py0, py1) = if wide {
+        (-0.98, 0.10, -0.985, 0.955)
+    } else {
+        (-0.92, 0.92, -0.985, 0.38)
+    };
+    let (rx0, rx1) = (px0 + 0.08, px1 - 0.08);
+    // a dimmer that spares the stage, so the car stays bright
+    if wide {
+        quad(ui, -1.0, -1.0, 0.14, 1.0, [0.05, 0.04, 0.09, 0.45]);
+    } else {
+        quad(ui, -1.0, -1.0, 1.0, 0.42, [0.05, 0.04, 0.09, 0.45]);
+    }
+    panel(ui, a, py1, py0, px1, px0);
+    let title_y = if wide { 0.885 } else { 0.31 };
+    label_c_at(ui, (px0 + px1) * 0.5, title_y, T_TITLE * ui_k(a), a, PAPER, "GARAGE");
+    label_c_at(ui, (px0 + px1) * 0.5, title_y - 0.057, T_HINT * ui_k(a), a, DIM, &fit("LEFT / RIGHT TO CHANGE", (rx1 - rx0) * 0.95, T_HINT * ui_k(a), a));
     let k = ui_k(a);
     let coll = look.matches_collection();
     let rows: [(&str, String, usize, usize); 7] = [
@@ -423,32 +441,32 @@ pub fn garage_menu(
         ("BOOST TRAIL", look.trail_name().to_string(), look.trail, crate::custom::TRAILS.len()),
         ("GOAL EXPLOSION", look.explosion_name().to_string(), look.explosion, crate::custom::EXPLOSIONS.len()),
     ];
-    let top = GARAGE_TOP;
+    let top = if wide { GARAGE_TOP } else { 0.22 };
     let row_h = GARAGE_ROW_H;
     for (i, (name, val, idx, n)) in rows.iter().enumerate() {
         let y = top - i as f32 * row_h;
         if i == sel {
-            quad(ui, -0.80, y - row_h + 0.04, 0.80, y + 0.030, SEL);
-            quad(ui, -0.817, y - row_h + 0.04, -0.802, y + 0.030, GOLD);
+            quad(ui, rx0 - 0.02, y - row_h + 0.04, rx1 + 0.02, y + 0.030, SEL);
+            quad(ui, rx0 - 0.037, y - row_h + 0.04, rx0 - 0.022, y + 0.030, GOLD);
         }
         let col = if i == sel { GOLD } else { PAPER };
-        row_pair(ui, -0.78, 0.78, y, name, col, val, CYAN, T_BODY * k, a);
+        row_pair(ui, rx0, rx1, y, name, col, val, CYAN, T_BODY * k, a);
         // the paint row shows the palette itself; everything else gets dots
         if i == 2 {
             for (d, (_, rgb)) in crate::custom::PAINTS.iter().enumerate() {
-                let x = -0.78 + d as f32 * 0.030;
+                let x = rx0 + d as f32 * ((rx1 - rx0) / 13.0).min(0.030);
                 let on = d == *idx;
                 let h = if on { 0.020 } else { 0.012 };
-                quad(ui, x, y - 0.040, x + 0.024, y - 0.040 + h, [rgb[0], rgb[1], rgb[2], 1.0]);
+                quad(ui, x, y - 0.040, x + ((rx1 - rx0) / 16.0).min(0.024), y - 0.040 + h, [rgb[0], rgb[1], rgb[2], 1.0]);
                 if on {
-                    quad(ui, x, y - 0.046, x + 0.024, y - 0.042, GOLD);
+                    quad(ui, x, y - 0.046, x + ((rx1 - rx0) / 16.0).min(0.024), y - 0.042, GOLD);
                 }
             }
         } else {
             for d in 0..*n {
-                let x = -0.78 + d as f32 * 0.020;
+                let x = rx0 + d as f32 * ((rx1 - rx0) / 21.0).min(0.020);
                 let on = d == *idx;
-                quad(ui, x, y - 0.036, x + 0.011, y - 0.031, if on { GOLD } else { [0.3, 0.33, 0.38, 0.7] });
+                quad(ui, x, y - 0.036, x + 0.009, y - 0.031, if on { GOLD } else { [0.3, 0.33, 0.38, 0.7] });
             }
         }
     }
@@ -465,9 +483,9 @@ pub fn garage_menu(
         5 => crate::custom::TRAILS[look.trail].1.to_string(),
         _ => crate::custom::EXPLOSIONS[look.explosion].1.to_string(),
     };
-    label_c(ui, top - 7.0 * row_h - 0.03, T_HINT * k, a, DIM, &fit(&blurb, 1.5, T_HINT * k, a));
+    label_c_at(ui, (px0 + px1) * 0.5, top - 7.0 * row_h - 0.03, T_HINT * k, a, DIM, &fit(&blurb, (rx1 - rx0) * 0.98, T_HINT * k, a));
     nav_strip(ui, a, cur, 0);
-    legend(ui, -0.93, a, T_HINT, &[("LEFT/RIGHT", "CHANGE"), ("ESC", "BACK")]);
+    legend(ui, if wide { -0.93 } else { -0.93 }, a, T_HINT, &[("LEFT/RIGHT", "CHANGE"), ("ESC", "BACK")]);
 }
 
 /// Layout constants for the list menus, so hit-testing uses the SAME
@@ -478,6 +496,8 @@ pub const LIST_TOP: f32 = 0.70;
 pub const TRIALS_ROW_H: f32 = 0.058;
 pub const ACADEMY_ROW_H: f32 = 0.062;
 pub const GARAGE_TOP: f32 = 0.66;
+/// the tall-window layout puts the rows lower, under the stage
+pub const GARAGE_TOP_TALL: f32 = 0.22;
 pub const GARAGE_ROW_H: f32 = 0.082;
 
 /// The trials list: name, what it asks, which map, and your best.
@@ -1109,5 +1129,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.94    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.95    ESC QUITS FROM THIS SCREEN");
 }

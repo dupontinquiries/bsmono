@@ -3098,6 +3098,33 @@ The swap also lifts the car clear of the floor if the new model is taller,
 rather than leaving it half-buried, and toasts the name and position in the
 list so you know where you are in thirty cars.
 
+## v1.95.0 — the garage puts the car on stage
+
+The customizer described a car in words while the car itself sat behind the
+panel. Twenty skins, six rigs and twelve paints are hard to choose between
+when you cannot see any of them.
+
+THE LIVE VIEW IS THE REAL CAR, not a thumbnail: the same model pushed into
+the scene a few metres in front of the camera, on a slow turntable with its
+wheels turning. Because it is genuinely in the scene it gets the real skin
+shader, the real rig motion, the real reflections and the real lighting —
+and none of that has to be kept in sync with a separate preview path, which
+is the usual way a preview drifts out of date. It stands upright in the
+world rather than in the camera's frame, since a car leaning with the camera
+reads as broken.
+
+THE PANEL MOVES ASIDE RATHER THAN THE CAR MOVING BEHIND IT. On a wide window
+there is room to the right and none above, so the car goes right and the
+panel takes the left. On a tall or square one the reverse: the car goes
+above and the panel drops to the lower part. The dimmer follows the panel
+instead of covering the screen, so the stage stays bright.
+
+The rows, dots, swatches and blurb are all laid out from the panel's own
+bounds now rather than from fixed screen coordinates, so they reflow with
+it. Hit-testing follows too — the panel is in a different place on a tall
+window, and a click has to land on the row it appears to be over. `--sim
+menus` checks both layouts.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
