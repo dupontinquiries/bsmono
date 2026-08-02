@@ -20,13 +20,23 @@ Snapshot of the last `parity_audit.py` run. It is a snapshot and it will drift �
 the tool is the truth, and this table exists so a reader who has not run it can
 see roughly where things stand.
 
+Read the percentage as a worklist, not a score. The detector matches a
+surface's NAME anywhere in the port, so it cannot tell a ported widget from a
+doc comment that mentions one; `parity_audit.py --why <Surface>` prints every
+match with its location and marks which are comments, so any single claim can
+be checked in about ten seconds. snapclone's denominator jumped 38 → 58 when
+the detector learned to find surfaces by inheritance rather than by name
+suffix, which dropped its number from an inflated 39% to 34%. Expect the same
+correction wherever a Qt app names things in families the old suffix list could
+not see.
+
 | port | surfaces | covered | bin | catalogued | primary |
 |---|---|---|---|---|---|
 | bo-suite | 47 | 51% | yes | yes | — |
 | bot-arena | 2 | 50% | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
-| snapclone | 38 | 32% | yes | yes | — |
+| snapclone | 58 | 34% | yes | yes | — |
 | voiceterm | 32 | 34% | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
