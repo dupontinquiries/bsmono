@@ -21,6 +21,14 @@ pub struct Models {
     scanned: bool,
     /// This machine's id, derived from its public key. Shown so it can be transcribed elsewhere.
     my_id: String,
+    /// Trusted machines, loaded from disk and saved on every change.
+    ///
+    /// Held here rather than rebuilt per frame because a registry that is reloaded each frame would
+    /// discard an edit before the save, and saved on every change rather than on exit because a
+    /// crash between the two loses exactly the machine someone just added.
+    trusted: logscope_fan::trustkit::Registry,
+    /// What went wrong with the last add or save, if anything.
+    trust_note: Option<String>,
     add_id: String,
     machines: Vec<String>,
     machine_note: String,
@@ -44,6 +52,8 @@ impl Default for Models {
             // A failure to load falls back to a visible marker rather than a plausible-looking id: an
             // id that parses and is nobody's is worse than one that obviously did not load, because
             // the first gets pasted somewhere.
+            trusted: logscope_fan::trustkit::Registry::load(&trust_path()).0,
+            trust_note: None,
             my_id: std::env::var("HOME").ok()
                 .map(|h| std::path::PathBuf::from(h).join(".local/share/logscope/identity.key"))
                 .and_then(|p| logscope_fan::machineid::Identity::load_or_create(&p).ok())
@@ -135,9 +145,22 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
                         // offline" — pointing at the network instead of at the typing.
                         Err(e) => self.machine_note = e.explain(),
                         Ok(id) => {
+                            // INTO THE REGISTRY AND ONTO DISK. This pushed to a plain Vec that nothing read and
+                            // nothing saved — a machine "added" in the UI was trusted by no code and gone on
+                            // restart, which is worse than no button: the operator believes the step is done.
+                            //
+                            // Compute is the default level. It can run inference and cannot receive a workspace
+                            // handoff — granting the strongest level from a typed id would make one keystroke the
+                            // whole authorisation.
+                            self.trusted.register(&id, logscope_fan::trustkit::Trust::Compute);
                             self.machines.push(id.clone());
                             self.add_id.clear();
-                            self.machine_note = format!("added {id}");
+                            // UNVERIFIED, not "added": an id alone carries no key, so the machine is listed and
+                            // cannot yet be authenticated. "added" would overstate what just happened.
+                            self.machine_note = match self.trusted.save(&trust_path()) {
+                                Ok(()) => format!("added {id} — unverified until it announces itself"),
+                                Err(e) => format!("added {id} FOR THIS SESSION ONLY — could not save: {e}"),
+                            };
                         }
                     }
                 }
@@ -145,8 +168,33 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
             if !self.machine_note.is_empty() {
                 ui.label(egui::RichText::new(&self.machine_note).small().color(theme::DIM()));
             }
-            for m in &self.machines {
-                ui.label(egui::RichText::new(format!("  {m}")).monospace().small());
+            // FROM THE REGISTRY, not from a session Vec — so the list survives a restart and shows
+            // what is actually trusted rather than what was typed since launch.
+            //
+            // The verified/unverified distinction is the point of showing it at all: an entry with no
+            // key cannot be authenticated, so it is listed and cannot be acted on. trustkit calls that
+            // unverifiable(), and a list that hid it would imply a working link that does not exist.
+            let mut revoke: Option<String> = None;
+            for (id, level, verified) in self.trusted.entries_for_display() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("  {id}")).monospace().small());
+                    ui.label(egui::RichText::new(if verified { "✓ key on file" }
+                        else { "⚠ unverified — no key yet" })
+                        .small().color(if verified { theme::GREEN() } else { theme::AMBER() }));
+                    ui.label(egui::RichText::new(format!("{level:?}")).small().color(theme::DIM()));
+                    if ui.small_button("revoke").clicked() { revoke = Some(id.clone()); }
+                });
+            }
+            // Revoked outside the loop: mutating the registry while iterating it is the borrow the
+            // compiler would refuse, and collecting first is also what makes the save happen once.
+            if let Some(id) = revoke {
+                self.trusted.revoke(&id);
+                self.machine_note = match self.trusted.save(&trust_path()) {
+                    Ok(()) => format!("revoked {id}"),
+                    // A revocation that failed to save comes BACK on restart, which is the worst
+                    // direction for this error to go — so it says so plainly.
+                    Err(e) => format!("revoked {id} for this session only — could NOT save: {e}"),
+                };
             }
         });
     }
@@ -249,4 +297,10 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
             }
         });
     }
+}
+
+/// Where the trust list lives — beside the identity, because they are one setting.
+fn trust_path() -> std::path::PathBuf {
+    std::env::var("HOME").ok().map(std::path::PathBuf::from).unwrap_or_default()
+        .join(".local/share/logscope/trusted.txt")
 }
