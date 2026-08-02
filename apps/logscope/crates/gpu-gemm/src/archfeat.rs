@@ -172,7 +172,14 @@ impl Feature {
             // head_dim > 192, which stays causal-only and SAYS SO at dispatch rather than silently
             // ignoring the window.
             Feature::StandardSwa => true,
-            Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
+            // IMPLEMENTED, and this table did not learn — the third stale entry found here, after
+            // ExpertWeightsScale and ExpertWeightsNorm. `{arch}.rope.freq_base_swa` is read per layer
+            // and applied at all three rope sites via `w.rope_base.unwrap_or(base)`; Gemma's windowed
+            // layers use a different base from its global ones and have since the swa work.
+            //
+            // A stale FALSE here is not harmless: is_supported vetoes on any gap, so a table claiming
+            // a feature is missing refuses an architecture the engine can actually run.
+            Feature::PerLayerRopeFreqs => true,
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
             Feature::LayerOutputScale => false,  // the tensor is not read
             // Implemented in _289: the loader now reads attn_k_b + attn_v_b and concatenates them, having
@@ -567,5 +574,72 @@ mod tests {
         // Metadata path — and it must be able to CONTRADICT the count, or reading it changes nothing.
         assert!(decide(Some(1), 128), "a 128-expert model that declares qk-norm keeps it");
         assert!(!decide(Some(0), 16), "and a 16-expert model that declares none does not");
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+
+    /// Per-layer RoPE frequencies are implemented, and the table said otherwise.
+    ///
+    /// Third stale entry found in this table, after ExpertWeightsScale and ExpertWeightsNorm. Each was
+    /// implemented in the loader and left marked missing here — and a stale `false` is not harmless,
+    /// because `is_supported` vetoes on ANY gap: the table claiming a feature is absent refuses an
+    /// architecture the engine can run.
+    ///
+    /// `{arch}.rope.freq_base_swa` is read per layer and applied at all three rope sites through
+    /// `w.rope_base.unwrap_or(base)`. Gemma's windowed layers have used a different base from its
+    /// global ones since the SWA work.
+    #[test]
+    fn per_layer_rope_is_implemented_not_a_gap() {
+        assert!(Feature::PerLayerRopeFreqs.implemented());
+        for arch in ["gemma3", "gemma2", "llama"] {
+            assert!(!gaps(arch, 0).contains(&Feature::PerLayerRopeFreqs),
+                "{arch} must not be blocked on a feature the loader has");
+        }
+    }
+
+    /// The three that ARE still missing, so the list stays honest in both directions.
+    ///
+    /// Marking a feature implemented when it is not is the worse error — it turns a clean refusal into
+    /// a model that loads and produces wrong text — so these are pinned as firmly as the correction.
+    #[test]
+    fn the_remaining_gaps_are_still_gaps() {
+        assert!(!Feature::LogitSoftcap.implemented(), "nothing applies a softcap anywhere");
+        assert!(!Feature::PerLayerHeadDim.implemented(), "head_dim is one model-wide value");
+        assert!(!Feature::LayerOutputScale.implemented(), "the tensor is not read");
+    }
+
+    /// Some features are required by an ARCHITECTURE and some by a FILE, and the table only expresses
+    /// the first.
+    ///
+    /// I wrote this test asserting that every implemented feature must be required by some declared
+    /// architecture, and it failed on PerLayerRopeFreqs — correctly. Gemma uses a separate rope base
+    /// for its windowed layers only when the checkpoint carries `rope.freq_base_swa`; a Gemma without
+    /// that key needs one base and is not missing anything.
+    ///
+    /// So "implemented and required by no architecture" is a legitimate state, and the test that
+    /// assumed otherwise was asserting a rule this table does not have. Recorded rather than deleted,
+    /// because the distinction is easy to lose: `required()` answers what an ARCH always needs, and a
+    /// file-conditional capability has no place in it.
+    #[test]
+    fn a_file_conditional_feature_is_implemented_and_required_by_NO_arch() {
+        assert!(Feature::PerLayerRopeFreqs.implemented());
+        let archs = ["llama", "llama4", "qwen3moe", "gemma3", "glm-dsa", "deepseek2", "glm4moe"];
+        assert!(!archs.iter().any(|a| required(a, 0).contains(&Feature::PerLayerRopeFreqs)),
+            "no arch requires it unconditionally — it depends on rope.freq_base_swa being present");
+    }
+
+    /// The expert-weighting features ARE architectural, and must be declared.
+    ///
+    /// The contrast that makes the case above legible: these are properties of the routing math, true
+    /// of every checkpoint of the architecture, so a file omitting the key gets a default rather than
+    /// a different forward pass.
+    #[test]
+    fn the_architectural_features_are_declared_by_the_archs_that_have_them() {
+        for f in [Feature::ExpertWeightsScale, Feature::ExpertWeightsNorm] {
+            assert!(required("glm-dsa", 0).contains(&f), "{f:?} is a glm-dsa property");
+        }
     }
 }
