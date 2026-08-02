@@ -15,6 +15,14 @@ use uikit_egui::Adaptive;
 
 struct Feel {
     board: Board,
+    /// The minimized tray, the microterm and dictation — three ported surfaces
+    /// the demo could not reach. A keyboard that cannot minimise, cannot show
+    /// its terminal and cannot dictate is not the keyboard being shipped, and
+    /// the modules existed the whole time.
+    tray: crate::tray::Tray,
+    tray_open: bool,
+    microterm: crate::microterm::Microterm,
+    dictation: crate::dictation::Dictation,
     /// The REAL layout files (resources/layouts/*.json), with shift/caps + the symbols toggle —
     /// shown when the sidebar's real-layout tabs are active (indices past the demo layouts).
     real: RealBoard,
@@ -38,6 +46,10 @@ impl Feel {
             typed: String::new(),
             // A starter word list so the demo binary can be swiped immediately; on-device the
             // host loads rusty-board's shipped dictionary into the same recognizer.
+            tray: Default::default(),
+            tray_open: false,
+            microterm: Default::default(),
+            dictation: Default::default(),
             swipe: SwipeState::with_dictionary(
                 include_str!("../demo_words.txt").lines().map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty()).collect()),
@@ -62,6 +74,50 @@ impl eframe::App for Feel {
                 // A diagnostic that ships switched off and is reachable without a rebuild —
                 // the same bargain as snapclone's trace channels. On device this is what tells
                 // you whether a gesture was read as cardinal, swipe, or nothing at all.
+                // MINIMISE / MICROTERM / DICTATE — the three surfaces the demo
+                // never reached. Placed on the top strip because that is where
+                // the real keyboard puts its chrome, and because a control you
+                // cannot find is the same as a control that does not exist.
+                if ui.selectable_label(self.tray_open, "▁ tray").clicked() {
+                    self.tray_open = !self.tray_open;
+                }
+                if ui.selectable_label(self.microterm.is_visible(), "term").clicked() {
+                    if self.microterm.is_visible() { self.microterm.hide(); }
+                    else {
+                        // show() is a no-op on empty content by design — an
+                        // empty microterm has nothing to display, so opening it
+                        // would just be a blank strip. Give it the terminal.
+                        self.microterm.set_content(crate::microterm::Content::Terminal);
+                        self.microterm.show();
+                    }
+                }
+                {
+                    let listening = self.dictation.is_active();
+                    if ui.selectable_label(listening, if listening { "● dictating" } else { "dictate" }).clicked() {
+                        if listening {
+                            // PartialsOnly: the last partial IS the result, so
+                            // release commits without a second inference.
+                            if let Some(text) = self.dictation.finish() {
+                                if !self.typed.is_empty() && !self.typed.ends_with(' ') {
+                                    self.typed.push(' ');
+                                }
+                                self.typed.push_str(&text);
+                            }
+                        } else {
+                            self.dictation.start();
+                        }
+                    }
+                    if listening {
+                        // The partial goes to the MICROTERM's voice preview,
+                        // which is the surface built for it — showing it in the
+                        // toolbar instead would leave that surface unreachable
+                        // again by a different route.
+                        self.microterm.set_content(crate::microterm::Content::VoicePreview {
+                            partial: self.dictation.partial().to_string(), level: 0.4 });
+                        self.microterm.show();
+                    }
+                }
+                ui.separator();
                 let mut dbg = trail_debug_styling();
                 if ui.checkbox(&mut dbg, "trail shows gesture category").changed() {
                     set_trail_debug_styling(dbg);
@@ -99,6 +155,89 @@ impl eframe::App for Feel {
             }
             ui.add_space(4.0);
         });
+
+        // The microterm strip and the minimized tray, drawn above the keyboard.
+
+        // Both were ported and unreachable; a tray you cannot open is the same as
+
+        // no tray.
+
+        if self.microterm.is_visible() {
+
+            egui::TopBottomPanel::bottom("microterm").show(ctx, |ui| {
+
+                let c = uikit_egui::palette_colors(self.board.palette());
+
+                if let Some(tapped) = crate::microterm::microterm_ui(ui, &mut self.microterm, &c) {
+
+                    self.typed.push_str(&tapped);
+
+                }
+
+            });
+
+        }
+
+        if self.tray_open {
+
+            egui::TopBottomPanel::bottom("tray").show(ctx, |ui| {
+
+                ui.horizontal(|ui| {
+
+                    if ui.button("expand").clicked() { self.tray.expand(); self.tray_open = false; }
+
+                    // The spacebar carries all three gesture vocabularies: tap for a
+
+                    // space, double-tap to toggle selection, swipe for arrows.
+
+                    let (rect, resp) = ui.allocate_exact_size(
+
+                        egui::vec2(ui.available_width() - 80.0, 40.0),
+
+                        egui::Sense::click_and_drag());
+
+                    ui.painter().rect_filled(rect, 6.0,
+
+                        if self.tray.selecting { egui::Color32::from_rgb(80, 70, 40) }
+
+                        else { egui::Color32::from_gray(40) });
+
+                    ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER,
+
+                        if self.tray.selecting { "select" } else { "space" },
+
+                        egui::FontId::proportional(13.0), egui::Color32::from_gray(200));
+
+                    if resp.drag_started() {
+
+                        if let Some(p) = resp.interact_pointer_pos() { self.tray.press(p.x, p.y); }
+
+                    }
+
+                    if resp.drag_stopped() {
+
+                        let now_ms = (ui.input(|i| i.time) * 1000.0) as u64;
+
+                        if let Some(p) = resp.interact_pointer_pos() {
+
+                            for ev in self.tray.release(p.x, p.y, now_ms) {
+
+                                if let crate::tray::TrayEvent::Space = ev { self.typed.push(' '); }
+
+                            }
+
+                        }
+
+                    }
+
+                    if ui.button("close").clicked() { self.tray.close(); self.tray_open = false; }
+
+                });
+
+            });
+
+        }
+
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let adaptive = Adaptive::detect(ctx);
