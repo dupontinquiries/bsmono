@@ -89,6 +89,11 @@ impl Default for Writer {
 /// A trailing silent `e` is dropped, which is wrong for "the" and right far more
 /// often — and the writer can see the ruler, so an approximate count that is
 /// close beats an exact one that needs a dictionary at every keystroke.
+/// Must match packaging/org.krapper.KRapper.desktop exactly. A mismatch fails
+/// SILENTLY: the app runs and has no icon, no dock grouping and the wrong
+/// name in the switcher.
+const APP_ID: &str = "org.krapper.KRapper";
+
 pub fn syllables(line: &str) -> usize {
     let l = line.trim().to_lowercase();
     if l.is_empty() { return 0; }
@@ -215,7 +220,7 @@ pub fn writer_ui(ui: &mut egui::Ui, w: &mut Writer,
 #[cfg(feature = "app")]
 pub fn run(title: &str) -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([760.0, 620.0]),
+        viewport: uikit_egui::desktop::viewport(APP_ID, "kRapper", [760.0, 620.0]),
         ..Default::default()
     };
     eframe::run_native(title, opts, Box::new(|_cc| Ok(Box::<Shell>::default())))

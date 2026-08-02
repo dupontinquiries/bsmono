@@ -42,10 +42,18 @@ impl eframe::App for App {
     }
 }
 
+/// Must match packaging/org.bosuite.BoSuite.desktop exactly. A mismatch fails
+/// SILENTLY: the app runs and has no icon, no dock grouping and the wrong
+/// name in the switcher.
+const APP_ID: &str = "org.bosuite.BoSuite";
+
 fn main() -> eframe::Result<()> {
     eframe::run_native(
         "bo-suite (egui)",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+        viewport: uikit_egui::desktop::viewport(APP_ID, "Bo Suite", [900.0, 700.0]),
+        ..Default::default()
+    },
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
 }

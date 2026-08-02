@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=VoiceTerm
+GenericName=Voice Terminal
+Comment=Terminal with voice control, panes and an integrated reader
+Exec=voiceterm-egui
+Icon=org.voiceterm.VoiceTerm
+Terminal=false
+Categories=System;TerminalEmulator;Utility;
+Keywords=terminal;voice;shell;dictation;
+StartupNotify=true
+StartupWMClass=org.voiceterm.VoiceTerm

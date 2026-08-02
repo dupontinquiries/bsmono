@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=kRapper
+GenericName=Lyric Writer
+Comment=Hum a vibe and write to it — stress-matched suggestions and a hot-mic scratchpad
+Exec=krapper-egui
+Icon=org.krapper.KRapper
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=lyrics;rap;writing;music;voice;
+StartupNotify=true
+StartupWMClass=org.krapper.KRapper

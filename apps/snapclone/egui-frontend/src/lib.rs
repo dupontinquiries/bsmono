@@ -495,4 +495,37 @@ mod faithful_shell_tests {
             run_bar(&mut bar); // must not panic on any page form (centered vs segmented)
         }
     }
+
+#[cfg(test)]
+mod desktop_entry_tests {
+    /// The shipped entry, read at compile time so the test cannot pass against
+    /// a file that is not the one installed.
+    const ENTRY: &str = include_str!("../../packaging/org.snapclone.SnapClone.desktop");
+
+    #[test]
+    fn the_app_id_matches_the_desktop_files_icon_and_name() {
+        // The mismatch that produces a working app with no icon. Checking it
+        // here means a rename of either side breaks the build rather than the
+        // dock.
+        let icon = ENTRY.lines().find_map(|l| l.strip_prefix("Icon=")).expect("Icon=");
+        assert_eq!(icon, "org.snapclone.SnapClone");
+        assert!(uikit_egui::desktop::is_valid_app_id(icon), "{icon}");
+        // StartupWMClass covers X11, where the compositor matches on class
+        // rather than app id; both must name the same app or the integration
+        // works on one display server and not the other.
+        assert!(ENTRY.contains("StartupWMClass="), "no StartupWMClass");
+    }
+
+    #[test]
+    fn the_entry_has_what_a_launcher_needs() {
+        // A .desktop file missing any of these is accepted by the spec and
+        // shows up wrong: no category means no menu placement, no Exec means it
+        // cannot be launched at all.
+        for key in ["Type=Application", "Name=", "Exec=", "Icon=", "Categories="] {
+            assert!(ENTRY.contains(key), "missing {key}");
+        }
+        // Terminal=true on a GUI app opens a console window alongside it.
+        assert!(ENTRY.contains("Terminal=false"));
+    }
+}
 }

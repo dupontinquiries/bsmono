@@ -37,10 +37,19 @@ impl eframe::App for App {
     }
 }
 
+/// Must match `packaging/org.snapclone.SnapClone.desktop` exactly — no
+/// extension, same case. A mismatch fails SILENTLY: the app runs perfectly and
+/// has no icon, no dock grouping and the wrong name, and nobody connects those
+/// symptoms to a string.
+const APP_ID: &str = "org.snapclone.SnapClone";
+
 fn main() -> eframe::Result<()> {
-    eframe::run_native(
-        "snapclone (egui)",
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(App::new()))),
-    )
+    let opts = eframe::NativeOptions {
+        // NativeOptions::default() sets no app id, which on Wayland means the
+        // compositor can never find the .desktop entry — there is no WM_CLASS to
+        // fall back on there, so this IS the desktop integration.
+        viewport: uikit_egui::desktop::viewport(APP_ID, "SnapClone", [420.0, 820.0]),
+        ..Default::default()
+    };
+    eframe::run_native(APP_ID, opts, Box::new(|_cc| Ok(Box::new(App::new()))))
 }

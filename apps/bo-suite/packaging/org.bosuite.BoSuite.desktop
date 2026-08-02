@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Bo Suite
+GenericName=Spatial Audio Router
+Comment=Route audio across Mozart and Bluetooth speakers by room and channel
+Exec=bo-suite-egui
+Icon=org.bosuite.BoSuite
+Terminal=false
+Categories=AudioVideo;Audio;Mixer;
+Keywords=audio;speakers;multiroom;bluetooth;mozart;spatial;
+StartupNotify=true
+StartupWMClass=org.bosuite.BoSuite
