@@ -25,6 +25,7 @@ pub mod settings_store;
 pub mod inbox;
 pub mod unified_nav;
 pub mod friends;
+pub mod modal;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -91,6 +92,10 @@ pub struct Snapclone {
     pub cards: crate::friends::Accordion,
     /// The manual add-peer form: the only way in when discovery does not work.
     pub add_form: crate::friends::AddForm,
+    /// The six-layer modal stack (Qt ModalSurface) every dialog is presented
+    /// into. Owning it here is the point: z-order becomes a property of the
+    /// structure rather than of which code called raise() last.
+    pub modal: crate::modal::ModalSurface,
     gesture: GestureLayer,
     palette: String,
 }
@@ -119,6 +124,7 @@ impl Snapclone {
             picker: Default::default(),
             cards: Default::default(),
             add_form: Default::default(),
+            modal: Default::default(),
             conversation: Default::default(),
             conversation_peer: String::new(),
             bar: UnifiedNav::new(),
@@ -153,6 +159,16 @@ impl Snapclone {
         self.roster.set(self.peers.iter().map(Snapclone::friend_of).collect());
     }
 
+    /// Confirm the pending delete. Split from apply_friends because the
+    /// confirmation arrives as its own answer, not as part of the tap that
+    /// asked the question.
+    pub fn confirm_delete(&mut self, id: &str) {
+        self.peers.retain(|p| p.name != id);
+        self.cards.close(id);
+        self.sync_roster();
+        self.modal.dismiss(&format!("confirm-delete:{id}"));
+    }
+
     /// Carry out what the Friends page asked for.
     pub fn apply_friends(&mut self, a: crate::friends::Action) {
         use crate::friends::Action;
@@ -172,13 +188,18 @@ impl Snapclone {
                     self.nav.push_subpage(i);
                 }
             }
-            Action::Invoke(id, act) => {
-                if act == "delete" {
-                    self.peers.retain(|p| p.name != id);
-                    self.cards.close(&id);
-                    self.sync_roster();
-                }
-            }
+            Action::Invoke(id, act) => match act.as_str() {
+                // Delete asks first, in the Confirm layer above the dialog
+                // layer — removing a contact on a single tap of a menu item
+                // that sits one row below "Message" is how people lose people.
+                "delete" => self.modal.present_default(
+                    &format!("confirm-delete:{id}"), crate::modal::Layer::Confirm,
+                    crate::modal::Rect::new(40.0, 200.0, 300.0, 140.0)),
+                "edit" => self.modal.present_default(
+                    &format!("editor:{id}"), crate::modal::Layer::Dialog,
+                    crate::modal::Rect::new(20.0, 80.0, 340.0, 400.0)),
+                _ => {}
+            },
             Action::ImportVCard => {}
         }
     }
@@ -190,6 +211,13 @@ impl Snapclone {
     /// Swipe between top-level pages (unless drilled into a subpage — then swipe is off so the
     /// content can scroll/interact).
     pub fn swipe_page(&mut self, sign: i32) {
+        // A swipe under an open dialog would change the page out from under it
+        // and leave the dialog floating over a screen it has nothing to do
+        // with. This is what Qt's stackChanged signal exists to let callers
+        // ask.
+        if self.modal.blocks_input() {
+            return;
+        }
         if self.nav.can_go_back() {
             return;
         }
@@ -514,15 +542,46 @@ mod tests {
     }
 
     #[test]
-    fn deleting_from_a_card_removes_the_row_and_closes_the_menu() {
-        // Leaving the accordion open on a deleted id strands the menu over
-        // whichever row slides up into its place.
+    fn delete_asks_before_it_deletes() {
+        // Qt puts a ChevronConfirm in the way — "Remove %1 from your address
+        // book?" — and the port was deleting on the single tap of a menu item
+        // sitting one row below "Message". That is how people lose people.
         let mut s = app();
         s.cards.open_only("bob");
         s.apply_friends(crate::friends::Action::Invoke("bob".into(), "delete".into()));
+        assert_eq!(s.roster.len(), 2, "nobody is gone yet");
+        assert_eq!(s.modal.blocking_layer(), Some(crate::modal::Layer::Confirm));
+
+        s.confirm_delete("bob");
         assert_eq!(s.roster.len(), 1);
         assert!(s.roster.get("bob").is_none());
+        // Leaving the accordion open on a deleted id strands the menu over
+        // whichever row slides up into its place.
         assert!(!s.cards.is_open("bob"));
+        assert!(s.modal.is_empty(), "and the confirm goes with it");
+    }
+
+    #[test]
+    fn dismissing_the_confirm_keeps_the_contact() {
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Invoke("bob".into(), "delete".into()));
+        s.modal.dismiss_topmost();
+        assert_eq!(s.roster.len(), 2, "backing out of a confirm is not a delete");
+    }
+
+    #[test]
+    fn a_swipe_under_an_open_dialog_does_not_change_the_page() {
+        // Otherwise the dialog is left floating over a screen it has nothing
+        // to do with.
+        let mut s = app();
+        let page = s.nav.page();
+        s.apply_friends(crate::friends::Action::Invoke("bob".into(), "edit".into()));
+        assert!(s.modal.blocks_input());
+        s.swipe_page(1);
+        assert_eq!(s.nav.page(), page, "the swipe was swallowed by the dialog");
+        s.modal.dismiss_all();
+        s.swipe_page(1);
+        assert_ne!(s.nav.page(), page, "and works again once it closes");
     }
 
     #[test]

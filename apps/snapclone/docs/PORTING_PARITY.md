@@ -43,7 +43,7 @@ starts hidden with the auto-login ordering rule.
 | MediaSendSummary | pending |  |
 | MobileDialog | pending |  |
 | ModalLayerTestPanel | pending |  |
-| ModalSurface | pending |  |
+| ModalSurface | ported | modal.rs — six layers, derived scrim, tap-outside, dismissTopmost ordering |
 | MonthlyExportReminder | pending |  |
 | OutboxWidget | pending |  |
 | PagePeelHint | pending |  |
