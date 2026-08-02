@@ -9,6 +9,7 @@
 pub mod transport;
 pub mod spaces;
 pub mod library;
+pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
 pub mod chrome;
@@ -60,6 +61,10 @@ pub struct Controller {
     /// SEARCH over a track list rather than owning a paged list, so the tracks
     /// live here and the search is the view state.
     pub search: crate::library::Search,
+    /// The catalogue, fed by a source the host supplies. Previously this was a
+    /// `Vec::new()` that no code ever filled — a connected placeholder that the
+    /// wiring checker reported as done.
+    pub catalog: crate::catalog_source::Catalog,
     pub tracks: Vec<crate::library::Track>,
     pub plays: Vec<crate::library::Play>,
     pub mixer: crate::device::Mixer,
@@ -85,6 +90,7 @@ impl Controller {
             transport: Default::default(),
             routing: Default::default(),
             search: Default::default(),
+            catalog: Default::default(),
             tracks: Vec::new(),
             plays: Vec::new(),
             mixer: Default::default(),
@@ -224,13 +230,45 @@ impl Controller {
             });
         }
         ui.separator();
+        // Prefer the real catalogue. `self.tracks` remains for the in-memory
+        // demo path; when a source has been supplied, the catalogue is the
+        // truth and the search filters what it returned.
+        if self.catalog.loaded {
+            if let Some(why) = self.catalog.empty_reason() {
+                ui.colored_label(c.text_weak, why);
+                return;
+            }
+            let q = self.search.query.trim().to_lowercase();
+            let hits: Vec<crate::catalog_source::CatalogTrack> = self.catalog.rows.iter()
+                .filter(|t| q.is_empty() || t.label().to_lowercase().contains(&q)
+                            || t.sub().to_lowercase().contains(&q))
+                .cloned().collect();
+            if hits.is_empty() { ui.colored_label(c.text_weak, "nothing matches"); return; }
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for t in hits {
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(false, t.label()).clicked() {
+                            self.now.title = t.label();
+                            self.now.artist = t.artists.join(", ");
+                            self.transport.title = t.label();
+                            self.transport.artist = self.now.artist.clone();
+                            self.transport.playing = true;
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.colored_label(c.text_weak, t.sub());
+                        });
+                    });
+                }
+            });
+            return;
+        }
         let rows: Vec<crate::library::Track> =
             self.search.results(&self.tracks).into_iter().cloned().collect();
         if rows.is_empty() {
             // Which empty it is: an unsearched library and one with no matches
             // look the same otherwise.
-            ui.colored_label(c.text_weak, if self.tracks.is_empty() { "no tracks" }
-                             else { "nothing matches" });
+            ui.colored_label(c.text_weak,
+                if self.tracks.is_empty() { "catalogue not opened" } else { "nothing matches" });
             return;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
