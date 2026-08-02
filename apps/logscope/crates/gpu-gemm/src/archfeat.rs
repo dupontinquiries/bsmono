@@ -567,6 +567,3 @@ mod tests {
         assert!(decide(Some(1), 128), "a 128-expert model that declares qk-norm keeps it");
         assert!(!decide(Some(0), 16), "and a 16-expert model that declares none does not");
     }
-
-    #[test]
-
