@@ -56,3 +56,45 @@ an M2.
 
 Expected: prefill moves from bandwidth-per-tile to bandwidth-once, so the ceiling becomes the same
 compute bound q8_0 already reaches. Whether it lands near 2795 GFLOP/s is a measurement, not a promise.
+
+---
+
+# And decode is 6–10× off the same bound
+
+Measured from real runs on an M2 Ultra and M2 Max:
+
+```
+Llama-3.2-3B Q8_0   3.20 GiB/tok → floor 12.4 ms, observed 76.0 =  6.1× off
+DeepSeek-8B Q4_K    2.60 GiB/tok → floor 10.1 ms, observed 95.9 =  9.5× off
+Llama-3.2-1B Q4_K   0.55 GiB/tok → floor  2.1 ms, observed 21.2 =  9.9× off
+```
+
+Consistent across sizes and quants, so it is structural rather than a bad shape.
+
+## What has already been ruled out
+
+**Kernel choice within the current set.** The autotune candidate list contains `V1` (one thread per
+row, no reduction, no threadgroup memory), `V2`, `V2Wg128` and `V2WgSg`. It searches them per shape
+and `V2Wg128` wins. So the occupancy argument — that a large `red[tile*128]` threadgroup buffer pins
+concurrent workgroups on AGX, where each core has ~32 KB — was already put to the test by V1 and lost.
+
+That matters: it means the 6–10× is **not** a tuning problem. Every non-subgroup kernel is that far off.
+
+**Dispatch overhead.** 13–14 submits/token with 81% bind-group reuse, and setup time is 0.1–0.8% of
+wall. The GPU is not waiting on the host.
+
+## What remains
+
+`V2WgSg` — the one kernel the in-tree analysis expects to win on this hardware, because it uses native
+`subgroupAdd` with minimal or zero threadgroup memory. It is the ggml-metal shape: *"rows per SIMD
+group"*, one 32-wide subgroup cooperatively reducing a column-tile with no threadgroup memory at all.
+
+**It is disabled on three drivers because it is wrong on them.** So the decode speedup is gated behind
+fixing the subgroup kernel, which is gated behind the short-binding finding from `--gate-bytes` — reads
+past the first `u32` return zero.
+
+**That is one chain, not three problems.** The same short binding plausibly explains the Q6_K gate, the
+Q4_K gate, and the disabled decode kernel. Fixing it is the highest-value single action available, and
+it needs a dispatch-time print of the bound buffer length on hardware to localise — the input branch
+takes `as_entire_binding()` for `view: None`, which is correct on inspection, so the fault is either a
+view arriving where none should, or the dims uniform cutting the loop short.
