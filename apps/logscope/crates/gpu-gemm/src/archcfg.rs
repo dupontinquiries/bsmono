@@ -740,4 +740,20 @@ mod tests {
         assert!(!c.supported && c.note.contains("llama.cpp"));
         assert!(qkv_bias_tensors(&c, 0).is_empty());
     }
-}
+}    fn the_shared_expert_count_comes_from_the_FILE_when_it_says() {
+        // The loader passed a literal 0 and it worked for Scout only because moe_config rescues an
+        // arch declaring moe_shared_expert with .max(1). Correct by accident — an architecture with
+        // TWO shared experts loses one silently, and a missing always-on expert degrades output
+        // without breaking a shape.
+        let l4 = for_arch("llama4");
+        // The rescue still applies when the file says nothing, so Scout is unchanged.
+        assert_eq!(moe_config(&l4, 16, 1, 0, None, None).n_shared, 1, "flag rescues a silent file");
+        // But a file that declares more must get more.
+        assert_eq!(moe_config(&l4, 16, 1, 2, None, None).n_shared, 2, "the file outranks the flag");
+        // And an arch with no shared expert keeps none when the file says none.
+        let q = for_arch("qwen3moe");
+        assert_eq!(moe_config(&q, 128, 8, 0, None, None).n_shared, 0);
+    }
+
+    #[test]
+
