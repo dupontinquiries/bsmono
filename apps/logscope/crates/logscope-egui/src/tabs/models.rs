@@ -54,8 +54,7 @@ impl Default for Models {
             // the first gets pasted somewhere.
             trusted: logscope_fan::trustkit::Registry::load(&trust_path()).0,
             trust_note: None,
-            my_id: std::env::var("HOME").ok()
-                .map(|h| std::path::PathBuf::from(h).join(".local/share/logscope/identity.key"))
+            my_id: Some(state_dir().join(logscope_fan::clusternode::IDENTITY_FILE))
                 .and_then(|p| logscope_fan::machineid::Identity::load_or_create(&p).ok())
                 .map(|id| id.id())
                 .unwrap_or_else(|| "— identity unavailable —".into()),
@@ -300,7 +299,20 @@ there is nothing else to exchange.").small().color(theme::FAINT()));
 }
 
 /// Where the trust list lives — beside the identity, because they are one setting.
+/// Where the trusted-devices list lives.
+///
+/// The FILENAME comes from logscope_fan rather than being spelled again here. It was written out in
+/// both places and they happened to agree — which is the state a path spends right up until one of
+/// them is edited, and then a device list silently splits in two with neither half wrong.
 fn trust_path() -> std::path::PathBuf {
+    state_dir().join(logscope_fan::clusternode::TRUSTED_FILE)
+}
+
+/// The directory holding identity, trusted devices and the chat autosave.
+///
+/// One definition, because an operator backing up this directory should get all of it — and a second
+/// spelling of the path is how one file ends up somewhere the backup does not reach.
+pub fn state_dir() -> std::path::PathBuf {
     std::env::var("HOME").ok().map(std::path::PathBuf::from).unwrap_or_default()
-        .join(".local/share/logscope/trusted.txt")
+        .join(".local/share/logscope")
 }
