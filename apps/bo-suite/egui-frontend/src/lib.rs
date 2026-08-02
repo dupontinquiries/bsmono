@@ -8,6 +8,8 @@
 
 pub mod transport;
 pub mod spaces;
+pub mod library;
+pub mod dialogs;
 pub mod soundscape;
 use egui::Ui;
 use uikit_egui::{a11y::semantic_toggle, A11yScene, Adaptive, GestureLayer, PaletteColors};
