@@ -120,6 +120,14 @@ dispatch-bound fix"),
 signature. Either the kernels are slow or the GPU idles between batches, and THIS PROFILE CANNOT TELL \
 WHICH. A per-shape --gate-perf separates them: kernels at full bandwidth in isolation means the gaps \
 are the problem", efficiency * 100.0),
+            // "executing at 0% of the bandwidth limit" appeared in a real log, and 0% did not mean
+            // the GPU was idle — it meant gib_per_s was 0 because --gate-perf had never run, so
+            // efficiency() returned 0 by construction. A percentage computed from a missing
+            // measurement is not a small number, it is no number, and printing it as one sent the
+            // reader looking for a kernel that was 500x too slow.
+            Verdict::ComputeBoundBelowRoofline { efficiency } if *efficiency <= 0.0 => {
+                "no dispatch or stall signature, and the bandwidth ceiling is UNMEASURED — run `kernel-validate --gate-perf` first, because without it there is nothing to be a percentage of".into()
+            }
             Verdict::ComputeBoundBelowRoofline { efficiency } => format!(
                 "executing at {:.0}% of the bandwidth limit with no dispatch or stall signature — the \
 gap is in the kernels themselves, and the profile cannot see which. --gate-perf per shape is the next \
@@ -169,6 +177,21 @@ mod tests {
     fn s(tokens: u64, wall: f64, setup: f64, sync: f64, submits: u64, active_gib: f64) -> Sample {
         Sample { tokens, wall_ms: wall, setup_ms: setup, sync_ms: sync, submits,
                  active_bytes: (active_gib * (1u64 << 30) as f64) as u64, gib_per_s: 258.1 }
+    }
+
+    #[test]
+    fn a_MISSING_bandwidth_measurement_is_not_zero_percent() {
+        // From a real log: "executing at 0% of the bandwidth limit". The GPU was not idle — gib_per_s
+        // was 0 because --gate-perf had never run, so efficiency() returned 0 by construction. A
+        // percentage computed from a missing measurement is not a small number, it is NO number, and
+        // printing it as one sends the reader hunting a kernel 500x too slow.
+        let s = Sample { tokens: 555, wall_ms: 103568.0, setup_ms: 211.0, sync_ms: 0.0,
+                         submits: 8063, active_bytes: 0, gib_per_s: 0.0 };
+        let v = verdict(&s, 50.0);
+        let a = v.advice();
+        assert!(a.contains("UNMEASURED"), "got {a}");
+        assert!(!a.contains("0%"), "a missing measurement must not render as a percentage: {a}");
+        assert!(a.contains("gate-perf"), "and it must say what would produce one");
     }
 
     #[test]
@@ -253,8 +276,12 @@ mod tests {
         assert!((s.submits_per_token() - 7.5).abs() < 0.1);
         let v = verdict(&s, 30.0);
         assert!(matches!(v, Verdict::ComputeBoundBelowRoofline { .. }), "{v:?}");
-        assert!(v.advice().contains("profile cannot see which"));
-        assert!(v.advice().contains("--gate-perf"), "and names the measurement that would");
+        // This asserted "profile cannot see which" — the wording of a verdict that ALSO reported
+        // "0% of the bandwidth limit" from a gib_per_s of 0. The test pinned the bug: it checked that
+        // the message named the next measurement, and not that the number preceding it meant anything.
+        assert!(v.advice().contains("UNMEASURED"), "no bandwidth reading: say so, do not render 0%");
+        assert!(!v.advice().contains("0%"));
+        assert!(v.advice().contains("gate-perf"), "and names the measurement that would");
     }
 
     #[test]

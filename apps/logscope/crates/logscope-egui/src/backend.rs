@@ -975,7 +975,10 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             // Same class as gate-q4k claiming "the loader can stop requantizing" while testing only
             // dequantization — a label asserting more than its evidence, which is worse than no label
             // because nobody re-derives it.
-            let bound = if accounted < total_ms * 0.02 { "UNACCOUNTED — neither setup nor sync sees it" }
+            // The suffix "-bound" is appended by the caller, so a phrase that already reads as a
+            // sentence produced "neither setup nor sync sees it-bound" in a real log. Kept short and
+            // adjectival for that reason: the label must survive the template it is dropped into.
+            let bound = if accounted < total_ms * 0.02 { "UNACCOUNTED" }
                 else if accounted < total_ms * 0.15 { "likely GPU-execution" }
                 else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
             // NAME THE BOTTLENECK, not just the split. "GPU-execution-bound, 0.1% accounted" says
