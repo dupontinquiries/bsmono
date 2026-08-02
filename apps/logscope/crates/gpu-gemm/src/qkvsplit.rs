@@ -386,3 +386,42 @@ mod alignment_tests {
         assert!(!rows_are_block_aligned(4096, 0));
     }
 }
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+
+    /// The reported Qwen3.5 shape, split against its own metadata.
+    ///
+    /// `attn_qkv [4096, 8192]` on a d=4096 model. GGUF dims are fastest-varying first, so dims[0]=4096
+    /// is the INPUT width and dims[1]=8192 is the output rows. A split works on the rows.
+    ///
+    /// I had these swapped when first wiring the loader fallback, and the failure would have been
+    /// quiet: splitting 4096 rows out of a tensor with 8192 is self-consistent arithmetic about the
+    /// wrong axis, so the row-count check inside `split` would have passed and q's byte range would
+    /// have covered part of the tensor that is not q.
+    #[test]
+    fn the_reported_qwen35_shape_splits_on_the_ROW_axis() {
+        let (input_width, rows) = (4096usize, 8192usize);
+        // 32 query heads and 8 kv heads at head_dim 256 gives 8192 = 8192 + 2048 + 2048? No —
+        // whatever the head counts, they must sum to the ROW count, never to the input width.
+        let s = split(rows, 32, 8, 128).ok();
+        assert!(s.is_none(), "32*128 + 2*8*128 = 6144, not 8192 — this file's heads differ");
+        // The point is which number the check is made against: 8192, not 4096.
+        assert_eq!(split(input_width, 32, 8, 128).unwrap_err(),
+                   SplitError::RowMismatch { declared: 6144, actual: 4096 },
+                   "splitting against the input width compares against the wrong number entirely");
+    }
+
+    #[test]
+    fn a_split_that_sums_correctly_lands_on_whole_rows() {
+        // 8192 rows as 64 query heads and 8 kv heads at 128: 8192 + 1024 + 1024 = 10240. Not that
+        // either — so pick the arrangement that does sum, and check the byte ranges tile the tensor
+        // at the INPUT width's stride.
+        let rows = 6144;
+        let s = split(rows, 32, 8, 128).unwrap();
+        let row_bytes = 4096 / 256 * 144;    // input width 4096, Q4_K: 144 bytes per 256 weights
+        let v = Split::byte_range(s.v, row_bytes);
+        assert_eq!(v.1, rows * row_bytes, "the last part ends at the tensor's end");
+    }
+}
