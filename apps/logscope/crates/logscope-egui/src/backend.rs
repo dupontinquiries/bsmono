@@ -1688,3 +1688,38 @@ mod template_translation_tests {
         assert!(normalize_prompt_template(p, TemplateKind::ChatML).is_none());
     }
 }
+
+/// The two bits-per-weight tables must agree.
+///
+/// `gpu_kernels::rolequant::Level` and `logscope::rolequant_hint` carry the same constants because
+/// `logscope` cannot depend on `gpu-gemm` — the advice line needs the arithmetic and the policy lives
+/// engine-side.
+///
+/// That duplication already went wrong once in this tree, with the watchdog tables: a policy expressed
+/// in two places gets corrected in one, and the survivor looks right because it matches the code
+/// around it. This crate depends on both, so the agreement is checkable here even though neither can
+/// check it alone.
+#[cfg(all(test, feature = "wgpu-engine"))]
+mod rolequant_agreement {
+    #[test]
+    fn the_bpw_constants_match_across_crates() {
+        use gpu_kernels::rolequant::Level;
+        assert_eq!(Level::Q2.bpw(), logscope::rolequant_hint::Q2_BPW);
+        assert_eq!(Level::Q4.bpw(), logscope::rolequant_hint::Q4_BPW);
+    }
+
+    #[test]
+    fn the_saving_the_advice_quotes_is_what_the_planner_would_free() {
+        // The advice says "a liaison at Q2 frees ~N GiB". If the planner would free a different
+        // number, the line is describing a plan nobody will get — which is worse than no advice,
+        // because it is checkable and wrong rather than merely absent.
+        use gpu_kernels::rolequant::{Level, Member, Role};
+        let m = Member { name: "liaison".into(), role: Role::Liaison,
+                         params: 8_000_000_000, chosen: Level::Q4 };
+        let planner_frees = (m.bytes_at(Level::Q4) - m.bytes_at(Level::Q2)) as f32
+            / (1u64 << 30) as f32;
+        let advice_says = logscope::rolequant_hint::liaison_saving_gib(8_000_000_000).unwrap();
+        assert!((planner_frees - advice_says).abs() < 0.01,
+            "advice quotes {advice_says:.2} GiB, planner frees {planner_frees:.2}");
+    }
+}
