@@ -7274,7 +7274,11 @@ not a surprise; coherent output is the evidence that would flip the flag",
                 // the rest of the message less
                 let detail = detail.trim_end_matches('.').to_string();
                 return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {detail}. \
-                    Use the llama.cpp backend for this model.\n{layout}"));
+                    Use the llama.cpp backend for this model, or set LOGSCOPE_TRY_UNSUPPORTED_ARCH=1 \
+to attempt it anyway — an architecture becomes supported only once it has completed a forward pass on \
+a real checkpoint, and this refusal is what prevents that ever happening. Wrong output is the EXPECTED \
+failure when forcing it, not a surprise; coherent output is the evidence that would flip the flag.\n\
+{layout}"));
             }
             eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
         }
