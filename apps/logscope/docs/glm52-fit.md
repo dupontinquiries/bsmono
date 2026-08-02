@@ -244,3 +244,68 @@ whether `moe_stream_pin` is `None` when the loader prints `MoE fits FULLY RESIDE
 
 **Quick empirical test:** load a MoE model that fits resident and look for `MoE fits FULLY RESIDENT`
 followed by any streaming activity. If the two appear together, reading 2 is correct.
+
+---
+
+# The MLA dims the loader refuses for are all derivable from the tensor shapes
+
+The actual failure, from a real GLM-5.2 preview run:
+
+```
+worker: load failed: architecture 'glm-dsa' ships MLA tensors but no
+kv_lora_rank in its metadata, so the latent dimensions are unknown.
+```
+
+The refusal is honest — the metadata genuinely omits it. **But the tensors carry it.** From the same
+run's dump:
+
+```
+blk.0.attn_kv_a_norm.weight     [512]           -> kv_lora_rank  = 512
+blk.0.attn_q_a_norm.weight      [2048]          -> q_lora_rank   = 2048
+blk.0.attn_kv_a_mqa.weight      [6144 x 576]    -> 576 - 512     = 64 = qk_rope_head_dim
+blk.0.attn_k_b.weight           [192 x 512 x 64]-> 64 heads over the 512 latent
+blk.0.attn_v_b.weight           [512 x 256 x 64]-> v_head_dim    = 256
+```
+
+**The norm vector's length *is* the latent rank** — `attn_kv_a_norm` normalizes the compressed KV, so
+it has exactly `kv_lora_rank` elements. Same for `attn_q_a_norm` and the query rank. And
+`kv_a_mqa`'s output width is `kv_lora_rank + qk_rope_head_dim` by the DeepSeek-MLA convention, so the
+rope dim falls out of the subtraction: 576 − 512 = 64.
+
+Nothing here is inferred from the family name. Every number comes from a shape in this file.
+
+## Why deriving beats refusing
+
+llama.cpp resolves missing hparams from tensor shapes routinely — a converted checkpoint that lost a
+key is common, and the shapes cannot disagree with themselves. Refusing costs a model that is fully
+described; deriving costs a check.
+
+**And the check is free here.** The derived values must be mutually consistent: `kv_a_mqa`'s width must
+equal `kv_a_norm`'s length plus the rope dim, `k_b` and `v_b` must agree on the head count, and the
+latent in `k_b` must equal `kv_a_norm`'s length. Four shapes constraining three numbers — so a file
+whose tensors disagree fails loudly rather than loading at a guessed rank.
+
+That is the opposite of the situation the fused-qkv split was in, where the head counts and the tensor
+were the *only* two facts and either could be wrong. Here the tensors over-determine the answer.
+
+## What the same dump confirms about the indexer
+
+```
+blk.0.indexer.attn_k.weight     [6144 x 128]
+blk.0.indexer.attn_q_b.weight   [2048 x 4096]
+blk.0.indexer.k_norm.{weight,bias} [128]
+blk.0.indexer.proj.weight       [6144 x 32]
+```
+
+The sparse-attention indexer is real and shipped, not a config flag — a small separate attention that
+scores keys, with its own k-norm carrying a **bias** (unusual, and worth noting before someone writes
+it weightless). `indexer_needed_at` already says it is a no-op below `index_topk`, so a short-context
+run does not need these tensors — but they are here, and any implementation should read their shapes
+rather than assume DeepSeek's.
+
+## Mixed quantization in one block
+
+`attn_output` and `ffn_gate` are Q5_K, `ffn_down` is Q6_K, the MLA projections are Q8_0, the norms F32.
+**Five formats in one layer.** Anything that reasons about "the model's quantization" as a single value
+— including the `conversion_cost` advice added in _461, which reads the expert tensors' type — is
+answering about one tensor and generalising. For this file that generalisation is wrong five ways.
