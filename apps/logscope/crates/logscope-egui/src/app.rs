@@ -240,6 +240,13 @@ impl LogscopeApp {
         // pipeline panel is open.
         {
             let items: Vec<String> = self.model.items.iter().map(|i| i.name().to_string()).collect();
+            // A failed load leaves the picker naming a model that is not running. The chat tab
+            // observes the failure; the app owns the picker, so the decision is handed across rather
+            // than written from two places — which is the split _290 had to repair.
+            if let Some(revert) = self.tabs.chat.take_revert_picker() {
+                self.model.revert_to(revert.as_deref());
+            }
+
             if let Some(idx) = logscope::activemodel::write_through(&self.active_model(), &items) {
                 self.model.selected = idx;
             }

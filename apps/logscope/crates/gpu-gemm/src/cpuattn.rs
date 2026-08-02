@@ -21,13 +21,46 @@
 //! dot a strided gather. llama.cpp transposes on write for exactly this reason: once per token, rather
 //! than a stride penalty on every score of every subsequent token.
 
+/// Sum an iterator of f32 across eight independent accumulators.
+///
+/// Rust will not reassociate a float reduction — `iter().sum()` is one dependency chain, and every add
+/// waits for the previous one. Eight chains run independently and the compiler vectorizes them. The
+/// order is fixed and therefore deterministic; it simply is not left-to-right.
+#[inline]
+fn sum8(it: impl Iterator<Item = f32>) -> f32 {
+    let mut acc = [0f32; 8];
+    let mut i = 0usize;
+    for v in it { acc[i & 7] += v; i += 1; }
+    acc.iter().sum()
+}
+
 /// RMS norm: `x * w / sqrt(mean(x^2) + eps)`.
 ///
 /// Two passes over `d` floats, which is nothing beside the matvec that follows — no reason to fuse it
 /// and lose the clarity.
 pub fn rmsnorm(x: &[f32], w: &[f32], eps: f32, out: &mut [f32]) {
     let n = x.len();
-    let mean_sq = x.iter().map(|v| v * v).sum::<f32>() / n as f32;
+    // MULTI-ACCUMULATOR, not `iter().sum()`. A single accumulator serialises the whole loop on one
+    // dependency chain: every add waits for the previous one. Measured here: 5.00 us against 0.63 us
+    // for the same dot — EIGHT TIMES.
+    //
+    // CHECKED AGAINST COLIBRI, which corrects the obvious explanation. It does NOT build with
+    // -ffast-math — its Makefile is `-O3 -march=native -fopenmp`. Instead its kernels write the
+    // accumulators out by hand:
+    //
+    //     float32x4_t ac0=vdupq_n_f32(0), ac1=vdupq_n_f32(0);
+    //     ...
+    //     a = vaddvq_f32(vaddq_f32(ac0, ac1));
+    //
+    // Two vectors of four lanes, combined at the end — the same eight chains this produces, reached by
+    // intrinsics rather than by letting LLVM vectorize eight scalars. So the technique is MULTIPLE
+    // ACCUMULATORS in any language, not a compiler flag, and C would need the same treatment. Rust's
+    // IEEE ordering makes it mandatory rather than merely advisable, which is the only real difference.
+    //
+    // Eight accumulators grant the permission explicitly, by choosing the order rather than asking the
+    // compiler to pick one. Deterministic, and the reference tests still pass because the tolerance
+    // covers a reassociation rather than an error.
+    let mean_sq = sum8(x.iter().map(|v| v * v)) / n as f32;
     let scale = 1.0 / (mean_sq + eps).sqrt();
     for i in 0..n { out[i] = x[i] * scale * w[i]; }
 }
@@ -48,7 +81,10 @@ pub fn attend(q: &[f32], k: &[f32], v: &[f32], n_pos: usize, head_dim: usize, sc
     for p in 0..n_pos {
         let ko = p * head_dim;
         if ko + head_dim > k.len() { break; }
-        let score: f32 = (0..head_dim).map(|i| q[i] * k[ko + i]).sum::<f32>() * scale;
+        // Same reduction shape as rmsnorm, and far hotter: this runs once per cached position per
+        // head per layer per token.
+        let kk = &k[ko..ko + head_dim];
+        let score: f32 = sum8(q[..head_dim].iter().zip(kk).map(|(a, b)| a * b)) * scale;
         if score > m {
             // Rescale what we have to the new maximum. Doing it this way round means the exponent
             // argument is always <= 0, so nothing overflows however large the scores get.

@@ -174,6 +174,13 @@ impl Governor {
     }
 
     pub fn learned_cap(&self) -> usize { self.learned_cap }
+
+    /// Which resource is the binding constraint on this device.
+    ///
+    /// Exposed so callers can key on the CONSTRAINT rather than on a vendor. The arena defaulted to
+    /// `conservative_vma` — "Vulkan on Apple" — while its own comment said "on where BO VMA is the
+    /// binding constraint", which is this.
+    pub fn budget_kind(&self) -> LimitKind { self.budget.kind }
     pub fn proven_safe(&self) -> usize { self.proven_safe }
     pub fn pressure_ceiling(&self) -> Option<usize> { self.pressure_ceiling }
     pub fn budget(&self) -> Budget { self.budget }
@@ -254,6 +261,45 @@ mod tests {
         // Apple-on-Vulkan (Honeykrisp) is tighter still
         let vk_apple = Budget::for_backend(WgpuBackend::Vulkan, true, true);
         assert!(vk_apple.soft_object_cap <= vk.soft_object_cap);
+    }
+
+    #[test]
+    fn every_backend_that_counts_OBJECTS_wants_the_arena() {
+        // The arena packs weights into a few big slabs so a model costs a couple dozen buffer objects
+        // instead of thousands. It defaulted to conservative_vma — "Vulkan on Apple" — while its own
+        // comment said "on where BO VMA is the binding constraint".
+        //
+        // Both Metal (BufferObjects) and Vulkan (AllocationCount, commonly 4096 on desktop and tighter
+        // on mobile) are that case. The practical miss was a PHONE: an Adreno or Mali device has the
+        // tightest object budget of anything we run on, and got the arena off because it is not Apple.
+        for (backend, apple) in [(WgpuBackend::Vulkan, true), (WgpuBackend::Vulkan, false),
+                                 (WgpuBackend::Metal, false)] {
+            let g = Governor::new(Budget::for_backend(backend, true, apple));
+            assert!(matches!(g.budget_kind(), LimitKind::BufferObjects | LimitKind::AllocationCount),
+                "{backend:?} apple={apple} counts objects and should get the arena");
+        }
+    }
+
+    #[test]
+    fn the_cap_climbs_without_bound_until_SOMETHING_reports_pressure() {
+        // The bug this pairs with: observe_pressure had exactly one trigger — a dims-buffer allocation
+        // failure — while the failure this hardware actually produces is a device OOM, handled
+        // elsewhere and never fed back. So the window climbed 8→10→12→15→18→22 across a session, hit
+        // VMA exhaustion, was degraded for that step, and climbed straight back on the next.
+        //
+        // The governor itself is correct. A ratchet whose only sensor is a failure mode the device does
+        // not produce is a ratchet that does not ratchet.
+        let mut g = Governor::new(Budget::for_backend(WgpuBackend::Vulkan, false, false));
+        let start = g.learned_cap();
+        for _ in 0..12 { g.observe_clean(g.learned_cap()); }
+        assert!(g.learned_cap() > start * 3, "unbounded climb: {} from {start}", g.learned_cap());
+
+        // One pressure report latches it, and clean runs afterwards cannot climb back above it.
+        let at = g.learned_cap();
+        g.observe_pressure(at);
+        assert!(g.learned_cap() < at);
+        for _ in 0..12 { g.observe_clean(g.learned_cap()); }
+        assert!(g.learned_cap() < at, "the ceiling holds: {} vs {at}", g.learned_cap());
     }
 
     #[test]

@@ -179,3 +179,70 @@ mod tests {
         assert_ne!(Source::Deployment.label(), Source::Picker.label());
     }
 }
+
+/// What the picker should show after a load FAILS.
+///
+/// The picker is set optimistically when a load starts, so a failure leaves it pointing at a model
+/// that is not loaded — and `resolve` faithfully reports that as active. The menu then asserts the
+/// wrong model is running, which is worse than showing nothing: a name in the active slot is the one
+/// piece of state an operator does not re-check.
+///
+/// Returns the name to revert to, or `None` when there is nothing to revert to and the picker should
+/// be cleared rather than left lying.
+///
+/// ## Why revert rather than mark
+///
+/// A "failed" badge beside the name still leaves the name in the active slot, and the next glance
+/// reads the name. The engine is running the previous model or nothing at all, and the display should
+/// say which of those is true.
+pub fn on_load_failed(picker: Option<&str>, last_loaded: Option<&str>) -> Option<String> {
+    match (picker, last_loaded) {
+        // The failure was a switch away from something that IS loaded: go back to it.
+        (Some(p), Some(l)) if p != l => Some(l.to_string()),
+        // The failed model is also the last loaded one — the engine unloaded it to make room and then
+        // could not reload. Nothing is running, so the picker must not name it.
+        (Some(_), Some(_)) => None,
+        // First load of the session failed: there is nothing to fall back to.
+        (Some(_), None) => None,
+        (None, l) => l.map(str::to_string),
+    }
+}
+
+#[cfg(test)]
+mod load_failure_tests {
+    use super::*;
+
+    #[test]
+    fn a_failed_SWITCH_reverts_to_what_is_actually_loaded() {
+        // The reported bug: the menu keeps showing the model that failed, so it looks like the wrong
+        // model is running.
+        assert_eq!(on_load_failed(Some("qwen3-30b"), Some("llama-3b")), Some("llama-3b".into()));
+    }
+
+    #[test]
+    fn a_failed_RELOAD_of_the_current_model_clears_the_picker() {
+        // The engine unloaded it to make room and could not bring it back, so nothing is running. The
+        // picker must not keep naming it — that is the case where the display is most confidently wrong.
+        assert_eq!(on_load_failed(Some("qwen3-30b"), Some("qwen3-30b")), None);
+    }
+
+    #[test]
+    fn the_first_load_of_a_session_has_nothing_to_revert_to() {
+        assert_eq!(on_load_failed(Some("qwen3-30b"), None), None);
+    }
+
+    #[test]
+    fn resolve_reports_the_reverted_name_as_active() {
+        // End to end: after reverting, resolve must name the model that is actually loaded — otherwise
+        // the fix moves the wrong name somewhere else rather than removing it.
+        let reverted = on_load_failed(Some("qwen3-30b"), Some("llama-3b"));
+        let r = resolve(None, reverted.as_deref());
+        assert_eq!(r.name.as_deref(), Some("llama-3b"));
+    }
+
+    #[test]
+    fn clearing_the_picker_leaves_NOTHING_active_rather_than_a_stale_name() {
+        let r = resolve(None, on_load_failed(Some("qwen3-30b"), Some("qwen3-30b")).as_deref());
+        assert!(r.name.is_none(), "nothing is loaded, so nothing should be named");
+    }
+}

@@ -1208,6 +1208,16 @@ fn main() {
             let secs = t0.elapsed().as_secs_f64();
             let gibs = (bytes * iters as f64) / (1u64 << 30) as f64 / secs;
             println!("  {label:>16}: {:.3} ms/call · {:.1} GiB/s", secs / iters as f64 * 1000.0, gibs);
+            // PERSIST THE BEST FIGURE for this adapter. Measured here and nowhere else, and until now
+            // it went to stdout and stopped — so the running engine had no bandwidth and perfverdict
+            // could never say "at the memory limit, the split is irrelevant", the one verdict that
+            // stops work rather than directing it.
+            //
+            // bandwidth_put keeps the maximum: this loop measures several tiles and the fastest is the
+            // device's capability, while a slower tile is a fact about that tile.
+            if gibs > gpu_kernels::store::bandwidth_get(&gpu.adapter_name).unwrap_or(0.0) as f64 {
+                gpu_kernels::store::bandwidth_put(&gpu.adapter_name, gibs as f32);
+            }
         };
         for tile in [1u32, 2, 4, 8] {
             println!("— tile {tile} —");
@@ -2825,7 +2835,7 @@ fn main() {
         let rw = mk(1, ne * d);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let n2v = mk(7, d); let xin = mk(8, d);
         let n2t = gpu.upload(&n2v, 1, d); let x2t = gpu.upload(&xin, 1, d);
         // streaming auto-forces the v1 path (its intercept lives there); resident uses V1 too for A/B parity.
@@ -2882,7 +2892,7 @@ fn main() {
         // already resident and prefetch is a no-op, which is itself worth knowing.)
         let (d, ff, ne, n_used) = (128usize, 256usize, 16usize, 4usize);
         let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         // two layers, each with its own router + experts
         let rw: Vec<Vec<f32>> = (0..2).map(|l| mk(1 + l as u32, ne * d)).collect();
         let gus: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(100 + l as u32 * 50 + e as u32, 2 * ff * d)).collect()).collect();
@@ -2990,7 +3000,7 @@ fn main() {
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
         let (d, ff, ne, n_used, ring, pin) = (128usize, 256usize, 8usize, 4usize, 3usize, 2usize);
         let mk = |seed: u32, n: usize| -> Vec<f32> { (0..n).map(|i| { let x = (i as u32).wrapping_mul(2654435761).wrapping_add(seed); ((x >> 9) as f32 / 8_388_608.0) - 1.0 }).collect() };
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw = mk(1, ne * d);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| mk(100 + e as u32, 2 * ff * d)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| mk(900 + e as u32, d * ff)).collect();
@@ -3421,6 +3431,15 @@ stops at the limit it was given has measured the limit, not the device.");
         } else if gib * (1u64 << 30) as f64 > assumed as f64 * 1.25 {
             println!("gate-vram: the device honours MORE than the engine budgets — \
 memplan's cap is measuring something that no longer applies (see docs/asahi-vram-ceiling.md)");
+        } else if (assumed as f64) > gib * (1u64 << 30) as f64 {
+            // THE DANGEROUS DIRECTION, and I only ever checked the other one. A budget ABOVE what the
+            // device honours is what plans an allocation that cannot be satisfied — it is the enabler
+            // for the OOM class, not a conservatism. Measured on a 64 GiB M2 Max: ceiling 31.0 GiB
+            // against a 48.0 GiB budget, reported as "consistent".
+            println!("gate-vram: THE BUDGET EXCEEDS THE CEILING — {:.1} GiB budgeted against {gib:.1} \
+GiB verified. A plan sized to the budget will be approved and then fail to allocate. Set \
+LOGSCOPE_MAX_GPU_GB={:.0} or lower until the measurement is wired in",
+                assumed as f64 / (1u64 << 30) as f64, gib * 0.75);
         } else if got == 0 {
             println!("gate-vram: nothing verified — the probe could not allocate even one slab");
         } else {
@@ -3494,6 +3513,202 @@ everywhere: it looks like a hardware problem"
         });
         return;
     }
+    // Compares the native IQ1_S matvec against dot_iq1_s, which already bit-matches gguf's
+    // transcribed dequantizer — so a divergence here is the KERNEL, not the format reading.
+    //
+    // Tolerance rather than exact: the GPU splits the accumulation into two chains and floating-point
+    // addition is not associative, so the results differ by reassociation exactly as
+    // linear_q8_0_gemm_rb already notes about its own tiling. An exact-match gate would fail on a
+    // correct kernel, which is worse than no gate.
+    if args.iter().any(|a| a == "--gate-iq1s-kernel") {
+        let gpu = Gpu::new();
+        println!("gate-iq1s-kernel: adapter = {}", gpu.adapter_name);
+        let (n, k) = (8usize, 512usize);        // 2 super-blocks per row
+        let nblk = k / 256;
+        // Plausible f16 scales, not random bytes: random ones decode to inf/NaN, which is how four
+        // Q6_K "kernel faults" turned out to be a bad fixture.
+        let mut raw = vec![0u8; n * nblk * 50];
+        for r in 0..n * nblk {
+            let b = &mut raw[r * 50..(r + 1) * 50];
+            b[0..2].copy_from_slice(&0x2E66u16.to_le_bytes());
+            for i in 2..34 { b[i] = ((i * 7 + r * 13) % 251) as u8; }
+            for i in 0..8 {
+                let h = ((i as u16 * 4099) & 0x7FFF) | if i % 3 == 0 { 0x8000 } else { 0 };
+                b[34 + 2 * i..36 + 2 * i].copy_from_slice(&h.to_le_bytes());
+            }
+        }
+        let act: Vec<f32> = (0..k).map(|i| ((i % 19) as f32 - 9.0) * 0.11).collect();
+        let mut want = vec![0f32; n];
+        for r in 0..n {
+            want[r] = gpu_kernels::cpumatvec::dot_iq1_s(&raw[r * nblk * 50..(r + 1) * nblk * 50], &act)
+                .expect("the CPU reference reads this fixture");
+        }
+        let got = gpu.matvec_iq1_s(&act, &raw, n, k);
+        let mut worst = 0f32;
+        for r in 0..n {
+            let e = (got[r] - want[r]).abs() / want[r].abs().max(1.0);
+            if e > worst { worst = e; }
+        }
+        let ok = worst < 1e-4;
+        println!("  rows {n}, k {k}, worst relative error {worst:.2e}");
+        println!("  cpu[0..4] = {:?}", &want[..4.min(n)]);
+        println!("  gpu[0..4] = {:?}", &got[..4.min(n)]);
+        println!("gate-iq1s-kernel: native IQ1_S matvec {} the CPU reference {}",
+            if ok { "MATCHES" } else { "DIVERGES from" }, if ok { "✓" } else { "" });
+        if !ok {
+            println!("  => the format reading is already proven by dot_iq1_s matching the \
+dequantizer, so a divergence here is the kernel's arithmetic or its indexing, not the layout");
+        }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--gate-bytes") {
+        // ISOLATES byte_at. Five rounds of inference from dequantizer output have not settled whether
+        // it advances past the first u32, because the dequantizers do too much for their output to name
+        // one cause. This does one thing.
+        let gpu = Gpu::new();
+        println!("gate-bytes: adapter = {}", gpu.adapter_name);
+        let n = 64usize;
+        let raw: Vec<u8> = (0..n).map(|i| i as u8).collect();     // byte i holds the value i
+        // Both candidates in one run: the binding trace shows what was bound, and the dims below show
+        // what the shader was told to loop to. A short binding and a short dims value produce the same
+        // output, and only printing both tells them apart.
+        eprintln!("  probe dims.x       : {n} (the shader returns early above this)");
+        eprintln!("  probe source bytes : {} ({} u32 words)", raw.len(), raw.len() / 4);
+        eprintln!("  (set LOGSCOPE_TRACE_BIND=1 to see what dispatch actually bound)");
+        let got = gpu.byte_probe(&raw);
+        // ALL OF IT, in rows of 16. The first run reported "neither clamped nor zeroed" while showing
+        // zeros at 4..15 — which means something PAST 16 is non-zero, so the pattern is not uniform and
+        // truncating the output hid the shape that identifies it.
+        println!("  source bytes 0..16 : {:?}", &raw[..16]);
+        for row in 0..(n / 16) {
+            let g: Vec<u8> = got[row * 16..(row + 1) * 16].iter().map(|v| *v as u8).collect();
+            println!("  byte_at {:>2}..{:<3}    : {g:?}", row * 16, row * 16 + 16);
+        }
+        let nz: Vec<usize> = got.iter().enumerate()
+            .filter(|(_, v)| **v != 0.0).map(|(i, _)| i).collect();
+        println!("  non-zero indices   : {nz:?}");
+        let correct: Vec<usize> = got.iter().enumerate()
+            .filter(|(i, v)| **v as u8 == raw[*i]).map(|(i, _)| i).collect();
+        println!("  CORRECT indices    : {correct:?}");
+        // THE STRIDE TEST. Your M2 Ultra returned correct bytes at exactly i % 16 < 4 — only every
+        // fourth u32 reachable, which is a 16-byte stride on an array<u32>: std140 scalar padding on a
+        // buffer that should be std430. Reading the same bytes through array<vec4<u32>> either fixes
+        // it (layout confirmed) or does not (theory wrong), and one run settles which.
+        // NO SHADER AT ALL. Both shader probes fail identically, which rules out the element size and
+        // points at the buffer: if only 4 of every 16 bytes ever arrived, both shaders are reading
+        // correctly and reporting what is there. A round trip through upload_bytes and back settles
+        // which side of the boundary the fault is on.
+        // THE INDEX ITSELF. The correct set is 0..3, 16..19, 32..35, 48..51 — four consecutive values
+        // every sixteen, which is an invocation-id shape, not a memory shape. This writes dst[i] = i
+        // with no source buffer touched at all.
+        // SIZE SWEEP. Everything on our side checks out — upload byte-exact, invocation index
+        // correct, binding the whole buffer, layout standard — and the storage read still returns
+        // zero for 12 of every 16 bytes. The one property never questioned is the probe's own size:
+        // its source buffer is 64 bytes, while every real tensor is megabytes.
+        //
+        // A 64-byte storage buffer is small enough to hit driver minimum-size or alignment handling.
+        // If the 4-of-16 pattern is an artifact of that, it disappears as the buffer grows — and the
+        // real kernels, which work, would be explained. If it persists at 64 KiB, the fault is real
+        // and size-independent.
+        println!("  --- size sweep: is the 4-of-16 pattern a small-buffer artifact? ---");
+        for sz in [64usize, 256, 4096, 65536] {
+            let big: Vec<u8> = (0..sz).map(|i| (i % 251) as u8).collect();
+            let got = gpu.byte_probe(&big);
+            let ok = got.iter().enumerate().take(sz).all(|(i, v)| *v as u8 == big[i]);
+            let correct = got.iter().enumerate().take(64.min(sz))
+                .filter(|(i, v)| **v as u8 == big[*i]).count();
+            println!("    {sz:>6} bytes: {} ({correct} of the first {} correct)",
+                if ok { "CORRECT" } else { "wrong" }, 64.min(sz));
+        }
+        // SHARED INDEX vs DISTINCT INDEX. byte_at reads src[i>>2], so four adjacent threads read the
+        // SAME word and each extracts a byte. MATVEC_Q4's inner loop does not do that — it walks
+        // distinct indices per thread — and it works on this hardware.
+        //
+        // The observed fault is exact: only u32 indices divisible by 4 return data, which is what
+        // scalar loads look like when folded into a vec4 load using only .x. If one word per thread
+        // reads correctly while byte_at does not, the fault is the ACCESS PATTERN, not storage reads.
+        {
+            // Values f32 holds EXACTLY. My first fixture used a hash and reported 1-of-64 correct on
+            // lavapipe, which works — f32 cannot represent an arbitrary u32, so the round-trip failed
+            // for reasons having nothing to do with the read. The same class as the Q6_K fixture whose
+            // random f16 scales decoded to NaN.
+            let words: Vec<u32> = (0..64u32).map(|i| i * 1000 + 7).collect();
+            let got = gpu.word_probe(&words);
+            let ok = got.iter().zip(&words).all(|(g, w)| *g as u32 == *w);
+            let correct = got.iter().zip(&words).filter(|(g, w)| **g as u32 == **w).count();
+            println!("  word_probe dst[i]=src[i] : {} ({correct} of 64 correct)",
+                if ok { "CORRECT" } else { "wrong" });
+            if ok {
+                println!("  => DISTINCT indices read fine; the fault is the SHARED-index pattern in \
+byte_at, not storage reads. Every kernel that works avoids reading one word from four threads.");
+            } else {
+                println!("  => distinct indices fail too, so the fault is storage reads themselves \
+and the working kernels need explaining, not the probe.");
+            }
+        }
+        let ids = gpu.id_probe(n);
+        let id_ok = ids.iter().enumerate().all(|(i, v)| *v as usize == i);
+        println!("  id_probe dst[i]=i  : {:?}",
+            ids.iter().take(16).map(|v| *v as u32).collect::<Vec<_>>());
+        if !id_ok {
+            println!("  => THE INVOCATION INDEX IS WRONG, with no memory read involved. Every kernel \
+that indexes by global_invocation_id is affected — which is all of them — and no amount of work on \
+byte_at or on any quantization can fix it.");
+        }
+        let back = gpu.upload_readback_probe(&raw);
+        let upload_ok = back == raw;
+        println!("  upload+readback    : {:?}", &back[..16.min(back.len())]);
+        if !upload_ok {
+            let bad: Vec<usize> = back.iter().enumerate()
+                .filter(|(i, b)| **b != raw[*i]).map(|(i, _)| i).take(12).collect();
+            println!("  => THE UPLOAD IS WRONG, no shader involved. First wrong indices: {bad:?}. \
+The fault is in the write path (upload_bytes / write_chunked), not in any kernel — which means every \
+quant gate has been reporting a WRITE bug as a read bug.");
+        } else {
+            println!("  => the upload is byte-exact, so the buffer holds what it should and the fault \
+is between binding and execution.");
+        }
+        let v4 = gpu.byte_probe_vec4(&raw);
+        let v4_ok = v4.iter().enumerate().all(|(i, x)| *x as u8 == raw[i]);
+        let scalar_ok = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        println!("  vec4 byte_at 0..16 : {:?}",
+            v4.iter().take(16).map(|x| *x as u8).collect::<Vec<_>>());
+        println!("gate-bytes: scalar array<u32> {} | vec4 array<vec4<u32>> {}",
+            if scalar_ok { "OK" } else { "WRONG" }, if v4_ok { "OK" } else { "WRONG" });
+        if !scalar_ok && v4_ok {
+            println!("  => CONFIRMED: array<u32> is laid out with a 16-byte stride (std140 padding). \
+Every u32 storage binding must become array<vec4<u32>> with the component selected by hand. This is \
+the root cause of gate-q6k, gate-q4k AND the disabled subgroup decode kernel.");
+        } else if !scalar_ok && !v4_ok {
+            println!("  => the stride theory is WRONG: both layouts fail, so the fault is not the \
+element size. Paste both rows above.");
+        }
+        let exact = scalar_ok;
+        if exact {
+            println!("gate-bytes: byte_at is CORRECT — the fault is in the dequantizers, not the reader \u{2713}");
+        } else {
+            let first_bad = got.iter().position(|v| (*v as u8) != raw[got.iter().position(|_| true).unwrap()]);
+            let bad = got.iter().enumerate().find(|(i, v)| **v as u8 != raw[*i]).map(|(i, _)| i);
+            let _ = first_bad;
+            println!("  first wrong index  : {bad:?}");
+            // Name the shape, because the fixes are opposite.
+            // CLASSIFY FROM THE FIRST WRONG INDEX, not from index 4. The first version hardcoded a
+            // skip of 4 — an assumption that word 0 always reads correctly — and on the M2 Ultra it
+            // reported "neither clamped nor zeroed" for output that was plainly zeroed from index 4.
+            // The whole point of this probe was to stop guessing, and its verdict was itself a guess.
+            let bad = got.iter().enumerate().position(|(i, v)| *v as u8 != raw[i]).unwrap_or(got.len());
+            let tail = &got[bad..];
+            let tail_zero = !tail.is_empty() && tail.iter().all(|v| *v == 0.0);
+            let tail_same = !tail.is_empty() && tail.windows(2).all(|w| w[0] == w[1]);
+            println!("gate-bytes: byte_at is WRONG — {}",
+                if tail_zero { "reads past word 0 return ZERO, so the BINDING is short" }
+                else if tail_same { "reads past word 0 CLAMP to a stale value, so the binding is fine \
+and the INDEX is wrong" }
+                else { "the pattern is neither clamped nor zeroed; paste the two rows above" });
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--gate-q6k") {
         // Q6_K on the GPU, against the CPU reference in gguf.rs. Bit-exactness is the bar, not "close":
         // this decides whether Scout's experts can be FILE VIEWS instead of 200 GiB of host copies, and a
@@ -3502,11 +3717,38 @@ everywhere: it looks like a hardware problem"
         eprintln!("gate-q6k: adapter = {}", gpu.adapter_name);
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
         // Pseudo-random blocks, including bytes that exercise the sign of the scales and the high bits.
+        // REALISTIC f16 SCALES, not random bytes. Every byte was pseudo-random, INCLUDING the f16 `d`
+        // at offsets 208..209 — which lands on inf, NaN and subnormal patterns that no real checkpoint
+        // contains, and produces the absurd reference values this gate was printing (weights of 45139,
+        // a "scale" of 3241731).
+        //
+        // CPU and GPU are ALLOWED to differ on inf and NaN, and Apple hardware flushes denormals where
+        // a software rasterizer does not. So the gate was comparing two implementations on inputs where
+        // disagreement is legal, and calling it a kernel fault.
+        //
+        // The same trap was fixed in the unit tests twice (the Q4_K fixture and the decode fixture) and
+        // never here — the tests learned and the gates did not.
+        let f32_to_half = |f: f32| -> u16 {
+            let b = f.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            let mant = (b >> 13) & 0x3FF;
+            if exp <= 0 { return sign; }
+            sign | ((exp as u16) << 10) | mant as u16
+        };
         let mk = |nblk: usize, seed: u32| -> Vec<u8> {
-            (0..nblk * 210).map(|i| {
+            let mut v: Vec<u8> = (0..nblk * 210).map(|i| {
                 let z = (i as u32).wrapping_mul(2654435761).wrapping_add(seed);
                 ((z >> 13) & 0xFF) as u8
-            }).collect()
+            }).collect();
+            for b in 0..nblk {
+                // A scale in the range a real Q6_K checkpoint uses. Signed, so the negative-scale
+                // check still exercises what it is for.
+                let d = 0.002 + ((b + seed as usize) % 23) as f32 * 0.0007;
+                let d = if (b + seed as usize) % 5 == 0 { -d } else { d };
+                v[b * 210 + 208..b * 210 + 210].copy_from_slice(&f32_to_half(d).to_le_bytes());
+            }
+            v
         };
         // HAND-CHECKED BLOCK FIRST. A single block with known bytes isolates the arithmetic from the
         // chunking, and prints the first few values from both paths so the divergence is visible rather
@@ -3590,10 +3832,30 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         // d/dmin, both branches of the 6-bit scale/min unpack, and both nibble halves.
         let nblk = 37usize; // deliberately not a round number
         let n = nblk * 256;
-        let raw: Vec<u8> = (0..nblk * 144).map(|i| {
+        // Q4_K super-block: f16 `d` at 0..2, f16 `dmin` at 2..4, then packed scales and nibbles. Both
+        // f16 fields were pseudo-random, landing on inf/NaN/subnormal patterns no checkpoint contains —
+        // which is why the reference printed a "scale" of 3,241,731. CPU and GPU may legally disagree
+        // there, and Apple hardware flushes denormals where a software rasterizer does not, so the gate
+        // was calling a legal disagreement a kernel fault.
+        let half = |f: f32| -> u16 {
+            let b = f.to_bits();
+            let sign = ((b >> 16) & 0x8000) as u16;
+            let exp = ((b >> 23) & 0xFF) as i32 - 127 + 15;
+            let mant = (b >> 13) & 0x3FF;
+            if exp <= 0 { return sign; }
+            sign | ((exp as u16) << 10) | mant as u16
+        };
+        let mut raw: Vec<u8> = (0..nblk * 144).map(|i| {
             let x = (i as u32).wrapping_mul(2654435761).wrapping_add(0x9E37);
             (x >> 13) as u8
         }).collect();
+        for b in 0..nblk {
+            let d = 0.003 + (b % 17) as f32 * 0.0011;
+            let dmin = 0.001 + (b % 11) as f32 * 0.0004;
+            raw[b * 144..b * 144 + 2].copy_from_slice(&half(d).to_le_bytes());
+            raw[b * 144 + 2..b * 144 + 4].copy_from_slice(&half(dmin).to_le_bytes());
+        }
+        let raw = raw;
         let want = gpu_kernels::gguf::dequantize(12, &raw, n).expect("cpu q4_k");
         let got = gpu.dequant_q4k(&raw, n);
         ck(&format!("output length matches ({} values)", want.len()), got.len() == want.len());
@@ -3602,7 +3864,22 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         ck(&format!("GPU dequant == CPU dequant: max|diff|={maxdiff:.3e}, {mismatches} differing"), maxdiff == 0.0);
         // A real weight distribution, not just random bytes: build blocks whose nibbles vary smoothly so a
         // scale/min mix-up shows up as structure rather than noise.
-        let raw2: Vec<u8> = (0..nblk * 144).map(|i| ((i * 7) % 251) as u8).collect();
+        // Same pinning as `raw`: only the quant nibbles should be random. This fixture still carried
+        // random f16 fields, which is why "second pattern" and "block scales" kept reporting values in
+        // the millions after the first fixture was fixed.
+        let pin_q4k = |v: &mut Vec<u8>, nb: usize| {
+            for b in 0..nb {
+                let d = 0.004 + (b % 13) as f32 * 0.0009;
+                let dmin = 0.0012 + (b % 7) as f32 * 0.0003;
+                v[b * 144..b * 144 + 2].copy_from_slice(&half(d).to_le_bytes());
+                v[b * 144 + 2..b * 144 + 4].copy_from_slice(&half(dmin).to_le_bytes());
+            }
+        };
+        let raw2: Vec<u8> = {
+            let mut v: Vec<u8> = (0..nblk * 144).map(|i| ((i * 7) % 251) as u8).collect();
+            pin_q4k(&mut v, nblk);
+            v
+        };
         let want2 = gpu_kernels::gguf::dequantize(12, &raw2, n).expect("cpu q4_k 2");
         let got2 = gpu.dequant_q4k(&raw2, n);
         let d2 = got2.iter().zip(&want2).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
@@ -3625,6 +3902,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
                 let x = (i as u32).wrapping_mul(2246822519).wrapping_add(7);
                 (x >> 11) as u8
             }).collect();
+            let raw3 = { let mut v = raw3; pin_q4k(&mut v, nb); v };
             let f32ref = gpu_kernels::gguf::dequantize(12, &raw3, total).expect("cpu q4_k");
             let (cpu_blob, qs_off) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
             let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
@@ -3662,6 +3940,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
                 let x = (i as u32).wrapping_mul(40503).wrapping_add(12345);
                 (x >> 7) as u8
             }).collect();
+            let raw4 = { let mut v = raw4; pin_q4k(&mut v, nb); v };
             // reference Lin: the exact CPU route this replaces
             let f32ref = gpu_kernels::gguf::dequantize(12, &raw4, total).expect("cpu q4_k");
             let cpu_lin = gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&f32ref, rows, k));
@@ -3779,9 +4058,13 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             ck(&format!("chunked conversion is exact across boundaries ({diff} words differ)"), diff == 0);
         }
 
-        println!("gate-q4k: {}", if ok {
-            "GPU reads native Q4_K exactly \u{2713} — the loader can stop requantizing"
-        } else { "FAIL \u{2717}" });
+        // CLAIMS ONLY WHAT IT TESTS. This said "the loader can stop requantizing", and I acted on
+        // that for several commits — it exercises dequant_q4k, which is exact Q4_K -> f32, NOT a
+        // native matvec over Q4_K blocks. And the verdict now routes through gateclass, so a pass on
+        // a software rasterizer cannot print the tick a reader skims for.
+        let line = gpu_kernels::gateclass::verdict_line("gate-q4k", &gpu.adapter_name,
+            "Q4_K dequantizes exactly — the CONVERSION, not a native Q4_K matvec");
+        println!("{}", if ok { line.as_str() } else { "gate-q4k: FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-moe-raw") {
@@ -3815,7 +4098,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             gpu_kernels::gguf::dequantize(12, &down[e * dn_nb * 144..(e + 1) * dn_nb * 144], d * ff).unwrap()).collect();
 
         let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
-            norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+            norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw: Vec<f32> = (0..ne * d).map(|i| (((i as u32).wrapping_mul(2654435761) >> 9) as f32 / 8_388_608.0) - 1.0).collect();
         let xin: Vec<f32> = (0..d).map(|i| ((i as f32) * 0.023).cos()).collect();
 
@@ -3883,7 +4166,7 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             (gpu_kernels::moe::RouteNorm::Sigmoid, false, "sigmoid, weight-after (GPU-routed v2)"),
         ] {
             let cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32,
-                n_shared: 0, norm, normalize: true, weight_before: wbefore };
+                n_shared: 0, norm, normalize: true, weight_before: wbefore, routed_scale: 1.0 };
             // ---- CPU reference ----
             let mut logits = vec![0f32; ne];
             for e in 0..ne { logits[e] = (0..d).map(|i| rw[e * d + i] * xin[i]).sum(); }
@@ -3961,7 +4244,7 @@ still pass, which is why this one exists."
             stacked_gu: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&gus.concat(), ne * 2 * ff, d)),
             stacked_down: gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&dns.concat(), ne * d, ff)),
             cfg: gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: n_used as u32, n_shared: 0,
-                norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false },
+                norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 },
             shared: if shared {
                 Some((gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(31, 2 * ff * d), 2 * ff, d)),
                       gpu_kernels::Lin::q4(gpu.quantize_q4_resident(&mk(32, d * ff), d, ff))))
@@ -4871,7 +5154,7 @@ still pass, which is why this one exists."
     // shared=None (must equal the old routed-only result) and shared=Some (routed + dense SwiGLU).
     {
         let (d, ff, sff, ne, t) = (8usize, 6usize, 10usize, 4usize, 3usize);
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw = rnd(ne * d, 51);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 60 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 70 + e)).collect();
@@ -4928,7 +5211,7 @@ still pass, which is why this one exists."
         // INPUT (weight-before-FFN), plus the shared expert. CPU reference mirrors HF/llama.cpp
         // semantics directly (FFN(w·x), combined with weight 1).
         let l4cfg = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 1, n_shared: 1,
-            norm: gpu_kernels::moe::RouteNorm::Sigmoid, normalize: false, weight_before: true };
+            norm: gpu_kernels::moe::RouteNorm::Sigmoid, normalize: false, weight_before: true, routed_scale: 1.0 };
         let l4_ref = {
             let mut out = xin.clone();
             for tok in 0..t {
@@ -4956,7 +5239,7 @@ still pass, which is why this one exists."
     // fusion — the dispatch count drops, the numbers must not move.
     {
         let (d, ff, ne) = (64usize, 32usize, 4usize);
-        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false };
+        let cfgm = gpu_kernels::moe::MoeConfig { n_routed: ne as u32, n_used: 2, n_shared: 0, norm: gpu_kernels::moe::RouteNorm::Softmax, normalize: true, weight_before: false, routed_scale: 1.0 };
         let rw = rnd(ne * d, 151);
         let gus: Vec<Vec<f32>> = (0..ne).map(|e| rnd(2 * ff * d, 160 + e)).collect();
         let dns: Vec<Vec<f32>> = (0..ne).map(|e| rnd(d * ff, 170 + e)).collect();

@@ -210,3 +210,59 @@ mod tests {
         assert!(f.find("[system]") < f.find("[user]"), "system leads");
     }
 }
+
+/// The rules for a turn the observations do not bear on.
+///
+/// ## Observed failure
+///
+/// In a real session every reply opened with a sentence announcing that the compute backend had
+/// finished processing the observations — including the answer to "hi there". With nothing to relay,
+/// that line announces a result which does not exist.
+///
+/// Worse, asked to "tell the debaters to check their error return numbers" with **no debate running**,
+/// the model reported a `Terminal::new()` failing with error 2. That is a status from a run that never
+/// started, and it reads as a report. The format was available, so it was filled — which is precisely
+/// the failure `reasontemplate` names.
+///
+/// Appended as its own constant rather than edited into `LIAISON_SYSTEM`: that literal is a multi-line
+/// escaped string and adding to it kept producing escaping errors, which is a bad trade for a prompt
+/// change.
+pub const LIAISON_NO_OBSERVATIONS: &str = "\
+WHEN THE OBSERVATION LIST IS EMPTY OR DOES NOT BEAR ON WHAT WAS ASKED:
+- Do not open with a status line. A sentence announcing that the backend finished processing is \
+boilerplate; with nothing to report it is worse than boilerplate, because it announces a result that \
+does not exist. Say nothing about the backend at all.
+- Answer the question directly, as an ordinary assistant would. A greeting gets a greeting; a request \
+to write code gets code. You are a liaison only when there is something to relay.
+- If asked about something that is NOT RUNNING, say so plainly. Do not invent its state. An error code \
+you did not observe, a status you were not given, a result from a run that never started: each of \
+these reads as a report and is a fabrication, and it is worse than an unhelpful answer because the \
+person will act on it.";
+
+#[cfg(test)]
+mod no_obs_tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_observation_list_gets_an_ORDINARY_answer() {
+        assert!(LIAISON_NO_OBSERVATIONS.contains("Do not open with a status line"));
+        assert!(LIAISON_NO_OBSERVATIONS.contains("announces a result that does not exist"));
+        assert!(LIAISON_NO_OBSERVATIONS.contains("A greeting gets a greeting"));
+    }
+
+    #[test]
+    fn the_state_of_something_NOT_RUNNING_must_not_be_invented() {
+        // The transcript's second failure: an error return reported for a process that never started.
+        assert!(LIAISON_NO_OBSERVATIONS.contains("NOT RUNNING"));
+        assert!(LIAISON_NO_OBSERVATIONS.contains("Do not invent its state"));
+        assert!(LIAISON_NO_OBSERVATIONS.contains("a run that never started"));
+        assert!(LIAISON_NO_OBSERVATIONS.contains("the person will act on it"));
+    }
+
+    #[test]
+    fn it_is_appended_to_the_system_prompt_not_replacing_it() {
+        // Both apply: the observation rules still govern when there ARE observations.
+        assert!(!LIAISON_SYSTEM.is_empty());
+        assert!(!LIAISON_NO_OBSERVATIONS.is_empty());
+    }
+}

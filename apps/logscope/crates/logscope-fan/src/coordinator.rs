@@ -20,20 +20,65 @@
 //! to assemble the per-unit outputs onto the shared-context file. This module only decides WHAT to run.
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Mode { Barebones, Coordinator, Aggressive }
+pub enum Mode { Barebones, Coordinator, Aggressive, LongHorizon, ThinkerLiaison, LiaisonDebate }
 
 impl Mode {
     pub fn label(self) -> &'static str {
-        match self { Mode::Barebones => "Barebones", Mode::Coordinator => "Coordinator", Mode::Aggressive => "Aggressive coordinator" }
+        match self {
+            Mode::Barebones => "Barebones",
+            Mode::Coordinator => "Coordinator",
+            Mode::Aggressive => "Aggressive coordinator",
+            Mode::LongHorizon => "Long-horizon engineer",
+            Mode::ThinkerLiaison => "Thinker + liaison",
+            Mode::LiaisonDebate => "Liaison + debate panel",
+        }
     }
     pub fn blurb(self) -> &'static str {
         match self {
             Mode::Barebones => "One model, one prompt — fastest, lowest load.",
             Mode::Coordinator => "Fans the task out to parallel workers (one per unit), each aware of the others, then stitches.",
             Mode::Aggressive => "Like Coordinator, plus best-of-K per unit — more parallel runs for higher quality.",
+            // The three below vary WHO REASONS, where the three above vary how wide the fan-out is.
+            // Two axes, deliberately in one list because an operator picks one thing.
+            Mode::LongHorizon => "One large model, unguided. For runs where nobody is watching and the \
+session has to carry itself — it cannot usefully stop and ask, so it does not try.",
+            Mode::ThinkerLiaison => "A large model with a small one relaying and condensing. The \
+default: the liaison keeps the thinker's context clean and answers while it works.",
+            Mode::LiaisonDebate => "Several small models debating, with the liaison summarizing. They \
+can pause to ask YOU a question between messages, and one is held blind to your answer — so the next \
+round shows whether your hint drove the conclusion or the question did.",
         }
     }
-    pub fn all() -> [Mode; 3] { [Mode::Barebones, Mode::Coordinator, Mode::Aggressive] }
+    pub fn all() -> [Mode; 6] {
+        [Mode::Barebones, Mode::Coordinator, Mode::Aggressive,
+         Mode::LongHorizon, Mode::ThinkerLiaison, Mode::LiaisonDebate]
+    }
+
+    /// Which axis this mode varies.
+    ///
+    /// Six entries in one list, and they answer two different questions: Barebones/Coordinator/
+    /// Aggressive vary HOW WIDE the fan-out is, and the other three vary WHO REASONS. An operator
+    /// picking from an undifferentiated list of six has to already know that to choose sensibly.
+    ///
+    /// One list is still right — you pick one mode — but the list should say which question each entry
+    /// answers rather than leaving it to be inferred from the names.
+    pub fn axis(self) -> &'static str {
+        match self {
+            Mode::Barebones | Mode::Coordinator | Mode::Aggressive => "how wide",
+            Mode::LongHorizon | Mode::ThinkerLiaison | Mode::LiaisonDebate => "who reasons",
+        }
+    }
+
+    /// Does this mode run a debating panel?
+    pub fn is_panel(self) -> bool { matches!(self, Mode::LiaisonDebate) }
+
+    /// Can this mode stop and ask the operator mid-run?
+    ///
+    /// The long-horizon mode deliberately cannot: it exists for sessions where nobody is watching, and
+    /// a question nobody answers stalls the run rather than improving it.
+    pub fn can_interrupt(self) -> bool {
+        !matches!(self, Mode::LongHorizon | Mode::Barebones)
+    }
 }
 
 /// A unit to parallelize — typically one function/item to write.
@@ -96,7 +141,12 @@ fn sys_aggregate() -> String {
 pub fn plan(mode: Mode, task: &Task) -> Plan {
     let single = |sys: String| WorkerPrompt { label: "main".into(), system: sys, user: task.goal.clone(), styles: Vec::new() };
     match mode {
-        Mode::Barebones => Plan { mode_name: "barebones", workers: vec![single(sys_barebones())], best_of: 1, aggregate: Aggregation::Single },
+        // The reasoning modes plan like Barebones at THIS layer: one worker prompt. Who answers
+        // it — a thinker, a thinker plus liaison, or a panel — is decided by the runtime that
+        // consumes the plan. Folding it in here would conflate two axes and hand the panel a
+        // fan-out width it never asked for.
+        Mode::Barebones | Mode::LongHorizon | Mode::ThinkerLiaison | Mode::LiaisonDebate =>
+            Plan { mode_name: "barebones", workers: vec![single(sys_barebones())], best_of: 1, aggregate: Aggregation::Single },
         Mode::Coordinator | Mode::Aggressive => {
             let best_of = if mode == Mode::Aggressive { 3 } else { 1 };
             let mode_name = if mode == Mode::Aggressive { "aggressive coordinator" } else { "coordinator" };
@@ -131,6 +181,69 @@ pub fn aggregate_system() -> String { sys_aggregate() }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn all_modes_are_CONTIGUOUS_by_axis() {
+        // The UI prints a heading whenever the axis changes, so an interleaved list would print the
+        // same heading twice and read as a bug. Contiguity is a property of Mode::all() that the
+        // renderer depends on and nothing else enforced.
+        let axes: Vec<&str> = Mode::all().iter().map(|m| m.axis()).collect();
+        let mut seen: Vec<&str> = Vec::new();
+        for a in &axes {
+            if seen.last() != Some(a) {
+                assert!(!seen.contains(a), "axis {a:?} appears in two runs: {axes:?}");
+                seen.push(a);
+            }
+        }
+        assert_eq!(seen.len(), 2, "two axes, two headings");
+    }
+
+    #[test]
+    fn every_mode_has_an_axis_and_they_are_the_expected_two() {
+        // A third axis is not wrong, but it would need a UI decision rather than appearing silently.
+        for m in Mode::all() {
+            assert!(matches!(m.axis(), "how wide" | "who reasons"), "{m:?} has axis {:?}", m.axis());
+        }
+    }
+
+    #[test]
+    fn the_three_reasoning_modes_are_selectable() {
+        // They were built (panelmode, panelvoice, deliberate) and never given an entry, which is why
+        // the debate panel could not be found in the menu.
+        let all = Mode::all();
+        assert!(all.contains(&Mode::LongHorizon));
+        assert!(all.contains(&Mode::ThinkerLiaison));
+        assert!(all.contains(&Mode::LiaisonDebate));
+        assert_eq!(all.len(), 6, "three fan-out widths plus three reasoning shapes");
+    }
+
+    #[test]
+    fn long_horizon_CANNOT_interrupt_and_that_is_the_point() {
+        // It exists for sessions where nobody is watching. A question nobody answers stalls the run
+        // rather than improving it, so the mode does not try — which is the actual difference from
+        // thinker+liaison, not a limitation of it.
+        assert!(!Mode::LongHorizon.can_interrupt());
+        assert!(Mode::ThinkerLiaison.can_interrupt());
+        assert!(Mode::LiaisonDebate.can_interrupt());
+    }
+
+    #[test]
+    fn only_the_debate_mode_runs_a_panel() {
+        assert!(Mode::LiaisonDebate.is_panel());
+        for m in [Mode::Barebones, Mode::Coordinator, Mode::Aggressive,
+                  Mode::LongHorizon, Mode::ThinkerLiaison] {
+            assert!(!m.is_panel(), "{m:?}");
+        }
+    }
+
+    #[test]
+    fn every_mode_has_a_label_and_a_description() {
+        // The dropdown shows both, and an empty one reads as a broken entry rather than a mode.
+        for m in Mode::all() {
+            assert!(!m.label().is_empty(), "{m:?}");
+            assert!(m.blurb().len() > 20, "{m:?} needs a description someone can choose from");
+        }
+    }
+
     use super::*;
 
     fn task3() -> Task {

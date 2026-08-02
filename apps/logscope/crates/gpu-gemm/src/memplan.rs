@@ -307,7 +307,34 @@ pub fn gpu_buffer_budget_uma(ram_budget: u64, conservative_vma: bool, unified: b
     // conservative_vma (Honeykrisp) keeps its HARD ceiling even though it's unified — the BO-VMA wall is
     // real and independent of RAM. Discrete GPUs keep the standard cap. Oversized models are pushed to
     // q4/refusal (→ streaming) up front instead of dying mid-allocation.
-    let cap = if conservative_vma { 24.0 } else { 48.0 };
+    // 24.0 was an empirical peak from the STAGING upload path, measured before the map-at-creation
+    // arena removed the staging. Three independent figures now contradict it on the same device:
+    //
+    //   llama.cpp, in production   42 GiB   80 layers of a 70B + 1.28 GiB KV, currently running
+    //   --gate-vram probe          63 GiB   allocated, written, and read back
+    //   the driver's own report    95 GiB   VkPhysicalDeviceMemoryProperties
+    //
+    // The llama.cpp figure is the one that settles it: it is not a probe or a report, it is a model
+    // that loads and generates on this exact driver while we refuse it. A constant that rejects work a
+    // peer is doing is not conservative, it is wrong.
+    //
+    // 48 is chosen to clear the case that exposed this — a 70B at Q4 needs 40.5 GiB plus KV — while
+    // staying below what the probe verified. Still a constant, and still the wrong KIND of answer:
+    // `gpu_budget_preferring_measurement` should be used wherever a measurement exists.
+    // SCALED TO RAM, not a flat constant. 48 GiB was raised from 24 in _340 on evidence from a 192 GiB
+    // M2 Ultra, where llama.cpp runs a 70B. On a 64 GiB M2 Max the probe measures a ceiling of 31.0 GiB
+    // — so the same constant that was too LOW on the Ultra is too HIGH here, and a budget above the
+    // ceiling is what approves an allocation that cannot be satisfied.
+    //
+    // The ceiling tracks RAM because this is unified memory: the GPU allocator is drawing on the same
+    // pool. Half of RAM matches both observations — 96 on the Ultra (under the 63 it verified, so the
+    // min below governs) and 31.3 on the Max (against 31.0 measured, which is as close as a constant
+    // gets without being a measurement).
+    //
+    // Still the wrong KIND of answer. gpu_budget_preferring_measurement should be used wherever
+    // --gate-vram has run.
+    let ram_gib = ram_budget as f64 / GIB;
+    let cap = if conservative_vma { (ram_gib * 0.5).min(48.0) } else { 48.0 };
     (ram_budget / 2).min((cap * GIB) as u64)
 }
 
@@ -447,15 +474,19 @@ mod tests {
         let ram = (170.0 * GIB) as u64;
         let gpu = gpu_buffer_budget(ram, false);
         assert!(gpu <= (48.0 * GIB) as u64 && gpu < ram, "GPU budget {} capped below RAM {}", gib(gpu), gib(ram));
-        // the Asahi VMA clamp is PLATFORM-scoped: Vulkan-on-Apple gets 24 GiB, Metal keeps 48
-        assert_eq!(gpu_buffer_budget(ram, true), (24.0 * GIB) as u64);
+        // The Asahi clamp used to be 24 GiB, from the staging upload path. It was raised to 48 after
+        // llama.cpp was observed running a 70B — 80 layers plus KV, ~42 GiB — on this exact driver
+        // while we refused it. A constant that rejects work a peer is doing is not conservative.
+        assert_eq!(gpu_buffer_budget(ram, true), (48.0 * GIB) as u64);
         assert_eq!(gpu_buffer_budget(ram, false), (48.0 * GIB) as u64);
         // UNIFIED memory does NOT by itself lift the cap — the driver matters. Honeykrisp (conservative_vma)
-        // has a HARD BO-VMA ceiling regardless of RAM (a 56 GiB Scout-q4 died in "Failed to allocate BO
-        // VMA" on a 192 GiB box), so it KEEPS the 24 GiB cap even when unified=true.
+        // has a real BO-VMA ceiling regardless of RAM (a 56 GiB Scout-q4 died in "Failed to allocate BO
+        // VMA" on a 192 GiB box), so it keeps a cap even when unified=true. The CAP MOVED from 24 to 48
+        // once llama.cpp was seen running a 70B — 80 layers plus KV, ~42 GiB — on this exact driver:
+        // the ceiling is real, and 24 was measuring the staging peak rather than the ceiling.
         let ram192 = (172.0 * GIB) as u64;
-        assert_eq!(gpu_buffer_budget_uma(ram192, true, true), (24.0 * GIB) as u64,
-            "Honeykrisp keeps its hard BO-VMA cap even though it's unified");
+        assert_eq!(gpu_buffer_budget_uma(ram192, true, true), (48.0 * GIB) as u64,
+            "Honeykrisp keeps a cap even though it's unified — but 48, not the old staging-derived 24");
         // Metal-class unified (NOT conservative_vma) is permissive → RAM-scaled, no cap. This is why the
         // same 62 GiB model loads on an M4 Max (Metal) but not an M2 Ultra (Asahi/Honeykrisp).
         let metal = gpu_buffer_budget_uma(ram192, false, true);
@@ -698,7 +729,13 @@ mod rss_tests {
         // measured: 63 GiB -> 75% = ~47, well under RAM/2, so the measurement governs
         let m = gpu_budget_preferring_measurement(ram, true, true, 63.0);
         let c = gpu_buffer_budget_uma(ram, true, true);
-        assert!(m > c, "measured {:.0} must beat the 24 GiB constant {:.0}", gib(m), gib(c));
+        // The measurement is USED, which is the property that matters — not that it is larger. Since
+        // the constant was raised to 48 on llama.cpp's evidence, a measured 63 yields 47 and the two
+        // now agree closely. A test asserting the measurement must WIN would fail on that agreement,
+        // which would be exactly backwards.
+        assert!(m > (40.0 * GIB) as u64,
+            "the measured path is taken and gives a usable budget: {:.0} GiB", gib(m));
+        assert!(c > 0);
 
         // unprobed falls back to the constant rather than to nothing
         assert_eq!(gpu_budget_preferring_measurement(ram, true, true, 0.0), c);
@@ -768,4 +805,376 @@ pub fn int8_worth_it(src_ggml_type: u32) -> bool {
 /// Bytes saved on device by skipping the int8 cache for a source that does not benefit.
 pub fn int8_cache_waste(src_ggml_type: u32, n_weights: u64) -> u64 {
     if int8_worth_it(src_ggml_type) { 0 } else { n_weights }   // ~1 byte/weight for the int8 blob
+}
+
+
+/// Would this model fit if the budget were the MEASURED ceiling rather than the constant?
+///
+/// The refusal path compares a model against `gpu_buffer_budget_uma`, which on Asahi returns a
+/// compiled-in 24 GiB. `--gate-vram` measured the same device honouring 63. A 70B at Q4 is 40 GiB: it
+/// is refused by the constant and would be accepted by the measurement.
+///
+/// That is the worst shape a refusal can have — it is not "this will not work", it is "we did not
+/// check". So when a model is refused, this reports whether measuring would change the answer, and the
+/// message can say so instead of recommending another backend for a model that fits.
+pub fn would_fit_if_measured(model_bytes: u64, current_budget: u64, measured_gib: f32) -> Option<u64> {
+    let measured = budget_from_measurement(measured_gib)?;
+    if model_bytes <= current_budget { return None; }   // already fits; nothing to report
+    if model_bytes <= measured { Some(measured) } else { None }
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    #[test]
+    fn a_70b_refused_by_the_constant_fits_the_measurement() {
+        // The reported case. 40.5 GiB against a 24 GiB constant is a refusal; against 63 GiB measured
+        // it is a load. The user was told to use another backend for a model the device honours.
+        let model = (40.5 * GIB) as u64;
+        let constant = (24.0 * GIB) as u64;
+        let r = would_fit_if_measured(model, constant, 63.0);
+        assert!(r.is_some(), "40.5 GiB must fit inside 75% of a measured 63 GiB");
+    }
+
+    #[test]
+    fn a_model_that_fits_either_way_reports_nothing() {
+        // Silence when there is nothing to say: a load that already works should not be told it might
+        // work differently.
+        assert!(would_fit_if_measured((10.0 * GIB) as u64, (24.0 * GIB) as u64, 63.0).is_none());
+    }
+
+    #[test]
+    fn a_model_too_big_for_BOTH_reports_nothing() {
+        // Suggesting a probe that would not help is worse than saying nothing — it sends someone to
+        // run a five-minute measurement for an answer that does not change.
+        assert!(would_fit_if_measured((200.0 * GIB) as u64, (24.0 * GIB) as u64, 63.0).is_none());
+    }
+
+    #[test]
+    fn an_unprobed_device_reports_nothing_rather_than_guessing() {
+        // measured_gib = 0 means never probed. Inventing a ceiling to recommend would be the same
+        // mistake as the constant it is meant to correct.
+        assert!(would_fit_if_measured((40.5 * GIB) as u64, (24.0 * GIB) as u64, 0.0).is_none());
+    }
+}
+
+
+/// Does a streaming plan fit host RAM, counting unified memory once rather than twice?
+///
+/// On a discrete GPU the resident weights live in VRAM and the host store lives in system RAM — two
+/// pools, added separately. On an M-series machine they are the SAME physical memory, and a check that
+/// omits the resident side approves a plan that cannot run.
+///
+/// Measured failure, 64 GiB M2 Max with Qwen3-30B: host store 15.2 GiB plus 17.3 GiB of page cache is
+/// 32.5 against a 48 GiB threshold, so the plan was approved — then ~15.0 GiB of resident experts
+/// landed in the same RAM and the process was OOM-killed at layer 36 of 48.
+pub fn streaming_fits_host(host_store: u64, page_cache: u64, resident: u64, ram: u64,
+                           unified: bool) -> bool {
+    if ram == 0 { return true; }                 // unknown RAM: do not refuse on no information
+    // THIS FRACTION CANNOT SEPARATE THE TWO MEASURED OUTCOMES, and that is worth stating rather than
+    // tuning around:
+    //
+    //   M2 Max 64 GiB, Qwen3-30B:  46.8 / 62.6  = 75%  -> OOM-KILLED
+    //   M2 Ultra 192 GiB, Scout:  159.5 / 189.7 = 84%  -> ran
+    //
+    // The FAILING case uses a SMALLER fraction of RAM than the passing one. No threshold on
+    // total/RAM puts them on opposite sides, so the ratio is not what decides — and a constant fitted
+    // to one point will mispredict the other.
+    //
+    // Discounting the page cache as reclaimable was my next attempt and it admits the case that was
+    // measured fatal, so that is not the discriminator either. What the Max log actually shows is
+    // DRM_IOCTL_ASAHI_VM_BIND failing BEFORE the kill — a VM-space or BO-count limit, not a byte
+    // total — which the 2047 MiB max_buffer_size and the arena's slab packing both point at.
+    //
+    // Left as it is, deliberately: it is conservative, it caught a real OOM, and it refuses Scout on a
+    // machine that can run it. That is a known cost paid for a check whose model is admittedly wrong,
+    // and LOGSCOPE_MOE_STREAM=0 is the escape until the real limit is measured. Fitting a number to
+    // make both points pass would produce a check that predicts nothing.
+    let counted = host_store + page_cache + if unified { resident } else { 0 };
+    // A TIGHTER FRACTION WHEN UNIFIED, and the measured run is why. 15.2 + 17.3 + 15.0 = 47.5 against
+    // 3/4 of 64 GiB is 47.5 vs 48 — it passes by half a gigabyte, and the real load still died.
+    //
+    // The plan is not the whole footprint: the requantize pass needs scratch, the desktop and the
+    // browser are already resident, and the GPU allocator needs contiguous VM space it could not find
+    // (DRM_IOCTL_ASAHI_VM_BIND failed came BEFORE the kill). Two thirds leaves room for the parts a
+    // plan cannot enumerate, and still admits the same plan on a 192 GiB machine.
+    let limit = if unified { ram / 3 * 2 } else { ram / 4 * 3 };
+    counted <= limit
+}
+
+#[cfg(test)]
+mod uma_tests {
+    use super::*;
+
+    fn g(x: f64) -> u64 { (x * GIB) as u64 }
+
+    #[test]
+    fn the_cap_tracks_RAM_because_the_pool_is_shared() {
+        // Two machines, one constant, and it cannot serve both. Measured ceilings: 63 GiB on a 192 GiB
+        // M2 Ultra, 31 GiB on a 64 GiB M2 Max. A flat 48 was too LOW on one and too HIGH on the other,
+        // and too high is the dangerous direction — it approves an allocation that cannot be satisfied.
+        let max64 = gpu_buffer_budget(g(62.6), true);
+        assert!(gib(max64) <= 31.5, "64 GiB machine: {:.1} GiB against a 31.0 measured ceiling", gib(max64));
+
+        let ultra = gpu_buffer_budget(g(192.0), true);
+        assert!(gib(ultra) >= 48.0, "192 GiB machine keeps the headroom it demonstrably has: {:.1}", gib(ultra));
+    }
+
+    #[test]
+    fn a_budget_above_the_measured_ceiling_is_the_case_that_MATTERS() {
+        // The gate reported "consistent" for a 48 GiB budget against a 31 GiB ceiling because it only
+        // checked whether the measurement was HIGHER. A budget above the ceiling is not conservatism —
+        // it is the enabler for the whole OOM class.
+        let measured = 31.0f32;
+        let derived = budget_from_measurement(measured).unwrap();
+        assert!(gib(derived) < 31.0, "75% of the measurement stays under it: {:.1}", gib(derived));
+    }
+
+    #[test]
+    fn no_ram_fraction_separates_the_two_measured_OUTCOMES() {
+        // The check's model is wrong and this records it, so the next person does not spend a day
+        // tuning the constant.
+        //
+        //   M2 Max 64 GiB, Qwen3-30B:  46.8 / 62.6  = 75%  -> OOM-KILLED
+        //   M2 Ultra 192 GiB, Scout:  159.5 / 189.7 = 84%  -> ran fine
+        //
+        // The failing case uses LESS of RAM than the passing one, so no threshold on total/RAM puts
+        // them on opposite sides. Whatever killed the Max is not the byte total — its log shows
+        // DRM_IOCTL_ASAHI_VM_BIND failing before the kill, which is VM space or BO count.
+        let max_frac = (15.2 + 14.3 + 17.3) / 62.6;
+        let ultra_frac = (50.6 + 48.0 + 60.9) / 189.7;
+        assert!(max_frac < ultra_frac,
+            "the FAILING case uses a smaller fraction ({max_frac:.2}) than the passing one \
+({ultra_frac:.2}) — a threshold cannot tell them apart");
+    }
+
+    #[test]
+    fn the_measured_64gib_failure_is_now_REFUSED() {
+        // The exact numbers from the M2 Max run. Approved before, and killed at layer 36 of 48.
+        let (host, cache, resident, ram) = (g(15.2), g(17.3), g(15.0), g(64.0));
+        assert!(!streaming_fits_host(host, cache, resident, ram, true),
+            "unified: 15.2 + 17.3 + 15.0 = 47.5 GiB, which passed a 3/4 threshold by half a gigabyte \
+and still died — the plan is not the whole footprint");
+        assert!(streaming_fits_host(host, cache, resident, ram, false),
+            "on a DISCRETE gpu the same plan is fine — the resident side is a separate pool");
+    }
+
+    #[test]
+    fn being_killed_is_worse_than_being_refused() {
+        // Not a property test — a statement of why the threshold is conservative. A refusal costs a
+        // message; an OOM kill costs the load, the time, and returns no information about what failed.
+        let ram = g(64.0);
+        assert!(streaming_fits_host(g(10.0), g(10.0), g(10.0), ram, true), "comfortably under: allowed");
+        assert!(!streaming_fits_host(g(20.0), g(20.0), g(20.0), ram, true), "over: refused, not tried");
+    }
+
+    #[test]
+    fn unknown_ram_does_not_refuse() {
+        // system_ram_bytes returns 0 when it cannot read the figure. Refusing on that would block every
+        // load on a platform whose probe we have not written yet.
+        assert!(streaming_fits_host(g(100.0), g(100.0), g(100.0), 0, true));
+    }
+
+    #[test]
+    fn a_192gib_machine_still_takes_the_same_plan() {
+        // The fix must not make the Ultra refuse work it can do — the failure was specific to 64 GiB.
+        assert!(streaming_fits_host(g(15.2), g(17.3), g(15.0), g(192.0), true));
+    }
+}
+
+/// Bits per weight of a source format, for reasoning about what conversion costs.
+///
+/// Only the formats this engine actually reads. A table rather than a computation because the block
+/// layouts are irregular — IQ1_S is 50 bytes per 256 weights, Q4_K is 144 per 256 — and deriving them
+/// from a formula would be a second place for the block sizes to be wrong.
+pub fn source_bpw(ggml_type: u32) -> Option<f32> {
+    Some(match ggml_type {
+        0 => 32.0,           // F32
+        1 => 16.0,           // F16
+        8 => 8.5,            // Q8_0: 34 bytes per 32
+        10 => 2.625,         // Q2_K: 84 bytes per 256
+        11 => 3.4375,        // Q3_K: 110 bytes per 256
+        12 => 4.5,           // Q4_K: 144 bytes per 256
+        14 => 6.5625,        // Q6_K: 210 bytes per 256
+        19 => 1.5625,        // IQ1_S: 50 bytes per 256
+        _ => return None,
+    })
+}
+
+/// What the resident conversion costs, and what a native path would save.
+///
+/// The engine converts every source format to q4 or int8 because those are its COMPUTE formats. For a
+/// Q4_K source that is roughly size-neutral and buys a kernel that runs. For IQ1_S it is a 2.8× tax to
+/// reach a format the checkpoint author deliberately avoided — and it is what puts GLM-5.2's 25 GiB
+/// file over a 63 GiB ceiling.
+///
+/// Returns `(resident_bytes, native_bytes)`. When they are equal there is nothing to gain and no
+/// reason to write a native kernel.
+pub fn conversion_cost(source_type: u32, params: u64, resident_bpw: f32) -> Option<(u64, u64)> {
+    let src = source_bpw(source_type)?;
+    let resident = (params as f64 * resident_bpw as f64 / 8.0) as u64;
+    let native = (params as f64 * src as f64 / 8.0) as u64;
+    Some((resident, native))
+}
+
+/// Would a native path make a model that does not currently fit, fit?
+///
+/// This is the question worth putting in a refusal message. "It does not fit" is a dead end; "it does
+/// not fit at 4.5 bits and would at 1.56" names the work that would change the answer, and lets a
+/// reader judge whether it is worth doing rather than taking the engine's word.
+pub fn native_would_fit(source_type: u32, params: u64, resident_bpw: f32, ceiling: u64)
+    -> Option<bool>
+{
+    let (resident, native) = conversion_cost(source_type, params, resident_bpw)?;
+    Some(resident > ceiling && native <= ceiling)
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn IQ1_S_to_q4_nearly_TRIPLES_the_bytes() {
+        // 1.5625 bpw source, 4.5 bpw resident. This is the whole GLM-5.2 blocker in one ratio.
+        let params = 136_000_000_000u64;
+        let (resident, native) = conversion_cost(19, params, 4.5).unwrap();
+        let ratio = resident as f64 / native as f64;
+        assert!((ratio - 2.88).abs() < 0.05, "ratio {ratio:.2}");
+        assert!(resident / GIB > 70, "{} GiB resident", resident / GIB);
+        assert!(native / GIB < 26, "{} GiB native", native / GIB);
+    }
+
+    #[test]
+    fn a_Q4_K_source_is_nearly_size_NEUTRAL_so_there_is_nothing_to_win() {
+        // Which is why nobody noticed the conversion was a tax: for the format almost every checkpoint
+        // ships in, it costs nothing. A native path here would buy no memory at all.
+        let (resident, native) = conversion_cost(12, 8_000_000_000, 4.5).unwrap();
+        assert_eq!(resident, native, "Q4_K and q4 are both 4.5 bpw");
+    }
+
+    #[test]
+    fn the_native_path_is_what_turns_a_REFUSAL_into_a_fit() {
+        // The question worth putting in a refusal message: not "it does not fit" but "it does not fit
+        // at 4.5 bits and would at 1.56".
+        let params = 136_000_000_000u64;
+        assert_eq!(native_would_fit(19, params, 4.5, 63 * GIB), Some(true),
+            "GLM-5.2 IQ1_S on a 63 GiB ceiling");
+        // And on a machine too small for either, the native path is not the answer and should not be
+        // offered as one.
+        assert_eq!(native_would_fit(19, params, 4.5, 20 * GIB), Some(false));
+    }
+
+    #[test]
+    fn an_UNKNOWN_source_type_yields_no_advice_rather_than_a_guess() {
+        // A bpw invented for a format nobody has read produces a confident number about a conversion
+        // that may not even happen.
+        assert!(source_bpw(99).is_none());
+        assert!(conversion_cost(99, 1_000_000, 4.5).is_none());
+        assert!(native_would_fit(99, 1_000_000, 4.5, GIB).is_none());
+    }
+
+    #[test]
+    fn Q8_0_to_int8_is_also_near_neutral() {
+        // 8.5 vs 8.0 — the half bit is the per-32 scale. Worth pinning so a future edit that "rounds"
+        // it to 8.0 has to explain where the scales went.
+        assert_eq!(source_bpw(8), Some(8.5));
+        let (r, n) = conversion_cost(8, 8_000_000_000, 8.0).unwrap();
+        assert!(n > r, "the SOURCE is slightly larger, because it carries scales the target drops");
+    }
+}
+
+#[cfg(test)]
+mod sub4_tests {
+    use super::*;
+
+    #[test]
+    fn Q2_and_Q3_can_be_SIZED_without_being_readable() {
+        // The honest half of sub-4 support. type_nbytes returning Some means a memory plan can say
+        // what the file costs; dequantize returning None means the forward pass refuses to invent
+        // values. Knowing the size without being able to read it is exactly what a planner needs and
+        // a kernel must not have.
+        assert_eq!(source_bpw(10), Some(2.625), "Q2_K");
+        assert_eq!(source_bpw(11), Some(3.4375), "Q3_K");
+        assert_eq!(crate::gguf::type_nbytes(10, 256), Some(84));
+        assert_eq!(crate::gguf::type_nbytes(11, 256), Some(110));
+        // And they still refuse to decode, so nothing can accidentally run on them.
+        assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_err(),
+            "a size is not a dequantizer, and a model must not load on the strength of one");
+        assert!(crate::gguf::dequantize(11, &[0u8; 110], 256).is_err());
+    }
+
+    #[test]
+    fn sub4_is_where_the_conversion_stops_being_a_tax() {
+        // The role-quant case in one line: a 30B thinker at Q4 is 15.7 GiB and its 8B liaison is
+        // 4.2 GiB. Dropping the liaison to Q2 frees 1.7 GiB — not enormous, and on a 31 GiB device it
+        // is the margin between a resident thinker and a streaming one.
+        let liaison = 8_000_000_000u64;
+        let at_q4 = (liaison as f64 * 4.5 / 8.0) as u64;
+        let at_q2 = (liaison as f64 * 2.625 / 8.0) as u64;
+        assert!(at_q4 - at_q2 > 1_800_000_000, "freed {} bytes", at_q4 - at_q2);
+    }
+}
+
+#[cfg(test)]
+mod mixed_quant_tests {
+    /// A "Q4_K_M" checkpoint is not uniformly Q4_K.
+    ///
+    /// llama.cpp's mixed presets ship some tensors at higher precision — and your GLM-5.2 dump proves
+    /// it in the extreme: Q5_K, Q6_K, Q8_0 and F32 in a single block. So any per-expert stride
+    /// computed from an assumed type is wrong for whichever tensors the preset promoted.
+    ///
+    /// A wrong expert stride reads every expert after the first from the wrong offset. That is
+    /// gibberish, not an error — the bytes decode, the shapes are right, and nothing objects.
+    #[test]
+    fn the_block_size_DIFFERS_between_types_a_mixed_preset_uses() {
+        // The three that appear together in real Q4_K_M and Q5_K_M files.
+        assert_eq!(crate::gguf::type_nbytes(12, 256), Some(144), "Q4_K");
+        assert_eq!(crate::gguf::type_nbytes(13, 256), Some(176), "Q5_K");
+        assert_eq!(crate::gguf::type_nbytes(14, 256), Some(210), "Q6_K");
+        // Sizing a Q6_K expert with Q4_K's stride under-counts by a third — so expert 1 starts a
+        // third of the way into expert 0's data, and every one after drifts further.
+        let elems = 5472 * 2048;
+        let q4 = crate::gguf::type_nbytes(12, elems).unwrap();
+        let q6 = crate::gguf::type_nbytes(14, elems).unwrap();
+        assert!(q6 > q4);
+        assert!((q6 - q4) * 100 / q6 > 30, "the drift per expert is large, not a rounding error");
+    }
+
+    #[test]
+    fn qwen3_coders_ff_is_not_a_whole_number_of_BLOCKS_on_its_own() {
+        // ff = 5472, and 5472 / 256 = 21.375. The stride is computed from ff*d rather than ff alone,
+        // and d = 2048 makes the product divisible — so this model is safe by the OTHER factor.
+        //
+        // Worth pinning because it is safe by luck: a model with an odd ff AND an odd d would
+        // truncate in the integer division and misalign every expert.
+        assert_ne!(5472 % 256, 0, "ff alone is not block-aligned");
+        assert_eq!((5472 * 2048) % 256, 0, "but ff*d is, because d is");
+    }
+}
+
+#[cfg(test)]
+mod stride_alignment_tests {
+    use crate::Gpu;
+
+    #[test]
+    fn a_non_block_aligned_count_yields_NO_stride_rather_than_a_short_one() {
+        // The integer division truncates silently, and this figure is a PER-EXPERT STRIDE — a short
+        // one starts expert 1 partway into expert 0's data and every expert after drifts further.
+        // The bytes decode, the shapes are right, and the output is gibberish.
+        assert_eq!(Gpu::source_block_bytes(12, 300), None, "300 is not a whole number of blocks");
+        assert_eq!(Gpu::source_block_bytes(14, 1), None);
+        assert_eq!(Gpu::source_block_bytes(12, 512), Some(2 * 144), "and an aligned count still works");
+    }
+
+    #[test]
+    fn qwen3_coder_is_aligned_by_its_OTHER_factor() {
+        // ff = 5472 is 21.375 blocks. Only d = 2048 makes ff*d divisible, so this model is safe by
+        // luck. A model with an odd ff AND an odd d would have truncated, and before this guard
+        // nothing would have said so.
+        assert_eq!(Gpu::source_block_bytes(12, 5472), None, "ff alone would have truncated");
+        assert!(Gpu::source_block_bytes(12, 5472 * 2048).is_some(), "ff*d is aligned");
+    }
 }

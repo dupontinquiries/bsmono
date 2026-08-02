@@ -50,3 +50,10 @@ None of the four imports touches a workspace file or the manifest. An import
 that also rewires the build makes it impossible to tell later which changes came
 from upstream and which were integration choices. Integration is a separate
 commit on top of each branch.
+
+## upstream-492 (merged)
+
+`20260719--monorepo-latest_492`, main at `370eedee`. 186 commits of logscope
+work off the same `51d8c068` split as the 338 line. Merged into main; the seven
+files both lines touched, the four textual conflicts and the one silent
+theme.rs breakage are written up in `MERGE_492_AUDIT.md`.

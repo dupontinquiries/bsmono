@@ -108,7 +108,14 @@ impl Default for Defaults {
             // 3072 x 8192 is the shape the 256-token chunk was originally tuned on.
             prefill_work_budget: 3072 * 8192 * 256,
             prefill_chunk_max: 256,
-            prefill_chunk_max_moe: 1024,
+            // LOWERED FROM 1024, which is measured to hang. Qwen3-30B took the raise to 1024, spent
+            // 37 s in prefill and then produced GPU timeouts at hundreds per second.
+            //
+            // 256 (the dense bound) is measured safe and 1024 is measured fatal; nothing between was
+            // tested, so 512 is a bounded guess rather than a derived value — and it is labelled as
+            // one. Clamping all the way back to 256 was my first fix and discards the whole FFN
+            // benefit, which is a real cost paid to avoid an unmeasured risk.
+            prefill_chunk_max_moe: 512,
             submit_batch: 16,
             min_verdict_margin: 0.05,
             subgroup_matvec: true,
@@ -165,6 +172,18 @@ impl Defaults {
             // sparsity = how much of the FFN each dispatch actually touches
             Some((n_expert, n_used)) if n_expert > n_used && n_used > 0 => {
                 let sparsity = (n_expert / n_used.max(1)) as u32;
+                // ATTENTION IS NOT SPARSE, and that is what this multiplier forgot.
+                //
+                // The FFN reasoning is sound: with 8 of 128 experts active each one sees ~1/16 of the
+                // tokens, so a 16x chunk restores its dispatch to a dense model's length and cuts the
+                // COUNT of tiny per-expert dispatches. But attention runs over every token in the
+                // chunk against the whole context, dense, on every layer — so the same 16x makes the
+                // ATTENTION dispatch sixteen times longer, which is precisely what the GPU watchdog
+                // kills.
+                //
+                // Observed: Qwen3-30B raised 256 -> 1024, prefill 37 s, then GPU timeouts at hundreds
+                // per second. The dense bound is the one attention was measured safe at, so the raise
+                // may reduce dispatch count and must not exceed it.
                 scaled.saturating_mul(sparsity).clamp(16, self.prefill_chunk_max_moe)
             }
             _ => scaled.clamp(16, self.prefill_chunk_max),
@@ -175,12 +194,31 @@ impl Defaults {
 /// Device-specific defaults, from measurements on this project rather than from guesses.
 ///
 /// Only deviations from `Defaults::default()` are set, and each one has a reason recorded next to it.
-pub fn device_defaults(adapter: &str) -> Defaults {
+/// Does this adapter's driver kill long-running compute dispatches?
+///
+/// EXPOSED so it can be cross-checked against the engine's `watchdog_prone_name`, which encodes the
+/// same decision in gpu-gemm. That duplication already went wrong once — _358 widened the engine's
+/// guard to mobile GPUs and this table stayed Apple-only, because a policy expressed in two places
+/// gets corrected in one and the survivor looks right. logscope cannot depend on gpu-gemm, so the two
+/// stay separate and a test in logscope-egui (which sees both) asserts they agree.
+pub fn watchdog_prone(adapter: &str) -> bool {
     let a = adapter.to_ascii_lowercase();
+    ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx", "honeykrisp"]
+        .iter().any(|m| a.contains(m))
+}
+
+pub fn device_defaults(adapter: &str) -> Defaults {
     let mut d = Defaults::default();
     // Asahi/Honeykrisp on Apple silicon: subgroup matvec can hang large matmuls, so it is opt-in; the
     // firmware watchdog is strict, so conversion dispatches are kept small.
-    if a.contains("apple") && a.contains("vulkan") {
+    // WATCHDOG-PRONE DEVICES, not Apple. This table encodes the same decision the engine's subgroup
+    // guard makes, and _358 widened THAT one to mobile GPUs after a Fairphone reported "not enough
+    // wavelets" — while this copy stayed Apple-only. Duplicated policy, fixed in one place.
+    //
+    // Both properties generalise: the subgroup matvec is now known wrong or unsupported on three
+    // drivers, and every mobile driver has the strict dispatch watchdog that motivates the small
+    // conversion chunk. A phone taking this table's defaults gets the fast path that hangs it.
+    if watchdog_prone(adapter) {
         d.subgroup_matvec = false;
         d.convert_chunk_blocks = 16384;
         // Submission is the dominant cost here, so a larger batch is worth more than on other drivers.
@@ -268,6 +306,51 @@ measurements will be taken again", path.display()))),
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_moe_chunk_raise_cannot_exceed_the_ATTENTION_bound() {
+        // The sparsity multiplier restores FFN dispatch length and says nothing about attention, which
+        // is dense over every token in the chunk on every layer. Qwen3-30B was raised 256 -> 1024 and
+        // the GPU watchdog fired at hundreds of timeouts per second.
+        let d = Defaults::default();
+        // 128 experts, 8 active: sparsity 16, which would multiply the chunk far past the dense bound.
+        let moe = d.prefill_chunk_moe(2048, 5472, false, Some((128, 8)));
+        let dense = d.prefill_chunk_moe(2048, 5472, false, None);
+        // The raise still helps — it must, or the FFN benefit is thrown away to avoid an unmeasured
+        // risk — but it cannot reach the value that was measured to hang.
+        assert!(moe > dense, "the raise still helps: {moe} vs dense {dense}");
+        assert!(moe <= 512, "and cannot reach 1024, which produced GPU timeouts: {moe}");
+    }
+
+    #[test]
+    fn a_MOBILE_gpu_gets_the_same_defaults_as_apple() {
+        // The bug: this table and the engine's subgroup guard encode the same decision, and _358
+        // widened only the guard — after a Fairphone reported "not enough wavelets", which is a driver
+        // refusing a workgroup that demands more subgroups than it can schedule. A phone taking this
+        // table's defaults got subgroup_matvec ON, which is the path that fails.
+        for a in ["Adreno (TM) 740", "Mali-G715", "Immortalis-G720", "Samsung Xclipse 940"] {
+            let d = device_defaults(a);
+            assert!(!d.subgroup_matvec, "{a} must not take the subgroup path");
+            assert_eq!(d.convert_chunk_blocks, 16384, "{a} has the same strict dispatch watchdog");
+        }
+    }
+
+    #[test]
+    fn apple_still_gets_them() {
+        let d = device_defaults("Apple M2 Max (G14C B1) [Vulkan]");
+        assert!(!d.subgroup_matvec);
+        assert_eq!(d.submit_batch, 16);
+    }
+
+    #[test]
+    fn a_desktop_card_keeps_the_FAST_defaults() {
+        // The other direction, and it matters as much: applying the conservative table everywhere
+        // costs every desktop the subgroup kernel for a watchdog it does not have.
+        for a in ["NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX", "Intel Arc A770"] {
+            let d = device_defaults(a);
+            assert!(d.subgroup_matvec, "{a} should keep the fast path");
+        }
+    }
+
     use super::*;
 
     #[test]

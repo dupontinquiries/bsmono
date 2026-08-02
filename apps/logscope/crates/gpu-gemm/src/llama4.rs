@@ -52,6 +52,33 @@ impl AttnTemp {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_temperature_parameters_are_DEFAULTS_not_constants() {
+        // floor_scale 8192 and attn_scale 0.1 are Llama-4's documented values, and the loader now
+        // reads {arch}.attention.floor_scale and .scale over them. Same class as nope_step being
+        // hardcoded to 4: a value the file carries, taken from a constant instead — and a wrong scale
+        // produces text that is merely WORSE, with every tensor and shape correct.
+        let d = AttnTemp::default();
+        assert_eq!(d.floor_scale, 8192.0);
+        assert_eq!(d.attn_scale, 0.1);
+        assert!(d.enabled);
+
+        // An overridden pair must actually change the scale, or reading metadata is decoration.
+        let mut o = AttnTemp::default();
+        o.floor_scale = 4096.0;
+        assert_ne!(o.scale(8192), d.scale(8192),
+            "a different floor must change the scale at the same position");
+    }
+
+    #[test]
+    fn the_scale_is_a_NO_OP_below_the_floor() {
+        // Short contexts must be bit-unaffected, or every existing short-prompt result would shift
+        // when this became metadata-driven.
+        let d = AttnTemp::default();
+        assert_eq!(d.scale(0), 1.0);
+        assert_eq!(d.scale(100), 1.0);
+    }
+
     use super::*;
 
     fn approx(a: f32, b: f32) -> bool { (a - b).abs() < 1e-6 }
