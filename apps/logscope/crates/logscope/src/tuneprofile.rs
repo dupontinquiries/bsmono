@@ -108,7 +108,14 @@ impl Default for Defaults {
             // 3072 x 8192 is the shape the 256-token chunk was originally tuned on.
             prefill_work_budget: 3072 * 8192 * 256,
             prefill_chunk_max: 256,
-            prefill_chunk_max_moe: 1024,
+            // LOWERED FROM 1024, which is measured to hang. Qwen3-30B took the raise to 1024, spent
+            // 37 s in prefill and then produced GPU timeouts at hundreds per second.
+            //
+            // 256 (the dense bound) is measured safe and 1024 is measured fatal; nothing between was
+            // tested, so 512 is a bounded guess rather than a derived value — and it is labelled as
+            // one. Clamping all the way back to 256 was my first fix and discards the whole FFN
+            // benefit, which is a real cost paid to avoid an unmeasured risk.
+            prefill_chunk_max_moe: 512,
             submit_batch: 16,
             min_verdict_margin: 0.05,
             subgroup_matvec: true,
@@ -165,6 +172,18 @@ impl Defaults {
             // sparsity = how much of the FFN each dispatch actually touches
             Some((n_expert, n_used)) if n_expert > n_used && n_used > 0 => {
                 let sparsity = (n_expert / n_used.max(1)) as u32;
+                // ATTENTION IS NOT SPARSE, and that is what this multiplier forgot.
+                //
+                // The FFN reasoning is sound: with 8 of 128 experts active each one sees ~1/16 of the
+                // tokens, so a 16x chunk restores its dispatch to a dense model's length and cuts the
+                // COUNT of tiny per-expert dispatches. But attention runs over every token in the
+                // chunk against the whole context, dense, on every layer — so the same 16x makes the
+                // ATTENTION dispatch sixteen times longer, which is precisely what the GPU watchdog
+                // kills.
+                //
+                // Observed: Qwen3-30B raised 256 -> 1024, prefill 37 s, then GPU timeouts at hundreds
+                // per second. The dense bound is the one attention was measured safe at, so the raise
+                // may reduce dispatch count and must not exceed it.
                 scaled.saturating_mul(sparsity).clamp(16, self.prefill_chunk_max_moe)
             }
             _ => scaled.clamp(16, self.prefill_chunk_max),
@@ -287,6 +306,21 @@ measurements will be taken again", path.display()))),
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_moe_chunk_raise_cannot_exceed_the_ATTENTION_bound() {
+        // The sparsity multiplier restores FFN dispatch length and says nothing about attention, which
+        // is dense over every token in the chunk on every layer. Qwen3-30B was raised 256 -> 1024 and
+        // the GPU watchdog fired at hundreds of timeouts per second.
+        let d = Defaults::default();
+        // 128 experts, 8 active: sparsity 16, which would multiply the chunk far past the dense bound.
+        let moe = d.prefill_chunk_moe(2048, 5472, false, Some((128, 8)));
+        let dense = d.prefill_chunk_moe(2048, 5472, false, None);
+        // The raise still helps — it must, or the FFN benefit is thrown away to avoid an unmeasured
+        // risk — but it cannot reach the value that was measured to hang.
+        assert!(moe > dense, "the raise still helps: {moe} vs dense {dense}");
+        assert!(moe <= 512, "and cannot reach 1024, which produced GPU timeouts: {moe}");
+    }
+
     #[test]
     fn a_MOBILE_gpu_gets_the_same_defaults_as_apple() {
         // The bug: this table and the engine's subgroup guard encode the same decision, and _358
