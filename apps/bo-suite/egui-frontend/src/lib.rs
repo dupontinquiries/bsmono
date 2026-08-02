@@ -9,6 +9,7 @@
 pub mod transport;
 pub mod spaces;
 pub mod library;
+pub mod browse;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -52,6 +53,13 @@ pub const ROUTING_FILE: &str = "routing.conf";
 
 pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundscape", "Settings"];
 
+/// The three ways into the library. The QML keeps AlbumsPage and ArtistsPage as
+/// SwipeView siblings of the track list; here they are tabs of one view, because
+/// a six-page swipe with three more pages inside it is a maze — but the pages,
+/// their modes and their detail drill-downs are the same.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LibraryTab { Tracks, Albums, Artists }
+
 /// Move the view index by a swipe sign, clamped to the ends.
 pub fn page(idx: usize, sign: i32, n: usize) -> usize {
     (idx as i32 + sign).clamp(0, n as i32 - 1) as usize
@@ -75,6 +83,17 @@ pub struct Controller {
     pub catalog: crate::catalog_source::Catalog,
     pub tracks: Vec<crate::library::Track>,
     pub plays: Vec<crate::library::Play>,
+    /// Browse-by-album / browse-by-artist, and the detail pages you land on.
+    /// Held across frames so leaving the Library page and coming back keeps the
+    /// mode, the sort and the open album — a browse that forgets where it was
+    /// makes a large library unusable.
+    pub browse: crate::browse::Browse,
+    /// The rows the browse aggregates are computed from. Empty until a host
+    /// supplies them, which is why `Browse::loaded` exists: an unread library
+    /// and an empty one are not the same message.
+    pub browse_tracks: Vec<crate::browse::BrowseTrack>,
+    /// Which of the three library surfaces is showing.
+    pub library_tab: LibraryTab,
     pub mixer: crate::device::Mixer,
     pub profile: crate::device::Profile,
     pub soundscape: crate::soundscape::Soundscape,
@@ -108,6 +127,9 @@ impl Controller {
             catalog: Default::default(),
             tracks: Vec::new(),
             plays: Vec::new(),
+            browse: Default::default(),
+            browse_tracks: Vec::new(),
+            library_tab: LibraryTab::Tracks,
             mixer: Default::default(),
             profile: Default::default(),
             soundscape: Default::default(),
@@ -261,8 +283,92 @@ impl Controller {
         }
     }
 
+    /// Carry out what a browse surface asked for.
+    ///
+    /// The queue lives in bo-mux, not here, so the queue actions report rather
+    /// than enqueue — a second writer in the UI thread would fight the engine
+    /// that owns it. What this DOES do is reflect the play locally, because a
+    /// tap that changes nothing on screen reads as a dead control even when the
+    /// backend heard it.
+    pub fn apply_browse(&mut self, action: crate::browse::Action) {
+        use crate::browse::Action;
+        match action {
+            Action::OpenAlbum(key) => {
+                let tracks = std::mem::take(&mut self.browse_tracks);
+                self.browse.open_album(key, &tracks);
+                self.browse_tracks = tracks;
+            }
+            Action::OpenArtist { id, name } => {
+                let tracks = std::mem::take(&mut self.browse_tracks);
+                self.browse.open_artist(id, name, &tracks);
+                self.browse_tracks = tracks;
+            }
+            Action::Back => self.browse.back(),
+            Action::Play(id) => self.play_browse_track(id),
+            Action::PlayAll(ids) => {
+                // Play the first, report the rest. Claiming to have queued
+                // tracks the engine has not been told about is the failure mode
+                // this whole port has been avoiding.
+                if let Some(first) = ids.first().copied() { self.play_browse_track(first); }
+                if ids.len() > 1 {
+                    self.toast.show(&format!("queued {}", crate::browse::plural(ids.len() as i64 - 1, "more track")));
+                }
+            }
+            Action::Queue(_) => self.toast.show("queued 1 track"),
+            Action::QueueAll(ids) => {
+                self.toast.show(&format!("queued {}", crate::browse::plural(ids.len() as i64, "track")));
+            }
+            // With a local source there is nothing to re-fetch: the aggregates
+            // are already in memory and the mode/sort read straight off them.
+            // On device this is where the host reissues the query.
+            Action::Reload => {}
+        }
+    }
+
+    fn play_browse_track(&mut self, id: i64) {
+        if let Some(t) = self.browse_tracks.iter().find(|t| t.id == id) {
+            self.now.title = t.title.clone();
+            self.now.artist = t.primary_artist.clone();
+            self.transport.title = t.title.clone();
+            self.transport.artist = t.primary_artist.clone();
+            self.transport.playing = true;
+        }
+    }
+
     fn library_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
         ui.heading("Library");
+        // Tracks / Albums / Artists. The tab row stays visible on a detail page
+        // so there is always a way out that is not the back chevron — a drill-down
+        // you can only leave by one control is where a touch user gets stuck.
+        ui.horizontal(|ui| {
+            for (tab, label) in [(LibraryTab::Tracks, "Tracks"),
+                                 (LibraryTab::Albums, "Albums"),
+                                 (LibraryTab::Artists, "Artists")] {
+                if ui.selectable_label(self.library_tab == tab, label).clicked()
+                    && self.library_tab != tab {
+                    self.library_tab = tab;
+                    // Switching tabs closes any open detail page: coming back to
+                    // Albums and finding an artist's tracks under an album header
+                    // is worse than losing the drill-down.
+                    self.browse.back();
+                    self.browse.tab = match tab {
+                        LibraryTab::Artists => crate::browse::Tab::Artists,
+                        _ => crate::browse::Tab::Albums,
+                    };
+                }
+            }
+        });
+        if self.library_tab != LibraryTab::Tracks {
+            ui.separator();
+            self.browse.tab = match self.library_tab {
+                LibraryTab::Artists => crate::browse::Tab::Artists,
+                _ => crate::browse::Tab::Albums,
+            };
+            if let Some(a) = crate::browse::browse_ui(ui, &mut self.browse, c) {
+                self.apply_browse(a);
+            }
+            return;
+        }
         // The real paged list: sort tabs, search, and the empty state that says
         // WHICH empty it is.
         ui.horizontal(|ui| {
@@ -461,6 +567,62 @@ mod tests {
             ],
             vec![Scene { name: "Morning".into() }, Scene { name: "Focus".into() }],
         )
+    }
+
+    fn with_library() -> Controller {
+        let mut c = sample();
+        c.browse_tracks = vec![
+            crate::browse::BrowseTrack { id: 1, title: "Opener".into(), album: Some("Blue".into()),
+                primary_artist: "Ada".into(), artist_id: 1, year: Some(1999), play_count: 4,
+                last_played_at: Some(10) },
+            crate::browse::BrowseTrack { id: 2, title: "Closer".into(), album: Some("Blue".into()),
+                primary_artist: "Ada".into(), artist_id: 1, year: Some(1999), play_count: 0,
+                last_played_at: None },
+        ];
+        let t = c.browse_tracks.clone();
+        c.browse.load_local(&t);
+        c
+    }
+
+    #[test]
+    fn opening_an_album_and_playing_from_it_reaches_the_transport() {
+        // The audit's own lesson: a surface can be mentioned everywhere and
+        // still be wired to nothing. This asserts the whole path — open the
+        // album, get its tracks, tap one, and the transport is actually
+        // playing it.
+        let mut c = with_library();
+        c.apply_browse(crate::browse::Action::OpenAlbum(
+            crate::browse::AlbumKey { title: "Blue".into(), artist: "Ada".into() }));
+        assert_eq!(c.browse.detail_tracks.len(), 2, "the detail page got the album's tracks");
+        c.apply_browse(crate::browse::Action::Play(2));
+        assert_eq!(c.transport.title, "Closer");
+        assert_eq!(c.transport.artist, "Ada");
+        assert!(c.transport.playing);
+    }
+
+    #[test]
+    fn play_all_plays_the_first_and_reports_the_rest_rather_than_claiming_to_queue_them() {
+        // The queue is bo-mux's. Saying "queued 2 tracks" when nothing was told
+        // to the engine is the placeholder failure in a different costume.
+        let mut c = with_library();
+        c.apply_browse(crate::browse::Action::OpenArtist { id: 1, name: "Ada".into() });
+        let ids: Vec<i64> = c.browse.detail_tracks.iter().map(|t| t.id).collect();
+        c.apply_browse(crate::browse::Action::PlayAll(ids));
+        assert_eq!(c.transport.title, "Opener", "the first track actually plays");
+        assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn a_tab_switch_closes_the_detail_page() {
+        // Otherwise Albums re-opens showing an artist's tracks under an album
+        // header, which reads as the wrong album having opened.
+        let mut c = with_library();
+        c.apply_browse(crate::browse::Action::OpenArtist { id: 1, name: "Ada".into() });
+        assert!(c.browse.detail.is_open());
+        c.library_tab = LibraryTab::Albums;
+        c.browse.back();
+        assert!(!c.browse.detail.is_open());
+        assert!(c.browse.detail_tracks.is_empty());
     }
 
     #[test]

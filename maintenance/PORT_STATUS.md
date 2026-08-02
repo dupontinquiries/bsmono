@@ -16,14 +16,19 @@ Three things, because a port can be "done" and still reach nobody:
 
 ## Current state
 
+Snapshot of the last `parity_audit.py` run. It is a snapshot and it will drift —
+the tool is the truth, and this table exists so a reader who has not run it can
+see roughly where things stand.
+
 | port | surfaces | covered | bin | catalogued | primary |
 |---|---|---|---|---|---|
-| bo-suite | 46 | 2% | yes | yes | — |
+| bo-suite | 47 | 51% | yes | yes | — |
 | bot-arena | 2 | 50% | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
-| snapclone | 38 | 13% | yes | yes | — |
-| voiceterm | 32 | 25% | yes | yes | **yes** |
+| snapclone | 38 | 32% | yes | yes | — |
+| voiceterm | 32 | 34% | yes | yes | **yes** |
+| krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
 
 **Every port compiles.** That was worth establishing before anything else,
@@ -62,9 +67,13 @@ over-counts.
 
 ## Where the work is
 
-`bo-suite` at 2% of 46 surfaces is the least-started port and the biggest single
-gap. `snapclone` at 13% of 38 has the most surfaces of any real Qt app. Both
-have concrete next-surface lists.
+`snapclone` at 32% of 38 now has the largest untouched surface area of any real
+Qt app, and its port is still mostly a nav bar (see below). `voiceterm` at 34%
+of 32 is second and still has no text input. `bo-suite`, which was the biggest
+gap at 2%, is at 51% after the transport / spaces / mixer / soundscape /
+settings / safety / scroll-feel passes and the browse pages (albums and artists,
+with their detail drill-downs). Each has a concrete next-surface list at the
+bottom of an audit run.
 
 `studio` (the kdenlive/Audacity work) is not in this table because it is not a
 *port* of an existing frontend — it is a new application with seven crates and
