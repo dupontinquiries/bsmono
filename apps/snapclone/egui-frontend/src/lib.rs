@@ -18,6 +18,7 @@ pub mod conversation;
 pub mod composer;
 pub mod group_voice;
 pub mod settings_page;
+pub mod settings_store;
 pub mod inbox;
 pub mod unified_nav;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
@@ -46,6 +47,8 @@ pub struct Snapclone {
     /// found — shown as such rather than as an empty preview, because a black
     /// rectangle and a missing device look identical.
     pub camera: Option<crate::camera_source::CameraChoice>,
+    /// Why the last save failed, if it did.
+    pub settings_error: Option<String>,
     pub inbox: crate::inbox::Inbox,
     pub composer: crate::composer::Composer,
     pub settings: crate::settings_page::SettingsPage,
@@ -79,9 +82,12 @@ impl Snapclone {
         Snapclone {
             viewfinder: Default::default(),
             camera: None,
+            settings_error: None,
             inbox: Default::default(),
             composer: Default::default(),
-            settings: crate::settings_page::SettingsPage::new(Default::default()),
+            // Load from disk rather than defaults: a settings page that starts
+            // blank every launch is the same lie as one that never saved.
+            settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
             group_voice: Default::default(),
             picker: Default::default(),
             conversation: Default::default(),
@@ -253,6 +259,19 @@ impl Snapclone {
         // background styles. The background picker stays as an appearance
         // control, but it is no longer the whole page.
         crate::settings_page::settings_ui(ui, &mut self.settings, c);
+        // Persist. The io error is SHOWN rather than swallowed — a Save that
+        // silently fails is the same lie as one that never wrote, and a
+        // read-only config dir is a real thing on locked-down devices.
+        if ui.add_enabled(self.settings.is_dirty(), egui::Button::new("Save to disk")).clicked() {
+            self.settings.save();
+            match crate::settings_store::store(&self.settings.current) {
+                Ok(()) => self.settings_error = None,
+                Err(e) => self.settings_error = Some(format!("could not save: {e}")),
+            }
+        }
+        if let Some(err) = &self.settings_error {
+            ui.colored_label(c.warning, err);
+        }
         ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.colored_label(c.text_weak, "background:");
