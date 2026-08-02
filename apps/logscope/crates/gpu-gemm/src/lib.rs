@@ -363,6 +363,15 @@ pub struct SubmitCauseSnapshot {
 }
 
 impl SubmitCauseSnapshot {
+    /// Downloads since an earlier snapshot.
+    ///
+    /// Exposed so the profile can check itself: every download maps a buffer and every map polls, so
+    /// a poll count below the download count means one of the two counters is not measuring what its
+    /// name says.
+    pub fn downloads_since(&self, since: &SubmitCauseSnapshot) -> u64 {
+        self.download.saturating_sub(since.download)
+    }
+
     pub fn now() -> SubmitCauseSnapshot {
         use std::sync::atomic::Ordering::Relaxed;
         SubmitCauseSnapshot {
