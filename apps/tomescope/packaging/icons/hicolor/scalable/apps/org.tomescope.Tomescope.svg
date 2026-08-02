@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- org.tomescope.Tomescope application icon. Scalable, so one file serves
+     every size a launcher asks for. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#171310"/>
+  <path d="M28 34h30a8 8 0 0 1 6 3 8 8 0 0 1 6-3h30v58H70a8 8 0 0 0-6 3 8 8 0 0 0-6-3H28z"
+        fill="none" stroke="#E0C68A" stroke-width="5" stroke-linejoin="round"/>
+  <path d="M64 40v54" stroke="#E0C68A" stroke-width="5"/>
+</svg>

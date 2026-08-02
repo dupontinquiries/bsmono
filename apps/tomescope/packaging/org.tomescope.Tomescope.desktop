@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Tomescope
+GenericName=Ebook Reader
+Comment=Read EPUB, PDF, CBZ and more, with highlights, notes and flashcards
+Exec=tomescope %f
+Icon=org.tomescope.Tomescope
+Terminal=false
+Categories=Office;Viewer;Literature;
+Keywords=ebook;epub;pdf;comic;cbz;reader;books;
+StartupNotify=true
+StartupWMClass=org.tomescope.Tomescope
+MimeType=application/epub+zip;application/pdf;application/x-cbz;application/x-cbr;application/x-fictionbook+xml;text/markdown;text/html;text/plain;

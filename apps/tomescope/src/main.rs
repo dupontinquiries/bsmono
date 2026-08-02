@@ -12,11 +12,27 @@ use tomescope::reader::ReaderState;
 use tomescope::stats::{ActiveSession, StatsLog};
 use tomescope::study::Deck;
 use tomescope::theme::ReaderPrefs;
-use uikit_egui::{apply_prefs, fuzzy, palette_colors, Adaptive, LiveBackground, Nav, Toasts};
+// Toasts moved into its own module when it was promoted to the shared kit; the
+// root re-export went away.
+use uikit_egui::toast::Toasts;
+use uikit_egui::{apply_prefs, fuzzy, palette_colors, Adaptive, LiveBackground, Nav};
+
+/// Must match `packaging/org.tomescope.Tomescope.desktop` exactly.
+const APP_ID: &str = "org.tomescope.Tomescope";
 
 fn main() -> eframe::Result<()> {
+    // `Exec=tomescope %f` means a double-clicked EPUB arrives here. Taking the
+    // FIRST non-flag argument rather than all of them: %f is single-file by
+    // definition (%F is the multi-file form), and opening five readers because
+    // someone selected five books is not what they asked for.
+    let open_path: Option<std::path::PathBuf> = std::env::args_os()
+        .skip(1)
+        .map(std::path::PathBuf::from)
+        .find(|p| !p.to_string_lossy().starts_with('-'));
+
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
+            .with_app_id(APP_ID)
             .with_title("Tomescope")
             .with_inner_size([1180.0, 820.0])
             .with_min_inner_size([420.0, 480.0]),
@@ -24,9 +40,18 @@ fn main() -> eframe::Result<()> {
     };
 
     eframe::run_native(
-        "tomescope",
+        APP_ID,
         native_options,
-        Box::new(|cc| Ok(Box::new(TomeApp::new(cc)))),
+        Box::new(move |cc| {
+            let mut app = TomeApp::new(cc);
+            if let Some(p) = open_path {
+                // A path that does not exist, or is not a book, must not take
+                // the app down — a file manager can hand us anything, and the
+                // library is a perfectly good place to land.
+                app.open_from_path(&p);
+            }
+            Ok(Box::new(app))
+        }),
     )
 }
 
@@ -102,7 +127,7 @@ impl TomeApp {
 
         Self {
             library,
-            textures: TextureCache::default(),
+            textures: TextureCache::new(64),
             toasts: Toasts::new(),
             nav: Nav::new(4),
             adaptive: Adaptive::detect(&cc.egui_ctx),
@@ -145,6 +170,22 @@ impl TomeApp {
             info_open: false,
 
             last_frame_time: 0.0,
+        }
+    }
+
+    /// Open a file handed to us by a file manager.
+    ///
+    /// Imports it if the library has not seen it, then opens by id — so a book
+    /// you have read before lands on the entry holding your position and
+    /// highlights rather than a fresh duplicate that has neither.
+    pub fn open_from_path(&mut self, path: &std::path::Path) {
+        let covers = persist::covers_dir();
+        match self.library.import_file(path, &covers) {
+            Some(id) => self.open_book_by_id(id),
+            // Not fatal: a file manager can hand us anything, and the library is
+            // a perfectly good place to land.
+            None => self.toasts.error(
+                format!("Could not open {}", path.display()), now()),
         }
     }
 
@@ -241,8 +282,8 @@ impl TomeApp {
                 .selected_text(self.sort_key.label())
                 .show_ui(ui, |ui| {
                     for key in SortKey::all() {
-                        if ui.selectable_label(self.sort_key == *key, key.label()).clicked() {
-                            self.sort_key = *key;
+                        if ui.selectable_label(self.sort_key == key, key.label()).clicked() {
+                            self.sort_key = key;
                         }
                     }
                 });
@@ -619,6 +660,12 @@ fn now() -> f64 {
 }
 
 impl eframe::App for TomeApp {
+    // The fleet's eframe convention requires ui(); this app predates it and
+    // drives everything from update(), which is still called. An empty ui() is
+    // the honest adapter — moving the body would be a rewrite this commit is
+    // not.
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.adaptive = Adaptive::detect(ctx);
         let colors = palette_colors(&self.app_palette);

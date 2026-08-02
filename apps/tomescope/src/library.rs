@@ -199,6 +199,58 @@ impl Library {
     }
 
     /// Walk every scan root, probing new files and re-linking known ones.
+    /// Import ONE file, for a book opened from a file manager.
+    ///
+    /// `Exec=tomescope %f` in the desktop entry means a double-clicked EPUB
+    /// arrives as argv, and books open by library id — so a file that is not in
+    /// the library yet has to be added before it can be read. Without this the
+    /// entry launches the app and shows the library, which looks exactly like
+    /// the association not working.
+    ///
+    /// Returns the id, whether the file was already known or not. **Already
+    /// known is a success**: opening a book you have read before must land in
+    /// the library entry that holds your position and highlights, not create a
+    /// duplicate that has neither.
+    pub fn import_file(&mut self, path: &Path, covers_dir: &Path) -> Option<u64> {
+        let meta = std::fs::metadata(path).ok()?;
+        if !meta.is_file() { return None; }
+        let id = book_id(path, meta.len());
+        if self.books.iter().any(|b| b.id == id) { return Some(id); }
+
+        let probe = crate::formats::probe(path).ok()?;
+        let cover_file = probe.cover.as_ref().and_then(|c| {
+            let ext = if c.bytes.starts_with(&[0x89, b'P']) { "png" } else { "jpg" };
+            let file = covers_dir.join(format!("{id:016x}.{ext}"));
+            std::fs::create_dir_all(covers_dir).ok()?;
+            std::fs::write(&file, &c.bytes).ok()?;
+            Some(file)
+        });
+        self.books.push(BookRecord {
+            id,
+            path: path.to_path_buf(),
+            format: probe.format,
+            title: probe.title,
+            authors: probe.authors,
+            series: probe.series,
+            year: probe.year,
+            language: probe.language,
+            publisher: probe.publisher,
+            isbn: probe.isbn,
+            description: probe.description,
+            tags: Vec::new(),
+            file_size: meta.len(),
+            added_unix: crate::util::now_unix(),
+            cover_file,
+            last_open_unix: None,
+            position: Locus::START,
+            raster_page: 0,
+            percent: 0.0,
+            finished: false,
+            rating: 0,
+        });
+        Some(id)
+    }
+
     pub fn scan(&mut self, covers_dir: &Path) -> ScanReport {
         let mut report = ScanReport { added: 0, updated: 0, missing: 0, errors: Vec::new() };
         let mut seen: HashMap<PathBuf, u64> = HashMap::new();

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.tomescope.Tomescope</id>
+  <name>Tomescope</name>
+  <summary>Ebook and comic reader with notes and flashcards</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Tomescope reads EPUB, PDF, CBZ, FB2, Markdown, HTML and plain text, and
+       keeps what you make of them alongside the books.</p>
+    <ul>
+      <li>Highlights and margin notes that survive a reflow</li>
+      <li>Flashcards with spaced repetition, made from what you highlighted</li>
+      <li>Library shelves, reading stats and OPDS import</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.tomescope.Tomescope.desktop</launchable>
+  <provides>
+    <mediatype>application/epub+zip</mediatype>
+    <mediatype>application/pdf</mediatype>
+    <mediatype>application/x-cbz</mediatype>
+  </provides>
+  <releases>
+    <release version="0.1.0" date="2026-08-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>
