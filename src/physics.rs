@@ -78,6 +78,8 @@ pub struct Car {
     dodge_start: Quat,
     dodge_len: f32,
     dodge_roll: f32,
+    /// how much STEER went into choosing this dodge's direction
+    dodge_steer: f32,
     dodge_turn: f32,
     dodge_cancel: bool,
     reset_cd: f32,
@@ -116,6 +118,7 @@ impl Car {
             dodge_start: Quat::IDENTITY,
             dodge_len: 0.62,
             dodge_roll: 0.0,
+            dodge_steer: 0.0,
             dodge_turn: 0.0,
             dodge_cancel: false,
             reset_cd: 0.0,
@@ -1015,6 +1018,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                 car.dodge_timer = car.dodge_len;
                 car.dodge_start = car.rot;
                 car.dodge_roll = 0.0;
+                car.dodge_steer = c.steer.abs().min(1.0);
                 car.dodge_turn = 0.0;
                 car.dodge_cancel = false;
                 let yaw_only = yaw_quat(car.rot);
@@ -1071,7 +1075,19 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             }
             // air roll layers ON TOP (the half-flip's 180) without stealing
             // from the flip's own rotation
-            car.dodge_roll += c.roll * 5.0 * dt;
+            // ONE INPUT, ONE ROTATION. With powerslide held, steer is also
+            // the air-roll axis — so a forward-right flip spent the same
+            // stick twice: once choosing the dodge's diagonal direction and
+            // again as barrel roll layered on top, which over a 0.78 s dodge
+            // is another 220 degrees. It read as flipping twice.
+            //
+            // The roll passthrough is now scaled down by however much steer
+            // went into the dodge itself. A diagonal dodge consumed the
+            // steer axis and gets no roll from it; a straight forward or
+            // back dodge did not, so it keeps the full passthrough — which
+            // is what the half-flip needs.
+            let roll_share = (1.0 - car.dodge_steer).clamp(0.0, 1.0);
+            car.dodge_roll += c.roll * 5.0 * dt * roll_share;
             car.rot = (car.dodge_start
                 * Quat::from_axis_angle(car.dodge_axis, car.dodge_turn)
                 * Quat::from_rotation_z(car.dodge_roll))

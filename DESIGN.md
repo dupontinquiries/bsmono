@@ -2390,6 +2390,36 @@ vertices than the old sphere: it has slightly fewer, and that says nothing
 — a torus is not a worse shape for being efficient. The real question is
 whether it is disc-shaped, so that is what the harness asks now.
 
+## v1.74.0 — one input, one rotation
+
+Reported: flipping forward-and-right while HOLDING POWERSLIDE flips twice,
+where the same input without powerslide flips once, correctly.
+
+The cause is that powerslide is the air-roll modifier, so with it held the
+steer axis feeds two things at once. A forward-right dodge spends steer
+choosing its diagonal direction, and then the very same stick arrives again
+as barrel roll layered on top of the scripted flip — 5 rad/s over a 0.78 s
+dodge is another 220 degrees. Hence "double".
+
+The roll passthrough exists on purpose (it is what makes a half-flip
+possible), so the fix is not to remove it but to stop double-counting: the
+passthrough is now scaled by however much steer went into the dodge itself.
+A diagonal dodge consumed the steer axis and gets no roll from it; a
+straight forward or back dodge did not, so it keeps the full passthrough.
+
+Measured in `--sim flip`, total rotation with and without powerslide:
+
+    forward+right      411 deg -> 411 deg   (delta 0)
+    forward            357 deg -> 357 deg   (delta 0)
+    back (half-flip)   357 deg -> 512 deg   (delta 155, as it should be)
+
+The harness needed two fixes of its own before it could tell the truth. It
+spawned the car six metres up, where the first jump does nothing and no
+dodge ever fires — so it was measuring free air roll rather than a flip.
+And it applied the roll as `-steer`, which is zero for a pure backflip, so
+the half-flip case exercised nothing: a half-flip dodges straight back and
+rolls AFTER the flip has started, so the roll is its own input.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

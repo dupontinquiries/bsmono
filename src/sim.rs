@@ -3486,6 +3486,76 @@ pub fn run(args: &[String]) {
                 );
             }
         }
+        // ---- POWERSLIDE MUST NOT DOUBLE THE FLIP ----
+        // Holding slide turns steer into air roll, and a diagonal dodge has
+        // already spent steer on its direction. Unless the passthrough is
+        // scaled, the same stick rotates the car twice.
+        let mut ok_all = true;
+        println!();
+        println!("{:<22} {:>10} {:>10} {:>9}", "input", "plain", "+slide", "delta");
+        // The third value is the roll applied WHILE the flip runs. For a
+        // diagonal dodge that is the steer axis itself (powerslide maps it
+        // to roll, which is the bug). For a half-flip you dodge straight
+        // back and only then roll — so the roll is its own input.
+        for (label, thr, st, roll) in [
+            ("forward+right", 1.0f32, 1.0f32, -1.0f32),
+            ("forward", 1.0, 0.0, 0.0),
+            ("back (half-flip)", -1.0, 0.0, -1.0),
+        ] {
+            let turn_of = |slide: bool| -> f32 {
+                let world = World::generate(9, crate::world::style(ARENA), 0.31, 1.0);
+                let ball = Ball::new();
+                let cfg = Config::default();
+                let mut car = physics::Car::new();
+                // A dodge needs a GROUND jump first — spawned in mid-air the
+                // first press does nothing and no flip ever fires, so this
+                // was measuring free air roll rather than a flip.
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+                car.sync_rot();
+                let mut c = physics::Controls::default();
+                for _ in 0..20 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                c.jump_pressed = true;
+                c.jump_held = true;
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                c.jump_pressed = false;
+                for _ in 0..10 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                c.throttle = thr;
+                c.steer = st;
+                c.roll = if slide { roll } else { 0.0 };
+                c.jump_pressed = true;
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                c.jump_pressed = false;
+                let mut total = 0.0f32;
+                let mut prev = car.rot;
+                for _ in 0..140 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                    let (_, mut d) = (car.rot * prev.inverse()).normalize().to_axis_angle();
+                    if d > std::f32::consts::PI {
+                        d -= std::f32::consts::TAU;
+                    }
+                    total += d.abs();
+                    prev = car.rot;
+                }
+                total.to_degrees()
+            };
+            let plain = turn_of(false);
+            let slid = turn_of(true);
+            let delta = (slid - plain).abs();
+            println!("{:<22} {:>9.0}d {:>9.0}d {:>8.0}d", label, plain, slid, delta);
+            if label == "forward+right" && delta >= 60.0 {
+                ok_all = false;
+                println!("   powerslide DOUBLES a diagonal flip");
+            }
+            if label == "back (half-flip)" && delta <= 90.0 {
+                ok_all = false;
+                println!("   the half-flip lost its air roll");
+            }
+        }
+        println!("{}", if ok_all { "FLIPS: PASS" } else { "FLIPS: FAIL" });
         return;
     }
     if name == "mech" {
