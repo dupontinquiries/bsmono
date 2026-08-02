@@ -10253,6 +10253,34 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         self.byte_probe_with(raw, BYTE_PROBE_VEC4)
     }
 
+    /// Native IQ1_S mat-vec: `c[n] = w[n,k] · a[k]`, reading the checkpoint's 50-byte super-blocks.
+    ///
+    /// Uploads the 2048-entry ternary codebook alongside the weights. 16 KiB, once per call here —
+    /// a resident path would hold it for the model's life, since it is the same grid for every IQ1_S
+    /// tensor and every layer.
+    pub fn matvec_iq1_s(&self, a: &[f32], raw: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let at = self.upload(a, 1, k);
+        let wt = self.upload_bytes(raw, "iq1s-weights");
+        // The grid as u32 pairs: entry i is (low 4 signed bytes, high 4). Packed here rather than in
+        // the shader because it is constant for the process and unpacking it per dispatch would be
+        // 16 KiB of work per matvec.
+        let mut grid = Vec::with_capacity(4096);
+        for e in crate::iq1s_grid::IQ1S_GRID.iter() {
+            grid.push((*e & 0xFFFF_FFFF) as u32);
+            grid.push((*e >> 32) as u32);
+        }
+        let gt = self.upload_bytes(bytemuck::cast_slice(&grid), "iq1s-grid");
+        let out = self.alloc(1, n);
+        let gx = (n as u32).min(32768);
+        let gy = (n as u32).div_ceil(gx);
+        let dims = [1u32, n as u32, k as u32, (k / 256) as u32, gx, 0, 0, 0];
+        let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, view: None };
+        let gten = Tensor { buf: gt, rows: 1, cols: grid.len(), pool: None, view: None };
+        self.dispatch(MATVEC_IQ1_S, &[&at, &wten, &gten], &out,
+                      bytemuck::cast_slice(&dims), (gx, gy, 1));
+        self.download(&out)
+    }
+
     pub fn byte_probe(&self, raw: &[u8]) -> Vec<f32> { self.byte_probe_with(raw, BYTE_PROBE) }
 
     /// Upload bytes and read them straight back, with NO shader involved.
@@ -12927,6 +12955,90 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
     let i = g.x;
     if (i >= dims.x) { return; }
     dst[i] = f32(i);
+}
+"#;
+
+/// IQ1_S mat-vec, reading the checkpoint's own 50-byte super-blocks.
+///
+/// ## Why a native kernel rather than a conversion
+///
+/// The engine converts every source format to q4 before running. For Q4_K that is size-neutral. For
+/// IQ1_S it is a **2.88× expansion** — 25 GiB of GLM-5.2 becomes 71.5 GiB — which is the entire
+/// reason that model does not fit on a 63 GiB machine. Converting up cannot recover quality the
+/// checkpoint already discarded; it only spends the memory.
+///
+/// ## Layout, from `gguf.rs`'s dequantizer rather than from the spec
+///
+/// 50 bytes per 256 weights: `d` as f16, 32 bytes of `qs`, then eight `u16` of `qh`. Each group of 8
+/// weights takes an **11-bit** codebook index — 8 bits from `qs`, 3 more from `qh` at a per-group
+/// offset — into 2048 ternary entries. Per 32-weight sub-block `qh` also carries a 3-bit scale
+/// (`dl = d·(2s+1)`) and a sign bit selecting `±IQ1S_DELTA`.
+///
+/// The grid arrives as a storage buffer of `u32` pairs: entry `i` is `grid[2i]` (values 0..3) and
+/// `grid[2i+1]` (values 4..7), each byte a signed ternary value.
+///
+/// ## Activations stay f32
+///
+/// The weights are ternary, so the product is a select-and-add and there is nothing for an integer
+/// path to accelerate. That is the opposite of the Q8_0 case where the integer dot was worth 2×.
+pub const MATVEC_IQ1_S: &str = r#"
+struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, pad0:u32, pad1:u32, pad2:u32 };
+@group(0) @binding(0) var<storage, read> a: array<f32>;      // activations [k]
+@group(0) @binding(1) var<storage, read> w: array<u32>;      // IQ1_S blocks, 50 B per 256
+@group(0) @binding(2) var<storage, read> grid: array<u32>;   // 2048 entries, 2 u32 each
+@group(0) @binding(3) var<storage, read_write> c: array<f32>;
+@group(0) @binding(4) var<uniform> d: D;
+
+// Byte at absolute offset `i` of the weight blob. IQ1_S rows are 50-byte multiples, which is NOT a
+// multiple of 4, so a row does not start on a word boundary and every read must go through here.
+fn wbyte(i: u32) -> u32 { return (w[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+fn whalf(i: u32) -> u32 { return wbyte(i) | (wbyte(i + 1u) << 8u); }
+
+// f16 -> f32. The scale is the only float in the block and it is half-precision.
+fn f16(h: u32) -> f32 {
+    let sgn = f32(1 - i32((h >> 15u) & 1u) * 2);
+    let exp = (h >> 10u) & 0x1Fu;
+    let man = h & 0x3FFu;
+    if (exp == 0u) { return sgn * f32(man) * 5.9604645e-8; }
+    if (exp == 31u) { return sgn * 65504.0; }
+    return sgn * exp2(f32(i32(exp) - 15)) * (1.0 + f32(man) / 1024.0);
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let row = g.x + g.y * d.gx;
+    if (row >= d.n) { return; }
+    let nblk = d.k / 256u;
+    let rowbase = row * nblk * 50u;          // 50 bytes per 256 weights
+    // Two accumulator chains: every FMA otherwise waits on the previous one, which serialises the
+    // loop to iterations x latency regardless of available bandwidth. Colibri's int8 matvec does the
+    // same on NEON, and here k is thousands rather than tens.
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    for (var b = 0u; b < nblk; b = b + 1u) {
+        let blk = rowbase + b * 50u;
+        let dsc = f16(whalf(blk));
+        for (var ib = 0u; ib < 8u; ib = ib + 1u) {
+            let h = whalf(blk + 34u + 2u * ib);
+            let dl = dsc * f32(2u * ((h >> 12u) & 7u) + 1u);
+            var delta = 0.125;
+            if ((h & 0x8000u) != 0u) { delta = -0.125; }
+            for (var l = 0u; l < 4u; l = l + 1u) {
+                // 11-bit index: 8 bits from qs, 3 from qh at this group's offset.
+                let idx = wbyte(blk + 2u + ib * 4u + l) | (((h >> (3u * l)) & 7u) << 8u);
+                let lo = grid[idx * 2u];
+                let hi = grid[idx * 2u + 1u];
+                let base = b * 256u + ib * 32u + l * 8u;
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    let tl = f32(i32((lo >> (8u * j)) & 0xFFu) << 24u >> 24u);
+                    let th = f32(i32((hi >> (8u * j)) & 0xFFu) << 24u >> 24u);
+                    acc0 = acc0 + a[base + j] * (tl + delta) * dl;
+                    acc1 = acc1 + a[base + 4u + j] * (th + delta) * dl;
+                }
+            }
+        }
+    }
+    c[row] = acc0 + acc1;
 }
 "#;
 
