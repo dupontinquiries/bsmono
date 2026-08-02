@@ -187,3 +187,107 @@ mod tests {
         assert_eq!(b.owner(1), Some(1));
     }
 }
+
+impl Batch {
+    /// The rows to run this step, given what the device can take.
+    ///
+    /// `Batch` tracks WHO is still generating and `batchplan` decides HOW MANY may share a dispatch;
+    /// neither was joined to the other, so a call site would have had to know both. This is the single
+    /// question a caller should ask: *how many seats do I run this pass, and which*.
+    ///
+    /// Members that have finished are excluded — a done seat contributes no row, and padding the batch
+    /// to a fixed width would spend a slot computing tokens nobody reads. That is the ragged part, and
+    /// it is why a panel whose debaters finish at different lengths still batches usefully near the end
+    /// rather than degrading to one live row plus filler.
+    ///
+    /// Returns `None` when there is nothing worth batching — one live seat, or none. The caller then
+    /// takes its ordinary single-stream path rather than a batch loop with one element.
+    pub fn plan_step(&self, plan: impl Fn(usize) -> crate::batchplan::BatchPlan)
+        -> Option<(crate::batchplan::BatchPlan, Vec<usize>)>
+    {
+        let live: Vec<usize> = self.seats.iter().enumerate()
+            .filter(|(_, s)| !s.done).map(|(i, _)| i).collect();
+        if live.len() < 2 { return None; }
+        let p = plan(live.len());
+        if !p.worth_it() { return None; }
+        // Take the first `width` live seats. Round-robin fairness across steps is `advance`'s job;
+        // this only decides who is in THIS dispatch, and taking a prefix keeps the mapping from row
+        // index to member trivially invertible — which matters because a wrong row-to-member mapping
+        // attributes one member's token to another and reads as a model producing nonsense.
+        Some((p, live.into_iter().take(p.width).collect()))
+    }
+}
+
+#[cfg(test)]
+mod plan_step_tests {
+    use super::*;
+    use crate::batchplan;
+
+    fn unconstrained(rows: usize) -> batchplan::BatchPlan { batchplan::plan(rows, None) }
+    fn watchdogged(rows: usize) -> batchplan::BatchPlan { batchplan::plan(rows, Some(3)) }
+
+    #[test]
+    fn a_five_seat_panel_runs_all_five_in_one_step() {
+        let b = Batch::new(5, 0);
+        let (p, rows) = b.plan_step(unconstrained).expect("worth batching");
+        assert_eq!(p.width, 5);
+        assert_eq!(rows, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn FINISHED_seats_are_excluded_rather_than_padded() {
+        // Padding to a fixed width spends a slot computing tokens nobody reads. A panel whose debaters
+        // finish at different lengths should keep batching the ones still going.
+        let mut b = Batch::new(5, 0);
+        b.finish(1);
+        b.finish(3);
+        let (p, rows) = b.plan_step(unconstrained).expect("three still live");
+        assert_eq!(p.width, 3);
+        assert_eq!(rows, vec![0, 2, 4], "the live seats, by their own indices");
+    }
+
+    #[test]
+    fn ONE_live_seat_is_not_batched() {
+        // The caller takes its ordinary path: same work, less machinery, and no row-mapping to get
+        // wrong.
+        let mut b = Batch::new(3, 0);
+        b.finish(0);
+        b.finish(2);
+        assert!(b.plan_step(unconstrained).is_none());
+    }
+
+    #[test]
+    fn a_watchdog_narrows_the_step_and_leaves_the_rest_for_later() {
+        // Five live seats on a device that survives three: run three now. The remaining two are still
+        // live and will be picked up next step — narrowing a dispatch delays work, it does not drop it.
+        let b = Batch::new(5, 0);
+        let (p, rows) = b.plan_step(watchdogged).expect("worth batching");
+        assert_eq!(p.width, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(p.passes, 2, "five seats at width three is two passes");
+        assert!(!b.all_done(), "and nobody was finished by planning");
+    }
+
+    #[test]
+    fn an_empty_or_finished_batch_plans_nothing() {
+        let mut b = Batch::new(2, 0);
+        b.finish(0);
+        b.finish(1);
+        assert!(b.all_done());
+        assert!(b.plan_step(unconstrained).is_none());
+    }
+
+    #[test]
+    fn the_row_to_member_mapping_stays_invertible() {
+        // A wrong mapping attributes one member's token to another, which reads as a model producing
+        // nonsense rather than as a batching bug — so the rows returned must be exactly the seats the
+        // caller will read back, in order.
+        let mut b = Batch::new(6, 0);
+        b.finish(2);
+        let (_, rows) = b.plan_step(unconstrained).unwrap();
+        for (row, &member) in rows.iter().enumerate() {
+            assert!(!b.seats[member].done, "row {row} maps to a live seat");
+        }
+        assert_eq!(rows, vec![0, 1, 3, 4, 5]);
+    }
+}
