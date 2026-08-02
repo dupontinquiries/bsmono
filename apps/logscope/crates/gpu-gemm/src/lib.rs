@@ -8111,8 +8111,23 @@ host-copy path (dequantize + requantize every expert into RAM)");
                 kq_norm: if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
                     Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim))
                 } else { None },
+                // ATTENTION TEMPERATURE FROM METADATA. floor_scale 8192 and attn_scale 0.1 are
+                // Llama-4's documented defaults, hardcoded here where the file carries them — the same
+                // shape as nope_step, and the same failure: a wrong scale produces text that is merely
+                // worse, with every shape and tensor correct.
+                //
+                // It applies to NoPE layers deliberately: in iRoPE the rotary layers get position from
+                // RoPE and the NoPE layers get it from length-dependent temperature instead, so this
+                // condition is the design rather than a coincidence of the same modulus.
                 attn_temp: if is_llama4 && nope_step > 0 && (i + 1) % nope_step == 0 {
-                    Some(crate::llama4::AttnTemp::default())
+                    let mut t = crate::llama4::AttnTemp::default();
+                    if let Some(v) = g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)) {
+                        t.floor_scale = v;
+                    }
+                    if let Some(v) = g.get_f32(&format!("{}.attention.scale", acfg.prefix)) {
+                        t.attn_scale = v;
+                    }
+                    Some(t)
                 } else { None },
             });
         }
