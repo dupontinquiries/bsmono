@@ -3521,6 +3521,12 @@ everywhere: it looks like a hardware problem"
         println!("gate-bytes: adapter = {}", gpu.adapter_name);
         let n = 64usize;
         let raw: Vec<u8> = (0..n).map(|i| i as u8).collect();     // byte i holds the value i
+        // Both candidates in one run: the binding trace shows what was bound, and the dims below show
+        // what the shader was told to loop to. A short binding and a short dims value produce the same
+        // output, and only printing both tells them apart.
+        eprintln!("  probe dims.x       : {n} (the shader returns early above this)");
+        eprintln!("  probe source bytes : {} ({} u32 words)", raw.len(), raw.len() / 4);
+        eprintln!("  (set LOGSCOPE_TRACE_BIND=1 to see what dispatch actually bound)");
         let got = gpu.byte_probe(&raw);
         // ALL OF IT, in rows of 16. The first run reported "neither clamped nor zeroed" while showing
         // zeros at 4..15 — which means something PAST 16 is non-zero, so the pattern is not uniform and
