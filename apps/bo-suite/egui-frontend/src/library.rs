@@ -1,336 +1,279 @@
-//! library — the paged track list, shared by eight pages.
+//! library — search, history and playlists, ported from the QML pages.
 //!
-//! `AllTracksPage`, `AlbumsPage`, `ArtistsPage`, `PlaylistsPage`, `TagsPage`,
-//! `SearchPage`, `HistoryPage` and `QueuePage` are the same surface with
-//! different sources: a paged list of tracks, sorted, filtered, and enqueued.
-//! Porting them as one model rather than eight is not a shortcut — it is what
-//! stops the sort behaving differently on the artists page than on the albums
-//! page, which is the usual fate of eight separate implementations.
+//! Three pages that share a track model: `SearchPage`, `HistoryPage` (with its
+//! hour histogram and relative times) and `PlaylistDetailPage` (with drag
+//! reordering).
 //!
-//! ## Paging, and why `maybeFetchMore` is the interesting part
+//! ## The bits with actual behaviour
 //!
-//! `pageSize: 100`, and the QML fetches more as you approach the end. Two rules
-//! fall out, and both are about not lying to the user:
-//!
-//! * **Never request a page already in flight.** Scrolling fast fires the
-//!   trigger every frame, and without a guard the same page is requested a
-//!   dozen times — which on a speaker over the network is a real stall.
-//! * **A total of zero is not the same as "not loaded yet".** An empty library
-//!   and an unfetched one look identical if you only track a count, and showing
-//!   "no tracks" over a library that is still loading is the difference between
-//!   a slow app and a broken one.
+//! * **`relativeTime(unix_sec)`** — "3 minutes ago", not a timestamp. A
+//!   listening history is read as *recency*, and a wall-clock time makes the
+//!   reader do the subtraction.
+//! * **`hourMax`** — the histogram normalises to its own peak. Normalising to a
+//!   fixed ceiling makes a quiet week look like no listening at all.
+//! * **Playlist reorder** is a **move**, not a swap. Dragging track 5 to
+//!   position 1 should shift 1–4 down; swapping would put track 1 where 5 was,
+//!   which is not what the hand did.
 
-/// How the list is ordered. The tags are the QML's, because they are also what
-/// the backend takes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Sort {
-    #[default]
-    Title,
-    Artist,
-    Album,
-}
-
-impl Sort {
-    pub const ALL: [Sort; 3] = [Sort::Title, Sort::Artist, Sort::Album];
-    pub fn tag(self) -> &'static str {
-        match self { Sort::Title => "title", Sort::Artist => "artist", Sort::Album => "album" }
-    }
-    pub fn label(self) -> &'static str {
-        match self { Sort::Title => "Title", Sort::Artist => "Artist", Sort::Album => "Album" }
-    }
-    /// An unknown tag falls back to Title rather than leaving the list in an
-    /// undefined order — a list whose order nobody can predict is unusable.
-    pub fn from_tag(t: &str) -> Sort {
-        Sort::ALL.into_iter().find(|s| s.tag() == t).unwrap_or(Sort::Title)
-    }
-}
-
-/// Where a chosen track goes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Enqueue {
-    /// Replace the queue and play now.
-    #[default]
-    Now,
-    /// After the current track.
-    Next,
-    /// At the end.
-    Last,
-}
-
-impl Enqueue {
-    pub const ALL: [Enqueue; 3] = [Enqueue::Now, Enqueue::Next, Enqueue::Last];
-    pub fn tag(self) -> &'static str {
-        match self { Enqueue::Now => "now", Enqueue::Next => "next", Enqueue::Last => "last" }
-    }
-    pub fn label(self) -> &'static str {
-        match self { Enqueue::Now => "Play now", Enqueue::Next => "Play next", Enqueue::Last => "Add to end" }
-    }
-}
-
+/// One track, as the library pages need it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Track {
-    pub id: String,
+    pub id: u64,
     pub title: String,
     pub artist: String,
     pub album: String,
-    pub duration_s: f64,
+    pub tags: Vec<String>,
 }
 
 impl Track {
-    /// A track with no title shows its id — an empty row reads as a broken list.
-    pub fn label(&self) -> &str {
-        if self.title.trim().is_empty() { &self.id } else { &self.title }
+    /// Does this track match a query? Title, artist and album, case-insensitive.
+    /// A library search that needs exact case is one nobody uses twice.
+    pub fn matches(&self, q: &str) -> bool {
+        let q = q.trim().to_lowercase();
+        if q.is_empty() { return true; }
+        self.title.to_lowercase().contains(&q)
+            || self.artist.to_lowercase().contains(&q)
+            || self.album.to_lowercase().contains(&q)
+            || self.tags.iter().any(|t| t.to_lowercase().contains(&q))
     }
-    /// The sort key for a field, lowercased so ordering is not case-dependent:
-    /// "abba" and "ABBA" belong together.
-    pub fn key(&self, s: Sort) -> String {
-        match s {
-            Sort::Title => self.label().to_lowercase(),
-            Sort::Artist => self.artist.to_lowercase(),
-            Sort::Album => self.album.to_lowercase(),
+}
+
+/// A play, for the history page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Play {
+    pub track: u64,
+    /// Unix seconds.
+    pub at: i64,
+    /// Hour of day 0..23, as the QML's hourStats groups them.
+    pub hour: u8,
+}
+
+/// `relativeTime(unix_sec)`.
+///
+/// A listening history is read as recency, so a wall-clock time makes the reader
+/// do the subtraction. Coarsens as it goes back, because "43 minutes ago" is
+/// useful and "43 days 2 hours ago" is not.
+pub fn relative_time(now: i64, then: i64) -> String {
+    let d = now - then;
+    if d < 0 { return "just now".into(); }   // a clock skew must not read "in -3s"
+    match d {
+        0..=44 => "just now".into(),
+        45..=5399 => {
+            let m = (d + 30) / 60;
+            format!("{} minute{} ago", m.max(1), if m == 1 { "" } else { "s" })
+        }
+        5400..=86_399 => {
+            let h = (d + 1800) / 3600;
+            format!("{} hour{} ago", h.max(1), if h == 1 { "" } else { "s" })
+        }
+        86_400..=2_591_999 => {
+            let dd = d / 86_400;
+            format!("{} day{} ago", dd.max(1), if dd == 1 { "" } else { "s" })
+        }
+        _ => {
+            let mo = d / 2_592_000;
+            format!("{} month{} ago", mo.max(1), if mo == 1 { "" } else { "s" })
         }
     }
 }
 
-/// `pageSize: 100`.
-pub const PAGE_SIZE: usize = 100;
-
-/// How close to the end triggers a fetch, in rows. Enough that the next page
-/// arrives before the user reaches it on a network with real latency.
-pub const PREFETCH_ROWS: usize = 20;
-
-/// A paged list, shared by every library page.
-#[derive(Debug, Clone, Default)]
-pub struct Library {
-    pub tracks: Vec<Track>,
-    /// Total the backend reports. `None` = not fetched yet, which is NOT the
-    /// same as zero — showing "no tracks" over a loading library is the
-    /// difference between a slow app and a broken one.
-    pub total: Option<usize>,
-    pub sort: Sort,
-    pub enqueue: Enqueue,
-    pub query: String,
-    /// A page request currently outstanding.
-    in_flight: Option<usize>,
+/// Plays per hour of day, 24 buckets.
+pub fn hour_stats(plays: &[Play]) -> [u32; 24] {
+    let mut h = [0u32; 24];
+    for p in plays { h[(p.hour % 24) as usize] += 1; }
+    h
 }
 
-impl Library {
-    pub fn loading(&self) -> bool { self.in_flight.is_some() }
+/// The histogram's peak, for normalising the bars.
+///
+/// Normalising to the peak rather than a fixed ceiling: a quiet week scaled
+/// against a busy one's maximum looks like no listening at all, and the shape is
+/// what the page is for. Returns at least 1 so a division cannot be by zero.
+pub fn hour_max(stats: &[u32; 24]) -> u32 { stats.iter().copied().max().unwrap_or(0).max(1) }
 
-    /// Has everything been fetched?
-    pub fn complete(&self) -> bool {
-        matches!(self.total, Some(t) if self.tracks.len() >= t)
-    }
+/// A playlist, with the reordering the detail page does.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Playlist {
+    pub id: i64,
+    pub name: String,
+    pub description: String,
+    pub tracks: Vec<u64>,
+}
 
-    /// What to show when the list is empty, distinguishing the three cases a
-    /// single "no results" message would collapse.
-    pub fn empty_reason(&self) -> Option<&'static str> {
-        if !self.tracks.is_empty() { return None; }
-        if self.total.is_none() { return Some("loading…"); }
-        if !self.query.trim().is_empty() { return Some("nothing matches"); }
-        Some("no tracks")
-    }
-
-    /// `maybeFetchMore(visible_end)` — the page index to request, or `None`.
+impl Playlist {
+    /// Move a track from one index to another.
     ///
-    /// Returns `None` while a request is outstanding: scrolling fast fires this
-    /// every frame, and without the guard the same page is requested a dozen
-    /// times, which on a speaker over the network is a real stall.
-    pub fn maybe_fetch(&self, visible_end: usize) -> Option<usize> {
-        if self.in_flight.is_some() || self.complete() { return None; }
-        if self.total.is_some() && visible_end + PREFETCH_ROWS < self.tracks.len() { return None; }
-        Some(self.tracks.len() / PAGE_SIZE)
-    }
-
-    /// Mark a request as sent.
-    pub fn begin_fetch(&mut self, page: usize) { self.in_flight = Some(page); }
-
-    /// A page arrived. Appends and clears the guard.
-    ///
-    /// A page for an index we did not ask for is IGNORED rather than appended:
-    /// a late response from a cancelled request would otherwise splice stale
-    /// rows into the middle of the list.
-    pub fn receive(&mut self, page: usize, tracks: Vec<Track>, total: usize) -> bool {
-        if self.in_flight != Some(page) { return false; }
-        self.in_flight = None;
-        self.total = Some(total);
-        self.tracks.extend(tracks);
+    /// A MOVE, not a swap: dragging track 5 to position 1 shifts 1–4 down.
+    /// Swapping would put track 1 where 5 was, which is not what the hand did
+    /// and is the single most common reorder bug.
+    pub fn move_track(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.tracks.len() || to >= self.tracks.len() || from == to { return false; }
+        let t = self.tracks.remove(from);
+        self.tracks.insert(to, t);
         true
     }
 
-    /// Changing the sort or query invalidates every fetched page.
+    /// Add, refusing a duplicate.
     ///
-    /// Keeping them would show the first hundred titles sorted by artist, which
-    /// is neither ordering and looks like corruption.
-    pub fn reset(&mut self) {
-        self.tracks.clear();
-        self.total = None;
-        self.in_flight = None;
+    /// The same track twice in a playlist is almost always a double-tap rather
+    /// than an intention, and it breaks "remove this track" — which one?
+    pub fn add(&mut self, track: u64) -> bool {
+        if self.tracks.contains(&track) { return false; }
+        self.tracks.push(track);
+        true
     }
 
-    pub fn set_sort(&mut self, s: Sort) {
-        if self.sort != s { self.sort = s; self.reset(); }
+    pub fn remove(&mut self, track: u64) -> bool {
+        let n = self.tracks.len();
+        self.tracks.retain(|t| *t != track);
+        self.tracks.len() != n
     }
 
-    pub fn set_query(&mut self, q: &str) {
-        if self.query != q { self.query = q.to_string(); self.reset(); }
+    /// A playlist needs a name to be saved — an unnamed one cannot be found again.
+    pub fn can_save(&self) -> bool { !self.name.trim().is_empty() }
+}
+
+/// Search state.
+#[derive(Debug, Clone, Default)]
+pub struct Search {
+    pub query: String,
+    /// Restrict to one tag; empty means all.
+    pub tag: String,
+}
+
+impl Search {
+    pub fn results<'a>(&self, all: &'a [Track]) -> Vec<&'a Track> {
+        all.iter()
+            .filter(|t| self.tag.is_empty() || t.tags.iter().any(|x| x == &self.tag))
+            .filter(|t| t.matches(&self.query))
+            .collect()
     }
 
-    /// Rows to draw, sorted locally within what has been fetched.
-    ///
-    /// Ties break on id so the list cannot shuffle between frames — a list that
-    /// reorders under a scrolling finger is the fastest way to lose someone's
-    /// place.
-    pub fn rows(&self) -> Vec<&Track> {
-        let mut v: Vec<&Track> = self.tracks.iter().collect();
-        let s = self.sort;
-        v.sort_by(|a, b| a.key(s).cmp(&b.key(s)).then(a.id.cmp(&b.id)));
+    /// Every tag in the library with a count, most-used first.
+    /// Alphabetical ties, so the tag cloud does not reshuffle between frames.
+    pub fn tags(all: &[Track]) -> Vec<(String, usize)> {
+        use std::collections::BTreeMap;
+        let mut m: BTreeMap<&str, usize> = BTreeMap::new();
+        for t in all { for g in &t.tags { *m.entry(g.as_str()).or_insert(0) += 1; } }
+        let mut v: Vec<(String, usize)> = m.into_iter().map(|(k, n)| (k.into(), n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v
     }
-}
-
-/// Total running time, for the header a detail page shows.
-pub fn total_duration(tracks: &[Track]) -> f64 {
-    tracks.iter().map(|t| t.duration_s.max(0.0)).sum()
-}
-
-/// `h:mm:ss`, or `m:ss` under an hour — an album shows minutes, a playlist may
-/// show hours, and padding a three-minute album to `0:03:12` is noise.
-pub fn duration_label(secs: f64) -> String {
-    let s = secs.max(0.0) as u64;
-    let (h, m, sec) = (s / 3600, (s / 60) % 60, s % 60);
-    if h > 0 { format!("{h}:{m:02}:{sec:02}") } else { format!("{m}:{sec:02}") }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn t(id: &str, title: &str, artist: &str, album: &str) -> Track {
-        Track { id: id.into(), title: title.into(), artist: artist.into(),
-                album: album.into(), duration_s: 180.0 }
+    fn t(id: u64, title: &str, artist: &str, tags: &[&str]) -> Track {
+        Track { id, title: title.into(), artist: artist.into(), album: "Album".into(),
+                tags: tags.iter().map(|s| s.to_string()).collect() }
     }
 
-    fn page(n: usize) -> Vec<Track> {
-        (0..n).map(|i| t(&format!("id{i:03}"), &format!("T{i}"), "A", "B")).collect()
-    }
-
-    #[test]
-    fn an_empty_list_says_which_empty_it_is() {
-        // "No tracks" over a library that is still loading is the difference
-        // between a slow app and a broken one.
-        let mut l = Library::default();
-        assert_eq!(l.empty_reason(), Some("loading…"), "total unknown");
-        l.total = Some(0);
-        assert_eq!(l.empty_reason(), Some("no tracks"));
-        l.query = "zzz".into();
-        assert_eq!(l.empty_reason(), Some("nothing matches"));
-        l.tracks.push(t("1", "x", "y", "z"));
-        assert_eq!(l.empty_reason(), None);
+    fn lib() -> Vec<Track> {
+        vec![t(1, "Rain", "Ambient Co", &["calm", "rain"]),
+             t(2, "Thunder", "Ambient Co", &["storm"]),
+             t(3, "Morning", "Dawn", &["calm"])]
     }
 
     #[test]
-    fn a_page_already_in_flight_is_not_requested_again() {
-        // Scrolling fast fires the trigger every frame; without the guard the
-        // same page is requested a dozen times, which stalls a speaker.
-        let mut l = Library::default();
-        let p = l.maybe_fetch(0).expect("first page");
-        l.begin_fetch(p);
-        assert_eq!(l.maybe_fetch(0), None, "guarded while outstanding");
-        assert!(l.loading());
-        l.receive(p, page(100), 250);
-        assert!(!l.loading());
-        assert_eq!(l.maybe_fetch(95), Some(1), "and the next page is asked for");
+    fn relative_time_coarsens_as_it_goes_back() {
+        // "43 minutes ago" is useful; "43 days 2 hours ago" is not.
+        let now = 1_700_000_000;
+        assert_eq!(relative_time(now, now), "just now");
+        assert_eq!(relative_time(now, now - 30), "just now");
+        assert_eq!(relative_time(now, now - 60), "1 minute ago");
+        assert_eq!(relative_time(now, now - 180), "3 minutes ago");
+        assert_eq!(relative_time(now, now - 7200), "2 hours ago");
+        assert_eq!(relative_time(now, now - 86_400 * 3), "3 days ago");
+        assert!(relative_time(now, now - 86_400 * 90).contains("month"));
     }
 
     #[test]
-    fn a_late_page_from_a_cancelled_request_is_ignored() {
-        // Otherwise stale rows splice into the middle of the list.
-        let mut l = Library::default();
-        l.begin_fetch(0);
-        assert!(!l.receive(3, page(10), 100), "not the page we asked for");
-        assert!(l.tracks.is_empty());
-        assert!(l.receive(0, page(10), 100));
-        assert_eq!(l.tracks.len(), 10);
+    fn a_clock_skew_does_not_produce_a_negative_age() {
+        // A play stamped in the future - clock skew across devices, which a
+        // multi-room system has by definition - must not read "in -3 seconds".
+        let now = 1_700_000_000;
+        assert_eq!(relative_time(now, now + 500), "just now");
     }
 
     #[test]
-    fn a_complete_list_stops_asking() {
-        let mut l = Library::default();
-        l.begin_fetch(0);
-        l.receive(0, page(40), 40);
-        assert!(l.complete());
-        assert_eq!(l.maybe_fetch(39), None);
+    fn the_histogram_normalises_to_its_own_peak() {
+        // A quiet week scaled against a busy one's maximum looks like no
+        // listening at all, and the shape is what the page is for.
+        let plays: Vec<Play> = [7u8, 7, 7, 22, 22, 9].iter().enumerate()
+            .map(|(i, h)| Play { track: i as u64, at: 0, hour: *h }).collect();
+        let s = hour_stats(&plays);
+        assert_eq!(s[7], 3);
+        assert_eq!(s[22], 2);
+        assert_eq!(hour_max(&s), 3);
+        // an empty history divides by one rather than zero
+        assert_eq!(hour_max(&hour_stats(&[])), 1);
     }
 
     #[test]
-    fn changing_the_sort_discards_the_fetched_pages() {
-        // Keeping them shows the first hundred titles sorted by artist, which is
-        // neither ordering and looks like corruption.
-        let mut l = Library::default();
-        l.begin_fetch(0);
-        l.receive(0, page(100), 500);
-        assert_eq!(l.tracks.len(), 100);
-        l.set_sort(Sort::Artist);
-        assert!(l.tracks.is_empty());
-        assert_eq!(l.total, None, "and the total is unknown again");
-        // setting the SAME sort is a no-op, so a redraw does not wipe the list
-        l.begin_fetch(0);
-        l.receive(0, page(100), 500);
-        l.set_sort(Sort::Artist);
-        assert_eq!(l.tracks.len(), 100);
+    fn an_out_of_range_hour_cannot_panic() {
+        // Hours arrive from a device clock and 24 is a real off-by-one.
+        let s = hour_stats(&[Play { track: 1, at: 0, hour: 24 },
+                             Play { track: 2, at: 0, hour: 255 }]);
+        assert_eq!(s[0], 1, "24 wraps to 0");
+        assert_eq!(s.iter().sum::<u32>(), 2);
     }
 
     #[test]
-    fn changing_the_query_also_resets() {
-        let mut l = Library::default();
-        l.begin_fetch(0);
-        l.receive(0, page(20), 20);
-        l.set_query("abba");
-        assert!(l.tracks.is_empty());
-        l.set_query("abba");
-        assert!(l.tracks.is_empty(), "and repeating it is harmless");
+    fn reordering_a_playlist_moves_rather_than_swaps() {
+        // Dragging track 5 to position 1 shifts 1-4 down. Swapping would put
+        // track 1 where 5 was, which is not what the hand did.
+        let mut p = Playlist { tracks: vec![1, 2, 3, 4, 5], ..Default::default() };
+        assert!(p.move_track(4, 0));
+        assert_eq!(p.tracks, vec![5, 1, 2, 3, 4]);
+        // a no-op drag costs nothing and is refused rather than churning
+        assert!(!p.move_track(2, 2));
+        assert!(!p.move_track(9, 0));
+        assert_eq!(p.tracks.len(), 5, "nothing lost or duplicated");
     }
 
     #[test]
-    fn sorting_is_case_insensitive_and_stable() {
-        // "abba" and "ABBA" belong together, and a list that reorders under a
-        // scrolling finger loses your place.
-        let mut l = Library::default();
-        l.tracks = vec![t("c", "beta", "ABBA", "x"), t("a", "Alpha", "abba", "x"),
-                        t("b", "alpha", "zz", "x")];
-        let ids: Vec<&str> = l.rows().iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, vec!["a", "b", "c"], "Alpha and alpha adjacent, tie on id");
-        let again: Vec<&str> = l.rows().iter().map(|r| r.id.as_str()).collect();
-        assert_eq!(ids, again);
+    fn a_track_cannot_be_added_to_a_playlist_twice() {
+        // The same track twice is almost always a double-tap, and it breaks
+        // "remove this track" - which one?
+        let mut p = Playlist::default();
+        assert!(p.add(7));
+        assert!(!p.add(7));
+        assert_eq!(p.tracks, vec![7]);
+        assert!(p.remove(7));
+        assert!(!p.remove(7), "removing twice is false, not an error");
     }
 
     #[test]
-    fn an_unknown_sort_tag_falls_back_rather_than_leaving_it_undefined() {
-        assert_eq!(Sort::from_tag("artist"), Sort::Artist);
-        assert_eq!(Sort::from_tag("nonsense"), Sort::Title);
-        for s in Sort::ALL { assert_eq!(Sort::from_tag(s.tag()), s); }
+    fn an_unnamed_playlist_cannot_be_saved() {
+        // It cannot be found again.
+        let mut p = Playlist::default();
+        assert!(!p.can_save());
+        p.name = "   ".into();
+        assert!(!p.can_save(), "whitespace is not a name");
+        p.name = "Evening".into();
+        assert!(p.can_save());
     }
 
     #[test]
-    fn a_track_with_no_title_shows_its_id() {
-        assert_eq!(t("id7", "", "a", "b").label(), "id7");
-        assert_eq!(t("id7", "  ", "a", "b").label(), "id7");
+    fn search_covers_tags_as_well_as_text() {
+        let all = lib();
+        let mut s = Search::default();
+        s.query = "calm".into();
+        assert_eq!(s.results(&all).len(), 2, "matched by tag");
+        s.query = "ambient".into();
+        assert_eq!(s.results(&all).len(), 2, "matched by artist");
+        s.query = String::new();
+        s.tag = "storm".into();
+        assert_eq!(s.results(&all).len(), 1, "the tag filter alone");
     }
 
     #[test]
-    fn durations_show_hours_only_when_there_are_hours() {
-        assert_eq!(duration_label(192.0), "3:12");
-        assert_eq!(duration_label(3612.0), "1:00:12");
-        assert_eq!(duration_label(-5.0), "0:00");
-        assert_eq!(duration_label(total_duration(&page(3))), "9:00");
-        assert_eq!(total_duration(&[]), 0.0);
-    }
-
-    #[test]
-    fn the_enqueue_modes_are_the_three_the_qml_offers() {
-        assert_eq!(Enqueue::default(), Enqueue::Now);
-        let tags: Vec<&str> = Enqueue::ALL.iter().map(|e| e.tag()).collect();
-        assert_eq!(tags, vec!["now", "next", "last"]);
+    fn the_tag_cloud_is_counted_and_stably_ordered() {
+        let all = lib();
+        let a = Search::tags(&all);
+        assert_eq!(a, Search::tags(&all));
+        assert_eq!(a[0], ("calm".to_string(), 2), "most used first");
     }
 }
