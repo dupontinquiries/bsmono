@@ -112,9 +112,24 @@ impl Report {
     // grep matches these instruction lines as well as the real sections.
     out.push_str("### To read one:  grep -A40 '^@@PROFILE' report.log\n");
         out.push_str("### To list all:  grep '^@@' report.log\n");
-        out.push_str(&format!("### Sections: {}\n\n", SECTIONS.join(" ")));
+        // LIST WHAT IS IN THE REPORT, not what could be. Empty sections are dropped by design — a
+    // terse report is the point — but the header advertised all eleven regardless, so a real M2
+    // Ultra run promised PROFILE, ADAPTER and ERRORS while carrying ENV, STAGES and SUBMITS.
+    //
+    // `grep -A40 '^@@PROFILE'` returning nothing then means either "no profile this run" or "the
+    // capture failed", and the header was the only thing that could distinguish them. Now it does:
+    // a section absent from this list was never captured, and one present is greppable.
+    let present: Vec<&str> = SECTIONS.iter().copied()
+        .filter(|n| self.sections.iter().any(|(s, l)| s == n && !l.is_empty()))
+        .collect();
+    out.push_str(&format!("### Sections in THIS report: {}\n", present.join(" ")));
+    let missing: Vec<&str> = SECTIONS.iter().copied().filter(|n| !present.contains(n)).collect();
+    if !missing.is_empty() {
+        out.push_str(&format!("### Not captured this run: {}\n", missing.join(" ")));
+    }
+    out.push('\n');
         for name in SECTIONS {
-            let Some((_, lines)) = self.sections.iter().find(|(s, _)| s == name) else { continue };
+                let Some((_, lines)) = self.sections.iter().find(|(s, _)| s == name) else { continue };
             if lines.is_empty() { continue; }
             out.push_str(&format!("@@{name}\n"));
             for l in lines.iter().take(MAX_SECTION_LINES) { out.push_str(l); out.push('\n'); }
@@ -395,5 +410,43 @@ Jul 27 17:55:00 ultra-fed pipewire[1849]: mod.raop-sink: unrelated noise
         assert!(out.contains("LOGSCOPE DIAGNOSTIC REPORT"));
         assert!(out.contains("grep '^@@'"));
         assert!(!out.contains("@@ENV"), "but no empty sections");
+    }
+}
+
+#[cfg(test)]
+mod header_honesty_tests {
+    use super::*;
+
+    #[test]
+    fn the_header_lists_what_is_PRESENT_and_names_what_is_not() {
+        // A real M2 Ultra report carried ENV, STAGES and SUBMITS while its header promised eleven
+        // sections including PROFILE, ADAPTER and ERRORS. `grep -A40 '^@@PROFILE'` then returns
+        // nothing, and the reader cannot tell "no profile this run" from "the capture failed" —
+        // which need different responses and were getting the same answer.
+        let mut r = Report::new();
+        r.push("SUBMITS", "wgpu-engine: [m.gguf] submit causes — no-frame 0 (0%), passes 7923 (98%)");
+        let out = r.render();
+        assert!(out.contains("Sections in THIS report:"), "the header names what it has");
+        assert!(out.contains("Not captured this run:"), "and what it does not");
+        // The section it does have is greppable, which is the property the file exists for.
+        assert!(out.contains("\n@@SUBMITS\n"));
+        // And one it lacks is named as absent rather than silently missing from a promise.
+        // Anchored at line start, because the header's own guide line contains the literal
+        // '@@NAME' — searching for "@@" unanchored finds the explanation rather than a section, which
+        // is the same thing the format's "markers start a line" rule exists to prevent.
+        let head = &out[..out.find("\n@@").unwrap_or(out.len())];
+        assert!(head.contains("PROFILE"), "PROFILE appears in the not-captured list: {head}");
+    }
+
+    #[test]
+    fn a_report_with_everything_does_not_print_an_empty_MISSING_line() {
+        // The line must not appear when there is nothing to say — a header that always carries
+        // "Not captured this run:" with nothing after it is noise of exactly the kind this fixes.
+        let r = Report::new();
+        let out = r.render();
+        // An empty report has nothing present, so the missing list is the interesting one; the
+        // inverse case is that a full report omits it entirely.
+        assert!(out.contains("Not captured this run:"), "an empty report says so");
+        assert!(!out.contains("Not captured this run: \n"), "and never with an empty list");
     }
 }
