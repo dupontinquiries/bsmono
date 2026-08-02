@@ -1,3 +1,4 @@
+pub mod artifacts;
 pub mod fleet;
 pub mod network;
 pub mod apps;
