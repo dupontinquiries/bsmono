@@ -83,6 +83,25 @@ def main():
                               f"ships — systemctl offers a link to nothing")
                         problems += 1
 
+                # A daemon whose man page and --help disagree, or which has no
+                # --help at all, cannot be introspected on a machine where it is
+                # already running — and that is every machine where it matters,
+                # because running it by hand there fails to bind and looks like
+                # the service is broken.
+                # Only for DAEMONS — a socket unit is the marker. A GUI app
+                # launched from a menu has no bind to fail and no one types its
+                # name; demanding --help there is noise, and noise is what makes
+                # a checker ignored.
+                sock_name = base[:-len('.service')] + '.socket'
+                main_rs = os.path.join(APPS, app, 'src', 'main.rs')
+                if sock_name in names and os.path.isfile(main_rs):
+                    try: body = open(main_rs, encoding='utf8').read()
+                    except Exception: body = ''
+                    if 'wants_help' not in body:
+                        print(f"{app}: main.rs has no --help — running it by hand "
+                              f"gives a bind error instead of an explanation")
+                        problems += 1
+
                 if val(text, 'ExecStart') is None:
                     print(f"{app}/{base}: no ExecStart")
                     problems += 1

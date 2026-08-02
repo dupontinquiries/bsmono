@@ -76,7 +76,52 @@ pub fn run(name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `--help` output.
+///
+/// A daemon still needs one. `systemctl status` shows the ExecStart line, and
+/// the first thing anyone does with an unfamiliar binary is run it with
+/// --help — getting a socket bind error instead is how someone concludes the
+/// service is broken when it is merely already running.
+fn usage() -> String {
+    format!("\
+settingsd \u{2014} the settings daemon
+
+USAGE:
+    settingsd [OPTIONS]
+
+serves the cross-app settings namespace over the `settings` socket.
+
+OPTIONS:
+    -h, --help       show this and exit
+    -V, --version    show the version and exit
+
+NOTE:
+    settingsd is socket-activated. systemd creates the socket at login and starts
+    this on the first connection, so there is normally no reason to run it by
+    hand \u{2014} and doing so while settingsd.socket is enabled will fail to bind.
+
+    Enable the SOCKET, not the service:
+        systemctl --user enable --now settingsd.socket
+
+SEE ALSO:
+    man settingsd(1)
+")
+}
+
 fn main() {
+    // --help and --version before anything touches the socket: a binary that
+    // has to bind before it can tell you what it is cannot be introspected on a
+    // machine where it is already running, which is every machine where it
+    // matters.
+    let cli = cli_kit::Cli::from_env();
+    if cli.wants_help() {
+        print!("{}", usage());
+        return;
+    }
+    if cli.flag("version") || cli.flag("V") {
+        println!("settingsd {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let name = NS;
     eprintln!("settingsd: serving on {} (persisting to ~/.config/{APP}/{FILE})", ipc_kit::socket_path(name).display());
     if let Err(e) = run(name) {
