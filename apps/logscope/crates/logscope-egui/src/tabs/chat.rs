@@ -6697,6 +6697,15 @@ them to", patches.len());
                 // mobilelayout::row_mode decides when a row should instead SHED controls, because a wrapped
                 // four-line bar of tiny buttons is not usable either.
                 ui.horizontal_wrapped(|ui| {
+                    // SHED, DO NOT STACK. Wrapping stopped the overlap and left a phone with a four-line bar of
+                    // tiny buttons, which is not usable either — I fixed half the problem in _367 and wired the
+                    // decision that fixes the other half without ever calling it.
+                    //
+                    // Two controls must stay reachable (send state, and the mode the run is in); the rest go
+                    // behind a menu when the width cannot hold them at a touch-sized target.
+                    let touch = ui.input(|i| i.pointer.has_pointer()) == false || cfg!(target_os = "android");
+                    let overflow = crate::mobilelayout::row_mode(ui.available_width(), 2, 5, touch)
+                        == crate::mobilelayout::RowMode::Overflow;
                     if theme::carved_button(ui, "📎 Attach").on_hover_text("Attach a text file into your message (bounded)").clicked() {
                         let start = self.save_dir.clone()
                             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
@@ -6736,16 +6745,28 @@ them to", patches.len());
                     // PANEL MODE. Built in _373/_375 and never given a control, which is why it could not be
                     // found in the menu. Its advantage is not answer quality — it is that several short turns
                     // can each stop and ask, where one long generation cannot interrupt itself usefully.
-                    ui.checkbox(&mut self.panel_mode, RichText::new("debate panel").small())
-                        .on_hover_text("Several small models debate instead of one thinker. They can pause to \
-ask you a question between messages, and one member is held BLIND to the answer — so the next \
-round can tell whether your hint drove the conclusion or the question did.");
-                    ui.checkbox(&mut self.stepwise, RichText::new("stepwise").small())
-                        .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
-                    ui.checkbox(&mut self.auto_continue, RichText::new("auto-continue").small())
-                        .on_hover_text("When a reply hits the length cap, keep generating to finish it");
-                    ui.checkbox(&mut self.patch_mode, RichText::new("patch mode").small())
-                        .on_hover_text("edit mode: the model emits unified-diff patches (only changed lines) instead of rewriting whole files — fewer tokens per edit, applied context-anchored and committed via gitmind.");
+                    // The four mode toggles, rendered inline when the bar can hold them and inside the ⋯ menu
+                    // when it cannot. Hoisted into locals so ONE definition serves both placements — two copies
+                    // would be a policy expressed twice, which is how the watchdog tables drifted.
+                    let (mut panel_mode, mut stepwise) = (self.panel_mode, self.stepwise);
+                    let (mut auto_continue, mut patch_mode) = (self.auto_continue, self.patch_mode);
+                    {
+                        let mut modes = |ui: &mut egui::Ui| {
+                        ui.checkbox(&mut panel_mode, RichText::new("debate panel").small())
+                            .on_hover_text("Several small models debate instead of one thinker. They can pause to \
+    ask you a question between messages, and one member is held BLIND to the answer — so the next \
+    round can tell whether your hint drove the conclusion or the question did.");
+                        ui.checkbox(&mut stepwise, RichText::new("stepwise").small())
+                            .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
+                        ui.checkbox(&mut auto_continue, RichText::new("auto-continue").small())
+                            .on_hover_text("When a reply hits the length cap, keep generating to finish it");
+                        ui.checkbox(&mut patch_mode, RichText::new("patch mode").small())
+                            .on_hover_text("edit mode: the model emits unified-diff patches (only changed lines) instead of rewriting whole files — fewer tokens per edit, applied context-anchored and committed via gitmind.");
+                        };
+                        if overflow { ui.menu_button("⋯ modes", |ui| modes(ui)); } else { modes(ui); }
+                    }
+                    self.panel_mode = panel_mode; self.stepwise = stepwise;
+                    self.auto_continue = auto_continue; self.patch_mode = patch_mode;
                     if self.hit_cap && !streaming {
                         if theme::action_button(ui, "⏭ Continue", theme::CYAN(), true)
                             .on_hover_text("The last reply hit the length cap — resume it").clicked() { do_continue = true; }
