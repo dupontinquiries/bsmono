@@ -343,12 +343,19 @@ pub fn blocks_drawer_ui(
 /// `$XDG_CONFIG_HOME/voiceterm-egui/prefs.kv` (or `~/.config/...`) — one `key=value` per line,
 /// the settings-kit kv schema verbatim, so the file is greppable and hand-editable.
 pub fn prefs_path() -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    base.join("voiceterm-egui").join("prefs.kv")
+    // config-kit, not a second copy of the same rule. This function used to
+    // hand-roll XDG_CONFIG_HOME / ~/.config / "." with a comment saying "as
+    // pbedit/config-kit use" — which is the moment to CALL config-kit rather
+    // than describe it. Two copies of a path rule drift silently: the day one
+    // gains a fallback the other does not, prefs written by one build stop
+    // being found by the next.
+    config_kit::config_dir(PREFS_APP).join(PREFS_FILE)
 }
+
+/// The app namespace and filename. Named so the two sites that need them —
+/// the path and any migration — cannot disagree.
+pub const PREFS_APP: &str = "voiceterm-egui";
+pub const PREFS_FILE: &str = "prefs.kv";
 
 /// Load prefs from [`prefs_path`]; missing file (or any unreadable line) falls back to defaults —
 /// `Prefs::apply_kv` is tolerant of partial sets by design.
@@ -366,12 +373,12 @@ pub fn load_prefs() -> settings_kit::Prefs {
 /// Persist prefs to [`prefs_path`] (creating the directory). Errors are returned, not panicked —
 /// a read-only config dir shouldn't take the app down.
 pub fn save_prefs(prefs: &settings_kit::Prefs) -> std::io::Result<()> {
-    let path = prefs_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
     let text: String = prefs.to_kv().into_iter().map(|(k, v)| format!("{k}={v}\n")).collect();
-    std::fs::write(path, text)
+    // config-kit::save creates the directory and writes, which is what the
+    // hand-rolled version did — keeping the settings-kit kv SCHEMA, since that
+    // is the part worth sharing across apps, while the PATH rule comes from one
+    // place.
+    config_kit::save(PREFS_APP, PREFS_FILE, &text)
 }
 
 // ── theme picker ("long-press to show all vibes") ────────────────────────────
@@ -1246,4 +1253,29 @@ mod tests {
         assert_eq!(sb.active, 0);
         assert_eq!(sb.sessions.len(), 2);
     }
+
+#[cfg(test)]
+mod prefs_path_tests {
+    use super::*;
+
+    #[test]
+    fn the_path_is_unchanged_by_the_consolidation() {
+        // A silent MOVE would strand every existing prefs file: the app would
+        // start with defaults and the user's settings would still be on disk,
+        // somewhere they never look. So the new path is checked against the
+        // rule the hand-rolled version implemented.
+        let p = prefs_path();
+        assert!(p.ends_with("voiceterm-egui/prefs.kv"), "{}", p.display());
+        // and it sits under the XDG config home, not the data or cache one
+        assert!(p.starts_with(config_kit::config_home()), "{}", p.display());
+    }
+
+    #[test]
+    fn the_app_and_file_names_come_from_one_place() {
+        // Two literals in two functions is how a save and a load end up
+        // pointing at different files.
+        assert!(prefs_path().to_string_lossy().contains(PREFS_APP));
+        assert!(prefs_path().to_string_lossy().ends_with(PREFS_FILE));
+    }
+}
 }

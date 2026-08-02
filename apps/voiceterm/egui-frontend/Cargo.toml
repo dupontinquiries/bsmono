@@ -25,6 +25,9 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# XDG resolution. prefs_path() hand-rolled the same logic, with a comment
+# saying "as config-kit uses" — so the fleet had two copies of one rule.
+config-kit = { path = "../../../shared/config-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 uikit-term = { path = "../../../shared/uikit/crates/uikit-term" }
