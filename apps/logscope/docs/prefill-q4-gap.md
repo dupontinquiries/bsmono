@@ -179,3 +179,54 @@ correspondingly fewer times. The q4 gap is therefore **tile size**, not kernel a
 The original note read the small-batch kernel's comment — *"instead of the strided LINEAR_Q4 re-reading
 weights per tile"* — and inferred that LINEAR_Q4 was per-row. It says *per tile*, and the tile is 8×8.
 An accurate comment, read too quickly, produced a wrong conclusion about which kernel exists.
+
+
+---
+
+# The prefill number, worked through
+
+Qwen3-30B, 1625 tokens, **31.72s observed**.
+
+The strided `LINEAR_Q4` re-reads the weights per tile rather than per chunk. At a tile width of 8 that
+is ~203 weight passes for this prompt, moving **~343 GiB** of the model's 1.69 GiB active set.
+
+```
+343 GiB at the measured 258 GiB/s   =  1.3 s
+observed                            = 31.7 s
+effective bandwidth                 = 10.8 GiB/s  (4% of the device)
+```
+
+**Two independent problems, and they multiply.**
+
+**The traffic is ~100× what a GEMM would move.** A register-blocked kernel makes one weight pass per
+*chunk*: 2 passes, 2.7 GiB, ~10 ms at full bandwidth. The strided kernel makes one per *tile*.
+
+**And the 343 GiB is being moved at 4% of device bandwidth**, which the re-read does not explain — a
+strided read pattern is still a read pattern, and 10.8 GiB/s on a device that measures 258 says the
+access is defeating the memory system rather than merely repeating it.
+
+## Why chunk size cannot fix it
+
+Raising the prefill chunk was expected to help and does not: at chunk 1024 the kernel does 128 tiles
+per chunk over 2 chunks; at chunk 8 it does 1 tile per chunk over 203 chunks. **Same 203 passes.** The
+chunk controls dispatch count, not traffic, because the re-read is *inside* the kernel.
+
+That is worth knowing before anyone tunes `LOGSCOPE_PREFILL_CHUNK` looking for prefill speed — the knob
+does not reach this.
+
+## What the references do here
+
+llama.cpp's `mul_mat` for a batched shape reads each weight block once and accumulates across the batch,
+which is the one-pass-per-chunk form. ggml-metal's equivalent adds `vec4` loads on top. Neither has a
+per-tile re-read for any quantization, because neither has a separate "small batch" and "large batch"
+kernel — the batched path *is* the path.
+
+This engine's split at m=8 is the anomaly, and above the split it falls to a shape neither reference
+uses.
+
+## Order
+
+A register-blocked q4 GEMM addresses the 100×. The 4% is separate and may share a cause with decode's
+6–10× — both are shapes where the GPU idles on memory, and both are on a driver whose subgroup path is
+disabled. Fixing one does not obviously fix the other, and the prefill number is large enough that it
+should be measured again after the GEMM rather than predicted.
