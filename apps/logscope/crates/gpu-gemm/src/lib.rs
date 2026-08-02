@@ -8119,6 +8119,31 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     let n_swa = g.get_u32(&format!("{}.attention.sliding_window", acfg.prefix)).unwrap_or(0);
                     let ty = if is_llama4 { crate::swa::SwaType::Chunked } else { crate::swa::SwaType::Standard };
                     let windowed = swa_pattern.get(i).copied().unwrap_or(false);
+                    // iRoPE PAIRS THESE TWO PATTERNS, and they are computed independently here — the
+                    // NoPE set from `no_rope_interval`, the windowed set from
+                    // `sliding_window_pattern`. In Llama-4 they must be COMPLEMENTARY: rotary layers
+                    // take chunked LOCAL attention, and the NoPE layers take GLOBAL attention with
+                    // length-dependent temperature instead. That pairing is the whole mechanism.
+                    //
+                    // If the two metadata keys disagree, a layer gets local attention AND no positional
+                    // signal at all, or global attention with rotation — either way the model loads,
+                    // every shape matches, and the text degrades. Warned rather than corrected, because
+                    // the file is the authority and silently overriding it would hide a real
+                    // disagreement.
+                    if is_llama4 {
+                        let is_nope = nope_step > 0 && (i + 1) % nope_step == 0;
+                        if n_swa > 0 && windowed == is_nope {
+                            static WARNED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("loader: Llama-4 layer {i} is {}windowed and {}NoPE — iRoPE \
+expects these COMPLEMENTARY (rotary layers local, NoPE layers global). The two patterns come from \
+different metadata keys and disagree here; output will be degraded rather than broken",
+                                    if windowed { "" } else { "not " },
+                                    if is_nope { "" } else { "not " });
+                            }
+                        }
+                    }
                     if n_swa > 0 && windowed { Some((n_swa, ty)) } else { None }
                 },
                 kq_norm: if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
