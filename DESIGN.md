@@ -2892,6 +2892,36 @@ written for.
 `--sim loop` now reports rings per segment and walks the world SDF straight
 through the carved junctions: 40 of 40 are open all the way through.
 
+## v1.89.0 — the menus, fixed and measured
+
+THE MOUSE DID NOTHING on the three newest screens, and the reason is a
+one-line omission: `hover_row` ended with `_ => None`, so TRIALS, ACADEMY
+and GARAGE had no hit-testing arm at all. Every click on them was correctly
+computing "no row is under the cursor". They have arms now, using the SAME
+layout constants the drawing uses — which were previously buried inside the
+draw functions, and are shared consts precisely so the two can never drift
+apart again. Clicking a garage row also cycles its option: left half back,
+right half forward, since a row that cycles needs a direction and a click
+has one.
+
+OVERLAPPING TEXT. Text width scales with 1/aspect, so the same string is
+far wider in NDC on a narrow window than on a wide one — and rows laid out
+against FIXED budgets ("the name gets 0.52") walked straight into the value
+beside them. `row_pair` measures the value first and gives the name whatever
+is left after it and a gap, so the two cannot collide at any window shape.
+Titles and subtitles now scale with the same factor as everything else;
+previously they were fixed-size and simply ran off the panel.
+
+The scale floor also moved from 0.62 to 0.46, because 0.62 on a tall narrow
+window still left text wider than the panel containing it.
+
+New `--sim menus` measures the widest possible row against the panel across
+six window shapes from 0.55 to 2.4, and checks that a click in the middle of
+a row lands on that row and that a click above the list hits nothing:
+
+    aspect   0.55  0.75  1.00  1.33  1.78  2.40
+    widest   1.02  0.76  0.73  0.73  0.70  0.53   (panel is 1.60)
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

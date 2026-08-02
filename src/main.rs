@@ -1373,7 +1373,32 @@ impl Game {
         let esc = Key::Named(NamedKey::Escape);
         let enter = Key::Named(NamedKey::Enter);
         match self.mode {
-            Mode::Garage { .. } => {}
+            Mode::Garage { .. } => {
+                if let Some(i) = self.hover_row() {
+                    self.mode = Mode::Garage { sel: i };
+                    self.look_sel = i;
+                    // left half steps back, right half steps forward: a list
+                    // whose rows cycle needs a direction, and a click has one
+                    let fwd = self.cursor.0 >= 0.0;
+                    let n = custom::slots()[i].1;
+                    if i == 0 {
+                        let c = self.look.matches_collection().unwrap_or(0);
+                        let m = custom::COLLECTIONS.len();
+                        self.look.set_collection(if fwd { (c + 1) % m } else { (c + m - 1) % m });
+                    } else {
+                        let cur = match i {
+                            1 => &mut self.look.skin,
+                            2 => &mut self.look.paint,
+                            3 => &mut self.look.rig,
+                            4 => &mut self.look.wheels,
+                            5 => &mut self.look.trail,
+                            _ => &mut self.look.explosion,
+                        };
+                        *cur = if fwd { (*cur + 1) % n } else { (*cur + n - 1) % n };
+                    }
+                    self.save.look = self.look.encode();
+                }
+            }
             Mode::Academy { sel } => {
                 if let Some(i) = self.hover_row() {
                     if i == sel {
@@ -1844,6 +1869,21 @@ impl Game {
                 hud::hit_row_scrolled(hud::MAPS_TOP, hud::maps_row_h(), n, vis, start, y)
             }
             Mode::Online { .. } => hud::hit_row(hud::ONL_TOP, hud::ONL_ROW_H, hud::ONLINE_ROWS, y),
+            // These three had no arm at all, so `hover_row` returned None and
+            // every click on them did nothing.
+            Mode::Trials { .. } => {
+                let n = trials::TRIALS.len();
+                let vis = hud::vis_rows(hud::TRIALS_ROW_H, hud::LIST_TOP, hud::TW_BOTTOM);
+                let start = self.mscroll.max(0.0) as usize;
+                hud::hit_row_scrolled(hud::LIST_TOP, hud::TRIALS_ROW_H, n, vis, start, y)
+            }
+            Mode::Academy { .. } => {
+                let n = academy::LESSONS.len();
+                let vis = hud::vis_rows(hud::ACADEMY_ROW_H, hud::LIST_TOP, hud::TW_BOTTOM);
+                let start = self.mscroll.max(0.0) as usize;
+                hud::hit_row_scrolled(hud::LIST_TOP, hud::ACADEMY_ROW_H, n, vis, start, y)
+            }
+            Mode::Garage { .. } => hud::hit_row(hud::GARAGE_TOP, hud::GARAGE_ROW_H, custom::slots().len(), y),
             _ => None,
         }
     }

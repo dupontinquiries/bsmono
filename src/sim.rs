@@ -3486,6 +3486,67 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "menus" {
+        // Menus break in ways that are invisible until someone opens one on a
+        // narrow window. Text width scales with 1/aspect, so the same string
+        // is far wider in NDC on a tall thin window than on a wide one — and
+        // a layout laid out against fixed budgets marches straight off the
+        // panel or into the value beside it.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // the panel these menus draw inside
+        const PANEL: f32 = 0.80;
+        println!("{:>9} {:>9} {:>11} {:>11}", "aspect", "scale", "widest row", "fits panel");
+        let mut all_fit = true;
+        for a in [0.55f32, 0.75, 1.0, 1.33, 1.78, 2.4] {
+            let k = crate::hud::ui_k(a);
+            // the longest name and the longest value that can share a row
+            let longest_name = crate::custom::SKINS
+                .iter()
+                .map(|(n, _)| *n)
+                .chain(crate::academy::LESSONS.iter().map(|l| l.name))
+                .chain(crate::trials::TRIALS.iter().map(|t| t.name))
+                .max_by_key(|s| s.len())
+                .unwrap_or("");
+            let name_w = crate::font::width(longest_name, crate::hud::T_BODY * k, a);
+            let val_w = crate::font::width("LEARNED", crate::hud::T_BODY * k, a);
+            let total = name_w + val_w + 0.035;
+            let fits = total <= PANEL * 2.0;
+            all_fit &= fits;
+            println!(
+                "{:>9.2} {:>9.2} {:>11.2} {:>11}",
+                a,
+                k,
+                total,
+                if fits { "yes" } else { "NO" }
+            );
+        }
+        check("the longest row fits at every window shape", all_fit);
+        // rows must be hit-testable exactly where they are drawn
+        let mid = crate::hud::LIST_TOP - crate::hud::TRIALS_ROW_H * 2.5;
+        check(
+            "a click in the middle of row 2 lands on row 2",
+            crate::hud::hit_row(crate::hud::LIST_TOP, crate::hud::TRIALS_ROW_H, 8, mid) == Some(2),
+        );
+        check(
+            "a click above the list hits nothing",
+            crate::hud::hit_row(crate::hud::LIST_TOP, crate::hud::TRIALS_ROW_H, 8, 0.95).is_none(),
+        );
+        check(
+            "the garage rows are hit-testable too",
+            crate::hud::hit_row(
+                crate::hud::GARAGE_TOP,
+                crate::hud::GARAGE_ROW_H,
+                crate::custom::slots().len(),
+                crate::hud::GARAGE_TOP - crate::hud::GARAGE_ROW_H * 3.5,
+            ) == Some(3),
+        );
+        println!("{}", if pass { "MENUS: PASS" } else { "MENUS: FAIL" });
+        return;
+    }
     if name == "garage" {
         // The customizer, checked as data: every slot has options, every
         // option has a name and a description, and a loadout survives a save.

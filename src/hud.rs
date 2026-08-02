@@ -101,6 +101,38 @@ fn label_c(ui: &mut Vec<UiVert>, y: f32, px: f32, a: f32, c: [f32; 4], s: &str) 
 }
 
 /// Truncate a string so it renders no wider than `maxw` NDC units.
+/// Draw a NAME on the left and a VALUE on the right of the same row without
+/// them ever touching.
+///
+/// The trick is measuring the value first: text width scales with 1/aspect,
+/// so on a narrow window the same string is far wider in NDC and a label
+/// laid out against a fixed budget marched straight into the value beside
+/// it. The label now gets whatever is left after the value and a gap, so the
+/// two cannot collide at any window shape.
+#[allow(clippy::too_many_arguments)]
+pub fn row_pair(
+    ui: &mut Vec<UiVert>,
+    left: f32,
+    right: f32,
+    y: f32,
+    name: &str,
+    name_col: [f32; 4],
+    value: &str,
+    value_col: [f32; 4],
+    px: f32,
+    a: f32,
+) {
+    let gap = 0.035;
+    let vw = font::width(value, px, a).min((right - left) * 0.62);
+    let avail = (right - left - vw - gap).max(0.08);
+    font::text(ui, left, y, px, a, name_col, &fit(name, avail, px, a));
+    if !value.is_empty() {
+        let v = fit(value, (right - left) * 0.62, px, a);
+        let w = font::width(&v, px, a);
+        font::text(ui, right - w, y, px, a, value_col, &v);
+    }
+}
+
 fn fit(s: &str, maxw: f32, px: f32, a: f32) -> String {
     if font::width(s, px, a) <= maxw {
         return s.to_string();
@@ -162,7 +194,9 @@ fn inset(ui: &mut Vec<UiVert>, a: f32, x0: f32, y0: f32, x1: f32, y1: f32) {
 /// WIDER in NDC there and runs out of its button. Everything in the menus
 /// scales through this, and long labels additionally get `fit()`.
 pub fn ui_k(a: f32) -> f32 {
-    (a / 1.70).clamp(0.62, 1.0)
+    // The floor used to be 0.62, which on a tall narrow window left text
+    // wider than the panel it sat in — everything crowded and overlapped.
+    (a / 1.70).clamp(0.46, 1.0)
 }
 
 pub const T_TITLE: f32 = 0.0138;
@@ -301,21 +335,22 @@ pub fn academy_menu(
 ) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.86, -0.985, 0.86, 0.955);
-    label_c(ui, 0.885, T_TITLE, a, PAPER, "ACADEMY");
+    label_c(ui, 0.885, T_TITLE * ui_k(a), a, PAPER, "ACADEMY");
     label_c(
         ui,
         0.828,
-        T_HINT,
+        T_HINT * ui_k(a),
         a,
         DIM,
-        &format!(
-            "{} OF {} LEARNED - THE GAME WATCHES AND TELLS YOU WHEN YOU HAVE IT",
-            passed.count(),
-            crate::academy::LESSONS.len()
+        &fit(
+            &format!("{} OF {} LEARNED", passed.count(), crate::academy::LESSONS.len()),
+            1.62,
+            T_HINT * ui_k(a),
+            a,
         ),
     );
-    let row_h = 0.062;
-    let top = 0.70;
+    let row_h = ACADEMY_ROW_H;
+    let top = LIST_TOP;
     let n = crate::academy::LESSONS.len();
     let vis = vis_rows(row_h, top, TW_BOTTOM);
     let start = scroll.min(n.saturating_sub(vis.min(n)));
@@ -331,10 +366,7 @@ pub fn academy_menu(
             quad(ui, -0.817, y - row_h + 0.026, -0.802, y + 0.022, GOLD);
         }
         let col = if i == sel { GOLD } else if got { CYAN } else { PAPER };
-        font::text(ui, -0.78, y, T_BODY * k, a, col, &fit(l.name, 0.60, T_BODY * k, a));
-        let mark = if got { "LEARNED" } else { "" };
-        let w = font::width(mark, T_HINT * k, a);
-        font::text(ui, 0.78 - w, y, T_HINT * k, a, CYAN, mark);
+        row_pair(ui, -0.78, 0.78, y, l.name, col, if got { "LEARNED" } else { "" }, CYAN, T_BODY * k, a);
         if i == sel {
             font::text(ui, -0.78, y - row_h * 0.5, T_HINT * k, a, DIM, &fit(l.hint, 1.5, T_HINT * k, a));
         }
@@ -368,8 +400,8 @@ pub fn garage_menu(
 ) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.86, -0.985, 0.86, 0.955);
-    label_c(ui, 0.885, T_TITLE, a, PAPER, "GARAGE");
-    label_c(ui, 0.828, T_HINT, a, DIM, "LEFT / RIGHT TO CHANGE - EVERYTHING HERE IS COSMETIC");
+    label_c(ui, 0.885, T_TITLE * ui_k(a), a, PAPER, "GARAGE");
+    label_c(ui, 0.828, T_HINT * ui_k(a), a, DIM, &fit("LEFT / RIGHT TO CHANGE - ALL COSMETIC", 1.62, T_HINT * ui_k(a), a));
     let k = ui_k(a);
     let coll = look.matches_collection();
     let rows: [(&str, String, usize, usize); 7] = [
@@ -389,8 +421,8 @@ pub fn garage_menu(
         ("BOOST TRAIL", look.trail_name().to_string(), look.trail, crate::custom::TRAILS.len()),
         ("GOAL EXPLOSION", look.explosion_name().to_string(), look.explosion, crate::custom::EXPLOSIONS.len()),
     ];
-    let top = 0.66;
-    let row_h = 0.082;
+    let top = GARAGE_TOP;
+    let row_h = GARAGE_ROW_H;
     for (i, (name, val, idx, n)) in rows.iter().enumerate() {
         let y = top - i as f32 * row_h;
         if i == sel {
@@ -398,9 +430,7 @@ pub fn garage_menu(
             quad(ui, -0.817, y - row_h + 0.04, -0.802, y + 0.030, GOLD);
         }
         let col = if i == sel { GOLD } else { PAPER };
-        font::text(ui, -0.78, y, T_BODY * k, a, col, name);
-        let w = font::width(val, T_BODY * k, a);
-        font::text(ui, 0.78 - w, y, T_BODY * k, a, CYAN, val);
+        row_pair(ui, -0.78, 0.78, y, name, col, val, CYAN, T_BODY * k, a);
         // the paint row shows the palette itself; everything else gets dots
         if i == 2 {
             for (d, (_, rgb)) in crate::custom::PAINTS.iter().enumerate() {
@@ -438,6 +468,16 @@ pub fn garage_menu(
     legend(ui, -0.93, a, T_HINT, &[("LEFT/RIGHT", "CHANGE"), ("ESC", "BACK")]);
 }
 
+/// Layout constants for the list menus, so hit-testing uses the SAME
+/// numbers the drawing does. When these lived only inside the draw
+/// functions, the new screens had no way to answer "which row is under the
+/// cursor" and mouse input silently did nothing on them.
+pub const LIST_TOP: f32 = 0.70;
+pub const TRIALS_ROW_H: f32 = 0.058;
+pub const ACADEMY_ROW_H: f32 = 0.062;
+pub const GARAGE_TOP: f32 = 0.66;
+pub const GARAGE_ROW_H: f32 = 0.082;
+
 /// The trials list: name, what it asks, which map, and your best.
 pub fn trials_menu(
     ui: &mut Vec<UiVert>,
@@ -449,18 +489,18 @@ pub fn trials_menu(
 ) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
     panel(ui, a, -0.86, -0.985, 0.86, 0.955);
-    label_c(ui, 0.885, T_TITLE, a, PAPER, "TRIALS");
+    label_c(ui, 0.885, T_TITLE * ui_k(a), a, PAPER, "TRIALS");
     let done = bests.finished();
     label_c(
         ui,
         0.828,
-        T_HINT,
+        T_HINT * ui_k(a),
         a,
         DIM,
-        &format!("{done} OF {} COMPLETE - ONE THING TO DO ON EVERY MAP", crate::trials::TRIALS.len()),
+        &fit(&format!("{done} OF {} COMPLETE", crate::trials::TRIALS.len()), 1.62, T_HINT * ui_k(a), a),
     );
-    let row_h = 0.058;
-    let top = 0.70;
+    let row_h = TRIALS_ROW_H;
+    let top = LIST_TOP;
     let n = crate::trials::TRIALS.len();
     let vis = vis_rows(row_h, top, TW_BOTTOM);
     let start = scroll.min(n.saturating_sub(vis.min(n)));
@@ -476,12 +516,14 @@ pub fn trials_menu(
             quad(ui, -0.817, y - row_h + 0.026, -0.802, y + 0.022, GOLD);
         }
         let col = if i == sel { GOLD } else if best > 0.0 { CYAN } else { PAPER };
-        font::text(ui, -0.78, y, T_BODY * k, a, col, &fit(t.name, 0.52, T_BODY * k, a));
-        let map = crate::world::style(t.map).name;
-        font::text(ui, -0.20, y, T_HINT * k, a, DIM, &fit(map, 0.34, T_HINT * k, a));
         let right = if best > 0.0 { format!("{best:.1}s") } else { "-".to_string() };
-        let w = font::width(&right, T_BODY * k, a);
-        font::text(ui, 0.78 - w, y, T_BODY * k, a, if best > 0.0 { CYAN } else { DIM }, &right);
+        // the map name only appears when there is room for it
+        let label = if a > 1.35 {
+            format!("{}   {}", t.name, crate::world::style(t.map).name)
+        } else {
+            t.name.to_string()
+        };
+        row_pair(ui, -0.78, 0.78, y, &label, col, &right, if best > 0.0 { CYAN } else { DIM }, T_BODY * k, a);
         if i == sel {
             font::text(ui, -0.78, y - row_h * 0.52, T_HINT * k, a, DIM, &fit(t.blurb, 1.4, T_HINT * k, a));
         }
@@ -1057,5 +1099,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.88    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.89    ESC QUITS FROM THIS SCREEN");
 }

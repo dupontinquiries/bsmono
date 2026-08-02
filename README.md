@@ -449,3 +449,5 @@ VIPERA and AEGIS are built from a written specification, hardpoints first — se
 Drop a car in as `assets/cars/<name>.glb` and it loads; `--sim glb` verifies it. Every car has an EV variant with an ion thruster.
 
 GARAGE: ten animated skins, seven wheels, six trails, six goal explosions. `--sim garage` verifies the data.
+
+`--sim menus` checks menu layout across window shapes and verifies rows are hit-testable where they are drawn.
