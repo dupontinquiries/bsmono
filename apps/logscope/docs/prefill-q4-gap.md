@@ -98,3 +98,50 @@ Q4_K gate, and the disabled decode kernel. Fixing it is the highest-value single
 it needs a dispatch-time print of the bound buffer length on hardware to localise — the input branch
 takes `as_entire_binding()` for `view: None`, which is correct on inspection, so the fault is either a
 view arriving where none should, or the dims uniform cutting the loop short.
+
+
+---
+
+# The wide-load decode kernel exists and the autotune cannot reach it
+
+`MATVEC_Q8_0_TILED_V3` — 128-bit `vec4<u32>` loads, four words per transaction instead of one. Its own
+comment states the case exactly:
+
+> The profile says decode is **latency/occupancy-bound** (≈6% BW, ≈1% ALU — the GPU idles on memory
+> latency), and wider loads put more bytes in flight per request, the textbook fix.
+
+That is precisely the 6–10×-off-roofline picture measured above: low bandwidth utilisation, near-zero
+ALU, the GPU waiting on memory rather than working.
+
+**But `MatvecKernel` is `V1 | V2 | V2Wg128 | V2WgSg`. There is no V3.** It reaches the GPU only through
+`LOGSCOPE_MATVEC_V3=1` and a bench in `main.rs`, so the per-shape autotune — which searches every other
+kernel and picks `V2Wg128` — has never compared against it.
+
+That is why `V2Wg128` "wins": it wins the search it was entered in.
+
+## What to try, in order
+
+```
+LOGSCOPE_MATVEC_V3=1        # the wide-load kernel, on a Q8_0 model
+```
+
+Q8_0 first because V3 is the q8_0 kernel — `Llama-3.2-3B-Instruct-Q8_0` at 76 ms/token against a
+12.4 ms floor is the cleanest test available.
+
+If it moves the number, the durable fix is adding `V3` to the `MatvecKernel` enum and the autotune
+candidate list, so it competes per shape like the others rather than being an env flag someone has to
+know about.
+
+## Why this is independent of the subgroup chain
+
+`V2WgSg` is blocked behind the short-binding finding and may take a while. V3 needs neither subgroups
+nor any driver feature the guard has disabled — it is the same barrier-tree reduction with wider loads.
+So it is the one decode speedup available *without* resolving `--gate-bytes`.
+
+## What the references say
+
+ggml-metal's decode kernels load `device const float4*` and `device const uchar4*` throughout — wide
+loads are the default there, not an option. Colibri does the same on the CPU side with `float32x4_t`
+accumulators, which is where the 2× integer-dot finding came from.
+
+Both treat 4-wide as the baseline shape. This engine has it, benchmarks it, and does not select it.
