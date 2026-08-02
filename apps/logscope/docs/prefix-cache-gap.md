@@ -56,3 +56,36 @@ re-doing every previous turn.
 
 Do this before the q4 GEMM. It is a call-site change against an existing tested function, where the GEMM
 is a new kernel that cannot be validated off-hardware — and on a long chat this is worth more.
+
+
+---
+
+# Correction: the extend path works, and starts from zero
+
+The section above said the extend machinery was unreachable. That is wrong and the correction narrows
+the fix considerably.
+
+`block_prefill_ext` — the per-layer extend — **is called**, from the memory-bounded chunked prefill
+(`lib.rs:4852` and `10892`). Every prefill already runs as a sequence of extends: chunk 1 fills the
+cache, chunk 2 extends it, and so on. The machinery is exercised on every single turn.
+
+`attention_mh_ext` shows as unused because `block_prefill_ext` reaches attention by another route, not
+because the extend path is dead.
+
+**So what is missing is one decision, not a subsystem.** Chunked prefill always starts at `base = 0`
+and walks the whole prompt. A prefix hit would start it at `base = cached_len` with the new suffix as
+the remaining chunks — the same loop, entered later.
+
+That makes this a considerably better first task than it looked:
+
+* the extend path is not new code, and it is not untested — it runs on every prefill today;
+* the failure mode of getting `base` wrong is loud (wrong positions, immediately visible output), not
+  the silent degradation that has made everything else this session hard to verify;
+* and it needs no GPU work at all.
+
+What it does need is the bookkeeping to know how many rows a matched cache holds, and a lookup that
+finds the longest cached prefix of the current prompt on the same branch — the linear analogue of the
+fan-out `shared` computation in `backend.rs:1108`, which already does exactly this shape across
+branches.
+
+**The measured prize is unchanged**: 258 new tokens took 8.44 s on turn five against 1.05 s on turn one.
