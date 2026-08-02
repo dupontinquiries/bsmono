@@ -7705,10 +7705,16 @@ Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp ba
                 // errors point the same way: q's range would have covered part of the tensor that is
                 // not q, and the row-count check would not have caught it because the numbers are
                 // self-consistent — just about the wrong dimension.
-                let rows_of = |n: &str| g.tensor(n)
-                    .map(|t| t.dims.iter().skip(1).product::<u64>() as usize);
-                let row_bytes = |n: &str| g.tensor(n)
-                    .and_then(|t| gguf::type_nbytes(t.ggml_type, t.dims[0] as usize));
+                // Both derived by qkvsplit::dims_to_rows_and_stride, which is where the axis bug was
+                // and is now the tested unit — the loader closure could not be tested from here, and
+                // every gate passed while this was backwards because none of them loads a fused
+                // tensor.
+                let derive = |n: &str| g.tensor(n).and_then(|t| {
+                    let ty = t.ggml_type;
+                    crate::qkvsplit::dims_to_rows_and_stride(&t.dims, |w| gguf::type_nbytes(ty, w))
+                });
+                let rows_of = |n: &str| derive(n).map(|(r, _)| r);
+                let row_bytes = |n: &str| derive(n).map(|(_, s)| s);
                 for fused in crate::qkvsplit::FUSED_NAMES {
                     let src = match crate::qkvsplit::resolve(name, fused) { Some((s, _)) => s, None => break };
                     // A None here means the row is not a whole number of quantization blocks, so it
