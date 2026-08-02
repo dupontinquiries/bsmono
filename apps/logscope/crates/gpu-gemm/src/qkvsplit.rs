@@ -508,3 +508,93 @@ mod dims_tests {
         assert_eq!(rows, 8192);
     }
 }
+
+#[cfg(test)]
+mod equivalence_tests {
+    use super::*;
+
+    /// The claim the whole fused path rests on, tested against real quantized bytes.
+    ///
+    /// The loader slices the fused tensor's BYTES and dequantizes only that range. That is only
+    /// correct if it produces the same values as dequantizing the whole tensor and slicing the
+    /// resulting floats — and nothing checked it, because every test and gate exercises dense tensors
+    /// that never take this path.
+    ///
+    /// This is the check that would have caught the swapped axes in _465 and the one that would catch
+    /// a mid-block slice, without needing a fused checkpoint.
+    fn q4k_blocks(nblk: usize, seed: u8) -> Vec<u8> {
+        // 144 bytes per 256 weights: d (f16), dmin (f16), 12 scale bytes, 128 quant bytes.
+        let mut v = vec![0u8; nblk * 144];
+        for b in 0..nblk {
+            let blk = &mut v[b * 144..(b + 1) * 144];
+            // Plausible f16 scales rather than random bytes — random ones decode to inf/NaN, which is
+            // how four Q6_K "kernel faults" turned out to be a bad fixture.
+            blk[0..2].copy_from_slice(&0x2E66u16.to_le_bytes());   // ~0.1
+            blk[2..4].copy_from_slice(&0x2800u16.to_le_bytes());   // ~0.03
+            for i in 4..144 { blk[i] = ((i * 7 + b * 13 + seed as usize) % 251) as u8; }
+        }
+        v
+    }
+
+    #[test]
+    fn slicing_bytes_then_dequantizing_equals_dequantizing_then_slicing() {
+        // 6144 rows of 256 weights: q=4096, k=1024, v=1024 at 32/8 heads of 128.
+        let (rows, width) = (6144usize, 256usize);
+        let row_bytes = width / 256 * 144;
+        let raw = q4k_blocks(rows, 3);
+
+        let whole = crate::gguf::dequantize(12, &raw, rows * width).expect("q4_k dequantizes");
+        let s = split(rows, 32, 8, 128).expect("sums");
+
+        for part in [Part::Q, Part::K, Part::V] {
+            let span = s.span(part);
+            let (b0, b1) = Split::byte_range(span, row_bytes);
+            // What the loader does: slice the bytes, dequantize just those.
+            let sliced = crate::gguf::dequantize(12, &raw[b0..b1], (span.1 - span.0) * width)
+                .expect("a row-aligned slice is still whole blocks");
+            // What it must equal: dequantize everything, then take the same rows.
+            let expected = &whole[span.0 * width..span.1 * width];
+            assert_eq!(sliced.len(), expected.len(), "{part:?} length");
+            assert_eq!(&sliced[..], expected, "{part:?} values differ — the byte slice is misaligned");
+        }
+    }
+
+    #[test]
+    fn the_three_parts_RECONSTRUCT_the_whole_tensor() {
+        // Stronger than checking each part: concatenating them must reproduce the original exactly,
+        // which catches a gap or an overlap that per-part checks could both pass.
+        let (rows, width) = (6144usize, 256usize);
+        let row_bytes = width / 256 * 144;
+        let raw = q4k_blocks(rows, 11);
+        let whole = crate::gguf::dequantize(12, &raw, rows * width).unwrap();
+        let s = split(rows, 32, 8, 128).unwrap();
+
+        let mut rebuilt = Vec::with_capacity(whole.len());
+        for part in [Part::Q, Part::K, Part::V] {
+            let (b0, b1) = Split::byte_range(s.span(part), row_bytes);
+            let span = s.span(part);
+            rebuilt.extend(crate::gguf::dequantize(12, &raw[b0..b1], (span.1 - span.0) * width).unwrap());
+        }
+        assert_eq!(rebuilt.len(), whole.len());
+        assert_eq!(rebuilt, whole, "q|k|v concatenated must be the original, with no gap or overlap");
+    }
+
+    #[test]
+    fn a_SWAPPED_axis_reading_produces_different_values() {
+        // The bug from _465, caught by this test rather than by a real checkpoint. Splitting against
+        // the wrong dimension yields a byte range that decodes to something — just not q.
+        let (rows, width) = (6144usize, 256usize);
+        let row_bytes = width / 256 * 144;
+        let raw = q4k_blocks(rows, 5);
+        let right = split(rows, 32, 8, 128).unwrap();
+        // A swapped reading would have split against the width instead, and split() refuses that here
+        // only because the numbers happen not to sum. When they DO sum, nothing objects:
+        let wrong = split(6144, 16, 16, 128).unwrap();   // 2048+2048+2048, also 6144
+        let (rb0, rb1) = Split::byte_range(right.span(Part::Q), row_bytes);
+        let (wb0, wb1) = Split::byte_range(wrong.span(Part::Q), row_bytes);
+        assert_ne!((rb0, rb1), (wb0, wb1), "different head counts must select different bytes");
+        let a = crate::gguf::dequantize(12, &raw[rb0..rb1], (rb1 - rb0) / row_bytes * width).unwrap();
+        let b = crate::gguf::dequantize(12, &raw[wb0..wb1], (wb1 - wb0) / row_bytes * width).unwrap();
+        assert_ne!(a.len(), b.len(), "and a different amount of the tensor — silently, if unchecked");
+    }
+}
