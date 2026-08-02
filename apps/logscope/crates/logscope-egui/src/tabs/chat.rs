@@ -608,7 +608,11 @@ fn parse_inline(s: &str) -> Vec<Run> {
 fn md_line_job(ui: &egui::Ui, line: &str, size: f32, base: egui::Color32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     use egui::{FontFamily, FontId};
-    let strong = ui.visuals().strong_text_color();
+    // CONTRAST-ENSURED, like the accent two lines down. This was
+    // `ui.visuals().strong_text_color()` — egui's untreated default — so bold runs in a message could
+    // fail to read on themes where every other markdown colour had been adjusted. The fix that was
+    // applied to links and inline code was never applied here.
+    let strong = theme::md_strong();
     let mut job = LayoutJob::default();
     job.wrap.max_width = ui.available_width();
     // inline code/links use the CONTRAST-ENSURED accent: the raw palette cyan is neon on several
