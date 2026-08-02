@@ -23,6 +23,12 @@
 //! kept, because the first form on a page is usually the real one and the second
 //! is a newsletter signup.
 
+#[path = "../../src/ad_filter.rs"]
+#[allow(dead_code)]
+pub mod ad_filter;
+
+pub use ad_filter::{FilterMode, FilterStats};
+
 /// What kind of thing was found. Mirrors `web_interact::WebWidget` without
 /// mounting it: that module pulls in `ureq` for form submission, and a view
 /// does not make network calls.
@@ -88,6 +94,13 @@ impl Action {
 /// The browser page's state.
 #[derive(Debug, Clone, Default)]
 pub struct Browser {
+    /// Ad and tracker filtering. Mounted from the app's own `ad_filter` rather
+    /// than reimplemented — its `classify_tracking_wrapper` exempts semantic
+    /// tags (article, section, header) on the grounds that they "carry meaning
+    /// we shouldn't override", and a second filter that did not know that would
+    /// strip real content while claiming to remove ads.
+    pub filter_mode: FilterMode,
+    pub filter_stats: FilterStats,
     pub url: String,
     pub title: String,
     pub actions: Vec<Action>,
@@ -120,8 +133,22 @@ impl Browser {
         Some("nothing to act on here")
     }
 
+    /// What the filter did on this page, for the row that reports it.
+    ///
+    /// Reported rather than silent: a filter that removes things without saying
+    /// so is indistinguishable from a broken page, and the first thing anyone
+    /// does when a site looks wrong is turn the filter off — so it has to be
+    /// obvious that it was on.
+    pub fn filter_summary(&self) -> Option<String> {
+        if self.filter_mode == FilterMode::Off { return None; }
+        Some(self.filter_stats.summary())
+    }
+
     pub fn load(&mut self, url: &str) {
         self.url = url.to_string();
+        // Per-page, not cumulative: "412 trackers blocked" across a session
+        // tells you nothing about the page in front of you.
+        self.filter_stats = FilterStats::default();
         self.loading = true;
         // Cleared on load, not on arrival: leaving the previous page's login
         // form visible while a new page loads invites acting on the wrong site,
@@ -193,6 +220,54 @@ mod tests {
             ..Default::default()
         };
         assert!(b.ranked()[0].label().contains("/real"));
+    }
+
+    #[test]
+    fn the_filter_reports_what_it_did() {
+        // A filter that removes things silently is indistinguishable from a
+        // broken page, and the first thing anyone does when a site looks wrong
+        // is turn the filter off — so it has to be obvious it was on.
+        let mut b = Browser { filter_mode: FilterMode::Standard, ..Default::default() };
+        assert!(b.filter_summary().is_some());
+        b.filter_mode = FilterMode::Off;
+        assert_eq!(b.filter_summary(), None, "nothing to report when it is off");
+    }
+
+    #[test]
+    fn filter_stats_are_per_page_not_cumulative() {
+        // "412 trackers blocked" across a session tells you nothing about the
+        // page in front of you.
+        let mut b = Browser { filter_mode: FilterMode::Standard, ..Default::default() };
+        b.filter_stats.filtered_elements = 17;
+        b.load("https://elsewhere.test");
+        assert_eq!(b.filter_stats.filtered_elements, 0, "reset with the page");
+    }
+
+    #[test]
+    fn a_tracking_wrapper_is_unwrapped_rather_than_hidden() {
+        // The distinction the mounted filter draws, and the reason to mount it
+        // rather than write a second one: a div with tracking attributes AND
+        // children is a wrapper AROUND real content, so it is unwrapped —
+        // children rendered directly. Hiding it would take the article with it.
+        // Only a CHILDLESS one is a tracking pixel and gets dropped.
+        let attrs = [("data-analytics-id", "x")];
+        let (hide, unwrap) = ad_filter::classify_tracking_wrapper("div", &attrs, true);
+        assert!(!hide, "the content inside must survive");
+        assert!(unwrap, "but the wrapper does not");
+        let (hide_pixel, _) = ad_filter::classify_tracking_wrapper("div", &attrs, false);
+        assert!(hide_pixel, "a childless tracker is a pixel and goes");
+    }
+
+    #[test]
+    fn semantic_tags_are_exempt_whatever_attributes_they_carry() {
+        // article/section/header "carry meaning we shouldn't override" — a
+        // second filter that did not know that would strip real content while
+        // claiming to remove ads.
+        let attrs = [("data-analytics-id", "x")];
+        for tag in ["article", "section", "header", "main"] {
+            let (hide, unwrap) = ad_filter::classify_tracking_wrapper(tag, &attrs, false);
+            assert!(!hide && !unwrap, "{tag} was touched");
+        }
     }
 
     #[test]
