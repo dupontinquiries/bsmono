@@ -7568,7 +7568,34 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                         auto_q4 = true;
                         // moe_stream_pin stays None, which is what selects the resident path below.
                     } else if dense + ring_cost > gpu_budget {
-                                    return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB. Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget)));
+                                    return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB.{} Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget),
+                            // NAME THE FIX, not just the number. "It does not fit" is a dead end;
+                            // "it does not fit at 4.5 bits and would at 1.56" names the work that
+                            // changes the answer and lets a reader judge whether it is worth doing.
+                            //
+                            // Only shown when the source format is genuinely cheaper than the resident
+                            // one — for Q4_K the conversion is size-neutral and a native path would buy
+                            // nothing, so offering it there would send someone after 0 GiB.
+                            {
+                                let params = (dense + (n_expert as u64) * per_expert_all_layers)
+                                    .saturating_mul(8) / 45 * 10;   // undo 4.5 bpw to weights
+                                // The expert tensors' own type, looked up rather than assumed: the
+                                // dense weights may be a different format from the experts, and it is
+                                // the experts that dominate this budget.
+                                let et = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter()
+                                    .find_map(|n| g.tensor(&format!("blk.0.{n}.weight"))
+                                        .map(|t| t.ggml_type))
+                                    .unwrap_or(u32::MAX);
+                                match crate::memplan::conversion_cost(et, params, 4.5) {
+                                    Some((res, nat)) if nat < res => format!(
+                                        " The source is {:.2} bpw and the engine converts it to 4.5 \
+bpw q4 before running: {:.1} GiB native against {:.1} GiB resident, so a native kernel for this \
+format would save ~{:.1} GiB and is what would make this fit.",
+                                        crate::memplan::source_bpw(et).unwrap_or(0.0),
+                                        gib(nat), gib(res), gib(res.saturating_sub(nat))),
+                                    _ => String::new(),
+                                }
+                            }));
                                 }
                                 let pin_fit = ((gpu_budget - dense - ring_cost) / per_expert_all_layers) as usize;
                                 let pin = std::env::var("LOGSCOPE_MOE_PIN").ok().and_then(|s| s.parse().ok()).unwrap_or(pin_fit).min(pin_fit).min(n_expert);
