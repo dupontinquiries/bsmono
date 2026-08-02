@@ -471,6 +471,8 @@ struct Game {
     moments: Vec<replay::Moment>,
     /// playing a replay: (which moment, time into it)
     watching: Option<(usize, f32)>,
+    /// where the car last hit something, in its own frame, and how long ago
+    last_hit: (Vec3, f32),
     /// the garage: skin, wheels, trail, goal explosion
     look: custom::Loadout,
     look_sel: usize,
@@ -977,6 +979,7 @@ fn main() {
         rec: replay::Recorder::default(),
         moments: Vec::new(),
         watching: None,
+        last_hit: (Vec3::ZERO, 9.0),
         look: look0,
         look_sel: 0,
         trial: None,
@@ -1912,17 +1915,29 @@ impl Game {
                 let slots = custom::slots();
                 let n = slots.len();
                 let cnt = slots[sel.min(n - 1)].1;
+                // the collection row writes every other slot at once
+                if sel == 0 {
+                    let n = custom::COLLECTIONS.len();
+                    let curc = self.look.matches_collection().unwrap_or(0);
+                    match (&key, ch) {
+                        (Key::Named(NamedKey::ArrowLeft), _) | (_, "a") => self.look.set_collection((curc + n - 1) % n),
+                        (Key::Named(NamedKey::ArrowRight), _) | (_, "d") => self.look.set_collection((curc + 1) % n),
+                        _ => {}
+                    }
+                }
                 let cur = match sel {
-                    0 => &mut self.look.skin,
-                    1 => &mut self.look.rig,
-                    2 => &mut self.look.wheels,
-                    3 => &mut self.look.trail,
+                    0 => &mut self.look.skin, // handled above; keeps the borrow simple
+                    1 => &mut self.look.skin,
+                    2 => &mut self.look.paint,
+                    3 => &mut self.look.rig,
+                    4 => &mut self.look.wheels,
+                    5 => &mut self.look.trail,
                     _ => &mut self.look.explosion,
                 };
                 match (&key, ch) {
                     (Key::Named(NamedKey::Escape), _) => self.close_menu(),
-                    (Key::Named(NamedKey::ArrowLeft), _) | (_, "a") => *cur = (*cur + cnt - 1) % cnt,
-                    (Key::Named(NamedKey::ArrowRight), _) | (_, "d") => *cur = (*cur + 1) % cnt,
+                    (Key::Named(NamedKey::ArrowLeft), _) | (_, "a") if sel > 0 => *cur = (*cur + cnt - 1) % cnt,
+                    (Key::Named(NamedKey::ArrowRight), _) | (_, "d") if sel > 0 => *cur = (*cur + 1) % cnt,
                     (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
                         self.mode = Mode::Garage { sel: (sel + n - 1) % n }
                     }
@@ -3081,6 +3096,11 @@ impl Game {
         if ev.jumped {
             self.snd.fire(Sfx::Jump);
         }
+        // the IMPACT skin spreads its rings from here
+        self.last_hit.1 += dt;
+        if let Some(t0) = ev.touches.first() {
+            self.last_hit = (self.car.rot.inverse() * (t0.0 - self.car.pos), 0.0);
+        }
         // ---- REPLAY: keep the last twelve seconds, and watch for tricks ----
         {
             let ground = self.world.sdf(self.car.pos);
@@ -3906,9 +3926,18 @@ impl Game {
         [d.x, d.y, d.z, if boosting { 1.0 } else { 0.0 }]
     }
 
+    /// The third input: the last contact point in the car's own frame, and
+    /// how long ago, so IMPACT can roll a wave out from where it was hit.
+    fn skin_params3(&self) -> [f32; 4] {
+        let h = self.last_hit.0;
+        [h.x, h.y, h.z, self.last_hit.1]
+    }
+
     fn skin_params(&self) -> [f32; 4] {
         let sp = (self.car.vel.length() / 25.0).clamp(0.0, 1.0);
-        [self.look.skin as f32, (self.save.car as f32) * 1.7, 1.0, sp]
+        // z doubles as the MOMENTUM input: how hot the current combo is
+        let combo = (self.combo as f32 / 8.0).clamp(0.0, 1.0);
+        [self.look.skin as f32, (self.save.car as f32) * 1.7, combo.max(0.35), sp]
     }
 
     fn push_car(
@@ -3934,7 +3963,8 @@ impl Game {
                     color: [f32; 4],
                     params: [f32; 4],
                     skin: [f32; 4],
-                    skin2: [f32; 4]| {
+                    skin2: [f32; 4],
+                    skin3: [f32; 4]| {
             let nrm3 = Mat3::from_mat4(model).inverse().transpose();
             let mut raw = ObjectRaw::default();
             raw.model = model.to_cols_array();
@@ -3943,6 +3973,7 @@ impl Game {
             raw.params = params;
             raw.skin = skin;
             raw.skin2 = skin2;
+            raw.skin3 = skin3;
             objs.push(ObjDraw { mesh, tex, raw });
         };
         // one rim per wheel position: a split wheel can be several prims
@@ -3953,6 +3984,10 @@ impl Game {
         let rim_style = if rt_slot > 0.5 { self.look.wheels } else { 0 };
         let rig = if rt_slot > 0.5 { self.look.rig } else { 0 };
         let skin2 = if rt_slot > 0.5 { self.skin_params2() } else { [0.0; 4] };
+        let skin3 = if rt_slot > 0.5 { self.skin_params3() } else { [0.0; 4] };
+        // PAINT multiplies the body's own colour, so a finish is a behaviour
+        // and the paint is whose car it is
+        let paint = if rt_slot > 0.5 { self.look.paint_rgb() } else { [1.0; 3] };
         let wheel_r = self.cars.models[model_i].wheel_r * scale;
         let rim_col = [0.72, 0.75, 0.80, 1.0];
         #[allow(unused)]
@@ -3983,6 +4018,9 @@ impl Game {
                 continue;
             }
             let mut color = prim.color;
+            if matches!(prim.tag, model::Tag::Body) && self.look.paint > 0 {
+                color = [color[0] * paint[0], color[1] * paint[1], color[2] * paint[2], color[3]];
+            }
             if let Some(t) = tint {
                 color = [color[0] * t[0], color[1] * t[1], color[2] * t[2], color[3]];
             }
@@ -4051,7 +4089,7 @@ impl Game {
             let spec = if matches!(prim.tag, model::Tag::Body) { 0.6 } else { 0.15 };
             // the skin rides on the BODY only — wheels keep their own look
             let sk = if matches!(prim.tag, model::Tag::Body) { skin } else { [0.0; 4] };
-            push_skinned(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot], sk, skin2);
+            push_skinned(objs, prim.mesh_id, prim.tex_id, m, color, [0.0, 0.0, spec, rt_slot], sk, skin2, skin3);
             // THE GARAGE RIM, drawn over whatever wheel the car already has.
             // Because it rides the wheel's own pivot and transform, a style
             // applies to every car in the game — the imported bodies too —
@@ -4062,7 +4100,7 @@ impl Game {
                 let rm = m
                     * Mat4::from_translation(prim.pivot)
                     * Mat4::from_scale(Vec3::new(side * wheel_r * 1.02, wheel_r * 1.02, wheel_r * 1.02));
-                push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4], [0.0; 4]);
+                push_skinned(objs, world::M_RIM_0 + rim_style, None, rm, rim_col, [0.0, 0.08, 0.75, 0.0], [0.0; 4], [0.0; 4], [0.0; 4]);
             }
         }
     }

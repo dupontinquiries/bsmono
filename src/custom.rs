@@ -53,6 +53,59 @@ pub const SKINS: &[(&str, &str)] = &[
     ("THERMAL", "false colour by the air the bodywork is pushing"),
     ("AURORA", "curtains that hang in the air as you climb"),
     ("CRYSTAL", "a lens rather than a mirror"),
+    ("MOMENTUM", "brightens as your combo builds, and cools when you drop it"),
+    ("IMPACT", "rings spread from wherever you last hit something"),
+    ("CONSTELLATION", "stars fixed in the world; the car moves through them"),
+    ("MIRAGE", "the paint refuses to hold still"),
+];
+
+/// PAINT. Every finish takes a colour, so a skin is a behaviour and the
+/// paint is whose car it is. Stored as linear RGB, deliberately saturated —
+/// the skins tend to wash a colour out, so a timid palette disappears.
+pub const PAINTS: &[(&str, [f32; 3])] = &[
+    ("FACTORY", [1.00, 1.00, 1.00]),
+    ("CRIMSON", [0.72, 0.06, 0.10]),
+    ("EMBER", [0.95, 0.35, 0.05]),
+    ("SOLAR", [1.00, 0.78, 0.10]),
+    ("LIME", [0.45, 0.90, 0.15]),
+    ("JADE", [0.05, 0.55, 0.35]),
+    ("CYAN", [0.10, 0.75, 0.95]),
+    ("COBALT", [0.10, 0.25, 0.85]),
+    ("VIOLET", [0.45, 0.15, 0.85]),
+    ("MAGENTA", [0.95, 0.12, 0.60]),
+    ("BONE", [0.92, 0.90, 0.84]),
+    ("OBSIDIAN", [0.06, 0.06, 0.08]),
+];
+
+/// COLLECTIONS — a whole look in one pick.
+///
+/// Choosing five slots that agree with one another is most of the work of
+/// looking good, and it is work most people would rather not do. Each of
+/// these is a curated set where the parts share an idea: NOVA CORE is all
+/// heat and pressure, WRAITH is all absence, PARADE is deliberately loud.
+/// Picking one writes every slot; changing a slot afterwards just leaves
+/// you on your own set, which is how it should be.
+pub struct Collection {
+    pub name: &'static str,
+    pub blurb: &'static str,
+    pub skin: usize,
+    pub rig: usize,
+    pub wheels: usize,
+    pub trail: usize,
+    pub explosion: usize,
+    pub paint: usize,
+}
+
+pub const COLLECTIONS: &[Collection] = &[
+    Collection { name: "FACTORY", blurb: "as it left the works", skin: 0, rig: 0, wheels: 0, trail: 0, explosion: 0, paint: 0 },
+    Collection { name: "NOVA CORE", blurb: "heat and pressure: forge paint, unfolding plates, a supernova", skin: 8, rig: 3, wheels: 1, trail: 3, explosion: 1, paint: 2 },
+    Collection { name: "WRAITH", blurb: "absence: ghost paint, a void trail, and everything falls inward", skin: 12, rig: 4, wheels: 6, trail: 4, explosion: 5, paint: 11 },
+    Collection { name: "CIRCUITRY", blurb: "a machine that admits it: traces, a tremor, hexagons", skin: 7, rig: 2, wheels: 3, trail: 1, explosion: 2, paint: 6 },
+    Collection { name: "PARADE", blurb: "loud on purpose: iridescent, prismatic, spectrum everywhere", skin: 1, rig: 1, wheels: 5, trail: 5, explosion: 4, paint: 9 },
+    Collection { name: "COLD FRONT", blurb: "aurora over chrome, ion thrust, a clean shockwave", skin: 14, rig: 1, wheels: 2, trail: 1, explosion: 0, paint: 7 },
+    Collection { name: "PREDATOR", blurb: "it watches the ball, and it breathes while it waits", skin: 10, rig: 1, wheels: 2, trail: 3, explosion: 3, paint: 1 },
+    Collection { name: "MERIDIAN", blurb: "liquid chrome, hovering, nothing but reflections", skin: 4, rig: 4, wheels: 4, trail: 2, explosion: 0, paint: 10 },
+    Collection { name: "SPECTRE", blurb: "crystal facets, a shiver on contact, prism shards", skin: 15, rig: 5, wheels: 6, trail: 5, explosion: 4, paint: 8 },
 ];
 
 /// RIGS — how the car's parts MOVE. Skins change what a surface looks like;
@@ -103,6 +156,7 @@ pub const EXPLOSIONS: &[(&str, &str)] = &[
 pub struct Loadout {
     pub skin: usize,
     pub rig: usize,
+    pub paint: usize,
     pub wheels: usize,
     pub trail: usize,
     pub explosion: usize,
@@ -110,11 +164,35 @@ pub struct Loadout {
 
 impl Default for Loadout {
     fn default() -> Loadout {
-        Loadout { skin: 0, rig: 0, wheels: 0, trail: 0, explosion: 0 }
+        Loadout { skin: 0, rig: 0, paint: 0, wheels: 0, trail: 0, explosion: 0 }
     }
 }
 
 impl Loadout {
+    pub fn paint_name(&self) -> &'static str {
+        PAINTS[self.paint.min(PAINTS.len() - 1)].0
+    }
+    pub fn paint_rgb(&self) -> [f32; 3] {
+        PAINTS[self.paint.min(PAINTS.len() - 1)].1
+    }
+    /// Apply a whole collection.
+    pub fn set_collection(&mut self, i: usize) {
+        let c = &COLLECTIONS[i.min(COLLECTIONS.len() - 1)];
+        self.skin = c.skin.min(SKINS.len() - 1);
+        self.rig = c.rig.min(RIGS.len() - 1);
+        self.wheels = c.wheels.min(WHEELS.len() - 1);
+        self.trail = c.trail.min(TRAILS.len() - 1);
+        self.explosion = c.explosion.min(EXPLOSIONS.len() - 1);
+        self.paint = c.paint.min(PAINTS.len() - 1);
+    }
+    /// Which collection this matches, if any — so the screen can say.
+    pub fn matches_collection(&self) -> Option<usize> {
+        COLLECTIONS.iter().position(|c| {
+            c.skin == self.skin && c.rig == self.rig && c.wheels == self.wheels
+                && c.trail == self.trail && c.explosion == self.explosion && c.paint == self.paint
+        })
+    }
+
     pub fn rig_name(&self) -> &'static str {
         RIGS[self.rig.min(RIGS.len() - 1)].0
     }
@@ -137,7 +215,7 @@ impl Loadout {
         EXPLOSIONS[self.explosion.min(EXPLOSIONS.len() - 1)].0
     }
     pub fn encode(&self) -> String {
-        format!("{} {} {} {} {}", self.skin, self.wheels, self.trail, self.explosion, self.rig)
+        format!("{} {} {} {} {} {}", self.skin, self.wheels, self.trail, self.explosion, self.rig, self.paint)
     }
     pub fn decode(s: &str) -> Loadout {
         let v: Vec<usize> = s.split_whitespace().filter_map(|t| t.parse().ok()).collect();
@@ -147,14 +225,17 @@ impl Loadout {
             trail: v.get(2).copied().unwrap_or(0).min(TRAILS.len() - 1),
             explosion: v.get(3).copied().unwrap_or(0).min(EXPLOSIONS.len() - 1),
             rig: v.get(4).copied().unwrap_or(0).min(RIGS.len() - 1),
+            paint: v.get(5).copied().unwrap_or(0).min(PAINTS.len() - 1),
         }
     }
 }
 
 /// The four rows the customizer screen shows.
-pub fn slots() -> [(&'static str, usize); 5] {
+pub fn slots() -> [(&'static str, usize); 7] {
     [
+        ("COLLECTION", COLLECTIONS.len()),
         ("SKIN", SKINS.len()),
+        ("PAINT", PAINTS.len()),
         ("RIG", RIGS.len()),
         ("WHEELS", WHEELS.len()),
         ("BOOST TRAIL", TRAILS.len()),

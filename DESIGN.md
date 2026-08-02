@@ -2819,6 +2819,45 @@ all move together reads as one wobbling object rather than as machinery.
 Sixteen skins, six rigs, seven wheels, six trails, six explosions: 24,192
 combinations, all cosmetic, all saved.
 
+## v1.87.0 — collections, paint, and four skins that keep score
+
+COLLECTIONS. Choosing six slots that agree with one another is most of the
+work of looking good, and it is work most people would rather not do. Nine
+curated sets, each built around one idea rather than one colour:
+
+    NOVA CORE   heat and pressure — forge paint, unfolding plates, supernova
+    WRAITH      absence — ghost, hover, a void trail, everything falls inward
+    CIRCUITRY   a machine that admits it — traces, a tremor, hexagons
+    PARADE      loud on purpose — iridescent, prism, spectrum everywhere
+    COLD FRONT  aurora over cobalt, ion thrust, one clean shockwave
+    PREDATOR    it watches the ball, and it breathes while it waits
+    MERIDIAN    liquid chrome, hovering, nothing but reflections
+    SPECTRE     crystal facets, a shiver on contact, prism shards
+
+Picking one writes every slot; changing a slot afterwards just leaves you on
+"CUSTOM", which is how it should be — the set is a starting point, not a
+cage.
+
+PAINT, twelve colours, deliberately saturated because the skins tend to wash
+a colour out and a timid palette disappears under them. The finish is a
+BEHAVIOUR and the paint is whose car it is, which is why they are separate
+slots. The garage shows the palette itself on that row rather than dots.
+
+FOUR MORE EXOTICS, reading things the others do not:
+
+  MOMENTUM       the paint keeps score: hotter the longer you keep the ball
+                 alive, cooling the moment you drop it
+  IMPACT         rings spread from wherever the car last hit something,
+                 travelling outward in BODY space so the wave rolls across
+                 the panels that actually took the blow
+  CONSTELLATION  stars fixed in the WORLD, not on the paint — the body moves
+                 through the field like light through a window
+  MIRAGE         a travelling wave bends the surface before anything is
+                 shaded with it, so the reflection swims
+
+Twenty skins, six rigs, twelve paints, seven wheels, six trails, six
+explosions — 362,880 combinations, nine of them one keypress away.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

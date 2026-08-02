@@ -340,7 +340,7 @@ fn hue_shift(c: vec3<f32>, a: f32) -> vec3<f32> {
     return c * cosa + cross(k, c) * sin(a) + k * dot(k, c) * (1.0 - cosa);
 }
 
-fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, pw: vec3<f32>, n: vec3<f32>, v: vec3<f32>, t: f32, speed: f32, phase: f32, ball: vec3<f32>, boost: f32) -> SkinOut {
+fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, pw: vec3<f32>, n: vec3<f32>, v: vec3<f32>, t: f32, speed: f32, phase: f32, ball: vec3<f32>, boost: f32, hit: vec4<f32>, combo: f32) -> SkinOut {
     var o: SkinOut;
     o.albedo = base;
     o.emissive = 0.0;
@@ -456,6 +456,43 @@ fn apply_skin(id: i32, base: vec3<f32>, p: vec3<f32>, pw: vec3<f32>, n: vec3<f32
         o.spec = 0.85;
         let facet = sin(p.x * 14.0) * sin(p.y * 13.0) * sin(p.z * 12.0);
         o.emissive = smoothstep(0.75, 1.0, abs(facet)) * 0.5;
+    } else if (id == 16) {
+        // MOMENTUM: the paint keeps score. `phase2` carries the combo, so
+        // the car gets hotter the longer you keep the ball alive and cools
+        // the moment you drop it — a finish that is a running commentary.
+        let heat = clamp(combo, 0.0, 1.0);
+        o.albedo = mix(base * 0.7, hue_shift(vec3(1.0, 0.55, 0.1), heat * 2.4), heat);
+        o.emissive = heat * heat * 1.5;
+        o.spec = 0.2 + 0.4 * heat;
+    } else if (id == 17) {
+        // IMPACT: rings spreading from wherever the car last hit something.
+        // The wave travels outward in BODY space from the contact point, so
+        // it rolls across the panels that actually took the blow.
+        let d = length(p - hit.xyz);
+        let age = hit.w;
+        let front = age * 3.2;
+        let ring = smoothstep(0.25, 0.0, abs(d - front)) * clamp(1.0 - age * 0.8, 0.0, 1.0);
+        o.albedo = mix(base, vec3(1.0, 0.95, 0.85), ring * 0.8);
+        o.emissive = ring * 2.0;
+        o.spec = 0.3;
+    } else if (id == 18) {
+        // CONSTELLATION: stars fixed in the WORLD, not on the paint. The
+        // body moves through the field, so points appear and pass over it
+        // like light through a window rather than a texture riding along.
+        let g = fract(pw * 1.7) - 0.5;
+        let star = smoothstep(0.42, 0.5, 0.5 - length(g));
+        let twinkle = 0.6 + 0.4 * sin(t * 3.0 + pw.x * 4.0 + pw.z * 3.0);
+        o.albedo = mix(base * 0.35, vec3(0.85, 0.90, 1.0), star * twinkle);
+        o.emissive = star * twinkle * 1.6;
+        o.spec = 0.35;
+    } else if (id == 19) {
+        // MIRAGE: the paint will not hold still. The surface normal is bent
+        // by a travelling wave before anything is shaded with it, so the
+        // reflection swims and the highlights slide across the panels.
+        let w1 = sin(p.z * 9.0 - t * 2.2) * sin(p.y * 7.0 + t * 1.3);
+        o.albedo = hue_shift(base, w1 * 0.7 + graze * 1.2);
+        o.emissive = smoothstep(0.6, 1.0, abs(w1)) * 0.35;
+        o.spec = 0.45 + 0.35 * graze;
     } else if (id == 9) {
         // MOIRE: two lattices at slightly different scales, so the
         // interference pattern shifts with both angle and time
@@ -694,6 +731,7 @@ struct Object {
     // x mode (0 plain, 1 terrain grid), y emissive, z spec, w rt self id + 1
     skin: vec4<f32>,       // x id, y phase, z intensity, w speed 0..1
     skin2: vec4<f32>,      // xyz ball direction in body space, w boost 0..1
+    skin3: vec4<f32>,      // xyz last contact in body space, w seconds since
 };
 @group(1) @binding(0) var<uniform> O: Object;
 @group(2) @binding(0) var t_col: texture_2d<f32>;
@@ -778,7 +816,7 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
     if (skin_id > 0) {
         // in the BODY's own space, so a moving car carries its finish
         let lp = (in.wpos - O.model[3].xyz);
-        let sk = apply_skin(skin_id, base, lp, in.wpos, n, v, G.cam.w, O.skin.w, O.skin.y, O.skin2.xyz, O.skin2.w);
+        let sk = apply_skin(skin_id, base, lp, in.wpos, n, v, G.cam.w, O.skin.w, O.skin.y, O.skin2.xyz, O.skin2.w, O.skin3, O.skin.z);
         base = sk.albedo;
         skin_em = sk.emissive * O.skin.z;
         skin_spec = sk.spec;

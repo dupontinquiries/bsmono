@@ -3515,6 +3515,46 @@ pub fn run(args: &[String]) {
             TRAILS.len(),
             EXPLOSIONS.len()
         );
+        // ---- COLLECTIONS: does a curated set actually apply? ----
+        {
+            use crate::custom::COLLECTIONS;
+            println!("collections:");
+            let mut all_valid = true;
+            let mut round_trips = true;
+            for (i, c) in COLLECTIONS.iter().enumerate() {
+                let mut l = Loadout::default();
+                l.set_collection(i);
+                let applied = l.skin == c.skin && l.rig == c.rig && l.wheels == c.wheels
+                    && l.trail == c.trail && l.explosion == c.explosion && l.paint == c.paint;
+                // and the set must be recognised as itself afterwards
+                let named = l.matches_collection() == Some(i);
+                all_valid &= applied;
+                round_trips &= named;
+                println!(
+                    "   {:<14} {} / {} / {} / {} / {}",
+                    c.name,
+                    l.skin_name(),
+                    l.paint_name(),
+                    l.rig_name(),
+                    l.trail_name(),
+                    l.explosion_name()
+                );
+            }
+            check("every collection applies all six slots", all_valid);
+            check("and the screen can name it back", round_trips);
+            check(
+                "each collection is a distinct look",
+                (0..COLLECTIONS.len()).all(|i| {
+                    let mut l = Loadout::default();
+                    l.set_collection(i);
+                    l.matches_collection() == Some(i)
+                }),
+            );
+            let mut custom = Loadout::default();
+            custom.set_collection(2);
+            custom.wheels = (custom.wheels + 1) % WHEELS.len();
+            check("changing a slot leaves you on your own set", custom.matches_collection().is_none());
+        }
         check(
             "the exotics read the game, not just the clock",
             SKINS.iter().any(|(n, _)| *n == "HUNTER")
@@ -3525,7 +3565,7 @@ pub fn run(args: &[String]) {
             "every rig says what it moves",
             crate::custom::RIGS.iter().all(|(n, b)| !n.is_empty() && b.len() > 12),
         );
-        println!("   {} combinations", SKINS.len() * crate::custom::RIGS.len() * WHEELS.len() * TRAILS.len() * EXPLOSIONS.len());
+        println!("   {} combinations across {} collections", SKINS.len() * crate::custom::RIGS.len() * crate::custom::PAINTS.len() * WHEELS.len() * TRAILS.len() * EXPLOSIONS.len(), crate::custom::COLLECTIONS.len());
         check("every slot has choices", SKINS.len() >= 8 && WHEELS.len() >= 6 && TRAILS.len() >= 5 && EXPLOSIONS.len() >= 5);
         check(
             "every skin says what it does",

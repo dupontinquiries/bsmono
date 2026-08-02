@@ -78,7 +78,10 @@ pub struct ObjectRaw {
     /// Skins that read these can do things a texture cannot — face the play,
     /// open under power, know how high they are.
     pub skin2: [f32; 4],
-    pub _pad: [f32; 16],
+    /// xyz: the last contact point in the BODY's frame; w: seconds since.
+    /// A finish can then spread rings from where you actually hit something.
+    pub skin3: [f32; 4],
+    pub _pad: [f32; 12],
 }
 
 impl Default for ObjectRaw {
@@ -88,7 +91,7 @@ impl Default for ObjectRaw {
             nrm: [0.0; 16],
             color: [1.0; 4],
             params: [0.0; 4],
-            skin: [0.0; 4], skin2: [0.0; 4], _pad: [0.0; 16],
+            skin: [0.0; 4], skin2: [0.0; 4], skin3: [0.0; 4], _pad: [0.0; 12],
         }
     }
 }

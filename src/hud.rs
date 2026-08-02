@@ -371,15 +371,26 @@ pub fn garage_menu(
     label_c(ui, 0.885, T_TITLE, a, PAPER, "GARAGE");
     label_c(ui, 0.828, T_HINT, a, DIM, "LEFT / RIGHT TO CHANGE - EVERYTHING HERE IS COSMETIC");
     let k = ui_k(a);
-    let rows: [(&str, String, usize, usize); 5] = [
+    let coll = look.matches_collection();
+    let rows: [(&str, String, usize, usize); 7] = [
+        (
+            "COLLECTION",
+            match coll {
+                Some(i) => crate::custom::COLLECTIONS[i].name.to_string(),
+                None => "CUSTOM".to_string(),
+            },
+            coll.unwrap_or(0),
+            crate::custom::COLLECTIONS.len(),
+        ),
         ("SKIN", look.skin_name().to_string(), look.skin, crate::custom::SKINS.len()),
+        ("PAINT", look.paint_name().to_string(), look.paint, crate::custom::PAINTS.len()),
         ("RIG", look.rig_name().to_string(), look.rig, crate::custom::RIGS.len()),
         ("WHEELS", look.wheel_name().to_string(), look.wheels, crate::custom::WHEELS.len()),
         ("BOOST TRAIL", look.trail_name().to_string(), look.trail, crate::custom::TRAILS.len()),
         ("GOAL EXPLOSION", look.explosion_name().to_string(), look.explosion, crate::custom::EXPLOSIONS.len()),
     ];
-    let top = 0.64;
-    let row_h = 0.098;
+    let top = 0.66;
+    let row_h = 0.082;
     for (i, (name, val, idx, n)) in rows.iter().enumerate() {
         let y = top - i as f32 * row_h;
         if i == sel {
@@ -390,22 +401,39 @@ pub fn garage_menu(
         font::text(ui, -0.78, y, T_BODY * k, a, col, name);
         let w = font::width(val, T_BODY * k, a);
         font::text(ui, 0.78 - w, y, T_BODY * k, a, CYAN, val);
-        // a dotted position indicator, so you can see how many there are
-        for d in 0..*n {
-            let x = -0.78 + d as f32 * 0.022;
-            let on = d == *idx;
-            quad(ui, x, y - 0.036, x + 0.012, y - 0.030, if on { GOLD } else { [0.3, 0.33, 0.38, 0.7] });
+        // the paint row shows the palette itself; everything else gets dots
+        if i == 2 {
+            for (d, (_, rgb)) in crate::custom::PAINTS.iter().enumerate() {
+                let x = -0.78 + d as f32 * 0.030;
+                let on = d == *idx;
+                let h = if on { 0.020 } else { 0.012 };
+                quad(ui, x, y - 0.040, x + 0.024, y - 0.040 + h, [rgb[0], rgb[1], rgb[2], 1.0]);
+                if on {
+                    quad(ui, x, y - 0.046, x + 0.024, y - 0.042, GOLD);
+                }
+            }
+        } else {
+            for d in 0..*n {
+                let x = -0.78 + d as f32 * 0.020;
+                let on = d == *idx;
+                quad(ui, x, y - 0.036, x + 0.011, y - 0.031, if on { GOLD } else { [0.3, 0.33, 0.38, 0.7] });
+            }
         }
     }
     // what the current pick actually does
     let blurb = match sel {
-        0 => look.skin_blurb().to_string(),
-        1 => look.rig_blurb().to_string(),
-        2 => format!("{} spokes", crate::custom::WHEELS[look.wheels].1),
-        3 => crate::custom::TRAILS[look.trail].1.to_string(),
+        0 => match coll {
+            Some(i) => crate::custom::COLLECTIONS[i].blurb.to_string(),
+            None => "your own set — pick a collection to start from".to_string(),
+        },
+        1 => look.skin_blurb().to_string(),
+        2 => "the finish is a behaviour; the paint is whose car it is".to_string(),
+        3 => look.rig_blurb().to_string(),
+        4 => format!("{} spokes", crate::custom::WHEELS[look.wheels].1),
+        5 => crate::custom::TRAILS[look.trail].1.to_string(),
         _ => crate::custom::EXPLOSIONS[look.explosion].1.to_string(),
     };
-    label_c(ui, top - 5.0 * row_h - 0.04, T_HINT * k, a, DIM, &fit(&blurb, 1.5, T_HINT * k, a));
+    label_c(ui, top - 7.0 * row_h - 0.03, T_HINT * k, a, DIM, &fit(&blurb, 1.5, T_HINT * k, a));
     nav_strip(ui, a, cur, 0);
     legend(ui, -0.93, a, T_HINT, &[("LEFT/RIGHT", "CHANGE"), ("ESC", "BACK")]);
 }
@@ -1029,5 +1057,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.86    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.87    ESC QUITS FROM THIS SCREEN");
 }
