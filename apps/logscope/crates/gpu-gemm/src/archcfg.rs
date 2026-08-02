@@ -361,6 +361,28 @@ mod tests {
     }
 
     #[test]
+    fn the_nope_interval_decides_which_layers_ROTATE() {
+        // Scout's gibberish has survived every GPU-side fix on both platforms, and this is the kind of
+        // thing that would produce it: nope_step was hardcoded to 4, so every fourth layer skips
+        // rotation. That is Scout's documented pattern and an ASSUMPTION about every other Llama-4
+        // checkpoint — Maverick, and anything shipped later.
+        //
+        // A wrong interval applies RoPE to a layer that should have none and vice versa. Every tensor
+        // is present, every shape matches, the model loads, and the text is garbled. Nothing in a
+        // shape check can see it, which is why it outlived them.
+        //
+        // The rule, as the loader applies it: layer i is NoPE when (i + 1) % step == 0.
+        let nope_at = |i: usize, step: usize| step > 0 && (i + 1) % step == 0;
+        for i in 0..12 {
+            assert_eq!(nope_at(i, 4), matches!(i, 3 | 7 | 11), "step 4, layer {i}");
+        }
+        // A different interval selects a different set — which is the whole reason it must be read.
+        assert!(nope_at(1, 2) && !nope_at(1, 4), "step 2 and step 4 disagree at layer 1");
+        // step 0 means no NoPE layers at all, which is every non-Llama-4 architecture.
+        for i in 0..12 { assert!(!nope_at(i, 0)); }
+    }
+
+    #[test]
     fn llama_is_supported_today() {
         let c = for_arch("llama");
         assert!(c.supported && c.note.is_empty());
