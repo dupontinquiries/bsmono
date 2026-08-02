@@ -76,6 +76,17 @@ def main():
                 if v is not None and v != stem:
                     print(f"{app}: {os.path.basename(e)} {key}{v} != filename stem {stem}")
                     problems += 1
+            # A named icon that does not ship is a blank tile in the launcher.
+            # Stock names (no dots) legitimately come from the theme.
+            icon = value(text, "Icon=")
+            if icon and '.' in icon:
+                svg = os.path.join(APPS, app, 'packaging', 'icons', 'hicolor',
+                                   'scalable', 'apps', icon + '.svg')
+                if not os.path.isfile(svg):
+                    print(f"{app}: {os.path.basename(e)} names icon '{icon}' and "
+                          f"no packaging/icons/.../{icon}.svg ships — blank tile")
+                    problems += 1
+
             if stem in set_ids: matched = True
 
         if set_ids and not matched:

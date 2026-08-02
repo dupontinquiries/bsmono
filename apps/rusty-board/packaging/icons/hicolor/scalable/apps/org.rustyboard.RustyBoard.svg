@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- org.rustyboard.RustyBoard application icon. Scalable, so one file serves every size a
+     launcher asks for. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#1c1512"/>
+  <rect x='16' y='40' width='96' height='52' rx='8' fill='none' stroke='#D98C5F' stroke-width='5'/><path d='M30 56h8M48 56h8M66 56h8M84 56h8M30 72h8M48 72h32M88 72h8' stroke='#D98C5F' stroke-width='5' stroke-linecap='round'/>
+</svg>

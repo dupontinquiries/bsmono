@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- org.bigsilicon.Settings application icon. Scalable so one file covers every size a
+     launcher asks for; a PNG at one size is upscaled and looks soft on a HiDPI
+     dock. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#12161c"/>
+  <circle cx="64" cy="64" r="18" fill="none" stroke="#8FB8DE" stroke-width="5"/><path d="M64 22v14M64 92v14M22 64h14M92 64h14M34 34l10 10M84 84l10 10M94 34L84 44M44 84L34 94" stroke="#8FB8DE" stroke-width="5" stroke-linecap="round"/>
+</svg>
