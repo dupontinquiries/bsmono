@@ -81,6 +81,8 @@ struct RawPrim {
     color: [f32; 4],
     tex_uri: Option<String>,
     tag: Tag,
+    /// the axle, when this prim came out of a wheel split
+    pivot: Option<Vec3>,
 }
 
 /// SPLIT THE WHEELS OFF A MERGED BODY.
@@ -97,6 +99,106 @@ struct RawPrim {
 /// round and centred on its own axle, so a cluster centre plus a radius
 /// describes it well — and triangles are then assigned whole, by their
 /// centroid, so a tyre never ends up half body.
+/// FIND THE CAR'S OWN FRAME.
+///
+/// An exported model can arrive in any orientation — on its side, nose-aft,
+/// Z-up — and the game cannot tell by looking at a vertex buffer. But a car
+/// has a giveaway: FOUR WHEELS, the same size, low down, at the corners. So
+/// try every axis-aligned orientation, score each by how well a wheel set
+/// falls out of it, and keep the best. That fixes a rolled or reversed
+/// import without anyone having to eyeball it and type in a rotation.
+///
+/// Returns the rotation that puts the car upright and nose at -Z.
+pub fn find_orientation(verts: &[Vertex]) -> Quat {
+    // the 24 axis-aligned rotations, as (up axis, forward axis) pairs
+    const AXES: [Vec3; 6] = [Vec3::X, Vec3::NEG_X, Vec3::Y, Vec3::NEG_Y, Vec3::Z, Vec3::NEG_Z];
+    let mut best = (f32::MIN, Quat::IDENTITY);
+    for up in AXES {
+        for fwd in AXES {
+            if up.dot(fwd).abs() > 0.5 {
+                continue; // not perpendicular
+            }
+            // the rotation taking this candidate frame to (Y up, -Z forward)
+            let right = fwd.cross(up).normalize();
+            let m = glam::Mat3::from_cols(right, up, -fwd).transpose();
+            let q = Quat::from_mat3(&m);
+            let score = wheel_score(verts, q);
+            if score > best.0 {
+                best = (score, q);
+            }
+        }
+    }
+    best.1
+}
+
+/// How much this orientation looks like an upright car: four low clusters at
+/// the corners, of similar size, wider than they are tall.
+pub fn wheel_score(verts: &[Vertex], q: Quat) -> f32 {
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for v in verts {
+        let p = q * Vec3::from_array(v.pos);
+        lo = lo.min(p);
+        hi = hi.max(p);
+    }
+    let half = (hi - lo) * 0.5;
+    let mid = (lo + hi) * 0.5;
+    if half.y < 1e-4 || half.z < 1e-4 || half.x < 1e-4 {
+        return f32::MIN;
+    }
+    // a car is longer than it is wide, and wider than it is tall
+    let mut score = 0.0f32;
+    score += (half.z / half.x).clamp(0.0, 3.0) * 2.0; // long
+    score += (half.x / half.y).clamp(0.0, 4.0); // wide, not tall
+    // and its mass sits low: more of the body below the middle than above
+    let mut below = 0u32;
+    let mut corners = [0u32; 4];
+    for v in verts {
+        let p = q * Vec3::from_array(v.pos) - mid;
+        if p.y < 0.0 {
+            below += 1;
+        }
+        if p.y < -half.y * 0.15 && p.x.abs() > half.x * 0.45 && p.z.abs() > half.z * 0.25 {
+            let ci = (if p.x > 0.0 { 1 } else { 0 }) + (if p.z > 0.0 { 2 } else { 0 });
+            corners[ci] += 1;
+        }
+    }
+    score += (below as f32 / verts.len().max(1) as f32) * 3.0;
+    // four populated corners is the strongest signal there is
+    let filled = corners.iter().filter(|c| **c > 40).count();
+    score += filled as f32 * 2.5;
+    // ...and they should be evenly filled: a lopsided set means the guess is
+    // catching bodywork on one side rather than wheels on both
+    let mx = *corners.iter().max().unwrap_or(&1) as f32;
+    let mn = *corners.iter().min().unwrap_or(&0) as f32;
+    if mx > 0.0 {
+        score += (mn / mx) * 2.0;
+    }
+    // NOSE OR TAIL. Everything above is symmetric front-to-back, so a car
+    // and the same car reversed score identically — which is a coin flip on
+    // every 180-degree yaw, and half the imports came out backwards. A car
+    // is LOWER AT THE FRONT and carries its bulk behind the cabin, so
+    // compare the mean height of each half and reward the frame whose -Z end
+    // is the low one.
+    let (mut front_h, mut front_n, mut back_h, mut back_n) = (0.0f64, 0u32, 0.0f64, 0u32);
+    for v in verts {
+        let p = q * Vec3::from_array(v.pos) - mid;
+        if p.z < -half.z * 0.35 {
+            front_h += p.y as f64;
+            front_n += 1;
+        } else if p.z > half.z * 0.35 {
+            back_h += p.y as f64;
+            back_n += 1;
+        }
+    }
+    if front_n > 20 && back_n > 20 {
+        let fa = (front_h / front_n as f64) as f32;
+        let ba = (back_h / back_n as f64) as f32;
+        // normalised by the car's height so it is comparable between models
+        score += ((ba - fa) / half.y).clamp(-1.5, 1.5) * 2.5;
+    }
+    score
+}
+
 fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
     // only worth attempting on a single merged prim with no wheels tagged
     if raws.len() != 1 || raws[0].tag != Tag::Body {
@@ -178,7 +280,7 @@ fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
     // assign triangles whole, by centroid, so no tyre is half body
     let src = raws.remove(0);
     let mut out: Vec<RawPrim> = Vec::new();
-    let mut body = RawPrim { verts: src.verts.clone(), idx: Vec::new(), color: src.color, tex_uri: src.tex_uri.clone(), tag: Tag::Body };
+    let mut body = RawPrim { verts: src.verts.clone(), idx: Vec::new(), color: src.color, tex_uri: src.tex_uri.clone(), tag: Tag::Body, pivot: None };
     let mut wheels: Vec<RawPrim> = (0..4)
         .map(|i| RawPrim {
             verts: src.verts.clone(),
@@ -186,6 +288,7 @@ fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
             color: src.color,
             tex_uri: src.tex_uri.clone(),
             tag: if centres[i].z < 0.0 { Tag::WheelFront } else { Tag::WheelBack },
+            pivot: None,
         })
         .collect();
     for t in src.idx.chunks_exact(3) {
@@ -198,7 +301,12 @@ fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
         for i in 0..4 {
             let d = ((c.y - centres[i].y).powi(2) + (c.z - centres[i].z).powi(2)).sqrt();
             let same_side = c.x.signum() == centres[i].x.signum();
-            if same_side && d < radii[i] * 1.05 && c.x.abs() > half.x * 0.35 {
+            // TIGHTER. At 1.05 the disc reached past the tyre and swept in
+            // bumper and arch — Orion's bumper turned with its wheels. A
+            // wheel also lives in a slab of its own along the axle, so the
+            // triangle has to be near that too, not merely outboard.
+            let in_slab = (c.x - centres[i].x).abs() < radii[i] * 0.75;
+            if same_side && d < radii[i] * 0.92 && in_slab && c.x.abs() > half.x * 0.40 {
                 which = Some(i);
                 break;
             }
@@ -236,12 +344,18 @@ fn split_wheels(raws: &mut Vec<RawPrim>) -> bool {
     }
     compact(&mut body);
     out.push(body);
-    for mut w in wheels.into_iter() {
+    for (i, mut w) in wheels.into_iter().enumerate() {
         if w.idx.is_empty() {
             continue;
         }
         compact(&mut w);
         w.color = src.color;
+        // THE PIVOT IS THE AXLE, not the average of the prim's vertices.
+        // Averaging is fine for a clean wheel and wrong for one that caught
+        // a little bodywork: the centre shifts off the axle and the wheel
+        // visibly wobbles as it turns. The cluster centre found above IS the
+        // axle, so carry it out rather than recomputing something else.
+        w.pivot = Some(centres[i] + mid);
         out.push(w);
     }
     *raws = out;
@@ -320,7 +434,7 @@ fn collect_node(
                     _ => None,
                 }
             });
-            out.push(RawPrim { verts, idx, color, tex_uri, tag });
+            out.push(RawPrim { verts, idx, color, tex_uri, tag, pivot: None });
         }
     }
     for child in node.children() {
@@ -457,6 +571,24 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let long = ext.z.max(ext.x).max(ext.y).max(1e-6);
     let s = target_len / long;
     let yaw = if flip { std::f32::consts::PI } else { 0.0 };
+    // ---- ORIENT FIRST ----
+    // Everything downstream — the wheel split, the hitbox, the nose — assumes
+    // an upright car facing -Z. Several of these models do not arrive that
+    // way (on their side, nose-aft, back upward), so put them in that frame
+    // before anything reads them.
+    {
+        let all: Vec<Vertex> = raws.iter().flat_map(|r| r.verts.iter().copied()).collect();
+        let q = find_orientation(&all);
+        if q != Quat::IDENTITY {
+            for r in raws.iter_mut() {
+                for v in r.verts.iter_mut() {
+                    v.pos = (q * Vec3::from_array(v.pos)).to_array();
+                    v.nrm = (q * Vec3::from_array(v.nrm)).to_array();
+                }
+            }
+        }
+    }
+
     // A merged export has no wheels the game can see: find them.
     let split = split_wheels(&mut raws);
     if split {
@@ -498,6 +630,13 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
                 wheel_top = wheel_top.max(p.y);
             }
             pivot /= r.verts.len().max(1) as f32;
+            // ...unless the split told us where the AXLE is. Averaging a
+            // prim's vertices is right for a clean wheel and wrong for one
+            // that caught a little bodywork — the centre shifts off the axle
+            // and the wheel visibly wobbles as it turns.
+            if let Some(ax) = r.pivot {
+                pivot = (ax - center) * s;
+            }
         }
         for v in &r.verts {
             cloud_all.push(Vec3::from_array(v.pos));

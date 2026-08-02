@@ -882,7 +882,7 @@ fn main() {
     let backfire = model::load(&cars_dir.join("backfire"), &mut gpu, 1.28);
     let breakout = model::load(&cars_dir.join("breakout"), &mut gpu, 1.30);
     let assael = model::load(&cars_dir.join("assael"), &mut gpu, 1.34);
-    let guardian = model::load_oriented(&cars_dir.join("guardian"), &mut gpu, 1.30, true); // arrived nose-aft
+    let guardian = model::load(&cars_dir.join("guardian"), &mut gpu, 1.30); // orientation is detected now
     let orion = model::load(&cars_dir.join("orion"), &mut gpu, 1.32);
     let vulcan = model::load(&cars_dir.join("vulcan"), &mut gpu, 1.30);
     let xdevil = model::load(&cars_dir.join("xdevil"), &mut gpu, 1.32);

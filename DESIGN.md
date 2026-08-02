@@ -2949,6 +2949,51 @@ whenever it is non-zero. A low number with drops means the renderer is
 abandoning frames; a low number without them means the GPU is simply busy.
 The old counter could not tell those apart because it hid both.
 
+## v1.91.0 — the imports find their own way up
+
+Five of the six reports shared two causes, so they are fixed once each
+rather than car by car.
+
+ORIENTATION IS DETECTED NOW. An export can arrive in any frame and a vertex
+buffer does not say which — but a car has a giveaway: FOUR WHEELS, the same
+size, low down, at the corners. Every axis-aligned frame is scored on that
+(plus: longer than wide, wider than tall, mass sitting low) and the best is
+kept. What it found matches the report exactly:
+
+    vulcan    240 deg about (1,-1,-1)     "on its right side"
+    backfire  270 deg about (1, 0, 0)     "backside facing up and rotated"
+    breakout  180 deg about (0, 1, 0)     "reversed, back facing front"
+    guardian  180 deg about (0, 1, 0)     (the hand-typed flip is gone)
+    orion      90 deg about (0, 1, 0)
+    assael     90 deg about (0, 1, 0)
+
+Everything above is front-to-back symmetric, so a car and the same car
+reversed score identically — a coin flip on every 180-degree yaw, which is
+why half of them came out backwards. A car is LOWER AT THE FRONT, so the
+score now compares the mean height of each half and rewards the frame whose
+nose end is the low one.
+
+WHEELS SPIN ABOUT THEIR AXLE. The pivot was the mean of the prim's
+vertices, which is right for a clean wheel and wrong for one that caught a
+little bodywork: the centre shifts off the axle and the wheel wobbles. The
+split already computes each wheel's circle centre, so that is carried out
+and used directly.
+
+AND THEY CATCH LESS BODYWORK. The capture disc ran to 1.05x the wheel
+radius and swept in bumper and arch — Orion's bumper turned with its
+wheels. It is 0.92x now, and a triangle must also lie in the wheel's own
+slab along the axle, not merely outboard of centre.
+
+AEGIS HAS VOLUME. At half the height of the others it read as a plate with
+wheels; the wedge silhouette is the point but a wedge still needs body
+behind it. Sections are ~60% deeper, carried in the middle where a cabin and
+floor would be, and the hitbox follows.
+
+THE CUBE HAS ARCHES. A solid box with wheels bolted to its faces has them
+half-buried, which looks like a mistake rather than a joke. The lower body
+is four corner posts, two sills and a spine, leaving a real opening at each
+corner for the wheel.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

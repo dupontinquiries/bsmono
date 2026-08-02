@@ -3853,6 +3853,44 @@ pub fn run(args: &[String]) {
             );
         }
 
+        // ---- ORIENTATION: which way did each model arrive? ----
+        // A car has a giveaway — four wheels of a size, low down, at the
+        // corners — so every axis-aligned frame is scored and the best kept.
+        // These models really did arrive on their sides and back-to-front.
+        println!();
+        println!("{:<12} {:>28} {:>9}", "model", "correction applied", "score");
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut vs: Vec<crate::meshgen::Vertex> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let (Some(ps), Some(ns)) = (reader.read_positions(), reader.read_normals()) {
+                        for (p, nr) in ps.zip(ns) {
+                            vs.push(crate::meshgen::Vertex { pos: p, nrm: nr, uv: [0.0, 0.0] });
+                        }
+                    } else if let Some(ps) = reader.read_positions() {
+                        for p in ps {
+                            vs.push(crate::meshgen::Vertex { pos: p, nrm: [0.0, 1.0, 0.0], uv: [0.0, 0.0] });
+                        }
+                    }
+                }
+            }
+            if vs.is_empty() {
+                continue;
+            }
+            let q = crate::model::find_orientation(&vs);
+            let (ax, ang) = q.to_axis_angle();
+            let desc = if ang.abs() < 0.01 {
+                "none (already upright)".to_string()
+            } else {
+                format!("{:.0} deg about ({:.0},{:.0},{:.0})", ang.to_degrees(), ax.x, ax.y, ax.z)
+            };
+            println!("{:<12} {:>28} {:>9.1}", n.trim_end_matches(".glb"), desc, crate::model::wheel_score(&vs, q));
+        }
+
         // ---- WHEELS: did the splitter find four of them? ----
         // These models arrive as one merged mesh, so nothing spins unless
         // the wheels are found geometrically. Mirror the splitter's method

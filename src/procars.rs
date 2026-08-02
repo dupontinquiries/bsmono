@@ -548,28 +548,32 @@ pub fn aegis(gpu: &mut Gpu) -> Model {
 
     // the wedge: a sharp point at the nose, a raised centre ridge, and a
     // body that is wider at the bottom than the top
+    // FULLER. At half the height of the others this read as a plate with
+    // wheels rather than a car — the wedge silhouette is the point, but a
+    // wedge still needs volume behind it. Roughly 60% more section depth,
+    // carried mostly in the middle where a cabin and a floor would be.
     let wedge = [
-        (-half_len, 0.07, -0.020, 0.005, 0.05),
-        (-0.58, 0.20, -0.040, 0.030, 0.05),
-        (-0.28, 0.33, -0.050, 0.070, 0.05),
-        (0.06, 0.36, -0.055, 0.085, 0.05),
-        (0.40, 0.35, -0.050, 0.075, 0.05),
-        (0.66, 0.28, -0.040, 0.045, 0.05),
-        (half_len, 0.16, -0.025, 0.015, 0.05),
+        (-half_len, 0.08, -0.030, 0.012, 0.05),
+        (-0.58, 0.22, -0.058, 0.055, 0.05),
+        (-0.28, 0.34, -0.075, 0.115, 0.05),
+        (0.06, 0.37, -0.082, 0.140, 0.05),
+        (0.40, 0.36, -0.075, 0.125, 0.05),
+        (0.66, 0.30, -0.058, 0.080, 0.05),
+        (half_len, 0.18, -0.035, 0.030, 0.05),
     ];
     prims.push(body_prim(gpu, part(meshgen::loft(&wedge, 7), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), steel));
 
     // the centre ridge — the primary visual axis, nose tip to windscreen
     prims.push(body_prim(
         gpu,
-        part(meshgen::loft(&[(-half_len + 0.02, 0.020, 0.000, 0.012, 0.05), (-0.30, 0.055, 0.040, 0.085, 0.05), (-0.02, 0.045, 0.070, 0.100, 0.05)], 5), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
+        part(meshgen::loft(&[(-half_len + 0.02, 0.022, 0.008, 0.024, 0.05), (-0.30, 0.058, 0.070, 0.128, 0.05), (-0.02, 0.048, 0.110, 0.152, 0.05)], 5), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
         steel,
     ));
 
     // cockpit: a flattened black trapezoidal prism, not a bubble
     prims.push(body_prim(
         gpu,
-        part(meshgen::loft(&[(-0.20, 0.16, 0.060, 0.090, 0.10), (0.04, 0.22, 0.055, 0.130, 0.10), (0.34, 0.16, 0.050, 0.100, 0.10)], 7), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
+        part(meshgen::loft(&[(-0.20, 0.17, 0.105, 0.140, 0.10), (0.04, 0.23, 0.100, 0.190, 0.10), (0.34, 0.17, 0.095, 0.155, 0.10)], 7), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
         [0.04, 0.05, 0.06, 1.0],
     ));
 
@@ -610,7 +614,7 @@ pub fn aegis(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.24, 0.010, 0.014), Quat::IDENTITY, Vec3::new(0.0, 0.035, half_len - 0.02)), copper));
 
     mount_wheels(gpu, &mut prims, &hp, copper, 6);
-    Model { prims, drive: Drive::Combustion, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.155, half_w, wheel_r }
+    Model { prims, drive: Drive::Combustion, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.205, half_w, wheel_r }
 }
 
 pub fn breadbox(gpu: &mut Gpu) -> Model {
@@ -657,9 +661,29 @@ pub fn cube(gpu: &mut Gpu) -> Model {
     // the cube: equal in every direction, wrong in every situation. touches
     // are chaos, dribbles are a dare
     let mut prims = Vec::new();
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::splat(0.30), Quat::IDENTITY, Vec3::new(0.0, 0.05, 0.0)), [0.90, 0.35, 0.30, 1.0]));
+    // WHEEL ARCHES. A solid box with wheels bolted to its faces has them
+    // half-buried in the bodywork, which looks like a mistake rather than a
+    // joke. Build the lower body from four posts instead, leaving a genuine
+    // opening at each corner for the wheel to sit in.
+    let body = [0.90, 0.35, 0.30, 1.0];
+    // upper block: everything above the arches
+    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.30, 0.17, 0.30), Quat::IDENTITY, Vec3::new(0.0, 0.18, 0.0)), body));
+    // four corner posts and two sills, framing an arch on each side
+    for sx in [-1.0f32, 1.0] {
+        for sz in [-1.0f32, 1.0] {
+            prims.push(body_prim(
+                gpu,
+                part(meshgen::boxx(), Vec3::new(0.075, 0.13, 0.075), Quat::IDENTITY, Vec3::new(sx * 0.225, -0.09, sz * 0.225)),
+                body,
+            ));
+        }
+        // the sill between the two arches on this side
+        prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.055, 0.055, 0.30), Quat::IDENTITY, Vec3::new(sx * 0.245, -0.16, 0.0)), body));
+    }
+    // and a spine down the middle so it still reads as one solid object
+    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.17, 0.13, 0.30), Quat::IDENTITY, Vec3::new(0.0, -0.09, 0.0)), body));
     prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.31, 0.06, 0.31), Quat::IDENTITY, Vec3::new(0.0, 0.36, 0.0)), [0.98, 0.92, 0.85, 1.0]));
-    wheels(gpu, &mut prims, 0.11, 0.28, -0.24, 0.24, -0.16);
+    wheels(gpu, &mut prims, 0.11, 0.30, -0.225, 0.225, -0.14);
     Model { prims, drive: Drive::Combustion, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.34, half_h: 0.34, half_w: 0.34, wheel_r: 0.11 }
 }
 
