@@ -9924,7 +9924,17 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     ///
     /// Lives here rather than in the gate so `upload_bytes` and `dispatch` stay private — a diagnostic
     /// is not a reason to widen an API surface.
-    pub fn byte_probe(&self, raw: &[u8]) -> Vec<f32> {
+    /// As `byte_probe`, but the shader reads `array<vec4<u32>>`.
+    ///
+    /// Confirms or refutes the 16-byte-stride diagnosis in one run: if this reads correctly where the
+    /// scalar probe does not, `array<u32>` is being laid out with std140 padding.
+    pub fn byte_probe_vec4(&self, raw: &[u8]) -> Vec<f32> {
+        self.byte_probe_with(raw, BYTE_PROBE_VEC4)
+    }
+
+    pub fn byte_probe(&self, raw: &[u8]) -> Vec<f32> { self.byte_probe_with(raw, BYTE_PROBE) }
+
+    fn byte_probe_with(&self, raw: &[u8], shader: &str) -> Vec<f32> {
         let n = raw.len();
         let mut padded = raw.to_vec();
         padded.resize(n.div_ceil(4) * 4, 0);
@@ -9932,7 +9942,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let srct = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, view: None };
         let out = self.alloc_resident_words(n);
         let dims = [n as u32, 0u32, 0u32, 0u32];
-        self.dispatch(BYTE_PROBE, &[&srct], &out, bytemuck::cast_slice(&dims),
+        self.dispatch(shader, &[&srct], &out, bytemuck::cast_slice(&dims),
                       ((n as u32).div_ceil(64), 1, 1));
         self.download(&out)
     }
@@ -12504,6 +12514,40 @@ pub fn watchdog_prone_name(adapter: &str) -> bool {
     ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx", "honeykrisp"]
         .iter().any(|m| n.contains(m))
 }
+
+/// The same probe, reading through `array<vec4<u32>>` instead of `array<u32>`.
+///
+/// ## The diagnosis this confirms
+///
+/// On an M2 Ultra the scalar probe returned correct bytes at exactly `i % 16 < 4` — that is,
+/// `src[0]`, `src[4]`, `src[8]`, `src[12]` read and every element between them returned zero.
+///
+/// **Only every fourth `u32` is reachable.** That is a 16-byte stride on an `array<u32>`: std140
+/// scalar-array padding applied to a storage buffer that should be std430 and tightly packed. Each
+/// scalar occupies a 16-byte slot and only its first 4 bytes hold data.
+///
+/// If this vec4 variant reads the source correctly while the scalar one does not, the layout is the
+/// cause and the fix is mechanical: every `array<u32>` storage binding becomes `array<vec4<u32>>`
+/// with the component selected by hand. If BOTH fail, the stride theory is wrong and the fault is
+/// elsewhere — which is why this ships as a probe rather than as a rewrite of every kernel.
+pub const BYTE_PROBE_VEC4: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+// Same byte address, reached through a vec4 element: word i>>2 is component (i>>2)&3 of vec4 i>>4.
+fn byte_at(i: u32) -> u32 {
+    let w = src[i >> 4u][(i >> 2u) & 3u];
+    return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(byte_at(i));
+}
+"#;
 
 pub const BYTE_PROBE: &str = r#"
 @group(0) @binding(0) var<storage, read> src: array<u32>;
