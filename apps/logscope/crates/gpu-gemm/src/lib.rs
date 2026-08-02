@@ -7696,11 +7696,19 @@ Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp ba
             // ordinary miss below is correct, while Err means one exists at a shape the metadata does
             // not describe — which must STOP rather than slice something plausible.
             if g.tensor(name).is_none() {
-                let rows_of = |n: &str| g.tensor(n).map(|t| t.dims[0] as usize);
-                let row_bytes = |n: &str| g.tensor(n).and_then(|t| {
-                    let cols = t.dims.iter().skip(1).product::<u64>() as usize;
-                    gguf::type_nbytes(t.ggml_type, cols)
-                });
+                // GGUF DIMS ARE FASTEST-VARYING FIRST. For the reported `attn_qkv [4096, 8192]` on a
+                // d=4096 model, dims[0]=4096 is the INPUT width and dims[1]=8192 is the output rows —
+                // so a "row" in the split's sense is dims[0] wide and there are dims[1..] of them.
+                //
+                // I had these swapped on the first pass, which would have split 4096 rows out of a
+                // tensor that has 8192 and sliced at a stride computed from the wrong axis. Both
+                // errors point the same way: q's range would have covered part of the tensor that is
+                // not q, and the row-count check would not have caught it because the numbers are
+                // self-consistent — just about the wrong dimension.
+                let rows_of = |n: &str| g.tensor(n)
+                    .map(|t| t.dims.iter().skip(1).product::<u64>() as usize);
+                let row_bytes = |n: &str| g.tensor(n)
+                    .and_then(|t| gguf::type_nbytes(t.ggml_type, t.dims[0] as usize));
                 for fused in crate::qkvsplit::FUSED_NAMES {
                     let src = match crate::qkvsplit::resolve(name, fused) { Some((s, _)) => s, None => break };
                     // A None here means the row is not a whole number of quantization blocks, so it
@@ -7720,7 +7728,7 @@ last block and k's first would decode to garbage")),
                             let t = g.tensor(&srcname).ok_or(format!("missing tensor {srcname}"))?;
                             let raw = set.slice(t.offset + b0 as u64, b1 - b0).ok_or(format!(
                                 "fused tensor {srcname} data out of range for {name}"))?;
-                            let cols = t.dims.iter().skip(1).product::<u64>() as usize;
+                            let cols = t.dims[0] as usize;      // input width, matching row_bytes
                             let rows = (b1 - b0) / rb;
                             return gguf::dequantize(t.ggml_type, raw, rows * cols);
                         }
