@@ -7094,7 +7094,24 @@ layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
             // refuse with the arch's precise note. Architectures with no dense form (Llama4) never escape.
             let expert_count = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
             let dense_ok = acfg.dense_supported && expert_count == 0;
-            if !dense_ok {
+            // BREAK THE DEADLOCK. `supported` flips only once an architecture has completed a forward
+            // pass on a real checkpoint — which is the right rule, and it means an arch can never
+            // become supported, because attempting it is what produces the evidence and attempting it
+            // is what this refuses.
+            //
+            // GLM-5.2 is exactly there: its two expert-weighting gaps are implemented, its third is a
+            // no-op below 2048 context, its MLA layout is fixed, and it cannot be RUN to find out.
+            //
+            // So: an explicit opt-in, named for what it is. This does not claim the model works — it
+            // lets someone find out, which is the only path to the verification the flag demands.
+            let forced = std::env::var_os("LOGSCOPE_TRY_UNSUPPORTED_ARCH").is_some();
+            if forced {
+                eprintln!("loader: '{arch}' is NOT verified — trying it anyway because \
+LOGSCOPE_TRY_UNSUPPORTED_ARCH is set. Remaining gaps: {}. Wrong output is the EXPECTED failure here, \
+not a surprise; coherent output is the evidence that would flip the flag",
+                    crate::archfeat::gap_report(&arch, variant).join("; "));
+            }
+            if !dense_ok && !forced {
                 let moe_hint = if expert_count > 0 { format!(" (this is a {expert_count}-expert MoE checkpoint)") } else { String::new() };
                 // Append layer-0's tensors so the exact expert stacking layout is visible right here — the
                 // one thing needed to wire the MoE forward, without a separate dump run.
