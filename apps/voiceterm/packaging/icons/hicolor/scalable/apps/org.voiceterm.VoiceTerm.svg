@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- org.voiceterm.VoiceTerm application icon. Scalable so one file covers every size a
+     launcher asks for; a PNG at one size is upscaled and looks soft on a HiDPI
+     dock. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <rect width="128" height="128" rx="28" fill="#0d1620"/>
+  <rect x="22" y="30" width="84" height="68" rx="8" fill="none" stroke="#5CC8FF" stroke-width="5"/><path d="M38 54l14 12-14 12" fill="none" stroke="#5CC8FF" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/><path d="M62 78h28" stroke="#5CC8FF" stroke-width="5" stroke-linecap="round"/>
+</svg>
