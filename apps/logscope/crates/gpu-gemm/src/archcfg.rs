@@ -740,7 +740,8 @@ mod tests {
         assert!(!c.supported && c.note.contains("llama.cpp"));
         assert!(qkv_bias_tensors(&c, 0).is_empty());
     }
-}    fn the_shared_expert_count_comes_from_the_FILE_when_it_says() {
+    #[test]
+    fn the_shared_expert_count_comes_from_the_FILE_when_it_says() {
         // The loader passed a literal 0 and it worked for Scout only because moe_config rescues an
         // arch declaring moe_shared_expert with .max(1). Correct by accident — an architecture with
         // TWO shared experts loses one silently, and a missing always-on expert degrades output
@@ -754,6 +755,4 @@ mod tests {
         let q = for_arch("qwen3moe");
         assert_eq!(moe_config(&q, 128, 8, 0, None, None).n_shared, 0);
     }
-
-    #[test]
-
+}
