@@ -179,3 +179,51 @@ Also unlike those two, it applies to **every** decode kernel and quantization at
 
 **Written from Colibri's source, not measured here** — the container has no Rust toolchain after a
 reset, so this is a reading of two implementations rather than a benchmark of either.
+
+---
+
+# Fan-out already has the batch that decode is missing, and decodes it serially
+
+Colibri's `decode_batch.h` names the technique in its header: *"`base` belongs to one sequence's KV
+state. Keeping this arithmetic in a model-independent seam makes **ragged decode row ownership**
+directly testable."* Multiple sequences decoding together, each contributing one row.
+
+**This engine already produces those sequences.** Fan-out runs N branches over a shared prefix — the
+loader computes the longest common token prefix across every branch and prefills it once. And then
+`lanes.rs` says what happens next:
+
+> two long-running director tasks serialize (the fan's "round-robin")
+
+Each branch decodes **alone, at m=1**, one after another.
+
+## What that costs
+
+For an N-branch fan, the weights are read N times per token-step instead of once. `MATVEC_SMALL_Q4`
+already handles m≤8 by reading each nibble once and accumulating all m rows, and each row is bit-exact
+to the m=1 kernel. A 4-branch fan is a 4× reduction in decode weight traffic for a kernel that exists,
+is tested, and is currently reached by nothing.
+
+## Why this is the better first batching target than speculation
+
+Speculative verify (`specverify.rs`) needs a draft model, an accept rule, and a policy for how many
+tokens to draft — and a fully-rejected round wastes the draft's time. **Fan-out needs none of that:**
+
+* the sequences are all **real**, so every row of the batch is work someone asked for;
+* there is no accept/reject, so no round is ever wasted;
+* the shared prefix is already computed, so the KV states are already siblings;
+* and the batch size is whatever the user chose, not something to tune.
+
+It is the same lever — more rows in flight to cover memory latency — with none of the machinery.
+
+## What it needs
+
+The round-robin replaced by a step that advances all live branches together: gather one activation row
+per branch, call `apply(.., n_live)` once per layer, scatter the results back to each branch's KV.
+`decode_batch.h`'s seam is exactly that — per-sequence KV row arithmetic kept separate from the model,
+so ownership stays testable when the rows are interleaved.
+
+Branches finish at different lengths, which is the "ragged" part: the batch shrinks as sequences hit
+their stop token, and m must follow it down rather than padding.
+
+**Read from Colibri and from this tree's own comments, not measured** — the container has no toolchain
+after a reset.
