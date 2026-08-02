@@ -411,6 +411,25 @@ precision, and cost {:.1} GiB of disk for nothing",
             if !gpu.profile_forced() && std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_none() {
                 let (k, n) = (model.d, 2 * model.h); // wgate_up: the largest decode mat-vec
                 if let Some(t) = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n) {
+                    // RE-APPLY THE GUARD ON CACHE LOAD. The autotune SEARCH skips subgroup kernels
+                    // when sg_ok is false, but a cached choice was restored without that check — so a
+                    // cache written when the subgroup kernel was allowed (a different build, driver,
+                    // or LOGSCOPE_MATVEC_SG=1 run) selects V2WgSg on a machine where the guard has
+                    // since disabled it. Your Qwen log shows exactly that: "subgroup decode kernel
+                    // DISABLED" three lines above "decode tile = 8 (kernel V2WgSg, cached autotune)".
+                    //
+                    // A guard enforced on one path and not the other is the same class as every other
+                    // stale-check bug this session; a cache is just a path that skips the code that
+                    // would have said no.
+                    let t = {
+                        let dc = gpu_kernels::DecodeConfig::unpack(t);
+                        if dc.kernel.needs_subgroups() && !gpu.subgroup_kernel_ok() {
+                            eprintln!("wgpu-engine: cached decode kernel {:?} needs subgroups, which \
+are disabled on this device — falling back to the autotuned non-subgroup default", dc.kernel);
+                            gpu_kernels::DecodeConfig { kernel: gpu_kernels::MatvecKernel::V2Wg128,
+                                                        tile: dc.tile }.pack()
+                        } else { t }
+                    };
                     gpu.set_matvec_tile(t);
                     // UNPACK BEFORE PRINTING. The cache stores a packed (kernel, tile) u32 and this
                     // printed it raw, so the line read "decode tile = 2147549192" — a value that

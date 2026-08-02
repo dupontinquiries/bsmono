@@ -2594,6 +2594,14 @@ impl Gpu {
         self.conservative_vma || watchdog_prone_name(&self.adapter_name)
     }
 
+    /// Did the subgroup matvec pass its load-time self-check on this driver?
+    ///
+    /// Exposed so a CACHED kernel choice can be re-checked against it. The autotune search already
+    /// honours this; the cache-load path did not, which is how a disabled kernel gets selected.
+    pub fn subgroup_kernel_ok(&self) -> bool {
+        self.sg_ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn oom_backoff(&self) -> bool { self.oom_flag.load(std::sync::atomic::Ordering::Relaxed) }
     pub fn clear_oom(&self) { self.oom_flag.store(false, std::sync::atomic::Ordering::Relaxed); }
     /// Test/validation hook: force the OOM-backoff flag so the download guards can be exercised without an
