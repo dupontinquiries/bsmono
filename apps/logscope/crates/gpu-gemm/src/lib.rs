@@ -10284,6 +10284,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
 
     pub fn byte_probe(&self, raw: &[u8]) -> Vec<f32> { self.byte_probe_with(raw, BYTE_PROBE) }
 
+    /// `dst[i] = f32(src[i])` over `n` words — distinct index per thread.
+    pub fn word_probe(&self, words: &[u32]) -> Vec<f32> {
+        self.byte_probe_with(bytemuck::cast_slice(words), WORD_PROBE)
+    }
+
     /// Upload bytes and read them straight back, with NO shader involved.
     ///
     /// The scalar and vec4 probes fail IDENTICALLY on hardware — only the first 4 bytes of every 16
@@ -13040,6 +13045,34 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
         }
     }
     c[row] = acc0 + acc1;
+}
+"#;
+
+/// `dst[i] = f32(src[i])` — one distinct word per thread, no shift, no shared index.
+///
+/// ## What this isolates
+///
+/// `byte_at` reads `src[i >> 2]`, so **four adjacent threads read the same word** and each extracts a
+/// different byte. That is the one property the real matvecs do not share: `MATVEC_Q4`'s inner loop
+/// walks distinct indices per thread.
+///
+/// The observed fault is exact and size-independent — only `u32` indices ≡ 0 (mod 4) return data, and
+/// in the vec4 form only component `.x` of each element. That is what scalar loads look like when the
+/// compiler folds them into a `vec4` load and uses only the first lane.
+///
+/// If this probe reads correctly while `byte_at` does not, the fault is in the *shared-index* access
+/// pattern rather than in storage reads at all — and every kernel that works, works because it does
+/// not do that.
+pub const WORD_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(src[i]);
 }
 "#;
 
