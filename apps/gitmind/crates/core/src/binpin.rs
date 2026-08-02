@@ -175,6 +175,44 @@ pub fn remove(name: &str, label: &str) -> Result<(), String> {
     save_manifest(&m)
 }
 
+/// Remove an app entirely: every version, the manifest, and the current binary.
+///
+/// `remove()` takes a LABEL and removes one version. There was no way to remove
+/// an app, so the GUI called `remove(name, "")` — an empty label matches no
+/// version, retains everything, and saves an unchanged manifest. It reported
+/// success and did nothing, which is the worst of both.
+pub fn remove_app(name: &str) -> Result<(), String> {
+    let m = load_manifest(name);
+    let bdir = bin_dir();
+    for v in &m.versions {
+        let _ = std::fs::remove_file(bdir.join(format!("{name}@{}", v.label)));
+        let _ = std::fs::remove_file(applications_dir().join(desktop_filename(name, &v.label)));
+    }
+    let _ = std::fs::remove_file(bdir.join(name));
+    // The manifest goes last: if anything above failed, the app is still listed
+    // and can be removed again. Deleting it first would strand the binaries with
+    // nothing recording that they exist.
+    std::fs::remove_file(manifest_path(name))
+        .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+        .map_err(|e| e.to_string())
+}
+
+/// Every installed version, as `(app, label, is_current)`.
+///
+/// `list_apps` returns manifest NAMES only, which is why the GUI could not show
+/// or remove a specific version — it had nothing to name one with.
+pub fn list_versions() -> Vec<(String, String, bool)> {
+    let mut out = Vec::new();
+    for name in list_apps() {
+        let m = load_manifest(&name);
+        for v in m.versions {
+            let cur = m.current.as_deref() == Some(v.label.as_str());
+            out.push((name.clone(), v.label, cur));
+        }
+    }
+    out
+}
+
 pub fn desktop_filename(name: &str, label: &str) -> String {
     format!("gitmind-{name}@{label}.desktop")
 }
@@ -262,4 +300,92 @@ pub fn build_from_commit(
     }
     let art = workdir.join(artifact);
     std::fs::read(&art).map_err(|e| format!("artifact not found at {}: {e}", art.display()))
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+
+    /// Point HOME at a scratch dir so the store is real but disposable — these
+    /// functions touch the filesystem by design, and a mock would test the mock.
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let p = std::env::temp_dir().join(format!("gitmind-test-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            std::env::set_var("HOME", &p);
+            Scratch(p)
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    fn pin(name: &str, label: &str) {
+        let mut m = load_manifest(name);
+        m.versions.push(AppVersion {
+            label: label.into(), commit: "c0ffee".into(), oid: "0".into(),
+            target: "host".into(), installed: 0, path: String::new(),
+        });
+        if m.current.is_none() { m.current = Some(label.into()); }
+        save_manifest(&m).unwrap();
+    }
+
+    #[test]
+    fn removing_with_an_empty_label_no_longer_looks_like_success() {
+        // THE bug: the GUI called remove(name, "") because list_apps gives bare
+        // names. An empty label matches no version, so retain() kept everything
+        // and the manifest was saved unchanged — while the UI said "removed".
+        let _s = Scratch::new("empty-label");
+        pin("demo", "v1");
+        remove("demo", "").unwrap();
+        assert_eq!(load_manifest("demo").versions.len(), 1,
+                   "an empty label still removes nothing — which is why remove_app exists");
+    }
+
+    #[test]
+    fn remove_app_takes_the_whole_app_with_it() {
+        let _s = Scratch::new("whole-app");
+        pin("demo", "v1");
+        pin("demo", "v2");
+        assert_eq!(list_apps(), vec!["demo".to_string()]);
+        remove_app("demo").unwrap();
+        assert!(list_apps().is_empty(), "the app is gone from the list");
+        assert!(load_manifest("demo").versions.is_empty());
+    }
+
+    #[test]
+    fn removing_an_app_that_is_not_there_is_not_an_error() {
+        // Two clicks on remove, or a stale list. Failing the second is noise
+        // about a state the user already wanted.
+        let _s = Scratch::new("absent");
+        assert!(remove_app("never-installed").is_ok());
+    }
+
+    #[test]
+    fn list_versions_names_something_remove_can_use() {
+        // The root cause: list_apps returns names with no way to identify a
+        // version, so the GUI had nothing to pass as a label.
+        let _s = Scratch::new("versions");
+        pin("demo", "v1");
+        pin("demo", "v2");
+        let v = list_versions();
+        assert_eq!(v.len(), 2);
+        assert!(v.iter().any(|(a, l, cur)| a == "demo" && l == "v1" && *cur));
+        assert!(v.iter().any(|(a, l, cur)| a == "demo" && l == "v2" && !*cur));
+        // and each one round-trips through remove
+        remove("demo", "v2").unwrap();
+        assert_eq!(list_versions().len(), 1);
+    }
+
+    #[test]
+    fn removing_the_current_version_clears_the_pointer() {
+        // Otherwise `current` names a version that is gone and `gitmind run`
+        // fails with a missing file rather than saying nothing is selected.
+        let _s = Scratch::new("current");
+        pin("demo", "v1");
+        remove("demo", "v1").unwrap();
+        assert_eq!(load_manifest("demo").current, None);
+    }
 }
