@@ -1105,6 +1105,77 @@ pub fn run(args: &[String]) {
         check("a flick at pace is stronger than one at a crawl", speed_spread > 4.0);
         println!("   (speed adds {speed_spread:.1} m/s across 5 -> 20 m/s)");
 
+        // ---- THE POWER FLICK ----
+        // The real test of a flick is what it does from a FAST dribble: the
+        // ball should leave well above the car's own speed, because the
+        // car's momentum goes through the contact and the rotation adds on
+        // top. A flick that merely matches car speed is a pass, not a shot.
+        println!();
+        println!("{:<10} {:>9} {:>9} {:>9} {:>8}", "car speed", "exit", "gain", "angle", "verdict");
+        let mut gains = Vec::new();
+        for target in [9.0f32, 14.0, 19.0, 23.0] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            // get to speed with the ball still out of the way
+            c.throttle = 1.0;
+            c.boost = true;
+            for _ in 0..900 {
+                if car.vel.length() >= target {
+                    break;
+                }
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // place the ball and HOLD the speed while it settles, otherwise
+            // the car coasts down and the flick is measured at the wrong pace
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.34 + Vec3::Y * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..30 {
+                c.boost = car.vel.length() < target;
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            let carspeed = car.vel.length();
+            c.boost = false;
+            c.jump_pressed = true;
+            c.jump_held = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            for _ in 0..9 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.throttle = 1.0;
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            // let the flick play out, then read the ball once it is clear of
+            // the car — that is the shot, whatever the contact history was
+            for _ in 0..70 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            let v = ball.vel;
+            let exit = v.length();
+            let flat = Vec3::new(v.x, 0.0, v.z).length();
+            let ang = v.y.atan2(flat.max(0.01)).to_degrees();
+            let gain = exit - carspeed;
+            gains.push(gain);
+            println!(
+                "{:<10.1} {:>8.1} {:>+8.1} {:>8.0}d {:>8}",
+                carspeed,
+                exit,
+                gain,
+                ang,
+                if gain > 8.0 { "power" } else { "a pass" }
+            );
+        }
+        check("a flick adds real pace at speed", gains.last().copied().unwrap_or(0.0) > 8.0);
+        check("and adds more the faster you are going", gains[3] > gains[0] + 2.0);
+
         // ---- AIR DRIBBLE: how long does the ball stay on the nose? ----
         println!();
         println!("{:<16} {:>9} {:>9} {:>8}", "air carry", "seconds", "touches", "drift");
@@ -4299,6 +4370,69 @@ pub fn run(args: &[String]) {
             }
             println!("   available again after {waited:.2}s");
             check("but it always comes back", waited < h.pulse_cd + 0.2);
+            // ---- AND THROUGH THE REAL PATH ----
+            // Everything above calls hover_pulse directly, which proves the
+            // function and not the plumbing. This drives it the way the game
+            // does: a jump press through physics::step, with the ball where
+            // a hovercar actually carries it.
+            {
+                let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+                let mut car2 = physics::Car::new();
+                car2.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.9, 0.0);
+                car2.sync_rot();
+                car2.hover = Some(physics::Hover::default());
+                let mut b2 = Ball::new();
+                b2.pos = car2.pos + car2.forward() * 2.2 + Vec3::Y * 0.3;
+                b2.vel = Vec3::ZERO;
+                b2.prev = b2.pos;
+                let mut c2 = physics::Controls::default();
+                let mut ev2 = StepEvents::default();
+                // settle, with no jump
+                for _ in 0..30 {
+                    physics::step(&mut car2, &mut b2, &mut world, &c2, &cfg, DT, &mut ev2);
+                }
+                let before = b2.vel.length();
+                let cary = car2.vel.y;
+                c2.jump_pressed = true;
+                ev2.pulses.clear();
+                physics::step(&mut car2, &mut b2, &mut world, &c2, &cfg, DT, &mut ev2);
+                c2.jump_pressed = false;
+                let after = b2.vel.length();
+                println!(
+                    "   through physics::step: ball {before:.1} -> {after:.1} m/s, car lift {:+.1}, pulses {}",
+                    car2.vel.y - cary,
+                    ev2.pulses.len()
+                );
+                check("a jump press pulses through the real step path", ev2.pulses.len() == 1);
+                check("...and the ball is pushed by it", after > before + 1.0);
+                // ---- AND IT SURVIVES A RESET ----
+                // `reset` rebuilds the car from Car::new() and carries across
+                // only the fields it names, so anything describing the
+                // VEHICLE rather than its motion is lost on every kickoff.
+                // The hover chassis was, which is why the pulse worked once
+                // and then quietly became an ordinary jump.
+                car2.reset(&world);
+                println!(
+                    "   after a reset: still a hovercar: {}, drivetrain kept: {}",
+                    car2.hover.is_some(),
+                    car2.drive == crate::model::Drive::Electric || car2.drive == crate::model::Drive::Combustion
+                );
+                check("a reset does not turn a hovercar back into a car", car2.hover.is_some());
+                let mut b3 = Ball::new();
+                b3.pos = car2.pos + car2.forward() * 2.0 + Vec3::Y * 0.3;
+                b3.prev = b3.pos;
+                let mut ev3 = StepEvents::default();
+                let mut c3 = physics::Controls::default();
+                for _ in 0..20 {
+                    physics::step(&mut car2, &mut b3, &mut world, &c3, &cfg, DT, &mut ev3);
+                }
+                let v0 = b3.vel.length();
+                c3.jump_pressed = true;
+                ev3.pulses.clear();
+                physics::step(&mut car2, &mut b3, &mut world, &c3, &cfg, DT, &mut ev3);
+                println!("   pulse after reset: ball {v0:.1} -> {:.1} m/s", b3.vel.length());
+                check("and the pulse still pushes the ball afterwards", ev3.pulses.len() == 1 && b3.vel.length() > v0 + 1.0);
+            }
             // a redirect: the blast should ADD to a ball already moving
             let mut fast = Ball::new();
             fast.pos = car.pos + Vec3::new(1.6, 0.3, 0.0);

@@ -279,12 +279,22 @@ impl Car {
         // (DROPSHOT) used to spawn the car INSIDE the platform
         let clr = self.half_h + 0.05;
         let p = world.spawn_at(0.0, 26.0, clr);
+        // WHAT SURVIVES A RESET IS THE CAR YOU CHOSE.
+        //
+        // This rebuilds from `Car::new()` and carries across only the fields
+        // listed here — so anything describing the VEHICLE rather than its
+        // motion is silently lost on every kickoff, respawn and map load.
+        // The hover chassis was: after the first reset a hovercar reverted to
+        // a wheeled one, which is why its jump stopped pulsing the ball. The
+        // drivetrain had the same hole.
         *self = Car {
             half_len: self.half_len,
             half_h: self.half_h,
             half_w: self.half_w,
             wheel_r: self.wheel_r,
-            boost: 45.0,
+            drive: self.drive,
+            hover: self.hover,
+            boost: if self.hover.is_some() { 45.0 } else { 45.0 },
             pos: p,
             ..Car::new()
         };

@@ -3298,6 +3298,35 @@ of it better rather than worse: forward 22.3 m/s at 23 degrees (was 17.8 at
 before. The tuning is a genuine trade — at 0.048 the carry was better still
 and flicks went flat at 16 degrees, so 0.034 is where both hold.
 
+## v1.101.0 — a reset was quietly un-hovering the car
+
+Reported: the hovercars' jump does not push the ball.
+
+The pulse itself was fine, and that is why the harness had not caught it —
+every test called `hover_pulse` DIRECTLY, which proves the function and says
+nothing about the plumbing. Driving it the way the game does, through a jump
+press into `physics::step`, also worked: ball 1.9 -> 6.7 m/s, car lift +7.5.
+
+The fault was upstream. `Car::reset` rebuilds from `Car::new()` and carries
+across only the fields it explicitly names — half extents and wheel radius —
+so anything describing the VEHICLE rather than its motion is silently lost
+on every kickoff, respawn and map load. `hover` was one of those fields. The
+car kept floating because the model re-applies its dimensions afterwards,
+but the CHASSIS was gone: no cushion config, no field, and a jump that went
+back to being an ordinary wheeled jump. It worked once, before the first
+reset, and never again.
+
+`drive` had exactly the same hole, so an EV silently lost its torque curve
+at the first kickoff too.
+
+Both are carried across now, and the harness tests the property rather than
+the function: pulse, reset, pulse again — 0.6 -> 6.9 m/s afterwards.
+
+The general lesson is worth keeping: a struct rebuilt field-by-field is a
+list that has to be maintained, and it fails SILENTLY when something new is
+added. Every field added to `Car` since that function was written was a
+candidate for this bug.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
