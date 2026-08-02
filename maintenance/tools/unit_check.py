@@ -71,6 +71,18 @@ def main():
                     print(f"{app}/{base}: ProtectHome=true but ReadWritePaths={rw} "
                           f"is under %h — the daemon cannot write its own state")
                     problems += 1
+                # Documentation=man:x(1) that resolves to nothing is worse than
+                # no Documentation at all: systemctl status offers the link and
+                # `man` then reports no such entry.
+                doc = val(text, 'Documentation')
+                if doc and doc.startswith('man:'):
+                    name = doc[4:].split('(')[0]
+                    page = os.path.join(APPS, app, 'man', name + '.1')
+                    if not os.path.isfile(page):
+                        print(f"{app}/{base}: Documentation={doc} but no man/{name}.1 "
+                              f"ships — systemctl offers a link to nothing")
+                        problems += 1
+
                 if val(text, 'ExecStart') is None:
                     print(f"{app}/{base}: no ExecStart")
                     problems += 1

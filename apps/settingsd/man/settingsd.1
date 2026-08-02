@@ -1,0 +1,44 @@
+.TH SETTINGSD 1 "2026-08-02" "logscope" "User Commands"
+.SH NAME
+settingsd \- the settings daemon
+.SH SYNOPSIS
+.B settingsd
+.SH DESCRIPTION
+.B settingsd
+serves the cross-app settings namespace, so a preference changed in one app reaches the others.
+.PP
+It is
+.B socket-activated:
+systemd creates the socket at login and starts the daemon on the first
+connection. There is normally no reason to run it by hand, and doing so while
+the socket unit is enabled will fail to bind.
+.PP
+An app connecting before the daemon is running blocks on the socket rather than
+failing, so nothing needs a retry loop or a start-order dependency.
+.SH FILES
+.TP
+.I $XDG_RUNTIME_DIR/settings.sock
+The socket. Mode 0600 \(em per-user, not shared between accounts on one machine.
+.TP
+.I ~/.local/share/settingsd/
+State. The only path the service unit leaves writable.
+.SH "EXIT STATUS"
+.TP
+.B 0
+Clean shutdown.
+.TP
+.B non-zero
+Failure; systemd restarts it after 2 seconds.
+.SH "SEE ALSO"
+.BR systemd.socket (5)
+.PP
+Enable the
+.B socket,
+not the service:
+.PP
+.RS
+systemctl --user enable --now settingsd.socket
+.RE
+.PP
+Enabling the service directly starts it at login regardless, which defeats
+socket activation and reintroduces the idle process it exists to avoid.
