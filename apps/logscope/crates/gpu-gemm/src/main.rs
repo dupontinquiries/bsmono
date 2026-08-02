@@ -3621,6 +3621,32 @@ dequantizer, so a divergence here is the kernel's arithmetic or its indexing, no
             println!("    {sz:>6} bytes: {} ({correct} of the first {} correct)",
                 if ok { "CORRECT" } else { "wrong" }, 64.min(sz));
         }
+        // SHARED INDEX vs DISTINCT INDEX. byte_at reads src[i>>2], so four adjacent threads read the
+        // SAME word and each extracts a byte. MATVEC_Q4's inner loop does not do that — it walks
+        // distinct indices per thread — and it works on this hardware.
+        //
+        // The observed fault is exact: only u32 indices divisible by 4 return data, which is what
+        // scalar loads look like when folded into a vec4 load using only .x. If one word per thread
+        // reads correctly while byte_at does not, the fault is the ACCESS PATTERN, not storage reads.
+        {
+            // Values f32 holds EXACTLY. My first fixture used a hash and reported 1-of-64 correct on
+            // lavapipe, which works — f32 cannot represent an arbitrary u32, so the round-trip failed
+            // for reasons having nothing to do with the read. The same class as the Q6_K fixture whose
+            // random f16 scales decoded to NaN.
+            let words: Vec<u32> = (0..64u32).map(|i| i * 1000 + 7).collect();
+            let got = gpu.word_probe(&words);
+            let ok = got.iter().zip(&words).all(|(g, w)| *g as u32 == *w);
+            let correct = got.iter().zip(&words).filter(|(g, w)| **g as u32 == **w).count();
+            println!("  word_probe dst[i]=src[i] : {} ({correct} of 64 correct)",
+                if ok { "CORRECT" } else { "wrong" });
+            if ok {
+                println!("  => DISTINCT indices read fine; the fault is the SHARED-index pattern in \
+byte_at, not storage reads. Every kernel that works avoids reading one word from four threads.");
+            } else {
+                println!("  => distinct indices fail too, so the fault is storage reads themselves \
+and the working kernels need explaining, not the probe.");
+            }
+        }
         let ids = gpu.id_probe(n);
         let id_ok = ids.iter().enumerate().all(|(i, v)| *v as usize == i);
         println!("  id_probe dst[i]=i  : {:?}",
