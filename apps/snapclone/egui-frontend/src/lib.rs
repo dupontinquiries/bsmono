@@ -11,6 +11,7 @@ use egui::Ui;
 use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteColors};
 
 pub mod camera;
+pub mod debounce;
 pub mod camera_source;
 pub mod peer_source;
 pub mod contacts;
@@ -50,6 +51,10 @@ pub struct Snapclone {
     pub camera: Option<crate::camera_source::CameraChoice>,
     /// Why the last save failed, if it did.
     pub settings_error: Option<String>,
+    /// Page transitions, debounced. The nav is instant (leading edge) while the
+    /// per-page LOAD waits for the swipe to settle — so a fast scroll through
+    /// five pages loads the fifth once rather than all five in turn.
+    pub page_debounce: crate::debounce::Debouncer<usize>,
     pub inbox: crate::inbox::Inbox,
     pub composer: crate::composer::Composer,
     pub settings: crate::settings_page::SettingsPage,
@@ -84,6 +89,8 @@ impl Snapclone {
             viewfinder: Default::default(),
             camera: None,
             settings_error: None,
+            page_debounce: crate::debounce::Debouncer::new(
+                crate::debounce::Config::page_transition()),
             inbox: Default::default(),
             composer: Default::default(),
             // Load from disk rather than defaults: a settings page that starts
@@ -131,6 +138,17 @@ impl Snapclone {
     }
 
     /// Render: live background, then the current page/subpage.
+    /// Note the page the user is on, and report when they have settled there.
+    ///
+    /// The caller does the expensive part — fetching a conversation, opening a
+    /// camera — only on Settled. Doing it on every frame of a swipe is what
+    /// makes a page transition stutter, and doing it only on Settled without a
+    /// leading edge is what makes it feel laggy.
+    pub fn note_page(&mut self, page: usize, now_ms: u64) -> Option<usize> {
+        self.page_debounce.change(page, now_ms);
+        self.page_debounce.tick(now_ms).map(|(_, p)| p)
+    }
+
     pub fn ui(&mut self, ui: &mut Ui, adaptive: &Adaptive) {
         let colors = uikit_egui::palette_colors(&self.palette);
         let surface = ui.available_rect_before_wrap();
