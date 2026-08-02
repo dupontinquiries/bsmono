@@ -27,8 +27,6 @@ pub struct Models {
     /// discard an edit before the save, and saved on every change rather than on exit because a
     /// crash between the two loses exactly the machine someone just added.
     trusted: logscope_fan::trustkit::Registry,
-    /// What went wrong with the last add or save, if anything.
-    trust_note: Option<String>,
     add_id: String,
     machines: Vec<String>,
     machine_note: String,
@@ -53,7 +51,6 @@ impl Default for Models {
             // id that parses and is nobody's is worse than one that obviously did not load, because
             // the first gets pasted somewhere.
             trusted: logscope_fan::trustkit::Registry::load(&trust_path()).0,
-            trust_note: None,
             my_id: Some(state_dir().join(logscope_fan::clusternode::IDENTITY_FILE))
                 .and_then(|p| logscope_fan::machineid::Identity::load_or_create(&p).ok())
                 .map(|id| id.id())
