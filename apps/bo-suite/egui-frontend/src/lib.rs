@@ -13,6 +13,7 @@ pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
 pub mod chrome;
+pub mod scrollfeel;
 pub mod anticipation;
 pub mod safety;
 pub mod dialogs;
