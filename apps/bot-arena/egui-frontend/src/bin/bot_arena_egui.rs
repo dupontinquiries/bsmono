@@ -42,10 +42,17 @@ impl eframe::App for App {
     }
 }
 
+/// Must match packaging/org.botarena.BotArena.desktop exactly — a mismatch fails
+/// silently, leaving a working app with no icon.
+const APP_ID: &str = "org.botarena.BotArena";
+
 fn main() -> eframe::Result<()> {
     eframe::run_native(
         "bot-arena (egui)",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+        viewport: uikit_egui::desktop::viewport(APP_ID, "Bot Arena", [900.0, 700.0]),
+        ..Default::default()
+    },
         Box::new(|_cc| Ok(Box::new(App::new()))),
     )
 }

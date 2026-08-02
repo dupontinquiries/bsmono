@@ -340,10 +340,19 @@ impl eframe::App for Feel {
 
 /// Run the keyboard app. Both `src/bin/rusty_board_egui.rs` (the deploy binary) and
 /// `examples/feel.rs` (the dev harness) are one call to this.
+/// Must match `packaging/org.rustyboard.RustyBoard.desktop` exactly. A mismatch
+/// fails silently: the keyboard runs and has no icon or dock grouping.
+pub const APP_ID: &str = "org.rustyboard.RustyBoard";
+
 pub fn run(title: &str) -> eframe::Result<()> {
-    eframe::run_native(
-        title,
-        eframe::NativeOptions::default(),
-        Box::new(|_cc| Ok(Box::new(Feel::new()))),
-    )
+    let opts = eframe::NativeOptions {
+        // An on-screen keyboard wants to be WIDE and SHORT, and it must not
+        // steal focus from the app being typed into — a keyboard that takes
+        // focus types into itself.
+        viewport: uikit_egui::desktop::viewport(APP_ID, title, [900.0, 340.0])
+            .with_resizable(true)
+            .with_active(false),
+        ..Default::default()
+    };
+    eframe::run_native(APP_ID, opts, Box::new(|_cc| Ok(Box::new(Feel::new()))))
 }

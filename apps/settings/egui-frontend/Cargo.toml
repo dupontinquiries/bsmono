@@ -8,8 +8,22 @@ description = "The central BigSilicon settings app: an egui UI on uikit-egui tha
 [lib]
 path = "src/lib.rs"
 
+# The crate described itself as "the central BigSilicon settings app" and
+# shipped only a library — nothing to launch, so the desktop entry would have
+# pointed at a binary that does not exist.
+[[bin]]
+name = "settings-egui"
+path = "src/bin/settings_egui.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+app = ["dep:eframe", "dep:config-kit"]
+
 [dependencies]
 egui = "0.34"
 settings-kit = { path = "../../../shared/settings-kit" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+config-kit = { path = "../../../shared/config-kit", optional = true }

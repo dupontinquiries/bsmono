@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Bot Arena
+GenericName=Code Agent Arena
+Comment=Population-based code-agent arena — run, score and compare agents
+Exec=bot-arena-egui
+Icon=org.botarena.BotArena
+Terminal=false
+Categories=Development;Science;
+Keywords=agents;arena;evaluation;code;
+StartupNotify=true
+StartupWMClass=org.botarena.BotArena
