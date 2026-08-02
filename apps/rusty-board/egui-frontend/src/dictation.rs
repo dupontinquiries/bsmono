@@ -96,7 +96,26 @@ impl Dictation {
     /// text over the committed result.
     pub fn partial_arrived(&mut self, text: &str) {
         if self.state != State::Listening || self.finished { return; }
-        self.partial = text.trim().to_string();
+        // Whisper invents text from silence — "thank you", "you", "[BLANK_AUDIO]"
+        // — and in PartialsOnly mode the last partial IS what gets committed, so
+        // an unfiltered hallucination is typed into the user's document. The
+        // filter is deliberately CONSERVATIVE: it matches the canonical list
+        // exactly, so "thank you very much for the help" survives.
+        // filter_transcript composes the three filters in the right order and
+        // returns None when nothing survives — using it rather than chaining
+        // the parts by hand, since the ordering (de-loop AFTER artifact strip,
+        // because artifacts sit past the loop) is a decision the kit already
+        // made and getting it wrong here would be invisible.
+        //
+        // require_speech is FALSE on partials: a partial is mid-word by nature
+        // and rejecting it for not looking like a sentence would blank the
+        // preview on every other frame.
+        match voice_kit::hallucination::filter_transcript(text, true, true, false) {
+            Some(cleaned) => self.partial = cleaned,
+            // Keep the previous partial rather than blanking: a moment of
+            // silence mid-sentence should not erase what was already heard.
+            None => {}
+        }
     }
 
     /// The user released. Returns the text to insert, or `None` when there is
@@ -133,7 +152,11 @@ impl Dictation {
         if self.finished || self.state != State::Transcribing { return None; }
         self.finished = true;
         self.state = State::Idle;
-        let text = text.trim().to_string();
+        // Now actually hallucinated-away, rather than only described as such.
+        // require_speech is TRUE here: a final IS a complete utterance, so one
+        // that does not look like speech is whisper filling silence.
+        let text = voice_kit::hallucination::filter_transcript(text, true, true, true)
+            .unwrap_or_default();
         let previous = std::mem::take(&mut self.partial);
         // An empty or hallucinated-away final must not wipe a good partial: the
         // partial was accurate enough to read, so keep it.
@@ -323,4 +346,62 @@ mod tests {
         assert!(w.start > 0, "the opening is no longer re-read every time");
         assert!(w.len() < long, "and the work per partial is bounded");
     }
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn listening() -> Dictation {
+        let mut d = Dictation::default();
+        d.start();
+        d
+    }
+
+    #[test]
+    fn a_hallucinated_partial_does_not_erase_a_good_one() {
+        // Whisper invents "thank you" from silence, and in PartialsOnly the last
+        // partial IS what gets committed — so an unfiltered one is typed into
+        // the user's document. A pause mid-sentence must keep what was heard.
+        let mut d = listening();
+        d.partial_arrived("turn left at the");
+        d.partial_arrived("thank you");
+        assert_eq!(d.partial(), "turn left at the", "the silence was dropped");
+        d.partial_arrived("turn left at the lights");
+        assert_eq!(d.partial(), "turn left at the lights");
+    }
+
+    #[test]
+    fn a_real_phrase_containing_a_filtered_word_survives() {
+        // The filter matches the canonical list EXACTLY, so this must not be
+        // mistaken for the hallucination it starts with.
+        let mut d = listening();
+        d.partial_arrived("thank you very much for the help");
+        assert_eq!(d.partial(), "thank you very much for the help");
+    }
+
+    #[test]
+    fn trailing_artifacts_are_stripped_from_a_partial() {
+        let mut d = listening();
+        d.partial_arrived("meet me at six [BLANK_AUDIO]");
+        assert_eq!(d.partial(), "meet me at six");
+    }
+
+    #[test]
+    fn an_artifact_in_the_middle_is_left_alone() {
+        // Only the END is trimmed — text after an artifact is real speech, and
+        // cutting there would lose it.
+        let mut d = listening();
+        d.partial_arrived("hello [BLANK_AUDIO] world");
+        assert!(d.partial().contains("world"), "{}", d.partial());
+    }
+
+    #[test]
+    fn a_partial_is_not_required_to_look_like_a_sentence() {
+        // A partial is mid-word by nature; rejecting it for not looking like
+        // speech would blank the preview every other frame.
+        let mut d = listening();
+        d.partial_arrived("navig");
+        assert_eq!(d.partial(), "navig");
+    }
+}
 }
