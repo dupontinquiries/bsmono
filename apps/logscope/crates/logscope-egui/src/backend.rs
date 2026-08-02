@@ -1510,9 +1510,25 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
 builds Llama-3 markers and the worker translates them authoritatively)");
                             }
                         } else {
-                            eprintln!("worker: PROMPT TEMPLATE MISMATCH — UI sent {sent} markers to a {:?} \
-model; translated. This is stale UI template state, not the Llama-4 handoff — please report it.",
-                                backend.template());
+                            // ONCE, AND NOT AS A FAULT. This printed on every model switch and ended with "please
+                            // report it" — right when the translation was partial, wrong since _409 made it total.
+                            //
+                            // The cause is structural and known: the prompt is BUILT AT SEND TIME, before the load
+                            // completes, so it necessarily carries the previous model's markers on the first turn
+                            // after a switch. The worker translating authoritatively is the design, not a symptom.
+                            //
+                            // A warning that fires on correct behaviour is one people learn to skip — and THIS
+                            // message is what hid a real garbling bug for weeks, because it read as a resolved
+                            // notice. One informational line naming the actual remaining work.
+                            static MISMATCH_NOTE: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !MISMATCH_NOTE.swap(true, Ordering::Relaxed) {
+                                eprintln!("worker: prompt carried {sent} markers to a {:?} model and was \\
+translated. Expected on the first turn after a model switch — the prompt is built before the load \\
+finishes, so it cannot know the new template. The durable fix is rebuilding it once Evt::Loaded \\
+lands; until then the translation is total and this is not a fault.",
+                                    backend.template());
+                            }
                         }
                         fixed
                     }
