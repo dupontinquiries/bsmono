@@ -91,8 +91,15 @@ impl Camera {
     ) {
         // ---- gravity-aware up basis: smoothed, rate-capped, blendable ----
         let g = world.gravity_dir(car.pos);
-        let want_up = (Vec3::Y * (1.0 - cfg.grav_follow) + (-g) * cfg.grav_follow).normalize_or(Vec3::Y);
-        self.up = Self::rotate_toward(self.up, want_up, 2.4 * dt);
+        // The horizon leans toward local gravity, but not all the way and
+        // not quickly: at full follow and 2.4 rad/s the world rolled out
+        // from under you every time a tube's "down" swung round, which is
+        // disorienting rather than dramatic. Two thirds of the way, at half
+        // the rate, keeps the sense of being inside a pipe without the room
+        // spinning.
+        let follow = cfg.grav_follow * 0.68;
+        let want_up = (Vec3::Y * (1.0 - follow) + (-g) * follow).normalize_or(Vec3::Y);
+        self.up = Self::rotate_toward(self.up, want_up, 1.15 * dt);
 
         self.update_heading(car, flipping, dt);
 

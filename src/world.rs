@@ -914,7 +914,7 @@ impl World {
                             // cars into walls, 21/24 -> 17/24), but in a
                             // 12 m bore a boosting car flies up the middle
                             // and never touches a wall at all.
-                            g: (r / 10.0).clamp(0.55, 1.5),
+                            g: (r / 12.0).clamp(0.45, 1.15),
                             surf: true,
                             follow: None,
                         });
@@ -1036,9 +1036,14 @@ impl World {
                 // ---- jungle-gym lattice: a tall random tube network with
                 // switchbacks, drops and knuckle joints everywhere ----
                 let mut anchors: Vec<Vec3> = Vec::new();
-                for k in 0..32 {
+                // FEWER, BETTER SPACED. At 32 anchors with four links each the
+                // lattice was a thicket: tubes crossed constantly, junction
+                // rooms piled into one another and the sculpture stopped
+                // reading as a structure. Twenty-two anchors on a wider ring
+                // gives the same three-tier shape with room to see it.
+                for k in 0..22 {
                     let a = rng.range(0.0, std::f32::consts::TAU);
-                    let rr = rng.range(34.0, 150.0) * ws;
+                    let rr = rng.range(48.0, 165.0) * ws;
                     // SKY HIGH: three tiers, the top one well above the old
                     // ceiling, so the sculpture climbs instead of sprawling
                     let y = match k % 3 {
@@ -1057,8 +1062,11 @@ impl World {
                         .map(|j| (anchors[i].distance(anchors[j]), j))
                         .collect();
                     near.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    for &(d, j) in near.iter().take(4) {
-                        if j < i || d > 105.0 {
+                    // three links, and a minimum span: very short links were
+                    // the ones that tangled, since two anchors a few metres
+                    // apart still get a full-width pipe and a junction room
+                    for &(d, j) in near.iter().take(3) {
+                        if j < i || d > 105.0 || d < 26.0 {
                             continue;
                         }
                         // no cramped links: the thin end of the range was
@@ -1639,7 +1647,7 @@ impl World {
                             // cars into walls, 21/24 -> 17/24), but in a
                             // 12 m bore a boosting car flies up the middle
                             // and never touches a wall at all.
-                            g: (r / 10.0).clamp(0.55, 1.5),
+                            g: (r / 12.0).clamp(0.45, 1.15),
                             surf: true,
                             follow: None,
                         });
@@ -2944,7 +2952,7 @@ impl World {
                         let steps = ((p0.distance(p1) / 5.0).ceil() as usize).clamp(2, 24);
                         for t in 0..=steps {
                             let q = p0.lerp(p1, t as f32 / steps as f32);
-                            grav.push(GravNode { pos: q, down: Vec3::NEG_Y, r: r * 1.45, tube: true, inward: false, g: (r / 10.0).clamp(0.55, 1.5), surf: true, follow: None });
+                            grav.push(GravNode { pos: q, down: Vec3::NEG_Y, r: r * 1.45, tube: true, inward: false, g: (r / 12.0).clamp(0.45, 1.15), surf: true, follow: None });
                             flows.push(Flow { pos: q, r: r * 0.95, vel: (p1 - p0).normalize_or(Vec3::Y) * 20.0 });
                         }
                     }
@@ -4360,7 +4368,9 @@ impl World {
             // shape plants you quickly and then lets go.
             if n.tube {
                 let axis_frac = (best.0 / (n.r / 1.45).max(0.01)).clamp(0.0, 1.0);
-                g *= 0.40 + 1.30 * (1.0 - axis_frac);
+                // still strongest at the axis so a car entering a wide bore
+                // gets planted, but the peak comes down: at 1.7x it pinned
+                g *= 0.50 + 0.95 * (1.0 - axis_frac);
             }
             // a collapsing node hauls on everything in reach
             if let Some((bi, _)) = self.bh {

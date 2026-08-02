@@ -2454,6 +2454,35 @@ treatment: a smooth angular offset per sample rather than a random one.
 future roughness experiment that quantises space will fail rather than
 ship.
 
+## v1.76.0 — a calmer Perplexus, a calmer horizon
+
+PERPLEXUS WAS A THICKET. Thirty-two anchors with four links each meant
+tubes crossed constantly, junction rooms piled into one another, and the
+sculpture stopped reading as a structure. It is twenty-two anchors on a
+wider ring (48-165 m) with three links each, and links shorter than 26 m
+are skipped — those were the ones that tangled, since two anchors a few
+metres apart still get a full-width pipe and a junction room of their own.
+
+    shapes 944 -> 725,  routes 94 -> 53,  worldgen 21 ms -> 11 ms
+
+The loops are still seamless, the bores still drivable (p10 3.21 m, 1%
+tight), and in-bore time actually went UP to 94% — a cleaner lattice is
+easier to stay inside.
+
+PIPE GRAVITY, softer. It ran (r/10) clamped to 1.5 with an axis boost of up
+to 1.7x, so a bore could pull at 2.55x world gravity. It is (r/12) clamped
+to 1.15 with a 1.45x axis boost — a peak of 1.67x, about a third less. The
+axis-strong shape stays, because that is what plants a car entering a wide
+pipe rather than letting it fly up the middle; tuning it needs care, since
+the driving-contact metric is noisy (46% here against 54% before, and a
+nearby setting measured 15%).
+
+THE CAMERA STOPS ROLLING SO HARD. The horizon leaned all the way to local
+gravity at 2.4 rad/s, so the world rotated out from under you every time a
+tube's "down" swung round — disorienting rather than dramatic. It leans two
+thirds of the way at 1.15 rad/s now: still unmistakably inside a pipe,
+without the room spinning.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
