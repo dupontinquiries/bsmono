@@ -62,3 +62,58 @@ The claim came from an older log in which every turn's prefill scaled with total
 log predates the anchor reuse or came from a path that does not take it, I did not check before
 writing three paragraphs of consequence. The measurement was real; the conclusion drawn from it was
 not.
+
+
+---
+
+# The batched decode kernels exist and decode never reaches them
+
+The 14× says decode needs rows in flight. The engine already has the kernel for that:
+
+```
+m == 1        MATVEC_Q4          one row
+m <= 8        MATVEC_SMALL_Q4    reads each nibble ONCE, accumulates all m rows
+m >  8        LINEAR_Q4          strided
+```
+
+`MATVEC_SMALL_Q4`'s own comment names its purpose: *"small batch (speculative verify block / batched
+decode): read each weight nibble once, accumulate all m rows — keeps Q4's halved weight-bandwidth
+advantage."* Each row is bit-exact to the m=1 kernel.
+
+**Decode passes m=1.** `Lin::apply(gpu, a, m)` routes by m and the decode loop produces one token at a
+time, so the m≤8 branch is reached only by the speculative-verify path — and nothing drives it.
+
+`windowed sampling ON (k=4)` is not this. The window is for sampling — a resident int8 embed table for
+top-k — and does not batch the matvec.
+
+## What this is worth
+
+At m=4, each weight read serves four rows. The 2.6 GiB/token becomes 2.6 GiB per *four* tokens, and
+more importantly there are four independent rows of work in flight to cover the memory latency that
+decode currently has nothing to hide behind. That is the same mechanism prefill uses to be 14× faster
+per token, applied at a batch size the existing kernel already supports.
+
+It does not require the subgroup kernel, a new shader, or the driver question `--gate-bytes` is chasing.
+
+## What is missing
+
+A draft model producing k tokens, and a verify step calling `apply(.., k)` and accepting the longest
+matching prefix. The `Deploy` panel already models the pairing — `tree_ready()` is true when a target
+and a smaller draft are both selected, and renders "speculation on" — so the configuration exists and
+the runtime does not.
+
+## Against the references
+
+llama.cpp's speculative decoding is a separate example binary driving two contexts, with the same
+accept-longest-prefix rule; the batching it needs from the backend is exactly `mul_mat` at m=k, which
+this engine has. Colibri does not do speculation at all — it is single-model by design — so the shape
+here comes from llama.cpp rather than from both.
+
+## Order, revised
+
+1. `--gate-bytes` — still first, because if the invocation index is wrong it invalidates kernel work.
+2. **Speculative verify** — new here, and ahead of V3 and the q4 GEMM: the kernel is written and
+   tested, the failure mode is loud (a wrong verify produces wrong tokens immediately), and it attacks
+   the 14× directly rather than the constant in front of it.
+3. V3's autotune result on hardware.
+4. The q4 prefill GEMM.
