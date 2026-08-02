@@ -982,3 +982,104 @@ and still died — the plan is not the whole footprint");
         assert!(streaming_fits_host(g(15.2), g(17.3), g(15.0), g(192.0), true));
     }
 }
+
+/// Bits per weight of a source format, for reasoning about what conversion costs.
+///
+/// Only the formats this engine actually reads. A table rather than a computation because the block
+/// layouts are irregular — IQ1_S is 50 bytes per 256 weights, Q4_K is 144 per 256 — and deriving them
+/// from a formula would be a second place for the block sizes to be wrong.
+pub fn source_bpw(ggml_type: u32) -> Option<f32> {
+    Some(match ggml_type {
+        0 => 32.0,           // F32
+        1 => 16.0,           // F16
+        8 => 8.5,            // Q8_0: 34 bytes per 32
+        12 => 4.5,           // Q4_K: 144 bytes per 256
+        14 => 6.5625,        // Q6_K: 210 bytes per 256
+        19 => 1.5625,        // IQ1_S: 50 bytes per 256
+        _ => return None,
+    })
+}
+
+/// What the resident conversion costs, and what a native path would save.
+///
+/// The engine converts every source format to q4 or int8 because those are its COMPUTE formats. For a
+/// Q4_K source that is roughly size-neutral and buys a kernel that runs. For IQ1_S it is a 2.8× tax to
+/// reach a format the checkpoint author deliberately avoided — and it is what puts GLM-5.2's 25 GiB
+/// file over a 63 GiB ceiling.
+///
+/// Returns `(resident_bytes, native_bytes)`. When they are equal there is nothing to gain and no
+/// reason to write a native kernel.
+pub fn conversion_cost(source_type: u32, params: u64, resident_bpw: f32) -> Option<(u64, u64)> {
+    let src = source_bpw(source_type)?;
+    let resident = (params as f64 * resident_bpw as f64 / 8.0) as u64;
+    let native = (params as f64 * src as f64 / 8.0) as u64;
+    Some((resident, native))
+}
+
+/// Would a native path make a model that does not currently fit, fit?
+///
+/// This is the question worth putting in a refusal message. "It does not fit" is a dead end; "it does
+/// not fit at 4.5 bits and would at 1.56" names the work that would change the answer, and lets a
+/// reader judge whether it is worth doing rather than taking the engine's word.
+pub fn native_would_fit(source_type: u32, params: u64, resident_bpw: f32, ceiling: u64)
+    -> Option<bool>
+{
+    let (resident, native) = conversion_cost(source_type, params, resident_bpw)?;
+    Some(resident > ceiling && native <= ceiling)
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn IQ1_S_to_q4_nearly_TRIPLES_the_bytes() {
+        // 1.5625 bpw source, 4.5 bpw resident. This is the whole GLM-5.2 blocker in one ratio.
+        let params = 136_000_000_000u64;
+        let (resident, native) = conversion_cost(19, params, 4.5).unwrap();
+        let ratio = resident as f64 / native as f64;
+        assert!((ratio - 2.88).abs() < 0.05, "ratio {ratio:.2}");
+        assert!(resident / GIB > 70, "{} GiB resident", resident / GIB);
+        assert!(native / GIB < 26, "{} GiB native", native / GIB);
+    }
+
+    #[test]
+    fn a_Q4_K_source_is_nearly_size_NEUTRAL_so_there_is_nothing_to_win() {
+        // Which is why nobody noticed the conversion was a tax: for the format almost every checkpoint
+        // ships in, it costs nothing. A native path here would buy no memory at all.
+        let (resident, native) = conversion_cost(12, 8_000_000_000, 4.5).unwrap();
+        assert_eq!(resident, native, "Q4_K and q4 are both 4.5 bpw");
+    }
+
+    #[test]
+    fn the_native_path_is_what_turns_a_REFUSAL_into_a_fit() {
+        // The question worth putting in a refusal message: not "it does not fit" but "it does not fit
+        // at 4.5 bits and would at 1.56".
+        let params = 136_000_000_000u64;
+        assert_eq!(native_would_fit(19, params, 4.5, 63 * GIB), Some(true),
+            "GLM-5.2 IQ1_S on a 63 GiB ceiling");
+        // And on a machine too small for either, the native path is not the answer and should not be
+        // offered as one.
+        assert_eq!(native_would_fit(19, params, 4.5, 20 * GIB), Some(false));
+    }
+
+    #[test]
+    fn an_UNKNOWN_source_type_yields_no_advice_rather_than_a_guess() {
+        // A bpw invented for a format nobody has read produces a confident number about a conversion
+        // that may not even happen.
+        assert!(source_bpw(99).is_none());
+        assert!(conversion_cost(99, 1_000_000, 4.5).is_none());
+        assert!(native_would_fit(99, 1_000_000, 4.5, GIB).is_none());
+    }
+
+    #[test]
+    fn Q8_0_to_int8_is_also_near_neutral() {
+        // 8.5 vs 8.0 — the half bit is the per-32 scale. Worth pinning so a future edit that "rounds"
+        // it to 8.0 has to explain where the scales went.
+        assert_eq!(source_bpw(8), Some(8.5));
+        let (r, n) = conversion_cost(8, 8_000_000_000, 8.0).unwrap();
+        assert!(n > r, "the SOURCE is slightly larger, because it carries scales the target drops");
+    }
+}
