@@ -50,8 +50,31 @@ pub enum State {
 }
 
 /// One dictation session.
+/// Map a settings-kit filter level to voice-kit's three flags.
+///
+/// voice-kit's own doc says "the flags come from a settings-kit `VoiceFilter`
+/// level, mapped by voiced so this crate stays UI-agnostic" — the mapping was
+/// always meant to live at the call site, and I had hardcoded `(true, true, _)`
+/// instead, which silently overrode anyone who had chosen Off.
+///
+/// `partial` matters because a partial is mid-word by nature: requiring it to
+/// look like a complete sentence would blank the preview every other frame, so
+/// Strict only tightens the FINAL.
+pub fn filter_flags(level: settings_kit::VoiceFilter, partial: bool) -> (bool, bool, bool) {
+    use settings_kit::VoiceFilter as V;
+    match level {
+        V::Off => (false, false, false),
+        V::Light => (true, false, false),
+        V::Standard => (true, true, false),
+        V::Strict => (true, true, !partial),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Dictation {
+    /// How hard to filter. From settings-kit's A11yPrefs, so a user who chose
+    /// Off is not silently overridden by a hardcoded Standard.
+    pub filter_level: settings_kit::VoiceFilter,
     pub mode: Mode,
     state: State,
     /// The live, uncommitted text — a complete transcription of the utterance
@@ -67,6 +90,7 @@ pub struct Dictation {
 impl Default for Dictation {
     fn default() -> Self {
         Dictation {
+            filter_level: settings_kit::VoiceFilter::Standard,
             mode: Mode::default(), state: State::Idle,
             partial: String::new(), committed: String::new(), finished: false,
         }
@@ -110,7 +134,8 @@ impl Dictation {
         // require_speech is FALSE on partials: a partial is mid-word by nature
         // and rejecting it for not looking like a sentence would blank the
         // preview on every other frame.
-        match voice_kit::hallucination::filter_transcript(text, true, true, false) {
+        let (a, h, sp) = filter_flags(self.filter_level, true);
+        match voice_kit::hallucination::filter_transcript(text, a, h, sp) {
             Some(cleaned) => self.partial = cleaned,
             // Keep the previous partial rather than blanking: a moment of
             // silence mid-sentence should not erase what was already heard.
@@ -155,7 +180,8 @@ impl Dictation {
         // Now actually hallucinated-away, rather than only described as such.
         // require_speech is TRUE here: a final IS a complete utterance, so one
         // that does not look like speech is whisper filling silence.
-        let text = voice_kit::hallucination::filter_transcript(text, true, true, true)
+        let (a, h, sp) = filter_flags(self.filter_level, false);
+        let text = voice_kit::hallucination::filter_transcript(text, a, h, sp)
             .unwrap_or_default();
         let previous = std::mem::take(&mut self.partial);
         // An empty or hallucinated-away final must not wipe a good partial: the
@@ -355,6 +381,40 @@ mod filter_tests {
         let mut d = Dictation::default();
         d.start();
         d
+    }
+
+    #[test]
+    fn a_user_who_chose_off_is_not_silently_overridden() {
+        // The bug this mapping fixes: the flags were hardcoded to (true, true, _),
+        // so a person who turned filtering OFF still had their transcripts
+        // rewritten — and could never work out why.
+        use settings_kit::VoiceFilter as V;
+        assert_eq!(filter_flags(V::Off, true), (false, false, false));
+        assert_eq!(filter_flags(V::Off, false), (false, false, false));
+        let mut d = listening();
+        d.filter_level = V::Off;
+        d.partial_arrived("thank you");
+        assert_eq!(d.partial(), "thank you", "off means off");
+    }
+
+    #[test]
+    fn each_level_adds_exactly_one_filter() {
+        // Light trims artifacts, Standard also drops hallucinations, Strict also
+        // requires speech. A level that skipped one would be indistinguishable
+        // from its neighbour.
+        use settings_kit::VoiceFilter as V;
+        assert_eq!(filter_flags(V::Light, false),    (true, false, false));
+        assert_eq!(filter_flags(V::Standard, false), (true, true,  false));
+        assert_eq!(filter_flags(V::Strict, false),   (true, true,  true));
+    }
+
+    #[test]
+    fn strict_tightens_the_final_but_not_the_partial() {
+        // A partial is mid-word by nature; requiring it to look like a complete
+        // sentence would blank the preview every other frame.
+        use settings_kit::VoiceFilter as V;
+        assert_eq!(filter_flags(V::Strict, true).2, false, "partial is not required to be speech");
+        assert_eq!(filter_flags(V::Strict, false).2, true, "the final is");
     }
 
     #[test]
