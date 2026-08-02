@@ -7510,21 +7510,34 @@ failure when forcing it, not a surprise; coherent output is the evidence that wo
             // dimension right — so a wrong one is invisible in the output and this line is the only
             // place it can be caught. Printing the SOURCE matters as much as the value: "4 (default)"
             // and "4 (file)" mean different things when the output is bad.
+            // "(default)" IMPLIED THE FILE COULD HAVE SAID OTHERWISE, and for three of these four it
+            // cannot: llama.cpp's key table defines `expert_shared_count`, `attention.scale` and
+            // `attention.sliding_window_pattern` — and has NO key for the NoPE interval, for qk-norm,
+            // or for the temperature floor. It derives all three from the architecture, exactly as our
+            // constants did.
+            //
+            // So the metadata reads I added for those keys can never fire. They are harmless, and the
+            // log line was not: an operator debugging Scout's output would read "(default)" as "this
+            // checkpoint omitted it" and go looking for a file that could override it. There is none.
+            //
+            // A value nobody can override is an ARCH CONSTANT, and calling it a default was the same
+            // overstatement as every other label this session — a word implying evidence that does not
+            // exist.
             let src = |k: &str| if g.get_u32(&format!("{}.{k}", acfg.prefix)).is_some()
                 { "file" } else { "default" };
+            let arch_const = "arch constant — GGUF defines no key";
             eprintln!("loader: Llama-4 iRoPE — NoPE every {nope_step} layers from layer {} ({}); \
 qk-norm {} ({}); shared experts {} ({}); attn-temp floor {} ({})",
-                nope_step.saturating_sub(1), src("attention.no_rope_interval"),
+                nope_step.saturating_sub(1), arch_const,
                 if g.get_u32(&format!("{}.attention.use_qk_norm", acfg.prefix))
                     .map(|v| v != 0)
                     .unwrap_or_else(|| g.get_u32(&format!("{}.expert_count", acfg.prefix))
                         .unwrap_or(0) != 128) { "on" } else { "off" },
-                src("attention.use_qk_norm"),
+                arch_const,
                 g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(1),
                 src("expert_shared_count"),
                 g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)).unwrap_or(8192.0),
-                if g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)).is_some()
-                    { "file" } else { "default" });
+                arch_const);
         }
         // Which layers are windowed. llama.cpp's default pattern puts the FULL-attention layer last in
         // each group (dense_first = false), so a period of 4 gives [swa, swa, swa, dense].

@@ -485,7 +485,7 @@ happening somewhere GPU_SYNC_NS is not wrapped around"),
 }
 
 /// Check a profile against itself. Empty means the numbers can coexist.
-pub fn profile_doubts(polls: u64, downloads: u64, sync_ms: f64, wall_ms: f64) -> Vec<ProfileDoubt> {
+pub fn profile_doubts(_polls: u64, downloads: u64, sync_ms: f64, wall_ms: f64) -> Vec<ProfileDoubt> {
     let mut v = Vec::new();
     // THE POLL/DOWNLOAD DOUBT IS WITHDRAWN, one commit after I wrote it. SUBMIT_BY_DOWNLOAD is tagged
     // in THREE places — `run`, `sample_at` and `download` — and only the last one maps a buffer and
