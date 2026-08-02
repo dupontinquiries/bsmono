@@ -3,6 +3,14 @@ sys.path.insert(0,'.')
 import pandapower as pp
 from pandapower import networks as nw
 
+def ybus_triplets(ppc):
+    import numpy as np
+    Y = ppc["internal"]["Ybus"]
+    Y = Y.tocoo()
+    return [[int(i), int(j), float(v.real), float(v.imag)]
+            for i, j, v in zip(Y.row, Y.col, Y.data)]
+
+
 CASES = ["case9","case14","case30","case57","case118","case300"]
 
 for name in CASES:
@@ -28,6 +36,12 @@ for name in CASES:
             "gen": [[float(r[0]), float(r[1]), float(r[2]), float(r[3]),
                      float(r[4]), float(r[5]), float(r[7])] for r in gen],
             # the answer
+            # pandapower's OWN admittance matrix, as triplets. Exported because pandapower's
+            # transformer model carries iron-loss conductance (pfe_kw) that the MATPOWER branch
+            # format cannot express, so a Ybus rebuilt from `branch` alone differs on the diagonal
+            # at transformer buses. Shipping theirs makes the solver test unambiguous and lets the
+            # builder be checked against it rather than against a guess.
+            "ybus": ybus_triplets(ppc),
             "solution_vm": [float(r[7]) for r in bus],
             "solution_va_deg": [float(r[8]) for r in bus],
         }

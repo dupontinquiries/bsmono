@@ -19,8 +19,8 @@ receiving them — which is why it is the right on-ramp from network analysis to
 | crate | layer | owns | status |
 |---|---|---|---|
 | `sim-num` | — | deterministic reductions, compensated arithmetic, f64 kernels, Newton | **built** |
-| `sim-power` | L0 | Ybus, polar Jacobian, PV/PQ switching, AC power flow | next |
-| `sim-field` | L1 | 2D Laplace/Poisson on triangles → C, L per unit length → RLGC | planned |
+| `sim-power` | L0 | Ybus, polar Jacobian, AC power flow | **built** |
+| `sim-field` | L1 | 2D Laplace/Poisson on triangles → C, L per unit length → RLGC | next |
 | `sim-pcb` | L2 | stackup, PDN impedance, thermal; consumes `cad-nifty` geometry | planned |
 | `sim-litho` | L3 | EUV imaging by Fourier optics; f32-safe, GPU-shaped | planned |
 | `sim-rtl` | L4 | logic evaluation; bit-exact, no floating point | planned |
@@ -59,3 +59,36 @@ self-consistency check. Regenerate with `tools/gen_fixtures.py` against a pandap
 
 Every layer owes an equivalent: L1 against analytic coax and microstrip Z₀ tables, L3 against
 known diffraction patterns.
+
+
+## L0 status
+
+All six fixtures converge from a flat start, 4–5 iterations, observed convergence order 2.0–2.8,
+agreeing with pandapower to between 1e-15 and 1e-11 in both magnitude and angle. `cargo run -p
+simscope-cli -- fixtures` prints the table.
+
+Two things are load-bearing and worth not undoing:
+
+**The finite-difference Jacobian test.** A wrong Jacobian still converges — linearly instead of
+quadratically — so getting the right answer validates nothing about the derivatives. Central
+differences on the residual are the only direct check, and the quadratic order in the report is the
+behavioural corroboration.
+
+**pandapower's Ybus ships in the fixture.** Our own builder agrees with it off-diagonal to 1e-9 and
+in the imaginary diagonal, differing only in real diagonal terms at transformer buses — that is
+pandapower's iron-loss conductance (`pfe_kw`), which the MATPOWER branch format cannot express. The
+test asserts the *shape* of the disagreement rather than a loose tolerance, so a genuine tap-algebra
+error would still fail. Solving uses the reference matrix, which keeps the solver test about Newton
+rather than about a transformer model.
+
+### L0 debts
+
+- **Dense LU.** case300 (530 unknowns) takes 287 ms, almost all of it O(n³) factorisation done five
+  times. Power flow Jacobians are ~4 nonzeros per row; sparse LU is the fix and this becomes its
+  differential oracle.
+- **No PV→PQ switching.** The fixtures carry Qmax = Qmin = 0, meaning pandapower ran with
+  `enforce_q_lims=False`, so matching it requires *not* enforcing limits. The switching hook exists
+  in `System::after_step` and is unused.
+- **No sparse Ybus.** Stored dense, O(n²), which caps us near a thousand buses.
+- **No DC power flow, no contingency batch.** N-1 screening across thousands of independent solves
+  is the workload that actually justifies a GPU, and it is not written.
