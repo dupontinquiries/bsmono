@@ -309,3 +309,53 @@ rather than assume DeepSeek's.
 **Five formats in one layer.** Anything that reasons about "the model's quantization" as a single value
 — including the `conversion_cost` advice added in _461, which reads the expert tensors' type — is
 answering about one tensor and generalising. For this file that generalisation is wrong five ways.
+
+---
+
+# The MLA ranks are in the tensor shapes, and the loader only looks at metadata
+
+The preview log ends the load with:
+
+```
+worker: load failed: architecture 'glm-dsa' ships MLA tensors but no kv_lora_rank in its metadata
+```
+
+That is a correct refusal — the latent dimensions genuinely are unknown from metadata. **But they are
+not unknown from the file.** The dump printed right below the error contains them:
+
+```
+blk.0.attn_kv_a_norm.weight   [512]              → kv_lora_rank = 512
+blk.0.attn_q_a_norm.weight    [2048]             → q_lora_rank  = 2048
+blk.0.attn_k_b.weight         [192×512×64]       → 64 heads, 512 latent, 192 = qk_nope + qk_rope
+blk.0.attn_v_b.weight         [512×256×64]       → 64 heads, v_head_dim = 256
+```
+
+A LoRA-style norm vector has exactly rank elements — that is what it normalizes. So `kv_lora_rank` is
+the length of `attn_kv_a_norm.weight`, and `q_lora_rank` the length of `attn_q_a_norm.weight`, with no
+inference beyond "a norm has one weight per channel".
+
+**The head count and the per-head dims fall out of the same dump**: `attn_k_b` is `[192, 512, 64]` and
+`attn_v_b` is `[512, 256, 64]`, so 64 heads, a 512-wide latent, and `v_head_dim = 256`. The 192 is
+`qk_nope_head_dim + qk_rope_head_dim`, which metadata splits and the tensor does not — so that one still
+needs the file's hparams or a convention.
+
+## Why this is worth doing rather than waiting for better metadata
+
+The refusal message already says the MLA path is implemented and validated and that only the dimensions
+are missing. Deriving four of the five from shapes turns "this checkpoint cannot be loaded" into "this
+checkpoint loads if the qk split is known" — and the qk split is the one value with a documented
+DeepSeek-V3 convention (128 + 64) that this file's 192 matches exactly.
+
+## The confirmed shape of the remaining work
+
+The dump also settles two open questions:
+
+**The sparse indexer is real and has tensors.** `indexer.attn_k`, `indexer.attn_q_b`, `indexer.k_norm`
+and `indexer.proj` are all present per block. `archfeat`'s `SparseAttentionIndexer` gap is not
+speculative, and `indexer.proj [6144×32]` says the index projection is 32-wide.
+
+**Layer 0 is dense.** `ffn_gate`/`ffn_up`/`ffn_down` appear without an `_exps` suffix, so GLM-5.2 has
+dense leading layers before the MoE ones — the interleaved pattern the loader already detects per block
+from the tensors present, rather than assuming from the architecture.
+
+**Read from the preview log, not measured** — no toolchain in this container after the reset.
