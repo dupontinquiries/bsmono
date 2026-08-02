@@ -388,3 +388,104 @@ mod persist_tests {
         assert_eq!(r.level("m1"), Trust::Compute);
     }
 }
+
+/// Load and save the registry at a path.
+///
+/// `to_text` and `from_text` existed and nothing called them, so a machine an operator added lived
+/// only until the process exited — the exact failure the persistence was written to prevent, left one
+/// step short of working.
+impl Registry {
+    /// Read the registry, returning an empty one if the file is absent.
+    ///
+    /// A missing file is NOT an error: the first run has no trusted machines, and treating that as a
+    /// failure would put a scary message in front of every new install.
+    pub fn load(path: &std::path::Path) -> (Registry, Vec<String>) {
+        match std::fs::read_to_string(path) {
+            Ok(t) => Registry::from_text(&t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Registry::new(), Vec::new()),
+            Err(e) => (Registry::new(), vec![format!("could not read {}: {e}", path.display())]),
+        }
+    }
+
+    /// Write the registry, creating the directory if needed.
+    ///
+    /// Writes to a temporary file and renames, so an interrupted save cannot leave a truncated
+    /// registry — losing half the trust list is worse than failing to save, because the half that
+    /// survives looks complete.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        if let Some(dir) = path.parent() { std::fs::create_dir_all(dir)?; }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, self.to_text())?;
+        std::fs::rename(&tmp, path)
+    }
+}
+
+#[cfg(test)]
+mod registry_io_tests {
+    use super::*;
+
+    fn tmp(n: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("logscope-trust-{n}-{}", std::process::id()));
+        p
+    }
+
+    #[test]
+    fn a_missing_file_is_an_empty_registry_not_an_ERROR() {
+        // The first run has no trusted machines. Treating that as a failure would put a scary message
+        // in front of every new install, and a message that fires for everyone is one nobody reads.
+        let (r, bad) = Registry::load(&tmp("absent"));
+        assert!(bad.is_empty());
+        assert_eq!(r.level("anything"), Trust::Unknown);
+    }
+
+    #[test]
+    fn a_saved_registry_survives_a_reload() {
+        let p = tmp("roundtrip");
+        let _ = std::fs::remove_file(&p);
+        let mut r = Registry::new();
+        r.register_keyed("m2", Trust::Handoff, vec![0xab, 0xcd]);
+        r.save(&p).expect("saves");
+        let (back, bad) = Registry::load(&p);
+        assert!(bad.is_empty(), "{bad:?}");
+        assert_eq!(back.level("m2"), Trust::Handoff);
+        assert_eq!(back.key("m2"), Some(&[0xab, 0xcd][..]));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn the_save_is_ATOMIC_so_an_interruption_cannot_truncate_it() {
+        // Losing half the trust list is worse than failing to save, because the half that survives
+        // looks complete — an operator sees three of their four machines and does not know a fourth
+        // is missing rather than offline.
+        let p = tmp("atomic");
+        let _ = std::fs::remove_file(&p);
+        let mut r = Registry::new();
+        for i in 0..20 { r.register_keyed(&format!("m{i}"), Trust::Compute, vec![i as u8]); }
+        r.save(&p).unwrap();
+        // The temporary must not be left behind — a stray .tmp beside the registry is the kind of
+        // thing someone deletes, or worse, opens and edits.
+        assert!(!p.with_extension("tmp").exists(), "the temporary was renamed, not copied");
+        let (back, _) = Registry::load(&p);
+        assert_eq!(back.handoff_targets().len(), 0);
+        for i in 0..20 { assert_eq!(back.level(&format!("m{i}")), Trust::Compute); }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn a_revocation_survives_the_round_trip() {
+        // to_text skips revoked entries, so this checks the two halves agree: a revoked machine must
+        // not come back as Unknown-but-present, and must not come back at all.
+        let p = tmp("revoke");
+        let _ = std::fs::remove_file(&p);
+        let mut r = Registry::new();
+        r.register_keyed("gone", Trust::Handoff, vec![1]);
+        r.register_keyed("stays", Trust::Compute, vec![2]);
+        r.revoke("gone");
+        r.save(&p).unwrap();
+        let (back, _) = Registry::load(&p);
+        assert_eq!(back.level("gone"), Trust::Unknown);
+        assert_eq!(back.level("stays"), Trust::Compute);
+        let _ = std::fs::remove_file(&p);
+    }
+}
