@@ -3625,8 +3625,28 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
     /// rather than host copies. `gate`/`up`/`down` are the whole expert tensors as they appear in a file.
     pub fn build_moe_stream_raw(&self, gate: &'static [u8], up: &'static [u8], down: &'static [u8],
                                 n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize) -> MoeStream {
-        let gu_expert_bytes = ff * d / 256 * 144;
-        let dn_expert_bytes = d * ff / 256 * 144;
+        // 144 IS Q4_K's BLOCK SIZE, and this helper hardcoded it — so every MoE streaming test only
+        // ever exercised Q4_K experts. A "Q4_K_M" checkpoint is MIXED: llama.cpp ships some tensors as
+        // Q6_K (210 bytes per 256), and the production path at build time uses the type-aware
+        // `source_block_bytes` precisely because of that.
+        //
+        // A fixture that can only produce one type cannot catch a stride computed for the wrong one —
+        // and a wrong expert stride reads every expert after the first from the wrong offset, which
+        // is gibberish rather than an error.
+        //
+        // Defaults to Q4_K so existing callers are unchanged; `build_moe_stream_raw_typed` takes the
+        // ggml types.
+        self.build_moe_stream_raw_typed(gate, up, down, n_expert, ff, d, n_used, ring, 12, 12)
+    }
+
+    /// As `build_moe_stream_raw`, with the gate/up and down source types given.
+    pub fn build_moe_stream_raw_typed(&self, gate: &'static [u8], up: &'static [u8], down: &'static [u8],
+        n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize,
+        gu_ty: u32, dn_ty: u32) -> MoeStream {
+        let gu_expert_bytes = Self::source_block_bytes(gu_ty, ff * d)
+            .expect("a source type this helper can size");
+        let dn_expert_bytes = Self::source_block_bytes(dn_ty, d * ff)
+            .expect("a source type this helper can size");
         // These are VIEWS into a retained mapping, not copies — so the mapping must stay resident for the
         // process lifetime. Declaring it here rather than at the release site keeps the fact next to the
         // thing that makes it true.
