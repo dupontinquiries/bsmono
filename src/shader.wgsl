@@ -220,12 +220,26 @@ fn gather_try(c: ptr<function, Cands>, i: u32, ro: vec3<f32>, rd: vec3<f32>, tma
     // low quality gathers fewer candidates: the marcher's cost is
     // (candidates x steps), so this is the cheapest knob there is
     let kcap = max(4u, u32(4.0 + 12.0 * clamp(G.rt.y, 0.0, 1.0)));
-    if ((*c).n < min(KMAX, kcap)) {
-        // SORTED INSERT by entry distance. The nearest candidate is tested
-        // first, so the running minimum drops immediately and everything
-        // behind it gets rejected by the bound — order is most of the win.
-        let e0 = -b - sq;
-        let e1 = -b + sq;
+    let cap = min(KMAX, kcap);
+    let e0 = -b - sq;
+    let e1 = -b + sq;
+    // KEEP THE NEAREST, NOT THE FIRST.
+    //
+    // A full list used to drop everything that arrived afterwards, so which
+    // shapes a ray saw depended on the order the cell happened to store
+    // them. That is wrong as well as slow: a nearer shape found late was
+    // discarded in favour of a farther one found early, and on a busy cell
+    // the ray could miss the very thing it was about to hit.
+    //
+    // Now a full list rejects on a SINGLE COMPARE when the newcomer is
+    // farther than the current worst — which is the common case, so the
+    // insertion sort below only runs when it is actually going to change
+    // the answer.
+    if ((*c).n >= cap) {
+        if (e0 >= (*c).t0[cap - 1u]) { return; }
+        (*c).n = cap - 1u; // drop the worst, then insert normally
+    }
+    {
         var k = (*c).n;
         loop {
             if (k == 0u) { break; }

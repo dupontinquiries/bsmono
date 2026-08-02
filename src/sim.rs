@@ -1841,6 +1841,81 @@ pub fn run(args: &[String]) {
                 saved * 100.0
             );
         }
+        // ---- THE GATHER: nearest-N versus first-N ----
+        // The candidate list is capped. It used to keep whichever shapes
+        // arrived first and drop the rest, so what a ray saw depended on the
+        // order a cell happened to store them in — and a nearer shape found
+        // late was thrown away in favour of a farther one found early.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let cap = 16usize;
+            let (mut wrong, mut rays, mut shifts_old, mut shifts_new) = (0u32, 0u32, 0u64, 0u64);
+            for k in 0..500 {
+                let a = k as f32 * 0.7548;
+                let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.08 - 0.3, a.sin()).normalize();
+                // every candidate the ray could see, in cell order
+                let mut hits: Vec<(f32, usize)> = Vec::new();
+                for (c, r, i) in shapes.iter() {
+                    let to = *c - eye;
+                    let b = to.dot(dir);
+                    let disc = b * b - (to.length_squared() - r * r);
+                    if disc <= 0.0 {
+                        continue;
+                    }
+                    let sq = disc.sqrt();
+                    let (t0, t1) = (b - sq, b + sq);
+                    if t1 < 0.0 || t0 > 260.0 {
+                        continue;
+                    }
+                    hits.push((t0, *i));
+                }
+                if hits.len() <= cap {
+                    continue;
+                }
+                rays += 1;
+                // FIRST-N: whatever arrived first, then sorted
+                let mut first_n: Vec<(f32, usize)> = hits[..cap].to_vec();
+                first_n.sort_by(|a, b| a.0.total_cmp(&b.0));
+                // NEAREST-N: what the ray should actually consider
+                let mut near_n = hits.clone();
+                near_n.sort_by(|a, b| a.0.total_cmp(&b.0));
+                near_n.truncate(cap);
+                // did first-N miss something nearer than the ones it kept?
+                if near_n[0].0 < first_n[0].0 - 1e-4 {
+                    wrong += 1;
+                }
+                // insertion cost: first-N shifts on every accepted candidate
+                shifts_old += cap as u64 * 3;
+                // nearest-N rejects on one compare once full
+                let mut kept = 0u64;
+                let worst = near_n.last().unwrap().0;
+                for (t0, _) in hits.iter() {
+                    if *t0 < worst {
+                        kept += 1;
+                    }
+                }
+                shifts_new += kept * 2;
+            }
+            println!();
+            println!("gather on a busy cell ({rays} rays with more than {cap} candidates):");
+            println!(
+                "   first-N missed a NEARER shape on {wrong} of them ({:.0}%)",
+                wrong as f32 / rays.max(1) as f32 * 100.0
+            );
+            println!(
+                "   insertion work {shifts_old} -> {shifts_new} ({:.0}% less)",
+                (1.0 - shifts_new as f32 / shifts_old.max(1) as f32) * 100.0
+            );
+        }
+
         // ---- ALL THREE RAY SYSTEMS ----
         // A fragment pays for a shadow ray, four AO probes and a reflection.
         // Optimising only the reflection optimises part of the bill, so

@@ -2690,6 +2690,34 @@ New in `--sim march`: a per-fragment breakdown across all three systems, so
 the next round of this work starts by looking at which one is actually
 expensive rather than at the one that was expensive last time.
 
+## v1.83.0 — the gather kept the wrong candidates
+
+With the three marches trimmed, the remaining per-fragment cost is the
+GATHER that feeds them — it runs three times a fragment and had never been
+looked at. What turned up there is a correctness bug wearing a performance
+costume.
+
+The candidate list is capped (16 at full quality, fewer as quality drops).
+It used to keep whichever shapes ARRIVED FIRST and drop everything after,
+so what a ray could see depended on the order a cell happened to store its
+contents in — and a nearer shape found late was discarded in favour of a
+farther one found early. Measured on PERPLEXUS, over rays whose cell holds
+more than sixteen candidates:
+
+    first-N missed a NEARER shape on 34% of them
+
+Those are reflections and shadows passing through geometry they should have
+hit. The list now keeps the NEAREST candidates: when it is full and the
+newcomer is farther than the current worst, it rejects on a single compare —
+the common case — and only runs the insertion sort when the answer will
+actually change. Insertion work drops 38% as a side effect, but the reason
+to do it is that the previous behaviour was order-dependent.
+
+Worth naming the pattern, because it has now happened three times in this
+renderer: a cap that silently discards is not a performance decision, it is
+an unstated approximation. Draw distance discards what you cannot see; this
+discarded whatever happened to be indexed late.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
