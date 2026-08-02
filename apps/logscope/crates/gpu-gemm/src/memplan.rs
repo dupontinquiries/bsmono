@@ -1154,3 +1154,27 @@ mod mixed_quant_tests {
         assert_eq!((5472 * 2048) % 256, 0, "but ff*d is, because d is");
     }
 }
+
+#[cfg(test)]
+mod stride_alignment_tests {
+    use crate::Gpu;
+
+    #[test]
+    fn a_non_block_aligned_count_yields_NO_stride_rather_than_a_short_one() {
+        // The integer division truncates silently, and this figure is a PER-EXPERT STRIDE — a short
+        // one starts expert 1 partway into expert 0's data and every expert after drifts further.
+        // The bytes decode, the shapes are right, and the output is gibberish.
+        assert_eq!(Gpu::source_block_bytes(12, 300), None, "300 is not a whole number of blocks");
+        assert_eq!(Gpu::source_block_bytes(14, 1), None);
+        assert_eq!(Gpu::source_block_bytes(12, 512), Some(2 * 144), "and an aligned count still works");
+    }
+
+    #[test]
+    fn qwen3_coder_is_aligned_by_its_OTHER_factor() {
+        // ff = 5472 is 21.375 blocks. Only d = 2048 makes ff*d divisible, so this model is safe by
+        // luck. A model with an odd ff AND an odd d would have truncated, and before this guard
+        // nothing would have said so.
+        assert_eq!(Gpu::source_block_bytes(12, 5472), None, "ff alone would have truncated");
+        assert!(Gpu::source_block_bytes(12, 5472 * 2048).is_some(), "ff*d is aligned");
+    }
+}
