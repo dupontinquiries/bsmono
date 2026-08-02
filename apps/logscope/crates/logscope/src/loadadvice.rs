@@ -72,7 +72,35 @@ pub fn advise(f: &LoadFacts) -> Vec<String> {
             f.gpu_gib_s, f.cpu_gib_s));
     }
 
-    // 4. Asymmetric cores worth using?
+    // 3b. Precision the panel roles do not need.
+//
+// The liaison advice below says a small reporter can run on the efficiency cores. The same
+// reasoning applies to its BITS: a model that paraphrases a backend's state does not need the
+// precision of the model whose reasoning is the product, and taking it from there frees room
+// where the loss costs least.
+//
+// Stated as arithmetic rather than a recommendation, because whether a given quantization is
+// good enough for a job is a quality judgement no planner can make — but "this would free N
+// GiB" is a fact, and it is the fact someone needs to decide.
+{
+    use crate::rolequant_hint;
+    // ONLY WHEN THE FIT IS TIGHT. I wrote this unconditionally and an existing test caught it —
+    // "a healthy fitting model produces no advice at all" — which is exactly the mistake I fixed
+    // in the template warning one commit earlier, made again immediately.
+    //
+    // Freeing 1.7 GiB is not interesting when 30 GiB are spare. It is the whole question when the
+    // model uses most of the budget, and firing in both cases is what makes a reader stop
+    // distinguishing them.
+    let model_bytes = f.bytes_per_layer.saturating_mul(f.n_layers as u64);
+    let tight = f.gpu_budget_bytes > 0
+        && model_bytes * 100 > f.gpu_budget_bytes * 75;   // within 25% of the budget
+    if let Some(freed) = rolequant_hint::liaison_saving_gib(8_000_000_000).filter(|_| tight) {
+        out.push(format!(
+            "a liaison at Q2 instead of q4 frees ~{freed:.1} GiB — it reports on the thinker rather than reasoning, so the precision it gives up is the precision it was not using. On a device where the thinker only just fits, that is the margin between resident and streaming"));
+    }
+}
+
+// 4. Asymmetric cores worth using?
     let cpus = crate::coreclass::read_capacities();
     if let Some((e, p)) = crate::coreclass::classify(&cpus) {
         out.push(format!("{} performance and {} efficiency cores detected — a small liaison can run on \
