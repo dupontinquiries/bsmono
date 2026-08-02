@@ -20,6 +20,9 @@ app = ["dep:eframe"]
 [dependencies]
 # The camera bridge device-kit was written for — its description names
 # snapclone explicitly, and no port had ever depended on it.
+# One authenticated session per peer, streams on demand. The roster was a
+# hardcoded Vec<Peer> of names with an online bool.
+peermux-core = { path = "../../../shared/peermux-core" }
 device-kit = { path = "../../../shared/device-kit" }
 egui = "0.34"
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
