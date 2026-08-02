@@ -207,6 +207,7 @@ version = "0.1.0"
 dependencies = [
  "audiopus",
  "bliss-audio",
+ "bo-core",
  "cstr",
  "dbus",
  "dirs",
@@ -230,6 +231,10 @@ dependencies = [
  "urlencoding",
  "walkdir",
 ]
+
+[[package]]
+name = "bo-core"
+version = "0.1.0"
 
 [[package]]
 name = "bo-mux"
