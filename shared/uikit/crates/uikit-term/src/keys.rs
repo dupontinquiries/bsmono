@@ -60,13 +60,41 @@ pub enum Key {
 
 /// Encode a key press as the bytes a shell expects, or `None` when the press
 /// carries nothing (a bare modifier, an unmapped function key).
+/// The two terminal modes that change what a key means. Set by the program
+/// running in the terminal, which is why encoding cannot be a pure function of
+/// the key: the same arrow press is two different byte sequences depending on
+/// what the foreground process asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TermMode {
+    /// DECCKM (CSI ? 1 h). Arrows become SS3 — `ESC O A` rather than `ESC [ A`.
+    pub app_cursor: bool,
+    /// DEC 2004. Pastes are wrapped in markers so a program can tell pasted
+    /// text from typing.
+    pub bracketed_paste: bool,
+}
+
+/// Encode with the default (reset) modes. Kept so existing callers do not have
+/// to thread a mode they do not track.
 pub fn encode(key: Key, m: Mods) -> Option<Vec<u8>> {
+    encode_mode(key, m, TermMode::default())
+}
+
+/// Encode a keypress for a terminal in a given mode.
+pub fn encode_mode(key: Key, m: Mods, mode: TermMode) -> Option<Vec<u8>> {
     let csi = |b: u8| -> Vec<u8> {
         if m.any() {
             // CSI 1 ; N <final> — the modified form. Emitting the unmodified
             // sequence for a modified press is how Ctrl-Left silently becomes
             // plain Left, which is maddening precisely because it half-works.
             format!("\x1b[1;{}{}", m.param(), b as char).into_bytes()
+        } else if mode.app_cursor {
+            // DECCKM: fzf, vim, less and readline in some configs set this, and
+            // an unmodified arrow must then be SS3. voiceterm always sent CSI,
+            // which broke arrow navigation inside exactly those programs — the
+            // reported symptom was Ctrl-R history search where you could not
+            // move through the matched text. Modified arrows keep the CSI 1;N
+            // form in both modes; that is what xterm does.
+            vec![0x1b, b'O', b]
         } else {
             vec![0x1b, b'[', b]
         }
@@ -96,7 +124,13 @@ pub fn encode(key: Key, m: Mods) -> Option<Vec<u8>> {
         Key::Enter => vec![b'\r'],
         // Tab is 0x09; SHIFT-Tab is a different sequence entirely (CSI Z), and
         // conflating them breaks reverse completion.
-        Key::Tab => if m.shift { b"\x1b[Z".to_vec() } else { vec![0x09] },
+        // Tab is 0x09; SHIFT-Tab is CSI Z. ALT-Tab is ESC TAB, which is what
+        // zsh's autosuggestion-accept and forward-word bindings expect —
+        // checking only the shift bit meant every modified Tab arrived as a
+        // bare completion request.
+        Key::Tab => if m.shift { b"\x1b[Z".to_vec() }
+                    else if m.alt { b"\x1b\t".to_vec() }
+                    else { vec![0x09] },
         // Backspace sends DEL (0x7f), not BS (0x08). This is the single most
         // common terminal bug: send 0x08 and readline treats it as Ctrl-H,
         // which usually also deletes, so it looks fine until something binds
@@ -135,6 +169,57 @@ pub fn encode(key: Key, m: Mods) -> Option<Vec<u8>> {
             }
         }
     })
+}
+
+/// The control byte for Ctrl-<c>, exposed so callers can ask without going
+/// through a full keypress. Case-insensitive: Ctrl+Shift+C still means 0x03 on
+/// the platforms that deliver it at all.
+pub fn ctrl_byte_of(c: char) -> Option<u8> {
+    let u = c.to_ascii_uppercase();
+    match u {
+        'A'..='Z' => Some((u as u8) - b'A' + 1),
+        '[' => Some(0x1b),
+        '\\' => Some(0x1c),
+        ']' => Some(0x1d),
+        ' ' | '@' => Some(0x00),
+        _ => {
+            // Some platforms hand us the control character itself.
+            let n = c as u32;
+            if (1..=26).contains(&n) { Some(n as u8) } else { None }
+        }
+    }
+}
+
+/// Normalise assembled text to the byte a physical Enter sends.
+///
+/// `\n` becomes `\r`, and `\r\n` collapses to one `\r`. Anything that builds a
+/// command string from another source — voice dispatch, a command palette,
+/// history replay — produces line feeds, and a shell handed `\n` stacks the
+/// cursor instead of running the command.
+pub fn canonical(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut prev_cr = false;
+    for ch in raw.chars() {
+        match ch {
+            '\r' => { out.push('\r'); prev_cr = true; }
+            '\n' => { if !prev_cr { out.push('\r'); } prev_cr = false; }
+            c => { out.push(c); prev_cr = false; }
+        }
+    }
+    out
+}
+
+/// Encode a paste, wrapped in DEC 2004 markers when the program asked for them.
+///
+/// The markers are what let an editor tell pasted text from typing and skip
+/// auto-indent — the difference between pasting code and pasting a staircase.
+pub fn paste(text: &str, mode: TermMode) -> Vec<u8> {
+    let body = canonical(text);
+    if !mode.bracketed_paste { return body.into_bytes(); }
+    let mut v = b"\x1b[200~".to_vec();
+    v.extend_from_slice(body.as_bytes());
+    v.extend_from_slice(b"\x1b[201~");
+    v
 }
 
 /// Does this press interrupt the foreground command?
