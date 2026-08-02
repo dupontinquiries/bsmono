@@ -455,3 +455,5 @@ GARAGE: ten animated skins, seven wheels, six trails, six goal explosions. `--si
 The FPS readout counts frames that reached the screen, and shows dropped frames when the surface is abandoning them.
 
 Five cars are assembled from mined vehicle part layouts; `--sim parts` checks the donors stay distinct.
+
+Six hovercars: a cushion instead of wheels, momentum instead of grip, and a repulsor field that herds the ball. `--sim hover` verifies all three.

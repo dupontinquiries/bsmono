@@ -413,6 +413,7 @@ pub fn run(args: &[String]) {
         use crate::render::{CSDF_H, CSDF_SLAB, CSDF_W};
         // a stand-in model with known proportions (length >> width > height)
         let mut m = crate::model::Model {
+            hover: None,
             prims: Vec::new(),
             drive: crate::model::Drive::Combustion,
             cloud: Vec::new(),
@@ -3749,6 +3750,130 @@ pub fn run(args: &[String]) {
         });
         println!("   e.g. {} / {} / {} / {} / {}", round.skin_name(), round.rig_name(), round.wheel_name(), round.trail_name(), round.explosion_name());
         println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
+        return;
+    }
+    if name == "hover" {
+        // A hovercar should not merely look different. Three things decide
+        // whether it plays differently: does it hold a ride height, does it
+        // slide where a tyre would grip, and does it move the ball WITHOUT
+        // touching it?
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        let make = |h: Option<physics::Hover>| -> (physics::Car, World) {
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 2.0, 0.0);
+            car.sync_rot();
+            car.hover = h;
+            (car, world)
+        };
+        // ---- does it settle, and where? ----
+        println!("{:<14} {:>10} {:>10} {:>10}", "chassis", "ride", "settle", "overshoot");
+        let hovers: [(&str, physics::Hover); 3] = [
+            ("soft/wide", physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+            ("balanced", physics::Hover::default()),
+            ("stiff/low", physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+        ];
+        let mut all_settled = true;
+        for (nm, h) in hovers {
+            let (mut car, world) = make(Some(h));
+            let ball = Ball::new();
+            let c = physics::Controls::default();
+            let (mut settle_t, mut peak) = (0.0f32, 0.0f32);
+            let mut t = 0.0f32;
+            while t < 4.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+                let gap = world.sdf(car.pos) - car.half_h;
+                peak = peak.max(gap);
+                if settle_t == 0.0 && (gap - h.ride).abs() < 0.05 && t > 0.3 {
+                    settle_t = t;
+                }
+            }
+            let gap = world.sdf(car.pos) - car.half_h;
+            let ok = (gap - h.ride).abs() < 0.12;
+            all_settled &= ok;
+            println!("{:<14} {:>10.2} {:>9.2}s {:>10.2}", nm, gap, settle_t, peak);
+        }
+        check("every hover chassis holds its ride height", all_settled);
+        // ---- does it slide where a tyre grips? ----
+        let slide_of = |h: Option<physics::Hover>| -> f32 {
+            let (mut car, world) = make(h);
+            let ball = Ball::new();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            for _ in 0..180 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // now turn hard and see how much momentum carries straight on
+            c.steer = 1.0;
+            let v0 = car.vel.normalize_or(Vec3::NEG_Z);
+            for _ in 0..70 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            let f = car.forward();
+            // the angle between where it points and where it is going
+            car.vel.normalize_or(f).angle_between(f).to_degrees().max(v0.angle_between(f).to_degrees() * 0.0)
+        };
+        let tyre = slide_of(None);
+        let hov = slide_of(Some(physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }));
+        println!();
+        println!("after a hard turn: a wheeled car drifts {tyre:.0} deg from its nose, a hovercar {hov:.0}");
+        check("a hovercar slides where a tyre would grip", hov > tyre + 8.0);
+        // ---- does it move the ball without touching it? ----
+        {
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.6, 4.0);
+            car.sync_rot();
+            car.hover = Some(physics::Hover::default());
+            let mut ball = Ball::new();
+            // well clear of the bodywork: any motion here is the field
+            ball.pos = car.pos + car.forward() * 2.6;
+            ball.prev = ball.pos;
+            let gap0 = ball.pos.distance(car.pos);
+            let mut ev = StepEvents::default();
+            let mut contacts = 0;
+            for _ in 0..60 {
+                ev.touches.clear();
+                physics::hover_field(&mut car, &mut ball, DT, false, &mut ev);
+                let hit = ball.pos.distance(car.pos) < car.half_len + ball.r;
+                if hit {
+                    contacts += 1;
+                }
+                ball.pos += ball.vel * DT;
+            }
+            let moved = ball.vel.length();
+            println!("ball at {gap0:.1} m: pushed to {moved:.1} m/s with {contacts} contacts");
+            // 2.6 m out is most of the way to the field edge, where the falloff
+            // has it down to a nudge — which is the point: it herds at range
+            // and only presses hard up close.
+            check("the field moves the ball at range, untouched", moved > 1.0 && contacts == 0);
+            // and the pulse is the shot
+            let mut ball2 = Ball::new();
+            ball2.pos = car.pos + car.forward() * 2.0;
+            ball2.prev = ball2.pos;
+            let mut v_plain = 0.0;
+            for _ in 0..30 {
+                physics::hover_field(&mut car, &mut ball2, DT, false, &mut ev);
+                v_plain = ball2.vel.length();
+            }
+            let mut ball3 = Ball::new();
+            ball3.pos = car.pos + car.forward() * 2.0;
+            ball3.prev = ball3.pos;
+            let mut v_pulse = 0.0;
+            for _ in 0..30 {
+                physics::hover_field(&mut car, &mut ball3, DT, true, &mut ev);
+                v_pulse = ball3.vel.length();
+            }
+            println!("field {v_plain:.1} m/s, pulse {v_pulse:.1} m/s");
+            check("the pulse is the hovercar's shot", v_pulse > v_plain * 2.5);
+        }
+        println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
         return;
     }
     if name == "parts" {

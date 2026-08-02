@@ -122,6 +122,7 @@ pub fn assemble(
     Model {
         prims,
         drive,
+        hover: None,
         cloud: Vec::new(),
         cloud_n: Vec::new(),
         sdf_half: Vec3::ZERO,

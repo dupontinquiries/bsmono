@@ -885,6 +885,38 @@ fn main() {
     let tl4 = partcars::tl4(&mut gpu);
     let spearhead = partcars::spearhead(&mut gpu);
     let outback = partcars::outback(&mut gpu);
+    // ---- HOVERCARS ----
+    // Six of them, and the numbers are the design: ride height, cushion
+    // stiffness, how much sideways motion they hold, and the reach and force
+    // of the repulsor field. A stiff, low, tight-fielded machine darts and
+    // pokes; a soft, high, wide-fielded one wallows and shepherds.
+    let hover_defs: [(&str, f32, physics::Hover); 6] = [
+        // BRUTIS: a hover tank. Heavy, slow to settle, enormous soft field —
+        // it does not shoot so much as lean on the ball.
+        ("brutis", 1.36, physics::Hover { ride: 0.62, stiff: 30.0, hold: 0.30, field_r: 4.4, field_k: 22.0 }),
+        // AKIMBO: sleek and stiff. Almost no lateral hold, so it slides like
+        // a puck and has to be flown rather than driven.
+        ("akimbo", 1.28, physics::Hover { ride: 0.42, stiff: 58.0, hold: 0.09, field_r: 2.6, field_k: 30.0 }),
+        // MATRIS: the balanced one, and the place to start.
+        ("matris", 1.30, physics::Hover { ride: 0.52, stiff: 44.0, hold: 0.20, field_r: 3.2, field_k: 26.0 }),
+        // VECTORZOID: shielded — the strongest field in the game, at the
+        // cost of a soft cushion that pitches under its own thrust.
+        ("vectorzoid", 1.30, physics::Hover { ride: 0.58, stiff: 34.0, hold: 0.16, field_r: 4.0, field_k: 36.0 }),
+        // TEMPEST: a hovertank. Rides high enough to clear things, and holds
+        // enough to actually turn.
+        ("tempest", 1.40, physics::Hover { ride: 0.72, stiff: 36.0, hold: 0.26, field_r: 3.8, field_k: 24.0 }),
+        // CONTINGENCY: motorcycle-sized. Stiff, low, and a lance of a field —
+        // it pokes the ball rather than pushing it.
+        ("contingency", 1.10, physics::Hover { ride: 0.34, stiff: 66.0, hold: 0.07, field_r: 2.2, field_k: 34.0 }),
+    ];
+    let hover_dir = dir.join("hover");
+    let mut hovercars: Vec<model::Model> = Vec::new();
+    for (name, len, h) in hover_defs.iter() {
+        let mut m = model::load(&hover_dir.join(name), &mut gpu, *len);
+        m.hover = Some(*h);
+        m.drive = model::Drive::Electric; // nothing here burns fuel
+        hovercars.push(m);
+    }
     // imported bodies (single-file .glb, geometry and materials inline)
     let cars_dir = dir.join("cars");
     let backfire = model::load(&cars_dir.join("backfire"), &mut gpu, 1.28);
@@ -909,6 +941,10 @@ fn main() {
         ],
         active: 0,
     };
+    for (i, m) in hovercars.into_iter().enumerate() {
+        cars.models.push(m);
+        cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency"][i]);
+    }
     // EVERY car gets an electric variant. Rather than model them twice, the
     // petrol body is converted: light bars, blanked grille, battery sills and
     // an ion thruster, plus the electric torque curve.
@@ -1177,6 +1213,7 @@ fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.half_w = (m.half_w * size).max(0.12);
     car.wheel_r = (m.wheel_r * size).max(0.05);
     car.drive = m.drive;
+    car.hover = m.hover;
 }
 
 impl Game {

@@ -63,6 +63,10 @@ pub struct Car {
     pub wheel_r: f32,
     /// drivetrain: an electric car pulls harder from a standstill
     pub drive: crate::model::Drive,
+    /// HOVER CHASSIS. A hovercar has no tyres, so most of what the wheeled
+    /// car does is wrong for it: it does not sit ON the ground, it does not
+    /// grip sideways, and it does not strike the ball with its bodywork.
+    pub hover: Option<Hover>,
     pub wheel_spin: f32,
     pub steer_vis: f32,
     // jump / dodge state
@@ -86,6 +90,23 @@ pub struct Car {
     pub supersonic: bool,
 }
 
+/// A hovercar's character, in five numbers.
+#[derive(Clone, Copy)]
+pub struct Hover {
+    pub ride: f32,
+    pub stiff: f32,
+    /// lateral hold, 0..1 — a tyre is effectively 1, a cushion is not
+    pub hold: f32,
+    pub field_r: f32,
+    pub field_k: f32,
+}
+
+impl Default for Hover {
+    fn default() -> Hover {
+        Hover { ride: 0.55, stiff: 42.0, hold: 0.18, field_r: 3.2, field_k: 26.0 }
+    }
+}
+
 impl Car {
     pub fn new() -> Car {
         Car {
@@ -100,6 +121,7 @@ impl Car {
             half_h: 0.19,
             wheel_r: 0.11,
             drive: crate::model::Drive::Combustion,
+            hover: None,
             half_w: 0.32,
             susp: 0.0,
             prev: Vec3::ZERO,
@@ -321,6 +343,7 @@ pub fn step(
     }
     step_bodies(world, car, ball, dt, cfg.arena.gravity);
     collide_car_ball(car, ball, cfg, WHO_PLAYER, ev);
+    hover_field(car, ball, dt, c.boost, ev);
 
     // blast-off launchers: anything on the ring gets the arrow
     for i in 0..world.launchers.len() {
@@ -598,6 +621,27 @@ fn crossed(ring: &crate::world::Ring, a: Vec3, b: Vec3) -> bool {
 
 // ---------------------------------------------------------------- car ----
 fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Config, dt: f32, ev: &mut StepEvents) {
+    // ---- THE CUSHION ----
+    // A wheeled car is held ON the surface; a hovercar is held ABOVE it by a
+    // spring along the surface normal, damped so it settles rather than
+    // bouncing. It runs before and independently of the grounded test,
+    // because a hovercar is never "grounded" in the wheeled sense — the
+    // cushion IS its ground.
+    if let Some(h) = car.hover {
+        let gap = world.sdf(car.pos);
+        let want = car.half_h + h.ride;
+        if gap < want * 3.0 {
+            let n = world.normal(car.pos);
+            let err = want - gap;
+            let closing = -car.vel.dot(n);
+            // A proportional spring alone balances gravity at an OFFSET —
+            // every chassis floated a fixed distance below its ride height,
+            // by exactly g/stiffness. Carrying the car's weight explicitly
+            // leaves the spring to do only what it is for: correcting error.
+            let push = err * h.stiff + closing * (h.stiff * 0.22).sqrt() * 2.0 + GRAV;
+            car.vel += n * push.clamp(-30.0, 70.0) * dt;
+        }
+    }
     let d = world.sdf(car.pos);
     let n = world.normal(car.pos);
     let clearance = car.half_h;
@@ -749,7 +793,13 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // lateral grip (loosened by powerslide)
         let grip_k = cfg.car.grip * cfg.arena.friction;
         // slide grip near-zero so the rear swings: hairpins on a dime
-        let grip = if c.powerslide { 1.3 * grip_k.sqrt() } else { 11.0 * grip_k };
+        // A HOVERCAR BARELY HOLDS: it keeps its momentum while the nose
+        // points elsewhere, so you steer by pointing and thrusting.
+        let grip = match car.hover {
+            Some(h) => 11.0 * grip_k * h.hold,
+            None if c.powerslide => 1.3 * grip_k.sqrt(),
+            None => 11.0 * grip_k,
+        };
         car.vel -= side * vs * (1.0 - (-grip * dt).exp());
 
         // keep the car pressed onto the surface
@@ -785,14 +835,18 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             // car clean off the ground again — you cannot dribble on a
             // trampoline. Compression stays soft; the way back is firm.
             let cdamp = if vn < 0.0 { 24.0 } else { 19.0 };
-            car.vel += n * (e * 58.0 - vn * cdamp) * dt;
+            if car.hover.is_none() {
+                car.vel += n * (e * 58.0 - vn * cdamp) * dt;
+            }
         } else {
             // stick to the surface: gentle over crests on the floor, strong
             // magnetic grip on walls and ceilings (the RL wall-drive feel)
             // stickier on a heavy world: the surface holds you through the
             // curve instead of letting you drift off the horizon
             let stick = if steep { 22.0 } else { 2.4 } * gmul.clamp(1.0, 3.2);
-            car.vel -= n * stick * dt;
+            if car.hover.is_none() {
+                car.vel -= n * stick * dt;
+            }
         }
         // PLATFORM RIDING: a car standing on a moving deck is carried by
         // it — position follows exactly (so a fast platform cannot slide out
@@ -886,7 +940,7 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
                         car.ang += tau_b * 15.0 * w * dt;
                     }
                 }
-                if dp < rim {
+                if dp < rim && car.hover.is_none() {
                     let np = world.normal(pt);
                     car.pos += np * (rim - dp) * 0.55;
                     let vn = car.vel.dot(np);
@@ -1449,6 +1503,39 @@ pub fn step_ball(ball: &mut Ball, world: &World, cfg: &Config, dt: f32, ev: &mut
 }
 
 // ---------------------------------------------------- car <-> ball -------
+/// THE REPULSOR FIELD. A hovercar has no bodywork worth hitting a ball
+/// with — it is held up by pressure and it moves the ball the same way. A
+/// cone in front of the nose pushes the ball away, hardest straight ahead
+/// and falling off with distance, so the ball is never STRUCK, it is HERDED:
+/// held ahead of you at range, steered round a corner untouched. Power has
+/// to come from a PULSE rather than from driving hard.
+pub fn hover_field(car: &mut Car, ball: &mut Ball, dt: f32, boost: bool, ev: &mut StepEvents) {
+    let Some(h) = car.hover else { return };
+    let to = ball.pos - car.pos;
+    let dist = to.length();
+    if dist > h.field_r + ball.r || dist < 1e-4 {
+        return;
+    }
+    let dir = to / dist;
+    let aim = dir.dot(car.forward()).max(0.0);
+    let cone = aim * aim;
+    if cone < 0.02 {
+        return;
+    }
+    let reach = (1.0 - (dist / (h.field_r + ball.r)).clamp(0.0, 1.0)).powi(2);
+    let mut push = h.field_k * cone * reach;
+    if boost {
+        push *= 3.4; // the pulse: the hovercar's shot
+    }
+    ball.vel += dir * push * dt;
+    // the ball presses back, so the field is not a free tractor beam
+    car.vel -= dir * push * dt * 0.16;
+    ball.ang += dir.cross(Vec3::Y) * push * dt * 0.05;
+    if push > 4.0 {
+        ev.touches.push((ball.pos - dir * ball.r, push.min(40.0)));
+    }
+}
+
 pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, ev: &mut StepEvents) {
     // THE HITBOX IS A BOX. A capsule is round on top, so a ball resting on
     // it had barely a hand's width of contact before separating — which is

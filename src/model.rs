@@ -61,6 +61,8 @@ pub struct Model {
     pub prims: Vec<Prim>,
     /// drivetrain character (electric cars pull harder off the line)
     pub drive: Drive,
+    /// hover chassis, if this is a hovercar rather than a wheeled one
+    pub hover: Option<crate::physics::Hover>,
     /// downsampled surface points (final meters) for the reflection SDF bake
     pub cloud: Vec<Vec3>,
     /// outward normal for each cloud point — this is what makes the baked
@@ -658,5 +660,5 @@ pub fn load_oriented(dir: &Path, gpu: &mut Gpu, target_len: f32, flip: bool) -> 
     let stride = (cloud_all.len() / 2600).max(1);
     let cloud: Vec<Vec3> = cloud_all.into_iter().step_by(stride).collect();
     let cloud_n: Vec<Vec3> = cloud_nrm.into_iter().step_by(stride).collect();
-    Model { prims, drive: Drive::Combustion, cloud, cloud_n, sdf_half: Vec3::ZERO, half_len: half.z, half_h: half.y, half_w: half.x, wheel_r }
+    Model { prims, drive: Drive::Combustion, hover: None, cloud, cloud_n, sdf_half: Vec3::ZERO, half_len: half.z, half_h: half.y, half_w: half.x, wheel_r }
 }

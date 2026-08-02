@@ -3032,6 +3032,49 @@ rings are catalogued as wheels. Dropping them all left SPEARHEAD nearly
 empty, so only the four lowest are treated as running gear and the rest are
 drawn as the rings they actually are.
 
+## v1.93.0 — hovercars, which play by different rules
+
+Six hovercars, and the point of them is not that they float. Almost every
+assumption the wheeled car makes is wrong for a machine with no tyres, so
+three of them are replaced.
+
+THE CUSHION. A wheeled car is held ON the surface; a hovercar is held ABOVE
+it by a damped spring along the surface normal. It floats over gaps, kerbs
+and ramps that a wheeled car has to climb. Getting there meant switching off
+three things that exist to keep tyres on the ground — the suspension spring,
+the surface stick, and the four wheel probes — each of which was quietly
+dragging the hull back down to wheel height.
+
+NO LATERAL HOLD. A tyre cancels sideways motion almost entirely; a cushion
+of air does not. A hovercar keeps whatever momentum it had while the nose
+merely points somewhere else, so you steer by pointing and thrusting rather
+than by turning. Measured after a hard turn: a wheeled car ends up 11
+degrees off its nose, a hovercar 90.
+
+THE REPULSOR FIELD, which is the interesting one. A hovercar has no bodywork
+worth hitting a ball with, so it does not hit: a cone in front of the nose
+PUSHES, hardest straight ahead and falling off with distance. The ball is
+never struck, it is HERDED — held ahead of you at range, steered round a
+corner untouched, pressed up a wall. Verified at 2.6 m with zero contacts.
+Since the force falls off with distance, a hovercar cannot hit hard by
+driving hard: power comes from the PULSE on boost, which is 3.5x the steady
+field (5.9 m/s against 1.7). And the ball presses back on the car, so the
+field is not a free tractor beam.
+
+Two bugs worth recording. The cushion first went inside the grounded branch,
+so it stopped the instant the car floated — every chassis sat vibrating on
+the contact threshold at 0.11 m whatever its stiffness. And a proportional
+spring balances gravity at an OFFSET, so each one then floated exactly
+g/stiffness below its ride height; carrying the weight explicitly leaves the
+spring to correct error only. Heights now land on 0.62, 0.55 and 0.34 as
+set.
+
+The six differ in ride height, cushion stiffness, lateral hold and field
+reach: BRUTIS leans on the ball with an enormous soft field, AKIMBO slides
+like a puck, CONTINGENCY pokes with a lance, TEMPEST rides high enough to
+clear things, VECTORZOID has the strongest field in the game, MATRIS is
+where to start.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
