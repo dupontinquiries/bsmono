@@ -15,16 +15,18 @@ pub enum Tab {
     Files,
     Timeline,
     Artifacts,
+    Share,
     Settings,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 10] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings];
+    pub const ALL: [Tab; 11] = [Tab::Fleet, Tab::Push, Tab::Network, Tab::Share, Tab::Apps, Tab::Import, Tab::Branches, Tab::Files, Tab::Artifacts, Tab::Timeline, Tab::Settings];
     pub fn label(self) -> &'static str {
         match self {
             Tab::Fleet => "Fleet",
             Tab::Push => "Push",
             Tab::Network => "Network",
+            Tab::Share => "Share",
             Tab::Apps => "Apps",
             Tab::Import => "Import",
             Tab::Branches => "Branches",
@@ -41,6 +43,7 @@ impl Tab {
             Tab::Fleet => "🛰",
             Tab::Push => "⬆",
             Tab::Network => "🌐",
+            Tab::Share => "📡",
             Tab::Apps => "📦",
             Tab::Import => "📥",
             Tab::Branches => "🌿",
@@ -61,6 +64,7 @@ pub struct App {
     pub push: pages::push::State,
     pub apps: pages::apps::State,
     pub artifacts: pages::artifacts::State,
+    pub share: pages::share::State,
     pub timeline: pages::timeline::State,
     pub import: pages::import::State,
     pub branches: pages::branches::State,
@@ -74,6 +78,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             artifacts: Default::default(),
+            share: Default::default(),
             tab: Tab::Network,
             prefs: {
                 // System palette: the minimal neutral-dark "system utilities" theme, shared with
@@ -151,6 +156,7 @@ impl App {
             let surface = ui.max_rect();
             match self.tab {
                 Tab::Network => pages::network::ui(self, ui),
+            Tab::Share => pages::share::ui(self, ui),
                 Tab::Apps => pages::apps::ui(self, ui),
                 Tab::Import => pages::import::ui(self, ui),
                 Tab::Branches => pages::branches::ui(self, ui),
