@@ -19,6 +19,27 @@ use voiceterm_egui::slide_menu::SlideOutcome;
 use uikit_egui::PaletteColors;
 use voiceterm_egui::App;
 
+/// What the central panel is showing.
+///
+/// The terminal is the default and always one tap away — voiceterm is a
+/// terminal first, and a switcher that made it a peer of the mail reader would
+/// be the wrong app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CentralView { Terminal, Mail, Browser, Graph, Archive }
+
+impl CentralView {
+    const ALL: [CentralView; 5] = [CentralView::Terminal, CentralView::Mail,
+                                   CentralView::Browser, CentralView::Graph,
+                                   CentralView::Archive];
+    fn label(self) -> &'static str {
+        match self {
+            CentralView::Terminal => "Terminal", CentralView::Mail => "Mail",
+            CentralView::Browser => "Web", CentralView::Graph => "Graph",
+            CentralView::Archive => "Archive",
+        }
+    }
+}
+
 struct VoicetermApp {
     app: App,
     sidebar: Sidebar,
@@ -51,6 +72,16 @@ struct VoicetermApp {
     tabbar_scroll_to: Option<f32>,
     /// The QML toast, ported: fire-and-forget status pill above the bottom chrome.
     toasts: uikit_egui::toast::Toasts,
+    /// WHICH SURFACE the central panel shows. voiceterm had twelve ported
+    /// modules — mail, browser, graph, cards, viz, model picker, setup wizard,
+    /// chat panel and more — and the central panel always drew the terminal, so
+    /// none of them could be reached. This is the switch that makes them exist.
+    view: CentralView,
+    mail: voiceterm_egui::mail_view::MailView,
+    browser: voiceterm_egui::browser::Browser,
+    graph: voiceterm_egui::graph_view::GraphView,
+    archive: voiceterm_egui::bars::ArchiveView,
+    bar_state: voiceterm_egui::bars::BarState,
     /// The settings screen (QML settings page): sidebar ⚙ toggles the right panel; edits apply
     /// live (App::apply_settings + palette each frame) and persist to prefs.kv on change.
     settings_open: bool,
@@ -266,6 +297,54 @@ impl eframe::App for VoicetermApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            // The view switcher. Terminal stays the default and is always one
+            // tap away — voiceterm is a terminal first.
+            ui.horizontal(|ui| {
+                for v in CentralView::ALL {
+                    if ui.selectable_label(self.view == v, v.label()).clicked() { self.view = v; }
+                }
+            });
+            ui.separator();
+            if self.view != CentralView::Terminal {
+                let c = self.colors;
+                match self.view {
+                    CentralView::Mail => {
+                        if let Some(conv) = voiceterm_egui::mail_view::list_ui(ui, &mut self.mail, &c) {
+                            self.toasts.info(format!("opened {conv}"), ui.input(|i| i.time));
+                        }
+                    }
+                    CentralView::Browser => {
+                        ui.horizontal(|ui| {
+                            let mut url = self.browser.url.clone();
+                            if ui.text_edit_singleline(&mut url).lost_focus() { self.browser.load(&url); }
+                        });
+                        if let Some(why) = self.browser.empty_reason() {
+                            ui.colored_label(c.text_weak, why);
+                        }
+                        for a in self.browser.ranked() {
+                            let on = a.actionable();
+                            ui.add_enabled(on, egui::Button::new(a.label()));
+                            if let Some(r) = a.blocked_reason() {
+                                ui.colored_label(c.text_weak, r);
+                            }
+                        }
+                    }
+                    CentralView::Graph => {
+                        let topo = voiceterm_egui::graph_view::nifty::Topology::new(&[], &[]);
+                        voiceterm_egui::graph_view::graph_ui(ui, &mut self.graph, &topo, &c);
+                    }
+                    CentralView::Archive => {
+                        ui.text_edit_singleline(&mut self.archive.query);
+                        let pages: Vec<voiceterm_egui::bars::PageEntry> = Vec::new();
+                        for p in self.archive.results(&pages) {
+                            ui.label(p.label());
+                        }
+                        if pages.is_empty() { ui.colored_label(c.text_weak, "nothing archived yet"); }
+                    }
+                    CentralView::Terminal => {}
+                }
+                return;
+            }
             self.app.handle_input(ui);
             let area = ui.available_rect_before_wrap();
             let colors = self.colors; // PaletteColors is Copy — keeps the borrows below simple
@@ -521,6 +600,12 @@ fn main() -> eframe::Result<()> {
                 blocks_open: false,
                 tabbar_scroll_to: None,
                 toasts: uikit_egui::toast::Toasts::new(),
+                view: CentralView::Terminal,
+                mail: Default::default(),
+                browser: Default::default(),
+                graph: Default::default(),
+                archive: Default::default(),
+                bar_state: Default::default(),
                 settings_open: false,
             }))
         }),
