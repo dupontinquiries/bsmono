@@ -8146,7 +8146,20 @@ different metadata keys and disagree here; output will be degraded rather than b
                     }
                     if n_swa > 0 && windowed { Some((n_swa, ty)) } else { None }
                 },
-                kq_norm: if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
+                // USE_QK_NORM FROM METADATA, not the expert count. This read `expert_count != 128`,
+                // using "has 128 experts" as a stand-in for "is Maverick" — the variant that disables
+                // post-rope Q/K norm. Scout has 16 and gets it; Maverick has 128 and does not.
+                //
+                // That proxy is the fifth of its kind this session, and the same failure: the name says
+                // one thing and the value encodes another. A future Llama-4 with 128 experts that DOES
+                // use qk-norm silently loses it, and a wrong qk-norm degrades text without breaking a
+                // single shape.
+                //
+                // The expert count stays as the FALLBACK, because it is the observed rule and files may
+                // omit the key.
+                kq_norm: if is_llama4 && g.get_u32(&format!("{}.attention.use_qk_norm", acfg.prefix))
+                    .map(|v| v != 0)
+                    .unwrap_or_else(|| g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128) {
                     Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim))
                 } else { None },
                 // ATTENTION TEMPERATURE FROM METADATA. floor_scale 8192 and attn_scale 0.1 are

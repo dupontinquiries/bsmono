@@ -548,4 +548,25 @@ mod tests {
     fn a_fully_supported_architecture_reports_no_gaps() {
         assert!(gaps("qwen3moe", 0).is_empty(), "qwen3moe should be fully covered");
     }
-}
+}    fn qk_norm_is_a_VARIANT_property_not_an_expert_count() {
+        // The loader read `expert_count != 128`, using "has 128 experts" as a stand-in for "is
+        // Maverick" — the variant that disables post-rope Q/K norm. Scout has 16 and gets it.
+        //
+        // Fifth proxy of the session, same failure: the name says one thing and the value encodes
+        // another. A future Llama-4 with 128 experts that DOES use qk-norm silently loses it, and a
+        // wrong qk-norm degrades text without breaking a single shape.
+        //
+        // The rule as the loader now applies it: metadata first, expert count as fallback.
+        let decide = |use_qk_norm: Option<u32>, experts: u32| -> bool {
+            use_qk_norm.map(|v| v != 0).unwrap_or(experts != 128)
+        };
+        // Fallback path — the observed rule, kept because files may omit the key.
+        assert!(decide(None, 16), "Scout: 16 experts, qk-norm on");
+        assert!(!decide(None, 128), "Maverick: 128 experts, qk-norm off");
+        // Metadata path — and it must be able to CONTRADICT the count, or reading it changes nothing.
+        assert!(decide(Some(1), 128), "a 128-expert model that declares qk-norm keeps it");
+        assert!(!decide(Some(0), 16), "and a 16-expert model that declares none does not");
+    }
+
+    #[test]
+
