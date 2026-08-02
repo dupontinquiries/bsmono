@@ -33,6 +33,28 @@ impl ClusterNode {
     ///
     /// A socket failure is RECORDED, not fatal: a phone with multicast blocked should still show its
     /// own id and its trust list, because those are what an operator needs to fix the situation.
+    /// Build from a state directory, loading the identity and the trust list from it.
+    ///
+    /// The two files live together because they are one setting: an identity without its registry is
+    /// a machine nobody trusts, and a registry without its identity is a list of machines that cannot
+    /// recognise you. Backing up the directory keeps the pair.
+    pub fn from_dir(dir: &std::path::Path, self_addr: String)
+        -> Result<(ClusterNode, Vec<String>), crate::machineid::IdentityError> {
+        let identity = crate::machineid::Identity::load_or_create(&dir.join("identity.key"))?;
+        let (registry, warnings) = crate::trustkit::Registry::load(&dir.join("trusted.txt"));
+        Ok((ClusterNode::new(identity, registry, self_addr), warnings))
+    }
+
+    /// Persist the trust list.
+    ///
+    /// Called after any change, because a machine added and not saved is one that vanishes on
+    /// restart — and it vanishes SILENTLY, reading as a discovery failure rather than as forgotten
+    /// state. That is the failure trustkit's persistence was written to prevent and which nothing was
+    /// calling.
+    pub fn save_registry(&self, dir: &std::path::Path) -> std::io::Result<()> {
+        self.registry.save(&dir.join("trusted.txt"))
+    }
+
     pub fn new(identity: crate::machineid::Identity, registry: crate::trustkit::Registry,
                self_addr: String) -> ClusterNode {
         let (wire, wire_error) = match crate::lanwire::LanWire::bind() {
@@ -109,6 +131,27 @@ mod tests {
         let id = crate::machineid::Identity::load_or_create(&p).unwrap();
         let _ = std::fs::remove_file(&p);
         ClusterNode::new(id, Registry::new(), "127.0.0.1:7000".into())
+    }
+
+    #[test]
+    fn the_identity_and_the_trust_list_load_from_ONE_directory() {
+        // They are one setting: an identity without its registry is a machine nobody trusts, and a
+        // registry without its identity is a list of machines that cannot recognise you. Backing up
+        // the directory has to keep the pair, or a restore produces a half-configured node.
+        let dir = std::env::temp_dir().join(format!("logscope-node-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut n, w) = ClusterNode::from_dir(&dir, "127.0.0.1:7000".into()).expect("creates");
+        assert!(w.is_empty(), "a fresh directory produces no warnings: {w:?}");
+        let id = n.identity.id();
+
+        n.registry.register_keyed("m2", Trust::Handoff, vec![1, 2, 3]);
+        n.save_registry(&dir).expect("saves");
+
+        // A second node from the same directory is the SAME machine with the SAME trust list.
+        let (n2, _) = ClusterNode::from_dir(&dir, "127.0.0.1:7000".into()).unwrap();
+        assert_eq!(n2.identity.id(), id, "the identity persisted");
+        assert_eq!(n2.registry.level("m2"), Trust::Handoff, "and so did the trust list");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
