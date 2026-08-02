@@ -1860,10 +1860,39 @@ impl Gpu {
         // breakdown of the same run measured 15.5% sync: the profile was not wrong about the paths it
         // watched, it was watching the wrong path. Every conclusion drawn from "setup 0.2% accounted"
         // rested on a denominator missing its largest term.
-        slice.map_async(wgpu::MapMode::Read, |_| {});
+        // The callback SIGNALS rather than discarding its result, so the bounded poll below has
+        // something to wait on. Without it there is no way to tell "not finished yet" from
+        // "finished while we slept", and the loop would exit on its first pass every time.
+        let mapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let m2 = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |_| {
+            m2.store(true, std::sync::atomic::Ordering::Release);
+        });
         let t_sync = std::time::Instant::now();
         GPU_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        // BOUNDED, NOT INDEFINITE. This is the decode loop's readback, and on a driver whose watchdog
+        // kills a long dispatch the work never completes — so an indefinite wait blocks the CPU
+        // forever on a job the GPU already abandoned. That is a HANG: no error, no output, and a log
+        // that simply stops after "windowed sampling ON".
+        //
+        // Polling in bounded steps turns it into a diagnosable failure. The GPU is not going to
+        // finish; the only question is whether anyone finds out.
+        const DECODE_POLL_BUDGET_S: u64 = 20;
+        let mut waited = std::time::Duration::ZERO;
+        let step = std::time::Duration::from_millis(50);
+        loop {
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            if mapped.load(std::sync::atomic::Ordering::Acquire) { break; }
+            if waited.as_secs() >= DECODE_POLL_BUDGET_S {
+                eprintln!("wgpu-engine: decode readback did not complete within \
+{DECODE_POLL_BUDGET_S}s — the GPU has almost certainly had this dispatch killed by its watchdog \
+(check `journalctl -b | grep 'GPU timeout'`). Lower LOGSCOPE_PREFILL_CHUNK or the decode window; \
+waiting longer will not help because the work is gone");
+                break;
+            }
+            std::thread::sleep(step);
+            waited += step;
+        }
         GPU_SYNC_NS.fetch_add(t_sync.elapsed().as_nanos() as u64,
                               std::sync::atomic::Ordering::Relaxed);
         let data = slice.get_mapped_range();
