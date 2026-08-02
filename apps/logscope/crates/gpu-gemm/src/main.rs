@@ -3416,6 +3416,13 @@ which is why bigger slabs cannot raise the ceiling");
         let gib = got as f64 / (1u64 << 30) as f64;
         // Did it POP, or did it just reach the limit I imposed? Reporting my own ceiling as a discovered
         // fact would be the same error as the 24 GiB constant this probe exists to question.
+        // RECORD IT. The measurement was printed and thrown away, so a loader that refuses a model
+        // on the compiled-in 48 GiB had no way to know this device honoured 63 — and the refusal
+        // message told the operator to set LOGSCOPE_MAX_GPU_GB by hand, every time, forever.
+        //
+        // Llama-4 Scout needs 54.8 GiB: between the constant and the measurement. The model is refused
+        // by a number nobody measured on a device that would run it.
+        gpu_kernels::store::vram_put(&gpu.adapter_name, gib as f32);
         let popped = got < max_gb * (1 << 30);
         println!("  {} {gib:.1} GiB in {:.1}s",
             if popped { "VERIFIED CEILING (allocation failed above this):" }

@@ -649,3 +649,72 @@ mod bandwidth_tests {
         assert_eq!(bandwidth_get("test-adapter-B-11"), Some(200.0));
     }
 }
+
+/// The GPU budget a device was MEASURED to honour, keyed by adapter.
+///
+/// The compiled-in ceiling for Asahi/Honeykrisp is 48 GiB, and `--gate-vram` measured the same M2
+/// Ultra honouring 63. Llama-4 Scout needs 54.8 — **between the two**. So the model is refused by a
+/// constant on a device that would run it, and the refusal message already says so, leaving the
+/// operator to set LOGSCOPE_MAX_GPU_GB by hand every time.
+///
+/// A measurement is worth more than a constant and should not have to be re-typed. Same shape as
+/// `bandwidth_put`: a TSV keyed by adapter name, so a machine that has run the probe remembers.
+fn vram_file() -> PathBuf { cache_root().join("measured-vram.tsv") }
+
+pub fn vram_put(adapter: &str, gib: f32) {
+    let mut out = String::new();
+    if let Ok(txt) = std::fs::read_to_string(vram_file()) {
+        for line in txt.lines() {
+            if line.split('\t').next() != Some(adapter) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str(&format!("{adapter}\t{gib:.2}\n"));
+    let _ = std::fs::create_dir_all(cache_root());
+    let _ = std::fs::write(vram_file(), out);
+}
+
+/// What this adapter was measured to honour, if it has ever been probed.
+///
+/// Returns None rather than a default, so a caller can tell "never measured" from "measured and
+/// small" — the whole point is to stop treating an unmeasured constant as a finding.
+pub fn vram_get(adapter: &str) -> Option<f32> {
+    let txt = std::fs::read_to_string(vram_file()).ok()?;
+    for line in txt.lines() {
+        let mut f = line.split('\t');
+        if f.next() == Some(adapter) {
+            return f.next().and_then(|v| v.parse().ok());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod vram_store_tests {
+    use super::*;
+
+    #[test]
+    fn a_measured_ceiling_round_trips_per_adapter() {
+        let a = format!("test-adapter-{}", std::process::id());
+        assert!(vram_get(&a).is_none(), "never measured means None, not a default");
+        vram_put(&a, 63.0);
+        assert_eq!(vram_get(&a), Some(63.0));
+        // A second measurement replaces rather than appends — a device's honoured ceiling is one
+        // value, and two lines for one adapter would make the answer depend on read order.
+        vram_put(&a, 61.5);
+        assert_eq!(vram_get(&a), Some(61.5));
+    }
+
+    #[test]
+    fn one_adapters_measurement_does_not_disturb_anothers() {
+        // A laptop and a desktop sharing a home directory over NFS is not exotic, and a probe on one
+        // must not silently raise the ceiling on the other.
+        let (a, b) = (format!("gpu-a-{}", std::process::id()), format!("gpu-b-{}", std::process::id()));
+        vram_put(&a, 63.0);
+        vram_put(&b, 12.0);
+        assert_eq!(vram_get(&a), Some(63.0));
+        assert_eq!(vram_get(&b), Some(12.0));
+    }
+}
