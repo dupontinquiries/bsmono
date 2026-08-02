@@ -157,3 +157,37 @@ version is where to start, because it tests whether the prediction is *accurate*
 built on the assumption that it is.
 
 **Read from both sources. Not measured** — no toolchain in the container after a reset.
+
+---
+
+# Audit: the expert tiering is fully ported and wired
+
+Checked `tier.h` against `expert_cache.rs` expecting another gap, and found none. Recording it because
+an audit that finds nothing is worth the same as one that does, and because three of Colibri's
+techniques have now been found half-ported — the prediction without the async read, the accumulator
+chain, the batched signature.
+
+**LFRU is there and credited.** `tier_lfru_score`'s `(heat << 8) | recent` is reproduced exactly,
+including the reasoning: one frequency count is worth 256 and a recent access at most 255, so *"a
+merely recent expert cannot displace a genuinely hotter one"*. Pure LRU pins whatever was touched last,
+which is wrong for MoE routing where a few experts carry most tokens.
+
+**The hysteresis is there too.** `pick_repin`'s comment names it — *"`tier_pick_lfru` + its 25%+4
+hysteresis"* — so a marginally hotter expert cannot evict a resident one and start a ping-pong.
+
+**And it is called.** `pick_repin_hinted` at `lib.rs:4399`, taking the route predictor's hint as an
+argument. That last part matters: the predictor and the eviction policy are connected, which is more
+than can be said for the predictor and the read path.
+
+## What this narrows
+
+The expert-streaming performance gap is **not** policy. Which experts to keep resident, when to swap,
+and how to avoid thrashing are all solved and running. What remains is entirely about **bytes**:
+
+* the 50.6 GiB host copy holding a size-neutral requantization;
+* `Advice::Random` plus no `WILLNEED`, so a correct prediction cannot make the read earlier;
+* and conversion-at-load, which is upstream of both.
+
+Three problems about moving data, none about deciding what to move. That is a more useful shape than
+"expert streaming is slow", and it means the tiering work does not need revisiting when the byte
+problems are fixed — the policy will still be making the right calls about a cheaper store.
