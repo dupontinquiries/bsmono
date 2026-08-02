@@ -54,3 +54,53 @@ implementation of it.
 
 **Read from Colibri's source and this engine's own log lines. Not measured** — no toolchain in the
 container after a reset.
+
+---
+
+# Colibri makes weights GPU-resident lazily, per tensor, on first use
+
+`backend_metal.h`'s contract:
+
+> The first successful call wraps `W` and its row scales in GPU-visible buffers; later calls reuse them
+> (weights are assumed stable at the same address).
+
+And the signature takes the format as a parameter rather than a precondition:
+
+```c
+int coli_metal_matmul(ColiMetalTensor **tensor, float *y, const float *x,
+                      const void *weights, const float *scales,
+                      int fmt, int S, int I, int O);
+/* fmt: 0=f32, 1=int8, 2=int4(packed), 3=int2(packed) */
+```
+
+**Three differences from this engine, each with a measured cost here.**
+
+**Residency is lazy and per tensor.** Nothing is uploaded until a matmul needs it. This engine converts
+and uploads the whole model at load — 23.4 s for Qwen3-30B before a token — and for MoE that includes
+experts a short session may never route to. With 8 of 128 active per token, most of a 128-expert layer
+can go untouched for an entire conversation.
+
+**The format is an argument, not a conversion.** `fmt` selects the unpack path inside the kernel; the
+weights are passed as they are. This engine converts to a single compute format at load, which is what
+`docs/prefill-q4-gap.md` (q4 has no GEMM), `dot_iq1_s` (IQ1_S inflates 2.88×) and the 50.6 GiB expert
+host copy are all consequences of. **One decision, three symptoms.**
+
+**And `S` is in the signature.** The Metal matmul is batched by construction — a caller with one row
+passes `S=1` and one with a fan passes `S=n`, through the same entry point. Nothing here has to be
+routed to a different kernel to get batching, which is exactly what the fan-out round-robin and
+`MATVEC_SMALL_Q4` currently need arranging by hand.
+
+## What it costs Colibri
+
+Lazy residency assumes the weights stay at a stable host address — the comment says so plainly. That
+rules out an arena that repacks, and it means the host copy is the source of truth rather than a
+staging buffer. This engine's arena exists precisely because the driver is BO-constrained and packing
+weights into ≤2047 MiB slabs is what makes them fit at all.
+
+So this is a trade, not a strict improvement: Colibri buys lazy upload and format flexibility by
+keeping the host mapping authoritative. On a driver with a two-buffer VMA ceiling, that choice would
+have to be reconciled with the slab packing rather than adopted.
+
+**The transferable part is the format argument.** Converting at load is what forces the host copy, the
+q4 GEMM gap, and the IQ1_S expansion — and it is a decision this engine makes once, at the top, for
+reasons that were about kernel simplicity rather than memory.
