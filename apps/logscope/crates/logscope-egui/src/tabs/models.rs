@@ -19,6 +19,17 @@ pub struct Models {
     root: String,
     entries: Vec<ModelEntry>,
     scanned: bool,
+    /// This machine's id, derived from its public key. Shown so it can be transcribed elsewhere.
+    my_id: String,
+    /// Trusted machines, loaded from disk and saved on every change.
+    ///
+    /// Held here rather than rebuilt per frame because a registry that is reloaded each frame would
+    /// discard an edit before the save, and saved on every change rather than on exit because a
+    /// crash between the two loses exactly the machine someone just added.
+    trusted: logscope_fan::trustkit::Registry,
+    add_id: String,
+    machines: Vec<String>,
+    machine_note: String,
     /// Planned moves awaiting confirmation. Non-empty means "showing a plan, not yet applied".
     plan: Vec<Move>,
     conflicts: Vec<String>,
@@ -32,6 +43,19 @@ impl Default for Models {
         Models {
             root: format!("{home}/models"),
             entries: Vec::new(), scanned: false,
+            // THE REAL KEY, not a placeholder. Same directory as the autosave state, so an operator
+            // who backs up ~/.local/share/logscope keeps their machine identity with it — losing it
+            // silently invalidates every registration other machines made against this one.
+            //
+            // A failure to load falls back to a visible marker rather than a plausible-looking id: an
+            // id that parses and is nobody's is worse than one that obviously did not load, because
+            // the first gets pasted somewhere.
+            trusted: logscope_fan::trustkit::Registry::load(&trust_path()).0,
+            my_id: Some(state_dir().join(logscope_fan::clusternode::IDENTITY_FILE))
+                .and_then(|p| logscope_fan::machineid::Identity::load_or_create(&p).ok())
+                .map(|id| id.id())
+                .unwrap_or_else(|| "— identity unavailable —".into()),
+            add_id: String::new(), machines: Vec::new(), machine_note: String::new(),
             plan: Vec::new(), conflicts: Vec::new(),
             note: String::new(), repo_hint: String::new(),
         }
@@ -76,7 +100,103 @@ impl Models {
         self.rescan();
     }
 
+    /// Trusted machines, buried under a collapsed header.
+    ///
+    /// Buried on purpose: this is set once per machine and then never touched, so it should not
+    /// occupy space in the view someone uses every day. It lives in the model selector because that is
+    /// where you already go to decide WHERE work runs — a machine and a model are the same decision
+    /// from the operator's side.
+    fn machines_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("trusted machines").default_open(false).show(ui, |ui| {
+            // THIS machine's id, shown so it can be read off and typed into another. It is a
+            // fingerprint of the public key, not a name — so pasting it IS the key exchange, and there
+            // is no second step to forget.
+            // NOT YET A REAL IDENTITY, and the UI must say so. The id derives from a fixed
+            // placeholder string, so it is stable, well-formed, and THE SAME ON EVERY MACHINE — an
+            // operator who copies it to a second device would register the first device's twin and
+            // wonder why nothing connects.
+            //
+            // Showing a plausible id for an identity that does not exist is the same class as
+            // "✓ verified" for a run with no verifier: a display that is affirmative by default.
+            // The identity is REAL — generated once and persisted at
+            // ~/.local/share/logscope/identity.key. I added a "placeholder identity" warning here
+            // while the wiring was in flight and it outlived the thing it warned about, which is a
+            // stale label claiming a defect that no longer exists — the same class as a stale gate,
+            // pointed the other way.
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("this machine:").small().color(theme::DIM()));
+                ui.label(egui::RichText::new(&self.my_id).monospace().small());
+                if ui.small_button("copy").clicked() { ui.ctx().copy_text(self.my_id.clone()); }
+            });
+            ui.label(egui::RichText::new(
+                "Type another machine's id here to trust it. The id is a fingerprint of its key, so \
+there is nothing else to exchange.").small().color(theme::FAINT()));
+            ui.horizontal_wrapped(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut self.add_id)
+                    .hint_text("xxxxx-xxxxx-xxxxx-xx").desired_width(190.0));
+                if ui.small_button("add").clicked() {
+                    match logscope_fan::machineid::parse(&self.add_id) {
+                        // The error is shown rather than swallowed: a mistyped id would otherwise be
+                        // an id nobody holds, and the failure would surface later as "that machine is
+                        // offline" — pointing at the network instead of at the typing.
+                        Err(e) => self.machine_note = e.explain(),
+                        Ok(id) => {
+                            // INTO THE REGISTRY AND ONTO DISK. This pushed to a plain Vec that nothing read and
+                            // nothing saved — a machine "added" in the UI was trusted by no code and gone on
+                            // restart, which is worse than no button: the operator believes the step is done.
+                            //
+                            // Compute is the default level. It can run inference and cannot receive a workspace
+                            // handoff — granting the strongest level from a typed id would make one keystroke the
+                            // whole authorisation.
+                            self.trusted.register(&id, logscope_fan::trustkit::Trust::Compute);
+                            self.machines.push(id.clone());
+                            self.add_id.clear();
+                            // UNVERIFIED, not "added": an id alone carries no key, so the machine is listed and
+                            // cannot yet be authenticated. "added" would overstate what just happened.
+                            self.machine_note = match self.trusted.save(&trust_path()) {
+                                Ok(()) => format!("added {id} — unverified until it announces itself"),
+                                Err(e) => format!("added {id} FOR THIS SESSION ONLY — could not save: {e}"),
+                            };
+                        }
+                    }
+                }
+            });
+            if !self.machine_note.is_empty() {
+                ui.label(egui::RichText::new(&self.machine_note).small().color(theme::DIM()));
+            }
+            // FROM THE REGISTRY, not from a session Vec — so the list survives a restart and shows
+            // what is actually trusted rather than what was typed since launch.
+            //
+            // The verified/unverified distinction is the point of showing it at all: an entry with no
+            // key cannot be authenticated, so it is listed and cannot be acted on. trustkit calls that
+            // unverifiable(), and a list that hid it would imply a working link that does not exist.
+            let mut revoke: Option<String> = None;
+            for (id, level, verified) in self.trusted.entries_for_display() {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!("  {id}")).monospace().small());
+                    ui.label(egui::RichText::new(if verified { "✓ key on file" }
+                        else { "⚠ unverified — no key yet" })
+                        .small().color(if verified { theme::GREEN() } else { theme::AMBER() }));
+                    ui.label(egui::RichText::new(format!("{level:?}")).small().color(theme::DIM()));
+                    if ui.small_button("revoke").clicked() { revoke = Some(id.clone()); }
+                });
+            }
+            // Revoked outside the loop: mutating the registry while iterating it is the borrow the
+            // compiler would refuse, and collecting first is also what makes the save happen once.
+            if let Some(id) = revoke {
+                self.trusted.revoke(&id);
+                self.machine_note = match self.trusted.save(&trust_path()) {
+                    Ok(()) => format!("revoked {id}"),
+                    // A revocation that failed to save comes BACK on restart, which is the worst
+                    // direction for this error to go — so it says so plainly.
+                    Err(e) => format!("revoked {id} for this session only — could NOT save: {e}"),
+                };
+            }
+        });
+    }
+
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        self.machines_ui(ui);
         ui.horizontal(|ui| {
             ui.label(RichText::new("Models root").color(theme::FAINT()));
             ui.add(egui::TextEdit::singleline(&mut self.root).desired_width(320.0));
@@ -173,4 +293,23 @@ impl Models {
             }
         });
     }
+}
+
+/// Where the trust list lives — beside the identity, because they are one setting.
+/// Where the trusted-devices list lives.
+///
+/// The FILENAME comes from logscope_fan rather than being spelled again here. It was written out in
+/// both places and they happened to agree — which is the state a path spends right up until one of
+/// them is edited, and then a device list silently splits in two with neither half wrong.
+fn trust_path() -> std::path::PathBuf {
+    state_dir().join(logscope_fan::clusternode::TRUSTED_FILE)
+}
+
+/// The directory holding identity, trusted devices and the chat autosave.
+///
+/// One definition, because an operator backing up this directory should get all of it — and a second
+/// spelling of the path is how one file ends up somewhere the backup does not reach.
+pub fn state_dir() -> std::path::PathBuf {
+    std::env::var("HOME").ok().map(std::path::PathBuf::from).unwrap_or_default()
+        .join(".local/share/logscope")
 }

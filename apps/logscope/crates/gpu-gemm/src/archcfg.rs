@@ -271,7 +271,15 @@ pub fn route_norm(cfg: &ArchConfig) -> crate::moe::RouteNorm {
 
 /// Build the MoE routing config from an arch + the checkpoint's expert counts (from `dim_keys`). `n_used`
 /// falls back to a sensible default when the metadata omits it.
-pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -> crate::moe::MoeConfig {
+/// `scale` and `norm` come from the checkpoint's `{arch}.expert_weights_scale` and
+/// `{arch}.expert_weights_norm` — the key names llama.cpp uses, arch-prefixed. Passed in rather than
+/// read here so this stays free of the Gguf, and taken as Options so "the metadata omits it" is
+/// distinguishable from "the metadata says 1.0".
+///
+/// The prefix matters more than it looks: reading these under the WRONG arch prefix returns None for a
+/// model that set them, which is exactly how glm-dsa's kv_lora_rank was misread as absent.
+pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32,
+                  scale: Option<f32>, norm: Option<bool>) -> crate::moe::MoeConfig {
     crate::moe::MoeConfig {
         n_routed,
         n_used: if n_used == 0 { 8.min(n_routed.max(1)) } else { n_used },
@@ -279,7 +287,40 @@ pub fn moe_config(cfg: &ArchConfig, n_routed: u32, n_used: u32, n_shared: u32) -
         norm: route_norm(cfg),
         // Llama4: raw-sigmoid top-1 gate applied to the expert's INPUT (weight-before-FFN);
         // everything else: normalized weights combined on the output.
-        normalize: !matches!(cfg.arch, Arch::Llama4),
+        // Metadata wins; the arch default is the fallback. llama.cpp reads this from the checkpoint
+        // rather than deriving it, and a model that sets expert_weights_norm=false without being
+        // Llama-4 would otherwise be normalized against its own config.
+        // METADATA WINS, EXCEPT WHERE THE ARCHITECTURE FORBIDS IT.
+        //
+        // Making this metadata-driven was right for Qwen and DeepSeek, and I introduced a risk with
+        // it: Llama-4's gate is not a normalization TOGGLE, it is a different forward pass. The raw
+        // sigmoid multiplies the expert's INPUT (weight_before), and a normalized weight applied there
+        // is not the same computation scaled — it is wrong. A checkpoint that happens to carry
+        // expert_weights_norm=true would have silently switched Llama-4 into a shape it does not have.
+        //
+        // So the arch VETOES rather than merely defaulting, which is archfeat's rule arriving here.
+        // ARCHITECTURAL WHERE THE ARCHITECTURE DECIDES IT, metadata only where it does not.
+        //
+        // Checked against llama.cpp's per-model builders, and it hardcodes norm_w as a LITERAL for
+        // both of these — not from hparams:
+        //
+        //     models/llama4.cpp:228     LLM_FFN_SILU, false,   <- Llama-4
+        //     models/qwen3moe.cpp:144   LLM_FFN_SILU, true,    <- Qwen3-MoE
+        //
+        // So my _370 change was wrong for BOTH, not just Llama-4. A Qwen checkpoint carrying
+        // expert_weights_norm=false would have switched off a normalization the architecture requires,
+        // and the output would have been plausible rather than broken.
+        //
+        // The scale is different and IS read from metadata in both files
+        // (hparams.expert_weights_scale), which is why routed_scale stays metadata-driven.
+        normalize: match cfg.arch {
+            Arch::Llama4 => false,
+            Arch::Qwen3Moe => true,
+            _ => norm.unwrap_or(true),
+        },
+        // GLM-5.2 sets routed_scaling_factor (2.5); everything else leaves it inert at 1.0. Applied
+        // AFTER normalization — see the ordering note on the field.
+        routed_scale: scale.unwrap_or(1.0),
         weight_before: matches!(cfg.arch, Arch::Llama4),
     }
 }
@@ -301,6 +342,45 @@ pub fn qk_norm_tensors(cfg: &ArchConfig, layer: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unverified_arch_can_never_verify_ITSELF_without_an_opt_in() {
+        // The deadlock this documents. `supported` flips only once an architecture has completed a
+        // forward pass on a real checkpoint — the right rule, and the reason deepseek2 stayed gated
+        // with no known gaps. But attempting the run IS what produces that evidence, and the loader
+        // refused the attempt, so the flag could never change.
+        //
+        // glm-dsa is precisely there: two of its three gaps implemented, the third a no-op below 2048
+        // context, MLA layout fixed — and unrunnable. LOGSCOPE_TRY_UNSUPPORTED_ARCH is the escape, and
+        // it claims nothing: it lets someone find out.
+        assert!(!is_supported("glm-dsa", 0), "still unverified, correctly");
+        assert!(!declared_supported("glm-dsa"), "and the declaration is what gates it, not the gaps");
+        // The gap list is now down to one, which is what makes the attempt worth offering.
+        assert_eq!(crate::archfeat::gaps("glm-dsa", 0).len(), 1,
+            "only the sparse indexer remains: {:?}", crate::archfeat::gaps("glm-dsa", 0));
+    }
+
+    #[test]
+    fn the_nope_interval_decides_which_layers_ROTATE() {
+        // Scout's gibberish has survived every GPU-side fix on both platforms, and this is the kind of
+        // thing that would produce it: nope_step was hardcoded to 4, so every fourth layer skips
+        // rotation. That is Scout's documented pattern and an ASSUMPTION about every other Llama-4
+        // checkpoint — Maverick, and anything shipped later.
+        //
+        // A wrong interval applies RoPE to a layer that should have none and vice versa. Every tensor
+        // is present, every shape matches, the model loads, and the text is garbled. Nothing in a
+        // shape check can see it, which is why it outlived them.
+        //
+        // The rule, as the loader applies it: layer i is NoPE when (i + 1) % step == 0.
+        let nope_at = |i: usize, step: usize| step > 0 && (i + 1) % step == 0;
+        for i in 0..12 {
+            assert_eq!(nope_at(i, 4), matches!(i, 3 | 7 | 11), "step 4, layer {i}");
+        }
+        // A different interval selects a different set — which is the whole reason it must be read.
+        assert!(nope_at(1, 2) && !nope_at(1, 4), "step 2 and step 4 disagree at layer 1");
+        // step 0 means no NoPE layers at all, which is every non-Llama-4 architecture.
+        for i in 0..12 { assert!(!nope_at(i, 0)); }
+    }
 
     #[test]
     fn llama_is_supported_today() {
@@ -399,7 +479,7 @@ mod tests {
         assert!(c.moe && !c.moe_shared_expert, "MoE with NO shared expert (unlike Qwen2-MoE)");
         assert_eq!(route_norm(&c), crate::moe::RouteNorm::Softmax);
         // Qwen3-30B-A3B: 128 experts, 8 active, no shared
-        let mc = moe_config(&c, 128, 8, 0);
+        let mc = moe_config(&c, 128, 8, 0, None, None);
         assert_eq!(mc.n_routed, 128);
         assert_eq!(mc.n_used, 8);
         assert_eq!(mc.n_shared, 0);
@@ -414,17 +494,17 @@ mod tests {
     fn moe_config_maps_arch_to_router() {
         // Qwen4: softmax gating, no shared expert
         let q = for_arch("qwen4");
-        let qc = moe_config(&q, 128, 8, 0);
+        let qc = moe_config(&q, 128, 8, 0, None, None);
         assert_eq!(qc.norm, crate::moe::RouteNorm::Softmax);
         assert_eq!(qc.n_used, 8);
         assert_eq!(qc.n_shared, 0);
         // Llama4: sigmoid gating, at least one shared expert
         let l = for_arch("llama4");
-        let lc = moe_config(&l, 128, 1, 1);
+        let lc = moe_config(&l, 128, 1, 1, None, None);
         assert_eq!(lc.norm, crate::moe::RouteNorm::Sigmoid);
         assert!(lc.n_shared >= 1, "llama4 forces a shared expert");
         // n_used defaults when metadata omits it
-        assert_eq!(moe_config(&q, 64, 0, 0).n_used, 8);
+        assert_eq!(moe_config(&q, 64, 0, 0, None, None).n_used, 8);
     }
 
     #[test]
@@ -470,6 +550,100 @@ mod tests {
         // and it must still refuse, because reading the weights is not the same as having run them
         assert!(!for_arch("deepseek2").supported);
         assert!(n.contains("unverified end to end"), "the remaining gap has to stay stated: {n}");
+    }
+
+    #[test]
+    fn the_registry_prefix_can_DISAGREE_with_the_file_and_the_file_wins() {
+        // Qwen3.5 ships files whose keys are `qwen35.*` while the registry says `qwen3_5`. The loader
+        // sniffed the real prefix, PRINTED that it was using it, and then never stored it — so every
+        // later read through acfg.prefix returned None on that file. Rope base, norm epsilon,
+        // expert_weights_scale: each defaulted silently, and a wrong rope base produces exactly the
+        // near-random output reported ("doctrine%," in answer to "hi there").
+        //
+        // NOTICING AND NOT ACTING IS WORSE THAN NOT NOTICING: the log claimed the file's prefix was in
+        // use, and it was not, so the one message that could have pointed here said the opposite.
+        let a = for_arch("qwen35");
+        let b = for_arch("qwen3_5");
+        assert_eq!(a.arch, b.arch, "both spellings are the same architecture");
+        // The registry's prefix is one spelling; a file using the other must override it, which is now
+        // done at the sniff site rather than left in a local.
+        assert_eq!(a.prefix, "qwen3_5", "registry default");
+    }
+
+    #[test]
+    fn checkpoint_metadata_OVERRIDES_the_arch_default() {
+        // llama.cpp reads expert_weights_norm from the checkpoint rather than deriving it from the
+        // architecture. A model that sets it false without being Llama-4 would otherwise be normalized
+        // against its own config — and the output would be plausible, not broken.
+        // Rewritten twice as the reference check narrowed it. Qwen and Llama-4 are now BOTH
+        // architectural — llama.cpp hardcodes norm_w for each — so this exercises an arch that has
+        // not been checked against a reference, where the checkpoint is still the better source.
+        let ds = for_arch("deepseek2");
+        assert!(moe_config(&ds, 128, 8, 0, None, None).normalize, "default when absent");
+        assert!(!moe_config(&ds, 128, 8, 0, None, Some(false)).normalize, "metadata wins");
+        // I asserted the other direction here in _370 — that metadata could turn Llama-4's gate ON.
+        // That is the case now vetoed: its raw sigmoid multiplies the expert's INPUT, so a normalized
+        // weight there is a different forward pass, not the same one scaled. The test asserted the
+        // behaviour and the behaviour was the bug.
+        assert!(!moe_config(&for_arch("llama4"), 16, 1, 1, None, Some(true)).normalize,
+            "the architecture vetoes; see LLAMA4_ignores_expert_weights_norm");
+    }
+
+    #[test]
+    fn LLAMA4_ignores_expert_weights_norm_because_its_gate_is_ARCHITECTURAL() {
+        // A risk I introduced when making this metadata-driven in _370. Llama-4's raw sigmoid
+        // multiplies the expert's INPUT, so a normalized weight applied there is not the same
+        // computation scaled — it is a different forward pass. A checkpoint carrying
+        // expert_weights_norm=true would have silently switched it into a shape it does not have.
+        let l4 = for_arch("llama4");
+        assert!(!moe_config(&l4, 16, 1, 1, None, Some(true)).normalize,
+            "metadata cannot turn Llama-4's raw-sigmoid gate into a normalized one");
+        assert!(!moe_config(&l4, 16, 1, 1, None, None).normalize);
+        assert!(moe_config(&l4, 16, 1, 1, None, None).weight_before,
+            "and the weight still goes to the expert's input, which is why");
+    }
+
+    #[test]
+    fn QWEN3MOE_also_ignores_the_metadata_and_llamacpp_is_why() {
+        // The check found this and it widened the last fix. llama.cpp hardcodes norm_w as a LITERAL
+        // in both per-model builders:
+        //
+        //     models/llama4.cpp:228     LLM_FFN_SILU, false,
+        //     models/qwen3moe.cpp:144   LLM_FFN_SILU, true,
+        //
+        // Neither reads hparams.expert_weights_norm. So a Qwen checkpoint carrying
+        // expert_weights_norm=false would have switched off a normalization the architecture
+        // requires — the same class of silent breakage as the Llama-4 case, in the other direction.
+        let q = for_arch("qwen3moe");
+        assert!(moe_config(&q, 128, 8, 0, None, Some(false)).normalize,
+            "the architecture requires it; metadata cannot switch it off");
+        assert!(moe_config(&q, 128, 8, 0, None, None).normalize);
+    }
+
+    #[test]
+    fn the_SCALE_is_still_metadata_driven_for_both() {
+        // The scale IS read from hparams in both files, which is why it stays metadata-driven — the
+        // two knobs are not the same kind of thing and treating them alike was the original mistake.
+        for a in ["llama4", "qwen3moe"] {
+            let c = for_arch(a);
+            assert_eq!(moe_config(&c, 16, 1, 1, Some(2.5), None).routed_scale, 2.5, "{a}");
+        }
+    }
+
+    #[test]
+    fn an_architecture_we_have_not_checked_still_takes_the_metadata() {
+        // The hardcoding is only justified where a reference implementation was read. Elsewhere the
+        // checkpoint remains the better source.
+        let d = for_arch("deepseek2");
+        assert!(!moe_config(&d, 128, 8, 0, None, Some(false)).normalize);
+    }
+
+    #[test]
+    fn an_absent_scale_is_INERT_rather_than_zero() {
+        // None means the metadata omitted it, which must leave every weight untouched. Defaulting to
+        // 0.0 would silence every routed expert and look like a broken router.
+        assert_eq!(moe_config(&for_arch("qwen3moe"), 128, 8, 0, None, None).routed_scale, 1.0);
+        assert_eq!(moe_config(&for_arch("qwen3moe"), 128, 8, 0, Some(2.5), None).routed_scale, 2.5);
     }
 
     #[test]
@@ -565,5 +739,20 @@ mod tests {
         assert_eq!(c.arch, Arch::Unknown);
         assert!(!c.supported && c.note.contains("llama.cpp"));
         assert!(qkv_bias_tensors(&c, 0).is_empty());
+    }
+    #[test]
+    fn the_shared_expert_count_comes_from_the_FILE_when_it_says() {
+        // The loader passed a literal 0 and it worked for Scout only because moe_config rescues an
+        // arch declaring moe_shared_expert with .max(1). Correct by accident — an architecture with
+        // TWO shared experts loses one silently, and a missing always-on expert degrades output
+        // without breaking a shape.
+        let l4 = for_arch("llama4");
+        // The rescue still applies when the file says nothing, so Scout is unchanged.
+        assert_eq!(moe_config(&l4, 16, 1, 0, None, None).n_shared, 1, "flag rescues a silent file");
+        // But a file that declares more must get more.
+        assert_eq!(moe_config(&l4, 16, 1, 2, None, None).n_shared, 2, "the file outranks the flag");
+        // And an arch with no shared expert keeps none when the file says none.
+        let q = for_arch("qwen3moe");
+        assert_eq!(moe_config(&q, 128, 8, 0, None, None).n_shared, 0);
     }
 }

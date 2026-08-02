@@ -118,6 +118,34 @@ impl Feature {
     }
 
     /// Does this engine implement it? Promoted to true only when a gate proves the behaviour.
+    /// Does a run at this context length actually need the sparse-attention indexer?
+    ///
+    /// Colibri's glm.c states it directly: the indexer is a NO-OP for `seq <= index_topk`, because
+    /// top-k of everything is everything. Below that bound dense causal attention is not an
+    /// approximation of the sparse path — it is the same computation, validated there against a
+    /// transformers oracle.
+    ///
+    /// So "unsupported architecture" is the wrong verdict for a short-context run, and a hard refusal
+    /// costs a model that would work. Above the bound the model degrades rather than breaking, which
+    /// is a warning rather than a gate.
+    pub fn indexer_needed_at(seq_len: usize, index_topk: usize) -> bool {
+        index_topk > 0 && seq_len > index_topk
+    }
+
+    /// What to tell an operator about a prompt of `seq_len` on a model with this bound.
+    ///
+    /// Returns None when the run is inside the exact range — silence is right there, because a warning
+    /// on every short prompt is one nobody reads by the time it matters.
+    ///
+    /// This does NOT refuse. Above the bound the model degrades rather than breaking, and a hard cap
+    /// would turn a usable long-context run into no run at all. The operator can judge a documented
+    /// approximation; they cannot judge a silent one.
+    pub fn indexer_warning(seq_len: usize, index_topk: usize) -> Option<String> {
+        if !Self::indexer_needed_at(seq_len, index_topk) { return None; }
+        Some(format!(
+            "prompt is {seq_len} tokens against a sparse-attention bound of {index_topk}. Dense attention is EXACT at or below the bound; above it this attends to every key where the model was trained to attend to the top {index_topk}, so quality degrades with length. Not a failure — an approximation you should know you are making"))
+    }
+
     pub fn implemented(self) -> bool {
         match self {
             Feature::NoPe => true,           // BlockWeights::nope
@@ -144,7 +172,14 @@ impl Feature {
             // head_dim > 192, which stays causal-only and SAYS SO at dispatch rather than silently
             // ignoring the window.
             Feature::StandardSwa => true,
-            Feature::PerLayerRopeFreqs => false, // one rope base is used for all layers
+            // IMPLEMENTED, and this table did not learn — the third stale entry found here, after
+            // ExpertWeightsScale and ExpertWeightsNorm. `{arch}.rope.freq_base_swa` is read per layer
+            // and applied at all three rope sites via `w.rope_base.unwrap_or(base)`; Gemma's windowed
+            // layers use a different base from its global ones and have since the swa work.
+            //
+            // A stale FALSE here is not harmless: is_supported vetoes on any gap, so a table claiming
+            // a feature is missing refuses an architecture the engine can actually run.
+            Feature::PerLayerRopeFreqs => true,
             Feature::PerLayerHeadDim => false,   // head_dim is a single model-wide value throughout
             Feature::LayerOutputScale => false,  // the tensor is not read
             // Implemented in _289: the loader now reads attn_k_b + attn_v_b and concatenates them, having
@@ -159,9 +194,20 @@ impl Feature {
             Feature::EmbeddingScale => true,     // Model::embed_scale, set from the arch at load
             Feature::PerLayerRopeBase => true,   // BlockWeights::rope_base, from rope.freq_base_swa
             Feature::AttentionScaleHparam => false, // 1/sqrt(head_dim) is hardcoded in the kernels
-            Feature::ExpertWeightsScale => false,   // the key is never read; effectively hardcoded to 1
-            Feature::ExpertWeightsNorm => false,    // moe::route normalizes for softmax only
-            Feature::SparseAttentionIndexer => false, // no indexer exists
+            // IMPLEMENTED in _369/_370, and this table did not learn — the exact stale-flag shape the
+            // Q6_K file-view gate had. `{arch}.expert_weights_scale` is read from metadata and applied
+            // in moe::route AFTER normalization (order is load-bearing: scaling first cancels against
+            // the divide, and the model would run with the factor silently doing nothing).
+            Feature::ExpertWeightsScale => true,
+            // Also metadata-driven now, with the arch as fallback — and Llama-4 VETOES it, because its
+            // raw-sigmoid gate multiplies the expert's input and a normalized weight there is a
+            // different forward pass rather than the same one scaled.
+            Feature::ExpertWeightsNorm => true,
+            // Still absent, and still the only real blocker — but NOT unconditionally. Colibri's
+            // glm.c: the DSA indexer is a no-op for seq <= index_topk, where top-k IS every key, so
+            // dense causal attention is the same computation rather than an approximation of it.
+            // GLM-5.2's index_topk is 2048. See `indexer_needed_at`.
+            Feature::SparseAttentionIndexer => false
         }
     }
 
@@ -405,8 +451,8 @@ mod tests {
     fn the_three_moe_gating_shapes_stay_distinct() {
         // Graph-level reads confirmed two DIFFERENT MoE conventions, and a third architecture family
         // uses a third. Collapsing them is the same class of mistake as the two Q/K norms.
-        let l4 = crate::archcfg::moe_config(&crate::archcfg::for_arch("llama4"), 16, 1, 1);
-        let q3 = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
+        let l4 = crate::archcfg::moe_config(&crate::archcfg::for_arch("llama4"), 16, 1, 1, None, None);
+        let q3 = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0, None, None);
         // llama4: sigmoid, weight on the expert INPUT, no normalization
         assert_eq!(l4.norm, crate::moe::RouteNorm::Sigmoid);
         assert!(l4.weight_before && !l4.normalize);
@@ -425,14 +471,48 @@ mod tests {
         // Getting that wrong would degrade output without any error, so it is worth a standing assertion
         // rather than a note in a commit.
         let c = crate::archcfg::for_arch("llama4");
-        let mc = crate::archcfg::moe_config(&c, 16, 1, 1);
+        let mc = crate::archcfg::moe_config(&c, 16, 1, 1, None, None);
         assert_eq!(mc.norm, crate::moe::RouteNorm::Sigmoid, "llama.cpp: EXPERT_GATING_FUNC_TYPE_SIGMOID");
         assert!(mc.weight_before, "the gate multiplies the expert INPUT");
         assert!(!mc.normalize, "llama.cpp passes norm_w = false");
         // and the contrast: qwen3moe is the ordinary softmax-over-normalized-weights case
-        let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0);
+        let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0, None, None);
         assert_eq!(q.norm, crate::moe::RouteNorm::Softmax);
         assert!(!q.weight_before && q.normalize);
+    }
+
+    #[test]
+    fn the_warning_is_SILENT_inside_the_exact_range() {
+        // A warning on every short prompt is one nobody reads by the time it matters, which is how the
+        // template-mismatch message became ignorable.
+        assert!(Feature::indexer_warning(100, 2048).is_none());
+        assert!(Feature::indexer_warning(2048, 2048).is_none(), "at the bound: still exact");
+        let w = Feature::indexer_warning(4096, 2048).expect("past the bound");
+        assert!(w.contains("degrades with length"));
+        assert!(w.contains("Not a failure"), "it must not read as an error");
+    }
+
+    #[test]
+    fn a_model_with_no_declared_bound_gets_NO_warning() {
+        // index_topk = 0 means the file did not say, and inventing a bound would produce a warning
+        // about a property nobody declared.
+        assert!(Feature::indexer_warning(100_000, 0).is_none());
+    }
+
+    #[test]
+    fn the_indexer_is_NOT_needed_below_index_topk() {
+        // Colibri's glm.c, stated directly: the DSA indexer is a no-op for seq <= index_topk, because
+        // top-k of everything IS everything. Below that bound dense causal attention is not an
+        // approximation of the sparse path — it is the same computation, validated there against a
+        // transformers oracle.
+        //
+        // GLM-5.2's index_topk is 2048. So "unsupported architecture" is the wrong verdict for a
+        // short-context run, and a hard refusal costs a model that would have worked.
+        assert!(!Feature::indexer_needed_at(1, 2048));
+        assert!(!Feature::indexer_needed_at(2048, 2048), "exactly at the bound: still every key");
+        assert!(Feature::indexer_needed_at(2049, 2048), "past it, the indexer selects a subset");
+        // A model that declares no index_topk cannot be reasoned about this way.
+        assert!(!Feature::indexer_needed_at(100_000, 0));
     }
 
     #[test]
@@ -441,11 +521,18 @@ mod tests {
         // glm-dsa is NOT glm4moe: it adds a sparse-attention indexer and two expert-weighting knobs that
         // the GLM-4 line does not have, and treating them as one architecture would silently apply the
         // wrong forward pass.
-        let g = gaps("glm-dsa", 0);
+        // All three are REQUIRED by the file — that has not changed and is the point of the test.
         for f in [Feature::SparseAttentionIndexer, Feature::ExpertWeightsScale, Feature::ExpertWeightsNorm] {
-            assert!(g.contains(&f), "glm-dsa needs {f:?}");
+            assert!(required("glm-dsa", 0).contains(&f), "glm-dsa requires {f:?}");
             assert!(!required("glm4moe", 0).contains(&f), "glm4moe does NOT — they are different archs");
         }
+        // But two are now IMPLEMENTED (_369/_370), so only one remains a GAP. This test asserted all
+        // three were gaps and would have kept saying so forever — the same shape as the Llama-4 veto,
+        // where the behaviour was tested, the test passed, and the test was wrong.
+        let g = gaps("glm-dsa", 0);
+        assert!(g.contains(&Feature::SparseAttentionIndexer), "the indexer is the remaining blocker");
+        assert!(!g.contains(&Feature::ExpertWeightsScale), "scale is read from metadata and applied");
+        assert!(!g.contains(&Feature::ExpertWeightsNorm), "norm is metadata-driven with an arch fallback");
         // MLA is shared and already implemented, so it must not appear as a gap for either
         assert!(!g.contains(&Feature::Mla));
 
@@ -467,5 +554,92 @@ mod tests {
     #[test]
     fn a_fully_supported_architecture_reports_no_gaps() {
         assert!(gaps("qwen3moe", 0).is_empty(), "qwen3moe should be fully covered");
+    }
+    #[test]
+    fn qk_norm_is_a_VARIANT_property_not_an_expert_count() {
+        // The loader read `expert_count != 128`, using "has 128 experts" as a stand-in for "is
+        // Maverick" — the variant that disables post-rope Q/K norm. Scout has 16 and gets it.
+        //
+        // Fifth proxy of the session, same failure: the name says one thing and the value encodes
+        // another. A future Llama-4 with 128 experts that DOES use qk-norm silently loses it, and a
+        // wrong qk-norm degrades text without breaking a single shape.
+        //
+        // The rule as the loader now applies it: metadata first, expert count as fallback.
+        let decide = |use_qk_norm: Option<u32>, experts: u32| -> bool {
+            use_qk_norm.map(|v| v != 0).unwrap_or(experts != 128)
+        };
+        // Fallback path — the observed rule, kept because files may omit the key.
+        assert!(decide(None, 16), "Scout: 16 experts, qk-norm on");
+        assert!(!decide(None, 128), "Maverick: 128 experts, qk-norm off");
+        // Metadata path — and it must be able to CONTRADICT the count, or reading it changes nothing.
+        assert!(decide(Some(1), 128), "a 128-expert model that declares qk-norm keeps it");
+        assert!(!decide(Some(0), 16), "and a 16-expert model that declares none does not");
+    }
+}
+
+#[cfg(test)]
+mod staleness_tests {
+    use super::*;
+
+    /// Per-layer RoPE frequencies are implemented, and the table said otherwise.
+    ///
+    /// Third stale entry found in this table, after ExpertWeightsScale and ExpertWeightsNorm. Each was
+    /// implemented in the loader and left marked missing here — and a stale `false` is not harmless,
+    /// because `is_supported` vetoes on ANY gap: the table claiming a feature is absent refuses an
+    /// architecture the engine can run.
+    ///
+    /// `{arch}.rope.freq_base_swa` is read per layer and applied at all three rope sites through
+    /// `w.rope_base.unwrap_or(base)`. Gemma's windowed layers have used a different base from its
+    /// global ones since the SWA work.
+    #[test]
+    fn per_layer_rope_is_implemented_not_a_gap() {
+        assert!(Feature::PerLayerRopeFreqs.implemented());
+        for arch in ["gemma3", "gemma2", "llama"] {
+            assert!(!gaps(arch, 0).contains(&Feature::PerLayerRopeFreqs),
+                "{arch} must not be blocked on a feature the loader has");
+        }
+    }
+
+    /// The three that ARE still missing, so the list stays honest in both directions.
+    ///
+    /// Marking a feature implemented when it is not is the worse error — it turns a clean refusal into
+    /// a model that loads and produces wrong text — so these are pinned as firmly as the correction.
+    #[test]
+    fn the_remaining_gaps_are_still_gaps() {
+        assert!(!Feature::LogitSoftcap.implemented(), "nothing applies a softcap anywhere");
+        assert!(!Feature::PerLayerHeadDim.implemented(), "head_dim is one model-wide value");
+        assert!(!Feature::LayerOutputScale.implemented(), "the tensor is not read");
+    }
+
+    /// Some features are required by an ARCHITECTURE and some by a FILE, and the table only expresses
+    /// the first.
+    ///
+    /// I wrote this test asserting that every implemented feature must be required by some declared
+    /// architecture, and it failed on PerLayerRopeFreqs — correctly. Gemma uses a separate rope base
+    /// for its windowed layers only when the checkpoint carries `rope.freq_base_swa`; a Gemma without
+    /// that key needs one base and is not missing anything.
+    ///
+    /// So "implemented and required by no architecture" is a legitimate state, and the test that
+    /// assumed otherwise was asserting a rule this table does not have. Recorded rather than deleted,
+    /// because the distinction is easy to lose: `required()` answers what an ARCH always needs, and a
+    /// file-conditional capability has no place in it.
+    #[test]
+    fn a_file_conditional_feature_is_implemented_and_required_by_NO_arch() {
+        assert!(Feature::PerLayerRopeFreqs.implemented());
+        let archs = ["llama", "llama4", "qwen3moe", "gemma3", "glm-dsa", "deepseek2", "glm4moe"];
+        assert!(!archs.iter().any(|a| required(a, 0).contains(&Feature::PerLayerRopeFreqs)),
+            "no arch requires it unconditionally — it depends on rope.freq_base_swa being present");
+    }
+
+    /// The expert-weighting features ARE architectural, and must be declared.
+    ///
+    /// The contrast that makes the case above legible: these are properties of the routing math, true
+    /// of every checkpoint of the architecture, so a file omitting the key gets a default rather than
+    /// a different forward pass.
+    #[test]
+    fn the_architectural_features_are_declared_by_the_archs_that_have_them() {
+        for f in [Feature::ExpertWeightsScale, Feature::ExpertWeightsNorm] {
+            assert!(required("glm-dsa", 0).contains(&f), "{f:?} is a glm-dsa property");
+        }
     }
 }

@@ -81,6 +81,38 @@ pub fn window_start(n_swa: u32, ty: SwaType, p1: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// iRoPE requires the NoPE and windowed sets to be complementary.
+    ///
+    /// Rotary layers take chunked LOCAL attention; NoPE layers take GLOBAL attention with
+    /// length-dependent temperature instead. That pairing IS the mechanism — it is how a Llama-4 model
+    /// gets position information on every layer despite a quarter of them having no rotation.
+    ///
+    /// The loader computes the two sets from DIFFERENT metadata keys (`no_rope_interval` and
+    /// `sliding_window_pattern`), so nothing structurally prevents them disagreeing. A layer that is
+    /// both windowed and NoPE has local attention and no positional signal at all; one that is neither
+    /// has global attention with rotation. Both load, both match every shape, and both degrade the
+    /// text — which is the shape of the Scout bug that has outlived every GPU-side fix.
+    #[test]
+    fn the_nope_and_windowed_sets_must_be_complementary() {
+        let nope_at = |i: usize, step: usize| step > 0 && (i + 1) % step == 0;
+        // The consistent case: period 4 windows three of every four, and NoPE takes the fourth.
+        let windowed = swa_layers(12, 4, false);
+        for i in 0..12 {
+            assert_ne!(windowed[i], nope_at(i, 4),
+                "layer {i}: windowed={} nope={} — these must differ", windowed[i], nope_at(i, 4));
+        }
+    }
+
+    #[test]
+    fn a_mismatched_period_makes_them_AGREE_somewhere() {
+        // Which is the condition the loader now warns on. With period 3 against a NoPE step of 4 the
+        // sets collide, and the collision is silent without the check.
+        let nope_at = |i: usize, step: usize| step > 0 && (i + 1) % step == 0;
+        let windowed = swa_layers(12, 3, false);
+        assert!((0..12).any(|i| windowed[i] == nope_at(i, 4)),
+            "a period/step mismatch must be detectable, or the warning can never fire");
+    }
+
     use super::*;
 
     #[test]

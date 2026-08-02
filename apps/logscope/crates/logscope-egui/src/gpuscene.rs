@@ -278,6 +278,10 @@ pub const SHADER_FS: &str = r#"
 in vec3 v_normal; in vec4 v_color; in vec3 v_world; flat in float v_mat; flat in float v_emissive;
 uniform sampler2DArray u_mat; uniform sampler2DArray u_nrm;
 uniform float u_texscale; uniform float u_time; uniform float u_bump; uniform float u_exposure;
+// Last touch in world space; .w is its age in seconds, NEGATIVE when nothing has been touched — which
+// must read as "no response" rather than "touched at the origin", or every surface near 0,0,0 glows
+// on startup.
+uniform vec4 u_touch;
 uniform vec3 u_sun_dir; uniform vec3 u_sun_col; uniform vec3 u_sky; uniform vec3 u_ground;
 uniform float u_ambient; uniform vec3 u_eye; uniform vec3 u_fog_col; uniform float u_fog;
 uniform float u_caustic; uniform vec3 u_caustic_col;   // >0 on aquatic scenes: animated underwater light dapple
@@ -288,6 +292,40 @@ out vec4 frag;
 vec3 tri(sampler2DArray t, float layer, vec3 wp, vec3 bw) {
     return texture(t, vec3(wp.yz, layer)).rgb * bw.x + texture(t, vec3(wp.zx, layer)).rgb * bw.y + texture(t, vec3(wp.xy, layer)).rgb * bw.z;
 }
+// TRIPLANAR surface coordinates. Projecting world XZ onto a face is correct for a floor and wrong
+// for everything else: on a vertical face the pattern is constant along Y, so it stretches and
+// SLIDES ACROSS THE FACE as the camera moves. That is the "textures slide over faces" symptom, and
+// it is not a texture bug — there are no textures, only patterns sampled in the wrong space.
+//
+// The fix is to choose the projection plane per-fragment from the dominant axis of the normal, and
+// blend at the seams so a 45-degree face does not pop between planes. The blend exponent controls
+// how sharp the transition is: too low and every face looks smeared, too high and the seam is a
+// visible line.
+// PROXIMITY RESPONSE. `u_touch.xyz` is the last touch point in world space and `u_touch.w` is its age
+// in seconds; a negative w means nothing has been touched, which must read as "no response" rather
+// than "touched at the origin" — otherwise every surface near 0,0,0 glows on startup.
+//
+// Returns 0..1, rising as a fragment is nearer the touch and decaying with age. This is the SAME
+// mechanism for a plant that breathes and a rune that lights: what differs is only how the value is
+// used — a displacement along the normal, or an emissive term.
+float touch_response(vec3 wp, float radius) {
+    if (u_touch.w < 0.0) return 0.0;
+    float d = distance(wp, u_touch.xyz);
+    float near = 1.0 - smoothstep(0.0, max(radius, 1e-3), d);
+    // Decay over roughly a second and a half: long enough to read as a response rather than a
+    // flicker, short enough that the surface settles before the next touch.
+    float fade = exp(-u_touch.w * 0.7);
+    return near * fade;
+}
+
+vec2 tri_uv(vec3 wp, vec3 n) {
+    vec3 a = abs(normalize(n));
+    a = pow(a, vec3(4.0));                       // sharpen toward the dominant axis
+    a /= max(a.x + a.y + a.z, 1e-5);
+    // Each plane drops the axis it faces along, so the coordinate always lies IN the surface.
+    return a.x * wp.zy + a.y * wp.xz + a.z * wp.xy;
+}
+
 // value noise (smooth, cheap) — used to break the caustic network into discontinuous, irregular bits.
 float vhash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 float vnoise(vec2 p) {
@@ -349,7 +387,11 @@ void main() {
     // highlights shimmer like light through moving water. The dry AIR interior (stone, layer 2) is left crisp.
     bool is_water = (v_mat > 2.5 && v_mat < 3.5);
     if (is_water) {
-        vec2 w = v_world.xz * 0.7 + u_time * 0.18;
+        // Triplanar, not XZ. A surface wobble must follow the surface: projected on XZ it is
+        // constant along Y, so on the dome and the outer wall the highlight slid across the face
+        // instead of moving with it. Caustics and the rain-stain below keep XZ deliberately —
+        // both fall from above, so a top-down projection is what they physically are.
+        vec2 w = tri_uv(v_world, N) * 0.7 + u_time * 0.18;
         vec3 wob = vec3(sin(w.x * 1.7) + cos(w.y * 1.3), 0.0, cos(w.x * 1.1) + sin(w.y * 1.9));
         N = normalize(N + wob * 0.16);
     }

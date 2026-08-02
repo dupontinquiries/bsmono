@@ -590,3 +590,105 @@ mod tests {
         assert_eq!(threads_for(1 << 30, 1), 1, "never more than are available");
     }
 }
+
+/// Dot one IQ1_S super-block row against a prepared f32 activation, reading the source bytes directly.
+///
+/// ## Why this exists
+///
+/// GLM-5.2 ships as IQ1_S and the loader converts every source format to f32 and then to q4 — a 20x
+/// transient and a 2.8x resident inflation, which is what puts a 25 GiB checkpoint over a 63 GiB
+/// ceiling. A path that reads the source layout removes both costs, because the weights never leave
+/// the size the checkpoint author chose.
+///
+/// This is the CPU half: usable on its own, and the reference a GPU kernel's gate would compare
+/// against. Written first deliberately — `gate-validity.md` records four faults found and fixed against
+/// a software rasterizer on a kernel that was still wrong on hardware, so the reference is the part
+/// that can be trusted from here.
+///
+/// ## The layout
+///
+/// 50 bytes per 256 weights: `d` as f16, 32 bytes of `qs`, then 8 `u16` of `qh`. Each group of 8
+/// weights takes an **11-bit** codebook index — 8 bits from `qs`, 3 more from `qh` — into the 2048
+/// ternary entries of `iq1s_grid`. Per 32-weight sub-block `qh` also carries a 3-bit scale
+/// (`dl = d·(2s+1)`) and a sign bit selecting `±IQ1S_DELTA`.
+///
+/// Activations stay f32 rather than being quantized: the weights are ternary, so the product is a
+/// select-and-add and there is nothing for an integer path to accelerate. That is the opposite of the
+/// Q8_0 case, where the integer dot was worth 2x.
+pub fn dot_iq1_s(raw: &[u8], act: &[f32]) -> Option<f32> {
+    let nblk = act.len() / 256;
+    if raw.len() < nblk * 50 { return None; }
+    let mut total = 0f32;
+    for b in 0..nblk {
+        let blk = &raw[b * 50..(b + 1) * 50];
+        let d = crate::gguf::f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
+        let qs = &blk[2..34];
+        for ib in 0..8 {
+            let h = u16::from_le_bytes([blk[34 + 2 * ib], blk[35 + 2 * ib]]);
+            let dl = d * (2 * ((h >> 12) & 7) + 1) as f32;
+            let delta = if h & 0x8000 != 0 { -crate::iq1s_grid::IQ1S_DELTA }
+                        else { crate::iq1s_grid::IQ1S_DELTA };
+            // Four groups of 8 weights per 32-wide sub-block.
+            let mut sub = 0f32;
+            for g in 0..4 {
+                let qi = ib * 4 + g;
+                // 11 bits: 8 from qs, 3 from qh at a per-group offset.
+                let idx = (qs[qi] as usize) | ((((h >> (3 * g)) & 7) as usize) << 8);
+                // `entry` returns the 8 ternary values already unpacked. I first wrote a 2-bit
+                // unpack of a raw grid word — a layout I INVENTED rather than read, and the test
+                // caught it at 56.8 against -6.9. Using the same accessor the dequantizer uses is
+                // what makes this a reading of the format rather than a second guess at it.
+                let gr = crate::iq1s_grid::entry(idx);
+                let base = b * 256 + ib * 32 + g * 8;
+                for j in 0..8 {
+                    sub += act[base + j] * (gr[j] as f32 + delta);
+                }
+            }
+            total += dl * sub;
+        }
+    }
+    Some(total)
+}
+
+#[cfg(test)]
+mod iq1s_dot_tests {
+    use super::*;
+
+    /// The dot must agree with dequantize-then-multiply.
+    ///
+    /// That equivalence is the whole claim: reading the source layout directly is only worth doing if
+    /// it produces the same answer as the path it replaces. Compared against `gguf::dequantize`, which
+    /// is itself the transcribed llama.cpp routine — so this checks the reading, not the codebook.
+    #[test]
+    fn it_matches_dequantize_then_dot() {
+        let nblk = 3usize;
+        // Plausible bytes: a real f16 scale, and qs/qh patterns that exercise several codebook entries.
+        let mut raw = vec![0u8; nblk * 50];
+        for b in 0..nblk {
+            let blk = &mut raw[b * 50..(b + 1) * 50];
+            blk[0..2].copy_from_slice(&0x2E66u16.to_le_bytes());   // ~0.1 in f16
+            for i in 0..32 { blk[2 + i] = ((i * 7 + b * 13) % 251) as u8; }
+            for i in 0..8 {
+                let h = ((i as u16 * 4099) & 0x7FFF) | if i % 3 == 0 { 0x8000 } else { 0 };
+                blk[34 + 2 * i..36 + 2 * i].copy_from_slice(&h.to_le_bytes());
+            }
+        }
+        let act: Vec<f32> = (0..nblk * 256).map(|i| ((i % 19) as f32 - 9.0) * 0.11).collect();
+
+        let w = crate::gguf::dequantize(19, &raw, nblk * 256).expect("iq1_s dequantizes");
+        let want: f32 = w.iter().zip(&act).map(|(a, b)| a * b).sum();
+        let got = dot_iq1_s(&raw, &act).expect("shapes agree");
+
+        let tol = want.abs().max(1.0) * 1e-4;
+        assert!((got - want).abs() <= tol,
+            "direct read {got} vs dequantize-then-dot {want} (tol {tol})");
+    }
+
+    #[test]
+    fn a_short_source_returns_None_rather_than_reading_past_it() {
+        // A truncated tensor would otherwise index out of bounds or, worse, read adjacent weights and
+        // return a plausible number — the failure this codebase keeps paying for.
+        assert!(dot_iq1_s(&[0u8; 49], &vec![0f32; 256]).is_none());
+        assert!(dot_iq1_s(&[0u8; 50], &vec![0f32; 256]).is_some());
+    }
+}

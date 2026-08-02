@@ -386,12 +386,18 @@ impl Msg {
     fn user(text: String) -> Self { Self { role: Role::User, variants: vec![text], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None } }
     fn assistant() -> Self { Self { role: Role::Assistant, variants: vec![String::new()], cur: 0, born: Instant::now(), editing: false, edit_buf: String::new(), think_open: true, parent: None } }
     fn text(&self) -> &str { &self.variants[self.cur] }
+    /// All variants, for an export that must not drop regenerations.
+    fn all_variants(&self) -> &[String] { &self.variants }
     fn cur_mut(&mut self) -> &mut String { &mut self.variants[self.cur] }
 }
 /// A message as the CONTEXT WINDOW sees it: role + cleaned text (see chosen_msgs). Drop-in for
 /// the builders' `m.role` / `m.text()` usage.
 struct CtxMsg { role: Role, text: String }
 impl CtxMsg { fn text(&self) -> &str { &self.text } }
+
+impl logscope::branchtree::Node for Msg {
+    fn parent(&self) -> Option<usize> { self.parent }
+}
 
 /// A structural edit requested from a message's controls, applied after the render pass (so the
 /// render can borrow `msgs` immutably-ish while the buttons just record intent).
@@ -634,9 +640,11 @@ fn parse_inline(s: &str) -> Vec<Run> {
 fn md_line_job(ui: &egui::Ui, line: &str, size: f32, base: egui::Color32) -> egui::text::LayoutJob {
     use egui::text::{LayoutJob, TextFormat};
     use egui::{FontFamily, FontId};
-    // Bold through the SAME contrast machinery as every other markdown color: egui's
-    // strong_text_color() is a generic guess that was never checked against these panels
-    // (the low-contrast-bold report). md_strong guarantees a heavier floor than body ink.
+    // CONTRAST-ENSURED, like the accent two lines down. This was
+    // `ui.visuals().strong_text_color()` — egui's untreated default, never checked against these
+    // panels — so bold runs in a message could fail to read on themes where every other markdown
+    // colour had been adjusted. md_strong guarantees a heavier floor than body ink; the fix that
+    // was applied to links and inline code was simply never applied here.
     let strong = theme::md_strong();
     let mut job = LayoutJob::default();
     job.wrap.max_width = ui.available_width();
@@ -771,6 +779,9 @@ const PERSONAS: &[(&str, &str, &str)] = &[
     // The LIAISON runs in FRONT of the big model: a small fast model that reports what the backend is
     // doing while the large one works. Its rules live in logscope::liaison_prompt so the same wording
     // governs the HUD strip and any direct chat with it — one prompt, not two that drift.
+    // Both halves. LIAISON_SYSTEM governs when there ARE observations; LIAISON_NO_OBSERVATIONS covers
+    // the turn it does not bear on — which is most of them when this is selected as a chat persona,
+    // and is why every reply opened with a backend status line including the answer to "hi there".
     ("liaison", "Liaison · reports backend state", logscope::liaison_prompt::LIAISON_SYSTEM),
 ];
 /// Look up a persona's full system prompt by key (the status-bar persona popup switches with this).
@@ -936,6 +947,16 @@ pub struct Chat {
     request_smaller_model: bool,   // :why asked to spawn the smallest local model for the diagnosis; ui() applies it
     show_help: bool,               // `?` keybinding overlay is open
     note: String,                  // transient status line (e.g. export path), cleared on next action
+    /// A failure that must NOT scroll away: model load errors, and anything else an operator has to
+    /// act on or report.
+    ///
+    /// `note` is a transient status line and the next status overwrites it — which is the wrong home
+    /// for the one message someone needs to keep. A load failure prints a paragraph of arithmetic
+    /// (host RAM, resident, page cache, the flag that would help) and then vanishes on the next tick.
+    ///
+    /// Persistent, with copy and close, because the two things anyone does with an error are paste it
+    /// somewhere and dismiss it.
+    error_banner: Option<String>,
     gitmind_session: Option<crate::gitmind_session::Session>, // a loaded .gitmind /tmp work session, if any
     agent_files: Vec<crate::workspace_exec::FileEvent>, // live feed of files the agent/drops touched in the workspace
     agent_plan: Vec<(String, bool)>, // the agent's committed plan (2): (step text, done) — rendered as an in-scene checklist
@@ -972,7 +993,25 @@ pub struct Chat {
     preview: Option<usize>,                 // index of the generated file whose body is expanded
     auto_continue: bool,                    // decode a fresh reply continuously up to the reply ceiling
     stepwise: bool,                         // checkpoint mode: model pauses at ⏸ STEP k/n markers, harness auto-continues
-    patch_mode: bool,                       // edit mode: model emits unified-diff patches instead of full files
+    patch_mode: bool,
+    /// The model actually running, as reported by a successful load.
+    last_loaded: Option<String>,
+    /// What the picker was asked for, so a failure can tell a switch from a reload.
+    last_picked: Option<String>,
+    /// Set on failure; the app applies it to the picker on the next frame. Some(None) means clear.
+    ///
+    /// Deferred rather than applied here because the picker lives in the app and this is the chat
+    /// tab — reaching across would be a second writer to the same state, which is the bug _290 fixed.
+    revert_picker: Option<Option<String>>,
+    /// Measured decode rate, for revealpace. None until a generation has been timed — which starts
+    /// the reveal in token mode, the safe default on an unknown model.
+    last_tok_per_s: Option<f32>,
+    /// Milliseconds the current tail has been withheld, so a boundary that never arrives still flushes.
+    reveal_held_ms: u64,
+    /// Bytes revealed at the last frame, so the held clock resets when the boundary moves.
+    reveal_shown_len: usize,
+    /// Debate-panel mode: several small models instead of one thinker, able to stop and ask.
+    panel_mode: bool,                       // edit mode: model emits unified-diff patches instead of full files
     step_last_paused: u32,                  // dedup: highest step number already paused on this reply
     step_continues: u32,                    // auto-continues issued for this reply (hard-capped)
     step_pending_continue: bool,            // a step pause finished → issue the continue when the stream closes
@@ -986,6 +1025,8 @@ pub struct Chat {
     show_checkpoints: bool,                 // checkpoints panel open
     /// GPU phase-breakdown subpanel open (📊 in the composer bar).
     show_metrics: bool,
+    /// Tracks which step faults have already been reported, so a repeat can stop the run.
+    step_verifier: crate::stepverify::Verifier,
     /// Steps the reader has opened, as (message, step). Per-step rather than per-message: opening one
     /// long step usually means wanting that one, not every step of every later reply.
     step_open: std::collections::HashSet<(usize, usize)>,
@@ -1079,6 +1120,7 @@ impl Default for Chat {
             request_smaller_model: false,
             show_help: false,
             note: String::new(),
+            error_banner: None,
             gitmind_session: None,
             agent_files: Vec::new(),
             agent_plan: Vec::new(),
@@ -1097,8 +1139,11 @@ impl Default for Chat {
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
             attach_picker: Default::default(), save_dir: None, last_saved: None, preview: None,
-            auto_continue: true, stepwise: false, patch_mode: false, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
+            auto_continue: true, stepwise: false, patch_mode: false, panel_mode: false,
+            last_tok_per_s: None, reveal_held_ms: 0, reveal_shown_len: 0,
+            last_loaded: None, last_picked: None, revert_picker: None, step_last_paused: 0, step_continues: 0, step_pending_continue: false, step_arm_continue: false, step_was_continue: false, step_empty_retries: 0, step_shell: None, step_inject: None, hit_cap: false,
             checkpoints: Vec::new(), show_checkpoints: false, checked_restore: false, recover: None,
+            step_verifier: crate::stepverify::Verifier::new(),
             step_open: Default::default(),
             watch: logscope::thinkerwatch::ThinkerWindow::new(),
             watch_full: String::new(), watch_gist: None,
@@ -1342,6 +1387,44 @@ impl Chat {
                                 // nominal plan so an under-planned reply still finishes. cap is the loop
                                 // backstop; grace bounds overshoot beyond n without an explicit finish.
                                 let cont = crate::stepwise::should_continue_ex(&mark, m.text(), self.step_continues, 24, crate::stepwise::DEFAULT_GRACE);
+                                // VERIFY BEFORE ADVANCING. A 30-turn run on a 1B model produced the
+                                // same broken snippet every turn because nothing ever checked whether
+                                // the code parsed — the prompts varied only in tone. prechecks has been
+                                // able to catch exactly that since _240 and had no caller.
+                                //
+                                // Runs on every step, not only ones whose summary mentions tests: a
+                                // step that does not say "test" is precisely the one that advances with
+                                // a dangling `else if` and takes the next step down with it.
+                                let mut cont = cont;
+                                if cont {
+                                    let blocking: Vec<String> = crate::stepwise::extract_files(m.text())
+                                        .iter()
+                                        .flat_map(|(name, body)| {
+                                            crate::prechecks::scan_rust(body).into_iter()
+                                                .filter(|f| f.confidence == crate::prechecks::Confidence::Certain)
+                                                .map(move |f| format!("{name}:{}: {} — {}", f.line, f.what, f.fix))
+                                        })
+                                        .collect();
+                                    match self.step_verifier.check(&blocking) {
+                                        crate::stepverify::Verdict::Advance => {}
+                                        crate::stepverify::Verdict::Revise { prompt, findings } => {
+                                            // Reuse the channel the cargo hook already uses to reach
+                                            // the model. A second mechanism would have been a field
+                                            // nobody reads — which is how prechecks ended up with zero
+                                            // callers in the first place.
+                                            self.step_inject = Some(prompt);
+                                            self.note = format!("step {}/{} — {} error(s), revising",
+                                                mark.k, mark.n, findings.len());
+                                        }
+                                        crate::stepverify::Verdict::Stuck { repeated } => {
+                                            // The same fault survived being reported. Thirty more turns
+                                            // will not fix it; stopping is the useful answer.
+                                            cont = false;
+                                            self.note = format!("step {}/{} — stopped: {} fault(s) \
+survived being reported, so more turns will not fix them", mark.k, mark.n, repeated.len());
+                                        }
+                                    }
+                                }
                                 self.step_pending_continue = cont;
                                 self.note = format!("step {}/{} — {}", mark.k, mark.n, mark.summary);
                                 // tests→cargo hook: a test/build step pauses, we materialize the reply's
@@ -1382,6 +1465,11 @@ impl Chat {
                                 // prefer it), scan the code so far for mechanical breaks. On a hit, queue a
                                 // ⟲ CHECK self-review nudge so the model looks back and fixes it in place on
                                 // resume — a review point offered, not a correction imposed.
+                                // Only when nothing more definite is already queued. A prechecks
+                                // finding is a fact about the code; the tripwire note is a nudge to
+                                // self-review. Letting the nudge overwrite the fact would send the
+                                // model to "look over your work" when the answer is "line 4 does not
+                                // parse" — which is the tone-instead-of-correctness failure again.
                                 if cont && self.step_shell.is_none() && self.step_inject.is_none() {
                                     let sig = crate::tripwire::scan(m.text());
                                     if let Some(note) = crate::tripwire::review_note(&sig) {
@@ -1429,6 +1517,18 @@ impl Chat {
                     }
                 }
                 self.last = Some((tokens, secs));
+                // APPLY THE PATCHES. patch_mode injected PATCH_MODE_PROMPT and then did nothing with the
+                // reply — the model was asked for unified diffs that were never parsed, so "patch mode" was a
+                // prompt change with no mechanism behind it. parse_patches and apply_file_patch_strict both
+                // existed already; only this call was missing.
+                if self.patch_mode {
+                    if let Some(txt) = idx.and_then(|k| self.msgs.get(k)).map(|m| m.text().to_string()) {
+                        self.apply_patch_reply(&txt);
+                    }
+                }
+                // A finished stream reveals everything; the held clock must not carry into the next turn.
+                self.reveal_held_ms = 0;
+                self.reveal_shown_len = 0;
                 self.stream = None;
                 self.rep_monitor.reset();
                 // Stepwise: the pause we requested has landed — arm the auto-continue. It fires in the
@@ -1508,10 +1608,34 @@ impl Chat {
                 self.stream = None;
                 self.rep_monitor.reset();
             }
-            Evt::Loaded(Ok(info)) => { self.template = info.template; }
-            Evt::Loaded(Err(_)) => {}
+            Evt::Loaded(Ok(info)) => {
+                self.template = info.template;
+                // Remember what is ACTUALLY running, so a later failure has something to revert to.
+                // Without this the picker is the only record of the model, and it is the record that
+                // is wrong after a failure.
+                self.last_loaded = Some(info.path.clone());
+            }
+            Evt::Loaded(Err(e)) => {
+                // The banner, not the note. This message carries the arithmetic — host RAM,
+                // resident, page cache, and the flag that would help — and it went to the
+                // terminal while the UI showed a line the next status overwrote.
+                self.error_banner = Some(e.to_string());
+                // The picker was set optimistically when the load STARTED, so a failure leaves it
+                // naming a model that is not running — and the menu then asserts the wrong model is
+                // loaded. A name in the active slot is the one piece of state nobody re-checks.
+                self.revert_picker =
+                    Some(logscope::activemodel::on_load_failed(
+                        self.last_picked.as_deref(), self.last_loaded.as_deref()));
+            }
         }
     }
+
+    /// Hand the pending revert to the app, once.
+    ///
+    /// The chat tab observes the failure and the app owns the picker; passing the decision across
+    /// rather than writing it directly keeps a single writer, which is what _290 had to restore after
+    /// two of them disagreed.
+    pub fn take_revert_picker(&mut self) -> Option<Option<String>> { self.revert_picker.take() }
 
     fn params(&self) -> GenParams {
         // Auto-continue → decode a fresh reply continuously up to N chunks in one session; the slider
@@ -1776,6 +1900,14 @@ impl Chat {
     fn build_prompt_upto(&self, upto: usize, doc: &crate::analysis::Doc) -> String {
         let mut sys = neutralize_markers(&self.full_system(doc));
         if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        // The liaison persona is written for a turn that HAS observations. Selected as a chat
+        // persona most turns have none — which is why every reply opened with a backend status line,
+        // including the answer to "hi there", and why "tell the debaters..." produced an error code
+        // for a run that never started.
+        if sys.contains("You are a liaison") {
+            sys.push_str("\n\n");
+            sys.push_str(logscope::liaison_prompt::LIAISON_NO_OBSERVATIONS);
+        }
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         match self.backend {
@@ -1807,6 +1939,14 @@ impl Chat {
     fn build_continue_prompt(&self, doc: &crate::analysis::Doc) -> String {
         let mut sys = neutralize_markers(&self.full_system(doc));
         if self.stepwise { sys.push_str(crate::stepwise::STEPWISE_PROMPT); }
+        // The liaison persona is written for a turn that HAS observations. Selected as a chat
+        // persona most turns have none — which is why every reply opened with a backend status line,
+        // including the answer to "hi there", and why "tell the debaters..." produced an error code
+        // for a run that never started.
+        if sys.contains("You are a liaison") {
+            sys.push_str("\n\n");
+            sys.push_str(logscope::liaison_prompt::LIAISON_NO_OBSERVATIONS);
+        }
         if self.patch_mode { sys.push_str(crate::patchmode::PATCH_MODE_PROMPT); }
         let sys = sys;
         let last = self.msgs.len().saturating_sub(1);
@@ -2474,8 +2614,8 @@ impl Chat {
 
     /// Finalize a non-blocking agent run: snapshot the workspace, surface the outcome, clear the driver.
     fn finish_agent_run(&mut self, stop: crate::workspace_exec::Stop) {
-        let (files, plan, verified, turns) = match self.agent_run.take() {
-            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns()),
+        let (files, plan, verified, turns, had_verifier) = match self.agent_run.take() {
+            Some(r) => (r.events().to_vec(), r.plan().steps.iter().map(|s| (s.text.clone(), s.done)).collect::<Vec<_>>(), r.verified(), r.turns(), r.had_verifier()),
             None => return,
         };
         self.agent_files = files;
@@ -2492,7 +2632,10 @@ impl Chat {
         let snap = self.gitmind_session.as_ref()
             .and_then(|s| crate::mount::snapshot(&s.ws, &format!("agent: {}", self.agent_task)).ok())
             .unwrap_or(false);
-        let vnote = if verified { " · ✓ verified" } else { " · ⚠ unverified" };
+        // THREE STATES, NOT TWO. `verified` starts true when no verify command is configured, so a
+        // run where nothing was checked rendered as "✓ verified" — which is worse than no badge,
+        // because it is the reason someone stops looking.
+        let vnote = crate::workspace_exec::VerifyBadge::of(verified, had_verifier).label();
         let snap_note = if snap { " · snapshotted" } else { "" };
         self.note = format!("agent: {stopdesc} · plan {done}/{total} · {touched} file(s){vnote}{snap_note} · :reapply to land");
     }
@@ -2500,6 +2643,52 @@ impl Chat {
     /// Launch a fan of agent branches with `cfg`, seeding goals from `task`. Shared by :fan-agent and :docs.
     /// Turn-0 context for any agent/fan run over the loaded workspace: bounded file tree + shared
     /// crew docs. This is what makes "add more blocks" land on a model that can SEE the repo.
+    /// Parse a patch-mode reply and apply it to the workspace.
+    ///
+    /// STRICT, and failing hunks are reported rather than forced. A hunk whose context does not match
+    /// is a hunk aimed at a file the model was not looking at, and applying it by searching nearby
+    /// would land a change on whatever happened to resemble it — valid-looking source that nobody
+    /// asked for. `apply_file_patch_strict` already refuses; this surfaces the refusal.
+    ///
+    /// Nothing is written unless EVERY hunk in that file applied. A half-patched file is worse than an
+    /// unpatched one: it compiles or it does not, and either way it no longer matches the diff the
+    /// model produced or the source it was reasoning about.
+    fn apply_patch_reply(&mut self, reply: &str) {
+        let patches = crate::patchmode::parse_patches(reply);
+        if patches.is_empty() { return; }
+        let Some(sess) = self.gitmind_session.as_ref() else {
+            self.note = format!("patch mode: {} patch(es) parsed but no workspace is open to apply \
+them to", patches.len());
+            return;
+        };
+        let root = sess.work_dir().to_path_buf();
+        let (mut applied, mut refused) = (0usize, Vec::new());
+        for fp in &patches {
+            let path = root.join(&fp.path);
+            let Ok(orig) = std::fs::read_to_string(&path) else {
+                refused.push(format!("{}: not readable under the workspace", fp.path));
+                continue;
+            };
+            let out = crate::patchmode::apply_file_patch_strict(&orig, fp);
+            if !out.is_clean() {
+                // Report which hunks failed and why. A count alone tells nobody what to re-ask for.
+                for line in out.report() { refused.push(format!("{}: {line}", fp.path)); }
+                continue;
+            }
+            match std::fs::write(&path, &out.text) {
+                Ok(()) => applied += 1,
+                Err(e) => refused.push(format!("{}: write failed: {e}", fp.path)),
+            }
+        }
+        self.note = if refused.is_empty() {
+            format!("patch mode: {applied} file(s) patched")
+        } else {
+            for r in &refused { eprintln!("patch: {r}"); }
+            format!("patch mode: {applied} applied, {} refused — see the log; nothing was force-fitted",
+                    refused.len())
+        };
+    }
+
     fn agent_context(&self) -> String {
         let Some(sess) = self.gitmind_session.as_ref() else { return String::new() };
         let root = sess.work_dir();
@@ -2770,7 +2959,7 @@ impl Chat {
                         if let Some(f) = self.agent_fan.as_mut() { f.set_width(lanes); steps.extend(f.fill()); }
                     }
                 }
-                crate::lanes::LaneEvt::LoadError(e) => { self.note = format!("lanes: load failed — {e}"); dead = true; }
+                crate::lanes::LaneEvt::LoadError(e) => { self.error_banner = Some(e.to_string()); self.note = format!("lanes: load failed — {e}"); dead = true; }
                 crate::lanes::LaneEvt::Token { job, text } => {
                     if let Some(&b) = self.lane_jobs.get(&job) {
                         if let Some(f) = self.agent_fan.as_mut() { f.on_token_branch(b, &text); }
@@ -5533,6 +5722,18 @@ impl Chat {
                 let mut cur = self.active_leaf;
                 while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
                 chain.reverse();
+                // EVERY BRANCH, EVERY MESSAGE, EVERY VARIANT. This walked active_leaf back through
+                // parents and wrote that ONE chain — dropping every alternative a fan-out produced, and
+                // within each surviving turn every regeneration except the selected one. It reported the
+                // turns it saved, so nothing indicated what was missing — the worst shape a data-loss bug
+                // can have.
+                let all_branches = logscope::branchtree::branches(&self.msgs, self.active_leaf);
+                let alt_variants: usize =
+                    self.msgs.iter().map(|m| m.all_variants().len().saturating_sub(1)).sum();
+                if all_branches.len() > 1 || alt_variants > 0 {
+                    eprintln!("export: {}", logscope::branchtree::manifest(&all_branches));
+                    eprintln!("export: {alt_variants} alternative variant(s) beyond the selected ones");
+                }
                 let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
                     .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(), m.text().to_string()))
                     .collect();
@@ -5648,6 +5849,18 @@ impl Chat {
                 let mut cur = self.active_leaf;
                 while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
                 chain.reverse();
+                // EVERY BRANCH, EVERY MESSAGE, EVERY VARIANT. This walked active_leaf back through
+                // parents and wrote that ONE chain — dropping every alternative a fan-out produced, and
+                // within each surviving turn every regeneration except the selected one. It reported the
+                // turns it saved, so nothing indicated what was missing — the worst shape a data-loss bug
+                // can have.
+                let all_branches = logscope::branchtree::branches(&self.msgs, self.active_leaf);
+                let alt_variants: usize =
+                    self.msgs.iter().map(|m| m.all_variants().len().saturating_sub(1)).sum();
+                if all_branches.len() > 1 || alt_variants > 0 {
+                    eprintln!("export: {}", logscope::branchtree::manifest(&all_branches));
+                    eprintln!("export: {alt_variants} alternative variant(s) beyond the selected ones");
+                }
                 let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
                     .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(), m.text().to_string()))
                     .collect();
@@ -5669,6 +5882,18 @@ impl Chat {
                 let mut cur = self.active_leaf;
                 while let Some(i) = cur { chain.push(i); cur = self.msgs.get(i).and_then(|m| m.parent); }
                 chain.reverse();
+                // EVERY BRANCH, EVERY MESSAGE, EVERY VARIANT. This walked active_leaf back through
+                // parents and wrote that ONE chain — dropping every alternative a fan-out produced, and
+                // within each surviving turn every regeneration except the selected one. It reported the
+                // turns it saved, so nothing indicated what was missing — the worst shape a data-loss bug
+                // can have.
+                let all_branches = logscope::branchtree::branches(&self.msgs, self.active_leaf);
+                let alt_variants: usize =
+                    self.msgs.iter().map(|m| m.all_variants().len().saturating_sub(1)).sum();
+                if all_branches.len() > 1 || alt_variants > 0 {
+                    eprintln!("export: {}", logscope::branchtree::manifest(&all_branches));
+                    eprintln!("export: {alt_variants} alternative variant(s) beyond the selected ones");
+                }
                 let turns: Vec<(String, String)> = chain.iter().filter_map(|&i| self.msgs.get(i))
                     .map(|m| ((if m.role == Role::Assistant { "assistant" } else { "user" }).to_string(), m.text().to_string()))
                     .collect();
@@ -5833,6 +6058,35 @@ impl Chat {
                         ui.label(RichText::new(format!("{c}×")).color(theme::CYAN()).small().strong());
                     }
                     if !self.note.is_empty() {
+// THE PERSISTENT BANNER, above the transient note. A load failure carries the numbers an
+// operator needs — host RAM, resident, page cache, the flag that would help — and it used to
+// land in `note`, which the next status overwrites.
+//
+// Copy comes first because the first thing anyone does with an error is paste it somewhere.
+// Close is explicit: an error that dismisses itself on a timer is one that vanishes while
+// being read, and this text is long enough to still be reading.
+if let Some(msg) = self.error_banner.clone() {
+    egui::Frame::none()
+        .fill(theme::RED().linear_multiply(0.12))
+        .inner_margin(egui::Margin::same(8))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("model not loaded").color(theme::RED()).strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("dismiss").clicked() {
+                        self.error_banner = None;
+                    }
+                    if ui.small_button("⧉").on_hover_text("copy the full message").clicked() {
+                        ui.ctx().copy_text(msg.clone());
+                    }
+                });
+            });
+            // Wrapped rather than truncated: the useful part of these messages is the numbers at
+            // the end, so eliding the tail removes exactly what someone opened it for.
+            ui.label(RichText::new(&msg).small());
+        });
+    ui.add_space(4.0);
+}
                         ui.label(RichText::new(&self.note).color(theme::GREEN()).small());
                     } else {
                         ui.label(RichText::new(self.modal_hint()).color(theme::FAINT()).small());
@@ -6090,6 +6344,9 @@ impl Chat {
                     ui.label(RichText::new(format!("thinking… ({:.0}s)", secs)).color(theme::CYAN()).small())
                         .on_hover_text("prefilling the prompt — the reply starts once this finishes");
                 } else if debug {
+                    // FEED REVEALPACE. Same numbers the debug readout uses, so the pace tracks the rate the
+                    // operator can see rather than a separate estimate that could disagree with it.
+                    if secs > 0.5 { self.last_tok_per_s = Some(toks as f32 / secs); }
                     ui.label(RichText::new(format!("{toks} tok · {:.1} tok/s", toks as f32 / secs)).color(theme::AMBER()).small());
                 } else if let Some(pred) = crate::estimate::predict(&self.gen_samples, self.last_prompt_tokens, 0.35) {
                     let pct = (crate::estimate::progress(toks, &pred) * 100.0).round() as u32;
@@ -6223,7 +6480,7 @@ impl Chat {
         if self.show_context {
             egui::SidePanel::right("chat_right").resizable(true).default_width(330.0).show_inside(ui, |ui| {
                 ui.add_space(theme::PAD_XS as f32);
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     if ui.selectable_label(self.right_page == RightPage::Files, RichText::new("📄 Files").small()).clicked() { self.right_page = RightPage::Files; }
                     if ui.selectable_label(self.right_page == RightPage::Graph, RichText::new("⌗ Graph").small()).clicked() { self.right_page = RightPage::Graph; }
                     if ui.selectable_label(self.right_page == RightPage::Context, RichText::new("⚙ Context").small()).clicked() { self.right_page = RightPage::Context; }
@@ -6317,7 +6574,17 @@ impl Chat {
                         RightPage::Prompting => {
                             ui.label(RichText::new("PROMPTING MODE").color(theme::DIM()).small().strong());
                             ui.add_space(4.0);
+                            // GROUP BY AXIS. Six entries answering two different questions — three vary how WIDE the
+                            // fan-out is, three vary WHO REASONS — and an undifferentiated list makes an operator infer
+                            // that from the names before they can choose. A heading per group costs two lines and
+                            // removes the inference.
+                            let mut last_axis = "";
                             for m in crate::coordinator::Mode::all() {
+                                if m.axis() != last_axis {
+                                    if !last_axis.is_empty() { ui.add_space(6.0); }
+                                    ui.label(RichText::new(m.axis()).color(theme::FAINT()).small());
+                                    last_axis = m.axis();
+                                }
                                 let on = self.coord_mode == m;
                                 if ui.selectable_label(on, RichText::new(m.label()).color(if on { theme::CYAN() } else { theme::INK() }).strong()).clicked() {
                                     self.coord_mode = m;
@@ -6833,7 +7100,21 @@ impl Chat {
                     }
                 }
                 ui.add_space(theme::PAD_XS as f32);
-                ui.horizontal(|ui| {
+                // MOBILE OVERLAP. egui's horizontal() does not wrap: controls past the right edge are drawn
+                // anyway, on top of each other. On a desktop this bar never reaches the edge, so the failure is
+                // invisible in development and immediate on a phone. horizontal_wrapped stops the overlap;
+                // mobilelayout::row_mode decides when a row should instead SHED controls, because a wrapped
+                // four-line bar of tiny buttons is not usable either.
+                ui.horizontal_wrapped(|ui| {
+                    // SHED, DO NOT STACK. Wrapping stopped the overlap and left a phone with a four-line bar of
+                    // tiny buttons, which is not usable either — I fixed half the problem in _367 and wired the
+                    // decision that fixes the other half without ever calling it.
+                    //
+                    // Two controls must stay reachable (send state, and the mode the run is in); the rest go
+                    // behind a menu when the width cannot hold them at a touch-sized target.
+                    let touch = ui.input(|i| i.pointer.has_pointer()) == false || cfg!(target_os = "android");
+                    let overflow = crate::mobilelayout::row_mode(ui.available_width(), 2, 5, touch)
+                        == crate::mobilelayout::RowMode::Overflow;
                     if theme::carved_button(ui, "📎 Attach").on_hover_text("Attach a text file into your message (bounded)").clicked() {
                         let start = self.save_dir.clone()
                             .or_else(|| std::env::var("HOME").ok().map(std::path::PathBuf::from))
@@ -6870,12 +7151,31 @@ impl Chat {
                         ui.label(RichText::new(e).color(egui::Color32::from_rgb(0xe0, 0x6c, 0x6c)).small());
                     }
                     ui.label(RichText::new(if self.threading { "threaded" } else { "single-shot" }).color(theme::FAINT()).small());
-                    ui.checkbox(&mut self.stepwise, RichText::new("stepwise").small())
-                        .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
-                    ui.checkbox(&mut self.auto_continue, RichText::new("auto-continue").small())
-                        .on_hover_text("When a reply hits the length cap, keep generating to finish it");
-                    ui.checkbox(&mut self.patch_mode, RichText::new("patch mode").small())
-                        .on_hover_text("edit mode: the model emits unified-diff patches (only changed lines) instead of rewriting whole files — fewer tokens per edit, applied context-anchored and committed via gitmind.");
+                    // PANEL MODE. Built in _373/_375 and never given a control, which is why it could not be
+                    // found in the menu. Its advantage is not answer quality — it is that several short turns
+                    // can each stop and ask, where one long generation cannot interrupt itself usefully.
+                    // The four mode toggles, rendered inline when the bar can hold them and inside the ⋯ menu
+                    // when it cannot. Hoisted into locals so ONE definition serves both placements — two copies
+                    // would be a policy expressed twice, which is how the watchdog tables drifted.
+                    let (mut panel_mode, mut stepwise) = (self.panel_mode, self.stepwise);
+                    let (mut auto_continue, mut patch_mode) = (self.auto_continue, self.patch_mode);
+                    {
+                        let mut modes = |ui: &mut egui::Ui| {
+                        ui.checkbox(&mut panel_mode, RichText::new("debate panel").small())
+                            .on_hover_text("Several small models debate instead of one thinker. They can pause to \
+    ask you a question between messages, and one member is held BLIND to the answer — so the next \
+    round can tell whether your hint drove the conclusion or the question did.");
+                        ui.checkbox(&mut stepwise, RichText::new("stepwise").small())
+                            .on_hover_text("checkpoint mode: the model works in numbered steps, pausing at ⏸ STEP k/n markers; the harness continues for you (warm-KV). Each pause is a fan-out injection point.");
+                        ui.checkbox(&mut auto_continue, RichText::new("auto-continue").small())
+                            .on_hover_text("When a reply hits the length cap, keep generating to finish it");
+                        ui.checkbox(&mut patch_mode, RichText::new("patch mode").small())
+                            .on_hover_text("edit mode: the model emits unified-diff patches (only changed lines) instead of rewriting whole files — fewer tokens per edit, applied context-anchored and committed via gitmind.");
+                        };
+                        if overflow { ui.menu_button("⋯ modes", |ui| modes(ui)); } else { modes(ui); }
+                    }
+                    self.panel_mode = panel_mode; self.stepwise = stepwise;
+                    self.auto_continue = auto_continue; self.patch_mode = patch_mode;
                     if self.hit_cap && !streaming {
                         if theme::action_button(ui, "⏭ Continue", theme::CYAN(), true)
                             .on_hover_text("The last reply hit the length cap — resume it").clicked() { do_continue = true; }
@@ -6989,6 +7289,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                     let expanded_now = self.expanded_msgs.clone();
                     let step_open = self.step_open.clone();
                     let mut toggle_step: Option<(usize, usize)> = None;
+                    let mut swipe_variant: Option<(usize, i32)> = None;
                     let mut expand_msg: Option<usize> = None;
                     let mut collapse_msg: Option<usize> = None;
                     for (i, m) in self.msgs.iter_mut().enumerate() {
@@ -7000,6 +7301,26 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                         let a = theme::appear(m.born, 0.18);
                         if a < 1.0 { ui.ctx().request_repaint(); }
                         let streaming_here = cur == Some(i);
+                        // SWIPE BETWEEN REGENERATIONS. A horizontal drag on a message steps its
+                        // variants, the way a photo gallery does — which takes the arrow buttons out of
+                        // a bar that was already overlapping rather than adding to it. The axis lock and
+                        // the mid-stream refusal live in chatgesture; this only supplies the drag.
+                        if m.variants.len() > 1 && !streaming_here {
+                            let d = ui.input(|i| i.pointer.delta());
+                            if ui.rect_contains_pointer(ui.min_rect())
+                                && ui.input(|i| i.pointer.primary_down()) {
+                                let ax = crate::chatgesture::lock_axis(d.x, d.y);
+                                let delta = if d.x < -crate::chatgesture::AXIS_LOCK_PT { 1 }
+                                            else if d.x > crate::chatgesture::AXIS_LOCK_PT { -1 }
+                                            else { 0 };
+                                if let crate::chatgesture::Action::ShowVariant { delta, .. } =
+                                    crate::chatgesture::action(
+                                        crate::chatgesture::Target::Message(i), delta, ax,
+                                        streaming_here, m.variants.len(), m.cur) {
+                                    swipe_variant = Some((i, delta));
+                                }
+                            }
+                        }
                         theme::fade(ui, a, |ui| {
                             egui::Frame { fill, corner_radius: theme::r(10),
                                 inner_margin: egui::Margin::symmetric(theme::PAD_MD, theme::PAD_SM + 2),
@@ -7029,7 +7350,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                 ui.add_space(2.0);
                                 if m.editing {
                                     ui.add(egui::TextEdit::multiline(&mut m.edit_buf).id(egui::Id::new(("logscope_chat_edit", i))).desired_rows(2).desired_width(f32::INFINITY));
-                                    ui.horizontal(|ui| {
+                                    ui.horizontal_wrapped(|ui| {
                                         if theme::action_button(ui, "Save & re-run", theme::GREEN(), true).clicked() { action = Some(MsgAction::EditSave(i)); }
                                         if ui.button("Cancel").clicked() { action = Some(MsgAction::EditCancel(i)); }
                                     });
@@ -7075,7 +7396,38 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                         }
                                         return;
                                     }
-                                    let segs = segment_message(m.text());
+                                    // BOUND THE MEASURE. Nothing capped prose width, so on a wide window a line ran past 200
+                                    // characters against a comfortable maximum of 80. The failure is not illegibility — it is
+                                    // the RETURN SWEEP: the eye travels back across the whole width and lands on the wrong line
+                                    // often enough to be exhausting over an hour. Nothing looks broken at any width, so it never
+                                    // presents as a bug; it presents as the reader being tired.
+                                    //
+                                    // Code is deliberately NOT bounded — a wrapped line of code loses its indentation as
+                                    // structure, so it takes the full width and scrolls instead.
+                                    // Measured from a laid-out glyph rather than assumed: the same point
+                                // size gives very different measures in a condensed face and a wide one.
+                                let fid = egui::TextStyle::Body.resolve(ui.style());
+                                let char_px = ui.painter()
+                                    .layout_no_wrap("0".into(), fid, theme::INK()).size().x;
+                                    let prose_w = crate::readability::prose_width(ui.available_width(), char_px);
+                                    ui.set_max_width(prose_w.max(120.0));
+                                    // SECTION-PACED REVEAL. Token-by-token was proof of life when generation was slow; above
+                                    // reading speed it is a jittering edge and half-formed words. revealpace holds the tail back
+                                    // to the last semantic boundary — but only when the model is FAST, because on a slow one a
+                                    // still screen reads as a hang, which is exactly when someone is deciding if anything works.
+                                    //
+                                    // The flush timeout bounds a boundary that never arrives (a long code block), and completion
+                                    // always reveals everything, so a held tail can never become text that never appears.
+                                    let shown = if streaming_here {
+                                        let pace = crate::revealpace::pace(self.last_tok_per_s);
+                                        let held = self.reveal_held_ms;
+                                        let n = crate::revealpace::reveal_upto(m.text(), pace, held, false);
+                    // Reset the clock whenever the boundary MOVED: the tail has only been withheld
+                    // since the last thing the reader actually saw, not since the turn began.
+                    if n != self.reveal_shown_len { self.reveal_held_ms = 0; self.reveal_shown_len = n; }
+                                        &m.text()[..n.min(m.text().len())]
+                                    } else { m.text() };
+                                    let segs = segment_message(shown);
                                     let last = segs.len().saturating_sub(1);
                                     let think_open = m.think_open;
                                     let mut toggle_think = false;
@@ -7199,6 +7551,17 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                             });
                             ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
                         }
+                    }
+                    // APPLY THE SWIPE. This was computed and discarded, so the gesture has done nothing since
+                    // _368 — the model layer was correct, tested, and never consulted.
+                    //
+                    // chatgesture::action already refused mid-stream swipes and single-variant messages, so
+                    // reaching here means the change is allowed. The clamp is the second half of that contract:
+                    // CLAMP, not wrap, because wrapping from the last regeneration back to the first reads as
+                    // having lost the newest one.
+                    if let Some((i, d)) = swipe_variant {
+                        let n = self.msgs[i].variants.len();
+                        self.msgs[i].cur = (self.msgs[i].cur as i32 + d).clamp(0, n as i32 - 1) as usize;
                     }
                 });
         });

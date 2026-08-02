@@ -560,3 +560,92 @@ pub fn gate_store() {
 
     println!("gate-store: {}", if ok { "content-addressed store checks \u{2713}" } else { "FAIL \u{2717}" });
 }
+
+// ── Measured device bandwidth ───────────────────────────────────────────────────────────────────
+//
+// `--gate-vram` and `--gate-perf` measure what a device actually does, and until now nothing carried
+// those figures back to a running engine. The consequence was concrete: perfverdict could never return
+// AtBandwidthLimit — the one verdict that says STOP OPTIMISING, because the run is at the physical
+// limit and the compute/submit/sync split is irrelevant.
+//
+// Stored per adapter, in the same tab-separated file style as the autotune tiles, because a measurement
+// belongs to a device and not to a build.
+
+fn bandwidth_file() -> PathBuf { cache_root().join("measured-bandwidth.tsv") }
+
+/// Record a measured device bandwidth, in GiB/s.
+///
+/// Refuses a non-positive figure rather than storing it: 0 is the sentinel for "never measured", and
+/// writing one would make an unmeasured device indistinguishable from a device measured at zero.
+pub fn bandwidth_put(adapter: &str, gib_per_s: f32) {
+    if !(gib_per_s > 0.0) { return; }
+    let _ = ensure_cache_dir();
+    let mut out = String::new();
+    if let Ok(txt) = std::fs::read_to_string(bandwidth_file()) {
+        for line in txt.lines() {
+            if line.split('\t').next() != Some(adapter) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str(&format!("{adapter}\t{gib_per_s}\n"));
+    let _ = std::fs::write(bandwidth_file(), out);
+}
+
+/// The measured bandwidth for this adapter, if one was ever recorded.
+///
+/// `None` means unmeasured, and every caller must treat that as "cannot evaluate" rather than
+/// substituting a default — a plausible default here produces a confident efficiency figure from no
+/// measurement, which is exactly the 24 GiB constant's failure in a new place.
+pub fn bandwidth_get(adapter: &str) -> Option<f32> {
+    let txt = std::fs::read_to_string(bandwidth_file()).ok()?;
+    for line in txt.lines() {
+        let mut f = line.split('\t');
+        if f.next() == Some(adapter) {
+            return f.next().and_then(|v| v.parse::<f32>().ok()).filter(|v| *v > 0.0);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod bandwidth_tests {
+    use super::*;
+
+    #[test]
+    fn an_unmeasured_adapter_returns_None_not_a_default() {
+        // The whole point. A default here would produce a confident efficiency figure from no
+        // measurement — the 24 GiB constant's failure in a new place.
+        assert!(bandwidth_get("no-such-adapter-9f3a2b").is_none());
+    }
+
+    #[test]
+    fn a_non_positive_measurement_is_REFUSED_rather_than_stored() {
+        // 0 is the sentinel for "never measured". Storing one would make an unmeasured device
+        // indistinguishable from a device measured at zero, and the caller could not tell.
+        let a = "test-adapter-refuses-zero-8c1d";
+        bandwidth_put(a, 0.0);
+        bandwidth_put(a, -5.0);
+        assert!(bandwidth_get(a).is_none());
+    }
+
+    #[test]
+    fn a_measurement_round_trips_and_the_latest_wins() {
+        let a = "test-adapter-roundtrip-4e7f";
+        bandwidth_put(a, 258.1);
+        assert_eq!(bandwidth_get(a), Some(258.1));
+        // Re-measuring replaces rather than appending, or the file grows and the first line wins
+        // forever — which would pin a device to whatever it measured on its worst day.
+        bandwidth_put(a, 301.4);
+        assert_eq!(bandwidth_get(a), Some(301.4));
+    }
+
+    #[test]
+    fn adapters_do_not_collide() {
+        bandwidth_put("test-adapter-A-11", 100.0);
+        bandwidth_put("test-adapter-B-11", 200.0);
+        assert_eq!(bandwidth_get("test-adapter-A-11"), Some(100.0));
+        assert_eq!(bandwidth_get("test-adapter-B-11"), Some(200.0));
+    }
+}

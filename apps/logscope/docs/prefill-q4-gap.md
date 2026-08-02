@@ -1,0 +1,317 @@
+# The prefill kernel gap: q8_0 has a GEMM, q4 does not
+
+Measured on an M2 Ultra: Qwen3-30B-A3B, 1625-token prompt, **31.72s prefill** — about 51 tok/s.
+
+## What the two paths actually are
+
+```
+m == 1        MATVEC_Q4          one row
+m <= 8        MATVEC_Q4_SMALLB   reads each nibble once, accumulates all m rows
+m >  8        LINEAR_Q4          strided — RE-READS THE WEIGHTS PER TILE
+```
+
+Prefill runs at `m = 1024`, so it takes the third. The in-tree comment on the small-batch kernel says
+exactly what the third one costs: it exists to keep *"Q4's halved weight-bandwidth advantage instead of
+the strided LINEAR_Q4 re-reading weights per tile"* — and then that advantage is given back above m=8.
+
+Meanwhile `q8_0` has `linear_q8_0_gemm_rb`, a register-blocked GEMM measured at **2795 GFLOP/s**,
+described in-tree as **2.8× the tiled kernel and 5.6× naive**, and it is the *default* — the tiled
+variant is the opt-in escape, not the fast path.
+
+**So a Q4_K model prefills on the kernel a Q8_0 model escaped from.** Q4_K_M is the format almost every
+checkpoint ships in, which makes this the common case rather than an edge.
+
+## Why it looks fine
+
+Nothing is broken. The output is correct, the profile reports the GPU busy, and decode — which runs at
+m=1 and uses `MATVEC_Q4` — is unaffected. The cost is confined to prefill, appears once per turn, and
+is easy to attribute to "long prompt" rather than to the kernel.
+
+It also does not show in the submit-cause breakdown, because the strided kernel is not doing *more
+submits* — it is doing more *bandwidth per submit*.
+
+## What the references do
+
+llama.cpp does not have this split: its `mul_mat` dispatches by quantization type into the same
+batched shape for every format, so Q4_K prefill and Q8_0 prefill differ in dequantization cost and not
+in memory traffic pattern.
+
+Colibri holds everything as int8-per-row and dequantizes on use inside one matvec — a single path, so
+the question does not arise. That is the design consequence of converting to ONE canonical compute
+format at load, which this engine deliberately does not do (it keeps q4 to halve the bytes).
+
+Keeping q4 is the right call for decode, which is bandwidth-bound at m=1. The gap is that the same
+decision was never revisited for prefill, which is compute-bound at m=1024 and has the opposite
+tradeoff.
+
+## The fix, and its size
+
+A register-blocked q4 GEMM, mirroring `linear_q8_0_gemm_rb`: hold a tile of `a` in registers, read each
+weight nibble once, accumulate across the tile. The q8_0 version already proves the shape works on this
+hardware and compiles on every backend — the q4 version differs only in unpacking two weights per byte.
+
+Gate it against the existing `MATVEC_Q4` reference the way `--gate-matvec` already does, and **run that
+gate on hardware**: this codebase has twice shipped a kernel that was bit-exact on lavapipe and wrong on
+an M2.
+
+Expected: prefill moves from bandwidth-per-tile to bandwidth-once, so the ceiling becomes the same
+compute bound q8_0 already reaches. Whether it lands near 2795 GFLOP/s is a measurement, not a promise.
+
+---
+
+# And decode is 6–10× off the same bound
+
+Measured from real runs on an M2 Ultra and M2 Max:
+
+```
+Llama-3.2-3B Q8_0   3.20 GiB/tok → floor 12.4 ms, observed 76.0 =  6.1× off
+DeepSeek-8B Q4_K    2.60 GiB/tok → floor 10.1 ms, observed 95.9 =  9.5× off
+Llama-3.2-1B Q4_K   0.55 GiB/tok → floor  2.1 ms, observed 21.2 =  9.9× off
+```
+
+Consistent across sizes and quants, so it is structural rather than a bad shape.
+
+## What has already been ruled out
+
+**Kernel choice within the current set.** The autotune candidate list contains `V1` (one thread per
+row, no reduction, no threadgroup memory), `V2`, `V2Wg128` and `V2WgSg`. It searches them per shape
+and `V2Wg128` wins. So the occupancy argument — that a large `red[tile*128]` threadgroup buffer pins
+concurrent workgroups on AGX, where each core has ~32 KB — was already put to the test by V1 and lost.
+
+That matters: it means the 6–10× is **not** a tuning problem. Every non-subgroup kernel is that far off.
+
+**Dispatch overhead.** 13–14 submits/token with 81% bind-group reuse, and setup time is 0.1–0.8% of
+wall. The GPU is not waiting on the host.
+
+## What remains
+
+`V2WgSg` — the one kernel the in-tree analysis expects to win on this hardware, because it uses native
+`subgroupAdd` with minimal or zero threadgroup memory. It is the ggml-metal shape: *"rows per SIMD
+group"*, one 32-wide subgroup cooperatively reducing a column-tile with no threadgroup memory at all.
+
+**It is disabled on three drivers because it is wrong on them.** So the decode speedup is gated behind
+fixing the subgroup kernel, which is gated behind the short-binding finding from `--gate-bytes` — reads
+past the first `u32` return zero.
+
+**That is one chain, not three problems.** The same short binding plausibly explains the Q6_K gate, the
+Q4_K gate, and the disabled decode kernel. Fixing it is the highest-value single action available, and
+it needs a dispatch-time print of the bound buffer length on hardware to localise — the input branch
+takes `as_entire_binding()` for `view: None`, which is correct on inspection, so the fault is either a
+view arriving where none should, or the dims uniform cutting the loop short.
+
+
+---
+
+# The wide-load decode kernel exists and the autotune cannot reach it
+
+`MATVEC_Q8_0_TILED_V3` — 128-bit `vec4<u32>` loads, four words per transaction instead of one. Its own
+comment states the case exactly:
+
+> The profile says decode is **latency/occupancy-bound** (≈6% BW, ≈1% ALU — the GPU idles on memory
+> latency), and wider loads put more bytes in flight per request, the textbook fix.
+
+That is precisely the 6–10×-off-roofline picture measured above: low bandwidth utilisation, near-zero
+ALU, the GPU waiting on memory rather than working.
+
+**But `MatvecKernel` is `V1 | V2 | V2Wg128 | V2WgSg`. There is no V3.** It reaches the GPU only through
+`LOGSCOPE_MATVEC_V3=1` and a bench in `main.rs`, so the per-shape autotune — which searches every other
+kernel and picks `V2Wg128` — has never compared against it.
+
+That is why `V2Wg128` "wins": it wins the search it was entered in.
+
+## What to try, in order
+
+```
+LOGSCOPE_MATVEC_V3=1        # the wide-load kernel, on a Q8_0 model
+```
+
+Q8_0 first because V3 is the q8_0 kernel — `Llama-3.2-3B-Instruct-Q8_0` at 76 ms/token against a
+12.4 ms floor is the cleanest test available.
+
+If it moves the number, the durable fix is adding `V3` to the `MatvecKernel` enum and the autotune
+candidate list, so it competes per shape like the others rather than being an env flag someone has to
+know about.
+
+## Why this is independent of the subgroup chain
+
+`V2WgSg` is blocked behind the short-binding finding and may take a while. V3 needs neither subgroups
+nor any driver feature the guard has disabled — it is the same barrier-tree reduction with wider loads.
+So it is the one decode speedup available *without* resolving `--gate-bytes`.
+
+## What the references say
+
+ggml-metal's decode kernels load `device const float4*` and `device const uchar4*` throughout — wide
+loads are the default there, not an option. Colibri does the same on the CPU side with `float32x4_t`
+accumulators, which is where the 2× integer-dot finding came from.
+
+Both treat 4-wide as the baseline shape. This engine has it, benchmarks it, and does not select it.
+
+
+---
+
+# Correction: q4 prefill is not missing a GEMM, its TILE is too small
+
+The earlier framing above — "q8_0 has a GEMM and q4 does not" — is not quite right, and the difference
+matters for what to build.
+
+`LINEAR_Q4` dispatches `((n+7)/8, (m+7)/8, 1)`. It **is** a tiled GEMM: 8 output columns by 8 rows per
+workgroup. It is not the naive per-row kernel the comment implied.
+
+So weights are re-read `m/8` times — **128 times for a 1024-token prefill chunk**. That is inherent to
+an 8-row tile, not a consequence of the kernel being unsophisticated.
+
+`linear_q8_0_gemm_rb` reaches 2795 GFLOP/s by holding a larger tile in registers, so it re-reads
+correspondingly fewer times. The q4 gap is therefore **tile size**, not kernel absence.
+
+## What that changes
+
+* **Chunking `MATVEC_SMALL_Q4` (m≤8) through a long prefill buys nothing** — it re-reads exactly as
+  often as the 8×8 tile already does. That hypothesis is closed; it looked like a free win and is not.
+* The work is a **register-blocked q4 GEMM with a wider tile**, mirroring the q8_0 one. Q4 has an
+  advantage here that q8_0 does not: half the weight bytes per element, so the same register budget
+  covers twice the k-extent per load.
+* Tile width is the tunable, and this engine already has per-shape GEMM autotune (`gemm_tile_for`) —
+  so the new kernel should enter that search rather than pick a constant, which is the lesson from V3
+  being unreachable.
+
+## Why the correction is worth recording
+
+The original note read the small-batch kernel's comment — *"instead of the strided LINEAR_Q4 re-reading
+weights per tile"* — and inferred that LINEAR_Q4 was per-row. It says *per tile*, and the tile is 8×8.
+An accurate comment, read too quickly, produced a wrong conclusion about which kernel exists.
+
+
+---
+
+# The prefill number, worked through
+
+Qwen3-30B, 1625 tokens, **31.72s observed**.
+
+The strided `LINEAR_Q4` re-reads the weights per tile rather than per chunk. At a tile width of 8 that
+is ~203 weight passes for this prompt, moving **~343 GiB** of the model's 1.69 GiB active set.
+
+```
+343 GiB at the measured 258 GiB/s   =  1.3 s
+observed                            = 31.7 s
+effective bandwidth                 = 10.8 GiB/s  (4% of the device)
+```
+
+**Two independent problems, and they multiply.**
+
+**The traffic is ~100× what a GEMM would move.** A register-blocked kernel makes one weight pass per
+*chunk*: 2 passes, 2.7 GiB, ~10 ms at full bandwidth. The strided kernel makes one per *tile*.
+
+**And the 343 GiB is being moved at 4% of device bandwidth**, which the re-read does not explain — a
+strided read pattern is still a read pattern, and 10.8 GiB/s on a device that measures 258 says the
+access is defeating the memory system rather than merely repeating it.
+
+## Why chunk size cannot fix it
+
+Raising the prefill chunk was expected to help and does not: at chunk 1024 the kernel does 128 tiles
+per chunk over 2 chunks; at chunk 8 it does 1 tile per chunk over 203 chunks. **Same 203 passes.** The
+chunk controls dispatch count, not traffic, because the re-read is *inside* the kernel.
+
+That is worth knowing before anyone tunes `LOGSCOPE_PREFILL_CHUNK` looking for prefill speed — the knob
+does not reach this.
+
+## What the references do here
+
+llama.cpp's `mul_mat` for a batched shape reads each weight block once and accumulates across the batch,
+which is the one-pass-per-chunk form. ggml-metal's equivalent adds `vec4` loads on top. Neither has a
+per-tile re-read for any quantization, because neither has a separate "small batch" and "large batch"
+kernel — the batched path *is* the path.
+
+This engine's split at m=8 is the anomaly, and above the split it falls to a shape neither reference
+uses.
+
+## Order
+
+A register-blocked q4 GEMM addresses the 100×. The 4% is separate and may share a cause with decode's
+6–10× — both are shapes where the GPU idles on memory, and both are on a driver whose subgroup path is
+disabled. Fixing one does not obviously fix the other, and the prefill number is large enough that it
+should be measured again after the GEMM rather than predicted.
+
+
+## Second correction: neither default path is autotuned — the gap is REGISTER BLOCKING
+
+I was about to write "q8_0's tile is autotuned per shape and q4's is a hardcoded workgroup size".
+Checking first: `gemm_tile_for` feeds only `linear_q8_0_gemm`, which is the **tiled** variant reached
+via `LOGSCOPE_PREFILL_TILED` — the opt-in *escape*, measured at 2.8× **slower** than the default.
+
+The default q8_0 prefill kernel is `linear_q8_0_gemm_rb`, and its own comment says it "has no override
+constants so it compiles on every backend". It is fixed-shape too.
+
+So the accurate statement is:
+
+| path | shape | tunable |
+|---|---|---|
+| q8_0 default | register-blocked, wide per-thread tile | no |
+| q8_0 escape | workgroup-tiled, override constants | yes, and 2.8× slower |
+| q4 default | `@workgroup_size(8,8,1)`, 8×8 per workgroup | no |
+
+**The difference is register blocking, not tunability.** A register-blocked kernel holds a wide tile of
+`a` in registers and streams weights past it once; an 8×8 workgroup tile re-reads the weight block for
+every group of 8 rows. That is why the q8_0 default beats the q8_0 *tunable* variant by 2.8× — and it is
+the property q4 lacks.
+
+So the work is unchanged in substance and clearer in shape: **port the register-blocking, not the
+tuning.** And q4's advantage still holds — half the weight bytes per element means the same register
+budget spans twice the k-extent.
+
+### Why both corrections happened
+
+Each time, a plausible reading of one comment produced a confident wrong claim about which kernel
+exists. The first read "re-reading weights per tile" as per-row; the second read `gemm_tile_for` as
+governing the fast path when it governs the slow one. **Both were caught by grepping for the caller
+rather than trusting the name** — which is the same discipline that found V3 unreachable, and the same
+one that failed when I concluded the autotune had exhausted kernel choice.
+
+
+---
+
+# The q4 GEMM, specified
+
+`LINEAR_Q8_0_RB` is the register-blocked GEMM: `BM=64, BN=64, BK=16`, a 16×16 workgroup, two 1024-entry
+workgroup staging arrays, and a **4×4 register tile held as four named `vec4`** — named rather than an
+`array<f32,16>` on purpose, because a dynamically-indexed array spills to local memory and defeats the
+whole kernel.
+
+The q4 version differs in **three lines**. Everything else — the tiling, the staging loops, the
+accumulate, the epilogue — is unchanged, which is the argument for doing it rather than writing a new
+kernel.
+
+**q8_0, as it stands:**
+```wgsl
+let scale = qs[gc*d.kb + (gk/32u)];
+let word  = qw[gc*(d.k/4u) + (gk/4u)];        // 4 weights per u32
+let ub    = extractBits(word, (gk%4u)*8u, 8u);
+let q     = select(i32(ub), i32(ub)-256, ub>=128u);   // signed byte
+wv = scale * f32(q);
+```
+
+**q4, from `MATVEC_Q4`'s own unpack:**
+```wgsl
+let scale = qs[gc*d.kb + (gk/32u)];           // unchanged — per-32 scales either way
+let word  = qw[gc*(d.k/8u) + (gk/8u)];        // 8 weights per u32
+let nib   = extractBits(word, (gk%8u)*4u, 4u);
+let q     = i32(nib) - 8;                     // symmetric, [-7,7]
+wv = scale * f32(q);
+```
+
+`extractBits` with a dynamic offset is used deliberately in both — the comment in `MATVEC_Q4` marks it
+**AGX-safe**, which a shift-and-mask apparently was not.
+
+## Gating it
+
+Compare against `MATVEC_Q4` at m=1 (which is the verified path) and against `LINEAR_Q4` at m>8, over
+several shapes including one past the 65535 workgroup limit. `--gate-matvec` already has that harness.
+
+**Default it OFF and run the gate on hardware before flipping it.** Four Q6_K faults were found and
+fixed against a software rasterizer on a kernel that was still wrong on an M2 — the same mistake here
+costs a prefill path that looks fast and is wrong, which is worse than one that is slow and right.
+
+## What it is expected to buy
+
+~100× less traffic on prefill: one weight pass per chunk instead of one per tile. It does **not**
+address the separate 4%-of-bandwidth finding, and conflating the two would make the result
+uninterpretable.

@@ -17,6 +17,7 @@ name = "logscope-serve"
 path = "src/serve.rs"
 
 [dependencies]
+libc = "0.2"     # madvise(WILLNEED) on predicted expert ranges — see prefetch.rs
 memmap2 = "0.9"  # mmap GGUFs (big-model loading) — scoped infra dep, not RAM-loading 40GB files
 wgpu = "29"
 naga = "29"  # in-process WGSL validation (the shader fitness gate) — pure Rust, no GPU

@@ -265,6 +265,7 @@ version = "0.1.0"
 dependencies = [
  "ash",
  "bytemuck",
+ "libc",
  "memmap2",
  "naga",
  "pollster",

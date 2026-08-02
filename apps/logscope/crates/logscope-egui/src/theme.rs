@@ -813,8 +813,20 @@ pub fn ensure_contrast_accent(fg: Color32, bg: Color32, min: f32) -> Color32 {
     let lighter = lift_col(fg, 40);
     let darker = scale_col(fg, 0.6);
     let go_lighter = contrast_ratio(lighter, bg) >= contrast_ratio(darker, bg);
-    let mut best = fg;
-    // up to 24 fine steps in the chosen direction; keep the first that clears, else the strongest.
+    // Up to 24 fine steps in the chosen direction, returning the FIRST that clears.
+    //
+    // The comment here said "keep the first that clears, else the strongest", and a `best`
+    // variable tracked that strongest candidate — assigned every iteration and never read.
+    // The fallback below ignores it entirely.
+    //
+    // Deleting it rather than reviving it, because the current fallback is the better one: a
+    // candidate that survived all 24 steps still FAILS the contrast target, so returning it
+    // would hand back illegible text with the hue preserved. ensure_contrast goes to a
+    // guaranteed pole — legible, with some desaturation, which is the right trade in the corner
+    // where no hue-preserving move works.
+    //
+    // A comment describing behaviour the code abandoned is the same failure as a stale label:
+    // the next reader trusts it and reasons from a policy nothing implements.
     for i in 1..=24u32 {
         let t = i as f32 / 24.0;
         let cand = if go_lighter {
@@ -825,7 +837,6 @@ pub fn ensure_contrast_accent(fg: Color32, bg: Color32, min: f32) -> Color32 {
             // toward a dark version: scale down (keeps hue, drops value).
             scale_col(fg, 1.0 - 0.85 * t)
         };
-        best = cand;
         if contrast_ratio(cand, bg) >= min { return cand; }
     }
     // couldn't reach the target with hue-preserving moves (very mid-tone surface): fall back to the
@@ -844,6 +855,8 @@ pub fn md_ink() -> Color32 { md_on_panel(INK(), 4.5) }
 /// Markdown accent (inline code / links), ≥ 4.5:1 on the panel — hue-preserving so `code` stays its accent
 /// color across light/dark themes and the day/night curve instead of collapsing toward black/white.
 pub fn md_accent() -> Color32 { md_accent_on_panel(CYAN(), 4.5) }
+/// Markdown **bold**, ≥ 7:1 on the panel.
+///
 /// Markdown secondary (bullets, quote text), ≥ 4.5:1 on the panel — real reading content gets the full
 /// body floor on the surface it lands on.
 pub fn md_dim() -> Color32 { md_on_panel(DIM(), 4.5) }
@@ -2156,5 +2169,34 @@ mod variant_tests {
         }
         assert_eq!(seen.len(), 16, "all sixteen detail tiers are distinct");
         set_variant(1);
+    }
+}
+
+#[cfg(test)]
+mod md_contrast_tests {
+    use super::*;
+
+    /// Every markdown colour must clear the body floor on the panel it lands on.
+    ///
+    /// Bold did not. The renderer used `ui.visuals().strong_text_color()` — egui's untreated default —
+    /// while links, inline code, body ink and secondary text all went through `ensure_contrast`. The
+    /// fix that was applied to the accent ("the raw palette cyan is neon on several themes and simply
+    /// fades against pale panels") was never applied to bold, and it read as an unreadable run in the
+    /// message view.
+    #[test]
+    fn every_markdown_colour_clears_the_body_floor() {
+        for (name, c) in [("ink", md_ink()), ("accent", md_accent()), ("strong", md_strong())] {
+            let r = contrast_ratio(c, PANEL());
+            assert!(r >= 4.4, "{name} is {r:.2}:1 against the panel — below the 4.5 body floor");
+        }
+    }
+
+    /// Bold is held higher than body, because bold that merely matches its surroundings is not bold.
+    #[test]
+    fn bold_stands_OUT_from_body_rather_than_merely_being_legible() {
+        let strong = contrast_ratio(md_strong(), PANEL());
+        let body = contrast_ratio(md_ink(), PANEL());
+        assert!(strong >= body, "bold {strong:.2}:1 vs body {body:.2}:1 — bold must not read weaker");
+        assert!(strong >= 6.9, "and it is held to 7:1, not the 4.5 floor: {strong:.2}");
     }
 }

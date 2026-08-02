@@ -414,19 +414,42 @@ precision, and cost {:.1} GiB of disk for nothing",
             // output is bit-identical for any tile (--gate-matvec), so this can never change results.
             if !gpu.profile_forced() && std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_none() {
                 let (k, n) = (model.d, 2 * model.h); // wgate_up: the largest decode mat-vec
+                // TWO GUARDS ON THE SAME PATH, from two lines that each found half of it.
+                //
+                // First: is the cached value even a config? Values like 2147549188 look like
+                // poison but are 0x8001_0004 — PACKED DecodeConfigs (high bit set, kernel id in
+                // the high half, tile in the low). A naive range check would discard every tuned
+                // config on every machine that had one and retune on every load.
+                //
+                // Second: is the cached KERNEL still allowed here? The autotune SEARCH skips
+                // subgroup kernels when sg_ok is false, but a restored choice skipped that check,
+                // so a cache written under a different build, driver, or LOGSCOPE_MATVEC_SG=1
+                // selects V2WgSg on a machine where the guard has since disabled it — visible in
+                // the wild as "subgroup decode kernel DISABLED" three lines above "kernel V2WgSg,
+                // cached autotune".
+                //
+                // A cache is just a path that skips the code that would have said no, and it needs
+                // every check the live path has.
                 let cached_raw = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n);
-                // Validate BEFORE applying — but validate CORRECTLY. The field values 2147549188 and
-                // 2147680260 that looked like poison are 0x8001_0004 / 0x8003_0004: PACKED
-                // DecodeConfigs (high bit = packed, kernel id << 16, tile low) — the previous
-                // range check would have discarded every tuned config on every machine that had
-                // one, forcing a retune per load. Packed values are accepted and printed decoded;
-                // bare legacy tiles are accepted in 1..=64; everything else really is poison.
                 let cached = cached_raw.filter(|&t| t & 0x8000_0000 != 0 || (1..=64).contains(&t));
                 if let (Some(raw), None) = (cached_raw, cached) {
                     eprintln!("wgpu-engine: cached decode tile {raw} is neither a packed config nor a sane bare tile — discarding, retuning");
                 }
                 if let Some(t) = cached {
+                    let t = if t & 0x8000_0000 != 0 {
+                        let dc = gpu_kernels::DecodeConfig::unpack(t);
+                        if dc.kernel.needs_subgroups() && !gpu.subgroup_kernel_ok() {
+                            eprintln!("wgpu-engine: cached decode kernel {:?} needs subgroups, which \
+are disabled on this device — falling back to the autotuned non-subgroup default", dc.kernel);
+                            gpu_kernels::DecodeConfig { kernel: gpu_kernels::MatvecKernel::V2Wg128,
+                                                        tile: dc.tile }.pack()
+                        } else { t }
+                    } else { t };
                     gpu.set_matvec_tile(t);
+                    // UNPACK BEFORE PRINTING, or the line reads "decode tile = 2147549192" — a
+                    // value that cannot be a tile, on every load. Harmless to the engine and
+                    // corrosive to the log: a number nobody can read is a line nobody checks, and
+                    // this is the line you consult when a shape is slow.
                     if t & 0x8000_0000 != 0 {
                         let c = gpu_kernels::DecodeConfig::unpack(t);
                         eprintln!("wgpu-engine: decode cfg = {:?} tile {} (cached autotune for this GPU)", c.kernel, c.tile);
@@ -799,9 +822,14 @@ would mislead every later load",
             // removes it — we re-insert the extended tip after generating.
             let kv_off = std::env::var("LOGSCOPE_KV_OFF").is_ok();
             let mut picked_session: Option<Session> = None; // Some ⇒ pool path (owns the source)
+            // `had_cache` distinguishes a MISS from a first turn. pool.pick returning None when the
+            // pool already holds entries means the prefix diverged or was evicted — and that costs the
+            // whole prompt again, which the log reported in words identical to a first turn.
+            let mut had_cache = false;
             let (reuse, l, pick_idx) = if kv_off {
                 (false, 0, 0)
             } else if let Some(pool) = self.pool.as_mut() {
+                had_cache = !pool.is_empty();
                 match pool.pick(&self.gpu, &self.model, &prompt_ids, 16, 256) {
                     Some((i, ln, sess)) => { picked_session = Some(sess); (true, ln, i) }
                     None => (false, 0, 0),
@@ -863,15 +891,42 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                 s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, pc);
                 s.pos = prompt_ids.len();
             }
+            // CARRIED TO THE PROFILE LINE. Decode compared against this model's OWN prefill needs no
+            // roofline, which is why it can be reported when the bandwidth verdict cannot — and the
+            // bandwidth verdict almost never can, because --gate-perf is rarely run.
+            let prefill_ms_per_tok = if prompt_ids.is_empty() { 0.0 }
+                else { t0.elapsed().as_secs_f64() * 1000.0 / prompt_ids.len() as f64 };
+            let prefill_tokens = prompt_ids.len();
             eprintln!("wgpu-engine: [{}] prompt {} tokens → up to {} (temp {:.2}); {} in {:.2}s, decoding…", self.name,
                 prompt_ids.len(), n_new, p.temperature,
-                if reuse { format!("reused {l} anchor tokens + prefilled {suffix_len}") } else { format!("full prefill") },
+                // NAME THE MISS. A hit says "reused N anchor tokens"; a miss said "full prefill",
+                // which is exactly what a FIRST turn says — so the one number worth watching was
+                // invisible, and a chat that silently lost its anchor every turn read as a chat with
+                // long prompts.
+                //
+                // A miss costs the whole prompt again: measured at 12.6 ms/tok on this device, so a
+                // 1700-token prompt is 20 s paid for nothing. The pool holds 3, and a fourth branch
+                // evicts one.
+                if reuse {
+                    format!("reused {l} anchor tokens + prefilled {suffix_len}")
+                } else if had_cache {
+                    format!("ANCHOR MISS — re-prefilled all {} tokens (the cached prefix diverged or \
+was evicted)", prompt_ids.len())
+                } else {
+                    format!("full prefill (first turn for this model)")
+                },
                 t0.elapsed().as_secs_f32());
             let td = Instant::now();
             // Batch 3: snapshot the engine's dispatch counters so we can report the CPU-bound (setup)
             // vs GPU-bound (sync) split for THIS generation — the data that answers "why is llama.cpp
             // faster": high submits/token + setup_ms-dominated ⇒ dispatch-bound (→ fuse kernels), not
             // compute-bound.
+            // The CAUSES need the same baseline. Read as absolutes they carry a lifetime total into a
+            // per-generation report — your log showed "349 submits" beside causes summing to 4132, and
+            // the causes grew across turns while the submit count did not.
+            let cause0 = gpu_kernels::SubmitCauseSnapshot::now();
+            let submit_ns0 = gpu_kernels::gpu_submit_ns();
+            let sample_ns0 = gpu_kernels::sample_ns();
             use std::sync::atomic::Ordering as AOrd;
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
@@ -971,8 +1026,16 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
             // mislabel sends optimisation effort at command setup when the kernels are the cost.
             let total_ms = (secs as f64) * 1000.0;
             let accounted = setup_ms + sync_ms;
-            let bound = if accounted < total_ms * 0.15 { "GPU-execution" }
-                        else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
+            // "GPU-execution-bound" WAS AN OVERSTATEMENT. The condition is that setup and sync
+            // together are under 15% of wall time — which says where the time ISN'T, not where it
+            // is. At the 0.1% seen in real runs, 99.9% is UNACCOUNTED, and unaccounted is not a
+            // bound: the GPU may be executing, or the timers may simply not cover the slow path.
+            // The "-bound" suffix is appended by the caller, so the label stays short and
+            // adjectival — a phrase that already reads as a sentence produced "neither setup nor
+            // sync sees it-bound" in a real log.
+            let bound = if accounted < total_ms * 0.02 { "UNACCOUNTED" }
+                else if accounted < total_ms * 0.15 { "likely GPU-execution" }
+                else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
             {
                 // WHY the submits happened — one run names the mechanism instead of three guesses
                 // (the Scout/Metal hunt). Printed only when a cause was recorded.
@@ -985,13 +1048,86 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                         self.name, d[0], pc(d[0]), d[1], pc(d[1]), d[2], pc(d[2]), d[3], pc(d[3]), d[4], pc(d[4]), d[5], pc(d[5]));
                 }
             }
+            // NAME THE BOTTLENECK, not just the split. "GPU-execution-bound, 0.1% accounted" says
+            // where the time ISN'T and leaves an operator with nothing to act on. perfverdict
+            // resolves it into one verdict — or says the run is at the memory roofline and the
+            // split is irrelevant, which is the answer that stops work rather than misdirecting it.
+            {
+                let sample = gpu_kernels::perfverdict::Sample {
+                    tokens: per as u64,
+                    wall_ms: total_ms,
+                    setup_ms,
+                    sync_ms,
+                    submits: ds as u64,
+                    // ACTIVE BYTES, derived from the architecture rather than stored — so it cannot
+                    // drift from what the model is. Parameters times resident bytes-per-parameter.
+                    active_bytes: {
+                        let experts = self.model.n_active_experts();
+                        let params = gpu_kernels::active_params_per_token(
+                            self.model.d, self.model.h, self.model.vocab, self.model.n_layers,
+                            self.model.n_kv_heads, self.model.head_dim, experts);
+                        (params as f64 * 0.5625) as u64      // q4 + per-32 scales
+                    },
+                    // READ FROM THE MEASUREMENT, and None stays None. An adapter that has never run
+                    // --gate-perf yields 0 and perfverdict reports efficiency 0 and says the
+                    // roofline cannot be evaluated — rather than substituting a default, which
+                    // would produce a confident efficiency figure from no measurement.
+                    gib_per_s: gpu_kernels::store::bandwidth_get(&self.gpu.adapter_name)
+                        .unwrap_or(0.0) as f64,
+                };
+                let expected_batch_ms = if ds > 0 { total_ms / ds as f64 } else { 0.0 };
+                let v = gpu_kernels::perfverdict::verdict(&sample, expected_batch_ms);
+                eprint!("[{}] ", gpu_kernels::stamp());
+                eprintln!("wgpu-engine: [{}] bottleneck — {}", self.name, v.advice());
+            }
             eprint!("[{}] ", gpu_kernels::stamp());
-            eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms vs sync {sync_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
+            // THREE BUCKETS, not two. queue.submit was timed by nothing, and on a driver whose
+            // completion callbacks are slow enough to disable the governor — "submit stalled 739ms" —
+            // it is exactly where time hides. Reporting two terms and calling the remainder
+            // unaccounted was how 99.8% became a mystery about kernels.
+            // Delta, like the others — an absolute here would be the lifetime-total bug from _456.
+            let submit_ms = (gpu_kernels::gpu_submit_ns().saturating_sub(submit_ns0)) as f64 / 1e6;
+            let sample_ms = (gpu_kernels::sample_ns().saturating_sub(sample_ns0)) as f64 / 1e6;
+            let accounted = setup_ms + sync_ms + submit_ms + sample_ms;
+            eprintln!("wgpu-engine: [{}] profile — {ds} submits ({:.0}/tok), {dp} polls | setup {setup_ms:.0}ms + submit {submit_ms:.0}ms + sync {sync_ms:.0}ms + sample {sample_ms:.0}ms of {total_ms:.0}ms ({bound}-bound, {:.1}% accounted)",
                 self.name, ds as f64 / per, accounted / total_ms.max(1.0) * 100.0);
             // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
             // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
             // said which mechanism was responsible.
-            let attr = format!("wgpu-engine: [{}] {}", self.name, gpu_kernels::submit_attribution());
+            // Same baseline and the same total as the profile line above, so the two can be read
+            // together. Passing `ds` means "N of M attributed" compares against THIS generation's
+            // submits rather than the process lifetime's.
+            let attr = format!("wgpu-engine: [{}] {}", self.name,
+                gpu_kernels::submit_attribution_since(cause0, ds as u64));
+            // THE PROFILE CHECKED AGAINST ITSELF. A line that contradicts itself is worse than no
+            // line: every number in it gets used to reason about where time goes, and one that cannot
+            // be true poisons the conclusions drawn from the rest.
+            //
+            // Your run printed "1 polls" beside "download 141" — every download maps a buffer and
+            // every map polls — and "sync 0ms" across 19.9 s, while a separate phase breakdown of the
+            // same run reported 15.5% sync.
+            for d in gpu_kernels::perfverdict::profile_doubts(
+                dp as u64,
+                gpu_kernels::SubmitCauseSnapshot::now().downloads_since(&cause0),
+                sync_ms as f64, total_ms as f64)
+            {
+                eprintln!("wgpu-engine: [{}] profile DOUBT — {}", self.name, d.explain());
+            }
+            // THE SELF-RELATIVE VERDICT. Prefill and decode read the same weights in the same run, so
+            // the ratio between their per-token costs measures how much latency decode fails to hide —
+            // with no bandwidth ceiling, no active-byte count and no gate run beforehand.
+            //
+            // Reported after the roofline verdict rather than instead of it: they answer different
+            // questions, and this one can answer whenever a generation happened at all.
+            {
+                let ntok = per as usize;
+                let dec_ms_per_tok = if ntok > 0 { total_ms as f64 / ntok as f64 } else { 0.0 };
+                let sr = gpu_kernels::perfverdict::self_relative(
+                    prefill_ms_per_tok, dec_ms_per_tok, prefill_tokens, ntok);
+                if !matches!(sr, gpu_kernels::perfverdict::SelfRelative::NotEnoughData) {
+                    eprintln!("wgpu-engine: phase balance — {}", sr.advice());
+                }
+            }
             eprintln!("[{}] {attr}", gpu_kernels::stamp());
             crate::diag::note(&attr);
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
@@ -1328,7 +1464,18 @@ fn normalize_prompt_template(prompt: &str, t: TemplateKind) -> Option<String> {
             let s = prompt.replace("<|begin_of_text|>", "")
                 .replace("<|start_header_id|>", "<|im_start|>")
                 .replace("<|end_header_id|>\n\n", "\n")
+                // TOTAL, not best-effort. The line above only matches when the marker is followed by
+                // exactly two newlines. Followed by anything else — one newline, a space, content —
+                // it SURVIVES into the prompt, and the tokenizer byte-encodes it as literal text.
+                // That is a Llama-3 marker sitting inside a ChatML turn, which is precisely the shape
+                // that garbles a reply while the prompt still looks structurally fine.
+                .replace("<|end_header_id|>", "\n")
                 .replace("<|eot_id|>", "<|im_end|>\n");
+            // NO SOURCE MARKER MAY SURVIVE. A partial translation is worse than none: the prompt keeps
+            // its shape, the reply garbles, and nothing in the log says which marker leaked.
+            debug_assert!(!s.contains("<|start_header_id|>") && !s.contains("<|end_header_id|>")
+                          && !s.contains("<|eot_id|>"),
+                "Llama-3 markers survived translation to ChatML");
             Some(s)
         }
         TemplateKind::Llama4 if prompt.contains("<|start_header_id|>") || prompt.contains("<|im_start|>") => {
@@ -1402,9 +1549,25 @@ fn worker(cmd_rx: Receiver<Cmd>, evt: Sender<Evt>, cancel: Arc<AtomicBool>, temp
 builds Llama-3 markers and the worker translates them authoritatively)");
                             }
                         } else {
-                            eprintln!("worker: PROMPT TEMPLATE MISMATCH — UI sent {sent} markers to a {:?} \
-model; translated. This is stale UI template state, not the Llama-4 handoff — please report it.",
-                                backend.template());
+                            // ONCE, AND NOT AS A FAULT. This printed on every model switch and ended with "please
+                            // report it" — right when the translation was partial, wrong since _409 made it total.
+                            //
+                            // The cause is structural and known: the prompt is BUILT AT SEND TIME, before the load
+                            // completes, so it necessarily carries the previous model's markers on the first turn
+                            // after a switch. The worker translating authoritatively is the design, not a symptom.
+                            //
+                            // A warning that fires on correct behaviour is one people learn to skip — and THIS
+                            // message is what hid a real garbling bug for weeks, because it read as a resolved
+                            // notice. One informational line naming the actual remaining work.
+                            static MISMATCH_NOTE: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !MISMATCH_NOTE.swap(true, Ordering::Relaxed) {
+                                eprintln!("worker: prompt carried {sent} markers to a {:?} model and was \\
+translated. Expected on the first turn after a model switch — the prompt is built before the load \\
+finishes, so it cannot know the new template. The durable fix is rebuilding it once Evt::Loaded \\
+lands; until then the translation is total and this is not a fault.",
+                                    backend.template());
+                            }
                         }
                         fixed
                     }
@@ -1478,4 +1641,124 @@ fn simulate(prompt: &str, evt: &Sender<Evt>, start: Instant, cancel: &Arc<Atomic
         std::thread::sleep(Duration::from_millis(8));
     }
     let _ = evt.send(Evt::Done { tokens: n, secs: start.elapsed().as_secs_f32() });
+}
+
+/// The two watchdog tables must agree.
+///
+/// `gpu_kernels::watchdog_prone_name` and `logscope::tuneprofile::watchdog_prone` encode the same
+/// decision in two crates, because `logscope` cannot depend on `gpu-gemm` and duplicating the
+/// predicate was cheaper than restructuring for it.
+///
+/// That duplication already went wrong once. _358 widened the engine's guard to mobile GPUs after a
+/// Fairphone reported "not enough wavelets", and the tuning table stayed Apple-only — so a phone got
+/// the subgroup path from one table while the other was refusing it. **A policy expressed in two
+/// places gets corrected in one, and the survivor looks right because it matches the code around it.**
+///
+/// This crate sees both, so the agreement is checkable here even though neither crate can check it
+/// alone. That is the durable fix: another sweep would have found instance seven, and this stops it
+/// being written.
+#[cfg(all(test, feature = "wgpu-engine"))]
+mod watchdog_agreement {
+    #[test]
+    fn both_crates_classify_every_adapter_identically() {
+        let cases = [
+            // Mobile — the class that was missing from the tuning table.
+            "Adreno (TM) 740", "Mali-G715", "PowerVR B-Series BXM-8-256",
+            "Immortalis-G720", "Samsung Xclipse 940", "Vivante GC7000",
+            // Apple, in both the spellings that appear in real adapter strings.
+            "Apple M2 Max (G14C B1) [Vulkan]", "Apple M2 Ultra (G14D B1) [Vulkan]",
+            "honeykrisp", "AGX",
+            // Desktop — must stay on the fast path in both.
+            "NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX", "Intel Arc A770",
+            "llvmpipe (LLVM 20.1.2, 256 bits) [Vulkan]",
+            // Neither — a device nobody has enumerated must not be guessed at differently.
+            "Some Vendor GPU Nobody Has Heard Of",
+        ];
+        for a in cases {
+            let engine = gpu_kernels::watchdog_prone_name(a);
+            let tuning = logscope::tuneprofile::watchdog_prone(a);
+            assert_eq!(engine, tuning,
+                "{a}: engine says {engine}, tuning table says {tuning} — the two tables have drifted, \
+which is exactly how a phone got the subgroup path from one while the other refused it");
+        }
+    }
+
+    #[test]
+    fn the_agreement_test_would_have_CAUGHT_the_original_drift() {
+        // Before _358 the tuning table matched only Apple. Adreno is the case that exposed it, and the
+        // test above compares that string — so this asserts the fixture is the one that matters rather
+        // than a set that happens to agree.
+        assert!(gpu_kernels::watchdog_prone_name("Adreno (TM) 740"));
+        assert!(logscope::tuneprofile::watchdog_prone("Adreno (TM) 740"));
+    }
+}
+
+
+#[cfg(test)]
+mod template_translation_tests {
+    use super::*;
+
+    /// A Llama-3 prompt whose header marker is NOT followed by two newlines.
+    ///
+    /// The translation replaced `<|end_header_id|>\n\n` only. Real prompts do not always have that
+    /// exact spacing — a system block with a single newline, or content starting immediately, leaves
+    /// the marker in place and the tokenizer byte-encodes it as literal text. A Llama-3 marker inside
+    /// a ChatML turn garbles the reply while the prompt still looks structurally fine, which is why it
+    /// survived: the diag prints special-token IDs, and a leaked marker is not a special token.
+    #[test]
+    fn no_llama3_marker_survives_translation_whatever_the_spacing() {
+        for tail in ["\n\n", "\n", " ", "", "\n \n"] {
+            let p = format!("<|begin_of_text|><|start_header_id|>user<|end_header_id|>{tail}hi<|eot_id|>");
+            let out = normalize_prompt_template(&p, TemplateKind::ChatML)
+                .expect("a Llama-3 prompt to a ChatML model must be rewritten");
+            assert!(!out.contains("<|start_header_id|>"), "spacing {tail:?}: start leaked");
+            assert!(!out.contains("<|end_header_id|>"), "spacing {tail:?}: END LEAKED — {out:?}");
+            assert!(!out.contains("<|eot_id|>"), "spacing {tail:?}: eot leaked");
+            assert!(out.contains("<|im_start|>") && out.contains("<|im_end|>"),
+                "spacing {tail:?}: ChatML markers must be present");
+        }
+    }
+
+    #[test]
+    fn a_prompt_already_in_the_right_family_is_left_alone() {
+        // Returning Some for a correct prompt would fire the mismatch warning on every turn, and a
+        // warning that always fires is one nobody reads — the reason the real one was ignorable.
+        let p = "<|im_start|>user\nhi<|im_end|>\n";
+        assert!(normalize_prompt_template(p, TemplateKind::ChatML).is_none());
+    }
+}
+
+/// The two bits-per-weight tables must agree.
+///
+/// `gpu_kernels::rolequant::Level` and `logscope::rolequant_hint` carry the same constants because
+/// `logscope` cannot depend on `gpu-gemm` — the advice line needs the arithmetic and the policy lives
+/// engine-side.
+///
+/// That duplication already went wrong once in this tree, with the watchdog tables: a policy expressed
+/// in two places gets corrected in one, and the survivor looks right because it matches the code
+/// around it. This crate depends on both, so the agreement is checkable here even though neither can
+/// check it alone.
+#[cfg(all(test, feature = "wgpu-engine"))]
+mod rolequant_agreement {
+    #[test]
+    fn the_bpw_constants_match_across_crates() {
+        use gpu_kernels::rolequant::Level;
+        assert_eq!(Level::Q2.bpw(), logscope::rolequant_hint::Q2_BPW);
+        assert_eq!(Level::Q4.bpw(), logscope::rolequant_hint::Q4_BPW);
+    }
+
+    #[test]
+    fn the_saving_the_advice_quotes_is_what_the_planner_would_free() {
+        // The advice says "a liaison at Q2 frees ~N GiB". If the planner would free a different
+        // number, the line is describing a plan nobody will get — which is worse than no advice,
+        // because it is checkable and wrong rather than merely absent.
+        use gpu_kernels::rolequant::{Level, Member, Role};
+        let m = Member { name: "liaison".into(), role: Role::Liaison,
+                         params: 8_000_000_000, chosen: Level::Q4 };
+        let planner_frees = (m.bytes_at(Level::Q4) - m.bytes_at(Level::Q2)) as f32
+            / (1u64 << 30) as f32;
+        let advice_says = logscope::rolequant_hint::liaison_saving_gib(8_000_000_000).unwrap();
+        assert!((planner_frees - advice_says).abs() < 0.01,
+            "advice quotes {advice_says:.2} GiB, planner frees {planner_frees:.2}");
+    }
 }

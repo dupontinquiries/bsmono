@@ -53,6 +53,26 @@ impl Default for ModelState {
     fn default() -> Self { Self { items: Vec::new(), selected: 0 } }
 }
 impl ModelState {
+    /// Point the picker back at `name` after a load failed, or clear the selection if it is gone.
+    ///
+    /// The picker is set optimistically when a load STARTS, so a failure leaves it naming a model that
+    /// is not running — and the menu then asserts the wrong model is loaded, which is worse than
+    /// showing nothing: a name in the active slot is the one piece of state nobody re-checks.
+    ///
+    /// `logscope::activemodel::on_load_failed` decides WHAT to revert to; this only applies it.
+    pub fn revert_to(&mut self, name: Option<&str>) {
+        match name {
+            Some(n) => {
+                if let Some(i) = self.items.iter().position(|it| it.key() == n) {
+                    self.selected = i;
+                }
+                // A name we cannot find in the list is left alone rather than guessed at: moving the
+                // selection somewhere arbitrary is the same failure in a different place.
+            }
+            None => self.selected = usize::MAX,
+        }
+    }
+
     pub fn current(&self) -> String {
         self.items.get(self.selected).map(|i| i.name().to_string()).unwrap_or_else(|| "—".into())
     }

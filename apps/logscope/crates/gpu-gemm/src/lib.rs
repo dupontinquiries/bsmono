@@ -12,6 +12,16 @@ pub mod cpumatvec;
 pub mod cpupool;
 pub mod cpuattn;
 pub mod cpudecode;
+pub mod perfverdict;
+pub mod qkvsplit;
+pub mod prefetch;
+pub mod mladims;
+pub mod rolequant;
+pub mod ragged;
+pub mod specverify;
+pub mod lookupdraft;
+pub mod specloop;
+pub mod gateclass;
 pub mod tensornames;
 pub mod cpuops;
 pub mod model_kind; // classify a gguf (LLM / diffusion / vision-projector) before the LLM loader tries it
@@ -310,8 +320,94 @@ pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// one and it was the only path left untagged — a run showed 4256 submits against 729 attributed, and
 /// the missing 3500 had to be here.
 pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Nanoseconds inside `queue.submit` — encoder finish plus the driver handoff.
+///
+/// The profile split wall time into setup (bind groups) and sync (waiting), and SUBMIT ITSELF WAS
+/// NEITHER. At 15 submits per token over thousands of tokens that is a third bucket, and on a driver
+/// whose completion callbacks are slow enough to disable the governor — your log reports "submit
+/// stalled 739ms" — it is exactly where time would hide.
+///
+/// Added after finding that 16 of 17 polls were uncounted: the lesson there was that an unmeasured
+/// path reads as an unexplained one, so the remaining unmeasured path is worth closing before drawing
+/// any more conclusions from the split.
+pub static GPU_SUBMIT_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Nanoseconds in host-side sampling: logits post-processing, penalties, top-k/p, argmax.
+///
+/// The fourth thing a generation does, and the last one nothing timed. With a 128k vocabulary this is
+/// half a megabyte of logits per token walked on the CPU, and none of it appears in setup, submit or
+/// sync — so it would land in the same unaccounted bucket that three commits have now been spent
+/// emptying.
+///
+/// Counted here rather than in the caller so every sampling path shares one definition; a timer per
+/// call site is how two of them end up measuring different spans.
+pub static SAMPLE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Time a host-side sampling step.
+#[inline]
+pub fn timed_sample<T>(f: impl FnOnce() -> T) -> T {
+    let t = std::time::Instant::now();
+    let r = f();
+    SAMPLE_NS.fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    r
+}
+
+pub fn sample_ns() -> u64 { SAMPLE_NS.load(std::sync::atomic::Ordering::Relaxed) }
 
 /// One line attributing every submit to its cause, for the profile report.
+/// A snapshot of the submit-cause counters, for reporting a DELTA rather than a lifetime total.
+///
+/// The profile measures submits as a delta from a snapshot and read the causes as absolutes, so one
+/// report carried two clocks: your log showed "349 submits" beside causes summing to 4132, and the
+/// causes grew across turns while the submit count did not.
+///
+/// gpu_counters_reset would also fix it and is only called by the validator; adding a second reset
+/// from the app would race with that one. A snapshot has no such conflict — two readers can each hold
+/// their own baseline.
+#[derive(Clone, Copy, Default)]
+pub struct SubmitCauseSnapshot {
+    passes: u64, retain: u64, download: u64, dims_wrap: u64, end_frame: u64, no_frame: u64,
+}
+
+impl SubmitCauseSnapshot {
+    /// Downloads since an earlier snapshot.
+    ///
+    /// Exposed so the profile can check itself: every download maps a buffer and every map polls, so
+    /// a poll count below the download count means one of the two counters is not measuring what its
+    /// name says.
+    pub fn downloads_since(&self, since: &SubmitCauseSnapshot) -> u64 {
+        self.download.saturating_sub(since.download)
+    }
+
+    pub fn now() -> SubmitCauseSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        SubmitCauseSnapshot {
+            passes: SUBMIT_BY_PASSES.load(Relaxed), retain: SUBMIT_BY_RETAIN.load(Relaxed),
+            download: SUBMIT_BY_DOWNLOAD.load(Relaxed), dims_wrap: SUBMIT_BY_DIMS_WRAP.load(Relaxed),
+            end_frame: SUBMIT_BY_END_FRAME.load(Relaxed), no_frame: SUBMIT_BY_NO_FRAME.load(Relaxed),
+        }
+    }
+}
+
+/// Attribution since `since`, so the causes share the profile's clock.
+pub fn submit_attribution_since(since: SubmitCauseSnapshot, actual: u64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = SubmitCauseSnapshot::now();
+    let d = |a: u64, b: u64| a.saturating_sub(b);
+    let (p, r, dl) = (d(now.passes, since.passes), d(now.retain, since.retain),
+                      d(now.download, since.download));
+    let (w, e, nf) = (d(now.dims_wrap, since.dims_wrap), d(now.end_frame, since.end_frame),
+                      d(now.no_frame, since.no_frame));
+    let _ = Relaxed;
+    let counted = p + r + dl + w + e + nf;
+    let total = counted.max(1);
+    let gap = actual.saturating_sub(counted);
+    format!("submit causes — no-frame {} ({:.0}%), passes {} ({:.0}%), download {} ({:.0}%), end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} submits attributed{} (shares are of the attributed subset)",
+        nf, nf as f64 * 100.0 / total as f64, p, p as f64 * 100.0 / total as f64,
+        dl, dl as f64 * 100.0 / total as f64, e, e as f64 * 100.0 / total as f64,
+        w, r, counted, actual,
+        if gap > 0 { format!(" — {gap} UNATTRIBUTED") } else { String::new() })
+}
+
 pub fn submit_attribution() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let (p, r, d, w, e, nf) = (SUBMIT_BY_PASSES.load(Relaxed), SUBMIT_BY_RETAIN.load(Relaxed),
@@ -319,12 +415,19 @@ pub fn submit_attribution() -> String {
         SUBMIT_BY_END_FRAME.load(Relaxed), SUBMIT_BY_NO_FRAME.load(Relaxed));
     let counted = p + r + d + w + e + nf;
     let actual = GPU_SUBMITS.load(Relaxed);
+    // PERCENTAGES ARE OF THE ATTRIBUTED SUBSET, not of all submits, and the line now says so. Sharing a
+    // sentence with "N of M attributed" while using a different denominator is unreadable: your log
+    // showed "817 submits" in the profile line and causes summing to 4269 in the next, and no reader
+    // can reconcile those without knowing which clock each is on.
+    //
+    // They were also on different clocks in fact, until this commit: GPU_SUBMITS was reset per run and
+    // the SUBMIT_BY_* counters never were.
     let total = counted.max(1);
     // Report the SHORTFALL too. The first version of this line accounted for 729 of 4256 submits and
     // said nothing about the other 3527, which made a partial answer look like a complete one.
     let gap = actual.saturating_sub(counted);
     format!("submit causes — no-frame {} ({:.0}%), passes {} ({:.0}%), download {} ({:.0}%), \
-end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} attributed{}",
+end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} submits attributed{} (shares are of the attributed subset)",
         nf, nf as f64 * 100.0 / total as f64, p, p as f64 * 100.0 / total as f64,
         d, d as f64 * 100.0 / total as f64, e, e as f64 * 100.0 / total as f64, w, r,
         counted, actual,
@@ -379,6 +482,31 @@ type BgKey = (usize, Vec<(wgpu::Buffer, u64, u64)>, (wgpu::Buffer, u64, u64), wg
 /// matter how long generation runs. The ring rewrites via write_buffer; a flush+poll fences a wrap so
 /// a slot is never rewritten while an in-flight dispatch still reads it.
 const DIMS_RING_SIZE: usize = 2048;
+
+/// ## A structural difference from llama.cpp, measured in buffer objects
+///
+/// Every dispatch here needs four u32s of shape, and we pass them in a UNIFORM BUFFER — cached by
+/// content up to `DIMS_CACHE_CAP` with a `DIMS_RING_SIZE` ring behind it. **Up to 6144 buffer objects
+/// holding sixteen bytes each.** The governor's own model puts `baseline_objects` at 6400 against a
+/// `soft_object_cap` of 8192, so the engine starts at 78% of its object budget before allocating a
+/// single weight.
+///
+/// llama.cpp's Vulkan backend passes the same parameters as PUSH CONSTANTS: no buffer, no cache, no
+/// ring, no wrap fence, no retain list. Vulkan guarantees at least 128 bytes; our dims are 16.
+///
+/// Adopting that would DELETE rather than shrink:
+/// * the dims cache and its 4096 buffers,
+/// * the 2048-entry ring and the wrap that calls `flush_and_wait`,
+/// * `DIMS_RETAIN_CAP` and the retained-keep list,
+/// * the `dims_alloc_failed` path and the M4 "Buffer 'dims' invalid" crash it exists to survive,
+/// * the `SUBMIT_BY_DIMS_WRAP` attribution category, because it would not exist.
+///
+/// NOT ATTEMPTED HERE, and the capability is unverified: wgpu 29 does not expose `PUSH_CONSTANTS` or
+/// `max_push_constant_size` under the names this crate would need, so whether it is reachable through
+/// this abstraction is an open question rather than a known yes. Recorded because the object-count
+/// arithmetic is the strongest argument yet for why our memory behaviour differs from llama.cpp's, and
+/// it does not depend on the answer.
+pub const DIMS_PUSH_BYTES: u32 = 16;
 /// Fixed uniform-buffer size for every dims buffer (largest dims payload is 16 u32 = 64 bytes; round up).
 const DIMS_BUF_SIZE: u64 = 256;
 /// How many times the retain-cap forced a mid-window poll+free (test/telemetry).
@@ -393,9 +521,49 @@ pub fn pool_hits() -> u64 { POOL_HITS.load(std::sync::atomic::Ordering::Relaxed)
 pub fn pool_misses() -> u64 { POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_submits() -> u64 { GPU_SUBMITS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_polls() -> u64 { GPU_POLLS.load(std::sync::atomic::Ordering::Relaxed) }
+/// Nanoseconds spent inside queue.submit this run.
+pub fn gpu_submit_ns() -> u64 { GPU_SUBMIT_NS.load(std::sync::atomic::Ordering::Relaxed) }
+
 pub fn gpu_setup_ns() -> u64 { GPU_SETUP_NS.load(std::sync::atomic::Ordering::Relaxed) }
 pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Relaxed) }
-pub fn gpu_counters_reset() { for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS, &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES] { c.store(0, std::sync::atomic::Ordering::Relaxed); } }
+/// Reset every per-run counter.
+///
+/// THE SUBMIT-CAUSE COUNTERS WERE MISSING, and the symptom was visible in every profile line: across
+/// four consecutive runs `no-frame` read 1480 each time while its share moved from 35% to 7%. The
+/// numerator was cumulative and the denominator was per-run, so the percentage described nothing —
+/// and it is the number an operator would tune against.
+///
+/// Adding a counter and forgetting the reset is easy precisely because the counter WORKS: it counts,
+/// the line prints, and only a comparison across runs shows it never moved.
+/// Count and time a blocking device poll.
+///
+/// SEVENTEEN CALL SITES, ONE COUNTED. The profile reported "1 polls" in every run — at 349 submits
+/// and at 8063 — because only the download path incremented, and it runs once per generation.
+///
+/// The same site is the only one that adds to GPU_SYNC_NS, which is why sync reads 0 ms of 19860 ms:
+/// the profile was timing one poll out of seventeen and reporting the result as though it covered all
+/// waiting. That is what made "UNACCOUNTED, 0.2% accounted" look like a mystery rather than a
+/// measurement gap — 99.8% of the time was in waits nobody instrumented.
+///
+/// Wrapping them means the split between setup and sync finally describes the whole generation.
+#[inline]
+pub fn counted_poll(device: &wgpu::Device) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let t = std::time::Instant::now();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    GPU_POLLS.fetch_add(1, Relaxed);
+    GPU_SYNC_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+}
+
+pub fn gpu_counters_reset() {
+    for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS,
+              &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES,
+              &SUBMIT_BY_PASSES, &SUBMIT_BY_RETAIN, &SUBMIT_BY_DOWNLOAD,
+              &SUBMIT_BY_DIMS_WRAP, &SUBMIT_BY_END_FRAME, &SUBMIT_BY_NO_FRAME, &GPU_SUBMIT_NS,
+              &SAMPLE_NS] {
+        c.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// Cached per-shader GPU objects: the bind-group layout and compiled compute
 /// pipeline. Building these is expensive (shader compilation), so they're created
@@ -546,11 +714,21 @@ pub struct Gpu {
 /// possible. The ggml-metal analogue is "rows per SIMD group": one 32-wide subgroup cooperatively reduces a
 /// column-tile with no threadgroup memory at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MatvecKernel { V1 = 0, V2 = 1, V2Wg128 = 2, V2WgSg = 3 }
+pub enum MatvecKernel { V1 = 0, V2 = 1, V2Wg128 = 2, V2WgSg = 3,
+    /// 128-bit `vec4<u32>` loads — four words per memory transaction instead of one.
+    ///
+    /// WAS UNREACHABLE. The kernel existed, was benchmarked in main.rs, and was selectable only via
+    /// LOGSCOPE_MATVEC_V3 — so the per-shape autotune searched every OTHER kernel and picked V2Wg128.
+    /// I read that as "kernel choice is exhausted"; it wins the search it was entered in.
+    ///
+    /// Its own comment says why it should win a latency-bound decode: the profile is ~6% bandwidth and
+    /// ~1% ALU, the GPU idling on memory, and wider loads put more bytes in flight per request. Both
+    /// references treat 4-wide as the baseline — ggml-metal loads `device const float4*` throughout.
+    V3 = 4 }
 impl MatvecKernel {
-    fn from_id(id: u32) -> MatvecKernel { match id { 0 => MatvecKernel::V1, 2 => MatvecKernel::V2Wg128, 3 => MatvecKernel::V2WgSg, _ => MatvecKernel::V2 } }
+    fn from_id(id: u32) -> MatvecKernel { match id { 0 => MatvecKernel::V1, 4 => MatvecKernel::V3, 2 => MatvecKernel::V2Wg128, 3 => MatvecKernel::V2WgSg, _ => MatvecKernel::V2 } }
     pub fn id(self) -> u32 { self as u32 }
-    pub fn label(self) -> &'static str { match self { MatvecKernel::V1 => "v1", MatvecKernel::V2 => "v2", MatvecKernel::V2Wg128 => "v2-wg128", MatvecKernel::V2WgSg => "v2-wg128-sg" } }
+    pub fn label(self) -> &'static str { match self { MatvecKernel::V3 => "v3-vec4", MatvecKernel::V1 => "v1", MatvecKernel::V2 => "v2", MatvecKernel::V2Wg128 => "v2-wg128", MatvecKernel::V2WgSg => "v2-wg128-sg" } }
     /// Whether this kernel needs the SUBGROUP device feature (so the autotuner can skip it where unsupported).
     pub fn needs_subgroups(self) -> bool { matches!(self, MatvecKernel::V2WgSg) }
 }
@@ -579,6 +757,10 @@ pub const DECODE_PROFILES: &[DecodeConfig] = &[
     DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V2Wg128, tile: 8 },
     DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2WgSg, tile: 8 },
     DecodeConfig { kernel: MatvecKernel::V2, tile: 4 }, DecodeConfig { kernel: MatvecKernel::V2, tile: 8 },
+    // V3 FIRST AMONG THE NEW ENTRIES: it is the kernel the profile's own analysis expects to win a
+    // latency-bound decode, and it was searched by nobody. Tiles 2/4/8 mirror what the others probe.
+    DecodeConfig { kernel: MatvecKernel::V3, tile: 2 }, DecodeConfig { kernel: MatvecKernel::V3, tile: 4 },
+    DecodeConfig { kernel: MatvecKernel::V3, tile: 8 },
     DecodeConfig { kernel: MatvecKernel::V1, tile: 1 }, DecodeConfig { kernel: MatvecKernel::V1, tile: 4 },
 ];
 /// Autotune probes at a capped output width: the best config transfers across n (it's set by k + kernel
@@ -1016,13 +1198,30 @@ impl Gpu {
             // on this driver, skip the subgroup kernel by default and use the barrier-reduction kernel,
             // which is robust here. LOGSCOPE_MATVEC_SG=1 forces it back on for experimentation.
             let asahi_vulkan = conservative_vma; // set above iff Vulkan + adapter name contains "Apple"
+        // MOBILE GPUs TOO. This guard was keyed on Apple-Vulkan alone, so an Adreno or Mali took the
+        // subgroup path with no check that the driver actually provides enough invocations per
+        // workgroup. Reported from a Fairphone: a load failure about "not enough wavelets" — a driver
+        // term for waves/subgroups, and not a string in this codebase, so it came from the driver
+        // refusing a workgroup that demanded more subgroups than it can schedule.
+        //
+        // Detected by ADAPTER NAME rather than by a feature bit, because there is no bit for "this is a
+        // phone": the subgroup extension is present and honest, and the limit is on how many the
+        // hardware runs at once. Names are a blunt instrument and a false positive here costs a slower
+        // kernel, while a false negative costs a load failure the user cannot diagnose.
+        let mobile_gpu = {
+            let n = gpu.adapter_name.to_ascii_lowercase();
+            ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante"]
+                .iter().any(|m| n.contains(m))
+        };
+        let asahi_vulkan = asahi_vulkan || mobile_gpu;
             let force_sg = std::env::var_os("LOGSCOPE_MATVEC_SG").is_some();
             // The host may also disable it via EngineConfig (from a tuning profile). The env var still
             // wins: a knob exists to be turned during a bisection, and a config file that silently
             // overrode it would make that impossible.
             let cfg_off = !engine_config().subgroup_matvec;
             if (asahi_vulkan || cfg_off) && !force_sg {
-                let why = if asahi_vulkan { "Asahi/Honeykrisp subgroup support can hang large matmuls" }
+                let why = if mobile_gpu { "mobile GPUs often cannot schedule enough subgroups per workgroup for this kernel" }
+                else if asahi_vulkan { "Asahi/Honeykrisp subgroup support can hang large matmuls" }
                           else { "disabled by engine config" };
                 eprintln!("wgpu-engine: subgroup decode kernel DISABLED on {} ({why}; LOGSCOPE_MATVEC_SG=1 re-enables)", gpu.adapter_name);
                 gpu.sg_ok.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -1173,6 +1372,9 @@ impl Gpu {
             pass.dispatch_workgroups(wg.0, wg.1, wg.2);
         }
         enc.copy_buffer_to_buffer(&out, 0, &staging, 0, out_bytes);
+        // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
+        // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+        SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.submit(enc);
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
@@ -1313,14 +1515,14 @@ impl Gpu {
                 since_submit += 1;
                 if since_submit >= CHUNKS_PER_SUBMIT {
                     self.end_frame();
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     since_submit = 0;
                 }
             }
             done += 1;
         }
         self.end_frame();
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         done
     }
 
@@ -1360,6 +1562,70 @@ impl Gpu {
     ///
     /// The qs region is placed on a 256-byte boundary so it can be bound as a storage view; the shader is
     /// told where it starts, so alignment padding costs a few bytes and no special-casing.
+    /// Convert a raw expert tensor of EITHER Q4_K or Q6_K into the resident q4 layout.
+    ///
+    /// ## Why this unblocks every Q4_K_M model
+    ///
+    /// `Q4_K_M` is a MIXTURE: most tensors are Q4_K, and `ffn_down` is Q6_K. The file-view path checked
+    /// `ggml_type != 12` and rejected the whole model on that one tensor, falling back to the host-copy
+    /// path — which dequantizes and requantizes every expert into RAM. On a 64 GiB machine that host
+    /// store was 15.2 GiB and the load was OOM-killed.
+    ///
+    /// So a single stale type check cost the entire zero-copy path for every model in common use.
+    ///
+    /// Q6_K goes through `q6k_dequant` — bit-exact against the CPU reference since the gate went green
+    /// — and then the same quantizer the resident path already uses. That is two passes rather than
+    /// one, paid ONCE at load, against a host copy paid in RAM for the whole session.
+    pub fn raw_expert_to_q4_resident(&self, raw: &[u8], ggml_type: u32, n: usize, k: usize)
+        -> Option<Q4Weight> {
+        match ggml_type {
+            12 => Some(self.q4k_to_q4_resident(raw, n, k)),
+            14 => {
+                // Q6_K: dequantize exactly, then quantize to the resident layout.
+                let f = self.download(&self.q6k_dequant(raw, n * k).ok()?);
+                Some(self.quantize_q4_resident(&f, n, k))
+            }
+            // Anything else is refused rather than guessed. Reading a type we have not verified would
+            // produce plausible weights and a quietly worse model — the failure this codebase keeps
+            // paying for.
+            _ => None,
+        }
+    }
+
+    /// Bytes one tensor of `count` weights occupies in its source format.
+    ///
+    /// Q4_K is 144 bytes per 256-weight super-block; Q6_K is 210. The file-view slicing was hardcoded
+    /// to 144, so a Q6_K tensor would have been sliced at the wrong stride even if the type check had
+    /// let it through — the two changes are only useful together.
+    /// Bytes occupied by `count` weights of a K-quant source type.
+    ///
+    /// **None when `count` is not a whole number of 256-weight blocks.** The integer division
+    /// otherwise truncates silently, and this figure is used as a PER-EXPERT STRIDE — so a short
+    /// stride starts expert 1 partway into expert 0's data and every expert after it drifts further.
+    /// The bytes still decode, the shapes are still right, and the output is gibberish.
+    ///
+    /// Qwen3-Coder is safe by luck rather than by check: its ff is 5472, which is 21.375 blocks, and
+    /// only `d = 2048` makes `ff * d` divisible. A model with an odd ff and an odd d would truncate,
+    /// and nothing would have said so.
+    ///
+    /// Refusing is right here because every caller can act on it — the loader has a type-aware path
+    /// and the planner wants a size it can trust. A wrong number is worse than no number when the
+    /// number is an offset.
+    pub fn source_block_bytes(ggml_type: u32, count: usize) -> Option<usize> {
+        if count % 256 != 0 { return None; }
+        match ggml_type {
+            // Q4_K and Q6_K only. Q5_K is NOT here on purpose: a test asserts an unverified source
+            // type has no block size, because this figure feeds the file-VIEW path and a size for a
+            // layout nobody has read end-to-end grants a capability rather than measuring one.
+            //
+            // I added Q5_K here and the test caught it — mixed presets do promote tensors to Q5_K, so
+            // the number is *correct*, and correct is not the bar. The bar is verified.
+            12 => Some(count / 256 * 144),   // Q4_K
+            14 => Some(count / 256 * 210),   // Q6_K
+            _ => None,
+        }
+    }
+
     pub fn q4k_to_q4_resident(&self, raw: &[u8], n: usize, k: usize) -> Q4Weight {
         assert!(k % 256 == 0, "q4_k conversion needs k % 256 == 0 (got {k})");
         let total = n * k;
@@ -1570,18 +1836,36 @@ impl Gpu {
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            // TAGGED: a readback, flushing the open frame first. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
             None::<()>
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc);
             None
         };
         let slice = staging.slice(..);
+        // MEASURED. This poll was recorded by nothing — not GPU_POLLS, not GPU_SYNC_NS — and it is
+        // the DECODE loop's readback, so the one wait that dominates decode was the one wait the
+        // profile could not see.
+        //
+        // That is why a real run reported "1 polls" and "sync 0ms of 19860ms" while a separate phase
+        // breakdown of the same run measured 15.5% sync: the profile was not wrong about the paths it
+        // watched, it was watching the wrong path. Every conclusion drawn from "setup 0.2% accounted"
+        // rested on a denominator missing its largest term.
         slice.map_async(wgpu::MapMode::Read, |_| {});
+        let t_sync = std::time::Instant::now();
+        GPU_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        GPU_SYNC_NS.fetch_add(t_sync.elapsed().as_nanos() as u64,
+                              std::sync::atomic::Ordering::Relaxed);
         let data = slice.get_mapped_range();
         let v = bytemuck::cast_slice::<u8, u32>(&data).to_vec();
         drop(data); staging.unmap();
@@ -1768,6 +2052,12 @@ pub struct RawExpertSrc {
     /// Bytes per expert in gate/up (each an [ff, d] matrix) and in down (a [d, ff] matrix).
     pub gu_expert_bytes: usize,
     pub dn_expert_bytes: usize,
+    /// Source ggml type of gate/up, and of down SEPARATELY.
+    ///
+    /// They differ in practice: Q4_K_M stores gate and up as Q4_K and ffn_down as Q6_K, which is the
+    /// mixture that made a single-type check reject every such model.
+    pub gu_type: u32,
+    pub dn_type: u32,
     pub ff: usize,
     pub d: usize,
 }
@@ -2173,7 +2463,7 @@ impl StreamSlots {
         gpu.queue.submit(Some(enc.finish()));
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&gpu.device);
         let data = slice.get_mapped_range().to_vec();
         staging.unmap();
         data
@@ -2278,7 +2568,7 @@ impl Gpu {
         let down = self.quantize_q4_resident(&vec![0.05f32; d * ff], d, ff);
         let x = self.upload(&vec![0.1f32; d], 1, d);
         let xff = self.upload(&vec![0.1f32; ff], 1, ff);
-        let wait = || { self.queue.submit(std::iter::empty()); let _ = self.device.poll(wgpu::PollType::wait_indefinitely()); };
+        let wait = || { self.queue.submit(std::iter::empty()); crate::counted_poll(&self.device); };
         for _ in 0..2 { let _ = self.linear_q4_0_t(&x, &gate, 1); let _ = self.linear_q4_0_t(&x, &up, 1); let _ = self.linear_q4_0_t(&xff, &down, 1); }
         wait();
         let t = std::time::Instant::now();
@@ -2296,7 +2586,7 @@ impl Gpu {
         let bytes = (slot_mib * (1 << 20)).min(max_buf & !255).max(4);
         let actual_mib = bytes / (1 << 20);
         let host = vec![0u8; bytes];
-        let wait = || { self.queue.submit(std::iter::empty()); let _ = self.device.poll(wgpu::PollType::wait_indefinitely()); };
+        let wait = || { self.queue.submit(std::iter::empty()); crate::counted_poll(&self.device); };
 
         // (1) STAGED fill: re-fillable STORAGE buffer via write_buffer (the discrete-GPU path).
         let staged_slot = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2397,6 +2687,9 @@ impl Gpu {
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
+            // TAGGED: a readback: copy_buffer_to_buffer into staging. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc);
         }
         let slice = staging.slice(..);
@@ -2453,6 +2746,26 @@ impl Gpu {
     /// Whether the device signalled OOM since the last clear (set by the uncaptured-error handler). The
     /// decode loop checks this to abort a step gracefully instead of pushing more allocations at a device
     /// that just failed one. Cleared by `clear_oom` once the caller has backed off (freed a window / cache).
+    /// Devices whose driver kills a long-running compute dispatch.
+    ///
+    /// Apple's Honeykrisp does, and so does every mobile driver — Android's GPU watchdog is the same
+    /// mechanism under a different name. `conservative_vma` was standing in for this and means "Vulkan
+    /// on Apple", so a phone took the unbounded path and would trip the very watchdog the guard exists
+    /// to avoid.
+    ///
+    /// Named for the property rather than the vendor, which is the whole lesson of the last four fixes.
+    pub fn watchdog_prone(&self) -> bool {
+        self.conservative_vma || watchdog_prone_name(&self.adapter_name)
+    }
+
+    /// Did the subgroup matvec pass its load-time self-check on this driver?
+    ///
+    /// Exposed so a CACHED kernel choice can be re-checked against it. The autotune search already
+    /// honours this; the cache-load path did not, which is how a disabled kernel gets selected.
+    pub fn subgroup_kernel_ok(&self) -> bool {
+        self.sg_ok.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn oom_backoff(&self) -> bool { self.oom_flag.load(std::sync::atomic::Ordering::Relaxed) }
     pub fn clear_oom(&self) { self.oom_flag.store(false, std::sync::atomic::Ordering::Relaxed); }
     /// Test/validation hook: force the OOM-backoff flag so the download guards can be exercised without an
@@ -2478,7 +2791,7 @@ impl Gpu {
         let r = f();
         // flush any open frame so the work is actually submitted before we poll for completion
         self.end_frame();
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         let verr = pollster::block_on(vscope.pop());
         if verr.is_some() {
             self.raise_degrade(what);
@@ -2527,7 +2840,7 @@ impl Gpu {
             verified += slab;
         }
         drop(held);
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         verified
     }
 
@@ -2653,11 +2966,14 @@ impl Gpu {
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
     fn flush_and_wait(&self) {
         if let Some(frame) = self.frame.lock().unwrap().take() {
+            // TAGGED: the explicit end_frame path. Six of eight submit callers incremented nothing, which is
+            // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+            SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc);
             self.retain_keep(frame.keep);
         }
         let t_poll = std::time::Instant::now();
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         check_stall(t_poll, 0);
         self.clear_retained();
     }
@@ -2680,7 +2996,10 @@ impl Gpu {
     fn submit(&self, enc: wgpu::CommandEncoder) {
         use std::sync::atomic::Ordering::Relaxed;
         GPU_SUBMITS.fetch_add(1, Relaxed);
+        let t_sub = std::time::Instant::now();
         self.queue.submit([enc.finish()]);
+        GPU_SUBMIT_NS.fetch_add(t_sub.elapsed().as_nanos() as u64,
+                                std::sync::atomic::Ordering::Relaxed);
         // SUBMIT GOVERNOR (see `inflight_cap`): bound queue depth so a display sharing this GPU is
         // serviced between submits. flush_every already bounds each submit's duration; without a depth
         // bound the encoder outruns the GPU and stacks hundreds of ms of compute in front of the
@@ -2729,7 +3048,16 @@ impl Gpu {
     /// Idempotent-safe: an already-open frame is flushed first (no commands are lost).
     pub fn begin_frame(&self) {
         let mut fr = self.frame.lock().unwrap();
-        if let Some(prev) = fr.take() { self.submit(prev.enc); }
+        // TAGGED: flushing a previous frame is an end_frame in all but name. Six of eight submit callers incremented nothing, which is
+        // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
+        // TAG INSIDE THE CONDITIONAL. This counted a submit whether or not one happened: when the
+        // frame was already empty, fr.take() yields None and nothing is flushed, but the counter had
+        // already advanced. Your log showed the result — "9824 of 9642 submits attributed", more
+        // causes than submits, which is arithmetically impossible and was mine from _406.
+        if let Some(prev) = fr.take() {
+            SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.submit(prev.enc);
+        }
         *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
@@ -2799,6 +3127,21 @@ impl Gpu {
         }
         let mut bg_entries = Vec::new();
         for (i, t) in inputs.iter().enumerate() {
+            // LOCALISE THE SHORT BINDING. --gate-bytes showed reads past the first u32 returning zero
+            // on real hardware, and the two candidates are indistinguishable from source: a view
+            // arriving where none should, or the dims uniform cutting the shader's loop short.
+            //
+            // This prints what is ACTUALLY bound, which separates them in one run: a view line here
+            // means the tensor carried one; no view line plus a short result means dims.
+            if std::env::var_os("LOGSCOPE_TRACE_BIND").is_some() {
+                let sz = t.buf.size();
+                match t.view {
+                    None => eprintln!("  bind[{i}] whole buffer, {sz} bytes ({} u32)", sz / 4),
+                    Some((off, len)) => eprintln!(
+                        "  bind[{i}] VIEW offset {off} len {len} of a {sz}-byte buffer ({} u32) \
+— if this input should be whole, the view is the fault", len / 4),
+                }
+            }
             let resource = match t.view {
                 None => t.buf.as_entire_binding(),
                 Some((off, len)) => wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &t.buf, offset: off, size: std::num::NonZeroU64::new(len) }),
@@ -2855,7 +3198,7 @@ impl Gpu {
                 *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
                 drop(fr);
                 if over_retain && self.pending_keep.lock().unwrap().len() >= DIMS_RETAIN_CAP {
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     self.clear_retained();
                     DIMS_RETAIN_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -2914,7 +3257,7 @@ impl Gpu {
                 // load-time peak is ~2× the resident size — that's what overran the ~56 GiB GPU VA ceiling
                 // loading the 70B (40 GiB arena + ~40 GiB un-drained staging). Flushing per slab caps it.
                 self.queue.submit(std::iter::empty());
-                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                crate::counted_poll(&self.device);
             }
             // size % COPY_BUFFER_ALIGNMENT (4) == 0 is REQUIRED for a mapped_at_creation buffer; both inputs
             // above are 256-aligned so this is a no-op today, but it guards any future unaligned size source.
@@ -2924,6 +3267,30 @@ impl Gpu {
                         else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
                 usage, mapped_at_creation: a.mapped });
+            // A FAILED ALLOCATION MUST NOT BE MAPPED. create_buffer returns a Buffer even when the
+            // driver could not back it — the failure arrives through the uncaptured-error handler and
+            // the buffer is INVALID. Mapping an invalid buffer panics inside wgpu:
+            //
+            //   Failed to allocate BO VMA / BO creation failed
+            //   panicked at wgpu_core.rs: Error in Buffer::get_mapped_range
+            //   Caused by: Buffer with 'arena-slab' label is invalid
+            //
+            // That is a Llama-3.3-70B load on a 48 GiB budget, and a crash is the worst possible
+            // outcome for a condition the memory planner exists to report. Polling flushes the
+            // pending device error so oom_flag is set before anything touches the buffer.
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            if self.oom_backoff() {
+                // Leave the slab out of the arena and hand back a tensor over a minimal buffer. The
+                // OOM flag is already set, so the enclosing load discards this and reports device OOM
+                // through the path built for it — rather than aborting the process here.
+                eprintln!("wgpu-engine: arena slab allocation FAILED ({} MiB) — the driver could not \
+back it. Reporting device OOM rather than mapping an invalid buffer",
+                    a.slab_size / (1 << 20));
+                let dummy = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("arena-slab-oom"), size: 4, usage,
+                    mapped_at_creation: false });
+                return Tensor { buf: dummy, rows, cols, pool: None, view: None };
+            }
             a.slabs.push(slab);
             a.used = 0;
             off = 0;
@@ -3279,8 +3646,28 @@ impl Gpu {
     /// rather than host copies. `gate`/`up`/`down` are the whole expert tensors as they appear in a file.
     pub fn build_moe_stream_raw(&self, gate: &'static [u8], up: &'static [u8], down: &'static [u8],
                                 n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize) -> MoeStream {
-        let gu_expert_bytes = ff * d / 256 * 144;
-        let dn_expert_bytes = d * ff / 256 * 144;
+        // 144 IS Q4_K's BLOCK SIZE, and this helper hardcoded it — so every MoE streaming test only
+        // ever exercised Q4_K experts. A "Q4_K_M" checkpoint is MIXED: llama.cpp ships some tensors as
+        // Q6_K (210 bytes per 256), and the production path at build time uses the type-aware
+        // `source_block_bytes` precisely because of that.
+        //
+        // A fixture that can only produce one type cannot catch a stride computed for the wrong one —
+        // and a wrong expert stride reads every expert after the first from the wrong offset, which
+        // is gibberish rather than an error.
+        //
+        // Defaults to Q4_K so existing callers are unchanged; `build_moe_stream_raw_typed` takes the
+        // ggml types.
+        self.build_moe_stream_raw_typed(gate, up, down, n_expert, ff, d, n_used, ring, 12, 12)
+    }
+
+    /// As `build_moe_stream_raw`, with the gate/up and down source types given.
+    pub fn build_moe_stream_raw_typed(&self, gate: &'static [u8], up: &'static [u8], down: &'static [u8],
+        n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize,
+        gu_ty: u32, dn_ty: u32) -> MoeStream {
+        let gu_expert_bytes = Self::source_block_bytes(gu_ty, ff * d)
+            .expect("a source type this helper can size");
+        let dn_expert_bytes = Self::source_block_bytes(dn_ty, d * ff)
+            .expect("a source type this helper can size");
         // These are VIEWS into a retained mapping, not copies — so the mapping must stay resident for the
         // process lifetime. Declaring it here rather than at the release site keeps the fact next to the
         // thing that makes it true.
@@ -3289,7 +3676,8 @@ impl Gpu {
         // page cache must not be dropped underneath them. Declaring it here rather than at the release
         // site keeps the fact next to the thing that makes it true.
         mark_map_views_live();
-        let raw = RawExpertSrc { gate, up, down, gu_expert_bytes, dn_expert_bytes, ff, d };
+        let raw = RawExpertSrc { gate, up, down, gu_expert_bytes, dn_expert_bytes, ff, d,
+                                 gu_type: 12, dn_type: 12 };
         let (_, gu_total) = raw.gu_layout();
         let (_, dn_total) = raw.dn_layout();
         MoeStream {
@@ -3472,6 +3860,8 @@ impl Gpu {
             MatvecKernel::V2 => self.matvec_decode_v2(a, w, cfg.tile),
             MatvecKernel::V2Wg128 => self.matvec_decode_v2wg128(a, w, cfg.tile),
             MatvecKernel::V2WgSg => self.matvec_decode_v2sg(a, w, cfg.tile),
+            // The wide-load kernel, now reachable by autotune rather than only by env var.
+            MatvecKernel::V3 => self.matvec_decode_v3(a, w, cfg.tile),
         }
     }
 
@@ -4075,6 +4465,28 @@ impl Gpu {
                                       &h.prev_experts, m.cfg.n_used as usize)
                     }
                 };
+                // START THE READ. The prediction fed the eviction policy and nothing else, so it
+                // changed WHICH expert was resident and never WHEN its bytes arrived — and the model
+                // mapping is advised Random, so a page is not read until it is faulted on.
+                //
+                // WILLNEED on the predicted ranges closes that gap: the kernel begins the read now and
+                // the fault at use time finds the page warm. Advisory, so a wrong prediction costs
+                // pages the kernel would have dropped anyway, and a failure leaves the old behaviour.
+                if !predicted.is_empty() {
+                    // `raw` lives on MoeStream — present only on the file-VIEW path, which is
+                    // exactly where a prefetch can help: the host-copy path has already paid for the
+                    // bytes, so hinting them would advise pages that are not the bottleneck.
+                    let g = sm.lock().unwrap();
+                    if let Some(raw) = g.raw.as_ref() {
+                        let (gu, dn) = crate::prefetch::ranges_for(
+                            &predicted, n_expert, raw.gu_expert_bytes, raw.dn_expert_bytes);
+                        // gate/up share a stride, so one hint per expert covers both when they are
+                        // one tensor; down is separate. Hinting the slices directly rather than the
+                        // mapping, because these ARE views into it.
+                        crate::prefetch::hint_all(raw.gate, &gu, crate::prefetch::BUDGET);
+                        crate::prefetch::hint_all(raw.down, &dn, crate::prefetch::BUDGET);
+                    }
+                }
                 let pick = sm.lock().unwrap().policy.pick_repin_hinted(n_expert, &predicted);
                 if let Some((evict, admit)) = pick {
                     if self.stream_repin(sm, evict, admit) {
@@ -4541,6 +4953,18 @@ impl Gpu {
         let base = if w.nope { 0.0 } else { base }; // Llama4 iRoPE: NoPE layers skip rotation (rope hosts' identity sentinel)
         let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd; // ad = attention width (== d for plain MHA)
         let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
+        // ORDER VERIFIED against llama.cpp models/qwen3moe.cpp, which does:
+        //
+        //     97:  Qcur = build_norm(Qcur, attn_q_norm, LLM_NORM_RMS, il);   <- QK-norm FIRST
+        //     100: Qcur = ggml_rope_ext(...);                               <- RoPE SECOND
+        //
+        // Read inside-out, the line below is project -> qk_norm -> rope -> post, which matches. The
+        // norm tensor is sized {n_embd_head_k} there and `hd` is passed here, so both are per
+        // head_dim rather than over the full projection.
+        //
+        // Pinned as a comment because the ordering lives inside one nested expression: a refactor
+        // that hoists these into statements could reorder them without looking wrong, and swapping
+        // norm and rope produces gibberish rather than an error.
         let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
         let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd), w, t, kv, hd, eps);
         let v = w.wv.apply(self, &n1, t);
@@ -6529,6 +6953,48 @@ impl DsaConfig {
     }
 }
 impl Model {
+    /// Weight PARAMETERS read for one decoded token.
+    ///
+    /// This is the numerator of the roofline bound, and it is architecture arithmetic rather than a
+    /// stored figure — so it cannot drift from what the model actually is.
+    ///
+    /// Parameters, not bytes, deliberately: the caller knows the residency format (q4, int8) and this
+    /// does not. Multiplying by a bytes-per-parameter guessed here would produce a confident figure
+    /// from an assumption, which is the shape of every memory bug in this codebase.
+    ///
+    /// `n_active_experts` is the routed count for an MoE and 0 for a dense model; the FFN is counted
+    /// once per active expert plus any shared one, because that is what decode reads.
+    pub fn active_params_per_token(&self, n_active_experts: usize) -> u64 {
+        active_params_per_token(self.d, self.h, self.vocab, self.n_layers,
+                                self.n_kv_heads, self.head_dim, n_active_experts)
+    }
+}
+
+/// The same arithmetic as a free function, so it can be tested without constructing a whole `Model`.
+///
+/// Extracted after the test could not build one: a figure this load-bearing should not be untestable
+/// because its container is awkward to make.
+pub fn active_params_per_token(d: usize, ff: usize, vocab: usize, n_layers: usize,
+                               n_kv_heads: usize, head_dim: usize, n_active_experts: usize) -> u64 {
+    {
+        let (d, ff) = (d as u64, ff as u64);
+        let kv = (n_kv_heads * head_dim) as u64;
+        // Attention: q and o are d x d; k and v are d x (n_kv * head_dim), which is SMALLER under GQA
+        // and is the whole point of GQA — assuming four d-by-d matrices overstates it by ~40% on a
+        // 32/8 model.
+        let attn = 2 * d * d + 2 * d * kv;
+        // SwiGLU: gate and up are d x ff, down is ff x d.
+        let one_ffn = 3 * d * ff;
+        let ffn = if n_active_experts == 0 { one_ffn } else { one_ffn * n_active_experts as u64 };
+        (attn + ffn) * n_layers as u64
+            // The output projection is read every token; the embedding table is a LOOKUP, not a matmul,
+            // so only one row of it moves and it does not belong in a per-token bandwidth figure.
+            + d * vocab as u64
+    }
+}
+
+impl Model {
+
     /// Cache key fragment describing what kind of decode this model performs. MoE and dense decode have
     /// very different dispatch profiles (a MoE layer issues per-expert work; a dense one does not), so
     /// anything tuned per-GPU must also be keyed on this — a verdict measured on a dense model does not
@@ -6548,6 +7014,15 @@ impl Model {
 
     /// Does any layer stream its experts from host memory? Changes what the prefill chunk should optimise
     /// for: refill traffic rather than dispatch duration.
+    /// Routed experts activated per token, or 0 for a dense model.
+    ///
+    /// Read from the first MoE layer's own config rather than a constant: this is the number that makes
+    /// a 30B-A3B read like a 3B, and getting it from anywhere but the model would put the roofline
+    /// bound an order of magnitude out.
+    pub fn n_active_experts(&self) -> usize {
+        self.layers.iter().find_map(|b| b.moe.as_ref().map(|m| m.cfg.n_used as usize)).unwrap_or(0)
+    }
+
     pub fn streams_experts(&self) -> bool {
         self.layers.iter().any(|b| b.moe.as_ref().is_some_and(|m| m.stream.is_some()))
     }
@@ -6665,7 +7140,12 @@ impl Gpu {
             "this ~{gib:.0} GiB model exceeds the GPU's allocatable memory even at q4-resident — too big for \
              the wgpu engine on this GPU (its resident copy of the weights won't fit). Use the llama.cpp / \
              ollama backend for this model (it mmaps weights into unified memory and fits where the wgpu \
-             engine can't), or run a smaller model."
+             engine can't), or run a smaller model.\n\n\
+             NOTE: the budget that admitted this load is a CONSTANT, not a measurement of what this \
+device honours — every load logs that warning and it is the reason a model can pass the fit check and \
+then fail allocating. `kernel-validate --gate-vram` finds the real ceiling, and LOGSCOPE_MAX_GPU_GB \
+pins it once you know. Until then the planner is guessing high, which turns a clean refusal into a \
+failed allocation partway through."
         )
     }
     /// Load inside an OutOfMemory error scope. Ok(Some) = loaded; Ok(None) = GPU OOM (captured, the
@@ -6681,7 +7161,7 @@ impl Gpu {
     fn try_load_resident_impl(&self, parts: &[&[u8]], stat: Option<&[&'static [u8]]>) -> Result<Option<Model>, String> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let res = self.load_gguf_inner(parts, stat, true);
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         let oom = pollster::block_on(scope.pop());
         if oom.is_some() {
             drop(res.ok()); // discard any partial/poisoned buffers from the failed attempt
@@ -6793,7 +7273,7 @@ the '{arch}' prefix — proceeding as '{arch}' (a converter mislabel); report th
 a '{declared}'");
             }
         }
-        let acfg = crate::archcfg::for_arch(&arch);
+        let mut acfg = crate::archcfg::for_arch(&arch);
         // MLA is detected by TENSOR PRESENCE, not arch name. The glm4moe family ships in two forms: some
         // use Multi-head Latent Attention (attn_kv_a/kv_b down/up projections — not wired yet), but others
         // use ordinary GQA attention (attn_q/k/v, often with QK-norm + bias) plus shared-expert MoE, which
@@ -6805,15 +7285,73 @@ a '{declared}'");
         let arch_is_mla_family = matches!(acfg.arch, crate::archcfg::Arch::DeepseekV3 | crate::archcfg::Arch::Glm4Moe);
         // If an MLA-family checkpoint actually ships MLA projection tensors, we can't run it yet (MLA
         // forward unwired) — refuse clearly. If it has standard attention tensors instead, proceed.
-        if arch_is_mla_family && has_mla_tensors {
+        // THE TENSORS DECIDE, NOT THE ARCH NAME. This required BOTH, so a checkpoint shipping MLA
+        // projections under an architecture the table calls standard-attention fell through to the
+        // dense loader and failed on a missing attn_q — which is what GLM-4.7 Flash does:
+        //
+        //   blk.0 is Multi-head Latent Attention (attn_q_a / attn_kv_a_mqa present, attn_q absent)
+        //   and the MLA path did not engage, so the dense loader ran instead.
+        //
+        // A family list is a prediction about which architectures use MLA; `has_mla_tensors` is an
+        // observation of what this file contains. When they disagree the file is right — the same
+        // principle as deriving the latent dims from shapes rather than trusting metadata.
+        //
+        // Kept in the condition so the arch list still explains WHY when it is the surprising case.
+        if has_mla_tensors {
+            if !arch_is_mla_family {
+                eprintln!("loader: '{arch}' is not in the MLA family list, and this checkpoint ships \
+MLA projections anyway — taking the MLA path because the tensors are what the forward pass has to \
+match. The family list is a prediction; the file is an observation");
+            }
             // No longer a blanket refusal. The MLA forward, the compressed cache, the per-layer
             // projections, the decode block and the per-layer routing are all in place and checked
             // (--gate-mla-block plus the kernel-validation suite). What is still worth refusing is a
             // checkpoint whose MLA metadata is absent, because then the dims are unknown and nothing
             // downstream can be trusted — that is a real missing input, not an unimplemented feature.
-            let have_cfg = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) > 0;
+            // SPARSE-ATTENTION BOUND, read rather than assumed. archfeat::Feature::indexer_needed_at
+            // encodes Colibri's finding — the DSA indexer is a no-op for seq <= index_topk, because
+            // top-k of everything is everything — and until now nothing supplied the number, so the
+            // conditional was theoretical.
+            //
+            // Read from the file: a checkpoint that ships a smaller bound than GLM-5.2's 2048 needs
+            // the indexer sooner, and one that ships none cannot be reasoned about this way at all.
+            if let Some(topk) = g.get_u32(&format!("{}.attention.index_topk", acfg.prefix))
+                .or_else(|| g.get_u32(&format!("{}.index_topk", acfg.prefix))) {
+                eprintln!("loader: sparse-attention bound index_topk={topk} — dense causal attention \
+is EXACT at or below that many tokens (the indexer selects every key there), and an approximation \
+above it. Keep prompts under {topk} until the indexer is implemented");
+            }
+            // DERIVE FROM THE SHAPES WHEN THE METADATA OMITS THE RANK. GLM-5.2's preview ships MLA
+            // tensors and no kv_lora_rank, and the refusal for it was honest but unnecessary: the
+            // norm vector's LENGTH is the latent rank, and kv_a_mqa's width is rank + rope_dim, so
+            // every dimension is recoverable from tensors the file already has.
+            //
+            // Safe here in a way it was not for the fused-qkv split, because the shapes OVER-determine
+            // the answer — four constrain three — so mladims cross-checks them and refuses a file
+            // whose tensors disagree rather than loading at a guessed rank.
+            let derived = crate::mladims::derive("blk.0.", &|n: &str| {
+                g.tensor(n).map(|t| t.dims.clone())
+            });
+            if let Ok(d) = &derived {
+                if g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) == 0 {
+                    eprintln!("loader: MLA dims DERIVED from tensor shapes (metadata omits \
+kv_lora_rank) — kv_lora {} q_lora {} rope_dim {} heads {} v_head_dim {}. The shapes cross-check, so \
+this is a reading of the file rather than a guess",
+                        d.kv_lora_rank, d.q_lora_rank, d.qk_rope_head_dim, d.n_head, d.v_head_dim);
+                }
+            }
+            let have_cfg = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) > 0
+                || derived.is_ok();
             if !have_cfg {
                 let layout = g.dump_tensors("blk.0.");
+                // The derivation was tried and failed; say WHY rather than repeating that the
+                // metadata is silent. "Unknown" sends someone looking for a config key; the real
+                // answer is usually a specific tensor that is absent or the wrong shape.
+                if let Err(e) = &derived {
+                    return Err(format!("architecture '{arch}' ships MLA tensors, the metadata omits \
+kv_lora_rank, and the dimensions could not be recovered from the shapes either: {}\n\nTensor layout:\n{}",
+                        e.explain(), layout));
+                }
                 return Err(format!("architecture '{arch}' ships MLA tensors but no kv_lora_rank in its \
 metadata, so the latent dimensions are unknown. The MLA path is implemented and validated; this \
 particular checkpoint cannot be sized. Use the llama.cpp backend for it.\n{layout}"));
@@ -6844,7 +7382,24 @@ layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
             // refuse with the arch's precise note. Architectures with no dense form (Llama4) never escape.
             let expert_count = g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0);
             let dense_ok = acfg.dense_supported && expert_count == 0;
-            if !dense_ok {
+            // BREAK THE DEADLOCK. `supported` flips only once an architecture has completed a forward
+            // pass on a real checkpoint — which is the right rule, and it means an arch can never
+            // become supported, because attempting it is what produces the evidence and attempting it
+            // is what this refuses.
+            //
+            // GLM-5.2 is exactly there: its two expert-weighting gaps are implemented, its third is a
+            // no-op below 2048 context, its MLA layout is fixed, and it cannot be RUN to find out.
+            //
+            // So: an explicit opt-in, named for what it is. This does not claim the model works — it
+            // lets someone find out, which is the only path to the verification the flag demands.
+            let forced = std::env::var_os("LOGSCOPE_TRY_UNSUPPORTED_ARCH").is_some();
+            if forced {
+                eprintln!("loader: '{arch}' is NOT verified — trying it anyway because \
+LOGSCOPE_TRY_UNSUPPORTED_ARCH is set. Remaining gaps: {}. Wrong output is the EXPECTED failure here, \
+not a surprise; coherent output is the evidence that would flip the flag",
+                    crate::archfeat::gap_report(&arch, variant).join("; "));
+            }
+            if !dense_ok && !forced {
                 let moe_hint = if expert_count > 0 { format!(" (this is a {expert_count}-expert MoE checkpoint)") } else { String::new() };
                 // Append layer-0's tensors so the exact expert stacking layout is visible right here — the
                 // one thing needed to wire the MoE forward, without a separate dump run.
@@ -6860,7 +7415,11 @@ layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
                 // the rest of the message less
                 let detail = detail.trim_end_matches('.').to_string();
                 return Err(format!("architecture '{arch}' isn't supported by the wgpu engine yet{moe_hint} — {detail}. \
-                    Use the llama.cpp backend for this model.\n{layout}"));
+                    Use the llama.cpp backend for this model, or set LOGSCOPE_TRY_UNSUPPORTED_ARCH=1 \
+to attempt it anyway — an architecture becomes supported only once it has completed a forward pass on \
+a real checkpoint, and this refusal is what prevents that ever happening. Wrong output is the EXPECTED \
+failure when forcing it, not a surprise; coherent output is the evidence that would flip the flag.\n\
+{layout}"));
             }
             eprintln!("loader: '{arch}' is a DENSE checkpoint (no experts) — loading via the {} forward path", acfg.prefix);
         }
@@ -6881,6 +7440,16 @@ layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
                 }
             }
         };
+
+        // AND STORE IT. The sniff wrote a local `pfx` and left acfg.prefix pointing at the
+        // registry's value, so every later read through acfg.prefix silently returned None on a
+        // file whose prefix differs — rope base, norm epsilon, expert_weights_scale, all of them.
+        // Each defaulted quietly, and a model with the wrong rope base produces exactly the
+        // near-random output reported for Qwen3.5 ("doctrine%," for "hi there").
+        //
+        // The loader NOTICED the mismatch and printed it. Noticing and not acting is worse than
+        // not noticing: the log says the file's prefix is being used, and it was not.
+        acfg.prefix = pfx;
         // Qwen3/3.5: real blk.N.attn_{q,k}_norm.weight tensors. Llama4: attn_qk_norm is set in the
         // registry but the GGUF carries NO norm-weight tensors — its QK-Norm is WEIGHTLESS (an
         // L2/RMS norm ≡ all-ones weights), applied on RoPE layers only; handled per-layer below.
@@ -6888,7 +7457,46 @@ layout is not.", if split_kv_b { "SPLIT k_b+v_b" } else { "fused" });
         let has_qk_norm = acfg.attn_qk_norm && !is_llama4;
         // Llama4 iRoPE: every 4th layer uses NO positional encoding (llama.cpp hardcodes the same
         // step). NoPE layers also skip the weightless QK-Norm (it applies with RoPE only).
-        let nope_step = if is_llama4 { 4usize } else { 0 };
+        // NoPE INTERVAL FROM METADATA, with 4 as the fallback. This was hardcoded to 4 — every fourth
+        // layer skips rotation — which is Scout's documented pattern and an ASSUMPTION about every
+        // other Llama-4 checkpoint, including Maverick and any future variant.
+        //
+        // A wrong interval applies RoPE to a layer that should have none and vice versa. The model
+        // loads, every tensor is present, every shape matches, and the output is garbled — which is
+        // exactly the Scout symptom that has survived every GPU-side fix on both platforms.
+        //
+        // Same shape as expert_weights_scale being "effectively hardcoded to 1": a value the file
+        // carries, read from a constant instead.
+        let nope_step = if is_llama4 {
+            g.get_u32(&format!("{}.attention.no_rope_interval", acfg.prefix))
+                .or_else(|| g.get_u32(&format!("{}.no_rope_interval", acfg.prefix)))
+                .map(|v| v as usize)
+                .unwrap_or(4)
+        } else { 0 };
+        if is_llama4 {
+            // Printed because a wrong interval is invisible in the output: the model runs and the
+            // text is merely bad, so the one place it can be caught is a line stating what was chosen.
+            // EVERY VALUE THAT WAS A CONSTANT, AND WHERE IT CAME FROM. Five of these were hardcoded
+            // and each produces text that is merely worse with every tensor present and every
+            // dimension right — so a wrong one is invisible in the output and this line is the only
+            // place it can be caught. Printing the SOURCE matters as much as the value: "4 (default)"
+            // and "4 (file)" mean different things when the output is bad.
+            let src = |k: &str| if g.get_u32(&format!("{}.{k}", acfg.prefix)).is_some()
+                { "file" } else { "default" };
+            eprintln!("loader: Llama-4 iRoPE — NoPE every {nope_step} layers from layer {} ({}); \
+qk-norm {} ({}); shared experts {} ({}); attn-temp floor {} ({})",
+                nope_step.saturating_sub(1), src("attention.no_rope_interval"),
+                if g.get_u32(&format!("{}.attention.use_qk_norm", acfg.prefix))
+                    .map(|v| v != 0)
+                    .unwrap_or_else(|| g.get_u32(&format!("{}.expert_count", acfg.prefix))
+                        .unwrap_or(0) != 128) { "on" } else { "off" },
+                src("attention.use_qk_norm"),
+                g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(1),
+                src("expert_shared_count"),
+                g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)).unwrap_or(8192.0),
+                if g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)).is_some()
+                    { "file" } else { "default" });
+        }
         // Which layers are windowed. llama.cpp's default pattern puts the FULL-attention layer last in
         // each group (dense_first = false), so a period of 4 gives [swa, swa, swa, dense].
         let swa_period = g.get_u32(&format!("{}.attention.sliding_window_pattern", acfg.prefix))
@@ -7112,8 +7720,50 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                                 let per_expert_all_layers = (n as u64) * per_expert_layer;
                                 let ring = (n_expert_used as u64 + 1).max(2); // per-layer streaming ring
                                 let ring_cost = (n as u64) * ring * per_expert_layer; // ring resident across all layers
-                                if dense + ring_cost > gpu_budget {
-                                    return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB. Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget)));
+                                // WOULD IT SIMPLY FIT? This check did not exist: the branch was entered for ANY
+                    // MoE model, so Scout streamed 16 experts through a staging ring against a budget
+                    // that holds all of them. Streaming costs a host copy of every expert, the ring's
+                    // completion fence, and most of the run's submits — all to avoid an allocation
+                    // that succeeds.
+                    //
+                    // The budget rose from 24 to 48 GiB in _340 on llama.cpp's evidence, which is what
+                    // makes this reachable now; at 24 the answer was genuinely no.
+                    let full_resident = dense + (n_expert as u64) * per_expert_all_layers;
+                    if full_resident <= gpu_budget {
+                        eprintln!("wgpu-engine: MoE fits FULLY RESIDENT ({:.1} GiB of {:.1} GiB budget) \
+— no expert streaming, no host copy, no staging ring. Set LOGSCOPE_MOE_STREAM=1 to force streaming.",
+                            gib(full_resident), gib(gpu_budget));
+                        auto_q4 = true;
+                        // moe_stream_pin stays None, which is what selects the resident path below.
+                    } else if dense + ring_cost > gpu_budget {
+                                    return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB.{} Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget),
+                            // NAME THE FIX, not just the number. "It does not fit" is a dead end;
+                            // "it does not fit at 4.5 bits and would at 1.56" names the work that
+                            // changes the answer and lets a reader judge whether it is worth doing.
+                            //
+                            // Only shown when the source format is genuinely cheaper than the resident
+                            // one — for Q4_K the conversion is size-neutral and a native path would buy
+                            // nothing, so offering it there would send someone after 0 GiB.
+                            {
+                                let params = (dense + (n_expert as u64) * per_expert_all_layers)
+                                    .saturating_mul(8) / 45 * 10;   // undo 4.5 bpw to weights
+                                // The expert tensors' own type, looked up rather than assumed: the
+                                // dense weights may be a different format from the experts, and it is
+                                // the experts that dominate this budget.
+                                let et = ["ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"].iter()
+                                    .find_map(|n| g.tensor(&format!("blk.0.{n}.weight"))
+                                        .map(|t| t.ggml_type))
+                                    .unwrap_or(u32::MAX);
+                                match crate::memplan::conversion_cost(et, params, 4.5) {
+                                    Some((res, nat)) if nat < res => format!(
+                                        " The source is {:.2} bpw and the engine converts it to 4.5 \
+bpw q4 before running: {:.1} GiB native against {:.1} GiB resident, so a native kernel for this \
+format would save ~{:.1} GiB and is what would make this fit.",
+                                        crate::memplan::source_bpw(et).unwrap_or(0.0),
+                                        gib(nat), gib(res), gib(res.saturating_sub(nat))),
+                                    _ => String::new(),
+                                }
+                            }));
                                 }
                                 let pin_fit = ((gpu_budget - dense - ring_cost) / per_expert_all_layers) as usize;
                                 let pin = std::env::var("LOGSCOPE_MOE_PIN").ok().and_then(|s| s.parse().ok()).unwrap_or(pin_fit).min(pin_fit).min(n_expert);
@@ -7127,14 +7777,54 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                                 let ram = crate::memplan::system_ram_bytes();
                                 eprintln!("loader: MoE streaming will hold ~{:.1} GiB of expert weights in HOST RAM \
 (plus ~{:.1} GiB of this file in page cache while loading)", gib(host_store), gib(set_data_len));
-                                if ram > 0 && host_store + set_data_len > ram * 3 / 4 {
+                                // ON UNIFIED MEMORY THE GPU BUDGET IS ALSO HOST RAM. This check
+                                // counted the host expert store and the page cache and omitted the
+                                // RESIDENT allocation — which is a separate pool on a discrete GPU and
+                                // the same physical memory on an M-series machine.
+                                //
+                                // Measured failure: 64 GiB M2 Max, Qwen3-30B. host 15.2 + cache 17.3 =
+                                // 32.5 against a 48 GiB threshold, so the plan was approved — and then
+                                // ~15.0 GiB of resident experts landed in the SAME RAM and the process
+                                // was OOM-killed at layer 36 of 48. Being killed is far worse than a
+                                // refusal: seventeen seconds spent and no information returned.
+                                // USE THE REAL SIGNAL. I wrote this as `conservative_vma ||
+                                // cfg!(macos)` — which is Apple-only, and misses every OTHER unified
+                                // device: an Adreno or Mali phone is an IntegratedGpu with exactly the
+                                // same shared pool, and it is the machine least able to absorb the
+                                // double-count.
+                                //
+                                // `self.unified` already exists and is derived from device_type via
+                                // zerocopy::is_unified_memory, which is the question actually being
+                                // asked. Third instance this session of a guard keyed on a proxy when
+                                // the real predicate was in scope.
+                                let uma_resident = if self.unified { gpu_budget } else { 0 };
+                                let unified = uma_resident > 0;
+                                if ram > 0 && !crate::memplan::streaming_fits_host(
+                                    host_store, set_data_len, uma_resident, ram, unified) {
                                     return Err(format!(
-                                        "MoE expert streaming needs ~{:.1} GiB of host RAM for expert weights plus \
+                                        "MoE expert streaming needs ~{:.1} GiB of host RAM for expert weights, ~{:.1} GiB of \
+resident weights that share the SAME memory on this unified-memory machine, plus \
 ~{:.1} GiB of page cache for the file, against {:.1} GiB of system RAM — this would be OOM-killed partway \
 through the load. The engine requantizes every expert to its own q4 layout on load, which is the cost here. \
 Options: run a smaller checkpoint, use the llama.cpp backend (which reads the file's native Q4_K blocks \
-directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the resident-fit error instead.",
-                                        gib(host_store), gib(set_data_len), gib(ram)));
+directly and needs no host copy){}.",
+                                        gib(host_store), gib(uma_resident), gib(set_data_len), gib(ram),
+                                        // NAME THE ESCAPE ONLY WHEN IT WORKS. This said "set
+                                        // LOGSCOPE_MOE_STREAM=0 to see the resident-fit error
+                                        // instead", which offers a flag as a way to reach a DIFFERENT
+                                        // error — so nobody tries it. When the model fits resident it
+                                        // is not an escape to another failure, it is the answer.
+                                        if full_resident <= gpu_budget {
+                                            format!(", or set LOGSCOPE_MOE_STREAM=0 — this model DOES \
+fit fully resident ({:.1} GiB against a {:.1} GiB budget), so streaming is not needed at all and \
+turning it off avoids the host copy entirely",
+                                                gib(full_resident), gib(gpu_budget))
+                                        } else {
+                                            format!(", or set LOGSCOPE_MOE_STREAM=0 to see the \
+resident-fit error instead — though at {:.1} GiB against a {:.1} GiB budget it will not fit that way \
+either",
+                                                gib(full_resident), gib(gpu_budget))
+                                        }));
                                 }
                                 auto_q4 = true;
                                 moe_stream_pin = Some(pin);
@@ -7144,10 +7834,12 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
                             } else {
                             // report what streaming WOULD do so it's actionable, even though execution isn't wired
                             let ceiling_note = if self.conservative_vma {
-                                " (this is the Asahi/Honeykrisp BO-VMA ceiling — a hard driver limit well below the machine's RAM; the same model loads on macOS/Metal, which has no such ceiling)"
+                                " (a CONSTANT for Asahi/Honeykrisp, not a measurement — it was taken from the staging upload path before the arena removed the staging, and `--gate-vram` measured this same device honouring 63 GiB)"
                             } else { "" };
                             let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
-                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 100 GiB/s). Options: the llama.cpp backend, run on Metal (macOS), or raise LOGSCOPE_MAX_GPU_GB to probe the real ceiling.",
+                                Some(p) => format!("won't fit resident in ~{:.1} GiB{} — layer streaming would pin {}/{} blocks and stream {} per token (~{:.0} ms/tok at 21 GiB/s, the MEASURED upload rate). \
+FIRST CHECK WHETHER THIS BUDGET IS REAL: it is a compiled-in constant, and on an M2 Ultra `kernel-validate --gate-vram` measured the device honouring 63 GiB against this figure's 24 — a model this size may simply fit. \
+Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp backend.",
                                     gib(gpu_budget), ceiling_note, p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
                                 None => format!("won't fit even a streaming ring in ~{:.1} GiB{}; use the llama.cpp backend.", gib(gpu_budget), ceiling_note),
                             };
@@ -7164,6 +7856,61 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
             }
         }
         let fetch = |name: &str| -> Result<Vec<f32>, String> {
+            // FUSED-QKV FALLBACK. A checkpoint shipping `attn_qkv` instead of separate q/k/v tensors
+            // (Qwen3.5-30B) previously failed here with "missing tensor". qkvsplit::locate resolves
+            // the name to the fused tensor and the byte range of the part wanted.
+            //
+            // Option vs Result carries the distinction: None means no fused tensor exists and the
+            // ordinary miss below is correct, while Err means one exists at a shape the metadata does
+            // not describe — which must STOP rather than slice something plausible.
+            if g.tensor(name).is_none() {
+                // GGUF DIMS ARE FASTEST-VARYING FIRST. For the reported `attn_qkv [4096, 8192]` on a
+                // d=4096 model, dims[0]=4096 is the INPUT width and dims[1]=8192 is the output rows —
+                // so a "row" in the split's sense is dims[0] wide and there are dims[1..] of them.
+                //
+                // I had these swapped on the first pass, which would have split 4096 rows out of a
+                // tensor that has 8192 and sliced at a stride computed from the wrong axis. Both
+                // errors point the same way: q's range would have covered part of the tensor that is
+                // not q, and the row-count check would not have caught it because the numbers are
+                // self-consistent — just about the wrong dimension.
+                // Both derived by qkvsplit::dims_to_rows_and_stride, which is where the axis bug was
+                // and is now the tested unit — the loader closure could not be tested from here, and
+                // every gate passed while this was backwards because none of them loads a fused
+                // tensor.
+                let derive = |n: &str| g.tensor(n).and_then(|t| {
+                    let ty = t.ggml_type;
+                    crate::qkvsplit::dims_to_rows_and_stride(&t.dims, |w| gguf::type_nbytes(ty, w))
+                });
+                let rows_of = |n: &str| derive(n).map(|(r, _)| r);
+                let row_bytes = |n: &str| derive(n).map(|(_, s)| s);
+                for fused in crate::qkvsplit::FUSED_NAMES {
+                    let src = match crate::qkvsplit::resolve(name, fused) { Some((s, _)) => s, None => break };
+                    // A None here means the row is not a whole number of quantization blocks, so it
+                    // cannot be sliced at a row boundary — q would end mid-block and both q's last
+                    // block and k's first would be garbage. Named, because falling through to
+                    // "missing tensor" would report the wrong problem entirely.
+                    let rb = match row_bytes(&src) {
+                        Some(b) => b,
+                        None => return Err(format!(
+                            "{name}: the fused tensor {src} has a row that is not a whole number of \
+quantization blocks, so it cannot be split at a row boundary — q would end mid-block and both q's \
+last block and k's first would decode to garbage")),
+                    };
+                    match crate::qkvsplit::locate(name, &rows_of, n_heads as usize,
+                                                  n_kv_heads as usize, head_dim as usize, rb) {
+                        Some(Ok((srcname, (b0, b1)))) => {
+                            let t = g.tensor(&srcname).ok_or(format!("missing tensor {srcname}"))?;
+                            let raw = set.slice(t.offset + b0 as u64, b1 - b0).ok_or(format!(
+                                "fused tensor {srcname} data out of range for {name}"))?;
+                            let cols = t.dims[0] as usize;      // input width, matching row_bytes
+                            let rows = (b1 - b0) / rb;
+                            return gguf::dequantize(t.ggml_type, raw, rows * cols);
+                        }
+                        Some(Err(e)) => return Err(format!("{name}: {}", e.explain())),
+                        None => break,
+                    }
+                }
+            }
             let t = g.tensor(name).ok_or(format!("missing tensor {name}"))?;
             let count = t.dims.iter().product::<u64>() as usize;
             let nbytes = gguf::type_nbytes(t.ggml_type, count).ok_or(format!("type {} unsupported for {name}", t.ggml_type))?;
@@ -7201,7 +7948,19 @@ directly and needs no host copy), or set LOGSCOPE_MOE_STREAM=0 to see the reside
         let arena_on = match arena_env.as_deref() {
             Some("0") | Some("false") => false,     // hard opt-out
             Some(_) => true,                        // explicit opt-in
-            None => self.conservative_vma,          // default: on where BO VMA is the binding constraint
+            // ON WHERE OBJECT COUNT IS THE BINDING CONSTRAINT, which is what the comment above always
+            // said and what the code did not check. `conservative_vma` means "Vulkan on Apple"; the
+            // governor already classifies the limit KIND, and both BufferObjects (Metal) and
+            // AllocationCount (all Vulkan, commonly 4096 on desktop and tighter on mobile) are exactly
+            // the case the arena exists for.
+            //
+            // The practical miss was a phone: an Adreno or Mali device has the tightest object budget
+            // of anything we run on, and defaulted the arena OFF because it is not Apple.
+            None => {
+                let kind = self.governor.lock().unwrap().budget_kind();
+                matches!(kind, crate::governor::LimitKind::BufferObjects
+                             | crate::governor::LimitKind::AllocationCount)
+            }
         };
         let _arena_guard = if arena_on {
             let max_buf = self.device.limits().max_buffer_size;
@@ -7316,7 +8075,14 @@ LOADER gap, not a bad checkpoint — see the MLA line earlier in this log for wh
                     }
                     let hint = if found.iter().any(|f| f.starts_with("attn_qkv") || f.starts_with("wqkv")
                                                    || f.starts_with("query_key_value")) {
-                        " — this looks like a FUSED qkv layout, which this loader does not split yet"
+                        // Says what the shapes WOULD have to be, so a reader can tell in one glance
+                    // whether the file matches the q|k|v blocked layout qkvsplit implements — or
+                    // whether it is something else and the split would produce attention over the
+                    // wrong projections. A message naming only the symptom leaves that unanswerable.
+                    " — this looks like a FUSED qkv layout. qkvsplit::split() implements the q|k|v \
+BLOCKED form (n_head*head_dim rows of q, then n_kv*head_dim of k, then the same of v); what remains \
+is wiring it here and checking that those rows sum to the tensor's own row count, because a layout \
+that is interleaved instead would slice plausibly and be wrong"
                     } else if found.iter().any(|f| f.starts_with("attn_q_a")) {
                         " — this is Multi-head Latent Attention"
                     } else { "" };
@@ -7463,22 +8229,58 @@ q/k/v block ORDER matches");
                                          format!("blk.{i}.ffn_up_exps.weight"),
                                          format!("blk.{i}.ffn_down_exps.weight")];
                             let mut spans = Vec::new();
+                            // Captured per tensor: gate/up and down differ in Q4_K_M.
+                            let mut types = [0u32; 3];
                             for (idx, nm) in names.iter().enumerate() {
                                 let t = g.tensor(nm).ok_or(format!("{nm} not found"))?;
-                                if t.ggml_type != 12 {
-                                    return Err(format!("{nm} is {}, not Q4_K — Q4_K_M mixes in other types",
+                                // Q4_K and Q6_K both. The check was `!= 12`, and Q4_K_M stores
+                                // ffn_down as Q6_K — so one tensor rejected the whole model and sent
+                                // it to the host-copy path. --gate-q6k has been bit-exact since it
+                                // went green; the check simply never learned.
+                                // GATE HELD AT Q4_K FOR NOW, deliberately. The type plumbing below is
+                                // Q6_K-ready — strides, per-tensor types, and a load-time conversion —
+                                // but the streaming FILL converts on-GPU via q4k_convert_from, and the
+                                // Q6_K equivalent needs a shader that does not exist yet
+                                // (Q6K_DEQUANT produces f32; quantize_q4_resident is CPU).
+                                //
+                                // Opening the gate without it would take the file-view path and then
+                                // produce garbage at fill time, which is strictly worse than the host
+                                // copy it replaced. LOGSCOPE_Q6K_VIEWS=1 opts in for anyone wiring the
+                                // shader.
+                                let q6_ok = std::env::var("LOGSCOPE_Q6K_VIEWS").is_ok();
+                                let allowed: &[u32] = if q6_ok { &[12, 14] } else { &[12] };
+                                if !allowed.contains(&t.ggml_type) {
+                                    return Err(format!("{nm} is {} — the file-view path reads Q4_K \
+today. Q6_K is bit-exact (--gate-q6k) and the loader is plumbed for it; what is missing is the on-GPU \
+Q6_K->q4 fill conversion. Until that exists this falls back to the host copy rather than reading a \
+format the fill path cannot convert",
                                         gguf::ggml_type_name(t.ggml_type)));
                                 }
                                 let count = t.dims.iter().product::<u64>() as usize;
                                 let want = if idx == 2 { d * expert_ff * n_expert } else { expert_ff * d * n_expert };
                                 if count != want { return Err(format!("{nm} has {count} elements, expected {want}")); }
-                                let nbytes = gguf::type_nbytes(12, count).ok_or("q4_k size")?;
+                                types[idx] = t.ggml_type;
+                                let nbytes = gguf::type_nbytes(t.ggml_type, count)
+                                    .ok_or("source block size")?;
                                 spans.push(sset.slice(t.offset, nbytes).ok_or(format!("{nm} span escapes the shards"))?);
                             }
+                            // gate and up must match each other; down may differ.
+                            if types[0] != types[1] {
+                                return Err(format!("gate is {} and up is {} — the streaming path packs \
+them as one blob, so they must share a format",
+                                    gguf::ggml_type_name(types[0]), gguf::ggml_type_name(types[1])));
+                            }
+                            let (gu_ty, dn_ty) = (types[0], types[2]);
                             Ok(RawExpertSrc {
                                 gate: spans[0], up: spans[1], down: spans[2],
-                                gu_expert_bytes: expert_ff * d / 256 * 144,
-                                dn_expert_bytes: d * expert_ff / 256 * 144,
+                                // Per-tensor strides: Q4_K is 144 bytes per 256 weights and Q6_K is
+                                // 210, so a hardcoded 144 would slice a Q6_K tensor at the wrong
+                                // offset even once the type check let it through.
+                                gu_expert_bytes: Self::source_block_bytes(gu_ty, expert_ff * d)
+                                    .ok_or_else(|| format!("no block size for type {gu_ty}"))?,
+                                dn_expert_bytes: Self::source_block_bytes(dn_ty, d * expert_ff)
+                                    .ok_or_else(|| format!("no block size for type {dn_ty}"))?,
+                                gu_type: gu_ty, dn_type: dn_ty,
                                 ff: expert_ff, d,
                             })
                         })();
@@ -7597,8 +8399,48 @@ host-copy path (dequantize + requantize every expert into RAM)");
                         }
                     } else { None };
                     drop(gsrc); drop(usrc);
+                    // PRINT THE ROUTING CONFIG AND ITS SOURCE, once. Five Llama-4 constants
+                    // turned out to be values the file carried, and each produced text that was
+                    // merely worse with every tensor present — the log line is where a wrong one
+                    // becomes visible. The same values decide MoE routing here: a normalize flag
+                    // read the wrong way, or a scale defaulted when the file specifies one,
+                    // rescales every expert's contribution and reads as a confused model.
+                    {
+                        static LOGGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            let norm_key = format!("{}.expert_weights_norm", acfg.prefix);
+                            let scale_key = format!("{}.expert_weights_scale", acfg.prefix);
+                            let c = crate::archcfg::moe_config(&acfg, n_expert as u32,
+                                n_expert_used as u32,
+                                g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(0),
+                                g.get_f32(&scale_key), g.get_u32(&norm_key).map(|v| v != 0));
+                            eprintln!("loader: MoE routing — {} of {} experts, normalize {} ({}), \
+scale {} ({}), shared {}, weight applied to {}",
+                                n_expert_used, n_expert,
+                                c.normalize,
+                                if g.get_u32(&norm_key).is_some() { "file" } else { "arch default" },
+                                c.routed_scale,
+                                if g.get_f32(&scale_key).is_some() { "file" } else { "default 1.0" },
+                                c.n_shared,
+                                if c.weight_before { "the expert's INPUT" } else { "its output" });
+                        }
+                    }
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,
-                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32, 0) }))
+                        // SHARED EXPERT COUNT FROM METADATA. This was a literal 0, and it worked for
+                        // Scout only because moe_config rescues an arch that declares
+                        // `moe_shared_expert` with `.max(1)`. Correct by accident: an architecture
+                        // with two shared experts, or one whose flag disagrees with its file, loses
+                        // them silently — and a missing always-on expert degrades output without
+                        // breaking a shape, which is the failure mode Scout has been showing.
+                        //
+                        // Fifth value this session that the file carries and the loader took from a
+                        // constant, after the NoPE interval, the attention temperature, qk-norm and
+                        // expert_weights_scale.
+                        cfg: crate::archcfg::moe_config(&acfg, n_expert as u32, n_expert_used as u32,
+                            g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(0),
+                            g.get_f32(&format!("{}.expert_weights_scale", acfg.prefix)),
+                            g.get_u32(&format!("{}.expert_weights_norm", acfg.prefix)).map(|v| v != 0)) }))
                 } else { None },
                 // Qwen3/3.5 per-head QK-Norm ([head_dim] each), applied before RoPE in the block forward.
                 q_norm: if has_qk_norm { Some(self.upload(&fetch(&format!("blk.{i}.attn_q_norm.weight"))?, 1, head_dim)) }
@@ -7678,9 +8520,21 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     // kv_lora] matrix mla.rs expects. Order matters and is k THEN v, matching the fused
                     // layout llama.cpp splits FROM.
                     ((Some(kb), Some(vb)), _) => {
-                        let (mut a, b) = (g1(kb)?, g1(vb)?);
-                        a.extend_from_slice(&b);
-                        self.upload_flat(&a)
+                        // PER-HEAD, not two blocks. mla.rs indexes kvb[head * (qk_nope + v_head)..], so
+                        // appending every k row then every v row is correct only at n_heads == 1 — and
+                        // head 0's k lands right by coincidence in BOTH layouts, so the wrong version loads,
+                        // runs, and produces text with every head's V read from the wrong rows.
+                        let (a, b) = (g1(kb)?, g1(vb)?);
+                        // Dims from metadata plus the arrays themselves: n_heads and kv_lora are
+                        // declared, and the per-head row counts follow from the lengths. Deriving
+                        // rather than reaching for an outer binding keeps this correct if the
+                        // checkpoint disagrees with a config default.
+                        let nh = g.get_u32(&format!("{}.attention.head_count", acfg.prefix))? as usize;
+                        let lora = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix))? as usize;
+                        if nh == 0 || lora == 0 { return None; }
+                        let (nope, vh) = (a.len() / (nh * lora), b.len() / (nh * lora));
+                        let fused = crate::mla::fuse_kv_b(&a, &b, nh, nope, vh, lora)?;
+                        self.upload_flat(&fused)
                     }
                     (_, Some(f)) => self.upload_flat(&g1(f)?),
                     _ => return None,
@@ -7697,13 +8551,66 @@ host-copy path (dequantize + requantize every expert into RAM)");
                     let n_swa = g.get_u32(&format!("{}.attention.sliding_window", acfg.prefix)).unwrap_or(0);
                     let ty = if is_llama4 { crate::swa::SwaType::Chunked } else { crate::swa::SwaType::Standard };
                     let windowed = swa_pattern.get(i).copied().unwrap_or(false);
+                    // iRoPE PAIRS THESE TWO PATTERNS, and they are computed independently here — the
+                    // NoPE set from `no_rope_interval`, the windowed set from
+                    // `sliding_window_pattern`. In Llama-4 they must be COMPLEMENTARY: rotary layers
+                    // take chunked LOCAL attention, and the NoPE layers take GLOBAL attention with
+                    // length-dependent temperature instead. That pairing is the whole mechanism.
+                    //
+                    // If the two metadata keys disagree, a layer gets local attention AND no positional
+                    // signal at all, or global attention with rotation — either way the model loads,
+                    // every shape matches, and the text degrades. Warned rather than corrected, because
+                    // the file is the authority and silently overriding it would hide a real
+                    // disagreement.
+                    if is_llama4 {
+                        let is_nope = nope_step > 0 && (i + 1) % nope_step == 0;
+                        if n_swa > 0 && windowed == is_nope {
+                            static WARNED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!("loader: Llama-4 layer {i} is {}windowed and {}NoPE — iRoPE \
+expects these COMPLEMENTARY (rotary layers local, NoPE layers global). The two patterns come from \
+different metadata keys and disagree here; output will be degraded rather than broken",
+                                    if windowed { "" } else { "not " },
+                                    if is_nope { "" } else { "not " });
+                            }
+                        }
+                    }
                     if n_swa > 0 && windowed { Some((n_swa, ty)) } else { None }
                 },
-                kq_norm: if is_llama4 && g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128 {
+                // USE_QK_NORM FROM METADATA, not the expert count. This read `expert_count != 128`,
+                // using "has 128 experts" as a stand-in for "is Maverick" — the variant that disables
+                // post-rope Q/K norm. Scout has 16 and gets it; Maverick has 128 and does not.
+                //
+                // That proxy is the fifth of its kind this session, and the same failure: the name says
+                // one thing and the value encodes another. A future Llama-4 with 128 experts that DOES
+                // use qk-norm silently loses it, and a wrong qk-norm degrades text without breaking a
+                // single shape.
+                //
+                // The expert count stays as the FALLBACK, because it is the observed rule and files may
+                // omit the key.
+                kq_norm: if is_llama4 && g.get_u32(&format!("{}.attention.use_qk_norm", acfg.prefix))
+                    .map(|v| v != 0)
+                    .unwrap_or_else(|| g.get_u32(&format!("{}.expert_count", acfg.prefix)).unwrap_or(0) != 128) {
                     Some(self.upload(&vec![1.0f32; head_dim], 1, head_dim))
                 } else { None },
+                // ATTENTION TEMPERATURE FROM METADATA. floor_scale 8192 and attn_scale 0.1 are
+                // Llama-4's documented defaults, hardcoded here where the file carries them — the same
+                // shape as nope_step, and the same failure: a wrong scale produces text that is merely
+                // worse, with every shape and tensor correct.
+                //
+                // It applies to NoPE layers deliberately: in iRoPE the rotary layers get position from
+                // RoPE and the NoPE layers get it from length-dependent temperature instead, so this
+                // condition is the design rather than a coincidence of the same modulus.
                 attn_temp: if is_llama4 && nope_step > 0 && (i + 1) % nope_step == 0 {
-                    Some(crate::llama4::AttnTemp::default())
+                    let mut t = crate::llama4::AttnTemp::default();
+                    if let Some(v) = g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)) {
+                        t.floor_scale = v;
+                    }
+                    if let Some(v) = g.get_f32(&format!("{}.attention.scale", acfg.prefix)) {
+                        t.attn_scale = v;
+                    }
+                    Some(t)
                 } else { None },
             });
         }
@@ -9156,6 +10063,11 @@ impl Gpu {
         } else {
             let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
             enc.copy_buffer_to_buffer(&src.buf, src_off, &dst.buf, dst_off, bytes);
+            // A device-side buffer copy, grouped with downloads as DATA MOVEMENT rather than
+            // compute. Not a readback — worth saying, because a counter named for one thing and
+            // counting another is the mislabel class this codebase keeps paying for. If the two
+            // ever need separating, this is the line to split.
+            SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc);
         }
     }
@@ -9335,7 +10247,52 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// non-convertible tensor forces the whole model onto the host-copy path — 200 GiB of traffic per
     /// generation plus the staging fence that costs most of its submits.
     ///
-    /// STATE: `--gate-q6k` is GREEN — bit-exact against the CPU reference at 1, 37 and 5000 blocks,
+    /// ## WARNING: GREEN ON LAVAPIPE, RED ON APPLE HARDWARE
+    ///
+    /// Everything below was verified on a software rasterizer. On an M2 Max it fails:
+    ///
+    /// ```text
+    ///   hand-checked block:  PASSES (first 4 weights exact)
+    ///   1 block:             rel 1.75    gpu non-zero: 64 of 256
+    ///   first divergence at index 4, then a repeated constant
+    /// ```
+    ///
+    /// ## The signature, now that the fixtures are clean (bundle _382)
+    ///
+    /// With plausible f16 scales the values are sane and the failure is unambiguous:
+    ///
+    /// ```text
+    ///   cpu: [6.298, 0.899, 9.897, 12.147, 13.946,  8.547, 10.347, -9.447]
+    ///   gpu: [6.298, 0.899, 9.897, 12.147, 14.396, 14.396, 14.396, 14.396]
+    /// ```
+    ///
+    /// **Four outputs correct, then a constant.** Four is exactly one `u32` of source bytes. Output
+    /// `l` reads `ql[l]`, so outputs 0..3 come from source word 0 and output 4 needs word 1 — and
+    /// `byte_at` stops advancing there. The repeated value is that stale word re-decoded, which is why
+    /// the results REPEAT rather than going to zero.
+    ///
+    /// `byte_at(i) = (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu`, and `src` is `array<u32>`. The
+    /// arithmetic is correct WGSL, so the suspect is the BINDING: if the view exposes one word, every
+    /// read past it clamps to the last valid index on this driver rather than returning zero. That is
+    /// the _297 class — a binding range wrong in a way a reference rasterizer forgives — reappearing
+    /// where only real hardware can see it.
+    ///
+    /// Note the negative-scale check fails at 1.008e3 while the others sit near 1e2, so it is a
+    /// SEPARATE fault rather than the same one scaled.
+    ///
+    /// The block is 2 halves x 32 iterations x 4 writes = 256. EXACTLY 64 LAND — one write per
+    /// iteration instead of four — and the values REPEAT rather than being zero, so the writes are
+    /// colliding rather than being skipped.
+    ///
+    /// A hand-checked single block passes because it exercises only the first few indices. The
+    /// cheapest check is the one that cannot see this.
+    ///
+    /// THE LESSON IS NOT ABOUT Q6_K. Lavapipe is a reference rasterizer — more permissive and more
+    /// nearly correct than a real driver — so it validates arithmetic and hides every codegen and
+    /// scheduling difference. Four faults were found and fixed against it, all four real, and the
+    /// kernel is still wrong on the only hardware that matters. See docs/gate-validity.md.
+    ///
+    /// STATE: `--gate-q6k` was green ON LAVAPIPE — bit-exact against the CPU reference at 1, 37 and 5000 blocks,
     /// including the negative-scales case. Four faults, found in this order:
     ///
     ///   1. `d` at bytes 208..209 fell outside the binding. A 210-byte `array<u32>` exposes 52 whole
@@ -9393,6 +10350,95 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             b0 += n;
         }
         Ok(out)
+    }
+
+    /// Read `n` bytes back through the shader's own `byte_at`, to test the reader in isolation.
+    ///
+    /// Lives here rather than in the gate so `upload_bytes` and `dispatch` stay private — a diagnostic
+    /// is not a reason to widen an API surface.
+    /// As `byte_probe`, but the shader reads `array<vec4<u32>>`.
+    ///
+    /// Confirms or refutes the 16-byte-stride diagnosis in one run: if this reads correctly where the
+    /// scalar probe does not, `array<u32>` is being laid out with std140 padding.
+    /// `dst[i] = f32(i)` — tests the invocation index alone.
+    pub fn id_probe(&self, n: usize) -> Vec<f32> {
+        self.byte_probe_with(&vec![0u8; n], ID_PROBE)
+    }
+
+    pub fn byte_probe_vec4(&self, raw: &[u8]) -> Vec<f32> {
+        self.byte_probe_with(raw, BYTE_PROBE_VEC4)
+    }
+
+    /// Native IQ1_S mat-vec: `c[n] = w[n,k] · a[k]`, reading the checkpoint's 50-byte super-blocks.
+    ///
+    /// Uploads the 2048-entry ternary codebook alongside the weights. 16 KiB, once per call here —
+    /// a resident path would hold it for the model's life, since it is the same grid for every IQ1_S
+    /// tensor and every layer.
+    pub fn matvec_iq1_s(&self, a: &[f32], raw: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let at = self.upload(a, 1, k);
+        let wt = self.upload_bytes(raw, "iq1s-weights");
+        // The grid as u32 pairs: entry i is (low 4 signed bytes, high 4). Packed here rather than in
+        // the shader because it is constant for the process and unpacking it per dispatch would be
+        // 16 KiB of work per matvec.
+        let mut grid = Vec::with_capacity(4096);
+        for e in crate::iq1s_grid::IQ1S_GRID.iter() {
+            grid.push((*e & 0xFFFF_FFFF) as u32);
+            grid.push((*e >> 32) as u32);
+        }
+        let gt = self.upload_bytes(bytemuck::cast_slice(&grid), "iq1s-grid");
+        let out = self.alloc(1, n);
+        let gx = (n as u32).min(32768);
+        let gy = (n as u32).div_ceil(gx);
+        let dims = [1u32, n as u32, k as u32, (k / 256) as u32, gx, 0, 0, 0];
+        let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, view: None };
+        let gten = Tensor { buf: gt, rows: 1, cols: grid.len(), pool: None, view: None };
+        self.dispatch(MATVEC_IQ1_S, &[&at, &wten, &gten], &out,
+                      bytemuck::cast_slice(&dims), (gx, gy, 1));
+        self.download(&out)
+    }
+
+    pub fn byte_probe(&self, raw: &[u8]) -> Vec<f32> { self.byte_probe_with(raw, BYTE_PROBE) }
+
+    /// `dst[i] = f32(src[i])` over `n` words — distinct index per thread.
+    pub fn word_probe(&self, words: &[u32]) -> Vec<f32> {
+        self.byte_probe_with(bytemuck::cast_slice(words), WORD_PROBE)
+    }
+
+    /// Upload bytes and read them straight back, with NO shader involved.
+    ///
+    /// The scalar and vec4 probes fail IDENTICALLY on hardware — only the first 4 bytes of every 16
+    /// are readable either way. That rules out the element size, and it points at the buffer rather
+    /// than the read: if only 4 of every 16 bytes ever arrived, both shaders are reading correctly and
+    /// reporting what is there.
+    ///
+    /// This settles it. A round trip through `upload_bytes` and a copy back to the host touches no
+    /// shader at all, so a mismatch is unambiguously the WRITE path — and a match means the upload is
+    /// fine and the fault is somewhere between binding and execution after all.
+    pub fn upload_readback_probe(&self, raw: &[u8]) -> Vec<u8> {
+        let mut padded = raw.to_vec();
+        padded.resize(raw.len().div_ceil(4) * 4, 0);
+        let src = self.upload_bytes(&padded, "readback-probe");
+        let t = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, view: None };
+        // download() reads a buffer back as f32 words; reinterpreting them as bytes recovers exactly
+        // what was uploaded, because nothing has interpreted them in between.
+        let words = self.download(&t);
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for w in &words { out.extend_from_slice(&w.to_bits().to_le_bytes()); }
+        out.truncate(raw.len());
+        out
+    }
+
+    fn byte_probe_with(&self, raw: &[u8], shader: &str) -> Vec<f32> {
+        let n = raw.len();
+        let mut padded = raw.to_vec();
+        padded.resize(n.div_ceil(4) * 4, 0);
+        let src = self.upload_bytes(&padded, "byte-probe-src");
+        let srct = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, view: None };
+        let out = self.alloc_resident_words(n);
+        let dims = [n as u32, 0u32, 0u32, 0u32];
+        self.dispatch(shader, &[&srct], &out, bytemuck::cast_slice(&dims),
+                      ((n as u32).div_ceil(64), 1, 1));
+        self.download(&out)
     }
 
     /// The device's per-buffer ceiling. No single allocation may exceed it, whatever the total budget.
@@ -10660,7 +11706,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 // FENCED flush: submit, WAIT for completion (so x is valid + scratch is done), release
                 // retained bind-groups, re-open the frame. The wait is what makes recycling safe.
                 self.end_frame();
-                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                crate::counted_poll(&self.device);
                 self.clear_retained();
                 self.begin_frame();
             }
@@ -11107,7 +12153,10 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
             // proactive (not gated on governor_dead, which only latches AFTER the first stalled submit — too
             // late for the first window). LOGSCOPE_WINDOW_ONE_SUBMIT=1 restores the collapse for A/B.
             let force_collapse = std::env::var_os("LOGSCOPE_WINDOW_ONE_SUBMIT").is_some();
-            if (self.conservative_vma || self.degraded()) && !force_collapse {
+            // WATCHDOG-PRONE, not Apple. Mobile drivers kill long dispatches the same way Honeykrisp
+            // does, and this guard bounds the decode window precisely to avoid that — so keying it on
+            // an Apple-only flag left a phone taking the unbounded path.
+            if (self.watchdog_prone() || self.degraded()) && !force_collapse {
                 self.set_flush_every(saved_flush.clamp(1, 64));
             } else {
                 self.set_flush_every((k as u32).saturating_mul(per_tok).clamp(saved_flush, 65536));
@@ -11147,9 +12196,22 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 // the next readback would map_async an invalid buffer and abort the process. Bail the
                 // window HERE — every slot, not just at the flush cadence — before download_u32, so the
                 // caller falls back to per-token decode (which doesn't hit the ceiling). Restore flush.
+                // A DEVICE OOM IS PRESSURE TOO, and it was the only kind this hardware actually
+                // reports. observe_pressure had exactly one trigger — dims_alloc_failed — while the
+                // failure your log shows is "DEVICE OOM caught (VMA exhausted)", handled elsewhere and
+                // never fed back. So the window climbed 8→10→12→15→18→22, hit VMA exhaustion, was
+                // degraded for that step, and CLIMBED STRAIGHT BACK on the next one, because the
+                // ceiling latch never learned.
+                //
+                // A ratchet whose only sensor is the failure mode this device does not produce is a
+                // ratchet that does not ratchet.
+                if self.oom_backoff() {
+                    self.governor.lock().unwrap().observe_pressure(k);
+                    self.clear_oom();
+                }
                 if self.dims_alloc_failed() {
                     self.end_frame();
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     self.clear_retained();
                     if !self.flush_every_pinned() { self.set_flush_every(saved_flush); }
                     // Tell the governor this k caused real device pressure so it ratchets the cap down and
@@ -11164,7 +12226,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 // `pre` logits (needed for the replay) are held by us, not the frame, so they survive.
                 if (j + 1) % SLOT_FLUSH == 0 {
                     self.end_frame();
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     self.clear_retained();
                     self.begin_frame();
                 }
@@ -11362,7 +12424,11 @@ impl KvSession for Session {
     }
     fn prefill_chunk(&mut self, gpu: &Gpu, m: &Model, chunk: &[u32]) { gpu.session_prefill(m, self, chunk); }
     fn sample_next(&mut self, sp: &SamplerParams) -> u32 {
-        if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) }
+        // TIMED. Host-side sampling is the fourth thing a generation does and the last one
+        // nothing measured — half a megabyte of logits walked per token at a 128k vocabulary,
+        // appearing in neither setup, submit nor sync. It would have landed in the same
+        // unaccounted bucket three commits have been spent emptying.
+        crate::timed_sample(|| if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) } )
     }
     fn decode_batch(gpu: &Gpu, m: &Model, sess: &mut [Session], toks: &[u32]) { gpu.decode_batched(m, sess, toks); }
 }
@@ -11382,7 +12448,11 @@ impl KvSession for SessionQ8 {
     }
     fn prefill_chunk(&mut self, gpu: &Gpu, m: &Model, chunk: &[u32]) { gpu.session_q8_prefill(m, self, chunk); }
     fn sample_next(&mut self, sp: &SamplerParams) -> u32 {
-        if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) }
+        // TIMED. Host-side sampling is the fourth thing a generation does and the last one
+        // nothing measured — half a megabyte of logits walked per token at a 128k vocabulary,
+        // appearing in neither setup, submit nor sync. It would have landed in the same
+        // unaccounted bucket three commits have been spent emptying.
+        crate::timed_sample(|| if sp.temperature > 0.0 { sample(&self.logits, sp, &mut self.rng) } else { argmax(&self.logits) } )
     }
     fn decode_batch(gpu: &Gpu, m: &Model, sess: &mut [SessionQ8], toks: &[u32]) { gpu.decode_batched_q8(m, sess, toks); }
 }
@@ -11918,6 +12988,224 @@ fn wgsl_fn_body(src: &str, sig: &str) -> Option<String> {
     Some(no_comments.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
+/// A shader that does NOTHING but read bytes back, so `byte_at` can be tested in isolation.
+///
+/// Five rounds of inference from dequantizer output have not settled whether `byte_at` advances past
+/// the first `u32`. The dequantizers do too much — scales, nibbles, sub-block indexing — for their
+/// output to name one cause. This does one thing, so its output is the answer rather than evidence for
+/// an argument.
+///
+/// `dst[i] = f32(byte_at(i))`. A correct run returns the source bytes. The failure modes are then
+/// distinguishable at a glance:
+///
+/// * `[0,1,2,3, 4,5,6,7, ...]` — `byte_at` is fine and the fault is in the dequantizers.
+/// * `[0,1,2,3, 0,1,2,3, ...]` — the index wraps within word 0.
+/// * `[0,1,2,3, 3,3,3,3, ...]` — reads past word 0 clamp to the last valid byte.
+/// * `[0,1,2,3, 0,0,0,0, ...]` — reads past the binding return zero, so the BINDING is short.
+///
+/// The last two are the ones the Q6_K signature is consistent with, and they need opposite fixes: a
+/// clamp means the binding is right and the index is wrong; a zero means the binding is short.
+/// Does this adapter's driver kill long-running compute dispatches?
+///
+/// PURE, so it can be cross-checked against `tuneprofile::device_defaults`, which encodes the same
+/// decision in a separate crate. That duplication already went wrong once: _358 widened the engine's
+/// guard to mobile GPUs and the tuning table stayed Apple-only for four days, because a policy
+/// expressed in two places gets corrected in one and the survivor looks right.
+pub fn watchdog_prone_name(adapter: &str) -> bool {
+    let n = adapter.to_ascii_lowercase();
+    ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx", "honeykrisp"]
+        .iter().any(|m| n.contains(m))
+}
+
+/// The same probe, reading through `array<vec4<u32>>` instead of `array<u32>`.
+///
+/// ## The diagnosis this confirms
+///
+/// On an M2 Ultra the scalar probe returned correct bytes at exactly `i % 16 < 4` — that is,
+/// `src[0]`, `src[4]`, `src[8]`, `src[12]` read and every element between them returned zero.
+///
+/// **Only every fourth `u32` is reachable.** That is a 16-byte stride on an `array<u32>`: std140
+/// scalar-array padding applied to a storage buffer that should be std430 and tightly packed. Each
+/// scalar occupies a 16-byte slot and only its first 4 bytes hold data.
+///
+/// If this vec4 variant reads the source correctly while the scalar one does not, the layout is the
+/// cause and the fix is mechanical: every `array<u32>` storage binding becomes `array<vec4<u32>>`
+/// with the component selected by hand. If BOTH fail, the stride theory is wrong and the fault is
+/// elsewhere — which is why this ships as a probe rather than as a rewrite of every kernel.
+pub const BYTE_PROBE_VEC4: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<vec4<u32>>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+// Same byte address, reached through a vec4 element: word i>>2 is component (i>>2)&3 of vec4 i>>4.
+fn byte_at(i: u32) -> u32 {
+    let w = src[i >> 4u][(i >> 2u) & 3u];
+    return (w >> ((i & 3u) * 8u)) & 0xFFu;
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(byte_at(i));
+}
+"#;
+
+/// Writes `dst[i] = f32(i)`. NO memory read, no source buffer, nothing but the builtin.
+///
+/// ## Why this is the probe that was missing
+///
+/// The upload is byte-exact and both element sizes fail identically, so the buffer is right and the
+/// read is right. What is left is the INDEX — and the set that comes back correct is
+/// `0,1,2,3, 16,17,18,19, 32,33,34,35, 48,49,50,51`.
+///
+/// That is not a memory pattern. It is four consecutive values every sixteen, which is what
+/// `global_invocation_id.x` looks like if the workgroup's x extent used in the builtin does not match
+/// the declared `@workgroup_size(64,1,1)`.
+///
+/// If this probe shows the same 4-of-16 pattern, nothing is wrong with any read: the invocations
+/// themselves are landing on the wrong indices, and every kernel that indexes by `global_invocation_id`
+/// is affected — which is all of them.
+pub const ID_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(i);
+}
+"#;
+
+/// IQ1_S mat-vec, reading the checkpoint's own 50-byte super-blocks.
+///
+/// ## Why a native kernel rather than a conversion
+///
+/// The engine converts every source format to q4 before running. For Q4_K that is size-neutral. For
+/// IQ1_S it is a **2.88× expansion** — 25 GiB of GLM-5.2 becomes 71.5 GiB — which is the entire
+/// reason that model does not fit on a 63 GiB machine. Converting up cannot recover quality the
+/// checkpoint already discarded; it only spends the memory.
+///
+/// ## Layout, from `gguf.rs`'s dequantizer rather than from the spec
+///
+/// 50 bytes per 256 weights: `d` as f16, 32 bytes of `qs`, then eight `u16` of `qh`. Each group of 8
+/// weights takes an **11-bit** codebook index — 8 bits from `qs`, 3 more from `qh` at a per-group
+/// offset — into 2048 ternary entries. Per 32-weight sub-block `qh` also carries a 3-bit scale
+/// (`dl = d·(2s+1)`) and a sign bit selecting `±IQ1S_DELTA`.
+///
+/// The grid arrives as a storage buffer of `u32` pairs: entry `i` is `grid[2i]` (values 0..3) and
+/// `grid[2i+1]` (values 4..7), each byte a signed ternary value.
+///
+/// ## Activations stay f32
+///
+/// The weights are ternary, so the product is a select-and-add and there is nothing for an integer
+/// path to accelerate. That is the opposite of the Q8_0 case where the integer dot was worth 2×.
+pub const MATVEC_IQ1_S: &str = r#"
+struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, pad0:u32, pad1:u32, pad2:u32 };
+@group(0) @binding(0) var<storage, read> a: array<f32>;      // activations [k]
+@group(0) @binding(1) var<storage, read> w: array<u32>;      // IQ1_S blocks, 50 B per 256
+@group(0) @binding(2) var<storage, read> grid: array<u32>;   // 2048 entries, 2 u32 each
+@group(0) @binding(3) var<storage, read_write> c: array<f32>;
+@group(0) @binding(4) var<uniform> d: D;
+
+// Byte at absolute offset `i` of the weight blob. IQ1_S rows are 50-byte multiples, which is NOT a
+// multiple of 4, so a row does not start on a word boundary and every read must go through here.
+fn wbyte(i: u32) -> u32 { return (w[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+fn whalf(i: u32) -> u32 { return wbyte(i) | (wbyte(i + 1u) << 8u); }
+
+// f16 -> f32. The scale is the only float in the block and it is half-precision.
+fn f16(h: u32) -> f32 {
+    let sgn = f32(1 - i32((h >> 15u) & 1u) * 2);
+    let exp = (h >> 10u) & 0x1Fu;
+    let man = h & 0x3FFu;
+    if (exp == 0u) { return sgn * f32(man) * 5.9604645e-8; }
+    if (exp == 31u) { return sgn * 65504.0; }
+    return sgn * exp2(f32(i32(exp) - 15)) * (1.0 + f32(man) / 1024.0);
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let row = g.x + g.y * d.gx;
+    if (row >= d.n) { return; }
+    let nblk = d.k / 256u;
+    let rowbase = row * nblk * 50u;          // 50 bytes per 256 weights
+    // Two accumulator chains: every FMA otherwise waits on the previous one, which serialises the
+    // loop to iterations x latency regardless of available bandwidth. Colibri's int8 matvec does the
+    // same on NEON, and here k is thousands rather than tens.
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    for (var b = 0u; b < nblk; b = b + 1u) {
+        let blk = rowbase + b * 50u;
+        let dsc = f16(whalf(blk));
+        for (var ib = 0u; ib < 8u; ib = ib + 1u) {
+            let h = whalf(blk + 34u + 2u * ib);
+            let dl = dsc * f32(2u * ((h >> 12u) & 7u) + 1u);
+            var delta = 0.125;
+            if ((h & 0x8000u) != 0u) { delta = -0.125; }
+            for (var l = 0u; l < 4u; l = l + 1u) {
+                // 11-bit index: 8 bits from qs, 3 from qh at this group's offset.
+                let idx = wbyte(blk + 2u + ib * 4u + l) | (((h >> (3u * l)) & 7u) << 8u);
+                let lo = grid[idx * 2u];
+                let hi = grid[idx * 2u + 1u];
+                let base = b * 256u + ib * 32u + l * 8u;
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    let tl = f32(i32((lo >> (8u * j)) & 0xFFu) << 24u >> 24u);
+                    let th = f32(i32((hi >> (8u * j)) & 0xFFu) << 24u >> 24u);
+                    acc0 = acc0 + a[base + j] * (tl + delta) * dl;
+                    acc1 = acc1 + a[base + 4u + j] * (th + delta) * dl;
+                }
+            }
+        }
+    }
+    c[row] = acc0 + acc1;
+}
+"#;
+
+/// `dst[i] = f32(src[i])` — one distinct word per thread, no shift, no shared index.
+///
+/// ## What this isolates
+///
+/// `byte_at` reads `src[i >> 2]`, so **four adjacent threads read the same word** and each extracts a
+/// different byte. That is the one property the real matvecs do not share: `MATVEC_Q4`'s inner loop
+/// walks distinct indices per thread.
+///
+/// The observed fault is exact and size-independent — only `u32` indices ≡ 0 (mod 4) return data, and
+/// in the vec4 form only component `.x` of each element. That is what scalar loads look like when the
+/// compiler folds them into a `vec4` load and uses only the first lane.
+///
+/// If this probe reads correctly while `byte_at` does not, the fault is in the *shared-index* access
+/// pattern rather than in storage reads at all — and every kernel that works, works because it does
+/// not do that.
+pub const WORD_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(src[i]);
+}
+"#;
+
+pub const BYTE_PROBE: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    dst[i] = f32(byte_at(i));
+}
+"#;
+
 pub const Q6K_DEQUANT: &str = r#"
 struct D { n:u32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;
@@ -12172,6 +13460,242 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 
 #[cfg(test)]
 mod shader_drift_tests {
+    /// V3 must be reachable by the autotune, not only by an env var.
+    ///
+    /// It existed, was benchmarked, and was selectable only through LOGSCOPE_MATVEC_V3 — so the
+    /// per-shape search compared every OTHER kernel and picked V2Wg128. I read that as "kernel choice
+    /// is exhausted". It wins the search it was entered in.
+    #[test]
+    fn the_autotune_candidate_list_includes_the_wide_load_kernel() {
+        use super::{DECODE_PROFILES, MatvecKernel};
+        assert!(DECODE_PROFILES.iter().any(|c| c.kernel == MatvecKernel::V3),
+            "V3 is not searched, so it cannot be chosen however fast it is");
+        // And every other kernel stays in, since removing a candidate is how a search silently narrows.
+        for k in [MatvecKernel::V1, MatvecKernel::V2, MatvecKernel::V2Wg128, MatvecKernel::V2WgSg] {
+            assert!(DECODE_PROFILES.iter().any(|c| c.kernel == k), "{k:?} dropped from the search");
+        }
+    }
+
+    /// A cached id must resolve to the kernel it was written for.
+    ///
+    /// V3 took id 4, an unused value, precisely so an existing cache cannot re-resolve to it. Reusing
+    /// an id would make every previously-cached choice silently mean something else — the stale-cache
+    /// class, self-inflicted.
+    #[test]
+    fn kernel_ids_are_stable_across_the_addition() {
+        use super::MatvecKernel;
+        assert_eq!(MatvecKernel::V1.id(), 0);
+        assert_eq!(MatvecKernel::V2.id(), 1);
+        assert_eq!(MatvecKernel::V2Wg128.id(), 2);
+        assert_eq!(MatvecKernel::V2WgSg.id(), 3);
+        assert_eq!(MatvecKernel::V3.id(), 4, "a NEW id, so no existing cache re-resolves");
+    }
+
+    #[test]
+    fn V3_does_not_need_subgroups() {
+        // The point of wiring it now: it is the one decode speedup that does not wait on the subgroup
+        // chain, which is blocked behind the short-binding finding.
+        use super::MatvecKernel;
+        assert!(!MatvecKernel::V3.needs_subgroups());
+        assert!(MatvecKernel::V2WgSg.needs_subgroups());
+    }
+
+    /// Every caller of `submit` must tag a cause.
+    ///
+    /// The profile reported "N UNATTRIBUTED, a submit path is still untagged" for months. There is one
+    /// submit site and eleven callers, and SIX of them incremented nothing — four buffer readbacks and
+    /// two frame flushes. The counters were correct; nobody was calling them.
+    ///
+    /// Source-read rather than behavioural for the same reason as the reset-list test: an untagged
+    /// caller produces a number that is correct in isolation, and only the shortfall line reveals it —
+    /// which is exactly the signal everyone had learned to ignore.
+    #[test]
+    fn every_submit_caller_tags_a_cause() {
+        let src = include_str!("lib.rs");
+        let mut untagged = Vec::new();
+        let lines: Vec<&str> = src.lines().collect();
+        for (n, l) in lines.iter().enumerate() {
+            // Skip this test's own source, which contains the pattern it searches for.
+            if l.contains("l.contains") { continue; }
+            if !l.contains("self.submit(") { continue; }
+            // A cause must be incremented within the few lines above the flush.
+            let lo = n.saturating_sub(8);
+            let tagged = lines[lo..n].iter().any(|w| w.contains("SUBMIT_BY_"));
+            if !tagged { untagged.push(n + 1); }
+        }
+        assert!(untagged.is_empty(),
+            "submit callers at lines {untagged:?} tag no cause — the profile's attribution shortfall comes from exactly this, and a new one is invisible until someone reads the UNATTRIBUTED count");
+    }
+
+    /// A packed decode config must not be readable as a tile.
+    ///
+    /// Both machines' logs printed "decode tile = 2147549192" on every load — 0x80010008, the packed
+    /// (kernel, tile) form with the high marker bit, shown raw. Tiles are 1/2/4/8.
+    ///
+    /// Harmless to the engine and corrosive to the log: a number nobody can read is a line nobody
+    /// checks, and it is the line you consult when a shape is slow.
+    #[test]
+    fn the_packed_form_round_trips_and_is_NOT_a_plausible_tile() {
+        for kernel in [super::MatvecKernel::from_id(1), super::MatvecKernel::from_id(3)] {
+            for tile in [1u32, 2, 4, 8] {
+                let packed = super::DecodeConfig { kernel, tile }.pack();
+                assert!(packed > 0x8000_0000, "the marker bit is what makes it unreadable raw");
+                let back = super::DecodeConfig::unpack(packed);
+                assert_eq!(back.tile, tile);
+                assert_eq!(back.kernel, kernel);
+            }
+        }
+        // The exact values from the two logs.
+        assert_eq!(super::DecodeConfig::unpack(2147549192).tile, 8, "M2 Max");
+        assert_eq!(super::DecodeConfig::unpack(2147680264).tile, 8, "M2 Ultra");
+    }
+
+    #[test]
+    fn a_legacy_bare_tile_still_unpacks() {
+        // Caches written before the marker bit existed hold a plain tile. Reading one as a packed
+        // value would give kernel garbage and a tile of 0.
+        let d = super::DecodeConfig::unpack(4);
+        assert_eq!(d.tile, 4);
+    }
+
+    /// The active-set arithmetic, checked against models whose size is known independently.
+    #[test]
+    fn active_params_matches_a_known_dense_model() {
+        // DeepSeek-R1-Distill-Llama-8B, from the loader's own line: d=4096 layers=32 heads=32/8
+        // head_dim=128 ff=14336 vocab=128256. An 8B dense model reads roughly all of itself per token,
+        // so the figure must land near 8e9 — and the GQA term is what makes it land there.
+        let p = super::active_params_per_token(4096, 14336, 128256, 32, 8, 128, 0);
+        assert!((7.0e9..9.0e9).contains(&(p as f64)), "got {:.2e}, expected ~8e9", p as f64);
+    }
+
+    #[test]
+    fn GQA_is_counted_and_NOT_four_square_matrices() {
+        // Assuming q, k, v and o are all d x d overstates attention on a 32/8 model. The roofline
+        // bound would then say the run was closer to the limit than it is — telling an operator to
+        // stop optimising a run that had headroom.
+        let gqa = super::active_params_per_token(4096, 14336, 128256, 32, 8, 128, 0);
+        let mha = super::active_params_per_token(4096, 14336, 128256, 32, 32, 128, 0);
+        assert!(mha > gqa, "full attention reads more: {mha} vs {gqa}");
+    }
+
+    #[test]
+    fn an_MoE_counts_only_the_ACTIVE_experts() {
+        // Qwen3-30B-A3B is 30B total and ~3B active. Counting all 128 experts would claim ten times
+        // the bandwidth the run needs, and the roofline verdict would then report a run as nowhere
+        // near the limit when it is at it.
+        let active8 = super::active_params_per_token(2048, 768, 151936, 48, 4, 128, 8);
+        let all128 = super::active_params_per_token(2048, 768, 151936, 48, 4, 128, 128);
+        assert!(all128 > active8 * 5, "routing is the whole difference: {all128} vs {active8}");
+    }
+
+    /// The watchdog guard must fire on every device whose driver kills long dispatches.
+    ///
+    /// It was keyed on `conservative_vma` — "Vulkan on Apple" — while bounding the decode window to
+    /// avoid a GPU watchdog. Android drivers have the same watchdog, so a phone took the unbounded
+    /// path and would trip the very thing the guard exists to prevent.
+    ///
+    /// Tested on the name list directly because `watchdog_prone` needs a live Gpu, and the list is the
+    /// part that goes stale when a vendor is added.
+    #[test]
+    fn the_watchdog_list_covers_mobile_AND_apple() {
+        let matches = |s: &str| {
+            let l = s.to_ascii_lowercase();
+            ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante", "apple", "agx"]
+                .iter().any(|m| l.contains(m))
+        };
+        for a in ["Adreno (TM) 740", "Mali-G715", "Immortalis-G720", "Samsung Xclipse 940",
+                  "Apple M2 Max (G14C B1) [Vulkan]", "Apple M2 Ultra (G14D B1) [Vulkan]"] {
+            assert!(matches(a), "{a} kills long dispatches and must be bounded");
+        }
+        // Desktop parts must NOT be bounded, or every one of them pays per-token submit overhead for
+        // a watchdog they do not have.
+        for a in ["NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX", "Intel Arc A770",
+                  "llvmpipe (LLVM 20.1.2, 256 bits)"] {
+            assert!(!matches(a), "{a} has no watchdog; bounding it costs speed for nothing");
+        }
+    }
+
+    /// Every per-run counter must be reset together.
+    ///
+    /// Observed across four consecutive runs: `no-frame 1480` each time, while its reported share moved
+    /// from 35% to 7%. The numerator was cumulative and the denominator per-run, so the percentage
+    /// described nothing — and it is the number an operator tunes against.
+    ///
+    /// The test reads the SOURCE of gpu_counters_reset rather than exercising it, because a counter
+    /// left out is invisible to a behavioural test: it counts correctly, the line prints, and only a
+    /// comparison across runs reveals it never moved. Checking the reset list directly is the only
+    /// thing that catches the omission at the moment someone adds a counter.
+    #[test]
+    fn every_submit_cause_counter_is_in_the_reset_list() {
+        let src = include_str!("lib.rs");
+        let start = src.find("pub fn gpu_counters_reset()").expect("reset fn");
+        let body = &src[start..start + 600];
+        for name in ["SUBMIT_BY_PASSES", "SUBMIT_BY_RETAIN", "SUBMIT_BY_DOWNLOAD",
+                     "SUBMIT_BY_DIMS_WRAP", "SUBMIT_BY_END_FRAME", "SUBMIT_BY_NO_FRAME"] {
+            assert!(body.contains(name),
+                "{name} is declared but never reset — its share of the profile will be nonsense");
+        }
+        // And the counters that were already there stay there.
+        for name in ["GPU_SUBMITS", "GPU_POLLS", "GPU_SETUP_NS", "GPU_SYNC_NS"] {
+            assert!(body.contains(name), "{name} dropped from the reset list");
+        }
+    }
+
+    /// Source strides must follow the tensor's own type.
+    ///
+    /// Q4_K is 144 bytes per 256-weight super-block and Q6_K is 210. The file-view slicing was
+    /// hardcoded to 144, so even with the type check lifted a Q6_K tensor would have been sliced at
+    /// the wrong offset — every expert after the first reading from the middle of its predecessor.
+    /// The two changes are only useful together, which is why the stride is tested rather than assumed.
+    #[test]
+    fn source_block_bytes_follows_the_type() {
+        let count = 256 * 100;
+        assert_eq!(super::Gpu::source_block_bytes(12, count), Some(100 * 144), "Q4_K");
+        assert_eq!(super::Gpu::source_block_bytes(14, count), Some(100 * 210), "Q6_K");
+        assert_ne!(super::Gpu::source_block_bytes(12, count),
+                   super::Gpu::source_block_bytes(14, count),
+                   "if these matched, a hardcoded stride would have been harmless and this is noise");
+    }
+
+    #[test]
+    fn an_unverified_source_type_has_NO_block_size() {
+        // Returning a plausible size for a format nobody has checked is how a model loads and produces
+        // quietly wrong output. None sends it to the host copy instead.
+        for t in [0u32, 8, 13, 19, 99] {
+            assert_eq!(super::Gpu::source_block_bytes(t, 256), None, "type {t}");
+        }
+    }
+
+    /// The mobile-GPU names that disable the subgroup kernel.
+    ///
+    /// Reported from a Fairphone: llama3.2-1B loaded and then failed with a driver message about "not
+    /// enough wavelets" — a driver term for waves/subgroups, and not a string in this codebase. The
+    /// guard existed but was keyed on Apple-Vulkan alone, so every mobile GPU took the subgroup path
+    /// with no check that the driver can schedule enough invocations per workgroup.
+    ///
+    /// Matched on ADAPTER NAME because there is no feature bit for "this is a phone" — the extension is
+    /// present and honest, and the limit is on how many subgroups run at once. A false positive costs a
+    /// slower kernel; a false negative costs a load failure the user cannot diagnose, so the list errs
+    /// toward matching.
+    #[test]
+    fn the_mobile_gpu_list_covers_the_major_vendors() {
+        let names = ["adreno", "mali", "powervr", "immortalis", "xclipse", "vivante"];
+        let matches = |s: &str| {
+            let l = s.to_ascii_lowercase();
+            names.iter().any(|m| l.contains(m))
+        };
+        // Real adapter strings, as reported by their drivers.
+        for a in ["Adreno (TM) 740", "Mali-G715", "PowerVR B-Series BXM-8-256",
+                  "Immortalis-G720", "Samsung Xclipse 940"] {
+            assert!(matches(a), "{a} must be recognised as mobile");
+        }
+        // And desktop parts must NOT match, or they lose the fast kernel for nothing.
+        for a in ["NVIDIA GeForce RTX 4090", "AMD Radeon RX 7900 XTX",
+                  "Intel Arc A770", "Apple M2 Ultra (G14D B1)", "llvmpipe (LLVM 20.1.2, 256 bits)"] {
+            assert!(!matches(a), "{a} must NOT be treated as mobile");
+        }
+    }
+
     /// `flush_every` must not be mutated by anything other than the tuner or an explicit pin.
     ///
     /// A permanent `store` of a reduced value was added here as "pacing after a readback" and acted as a
