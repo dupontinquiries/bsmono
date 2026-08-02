@@ -315,6 +315,51 @@ pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic
 pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// One line attributing every submit to its cause, for the profile report.
+/// A snapshot of the submit-cause counters, for reporting a DELTA rather than a lifetime total.
+///
+/// The profile measures submits as a delta from a snapshot and read the causes as absolutes, so one
+/// report carried two clocks: your log showed "349 submits" beside causes summing to 4132, and the
+/// causes grew across turns while the submit count did not.
+///
+/// gpu_counters_reset would also fix it and is only called by the validator; adding a second reset
+/// from the app would race with that one. A snapshot has no such conflict — two readers can each hold
+/// their own baseline.
+#[derive(Clone, Copy, Default)]
+pub struct SubmitCauseSnapshot {
+    passes: u64, retain: u64, download: u64, dims_wrap: u64, end_frame: u64, no_frame: u64,
+}
+
+impl SubmitCauseSnapshot {
+    pub fn now() -> SubmitCauseSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        SubmitCauseSnapshot {
+            passes: SUBMIT_BY_PASSES.load(Relaxed), retain: SUBMIT_BY_RETAIN.load(Relaxed),
+            download: SUBMIT_BY_DOWNLOAD.load(Relaxed), dims_wrap: SUBMIT_BY_DIMS_WRAP.load(Relaxed),
+            end_frame: SUBMIT_BY_END_FRAME.load(Relaxed), no_frame: SUBMIT_BY_NO_FRAME.load(Relaxed),
+        }
+    }
+}
+
+/// Attribution since `since`, so the causes share the profile's clock.
+pub fn submit_attribution_since(since: SubmitCauseSnapshot, actual: u64) -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = SubmitCauseSnapshot::now();
+    let d = |a: u64, b: u64| a.saturating_sub(b);
+    let (p, r, dl) = (d(now.passes, since.passes), d(now.retain, since.retain),
+                      d(now.download, since.download));
+    let (w, e, nf) = (d(now.dims_wrap, since.dims_wrap), d(now.end_frame, since.end_frame),
+                      d(now.no_frame, since.no_frame));
+    let _ = Relaxed;
+    let counted = p + r + dl + w + e + nf;
+    let total = counted.max(1);
+    let gap = actual.saturating_sub(counted);
+    format!("submit causes — no-frame {} ({:.0}%), passes {} ({:.0}%), download {} ({:.0}%), end_frame {} ({:.0}%), dims-wrap {}, retain {} | {} of {} submits attributed{} (shares are of the attributed subset)",
+        nf, nf as f64 * 100.0 / total as f64, p, p as f64 * 100.0 / total as f64,
+        dl, dl as f64 * 100.0 / total as f64, e, e as f64 * 100.0 / total as f64,
+        w, r, counted, actual,
+        if gap > 0 { format!(" — {gap} UNATTRIBUTED") } else { String::new() })
+}
+
 pub fn submit_attribution() -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let (p, r, d, w, e, nf) = (SUBMIT_BY_PASSES.load(Relaxed), SUBMIT_BY_RETAIN.load(Relaxed),
