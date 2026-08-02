@@ -1,9 +1,12 @@
-//! The minimum of the crate that `model.rs` needs when it is pulled in
-//! verbatim by a harness. `model.rs` names three siblings — `meshgen`,
-//! `render::Gpu`, and `physics::Hover` — and only `meshgen` carries real
-//! logic the loader depends on. The other two are satisfied here so that the
-//! loader compiles and runs without a device, without a physics step, and
-//! without touching the game's 180 KB `main.rs`.
+// NOTE: this file is include!d at the root of each harness, so its header
+// must be `//` and not `//!` — an inner doc comment is only legal at the top
+// of a file, and after inlining it is not at the top of anything.
+// The minimum of the crate that `model.rs` needs when it is pulled in
+// verbatim by a harness. `model.rs` names three siblings — `meshgen`,
+// `render::Gpu`, and `physics::Hover` — and only `meshgen` carries real
+// logic the loader depends on. The other two are satisfied here so that the
+// loader compiles and runs without a device, without a physics step, and
+// without touching the game's 180 KB `main.rs`.
 #[path = "../src/meshgen.rs"]
 pub mod meshgen;
 #[path = "../src/model.rs"]
