@@ -889,6 +889,10 @@ was evicted)", prompt_ids.len())
             // vs GPU-bound (sync) split for THIS generation — the data that answers "why is llama.cpp
             // faster": high submits/token + setup_ms-dominated ⇒ dispatch-bound (→ fuse kernels), not
             // compute-bound.
+            // The CAUSES need the same baseline. Read as absolutes they carry a lifetime total into a
+            // per-generation report — your log showed "349 submits" beside causes summing to 4132, and
+            // the causes grew across turns while the submit count did not.
+            let cause0 = gpu_kernels::SubmitCauseSnapshot::now();
             use std::sync::atomic::Ordering as AOrd;
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
@@ -1043,7 +1047,11 @@ was evicted)", prompt_ids.len())
             // WHY the frame drained, not just how often. On Metal a run showed 1119 submits/token at
             // 2.0 ms each while flush_every was 128 — five passes per submit — and nothing in the log
             // said which mechanism was responsible.
-            let attr = format!("wgpu-engine: [{}] {}", self.name, gpu_kernels::submit_attribution());
+            // Same baseline and the same total as the profile line above, so the two can be read
+            // together. Passing `ds` means "N of M attributed" compares against THIS generation's
+            // submits rather than the process lifetime's.
+            let attr = format!("wgpu-engine: [{}] {}", self.name,
+                gpu_kernels::submit_attribution_since(cause0, ds as u64));
             eprintln!("[{}] {attr}", gpu_kernels::stamp());
             crate::diag::note(&attr);
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
