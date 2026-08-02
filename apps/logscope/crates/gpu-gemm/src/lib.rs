@@ -2897,8 +2897,14 @@ impl Gpu {
         let mut fr = self.frame.lock().unwrap();
         // TAGGED: flushing a previous frame is an end_frame in all but name. Six of eight submit callers incremented nothing, which is
         // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
-        SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some(prev) = fr.take() { self.submit(prev.enc); }
+        // TAG INSIDE THE CONDITIONAL. This counted a submit whether or not one happened: when the
+        // frame was already empty, fr.take() yields None and nothing is flushed, but the counter had
+        // already advanced. Your log showed the result — "9824 of 9642 submits attributed", more
+        // causes than submits, which is arithmetically impossible and was mine from _406.
+        if let Some(prev) = fr.take() {
+            SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.submit(prev.enc);
+        }
         *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
