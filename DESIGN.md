@@ -2662,6 +2662,34 @@ the wheels — and sits the sill just proud of it. `--sim glb` reports the
 overhang per model and now fails if the measured flank ever collapses back
 to the bounding box.
 
+## v1.82.0 — the other two ray systems
+
+Every optimisation so far went into the REFLECTION march, which is only
+part of what a fragment pays for: it also casts a shadow ray and four
+ambient-occlusion probes. Measuring all three together showed the shadow
+ray was carrying nearly as much cost as the reflection and had received
+none of the improvements.
+
+SHADOW RAYS NOW RETIRE CANDIDATES. The shadow march is monotonic in t,
+exactly like the reflection, so it can walk a start index forward and stop
+considering shapes it has already gone past. The machinery was written for
+reflections and simply never applied here — the shadow was walking the full
+candidate list at every step. 24% fewer evaluations.
+
+REFLECTIONS MARCH AS FAR AS THEY ARE WORTH. `tmax` was a constant 260 m
+regardless of how much of the pixel the reflection would actually become. A
+reflection contributing a tenth of a fragment does not deserve a full-length
+march — the far end of it is fog-tinted sky either way. The distance now
+scales with the blend weight, which is 42% fewer evaluations on a weak
+reflection and leaves a mirror-bright one untouched.
+
+AO SKIPS ITSELF when its candidate set is empty and the fragment is clear of
+the ground: four map_d calls that could only ever return "no occlusion".
+
+New in `--sim march`: a per-fragment breakdown across all three systems, so
+the next round of this work starts by looking at which one is actually
+expensive rather than at the one that was expensive last time.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

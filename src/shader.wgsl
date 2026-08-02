@@ -477,8 +477,17 @@ fn soft_shadow(p: vec3<f32>, l: vec3<f32>, pdist: f32) -> f32 {
     let lod = clamp(pdist / 150.0, 0.0, 1.0);
     let steps = i32(mix(20.0 + 14.0 * G.rt.y, 9.0, lod));
     let skip_ter = p.y > 17.0 && l.y > 0.05;
+    // The shadow march is monotonic in t, exactly like the reflection, so it
+    // can retire candidates it has already gone past. It never did — the
+    // machinery was written for reflections and the other two ray systems
+    // were left walking the whole list at every step.
+    var first = 0u;
     for (var i = 0; i < steps; i = i + 1) {
-        let d = map_d(p + l * t, &c, skip_ter);
+        loop {
+            if (first >= c.n || c.t1[first] > t) { break; }
+            first = first + 1u;
+        }
+        let d = map_d_from(p + l * t, &c, skip_ter, first);
         res = min(res, 9.0 * d / t);
         t = t + clamp(d, 0.06 + lod * 0.2, 8.0);
         if (res < 0.015 || t > tmax) { break; }
@@ -491,6 +500,9 @@ fn calc_ao(p: vec3<f32>, n: vec3<f32>, pdist: f32) -> f32 {
     // AO is the first ray system to go at low quality
     if (pdist > 120.0 || G.rt.y < 0.45) { return 1.0; }
     var c = gather(p, n, 3.0, -1);
+    // nothing within reach and well clear of the ground: nothing to occlude
+    // by, so skip four map_d calls that can only return "no occlusion"
+    if (c.n == 0u && p.y > terrain_h(p.x, p.z) + 3.0) { return 1.0; }
     var occ = 0.0;
     var w = 1.0;
     for (var i = 1; i <= 4; i = i + 1) {
@@ -505,10 +517,17 @@ fn calc_ao(p: vec3<f32>, n: vec3<f32>, pdist: f32) -> f32 {
 /// One real reflection bounce: march the world, shade the hit with the same
 /// sun/fog/emissive model, fall back to the sky.
 fn trace_reflection(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32) -> vec3<f32> {
+    return trace_reflection_w(ro, rd, skip, base_dist, 1.0);
+}
+
+/// `weight` is how much of the result will actually survive the blend. A
+/// reflection contributing a tenth of the pixel does not deserve a full
+/// 260 m march — the far end of it is fog-tinted sky either way.
+fn trace_reflection_w(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32, weight: f32) -> vec3<f32> {
     let qn = clamp(G.rt.y, 0.0, 1.0);
     if (qn < 0.35 && base_dist > 70.0) { return sky_color(rd); }
     let lod = clamp(base_dist / 150.0, 0.0, 1.0);
-    let tmax = mix(260.0, 90.0, lod) * mix(0.4, 1.0, qn);
+    let tmax = mix(260.0, 90.0, lod) * mix(0.4, 1.0, qn) * mix(0.35, 1.0, clamp(weight * 2.2, 0.0, 1.0));
     // PORTAL-AWARE MARCH: the ray walks in its own frame (ro2/rd2) so that
     // when a step crosses a portal face the ray is teleported and simply
     // keeps going — the far side is then genuinely visible THROUGH the
@@ -795,7 +814,7 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
             if (cheap_refl) {
                 col = mix(col, sky_color(rr), amount * 0.8);
             } else {
-                let rc = trace_reflection(in.wpos + n * 0.05, rr, self_id, dist0);
+                let rc = trace_reflection_w(in.wpos + n * 0.05, rr, self_id, dist0, amount);
                 col = mix(col, rc, amount);
             }
         }

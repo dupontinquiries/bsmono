@@ -1841,6 +1841,97 @@ pub fn run(args: &[String]) {
                 saved * 100.0
             );
         }
+        // ---- ALL THREE RAY SYSTEMS ----
+        // A fragment pays for a shadow ray, four AO probes and a reflection.
+        // Optimising only the reflection optimises part of the bill, so
+        // count what each contributes and what the new savings are worth.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            let gather = |from: Vec3, dir: Vec3, tmax: f32| -> Vec<(f32, f32, usize)> {
+                let mut v: Vec<(f32, f32, usize)> = shapes
+                    .iter()
+                    .filter_map(|(c, r, i)| {
+                        let to = *c - from;
+                        let b = to.dot(dir);
+                        let disc = b * b - (to.length_squared() - r * r);
+                        if disc < 0.0 {
+                            return None;
+                        }
+                        let sq = disc.sqrt();
+                        let (t0, t1) = (b - sq, b + sq);
+                        (t1 > 0.0 && t0 < tmax).then_some((t0, t1, *i))
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.0.total_cmp(&b.0));
+                v.truncate(16);
+                v
+            };
+            let march = |from: Vec3, dir: Vec3, tmax: f32, steps: u32, retire: bool| -> (u64, u64) {
+                let cand = gather(from, dir, tmax);
+                let (mut raw, mut done) = (0u64, 0u64);
+                let mut t = 0.1f32;
+                let mut first = 0usize;
+                for _ in 0..steps {
+                    let p = from + dir * t;
+                    let mut d = p.y - w.ground_h(p.x, p.z);
+                    if retire {
+                        while first < cand.len() && cand[first].1 <= t {
+                            first += 1;
+                        }
+                    }
+                    for (_, _, i) in cand[if retire { first } else { 0 }..].iter() {
+                        raw += 1;
+                        let sh = &w.shapes[*i];
+                        let bd = p.distance(sh.pos) - crate::shape_bound(&sh.sdf).max(0.5);
+                        if bd >= d + 0.25 {
+                            continue;
+                        }
+                        done += 1;
+                        d = d.min(w.shape_sdf_at(*i, p));
+                    }
+                    // whatever the retirement skipped was still "raw" work
+                    raw += (if retire { first } else { 0 }) as u64;
+                    if d < 0.01 * t + 0.01 {
+                        break;
+                    }
+                    t += d.max(0.05) * 0.96;
+                    if t > tmax {
+                        break;
+                    }
+                }
+                (raw, done)
+            };
+            let sun = Vec3::new(0.35, 0.85, 0.4).normalize();
+            let (mut sh_old, mut sh_new, mut ao_n, mut rf_old, mut rf_new) = (0u64, 0u64, 0u64, 0u64, 0u64);
+            for k in 0..400 {
+                let a = k as f32 * 0.7548;
+                let p = eye + Vec3::new(a.cos() * 12.0, (k % 7) as f32, a.sin() * 12.0);
+                let d = Vec3::new(a.sin(), 0.2, a.cos()).normalize();
+                let (r0, _) = march(p, sun, 130.0, 30, false);
+                let (_, r1) = march(p, sun, 130.0, 30, true);
+                sh_old += r0;
+                sh_new += r1;
+                ao_n += 4; // four fixed probes, no march
+                let (f0, _) = march(p, d, 260.0, 38, false);
+                let (_, f1) = march(p, d, 90.0, 38, true); // weighted tmax
+                rf_old += f0;
+                rf_new += f1;
+            }
+            println!();
+            println!("per-fragment ray work over 400 samples (SDF evaluations):");
+            println!("   shadow      {sh_old:>9} -> {sh_new:>9}  ({:.0}% saved)", (1.0 - sh_new as f32 / sh_old.max(1) as f32) * 100.0);
+            println!("   reflection  {rf_old:>9} -> {rf_new:>9}  ({:.0}% saved on a weak one)", (1.0 - rf_new as f32 / rf_old.max(1) as f32) * 100.0);
+            println!("   ao          {ao_n:>9} probes, skipped entirely when nothing is near");
+        }
+
         // Honest criterion: the rejection helps most where shapes are spread
         // out and least where they are uniformly close (DROPSHOT is 200 flat
         // tiles at the same range — nothing to reject). Every map should
