@@ -57,8 +57,8 @@ starts hidden with the auto-login ordering rule.
 | SmartRibbon | pending |  |
 | SnapComposerDialog | pending |  |
 | SnapExporter | pending |  |
-| SnapFeedWidget | pending |  |
-| SnapViewerDialog | pending |  |
+| SnapFeedWidget | ported | snaps.rs `SnapFeed` — sealed tiles, 2 columns, order as supplied |
+| SnapViewerDialog | ported | snaps.rs `Viewer` — countdown that outlives an early close, playlist mode, save-not-notify |
 | SvgIcon | pending |  |
 | SwipeNavigator | ported | uikit_egui::nav + GestureLayer (page swipe, subpage drill, clamp) |
 | TabBar | pending |  |
