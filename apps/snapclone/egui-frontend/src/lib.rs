@@ -56,6 +56,13 @@ pub struct Snapclone {
     /// per-page LOAD waits for the swipe to settle — so a fast scroll through
     /// five pages loads the fifth once rather than all five in turn.
     pub page_debounce: crate::debounce::Debouncer<usize>,
+    /// Notify on arrival only when the window is NOT focused. Notifying while
+    /// someone is looking at the inbox is noise about something already on
+    /// screen, and it is how an app trains people to turn notifications off.
+    pub notify_enabled: bool,
+    /// Suppress sender and content in notifications — they persist in KDE's
+    /// history and show on lock screens.
+    pub high_security: bool,
     pub inbox: crate::inbox::Inbox,
     pub composer: crate::composer::Composer,
     pub settings: crate::settings_page::SettingsPage,
@@ -90,6 +97,8 @@ impl Snapclone {
             viewfinder: Default::default(),
             camera: None,
             settings_error: None,
+            notify_enabled: true,
+            high_security: false,
             page_debounce: crate::debounce::Debouncer::new(
                 crate::debounce::Config::page_transition()),
             inbox: Default::default(),
@@ -139,6 +148,26 @@ impl Snapclone {
     }
 
     /// Render: live background, then the current page/subpage.
+    /// Snaps arrived. Returns what to send to the notification daemon, or
+    /// `None` when nothing should be sent.
+    ///
+    /// `focused` is the window's own state: an app that notifies about a message
+    /// visible on screen is one people mute.
+    pub fn on_snaps_arrived(&self, from: &[String], focused: bool)
+        -> Option<uikit_egui::notify::Rendered> {
+        if !self.notify_enabled || focused || from.is_empty() { return None; }
+        let notes: Vec<uikit_egui::notify::Note> = from.iter().map(|f| {
+            uikit_egui::notify::Note {
+                from: f.clone(),
+                // A snap has no text — the picture is the message — so there is
+                // nothing to suppress in the detail, and the generic carries it.
+                detail: String::new(),
+                generic: "New snap".into(),
+            }
+        }).collect();
+        uikit_egui::notify::render_batch(&notes, self.high_security)
+    }
+
     /// Note the page the user is on, and report when they have settled there.
     ///
     /// The caller does the expensive part — fetching a conversation, opening a
@@ -545,6 +574,54 @@ mod desktop_entry_tests {
         }
         // Terminal=true on a GUI app opens a console window alongside it.
         assert!(ENTRY.contains("Terminal=false"));
+    }
+}
+
+#[cfg(test)]
+mod notify_tests {
+    use super::*;
+
+    fn app() -> Snapclone { Snapclone::new(Vec::new()) }
+
+    #[test]
+    fn a_focused_window_does_not_notify_about_what_is_on_screen() {
+        // An app that pops a notification for a message the user is looking at
+        // is one people mute, and a muted app cannot tell them anything.
+        let a = app();
+        assert!(a.on_snaps_arrived(&["Ada".into()], true).is_none());
+        assert!(a.on_snaps_arrived(&["Ada".into()], false).is_some());
+    }
+
+    #[test]
+    fn high_security_notifies_without_naming_anyone() {
+        // The notification persists in KDE history and shows on a lock screen;
+        // a name there defeats the encryption underneath it.
+        let mut a = app();
+        a.high_security = true;
+        let r = a.on_snaps_arrived(&["Ada".into()], false).unwrap();
+        assert!(!r.summary.contains("Ada"), "{r:?}");
+        assert!(!r.body.contains("Ada"), "{r:?}");
+    }
+
+    #[test]
+    fn a_burst_of_snaps_is_one_notification() {
+        let a = app();
+        let from: Vec<String> = (0..8).map(|i| format!("p{i}")).collect();
+        let r = a.on_snaps_arrived(&from, false).unwrap();
+        assert_eq!(r.summary, "8 new messages");
+    }
+
+    #[test]
+    fn nothing_arriving_notifies_nothing() {
+        let a = app();
+        assert!(a.on_snaps_arrived(&[], false).is_none());
+    }
+
+    #[test]
+    fn notifications_can_be_turned_off_entirely() {
+        let mut a = app();
+        a.notify_enabled = false;
+        assert!(a.on_snaps_arrived(&["Ada".into()], false).is_none());
     }
 }
 }
