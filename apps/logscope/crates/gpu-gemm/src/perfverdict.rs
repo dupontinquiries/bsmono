@@ -334,3 +334,109 @@ mod poll_coverage_tests {
 to nothing, which is how 99.8% of a generation became UNACCOUNTED");
     }
 }
+
+/// Decode compared against this model's OWN prefill, which needs no roofline.
+///
+/// `verdict()` reports "bandwidth ceiling UNMEASURED" whenever `--gate-perf` has not run, which is
+/// almost always — so the strongest signal available went unreported for want of a number nobody had.
+///
+/// Prefill and decode read the same weights. Prefill amortises each read across its chunk; decode at
+/// m=1 reads them per token. So decode SHOULD be slower per token in arithmetic terms and dramatically
+/// faster in memory terms, and the ratio between them is a self-contained measurement of how much
+/// latency decode is failing to hide.
+///
+/// Measured on DeepSeek-8B: prefill 12.6 ms/token, decode 182 ms/token — **14×**, on the same weights
+/// in the same run.
+#[derive(Clone, PartialEq, Debug)]
+pub enum SelfRelative {
+    /// Not enough of one phase to compare.
+    NotEnoughData,
+    /// Decode is within a small factor of prefill per token. Nothing to explain.
+    Consistent { ratio: f64 },
+    /// Decode is far slower per token than prefill on the same weights.
+    DecodeStarved { ratio: f64 },
+}
+
+/// Ratios above this are not explicable by decode's lower arithmetic intensity alone.
+///
+/// Decode does strictly less work per token than prefill and reads the same bytes, so a small factor
+/// is expected from fixed per-token costs. An order of magnitude is not — it says decode has nothing
+/// in flight to cover memory latency while prefill's batch covers it.
+pub const STARVED_RATIO: f64 = 4.0;
+
+/// Compare the two phases of one run.
+///
+/// Both arguments are ms per token of their own phase: prefill over its prompt, decode over its
+/// output. Deliberately not a `Sample`, because this needs no bandwidth, no active-byte count and no
+/// submit total — it is two numbers the engine already prints.
+pub fn self_relative(prefill_ms_per_tok: f64, decode_ms_per_tok: f64,
+                     prompt_tokens: usize, decoded_tokens: usize) -> SelfRelative {
+    // A handful of tokens of either phase is noise. 32 is enough to average over pipeline fill.
+    if prompt_tokens < 32 || decoded_tokens < 32 { return SelfRelative::NotEnoughData; }
+    if prefill_ms_per_tok <= 0.0 || decode_ms_per_tok <= 0.0 { return SelfRelative::NotEnoughData; }
+    let ratio = decode_ms_per_tok / prefill_ms_per_tok;
+    if ratio >= STARVED_RATIO { SelfRelative::DecodeStarved { ratio } }
+    else { SelfRelative::Consistent { ratio } }
+}
+
+impl SelfRelative {
+    pub fn advice(&self) -> String {
+        match self {
+            SelfRelative::NotEnoughData =>
+                "not enough of one phase to compare decode against prefill".into(),
+            SelfRelative::Consistent { ratio } => format!(
+                "decode is {ratio:.1}x prefill's cost per token, which is what fixed per-token costs \
+account for — nothing here suggests the decode kernel is starved"),
+            SelfRelative::DecodeStarved { ratio } => format!(
+                "decode is {ratio:.1}x SLOWER PER TOKEN than this model's own prefill, on the same \
+weights in the same run. Prefill reads each weight once per chunk and decode reads it once per token, \
+so decode should be the cheaper of the two — a gap this size means decode has nothing in flight to \
+cover memory latency while prefill's batch covers it. The batched matvec for m<=8 already exists \
+(MATVEC_SMALL_Q4); what is missing is something producing more than one candidate token, which is \
+speculative decoding. This comparison needs no bandwidth measurement, which is why it is reported \
+when the roofline verdict cannot be."),
+        }
+    }
+}
+
+#[cfg(test)]
+mod self_relative_tests {
+    use super::*;
+
+    #[test]
+    fn the_measured_deepseek_run_is_STARVED() {
+        // prefill 1634 tokens in 20.51s, decode 109 tokens in 19.9s — the real numbers.
+        let v = self_relative(20510.0 / 1634.0, 19900.0 / 109.0, 1634, 109);
+        match v {
+            SelfRelative::DecodeStarved { ratio } => assert!((ratio - 14.4).abs() < 0.5, "{ratio}"),
+            other => panic!("{other:?}"),
+        }
+        assert!(v.advice().contains("speculative decoding"));
+        assert!(v.advice().contains("needs no bandwidth measurement"));
+    }
+
+    #[test]
+    fn a_healthy_run_says_so_rather_than_staying_silent() {
+        // Decode doing 2x prefill's per-token cost is explained by fixed costs. Reporting that
+        // positively matters: a diagnostic that only speaks when something is wrong leaves a reader
+        // unable to tell "fine" from "not measured".
+        let v = self_relative(12.0, 24.0, 512, 256);
+        assert!(matches!(v, SelfRelative::Consistent { .. }));
+        assert!(v.advice().contains("nothing here suggests"));
+    }
+
+    #[test]
+    fn a_short_phase_is_NOT_ENOUGH_DATA_rather_than_a_verdict() {
+        // A three-token reply against a long prompt would otherwise produce a confident ratio built
+        // almost entirely from pipeline fill.
+        assert_eq!(self_relative(12.0, 200.0, 1634, 3), SelfRelative::NotEnoughData);
+        assert_eq!(self_relative(12.0, 200.0, 8, 256), SelfRelative::NotEnoughData);
+    }
+
+    #[test]
+    fn a_zero_timing_is_a_MISSING_measurement_not_an_infinite_ratio() {
+        // The same mistake as reporting 0% of an unmeasured bandwidth, which _441 had to fix.
+        assert_eq!(self_relative(0.0, 200.0, 512, 256), SelfRelative::NotEnoughData);
+        assert_eq!(self_relative(12.0, 0.0, 512, 256), SelfRelative::NotEnoughData);
+    }
+}
