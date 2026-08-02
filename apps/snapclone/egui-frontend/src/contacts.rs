@@ -1,7 +1,15 @@
-//! contacts — the picker, the editor and the security bar.
+//! contacts — `ContactPickerDialog`, `ContactEditorDialog`, `ConversationSecurityBar`.
 //!
 //! Three surfaces from the messaging core, ported together because they share a
 //! model and separating them would mean three copies of `Contact`.
+//!
+//! The Qt class names are spelled out above because `parity_audit.py` matches
+//! on them, and it was reporting the picker and the editor as PENDING while
+//! both were sitting here fully ported — a false negative that made the port
+//! look further behind than it was. Worth knowing in the other direction too:
+//! the audit cannot tell a real port from a comment mentioning a class name,
+//! so its number is a floor on what is named, not a measure of what works.
+//! The tests below are what actually pin the behaviour.
 //!
 //! ## The security bar is the one with real semantics
 //!
@@ -27,7 +35,15 @@
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Contact {
     pub id: String,
+    /// The name the PEER advertises, over SHAK. Ours to display, not to edit:
+    /// overwriting it locally throws away the only name that still identifies
+    /// this person after you forget what you renamed them to.
     pub display_name: String,
+    /// The local, user-chosen name. This is what the editor writes, and it
+    /// wins over the advertised one — `Core::Contact::label()`.
+    pub nickname: String,
+    /// Free-form local notes. "met at the conference, the one with the dog."
+    pub notes: String,
     /// The sc-ID; shown when a display name is missing rather than a blank row.
     pub sc_id: String,
     pub blocked: bool,
@@ -35,10 +51,16 @@ pub struct Contact {
 }
 
 impl Contact {
-    /// What to show. Never empty: a blank row in a contact list is unclickable
-    /// and looks like corruption.
+    /// What to show, in `Core::Contact::label()`'s order: the nickname you
+    /// chose, then the name they advertise, then the raw id. Never empty — a
+    /// blank row in a contact list is unclickable and looks like corruption.
+    ///
+    /// The nickname coming FIRST is the point of having one. You rename someone
+    /// because their advertised handle is `sc-a3f7` or a name you cannot place;
+    /// a rename that the list then ignores is not a rename.
     pub fn label(&self) -> &str {
-        if !self.display_name.is_empty() { &self.display_name }
+        if !self.nickname.is_empty() { &self.nickname }
+        else if !self.display_name.is_empty() { &self.display_name }
         else if !self.sc_id.is_empty() { &self.sc_id }
         else { "(unnamed)" }
     }
@@ -166,30 +188,50 @@ impl Picker {
     }
 }
 
-/// The contact editor.
+/// `ContactEditorDialog`.
+///
+/// It edits the NICKNAME and the notes. The advertised `display_name` is shown
+/// read-only, exactly as the dialog does with its "Display name" row, and used
+/// as the nickname field's placeholder so the box you type in already shows
+/// what you are overriding. The port previously wrote the advertised name,
+/// which destroys the one piece of identity that survives a bad rename.
 #[derive(Debug, Clone, Default)]
 pub struct Editor {
     pub contact: Option<Contact>,
-    pub draft_name: String,
+    pub draft_nickname: String,
+    pub draft_notes: String,
     pub avatar_path: String,
 }
 
 impl Editor {
     pub fn open(&mut self, c: &Contact) {
-        self.draft_name = c.display_name.clone();
+        self.draft_nickname = c.nickname.clone();
+        self.draft_notes = c.notes.clone();
         self.contact = Some(c.clone());
     }
 
+    /// What the empty nickname box shows: the advertised name, so the field is
+    /// visibly an override rather than a blank you must fill.
+    pub fn nickname_placeholder(&self) -> &str {
+        match self.contact.as_ref() {
+            Some(c) if !c.display_name.is_empty() => &c.display_name,
+            _ => "Enter a name…",
+        }
+    }
+
     pub fn is_dirty(&self) -> bool {
-        self.contact.as_ref().map(|c| c.display_name != self.draft_name).unwrap_or(false)
+        self.contact.as_ref()
+            .map(|c| c.nickname != self.draft_nickname.trim() || c.notes != self.draft_notes.trim())
+            .unwrap_or(false)
     }
 
     /// `onSave`. Returns the updated contact, or `None` when nothing changed —
     /// so a caller does not write and broadcast an identical record.
     pub fn save(&mut self) -> Option<Contact> {
+        if !self.is_dirty() { return None; }
         let c = self.contact.as_mut()?;
-        if c.display_name == self.draft_name { return None; }
-        c.display_name = self.draft_name.trim().to_string();
+        c.nickname = self.draft_nickname.trim().to_string();
+        c.notes = self.draft_notes.trim().to_string();
         Some(c.clone())
     }
 
@@ -206,8 +248,8 @@ mod tests {
     use super::*;
 
     fn c(id: &str, name: &str, fav: bool, blocked: bool) -> Contact {
-        Contact { id: id.into(), display_name: name.into(),
-                  sc_id: format!("sc-{id}"), blocked, favourite: fav }
+        Contact { id: id.into(), display_name: name.into(), nickname: String::new(),
+                  notes: String::new(), sc_id: format!("sc-{id}"), blocked, favourite: fav }
     }
 
     fn book() -> Vec<Contact> {
@@ -306,16 +348,81 @@ mod tests {
     }
 
     #[test]
+    fn a_local_rename_wins_over_the_advertised_name() {
+        // The whole reason to have a nickname: their handle is "sc-a3f7" or a
+        // name you cannot place, so you rename them. A rename the list then
+        // ignores is not a rename.
+        let mut x = c("1", "sc-a3f7c291", false, false);
+        assert_eq!(x.label(), "sc-a3f7c291");
+        x.nickname = "Ada".into();
+        assert_eq!(x.label(), "Ada");
+    }
+
+    #[test]
+    fn the_label_falls_back_through_all_three_names() {
+        let mut x = c("1", "", false, false);
+        assert_eq!(x.label(), "sc-1", "no names, so the routable id");
+        x.display_name = "Advertised".into();
+        assert_eq!(x.label(), "Advertised");
+        x.nickname = "Mine".into();
+        assert_eq!(x.label(), "Mine");
+    }
+
+    #[test]
+    fn the_editor_does_not_overwrite_the_advertised_name() {
+        // Writing display_name locally destroys the one piece of identity that
+        // survives a rename you later regret.
+        let mut e = Editor::default();
+        e.open(&c("1", "Ada Lovelace", false, false));
+        e.draft_nickname = "Ada".into();
+        let saved = e.save().expect("a change");
+        assert_eq!(saved.nickname, "Ada");
+        assert_eq!(saved.display_name, "Ada Lovelace", "untouched");
+    }
+
+    #[test]
+    fn the_nickname_box_shows_the_advertised_name_as_its_placeholder() {
+        // So the field reads as an override of something, not a blank to fill.
+        let mut e = Editor::default();
+        e.open(&c("1", "Ada Lovelace", false, false));
+        assert_eq!(e.nickname_placeholder(), "Ada Lovelace");
+        e.open(&c("2", "", false, false));
+        assert_eq!(e.nickname_placeholder(), "Enter a name…");
+    }
+
+    #[test]
+    fn notes_are_saved_and_count_as_a_change_on_their_own() {
+        let mut e = Editor::default();
+        e.open(&c("1", "Ada", false, false));
+        e.draft_notes = "  met at the conference  ".into();
+        assert!(e.is_dirty(), "a note is an edit even with the name untouched");
+        let saved = e.save().expect("a change");
+        assert_eq!(saved.notes, "met at the conference", "trimmed");
+    }
+
+    #[test]
+    fn whitespace_alone_is_not_an_edit() {
+        // Otherwise tabbing through the dialog broadcasts a record change.
+        let mut e = Editor::default();
+        e.open(&c("1", "Ada", false, false));
+        e.draft_nickname = "   ".into();
+        assert!(!e.is_dirty());
+        assert!(e.save().is_none());
+    }
+
+    #[test]
     fn saving_an_unchanged_contact_does_nothing() {
         // Otherwise the app writes and broadcasts an identical record.
         let mut e = Editor::default();
         e.open(&c("1", "Ada", false, false));
         assert!(!e.is_dirty());
         assert!(e.save().is_none());
-        e.draft_name = "Ada Lovelace".into();
+        e.draft_nickname = "Ada Lovelace".into();
         assert!(e.is_dirty());
         let saved = e.save().expect("a change to save");
-        assert_eq!(saved.display_name, "Ada Lovelace");
+        assert_eq!(saved.nickname, "Ada Lovelace");
+        assert_eq!(saved.display_name, "Ada",
+                   "the advertised name is not overwritten by a local rename");
         assert!(!e.is_dirty(), "clean afterwards");
     }
 

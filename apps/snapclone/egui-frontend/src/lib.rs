@@ -24,6 +24,7 @@ pub mod settings_page;
 pub mod settings_store;
 pub mod inbox;
 pub mod unified_nav;
+pub mod friends;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -82,6 +83,14 @@ pub struct Snapclone {
     pub nav: Nav,
     pub bg: LiveBackground,
     pub peers: Vec<Peer>,
+    /// The friends roster (Qt FriendListWidget). Derived from `peers` on
+    /// change rather than kept in parallel — two lists of the same people
+    /// disagree the moment one update misses.
+    pub roster: crate::friends::Roster,
+    /// Which row's action menu is open (Qt ContactCard), at most one.
+    pub cards: crate::friends::Accordion,
+    /// The manual add-peer form: the only way in when discovery does not work.
+    pub add_form: crate::friends::AddForm,
     gesture: GestureLayer,
     palette: String,
 }
@@ -108,15 +117,69 @@ impl Snapclone {
             settings: crate::settings_page::SettingsPage::new(crate::settings_store::load()),
             group_voice: Default::default(),
             picker: Default::default(),
+            cards: Default::default(),
+            add_form: Default::default(),
             conversation: Default::default(),
             conversation_peer: String::new(),
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
             bg: LiveBackground::new(BgStyle::Aurora),
-            peers,
             gesture: GestureLayer::horizontal_page(320.0),
             palette: String::new(),
+            // Built from the same peers, once, so the two cannot drift.
+            roster: {
+                let mut r = crate::friends::Roster::default();
+                r.set(peers.iter().map(Snapclone::friend_of).collect());
+                r
+            },
+            peers,
+        }
+    }
+
+    fn friend_of(p: &Peer) -> crate::friends::Friend {
+        crate::friends::Friend {
+            // A discovered Peer has one string standing for both its routable
+            // id and its name; a real contact record separates them, and the
+            // Friend row is built to take either.
+            id: p.name.clone(), name: p.name.clone(), online: p.online,
+        }
+    }
+
+    /// Re-derive the roster after the peer list changes. One source of truth:
+    /// keeping a second list in parallel means the day an update misses one of
+    /// them, the page shows someone as online who left an hour ago.
+    pub fn sync_roster(&mut self) {
+        self.roster.set(self.peers.iter().map(Snapclone::friend_of).collect());
+    }
+
+    /// Carry out what the Friends page asked for.
+    pub fn apply_friends(&mut self, a: crate::friends::Action) {
+        use crate::friends::Action;
+        match a {
+            // A manual add is optimistic: the row appears offline immediately,
+            // because a Connect button that visibly does nothing for two
+            // seconds gets pressed four more times.
+            Action::Add(p) => {
+                let name = p.host.clone();
+                if !self.peers.iter().any(|e| e.name == name) {
+                    self.peers.push(Peer { name: name.clone(), online: false });
+                }
+                self.sync_roster();
+            }
+            Action::Selected(id) => {
+                if let Some(i) = self.peers.iter().position(|p| p.name == id) {
+                    self.nav.push_subpage(i);
+                }
+            }
+            Action::Invoke(id, act) => {
+                if act == "delete" {
+                    self.peers.retain(|p| p.name != id);
+                    self.cards.close(&id);
+                    self.sync_roster();
+                }
+            }
+            Action::ImportVCard => {}
         }
     }
 
@@ -300,15 +363,14 @@ impl Snapclone {
             }
             return;
         }
-        // roster: tap a peer to drill into its subpage
-        for (i, p) in self.peers.clone().iter().enumerate() {
-            let dot = if p.online { c.success } else { c.text_weak };
-            if ui.horizontal(|ui| {
-                ui.colored_label(dot, "●");
-                ui.selectable_label(false, &p.name).clicked()
-            }).inner {
-                self.nav.push_subpage(i);
-            }
+        // The real FriendListWidget: cards with an action menu, the empty state
+        // that names the ports to open, and the add-peer form. The flat list of
+        // names this replaced had no way to add anyone, which is the half of
+        // the page that matters when discovery has failed and you are standing
+        // next to the person you are trying to reach.
+        if let Some(a) = crate::friends::friends_ui(
+            ui, &self.roster, &mut self.cards, &mut self.add_form, c) {
+            self.apply_friends(a);
         }
     }
 
@@ -420,6 +482,54 @@ mod tests {
             Peer { name: "alice".into(), online: true },
             Peer { name: "bob".into(), online: false },
         ])
+    }
+
+    #[test]
+    fn the_roster_is_built_from_the_peers_at_construction() {
+        // Not a second list that has to be remembered to update.
+        let s = app();
+        assert_eq!(s.roster.len(), 2);
+        assert_eq!(s.roster.online_count(), 1);
+        assert!(s.roster.get("alice").unwrap().online);
+    }
+
+    #[test]
+    fn a_manual_add_shows_the_row_immediately_as_offline() {
+        // A Connect button that visibly does nothing until the handshake
+        // completes gets pressed four more times.
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "192.168.1.5".into(), port: 9876 }));
+        assert_eq!(s.roster.len(), 3);
+        let added = s.roster.get("192.168.1.5").expect("the new row");
+        assert!(!added.online, "optimistic about the row, honest about the state");
+    }
+
+    #[test]
+    fn adding_a_peer_that_is_already_there_does_not_duplicate_it() {
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: "alice".into(), port: 9876 }));
+        assert_eq!(s.roster.len(), 2);
+    }
+
+    #[test]
+    fn deleting_from_a_card_removes_the_row_and_closes_the_menu() {
+        // Leaving the accordion open on a deleted id strands the menu over
+        // whichever row slides up into its place.
+        let mut s = app();
+        s.cards.open_only("bob");
+        s.apply_friends(crate::friends::Action::Invoke("bob".into(), "delete".into()));
+        assert_eq!(s.roster.len(), 1);
+        assert!(s.roster.get("bob").is_none());
+        assert!(!s.cards.is_open("bob"));
+    }
+
+    #[test]
+    fn tapping_a_row_drills_into_that_peers_subpage() {
+        let mut s = app();
+        s.apply_friends(crate::friends::Action::Selected("bob".into()));
+        assert_eq!(s.nav.subpage(), Some(1), "bob's index, not alice's");
     }
 
     #[test]
