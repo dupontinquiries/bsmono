@@ -82,8 +82,11 @@ fn cmd_scan(args: &[String]) -> anyhow::Result<()> {
         report.missing,
         report.errors.len()
     );
-    for err in &report.errors {
-        eprintln!("  ! {err}");
+    // ScanReport::errors is (path, message) — printing the tuple does not
+    // compile, and printing only the message loses which file failed, which is
+    // the one thing the operator needs from a scan of a thousand books.
+    for (path, msg) in &report.errors {
+        eprintln!("  ! {}: {msg}", path.display());
     }
     Ok(())
 }
