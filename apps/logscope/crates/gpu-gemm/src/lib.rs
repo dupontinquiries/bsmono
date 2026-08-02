@@ -7661,6 +7661,37 @@ Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp ba
             }
         }
         let fetch = |name: &str| -> Result<Vec<f32>, String> {
+            // FUSED-QKV FALLBACK. A checkpoint shipping `attn_qkv` instead of separate q/k/v tensors
+            // (Qwen3.5-30B) previously failed here with "missing tensor". qkvsplit::locate resolves
+            // the name to the fused tensor and the byte range of the part wanted.
+            //
+            // Option vs Result carries the distinction: None means no fused tensor exists and the
+            // ordinary miss below is correct, while Err means one exists at a shape the metadata does
+            // not describe — which must STOP rather than slice something plausible.
+            if g.tensor(name).is_none() {
+                let rows_of = |n: &str| g.tensor(n).map(|t| t.dims[0] as usize);
+                let row_bytes = |n: &str| g.tensor(n).and_then(|t| {
+                    let cols = t.dims.iter().skip(1).product::<u64>() as usize;
+                    gguf::type_nbytes(t.ggml_type, cols)
+                });
+                for fused in crate::qkvsplit::FUSED_NAMES {
+                    let src = match crate::qkvsplit::resolve(name, fused) { Some((s, _)) => s, None => break };
+                    let rb = match row_bytes(&src) { Some(b) => b, None => continue };
+                    match crate::qkvsplit::locate(name, &rows_of, n_heads as usize,
+                                                  n_kv_heads as usize, head_dim as usize, rb) {
+                        Some(Ok((srcname, (b0, b1)))) => {
+                            let t = g.tensor(&srcname).ok_or(format!("missing tensor {srcname}"))?;
+                            let raw = set.slice(t.offset + b0 as u64, b1 - b0).ok_or(format!(
+                                "fused tensor {srcname} data out of range for {name}"))?;
+                            let cols = t.dims.iter().skip(1).product::<u64>() as usize;
+                            let rows = (b1 - b0) / rb;
+                            return gguf::dequantize(t.ggml_type, raw, rows * cols);
+                        }
+                        Some(Err(e)) => return Err(format!("{name}: {}", e.explain())),
+                        None => break,
+                    }
+                }
+            }
             let t = g.tensor(name).ok_or(format!("missing tensor {name}"))?;
             let count = t.dims.iter().product::<u64>() as usize;
             let nbytes = gguf::type_nbytes(t.ggml_type, count).ok_or(format!("type {} unsupported for {name}", t.ggml_type))?;
