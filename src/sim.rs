@@ -2548,6 +2548,7 @@ pub fn run(args: &[String]) {
             let ball = Ball::new();
             let mut done = 0;
             let mut escaped = 0;
+            let (mut drive_frames, mut bore_frames, mut total_frames) = (0u64, 0u64, 0u64);
             let mut worst: Vec<(usize, f32)> = Vec::new();
             let n_routes = world.routes.len().min(24);
             for ri in 0..n_routes {
@@ -2586,6 +2587,7 @@ pub fn run(args: &[String]) {
                 c.boost = true;
                 let mut best = 0.0f32;
                 let mut out = false;
+                let (mut driven, mut in_bore, mut frames) = (0u32, 0u32, 0u32);
                 let dbg = std::env::var("DRIVE_DBG").map(|v| v == format!("{si}:{ri}")).unwrap_or(false);
                 let mut t = 0.0f32;
                 // these routes run 900-2200 m: give each one time to be
@@ -2608,6 +2610,17 @@ pub fn run(args: &[String]) {
                         acc += len;
                     }
                     best = best.max(along / total);
+                    // Is the car DRIVING something? On a map whose tubes all
+                    // interconnect, leaving the assigned polyline is not a
+                    // failure — you took another branch. What matters is
+                    // whether the bores are navigable at all.
+                    if car.on_ground {
+                        driven += 1;
+                    }
+                    if world.sdf(car.pos) < r * 1.2 {
+                        in_bore += 1;
+                    }
+                    frames += 1;
                     if dbg && (t * 8.0).fract() < DT * 8.0 {
                         eprintln!(
                             "  t={:4.2} along={:4.0}% off={:5.2} (r={:.1}) y={:6.1} og={} spd={:5.1} sdf={:6.2}",
@@ -2629,6 +2642,9 @@ pub fn run(args: &[String]) {
                 // falling out is a FAILURE, not progress: the projection
                 // keeps advancing while the car flies off, which flattered
                 // the first version of this test
+                drive_frames += driven as u64;
+                bore_frames += in_bore as u64;
+                total_frames += frames as u64;
                 if out {
                     escaped += 1;
                     worst.push((ri, best));
@@ -2639,6 +2655,17 @@ pub fn run(args: &[String]) {
                 }
             }
             worst.sort_by(|a, b| a.1.total_cmp(&b.1));
+            // THE REAL QUESTION for a tube map is navigability, not whether
+            // a car follows one nominated polyline. On a network whose lines
+            // all interconnect, taking a different branch is playing the map
+            // correctly, and "0 of 7 traversed" said nothing about whether
+            // the tubes are drivable — it turns out they are the best in the
+            // game.
+            println!(
+                "{label:<12} of the time in a bore: {:.0}%, wheels on a surface: {:.0}%",
+                bore_frames as f32 / total_frames.max(1) as f32 * 100.0,
+                drive_frames as f32 / total_frames.max(1) as f32 * 100.0
+            );
 // WHAT IS KNOWN ABOUT THE MONKEY RUN FAILURE, so nobody repeats it:
             //
             //  * The geometry is NOT misplaced. `--sim routecheck` reads the

@@ -2227,6 +2227,36 @@ belongs on the harness's fall-out rule and its spawn, not on the map. All
 of that is written into the harness alongside the eight things already
 ruled out.
 
+## v1.69.0 — Monkey Run was never broken; the question was
+
+Four sessions of "the vine lines are not drivable" ended today, and the
+answer was that the measurement asked the wrong thing.
+
+Following the evidence from last time — the failure was insensitive to the
+route geometry, so the harness was the suspect — the trace was run out to
+the moment a car "falls out". At sixty-nine seconds it read: wheels on a
+surface, SDF 0.22 (resting on a bore wall), climbing steadily at 14 m/s.
+The car was DRIVING, beautifully, for over a minute. It had simply taken a
+different branch: on a map whose tubes all interconnect, leaving the
+nominated polyline is playing the map correctly, not failing at it.
+
+So the harness now measures NAVIGABILITY rather than obedience:
+
+    MONKEY RUN   92% of the run inside a bore, 54% with wheels on a surface
+    PERPLEXUS    83% inside a bore,             8% with wheels on a surface
+
+That reverses the standing conclusion completely. Monkey Run is the best
+driving map in the game — its bores hold a car for nine tenths of a run and
+it spends over half of that actually on a surface. Perplexus, whose "22 of
+24 routes traversed" looked like the healthy number, is mostly FLYING: its
+routes are open-air lines between anchors (median SDF 16-22 in a 5.6 m
+bore), so a car crosses them without touching anything.
+
+The lesson is the same one this project keeps teaching from a new angle: a
+metric that measures the wrong thing will indict working code for as long
+as you let it, and the fix is to ask what the player actually experiences —
+"can I drive these tubes?" — rather than what is easy to count.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

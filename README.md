@@ -435,3 +435,5 @@ ACADEMY: ten lessons that the game verifies with the same detectors that name yo
 `--sim flick` measures flick pace, launch angle and carry for five dodge directions.
 
 `--sim routecheck` reads the world SDF along every route, showing whether a line threads a real bore or open air.
+
+`--sim drive` reports tube navigability: how much of a run is spent inside a bore and how much with wheels on a surface.
