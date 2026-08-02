@@ -1,0 +1,11 @@
+[package]
+name = "sim-power"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Level 0: AC power flow by Newton-Raphson. Ybus, polar Jacobian, PV/PQ switching."
+
+[dependencies]
+sim-num.workspace = true
+serde.workspace = true
+serde_json.workspace = true

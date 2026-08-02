@@ -1,0 +1,8 @@
+[package]
+name = "sim-litho"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Level 3: EUV imaging by Fourier optics. f32-safe, GPU-shaped."
+
+[dependencies]

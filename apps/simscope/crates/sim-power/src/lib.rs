@@ -1,0 +1,1 @@
+//! sim-power — placeholder

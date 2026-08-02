@@ -1,0 +1,15 @@
+[package]
+name = "simscope-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Driver: runs each layer headlessly and reports against its reference data."
+
+[[bin]]
+name = "simscope"
+path = "src/main.rs"
+
+[dependencies]
+sim-num.workspace = true
+sim-power.workspace = true
+serde_json.workspace = true

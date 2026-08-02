@@ -1,0 +1,8 @@
+[package]
+name = "sim-field"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Level 1: 2D field solve (Laplace/Poisson) on triangles -> RLGC extraction. The FEA on-ramp."
+
+[dependencies]
