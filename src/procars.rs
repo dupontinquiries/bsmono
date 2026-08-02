@@ -282,6 +282,66 @@ pub fn tram(gpu: &mut Gpu) -> Model {
     Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, half_w: 0.32, wheel_r: 0.125 }
 }
 
+// ======================= ELECTRIFICATION =================================
+// Every car in the game can be had as an EV. Rather than model fourteen more
+// vehicles, `electrify` takes a finished model and converts it: it keeps the
+// body exactly as it is and adds the small set of cues that actually say
+// "electric" — a full-width light bar at each end, sill strips along the
+// battery floor, a blanked grille where the intake was, and an ION THRUSTER
+// ring at the tail in place of an exhaust. The drivetrain flips with it, so
+// an EV variant also pulls harder off the line.
+
+/// Turn any model into its electric variant.
+pub fn electrify(gpu: &mut Gpu, base: &Model, accent: [f32; 4]) -> Model {
+    let mut prims = base.prims.clone();
+    let (hl, hh, hw) = (base.half_len, base.half_h, base.half_w);
+
+    // light bars: full width, front white and rear red
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::cbox(0.40), Vec3::new(hw * 0.80, 0.012, 0.018), Quat::IDENTITY, Vec3::new(0.0, hh * 0.15, -hl * 0.98)),
+        [0.86, 0.94, 1.0, 1.0],
+    ));
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::cbox(0.40), Vec3::new(hw * 0.82, 0.012, 0.018), Quat::IDENTITY, Vec3::new(0.0, hh * 0.25, hl * 0.96)),
+        [1.0, 0.24, 0.20, 1.0],
+    ));
+    // blanked grille: an EV has no radiator to feed
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::cbox(0.30), Vec3::new(hw * 0.42, hh * 0.22, 0.016), Quat::IDENTITY, Vec3::new(0.0, -hh * 0.12, -hl * 0.97)),
+        [0.10, 0.11, 0.13, 1.0],
+    ));
+    // sill strips: the giveaway that the floor is a battery
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::cbox(0.28), Vec3::new(0.011, 0.014, hl * 0.46), Quat::IDENTITY, Vec3::new(sx * hw * 0.97, -hh * 0.55, 0.0)),
+            accent,
+        ));
+    }
+    // ION THRUSTER: a glowing ring with a dark throat, where the pipes were
+    let ring = part(meshgen::torus(0.34, 20, 10), Vec3::splat(hh * 0.42), Quat::from_rotation_x(std::f32::consts::FRAC_PI_2), Vec3::new(0.0, hh * 0.02, hl * 0.99));
+    prims.push(body_prim(gpu, ring, accent));
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::sphere(10, 14), Vec3::new(hh * 0.30, hh * 0.30, 0.03), Quat::IDENTITY, Vec3::new(0.0, hh * 0.02, hl * 1.0)),
+        [0.05, 0.06, 0.09, 1.0],
+    ));
+    Model {
+        prims,
+        drive: Drive::Electric,
+        cloud: base.cloud.clone(),
+        cloud_n: base.cloud_n.clone(),
+        sdf_half: base.sdf_half,
+        half_len: hl,
+        half_h: hh,
+        half_w: hw,
+        wheel_r: base.wheel_r,
+    }
+}
+
 // ===================== CONCEPT CARS =====================================
 // Two vehicles built from a written specification rather than by eye, and
 // built in the order that specification insists on: WHEEL HARDPOINTS FIRST,

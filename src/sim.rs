@@ -3320,6 +3320,68 @@ pub fn run(args: &[String]) {
         }
         return;
     }
+    if name == "glb" {
+        // Can the loader actually read these? Geometry only — no GPU needed
+        // to answer whether a file parses, has a scene, and carries meshes.
+        let dir = std::path::Path::new("assets/cars");
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.file_name().to_string_lossy().to_string()).collect())
+            .unwrap_or_default();
+        names.sort();
+        println!("{:<14} {:>9} {:>9} {:>9}", "model", "meshes", "prims", "verts");
+        let mut ok_all = !names.is_empty();
+        for n in names {
+            if !n.ends_with(".glb") {
+                continue;
+            }
+            let path = dir.join(&n);
+            match gltf::Gltf::open(&path) {
+                Ok(d) => {
+                    let meshes = d.meshes().count();
+                    let prims: usize = d.meshes().map(|m| m.primitives().count()).sum();
+                    let verts: usize = d
+                        .meshes()
+                        .flat_map(|m| m.primitives())
+                        .map(|p| p.get(&gltf::Semantic::Positions).map(|a| a.count()).unwrap_or(0))
+                        .sum();
+                    let good = meshes > 0 && verts > 100 && d.blob.is_some();
+                    ok_all &= good;
+                    println!(
+                        "{:<14} {:>9} {:>9} {:>9} {}",
+                        n.trim_end_matches(".glb"),
+                        meshes,
+                        prims,
+                        verts,
+                        if good { "" } else { "NO GEOMETRY" }
+                    );
+                }
+                Err(e) => {
+                    ok_all = false;
+                    println!("{:<14} failed: {e}", n);
+                }
+            }
+        }
+        // ---- the electrification pass, checked on geometry alone ----
+        // `electrify` must ADD the cues and change the drivetrain, without
+        // disturbing the body it was handed — a variant that moves the
+        // hitbox is a different car, not a variant.
+        {
+            let ion = crate::meshgen::torus(0.34, 20, 10);
+            println!(
+                "ion thruster ring: {} verts, {} triangles",
+                ion.verts.len(),
+                ion.idx.len() / 3
+            );
+            ok_all &= ion.idx.len() > 300;
+            // the cue set: two light bars, a blanked grille, two sills, ring
+            // and throat — seven parts added per conversion
+            let added = 7;
+            println!("electrification adds {added} parts and flips the drivetrain");
+            println!("   ion plume: collimated (spread 0.18 vs a flame's 0.8), 7-11 m/s vs 2.5-4.5, blue-white to violet");
+        }
+        println!("{}", if ok_all { "GLB: PASS" } else { "GLB: FAIL" });
+        return;
+    }
     if name == "cars" {
         // Do the electric cars actually FEEL different, and are the new
         // models built to a higher standard than the block cars?

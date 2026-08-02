@@ -20,6 +20,7 @@ pub enum Tag {
     WheelBack,
 }
 
+#[derive(Clone, Copy)]
 pub struct Prim {
     pub mesh_id: usize,
     pub tex_id: Option<usize>,
@@ -166,17 +167,34 @@ fn collect_node(
 /// longest run (nose axis if wheels exist) spans `target_len` along Z with the
 /// nose at -Z, centered at the origin.
 pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
-    let doc = gltf::Gltf::open(dir.join("scene.gltf"))
-        .unwrap_or_else(|e| panic!("open {:?}: {e}", dir));
-    let buffer_uri = doc
-        .buffers()
-        .next()
-        .and_then(|b| match b.source() {
-            gltf::buffer::Source::Uri(u) => Some(u.to_string()),
-            _ => None,
-        })
-        .unwrap_or_else(|| "scene.bin".into());
-    let bin = std::fs::read(dir.join(&buffer_uri)).expect("read scene.bin");
+    // Two packagings of the same format. A .gltf folder keeps its buffer and
+    // textures as sibling files; a .glb is one binary with the buffer inline
+    // (and usually the images too). Take whichever is present, so a model
+    // can be dropped in either way.
+    let glb = dir.with_extension("glb");
+    let (doc, bin) = if glb.is_file() {
+        let d = gltf::Gltf::open(&glb).unwrap_or_else(|e| panic!("open {:?}: {e}", glb));
+        let blob = d.blob.clone().unwrap_or_default();
+        (d, blob)
+    } else if dir.join("slim.glb").is_file() {
+        let f = dir.join("slim.glb");
+        let d = gltf::Gltf::open(&f).unwrap_or_else(|e| panic!("open {:?}: {e}", f));
+        let blob = d.blob.clone().unwrap_or_default();
+        (d, blob)
+    } else {
+        let d = gltf::Gltf::open(dir.join("scene.gltf"))
+            .unwrap_or_else(|e| panic!("open {:?}: {e}", dir));
+        let buffer_uri = d
+            .buffers()
+            .next()
+            .and_then(|b| match b.source() {
+                gltf::buffer::Source::Uri(u) => Some(u.to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "scene.bin".into());
+        let bytes = std::fs::read(dir.join(&buffer_uri)).expect("read scene.bin");
+        (d, bytes)
+    };
 
     let mut raws: Vec<RawPrim> = Vec::new();
     let scene = doc.default_scene().or_else(|| doc.scenes().next()).expect("no scene");

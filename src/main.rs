@@ -858,11 +858,44 @@ fn main() {
     let tram = procars::tram(&mut gpu);
     let vipera = procars::vipera(&mut gpu);
     let aegis = procars::aegis(&mut gpu);
+    // imported bodies (single-file .glb, geometry and materials inline)
+    let cars_dir = dir.join("cars");
+    let backfire = model::load(&cars_dir.join("backfire"), &mut gpu, 1.28);
+    let breakout = model::load(&cars_dir.join("breakout"), &mut gpu, 1.30);
+    let assael = model::load(&cars_dir.join("assael"), &mut gpu, 1.34);
+    let guardian = model::load(&cars_dir.join("guardian"), &mut gpu, 1.30);
+    let orion = model::load(&cars_dir.join("orion"), &mut gpu, 1.32);
+    let vulcan = model::load(&cars_dir.join("vulcan"), &mut gpu, 1.30);
+    let xdevil = model::load(&cars_dir.join("xdevil"), &mut gpu, 1.32);
     let mut cars = CarModels {
-        models: vec![octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark, volt, axion, hauler, pulse, tram, vipera, aegis],
-        names: vec!["Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark", "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV", "Vipera", "Aegis"],
-        active: sv.car.min(15),
+        models: vec![
+            octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark,
+            volt, axion, hauler, pulse, tram, vipera, aegis,
+            backfire, breakout, assael, guardian, orion, vulcan, xdevil,
+        ],
+        names: vec![
+            "Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark",
+            "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV", "Vipera", "Aegis",
+            "Backfire", "Breakout", "Assael", "Guardian", "Orion", "Vulcan", "X-Devil",
+        ],
+        active: 0,
     };
+    // EVERY car gets an electric variant. Rather than model them twice, the
+    // petrol body is converted: light bars, blanked grille, battery sills and
+    // an ion thruster, plus the electric torque curve.
+    {
+        let n = cars.models.len();
+        for i in 0..n {
+            if cars.models[i].drive == model::Drive::Electric {
+                continue; // already electric
+            }
+            let accent = [0.30, 0.82, 1.0, 1.0];
+            let ev = procars::electrify(&mut gpu, &cars.models[i], accent);
+            cars.models.push(ev);
+            cars.names.push(Box::leak(format!("{} EV", cars.names[i]).into_boxed_str()));
+        }
+        cars.active = sv.car.min(cars.models.len() - 1);
+    }
     gpu.set_car_sdfs(&bake_car_sdfs(&mut cars.models));
     let cars = cars;
 
@@ -2655,7 +2688,12 @@ impl Game {
             if boosting {
                 let back = -self.car.forward();
                 let tail = self.car.pos + back * (self.car.half_len + 0.12);
-                self.fx.boost_trail(tail, back, self.car.vel);
+                // an electric car burns nothing: it runs an ion thruster
+                if self.cars.models[self.cars.active].drive == model::Drive::Electric {
+                    self.fx.ion_trail(tail, back, self.car.vel);
+                } else {
+                    self.fx.boost_trail(tail, back, self.car.vel);
+                }
             }
 
             // ---- adaptive-audio sense: measure, then hand to the mixer ----

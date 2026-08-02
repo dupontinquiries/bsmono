@@ -2552,6 +2552,33 @@ describes a surface; the worst describes its flattest slice.)
 Fourteen cars now. Wheels on both are built from the shared tyre-and-rim
 mesh with six radial spokes and a deep dish.
 
+## v1.79.0 — seven imported bodies, and an EV of everything
+
+SEVEN NEW CARS from supplied .glb files: Backfire, Breakout, Assael,
+Guardian, Orion, Vulcan and X-Devil — between 12k and 131k vertices each,
+so they carry far more shape than anything built procedurally here. The
+loader now takes either packaging: a .gltf folder with sibling buffer and
+textures, or a single .glb with everything inline. New `--sim glb` reports
+what each file actually contains, because a model that silently loads with
+no geometry is worse than one that fails.
+
+EVERY CAR NOW HAS AN ELECTRIC VARIANT — twenty-three bodies, and not one of
+them modelled twice. `electrify` takes a finished model and converts it,
+which is the only sane way to do this: it keeps the body and hitbox exactly
+as they are and adds the seven cues that say "electric" — a full-width
+light bar at each end, a blanked grille where the intake was (an EV has no
+radiator to feed), sill strips along the battery floor, and an ion thruster
+ring with a dark throat where the pipes were. The drivetrain flips with it,
+so an EV variant genuinely drives differently rather than just looking it.
+
+ION THRUSTERS replace the flame. The distinction is physical rather than
+decorative: a combustion flame is turbulent and orange because it is
+burning, while an ion plume is a collimated jet of charged gas — so it
+leaves the nozzle at 7-11 m/s against a flame's 2.5-4.5, spreads a fifth as
+much (0.18 against 0.8), and runs white-hot at the throat through cyan into
+violet as it cools. Same particle system, opposite character, and it fires
+automatically for any car with an electric drivetrain.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

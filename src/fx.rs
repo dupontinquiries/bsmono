@@ -52,6 +52,43 @@ impl Fx {
     }
 
     /// Two little embers out the back every frame while boosting.
+    /// ION THRUSTER: what an electric car boosts with. A combustion flame is
+    /// turbulent and orange because it is burning; an ion plume is a
+    /// collimated jet of charged gas, so it runs blue-white at the throat,
+    /// fades violet, spreads far less and travels much faster. Same particle
+    /// system, opposite character.
+    pub fn ion_trail(&mut self, tail: Vec3, back: Vec3, car_vel: Vec3) {
+        for k in 0..3 {
+            let core = k == 0;
+            let pos = tail + self.jitter(if core { 0.012 } else { 0.035 });
+            // collimated: nearly all the speed is along the nozzle axis
+            let vel = car_vel * 0.20 + back * self.rng.range(7.0, 11.0) + self.jitter(0.18);
+            let max = self.rng.range(0.10, 0.20);
+            let size = if core { self.rng.range(0.030, 0.055) } else { self.rng.range(0.055, 0.095) };
+            let cool = self.rng.f();
+            let tint = if core {
+                [0.92, 0.98, 1.0, 1.0]
+            } else if cool > 0.45 {
+                [0.35, 0.80, 1.0, 1.0]
+            } else {
+                [0.55, 0.42, 1.0, 1.0]
+            };
+            self.push(Particle {
+                pos,
+                vel,
+                life: 0.0,
+                max,
+                size,
+                grow: 0.10,
+                // white-hot throat, cyan body, violet as it cools
+                color: tint,
+                emissive: 1.0,
+                grav: 0.0,
+                drag: 1.2,
+            });
+        }
+    }
+
     pub fn boost_trail(&mut self, tail: Vec3, back: Vec3, car_vel: Vec3) {
         for _ in 0..2 {
             let hot = self.rng.f();
