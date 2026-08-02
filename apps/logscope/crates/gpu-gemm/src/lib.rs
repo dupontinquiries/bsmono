@@ -7203,9 +7203,26 @@ not a surprise; coherent output is the evidence that would flip the flag",
         if is_llama4 {
             // Printed because a wrong interval is invisible in the output: the model runs and the
             // text is merely bad, so the one place it can be caught is a line stating what was chosen.
-            eprintln!("loader: Llama-4 iRoPE — every {nope_step} layers skips rotation (NoPE), \
-starting at layer {}. Read from metadata, or 4 if the file omits it",
-                nope_step.saturating_sub(1));
+            // EVERY VALUE THAT WAS A CONSTANT, AND WHERE IT CAME FROM. Five of these were hardcoded
+            // and each produces text that is merely worse with every tensor present and every
+            // dimension right — so a wrong one is invisible in the output and this line is the only
+            // place it can be caught. Printing the SOURCE matters as much as the value: "4 (default)"
+            // and "4 (file)" mean different things when the output is bad.
+            let src = |k: &str| if g.get_u32(&format!("{}.{k}", acfg.prefix)).is_some()
+                { "file" } else { "default" };
+            eprintln!("loader: Llama-4 iRoPE — NoPE every {nope_step} layers from layer {} ({}); \
+qk-norm {} ({}); shared experts {} ({}); attn-temp floor {} ({})",
+                nope_step.saturating_sub(1), src("attention.no_rope_interval"),
+                if g.get_u32(&format!("{}.attention.use_qk_norm", acfg.prefix))
+                    .map(|v| v != 0)
+                    .unwrap_or_else(|| g.get_u32(&format!("{}.expert_count", acfg.prefix))
+                        .unwrap_or(0) != 128) { "on" } else { "off" },
+                src("attention.use_qk_norm"),
+                g.get_u32(&format!("{}.expert_shared_count", acfg.prefix)).unwrap_or(1),
+                src("expert_shared_count"),
+                g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)).unwrap_or(8192.0),
+                if g.get_f32(&format!("{}.attention.floor_scale", acfg.prefix)).is_some()
+                    { "file" } else { "default" });
         }
         // Which layers are windowed. llama.cpp's default pattern puts the FULL-attention layer last in
         // each group (dense_first = false), so a period of 4 gives [swa, swa, swa, dense].
