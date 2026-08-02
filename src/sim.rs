@@ -4363,6 +4363,66 @@ pub fn run(args: &[String]) {
             }
             let _ = &mut w;
         }
+        // ---- TUBE MESH: rings only at real mouths, and crossings open ----
+        for si in [21usize, 24] {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let segs = w
+                .shapes
+                .iter()
+                .filter(|sh| matches!(sh.sdf, crate::world::Sdf::Shell { .. }))
+                .count();
+            let rims = w.shapes.iter().filter(|sh| sh.mesh == crate::world::M_TUBE_RIM).count();
+            let cuts = w.shapes.iter().filter(|sh| sh.cut).count();
+            println!(
+                "{:<12} {} tube segments, {} mouth rings ({:.1} per segment), {} carves",
+                crate::world::style(si).name,
+                segs,
+                rims,
+                rims as f32 / segs.max(1) as f32,
+                cuts
+            );
+            // The artifact: a chamfer baked into the mesh drew TWO rings per
+            // segment. Anything approaching that is the bug coming back.
+            if rims as f32 > segs as f32 * 0.8 {
+                pass = false;
+                println!("   too many rings — the chamfer is back on every segment");
+            }
+        }
+        // Can you actually pass between two crossing tubes? Walk the world
+        // SDF straight through a carved junction and see if it stays open.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let cuts: Vec<(Vec3, f32)> = w
+                .shapes
+                .iter()
+                .filter(|sh| sh.cut && matches!(sh.sdf, crate::world::Sdf::Sphere { .. }))
+                .map(|sh| (sh.pos, match sh.sdf { crate::world::Sdf::Sphere { r } => r, _ => 0.0 }))
+                .collect();
+            let mut open_junctions = 0;
+            let mut tested = 0;
+            for (at, r) in cuts.iter().take(40) {
+                tested += 1;
+                // a short line through the junction in three directions: if
+                // the carve worked, the interior stays open across it
+                let dirs = [Vec3::X, Vec3::Y, Vec3::Z];
+                let clear = dirs.iter().any(|d| {
+                    (-6..=6).all(|k| {
+                        let p = *at + *d * (k as f32 / 6.0 * r * 0.85);
+                        w.sdf(p) > 0.35
+                    })
+                });
+                if clear {
+                    open_junctions += 1;
+                }
+            }
+            println!(
+                "PERPLEXUS    {} of {} carved junctions are open all the way through",
+                open_junctions, tested
+            );
+            if tested > 0 && open_junctions * 4 < tested * 3 {
+                pass = false;
+            }
+        }
         println!("{}", if pass { "LOOPS: PASS" } else { "LOOPS: FAIL" });
         return;
     }

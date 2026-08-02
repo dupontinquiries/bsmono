@@ -2858,6 +2858,40 @@ FOUR MORE EXOTICS, reading things the others do not:
 Twenty skins, six rigs, twelve paints, seven wheels, six trails, six
 explosions — 362,880 combinations, nine of them one keypress away.
 
+## v1.88.0 — the rings, and tubes that actually connect
+
+THE CIRCULAR ARTIFACTS were my own chamfer. v1.48 baked a mouth bevel into
+the tube MESH, which means every segment drew a ring at BOTH of its ends —
+and a pipe is dozens of overlapping segments, so the bore filled with
+concentric circles that appeared and vanished with the view angle.
+
+A chamfer belongs at an OPENING, so it is its own mesh now, placed only
+where a bore genuinely opens. Finding those needs two tests, and the second
+only became obvious after the first was not enough:
+
+  * no other tube continues the bore at that end, and
+  * the end is not buried inside a junction room — most of PERPLEXUS's links
+    end that way, and counting only the first test still produced 117 rings
+    for 94 segments
+
+    PERPLEXUS   94 segments -> 75 mouth rings (was a ring on every end)
+    MONKEY RUN  188 segments -> 1
+
+TUBES NOW CONNECT. Where two pipes crossed, the union kept BOTH sets of
+walls, so the bores stayed sealed from one another: the junction looked open
+and was not. A pass over the finished world finds every pair of tube axes
+that come within their combined radii at a genuine angle, and carves a
+sphere at the closest approach — which removes both inner walls at once.
+Perplexus opens 64 such crossings, Monkey Run 16.
+
+A tube segment is exactly a Shell shape, so both passes read the geometry
+back out of the world rather than being threaded through the generators.
+That is why they work on every map at once rather than on the one they were
+written for.
+
+`--sim loop` now reports rings per segment and walks the world SDF straight
+through the carved junctions: 40 of 40 are open all the way through.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -30,10 +30,12 @@ pub const M_TORUS_TUBE: usize = 12; // hollow torus: a seamless loop of pipe
 pub const M_RING_DECK: usize = 13; // flat annulus: a drivable planetary ring
 pub const M_HEX: usize = 12; // hexagonal tile prism
 pub const TERRAIN_CHUNKS: u32 = 6; // 6x6 cullable ground tiles
-pub const M_TERRAIN_0: usize = 24; // after the seven rim styles // first of TERRAIN_CHUNKS^2 chunk meshes
+pub const M_TERRAIN_0: usize = 25; // after the wheel rims and the tube rim // first of TERRAIN_CHUNKS^2 chunk meshes
 pub const M_SPHERE_LO: usize = 15; // far-field sphere: a fifth of the triangles
 pub const M_CAP_TALL_LO: usize = 16;
 /// the seven garage rim styles, registered right after the car LODs
+/// the chamfered lip drawn at a tube's real mouths (not at every segment)
+pub const M_TUBE_RIM: usize = 24;
 pub const M_RIM_0: usize = 17; // far-field capsule
 /// Terrain ground-truth grid: physics, placement, the render mesh and the
 /// ray-marched shadows all sample THESE nodes, so the floor you see is the
@@ -889,14 +891,7 @@ impl World {
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
                     let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.88);
                     shapes[si].blend = true;
-                    // BEVEL COLLARS: a fillet torus at each mouth eases the
-                    // transition (and hides the seam where the bore opens)
-                    for (ep, ea) in [(a, axis), (b, axis)] {
-                        let brot = Quat::from_rotation_arc(Vec3::Y, ea) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                        // (the mouth chamfer is part of the tube mesh now —
-                        // a collar torus here was one more ring in the way)
-                        let _ = (ep, brot);
-                    }
+
                     // A node every ~5 m with generous reach, following the
                     // SDF gradient. Sparse nodes left the middle of a long
                     // segment reverting toward world-down, so a car climbing
@@ -1622,14 +1617,7 @@ impl World {
                     let rot = Quat::from_rotation_arc(Vec3::Y, axis);
                     let si = push(shapes, M_SHELL_OPEN, mid, rot, Vec3::new(r, half, r), Sdf::Shell { r: r * 0.97, half, thick: (r * 0.10).max(0.55) }, [col[0], col[1], col[2], 0.55], glow, 0.88);
                     shapes[si].blend = true;
-                    // BEVEL COLLARS: a fillet torus at each mouth eases the
-                    // transition (and hides the seam where the bore opens)
-                    for (ep, ea) in [(a, axis), (b, axis)] {
-                        let brot = Quat::from_rotation_arc(Vec3::Y, ea) * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                        // (the mouth chamfer is part of the tube mesh now —
-                        // a collar torus here was one more ring in the way)
-                        let _ = (ep, brot);
-                    }
+
                     // A node every ~5 m with generous reach, following the
                     // SDF gradient. Sparse nodes left the middle of a long
                     // segment reverting toward world-down, so a car climbing
@@ -3404,6 +3392,114 @@ impl World {
                         }
                     }
                 }
+            }
+        }
+
+        // ---- TUBE CROSSINGS ----------------------------------------------
+        // Where two pipes cross, the union keeps BOTH sets of walls, so the
+        // bores stay sealed from one another and there is no way to pass
+        // between them — the junction looks open and is not.
+        //
+        // A tube segment is exactly a Shell shape, so they can be read back
+        // out of the world rather than threaded through the generators. For
+        // every pair whose axes come close enough to overlap, carve a sphere
+        // at the closest approach: that removes both inner walls at once and
+        // leaves a genuine opening.
+        {
+            let tubes: Vec<(usize, Vec3, Vec3, f32, f32)> = shapes
+                .iter()
+                .enumerate()
+                .filter_map(|(i, sh)| match sh.sdf {
+                    Sdf::Shell { r, half, .. } => {
+                        let axis = sh.inv_rot.inverse() * Vec3::Y;
+                        Some((i, sh.pos, axis, half, r))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let mut opened: Vec<(Vec3, f32)> = Vec::new();
+            for a in 0..tubes.len() {
+                for b in (a + 1)..tubes.len() {
+                    let (_, pa, aa, ha, ra) = tubes[a];
+                    let (_, pb, ab, hb, rb) = tubes[b];
+                    // segments of the same run overlap by design; only open
+                    // where two DIFFERENT pipes meet at an angle
+                    if aa.dot(ab).abs() > 0.94 {
+                        continue;
+                    }
+                    let reach = (ha + ra).max(hb + rb);
+                    if pa.distance(pb) > reach * 1.15 {
+                        continue;
+                    }
+                    // closest approach between the two axes
+                    let w0 = pa - pb;
+                    let (d1, d2, d3) = (aa.dot(ab), aa.dot(w0), ab.dot(w0));
+                    let den = 1.0 - d1 * d1;
+                    if den.abs() < 1e-4 {
+                        continue;
+                    }
+                    let ta = ((d1 * d3 - d2) / den).clamp(-ha, ha);
+                    let tb = ((d3 - d1 * d2) / den).clamp(-hb, hb);
+                    let ca = pa + aa * ta;
+                    let cb = pb + ab * tb;
+                    let gap = ca.distance(cb);
+                    if gap > (ra + rb) * 0.85 {
+                        continue; // they pass, they do not meet
+                    }
+                    let at = (ca + cb) * 0.5;
+                    let cut_r = ra.min(rb) * 0.92;
+                    if opened.iter().any(|(p, r)| p.distance(at) < (r + cut_r) * 0.5) {
+                        continue; // one opening per junction
+                    }
+                    opened.push((at, cut_r));
+                }
+            }
+            for (at, r) in opened {
+                let ci = push(&mut shapes, M_SPHERE, at, Quat::IDENTITY, Vec3::splat(r), Sdf::Sphere { r }, [0.0; 4], 0.0, 0.0);
+                shapes[ci].cut = true;
+            }
+
+            // ---- MOUTHS ----
+            // A chamfer belongs at an OPENING, not at every segment join —
+            // baked into the mesh it drew a ring at both ends of every link,
+            // and a tube is dozens of links, so the bore filled with
+            // concentric circles that flickered in and out with the view
+            // angle. An end is a real mouth only if no other tube continues
+            // the bore there, which the segment list can answer.
+            let mut mouths: Vec<(Vec3, Vec3, f32, [f32; 4])> = Vec::new();
+            for (i, pa, aa, ha, ra) in tubes.iter().copied() {
+                for sgn in [-1.0f32, 1.0] {
+                    let end = pa + aa * (ha * sgn);
+                    let continued = tubes.iter().any(|(j, pb, ab, hb, rb)| {
+                        if *j == i {
+                            return false;
+                        }
+                        // does another tube's bore contain this end point?
+                        let d = end - *pb;
+                        let along = d.dot(*ab).clamp(-hb, *hb);
+                        (d - *ab * along).length() < rb * 0.9 && along.abs() < hb * 0.98
+                    });
+                    // ...and an end buried inside a junction room is not a
+                    // mouth either: the room covers it, so a ring there is
+                    // just another circle floating in the geometry. Most of
+                    // PERPLEXUS's links end this way, which is why counting
+                    // only "no tube continues it" still produced a ring per
+                    // segment.
+                    let buried = shapes.iter().enumerate().any(|(j, sh)| {
+                        if j == i || sh.cut || matches!(sh.sdf, Sdf::None | Sdf::Shell { .. }) {
+                            return false;
+                        }
+                        sh.pos.distance(end) < shape_reach(&sh.sdf) * 0.9
+                    });
+                    if !continued && !buried {
+                        mouths.push((end, aa * sgn, ra, shapes[i].color));
+                    }
+                }
+            }
+            for (at, dir, r, col) in mouths {
+                let rot = Quat::from_rotation_arc(Vec3::NEG_Z, dir.normalize_or(Vec3::Z));
+                let mi = push(&mut shapes, M_TUBE_RIM, at, rot, Vec3::splat(r), Sdf::None, col, 0.10, 0.85);
+                shapes[mi].blend = false;
             }
         }
 

@@ -840,6 +840,7 @@ fn main() {
     for (_, spokes, dish) in custom::WHEELS.iter() {
         gpu.add_mesh(&meshgen::rim(*spokes, *dish, 24));
     }
+    gpu.add_mesh(&meshgen::tube_rim(40)); // M_TUBE_RIM
     // the ground, split into cullable chunks (placeholders until generate)
     let nc = world::TERRAIN_CHUNKS;
     for _ in 0..(nc * nc) {
