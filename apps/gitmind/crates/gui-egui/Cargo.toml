@@ -13,6 +13,12 @@ path = "src/lib.rs"
 
 [dependencies]
 egui = "0.34"
+# Image loading. egui::Image with a file:// URI renders NOTHING without a
+# registered loader and reports no error — the tile is simply absent, which is
+# indistinguishable from an app that has no screenshot. Needed for the Apps
+# page's preview tiles.
+egui_extras = { version = "0.34", features = ["image", "file"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
 eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "wayland", "x11"] }
 cockpit = { path = "../cockpit" }
 gitmind-core = { path = "../core" }

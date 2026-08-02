@@ -22,6 +22,22 @@
 
 use crate::app::App;
 
+/// Is there a cached preview tile for this build?
+///
+/// `cockpit::preview` captures one after a build and keys it by app + oid, so a
+/// rebuilt commit gets a fresh tile and old ones stay around. It also DROPS a
+/// near-uniform grab — a headless app draws nothing, and a blank square is
+/// worse than no square because it reads as a broken screenshot rather than an
+/// app that has no window.
+///
+/// So a missing file is the normal case, not an error: headless tools never get
+/// one, and the glyph is the intended result rather than a fallback from
+/// failure.
+pub fn tile_for(app: &str, oid: &str) -> Option<std::path::PathBuf> {
+    let p = cockpit::preview::shot_path(app, oid);
+    p.is_file().then_some(p)
+}
+
 #[derive(Default)]
 pub struct State {
     /// (app, label, is_current)
@@ -57,7 +73,19 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         if name != last_app {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                ui.label(crate::app::app_icon(&name));
+                // A real tile when the build produced one, the hash glyph
+                // otherwise. Both are the same width so the column does not
+                // jump between apps that have screenshots and apps that cannot.
+                let oid = gitmind_core::binpin::load_manifest(&name)
+                    .versions.first().map(|v| v.oid.clone()).unwrap_or_default();
+                match tile_for(&name, &oid) {
+                    Some(path) => {
+                        ui.add(egui::Image::new(format!("file://{}", path.display()))
+                            .fit_to_exact_size(egui::vec2(18.0, 18.0)))
+                            .on_hover_text("preview from the last build");
+                    }
+                    None => { ui.label(crate::app::app_icon(&name)); }
+                }
                 ui.label(egui::RichText::new(&name).strong());
                 if ui.small_button("remove app").clicked() {
                     app.apps.confirm = Some((name.clone(), String::new()));
@@ -133,5 +161,39 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.add_space(6.0);
         ui.separator();
         ui.label(egui::RichText::new(&app.apps.note).monospace().small());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_tile_is_the_normal_case_not_an_error() {
+        // cockpit::preview DROPS a near-uniform grab, because a headless app
+        // draws nothing and a blank square reads as a broken screenshot rather
+        // than an app with no window. So most CLI tools never have a tile, and
+        // the glyph is the intended result rather than a failure fallback.
+        assert!(tile_for("a-tool-that-was-never-captured", "deadbeef").is_none());
+    }
+
+    #[test]
+    fn the_tile_is_keyed_by_build_not_just_by_app() {
+        // A rebuilt commit must get a fresh tile, or the Apps page shows the
+        // previous build's window forever — which is worse than no tile,
+        // because it looks current.
+        let a = cockpit::preview::shot_path("demo", "aaaaaaaaaa11");
+        let b = cockpit::preview::shot_path("demo", "bbbbbbbbbb22");
+        assert_ne!(a, b);
+        // and the same build resolves to the same file, so the cache hits
+        assert_eq!(a, cockpit::preview::shot_path("demo", "aaaaaaaaaa11"));
+    }
+
+    #[test]
+    fn an_app_with_no_recorded_oid_still_resolves_to_a_path() {
+        // A manifest can exist before a build has been captured; asking for the
+        // tile must not panic on an empty oid.
+        let p = cockpit::preview::shot_path("demo", "");
+        assert!(p.to_string_lossy().ends_with("demo.png"));
     }
 }
