@@ -7061,6 +7061,19 @@ a '{declared}'");
             // (--gate-mla-block plus the kernel-validation suite). What is still worth refusing is a
             // checkpoint whose MLA metadata is absent, because then the dims are unknown and nothing
             // downstream can be trusted — that is a real missing input, not an unimplemented feature.
+            // SPARSE-ATTENTION BOUND, read rather than assumed. archfeat::Feature::indexer_needed_at
+            // encodes Colibri's finding — the DSA indexer is a no-op for seq <= index_topk, because
+            // top-k of everything is everything — and until now nothing supplied the number, so the
+            // conditional was theoretical.
+            //
+            // Read from the file: a checkpoint that ships a smaller bound than GLM-5.2's 2048 needs
+            // the indexer sooner, and one that ships none cannot be reasoned about this way at all.
+            if let Some(topk) = g.get_u32(&format!("{}.attention.index_topk", acfg.prefix))
+                .or_else(|| g.get_u32(&format!("{}.index_topk", acfg.prefix))) {
+                eprintln!("loader: sparse-attention bound index_topk={topk} — dense causal attention \
+is EXACT at or below that many tokens (the indexer selects every key there), and an approximation \
+above it. Keep prompts under {topk} until the indexer is implemented");
+            }
             let have_cfg = g.get_u32(&format!("{}.attention.kv_lora_rank", acfg.prefix)).unwrap_or(0) > 0;
             if !have_cfg {
                 let layout = g.dump_tensors("blk.0.");

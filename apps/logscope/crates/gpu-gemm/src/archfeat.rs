@@ -132,6 +132,20 @@ impl Feature {
         index_topk > 0 && seq_len > index_topk
     }
 
+    /// What to tell an operator about a prompt of `seq_len` on a model with this bound.
+    ///
+    /// Returns None when the run is inside the exact range — silence is right there, because a warning
+    /// on every short prompt is one nobody reads by the time it matters.
+    ///
+    /// This does NOT refuse. Above the bound the model degrades rather than breaking, and a hard cap
+    /// would turn a usable long-context run into no run at all. The operator can judge a documented
+    /// approximation; they cannot judge a silent one.
+    pub fn indexer_warning(seq_len: usize, index_topk: usize) -> Option<String> {
+        if !Self::indexer_needed_at(seq_len, index_topk) { return None; }
+        Some(format!(
+            "prompt is {seq_len} tokens against a sparse-attention bound of {index_topk}. Dense attention is EXACT at or below the bound; above it this attends to every key where the model was trained to attend to the top {index_topk}, so quality degrades with length. Not a failure — an approximation you should know you are making"))
+    }
+
     pub fn implemented(self) -> bool {
         match self {
             Feature::NoPe => true,           // BlockWeights::nope
@@ -458,6 +472,24 @@ mod tests {
         let q = crate::archcfg::moe_config(&crate::archcfg::for_arch("qwen3moe"), 128, 8, 0, None, None);
         assert_eq!(q.norm, crate::moe::RouteNorm::Softmax);
         assert!(!q.weight_before && q.normalize);
+    }
+
+    #[test]
+    fn the_warning_is_SILENT_inside_the_exact_range() {
+        // A warning on every short prompt is one nobody reads by the time it matters, which is how the
+        // template-mismatch message became ignorable.
+        assert!(Feature::indexer_warning(100, 2048).is_none());
+        assert!(Feature::indexer_warning(2048, 2048).is_none(), "at the bound: still exact");
+        let w = Feature::indexer_warning(4096, 2048).expect("past the bound");
+        assert!(w.contains("degrades with length"));
+        assert!(w.contains("Not a failure"), "it must not read as an error");
+    }
+
+    #[test]
+    fn a_model_with_no_declared_bound_gets_NO_warning() {
+        // index_topk = 0 means the file did not say, and inventing a bound would produce a warning
+        // about a property nobody declared.
+        assert!(Feature::indexer_warning(100_000, 0).is_none());
     }
 
     #[test]
