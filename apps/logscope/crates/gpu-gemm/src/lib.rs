@@ -7676,7 +7676,17 @@ Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp ba
                 });
                 for fused in crate::qkvsplit::FUSED_NAMES {
                     let src = match crate::qkvsplit::resolve(name, fused) { Some((s, _)) => s, None => break };
-                    let rb = match row_bytes(&src) { Some(b) => b, None => continue };
+                    // A None here means the row is not a whole number of quantization blocks, so it
+                    // cannot be sliced at a row boundary — q would end mid-block and both q's last
+                    // block and k's first would be garbage. Named, because falling through to
+                    // "missing tensor" would report the wrong problem entirely.
+                    let rb = match row_bytes(&src) {
+                        Some(b) => b,
+                        None => return Err(format!(
+                            "{name}: the fused tensor {src} has a row that is not a whole number of \
+quantization blocks, so it cannot be split at a row boundary — q would end mid-block and both q's \
+last block and k's first would decode to garbage")),
+                    };
                     match crate::qkvsplit::locate(name, &rows_of, n_heads as usize,
                                                   n_kv_heads as usize, head_dim as usize, rb) {
                         Some(Ok((srcname, (b0, b1)))) => {
