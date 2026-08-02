@@ -494,6 +494,16 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         7 => if n % 32 == 0 { Some(n / 32 * 24) } else { None }, // Q5_1: f16 d + f16 m + 4B qh + 16B nibbles
         8 => if n % 32 == 0 { Some(n / 32 * 34) } else { None }, // Q8_0: f16 scale + 32×i8
         12 => if n % 256 == 0 { Some(n / 256 * 144) } else { None }, // Q4_K super-block
+        // Q2_K: 84 bytes per 256 — 16 scale bytes, 64 quant bytes, d and dmin as f16.
+        // Q3_K: 110 bytes per 256 — 32 high-bit bytes, 64 quant, 12 scale, d as f16.
+        //
+        // Sizes only. Neither has a dequantizer yet, so a checkpoint of these types is REPORTED
+        // rather than read — which is the honest half: `type_nbytes` returning Some means the loader
+        // can compute a footprint and say what the file costs, and `dequantize` returning None means
+        // it refuses to invent values. Knowing the size without being able to read it is exactly what
+        // a memory plan needs and a forward pass must not have.
+        10 => if n % 256 == 0 { Some(n / 256 * 84) } else { None },   // Q2_K
+        11 => if n % 256 == 0 { Some(n / 256 * 110) } else { None },  // Q3_K
         19 => if n % 256 == 0 { Some(n / 256 * 50) } else { None },  // IQ1_S: 50 B per 256 → 1.5625 bits/wt
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block

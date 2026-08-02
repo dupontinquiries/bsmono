@@ -16,6 +16,7 @@ pub mod perfverdict;
 pub mod qkvsplit;
 pub mod prefetch;
 pub mod mladims;
+pub mod rolequant;
 pub mod specverify;
 pub mod lookupdraft;
 pub mod specloop;

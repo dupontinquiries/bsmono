@@ -993,6 +993,8 @@ pub fn source_bpw(ggml_type: u32) -> Option<f32> {
         0 => 32.0,           // F32
         1 => 16.0,           // F16
         8 => 8.5,            // Q8_0: 34 bytes per 32
+        10 => 2.625,         // Q2_K: 84 bytes per 256
+        11 => 3.4375,        // Q3_K: 110 bytes per 256
         12 => 4.5,           // Q4_K: 144 bytes per 256
         14 => 6.5625,        // Q6_K: 210 bytes per 256
         19 => 1.5625,        // IQ1_S: 50 bytes per 256
@@ -1081,5 +1083,37 @@ mod conversion_tests {
         assert_eq!(source_bpw(8), Some(8.5));
         let (r, n) = conversion_cost(8, 8_000_000_000, 8.0).unwrap();
         assert!(n > r, "the SOURCE is slightly larger, because it carries scales the target drops");
+    }
+}
+
+#[cfg(test)]
+mod sub4_tests {
+    use super::*;
+
+    #[test]
+    fn Q2_and_Q3_can_be_SIZED_without_being_readable() {
+        // The honest half of sub-4 support. type_nbytes returning Some means a memory plan can say
+        // what the file costs; dequantize returning None means the forward pass refuses to invent
+        // values. Knowing the size without being able to read it is exactly what a planner needs and
+        // a kernel must not have.
+        assert_eq!(source_bpw(10), Some(2.625), "Q2_K");
+        assert_eq!(source_bpw(11), Some(3.4375), "Q3_K");
+        assert_eq!(crate::gguf::type_nbytes(10, 256), Some(84));
+        assert_eq!(crate::gguf::type_nbytes(11, 256), Some(110));
+        // And they still refuse to decode, so nothing can accidentally run on them.
+        assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_err(),
+            "a size is not a dequantizer, and a model must not load on the strength of one");
+        assert!(crate::gguf::dequantize(11, &[0u8; 110], 256).is_err());
+    }
+
+    #[test]
+    fn sub4_is_where_the_conversion_stops_being_a_tax() {
+        // The role-quant case in one line: a 30B thinker at Q4 is 15.7 GiB and its 8B liaison is
+        // 4.2 GiB. Dropping the liaison to Q2 frees 1.7 GiB — not enormous, and on a 31 GiB device it
+        // is the margin between a resident thinker and a streaming one.
+        let liaison = 8_000_000_000u64;
+        let at_q4 = (liaison as f64 * 4.5 / 8.0) as u64;
+        let at_q2 = (liaison as f64 * 2.625 / 8.0) as u64;
+        assert!(at_q4 - at_q2 > 1_800_000_000, "freed {} bytes", at_q4 - at_q2);
     }
 }
