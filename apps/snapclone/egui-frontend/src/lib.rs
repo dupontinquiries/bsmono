@@ -12,6 +12,7 @@ use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteCo
 
 pub mod camera;
 pub mod debounce;
+pub mod confirm;
 pub mod camera_source;
 pub mod peer_source;
 pub mod contacts;
