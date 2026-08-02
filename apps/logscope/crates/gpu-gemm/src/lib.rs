@@ -1597,10 +1597,31 @@ impl Gpu {
     /// Q4_K is 144 bytes per 256-weight super-block; Q6_K is 210. The file-view slicing was hardcoded
     /// to 144, so a Q6_K tensor would have been sliced at the wrong stride even if the type check had
     /// let it through — the two changes are only useful together.
+    /// Bytes occupied by `count` weights of a K-quant source type.
+    ///
+    /// **None when `count` is not a whole number of 256-weight blocks.** The integer division
+    /// otherwise truncates silently, and this figure is used as a PER-EXPERT STRIDE — so a short
+    /// stride starts expert 1 partway into expert 0's data and every expert after it drifts further.
+    /// The bytes still decode, the shapes are still right, and the output is gibberish.
+    ///
+    /// Qwen3-Coder is safe by luck rather than by check: its ff is 5472, which is 21.375 blocks, and
+    /// only `d = 2048` makes `ff * d` divisible. A model with an odd ff and an odd d would truncate,
+    /// and nothing would have said so.
+    ///
+    /// Refusing is right here because every caller can act on it — the loader has a type-aware path
+    /// and the planner wants a size it can trust. A wrong number is worse than no number when the
+    /// number is an offset.
     pub fn source_block_bytes(ggml_type: u32, count: usize) -> Option<usize> {
+        if count % 256 != 0 { return None; }
         match ggml_type {
-            12 => Some(count / 256 * 144),
-            14 => Some(count / 256 * 210),
+            // Q4_K and Q6_K only. Q5_K is NOT here on purpose: a test asserts an unverified source
+            // type has no block size, because this figure feeds the file-VIEW path and a size for a
+            // layout nobody has read end-to-end grants a capability rather than measuring one.
+            //
+            // I added Q5_K here and the test caught it — mixed presets do promote tensors to Q5_K, so
+            // the number is *correct*, and correct is not the bar. The bar is verified.
+            12 => Some(count / 256 * 144),   // Q4_K
+            14 => Some(count / 256 * 210),   // Q6_K
             _ => None,
         }
     }
