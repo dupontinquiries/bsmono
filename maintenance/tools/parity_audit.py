@@ -58,6 +58,15 @@ def surfaces(app_dir):
         dirs[:] = [d for d in dirs if d not in ('target', 'build', '.git', 'egui-frontend')]
         for f in files:
             p = os.path.join(root, f)
+            # Test trees are not UI. voiceterm keeps golden OUTPUTS named
+            # `article.html.qml` under tests/golden/expected/, and the .qml rule
+            # was turning eleven of them into surfaces — a third of that app's
+            # denominator was fixture files it can never "port", which pushed
+            # its number down for no reason. The .rs branch already skipped
+            # these paths; the .qml branch did not.
+            rel = p.replace(os.sep, '/')
+            if any(seg in rel for seg in ('/tests/', '/fixtures/', '/golden/')):
+                continue
             # QML only — .html files under a docs or test tree are fixtures,
             # not UI surfaces, and voiceterm's showed up as "missing surfaces"
             # which is nonsense.

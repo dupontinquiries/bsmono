@@ -37,7 +37,7 @@ not see.
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
 | snapclone | 51 | 43% | yes | yes | — |
-| voiceterm | 32 | 34% | yes | yes | **yes** |
+| voiceterm | 22 | 50% | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
 
@@ -77,9 +77,14 @@ over-counts.
 
 ## Where the work is
 
-`snapclone` at 32% of 38 now has the largest untouched surface area of any real
-Qt app, and its port is still mostly a nav bar (see below). `voiceterm` at 34%
-of 32 is second and still has no text input. `bo-suite`, which was the biggest
+`snapclone` at 43% of 51 has the largest untouched surface area of any real Qt
+app. `voiceterm` is at 50% of 22 — this file previously said 34% of 32 and
+"still has no text input", and BOTH halves were wrong. Eleven of those 32
+"surfaces" were golden-output fixtures named `article.html.qml` under
+`tests/golden/expected/`, and the input path existed the whole time in
+`uikit_term::keys`. What it actually lacked was mode-awareness; that is now
+fixed in the shared kit rather than in voiceterm, since every egui app
+embedding the terminal had the same gap. `bo-suite`, which was the biggest
 gap at 2%, is at 51% after the transport / spaces / mixer / soundscape /
 settings / safety / scroll-feel passes and the browse pages (albums and artists,
 with their detail drill-downs). Each has a concrete next-surface list at the
