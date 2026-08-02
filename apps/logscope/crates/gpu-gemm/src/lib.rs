@@ -19,6 +19,7 @@ pub mod mladims;
 pub mod rolequant;
 pub mod ragged;
 pub mod specverify;
+pub mod batchplan;
 pub mod lookupdraft;
 pub mod specloop;
 pub mod gateclass;
@@ -2783,6 +2784,29 @@ impl Gpu {
     /// to avoid.
     ///
     /// Named for the property rather than the vendor, which is the whole lesson of the last four fixes.
+    /// How many independent rows this device can safely put in one dispatch.
+    ///
+    /// The engine already knows both halves and nobody had joined them: `watchdog_prone` says whether
+    /// long dispatches get killed here, and the governor's `learned_cap` is a width this device has
+    /// actually survived — ratcheted down by real pressure and latched, so it is a measurement rather
+    /// than a constant.
+    ///
+    /// On a device with no watchdog this is None and only the kernel's own row limit applies.
+    ///
+    /// This is the lever the engine pulls for itself. A caller batching a five-way panel should not
+    /// have to know what Honeykrisp does to a wide dispatch.
+    pub fn batch_plan(&self, rows: usize) -> crate::batchplan::BatchPlan {
+        let watchdog = if self.watchdog_prone() {
+            // The governor's cap is in decode-window units, not rows, so it is a bound rather than a
+            // budget: a device that has survived a window of N is not proven to survive N rows, but it
+            // is the only evidence available and it moves in the right direction under pressure.
+            Some(self.governor.lock().map(|g| g.learned_cap()).unwrap_or(1).max(1))
+        } else {
+            None
+        };
+        crate::batchplan::plan(rows, watchdog)
+    }
+
     pub fn watchdog_prone(&self) -> bool {
         self.conservative_vma || watchdog_prone_name(&self.adapter_name)
     }
