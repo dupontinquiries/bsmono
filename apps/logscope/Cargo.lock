@@ -2127,6 +2127,7 @@ name = "gpu-gemm"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
+ "libc",
  "memmap2",
  "naga",
  "pollster",
