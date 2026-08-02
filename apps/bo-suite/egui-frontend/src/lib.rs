@@ -38,7 +38,10 @@ pub struct Scene {
     pub name: String,
 }
 
-pub const VIEWS: [&str; 3] = ["Devices", "Scenes", "Library"];
+// Six views, not three. The port had eight ported modules and three views, two
+// of which were a heading and a sentence — "Browse ambient stems and playlists
+// (on-device: bo-mux catalog)" is a promise, not a library.
+pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundscape", "Settings"];
 
 /// Move the view index by a swipe sign, clamped to the ends.
 pub fn page(idx: usize, sign: i32, n: usize) -> usize {
@@ -48,6 +51,25 @@ pub fn page(idx: usize, sign: i32, n: usize) -> usize {
 /// Controller state + the swipe gesture + a11y scene.
 pub struct Controller {
     pub view_idx: usize,
+    /// The ported surfaces, held across frames so they keep their state — a
+    /// library that forgot its page, or a mixer that forgot its bands, is the
+    /// same empty demo by another route.
+    pub transport: crate::transport::Transport,
+    pub routing: crate::spaces::Routing,
+    /// Search state plus the catalogue it filters. The library module models
+    /// SEARCH over a track list rather than owning a paged list, so the tracks
+    /// live here and the search is the view state.
+    pub search: crate::library::Search,
+    pub tracks: Vec<crate::library::Track>,
+    pub plays: Vec<crate::library::Play>,
+    pub mixer: crate::device::Mixer,
+    pub profile: crate::device::Profile,
+    pub soundscape: crate::soundscape::Soundscape,
+    pub settings: crate::settings_page::SettingsPage,
+    pub sinks: crate::settings_page::SinkPicker,
+    pub now: crate::chrome::NowPlaying,
+    pub toast: crate::chrome::Toast,
+    pub add_to_playlist: crate::dialogs::AddToPlaylist,
     pub devices: Vec<Device>,
     pub scenes: Vec<Scene>,
     pub active_scene: usize,
@@ -59,7 +81,20 @@ pub struct Controller {
 
 impl Controller {
     pub fn new(devices: Vec<Device>, scenes: Vec<Scene>) -> Self {
-        Controller { view_idx: 0, devices, scenes, active_scene: 0, gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new() }
+        Controller { view_idx: 0, devices, scenes, active_scene: 0,
+            transport: Default::default(),
+            routing: Default::default(),
+            search: Default::default(),
+            tracks: Vec::new(),
+            plays: Vec::new(),
+            mixer: Default::default(),
+            profile: Default::default(),
+            soundscape: Default::default(),
+            settings: Default::default(),
+            sinks: Default::default(),
+            now: Default::default(),
+            toast: Default::default(),
+            add_to_playlist: Default::default(), gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new() }
     }
 
     pub fn current(&self) -> &'static str {
@@ -98,9 +133,16 @@ impl Controller {
             ui.separator();
             match self.view_idx {
                 0 => self.devices_view(ui, &colors),
-                1 => self.scenes_view(ui, &colors),
-                _ => self.library_view(ui, &colors),
+                1 => self.spaces_view(ui, &colors),
+                2 => self.library_view(ui, &colors),
+                3 => self.mixer_view(ui, &colors),
+                4 => self.soundscape_view(ui, &colors),
+                _ => self.settings_view(ui, &colors),
             }
+            // The transport bar is always on screen, which is the point of a
+            // controller: whatever page you are on, you can pause.
+            ui.separator();
+            self.transport_strip(ui, &colors);
         } else {
             // Compact width: a vertical-tabs sidebar instead of a whole-surface swipe gesture. The
             // devices view has volume Sliders, which claim horizontal drag themselves — a whole-surface
@@ -158,9 +200,132 @@ impl Controller {
         }
     }
 
-    fn library_view(&self, ui: &mut Ui, c: &PaletteColors) {
+    fn library_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
         ui.heading("Library");
-        ui.colored_label(c.text_weak, "Browse ambient stems and playlists (on-device: bo-mux catalog).");
+        // The real paged list: sort tabs, search, and the empty state that says
+        // WHICH empty it is.
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.search.query);
+            if !self.search.tag.is_empty() {
+                if ui.button(format!("tag: {} ×", self.search.tag)).clicked() {
+                    self.search.tag.clear();
+                }
+            }
+        });
+        // the tag cloud, most-used first
+        let tags = crate::library::Search::tags(&self.tracks);
+        if !tags.is_empty() && self.search.tag.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for (t, n) in tags.iter().take(8) {
+                    if ui.small_button(format!("{t} ({n})")).clicked() {
+                        self.search.tag = t.clone();
+                    }
+                }
+            });
+        }
+        ui.separator();
+        let rows: Vec<crate::library::Track> =
+            self.search.results(&self.tracks).into_iter().cloned().collect();
+        if rows.is_empty() {
+            // Which empty it is: an unsearched library and one with no matches
+            // look the same otherwise.
+            ui.colored_label(c.text_weak, if self.tracks.is_empty() { "no tracks" }
+                             else { "nothing matches" });
+            return;
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for t in rows {
+                ui.horizontal(|ui| {
+                    if ui.selectable_label(false, t.title.as_str()).clicked() {
+                        self.now.title = t.title.clone();
+                        self.now.artist = t.artist.clone();
+                        self.transport.title = t.title.clone();
+                        self.transport.artist = t.artist.clone();
+                        self.transport.duration = 210.0;
+                        self.transport.playing = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.colored_label(c.text_weak, t.album.as_str());
+                        if ui.small_button("+").clicked() {
+                            self.add_to_playlist.open(&t.id.to_string());
+                        }
+                    });
+                });
+            }
+        });
+    }
+
+    fn spaces_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        ui.heading("Spaces");
+        crate::spaces::spaces_ui(ui, &mut self.routing, c);
+    }
+
+    fn mixer_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        ui.heading("Mixer");
+        if self.mixer.is_flat() {
+            ui.colored_label(c.text_weak, "flat — no correction applied");
+        }
+        let ordered: Vec<(usize, crate::device::Band)> = self.mixer.ordered();
+        for (i, band) in ordered {
+            ui.horizontal(|ui| {
+                ui.label(crate::device::hz_label(band.center_hz));
+                let mut g = band.gain_db;
+                if ui.add(egui::Slider::new(&mut g, -crate::device::MAX_GAIN_DB
+                                            ..=crate::device::MAX_GAIN_DB)
+                          .show_value(false)).changed() {
+                    self.mixer.set_gain(i, g);
+                }
+                ui.label(crate::device::db_label(band.gain_db));
+            });
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("reset").clicked() { self.mixer.reset(); }
+            let peak = self.mixer.peak_boost_db();
+            if peak > 6.0 {
+                ui.colored_label(c.warning, format!("{} of boost — watch headroom",
+                                                    crate::device::db_label(peak)));
+            }
+        });
+    }
+
+    fn soundscape_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        ui.heading("Soundscape");
+        if crate::soundscape::soundscape_ui(ui, &mut self.soundscape, c) {
+            self.toast.show("loop search started");
+        }
+    }
+
+    fn settings_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        ui.heading("Settings");
+        for d in self.settings.problems() {
+            ui.colored_label(c.warning, format!("missing {} — {}", d.name, d.enables));
+        }
+        for d in self.settings.optional_missing() {
+            ui.colored_label(c.text_weak, format!("optional: {} enables {}", d.name, d.enables));
+        }
+        ui.separator();
+        ui.label(self.settings.scan.label());
+        if let Some(f) = self.settings.scan.fraction() {
+            ui.add(egui::ProgressBar::new(f));
+        }
+        if ui.add_enabled(self.settings.can_scan(), egui::Button::new("scan library")).clicked() {
+            self.settings.scan = crate::settings_page::Scan::Running {
+                seen: 0, total: None, path: String::new() };
+        }
+        ui.separator();
+        // product capabilities gate what is shown, per hasControl
+        ui.label(format!("{} {}", self.profile.emoji, self.profile.name));
+        if self.profile.has_control("autoroute") { ui.label("autoroute available"); }
+    }
+
+    /// The always-on transport strip, plus the toast that warns over it.
+    fn transport_strip(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        if let Some(msg) = self.toast.visible() {
+            ui.colored_label(c.warning, msg);
+        }
+        if self.now.active() { ui.label(self.now.line()); }
+        crate::transport::transport_ui(ui, &mut self.transport, c);
     }
 }
 
@@ -181,14 +346,17 @@ mod tests {
     #[test]
     fn paging_and_swipe_clamp() {
         let mut c = sample();
+        // Six views now, not three: the port had eight ported modules and only
+        // Devices/Scenes/Library, two of which were a heading and a sentence.
         assert_eq!(c.current(), "Devices");
         c.swipe(1);
-        assert_eq!(c.current(), "Scenes");
-        c.swipe(1);
-        c.swipe(1); // clamp at Library
-        assert_eq!(c.current(), "Library");
+        assert_eq!(c.current(), "Spaces");
+        for _ in 0..10 { c.swipe(1); }        // clamp at the last view
+        assert_eq!(c.current(), "Settings");
         c.swipe(-1);
-        assert_eq!(c.current(), "Scenes");
+        assert_eq!(c.current(), "Soundscape");
+        for _ in 0..10 { c.swipe(-1); }        // clamp at the first
+        assert_eq!(c.current(), "Devices");
     }
 
     #[test]

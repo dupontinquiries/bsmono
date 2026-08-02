@@ -44,6 +44,11 @@ pub struct Snapclone {
     pub composer: crate::composer::Composer,
     pub settings: crate::settings_page::SettingsPage,
     pub group_voice: crate::group_voice::GroupVoice,
+    pub picker: crate::contacts::Picker,
+    pub conversation: crate::conversation::Conversation,
+    /// Who the open conversation is with. The Conversation model holds the
+    /// ITEMS; which peer they belong to is the shell's business.
+    pub conversation_peer: String,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -71,6 +76,9 @@ impl Snapclone {
             composer: Default::default(),
             settings: crate::settings_page::SettingsPage::new(Default::default()),
             group_voice: Default::default(),
+            picker: Default::default(),
+            conversation: Default::default(),
+            conversation_peer: String::new(),
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -184,7 +192,24 @@ impl Snapclone {
     }
 
     fn peers_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
-        self.nav.title_bar(ui, "Peers");
+        self.nav.title_bar(ui, "Friends");
+        // The contact picker, so Friends is a place you DO something rather
+        // than a list you look at.
+        ui.horizontal(|ui| {
+            ui.text_edit_singleline(&mut self.picker.query);
+            let multi = self.picker.is_multi();
+            if ui.selectable_label(multi, "multi").clicked() {
+                self.picker.mode = if multi { crate::contacts::PickMode::Single }
+                                   else { crate::contacts::PickMode::Multi {
+                                       confirm_label: "Send".into() } };
+            }
+        });
+        let ids: Vec<String> = self.peers.iter().map(|p| p.name.clone()).collect();
+        for id in ids {
+            let sel = self.picker.selected().iter().any(|s| s == &id);
+            if ui.selectable_label(sel, &id).clicked() { self.picker.toggle(&id); }
+        }
+        ui.separator();
         if let Some(sel) = self.nav.subpage() {
             // subpage: peer detail
             if let Some(p) = self.peers.get(sel) {
@@ -251,6 +276,37 @@ impl Snapclone {
         self.nav.title_bar(ui, "Messages");
         if let Some(id) = crate::inbox::inbox_ui(ui, &mut self.inbox, c) {
             self.inbox.mark_read(id);
+            self.conversation_peer = id.to_string();
+        }
+        // The conversation itself, below the list: a tap on a row should show
+        // the thread rather than only marking it read.
+        if !self.conversation_peer.is_empty() {
+            ui.separator();
+            ui.label(format!("with {}", self.conversation_peer));
+            let items: Vec<crate::conversation::Item> =
+                self.conversation.ordered().into_iter().cloned().collect();
+            for it in items {
+                use crate::conversation::Item;
+                let (label, openable) = match &it {
+                    Item::Text { body, .. } => (body.clone(), false),
+                    Item::Snap { opened, .. } =>
+                        (if *opened { "snap (viewed)".to_string() }
+                         else { "snap — tap to open".to_string() }, !*opened),
+                    Item::Voice { secs, .. } => (format!("voice {secs}s"), false),
+                };
+                if ui.add_enabled(openable, egui::Button::new(label)).clicked() {
+                    self.conversation.tap_snap(it.id());
+                }
+            }
+            let n = self.conversation.unopened();
+            if n > 0 { ui.colored_label(c.accent, format!("{n} unopened")); }
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.conversation.draft);
+                if ui.add_enabled(self.conversation.can_send(),
+                                  egui::Button::new("send")).clicked() {
+                    self.conversation.take_draft();
+                }
+            });
         }
     }
 }
