@@ -1117,3 +1117,40 @@ mod sub4_tests {
         assert!(at_q4 - at_q2 > 1_800_000_000, "freed {} bytes", at_q4 - at_q2);
     }
 }
+
+#[cfg(test)]
+mod mixed_quant_tests {
+    /// A "Q4_K_M" checkpoint is not uniformly Q4_K.
+    ///
+    /// llama.cpp's mixed presets ship some tensors at higher precision — and your GLM-5.2 dump proves
+    /// it in the extreme: Q5_K, Q6_K, Q8_0 and F32 in a single block. So any per-expert stride
+    /// computed from an assumed type is wrong for whichever tensors the preset promoted.
+    ///
+    /// A wrong expert stride reads every expert after the first from the wrong offset. That is
+    /// gibberish, not an error — the bytes decode, the shapes are right, and nothing objects.
+    #[test]
+    fn the_block_size_DIFFERS_between_types_a_mixed_preset_uses() {
+        // The three that appear together in real Q4_K_M and Q5_K_M files.
+        assert_eq!(crate::gguf::type_nbytes(12, 256), Some(144), "Q4_K");
+        assert_eq!(crate::gguf::type_nbytes(13, 256), Some(176), "Q5_K");
+        assert_eq!(crate::gguf::type_nbytes(14, 256), Some(210), "Q6_K");
+        // Sizing a Q6_K expert with Q4_K's stride under-counts by a third — so expert 1 starts a
+        // third of the way into expert 0's data, and every one after drifts further.
+        let elems = 5472 * 2048;
+        let q4 = crate::gguf::type_nbytes(12, elems).unwrap();
+        let q6 = crate::gguf::type_nbytes(14, elems).unwrap();
+        assert!(q6 > q4);
+        assert!((q6 - q4) * 100 / q6 > 30, "the drift per expert is large, not a rounding error");
+    }
+
+    #[test]
+    fn qwen3_coders_ff_is_not_a_whole_number_of_BLOCKS_on_its_own() {
+        // ff = 5472, and 5472 / 256 = 21.375. The stride is computed from ff*d rather than ff alone,
+        // and d = 2048 makes the product divisible — so this model is safe by the OTHER factor.
+        //
+        // Worth pinning because it is safe by luck: a model with an odd ff AND an odd d would
+        // truncate in the integer division and misalign every expert.
+        assert_ne!(5472 % 256, 0, "ff alone is not block-aligned");
+        assert_eq!((5472 * 2048) % 256, 0, "but ff*d is, because d is");
+    }
+}
