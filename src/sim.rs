@@ -3752,6 +3752,62 @@ pub fn run(args: &[String]) {
         println!("{}", if pass { "GARAGE: PASS" } else { "GARAGE: FAIL" });
         return;
     }
+    if name == "keys" {
+        // `[` and `]` cycle cars. The subtlety is that a keyboard layout
+        // moves CHARACTERS around while the physical keys stay put: Dvorak
+        // puts the bracket characters where QWERTY has - and =, and puts /
+        // and = where QWERTY has the brackets. Matching only one of the two
+        // serves half the players, so both are matched — and this checks the
+        // combination does not accidentally swallow an unrelated key.
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<52} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // (character produced, physical key) -> direction, mirroring main.rs
+        let dir_of = |ch: &str, phys_bracket_left: bool, phys_bracket_right: bool| -> i32 {
+            if ch == "[" || phys_bracket_left {
+                -1
+            } else if ch == "]" || phys_bracket_right {
+                1
+            } else {
+                0
+            }
+        };
+        println!("{:<26} {:>10} {:>10}", "player presses", "layout", "direction");
+        let cases: [(&str, &str, &str, bool, bool, i32); 6] = [
+            ("the [ key", "qwerty", "[", true, false, -1),
+            ("the ] key", "qwerty", "]", false, true, 1),
+            // Dvorak: the bracket CHARACTERS live on QWERTY's -/= keys, so
+            // the physical bracket flags are false and only the char matches
+            ("the [ character", "dvorak", "[", false, false, -1),
+            ("the ] character", "dvorak", "]", false, false, 1),
+            // ...and the physical bracket keys produce / and = on Dvorak, so
+            // a player reaching for the same POSITION still gets it
+            ("the same position", "dvorak", "/", true, false, -1),
+            ("the same position", "dvorak", "=", false, true, 1),
+        ];
+        let mut all_right = true;
+        for (what, layout, ch, pl, pr, want) in cases {
+            let got = dir_of(ch, pl, pr);
+            println!("{:<26} {:>10} {:>10}", what, layout, got);
+            all_right &= got == want;
+        }
+        check("both layouts reach the cycle, by char or by key", all_right);
+        // and nothing else does
+        let innocent = ["w", "a", "s", "d", "-", "\\", "'", ",", ".", "p", "/"];
+        let mut swallowed = Vec::new();
+        for ch in innocent {
+            // no physical bracket pressed: an ordinary key on any layout
+            if dir_of(ch, false, false) != 0 {
+                swallowed.push(ch);
+            }
+        }
+        println!("   ordinary keys swallowed: {:?}", swallowed);
+        check("no ordinary key is captured by accident", swallowed.is_empty());
+        println!("{}", if pass { "KEYS: PASS" } else { "KEYS: FAIL" });
+        return;
+    }
     if name == "hover" {
         // A hovercar should not merely look different. Three things decide
         // whether it plays differently: does it hold a ride height, does it

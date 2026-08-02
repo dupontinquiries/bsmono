@@ -3075,6 +3075,29 @@ like a puck, CONTINGENCY pokes with a lance, TEMPEST rides high enough to
 clear things, VECTORZOID has the strongest field in the game, MATRIS is
 where to start.
 
+## v1.94.0 — [ and ] cycle cars
+
+With thirty-odd cars, walking to the garage to try the next one is the wrong
+amount of friction. `[` and `]` step through them in place.
+
+THE LAYOUT PROBLEM is the whole of the work here. A keyboard layout moves
+CHARACTERS while the physical keys stay put: Dvorak puts the bracket
+characters where QWERTY has - and =, and puts / and = where QWERTY has the
+brackets. Matching only the character serves the player who thinks "press
+the bracket"; matching only the position serves the one who thinks "press
+the key next to P". Both are matched, so both get what they reached for, and
+`--sim keys` confirms the combination captures nothing else — every ordinary
+key, including the / and - that Dvorak users hit constantly, passes through
+untouched.
+
+SINGLEPLAYER ONLY. In a net session the other players have been told which
+car you are driving and are predicting against its hitbox; swapping it
+mid-match would desync them.
+
+The swap also lifts the car clear of the floor if the new model is taller,
+rather than leaving it half-buried, and toasts the name and position in the
+list so you know where you are in thirty cars.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -1116,6 +1116,30 @@ fn main() {
                     match event.state {
                         ElementState::Pressed => {
                             game.analog.note_key(&key, &event.physical_key);
+                            // [ and ] cycle cars in singleplayer, matched on
+                            // BOTH the logical character and the physical key
+                            // position. Dvorak moves the bracket CHARACTERS to
+                            // where QWERTY has - and =, so a player who thinks
+                            // in characters and a player who thinks in key
+                            // positions both get what they reached for.
+                            if !event.repeat {
+                                use winit::keyboard::{KeyCode, PhysicalKey};
+                                let ch = match &key {
+                                    Key::Character(c) => c.as_str(),
+                                    _ => "",
+                                };
+                                let phys = event.physical_key;
+                                let dir = if ch == "[" || phys == PhysicalKey::Code(KeyCode::BracketLeft) {
+                                    -1
+                                } else if ch == "]" || phys == PhysicalKey::Code(KeyCode::BracketRight) {
+                                    1
+                                } else {
+                                    0
+                                };
+                                if dir != 0 {
+                                    game.cycle_car(dir);
+                                }
+                            }
                             if !event.repeat {
                                 game.key_down(key.clone(), elwt, &win);
                             } else if let Mode::Online { .. } = game.mode {
@@ -1402,6 +1426,32 @@ impl Game {
             self.cars.active = i;
             apply_car_dims(&mut self.car, &self.cars.models[i], self.cfg.car.size);
         }
+    }
+
+    /// Step through the garage with `[` and `]`.
+    ///
+    /// Only in singleplayer: in a net session everyone else has been told
+    /// which car you are driving, and swapping it mid-match would desync the
+    /// hitbox they are predicting against.
+    fn cycle_car(&mut self, dir: i32) {
+        if self.net.online() || self.mode != Mode::Play {
+            return;
+        }
+        let n = self.cars.models.len();
+        if n == 0 {
+            return;
+        }
+        let cur = self.cars.active;
+        let next = ((cur as i32 + dir).rem_euclid(n as i32)) as usize;
+        self.switch_car(next);
+        self.save.car = next;
+        // the hitbox changed under the car, so lift it clear of the floor
+        // rather than leaving a taller model half-buried in it
+        let d = self.world.sdf(self.car.pos);
+        if d < self.car.half_h {
+            self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
+        }
+        self.toastf(&format!("{} ({}/{})", self.cars.names[next], next + 1, n));
     }
 
     fn open_menu(&mut self, m: Mode) {
