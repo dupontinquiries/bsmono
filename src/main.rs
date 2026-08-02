@@ -9,6 +9,7 @@ mod font;
 mod fx;
 mod gamepad;
 mod gyro;
+mod trials;
 mod stream;
 mod hud;
 mod input;
@@ -50,6 +51,7 @@ const COMBO_WINDOW: f32 = 7.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
+    Trials { sel: usize },
     Splash,
     Play,
     Pause,
@@ -78,6 +80,7 @@ enum Row {
     Preset,
     Link(u8),
     Controls,
+    Trials,
     Fullscreen,
     Header,
     GameMode(u8), // 0 free, 1 sparta 50v50, 2 sparta 300
@@ -273,6 +276,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("BACK", Back),
         ],
         _ => vec![
+            ("TRIALS", Trials),
             ("CONTROLS + KEY BINDINGS", Controls),
             ("GAME MODES", Link(6)),
             ("CAMERA", Link(1)),
@@ -320,7 +324,7 @@ fn row_value(cfg: &Config, row: &Row) -> (String, Option<f32>) {
         }
         Row::Toggle { get, .. } => ((if get(cfg) { "ON" } else { "OFF" }).into(), None),
         Row::Preset => (PRESETS[cfg.preset % PRESETS.len()].into(), None),
-        Row::Link(_) | Row::Controls | Row::GameMode(_) => (String::new(), None),
+        Row::Link(_) | Row::Controls | Row::Trials | Row::GameMode(_) => (String::new(), None),
         Row::CarPick => ("<see below>".into(), None),
         Row::Fullscreen => ("TOGGLE".into(), None),
         Row::Header | Row::Back => (String::new(), None),
@@ -447,6 +451,14 @@ struct Game {
     gyro: gyro::Gyro,
     /// bounding spheres of the terrain chunks, for culling the ground
     tchunks: Vec<(Vec3, f32)>,
+    /// the trial being attempted, if any
+    trial: Option<trials::Run>,
+    /// best times, and the ghost of the best run for the current trial
+    bests: trials::Bests,
+    ghost: Vec<(Vec3, Quat)>,
+    trial_sel: usize,
+    /// distance travelled through portals this run (a trial metric)
+    portal_m: f32,
     style: style::Analyzer,
     // touch menu gesture state: where the finger went down, which row it
     // grabbed, whether it has moved far enough to count as a drag
@@ -850,6 +862,7 @@ fn main() {
     let vs0 = cfg.video.vsync;
     let rs0 = cfg.video.render_scale;
     let gyro_on0 = cfg.gyro.on;
+    let trials_bests0 = trials::Bests::decode(&sv.trials);
     let mut game = Game {
         gpu,
         world,
@@ -888,6 +901,11 @@ fn main() {
         tap_drive: (0.0, 0.0),
         gyro: gyro::Gyro::new(gyro_on0),
         tchunks,
+        trial: None,
+        bests: trials_bests0,
+        ghost: Vec::new(),
+        trial_sel: 0,
+        portal_m: 0.0,
         style: style::Analyzer::new(),
         mscroll: 0.0,
         mfling: 0.0,
@@ -1272,6 +1290,15 @@ impl Game {
         let esc = Key::Named(NamedKey::Escape);
         let enter = Key::Named(NamedKey::Enter);
         match self.mode {
+            Mode::Trials { sel } => {
+                if let Some(i) = self.hover_row() {
+                    if i == sel {
+                        self.start_trial(i);
+                    } else {
+                        self.mode = Mode::Trials { sel: i };
+                    }
+                }
+            }
             Mode::Play => {
                 if let Some(a) = self.action_for_mouse(b) {
                     self.one_shot(a);
@@ -1543,6 +1570,69 @@ impl Game {
         };
     }
 
+    /// Load a trial's map and start the clock. The ghost of your best run
+    /// on this trial (if any) rides along.
+    fn start_trial(&mut self, i: usize) {
+        let t = &trials::TRIALS[i.min(trials::TRIALS.len() - 1)];
+        if self.save.map != t.map {
+            self.load_map(t.map, self.save.seed);
+        }
+        self.car.reset(&self.world);
+        self.ball.reset_in_front(&self.car);
+        self.scores = [0, 0];
+        self.portal_m = 0.0;
+        self.air_t = 0.0;
+        self.trial = Some(trials::Run::new(i));
+        self.trial_sel = i;
+        self.mode = Mode::Play;
+        self.toastf(&format!("{} - {}", t.name, t.blurb));
+    }
+
+    /// One frame of trial progress, fed entirely from live physics state.
+    fn tick_trial(&mut self, dt: f32) {
+        let Some(mut run) = self.trial.take() else { return };
+        let gy = self.world.ground_h(self.car.pos.x, self.car.pos.z);
+        let in_tube = self.world.route_locate(self.car.pos).is_some();
+        let on_plat = self
+            .world
+            .platform_vel(self.car.pos - Vec3::Y * (self.car.half_h + 0.1), 1.2)
+            .map(|v| v.length() > 0.5)
+            .unwrap_or(false);
+        let done = run.tick(
+            dt,
+            self.car.pos,
+            self.car.rot,
+            self.car.vel.length(),
+            gy,
+            self.scores[0],
+            self.air_t,
+            self.combo,
+            in_tube,
+            on_plat,
+            std::mem::take(&mut self.portal_m),
+        );
+        if done {
+            let t = run.t;
+            let idx = run.idx;
+            let rec = self.bests.record(idx, t);
+            self.ghost = std::mem::take(&mut run.ghost);
+            self.save.trials = self.bests.encode();
+            self.toastf(&if rec {
+                format!("{} COMPLETE - {:.1}s  NEW BEST", trials::TRIALS[idx].name, t)
+            } else {
+                format!("{} COMPLETE - {:.1}s (best {:.1}s)", trials::TRIALS[idx].name, t, self.bests.get(idx))
+            });
+            self.trial = None;
+            return;
+        }
+        if run.failed {
+            self.toastf(&format!("{} - OUT OF TIME", run.trial().name));
+            self.trial = None;
+            return;
+        }
+        self.trial = Some(run);
+    }
+
     fn hover_row(&self) -> Option<usize> {
         let y = self.cursor.1;
         match self.mode {
@@ -1591,7 +1681,7 @@ impl Game {
             Row::Preset | Row::CarPick => {
                 self.tweaks_key(&Key::Named(NamedKey::ArrowRight), menu, i, win);
             }
-            Row::Link(_) | Row::Controls => {
+            Row::Link(_) | Row::Controls | Row::Trials => {
                 self.mscroll = 0.0;
                 self.mfling = 0.0;
                 self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
@@ -1634,6 +1724,22 @@ impl Game {
             _ => "",
         };
         match self.mode {
+            Mode::Trials { sel } => {
+                let n = trials::TRIALS.len();
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Trials { sel: (sel + n - 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Trials { sel: (sel + 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::Enter), _) => self.start_trial(sel),
+                    _ => {}
+                }
+            }
             Mode::Splash => match (&key, ch) {
                 (Key::Named(NamedKey::Escape), _) => {
                     self.net.leave();
@@ -1853,6 +1959,10 @@ impl Game {
                     self.binds_to_settings = true;
                     self.mode = Mode::Binds { sel: 0, capturing: false };
                 }
+            }
+            Row::Trials => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Trials { sel: self.trial_sel };
             }
             Row::Fullscreen => {
                 if matches!(key, Key::Named(NamedKey::Enter)) || dir != 0 {
@@ -2498,6 +2608,14 @@ impl Game {
         let mut ui: Vec<UiVert> = Vec::new();
         self.peer_tags(&mut ui, vp, aspect);
         match self.mode {
+            Mode::Trials { sel } => hud::trials_menu(
+                &mut ui,
+                aspect,
+                sel,
+                &self.bests,
+                self.mscroll.max(0.0) as usize,
+                self.cursor,
+            ),
             Mode::Splash => hud::splash(&mut ui, aspect, self.time, self.style().name),
             Mode::Play => {
                 self.draw_hud(&mut ui, aspect);
@@ -2755,6 +2873,7 @@ impl Game {
         if aerial_touch {
             self.air_link = 1.7;
         }
+        self.tick_trial(dt);
         if ball_air && self.air_link > 0.0 {
             self.air_t += dt;
             self.air_link -= dt;
@@ -2812,6 +2931,22 @@ impl Game {
     }
 
     fn draw_hud(&self, ui: &mut Vec<UiVert>, aspect: f32) {
+        // TRIAL BANNER: what you are attempting, the clock, and a bar that
+        // fills as you get there — plus the target to beat if you have one.
+        if let Some(run) = self.trial.as_ref() {
+            let t = run.trial();
+            let best = self.bests.get(run.idx);
+            hud::trial_banner(
+                ui,
+                aspect,
+                t.name,
+                run.t,
+                t.limit,
+                run.progress(),
+                best,
+                !self.ghost.is_empty(),
+            );
+        }
         let online = if self.net.online() {
             Some((
                 self.net.player_count(),
@@ -3221,6 +3356,29 @@ impl Game {
                 .map(|k| 2.0 + k as f32);
             let px = pflag.unwrap_or(if glassy { 1.0 } else { 0.0 });
             push(&mut objs, mesh, None, s.mat, s.color, [px, em, s.spec, 0.0]);
+        }
+
+        // ---- GHOST: your best run on this trial, racing alongside ----
+        if let (Some(run), false) = (self.trial.as_ref(), self.ghost.is_empty()) {
+            if let Some((gp, gr)) = trials::ghost_at(&self.ghost, run.t) {
+                let m = &self.cars.models[self.cars.active];
+                let base = Mat4::from_scale_rotation_translation(
+                    Vec3::splat(self.cfg.car.size),
+                    gr,
+                    gp,
+                );
+                for p in m.prims.iter() {
+                    let model = base;
+                    push(
+                        &mut objs,
+                        p.mesh_id,
+                        None,
+                        model,
+                        [0.45, 0.85, 1.0, 0.28],
+                        [0.0, 0.35, 0.1, 0.0],
+                    );
+                }
+            }
         }
 
         // ---- rain: instanced streaks around the car (MONKEY RUN) ----

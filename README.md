@@ -423,3 +423,5 @@ KUIPER runs live sky events: a world collapses into a black hole every five minu
 `--sim ballspin` checks that spin does what it should: curve, topspin, backspin, slide-to-roll.
 
 `--sim render` reports how much of each map survives culling, and the LOD triangle budget.
+
+TRIALS: fifteen challenges across eleven maps, with ghost replays of your best runs. `--sim trials` verifies the logic.

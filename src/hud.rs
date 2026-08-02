@@ -232,6 +232,101 @@ pub fn maps_row_h() -> f32 {
 pub const ONL_TOP: f32 = 0.60;
 pub const ONL_ROW_H: f32 = 0.105;
 
+/// The in-run banner: goal, clock, progress, and the time to beat.
+#[allow(clippy::too_many_arguments)]
+pub fn trial_banner(
+    ui: &mut Vec<UiVert>,
+    a: f32,
+    name: &str,
+    t: f32,
+    limit: f32,
+    progress: f32,
+    best: f32,
+    ghost: bool,
+) {
+    let (x0, x1) = (-0.34, 0.34);
+    let y = 0.86;
+    quad(ui, x0, y - 0.075, x1, y + 0.035, [0.06, 0.07, 0.11, 0.72]);
+    quad(ui, x0, y + 0.030, x1, y + 0.035, [GOLD[0], GOLD[1], GOLD[2], 0.8]);
+    label_c_at(ui, 0.0, y - 0.004, 0.0098, a, PAPER, name);
+    // the clock runs down, and reddens as it goes
+    let left = (limit - t).max(0.0);
+    let urgent = left < limit * 0.25;
+    let col = if urgent { [1.0, 0.45, 0.35, 1.0] } else { CYAN };
+    let clock = format!("{left:.1}s");
+    label_c_at(ui, 0.0, y - 0.046, 0.0088, a, col, &clock);
+    // progress
+    let by = y - 0.066;
+    quad(ui, x0 + 0.02, by, x1 - 0.02, by + 0.008, [0.20, 0.24, 0.30, 0.7]);
+    let w = (x1 - 0.02) - (x0 + 0.02);
+    quad(ui, x0 + 0.02, by, x0 + 0.02 + w * progress.clamp(0.0, 1.0), by + 0.008, GOLD);
+    let mut tail = String::new();
+    if best > 0.0 {
+        tail.push_str(&format!("BEST {best:.1}s"));
+    }
+    if ghost {
+        if !tail.is_empty() {
+            tail.push_str("  ");
+        }
+        tail.push_str("GHOST");
+    }
+    if !tail.is_empty() {
+        label_c_at(ui, 0.0, y - 0.098, 0.0068, a, DIM, &tail);
+    }
+}
+
+/// The trials list: name, what it asks, which map, and your best.
+pub fn trials_menu(
+    ui: &mut Vec<UiVert>,
+    a: f32,
+    sel: usize,
+    bests: &crate::trials::Bests,
+    scroll: usize,
+    cur: (f32, f32),
+) {
+    quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.45]);
+    panel(ui, a, -0.86, -0.985, 0.86, 0.955);
+    label_c(ui, 0.885, T_TITLE, a, PAPER, "TRIALS");
+    let done = bests.finished();
+    label_c(
+        ui,
+        0.828,
+        T_HINT,
+        a,
+        DIM,
+        &format!("{done} OF {} COMPLETE - ONE THING TO DO ON EVERY MAP", crate::trials::TRIALS.len()),
+    );
+    let row_h = 0.058;
+    let top = 0.70;
+    let n = crate::trials::TRIALS.len();
+    let vis = vis_rows(row_h, top, TW_BOTTOM);
+    let start = scroll.min(n.saturating_sub(vis.min(n)));
+    let end = (start + vis).min(n);
+    scrollbar(ui, a, 0.80, TW_BOTTOM, top + 0.02, n, vis, start);
+    let k = ui_k(a);
+    for i in start..end {
+        let t = &crate::trials::TRIALS[i];
+        let y = top - (i - start) as f32 * row_h;
+        let best = bests.get(i);
+        if i == sel {
+            quad(ui, -0.80, y - row_h + 0.026, 0.80, y + 0.022, SEL);
+            quad(ui, -0.817, y - row_h + 0.026, -0.802, y + 0.022, GOLD);
+        }
+        let col = if i == sel { GOLD } else if best > 0.0 { CYAN } else { PAPER };
+        font::text(ui, -0.78, y, T_BODY * k, a, col, &fit(t.name, 0.52, T_BODY * k, a));
+        let map = crate::world::style(t.map).name;
+        font::text(ui, -0.20, y, T_HINT * k, a, DIM, &fit(map, 0.34, T_HINT * k, a));
+        let right = if best > 0.0 { format!("{best:.1}s") } else { "-".to_string() };
+        let w = font::width(&right, T_BODY * k, a);
+        font::text(ui, 0.78 - w, y, T_BODY * k, a, if best > 0.0 { CYAN } else { DIM }, &right);
+        if i == sel {
+            font::text(ui, -0.78, y - row_h * 0.52, T_HINT * k, a, DIM, &fit(t.blurb, 1.4, T_HINT * k, a));
+        }
+    }
+    nav_strip(ui, a, cur, 0);
+    legend(ui, -0.93, a, T_HINT, &[("ENTER", "START"), ("ESC", "BACK")]);
+}
+
 // ---- menu NAV STRIP: jump straight to any screen with a thumb ----
 pub const NAV_BTNS: [&str; 6] = ["BACK", "SETUP", "CONTROLS", "MAPS", "VIDEO", "ONLINE"];
 pub const NAV_Y: f32 = -0.885;
@@ -799,5 +894,5 @@ pub fn splash(ui: &mut Vec<UiVert>, a: f32, t: f32, map_name: &str) {
         label_c(ui, -0.14, 0.018, a, GOLD, "PRESS ANY KEY OR CLICK");
     }
     label_c(ui, -0.30, 0.010, a, DIM, "G MAPS    O ONLINE");
-    label_c(ui, -0.44, 0.0085, a, DIM, "V1.58    ESC QUITS FROM THIS SCREEN");
+    label_c(ui, -0.44, 0.0085, a, DIM, "V1.59    ESC QUITS FROM THIS SCREEN");
 }

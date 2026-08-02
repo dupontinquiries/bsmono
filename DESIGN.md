@@ -1896,6 +1896,37 @@ Both changes are exercised by `--sim render`, which now also reports the
 terrain triangle budget alongside the per-map instance counts and the LOD
 savings.
 
+## v1.59.0 — TRIALS: a reason to visit thirty-six maps
+
+The game had grown a marble run, a chess board that plays itself, portal
+chambers, a dragon, a wave arena — and nothing ever asked you to go to any
+of them. TRIALS is a tour: fifteen challenges across eleven maps, each one
+chosen to teach the mechanic its map was built around. PERPLEXUS asks you
+to stay inside the pipes, CHAMBER to ride a piece across the board,
+APERTURE for a hundred and twenty metres of portal travel, BREAKWATER to
+surf the swell, CLOCKWORK to be carried by the machine.
+
+The design rule: every goal is scored from state the physics ALREADY
+produces — air-dribble time, combo count, height, speed, goals, tube
+occupancy, platform contact, portal distance — so a trial can never
+disagree with the simulation, and adding one is data, not code.
+
+GHOSTS. A run records your car's path at 20 Hz. Finish a trial and the
+ghost is kept, so the next attempt races your best — a translucent car
+running the line you ran, interpolated between samples. Bests persist in
+the save file.
+
+Presentation: a TRIALS screen (name, map, your best, and what the trial
+asks) reachable from the settings root, and an in-run banner with the goal,
+a countdown that reddens in the last quarter, a progress bar, the time to
+beat and whether a ghost is riding.
+
+`--sim trials` checks the layer headless in fourteen assertions: every
+trial points at a real map, they span the map list, each goal type can
+actually complete, running out of time fails you, records only improve,
+bests survive a save/load round trip, and ghosts replay where the run
+went (midpoint and clamped-past-the-end both correct).
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

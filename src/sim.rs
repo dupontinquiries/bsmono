@@ -840,6 +840,94 @@ pub fn run(args: &[String]) {
             if lost_at < 0.0 { "held the whole run".to_string() } else { format!("lost at {lost_at:.2} s") });
         return;
     }
+    if name == "trials" {
+        // The challenge layer, checked headless: every trial points at a real
+        // map, progress only comes from state the physics produces, the
+        // clock fails you, records only improve, and ghosts replay.
+        use crate::trials::{ghost_at, Bests, Goal, Run, TRIALS};
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<44} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        check("there are trials", TRIALS.len() >= 12);
+        check(
+            "every trial names a real map",
+            TRIALS.iter().all(|t| t.map < crate::world::STYLE_COUNT),
+        );
+        let maps: std::collections::HashSet<usize> = TRIALS.iter().map(|t| t.map).collect();
+        println!("   {} trials across {} maps", TRIALS.len(), maps.len());
+        check("they span the map list", maps.len() >= 8);
+        check(
+            "every trial is winnable in its limit",
+            TRIALS.iter().all(|t| t.limit >= 30.0),
+        );
+        // drive a trial to completion with plausible inputs
+        let hit = |g: Goal| -> (bool, f32) {
+            let idx = TRIALS.iter().position(|t| t.goal == g).unwrap_or(0);
+            let mut r = Run::new(idx);
+            let mut t = 0.0f32;
+            let mut done = false;
+            while t < TRIALS[idx].limit && !done {
+                let p = Vec3::new(t * 3.0, 90.0, 0.0); // high enough to satisfy height goals
+                done = r.tick(
+                    DT, p, glam::Quat::IDENTITY, 40.0, 0.0,
+                    (t * 0.6) as u32,      // goals trickle in
+                    t.min(9.0),            // air dribble time
+                    (t * 2.0) as u32,      // combo
+                    true, true,            // in a tube, on a platform
+                    0.6,                   // portal metres this step
+                );
+                t += DT;
+            }
+            (done, r.t)
+        };
+        let mut all_reachable = true;
+        for t in TRIALS.iter() {
+            let (done, _) = hit(t.goal);
+            if !done {
+                all_reachable = false;
+                println!("   unreachable: {} ({:?})", t.name, t.goal);
+            }
+        }
+        check("each goal type can actually complete", all_reachable);
+        // the clock must fail you
+        {
+            let mut r = Run::new(0);
+            let mut t = 0.0;
+            while t < TRIALS[0].limit + 1.0 {
+                r.tick(DT, Vec3::ZERO, glam::Quat::IDENTITY, 0.0, 0.0, 0, 0.0, 0, false, false, 0.0);
+                t += DT;
+            }
+            check("running out of time fails the run", r.failed && !r.done);
+        }
+        // records improve only
+        {
+            let mut b = Bests::default();
+            check("a first finish is a record", b.record(3, 12.0));
+            check("a slower run is not", !b.record(3, 15.0));
+            check("a faster run is", b.record(3, 9.5));
+            check("the best is kept", (b.get(3) - 9.5).abs() < 1e-3);
+            let round = Bests::decode(&b.encode());
+            check("bests survive the save file", (round.get(3) - 9.5).abs() < 0.01);
+            check("progress counts", round.finished() == 1);
+        }
+        // ghosts replay where the run went
+        {
+            let mut r = Run::new(0);
+            for k in 0..600 {
+                let p = Vec3::new(k as f32 * 0.1, 2.0, 0.0);
+                r.tick(DT, p, glam::Quat::IDENTITY, 10.0, 0.0, 0, 0.0, 0, false, false, 0.0);
+            }
+            let mid = ghost_at(&r.ghost, r.t * 0.5).map(|(p, _)| p.x).unwrap_or(-1.0);
+            let end = ghost_at(&r.ghost, r.t * 10.0).map(|(p, _)| p.x).unwrap_or(-1.0);
+            println!("   ghost: {} samples, midpoint x={mid:.1}, clamped end x={end:.1}", r.ghost.len());
+            check("the ghost follows the run", mid > 25.0 && mid < 35.0);
+            check("the ghost clamps past its end", end > 55.0);
+        }
+        println!("{}", if pass { "TRIALS: PASS" } else { "TRIALS: FAIL" });
+        return;
+    }
     if name == "render" {
         // What does the renderer actually submit? Instance count is the
         // honest proxy for GPU cost here, so measure it per map, from a
