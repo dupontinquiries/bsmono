@@ -7119,7 +7119,12 @@ impl Gpu {
             "this ~{gib:.0} GiB model exceeds the GPU's allocatable memory even at q4-resident — too big for \
              the wgpu engine on this GPU (its resident copy of the weights won't fit). Use the llama.cpp / \
              ollama backend for this model (it mmaps weights into unified memory and fits where the wgpu \
-             engine can't), or run a smaller model."
+             engine can't), or run a smaller model.\n\n\
+             NOTE: the budget that admitted this load is a CONSTANT, not a measurement of what this \
+device honours — every load logs that warning and it is the reason a model can pass the fit check and \
+then fail allocating. `kernel-validate --gate-vram` finds the real ceiling, and LOGSCOPE_MAX_GPU_GB \
+pins it once you know. Until then the planner is guessing high, which turns a clean refusal into a \
+failed allocation partway through."
         )
     }
     /// Load inside an OutOfMemory error scope. Ok(Some) = loaded; Ok(None) = GPU OOM (captured, the
