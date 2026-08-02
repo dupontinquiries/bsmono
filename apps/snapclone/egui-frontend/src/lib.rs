@@ -26,6 +26,7 @@ pub mod inbox;
 pub mod unified_nav;
 pub mod friends;
 pub mod modal;
+pub mod snaps;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -96,6 +97,19 @@ pub struct Snapclone {
     /// into. Owning it here is the point: z-order becomes a property of the
     /// structure rather than of which code called raise() last.
     pub modal: crate::modal::ModalSurface,
+    /// The sealed feed of unopened snaps (Qt SnapFeedWidget).
+    pub feed: crate::snaps::SnapFeed,
+    /// The ephemeral viewer. Holds the only decrypted bytes in the app, and
+    /// wipes them on close.
+    pub viewer: crate::snaps::Viewer,
+    feed_press: crate::snaps::Press,
+    /// Snaps opened this session, for the host to mark in storage.
+    pub snaps_viewed: Vec<String>,
+    /// Snaps whose view window has elapsed. Separate from `snaps_viewed`
+    /// because they answer different questions: one is "did they see it", the
+    /// other is "is the window over".
+    pub snaps_expired: Vec<String>,
+    pub last_saved: Option<String>,
     gesture: GestureLayer,
     palette: String,
 }
@@ -125,6 +139,12 @@ impl Snapclone {
             cards: Default::default(),
             add_form: Default::default(),
             modal: Default::default(),
+            feed: Default::default(),
+            viewer: Default::default(),
+            feed_press: Default::default(),
+            snaps_viewed: Vec::new(),
+            snaps_expired: Vec::new(),
+            last_saved: None,
             conversation: Default::default(),
             conversation_peer: String::new(),
             bar: UnifiedNav::new(),
@@ -229,6 +249,52 @@ impl Snapclone {
     /// Advance the animation; call once per frame with the frame delta.
     pub fn tick(&mut self, dt: f32) {
         self.bg.tick(dt);
+        // The viewer countdown runs on the same clock, and deliberately keeps
+        // running after the user closes early: the expiry event is what marks
+        // the snap in storage.
+        for ev in self.viewer.tick(dt * 1000.0) {
+            self.apply_snap_event(ev);
+        }
+    }
+
+    /// Open a snap from the feed, view-once, presented into the modal Dialog
+    /// layer so the swipe nav and the page behind it are both blocked.
+    pub fn open_snap(&mut self, snap: crate::snaps::Snap) {
+        let id = snap.id.clone();
+        for ev in self.viewer.open(snap) { self.apply_snap_event(ev); }
+        self.feed.remove(&id);
+        self.modal.present_default(&format!("snap:{id}"), crate::modal::Layer::Dialog,
+                                   crate::modal::Rect::new(0.0, 0.0, 400.0, 700.0));
+    }
+
+    /// Close the viewer by hand. The countdown is NOT stopped.
+    pub fn close_snap(&mut self) {
+        let id = self.viewer.current().map(|s| s.id.clone()).unwrap_or_default();
+        self.viewer.close();
+        self.modal.dismiss(&format!("snap:{id}"));
+    }
+
+    fn apply_snap_event(&mut self, ev: crate::snaps::ViewerEvent) {
+        use crate::snaps::ViewerEvent as V;
+        match ev {
+            // Both mark the row in the inbox; the tile is already gone from the
+            // feed, and an expiry for a snap the user closed early still has to
+            // land or the row stays looking unopened.
+            // Storage is the host's: it owns the snap records and this view
+            // does not. Recorded rather than applied, and deliberately NOT
+            // mapped onto inbox row ids — snap ids are strings and inbox ids
+            // are u64s, and inventing a conversion here to make the types line
+            // up would mark the wrong row.
+            V::Viewed(id) => {
+                if !self.snaps_viewed.contains(&id) { self.snaps_viewed.push(id); }
+            }
+            V::Expired(id) => {
+                if !self.snaps_expired.contains(&id) { self.snaps_expired.push(id.clone()); }
+                self.modal.dismiss(&format!("snap:{id}"));
+            }
+            V::Saved(_, path) => self.last_saved = Some(path),
+            V::Kept(_) => {}
+        }
     }
 
     /// Adopt cross-app settings + the swipe feel, and use the palette's background style pref.
@@ -510,6 +576,48 @@ mod tests {
             Peer { name: "alice".into(), online: true },
             Peer { name: "bob".into(), online: false },
         ])
+    }
+
+    fn a_snap(id: &str) -> crate::snaps::Snap {
+        crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
+            sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
+            duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn opening_a_snap_takes_the_tile_and_blocks_the_page_behind_it() {
+        let mut s = app();
+        s.feed.set_entries(vec![crate::snaps::FeedEntry {
+            id: "s1".into(), sender_name: "Ada".into(), sent_at: 0,
+            media: crate::snaps::Media::Image, thumb_path: String::new() }]);
+        s.open_snap(a_snap("s1"));
+        assert_eq!(s.feed.count(), 0, "a view-once snap cannot be tapped twice");
+        assert_eq!(s.snaps_viewed, vec!["s1".to_string()]);
+        assert!(s.modal.blocks_input(), "the viewer is modal");
+    }
+
+    #[test]
+    fn a_snap_closed_early_still_expires_and_still_wipes() {
+        // The two halves that matter: plaintext must not outlive the viewer,
+        // and the host must still hear the expiry or the row stays unopened.
+        let mut s = app();
+        s.open_snap(a_snap("s1"));
+        s.tick(1.0);
+        s.close_snap();
+        assert!(s.viewer.wiped(), "bytes gone on close");
+        assert!(s.snaps_expired.is_empty(), "the window has not elapsed yet");
+        s.tick(10.0);
+        assert_eq!(s.snaps_expired, vec!["s1".to_string()]);
+        assert!(s.modal.is_empty(), "and the modal goes with it");
+    }
+
+    #[test]
+    fn the_countdown_runs_on_the_frame_clock() {
+        let mut s = app();
+        s.open_snap(a_snap("s1"));
+        assert_eq!(s.viewer.countdown(), 1.0);
+        s.tick(2.5);
+        assert!(s.viewer.countdown() < 0.6 && s.viewer.countdown() > 0.4);
     }
 
     #[test]
