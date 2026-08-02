@@ -14,6 +14,7 @@ pub mod device;
 pub mod settings_page;
 pub mod chrome;
 pub mod anticipation;
+pub mod safety;
 pub mod dialogs;
 pub mod soundscape;
 use egui::Ui;
@@ -84,6 +85,9 @@ pub struct Controller {
     /// exactly as the QML specifies — "so it doesn't compete with any actual
     /// control".
     pub dot: crate::anticipation::AnticipationDot,
+    /// Volume safety. Per DEVICE session, so switching speakers re-asserts the
+    /// cap rather than carrying an unlock granted for a different one.
+    pub safety: crate::safety::Safety,
     pub add_to_playlist: crate::dialogs::AddToPlaylist,
     pub devices: Vec<Device>,
     pub scenes: Vec<Scene>,
@@ -111,6 +115,7 @@ impl Controller {
             now: Default::default(),
             toast: Default::default(),
             dot: Default::default(),
+            safety: Default::default(),
             add_to_playlist: Default::default(), gesture: GestureLayer::horizontal_page(320.0), a11y: A11yScene::new(), palette: String::new() }
     }
 
@@ -148,6 +153,24 @@ impl Controller {
                 }
             });
             ui.separator();
+            // The safety toast slides down from the TOP, above everything, and
+            // is drawn before the header so it cannot be pushed off by a view
+            // that changes height.
+            self.safety.tick(ui.input(|i| i.stable_dt));
+            if self.safety.toast_visible() {
+                ui.horizontal(|ui| {
+                    ui.colored_label(colors.warning, "Volume capped for hearing safety");
+                    if ui.button("Dismiss").clicked() { self.safety.dismiss(); }
+                    if ui.button("Unlock").clicked() {
+                        if let Some(v) = self.safety.unlock() {
+                            self.transport.title = self.transport.title.clone();
+                            let _ = v;   // the host applies it; the model decided it
+                        }
+                    }
+                });
+                ui.separator();
+                ui.ctx().request_repaint();
+            }
             // The dot lives in the header strip. Drawn before the body so it
             // keeps its place when a view changes height.
             {
