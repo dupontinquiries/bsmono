@@ -34,6 +34,16 @@ pub struct Peer {
 
 /// The snapclone view: page/subpage nav, a live background, the peer roster, and gesture/theme.
 pub struct Snapclone {
+    /// The ported surfaces. Held here rather than constructed per frame so they
+    /// keep their state — a viewfinder that forgot its focus point every frame,
+    /// or an inbox that forgot its filter, is the "dud demo" failure: the
+    /// widgets exist, nothing remembers anything, and the app looks unfinished
+    /// because it IS.
+    pub viewfinder: crate::camera::Viewfinder,
+    pub inbox: crate::inbox::Inbox,
+    pub composer: crate::composer::Composer,
+    pub settings: crate::settings_page::SettingsPage,
+    pub group_voice: crate::group_voice::GroupVoice,
     /// The unified bottom bar (Qt UnifiedNavBar): page arrows, sub-tab segments, underline
     /// morph, page dots. Owns the page + sub-tab state; `nav` mirrors the page for swipe.
     pub bar: UnifiedNav,
@@ -56,6 +66,11 @@ impl Snapclone {
     /// `auto_logged_in` mirrors Qt's construction-time auto-login check.
     pub fn new_with_login(peers: Vec<Peer>, auto_logged_in: bool) -> Snapclone {
         Snapclone {
+            viewfinder: Default::default(),
+            inbox: Default::default(),
+            composer: Default::default(),
+            settings: crate::settings_page::SettingsPage::new(Default::default()),
+            group_voice: Default::default(),
             bar: UnifiedNav::new(),
             login_visible: !auto_logged_in,
             nav: Nav::new(PAGES.len()),
@@ -120,18 +135,52 @@ impl Snapclone {
         }
 
         match self.nav.page() {
+            // The nav has always declared five pages — Camera, Inbox, Friends,
+            // Wayfinder, Settings — and the shell routed three of them, so two
+            // tabs led nowhere. That is most of why the app read as a demo: the
+            // chrome promised more than the body delivered.
             0 => self.camera_page(ui, &colors),
-            1 => self.peers_page(ui, &colors),
+            1 => self.inbox_page(ui, &colors),
+            2 => self.peers_page(ui, &colors),
+            3 => self.wayfinder_page(ui, &colors),
             _ => self.settings_page(ui, &colors),
         }
     }
 
     fn camera_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Camera");
-        // the carved preview surface (on-device: device-kit camera feed)
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 180.0), egui::Sense::hover());
-        ui.painter().rect(rect, egui::CornerRadius::same(10), c.bg_card, egui::Stroke::new(1.0, c.accent_soft), egui::StrokeKind::Inside);
-        ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "live preview", egui::FontId::proportional(14.0), c.text_weak);
+        // The REAL viewfinder, not a labelled rectangle. Tap-to-focus, the
+        // fading reticle, full-bleed vs framed and the front-camera mirror all
+        // come from camera.rs — which existed and was never called, which is
+        // exactly why the app looked like a placeholder.
+        ui.allocate_ui(egui::vec2(ui.available_width(), 220.0), |ui| {
+            crate::camera::viewfinder(ui, &mut self.viewfinder, None, c);
+        });
+        ui.horizontal(|ui| {
+            if ui.button("flip").clicked() { self.viewfinder.flip(); }
+            if ui.selectable_label(self.viewfinder.full_bleed, "fill").clicked() {
+                self.viewfinder.full_bleed = !self.viewfinder.full_bleed;
+            }
+            if ui.selectable_label(self.viewfinder.scan_mode, "scan").clicked() {
+                self.viewfinder.scan_mode = !self.viewfinder.scan_mode;
+            }
+        });
+        ui.separator();
+        // the composer, over the captured frame
+        ui.horizontal(|ui| {
+            ui.label("caption");
+            ui.text_edit_singleline(&mut self.composer.caption);
+            if ui.button("colour").clicked() { self.composer.cycle_color(); }
+            let d = self.composer.duration;
+            if ui.button(d.label()).clicked() {
+                use crate::composer::Duration;
+                self.composer.duration = match d {
+                    Duration::Seconds(s) if s < 10 => Duration::Seconds(s + 5),
+                    Duration::Seconds(_) => Duration::Unlimited,
+                    Duration::Unlimited => Duration::Seconds(5),
+                };
+            }
+        });
     }
 
     fn peers_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
@@ -158,6 +207,11 @@ impl Snapclone {
 
     fn settings_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Settings");
+        // The five real tab bodies from settings_page.rs, not one row of
+        // background styles. The background picker stays as an appearance
+        // control, but it is no longer the whole page.
+        crate::settings_page::settings_ui(ui, &mut self.settings, c);
+        ui.separator();
         ui.horizontal_wrapped(|ui| {
             ui.colored_label(c.text_weak, "background:");
             for s in BgStyle::all() {
@@ -166,6 +220,38 @@ impl Snapclone {
                 }
             }
         });
+    }
+
+    /// Wayfinder: the group voice channel and the landmark tools. Was a dead
+    /// tab.
+    fn wayfinder_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        self.nav.title_bar(ui, "Wayfinder");
+        ui.horizontal(|ui| {
+            if ui.selectable_label(self.group_voice.joined, "join channel").clicked() {
+                if self.group_voice.joined { self.group_voice.leave(); }
+                else { self.group_voice.join(); }
+            }
+            if ui.selectable_label(self.group_voice.muted, "mute").clicked() {
+                self.group_voice.muted = !self.group_voice.muted;
+            }
+            let ptt = self.group_voice.mode == crate::group_voice::TalkMode::PushToTalk;
+            if ui.selectable_label(ptt, "push to talk").clicked() {
+                self.group_voice.mode = if ptt { crate::group_voice::TalkMode::Open }
+                                        else { crate::group_voice::TalkMode::PushToTalk };
+            }
+        });
+        ui.separator();
+        crate::group_voice::roster_ui(ui, &self.group_voice, c);
+    }
+
+    /// The inbox, on its own page. Was absent entirely: the app had a Peers
+    /// list and no way to see a message, which is the gap that made a
+    /// messaging app read as a demo.
+    fn inbox_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        self.nav.title_bar(ui, "Messages");
+        if let Some(id) = crate::inbox::inbox_ui(ui, &mut self.inbox, c) {
+            self.inbox.mark_read(id);
+        }
     }
 }
 
