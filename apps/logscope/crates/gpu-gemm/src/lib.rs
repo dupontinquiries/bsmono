@@ -14,6 +14,7 @@ pub mod cpuattn;
 pub mod cpudecode;
 pub mod perfverdict;
 pub mod qkvsplit;
+pub mod specverify;
 pub mod gateclass;
 pub mod tensornames;
 pub mod cpuops;
