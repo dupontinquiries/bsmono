@@ -11,6 +11,8 @@
 //! inline tags (b/strong, i/em, code, a) with HTML entities — enough for command output, docs,
 //! and HTML mail. Unknown tags degrade to their text content rather than breaking.
 
+pub mod doc;
+
 /// Inline text styling (flattened from nested inline tags).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InlineStyle {

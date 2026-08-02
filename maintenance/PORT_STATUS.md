@@ -117,3 +117,35 @@ and may be far less. The next revision should check for **rendered surfaces** �
 a function that takes a `&mut Ui` and is called from the app's draw path — rather
 than a name appearing anywhere in the tree. That distinguishes a widget that
 exists from a widget that is mentioned.
+
+## web2qml is not a port, it is a rewrite
+
+voiceterm's web view is a native browser: `qml_gen.rs` (5880 lines),
+`web_islands.rs` (553), `ad_filter.rs` (404), `web_interact.rs` (334). It does
+not build a document and render it — it walks the scraper DOM and **writes QML
+source text**, which Qt parses, retains in a scene graph, and lays out. There is
+no intermediate representation, because QML *was* the intermediate
+representation.
+
+That is why this one cannot be translated the way the widget surfaces were. Two
+things Qt was silently carrying have to become explicit code:
+
+* **Identity.** `objectName: "_field_0"` names a widget that persists between
+  frames, and `submit_form_get` reads it back later. Immediate mode has no
+  widget to name; if what the user typed is not held outside the frame it does
+  not exist, and a form whose input clears on every repaint cannot be used at
+  all.
+* **Culling.** `opacity: (y + height >= _vpTop && y <= _vpBot)` is Qt
+  virtualising a long page declaratively. In egui that is hand-rolled, or a long
+  article pays a full layout pass every frame forever.
+
+`uikit-web` had `RichDoc` — a flat list of styled blocks, right for command
+output, docs and HTML mail, and structurally unable to express a table, a form
+or an image. `uikit_web::doc` is the other half: a node tree with document-order
+`NodeId`s, `FormState` living outside the frame, and `visible_rows` doing by
+hand what the opacity binding did declaratively.
+
+Still to port, named rather than left as a TODO in a file nobody opens: ad and
+tracker filtering, island placeholders for canvas/video/iframe (the node kind
+exists, the placeholder UI does not), hydration extraction (JSON-LD,
+`__NEXT_DATA__`), SPA and challenge detection, and a real box-model layout pass.
