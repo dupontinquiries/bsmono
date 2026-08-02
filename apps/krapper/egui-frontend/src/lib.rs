@@ -59,6 +59,11 @@ pub const SILENCE: f32 = 0.02;
 #[derive(Debug, Clone)]
 pub struct Writer {
     pub vibe: VibeSummary,
+    /// The hummed pitch, in the app's own note terms. `scale.rs` was mounted and
+    /// never read — which for kRapper is the whole premise going missing: you
+    /// hum a vibe and write over it, and a writer who cannot see what key they
+    /// hummed in is writing over nothing.
+    pub pitch_hz: Option<f32>,
     pub lyrics: String,
     pub mic: Mic,
     /// Smoothed input level, 0..1.
@@ -71,7 +76,8 @@ pub struct Writer {
 impl Default for Writer {
     fn default() -> Self {
         Writer {
-            vibe: VibeSummary::default(), lyrics: String::new(), mic: Mic::Off,
+            vibe: VibeSummary::default(), pitch_hz: None,
+            lyrics: String::new(), mic: Mic::Off,
             level: 0.0, blurbs: Vec::new(), status: "ready".into(),
         }
     }
@@ -131,6 +137,18 @@ impl Writer {
         self.mic = if !armed { Mic::Off }
                    else if self.level > SILENCE { Mic::Recording }
                    else { Mic::Armed };
+    }
+
+    /// The hummed note, e.g. "A♯3" — or `None` when nothing is being sung.
+    ///
+    /// Uses the app's own `scale::freq_to_note`, so the note the writing surface
+    /// shows is the note the recogniser heard rather than a second opinion.
+    pub fn note(&self) -> Option<String> {
+        let hz = self.pitch_hz?;
+        if hz <= 0.0 { return None; }
+        let (name, octave, cents) = crate::scale::freq_to_note(hz);
+        Some(if cents.abs() >= 25 { format!("{name}{octave} {cents:+}¢") }
+             else { format!("{name}{octave}") })
     }
 
     /// The stress cell for a syllable index, repeating the pattern to cover the
@@ -317,6 +335,23 @@ mod tests {
         // an empty pattern is unstressed rather than a panic
         w.vibe.stress_pattern.clear();
         assert_eq!(w.stress_at(5), 0);
+    }
+
+    #[test]
+    fn the_hummed_note_is_reported_in_the_apps_own_terms() {
+        // A writer who cannot see what key they hummed in is writing over
+        // nothing, which is the whole premise going missing.
+        let mut w = w8();
+        assert_eq!(w.note(), None, "nothing hummed yet");
+        w.pitch_hz = Some(440.0);
+        assert_eq!(w.note().as_deref(), Some("A4"), "concert A");
+        // a badly-out-of-tune hum reports the cents, so the writer can hear
+        // that they are between notes rather than on one
+        w.pitch_hz = Some(453.0);
+        assert!(w.note().unwrap().contains("¢"), "{:?}", w.note());
+        // silence and nonsense do not produce a note
+        w.pitch_hz = Some(0.0);
+        assert_eq!(w.note(), None);
     }
 
     #[test]
