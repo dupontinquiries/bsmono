@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "cli-kit"
+version = "0.1.0"
+
+[[package]]
 name = "core-kit"
 version = "0.1.0"
 
@@ -14,6 +18,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "models-kit"
+version = "0.1.0"
+
+[[package]]
 name = "net-kit"
 version = "0.1.0"
 dependencies = [
@@ -23,11 +31,15 @@ dependencies = [
 [[package]]
 name = "voice-kit"
 version = "0.1.0"
+dependencies = [
+ "models-kit",
+]
 
 [[package]]
 name = "voiced"
 version = "0.1.0"
 dependencies = [
+ "cli-kit",
  "ipc-kit",
  "voiced-core",
 ]

@@ -10,5 +10,8 @@ name = "sharemd"
 path = "src/main.rs"
 
 [dependencies]
+# Shared argument parsing — its own description says the portfolio hand-rolls
+# this about eleven times.
+cli-kit = { path = "../../shared/cli-kit" }
 ipc-kit = { path = "../../shared/ipc-kit" }
 datashare-core = { path = "../../shared/datashare-core" }
