@@ -9940,6 +9940,30 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
 
     pub fn byte_probe(&self, raw: &[u8]) -> Vec<f32> { self.byte_probe_with(raw, BYTE_PROBE) }
 
+    /// Upload bytes and read them straight back, with NO shader involved.
+    ///
+    /// The scalar and vec4 probes fail IDENTICALLY on hardware — only the first 4 bytes of every 16
+    /// are readable either way. That rules out the element size, and it points at the buffer rather
+    /// than the read: if only 4 of every 16 bytes ever arrived, both shaders are reading correctly and
+    /// reporting what is there.
+    ///
+    /// This settles it. A round trip through `upload_bytes` and a copy back to the host touches no
+    /// shader at all, so a mismatch is unambiguously the WRITE path — and a match means the upload is
+    /// fine and the fault is somewhere between binding and execution after all.
+    pub fn upload_readback_probe(&self, raw: &[u8]) -> Vec<u8> {
+        let mut padded = raw.to_vec();
+        padded.resize(raw.len().div_ceil(4) * 4, 0);
+        let src = self.upload_bytes(&padded, "readback-probe");
+        let t = Tensor { buf: src, rows: 1, cols: padded.len() / 4, pool: None, view: None };
+        // download() reads a buffer back as f32 words; reinterpreting them as bytes recovers exactly
+        // what was uploaded, because nothing has interpreted them in between.
+        let words = self.download(&t);
+        let mut out = Vec::with_capacity(words.len() * 4);
+        for w in &words { out.extend_from_slice(&w.to_bits().to_le_bytes()); }
+        out.truncate(raw.len());
+        out
+    }
+
     fn byte_probe_with(&self, raw: &[u8], shader: &str) -> Vec<f32> {
         let n = raw.len();
         let mut padded = raw.to_vec();

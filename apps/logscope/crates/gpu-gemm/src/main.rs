@@ -3546,6 +3546,23 @@ everywhere: it looks like a hardware problem"
         // fourth u32 reachable, which is a 16-byte stride on an array<u32>: std140 scalar padding on a
         // buffer that should be std430. Reading the same bytes through array<vec4<u32>> either fixes
         // it (layout confirmed) or does not (theory wrong), and one run settles which.
+        // NO SHADER AT ALL. Both shader probes fail identically, which rules out the element size and
+        // points at the buffer: if only 4 of every 16 bytes ever arrived, both shaders are reading
+        // correctly and reporting what is there. A round trip through upload_bytes and back settles
+        // which side of the boundary the fault is on.
+        let back = gpu.upload_readback_probe(&raw);
+        let upload_ok = back == raw;
+        println!("  upload+readback    : {:?}", &back[..16.min(back.len())]);
+        if !upload_ok {
+            let bad: Vec<usize> = back.iter().enumerate()
+                .filter(|(i, b)| **b != raw[*i]).map(|(i, _)| i).take(12).collect();
+            println!("  => THE UPLOAD IS WRONG, no shader involved. First wrong indices: {bad:?}. \
+The fault is in the write path (upload_bytes / write_chunked), not in any kernel — which means every \
+quant gate has been reporting a WRITE bug as a read bug.");
+        } else {
+            println!("  => the upload is byte-exact, so the buffer holds what it should and the fault \
+is between binding and execution.");
+        }
         let v4 = gpu.byte_probe_vec4(&raw);
         let v4_ok = v4.iter().enumerate().all(|(i, x)| *x as u8 == raw[i]);
         let scalar_ok = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
