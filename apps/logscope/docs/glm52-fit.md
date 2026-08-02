@@ -213,3 +213,34 @@ a 2.8× saving on top of a working path — it is what makes the path exist.
 | **fitting in memory** | **no — 71.5 GiB resident against 63 / 31 measured** |
 
 Everything except the last is done. The last needs a kernel.
+
+---
+
+# Open: `auto_q4` assigned and never read in the fully-resident branch
+
+`cargo` reports `value assigned to auto_q4 is never read` at `lib.rs:7568`. That line is inside the
+**fully-resident** MoE branch — the one whose comment says:
+
+> `moe_stream_pin` stays None, which is what selects the resident path below.
+
+`auto_q4` is read at 7678 (`q4_mode`), and assigned at three places: 7522, 7568 (resident), and 7634
+(streaming, alongside `moe_stream_pin = Some(pin)`).
+
+**Two readings, and they have very different consequences:**
+
+1. **Benign.** The branches are exclusive and the compiler is flagging a redundant store the resident
+   path never needs. Nothing to fix.
+2. **A real bug.** The resident branch falls through to 7634, which overwrites the store *and* sets
+   `moe_stream_pin = Some(pin)` — meaning a model that fits fully resident is put on the streaming
+   path anyway, contradicting its own log line. That would explain Scout being refused for
+   ~50 GiB of host expert storage on a machine where it fits resident.
+
+A brace-depth count from 7568 to 7634 gives −1, which is consistent with either: the branch may have
+closed, or an enclosing block may have.
+
+**Do not guess.** Resolving it needs reading the control flow properly, and the cost of being wrong is
+the memory path for every MoE model. The check is small: whether the resident branch reaches 7634, and
+whether `moe_stream_pin` is `None` when the loader prints `MoE fits FULLY RESIDENT`.
+
+**Quick empirical test:** load a MoE model that fits resident and look for `MoE fits FULLY RESIDENT`
+followed by any streaming activity. If the two appear together, reading 2 is correct.
