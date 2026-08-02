@@ -37,7 +37,18 @@ impl Default for Models {
         Models {
             root: format!("{home}/models"),
             entries: Vec::new(), scanned: false,
-            my_id: logscope_fan::machineid::encode(b"logscope-local-identity-placeholder"),
+            // THE REAL KEY, not a placeholder. Same directory as the autosave state, so an operator
+            // who backs up ~/.local/share/logscope keeps their machine identity with it — losing it
+            // silently invalidates every registration other machines made against this one.
+            //
+            // A failure to load falls back to a visible marker rather than a plausible-looking id: an
+            // id that parses and is nobody's is worse than one that obviously did not load, because
+            // the first gets pasted somewhere.
+            my_id: std::env::var("HOME").ok()
+                .map(|h| std::path::PathBuf::from(h).join(".local/share/logscope/identity.key"))
+                .and_then(|p| logscope_fan::machineid::Identity::load_or_create(&p).ok())
+                .map(|id| id.id())
+                .unwrap_or_else(|| "— identity unavailable —".into()),
             add_id: String::new(), machines: Vec::new(), machine_note: String::new(),
             plan: Vec::new(), conflicts: Vec::new(),
             note: String::new(), repo_hint: String::new(),
