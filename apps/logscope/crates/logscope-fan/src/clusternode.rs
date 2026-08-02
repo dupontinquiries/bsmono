@@ -218,11 +218,11 @@ impl ClusterNode {
         -> Result<(ClusterNode, Vec<String>), crate::machineid::IdentityError>
     {
         let identity = crate::machineid::Identity::load_or_create(&dir.join(IDENTITY_FILE))?;
-        let (registry, bad) = match std::fs::read_to_string(dir.join(TRUSTED_FILE)) {
-            Ok(t) => crate::trustkit::Registry::from_text(&t),
-            // No file yet is the normal first run, not an error.
-            Err(_) => (crate::trustkit::Registry::new(), Vec::new()),
-        };
+        // DELEGATE. Registry::load already existed, already handles a missing file as a normal first
+        // run, and is what the model panel calls — I reimplemented it here without checking, which is
+        // the duplicated-policy class I documented in bug-classes.md. Two readers of one file drift,
+        // and the one that drifts is whichever is edited second.
+        let (registry, bad) = crate::trustkit::Registry::load(&dir.join(TRUSTED_FILE));
         Ok((ClusterNode::new(identity, registry, self_addr), bad))
     }
 
@@ -231,14 +231,13 @@ impl ClusterNode {
     /// Called after any change rather than at exit: a crash or a kill must not lose a machine someone
     /// just registered, and an exit hook is exactly what does not run when it matters.
     ///
-    /// Written to a temp file and renamed, so an interrupted write leaves the previous list intact
-    /// rather than a truncated one — losing the file is the thing being guarded against, and a partial
-    /// write loses it just as thoroughly.
+    /// Atomicity comes from `Registry::save`, which already writes temp-and-rename — this only
+    /// chooses the path, so the composition adds a location and not a second file format.
     pub fn save_trusted(&self, dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!("{TRUSTED_FILE}.tmp"));
-        std::fs::write(&tmp, self.registry.to_text())?;
-        std::fs::rename(&tmp, dir.join(TRUSTED_FILE))
+        // Registry::save already writes temp-and-rename. Delegating rather than repeating it means
+        // there is one atomic-write implementation to be right, not two that must agree.
+        self.registry.save(&dir.join(TRUSTED_FILE))
     }
 }
 
