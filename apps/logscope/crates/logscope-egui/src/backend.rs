@@ -865,6 +865,12 @@ and a smaller chunk would re-pull every cold expert more often)".to_string()
                 s.logits = self.gpu.prefill_chunked(&self.model, &s.cache, &prompt_ids, pc);
                 s.pos = prompt_ids.len();
             }
+            // CARRIED TO THE PROFILE LINE. Decode compared against this model's OWN prefill needs no
+            // roofline, which is why it can be reported when the bandwidth verdict cannot — and the
+            // bandwidth verdict almost never can, because --gate-perf is rarely run.
+            let prefill_ms_per_tok = if prompt_ids.is_empty() { 0.0 }
+                else { t0.elapsed().as_secs_f64() * 1000.0 / prompt_ids.len() as f64 };
+            let prefill_tokens = prompt_ids.len();
             eprintln!("wgpu-engine: [{}] prompt {} tokens → up to {} (temp {:.2}); {} in {:.2}s, decoding…", self.name,
                 prompt_ids.len(), n_new, p.temperature,
                 // NAME THE MISS. A hit says "reused N anchor tokens"; a miss said "full prefill",
@@ -1062,6 +1068,21 @@ was evicted)", prompt_ids.len())
             // submits rather than the process lifetime's.
             let attr = format!("wgpu-engine: [{}] {}", self.name,
                 gpu_kernels::submit_attribution_since(cause0, ds as u64));
+            // THE SELF-RELATIVE VERDICT. Prefill and decode read the same weights in the same run, so
+            // the ratio between their per-token costs measures how much latency decode fails to hide —
+            // with no bandwidth ceiling, no active-byte count and no gate run beforehand.
+            //
+            // Reported after the roofline verdict rather than instead of it: they answer different
+            // questions, and this one can answer whenever a generation happened at all.
+            {
+                let ntok = per as usize;
+                let dec_ms_per_tok = if ntok > 0 { total_ms as f64 / ntok as f64 } else { 0.0 };
+                let sr = gpu_kernels::perfverdict::self_relative(
+                    prefill_ms_per_tok, dec_ms_per_tok, prefill_tokens, ntok);
+                if !matches!(sr, gpu_kernels::perfverdict::SelfRelative::NotEnoughData) {
+                    eprintln!("wgpu-engine: phase balance — {}", sr.advice());
+                }
+            }
             eprintln!("[{}] {attr}", gpu_kernels::stamp());
             crate::diag::note(&attr);
             let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
