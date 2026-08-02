@@ -6209,7 +6209,17 @@ them to", patches.len());
                         RightPage::Prompting => {
                             ui.label(RichText::new("PROMPTING MODE").color(theme::DIM()).small().strong());
                             ui.add_space(4.0);
+                            // GROUP BY AXIS. Six entries answering two different questions — three vary how WIDE the
+                            // fan-out is, three vary WHO REASONS — and an undifferentiated list makes an operator infer
+                            // that from the names before they can choose. A heading per group costs two lines and
+                            // removes the inference.
+                            let mut last_axis = "";
                             for m in crate::coordinator::Mode::all() {
+                                if m.axis() != last_axis {
+                                    if !last_axis.is_empty() { ui.add_space(6.0); }
+                                    ui.label(RichText::new(m.axis()).color(theme::FAINT()).small());
+                                    last_axis = m.axis();
+                                }
                                 let on = self.coord_mode == m;
                                 if ui.selectable_label(on, RichText::new(m.label()).color(if on { theme::CYAN() } else { theme::INK() }).strong()).clicked() {
                                     self.coord_mode = m;
