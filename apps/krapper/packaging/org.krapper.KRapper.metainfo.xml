@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Without this the app installs and launches but does not
+     appear in GNOME Software or KDE Discover at all — those read metainfo, not
+     .desktop entries, so a missing file makes an installed app invisible to the
+     one place most users look. -->
+<component type="desktop-application">
+  <id>org.krapper.KRapper</id>
+  <name>kRapper</name>
+  <summary>Write lyrics to a hummed vibe</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>kRapper listens to a hummed vibe and helps you write over it, matching stress to the beat you set.</p>
+    <ul>
+      <li>A stress ruler showing which syllables land hard in the bar</li>
+      <li>Suggestions filtered to what still fits the remaining syllables</li>
+      <li>Hot-mic scratchpad that distinguishes armed from recording</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.krapper.KRapper.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-08-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>

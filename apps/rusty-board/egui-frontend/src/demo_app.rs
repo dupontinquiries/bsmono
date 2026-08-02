@@ -345,6 +345,17 @@ impl eframe::App for Feel {
 pub const APP_ID: &str = "org.rustyboard.RustyBoard";
 
 pub fn run(title: &str) -> eframe::Result<()> {
+    // A SECOND keyboard is worse than untidy: it takes the input focus the
+    // first one was serving, so the user ends up typing into nothing. Refusing
+    // the second launch is the correct behaviour here even though it would be
+    // merely tidy for an ordinary app.
+    let claim = uikit_egui::single_instance::claim(APP_ID);
+    if !uikit_egui::single_instance::should_start(&claim) {
+        if let uikit_egui::single_instance::Claim::AlreadyRunning(pid) = claim {
+            eprintln!("rusty-board is already running (pid {pid})");
+        }
+        return Ok(());
+    }
     let opts = eframe::NativeOptions {
         // An on-screen keyboard wants to be WIDE and SHORT, and it must not
         // steal focus from the app being typed into — a keyboard that takes
@@ -354,5 +365,9 @@ pub fn run(title: &str) -> eframe::Result<()> {
             .with_active(false),
         ..Default::default()
     };
-    eframe::run_native(APP_ID, opts, Box::new(|_cc| Ok(Box::new(Feel::new()))))
+    let r = eframe::run_native(APP_ID, opts, Box::new(|_cc| Ok(Box::new(Feel::new()))));
+    // Released on the way out so a restart is immediate. The runtime dir is
+    // cleared at logout anyway, so a missed release costs nothing.
+    uikit_egui::single_instance::release(APP_ID);
+    r
 }

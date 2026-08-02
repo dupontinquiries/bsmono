@@ -87,6 +87,18 @@ def main():
                           f"no packaging/icons/.../{icon}.svg ships — blank tile")
                     problems += 1
 
+            # AppStream metadata — the file a software centre reads. Without it
+            # an installed app is invisible in the one place most users look.
+            # Looked for BESIDE the entry, not only in packaging/: snapclone
+            # keeps a second entry under resources/, and a helper tool like
+            # camera-view is not a software-centre app at all.
+            meta = os.path.join(os.path.dirname(e), stem + '.metainfo.xml')
+            if '.' not in stem:
+                pass          # a helper, not a listed application
+            elif not os.path.isfile(meta):
+                print(f"{app}: no {stem}.metainfo.xml — invisible in software centres")
+                problems += 1
+
             if stem in set_ids: matched = True
 
         if set_ids and not matched:

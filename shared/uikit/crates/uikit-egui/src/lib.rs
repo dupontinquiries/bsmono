@@ -18,6 +18,7 @@
 //! the touch layer).
 
 pub mod desktop;
+pub mod single_instance;
 pub mod a11y;
 pub mod adaptive;
 pub mod carved;

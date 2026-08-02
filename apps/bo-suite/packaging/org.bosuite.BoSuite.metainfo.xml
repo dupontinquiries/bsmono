@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- AppStream metadata. Without this the app installs and launches but does not
+     appear in GNOME Software or KDE Discover at all — those read metainfo, not
+     .desktop entries, so a missing file makes an installed app invisible to the
+     one place most users look. -->
+<component type="desktop-application">
+  <id>org.bosuite.BoSuite</id>
+  <name>Bo Suite</name>
+  <summary>Spatial audio router for Mozart and Bluetooth speakers</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>Bo Suite routes audio across a mesh of speakers by room and channel, so a layout plays where you put it.</p>
+    <ul>
+      <li>Assign each channel of a layout to a speaker, one channel per speaker</li>
+      <li>Rooms are saved and restored, including partial restores onto a changed mesh</li>
+      <li>Per-band EQ with headroom warnings, and a seamless-loop finder for ambience</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">org.bosuite.BoSuite.desktop</launchable>
+  <releases>
+    <release version="0.1.0" date="2026-08-02"/>
+  </releases>
+  <content_rating type="oars-1.1"/>
+</component>
