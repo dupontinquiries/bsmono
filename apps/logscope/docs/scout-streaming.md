@@ -56,3 +56,50 @@ The expert tensors must be readable as `&'static [u8]` views into the mmap, whic
 
 The size prize on Scout: **50.6 GiB of host RAM becomes zero.** The experts stay in the mapped file and
 convert on the GPU as the dense weights already do.
+
+
+---
+
+# Correction: the file-view path IS wired, and Q4_K_M is why Scout misses it
+
+The section above says `build_moe_stream_raw` and `raw_expert_to_q4_resident` have no callers. That is
+wrong. The loader builds a `RawExpertSrc` through `raw_try` and takes the file-view path when it can —
+my grep found no *direct* callers because the loader reaches them through that closure, and I
+concluded the path was dead without following it.
+
+**Why Scout falls back anyway:**
+
+```rust
+let allowed: &[u32] = if q6_ok { &[12, 14] } else { &[12] };
+if !allowed.contains(&t.ggml_type) { return Err(...) }   // -> host copy
+```
+
+Only Q4_K (type 12) is eligible by default. **Q4_K_M is a mixed quantization** — the "M" means some
+tensors are promoted to Q6_K, typically the ones the quantizer judges most sensitive. If any expert
+tensor in the set is Q6_K, the whole set is rejected and every expert takes the host copy.
+
+That is almost certainly Scout's 50.6 GiB: not a missing path, a **mixed file meeting an all-or-nothing
+eligibility test**.
+
+The loader's own message says what is missing: the Q6_K→q4 *fill* conversion. `--gate-q6k` shows Q6_K
+decoding is bit-exact and the strides and per-tensor types are already plumbed; the gap is one shader.
+
+## What to try
+
+```
+LOGSCOPE_Q6K_VIEWS=1
+```
+
+If Scout then loads without the host copy, the eligibility gate was the whole blocker and the fill
+conversion works well enough in practice. If it produces garbage, the missing fill shader is real and
+the gate is protecting against exactly what it says.
+
+**Either outcome is worth more than the estimate**, because the refusal currently computes a 50.6 GiB
+cost for a path the file may never have needed to take.
+
+## The all-or-nothing question
+
+Worth asking separately: the eligibility test rejects the *set* if any tensor fails. A mixed file could
+in principle stream its Q4_K experts as views and host-copy only the Q6_K ones. Whether that is worth
+the complexity depends on the mix — and on a Q4_K_M checkpoint the promoted tensors are a minority, so
+the saving would be most of the 50.6 GiB rather than all of it.
