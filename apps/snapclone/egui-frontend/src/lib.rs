@@ -12,6 +12,7 @@ use uikit_egui::{Adaptive, BgStyle, GestureLayer, LiveBackground, Nav, PaletteCo
 
 pub mod camera;
 pub mod contacts;
+pub mod conversation;
 pub mod composer;
 pub mod group_voice;
 pub mod settings_page;
