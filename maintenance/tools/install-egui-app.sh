@@ -103,6 +103,24 @@ else
     done
   fi
 
+  # Shell completions. The paths are the XDG-friendly per-user ones: bash reads
+  # ~/.local/share/bash-completion/completions/<cmd> lazily by NAME, so the file
+  # must be named after the command rather than after the app.
+  if [ -d "$APP_DIR/completions" ]; then
+    BASH_DIR="$PREFIX/share/bash-completion/completions"
+    ZSH_DIR="$PREFIX/share/zsh/site-functions"
+    for c in "$APP_DIR"/completions/*.bash; do
+      [ -f "$c" ] || continue
+      mkdir -p "$BASH_DIR"
+      install -m644 "$c" "$BASH_DIR/$(basename "$c" .bash)"
+    done
+    for c in "$APP_DIR"/completions/_*; do
+      [ -f "$c" ] || continue
+      mkdir -p "$ZSH_DIR"
+      install -m644 "$c" "$ZSH_DIR/$(basename "$c")"
+    done
+  fi
+
   # systemd user units, if the app ships any. @BIN_DIR@ is substituted here
   # rather than in the source, so the same unit file works at any prefix — a
   # hardcoded /usr/bin is why units so often need editing after a --user install.

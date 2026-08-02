@@ -1,0 +1,46 @@
+#compdef shelfctl
+# zsh completion for shelfctl.
+#
+# Written separately from the bash one rather than generated from it: zsh's
+# _arguments carries per-subcommand descriptions that bash has no equivalent
+# for, and a lowest-common-denominator generator would throw them away — the
+# descriptions are most of what makes zsh completion worth having.
+
+_shelfctl() {
+    local -a subcommands
+    subcommands=(
+        'scan:index the configured shelf directories'
+        'list:list books, optionally sorted'
+        'export-highlights:write highlights and margin notes out'
+        'stats:reading totals'
+        'info:show one book'\''s metadata'
+        'help:show usage'
+    )
+
+    _arguments -C \
+        '1: :->cmd' \
+        '*:: :->args'
+
+    case $state in
+        cmd) _describe -t commands 'shelfctl command' subcommands ;;
+        args)
+            case $words[1] in
+                list)
+                    _arguments \
+                        '--sort[order the list]:key:(recent title author progress)' \
+                        '--help[show usage]'
+                    ;;
+                export-highlights)
+                    _arguments \
+                        '--format[output format]:format:(md json txt)' \
+                        '--out[write to a file instead of stdout]:file:_files' \
+                        '--help[show usage]'
+                    ;;
+                info) _arguments '*:book:_files' ;;
+                *)    _arguments '--help[show usage]' ;;
+            esac
+            ;;
+    esac
+}
+
+_shelfctl "$@"
