@@ -70,6 +70,19 @@ else
     mkdir -p "$PREFIX/share/metainfo"
     install -m644 "$META" "$PREFIX/share/metainfo/$APP_ID.metainfo.xml"
   fi
+  # systemd user units, if the app ships any. @BIN_DIR@ is substituted here
+  # rather than in the source, so the same unit file works at any prefix — a
+  # hardcoded /usr/bin is why units so often need editing after a --user install.
+  if [ -d "$APP_DIR/systemd" ]; then
+    UNIT_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    mkdir -p "$UNIT_DIR"
+    for u in "$APP_DIR"/systemd/*.service "$APP_DIR"/systemd/*.socket; do
+      [ -f "$u" ] || continue
+      sed "s|@BIN_DIR@|$BIN_DIR|g" "$u" > "$UNIT_DIR/$(basename "$u")"
+    done
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    echo "    units in $UNIT_DIR — enable the .socket, not the .service"
+  fi
   echo "installed $APP_ID -> $APPS_DIR"
 fi
 

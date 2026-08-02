@@ -1,0 +1,38 @@
+[Unit]
+Description=Coordination daemon — serves coord-core over the coord socket
+Documentation=man:coordd(1)
+# No After=/Requires= on the socket: systemd handles that for socket-activated
+# units, and stating it here would only be a second place to get it wrong.
+
+[Service]
+Type=simple
+ExecStart=@BIN_DIR@/coordd
+Restart=on-failure
+RestartSec=2
+
+# A daemon answering a socket should be cheap. These are ceilings, not
+# reservations — nothing is held unless it is used.
+MemoryHigh=128M
+MemoryMax=256M
+CPUWeight=40
+
+# Hardening. A socket daemon needs almost nothing from the filesystem, so it
+# gets almost nothing: no home access at all, and only its own state directory
+# writable.
+PrivateTmp=true
+ProtectSystem=strict
+# ProtectHome=read-only, NOT true: the daemon writes its own state under
+# ~/.local/share, and ProtectHome=true makes the whole home invisible — so the
+# unit starts and the daemon then fails on its first write, which reads as a
+# daemon bug rather than a unit bug.
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+NoNewPrivileges=true
+RestrictAddressFamilies=AF_UNIX
+ReadWritePaths=%h/.local/share/coordd
+
+# NO [Install] SECTION, deliberately. The .socket carries WantedBy; a service
+# that is also wanted by default.target starts at login regardless, which
+# defeats socket activation and brings back the four idle processes it exists to
+# avoid. `systemctl --user enable <name>.socket` is the only thing to enable.

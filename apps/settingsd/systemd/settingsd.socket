@@ -1,0 +1,17 @@
+[Unit]
+Description=Settings daemon — serves the cross-app settings namespace (socket)
+
+[Socket]
+# Socket activation rather than an always-on service: these daemons exist to
+# answer other apps, and a user with no app running should not be paying for
+# four idle processes. systemd creates the socket at login and starts the daemon
+# on the first connection.
+#
+# It also removes the start-order problem entirely — an app connecting before
+# its daemon is up blocks on the socket instead of failing, so nothing needs an
+# After= chain or a retry loop.
+ListenStream=%t/settings.sock
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target
