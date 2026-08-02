@@ -10,6 +10,7 @@ pub mod transport;
 pub mod spaces;
 pub mod library;
 pub mod device;
+pub mod settings_page;
 pub mod chrome;
 pub mod dialogs;
 pub mod soundscape;
