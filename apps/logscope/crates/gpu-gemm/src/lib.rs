@@ -8466,6 +8466,19 @@ scale {} ({}), shared {}, weight applied to {}",
                                 if g.get_f32(&scale_key).is_some() { "file" } else { "default 1.0" },
                                 c.n_shared,
                                 if c.weight_before { "the expert's INPUT" } else { "its output" });
+                        // CROSS-CHECK THE ROUTING AGAINST THE TENSORS. Scout reports every one of these as
+                        // (default) — its file carries none of the keys — so expert_count, expert_used_count and
+                        // expert_shared_count are taken on trust. Two of the three are checkable: the stacked
+                        // tensor names the expert count, and a shared expert either has _shexp tensors or does not
+                        // exist. The third, top-k, is constrained by nothing in the file and cannot be checked.
+                        {
+                            let axis = g.tensor("blk.0.ffn_gate_exps.weight")
+                                .and_then(|t| t.dims.get(2).copied()).map(|n| n as usize);
+                            let shexp = g.tensor("blk.0.ffn_gate_shexp.weight").is_some();
+                            for d in crate::moe::check_routing(n_expert, n_expert_used, c.n_shared as usize, axis, shexp) {
+                                eprintln!("loader: MoE ROUTING DISAGREEMENT — {}", d.explain());
+                            }
+                        }
                         }
                     }
                     Some(Box::new(MoeLayer { router, gate_up, down, stacked_gu, stacked_down, shared, stream,

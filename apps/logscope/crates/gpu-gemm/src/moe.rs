@@ -289,3 +289,118 @@ scale was applied before the normalize and cancelled");
         assert!((sel[0].weight - want).abs() < 1e-6, "raw sigmoid gate, got {}", sel[0].weight);
     }
 }
+
+/// Cross-check the routing hparams against the expert tensors.
+///
+/// Scout's loader line reports every Llama-4 value as `(default)` — the file carries none of the keys
+/// — so `expert_count`, `expert_used_count` and `expert_shared_count` are all taken on trust. The
+/// tensors are not: an expert-stacked weight is `[d, ff, n_expert]` and a shared expert has its own
+/// `ffn_*_shexp` tensors or does not exist.
+///
+/// So two of the three guesses are checkable, and the third — `expert_used_count` — is not, which is
+/// worth knowing on its own: nothing in the file constrains how many experts are routed to, so a wrong
+/// top-k is invisible to any check and shows only as worse output.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum RoutingDisagreement {
+    /// The stacked expert tensor's count axis differs from `expert_count`.
+    ExpertCount { declared: usize, from_tensor: usize },
+    /// The metadata says there is a shared expert and no `_shexp` tensor exists, or vice versa.
+    SharedExpert { declared: usize, tensors_present: bool },
+    /// More experts routed to than exist.
+    TopKExceedsCount { used: usize, count: usize },
+}
+
+impl RoutingDisagreement {
+    pub fn explain(&self) -> String {
+        match self {
+            RoutingDisagreement::ExpertCount { declared, from_tensor } => format!(
+                "metadata says {declared} experts and the stacked tensor has {from_tensor} — routing \
+would index past the end or leave experts unreachable, and neither shows as an error"),
+            RoutingDisagreement::SharedExpert { declared, tensors_present } => format!(
+                "metadata says {declared} shared expert(s) and the checkpoint {} ffn_*_shexp tensors. \
+A shared expert is ALWAYS active, so a missing one silently drops a contribution from every token, \
+and an unexpected one is weights nobody reads",
+                if *tensors_present { "HAS" } else { "has NO" }),
+            RoutingDisagreement::TopKExceedsCount { used, count } => format!(
+                "routing to {used} of {count} experts — the top-k cannot exceed the pool"),
+        }
+    }
+}
+
+/// Check routing metadata against what the file actually contains.
+pub fn check_routing(
+    expert_count: usize, expert_used: usize, expert_shared: usize,
+    stacked_expert_axis: Option<usize>, shexp_tensors_present: bool,
+) -> Vec<RoutingDisagreement> {
+    let mut v = Vec::new();
+    if let Some(n) = stacked_expert_axis {
+        if n != expert_count {
+            v.push(RoutingDisagreement::ExpertCount { declared: expert_count, from_tensor: n });
+        }
+    }
+    if (expert_shared > 0) != shexp_tensors_present {
+        v.push(RoutingDisagreement::SharedExpert {
+            declared: expert_shared, tensors_present: shexp_tensors_present });
+    }
+    if expert_count > 0 && expert_used > expert_count {
+        v.push(RoutingDisagreement::TopKExceedsCount { used: expert_used, count: expert_count });
+    }
+    v
+}
+
+#[cfg(test)]
+mod routing_check_tests {
+    use super::*;
+
+    #[test]
+    fn scouts_reported_configuration_is_self_consistent_IF_the_tensors_agree() {
+        // 16 experts, 1 active, 1 shared — all three reported as (default) in a real load, so all
+        // three are guesses. This says what the file would have to contain for them to be right.
+        assert!(check_routing(16, 1, 1, Some(16), true).is_empty());
+    }
+
+    #[test]
+    fn a_SHARED_expert_claimed_with_no_tensors_is_caught() {
+        // The check that matters most for Scout: `shared experts 1 (default)` comes from an arch flag
+        // rescuing a literal 0, not from the file. A shared expert is ALWAYS active, so claiming one
+        // that does not exist drops a contribution from every single token — quietly.
+        let d = check_routing(16, 1, 1, Some(16), false);
+        assert_eq!(d.len(), 1);
+        assert!(d[0].explain().contains("silently drops a contribution from every token"));
+    }
+
+    #[test]
+    fn an_unexpected_shared_expert_is_also_caught() {
+        // The other direction: tensors present and metadata saying none means weights nobody reads,
+        // and a model quietly missing part of its FFN.
+        let d = check_routing(128, 8, 0, Some(128), true);
+        assert_eq!(d.len(), 1, "{d:?}");
+    }
+
+    #[test]
+    fn an_expert_COUNT_mismatch_is_caught_from_the_stacked_tensor() {
+        // Routing would index past the end or leave experts unreachable — neither is an error.
+        let d = check_routing(128, 8, 0, Some(64), false);
+        assert!(matches!(d[0], RoutingDisagreement::ExpertCount { from_tensor: 64, .. }));
+    }
+
+    #[test]
+    fn a_top_k_larger_than_the_pool_is_impossible() {
+        let d = check_routing(8, 16, 0, Some(8), false);
+        assert!(d.iter().any(|x| matches!(x, RoutingDisagreement::TopKExceedsCount { .. })));
+    }
+
+    #[test]
+    fn top_k_within_the_pool_cannot_be_checked_AT_ALL() {
+        // Worth stating: nothing in a checkpoint constrains how many experts are routed to. 8 of 128
+        // and 2 of 128 both produce a file that looks identical, so a wrong expert_used_count is
+        // invisible to every check and shows only as worse output.
+        assert!(check_routing(128, 8, 0, Some(128), false).is_empty());
+        assert!(check_routing(128, 2, 0, Some(128), false).is_empty());
+    }
+
+    #[test]
+    fn a_dense_model_is_not_penalised_for_having_no_expert_tensors() {
+        assert!(check_routing(0, 0, 0, None, false).is_empty());
+    }
+}
