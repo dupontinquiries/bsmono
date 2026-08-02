@@ -3513,6 +3513,55 @@ everywhere: it looks like a hardware problem"
         });
         return;
     }
+    // Compares the native IQ1_S matvec against dot_iq1_s, which already bit-matches gguf's
+    // transcribed dequantizer — so a divergence here is the KERNEL, not the format reading.
+    //
+    // Tolerance rather than exact: the GPU splits the accumulation into two chains and floating-point
+    // addition is not associative, so the results differ by reassociation exactly as
+    // linear_q8_0_gemm_rb already notes about its own tiling. An exact-match gate would fail on a
+    // correct kernel, which is worse than no gate.
+    if args.iter().any(|a| a == "--gate-iq1s-kernel") {
+        let gpu = Gpu::new();
+        println!("gate-iq1s-kernel: adapter = {}", gpu.adapter_name);
+        let (n, k) = (8usize, 512usize);        // 2 super-blocks per row
+        let nblk = k / 256;
+        // Plausible f16 scales, not random bytes: random ones decode to inf/NaN, which is how four
+        // Q6_K "kernel faults" turned out to be a bad fixture.
+        let mut raw = vec![0u8; n * nblk * 50];
+        for r in 0..n * nblk {
+            let b = &mut raw[r * 50..(r + 1) * 50];
+            b[0..2].copy_from_slice(&0x2E66u16.to_le_bytes());
+            for i in 2..34 { b[i] = ((i * 7 + r * 13) % 251) as u8; }
+            for i in 0..8 {
+                let h = ((i as u16 * 4099) & 0x7FFF) | if i % 3 == 0 { 0x8000 } else { 0 };
+                b[34 + 2 * i..36 + 2 * i].copy_from_slice(&h.to_le_bytes());
+            }
+        }
+        let act: Vec<f32> = (0..k).map(|i| ((i % 19) as f32 - 9.0) * 0.11).collect();
+        let mut want = vec![0f32; n];
+        for r in 0..n {
+            want[r] = gpu_kernels::cpumatvec::dot_iq1_s(&raw[r * nblk * 50..(r + 1) * nblk * 50], &act)
+                .expect("the CPU reference reads this fixture");
+        }
+        let got = gpu.matvec_iq1_s(&act, &raw, n, k);
+        let mut worst = 0f32;
+        for r in 0..n {
+            let e = (got[r] - want[r]).abs() / want[r].abs().max(1.0);
+            if e > worst { worst = e; }
+        }
+        let ok = worst < 1e-4;
+        println!("  rows {n}, k {k}, worst relative error {worst:.2e}");
+        println!("  cpu[0..4] = {:?}", &want[..4.min(n)]);
+        println!("  gpu[0..4] = {:?}", &got[..4.min(n)]);
+        println!("gate-iq1s-kernel: native IQ1_S matvec {} the CPU reference {}",
+            if ok { "MATCHES" } else { "DIVERGES from" }, if ok { "✓" } else { "" });
+        if !ok {
+            println!("  => the format reading is already proven by dot_iq1_s matching the \
+dequantizer, so a divergence here is the kernel's arithmetic or its indexing, not the layout");
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-bytes") {
         // ISOLATES byte_at. Five rounds of inference from dequantizer output have not settled whether
         // it advances past the first u32, because the dequantizers do too much for their output to name
