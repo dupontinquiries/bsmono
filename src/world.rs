@@ -42,7 +42,10 @@ pub const M_RIM_0: usize = 17; // far-field capsule
 /// floor you drive on (the analytic fbm is only sampled once, node-wise).
 pub const TG_N: usize = 221; // 220 cells, matching meshgen::terrain(_, 220, _)
 /// cell size of the gravity index
-const GCELL: f32 = 18.0;
+// 18 m cells left 44 nodes in the worst bucket; 12 m halves that. Going
+// further changed nothing measurable, because the cost of gravity_dir was
+// never the bucket walk — it was the SDF gradient it takes near a surface.
+const GCELL: f32 = 12.0;
 
 pub const TG_HALF: f32 = 1300.0;
 
@@ -298,6 +301,11 @@ pub struct Pad {
 
 pub struct World {
     pub grav: Vec<GravNode>,
+    /// last (point, normal) pair — see `normal`
+    nrm_cache: std::cell::Cell<(Vec3, Vec3)>,
+    /// how many SDF evaluations have been asked for — a stable measure of
+    /// physics cost that timing in a debug build cannot give
+    sdf_calls: std::cell::Cell<u64>,
     /// XZ spatial hash over gravity nodes. Finding the nearest two used to
     /// scan every node — 705 of them on PERPLEXUS, for every car and the
     /// ball, every frame, at five microseconds a call. That was the single
@@ -3689,7 +3697,7 @@ impl World {
             route_names.push(String::new());
             route_shapes.push(Vec::new());
         }
-        let mut w = World { grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
+        let mut w = World { nrm_cache: std::cell::Cell::new((Vec3::ZERO, Vec3::ZERO)), sdf_calls: std::cell::Cell::new(0), grav, ggrid, gdim, gdyn, mgrid: Vec::new(), sgrid, dyn_shapes, scell, sdim, routes, route_names, route_shapes, floodable, floods: Vec::new(), flood_cd: 34.0, flood_news: None, tiles, hitters, flows, chess, portals, bodies, spawn_hint, bh: None, blast: None, sky_news: None, bh_cd: 300.0, drop_cd: 300.0, kuiper: style.focal == 17, drop_pit, pit_cd: 0.0, anims, zones, launchers, time: 0.0, tgrid, shapes, rings, nets, pads, decor_cars, seed, t_amp: amp, t_freq: freq };
         // prime the mover index so the very first frame is already fast
         w.rebuild_movers();
         w
@@ -4092,7 +4100,13 @@ impl World {
         &self.mgrid[(cz * self.gdim + cx) as usize]
     }
 
+    /// Total SDF evaluations so far.
+    pub fn sdf_calls(&self) -> u64 {
+        self.sdf_calls.get()
+    }
+
     pub fn sdf(&self, p: Vec3) -> f32 {
+        self.sdf_calls.set(self.sdf_calls.get() + 1);
         let mut d = p.y - grid_h(&self.tgrid, p.x, p.z);
         let mut dcut = f32::MAX; // CSG: solid = max(union, -nearest cutter)
         let mut db = f32::MAX; // blend group accumulates through smin
@@ -4425,7 +4439,26 @@ impl World {
         }
     }
 
+    /// The SDF gradient at p — four SDF evaluations, and the single most
+    /// expensive thing the physics asks for.
+    ///
+    /// A ONE-ENTRY CACHE, because the same point is asked for twice every
+    /// frame: the ground solve wants the surface normal at the car, and
+    /// `gravity_dir` then wants it again at that same position to decide
+    /// which way "down" is near a surface. Two calls, eight SDF evaluations,
+    /// one answer. Remembering the last point collapses that to four and
+    /// costs a comparison.
     pub fn normal(&self, p: Vec3) -> Vec3 {
+        let (cp, cn) = self.nrm_cache.get();
+        if (cp - p).length_squared() < 1e-6 && cn != Vec3::ZERO {
+            return cn;
+        }
+        let n = self.normal_uncached(p);
+        self.nrm_cache.set((p, n));
+        n
+    }
+
+    fn normal_uncached(&self, p: Vec3) -> Vec3 {
         let e = 0.07;
         let k0 = Vec3::new(1.0, -1.0, -1.0);
         let k1 = Vec3::new(-1.0, -1.0, 1.0);
@@ -4480,6 +4513,18 @@ impl World {
             }
         }
         (dir, g)
+    }
+
+    /// How crowded the gravity index is: (cells used, mean per used cell,
+    /// worst cell). A query walks ONE cell, so the worst cell is the worst
+    /// case of the whole function.
+    pub fn grav_cell_stats(&self) -> (usize, f32, usize) {
+        let used: Vec<usize> = self.ggrid.iter().map(|c| c.len()).filter(|n| *n > 0).collect();
+        if used.is_empty() {
+            return (0, 0.0, 0);
+        }
+        let total: usize = used.iter().sum();
+        (used.len(), total as f32 / used.len() as f32, *used.iter().max().unwrap())
     }
 
     pub fn gravity_dir(&self, p: Vec3) -> Vec3 {

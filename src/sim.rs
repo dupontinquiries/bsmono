@@ -3529,6 +3529,21 @@ pub fn run(args: &[String]) {
         }
         println!("   in that same second: {presented} presented, {dropped} abandoned");
         check("abandoned frames are counted, not hidden", dropped > 0);
+        // THE COUNTER MUST ACTUALLY COUNT. The last version made FPS mean
+        // "frames that reached the screen" and then shipped without the line
+        // that advances the counter, so it read 0 forever. Check the source
+        // rather than the arithmetic: the increment has to exist next to the
+        // present call, because no amount of correct averaging saves a
+        // counter that never moves.
+        {
+            let src = include_str!("render.rs");
+            let has_present = src.contains("frame.present();");
+            let has_inc = src.contains("self.presented = self.presented.wrapping_add(1)")
+                || src.contains("self.presented += 1");
+            println!();
+            println!("   render.rs presents: {has_present}, and counts it: {has_inc}");
+            check("the present counter is actually incremented", has_present && has_inc);
+        }
         println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
         return;
     }
@@ -3574,6 +3589,21 @@ pub fn run(args: &[String]) {
         }
         println!("   in that same second: {presented} presented, {dropped} abandoned");
         check("abandoned frames are counted, not hidden", dropped > 0);
+        // THE COUNTER MUST ACTUALLY COUNT. The last version made FPS mean
+        // "frames that reached the screen" and then shipped without the line
+        // that advances the counter, so it read 0 forever. Check the source
+        // rather than the arithmetic: the increment has to exist next to the
+        // present call, because no amount of correct averaging saves a
+        // counter that never moves.
+        {
+            let src = include_str!("render.rs");
+            let has_present = src.contains("frame.present();");
+            let has_inc = src.contains("self.presented = self.presented.wrapping_add(1)")
+                || src.contains("self.presented += 1");
+            println!();
+            println!("   render.rs presents: {has_present}, and counts it: {has_inc}");
+            check("the present counter is actually incremented", has_present && has_inc);
+        }
         println!("{}", if pass { "FPS: PASS" } else { "FPS: FAIL" });
         return;
     }
@@ -4819,6 +4849,36 @@ pub fn run(args: &[String]) {
             }
             let plat_ns = t.elapsed().as_nanos() as f32 / n as f32;
             println!("PERPLEXUS per call: sdf {sdf_ns:.0} ns, gravity_dir {grav_ns:.0} ns, platform_vel {plat_ns:.0} ns");
+        {
+            // SDF EVALUATIONS PER STEP. Timing a debug build is noise; this
+            // is exact. The normal is four evaluations and the same point is
+            // asked for twice a frame (the ground solve, then gravity_dir),
+            // so the cache should show up here as a clean reduction.
+            let mut w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let mut ball = Ball::new();
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 0.5, 0.0);
+            car.sync_rot();
+            let cfg = Config::default();
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            let before = w.sdf_calls();
+            let steps = 600;
+            for _ in 0..steps {
+                let mut ev = StepEvents::default();
+                physics::step(&mut car, &mut ball, &mut w, &c, &cfg, DT, &mut ev);
+            }
+            let per = (w.sdf_calls() - before) as f32 / steps as f32;
+            println!("   {per:.1} SDF evaluations per physics step (car + ball)");
+        }
+        {
+            // gravity_dir walks ONE cell, so the worst cell is the worst case
+            // of the whole function — and a mean far below the worst means
+            // the cells are the wrong size rather than the map being busy.
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let (used, mean, worst) = w.grav_cell_stats();
+            println!("   gravity index: {used} cells used, {mean:.1} nodes each, worst {worst}");
+        }
             println!("   (every car and the ball hit all three every frame)");
         }
         return;

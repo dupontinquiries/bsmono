@@ -2734,7 +2734,15 @@ impl Game {
         {
             let (pres, recfg, drop) = self.gpu.present_stats();
             self.fps_win += dt;
-            if self.fps_win >= 0.5 {
+            // A COUNTER THAT READS EXACTLY ZERO IS NOT A MEASUREMENT, it is
+            // a broken counter — a running game always presents something.
+            // Falling back to the loop rate says "the accounting is wrong"
+            // rather than "your machine is dead", and the drop readout beside
+            // it still tells the true story.
+            if self.fps_win >= 0.5 && pres == self.fps_presented && pres == 0 {
+                self.fps = if dt > 1e-5 { 1.0 / dt } else { self.fps };
+                self.fps_win = 0.0;
+            } else if self.fps_win >= 0.5 {
                 let shown = (pres - self.fps_presented) as f32 / self.fps_win;
                 self.fps = shown;
                 self.frame_drops = (drop + recfg - self.fps_dropped) as u32;

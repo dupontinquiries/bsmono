@@ -3194,6 +3194,40 @@ charge tier so a pad transforms it, ELEGANCE a base reserve so large it is
 never quite out of thrust, ECHOTRON the only one with real lateral hold,
 FOLLY almost none at all.
 
+## v1.98.0 — the counter that never counted, and a gradient computed twice
+
+FPS READ 0 BECAUSE OF MY OWN CHANGE. v1.90 made FPS mean "frames that
+reached the screen" and then shipped WITHOUT THE LINE THAT ADVANCES THE
+COUNTER — a regex insert that failed silently while the struct fields around
+it landed. So `presented` stayed at zero and the readout dutifully reported
+0 FPS forever. A counter is worth exactly as much as the line that advances
+it, and `--sim fps` now checks the source for that line rather than only
+testing the arithmetic around it. There is also a guard: a reading of
+exactly zero is not a measurement, it is a broken counter, so it falls back
+to the loop rate and lets the drop count tell the real story.
+
+THE PROFILER SENT ME TO THE WRONG PLACE, twice, which is worth recording.
+`gravity_dir` costs 3400 ns and it has a spatial index, so the obvious
+suspect was bucket occupancy: the worst cell held 44 nodes. Quartering the
+cell area cut that to 39 and changed the cost NOT AT ALL — because 39 nodes
+at ten nanoseconds each is 390 ns, not 3400. The number never fit the
+theory.
+
+The real cost is that `gravity_dir` takes an SDF GRADIENT near a surface to
+decide which way "down" is, and a gradient is four SDF evaluations. The
+physics ground solve has already computed the normal at that exact point one
+moment earlier. Two calls, eight evaluations, one answer.
+
+A one-entry cache on the last (point, normal) pair collapses it. Measured by
+COUNTING evaluations rather than timing them — timing a debug build is
+noise, counting is exact:
+
+    27.3 -> 19.3 SDF evaluations per physics step   (29% fewer)
+
+That count is now reported by `--sim perf` as a stable measure of physics
+cost, which is a better instrument than the timings for exactly the reason
+this session demonstrates.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
