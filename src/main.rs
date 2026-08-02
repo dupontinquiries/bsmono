@@ -856,10 +856,12 @@ fn main() {
     let hauler = procars::hauler(&mut gpu);
     let pulse = procars::pulse(&mut gpu);
     let tram = procars::tram(&mut gpu);
+    let vipera = procars::vipera(&mut gpu);
+    let aegis = procars::aegis(&mut gpu);
     let mut cars = CarModels {
-        models: vec![octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark, volt, axion, hauler, pulse, tram],
-        names: vec!["Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark", "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV"],
-        active: sv.car.min(13),
+        models: vec![octane, fennec, dominus, breadbox, wedge, roller, longboy, cube, shark, volt, axion, hauler, pulse, tram, vipera, aegis],
+        names: vec!["Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark", "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV", "Vipera", "Aegis"],
+        active: sv.car.min(15),
     };
     gpu.set_car_sdfs(&bake_car_sdfs(&mut cars.models));
     let cars = cars;

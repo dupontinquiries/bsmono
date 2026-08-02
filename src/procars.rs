@@ -282,6 +282,251 @@ pub fn tram(gpu: &mut Gpu) -> Model {
     Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, half_w: 0.32, wheel_r: 0.125 }
 }
 
+// ===================== CONCEPT CARS =====================================
+// Two vehicles built from a written specification rather than by eye, and
+// built in the order that specification insists on: WHEEL HARDPOINTS FIRST,
+// then the chassis between them, then the body volumes around it. That
+// ordering is the whole point — it is what stops a car ending up beautiful
+// with its wheels somewhere impossible.
+//
+// The two use opposite design grammars, and the code is meant to show it:
+//
+//   VIPERA  continuous aerodynamic shell, soft edges, teardrop silhouette.
+//           Built from high-segment lofts so the surface curves.
+//   AEGIS   low wedge of interlocking armour plates, sharp edges, arrowhead
+//           silhouette. Built from SEVEN-segment lofts, so the same
+//           generator produces flat facets instead of curves.
+
+/// A hardpoint: where a wheel goes, decided before any bodywork exists.
+struct Hardpoint {
+    at: Vec3,
+    r: f32,
+    front: bool,
+}
+
+fn hardpoints(wheelbase: f32, track: f32, r: f32, ride: f32) -> Vec<Hardpoint> {
+    let mut v = Vec::new();
+    for (z, front) in [(-wheelbase * 0.5, true), (wheelbase * 0.5, false)] {
+        for sx in [-1.0f32, 1.0] {
+            v.push(Hardpoint { at: Vec3::new(sx * track * 0.5, ride, z), r, front });
+        }
+    }
+    v
+}
+
+fn mount_wheels(gpu: &mut Gpu, prims: &mut Vec<Prim>, hp: &[Hardpoint], rim: [f32; 4], spokes: u32) {
+    for h in hp {
+        let tyre = part(meshgen::wheel(0.58, 22), Vec3::splat(h.r), Quat::IDENTITY, h.at);
+        prims.push(Prim {
+            mesh_id: gpu.add_mesh(&tyre),
+            tex_id: None,
+            color: [0.06, 0.06, 0.07, 1.0],
+            tag: if h.front { Tag::WheelFront } else { Tag::WheelBack },
+            pivot: h.at,
+        });
+        // deep-dish rim: a disc plus radial spokes, so it reads as machined
+        let dish = part(meshgen::sphere(8, 14), Vec3::new(h.r * 0.26, h.r * 0.56, h.r * 0.56), Quat::IDENTITY, h.at);
+        prims.push(Prim { mesh_id: gpu.add_mesh(&dish), tex_id: None, color: rim, tag: if h.front { Tag::WheelFront } else { Tag::WheelBack }, pivot: h.at });
+        for k in 0..spokes {
+            let a = k as f32 / spokes as f32 * std::f32::consts::TAU;
+            let m = part(
+                meshgen::cbox(0.30),
+                Vec3::new(h.r * 0.10, h.r * 0.40, h.r * 0.055),
+                Quat::from_rotation_x(a),
+                h.at + Vec3::new(h.at.x.signum() * h.r * 0.10, 0.0, 0.0),
+            );
+            prims.push(Prim { mesh_id: gpu.add_mesh(&m), tex_id: None, color: rim, tag: if h.front { Tag::WheelFront } else { Tag::WheelBack }, pivot: h.at });
+        }
+    }
+}
+
+/// VIPERA — the green streamlined cyber-supercar.
+///
+/// One continuous shell: the cockpit is a dark canopy sunk INTO the body
+/// rather than a cabin sitting on top of it, the front fenders flare out of
+/// a narrow nose, and the rear haunches carry visibly more volume than the
+/// front. Proportions from the spec (4.6 : 2.15 : 1.0), scaled to the
+/// game's car space.
+pub fn vipera(gpu: &mut Gpu) -> Model {
+    let mut prims = Vec::new();
+    let paint = [0.06, 0.34, 0.16, 1.0];
+    let trim = [0.78, 0.80, 0.76, 1.0];
+    let (half_len, half_w, wheel_r) = (0.77f32, 0.36f32, 0.130f32);
+
+    // 1-4: hardpoints and wheels first, then everything else answers to them
+    let hp = hardpoints(1.05, 0.60, wheel_r, -0.055);
+
+    // 5: chassis slab between the hardpoints (battery floor, mostly hidden)
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::cbox(0.16), Vec3::new(0.26, 0.045, 0.58), Quat::IDENTITY, Vec3::new(0.0, -0.045, 0.0)),
+        [0.07, 0.08, 0.09, 1.0],
+    ));
+
+    // 7: the primary silhouette — a teardrop that starts narrow and low at
+    // the nose, swells through the front fenders, and carries its mass into
+    // the rear haunches
+    let shell = [
+        (-half_len, 0.13, -0.035, 0.010, 0.95),
+        (-0.56, 0.24, -0.055, 0.045, 0.85),
+        (-0.30, 0.34, -0.065, 0.085, 0.70),
+        (0.02, 0.36, -0.065, 0.105, 0.65),
+        (0.34, 0.35, -0.060, 0.095, 0.70),
+        (0.60, 0.30, -0.050, 0.060, 0.80),
+        (half_len, 0.22, -0.035, 0.020, 0.95),
+    ];
+    prims.push(body_prim(gpu, part(meshgen::loft(&shell, 26), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), paint));
+
+    // 8: the canopy, sunk into the shell — a single dark volume, steeply
+    // raked at the windscreen, blending imperceptibly into the rear deck
+    let canopy = [
+        (-0.34, 0.14, 0.055, 0.075, 0.95),
+        (-0.16, 0.23, 0.050, 0.150, 0.90),
+        (0.10, 0.24, 0.045, 0.160, 0.90),
+        (0.36, 0.17, 0.040, 0.110, 0.95),
+    ];
+    prims.push(body_prim(gpu, part(meshgen::loft(&canopy, 22), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), [0.05, 0.07, 0.08, 1.0]));
+
+    // 9: fenders — bulbous volumes that WRAP the wheels and flare wider than
+    // the nose. Front soft and round, rear heavier and squarer.
+    for h in hp.iter() {
+        let (w, hgt, len, round) = if h.front { (0.10, 0.115, 0.20, 0.80) } else { (0.115, 0.135, 0.23, 0.65) };
+        let arch = [
+            (h.at.z - len, w * 0.7, -0.05, hgt * 0.55, round),
+            (h.at.z, w, -0.06, hgt, round),
+            (h.at.z + len, w * 0.7, -0.05, hgt * 0.55, round),
+        ];
+        let m = part(meshgen::loft(&arch, 18), Vec3::ONE, Quat::IDENTITY, Vec3::new(h.at.x * 1.02, 0.0, 0.0));
+        prims.push(body_prim(gpu, m, paint));
+    }
+
+    // 12: the kidney side cavity, bordered by a bright structural trim that
+    // is real extruded geometry rather than paint
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::loft(&[(-0.20, 0.030, -0.030, 0.055, 0.9), (0.02, 0.045, -0.045, 0.075, 0.9), (0.24, 0.030, -0.030, 0.050, 0.9)], 16), Vec3::ONE, Quat::IDENTITY, Vec3::new(sx * 0.345, 0.0, 0.0)),
+            [0.03, 0.03, 0.04, 1.0],
+        ));
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::cbox(0.32), Vec3::new(0.010, 0.012, 0.24), Quat::from_rotation_x(0.06), Vec3::new(sx * 0.352, -0.052, 0.02)),
+            trim,
+        ));
+    }
+
+    // 14: lights as recessed geometry — the amber blade across the nose
+    for k in 0..5 {
+        let x = -0.16 + k as f32 * 0.08;
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.35), Vec3::new(0.030, 0.008, 0.012), Quat::IDENTITY, Vec3::new(x, -0.010, -half_len + 0.03)), [1.0, 0.80, 0.15, 1.0]));
+    }
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.35), Vec3::new(0.30, 0.010, 0.015), Quat::IDENTITY, Vec3::new(0.0, 0.030, half_len - 0.02)), [1.0, 0.22, 0.16, 1.0]));
+
+    // 16: a thin blade spoiler off the rear shoulders, and the boost aperture
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.28), Vec3::new(0.33, 0.010, 0.055), Quat::from_rotation_x(0.14), Vec3::new(0.0, 0.135, 0.66)), [0.10, 0.11, 0.12, 1.0]));
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.25), Vec3::new(0.012, 0.038, 0.028), Quat::IDENTITY, Vec3::new(sx * 0.26, 0.100, 0.655)), [0.10, 0.11, 0.12, 1.0]));
+    }
+    prims.push(body_prim(gpu, part(meshgen::sphere(10, 14), Vec3::new(0.055, 0.045, 0.030), Quat::IDENTITY, Vec3::new(0.0, 0.005, half_len - 0.01)), [0.10, 0.09, 0.08, 1.0]));
+
+    // 15: underbody — a dark floor with a diffuser, so it reads from below
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.14), Vec3::new(0.28, 0.012, 0.20), Quat::from_rotation_x(-0.12), Vec3::new(0.0, -0.075, 0.50)), [0.05, 0.05, 0.06, 1.0]));
+
+    mount_wheels(gpu, &mut prims, &hp, [0.16, 0.17, 0.19, 1.0], 6);
+    Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.175, half_w, wheel_r }
+}
+
+/// AEGIS — the silver armoured wedge.
+///
+/// The same loft generator, but at SEVEN segments a section stops being a
+/// curve and becomes a set of flat facets — so the identical machinery
+/// yields planar armour instead of aerodynamic skin. A central ridge runs
+/// from the front tip to the windscreen and is the car's visual axis; the
+/// flanks are three layered plates at different angles; the headlights are
+/// triangular recesses in an inverted V.
+pub fn aegis(gpu: &mut Gpu) -> Model {
+    let mut prims = Vec::new();
+    let steel = [0.42, 0.44, 0.47, 1.0];
+    let dark = [0.16, 0.17, 0.19, 1.0];
+    let glow = [0.95, 0.97, 1.0, 1.0];
+    let copper = [0.85, 0.45, 0.18, 1.0];
+    let (half_len, half_w, wheel_r) = (0.80f32, 0.37f32, 0.137f32);
+
+    let hp = hardpoints(1.08, 0.62, wheel_r, -0.045);
+
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::cbox(0.10), Vec3::new(0.26, 0.040, 0.60), Quat::IDENTITY, Vec3::new(0.0, -0.040, 0.0)),
+        [0.09, 0.09, 0.10, 1.0],
+    ));
+
+    // the wedge: a sharp point at the nose, a raised centre ridge, and a
+    // body that is wider at the bottom than the top
+    let wedge = [
+        (-half_len, 0.07, -0.020, 0.005, 0.05),
+        (-0.58, 0.20, -0.040, 0.030, 0.05),
+        (-0.28, 0.33, -0.050, 0.070, 0.05),
+        (0.06, 0.36, -0.055, 0.085, 0.05),
+        (0.40, 0.35, -0.050, 0.075, 0.05),
+        (0.66, 0.28, -0.040, 0.045, 0.05),
+        (half_len, 0.16, -0.025, 0.015, 0.05),
+    ];
+    prims.push(body_prim(gpu, part(meshgen::loft(&wedge, 7), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), steel));
+
+    // the centre ridge — the primary visual axis, nose tip to windscreen
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::loft(&[(-half_len + 0.02, 0.020, 0.000, 0.012, 0.05), (-0.30, 0.055, 0.040, 0.085, 0.05), (-0.02, 0.045, 0.070, 0.100, 0.05)], 5), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
+        steel,
+    ));
+
+    // cockpit: a flattened black trapezoidal prism, not a bubble
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::loft(&[(-0.20, 0.16, 0.060, 0.090, 0.10), (0.04, 0.22, 0.055, 0.130, 0.10), (0.34, 0.16, 0.050, 0.100, 0.10)], 7), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
+        [0.04, 0.05, 0.06, 1.0],
+    ));
+
+    // triangular headlight recesses, meeting in an inverted V
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(gpu, part(meshgen::loft(&[(-half_len + 0.04, 0.075, -0.010, 0.030, 0.05), (-half_len + 0.16, 0.030, 0.000, 0.018, 0.05)], 4), Vec3::ONE, Quat::from_rotation_y(sx * 0.22), Vec3::new(sx * 0.16, 0.0, 0.0)), dark));
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.075, 0.008, 0.010), Quat::from_rotation_y(sx * 0.30) * Quat::from_rotation_z(sx * 0.22), Vec3::new(sx * 0.17, 0.012, -half_len + 0.075)), glow));
+    }
+
+    // three layered side plates, each at its own angle
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.06), Vec3::new(0.014, 0.030, 0.30), Quat::from_rotation_z(sx * 0.20), Vec3::new(sx * 0.335, 0.055, 0.05)), steel));
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.06), Vec3::new(0.016, 0.045, 0.34), Quat::from_rotation_z(-sx * 0.14), Vec3::new(sx * 0.352, 0.000, 0.02)), [0.34, 0.36, 0.39, 1.0]));
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.06), Vec3::new(0.012, 0.020, 0.32), Quat::from_rotation_z(sx * 0.30), Vec3::new(sx * 0.340, -0.055, 0.02)), [0.10, 0.10, 0.11, 1.0]));
+    }
+
+    // angular fenders: armour plates around a wheel, not a curved arch
+    for h in hp.iter() {
+        let (w, hgt, len) = if h.front { (0.095, 0.105, 0.19) } else { (0.125, 0.140, 0.24) };
+        let arch = [
+            (h.at.z - len, w * 0.6, -0.045, hgt * 0.5, 0.05),
+            (h.at.z - len * 0.3, w, -0.055, hgt, 0.05),
+            (h.at.z + len * 0.3, w, -0.055, hgt, 0.05),
+            (h.at.z + len, w * 0.6, -0.045, hgt * 0.5, 0.05),
+        ];
+        prims.push(body_prim(gpu, part(meshgen::loft(&arch, 6), Vec3::ONE, Quat::IDENTITY, Vec3::new(h.at.x * 1.03, 0.0, 0.0)), if h.front { steel } else { [0.36, 0.38, 0.41, 1.0] }));
+    }
+
+    // rear quarter structures: big triangular volumes emerging from the body
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(gpu, part(meshgen::loft(&[(0.34, 0.10, -0.020, 0.090, 0.05), (0.62, 0.055, -0.010, 0.045, 0.05)], 5), Vec3::ONE, Quat::from_rotation_y(sx * 0.18), Vec3::new(sx * 0.28, 0.0, 0.0)), steel));
+    }
+    // central diffuser and twin fins
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.08), Vec3::new(0.20, 0.030, 0.055), Quat::from_rotation_x(-0.18), Vec3::new(0.0, -0.035, 0.66)), [0.08, 0.08, 0.09, 1.0]));
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.12), Vec3::new(0.010, 0.045, 0.075), Quat::from_rotation_z(sx * 0.12), Vec3::new(sx * 0.13, 0.055, 0.62)), dark));
+    }
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.24, 0.010, 0.014), Quat::IDENTITY, Vec3::new(0.0, 0.035, half_len - 0.02)), copper));
+
+    mount_wheels(gpu, &mut prims, &hp, copper, 6);
+    Model { prims, drive: Drive::Combustion, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.155, half_w, wheel_r }
+}
+
 pub fn breadbox(gpu: &mut Gpu) -> Model {
     let mut prims = Vec::new();
     // tall van body + darker cab face + mint roof rail

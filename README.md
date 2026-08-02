@@ -443,3 +443,5 @@ ACADEMY: ten lessons that the game verifies with the same detectors that name yo
 Twelve cars now, including three EVs that pull harder off the line and top out lower. `--sim cars` measures the drivetrain difference.
 
 `--sim hits` sweeps contact points and checks the ball's exit direction is continuous.
+
+VIPERA and AEGIS are built from a written specification, hardpoints first — see `procars.rs`.

@@ -2512,6 +2512,46 @@ across the range).
 Flicks, shots, dribbling and the spin harness all read unchanged, because
 the term only ever mattered where it was ill-defined.
 
+## v1.78.0 — VIPERA and AEGIS, built from a specification
+
+Two concept cars, built from a written spec rather than by eye — and built
+in the order that spec insists on: WHEEL HARDPOINTS FIRST, then the chassis
+between them, then body volumes around it. That ordering is the point. It
+is what stops a car ending up beautiful with its wheels somewhere
+impossible, and it made the rest of the construction fall out naturally:
+every fender is placed from its hardpoint, not guessed at.
+
+VIPERA — the green streamlined car. One continuous shell: a teardrop that
+starts narrow and low at the nose, swells through the front fenders and
+carries visibly more mass into the rear haunches. The cockpit is a dark
+canopy sunk INTO the shell rather than a cabin sitting on top of it, steeply
+raked at the windscreen and blending into the rear deck. The kidney side
+cavity is a real recess with an extruded metallic trim rather than paint,
+the amber light blade across the nose is five recessed segments, and there
+is a blade spoiler on struts, a boost aperture and a diffusered floor so it
+reads from underneath during aerials. Electric drivetrain.
+
+AEGIS — the silver armoured wedge. The interesting part is that it uses the
+SAME loft generator: at seven segments a cross-section stops being a curve
+and becomes flat facets, so identical machinery produces armour plate
+instead of aerodynamic skin. A centre ridge runs from the front tip to the
+windscreen as the car's visual axis; the flanks are three layered plates at
+different angles; the headlights are triangular recesses meeting in an
+inverted V; the rear quarters are big triangular structures with a central
+diffuser between them. Copper turbine wheels against flat grey armour, which
+is the contrast the spec asks for. Combustion drivetrain, so the two also
+drive differently.
+
+`--sim cars` measures the grammars rather than trusting them: the typical
+surface turn per step is 7 degrees on VIPERA's shell against 78 on AEGIS's
+plates. (The first version of that check read the WORST turn and failed —
+at the sharp ends of a very flat section, three times wider than tall, the
+normal swings fast even on a smooth surface. The typical turn is what
+describes a surface; the worst describes its flattest slice.)
+
+Fourteen cars now. Wheels on both are built from the shared tyre-and-rim
+mesh with six radial spokes and a deep dish.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

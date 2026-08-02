@@ -3425,6 +3425,54 @@ pub fn run(args: &[String]) {
         let tyre = ext(&new_wheel, 0) / ext(&new_wheel, 1).max(0.01);
         println!("   width/height: sphere {round:.2} (a ball), wheel {tyre:.2} (a tyre)");
         check("the wheel is disc-shaped, not spherical", tyre < 0.5 && round > 0.9);
+
+        // ---- the two concept cars: are their grammars actually different?
+        // VIPERA is a continuous shell (high-segment lofts, curved sections);
+        // AEGIS is armour plate (seven-segment lofts, flat facets). The same
+        // generator makes both, so the difference has to show in the mesh.
+        let vip_shell = crate::meshgen::loft(
+            &[
+                (-0.77, 0.13, -0.035, 0.010, 0.95),
+                (-0.30, 0.34, -0.065, 0.085, 0.70),
+                (0.02, 0.36, -0.065, 0.105, 0.65),
+                (0.60, 0.30, -0.050, 0.060, 0.80),
+                (0.77, 0.22, -0.035, 0.020, 0.95),
+            ],
+            26,
+        );
+        let aeg_wedge = crate::meshgen::loft(
+            &[
+                (-0.80, 0.07, -0.020, 0.005, 0.05),
+                (-0.28, 0.33, -0.050, 0.070, 0.05),
+                (0.06, 0.36, -0.055, 0.085, 0.05),
+                (0.66, 0.28, -0.040, 0.045, 0.05),
+                (0.80, 0.16, -0.025, 0.015, 0.05),
+            ],
+            7,
+        );
+        // "faceted" means neighbouring ring vertices turn in big steps
+        // The TYPICAL turn, not the worst: at the sharp ends of a very flat
+        // cross-section (the nose is three times wider than it is tall) the
+        // normal genuinely swings fast even on a smooth shell, so a
+        // worst-case reading says nothing about the surface as a whole.
+        let facet_angle = |m: &crate::meshgen::MeshData, ring: usize, section: usize| -> f32 {
+            let base = section * (ring + 1);
+            let mut steps: Vec<f32> = Vec::new();
+            for i in 1..ring {
+                let a = Vec3::from_array(m.verts[base + i].nrm);
+                let b = Vec3::from_array(m.verts[base + i - 1].nrm);
+                steps.push(a.angle_between(b).to_degrees());
+            }
+            steps.sort_by(f32::total_cmp);
+            steps[steps.len() / 2]
+        };
+        let smooth = facet_angle(&vip_shell, 26, 2); // the widest section
+        let faceted = facet_angle(&aeg_wedge, 7, 2);
+        println!();
+        println!("concept grammars: vipera turns {smooth:.0} deg per step (a shell), aegis {faceted:.0} deg (plates)");
+        check("the shell is smooth", smooth < 30.0);
+        check("the wedge is faceted", faceted > 40.0);
+        check("both come from the same generator", vip_shell.idx.len() > 0 && aeg_wedge.idx.len() > 0);
         println!("{}", if pass { "CARS: PASS" } else { "CARS: FAIL" });
         return;
     }
