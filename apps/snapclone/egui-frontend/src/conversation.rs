@@ -1,198 +1,179 @@
-//! conversation — the conversation detail view and the landmark dialog.
+//! conversation — the detail view and the diagnostics dialog.
 //!
-//! `ConversationDetailDialog` is where a conversation actually happens: the snap
-//! timeline, voice, and adding people. Its signals name the surface —
-//! `snapTapped`, `sendVoicePayload`, `addPeopleRequested`, `sendSnapRequested`
-//! — and `CallParticipant` says a conversation can carry a live call.
+//! `ConversationDetailDialog` is where a conversation actually happens: snaps to
+//! tap open, voice payloads, a call roster of `CallParticipant`, and an "add
+//! people" path. `DiagnosticsDialog` runs network checks and reports them as
+//! they complete.
 //!
-//! ## The viewed-snap rule
+//! ## Snaps are tapped once
 //!
-//! A snap has a timer, and tapping it starts that timer. The rule that matters:
-//! **a snap is consumed once**. Tapping an already-viewed snap must not restart
-//! it, or the whole premise fails — and the check has to be on the snap's own
-//! state rather than on the view's, because a conversation reopened from a
-//! notification builds a fresh view over the same snaps.
+//! `snapTapped(snapId)` opens a snap, and an opened snap with a timer is gone.
+//! So a tap must be **idempotent within the view**: a double-tap, or a re-render
+//! that replays the click, must not consume the snap twice — the second consume
+//! is against a snap that no longer exists, and the user sees a photo vanish
+//! they never saw.
 //!
-//! ## Voice
+//! ## Diagnostics report as they finish
 //!
-//! `sendVoicePayload(recipient, payload)`. Held to record, released to send,
-//! and a release below the floor sends nothing: an accidental brush of the
-//! button that ships 80ms of silence to someone is worse than a missed message,
-//! because they have to open it to find out it was nothing.
+//! `onCheckCompleted` fires per check, `onDiagnosisReady` when all are in. A
+//! diagnostics dialog that shows nothing until everything completes is useless
+//! precisely when it matters — the run is slow *because* something is wrong.
 
-/// One entry in the timeline.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Entry {
-    pub id: String,
-    pub from: String,
-    pub at: i64,
-    pub kind: EntryKind,
-    /// Set once the recipient has opened it.
-    pub viewed: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum EntryKind {
-    Snap { duration_s: u32 },
-    Voice { seconds: f32 },
-    Text { body: String },
-    /// Someone joined or left, shown inline so the conversation explains itself.
-    System { note: String },
-}
-
-impl Entry {
-    /// Can this be opened? A system note is not tappable, and a snap already
-    /// viewed is spent.
-    pub fn is_openable(&self) -> bool {
-        matches!(self.kind, EntryKind::Snap { .. } | EntryKind::Voice { .. }) && !self.viewed
-    }
-
-    /// Does this entry disappear after viewing? Text and system notes stay;
-    /// a snap with a zero timer stays too — zero means unlimited, the same rule
-    /// the composer encodes.
-    pub fn ephemeral(&self) -> bool {
-        matches!(self.kind, EntryKind::Snap { duration_s } if duration_s > 0)
-    }
-}
-
-/// Someone on a live call in this conversation.
-#[derive(Debug, Clone, PartialEq)]
+/// Someone in the call.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CallParticipant {
     pub id: String,
     pub name: String,
-    pub speaking: bool,
 }
 
-/// Minimum voice message length. Below this a release sends nothing — an
-/// accidental brush that ships 80ms of silence is worse than a missed message,
-/// because the recipient has to open it to find out it was nothing.
-pub const MIN_VOICE_SECONDS: f32 = 0.4;
+/// A message in the thread.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Item {
+    Text { id: String, from: String, body: String, at: i64 },
+    /// Tapping opens it; an opened snap with a timer does not come back.
+    Snap { id: String, from: String, at: i64, opened: bool },
+    Voice { id: String, from: String, at: i64, secs: u32 },
+}
 
+impl Item {
+    pub fn id(&self) -> &str {
+        match self { Item::Text { id, .. } | Item::Snap { id, .. } | Item::Voice { id, .. } => id }
+    }
+    pub fn at(&self) -> i64 {
+        match self { Item::Text { at, .. } | Item::Snap { at, .. } | Item::Voice { at, .. } => *at }
+    }
+}
+
+/// The conversation.
 #[derive(Debug, Clone, Default)]
 pub struct Conversation {
-    pub peer: String,
-    pub entries: Vec<Entry>,
+    pub items: Vec<Item>,
     pub call: Vec<CallParticipant>,
-    voice_held: Option<f32>,
-}
-
-/// What the view asks the owner to do.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ConversationAction {
-    OpenSnap(String),
-    SendVoice { recipient: String, seconds: f32 },
-    AddPeople,
-    SendSnap,
+    pub draft: String,
+    /// Snaps already consumed this session, so a second tap cannot consume
+    /// again. Held here rather than trusted from the item list, because the
+    /// list is rebuilt from the network and can arrive stale.
+    consumed: Vec<String>,
 }
 
 impl Conversation {
-    /// Timeline, oldest first, with ties on id so it cannot shuffle.
-    pub fn timeline(&self) -> Vec<&Entry> {
-        let mut v: Vec<&Entry> = self.entries.iter().collect();
-        v.sort_by(|a, b| a.at.cmp(&b.at).then(a.id.cmp(&b.id)));
+    /// Oldest first, ties broken on id so the thread cannot reorder between
+    /// frames — a message that jumps under the thumb is one you mis-tap, and
+    /// mis-tapping here opens a snap.
+    pub fn ordered(&self) -> Vec<&Item> {
+        let mut v: Vec<&Item> = self.items.iter().collect();
+        v.sort_by(|a, b| a.at().cmp(&b.at()).then(a.id().cmp(b.id())));
         v
     }
 
-    /// Unopened entries addressed to us. Drives the badge, and counts entries
-    /// rather than conversations because "3 unread" meaning three conversations
-    /// is a different and less useful number.
-    pub fn unopened(&self) -> usize {
-        self.entries.iter().filter(|e| e.is_openable()).count()
-    }
-
-    /// `snapTapped`. Returns the action, or `None` when there is nothing to
-    /// open — a spent snap must not restart, or the whole premise fails.
-    pub fn tap(&mut self, id: &str) -> Option<ConversationAction> {
-        let e = self.entries.iter_mut().find(|e| e.id == id)?;
-        if !e.is_openable() { return None; }
-        e.viewed = true;
-        Some(ConversationAction::OpenSnap(id.to_string()))
-    }
-
-    pub fn hold_voice(&mut self) { self.voice_held = Some(0.0); }
-
-    pub fn tick_voice(&mut self, dt: f32) {
-        if let Some(t) = self.voice_held.as_mut() { *t += dt.max(0.0); }
-    }
-
-    pub fn voice_seconds(&self) -> f32 { self.voice_held.unwrap_or(0.0) }
-    pub fn recording(&self) -> bool { self.voice_held.is_some() }
-
-    /// Release. Sends only if the message is long enough to be a message.
-    pub fn release_voice(&mut self) -> Option<ConversationAction> {
-        let held = self.voice_held.take()?;
-        if held < MIN_VOICE_SECONDS { return None; }
-        Some(ConversationAction::SendVoice { recipient: self.peer.clone(), seconds: held })
-    }
-
-    /// Abandon a recording without sending — for a call arriving mid-hold.
-    pub fn cancel_voice(&mut self) { self.voice_held = None; }
-
-    pub fn on_call(&self) -> bool { !self.call.is_empty() }
-
-    /// Who to show as the active speaker. `None` in a silent call, because
-    /// highlighting an arbitrary participant implies they are talking.
-    pub fn speaker(&self) -> Option<&CallParticipant> {
-        self.call.iter().find(|p| p.speaking)
-    }
-}
-
-// ── landmark ────────────────────────────────────────────────────────────────
-
-/// A place saved from a captured frame. `saved(Landmark)` in the header.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Landmark {
-    pub name: String,
-    pub lat: f64,
-    pub lon: f64,
-    pub has_frame: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct AddLandmark {
-    pub open: bool,
-    pub name: String,
-    pub lat: Option<f64>,
-    pub lon: Option<f64>,
-    pub has_frame: bool,
-}
-
-impl AddLandmark {
-    pub fn open(&mut self, lat: Option<f64>, lon: Option<f64>) {
-        self.open = true;
-        self.name.clear();
-        self.lat = lat;
-        self.lon = lon;
-        self.has_frame = false;
-    }
-
-    pub fn close(&mut self) { self.open = false; }
-
-    /// `setCapturedFrame`. A landmark without a picture is still a landmark, so
-    /// this is not required — only recorded.
-    pub fn set_frame(&mut self, present: bool) { self.has_frame = present; }
-
-    pub fn problems(&self) -> Vec<String> {
-        let mut v = Vec::new();
-        if self.name.trim().is_empty() { v.push("a landmark needs a name".into()); }
-        match (self.lat, self.lon) {
-            (Some(la), Some(lo)) => {
-                // Out-of-range coordinates put the pin somewhere impossible and
-                // the map silently shows nothing, which reads as a broken map.
-                if !(-90.0..=90.0).contains(&la) { v.push("latitude is out of range".into()); }
-                if !(-180.0..=180.0).contains(&lo) { v.push("longitude is out of range".into()); }
+    /// `snapTapped`. Returns the id to send, or `None` if this snap is already
+    /// open or already consumed.
+    ///
+    /// Idempotent on purpose: a double-tap or a replayed click must not consume
+    /// twice, because the second consume is against a snap that no longer
+    /// exists and the user watches a photo vanish they never saw.
+    pub fn tap_snap(&mut self, id: &str) -> Option<String> {
+        if self.consumed.iter().any(|c| c == id) { return None; }
+        let open = self.items.iter().any(|i| matches!(i,
+            Item::Snap { id: sid, opened: false, .. } if sid == id));
+        if !open { return None; }
+        self.consumed.push(id.to_string());
+        for i in self.items.iter_mut() {
+            if let Item::Snap { id: sid, opened, .. } = i {
+                if sid == id { *opened = true; }
             }
-            _ => v.push("no location fix yet".into()),
         }
+        Some(id.to_string())
+    }
+
+    pub fn is_consumed(&self, id: &str) -> bool { self.consumed.iter().any(|c| c == id) }
+
+    /// Unopened snaps waiting — the badge a conversation row shows.
+    pub fn unopened(&self) -> usize {
+        self.items.iter().filter(|i| matches!(i, Item::Snap { opened: false, .. })).count()
+    }
+
+    /// Can the draft be sent? Whitespace is not a message.
+    pub fn can_send(&self) -> bool { !self.draft.trim().is_empty() }
+
+    /// Send, returning the body and clearing the draft.
+    pub fn take_draft(&mut self) -> Option<String> {
+        if !self.can_send() { return None; }
+        Some(std::mem::take(&mut self.draft).trim().to_string())
+    }
+
+    /// Is a call up? An empty roster is not a call — showing call chrome with
+    /// nobody in it reads as a call you cannot hear.
+    pub fn in_call(&self) -> bool { !self.call.is_empty() }
+}
+
+/// One network check.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnostic {
+    pub name: String,
+    pub outcome: Outcome,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Still running. A distinct state, not an absence: "not yet" and "failed"
+    /// look identical if a pending check is simply missing from the list.
+    Pending,
+    Pass,
+    Warn,
+    Fail,
+}
+
+impl Outcome {
+    /// Sort rank: failures first, because they are what the dialog was opened
+    /// for. Pending sits above passes so a slow check does not look finished.
+    pub fn rank(self) -> u8 {
+        match self { Outcome::Fail => 0, Outcome::Warn => 1, Outcome::Pending => 2, Outcome::Pass => 3 }
+    }
+}
+
+/// The diagnostics run.
+#[derive(Debug, Clone, Default)]
+pub struct Diagnostics {
+    pub checks: Vec<Diagnostic>,
+}
+
+impl Diagnostics {
+    /// `onCheckCompleted` — replaces by name, so a re-run updates rather than
+    /// appending a second row for the same check.
+    pub fn complete(&mut self, d: Diagnostic) {
+        match self.checks.iter_mut().find(|c| c.name == d.name) {
+            Some(slot) => *slot = d,
+            None => self.checks.push(d),
+        }
+    }
+
+    /// Failures first, then warnings, then still-running, then passes; ties
+    /// alphabetical so the list does not reshuffle as results land.
+    pub fn ordered(&self) -> Vec<&Diagnostic> {
+        let mut v: Vec<&Diagnostic> = self.checks.iter().collect();
+        v.sort_by(|a, b| a.outcome.rank().cmp(&b.outcome.rank()).then(a.name.cmp(&b.name)));
         v
     }
 
-    pub fn can_save(&self) -> bool { self.problems().is_empty() }
+    /// Everything in? `onDiagnosisReady` fires on this.
+    pub fn finished(&self) -> bool {
+        !self.checks.is_empty() && !self.checks.iter().any(|c| c.outcome == Outcome::Pending)
+    }
 
-    pub fn save(&self) -> Option<Landmark> {
-        if !self.can_save() { return None; }
-        Some(Landmark { name: self.name.trim().to_string(),
-                        lat: self.lat?, lon: self.lon?, has_frame: self.has_frame })
+    /// The headline. Reported even while running, because a diagnostics dialog
+    /// that shows nothing until the end is useless precisely when it matters —
+    /// the run is slow BECAUSE something is wrong.
+    pub fn summary(&self) -> String {
+        let f = self.checks.iter().filter(|c| c.outcome == Outcome::Fail).count();
+        let w = self.checks.iter().filter(|c| c.outcome == Outcome::Warn).count();
+        let p = self.checks.iter().filter(|c| c.outcome == Outcome::Pending).count();
+        if f > 0 { format!("{f} failed") }
+        else if w > 0 { format!("{w} warning{}", if w == 1 { "" } else { "s" }) }
+        else if p > 0 { format!("checking… ({p} left)") }
+        else if self.checks.is_empty() { "no checks run".into() }
+        else { "all clear".into() }
     }
 }
 
@@ -200,143 +181,123 @@ impl AddLandmark {
 mod tests {
     use super::*;
 
-    fn snap(id: &str, at: i64, viewed: bool) -> Entry {
-        Entry { id: id.into(), from: "ada".into(), at, viewed,
-                kind: EntryKind::Snap { duration_s: 5 } }
+    fn snap(id: &str, at: i64, opened: bool) -> Item {
+        Item::Snap { id: id.into(), from: "ada".into(), at, opened }
     }
 
-    fn conv() -> Conversation {
-        Conversation { peer: "ada".into(),
-                       entries: vec![snap("s1", 100, false), snap("s2", 200, false)],
-                       ..Default::default() }
-    }
-
-    #[test]
-    fn a_snap_is_consumed_once() {
-        // Tapping a spent snap must not restart it, or the whole premise fails.
-        let mut c = conv();
-        assert_eq!(c.tap("s1"), Some(ConversationAction::OpenSnap("s1".into())));
-        assert_eq!(c.tap("s1"), None, "already viewed");
-        assert_eq!(c.unopened(), 1);
-    }
-
-    #[test]
-    fn a_zero_timer_snap_is_not_ephemeral() {
-        // Zero means unlimited, the same rule the composer encodes — treating it
-        // as "gone instantly" is the inversion that leaks a photo.
-        let unlimited = Entry { kind: EntryKind::Snap { duration_s: 0 }, ..snap("s", 1, false) };
-        assert!(!unlimited.ephemeral());
-        assert!(snap("s", 1, false).ephemeral());
-    }
-
-    #[test]
-    fn system_notes_are_not_tappable() {
-        let e = Entry { kind: EntryKind::System { note: "bo joined".into() }, ..snap("s", 1, false) };
-        assert!(!e.is_openable());
-        let t = Entry { kind: EntryKind::Text { body: "hi".into() }, ..snap("s", 1, false) };
-        assert!(!t.is_openable(), "text does not need opening");
-    }
-
-    #[test]
-    fn the_timeline_is_oldest_first_and_does_not_shuffle() {
-        let c = conv();
-        let a: Vec<&str> = c.timeline().iter().map(|e| e.id.as_str()).collect();
-        let b: Vec<&str> = c.timeline().iter().map(|e| e.id.as_str()).collect();
-        assert_eq!(a, vec!["s1", "s2"]);
-        assert_eq!(a, b);
-    }
-
-    #[test]
-    fn a_brush_of_the_voice_button_sends_nothing() {
-        // 80ms of silence is worse than a missed message: the recipient has to
-        // open it to find out it was nothing.
-        let mut c = conv();
-        c.hold_voice();
-        c.tick_voice(0.1);
-        assert!(c.recording());
-        assert_eq!(c.release_voice(), None);
-        assert!(!c.recording());
-    }
-
-    #[test]
-    fn a_real_voice_message_sends_to_the_peer() {
-        let mut c = conv();
-        c.hold_voice();
-        c.tick_voice(1.5);
-        match c.release_voice() {
-            Some(ConversationAction::SendVoice { recipient, seconds }) => {
-                assert_eq!(recipient, "ada");
-                assert!((seconds - 1.5).abs() < 1e-6);
-            }
-            other => panic!("expected a voice send, got {other:?}"),
+    fn convo() -> Conversation {
+        Conversation {
+            items: vec![
+                Item::Text { id: "t1".into(), from: "ada".into(), body: "hi".into(), at: 100 },
+                snap("s1", 200, false),
+                snap("s2", 300, true),
+            ],
+            ..Default::default()
         }
     }
 
     #[test]
-    fn a_cancelled_recording_sends_nothing() {
-        // A call arriving mid-hold must not ship the half-message.
-        let mut c = conv();
-        c.hold_voice();
-        c.tick_voice(3.0);
-        c.cancel_voice();
-        assert_eq!(c.release_voice(), None);
+    fn a_snap_can_only_be_consumed_once() {
+        // The second consume is against a snap that no longer exists, and the
+        // user watches a photo vanish they never saw.
+        let mut c = convo();
+        assert_eq!(c.tap_snap("s1").as_deref(), Some("s1"));
+        assert_eq!(c.tap_snap("s1"), None, "a double tap consumes nothing");
+        assert!(c.is_consumed("s1"));
     }
 
     #[test]
-    fn a_silent_call_has_no_active_speaker() {
-        // Highlighting an arbitrary participant implies they are talking.
-        let mut c = conv();
-        c.call = vec![CallParticipant { id: "a".into(), name: "Ada".into(), speaking: false },
-                      CallParticipant { id: "b".into(), name: "Bo".into(), speaking: false }];
-        assert!(c.on_call());
-        assert!(c.speaker().is_none());
-        c.call[1].speaking = true;
-        assert_eq!(c.speaker().unwrap().id, "b");
+    fn an_already_opened_snap_is_not_re_consumed() {
+        let mut c = convo();
+        assert_eq!(c.tap_snap("s2"), None, "s2 arrived already opened");
+        assert_eq!(c.tap_snap("nope"), None, "and an unknown id does nothing");
     }
 
     #[test]
-    fn a_landmark_needs_a_name_and_a_fix() {
-        let mut d = AddLandmark::default();
-        d.open(None, None);
-        assert!(!d.can_save());
-        assert!(d.problems().iter().any(|p| p.contains("name")));
-        assert!(d.problems().iter().any(|p| p.contains("location")));
-        d.name = "Pier".into();
-        d.lat = Some(55.6); d.lon = Some(12.6);
-        assert!(d.can_save());
-        assert_eq!(d.save().unwrap().name, "Pier");
+    fn consumption_survives_the_list_being_rebuilt_from_the_network() {
+        // The item list is rebuilt from the network and can arrive stale, which
+        // is exactly when a re-tap would double-consume.
+        let mut c = convo();
+        c.tap_snap("s1");
+        c.items = vec![snap("s1", 200, false)];   // stale: server has not caught up
+        assert_eq!(c.tap_snap("s1"), None, "we know we already opened it");
     }
 
     #[test]
-    fn impossible_coordinates_are_refused() {
-        // The map silently shows nothing for an out-of-range pin, which reads as
-        // a broken map rather than bad data.
-        let mut d = AddLandmark::default();
-        d.open(Some(999.0), Some(12.0));
-        d.name = "Nowhere".into();
-        assert!(!d.can_save());
-        assert!(d.problems().iter().any(|p| p.contains("latitude")));
+    fn the_unopened_badge_counts_what_is_waiting() {
+        let mut c = convo();
+        assert_eq!(c.unopened(), 1);
+        c.tap_snap("s1");
+        assert_eq!(c.unopened(), 0);
     }
 
     #[test]
-    fn a_landmark_without_a_picture_is_still_a_landmark() {
-        let mut d = AddLandmark::default();
-        d.open(Some(55.6), Some(12.6));
-        d.name = "Pier".into();
-        assert!(d.can_save(), "no frame required");
-        assert!(!d.save().unwrap().has_frame);
-        d.set_frame(true);
-        assert!(d.save().unwrap().has_frame);
+    fn the_thread_cannot_reorder_between_frames() {
+        // A message that jumps under the thumb is one you mis-tap, and
+        // mis-tapping here opens a snap.
+        let c = Conversation {
+            items: vec![snap("b", 100, false), snap("a", 100, false)],
+            ..Default::default()
+        };
+        let first: Vec<&str> = c.ordered().iter().map(|i| i.id()).collect();
+        let again: Vec<&str> = c.ordered().iter().map(|i| i.id()).collect();
+        assert_eq!(first, again);
+        assert_eq!(first, vec!["a", "b"], "equal times break on id");
     }
 
     #[test]
-    fn reopening_the_landmark_dialog_starts_clean() {
-        let mut d = AddLandmark::default();
-        d.open(Some(1.0), Some(2.0));
-        d.name = "One".into();
-        d.set_frame(true);
-        d.open(Some(3.0), Some(4.0));
-        assert!(d.name.is_empty());
-        assert!(!d.has_frame, "the previous frame is not carried over");
+    fn whitespace_is_not_a_message() {
+        let mut c = convo();
+        c.draft = "   ".into();
+        assert!(!c.can_send());
+        assert!(c.take_draft().is_none());
+        c.draft = "  hello  ".into();
+        assert_eq!(c.take_draft().as_deref(), Some("hello"), "trimmed");
+        assert!(c.draft.is_empty(), "and cleared");
+    }
+
+    #[test]
+    fn an_empty_roster_is_not_a_call() {
+        // Call chrome with nobody in it reads as a call you cannot hear.
+        let mut c = convo();
+        assert!(!c.in_call());
+        c.call.push(CallParticipant { id: "1".into(), name: "Ada".into() });
+        assert!(c.in_call());
+    }
+
+    #[test]
+    fn diagnostics_show_failures_first_and_pending_above_passes() {
+        // Failures are what the dialog was opened for, and a slow check must not
+        // look finished.
+        let mut d = Diagnostics::default();
+        for (n, o) in [("dns", Outcome::Pass), ("relay", Outcome::Fail),
+                       ("stun", Outcome::Pending), ("mtu", Outcome::Warn)] {
+            d.complete(Diagnostic { name: n.into(), outcome: o, detail: String::new() });
+        }
+        let order: Vec<&str> = d.ordered().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(order, vec!["relay", "mtu", "stun", "dns"]);
+    }
+
+    #[test]
+    fn a_rerun_updates_a_check_rather_than_adding_a_second_row() {
+        let mut d = Diagnostics::default();
+        d.complete(Diagnostic { name: "dns".into(), outcome: Outcome::Fail, detail: "x".into() });
+        d.complete(Diagnostic { name: "dns".into(), outcome: Outcome::Pass, detail: "ok".into() });
+        assert_eq!(d.checks.len(), 1);
+        assert_eq!(d.checks[0].outcome, Outcome::Pass);
+    }
+
+    #[test]
+    fn the_summary_is_useful_before_the_run_finishes() {
+        // A dialog that shows nothing until the end is useless precisely when it
+        // matters — the run is slow BECAUSE something is wrong.
+        let mut d = Diagnostics::default();
+        assert_eq!(d.summary(), "no checks run");
+        d.complete(Diagnostic { name: "a".into(), outcome: Outcome::Pending, detail: String::new() });
+        assert!(d.summary().contains("checking"));
+        assert!(!d.finished());
+        d.complete(Diagnostic { name: "a".into(), outcome: Outcome::Fail, detail: String::new() });
+        assert_eq!(d.summary(), "1 failed");
+        assert!(d.finished());
     }
 }
