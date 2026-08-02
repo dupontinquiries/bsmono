@@ -2357,6 +2357,39 @@ top speed at the end of the run, by which point the car had driven into a
 wall. It now times the launch on throttle alone and the top end under
 boost, because the drivetrain cap and the throttle cap are separate things.
 
+## v1.73.0 — lofted bodies, and five electric cars
+
+Last version chamfered the boxes; they were still boxes. The real fix is a
+LOFTED HULL: cross-sections along the length, skinned between, so a body
+tapers into its nose, swells over the wheel arches and pinches at the tail
+the way a car does. Each section carries a roundness value that blends it
+from a rectangle toward an ellipse, which is what produces a shoulder line
+instead of an edge. A hull carries 240 triangles against a box's 12.
+
+FIVE ELECTRIC CARS on that hull, each with a smoked glasshouse lofted
+separately and set into the body, flared wheel arches, sill strips along
+the battery floor and light bars that emit:
+
+  VOLT    compact hatch — dribbles like an Octane
+  AXION   low hypercar, spoiler on struts, a blade of light across the nose
+  HAULER  pickup with a bed the ball settles into
+  PULSE   rally EV on tall soft tyres with a four-lamp roof pod
+  TRAM    electric shuttle: a slab of glass with an enormous roof shelf
+
+WHEELS ARE WHEELS NOW, for every car in the game. They were squashed
+spheres, which is most of why even the older models read as toys; they are
+a tyre torus with capped rim discs, and because all twelve share one
+builder they all got the upgrade at once. Width against height: a sphere
+measures 1.00, the new wheel 0.17.
+
+The quality checks needed correcting twice, which is worth recording. I
+first asserted the hull had more VERTICES than a box — it has 7x, not the
+8x I guessed, because what curves is the surface BETWEEN vertices, so
+triangles are the right count (20x). And I asserted the new wheel had more
+vertices than the old sphere: it has slightly fewer, and that says nothing
+— a torus is not a worse shape for being efficient. The real question is
+whether it is disc-shaped, so that is what the harness asks now.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

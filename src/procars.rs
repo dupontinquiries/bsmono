@@ -28,8 +28,10 @@ fn body_prim(gpu: &mut Gpu, mesh: MeshData, color: [f32; 4]) -> Prim {
 }
 
 fn wheel_prim(gpu: &mut Gpu, r: f32, at: Vec3, front: bool) -> Prim {
-    // squashed sphere as a tire, baked at its pivot
-    let m = part(meshgen::sphere(12, 16), Vec3::new(r * 0.55, r, r), Quat::IDENTITY, at);
+    // A real tyre, baked at its pivot. This used to be a squashed sphere,
+    // which is most of why the older cars read as toys — every one of them
+    // gets the upgrade for free by sharing this function.
+    let m = part(meshgen::wheel(0.55, 18), Vec3::splat(r), Quat::IDENTITY, at);
     Prim {
         mesh_id: gpu.add_mesh(&m),
         tex_id: None,
@@ -72,22 +74,91 @@ fn ev_wheels(gpu: &mut Gpu, prims: &mut Vec<Prim>, r: f32, half_w: f32, fz: f32,
     }
 }
 
+/// The shared recipe: a lofted hull, a glasshouse set into it, wheel arches,
+/// a light bar at each end and sill strips along the battery floor. Sections
+/// run nose (-z) to tail (+z) as (z, half width, floor, roof, roundness).
+fn ev_body(
+    gpu: &mut Gpu,
+    prims: &mut Vec<Prim>,
+    sections: &[(f32, f32, f32, f32, f32)],
+    paint: [f32; 4],
+    glass: (f32, f32, f32, f32),
+    front_light: [f32; 4],
+    tail_light: [f32; 4],
+) {
+    let hull = part(meshgen::loft(sections, 24), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO);
+    prims.push(body_prim(gpu, hull, paint));
+    // glasshouse: a smaller loft riding on top, smoked
+    let (gz0, gz1, gw, gy) = glass;
+    let cabin = [
+        (gz0, gw * 0.72, gy, gy + 0.02, 0.9),
+        (gz0 + (gz1 - gz0) * 0.35, gw, gy - 0.01, gy + 0.085, 0.85),
+        (gz1, gw * 0.80, gy - 0.01, gy + 0.055, 0.9),
+    ];
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::loft(&cabin, 20), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
+        [0.09, 0.12, 0.16, 1.0],
+    ));
+    let nose = sections[0];
+    let tail = sections[sections.len() - 1];
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::cbox(0.40), Vec3::new(nose.1 * 0.86, 0.013, 0.02), Quat::IDENTITY, Vec3::new(0.0, (nose.2 + nose.3) * 0.5 + 0.02, nose.0 + 0.01)),
+        front_light,
+    ));
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::cbox(0.40), Vec3::new(tail.1 * 0.88, 0.013, 0.02), Quat::IDENTITY, Vec3::new(0.0, (tail.2 + tail.3) * 0.5 + 0.02, tail.0 - 0.01)),
+        tail_light,
+    ));
+    // sills: the giveaway that the floor is a battery
+    let mid = sections[sections.len() / 2];
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::cbox(0.28), Vec3::new(0.012, 0.016, mid.0.abs().max(0.30)), Quat::IDENTITY, Vec3::new(sx * mid.1 * 0.97, mid.2 + 0.03, 0.0)),
+            [front_light[0] * 0.5, front_light[1] * 0.8, front_light[2], 1.0],
+        ));
+    }
+}
+
+/// Wheel arches: a flared band over each wheel, so the body has haunches.
+fn arches(gpu: &mut Gpu, prims: &mut Vec<Prim>, r: f32, half_w: f32, fz: f32, bz: f32, y: f32, col: [f32; 4]) {
+    for z in [fz, bz] {
+        for sx in [-1.0f32, 1.0] {
+            let m = part(
+                meshgen::torus(0.30, 18, 8),
+                Vec3::new(r * 1.30, r * 1.30, r * 1.30),
+                Quat::from_rotation_z(std::f32::consts::FRAC_PI_2),
+                Vec3::new(sx * (half_w * 0.92), y, z),
+            );
+            prims.push(body_prim(gpu, m, col));
+        }
+    }
+}
+
 /// VOLT — a compact electric hatch. Short, tall-ish, friendly: the EV that
 /// dribbles like an Octane.
 pub fn volt(gpu: &mut Gpu) -> Model {
     let mut prims = Vec::new();
-    let body = [0.20, 0.62, 0.86, 1.0];
-    // lower hull, chamfered, with a slight nose-down rake
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.22), Vec3::new(0.30, 0.14, 0.52), Quat::from_rotation_x(-0.04), Vec3::new(0.0, 0.02, 0.0)), body));
-    // shoulder line and glasshouse
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.26, 0.11, 0.30), Quat::IDENTITY, Vec3::new(0.0, 0.17, 0.04)), [0.10, 0.13, 0.17, 1.0]));
-    // full-width light bar, front and rear
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.35), Vec3::new(0.27, 0.018, 0.02), Quat::IDENTITY, Vec3::new(0.0, 0.08, -0.52)), [0.85, 0.95, 1.0, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.35), Vec3::new(0.27, 0.016, 0.02), Quat::IDENTITY, Vec3::new(0.0, 0.09, 0.52)), [1.0, 0.25, 0.20, 1.0]));
-    // sill strips, the giveaway that the floor is a battery
-    for sx in [-1.0f32, 1.0] {
-        prims.push(body_prim(gpu, part(meshgen::cbox(0.25), Vec3::new(0.015, 0.02, 0.40), Quat::IDENTITY, Vec3::new(sx * 0.30, -0.08, 0.0)), [0.35, 0.85, 0.95, 1.0]));
-    }
+    let paint = [0.20, 0.62, 0.86, 1.0];
+    ev_body(
+        gpu,
+        &mut prims,
+        &[
+            (-0.52, 0.20, -0.05, 0.09, 0.75),
+            (-0.34, 0.28, -0.10, 0.15, 0.55),
+            (0.02, 0.30, -0.12, 0.17, 0.45),
+            (0.34, 0.29, -0.11, 0.16, 0.50),
+            (0.52, 0.22, -0.06, 0.10, 0.75),
+        ],
+        paint,
+        (-0.24, 0.26, 0.24, 0.16),
+        [0.85, 0.95, 1.0, 1.0],
+        [1.0, 0.25, 0.20, 1.0],
+    );
+    arches(gpu, &mut prims, 0.125, 0.30, -0.36, 0.36, -0.07, [0.13, 0.14, 0.16, 1.0]);
     ev_wheels(gpu, &mut prims, 0.125, 0.28, -0.36, 0.36, -0.07, [0.72, 0.76, 0.80, 1.0]);
     Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.26, half_w: 0.31, wheel_r: 0.125 }
 }
@@ -95,37 +166,120 @@ pub fn volt(gpu: &mut Gpu) -> Model {
 /// AXION — a low electric hypercar. Long, flat, fast: the flick blade.
 pub fn axion(gpu: &mut Gpu) -> Model {
     let mut prims = Vec::new();
-    let body = [0.08, 0.09, 0.12, 1.0];
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.18), Vec3::new(0.36, 0.085, 0.74), Quat::from_rotation_x(-0.07), Vec3::new(0.0, 0.0, 0.0)), body));
-    // cab canopy set back, and a spoiler on struts
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.34), Vec3::new(0.24, 0.075, 0.26), Quat::IDENTITY, Vec3::new(0.0, 0.11, 0.10)), [0.12, 0.16, 0.22, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.34, 0.012, 0.07), Quat::from_rotation_x(0.16), Vec3::new(0.0, 0.19, 0.62)), [0.16, 0.16, 0.18, 1.0]));
+    let paint = [0.08, 0.09, 0.12, 1.0];
+    ev_body(
+        gpu,
+        &mut prims,
+        &[
+            (-0.74, 0.20, -0.06, 0.00, 0.85),
+            (-0.48, 0.32, -0.08, 0.04, 0.55),
+            (-0.10, 0.36, -0.09, 0.07, 0.40),
+            (0.34, 0.35, -0.08, 0.06, 0.45),
+            (0.62, 0.28, -0.06, 0.03, 0.70),
+        ],
+        paint,
+        (-0.10, 0.30, 0.26, 0.06),
+        [0.75, 0.90, 1.0, 1.0],
+        [1.0, 0.20, 0.30, 1.0],
+    );
+    // spoiler on struts
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.34, 0.011, 0.06), Quat::from_rotation_x(0.16), Vec3::new(0.0, 0.16, 0.60)), [0.16, 0.16, 0.18, 1.0]));
     for sx in [-1.0f32, 1.0] {
-        prims.push(body_prim(gpu, part(meshgen::cbox(0.25), Vec3::new(0.012, 0.05, 0.03), Quat::IDENTITY, Vec3::new(sx * 0.24, 0.15, 0.62)), [0.16, 0.16, 0.18, 1.0]));
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.25), Vec3::new(0.011, 0.05, 0.025), Quat::IDENTITY, Vec3::new(sx * 0.24, 0.12, 0.60)), [0.16, 0.16, 0.18, 1.0]));
     }
-    // a single blade of light across the nose, and a bar across the tail
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.40), Vec3::new(0.32, 0.012, 0.02), Quat::IDENTITY, Vec3::new(0.0, 0.03, -0.74)), [0.75, 0.90, 1.0, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.40), Vec3::new(0.33, 0.014, 0.02), Quat::IDENTITY, Vec3::new(0.0, 0.10, 0.68)), [1.0, 0.20, 0.30, 1.0]));
+    arches(gpu, &mut prims, 0.105, 0.36, -0.50, 0.50, -0.045, [0.11, 0.11, 0.13, 1.0]);
     ev_wheels(gpu, &mut prims, 0.105, 0.34, -0.50, 0.50, -0.045, [0.55, 0.58, 0.62, 1.0]);
     Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.78, half_h: 0.17, half_w: 0.38, wheel_r: 0.105 }
 }
 
-/// HAULER — an electric pickup, all straight lines and shoulders. The
-/// heaviest-feeling of the three, with a flat bed the ball sits in.
+/// HAULER — an electric pickup, all shoulders. The heaviest-feeling of the
+/// three, with a flat bed the ball settles into.
 pub fn hauler(gpu: &mut Gpu) -> Model {
     let mut prims = Vec::new();
-    let body = [0.72, 0.74, 0.78, 1.0];
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.12), Vec3::new(0.33, 0.13, 0.62), Quat::IDENTITY, Vec3::new(0.0, 0.03, 0.0)), body));
-    // slab cab, set forward, with a deep windscreen rake
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.16), Vec3::new(0.30, 0.13, 0.26), Quat::from_rotation_x(-0.12), Vec3::new(0.0, 0.19, -0.14)), [0.16, 0.18, 0.21, 1.0]));
+    let paint = [0.72, 0.74, 0.78, 1.0];
+    ev_body(
+        gpu,
+        &mut prims,
+        &[
+            (-0.62, 0.26, -0.06, 0.10, 0.35),
+            (-0.40, 0.33, -0.10, 0.16, 0.20),
+            (0.00, 0.33, -0.11, 0.14, 0.15),
+            (0.36, 0.32, -0.10, 0.12, 0.15),
+            (0.60, 0.29, -0.07, 0.10, 0.30),
+        ],
+        paint,
+        (-0.40, -0.02, 0.29, 0.15),
+        [0.90, 0.96, 1.0, 1.0],
+        [1.0, 0.35, 0.22, 1.0],
+    );
     // bed walls: a shelf the ball settles into
     for sx in [-1.0f32, 1.0] {
-        prims.push(body_prim(gpu, part(meshgen::cbox(0.25), Vec3::new(0.03, 0.07, 0.24), Quat::IDENTITY, Vec3::new(sx * 0.30, 0.14, 0.34)), body));
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.22), Vec3::new(0.028, 0.06, 0.22), Quat::IDENTITY, Vec3::new(sx * 0.30, 0.16, 0.32)), paint));
     }
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.25), Vec3::new(0.32, 0.07, 0.03), Quat::IDENTITY, Vec3::new(0.0, 0.14, 0.58)), body));
-    prims.push(body_prim(gpu, part(meshgen::cbox(0.40), Vec3::new(0.32, 0.016, 0.02), Quat::IDENTITY, Vec3::new(0.0, 0.10, -0.62)), [0.90, 0.96, 1.0, 1.0]));
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.22), Vec3::new(0.31, 0.06, 0.028), Quat::IDENTITY, Vec3::new(0.0, 0.16, 0.56)), paint));
+    arches(gpu, &mut prims, 0.145, 0.33, -0.40, 0.40, -0.06, [0.20, 0.21, 0.24, 1.0]);
     ev_wheels(gpu, &mut prims, 0.145, 0.31, -0.40, 0.40, -0.06, [0.28, 0.30, 0.33, 1.0]);
     Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.28, half_w: 0.34, wheel_r: 0.145 }
+}
+
+/// PULSE — a rally EV on tall soft tyres: short overhangs, high stance, a
+/// light pod on the roof. Lands well and shrugs off bad ones.
+pub fn pulse(gpu: &mut Gpu) -> Model {
+    let mut prims = Vec::new();
+    let paint = [0.96, 0.55, 0.12, 1.0];
+    ev_body(
+        gpu,
+        &mut prims,
+        &[
+            (-0.46, 0.24, -0.02, 0.12, 0.55),
+            (-0.28, 0.31, -0.06, 0.18, 0.40),
+            (0.04, 0.32, -0.07, 0.19, 0.35),
+            (0.32, 0.30, -0.06, 0.17, 0.45),
+            (0.48, 0.25, -0.03, 0.12, 0.60),
+        ],
+        paint,
+        (-0.22, 0.20, 0.26, 0.19),
+        [1.0, 0.95, 0.75, 1.0],
+        [1.0, 0.30, 0.18, 1.0],
+    );
+    // roof light pod, four lamps
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.20, 0.020, 0.05), Quat::IDENTITY, Vec3::new(0.0, 0.31, -0.14)), [0.14, 0.15, 0.17, 1.0]));
+    for k in 0..4 {
+        let x = -0.135 + k as f32 * 0.09;
+        prims.push(body_prim(gpu, part(meshgen::sphere(8, 12), Vec3::splat(0.030), Quat::IDENTITY, Vec3::new(x, 0.325, -0.185)), [1.0, 0.97, 0.85, 1.0]));
+    }
+    arches(gpu, &mut prims, 0.155, 0.32, -0.32, 0.34, -0.02, [0.15, 0.15, 0.17, 1.0]);
+    ev_wheels(gpu, &mut prims, 0.155, 0.30, -0.32, 0.34, -0.02, [0.85, 0.86, 0.88, 1.0]);
+    Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.52, half_h: 0.30, half_w: 0.33, wheel_r: 0.155 }
+}
+
+/// TRAM — an electric shuttle: a long slab of glass and aluminium with a
+/// roof rail. Enormous roof shelf, so the ball just sits there.
+pub fn tram(gpu: &mut Gpu) -> Model {
+    let mut prims = Vec::new();
+    let paint = [0.86, 0.88, 0.91, 1.0];
+    ev_body(
+        gpu,
+        &mut prims,
+        &[
+            (-0.58, 0.24, -0.06, 0.20, 0.50),
+            (-0.36, 0.30, -0.10, 0.26, 0.25),
+            (0.02, 0.31, -0.11, 0.27, 0.18),
+            (0.38, 0.30, -0.10, 0.26, 0.25),
+            (0.58, 0.25, -0.06, 0.21, 0.50),
+        ],
+        paint,
+        (-0.44, 0.44, 0.28, 0.24),
+        [0.80, 0.92, 1.0, 1.0],
+        [1.0, 0.28, 0.24, 1.0],
+    );
+    // roof rail
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(gpu, part(meshgen::cbox(0.35), Vec3::new(0.014, 0.014, 0.34), Quat::IDENTITY, Vec3::new(sx * 0.22, 0.30, 0.02)), [0.30, 0.32, 0.35, 1.0]));
+    }
+    arches(gpu, &mut prims, 0.125, 0.31, -0.38, 0.40, -0.07, [0.22, 0.23, 0.26, 1.0]);
+    ev_wheels(gpu, &mut prims, 0.125, 0.29, -0.38, 0.40, -0.07, [0.62, 0.65, 0.70, 1.0]);
+    Model { prims, drive: Drive::Electric, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, half_w: 0.32, wheel_r: 0.125 }
 }
 
 pub fn breadbox(gpu: &mut Gpu) -> Model {

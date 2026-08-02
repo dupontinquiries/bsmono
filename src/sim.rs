@@ -2761,6 +2761,51 @@ pub fn run(args: &[String]) {
         let gain = (ice.0 - ev.0) / ice.0.max(0.01) * 100.0;
         println!("   the EV reaches 8 m/s {gain:.0}% sooner");
         check("the difference is felt, not cosmetic", gain > 8.0);
+        // ---- model quality: is there actually more car here? ----
+        // The builders need a GPU, but the mesh generators are pure, so the
+        // geometry can be measured directly — which is the part that decides
+        // whether a car reads as a vehicle or as stacked boxes.
+        println!();
+        let boxx = crate::meshgen::boxx();
+        let cbox = crate::meshgen::cbox(0.22);
+        let hull = crate::meshgen::loft(
+            &[
+                (-0.52, 0.20, -0.05, 0.09, 0.75),
+                (-0.34, 0.28, -0.10, 0.15, 0.55),
+                (0.02, 0.30, -0.12, 0.17, 0.45),
+                (0.34, 0.29, -0.11, 0.16, 0.50),
+                (0.52, 0.22, -0.06, 0.10, 0.75),
+            ],
+            24,
+        );
+        let old_wheel = crate::meshgen::sphere(12, 16);
+        let new_wheel = crate::meshgen::wheel(0.55, 18);
+        println!("{:<16} {:>9} {:>10}", "part", "vertices", "triangles");
+        for (nm, m) in [
+            ("plain box", &boxx),
+            ("chamfered box", &cbox),
+            ("lofted hull", &hull),
+            ("wheel (was)", &old_wheel),
+            ("wheel (now)", &new_wheel),
+        ] {
+            println!("{:<16} {:>9} {:>10}", nm, m.verts.len(), m.idx.len() / 3);
+        }
+        // Count TRIANGLES for shape (a hull's vertex count is misleading —
+        // it is the surface between them that curves), and for the wheel ask
+        // the question that matters: is it disc-shaped? A sphere is as wide
+        // as it is tall; a tyre is not.
+        let ext = |m: &crate::meshgen::MeshData, ax: usize| -> f32 {
+            m.verts.iter().map(|v| v.pos[ax].abs()).fold(0.0f32, f32::max)
+        };
+        check(
+            "a lofted hull carries far more shape than a box",
+            hull.idx.len() > boxx.idx.len() * 8,
+        );
+        check("the chamfered box has edges to catch light", cbox.idx.len() > boxx.idx.len());
+        let round = ext(&old_wheel, 0) / ext(&old_wheel, 1).max(0.01);
+        let tyre = ext(&new_wheel, 0) / ext(&new_wheel, 1).max(0.01);
+        println!("   width/height: sphere {round:.2} (a ball), wheel {tyre:.2} (a tyre)");
+        check("the wheel is disc-shaped, not spherical", tyre < 0.5 && round > 0.9);
         println!("{}", if pass { "CARS: PASS" } else { "CARS: FAIL" });
         return;
     }

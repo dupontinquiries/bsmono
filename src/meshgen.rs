@@ -365,6 +365,85 @@ pub fn cbox(bevel: f32) -> MeshData {
     m
 }
 
+/// A LOFTED HULL — the real answer to "these look like stacked boxes".
+///
+/// Takes cross-sections along Z (nose to tail) and skins between them, so a
+/// body can taper into its nose, swell over the wheel arches and pinch at
+/// the tail the way a car actually does. Each section is (z, half_width,
+/// bottom_y, top_y, corner) and the corner value rounds the section from a
+/// rectangle (0) toward an ellipse (1), which is what gives a shoulder line
+/// instead of an edge.
+pub fn loft(sections: &[(f32, f32, f32, f32, f32)], ring: u32) -> MeshData {
+    let mut m = MeshData::new();
+    if sections.len() < 2 {
+        return m;
+    }
+    let n = ring.max(8);
+    // a rounded-rectangle ring in the section's own space
+    let ring_pt = |hw: f32, y0: f32, y1: f32, corner: f32, t: f32| -> Vec3 {
+        let a = t * std::f32::consts::TAU;
+        let (ca, sa) = (a.cos(), a.sin());
+        let (cy, hy) = ((y0 + y1) * 0.5, (y1 - y0) * 0.5);
+        // blend between a box outline and an ellipse
+        let bx = ca.signum() * (ca.abs().powf(0.35));
+        let by = sa.signum() * (sa.abs().powf(0.35));
+        Vec3::new(
+            hw * (bx * (1.0 - corner) + ca * corner),
+            cy + hy * (by * (1.0 - corner) + sa * corner),
+            0.0,
+        )
+    };
+    let stride = n + 1;
+    for (si, &(z, hw, y0, y1, corner)) in sections.iter().enumerate() {
+        for i in 0..=n {
+            let t = i as f32 / n as f32;
+            let p = ring_pt(hw, y0, y1, corner, t);
+            // normal from neighbouring sections, so the skin shades smoothly
+            let (zp, zn) = (
+                sections[si.saturating_sub(1)],
+                sections[(si + 1).min(sections.len() - 1)],
+            );
+            let a = ring_pt(zp.1, zp.2, zp.3, zp.4, t) + Vec3::new(0.0, 0.0, zp.0);
+            let b = ring_pt(zn.1, zn.2, zn.3, zn.4, t) + Vec3::new(0.0, 0.0, zn.0);
+            let along = (b - a).normalize_or(Vec3::Z);
+            let t2 = (i as f32 + 0.25) / n as f32;
+            let q = ring_pt(hw, y0, y1, corner, t2);
+            let tang = (q - p).normalize_or(Vec3::X);
+            let nrm = tang.cross(along).normalize_or(Vec3::Y);
+            m.push(Vec3::new(p.x, p.y, z), nrm, Vec2::new(t, si as f32 / sections.len() as f32));
+        }
+    }
+    for si in 0..sections.len() - 1 {
+        for i in 0..n {
+            let a = (si as u32) * stride + i;
+            let b = a + 1;
+            let c = a + stride;
+            let d = c + 1;
+            m.idx.extend_from_slice(&[a, c, b, b, c, d]);
+        }
+    }
+    // cap the ends so the hull is closed
+    for (end, si) in [(0usize, 0u32), (sections.len() - 1, (sections.len() - 1) as u32)] {
+        let (z, hw, y0, y1, corner) = sections[end];
+        let base = m.verts.len() as u32;
+        let nz = if end == 0 { -1.0 } else { 1.0 };
+        m.push(Vec3::new(0.0, (y0 + y1) * 0.5, z), Vec3::new(0.0, 0.0, nz), Vec2::new(0.5, 0.5));
+        for i in 0..=n {
+            let p = ring_pt(hw, y0, y1, corner, i as f32 / n as f32);
+            m.push(Vec3::new(p.x, p.y, z), Vec3::new(0.0, 0.0, nz), Vec2::new(0.5, 0.5));
+        }
+        let _ = si;
+        for i in 0..n {
+            if nz > 0.0 {
+                m.idx.extend_from_slice(&[base, base + 1 + i, base + 2 + i]);
+            } else {
+                m.idx.extend_from_slice(&[base, base + 2 + i, base + 1 + i]);
+            }
+        }
+    }
+    m
+}
+
 /// A WHEEL: a tyre torus with a rim disc, instead of a squashed sphere.
 /// Unit radius 1 in Y/Z, `width` along X.
 pub fn wheel(width: f32, seg: u32) -> MeshData {
