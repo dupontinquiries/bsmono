@@ -484,6 +484,26 @@ pub fn gpu_sync_ns() -> u64 { GPU_SYNC_NS.load(std::sync::atomic::Ordering::Rela
 ///
 /// Adding a counter and forgetting the reset is easy precisely because the counter WORKS: it counts,
 /// the line prints, and only a comparison across runs shows it never moved.
+/// Count and time a blocking device poll.
+///
+/// SEVENTEEN CALL SITES, ONE COUNTED. The profile reported "1 polls" in every run — at 349 submits
+/// and at 8063 — because only the download path incremented, and it runs once per generation.
+///
+/// The same site is the only one that adds to GPU_SYNC_NS, which is why sync reads 0 ms of 19860 ms:
+/// the profile was timing one poll out of seventeen and reporting the result as though it covered all
+/// waiting. That is what made "UNACCOUNTED, 0.2% accounted" look like a mystery rather than a
+/// measurement gap — 99.8% of the time was in waits nobody instrumented.
+///
+/// Wrapping them means the split between setup and sync finally describes the whole generation.
+#[inline]
+pub fn counted_poll(device: &wgpu::Device) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let t = std::time::Instant::now();
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+    GPU_POLLS.fetch_add(1, Relaxed);
+    GPU_SYNC_NS.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+}
+
 pub fn gpu_counters_reset() {
     for c in [&GPU_SUBMITS, &GPU_POLLS, &GPU_SETUP_NS, &GPU_SYNC_NS,
               &DIMS_HITS, &DIMS_MISSES, &POOL_HITS, &POOL_MISSES,
@@ -1443,14 +1463,14 @@ impl Gpu {
                 since_submit += 1;
                 if since_submit >= CHUNKS_PER_SUBMIT {
                     self.end_frame();
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     since_submit = 0;
                 }
             }
             done += 1;
         }
         self.end_frame();
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         done
     }
 
@@ -2358,7 +2378,7 @@ impl StreamSlots {
         gpu.queue.submit(Some(enc.finish()));
         let slice = staging.slice(..);
         slice.map_async(wgpu::MapMode::Read, |_| {});
-        let _ = gpu.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&gpu.device);
         let data = slice.get_mapped_range().to_vec();
         staging.unmap();
         data
@@ -2463,7 +2483,7 @@ impl Gpu {
         let down = self.quantize_q4_resident(&vec![0.05f32; d * ff], d, ff);
         let x = self.upload(&vec![0.1f32; d], 1, d);
         let xff = self.upload(&vec![0.1f32; ff], 1, ff);
-        let wait = || { self.queue.submit(std::iter::empty()); let _ = self.device.poll(wgpu::PollType::wait_indefinitely()); };
+        let wait = || { self.queue.submit(std::iter::empty()); crate::counted_poll(&self.device); };
         for _ in 0..2 { let _ = self.linear_q4_0_t(&x, &gate, 1); let _ = self.linear_q4_0_t(&x, &up, 1); let _ = self.linear_q4_0_t(&xff, &down, 1); }
         wait();
         let t = std::time::Instant::now();
@@ -2481,7 +2501,7 @@ impl Gpu {
         let bytes = (slot_mib * (1 << 20)).min(max_buf & !255).max(4);
         let actual_mib = bytes / (1 << 20);
         let host = vec![0u8; bytes];
-        let wait = || { self.queue.submit(std::iter::empty()); let _ = self.device.poll(wgpu::PollType::wait_indefinitely()); };
+        let wait = || { self.queue.submit(std::iter::empty()); crate::counted_poll(&self.device); };
 
         // (1) STAGED fill: re-fillable STORAGE buffer via write_buffer (the discrete-GPU path).
         let staged_slot = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -2686,7 +2706,7 @@ impl Gpu {
         let r = f();
         // flush any open frame so the work is actually submitted before we poll for completion
         self.end_frame();
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         let verr = pollster::block_on(vscope.pop());
         if verr.is_some() {
             self.raise_degrade(what);
@@ -2735,7 +2755,7 @@ impl Gpu {
             verified += slab;
         }
         drop(held);
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         verified
     }
 
@@ -2868,7 +2888,7 @@ impl Gpu {
             self.retain_keep(frame.keep);
         }
         let t_poll = std::time::Instant::now();
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         check_stall(t_poll, 0);
         self.clear_retained();
     }
@@ -3090,7 +3110,7 @@ impl Gpu {
                 *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
                 drop(fr);
                 if over_retain && self.pending_keep.lock().unwrap().len() >= DIMS_RETAIN_CAP {
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     self.clear_retained();
                     DIMS_RETAIN_POLLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -3149,7 +3169,7 @@ impl Gpu {
                 // load-time peak is ~2× the resident size — that's what overran the ~56 GiB GPU VA ceiling
                 // loading the 70B (40 GiB arena + ~40 GiB un-drained staging). Flushing per slab caps it.
                 self.queue.submit(std::iter::empty());
-                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                crate::counted_poll(&self.device);
             }
             // size % COPY_BUFFER_ALIGNMENT (4) == 0 is REQUIRED for a mapped_at_creation buffer; both inputs
             // above are 256-aligned so this is a no-op today, but it guards any future unaligned size source.
@@ -6982,7 +7002,7 @@ impl Gpu {
     fn try_load_resident_impl(&self, parts: &[&[u8]], stat: Option<&[&'static [u8]]>) -> Result<Option<Model>, String> {
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
         let res = self.load_gguf_inner(parts, stat, true);
-        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        crate::counted_poll(&self.device);
         let oom = pollster::block_on(scope.pop());
         if oom.is_some() {
             drop(res.ok()); // discard any partial/poisoned buffers from the failed attempt
@@ -11336,7 +11356,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 // FENCED flush: submit, WAIT for completion (so x is valid + scratch is done), release
                 // retained bind-groups, re-open the frame. The wait is what makes recycling safe.
                 self.end_frame();
-                let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                crate::counted_poll(&self.device);
                 self.clear_retained();
                 self.begin_frame();
             }
@@ -11841,7 +11861,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 }
                 if self.dims_alloc_failed() {
                     self.end_frame();
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     self.clear_retained();
                     if !self.flush_every_pinned() { self.set_flush_every(saved_flush); }
                     // Tell the governor this k caused real device pressure so it ratchets the cap down and
@@ -11856,7 +11876,7 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 // `pre` logits (needed for the replay) are held by us, not the frame, so they survive.
                 if (j + 1) % SLOT_FLUSH == 0 {
                     self.end_frame();
-                    let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    crate::counted_poll(&self.device);
                     self.clear_retained();
                     self.begin_frame();
                 }

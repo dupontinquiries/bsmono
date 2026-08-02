@@ -302,3 +302,35 @@ mod tests {
         assert_eq!(x.sync_per_submit_ms(), 0.0);
     }
 }
+
+#[cfg(test)]
+mod poll_coverage_tests {
+    /// Every blocking poll must be counted, or the sync figure describes a fraction of the waiting.
+    ///
+    /// The profile reported "1 polls" in every run — at 349 submits and at 8063 — because one of
+    /// seventeen call sites incremented, and it runs once per generation. The same site was the only
+    /// one adding to GPU_SYNC_NS, which is why sync read 0 ms of 19860 ms.
+    ///
+    /// That is what made "UNACCOUNTED, 0.2% accounted" look like a mystery: 99.8% of the time was in
+    /// waits nobody instrumented, and the label blamed the kernels.
+    ///
+    /// Source-read because an uncounted poll produces no wrong number — it produces a MISSING one, and
+    /// nothing behavioural can see an absence.
+    #[test]
+    fn every_blocking_poll_goes_through_counted_poll() {
+        let src = include_str!("lib.rs");
+        let mut raw = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            if !line.contains("device.poll(wgpu::PollType::wait_indefinitely())") { continue; }
+            // The helper itself, and the download path which times its own span, are the exceptions.
+            if line.contains("counted_poll") || src.lines().nth(n.saturating_sub(1))
+                .map(|p| p.contains("GPU_POLLS")).unwrap_or(false) { continue; }
+            if line.contains("pub fn counted_poll") { continue; }
+            raw.push(n + 1);
+        }
+        // Allow the two inside counted_poll and the download path; anything else is uncounted waiting.
+        assert!(raw.len() <= 3,
+            "uncounted blocking polls at lines {raw:?} — each one is wall time the profile attributes \
+to nothing, which is how 99.8% of a generation became UNACCOUNTED");
+    }
+}
