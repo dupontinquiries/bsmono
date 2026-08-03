@@ -39,7 +39,7 @@ not see.
 
 | port | surfaces | covered | bin | catalogued | primary |
 |---|---|---|---|---|---|
-| bo-suite | 47 | 83% named / 23% code | yes | yes | — |
+| bo-suite | 47 | 85% named / 26% code | yes | yes | — |
 | bot-arena | 2 | 50% | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |

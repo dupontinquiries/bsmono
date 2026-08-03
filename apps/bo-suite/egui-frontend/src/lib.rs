@@ -16,6 +16,7 @@ pub mod channel;
 pub mod tags;
 pub mod outputs;
 pub mod sources;
+pub mod fileproc;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -132,6 +133,15 @@ pub struct Controller {
     /// Wall clock in seconds, for the "3d ago" column. Supplied by the host so
     /// the page does not reach for a clock it cannot be tested with.
     pub now_secs: i64,
+    /// The offline processing section at the bottom of the mixer page.
+    pub fileproc: crate::fileproc::FileProcessor,
+    /// The volume step keys, held across frames so their ripple and flash
+    /// survive the redraw they animate through.
+    pub key_down: crate::fileproc::StepKey,
+    pub key_up: crate::fileproc::StepKey,
+    pub key_mute: crate::fileproc::StepKey,
+    /// The processing request the host should perform.
+    pub pending_proc: Option<crate::fileproc::ProcAction>,
     pub speaker_col: crate::channel::ChannelColumn,
     pub instrumental_col: crate::channel::ChannelColumn,
     pub mixer: crate::device::Mixer,
@@ -184,6 +194,11 @@ impl Controller {
             sources_page: Default::default(),
             playlists_page: Default::default(),
             now_secs: 0,
+            fileproc: Default::default(),
+            key_down: crate::fileproc::StepKey::new("−", false),
+            key_up: crate::fileproc::StepKey::new("+", false),
+            key_mute: crate::fileproc::StepKey::new("MUTE", true),
+            pending_proc: None,
             // Frequencies and role hints come from the mixer's own band plan;
             // the column prints them so the choice is visible rather than
             // implied.
@@ -358,6 +373,12 @@ impl Controller {
         if let Some(s) = self.scenes.get(self.active_scene) {
             ui.colored_label(c.text_weak, format!("active: {}", s.name));
         }
+    }
+
+    /// Start an offline processing run, if the section will allow it.
+    pub fn start_proc(&mut self, which: &str) {
+        let a = if which == "run" { self.fileproc.run() } else { self.fileproc.act(which) };
+        if a.is_some() { self.pending_proc = a; }
     }
 
     /// Carry out a playlist action. The page owns no storage; the host performs
@@ -686,6 +707,19 @@ impl Controller {
             crate::channel::column_ui(ui, &mut self.instrumental_col, c);
         });
         crate::channel::curve_ui(ui, &self.speaker_col, &self.instrumental_col, 120.0, c);
+
+        // The step keys, in the app's own press language.
+        ui.horizontal(|ui| {
+            if crate::fileproc::step_key_ui(ui, &mut self.key_down, 40.0, c) {
+                self.dial.set_external((self.dial.value - 5.0).max(0.0));
+            }
+            if crate::fileproc::step_key_ui(ui, &mut self.key_up, 40.0, c) {
+                self.dial.set_external((self.dial.value + 5.0).min(100.0));
+            }
+            if crate::fileproc::step_key_ui(ui, &mut self.key_mute, 40.0, c) {
+                self.dial.set_external(0.0);
+            }
+        });
         ui.separator();
 
         let ordered: Vec<(usize, crate::device::Band)> = self.mixer.ordered();
@@ -816,6 +850,35 @@ mod tests {
         assert_eq!(c.queue.len(), 1, "and the rest are really in the queue");
         assert_eq!(c.queue.up_next().unwrap().title, "Closer");
         assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn a_processing_run_carries_the_resolved_output_and_locks_the_controls() {
+        let mut c = sample();
+        c.fileproc.input = "/m/a.wav".into();
+        c.fileproc.set_bitrate(96);
+        c.start_proc("run");
+        assert_eq!(c.pending_proc, Some(crate::fileproc::ProcAction::Run {
+            input: "/m/a.wav".into(), output: "/m/a.mixed.opus".into(), bitrate: 96 }));
+        // A second run would write a second file the user cannot tell from the
+        // first.
+        c.pending_proc = None;
+        c.start_proc("run");
+        assert_eq!(c.pending_proc, None);
+    }
+
+    #[test]
+    fn a_step_key_moves_the_dial_and_the_dial_stops_fighting_it() {
+        // Stepping is an external change as far as the wheel is concerned:
+        // whatever spin it had is no longer describing what is happening.
+        let mut c = sample();
+        c.dial.set_external(50.0);
+        c.dial.press(0.0, 0.0, 90.0, 100.0);
+        c.dial.drag(30.0, 0.0);
+        c.dial.release();
+        assert!(c.dial.spinning());
+        c.dial.set_external((c.dial.value - 5.0).max(0.0));
+        assert!(!c.dial.spinning());
     }
 
     #[test]
