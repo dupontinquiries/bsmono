@@ -40,6 +40,7 @@ pub mod scroll_areas;
 pub mod mobile_dialog;
 pub mod glass;
 pub mod swipe_physics;
+pub mod video_viewer;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -173,6 +174,11 @@ pub struct Snapclone {
     pub glass_shutter: crate::glass::GlassButton,
     /// Set when the shutter is tapped; the host captures the frame.
     pub shutter_pressed: bool,
+    /// The video snap viewer. Separate from `viewer` because a video snap is
+    /// PERSISTENT and exportable while an image snap is view-once — opening the
+    /// wrong one either destroys a video the user could keep or keeps an image
+    /// they were promised would vanish.
+    pub video: Option<crate::video_viewer::VideoViewer>,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -238,6 +244,7 @@ impl Snapclone {
             glass_flip: Default::default(),
             glass_shutter: Default::default(),
             shutter_pressed: false,
+            video: None,
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -526,6 +533,31 @@ impl Snapclone {
             Answer::Declined => {}
         }
         self.incoming_call = None;
+    }
+
+    /// Open a snap from the feed, routing by MEDIA KIND.
+    ///
+    /// A video goes to the persistent viewer and an image to the view-once one.
+    /// The routing lives here, once, rather than at each tile: a tile that
+    /// picked its own viewer would eventually pick the wrong one.
+    pub fn open_snap_routed(&mut self, snap: crate::snaps::Snap, surface: egui::Rect) {
+        let id = snap.id.clone();
+        if snap.media == crate::snaps::Media::Video {
+            self.video = Some(crate::video_viewer::VideoViewer::new(
+                snap.duration_secs.max(1) as f32 * 1000.0));
+            self.feed.remove(&id);
+            let r = self.dialog_rect(surface, 420.0);
+            self.modal.present_default(&format!("video:{id}"), crate::modal::Layer::Dialog, r);
+            return;
+        }
+        self.open_snap(snap);
+    }
+
+    /// Close the video viewer. Note what is absent: no wipe and no expiry — the
+    /// file stays in snap storage until it expires on its own schedule.
+    pub fn close_video(&mut self, id: &str) {
+        self.video = None;
+        self.modal.dismiss(&format!("video:{id}"));
     }
 
     /// Open a snap from the feed, view-once, presented into the modal Dialog
@@ -937,6 +969,51 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    fn a_video_snap(id: &str) -> crate::snaps::Snap {
+        crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
+            sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Video,
+            duration_secs: 12, bytes: vec![1, 2, 3] }
+    }
+
+    #[test]
+    fn a_video_snap_opens_the_persistent_viewer_and_an_image_opens_the_view_once_one() {
+        // The routing lives in one place because a tile that picked its own
+        // viewer would eventually pick the wrong one — and the wrong one either
+        // destroys a video the user could keep or keeps an image promised to
+        // vanish.
+        let surface = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 780.0));
+        let mut s = app();
+        s.open_snap_routed(a_video_snap("v1"), surface);
+        assert!(s.video.is_some(), "video went to the persistent viewer");
+        assert!(!s.viewer.is_open(), "and not to the ephemeral one");
+
+        let mut t = app();
+        t.open_snap_routed(a_snap("s1"), surface);
+        assert!(t.video.is_none());
+        assert!(t.viewer.is_open());
+    }
+
+    #[test]
+    fn closing_a_video_neither_wipes_nor_expires_it() {
+        // The whole difference from the image path, which does both.
+        let surface = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 780.0));
+        let mut s = app();
+        s.open_snap_routed(a_video_snap("v1"), surface);
+        s.close_video("v1");
+        assert!(s.video.is_none());
+        assert!(s.snaps_expired.is_empty(), "a video does not expire on close");
+        assert!(s.modal.is_empty());
+    }
+
+    #[test]
+    fn a_video_viewer_is_placed_by_the_form_factor_like_every_other_dialog() {
+        let mut s = app();
+        s.dialog_form = crate::mobile_dialog::Form::Sheet;
+        let surface = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 780.0));
+        s.open_snap_routed(a_video_snap("v1"), surface);
+        assert!(s.modal.blocks_input());
     }
 
     #[test]
