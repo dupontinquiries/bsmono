@@ -139,6 +139,18 @@ def label(iqm):
     return cat, name
 
 
+def load_overrides():
+    """Human verdicts about which way a chassis faces."""
+    p = os.path.join(HERE, "orient-overrides.json")
+    try:
+        return json.load(open(p)).get("overrides", {})
+    except Exception:
+        return {}
+
+
+OVERRIDES = load_overrides()
+
+
 def main():
     # ROSTER SOURCE. foldview_tuning.json is a list of models someone sat
     # down and tuned, not a list of models that work — and there are over a
@@ -172,18 +184,27 @@ def main():
         subprocess.run(["rm", "-rf", d])
 
         # probe the facing, unmerged, so part names survive
-        turn = 0.0
-        subprocess.run(
+        # DECLARED CORRECTIONS FIRST. A vehicle's nose is not reliably
+        # measurable (see tools/orient-overrides.json), so a human verdict
+        # beats a heuristic and this is where it goes.
+        ov = OVERRIDES.get(name, {})
+        flat_yaw = float(ov.get("yaw", 0.0))
+        turn = float(ov.get("turn", 0.0))
+        if turn == 0.0 and flat_yaw == 0.0:
+            subprocess.run(
             [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
              "--veh", os.path.join(DATA, iqm), "--gltf", "/tmp/_probe_r", "--t", "1.0"],
             capture_output=True, timeout=180)
-        try:
-            y = robot_yaw("/tmp/_probe_r")
-        except Exception:
-            y = None
-        # only act on a real misalignment; a few degrees is pose, not framing
-        if y is not None and abs(y) > 20.0:
-            turn = round(y / 90.0) * 90.0
+            try:
+                y = robot_yaw("/tmp/_probe_r")
+            except Exception:
+                y = None
+            # only act on a real misalignment; a few degrees is pose, not
+            # framing. Measured across the roster this fires on nothing —
+            # every robot already lands within 11 degrees of -Z — but it
+            # stays in for an import that does arrive turned.
+            if y is not None and abs(y) > 20.0:
+                turn = round(y / 90.0) * 90.0
 
         good = True
         for k in range(POSES):
@@ -198,11 +219,17 @@ def main():
                 good = False
                 fail.append((name, (r.stderr or "").strip().splitlines()[-1:] or ["?"]))
                 break
-            if turn:
-                yaw_pose(os.path.join(d, f"f{k:02d}"), turn * smoothstep(t))
+            # flat_yaw turns the whole strip; turn spends the rotation
+            # across the fold. They compose, so a chassis can do both.
+            deg = flat_yaw + turn * smoothstep(t)
+            if deg:
+                yaw_pose(os.path.join(d, f"f{k:02d}"), deg)
         if good:
             ok += 1
-        tag = f"turn {turn:.0f}deg" if turn else "aligned"
+        tag = ", ".join(
+            [x for x in (f"yaw {flat_yaw:.0f}" if flat_yaw else "",
+                         f"turn {turn:.0f}" if turn else "") if x]
+        ) or "as exported"
         print(f"  [{i:2d}/{len(todo)}] {name:22s} {'ok' if good else 'FAILED'}  {tag}")
     print(f"\n{ok} exported, {len(fail)} failed, {time.time()-t0:.0f}s")
     for n, msg in fail:

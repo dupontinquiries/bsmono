@@ -1,0 +1,29 @@
+{
+  "_doc": [
+    "Per-chassis orientation corrections, applied by export-roster.py.",
+    "",
+    "WHY THIS IS A FILE AND NOT AN ALGORITHM: a vehicle's NOSE cannot be",
+    "determined reliably from geometry. Two independent measures were tried",
+    "across the roster and disagreed with each other — a head/visor part-Z",
+    "test called 22 of 28 reversed, a taper-and-height asymmetry test called",
+    "16 reversed, and the two sets did not match. The robot pose IS",
+    "determinable (feet-to-head gives up, a left/right limb pair gives",
+    "forward, and all 28 measure +Y up and within 11 degrees of -Z), but a",
+    "car is roughly symmetric front to back and the asymmetries that do",
+    "exist are small and contradictory.",
+    "",
+    "So: the engine declares rather than guesses. Put a chassis in here and",
+    "its whole strip is turned by `yaw` degrees about Y.",
+    "",
+    "  yaw   turn the WHOLE strip, keeping vehicle and robot consistent with",
+    "        each other. Use when both modes face the same wrong way.",
+    "  turn  spend the rotation ACROSS the fold instead: the vehicle keeps",
+    "        its facing, the robot lands on the turned one, and the poses",
+    "        between carry the difference. Use when the vehicle looks right",
+    "        and the robot does not, or the reverse.",
+    "",
+    "Both are in degrees. Empty means the export is unmodified, which is the",
+    "current state — nothing here is a guess I could not verify."
+  ],
+  "overrides": {}
+}
