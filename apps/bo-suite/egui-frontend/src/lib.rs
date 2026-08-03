@@ -12,6 +12,7 @@ pub mod library;
 pub mod browse;
 pub mod queue;
 pub mod dial;
+pub mod channel;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -106,6 +107,10 @@ pub struct Controller {
     /// The volume the dial last reported, waiting for the host to debounce and
     /// push. `None` once it has been sent.
     pub pending_volume: Option<f32>,
+    /// The two mixer channels. Held separately rather than as one band list,
+    /// because the whole point of the page is that they are independent.
+    pub speaker_col: crate::channel::ChannelColumn,
+    pub instrumental_col: crate::channel::ChannelColumn,
     pub mixer: crate::device::Mixer,
     pub profile: crate::device::Profile,
     pub soundscape: crate::soundscape::Soundscape,
@@ -146,6 +151,15 @@ impl Controller {
             now_playing: Default::default(),
             dial: crate::dial::VolumeDial::new(0.0),
             pending_volume: None,
+            // Frequencies and role hints come from the mixer's own band plan;
+            // the column prints them so the choice is visible rather than
+            // implied.
+            speaker_col: crate::channel::ChannelColumn::new(
+                crate::channel::Channel::Speaker, 200.0, 1500.0, 8000.0,
+                ["body", "vocal presence", "air"]),
+            instrumental_col: crate::channel::ChannelColumn::new(
+                crate::channel::Channel::Instrumental, 200.0, 1500.0, 8000.0,
+                ["weight", "midrange", "shimmer"]),
             mixer: Default::default(),
             profile: Default::default(),
             soundscape: Default::default(),
@@ -552,6 +566,16 @@ impl Controller {
         if self.mixer.is_flat() {
             ui.colored_label(c.text_weak, "flat — no correction applied");
         }
+        // The two channel strips, side by side, over their response curves —
+        // the independence of the chains is the thing this page exists to show.
+        ui.horizontal(|ui| {
+            crate::channel::column_ui(ui, &mut self.speaker_col, c);
+            ui.separator();
+            crate::channel::column_ui(ui, &mut self.instrumental_col, c);
+        });
+        crate::channel::curve_ui(ui, &self.speaker_col, &self.instrumental_col, 120.0, c);
+        ui.separator();
+
         let ordered: Vec<(usize, crate::device::Band)> = self.mixer.ordered();
         for (i, band) in ordered {
             ui.horizontal(|ui| {
@@ -680,6 +704,27 @@ mod tests {
         assert_eq!(c.queue.len(), 1, "and the rest are really in the queue");
         assert_eq!(c.queue.up_next().unwrap().title, "Closer");
         assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn resetting_one_mixer_channel_leaves_the_other_alone() {
+        // Per-channel reset is the common need: you adjust one column, decide
+        // it was a bad call, and want to start over without losing the other.
+        let mut c = sample();
+        c.speaker_col.set_gain(1, 8.0);
+        c.instrumental_col.set_gain(0, -5.0);
+        c.speaker_col.reset();
+        assert!(c.speaker_col.is_neutral());
+        assert!(!c.instrumental_col.is_neutral());
+    }
+
+    #[test]
+    fn lifting_a_speaker_band_does_not_move_the_instrumental_curve() {
+        let mut c = sample();
+        let before = c.instrumental_col.response_db(1500.0);
+        c.speaker_col.set_gain(1, 10.0);
+        assert!(c.speaker_col.response_db(1500.0) > 9.0);
+        assert_eq!(c.instrumental_col.response_db(1500.0), before);
     }
 
     #[test]
