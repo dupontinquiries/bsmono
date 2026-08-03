@@ -11410,6 +11410,20 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     ///
     /// `queue` items are `(id, tokens, max_new)`; returns `(id, generated_tokens)` sorted
     /// by id. Greedy (temperature 0) output is identical to per-request `generate_kv`.
+    /// Generate several replies that share a prompt prefix.
+    ///
+    /// **The PREFILL is batched and the DECODE is not.** The shared prefix is computed once — which is
+    /// the large saving on a fan-out, and why a second turn reports "reused N anchor tokens" — but the
+    /// per-token loop drains the sessions and calls `session_step` on each in turn, so every branch
+    /// decodes at m=1 and reads the whole weight set for its own token.
+    ///
+    /// The name promises more than that, and it is worth being precise because the gap is the point:
+    /// four branches decoding at m=1 read the weights four times per token, where four rows in one
+    /// pass would read them once. That is not speculation and nothing is rejected — every branch needs
+    /// a real forward pass regardless, so batching them is certain work rather than a gamble.
+    ///
+    /// `ragged::Batch::plan_step` and `Gpu::batch_plan` exist to answer how wide that pass may be;
+    /// what is missing here is stepping the live sessions together instead of one at a time.
     pub fn run_batched(
         &self, m: &Model, prefix: Option<(&KvCache, usize)>,
         mut queue: Vec<(usize, Vec<u32>, usize)>, sampler: &SamplerParams, eos: Option<u32>,
