@@ -3676,6 +3676,26 @@ quant gate has been reporting a WRITE bug as a read bug.");
             println!("  => the upload is byte-exact, so the buffer holds what it should and the fault \
 is between binding and execution.");
         }
+        // THE WORKAROUND, tested against the fault word_probe just isolated. If four threads reading
+        // one word is what fails, staging that word through workgroup memory — one distinct load per
+        // thread, a barrier, then an explicit broadcast — should be correct.
+        //
+        // If this passes where byte_at fails, the fix for Q4_K, Q6_K and the subgroup matvec is the
+        // same restructuring, and it is mechanical rather than exploratory.
+        let st = gpu.byte_probe_staged(&raw);
+        let st_ok = st.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        println!("  staged byte_at 0..16: {:?}",
+            st.iter().take(16).map(|x| *x as u8).collect::<Vec<_>>());
+        println!("gate-bytes: workgroup-staged broadcast {}", if st_ok { "CORRECT" } else { "WRONG" });
+        let scalar_matches = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        if st_ok && !scalar_matches {
+            println!("  => WORKAROUND CONFIRMED. Staging the shared word through workgroup memory \
+fixes it, so the fault is a lane broadcast and every kernel that reads one word from several threads \
+needs the same restructuring: Q4_K and Q6_K scales, and the subgroup matvec.");
+        } else if !st_ok {
+            println!("  => the staged form fails too, so an explicit workgroup broadcast is not \
+enough and the fault is deeper than a scalarized load.");
+        }
         let v4 = gpu.byte_probe_vec4(&raw);
         let v4_ok = v4.iter().enumerate().all(|(i, x)| *x as u8 == raw[i]);
         let scalar_ok = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
