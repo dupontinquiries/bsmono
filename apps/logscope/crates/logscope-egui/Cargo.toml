@@ -51,6 +51,12 @@ default = ["gui", "gpu-scene"]
 # the egui/eframe GUI + its modules; off lets logscope-cli build lean (no eframe/vello)
 gui = ["dep:eframe", "dep:egui", "dep:rfd", "dep:async-std", "dep:tree-sitter", "dep:tree-sitter-rust"]
 wgpu-engine = ["dep:gpu-gemm"]
+# The scene/pearl/status viewers are 30-109 line DEV LOOPS, not deliverables, and
+# every one of them is a separate codegen + link unit against the whole 53k-line
+# crate and its 352 dependencies. `cargo test` builds bins too, so the cost was
+# being paid on every test run by everyone, to produce five programs almost
+# nobody runs. Off by default; render-scene.sh passes it.
+dev-views = ["gui"]
 # Forward the core's local GGML/GGUF inference so the egui app can build with `--features llamacpp`
 # (Vulkan) or `--features llamacpp-cpu`, matching the logscope core's feature names.
 llamacpp = ["logscope/llamacpp"]
@@ -80,17 +86,17 @@ path = "src/bin/logscope-cli.rs"
 [[bin]]
 name = "scene-view"
 path = "src/bin/scene-view.rs"
-required-features = ["gpu-scene"]
+required-features = ["gpu-scene", "dev-views"]
 
 [[bin]]
 name = "pearl-input-view"
 path = "src/bin/pearl-input-view.rs"
-required-features = ["gui"]
+required-features = ["gui", "dev-views"]
 
 [[bin]]
 name = "mic-pearl-view"
 path = "src/bin/mic-pearl-view.rs"
-required-features = ["gui"]
+required-features = ["gui", "dev-views"]
 
 [[bin]]
 name = "logscope-fabricd"
@@ -99,8 +105,9 @@ path = "src/bin/logscope-fabricd.rs"
 [[bin]]
 name = "scene-critique"
 path = "src/bin/scene-critique.rs"
+required-features = ["dev-views"]
 
 [[bin]]
 name = "status-view"
 path = "src/bin/status-view.rs"
-required-features = ["gpu-scene"]
+required-features = ["gpu-scene", "dev-views"]
