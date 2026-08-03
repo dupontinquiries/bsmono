@@ -296,3 +296,43 @@ Verified by, in order of strength:
   full orthotropic `D` is needed before FR-4 warp or nacre stacking can be modelled.
 - **No thermal coupling**, so `α` is stored and unused and thermal stress cannot be computed.
 - **No body forces, no traction boundary conditions.** Loads are nodal only.
+
+
+## Thermal, and the analogy made concrete
+
+Steady conduction is Laplace with `k` where `ε` was, so `assemble` is reused verbatim. The test
+that makes the point is cylindrical: a shell conducts `2πk/ln(b/a)` and a coax line holds
+`2πε/ln(b/a)` — the **same integral**. Running both through identical code and asserting
+`C/ε == G/k` is a stronger statement than either check alone.
+
+Heat balance is checked as a *reaction* (`K·T` restricted to the boundary) rather than by
+differentiating the field and integrating flux. The reaction is exact for the discrete system; the
+differentiated flux only converges. For conservation, exact beats convergent.
+
+**Thermal stress**: `σ = D(ε − ε₀)`, where `ε₀ = αΔT` is what the material wanted. Stress arises
+only from the part of that the geometry refused. Hence the sharpest test available —
+**unconstrained uniform heating produces exactly zero stress** — which is also where the most
+common implementation error shows: forgetting to subtract the free strain produces enormous,
+entirely plausible-looking stresses in a body that is simply expanding. Full restraint reproduces
+`−EαΔT/(1−ν)` to nine figures, and a CTE mismatch generates stress where a matched pair does not.
+
+The FR-4/copper reflow case is now expressible end to end: a 200 K excursion drives a mismatch
+strain of 0.011, well past copper's elastic limit — which is why via failure is fatigue cracking
+over many cycles rather than a single fracture.
+
+## Mixture bounds (`sim-mat::mixture`)
+
+The acceptance test for a homogenization solver that has not been written yet, deliberately built
+first. Voigt (uniform strain) bounds above, Reuss (uniform stress) below, and **anything outside
+that bracket is provably wrong** — no reference data, nothing to tune against. Hashin–Shtrikman
+narrows it for statistically isotropic mixtures, and the *width* of the bracket is itself the
+signal: wide means geometry decides and only a solve will do.
+
+For nacre the bracket is wide — 5% of a soft phase barely moves Voigt but collapses Reuss, because
+uniform stress puts all the strain into the compliant phase. And there is a limit stated as a test
+so it cannot be quietly forgotten: **these bounds constrain stiffness, not toughness.** Nacre's
+modulus is admissible and unremarkable. Its toughness is ~24× either constituent, and no bound of
+this kind can reach it, because bounds assume perfectly bonded phases while nacre's toughening is
+interfaces sliding, deflecting and bridging. **A homogenization that reproduces nacre's stiffness
+proves nothing about its toughness** — which is the clearest statement I can make of why the
+cohesive-interface model is the real work.
