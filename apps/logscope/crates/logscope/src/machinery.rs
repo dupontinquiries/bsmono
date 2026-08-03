@@ -1311,7 +1311,9 @@ mod rejoin_tests {
 pub enum Role {
     /// Runs inference. Gets the full mechanism.
     Worker,
-    /// Watches. Gets a lantern.
+    /// Watches. Gets a **lighthouse** — see `Lighthouse`, which supersedes the flat lantern this
+    /// started as. A lantern was one channel; a lighthouse carries capability, link and age on three
+    /// independent ones, and a phone's whole situation is that those three differ.
     Viewer,
 }
 
@@ -1550,5 +1552,135 @@ mod beacon_tests {
         }
         assert!(beacon_form("Atlantis").contains("lighthouse"));
         assert!(beacon_form("Treehouse").contains("paper lantern"));
+    }
+}
+
+/// A viewer's lighthouse: **height from capability, light from connection, vines from age.**
+///
+/// A lighthouse is the right structure because its job IS to be findable, and because it signals
+/// rather than manufactures — which is exactly what a phone in this cluster does. It also carries
+/// three independent facts on three independent channels, and they must stay independent:
+///
+/// * **height** — what this device could do if asked. A phone that could run a 3B model is a taller
+///   tower than one that could not. Stable: it does not flicker with the link.
+/// * **light** — how well we are hearing from it right now. Bright and steady on a good link, dim and
+///   guttering on a bad one, dark when silent.
+/// * **vines** — how long it has been quiet. Growth is about duration, not strength.
+///
+/// **A dim light on a tall clean tower says "good device, bad link".** A bright light on a short
+/// vine-covered one says "modest device, just came back after a long absence". One number could say
+/// neither.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Lighthouse {
+    /// Tower height in landmark-scales. Derived from capability, so it is stable across a session.
+    pub height: f32,
+    /// Lamp brightness 0..1, from link recency.
+    pub lamp: f32,
+    /// How fast the beam sweeps. Slows on a poor link — a guttering lamp reads as struggling in a way
+    /// a merely dimmer one does not.
+    pub sweep: f32,
+    /// Overgrowth 0..1, from silence.
+    pub vines: f32,
+}
+
+/// A device that can hold this much in GiB anchors the tallest tower. Above it, height stops growing:
+/// a workstation is not usefully drawn as ten times a phone, and the point is comparison at a glance
+/// rather than a bar chart.
+pub const LIGHTHOUSE_FULL_GIB: f32 = 32.0;
+
+/// Seconds since last contact at which the lamp is fully dark.
+pub const LIGHTHOUSE_DARK_S: f32 = 30.0;
+
+impl Lighthouse {
+    /// Build from what the cluster knows about a device.
+    ///
+    /// `tok_s` is the autotune's measured decode rate and `mem_gib` its usable memory. **Both matter
+    /// and neither alone is capability**: a machine with memory and no throughput cannot generate,
+    /// and one with throughput and no memory cannot hold a model worth generating from.
+    pub fn of(tok_s: f32, mem_gib: f32, since_contact_s: f32, silent_s: f32) -> Lighthouse {
+        // Geometric mean, so a device weak in EITHER dimension is short. An average would let 64 GiB
+        // and no compute masquerade as capable, which is the case most likely to mislead — it is
+        // exactly what an idle phone with a big card looks like on paper.
+        let m = (mem_gib / LIGHTHOUSE_FULL_GIB).clamp(0.0, 1.0);
+        let t = (tok_s / 20.0).clamp(0.0, 1.0);
+        let cap = (m * t).sqrt();
+        let lamp = (1.0 - since_contact_s / LIGHTHOUSE_DARK_S).clamp(0.0, 1.0);
+        Lighthouse {
+            // A floor, because a tower of zero height is not a lighthouse and a device we know
+            // nothing about should still be findable — unknown is not the same as absent.
+            height: 0.4 + 1.6 * cap,
+            lamp,
+            // Sweep falls faster than brightness so a marginal link LOOKS marginal before it looks
+            // dark: a lamp at half brightness sweeping at a fifth speed reads as struggling, where
+            // half-bright alone reads as merely distant.
+            sweep: lamp * lamp,
+            vines: (silent_s / WEATHER_FULL_AGE_S.max(0.001)).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Is this device worth offering work to? Height is capability, but a dark lamp means we cannot
+    /// reach it whatever it could do.
+    pub fn reachable(&self) -> bool { self.lamp > 0.15 }
+}
+
+#[cfg(test)]
+mod lighthouse_tests {
+    use super::*;
+
+    #[test]
+    fn a_CAPABLE_device_builds_a_taller_tower() {
+        let phone = Lighthouse::of(4.0, 6.0, 0.0, 0.0);
+        let workstation = Lighthouse::of(20.0, 32.0, 0.0, 0.0);
+        assert!(workstation.height > phone.height * 1.5);
+    }
+
+    #[test]
+    fn memory_WITHOUT_compute_does_not_make_a_tall_tower() {
+        // The geometric mean's whole purpose. An average would let 64 GiB and no throughput
+        // masquerade as capable — which is exactly what an idle machine with a big card looks like on
+        // paper, and the case most likely to mislead someone into routing work to it.
+        let big_slow = Lighthouse::of(0.5, 32.0, 0.0, 0.0);
+        let balanced = Lighthouse::of(8.0, 8.0, 0.0, 0.0);
+        assert!(balanced.height > big_slow.height, "{} vs {}", balanced.height, big_slow.height);
+    }
+
+    #[test]
+    fn a_dim_light_on_a_TALL_tower_says_good_device_bad_link() {
+        // The three channels staying independent is the entire design. One number could not say this.
+        let l = Lighthouse::of(20.0, 32.0, 24.0, 0.0);
+        assert!(l.height > 1.5, "still tall");
+        assert!(l.lamp < 0.3, "but barely lit");
+        assert!(l.vines < 0.1, "and not overgrown — it is reachable-ish, not long gone");
+    }
+
+    #[test]
+    fn a_bright_light_on_a_VINED_tower_says_just_came_back() {
+        let l = Lighthouse::of(6.0, 8.0, 0.0, WEATHER_FULL_AGE_S);
+        assert!(l.lamp > 0.9, "hearing it clearly now");
+        assert!(l.vines > 0.9, "after a long silence");
+    }
+
+    #[test]
+    fn the_SWEEP_falls_faster_than_the_brightness() {
+        // So a marginal link looks marginal before it looks dark. Half-bright alone reads as merely
+        // distant; half-bright sweeping at a quarter speed reads as struggling.
+        let l = Lighthouse::of(10.0, 16.0, LIGHTHOUSE_DARK_S * 0.5, 0.0);
+        assert!((l.lamp - 0.5).abs() < 0.05);
+        assert!(l.sweep < l.lamp * 0.6, "sweep {} vs lamp {}", l.sweep, l.lamp);
+    }
+
+    #[test]
+    fn an_UNKNOWN_device_still_gets_a_findable_tower() {
+        // Unknown is not the same as absent. A tower of zero height is not a lighthouse, and a device
+        // we have not measured should still be visible enough to ask about.
+        let l = Lighthouse::of(0.0, 0.0, 0.0, 0.0);
+        assert!(l.height > 0.3);
+        assert!(l.reachable(), "we are hearing from it, we just do not know what it can do");
+    }
+
+    #[test]
+    fn a_DARK_lighthouse_is_not_offered_work() {
+        // Height is capability; a dark lamp means we cannot reach it whatever it could do.
+        assert!(!Lighthouse::of(20.0, 32.0, LIGHTHOUSE_DARK_S, 0.0).reachable());
     }
 }
