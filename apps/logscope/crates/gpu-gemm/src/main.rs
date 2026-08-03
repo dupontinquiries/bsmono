@@ -3682,6 +3682,20 @@ is between binding and execution.");
         //
         // If this passes where byte_at fails, the fix for Q4_K, Q6_K and the subgroup matvec is the
         // same restructuring, and it is mechanical rather than exploratory.
+        // THE ISOLATING TEST. Same shared read as the failing version, same byte, only the
+        // EXTRACTION differs: extractBits instead of shift-and-mask. MATVEC_Q4 already uses it and
+        // calls it "AGX-safe dynamic offset" — someone hit this and worked around it without naming
+        // the fault.
+        let ex = gpu.byte_probe_extract(&raw);
+        let ex_ok = ex.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        println!("  extractBits byte_at : {:?}",
+            ex.iter().take(16).map(|x| *x as u8).collect::<Vec<_>>());
+        println!("gate-bytes: extractBits form {}", if ex_ok { "CORRECT" } else { "WRONG" });
+        if ex_ok {
+            println!("  => THE FAULT IS THE DYNAMIC SHIFT, not the shared read. `w >> (lane*8)` \
+returns zero for every lane whose shift is non-zero; extractBits with the same varying offset is \
+correct. The rule is mechanical: no shift by a lane-varying amount anywhere in a kernel.");
+        }
         let st = gpu.byte_probe_staged(&raw);
         let st_ok = st.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
         println!("  staged byte_at 0..16: {:?}",
