@@ -88,6 +88,11 @@ pub struct CarCfg {
     pub jump: f32,        // jump strength x
     pub analog: bool,     // wooting analog keys feed the movement axes
     pub analog_soft: f32, // wind-in depth: 0 = digital, 0.45 = default feather
+    /// HOLD vs CYCLE for autotarget. Hold is the default: a lock you have to
+    /// keep asking for is a lock you cannot forget you left on, because you
+    /// can feel the key. Cycle suits a pad, or a hand that would rather not
+    /// hold anything.
+    pub autotarget_hold: bool,
 }
 
 pub struct FlipCfg {
@@ -144,7 +149,7 @@ impl Default for Config {
             cam: CamCfg { fov_deg: 86.0, dist: 4.9, height: 1.21, angle_deg: 20.0, stiffness: 1.0, shake: 0.6, grav_follow: 1.0, plat_bend: 0.55 },
             arena: ArenaCfg { gravity: 1.0, bounce: 1.0, friction: 1.0, scale: 1.0 },
             ball: BallCfg { size: 1.0, bounce: 1.0, friction: 1.0, weight: 1.0 },
-            car: CarCfg { steer_rate: 0.9, input_ease: 1.1, size: 1.0, grip: 1.0, top_speed: 1.0, accel: 1.0, boost: 1.0, boost_regen: 0.0, boost_max: 1.0, unlimited_boost: false, jump: 1.0, analog: true, analog_soft: 0.45 },
+            car: CarCfg { steer_rate: 0.9, input_ease: 1.1, size: 1.0, grip: 1.0, top_speed: 1.0, accel: 1.0, boost: 1.0, boost_regen: 0.0, boost_max: 1.0, unlimited_boost: false, jump: 1.0, analog: true, analog_soft: 0.45 , autotarget_hold: true },
             flip: FlipCfg { spin: 1.0, strength: 1.0, resets: true, strict: true, unlimited: false, cancel: true, land_assist: 0.0, air_roll_default: false },
             video: VideoCfg { render_scale: 1.0, rays: true, quality: 1.0, filmic: true, exposure: 1.0, vignette: 0.32, grain: 0.12, letterbox: false, bloom: 0.7, vsync: true, screen_door: 0.05, tier: 0 },
             touch: TouchCfg { enabled: false, scale: 1.0, tap_to_move: true },

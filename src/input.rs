@@ -286,7 +286,13 @@ impl Bindings {
             (SteerR, vec![ch("d")]),
             (RollL, vec![ch("q")]),
             (RollR, vec![ch("e")]),
-            (Jump, vec![named(NamedKey::Space), Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_SOUTH)]),
+            // JUMP LOSES SPACE. Autotarget was asked for on space as a
+            // hold, and two actions on one key is worse than moving one.
+            // Jump keeps middle mouse and the pad's south button — so
+            // NOTHING CHANGES ON A CONTROLLER — and takes J on the keyboard.
+            // Rebindable, and if the trade is wrong it is one line in the
+            // Binds menu.
+            (Jump, vec![ch("j"), Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_SOUTH)]),
             // BOOST LOSES SHIFT. Transform was asked for on Shift, and two
             // actions on one key is worse than moving one of them. V is the
             // boost key the Dvorak scheme already uses, so it is not a new
@@ -310,7 +316,9 @@ impl Bindings {
             // used to it, and L-bumper on a pad.
             (Transform, vec![named(NamedKey::Shift), ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
             // X, and the right stick click — where a lock-on lives on a pad
-            (AutoTarget, vec![ch("x"), Bind::Pad(crate::gamepad::PB_R3)]),
+            // HOLD to hold a target, by default. X stays as a second
+            // binding for anyone who preferred it.
+            (AutoTarget, vec![named(NamedKey::Space), ch("x"), Bind::Pad(crate::gamepad::PB_R3)]),
             // MOUSE. Shooting belongs under the trigger finger, so Fire is
             // left mouse and the right trigger. Boost and jump pick up right
             // and middle as SECOND bindings rather than replacements — the

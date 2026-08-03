@@ -232,6 +232,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("UNLIMITED BOOST", Toggle { get: |c| c.car.unlimited_boost, set: |c, v| c.car.unlimited_boost = v }),
             ("INPUT", Header),
             ("ANALOG KEYS (WOOTING)", Toggle { get: |c| c.car.analog, set: |c, v| c.car.analog = v }),
+            ("AUTOTARGET: HOLD", Toggle { get: |c| c.car.autotarget_hold, set: |c, v| c.car.autotarget_hold = v }),
             ("MOTION / GYRO DRIVE", Link(7)),
             ("ANALOG WIND-IN DEPTH", pct(|c| c.car.analog_soft, |c, v| c.car.analog_soft = v, 0.0, 0.8)),
             ("BACK", Back),
@@ -485,6 +486,7 @@ struct Game {
     wep: weapons::Weapons,
     /// autotarget on: ball cam follows an opponent instead of the ball
     autotarget: bool,
+
     /// walk / run / boost / fall, for robot mode
     loco: anim::Locomotion,
     /// the pose it produced this frame
@@ -1374,6 +1376,11 @@ fn main() {
                         }
                         ElementState::Released => {
                             game.held.remove(&key);
+                            // HOLD MODE releases the lock with the key. Done
+                            // here rather than in one_shot because releases
+                            // are not shots — nothing else in the game needs
+                            // a key-up, which is why this is the only case.
+                            game.autotarget_release();
                         }
                     }
                 }
@@ -1626,7 +1633,10 @@ impl Game {
                 // three states now, not two. ball_cam is kept in step so the
                 // HUD and the save file, which both predate the enum, still
                 // mean what they meant.
-                self.cam.mode = self.cam.mode.next();
+                // the chassis decides whether a gunner seat exists at all
+                let guns = self.gun_mounts();
+                self.cam.gun_seat = guns.seat();
+                self.cam.mode = self.cam.mode.next(guns);
                 self.cam.ball_cam = self.cam.mode == camera::CamMode::Ball;
                 if self.cam.mode != camera::CamMode::First {
                     self.cam.look_pitch = self.cam.look_pitch.clamp(-0.55, 1.05);
@@ -1663,6 +1673,13 @@ impl Game {
                 }
             }
             Action::AutoTarget => {
+                // in HOLD mode the press turns it on and the release turns
+                // it off; the toggle path only runs in CYCLE mode
+                if self.cfg.car.autotarget_hold {
+                    self.autotarget = true;
+                    self.toastf("AUTOTARGET");
+                    return;
+                }
                 self.autotarget = !self.autotarget;
                 if !self.autotarget {
                     self.wep.locked = None;
@@ -1693,6 +1710,7 @@ impl Game {
             // ROBOT once past the halfway point of the strip: that is when
             // the body is on its feet, and it is what switches the flip into
             // a second jump and hands the camera to the mouse.
+            self.cam.nose_cam = self.car.flight;
             self.car.robot = self
                 .cars
                 .xform
@@ -1947,6 +1965,39 @@ impl Game {
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
         self.car.susp = (self.loco_pose.squash * self.loco_pose.weight).clamp(0.0, 1.0);
+    }
+
+    /// Let go of the target, if the lock was being held.
+    ///
+    /// Checks the binding rather than a hard-coded key, so rebinding
+    /// autotarget in the Binds menu moves the release with it — the failure
+    /// mode otherwise is a lock you can turn on and never turn off.
+    fn autotarget_release(&mut self) {
+        if !self.cfg.car.autotarget_hold || !self.autotarget {
+            return;
+        }
+        if self.action_down(Action::AutoTarget) {
+            return; // another bound key is still down
+        }
+        self.autotarget = false;
+        self.wep.locked = None;
+        self.cam.poi = None;
+        self.cam.combat = false;
+    }
+
+    /// What gun positions this chassis offers.
+    ///
+    /// Derived from the same categories tools/find-mounts.py profiles: a
+    /// flyer with rearward thrust has something to sight past, and anything
+    /// with under-wing hardpoints can shoot through its belly. A hull with
+    /// neither gets no gunner mode rather than an empty seat.
+    fn gun_mounts(&self) -> camera::GunMounts {
+        let name = self.cars.names[self.cars.active].to_ascii_lowercase();
+        let flyer = self.car.flight || name.starts_with("jet");
+        camera::GunMounts {
+            rear: flyer,
+            ventral: flyer || name.contains("freighter") || name.contains("hercules"),
+        }
     }
 
     /// Point the camera at an opponent instead of the ball.

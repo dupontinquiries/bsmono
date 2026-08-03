@@ -24,16 +24,67 @@ pub enum CamMode {
     Ball,
     /// proper third person: the body is the subject
     Chase,
-    /// from the head
+    /// from the head — or, on a flyer, from the nose
     First,
+    /// a defensive gun position: rear-facing, or ventral, depending on what
+    /// the model actually carries
+    Gunner,
+}
+
+/// Where a gunner sits. Which one a chassis offers is a property OF THE
+/// MODEL — tools/find-mounts.py already reports whether a hull has rearward
+/// thrusters to sight past or ventral hardpoints to shoot through — so this
+/// is chosen from the chassis rather than cycled blindly. A hull with
+/// neither simply has no gunner mode, and the camera skips it rather than
+/// showing an empty seat.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GunSeat {
+    /// looking back down the tail
+    Rear,
+    /// looking down through the belly
+    Ventral,
+}
+
+/// What the model provides.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GunMounts {
+    pub rear: bool,
+    pub ventral: bool,
+}
+
+impl GunMounts {
+    /// The seat to use, preferring the rear gun: on a flyer being chased,
+    /// the thing you want to see is behind you.
+    pub fn seat(self) -> Option<GunSeat> {
+        if self.rear {
+            Some(GunSeat::Rear)
+        } else if self.ventral {
+            Some(GunSeat::Ventral)
+        } else {
+            None
+        }
+    }
+    pub fn any(self) -> bool {
+        self.rear || self.ventral
+    }
 }
 
 impl CamMode {
-    pub fn next(self) -> CamMode {
+    /// Step to the next mode, skipping the gunner seat on a chassis that
+    /// does not have one. Cycling into a mode that cannot exist is how a
+    /// camera key stops feeling reliable.
+    pub fn next(self, guns: GunMounts) -> CamMode {
         match self {
             CamMode::Ball => CamMode::Chase,
             CamMode::Chase => CamMode::First,
-            CamMode::First => CamMode::Ball,
+            CamMode::First => {
+                if guns.any() {
+                    CamMode::Gunner
+                } else {
+                    CamMode::Ball
+                }
+            }
+            CamMode::Gunner => CamMode::Ball,
         }
     }
     pub fn label(self) -> &'static str {
@@ -41,6 +92,7 @@ impl CamMode {
             CamMode::Ball => "BALL CAM",
             CamMode::Chase => "CHASE CAM",
             CamMode::First => "FIRST PERSON",
+            CamMode::Gunner => "GUNNER",
         }
     }
 }
@@ -67,6 +119,10 @@ pub struct Camera {
     /// have been given the ball; hand it something else and the same rig
     /// becomes a combat camera. Set this and Ball mode follows it instead.
     pub poi: Option<Vec3>,
+    /// true when the body is a flyer: first person sits at the nose
+    pub nose_cam: bool,
+    /// which gun seat this chassis offers, if any
+    pub gun_seat: Option<GunSeat>,
     /// true while the POI is an opponent rather than the ball: the boom
     /// stops flattening itself into the horizontal plane, which is right for
     /// a ground game and wrong for a dogfight
@@ -89,6 +145,8 @@ impl Camera {
             look_yaw: 0.0,
             look_pitch: 0.0,
             poi: None,
+            nose_cam: false,
+            gun_seat: None,
             combat: false,
         }
     }
@@ -180,6 +238,12 @@ impl Camera {
             CamMode::Chase | CamMode::First => {
                 car.pos + self.up * eye_h + self.heading * lead
             }
+            // a gunner looks where the gun points: back down the tail, or
+            // down through the belly
+            CamMode::Gunner => match self.gun_seat {
+                Some(GunSeat::Ventral) => car.pos - self.up * 40.0,
+                _ => car.pos - self.heading * 40.0 + self.up * eye_h * 0.5,
+            },
         };
         let mut dir = target - car.pos;
         if dir.length_squared() < 1e-4 {
@@ -249,7 +313,17 @@ impl Camera {
             }
         }
         let k = 1.0 - (-9.0 * cfg.stiffness * dt).exp();
-        if self.mode == CamMode::First {
+        if self.mode == CamMode::Gunner {
+            // A GUN POSITION IS NOT A CHASE CAMERA. It is bolted to the
+            // hull, so it snaps like first person, and it looks where the
+            // gun points rather than where the nose does.
+            let f = self.heading;
+            let up = self.up;
+            self.pos = match self.gun_seat {
+                Some(GunSeat::Ventral) => car.pos - up * (car.half_h * 0.9),
+                _ => car.pos - f * (car.half_len * 0.85) + up * (car.half_h * 0.5),
+            };
+        } else if self.mode == CamMode::First {
             // ATTACHED TO THE HEAD. No boom, no smoothing on position — a
             // first-person eye that lags its own body reads as seasickness,
             // so this snaps and only the LOOK is smoothed.
@@ -257,8 +331,20 @@ impl Camera {
             // Nudged forward of the head rather than sat inside it: the
             // player's own model is still drawn, and an eye at the exact
             // head centre looks at the inside of its own face.
-            let f = (self.heading - self.up * self.heading.dot(self.up)).normalize_or(self.heading);
-            self.pos = car.pos + self.up * (car.half_h * 1.55) + f * (car.half_len * 0.55 + 0.25);
+            // ON A FLYER THE EYE IS THE NOSE, not the head. A jet has no
+            // head to sit behind, and putting the camera where a robot's
+            // would be leaves it hanging above the fuselage looking at its
+            // own spine. Out at the tip and level, it reads as a cockpit.
+            let f = if self.nose_cam {
+                self.heading
+            } else {
+                (self.heading - self.up * self.heading.dot(self.up)).normalize_or(self.heading)
+            };
+            self.pos = if self.nose_cam {
+                car.pos + f * (car.half_len * 0.95) + self.up * (car.half_h * 0.35)
+            } else {
+                car.pos + self.up * (car.half_h * 1.55) + f * (car.half_len * 0.55 + 0.25)
+            };
         } else {
             self.pos += (want - self.pos) * k;
         }
@@ -297,3 +383,62 @@ impl Camera {
 // quiet the unused import if Quat drops out of future edits
 #[allow(unused)]
 fn _k(_q: Quat) {}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_gunner_seat_is_skipped_when_the_hull_has_no_gun() {
+        let none = GunMounts::default();
+        let armed = GunMounts { rear: true, ventral: false };
+        // a hull with no gun position never lands on the empty seat
+        let mut m = CamMode::Ball;
+        for _ in 0..12 {
+            m = m.next(none);
+            assert_ne!(m, CamMode::Gunner, "cycled into a seat that does not exist");
+        }
+        // and one with a gun reaches it, exactly once per lap
+        let mut seen = 0;
+        let mut m = CamMode::Ball;
+        for _ in 0..4 {
+            m = m.next(armed);
+            if m == CamMode::Gunner {
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 1, "the gunner seat appeared {seen} times in one lap");
+    }
+
+    #[test]
+    fn a_rear_gun_is_preferred_to_a_belly_one() {
+        // being chased is the common case, so the default seat looks back
+        assert_eq!(GunMounts { rear: true, ventral: true }.seat(), Some(GunSeat::Rear));
+        assert_eq!(GunMounts { rear: false, ventral: true }.seat(), Some(GunSeat::Ventral));
+        assert_eq!(GunMounts::default().seat(), None);
+        assert!(!GunMounts::default().any());
+    }
+
+    #[test]
+    fn every_mode_is_reachable_and_the_cycle_closes() {
+        let armed = GunMounts { rear: true, ventral: false };
+        let mut seen: Vec<CamMode> = vec![CamMode::Ball];
+        let mut m = CamMode::Ball;
+        for _ in 0..8 {
+            m = m.next(armed);
+            if !seen.contains(&m) {
+                seen.push(m);
+            }
+        }
+        assert_eq!(seen.len(), 4, "not every camera mode is reachable: {seen:?}");
+        assert_eq!(m, CamMode::Ball, "the cycle does not return to where it started");
+    }
+
+    #[test]
+    fn every_mode_has_a_name() {
+        for m in [CamMode::Ball, CamMode::Chase, CamMode::First, CamMode::Gunner] {
+            assert!(!m.label().is_empty());
+        }
+    }
+}
