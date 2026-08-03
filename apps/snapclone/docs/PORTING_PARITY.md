@@ -30,7 +30,7 @@ starts hidden with the auto-login ordering rule.
 | ConversationDetailDialog | pending |  |
 | ConversationSecurityBar | pending |  |
 | DiagnosticsDialog | pending |  |
-| ExportReminderCard | pending |  |
+| ExportReminderCard | ported | export_reminder.rs — monthly gate, snooze, auto-sync escape hatch |
 | FriendListWidget | ported | friends.rs `Roster` + `AddForm` — dedupe by id, empty state, three address formats |
 | GroupVoiceBar | ported | voicebar.rs — swipe-to-latch, eased transmit meter, Securing as its own tier |
 | GroupVoiceCoordinator | pending |  |
@@ -44,7 +44,7 @@ starts hidden with the auto-login ordering rule.
 | MobileDialog | pending |  |
 | ModalLayerTestPanel | pending |  |
 | ModalSurface | ported | modal.rs — six layers, derived scrim, tap-outside, dismissTopmost ordering |
-| MonthlyExportReminder | pending |  |
+| MonthlyExportReminder | ported | export_reminder.rs `ReminderState` — pure should_show over month key |
 | OutboxWidget | ported | session.rs `Outbox` — transport phases, delivered is terminal, 24h prune of delivered only |
 | PagePeelHint | pending |  |
 | PressGesture | pending |  |
