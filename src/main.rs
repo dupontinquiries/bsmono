@@ -1,6 +1,7 @@
 //! SKYDRIBBLE — a Rocket-League-inspired open-world air-dribble playground.
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
+mod anim;
 mod analog;
 mod bots;
 mod camera;
@@ -476,6 +477,10 @@ struct Game {
     wep: weapons::Weapons,
     /// autotarget on: ball cam follows an opponent instead of the ball
     autotarget: bool,
+    /// walk / run / boost / fall, for robot mode
+    loco: anim::Locomotion,
+    /// the pose it produced this frame
+    loco_pose: anim::Pose,
     ball_model: model::Model,
     decor_model: model::Model,
     fx: fx::Fx,
@@ -1172,6 +1177,8 @@ fn main() {
         health: 1.0,
         wep: weapons::Weapons::new(),
         autotarget: false,
+        loco: anim::Locomotion::new(),
+        loco_pose: anim::Pose::default(),
         ball_model,
         decor_model,
         fx: fx::Fx::new(seed),
@@ -1862,6 +1869,32 @@ impl Game {
         self.set_car_model(m);
         self.save.car = m;
         self.toastf(&format!("{} ({}/{})", self.cars.names[m], next + 1, n));
+    }
+
+    /// Drive the gait, and put its body motion somewhere the renderer
+    /// already looks.
+    ///
+    /// `car.susp` is suspension compression, which the renderer bobs the
+    /// body by. A robot has no suspension, so in robot mode that channel is
+    /// free — and feeding footfall squash into it makes a walking bot dip
+    /// with each step using drawing code that already exists. It is not limb
+    /// articulation, but a body that dips on the beat and leans into a
+    /// sprint reads as walking long before its legs do.
+    fn update_locomotion(&mut self, dt: f32) {
+        if !self.car.robot {
+            self.loco_pose = anim::Pose::default();
+            return;
+        }
+        let up = -self.world.gravity_dir(self.car.pos);
+        let vert = self.car.vel.dot(up);
+        let horiz = (self.car.vel - up * vert).length();
+        let boosting = self.car.flight || self.action_down(Action::Boost);
+        self.loco_pose = self
+            .loco
+            .update(dt, horiz, vert, self.car.on_ground, boosting);
+        // element movement also belongs here: Air runs, Rock does not
+        let _ = self.wep.move_mul();
+        self.car.susp = (self.loco_pose.squash * self.loco_pose.weight).clamp(0.0, 1.0);
     }
 
     /// Point the camera at an opponent instead of the ball.
@@ -3190,6 +3223,7 @@ impl Game {
         }
         self.advance_xform(dt);
         self.update_autotarget(dt);
+        self.update_locomotion(dt);
 
         // ---- controller ----
         let ps = self.pad.poll();
