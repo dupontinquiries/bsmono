@@ -5253,7 +5253,7 @@ still pass, which is why this one exists."
         let got0 = gpu.download(&gpu.moe_ffn_t(&mk_layer(false), &n2t, t, d, &x2t));
         check("moe routed-only forward (baseline)", maxerr(&got0, &reference(false)), 1e-4);
         let got1 = gpu.download(&gpu.moe_ffn_t(&mk_layer(true), &n2t, t, d, &x2t));
-        check("moe shared-expert forward (routed + dense SwiGLU)", maxerr(&got1, &reference(true)), 1e-4);
+        check(&format!("moe shared-expert forward (routed + dense SwiGLU) at t={t}"), maxerr(&got1, &reference(true)), 1e-4);
 
         // Llama4 mode: top-1 by logit, gate = RAW sigmoid(top logit), applied to the expert's
         // INPUT (weight-before-FFN), plus the shared expert. CPU reference mirrors HF/llama.cpp
@@ -5278,7 +5278,7 @@ still pass, which is why this one exists."
         let mut l4 = mk_layer(true);
         l4.cfg = l4cfg;
         let got2 = gpu.download(&gpu.moe_ffn_t(&l4, &n2t, t, d, &x2t));
-        check("moe llama4 gating (raw-sigmoid top-1, weight-before-FFN, + shared)", maxerr(&got2, &l4_ref), 1e-4);
+        check(&format!("moe llama4 gating (raw-sigmoid top-1, weight-before-FFN, + shared) at t={t} PREFILL shape \u{2014} the routed decode path is gated on t==1 and is NOT covered here"), maxerr(&got2, &l4_ref), 1e-4);
     }
 
     // Fused gate‖up+SwiGLU MoE kernel (LOGSCOPE_FUSE_GLU) must be BIT-IDENTICAL to the unfused
