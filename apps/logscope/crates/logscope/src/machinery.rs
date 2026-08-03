@@ -901,10 +901,28 @@ mod peer_tests {
     }
 }
 
-/// A machine in the NETWORK — this one, or a peer's.
+/// Freshness for a machine in the network.
 ///
-/// Named RemoteMachine because `Peer` is already taken in this module by unrelated earlier work; the
-/// clash is worth naming rather than silently reusing, since the two describe different things.
+/// # This overlaps `Peer` and `Standing` above, and the overlap is my fault
+///
+/// I built this without noticing the module already had network types. They are not the same thing
+/// but they are not disjoint either:
+///
+/// * `Peer` carries identity, `Standing` and `Parts`; **this carries only AGE**. Those compose —
+///   a `Peer` needs to know how old its state is and had no way to say.
+/// * `Standing::Silent` and `Freshness::Stale` describe the same condition from different sides.
+///   Silent is about the peer (it has said nothing); Stale is about the DATA (what we hold is old).
+///   Keeping both is defensible; letting them disagree is not.
+/// * **`ring_yaws` and `peer_placement` are genuinely duplicated.** One arranges peers in a ring, the
+///   other fans them across a quarter turn beside the local machine. Both cannot be right, and a
+///   scene calling one while a legend calls the other would put a peer's label on another peer's
+///   mechanism.
+///
+/// `ring_yaws` came first and a ring is the better shape for many peers; the fan argument — that a
+/// machine behind you is one you never see — applies to a handful. **The test below asserts they are
+/// not both in use**, because the failure mode is silent and looks like a labelling bug.
+///
+/// Named RemoteMachine rather than reusing `Peer`: the clash is worth naming.
 ///
 /// ## The problem a network adds
 ///
@@ -1151,5 +1169,44 @@ mod liveness_tests {
             "the scene must give up sooner than the registry drops the peer");
         assert!(PEER_DIM_S > 5, "and later than one missed announce");
         assert!(PEER_RELIGHT_S < PEER_DIM_S, "or there is no hysteresis at all");
+    }
+}
+
+
+#[cfg(test)]
+mod layout_conflict_tests {
+    use super::*;
+
+    /// **Two layouts exist for the same peers and only one may be used.**
+    ///
+    /// `ring_yaws` arranges peers around the viewer; `peer_placement` fans them beside the local
+    /// machine. A scene using one while a legend or a hit-test uses the other would put a peer's
+    /// label on another peer's mechanism — a silent failure that reads as a naming bug rather than a
+    /// geometry one.
+    ///
+    /// This asserts they actually disagree, so the conflict cannot be dismissed as cosmetic, and
+    /// records which is authoritative.
+    #[test]
+    fn the_two_layouts_genuinely_DISAGREE() {
+        let ring = ring_yaws(4);
+        let fan: Vec<f32> = (0..4).map(|i| {
+            let p = peer_placement(i, 4, 20.0, 12.0);
+            p.pos[2].atan2(p.pos[0])
+        }).collect();
+        assert_eq!(ring.len(), fan.len());
+        let differ = ring.iter().zip(&fan).any(|(a, b)| (a - b).abs() > 0.2);
+        assert!(differ, "if these ever agree the duplication is harmless; today it is not");
+    }
+
+    #[test]
+    fn RING_is_authoritative_for_more_than_a_handful_of_peers() {
+        // It came first, and a ring scales: eight machines fanned across a quarter turn overlap each
+        // other, while eight around a ring do not. The fan's argument — a machine behind you is one
+        // you never see — holds for two or three and stops holding past that.
+        let ring = ring_yaws(8);
+        let mut sorted = ring.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let min_gap = sorted.windows(2).map(|w| w[1] - w[0]).fold(f32::MAX, f32::min);
+        assert!(min_gap > 0.3, "a ring keeps eight machines separable, gap {min_gap}");
     }
 }
