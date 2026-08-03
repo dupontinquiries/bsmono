@@ -32,6 +32,10 @@ pub struct Joint {
     pub names: Vec<String>,
     /// connects two things that do not touch
     pub misparented: bool,
+    /// the parts are interior structure — a gyro in a hull, a rib inside a
+    /// shell. Those are MEANT not to touch, so a large gap is the correct
+    /// answer rather than a fault, and only the exterior ones are real.
+    pub interior: bool,
     /// the joint it is actually adjacent to, when misparented
     pub should_parent: Option<usize>,
     /// gap to the declared parent, in units of the smaller joined part
@@ -48,6 +52,15 @@ impl Joint {
         } else {
             format!(" {}", self.names.join("/"))
         };
+        if self.misparented && self.interior {
+            return format!(
+                "J{} <- {}{}  interior, floats by design (nearest J{})",
+                self.i,
+                self.parent,
+                who,
+                self.should_parent.unwrap_or(0)
+            );
+        }
         if self.misparented {
             format!(
                 "J{} <- {}{}  MISPARENTED: touches J{} ({:.1}x vs {:.1}x)",
@@ -114,6 +127,7 @@ pub fn load(path: &std::path::Path) -> Vec<Joint> {
             angle: num(&body, "angle").unwrap_or(0.0),
             names,
             misparented: body.contains("\"misparented\":true"),
+            interior: body.contains("\"interior\":true"),
             should_parent: num(&body, "should_parent").map(|v| v as usize),
             gap_now: num(&body, "gap_now").unwrap_or(0.0),
             gap_best: num(&body, "gap_best").unwrap_or(0.0),
@@ -135,7 +149,10 @@ pub fn step(joints: &[Joint], cur: usize, d: i32, only_bad: bool) -> usize {
     let mut k = cur as i32;
     for _ in 0..n {
         k = (k + d).rem_euclid(n);
-        if !only_bad || joints[k as usize].misparented {
+        // "bad" means a genuine fault: an EXTERIOR part that has come away.
+        // Interior components are supposed to float, so stopping at them
+        // turns a fault list into a parts list.
+        if !only_bad || (joints[k as usize].misparented && !joints[k as usize].interior) {
             return k as usize;
         }
     }
@@ -149,7 +166,8 @@ mod tests {
     const SAMPLE: &str = r#"{
  "joints": [
   {"i":0,"parent":-1,"parts":7,"pivot":[0.0,-0.26,-0.2],"axis":[1.0,0.0,0.0],"angle":-1.5,"names":["guts", "guts"],"misparented":false},
-  {"i":1,"parent":0,"parts":2,"pivot":[-0.13,-0.04,-0.28],"axis":[1.0,0.0,0.0],"angle":0.06,"names":["muscle"],"misparented":true,"should_parent":2,"gap_now":1.10,"gap_best":0.25},
+  {"i":1,"parent":0,"parts":2,"pivot":[-0.13,-0.04,-0.28],"axis":[1.0,0.0,0.0],"angle":0.06,"names":["muscle"],"misparented":true,"interior":false,"should_parent":2,"gap_now":1.10,"gap_best":0.25},
+  {"i":3,"parent":0,"parts":1,"pivot":[0.0,0.0,0.0],"axis":[0.0,1.0,0.0],"angle":0.0,"names":["gyro"],"misparented":true,"interior":true,"should_parent":2,"gap_now":2.40,"gap_best":0.90},
   {"i":2,"parent":1,"parts":2,"pivot":[0.004,-0.04,-0.005],"axis":[1.0,0.0,0.0],"angle":0.05,"names":["core", "clad"],"misparented":false}
  ]
 }"#;
@@ -163,7 +181,7 @@ mod tests {
     #[test]
     fn it_reads_what_foldview_writes() {
         let j = parsed();
-        assert_eq!(j.len(), 3);
+        assert_eq!(j.len(), 4);
         assert_eq!(j[0].i, 0);
         assert_eq!(j[0].parent, -1, "a root should report -1");
         assert_eq!(j[0].parts, 7);
@@ -187,8 +205,17 @@ mod tests {
     }
 
     #[test]
+    fn an_interior_part_says_it_floats_by_design() {
+        let j = &parsed()[2];
+        assert!(j.misparented && j.interior);
+        let s = j.summary();
+        assert!(s.contains("floats by design"), "{s}");
+        assert!(!s.contains("MISPARENTED"), "an interior part was called a fault");
+    }
+
+    #[test]
     fn a_healthy_joint_reads_plainly() {
-        let s = parsed()[2].summary();
+        let s = parsed()[3].summary();
         assert!(!s.contains("MISPARENTED"));
         assert!(s.contains("core/clad"));
     }
@@ -204,11 +231,14 @@ mod tests {
     fn stepping_wraps_and_can_visit_only_the_broken_ones() {
         let j = parsed();
         assert_eq!(step(&j, 0, 1, false), 1);
-        assert_eq!(step(&j, 2, 1, false), 0, "it did not wrap");
-        assert_eq!(step(&j, 0, -1, false), 2);
+        assert_eq!(step(&j, 3, 1, false), 0, "it did not wrap");
+        assert_eq!(step(&j, 0, -1, false), 3);
         // filtered: only joint 1 is broken, so it is the only stop
         assert_eq!(step(&j, 0, 1, true), 1);
         assert_eq!(step(&j, 1, 1, true), 1, "filtered stepping left the only fault");
         assert_eq!(step(&j, 2, -1, true), 1);
+        // the interior gyro is flagged but must NOT be a stop: it floats by
+        // design, and stopping at it turns a fault list into a parts list
+        assert_eq!(step(&j, 1, 1, true), 1, "filtered stepping stopped at an interior part");
     }
 }
