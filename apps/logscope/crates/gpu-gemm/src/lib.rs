@@ -2450,6 +2450,14 @@ pub fn moe_stream_stats_reset() {
 /// pinned and means the policy has failed with 12 of 16. Without the denominators the rate cannot be
 /// judged, which is why the counters went unreported for so long — there was nothing to compare them
 /// against.
+/// Speculative fills issued and how many were wanted, for `PrefetchAccuracy`.
+///
+/// Both counters existed and neither was readable from outside, so LOGSCOPE_MOE_PREFETCH has never
+/// been judgeable — a flag whose effect nobody can see is a flag nobody should trust.
+pub fn moe_prefetch_stats() -> (u64, u64) {
+    moe_route_hist().lock().map(|h| (h.prefetched, h.prefetch_hits)).unwrap_or((0, 0))
+}
+
 pub fn moe_pin_counts() -> (usize, usize) {
     MOE_PIN_COUNTS.lock().map(|g| *g).unwrap_or((0, 0))
 }
