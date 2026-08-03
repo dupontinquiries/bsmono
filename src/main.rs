@@ -12,6 +12,7 @@ mod gyro;
 mod custom;
 mod partcars;
 mod partdata;
+mod patrol;
 mod trials;
 mod replay;
 mod academy;
