@@ -265,6 +265,63 @@ pub struct Weapons {
     pub aim: Option<Aim>,
     /// the live grapple line, if one is out
     pub hook: Option<Hook>,
+    /// the Watch: which element is attuned, and whether it is mid-swap
+    pub watch: Watch,
+    /// fitted addons; only the first MOD_SLOTS count
+    pub mods: Vec<Mod>,
+    /// Billy's held star — charge it, release it
+    pub star: Star,
+}
+
+/// STAR-FIRE, from exengine/weapon.h. Billy absorbs stars and throws them:
+/// hold to charge, release for a multiplier from 1 to 6. A release at or
+/// above STAR_FULL is a real star — a nova — and it locks the mechanic out
+/// for STAR_COOLDOWN afterwards. That lockout IS the cost; without it the
+/// right play would always be to hold.
+pub const STAR_CHARGE_SEC: f32 = 1.4;
+pub const STAR_FULL: f32 = 0.85;
+pub const STAR_COOLDOWN: f32 = 6.0;
+
+#[derive(Clone, Copy, Default)]
+pub struct Star {
+    pub charge: f32,
+    pub charging: bool,
+    pub cooldown: f32,
+}
+
+impl Star {
+    pub fn ready(&self) -> bool {
+        self.cooldown <= 0.0
+    }
+    pub fn begin(&mut self) {
+        if self.ready() {
+            self.charging = true;
+            self.charge = 0.0;
+        }
+    }
+    pub fn update(&mut self, dt: f32, held: bool) {
+        self.cooldown = (self.cooldown - dt).max(0.0);
+        if self.charging && held {
+            self.charge = (self.charge + dt / STAR_CHARGE_SEC).min(1.0);
+        } else if !held {
+            self.charging = false;
+        }
+    }
+    /// Returns the damage multiplier (1..6) and whether it was a full star.
+    pub fn release(&mut self) -> (f32, bool) {
+        let c = self.charge;
+        self.charging = false;
+        self.charge = 0.0;
+        let full = c >= STAR_FULL;
+        if full {
+            self.cooldown = STAR_COOLDOWN;
+        }
+        (1.0 + c * 5.0, full)
+    }
+    /// 0..1 remaining lockout, for the HUD.
+    pub fn cooldown_frac(&self) -> f32 {
+        (self.cooldown / STAR_COOLDOWN).clamp(0.0, 1.0)
+    }
 }
 
 /// The detached targeting view for the leap.
@@ -305,11 +362,25 @@ impl Weapons {
             locked: None,
             aim: None,
             hook: None,
+            watch: Watch::default(),
+            mods: Vec::new(),
+            star: Star::default(),
         }
     }
 
     pub fn profile(&self) -> &'static Form {
         &TABLE[self.form.min(FORMS - 1)]
+    }
+
+    /// The current form as the Watch and the fitted mods leave it.
+    pub fn effective(&self) -> Effective {
+        self.profile().effective(self.watch.active(), &self.mods)
+    }
+
+    /// Movement multiplier the attuned element grants, for the caller to
+    /// apply to the robot's speed. Air runs; Rock does not.
+    pub fn move_mul(&self) -> f32 {
+        self.watch.active().profile().move_mul
     }
 
     pub fn cycle(&mut self, d: i32) {
@@ -331,7 +402,10 @@ impl Weapons {
         boost: f32,
     ) -> Outcome {
         let mut out = Outcome::default();
-        let p = self.profile();
+        // the element and the fitted mods have their say BEFORE anything
+        // else: a rail core means this really is a railshot, not a push with
+        // a longer range
+        let p = self.effective();
         if self.cool > 0.0 || boost < p.cost {
             return out;
         }
@@ -947,5 +1021,428 @@ mod tests {
             late += w.step(1.0 / 60.0, &tg, &sdf, &nrm).total_impulse();
         }
         assert!(late > 1.0, "the wave never arrived");
+    }
+}
+
+// ==========================================================================
+// ELEMENTS — ported from exengine/element.h
+// ==========================================================================
+//
+// The coalition races from the film material: Ice, Fire, Air, Electricity,
+// Vine, Rock, Water. Two things ride on the element and neither is a
+// reskin — a combat profile that changes how you fight, and a
+// rock-paper-scissors graph where each element beats the next two and loses
+// to the previous two, so everything has exactly two good and two bad
+// matchups and nothing is strictly best.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Element {
+    None,
+    Ice,
+    Fire,
+    Air,
+    Electric,
+    Vine,
+    Rock,
+    Water,
+}
+
+pub const ELEMENTS: [Element; 7] = [
+    Element::Ice,
+    Element::Fire,
+    Element::Air,
+    Element::Electric,
+    Element::Vine,
+    Element::Rock,
+    Element::Water,
+];
+
+/// Damage, range, cooldown and movement, straight from `ex_element_profile`.
+/// Ice controls, Fire burns close, Air is mobility, Electric reaches, Vine
+/// sustains, Rock hits hard and slow, Water is the flexible baseline.
+pub struct ElemProfile {
+    pub damage: f32,
+    pub range: f32,
+    pub cooldown: f32,
+    pub move_mul: f32,
+}
+
+impl Element {
+    pub fn profile(self) -> ElemProfile {
+        let (d, r, c, m) = match self {
+            Element::Ice => (0.90, 1.40, 1.10, 0.95),
+            Element::Fire => (1.50, 0.70, 1.00, 1.00),
+            Element::Air => (0.70, 1.00, 0.60, 1.35),
+            Element::Electric => (1.10, 1.50, 0.90, 1.00),
+            Element::Vine => (1.00, 1.00, 1.00, 0.90),
+            Element::Rock => (1.40, 0.60, 1.30, 0.75),
+            Element::Water => (1.00, 1.15, 0.95, 1.05),
+            Element::None => (1.00, 1.00, 1.00, 1.00),
+        };
+        ElemProfile { damage: d, range: r, cooldown: c, move_mul: m }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Element::None => "none",
+            Element::Ice => "ice",
+            Element::Fire => "fire",
+            Element::Air => "air",
+            Element::Electric => "electric",
+            Element::Vine => "vine",
+            Element::Rock => "rock",
+            Element::Water => "water",
+        }
+    }
+
+    fn ring(self) -> Option<usize> {
+        ELEMENTS.iter().position(|e| *e == self)
+    }
+
+    /// 1.5 for a strong matchup, 0.66 for a weak one, 1.0 otherwise.
+    pub fn advantage(self, defender: Element) -> f32 {
+        let (Some(a), Some(d)) = (self.ring(), defender.ring()) else {
+            return 1.0;
+        };
+        let n = ELEMENTS.len();
+        let step = (d + n - a) % n;
+        if step == 1 || step == 2 {
+            1.5
+        } else if step == n - 1 || step == n - 2 {
+            0.66
+        } else {
+            1.0
+        }
+    }
+}
+
+/// THE WATCH. Cycling element is not free: there is an attune delay, and
+/// while attuning the active element is None — you fight with no bonus at
+/// all. That is what stops a hot-swap every shot.
+pub const ATTUNE_SEC: f32 = 0.5;
+
+#[derive(Clone, Copy)]
+pub struct Watch {
+    current: Element,
+    pending: Element,
+    timer: f32,
+    attuning: bool,
+}
+
+impl Default for Watch {
+    fn default() -> Watch {
+        Watch::new(Element::Ice)
+    }
+}
+
+impl Watch {
+    pub fn new(start: Element) -> Watch {
+        Watch { current: start, pending: start, timer: 0.0, attuning: false }
+    }
+
+    /// Denied mid-attune: you commit to a switch once you start it.
+    pub fn switch(&mut self, to: Element) -> bool {
+        if self.attuning || to == self.current {
+            return false;
+        }
+        self.pending = to;
+        self.timer = ATTUNE_SEC;
+        self.attuning = true;
+        true
+    }
+
+    pub fn cycle(&mut self) -> bool {
+        let i = self.current.ring().map_or(0, |i| (i + 1) % ELEMENTS.len());
+        self.switch(ELEMENTS[i])
+    }
+
+    pub fn update(&mut self, dt: f32) {
+        if !self.attuning {
+            return;
+        }
+        self.timer -= dt;
+        if self.timer <= 0.0 {
+            self.current = self.pending;
+            self.attuning = false;
+            self.timer = 0.0;
+        }
+    }
+
+    /// None while attuning — the window where the Watch is between forms.
+    pub fn active(&self) -> Element {
+        if self.attuning {
+            Element::None
+        } else {
+            self.current
+        }
+    }
+
+    pub fn attuning(&self) -> bool {
+        self.attuning
+    }
+}
+
+// ==========================================================================
+// MODS — ported from exengine/weaponmod.h
+// ==========================================================================
+//
+// Sixteen addons, three slots. Six of them are CONVERSIONS: they do not
+// nudge a number, they change the verb. A rail core turns anything into a
+// railshot, a scatter barrel turns anything into a cone. That matters more
+// here than it did in the source, because the verb IS the weapon — so a
+// conversion mod genuinely rebuilds the gun rather than retuning it.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mod {
+    LongBarrel,
+    Scope,
+    ExtMag,
+    Underbarrel,
+    Stabilizer,
+    Amplifier,
+    ChainCoil,
+    EnergonCell,
+    RapidCoil,
+    PierceCore,
+    ScatterBarrel,
+    RippleCoil,
+    CryoRounds,
+    FlakCore,
+    PlasmaCore,
+    SuppressCore,
+}
+
+pub const MOD_SLOTS: usize = 3;
+
+impl Mod {
+    pub fn name(self) -> &'static str {
+        match self {
+            Mod::LongBarrel => "LONG BARREL",
+            Mod::Scope => "SCOPE",
+            Mod::ExtMag => "EXTENDED MAG",
+            Mod::Underbarrel => "UNDERBARREL",
+            Mod::Stabilizer => "STABILIZER",
+            Mod::Amplifier => "AMPLIFIER",
+            Mod::ChainCoil => "CHAIN COIL",
+            Mod::EnergonCell => "ENERGON CELL",
+            Mod::RapidCoil => "RAPID COIL",
+            Mod::PierceCore => "PIERCE CORE",
+            Mod::ScatterBarrel => "SCATTER BARREL",
+            Mod::RippleCoil => "RIPPLE COIL",
+            Mod::CryoRounds => "CRYO ROUNDS",
+            Mod::FlakCore => "FLAK CORE",
+            Mod::PlasmaCore => "PLASMA CORE",
+            Mod::SuppressCore => "SUPPRESS CORE",
+        }
+    }
+
+    /// The six that rebuild the gun rather than retuning it.
+    pub fn conversion(self) -> Option<Verb> {
+        match self {
+            Mod::PierceCore => Some(Verb::Pierce),
+            Mod::ScatterBarrel => Some(Verb::Cone),
+            Mod::RippleCoil => Some(Verb::Bank),
+            Mod::FlakCore => Some(Verb::Flak),
+            Mod::PlasmaCore => Some(Verb::Chain),
+            Mod::SuppressCore => Some(Verb::Beam),
+            _ => None,
+        }
+    }
+}
+
+/// A form after the element and the fitted mods have had their say. Same
+/// field names as `Form`, so the firing code reads identically either way.
+#[derive(Clone, Copy)]
+pub struct Effective {
+    pub verb: Verb,
+    pub cooldown: f32,
+    pub cost: f32,
+    pub impulse: f32,
+    pub reach: f32,
+    pub speed: f32,
+    pub spread: f32,
+    pub pellets: u32,
+    pub slow: f32,
+    pub chains: u32,
+    pub color: [f32; 4],
+    pub muzzle: FxKind,
+    pub impact: FxKind,
+    pub move_mul: f32,
+}
+
+impl Form {
+    pub fn effective(&self, elem: Element, mods: &[Mod]) -> Effective {
+        let ep = elem.profile();
+        let mut e = Effective {
+            verb: self.verb,
+            cooldown: self.cooldown * ep.cooldown,
+            cost: self.cost,
+            impulse: self.impulse * ep.damage,
+            reach: self.reach * ep.range,
+            speed: self.speed,
+            spread: self.spread,
+            pellets: self.pellets,
+            slow: self.slow,
+            chains: if self.verb == Verb::Chain { 1 } else { 0 },
+            color: self.color,
+            muzzle: self.muzzle,
+            impact: self.impact,
+            move_mul: ep.move_mul,
+        };
+        for m in mods.iter().take(MOD_SLOTS) {
+            match m {
+                Mod::LongBarrel => { e.reach *= 1.35; e.impulse *= 1.15; e.cooldown *= 1.15; }
+                Mod::Scope => { e.spread *= 0.55; e.reach *= 1.20; }
+                Mod::ExtMag => { e.cooldown *= 0.75; }
+                Mod::Underbarrel => { e.pellets += 1; e.spread += 4.0; }
+                Mod::Stabilizer => { e.spread *= 0.60; }
+                Mod::Amplifier => { e.impulse *= 1.30; e.cooldown *= 1.20; }
+                Mod::ChainCoil => { e.chains += 1; }
+                Mod::EnergonCell => { e.impulse *= 1.45; e.cooldown *= 1.30; }
+                Mod::RapidCoil => { e.cooldown *= 0.60; e.impulse *= 0.75; }
+                Mod::CryoRounds => { e.slow = e.slow.max(0.45); }
+                Mod::PierceCore => { e.speed = 0.0; e.reach *= 1.25; e.cooldown *= 1.20; }
+                Mod::ScatterBarrel => { e.pellets = e.pellets.max(1) + 4; e.spread += 10.0; }
+                Mod::RippleCoil => {}
+                Mod::FlakCore => {}
+                Mod::PlasmaCore => { e.chains += 2; }
+                Mod::SuppressCore => { e.reach *= 1.4; e.slow = e.slow.max(0.7); e.impulse *= 0.6; }
+            }
+            if let Some(v) = m.conversion() {
+                e.verb = v;
+            }
+        }
+        // a conversion to a travelling verb needs a speed to travel at
+        if e.speed <= 0.0 && matches!(e.verb, Verb::Cone | Verb::Bank | Verb::Flak | Verb::Chain) {
+            e.speed = 34.0;
+        }
+        e
+    }
+}
+
+#[cfg(test)]
+mod ported_tests {
+    use super::*;
+
+    #[test]
+    fn every_element_has_two_good_and_two_bad_matchups() {
+        for a in ELEMENTS {
+            let mut good = 0;
+            let mut bad = 0;
+            for d in ELEMENTS {
+                let x = a.advantage(d);
+                if x > 1.2 { good += 1; }
+                if x < 0.9 { bad += 1; }
+            }
+            assert_eq!(good, 2, "{} has {good} strong matchups", a.name());
+            assert_eq!(bad, 2, "{} has {bad} weak matchups", a.name());
+        }
+        // and nothing beats itself
+        for a in ELEMENTS {
+            assert!((a.advantage(a) - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn attuning_costs_you_your_element() {
+        let mut w = Watch::new(Element::Ice);
+        assert_eq!(w.active(), Element::Ice);
+        assert!(w.switch(Element::Fire));
+        // the whole point: mid-swap you have no element at all
+        assert_eq!(w.active(), Element::None);
+        assert!(!w.switch(Element::Rock), "a switch was allowed mid-attune");
+        w.update(ATTUNE_SEC * 0.5);
+        assert_eq!(w.active(), Element::None);
+        w.update(ATTUNE_SEC);
+        assert_eq!(w.active(), Element::Fire);
+    }
+
+    #[test]
+    fn the_watch_cycles_all_seven() {
+        let mut w = Watch::new(Element::Ice);
+        let mut seen = vec![w.active()];
+        for _ in 0..6 {
+            assert!(w.cycle());
+            w.update(ATTUNE_SEC * 1.1);
+            seen.push(w.active());
+        }
+        for e in ELEMENTS {
+            assert!(seen.contains(&e), "{} never came round", e.name());
+        }
+    }
+
+    #[test]
+    fn element_changes_how_a_form_fights() {
+        let base = TABLE[0].effective(Element::None, &[]);
+        let fire = TABLE[0].effective(Element::Fire, &[]);
+        let ice = TABLE[0].effective(Element::Ice, &[]);
+        assert!(fire.impulse > base.impulse && fire.reach < base.reach, "fire should hit harder, closer");
+        assert!(ice.reach > base.reach && ice.impulse < base.impulse, "ice should reach further, softer");
+        let air = TABLE[0].effective(Element::Air, &[]);
+        assert!(air.cooldown < base.cooldown && air.move_mul > 1.0, "air should be the mobile one");
+    }
+
+    #[test]
+    fn conversion_mods_change_the_verb_not_the_numbers() {
+        // WATER is a Push; a rail core should make it a railshot outright
+        let e = TABLE[0].effective(Element::None, &[Mod::PierceCore]);
+        assert_eq!(e.verb, Verb::Pierce);
+        let s = TABLE[0].effective(Element::None, &[Mod::ScatterBarrel]);
+        assert_eq!(s.verb, Verb::Cone);
+        assert!(s.pellets > TABLE[0].pellets);
+        // and a travelling conversion must have something to travel at
+        let f = TABLE[7].effective(Element::None, &[Mod::FlakCore]); // TITANIUM is hitscan
+        assert_eq!(f.verb, Verb::Flak);
+        assert!(f.speed > 0.0, "a converted flak round had no speed");
+    }
+
+    #[test]
+    fn a_full_star_costs_you_the_star() {
+        let mut st = Star::default();
+        assert!(st.ready());
+        st.begin();
+        // a light tap is a weak throw and costs nothing
+        st.update(0.2, true);
+        let (mul, full) = st.release();
+        assert!(mul > 1.0 && mul < 2.0, "a tap gave {mul}x");
+        assert!(!full);
+        assert!(st.ready(), "a tap locked the star out");
+
+        // a held charge is a nova, and then you have nothing for a while
+        st.begin();
+        for _ in 0..120 {
+            st.update(1.0 / 60.0, true);
+        }
+        let (mul, full) = st.release();
+        assert!(mul > 5.5, "a full hold only gave {mul}x");
+        assert!(full);
+        assert!(!st.ready(), "the nova did not lock out");
+        assert!(st.cooldown_frac() > 0.9);
+        st.begin();
+        assert!(!st.charging, "it started charging while locked out");
+    }
+
+    #[test]
+    fn the_element_reaches_the_gun() {
+        // the wiring test: what fire() actually uses must be the effective
+        // profile, not the base table row
+        let mut w = Weapons::new();
+        w.form = 0;
+        w.watch = Watch::new(Element::Rock);
+        let rock = w.effective();
+        w.watch = Watch::new(Element::Ice);
+        let ice = w.effective();
+        assert!(rock.impulse > ice.impulse, "rock should hit harder than ice");
+        assert!(ice.reach > rock.reach, "ice should out-range rock");
+        w.mods.push(Mod::PierceCore);
+        assert_eq!(w.effective().verb, Verb::Pierce, "the mod never reached the gun");
+    }
+
+    #[test]
+    fn only_three_mods_are_ever_fitted() {
+        let many = [Mod::Amplifier, Mod::Amplifier, Mod::Amplifier, Mod::Amplifier, Mod::Amplifier];
+        let three = TABLE[0].effective(Element::None, &many[..3]);
+        let five = TABLE[0].effective(Element::None, &many);
+        assert!((three.impulse - five.impulse).abs() < 1e-4, "a fourth mod took effect");
     }
 }
