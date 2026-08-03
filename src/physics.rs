@@ -85,6 +85,8 @@ pub struct Car {
     pub pulse_t: f32,
     /// counts up while a pulse is firing, for the effect
     pub pulse_fire: f32,
+    /// 0..1 wind-up on a held jump (hovercars)
+    pub pulse_charge: f32,
     pub wheel_spin: f32,
     pub steer_vis: f32,
     // jump / dodge state
@@ -134,6 +136,18 @@ pub struct Hover {
     // ---- PULSE ----
     /// seconds between pulses
     pub pulse_cd: f32,
+    // ---- CHARGED PULSE ----
+    // Holding the jump winds the pulse up instead of firing it. The trade is
+    // the point: while you hold it the car brakes, so committing early costs
+    // you the ability to reposition, and a player who reads the ball's
+    // arrival a second in advance is paid for it. A tap is still the old
+    // instant pulse.
+    /// seconds of hold for a full charge
+    pub charge_time: f32,
+    /// power multiplier at full charge
+    pub charge_gain: f32,
+    /// how hard the car brakes while winding up, per second at full charge
+    pub charge_brake: f32,
     /// upward impulse it gives the car
     pub pulse_lift: f32,
     /// radius and strength of the omnidirectional blast
@@ -149,17 +163,38 @@ impl Default for Hover {
             hold: 0.18,
             field_r: 3.2,
             field_k: 26.0,
-            base_tank: 30.0,
+            // FIVE TIMES THE RESERVE. At 30 the base tier lasted under a
+            // second — enough to prove the idea and not enough to play with,
+            // so a hovercar between pads was still mostly a passenger. At
+            // 150 it carries about four and a half seconds of continuous
+            // low thrust, which is a whole approach and a recovery.
+            base_tank: 150.0,
             // Faster than it drains, deliberately. A hovercar that has to
             // WAIT for thrust is a hovercar that cannot steer, so the base
             // tier is designed to be back before you miss it.
-            base_regen: 44.0,
+            // ...and the refill scales with it, so the reserve still comes
+            // back faster than it drains (33/s out, 70/s in). The property
+            // that matters is not the size of the tank but that waiting for
+            // it is never the reason you lost the ball.
+            base_regen: 70.0,
             base_power: 0.55,
             charge_power: 1.25,
             pulse_cd: 1.6,
+            charge_time: 0.85,
+            charge_gain: 2.9,
+            // 8% less speed given up for the same wind-up: the trade was
+            // right in shape and slightly too steep to commit to
+            charge_brake: 2.02,
             pulse_lift: 7.5,
-            pulse_r: 5.0,
-            pulse_k: 15.0,
+            // +8% reach: enough to forgive a slightly early read without
+            // making position irrelevant — the falloff below is what keeps
+            // accuracy worth having
+            pulse_r: 5.4,
+            // ...and a little more force to pay for the sharper core. The
+            // centre-weighted falloff costs about 12% at mid-range, which
+            // was a side effect of reshaping the blast rather than anything
+            // anyone asked for, so the strength is raised to put it back.
+            pulse_k: 16.9,
         }
     }
 }
@@ -186,6 +221,7 @@ impl Car {
             charge: 0.0,
             pulse_t: 0.0,
             pulse_fire: 0.0,
+            pulse_charge: 0.0,
             half_w: 0.32,
             susp: 0.0,
             prev: Vec3::ZERO,
@@ -286,12 +322,22 @@ impl Car {
         // (DROPSHOT) used to spawn the car INSIDE the platform
         let clr = self.half_h + 0.05;
         let p = world.spawn_at(0.0, 26.0, clr);
+        // WHAT SURVIVES A RESET IS THE CAR YOU CHOSE.
+        //
+        // This rebuilds from `Car::new()` and carries across only the fields
+        // listed here — so anything describing the VEHICLE rather than its
+        // motion is silently lost on every kickoff, respawn and map load.
+        // The hover chassis was: after the first reset a hovercar reverted to
+        // a wheeled one, which is why its jump stopped pulsing the ball. The
+        // drivetrain had the same hole.
         *self = Car {
             half_len: self.half_len,
             half_h: self.half_h,
             half_w: self.half_w,
             wheel_r: self.wheel_r,
-            boost: 45.0,
+            drive: self.drive,
+            hover: self.hover,
+            boost: if self.hover.is_some() { 45.0 } else { 45.0 },
             pos: p,
             ..Car::new()
         };
@@ -412,7 +458,11 @@ pub fn step(
     collide_car_ball(car, ball, cfg, WHO_PLAYER, ev);
     hover_field(car, ball, dt, c.boost, ev);
     // A hovercar's jump is the pulse: it has no wheels to push off with.
-    if car.hover.is_some() && c.jump_pressed && hover_pulse(car, ball, ev) {
+    // FIRE ON RELEASE. A tap charges for a frame and goes off at base
+    // strength, which is the old behaviour; a hold winds up and lets go when
+    // you do. Firing on the press instead would make the charge unusable —
+    // there would be nothing left to release.
+    if car.hover.is_some() && !c.jump_held && car.pulse_charge > 0.0 && hover_pulse(car, ball, ev) {
         ev.jumped = true;
     }
 
@@ -705,18 +755,49 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     // because a hovercar is never "grounded" in the wheeled sense — the
     // cushion IS its ground.
     if let Some(h) = car.hover {
-        let gap = world.sdf(car.pos);
-        let want = car.half_h + h.ride;
-        if gap < want * 3.0 {
-            let n = world.normal(car.pos);
-            let err = want - gap;
+        // FOUR THRUSTERS, NOT ONE.
+        //
+        // Sampling the cushion at the car's CENTRE meant it knew nothing
+        // about attitude: point the nose up and the tail dips below the
+        // surface, the centre still reads its target gap, nothing pushes
+        // back, and the tail digs in and sticks. A real hovercraft is held
+        // up at several points, and that is also what levels it — the corner
+        // that is closest to the ground gets the hardest push, which is a
+        // righting moment for free.
+        //
+        // One shared normal for all four: the surface does not change much
+        // across a car's length, and a gradient is four SDF evaluations, so
+        // sampling it per corner would quadruple the cost of the cheapest
+        // useful part of the chassis.
+        let n = world.normal(car.pos);
+        let damp = (h.stiff * 0.22).sqrt() * 2.0;
+        let mut lift = Vec3::ZERO;
+        let mut twist = Vec3::ZERO;
+        let mut any = false;
+        for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let local = Vec3::new(sx * car.half_w * 0.78, -car.half_h, sz * car.half_len * 0.80);
+            let arm = car.rot * local;
+            let p = car.pos + arm;
+            let gap = world.sdf(p);
+            if gap > h.ride * 3.0 {
+                continue; // this corner is nowhere near anything
+            }
+            any = true;
+            let err = h.ride - gap;
             let closing = -car.vel.dot(n);
-            // A proportional spring alone balances gravity at an OFFSET —
-            // every chassis floated a fixed distance below its ride height,
-            // by exactly g/stiffness. Carrying the car's weight explicitly
-            // leaves the spring to do only what it is for: correcting error.
-            let push = err * h.stiff + closing * (h.stiff * 0.22).sqrt() * 2.0 + GRAV;
-            car.vel += n * push.clamp(-30.0, 70.0) * dt;
+            // a quarter of the car's weight on each thruster
+            let push = (err * h.stiff + closing * damp + GRAV) * 0.25;
+            let f = n * push.clamp(-8.0, 20.0);
+            lift += f;
+            // the righting moment: a corner pushed up rotates the car about
+            // its centre, so a nose-up hovercar levels itself instead of
+            // pivoting on its tail
+            twist += arm.cross(f);
+        }
+        if any {
+            car.vel += lift * dt;
+            // into the body frame, which is where angular velocity lives
+            car.ang += (car.rot.inverse() * twist) * dt * 0.55;
         }
     }
     let d = world.sdf(car.pos);
@@ -1382,6 +1463,23 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // worse place to be than a wheeled car with an empty tank.
         car.pulse_t = (car.pulse_t - dt).max(0.0);
         car.pulse_fire = (car.pulse_fire - dt * 4.0).max(0.0);
+        // WIND-UP. Holding jump charges the pulse and brakes the car while
+        // it does. Braking is what makes the mechanic a decision rather than
+        // a free upgrade: a full charge costs you most of your ability to
+        // adjust, so it has to be committed to BEFORE you know exactly where
+        // the ball will be.
+        // A PRESS ARMS IT, even if the release comes the same frame. Without
+        // this a pure tap never accumulated any charge, so the release test
+        // below saw zero and the pulse simply never fired — the old instant
+        // pulse would have been lost to the new mechanic.
+        if c.jump_pressed && car.pulse_t <= 0.0 {
+            car.pulse_charge = car.pulse_charge.max(0.02);
+        }
+        if c.jump_held && car.pulse_t <= 0.0 {
+            car.pulse_charge = (car.pulse_charge + dt / h.charge_time.max(0.05)).min(1.0);
+            let brake = h.charge_brake * car.pulse_charge * dt;
+            car.vel -= car.vel * brake.clamp(0.0, 0.5);
+        }
         if c.boost {
             if car.charge > 0.0 {
                 car.vel += car.forward() * BOOST_ACCEL * cfg.car.boost * h.charge_power * dt;
@@ -1690,20 +1788,32 @@ pub fn hover_pulse(car: &mut Car, ball: &mut Ball, ev: &mut StepEvents) -> bool 
     if car.pulse_t > 0.0 {
         return false;
     }
+    // a held jump multiplies the blast; a tap fires at the base strength
+    let power = 1.0 + car.pulse_charge * (h.charge_gain - 1.0);
+    car.pulse_charge = 0.0;
     car.pulse_t = h.pulse_cd;
     car.pulse_fire = 1.0;
     // lift: straight up in the WORLD, so it works whatever the car is doing
-    car.vel += Vec3::Y * h.pulse_lift;
+    car.vel += Vec3::Y * h.pulse_lift * (1.0 + (power - 1.0) * 0.35);
     // and the blast, falling off to nothing at the rim
     let to = ball.pos - car.pos;
     let d = to.length();
     if d < h.pulse_r + ball.r && d > 1e-4 {
+        // CENTRE-WEIGHTED FALLOFF. A wider blast that is flat across its
+        // radius would make position stop mattering — reach and accuracy
+        // would be the same thing. So the extra 8% of radius buys REACH at
+        // the rim while the core stays sharp: full force only very close,
+        // and a steeper taper than the plain inverse-square shape had.
+        //
+        // The result is that being early and roughly right still connects,
+        // and being early and exactly right hits appreciably harder.
         let f = 1.0 - (d / (h.pulse_r + ball.r)).clamp(0.0, 1.0);
-        let push = h.pulse_k * f * f;
+        let core = f * f * (0.45 + 0.55 * f); // peaks at the centre, tapers hard
+        let push = h.pulse_k * core * power;
         ball.vel += (to / d) * push;
         ev.touches.push((ball.pos - (to / d) * ball.r, push));
     }
-    ev.pulses.push((car.pos, h.pulse_r, h.pulse_k));
+    ev.pulses.push((car.pos, h.pulse_r, h.pulse_k * power));
     true
 }
 
@@ -1779,7 +1889,21 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
     let m_ball = M_BALL * cfg.ball.weight;
     // the patch under the ball moves with v + omega x r — a swinging hood
     // is the whole mechanism behind every flick
-    let v_surf = car.vel + car.omega.cross((cp + n * body) - car.pos);
+    // THE NOSE IS A TOOL, NOT A BAT.
+    //
+    // The contact point's velocity includes the car's rotation, so while you
+    // turn, the nose is sweeping sideways at omega x r — and a ball resting
+    // against it gets struck with that sweep on every contact frame. That is
+    // what "yanking" is: you turn to work around the outside of the ball and
+    // the nose shoves it away instead.
+    //
+    // The rotation is real and a fast one SHOULD throw the ball (that is a
+    // flick). But a carry is a continuous gentle contact, and there the
+    // sweep has no business being a strike, so it is heavily discounted
+    // while the contact stays soft. Hard contacts keep all of it.
+    let sweep = car.omega.cross((cp + n * body) - car.pos);
+    let carry_soft = 1.0 - (car.omega.length() / 3.5).clamp(0.0, 1.0);
+    let v_surf = car.vel + sweep * (1.0 - 0.72 * carry_soft);
     let rel = ball.vel - v_surf;
     let vn = rel.dot(n);
     if vn < 0.0 {
@@ -1853,7 +1977,14 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             // Barely any grip on the ground: the ball keeps its own
             // momentum and WILL leave the roof when you turn or brake. Air
             // carries keep theirs — that touch is the whole move.
-            let mu = if car.on_ground { 0.018 } else { 0.30 };
+            // LATERAL RETENTION. At 0.018 the hood had almost nothing
+            // holding the ball sideways, so any real turn slid it straight
+            // off — the nose could not be used to work around the outside of
+            // the ball because the ball was gone within a second. This is
+            // still far from a dish (the ball is genuinely unstable up
+            // there, as it should be) but there is now something to fight
+            // with. Airborne carries keep their much higher grip.
+            let mu = if car.on_ground { 0.034 } else { 0.30 };
             ball.vel -= (tang * mu).clamp_length_max(if car.on_ground { 0.35 } else { 1.4 });
             // and the hood is dished, so the ball rolls back to the middle
             let side = car.rot * Vec3::X;
@@ -1925,7 +2056,21 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // sweeping throws the ball, a contact sitting on the axis does not.
         let surf = v_surf - car.vel;
         let surf_speed = surf.length();
-        let spin = (car.omega.length() / 7.0).clamp(0.0, 1.0);
+        // A TURN IS NOT A FLICK.
+        //
+        // This term exists so that a car ROTATING OUT FROM UNDER the ball
+        // throws it — that is what a flick is. But it read any rotation at
+        // all, and simply turning the wheel spins the car 2-3 rad/s, which
+        // triggered it on every contact frame of a dribble. At 120 contacts
+        // a second even a small nudge becomes a large sideways acceleration:
+        // the nose yanked the ball round instead of letting it lag to the
+        // outside, which is the whole skill of carrying one.
+        //
+        // A dodge is 8 rad/s and a hard turn is 3, so the throw starts above
+        // anything steering can produce and reaches full at flip speed.
+        // Measured: a full-steer turn spins the car 2.1 rad/s and a dodge
+        // spins it 8. Zero at 3 and full by 6 sits clear of both.
+        let spin = ((car.omega.length() - 3.0) / 3.0).clamp(0.0, 1.0);
         let throw_w = spin * (surf_speed / 3.0).clamp(0.0, 1.0);
         let throw_dir = surf.normalize_or(Vec3::ZERO);
         let dir = dir_n

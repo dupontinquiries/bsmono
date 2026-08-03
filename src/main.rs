@@ -75,6 +75,7 @@ const COMBO_WINDOW: f32 = 7.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
+    Catalog { sel: usize },
     Garage { sel: usize },
     Academy { sel: usize },
     Trials { sel: usize },
@@ -109,6 +110,7 @@ enum Row {
     Trials,
     Academy,
     Garage,
+    Catalog,
     Fullscreen,
     Header,
     GameMode(u8), // 0 free, 1 sparta 50v50, 2 sparta 300
@@ -262,7 +264,8 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("GRAPHICS PRESET", Slider { get: |c| c.video.tier as f32, set: |c, v| config::apply_gfx_tier(c, v as u8), min: 0.0, max: 3.0, step: 1.0, def: 0.0, fmt: 1 }),
             ("RAYS", Header),
             ("RAY TRACING", Toggle { get: |c| c.video.rays, set: |c, v| c.video.rays = v }),
-            ("RAY QUALITY", pct(|c| c.video.quality, |c, v| c.video.quality = v, 0.4, 1.8)),
+            // one dial: steps, candidates, AO probes and range all follow it
+            ("RAYS", pct(|c| c.video.quality, |c, v| c.video.quality = v, 0.4, 1.8)),
             ("CINEMA", Header),
             ("FILMIC TONEMAP (ACES)", Toggle { get: |c| c.video.filmic, set: |c, v| c.video.filmic = v }),
             ("EXPOSURE", pct(|c| c.video.exposure, |c, v| c.video.exposure = v, 0.5, 1.8)),
@@ -305,6 +308,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("BACK", Back),
         ],
         _ => vec![
+            ("CATALOGUE - EVERY VEHICLE", Catalog),
             ("GARAGE - SKINS, WHEELS, TRAILS", Garage),
             ("ACADEMY - LEARN THE TRICKS", Academy),
             ("TRIALS", Trials),
@@ -355,7 +359,7 @@ fn row_value(cfg: &Config, row: &Row) -> (String, Option<f32>) {
         }
         Row::Toggle { get, .. } => ((if get(cfg) { "ON" } else { "OFF" }).into(), None),
         Row::Preset => (PRESETS[cfg.preset % PRESETS.len()].into(), None),
-        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::GameMode(_) => (String::new(), None),
+        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::Catalog | Row::GameMode(_) => (String::new(), None),
         Row::CarPick => ("<see below>".into(), None),
         Row::Fullscreen => ("TOGGLE".into(), None),
         Row::Header | Row::Back => (String::new(), None),
@@ -459,6 +463,13 @@ struct Chassis {
 struct CarModels {
     models: Vec<model::Model>,
     names: Vec<&'static str>,
+    /// What kind of vehicle it is, and one line on what it is like to drive.
+    ///
+    /// Forty-odd cars in a flat list of names is a catalogue you cannot
+    /// navigate: the only way to learn what "Trifang" is was to drive it.
+    /// The class says which family it belongs to, the line says why you
+    /// would pick it over its neighbours.
+    info: Vec<(&'static str, &'static str)>,
     active: usize,
     /// model index -> (chassis, position in that chassis' strip). Only bot
     /// poses appear here; an ordinary car is absent and simply cannot
@@ -470,6 +481,15 @@ struct CarModels {
     /// is reached by transforming rather than by cycling past six
     /// half-folded copies of it.
     cycle: Vec<usize>,
+}
+
+impl CarModels {
+    fn class_of(&self, i: usize) -> &'static str {
+        self.info.get(i).map(|x| x.0).unwrap_or("")
+    }
+    fn blurb_of(&self, i: usize) -> &'static str {
+        self.info.get(i).map(|x| x.1).unwrap_or("")
+    }
 }
 
 struct Game {
@@ -957,6 +977,11 @@ fn main() {
     let tl4 = partcars::tl4(&mut gpu);
     let spearhead = partcars::spearhead(&mut gpu);
     let outback = partcars::outback(&mut gpu);
+    let widowmaker = partcars::widowmaker(&mut gpu);
+    let madcar = partcars::madcar(&mut gpu);
+    let speedrunner = partcars::speedrunner(&mut gpu);
+    let eclipse = partcars::eclipse(&mut gpu);
+    let mach6 = partcars::mach6(&mut gpu);
     // ---- HOVERCARS ----
     // Six of them, and the numbers are the design: ride height, cushion
     // stiffness, how much sideways motion they hold, and the reach and force
@@ -985,7 +1010,7 @@ fn main() {
         ("blackstar", 1.22, physics::Hover { ride: 0.40, stiff: 60.0, hold: 0.10, field_r: 2.8, field_k: 30.0, pulse_cd: 1.05, pulse_k: 13.0, ..physics::Hover::default() }),
         // ELEGANCE: long and floaty, with a generous base reserve — it is
         // never quite out of thrust, which suits its complete lack of grip.
-        ("elegance", 1.34, physics::Hover { ride: 0.56, stiff: 38.0, hold: 0.12, field_r: 3.4, field_k: 25.0, base_tank: 40.0, base_regen: 50.0, ..physics::Hover::default() }),
+        ("elegance", 1.34, physics::Hover { ride: 0.56, stiff: 38.0, hold: 0.12, field_r: 3.4, field_k: 25.0, base_tank: 200.0, base_regen: 82.0, ..physics::Hover::default() }),
         // TRIFANG: three-pronged and stiff. A narrow, hard field: it stabs.
         ("trifang", 1.26, physics::Hover { ride: 0.44, stiff: 62.0, hold: 0.11, field_r: 2.4, field_k: 38.0, ..physics::Hover::default() }),
         // ECHOTRON: a civilian runabout. The most forgiving of them — real
@@ -1009,6 +1034,10 @@ fn main() {
         let mut m = model::load(&hover_dir.join(name), &mut gpu, *len);
         m.hover = Some(*h);
         m.drive = model::Drive::Electric; // nothing here burns fuel
+        // the parts that explain the chassis: skirt, four nozzles at the
+        // cushion's own sample points, and underglow
+        let accent = [0.35, 0.85, 1.0, 1.0];
+        m = procars::hoverize(&mut gpu, &m, accent, *h);
         hovercars.push(m);
     }
     // imported bodies (single-file .glb, geometry and materials inline)
@@ -1026,12 +1055,49 @@ fn main() {
             volt, axion, hauler, pulse, tram, vipera, aegis,
             backfire, breakout, assael, guardian, orion, vulcan, xdevil,
             rollout, cryofin, tl4, spearhead, outback,
+            widowmaker, madcar, speedrunner, eclipse, mach6,
         ],
         names: vec![
             "Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark",
             "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV", "Vipera", "Aegis",
             "Backfire", "Breakout", "Assael", "Guardian", "Orion", "Vulcan", "X-Devil",
             "Rollout", "Cryofin", "TL-4", "Spearhead", "Outback",
+            "Widowmaker", "Madcar", "Speedrunner", "Eclipse", "Mach 6",
+        ],
+        info: vec![
+            ("CLASSIC", "the benchmark: neutral, forgiving, good at everything"),
+            ("CLASSIC", "flat-nosed and low — the ball sits where you put it"),
+            ("CLASSIC", "long and low, built to scoop and carry"),
+            ("ODDITY", "tall and square: terrible aerials, unbeatable bumps"),
+            ("ODDITY", "a doorstop — the nose is almost on the floor"),
+            ("ODDITY", "a pebble: round in every direction, predictable nowhere"),
+            ("ODDITY", "a limousine hitbox; turns like one too"),
+            ("ODDITY", "a joke about being a box, kept because it is funny"),
+            ("ODDITY", "a streamliner with a fin you can feel in the air"),
+            ("ELECTRIC", "compact hatch — dribbles like an Octane"),
+            ("ELECTRIC", "low hypercar, the flick blade of the catalogue"),
+            ("ELECTRIC", "a pickup with a bed the ball settles into"),
+            ("ELECTRIC", "rally stance on tall tyres: lands well, shrugs off bad ones"),
+            ("ELECTRIC", "a shuttle with an enormous roof shelf"),
+            ("CONCEPT", "continuous shell, bubble canopy, muscular haunches"),
+            ("CONCEPT", "armoured wedge of interlocking plates"),
+            ("IMPORT", "digital camo, compact and squat"),
+            ("IMPORT", "the second art reference: crisp panels, clean shoulder"),
+            ("IMPORT", "a Dominus variant with a heavier tail"),
+            ("IMPORT", "broad and armoured, the widest of the imports"),
+            ("IMPORT", "long GT nose, the most detailed body here"),
+            ("IMPORT", "aggressive and angular; static wheels by choice"),
+            ("IMPORT", "horned and mean, a devil in profile"),
+            ("ASSEMBLED", "from a sci-fi tank: sponsons and a heavy tail"),
+            ("ASSEMBLED", "from a slick racer: spine and shell, the lightest"),
+            ("ASSEMBLED", "from a walking mech: plated and upright"),
+            ("ASSEMBLED", "from a rocket: a spine with rings down it"),
+            ("ASSEMBLED", "from a sci-fi jeep: boxy cabin, greebles everywhere"),
+            ("ASSEMBLED", "from a death-race car: armoured, tracked, all mass"),
+            ("ASSEMBLED", "from a wasteland truck: ringed and cluttered"),
+            ("ASSEMBLED", "from a flyer: mostly engine, pods where seats would be"),
+            ("ASSEMBLED", "from an attack helicopter: a spaceframe with a skin"),
+            ("ASSEMBLED", "from a classic racer: the busiest surface of the set"),
         ],
         active: 0,
         xform: HashMap::new(),
@@ -1041,6 +1107,22 @@ fn main() {
     for (i, m) in hovercars.into_iter().enumerate() {
         cars.models.push(m);
         cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency", "Blackstar", "Elegance", "Trifang", "Echotron", "Hardwall", "Folly", "Lineback", "Whistlewind"][i]);
+        cars.info.push(("HOVER", [
+            "a hover tank: leans on the ball with an enormous soft field",
+            "stiff and slippery — slides like a puck, has to be flown",
+            "the balanced hovercar, and the place to start",
+            "shielded: the strongest repulsor field in the game",
+            "rides high enough to clear things, and can actually turn",
+            "motorcycle-sized, with a lance of a field: it pokes",
+            "shortest pulse cooldown here — it fights by shoving",
+            "long and floaty, with a reserve that never quite runs out",
+            "three-pronged and stiff: a narrow, hard field that stabs",
+            "a civilian runabout, the most forgiving of them",
+            "police interceptor: the hardest pulse, and a long wait for it",
+            "a land surfer — carves in long arcs and cannot stop",
+            "modular racer: a pad turns it into something else",
+            "a hover IFV, heavy and high, and it leans on the ball",
+        ][i]));
     }
     // EVERY car gets an electric variant. Rather than model them twice, the
     // petrol body is converted: light bars, blanked grille, battery sills and
@@ -1055,6 +1137,10 @@ fn main() {
             let ev = procars::electrify(&mut gpu, &cars.models[i], accent);
             cars.models.push(ev);
             cars.names.push(Box::leak(format!("{} EV", cars.names[i]).into_boxed_str()));
+            cars.info.push((
+                "ELECTRIC",
+                Box::leak(format!("{} — electric: harder off the line, lower top end", cars.blurb_of(i)).into_boxed_str()) as &str,
+            ));
         }
         cars.active = sv.car.min(cars.models.len() - 1);
     }
@@ -1958,7 +2044,19 @@ impl Game {
         self.morph = None;
         self.set_car_model(m);
         self.save.car = m;
-        self.toastf(&format!("{} ({}/{})", self.cars.names[m], next + 1, n));
+        // v1.117's richer cycle toast: class and blurb are what you want
+        // when [ and ] exist for trying things without opening a menu. `m`
+        // is the model, `next` its place in the cycle list — my cycle_car
+        // walks cars.cycle rather than every model, so the two indices are
+        // not the same and their version used the raw slot for both.
+        self.toastf(&format!(
+            "{} [{}] {}/{} - {}",
+            self.cars.names[m],
+            self.cars.class_of(m),
+            next + 1,
+            n,
+            self.cars.blurb_of(m)
+        ));
     }
 
     /// Pull the trigger.
@@ -2167,6 +2265,17 @@ impl Game {
         let esc = Key::Named(NamedKey::Escape);
         let enter = Key::Named(NamedKey::Enter);
         match self.mode {
+            Mode::Catalog { .. } => {
+                if let Some(i) = self.hover_row() {
+                    if let Mode::Catalog { sel } = self.mode {
+                        if sel == i {
+                            self.switch_car(i);
+                            self.save.car = i;
+                        }
+                    }
+                    self.mode = Mode::Catalog { sel: i };
+                }
+            }
             Mode::Garage { .. } => {
                 if let Some(i) = self.hover_row() {
                     self.mode = Mode::Garage { sel: i };
@@ -2640,6 +2749,23 @@ impl Game {
         self.trial = Some(run);
     }
 
+    /// The catalogue's display list: a header wherever the family changes,
+    /// then its cars. Built the same way the drawing builds it, so a click
+    /// lands on the row it appears to be over.
+    fn catalog_rows(&self) -> Vec<(bool, usize)> {
+        let mut rows = Vec::new();
+        let mut last = "";
+        for i in 0..self.cars.names.len() {
+            let cls = self.cars.class_of(i);
+            if cls != last {
+                rows.push((true, i));
+                last = cls;
+            }
+            rows.push((false, i));
+        }
+        rows
+    }
+
     fn hover_row(&self) -> Option<usize> {
         let y = self.cursor.1;
         match self.mode {
@@ -2677,6 +2803,23 @@ impl Game {
                 let start = self.mscroll.max(0.0) as usize;
                 hud::hit_row_scrolled(hud::LIST_TOP, hud::ACADEMY_ROW_H, n, vis, start, y)
             }
+            Mode::Catalog { .. } => {
+                // the catalogue's rows include family headers, so a screen
+                // row is not a car index — the caller maps it back
+                let a = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
+                let wide = a > 1.25;
+                let (top, rh) = if wide {
+                    (hud::CAT_TOP, hud::CAT_ROW_H)
+                } else {
+                    (hud::CAT_TOP_TALL, hud::CAT_ROW_H_TALL)
+                };
+                let rows = self.catalog_rows();
+                let vis = ((top - hud::TW_BOTTOM) / rh) as usize;
+                let start = (self.mscroll.max(0.0) as usize).min(rows.len().saturating_sub(vis.min(rows.len())));
+                hud::hit_row_scrolled(top, rh, rows.len(), vis, start, y)
+                    .and_then(|r| rows.get(r).copied())
+                    .and_then(|(is_head, ci)| (!is_head).then_some(ci))
+            }
             Mode::Garage { .. } => {
                 // the panel drops below the stage on a tall window, so the
                 // rows are somewhere else and hit-testing has to know
@@ -2709,7 +2852,7 @@ impl Game {
             Row::Preset | Row::CarPick => {
                 self.tweaks_key(&Key::Named(NamedKey::ArrowRight), menu, i, win);
             }
-            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage => {
+            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::Catalog => {
                 self.mscroll = 0.0;
                 self.mfling = 0.0;
                 self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
@@ -2752,6 +2895,26 @@ impl Game {
             _ => "",
         };
         match self.mode {
+            Mode::Catalog { sel } => {
+                let n = self.cars.models.len();
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Catalog { sel: (sel + n - 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Catalog { sel: (sel + 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::Enter), _) => {
+                        self.switch_car(sel);
+                        self.save.car = sel;
+                        self.toastf(&format!("{} - {}", self.cars.names[sel], self.cars.blurb_of(sel)));
+                    }
+                    _ => {}
+                }
+            }
             Mode::Garage { sel } => {
                 let slots = custom::slots();
                 let n = slots.len();
@@ -3063,6 +3226,10 @@ impl Game {
             Row::Garage => {
                 self.mscroll = 0.0;
                 self.mode = Mode::Garage { sel: self.look_sel };
+            }
+            Row::Catalog => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Catalog { sel: self.cars.active };
             }
             Row::Fullscreen => {
                 if matches!(key, Key::Named(NamedKey::Enter)) || dir != 0 {
@@ -3756,6 +3923,16 @@ impl Game {
         let mut ui: Vec<UiVert> = Vec::new();
         self.peer_tags(&mut ui, vp, aspect);
         match self.mode {
+            Mode::Catalog { sel } => hud::catalog_menu(
+                &mut ui,
+                aspect,
+                sel,
+                self.cars.active,
+                &self.cars.names,
+                &self.cars.info,
+                self.mscroll.max(0.0) as usize,
+                self.cursor,
+            ),
             Mode::Garage { sel } => hud::garage_menu(&mut ui, aspect, sel, &self.look, self.cursor),
             Mode::Academy { sel } => hud::academy_menu(
                 &mut ui,
@@ -3796,8 +3973,15 @@ impl Game {
                             r,
                             Row::Link(_) | Row::Controls | Row::Fullscreen | Row::Back | Row::Preset | Row::GameMode(_) | Row::CarPick
                         );
+                        // the picker names the CLASS as well as the car, so
+                        // forty entries read as six families rather than one
+                        // undifferentiated list
                         let value = if matches!(r, Row::CarPick) {
-                            self.cars.names[self.cars.active].to_uppercase()
+                            format!(
+                                "{}  [{}]",
+                                self.cars.names[self.cars.active].to_uppercase(),
+                                self.cars.class_of(self.cars.active)
+                            )
                         } else {
                             value
                         };
@@ -3856,6 +4040,8 @@ impl Game {
             self.wx_rain = 0.0;
         }
 
+        // the single RAYS slider, normalised once and reused below
+        let q01 = ((self.cfg.video.quality - 0.4) / 1.4).clamp(0.0, 1.0);
         let globals = Globals {
             view_proj: vp.to_cols_array(),
             inv_view_proj: ivp.to_cols_array(),
@@ -3869,6 +4055,31 @@ impl Game {
             ],
             misc: [st.zenith[0], st.zenith[1], st.zenith[2], 0.0],
             rt: [if self.cfg.video.rays { 1.0 } else { 0.0 }, self.cfg.video.quality, rt_ids.static_n as f32, st.wet.max(wx_wet)],
+            // AO probe count follows quality: four is the full set, two is
+            // enough to keep contact shadows readable, and the probes are
+            // whole rays so halving them is a real saving rather than a
+            // shorter version of the same work.
+            // ONE SLIDER, EVERYTHING DOWNSTREAM OF IT.
+            //
+            // Two dials for one concept is worse than one: nobody knows
+            // which to move, and the pair have a cheap-and-ugly corner
+            // (short rays, many steps) that no one wants. RAYS is the single
+            // control now, and it drives each cost in proportion to what
+            // that cost is worth:
+            //
+            //   step budget    strongly — it is where the time goes
+            //   candidates     strongly — cost is candidates x steps
+            //   AO probes      in two stages — each probe is a whole ray
+            //   ray range      only mildly — measured at 10% of the saving,
+            //                  so it is a look control wearing a perf hat
+            ray2: [
+                // the bottom goes lower than it used to dare, because the
+                // blur that comes with it hides what a short march misses
+                0.40 + 0.75 * q01,
+                if q01 < 0.15 { 2.0 } else { 4.0 },
+                0.0,
+                0.0,
+            ],
             pcount: [self.world.portals.len().min(8) as f32, 0.0, 0.0, 0.0],
             portals: {
                 // up to four portals for the marcher; pairs are adjacent, so
@@ -4780,7 +4991,14 @@ impl Game {
         // real skin, the real rig motion, the real reflections and the real
         // lighting rather than a flat thumbnail that would have to be kept
         // in sync with all four.
-        if let Mode::Garage { .. } = self.mode {
+        // the catalogue previews what you are HIGHLIGHTING, not what you are
+        // driving — otherwise browsing shows you the same car forty times
+        let stage_car = match self.mode {
+            Mode::Catalog { sel } => Some(sel.min(self.cars.models.len() - 1)),
+            Mode::Garage { .. } => Some(self.cars.active),
+            _ => None,
+        };
+        if let Some(show) = stage_car {
             let aspect = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
             // camera basis, so the stand follows wherever you are looking
             let fwd = (self.cam.look - self.cam.pos).normalize_or(Vec3::NEG_Z);
@@ -4804,7 +5022,7 @@ impl Game {
             // car leaning with the camera reads as broken
             self.push_car(
                 &mut objs,
-                self.cars.active,
+                show,
                 at,
                 spin,
                 false,

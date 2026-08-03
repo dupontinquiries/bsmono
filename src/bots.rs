@@ -323,11 +323,27 @@ pub fn update(
             }
         }
         if info.landed && matches!(b.brain, Brain::Striker | Brain::Passer { .. }) {
-            // touched down: if the ball is still up and close, re-jump into
-            // the carry (bounce-dribble rhythm) instead of restarting setup
+            // TOUCHING DOWN IS NOT ALWAYS A FAILURE.
+            //
+            // This reset the phase and zeroed `phase_t` on EVERY landing,
+            // which is right for a setup that fell apart and wrong for an
+            // air sequence that clipped the floor. Since a striker carrying
+            // a ball brushes the ground constantly, the sequence restarted
+            // over and over: it could never accumulate the phase time any
+            // timed exit needs, so it lived in the air carry and finished
+            // 1% of the time. That is what the phase telemetry was showing.
+            //
+            // A landing mid-sequence, with the ball still up, is part of the
+            // move. Only a landing with the ball DOWN means the setup is
+            // genuinely over.
             let d = (ball.pos - b.car.pos).length();
-            b.phase = if ball.pos.y > 1.6 && d < 7.0 { Phase::Pop } else { Phase::Approach };
-            b.phase_t = 0.0;
+            let mid_air_move = matches!(b.phase, Phase::AirCarry | Phase::Reset | Phase::Flick)
+                && ball.pos.y > 1.6
+                && d < 7.0;
+            if !mid_air_move {
+                b.phase = if ball.pos.y > 1.6 && d < 7.0 { Phase::Pop } else { Phase::Approach };
+                b.phase_t = 0.0;
+            }
         }
         let pre = scratch.touches.len();
         physics::collide_car_ball(&mut b.car, ball, cfg, b.team, &mut scratch);
@@ -508,7 +524,15 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
                 && flat_d < 1.3
                 && (ball.vel - car.vel).length() < 4.5;
             let bounced_high = ball_rel.y > 1.2 && flat_d < 1.7 && ball.vel.y > -2.0;
-            if (settled && b.phase_t > 0.30 || bounced_high) && car.on_ground {
+            // A CARRY IS NOT ALWAYS GROUNDED. Requiring `on_ground` here
+            // sounded obvious and was the thing blocking the whole state
+            // machine: a car carrying a ball is repeatedly lifted a few
+            // centimetres by the contact, so the flag flickers off exactly
+            // when the ball is most settled. Traced: the bot held the ball
+            // for two full seconds and never popped, because every frame it
+            // qualified it happened to be airborne by a hand's width.
+            let near_ground = car.on_ground || world.sdf(car.pos) < car.half_h + 0.45;
+            if (settled && b.phase_t > 0.30 || bounced_high) && near_ground {
                 b.phase = Phase::Pop;
                 b.phase_t = 0.0;
             }
@@ -548,7 +572,17 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
             if !b.got_reset && b.phase_t > 0.7 && dist < 2.2 && ball_rel.y > 0.3 {
                 b.phase = Phase::Reset;
                 b.phase_t = 0.0;
-            } else if goal_d < 13.0 && dist < 2.4 {
+            } else if (goal_d < 13.0 && dist < 2.4)
+                // FINISH THE CARRY. Telemetry: the striker spends a THIRD of
+                // its life in AirCarry and 1% in Flick — it carries the ball
+                // beautifully and then carries it some more, because the only
+                // way out was being within 13 m of the goal with the ball
+                // still glued on. A carry that has gone on long enough, or
+                // that has drifted out of touch, should be spent rather than
+                // nursed: take the shot from wherever you are.
+                || (b.phase_t > 1.6 && dist < 3.0)
+                || (goal_d < 26.0 && b.phase_t > 0.9 && dist < 2.8)
+            {
                 b.phase = Phase::Flick;
                 b.phase_t = 0.0;
             }
@@ -566,7 +600,19 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
             }
         }
         Phase::Flick => {
-            aim(&mut c, car, (ball.pos - car.pos).normalize_or(Vec3::Z));
+            // STRIKE THE FAR SIDE. This aimed at the ball's CENTRE, which
+            // sends it wherever the car happened to be travelling — the
+            // finish had no target at all, which is why a striker could
+            // carry the ball the length of the pitch and then flick it
+            // sideways. Aiming at the back of the ball relative to the goal
+            // puts the contact on the far side, so the impulse goes through
+            // the ball toward the net.
+            // ...but only a BIAS, not a detour: at 0.85 of the radius the aim
+            // point sat far enough off the ball that the dodge started
+            // missing it (touches fell). Two fifths keeps the contact and
+            // still puts it on the goal side.
+            let strike = ball.pos - to_goal * (ball.r * 0.40);
+            aim(&mut c, car, (strike - car.pos).normalize_or(Vec3::Z));
             c.throttle = 1.0;
             if b.phase_t > 0.06 && car.can_flip() {
                 c.jump_pressed = true; // the dodge into the ball: the finish

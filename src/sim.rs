@@ -23,6 +23,10 @@ const DT: f32 = 1.0 / 120.0;
 const ARENA: usize = 20; // ARENA CLASSIC: flat pitch, paired goals
 
 pub struct Outcome {
+    /// seconds spent in each striker phase, summed over bots — the answer to
+    /// "where does the state machine stall?", which a sampled trace cannot
+    /// give because the interesting transitions happen between samples
+    pub phase_t: [f32; 6],
     pub goal_t: Option<f32>,
     pub air_touches: u32,
     pub resets: u32,
@@ -91,6 +95,7 @@ fn rig(seed: u64, n_strikers: usize, defender: bool) -> Rig {
 fn run_one(seed: u64, n_strikers: usize, defender: bool, secs: f32) -> Outcome {
     let mut r = rig(seed, n_strikers, defender);
     let mut o = Outcome {
+        phase_t: [0.0; 6],
         goal_t: None,
         air_touches: 0,
         resets: 0,
@@ -143,6 +148,21 @@ fn run_one(seed: u64, n_strikers: usize, defender: bool, secs: f32) -> Outcome {
                 o.defender_travel += (d.car.pos - def_prev).length().min(1.0);
                 def_prev = d.car.pos;
             }
+        }
+        // PHASE TELEMETRY. A striker is a state machine and the useful
+        // question is always "where does it stall?" — which a sampled trace
+        // cannot answer, because the interesting transitions happen between
+        // samples. Accumulate the time every bot spends in every phase.
+        for b in r.bots.iter().filter(|b| b.team < 8) {
+            let k = match b.phase {
+                crate::bots::Phase::Approach => 0,
+                crate::bots::Phase::Carry => 1,
+                crate::bots::Phase::Pop => 2,
+                crate::bots::Phase::AirCarry => 3,
+                crate::bots::Phase::Reset => 4,
+                crate::bots::Phase::Flick => 5,
+            };
+            o.phase_t[k] += DT;
         }
         if std::env::var("SIM_DEBUG").is_ok() && (t * 2.0).fract() < DT * 2.0 {
             let b0 = &r.bots[0];
@@ -483,6 +503,365 @@ pub fn run(args: &[String]) {
         println!("{:<34} {}", "flatter than long", if flat_enough { "ok" } else { "FAIL" });
         println!("{:<34} {}", "matches the model within 10 cm", if tight { "ok" } else { "FAIL" });
         println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
+        return;
+    }
+    if name == "shell" {
+        // WHAT MAKES A BODY LOOK LIKE A CAR BODY.
+        //
+        // Measured on the art target: Octane's painted shell has a MEDIAN
+        // dihedral angle of about 2 degrees — neighbouring triangles are
+        // very nearly coplanar, so the surface reads as continuous — while
+        // its p90 is 31 to 79 degrees, because a car also has crisp panel
+        // breaks. Smooth almost everywhere, sharp in a few deliberate
+        // places. A uniformly faceted shell reads as a low-poly prop; a
+        // uniformly smooth one reads as a bar of soap.
+        let dihedral = |m: &crate::meshgen::MeshData| -> (usize, f32, f32, f32) {
+            let tri = m.idx.len() / 3;
+            let mut face: Vec<Vec3> = Vec::with_capacity(tri);
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            let mut angs: Vec<f32> = edge
+                .values()
+                .filter(|f| f.len() == 2)
+                .map(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees())
+                .collect();
+            if angs.is_empty() {
+                return (tri, 0.0, 0.0, 0.0);
+            }
+            angs.sort_by(f32::total_cmp);
+            let mean = angs.iter().sum::<f32>() / angs.len() as f32;
+            (tri, mean, angs[angs.len() / 2], angs[angs.len() * 9 / 10])
+        };
+        // add the creased fraction: the references are ~10% of edges above
+        // 20 degrees, which is the difference between a designed body and an
+        // extruded one
+        let creased = |m: &crate::meshgen::MeshData| -> f32 {
+            let mut face: Vec<Vec3> = Vec::new();
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            // creases show up as edges whose two faces disagree, AND as
+            // boundary edges where the surface was split apart on purpose
+            let shared: Vec<&Vec<usize>> = edge.values().filter(|f| f.len() == 2).collect();
+            if shared.is_empty() {
+                return 0.0;
+            }
+            let hard = shared
+                .iter()
+                .filter(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees() > 20.0)
+                .count();
+            let split = edge.values().filter(|f| f.len() == 1).count();
+            (hard + split) as f32 / edge.len() as f32 * 100.0
+        };
+        println!("{:<20} {:>7} {:>8} {:>8} {:>8} {:>9}", "surface", "tris", "mean", "median", "p90", "creased");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8}", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4", "n/a");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS paint (ref)", 5995, "3.4", "0.4", "21.8", 10.4);
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS body  (ref)", 10102, "2.1", "0.6", "21.1", 10.4);
+        let hull = crate::meshgen::loft(
+            &[
+                (-0.77, 0.13, -0.035, 0.010, 0.95),
+                (-0.30, 0.34, -0.065, 0.085, 0.70),
+                (0.02, 0.36, -0.065, 0.105, 0.65),
+                (0.60, 0.30, -0.050, 0.060, 0.80),
+                (0.77, 0.22, -0.035, 0.020, 0.95),
+            ],
+            26,
+        );
+        let mut worst_median = 0.0f32;
+        for (nm, m) in [
+            ("our lofted hull", &hull),
+            ("chamfered box", &crate::meshgen::cbox(0.22)),
+            ("plain box", &crate::meshgen::boxx()),
+        ] {
+            let (t, mean, med, p90) = dihedral(m);
+            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d {:>8.1}%", nm, t, mean, med, p90, creased(m));
+            if nm == "our lofted hull" {
+                worst_median = med;
+            }
+        }
+        println!();
+        // ---- IS THE CATALOGUE ACTUALLY VARIED? ----
+        // Rocket League ships six hitbox presets for dozens of cars, and
+        // that is a deliberate design: the SHAPES vary, the boxes do not,
+        // because players need to know what they are playing against. Ours
+        // grew organically, so the question worth asking is the opposite —
+        // do forty cars mean forty vehicles, or forty paint jobs on one box?
+        {
+            // the procedural cars' declared half-extents, read from source
+            let src = include_str!("procars.rs");
+            let mut boxes: Vec<(String, f32, f32, f32)> = Vec::new();
+            for line in src.lines() {
+                if let Some(i) = line.find("half_len:") {
+                    let rest = &line[i..];
+                    let nums: Vec<f32> = rest
+                        .split(|c: char| !c.is_ascii_digit() && c != '.')
+                        .filter(|t| !t.is_empty())
+                        .filter_map(|t| t.parse::<f32>().ok())
+                        .collect();
+                    if nums.len() >= 4 {
+                        boxes.push((format!("car{}", boxes.len()), nums[0], nums[1], nums[2]));
+                    }
+                }
+            }
+            if boxes.len() >= 4 {
+                // cluster by rounded shape: how many DISTINCT boxes are there
+                let mut sigs: Vec<(i32, i32, i32)> = boxes
+                    .iter()
+                    .map(|b| ((b.1 * 12.0) as i32, (b.2 * 12.0) as i32, (b.3 * 12.0) as i32))
+                    .collect();
+                sigs.sort();
+                sigs.dedup();
+                let (mut lmin, mut lmax) = (f32::MAX, 0.0f32);
+                let (mut hmin, mut hmax) = (f32::MAX, 0.0f32);
+                for b in &boxes {
+                    lmin = lmin.min(b.1);
+                    lmax = lmax.max(b.1);
+                    hmin = hmin.min(b.2);
+                    hmax = hmax.max(b.2);
+                }
+                println!(
+                    "   hitboxes: {} cars, {} distinct shapes; length {:.2}-{:.2}, height {:.2}-{:.2}",
+                    boxes.len(),
+                    sigs.len(),
+                    lmin,
+                    lmax,
+                    hmin,
+                    hmax
+                );
+                println!(
+                    "   spread: longest is {:.1}x the shortest, tallest {:.1}x the flattest",
+                    lmax / lmin.max(0.01),
+                    hmax / hmin.max(0.01)
+                );
+            }
+        }
+        println!();
+        // ---- IS THE CATALOGUE DESCRIBED? ----
+        // Forty vehicles in a flat list of names is a catalogue nobody can
+        // navigate: the only way to learn what a car is was to drive it. Every
+        // entry needs a class and a line, and the lines have to be DIFFERENT
+        // — a table of "fast and fun" tells you nothing.
+        {
+            let src = include_str!("main.rs");
+            let classes = ["CLASSIC", "ODDITY", "ELECTRIC", "CONCEPT", "IMPORT", "ASSEMBLED", "HOVER"];
+            let mut counts: Vec<(&str, usize)> = classes
+                .iter()
+                .map(|c| (*c, src.matches(&format!("(\"{c}\",")).count()))
+                .collect();
+            counts.retain(|(_, n)| *n > 0);
+            let total: usize = counts.iter().map(|(_, n)| n).sum();
+            println!("   catalogue classes: {counts:?}");
+            println!("   {total} described entries across {} families", counts.len());
+            // and the descriptions must not repeat
+            let mut lines: Vec<&str> = Vec::new();
+            for l in src.lines() {
+                let t = l.trim();
+                if t.starts_with('"') && t.ends_with("\",") && t.len() > 30 {
+                    lines.push(t);
+                }
+            }
+            let before = lines.len();
+            lines.sort();
+            lines.dedup();
+            println!("   {} description lines, {} distinct", before, lines.len());
+            let ok_desc = counts.len() >= 6 && lines.len() == before;
+            println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
+        }
+        println!();
+        // ---- CATALOGUE AUDIT ----
+        // A house style is only a style if the whole catalogue is built to
+        // it. This reads the source and reports which cars are made from the
+        // reference recipe — a continuous lofted shell — and which are still
+        // assemblies of boxes, which can never read as bodywork however
+        // carefully they are proportioned.
+        {
+            let src = include_str!("procars.rs");
+            let names = [
+                "breadbox", "wedge", "roller", "longboy", "cube", "shark",
+                "volt", "axion", "hauler", "pulse", "tram", "vipera", "aegis",
+            ];
+            let mut lofted = 0;
+            let mut boxed: Vec<&str> = Vec::new();
+            for n in names {
+                let Some(i) = src.find(&format!("pub fn {n}(gpu")) else { continue };
+                let body = &src[i..src[i..].find("\nfn ").map(|j| i + j).unwrap_or(src.len())];
+                let end = body.find("\npub fn ").unwrap_or(body.len());
+                let body = &body[..end];
+                // a car counts as built to the style whether it lofts
+                // directly or through one of the shared builders — the
+                // EVs go via `ev_body`, which is the same recipe wearing a
+                // different name
+                if body.contains("shell_car(") || body.contains("meshgen::loft(") || body.contains("ev_body(") {
+                    lofted += 1;
+                } else {
+                    boxed.push(n);
+                }
+            }
+            println!(
+                "   catalogue: {lofted} of {} procedural cars use the lofted shell",
+                names.len()
+            );
+            if !boxed.is_empty() {
+                println!("   still assemblies: {boxed:?}");
+            }
+            // the cube is a joke about being a box and is allowed to stay one
+            let ok_cat = boxed.iter().all(|n| *n == "cube");
+            println!(
+                "   {}",
+                if ok_cat { "every car but the CUBE is built to the house style" } else { "STYLE DRIFT" }
+            );
+        }
+        println!();
+        // The second half of the look is the CRISP BREAK, and on the target
+        // it comes from separate material regions — Octane is Paint, Body,
+        // Window and Chassis as four meshes, so the boundary between them is
+        // a hard edge by construction rather than a crease inside one
+        // surface. Our cars work the same way: the hull is continuous and
+        // the glasshouse, spoiler and sills are their own parts, so the
+        // feature lines fall where the parts meet.
+        println!("   a car body = one continuous shell + separate parts for the breaks:");
+        println!("   OCTANE ships 4 body meshes (chassis, paint, body, window) + 8 wheel meshes");
+        // Both halves have to hold: continuous enough to read as bodywork,
+        // creased enough to read as designed. Faceted (creases everywhere)
+        // and soap (no creases) both fail.
+        let hull_creased = creased(&hull);
+        let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
+        println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
+        println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
+        return;
+    }
+    if name == "carry" {
+        // TURNING WITH THE BALL ON THE HOOD.
+        //
+        // What should happen: the ball has its own momentum, so when the car
+        // turns the ball LAGS toward the outside of the turn. That lag is the
+        // whole skill — you work around to the outside of the ball and use
+        // the nose to hold it, steering it by where you place the car.
+        //
+        // What "yanking" means: the nose drags the ball round with it, so
+        // the ball stays pinned dead ahead however hard you turn and there is
+        // nothing to work with.
+        //
+        // So measure the BEARING of the ball from the car's nose over a turn.
+        // Pinned at zero is the fault; a bearing that opens to the outside is
+        // the behaviour.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        println!("{:<14} {:>10} {:>11} {:>10}", "steer", "bearing", "lateral", "kept");
+        let mut bearings = Vec::new();
+        let mut inherit: Vec<f32> = Vec::new();
+        for steer in [0.35f32, 0.7, 1.0] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            c.throttle = 1.0;
+            for _ in 0..110 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // set it on the hood and let it settle straight
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..40 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            // now turn, and watch where the ball goes relative to the nose
+            c.steer = steer;
+            let mut peak = 0.0f32;
+            let mut lat = 0.0f32;
+            let mut kept = true;
+            for _ in 0..120 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                let rel = car.rot.inverse() * (ball.pos - car.pos);
+                if rel.length() > 3.0 {
+                    kept = false;
+                    break;
+                }
+                // bearing from straight ahead, signed toward the outside
+                let b = rel.x.atan2(-rel.z).to_degrees() * -steer.signum();
+                if b > peak {
+                    peak = b;
+                    lat = rel.x.abs();
+                }
+            }
+            println!("{:<14.2} {:>9.1}d {:>10.2}m {:>10}", steer, peak, lat, if kept { "yes" } else { "lost" });
+            bearings.push(peak);
+            // HOW MUCH OF THE CAR'S TURN DID THE BALL INHERIT?
+            // A ball with its own momentum turns LESS than the car under it —
+            // that difference is the lag you steer around. If it turns as
+            // much as the car, the nose is carrying it round: the yank.
+            {
+                let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+                let mut car = physics::Car::new();
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+                car.sync_rot();
+                let mut ball = Ball::new();
+                let mut c = physics::Controls::default();
+                let mut ev = StepEvents::default();
+                c.throttle = 1.0;
+                for _ in 0..110 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                let f = car.forward();
+                ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+                ball.vel = car.vel;
+                ball.prev = ball.pos;
+                for _ in 0..40 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let heading = |v: Vec3| v.z.atan2(v.x).to_degrees();
+                let c0 = heading(car.forward());
+                let b0 = heading(ball.vel);
+                c.steer = steer;
+                for _ in 0..36 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let dc = (heading(car.forward()) - c0).abs();
+                let db = (heading(ball.vel) - b0).abs();
+                println!(
+                    "   over 0.3s: car turned {dc:.1}d, ball turned {db:.1}d ({:.0}% inherited)",
+                    db / dc.max(0.01) * 100.0
+                );
+                inherit.push(db / dc.max(0.01));
+            }
+        }
+        // the ball must move to the OUTSIDE, and more so the harder you turn
+        // Rocket League's carry: the ball keeps most of its own line, and
+        // you steer by moving the car around it. Inheriting nearly all of
+        // the car's turn is the yank.
+        let worst = inherit.iter().cloned().fold(0.0f32, f32::max);
+        check("the ball keeps its own line through a turn", worst < 0.75);
+        check("the ball lags to the outside of the turn", bearings.iter().all(|b| *b > 8.0));
+        check("and lags further the harder you turn", bearings[2] > bearings[0] + 4.0);
+        println!("{}", if pass { "CARRY: PASS" } else { "CARRY: FAIL" });
         return;
     }
     if name == "hits" {
@@ -990,6 +1369,77 @@ pub fn run(args: &[String]) {
         check("a flick at pace is stronger than one at a crawl", speed_spread > 4.0);
         println!("   (speed adds {speed_spread:.1} m/s across 5 -> 20 m/s)");
 
+        // ---- THE POWER FLICK ----
+        // The real test of a flick is what it does from a FAST dribble: the
+        // ball should leave well above the car's own speed, because the
+        // car's momentum goes through the contact and the rotation adds on
+        // top. A flick that merely matches car speed is a pass, not a shot.
+        println!();
+        println!("{:<10} {:>9} {:>9} {:>9} {:>8}", "car speed", "exit", "gain", "angle", "verdict");
+        let mut gains = Vec::new();
+        for target in [9.0f32, 14.0, 19.0, 23.0] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            // get to speed with the ball still out of the way
+            c.throttle = 1.0;
+            c.boost = true;
+            for _ in 0..900 {
+                if car.vel.length() >= target {
+                    break;
+                }
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // place the ball and HOLD the speed while it settles, otherwise
+            // the car coasts down and the flick is measured at the wrong pace
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.34 + Vec3::Y * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..30 {
+                c.boost = car.vel.length() < target;
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            let carspeed = car.vel.length();
+            c.boost = false;
+            c.jump_pressed = true;
+            c.jump_held = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            for _ in 0..9 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.throttle = 1.0;
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            // let the flick play out, then read the ball once it is clear of
+            // the car — that is the shot, whatever the contact history was
+            for _ in 0..70 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            let v = ball.vel;
+            let exit = v.length();
+            let flat = Vec3::new(v.x, 0.0, v.z).length();
+            let ang = v.y.atan2(flat.max(0.01)).to_degrees();
+            let gain = exit - carspeed;
+            gains.push(gain);
+            println!(
+                "{:<10.1} {:>8.1} {:>+8.1} {:>8.0}d {:>8}",
+                carspeed,
+                exit,
+                gain,
+                ang,
+                if gain > 8.0 { "power" } else { "a pass" }
+            );
+        }
+        check("a flick adds real pace at speed", gains.last().copied().unwrap_or(0.0) > 8.0);
+        check("and adds more the faster you are going", gains[3] > gains[0] + 2.0);
+
         // ---- AIR DRIBBLE: how long does the ball stay on the nose? ----
         println!();
         println!("{:<16} {:>9} {:>9} {:>8}", "air carry", "seconds", "touches", "drift");
@@ -1190,6 +1640,365 @@ pub fn run(args: &[String]) {
                 grounded_frames as f32 / steps as f32 * 100.0
             );
         }
+        return;
+    }
+    if name == "shell" {
+        // WHAT MAKES A BODY LOOK LIKE A CAR BODY.
+        //
+        // Measured on the art target: Octane's painted shell has a MEDIAN
+        // dihedral angle of about 2 degrees — neighbouring triangles are
+        // very nearly coplanar, so the surface reads as continuous — while
+        // its p90 is 31 to 79 degrees, because a car also has crisp panel
+        // breaks. Smooth almost everywhere, sharp in a few deliberate
+        // places. A uniformly faceted shell reads as a low-poly prop; a
+        // uniformly smooth one reads as a bar of soap.
+        let dihedral = |m: &crate::meshgen::MeshData| -> (usize, f32, f32, f32) {
+            let tri = m.idx.len() / 3;
+            let mut face: Vec<Vec3> = Vec::with_capacity(tri);
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            let mut angs: Vec<f32> = edge
+                .values()
+                .filter(|f| f.len() == 2)
+                .map(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees())
+                .collect();
+            if angs.is_empty() {
+                return (tri, 0.0, 0.0, 0.0);
+            }
+            angs.sort_by(f32::total_cmp);
+            let mean = angs.iter().sum::<f32>() / angs.len() as f32;
+            (tri, mean, angs[angs.len() / 2], angs[angs.len() * 9 / 10])
+        };
+        // add the creased fraction: the references are ~10% of edges above
+        // 20 degrees, which is the difference between a designed body and an
+        // extruded one
+        let creased = |m: &crate::meshgen::MeshData| -> f32 {
+            let mut face: Vec<Vec3> = Vec::new();
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            // creases show up as edges whose two faces disagree, AND as
+            // boundary edges where the surface was split apart on purpose
+            let shared: Vec<&Vec<usize>> = edge.values().filter(|f| f.len() == 2).collect();
+            if shared.is_empty() {
+                return 0.0;
+            }
+            let hard = shared
+                .iter()
+                .filter(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees() > 20.0)
+                .count();
+            let split = edge.values().filter(|f| f.len() == 1).count();
+            (hard + split) as f32 / edge.len() as f32 * 100.0
+        };
+        println!("{:<20} {:>7} {:>8} {:>8} {:>8} {:>9}", "surface", "tris", "mean", "median", "p90", "creased");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8}", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4", "n/a");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS paint (ref)", 5995, "3.4", "0.4", "21.8", 10.4);
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS body  (ref)", 10102, "2.1", "0.6", "21.1", 10.4);
+        let hull = crate::meshgen::loft(
+            &[
+                (-0.77, 0.13, -0.035, 0.010, 0.95),
+                (-0.30, 0.34, -0.065, 0.085, 0.70),
+                (0.02, 0.36, -0.065, 0.105, 0.65),
+                (0.60, 0.30, -0.050, 0.060, 0.80),
+                (0.77, 0.22, -0.035, 0.020, 0.95),
+            ],
+            26,
+        );
+        let mut worst_median = 0.0f32;
+        for (nm, m) in [
+            ("our lofted hull", &hull),
+            ("chamfered box", &crate::meshgen::cbox(0.22)),
+            ("plain box", &crate::meshgen::boxx()),
+        ] {
+            let (t, mean, med, p90) = dihedral(m);
+            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d {:>8.1}%", nm, t, mean, med, p90, creased(m));
+            if nm == "our lofted hull" {
+                worst_median = med;
+            }
+        }
+        println!();
+        // ---- IS THE CATALOGUE ACTUALLY VARIED? ----
+        // Rocket League ships six hitbox presets for dozens of cars, and
+        // that is a deliberate design: the SHAPES vary, the boxes do not,
+        // because players need to know what they are playing against. Ours
+        // grew organically, so the question worth asking is the opposite —
+        // do forty cars mean forty vehicles, or forty paint jobs on one box?
+        {
+            // the procedural cars' declared half-extents, read from source
+            let src = include_str!("procars.rs");
+            let mut boxes: Vec<(String, f32, f32, f32)> = Vec::new();
+            for line in src.lines() {
+                if let Some(i) = line.find("half_len:") {
+                    let rest = &line[i..];
+                    let nums: Vec<f32> = rest
+                        .split(|c: char| !c.is_ascii_digit() && c != '.')
+                        .filter(|t| !t.is_empty())
+                        .filter_map(|t| t.parse::<f32>().ok())
+                        .collect();
+                    if nums.len() >= 4 {
+                        boxes.push((format!("car{}", boxes.len()), nums[0], nums[1], nums[2]));
+                    }
+                }
+            }
+            if boxes.len() >= 4 {
+                // cluster by rounded shape: how many DISTINCT boxes are there
+                let mut sigs: Vec<(i32, i32, i32)> = boxes
+                    .iter()
+                    .map(|b| ((b.1 * 12.0) as i32, (b.2 * 12.0) as i32, (b.3 * 12.0) as i32))
+                    .collect();
+                sigs.sort();
+                sigs.dedup();
+                let (mut lmin, mut lmax) = (f32::MAX, 0.0f32);
+                let (mut hmin, mut hmax) = (f32::MAX, 0.0f32);
+                for b in &boxes {
+                    lmin = lmin.min(b.1);
+                    lmax = lmax.max(b.1);
+                    hmin = hmin.min(b.2);
+                    hmax = hmax.max(b.2);
+                }
+                println!(
+                    "   hitboxes: {} cars, {} distinct shapes; length {:.2}-{:.2}, height {:.2}-{:.2}",
+                    boxes.len(),
+                    sigs.len(),
+                    lmin,
+                    lmax,
+                    hmin,
+                    hmax
+                );
+                println!(
+                    "   spread: longest is {:.1}x the shortest, tallest {:.1}x the flattest",
+                    lmax / lmin.max(0.01),
+                    hmax / hmin.max(0.01)
+                );
+            }
+        }
+        println!();
+        // ---- IS THE CATALOGUE DESCRIBED? ----
+        // Forty vehicles in a flat list of names is a catalogue nobody can
+        // navigate: the only way to learn what a car is was to drive it. Every
+        // entry needs a class and a line, and the lines have to be DIFFERENT
+        // — a table of "fast and fun" tells you nothing.
+        {
+            let src = include_str!("main.rs");
+            let classes = ["CLASSIC", "ODDITY", "ELECTRIC", "CONCEPT", "IMPORT", "ASSEMBLED", "HOVER"];
+            let mut counts: Vec<(&str, usize)> = classes
+                .iter()
+                .map(|c| (*c, src.matches(&format!("(\"{c}\",")).count()))
+                .collect();
+            counts.retain(|(_, n)| *n > 0);
+            let total: usize = counts.iter().map(|(_, n)| n).sum();
+            println!("   catalogue classes: {counts:?}");
+            println!("   {total} described entries across {} families", counts.len());
+            // and the descriptions must not repeat
+            let mut lines: Vec<&str> = Vec::new();
+            for l in src.lines() {
+                let t = l.trim();
+                if t.starts_with('"') && t.ends_with("\",") && t.len() > 30 {
+                    lines.push(t);
+                }
+            }
+            let before = lines.len();
+            lines.sort();
+            lines.dedup();
+            println!("   {} description lines, {} distinct", before, lines.len());
+            let ok_desc = counts.len() >= 6 && lines.len() == before;
+            println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
+        }
+        println!();
+        // ---- CATALOGUE AUDIT ----
+        // A house style is only a style if the whole catalogue is built to
+        // it. This reads the source and reports which cars are made from the
+        // reference recipe — a continuous lofted shell — and which are still
+        // assemblies of boxes, which can never read as bodywork however
+        // carefully they are proportioned.
+        {
+            let src = include_str!("procars.rs");
+            let names = [
+                "breadbox", "wedge", "roller", "longboy", "cube", "shark",
+                "volt", "axion", "hauler", "pulse", "tram", "vipera", "aegis",
+            ];
+            let mut lofted = 0;
+            let mut boxed: Vec<&str> = Vec::new();
+            for n in names {
+                let Some(i) = src.find(&format!("pub fn {n}(gpu")) else { continue };
+                let body = &src[i..src[i..].find("\nfn ").map(|j| i + j).unwrap_or(src.len())];
+                let end = body.find("\npub fn ").unwrap_or(body.len());
+                let body = &body[..end];
+                // a car counts as built to the style whether it lofts
+                // directly or through one of the shared builders — the
+                // EVs go via `ev_body`, which is the same recipe wearing a
+                // different name
+                if body.contains("shell_car(") || body.contains("meshgen::loft(") || body.contains("ev_body(") {
+                    lofted += 1;
+                } else {
+                    boxed.push(n);
+                }
+            }
+            println!(
+                "   catalogue: {lofted} of {} procedural cars use the lofted shell",
+                names.len()
+            );
+            if !boxed.is_empty() {
+                println!("   still assemblies: {boxed:?}");
+            }
+            // the cube is a joke about being a box and is allowed to stay one
+            let ok_cat = boxed.iter().all(|n| *n == "cube");
+            println!(
+                "   {}",
+                if ok_cat { "every car but the CUBE is built to the house style" } else { "STYLE DRIFT" }
+            );
+        }
+        println!();
+        // The second half of the look is the CRISP BREAK, and on the target
+        // it comes from separate material regions — Octane is Paint, Body,
+        // Window and Chassis as four meshes, so the boundary between them is
+        // a hard edge by construction rather than a crease inside one
+        // surface. Our cars work the same way: the hull is continuous and
+        // the glasshouse, spoiler and sills are their own parts, so the
+        // feature lines fall where the parts meet.
+        println!("   a car body = one continuous shell + separate parts for the breaks:");
+        println!("   OCTANE ships 4 body meshes (chassis, paint, body, window) + 8 wheel meshes");
+        // Both halves have to hold: continuous enough to read as bodywork,
+        // creased enough to read as designed. Faceted (creases everywhere)
+        // and soap (no creases) both fail.
+        let hull_creased = creased(&hull);
+        let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
+        println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
+        println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
+        return;
+    }
+    if name == "carry" {
+        // TURNING WITH THE BALL ON THE HOOD.
+        //
+        // What should happen: the ball has its own momentum, so when the car
+        // turns the ball LAGS toward the outside of the turn. That lag is the
+        // whole skill — you work around to the outside of the ball and use
+        // the nose to hold it, steering it by where you place the car.
+        //
+        // What "yanking" means: the nose drags the ball round with it, so
+        // the ball stays pinned dead ahead however hard you turn and there is
+        // nothing to work with.
+        //
+        // So measure the BEARING of the ball from the car's nose over a turn.
+        // Pinned at zero is the fault; a bearing that opens to the outside is
+        // the behaviour.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<50} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        println!("{:<14} {:>10} {:>11} {:>10}", "steer", "bearing", "lateral", "kept");
+        let mut bearings = Vec::new();
+        let mut inherit: Vec<f32> = Vec::new();
+        for steer in [0.35f32, 0.7, 1.0] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            c.throttle = 1.0;
+            for _ in 0..110 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+            }
+            // set it on the hood and let it settle straight
+            let f = car.forward();
+            ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+            ball.vel = car.vel;
+            ball.prev = ball.pos;
+            for _ in 0..40 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            // now turn, and watch where the ball goes relative to the nose
+            c.steer = steer;
+            let mut peak = 0.0f32;
+            let mut lat = 0.0f32;
+            let mut kept = true;
+            for _ in 0..120 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                let rel = car.rot.inverse() * (ball.pos - car.pos);
+                if rel.length() > 3.0 {
+                    kept = false;
+                    break;
+                }
+                // bearing from straight ahead, signed toward the outside
+                let b = rel.x.atan2(-rel.z).to_degrees() * -steer.signum();
+                if b > peak {
+                    peak = b;
+                    lat = rel.x.abs();
+                }
+            }
+            println!("{:<14.2} {:>9.1}d {:>10.2}m {:>10}", steer, peak, lat, if kept { "yes" } else { "lost" });
+            bearings.push(peak);
+            // HOW MUCH OF THE CAR'S TURN DID THE BALL INHERIT?
+            // A ball with its own momentum turns LESS than the car under it —
+            // that difference is the lag you steer around. If it turns as
+            // much as the car, the nose is carrying it round: the yank.
+            {
+                let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+                let mut car = physics::Car::new();
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+                car.sync_rot();
+                let mut ball = Ball::new();
+                let mut c = physics::Controls::default();
+                let mut ev = StepEvents::default();
+                c.throttle = 1.0;
+                for _ in 0..110 {
+                    physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                }
+                let f = car.forward();
+                ball.pos = car.pos + f * 0.30 + Vec3::Y * (car.half_h + ball.r + 0.02);
+                ball.vel = car.vel;
+                ball.prev = ball.pos;
+                for _ in 0..40 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let heading = |v: Vec3| v.z.atan2(v.x).to_degrees();
+                let c0 = heading(car.forward());
+                let b0 = heading(ball.vel);
+                c.steer = steer;
+                for _ in 0..36 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                let dc = (heading(car.forward()) - c0).abs();
+                let db = (heading(ball.vel) - b0).abs();
+                println!(
+                    "   over 0.3s: car turned {dc:.1}d, ball turned {db:.1}d ({:.0}% inherited)",
+                    db / dc.max(0.01) * 100.0
+                );
+                inherit.push(db / dc.max(0.01));
+            }
+        }
+        // the ball must move to the OUTSIDE, and more so the harder you turn
+        // Rocket League's carry: the ball keeps most of its own line, and
+        // you steer by moving the car around it. Inheriting nearly all of
+        // the car's turn is the yank.
+        let worst = inherit.iter().cloned().fold(0.0f32, f32::max);
+        check("the ball keeps its own line through a turn", worst < 0.75);
+        check("the ball lags to the outside of the turn", bearings.iter().all(|b| *b > 8.0));
+        check("and lags further the harder you turn", bearings[2] > bearings[0] + 4.0);
+        println!("{}", if pass { "CARRY: PASS" } else { "CARRY: FAIL" });
         return;
     }
     if name == "hits" {
@@ -1915,6 +2724,98 @@ pub fn run(args: &[String]) {
                 "   insertion work {shifts_old} -> {shifts_new} ({:.0}% less)",
                 (1.0 - shifts_new as f32 / shifts_old.max(1) as f32) * 100.0
             );
+        }
+
+        // ---- WHAT THE ONE RAYS SLIDER BUYS ----
+        // Everything the marcher spends is downstream of this single
+        // control: the step budget, the candidate cap, the AO probe count
+        // and (mildly) how far a ray may travel. Worth measuring end to end,
+        // because a slider whose range nobody has measured is a slider
+        // people leave alone.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            println!();
+            println!("{:>8} {:>7} {:>6} {:>7} {:>12} {:>9} {:>8}", "RAYS", "steps", "cand", "probes", "evaluations", "vs max", "traced");
+            let mut base = 0u64;
+            for q in [1.8f32, 1.4, 1.0, 0.7, 0.4] {
+                // mirror the shader's derivations exactly
+                let q01 = ((q - 0.4) / 1.4).clamp(0.0, 1.0);
+                let dist = 0.40 + 0.75 * q01;
+                let kcap = (4.0 + 12.0 * q01) as usize;
+                let probes = if q01 < 0.15 { 2 } else { 4 };
+                let steps = ((((30.0 + 18.0 * q) * 0.5_f32.max(q01)) * dist).max(5.0) as i32).min(48);
+                let tmax = 260.0 * dist;
+                let mut evals = 0u64;
+                for k in 0..500 {
+                    let a = k as f32 * 0.7548;
+                    let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.08 - 0.3, a.sin()).normalize();
+                    let mut cand: Vec<(f32, f32, usize)> = shapes
+                        .iter()
+                        .filter_map(|(c, r, i)| {
+                            let to = *c - eye;
+                            let b = to.dot(dir);
+                            let disc = b * b - (to.length_squared() - r * r);
+                            if disc < 0.0 {
+                                return None;
+                            }
+                            let sq = disc.sqrt();
+                            ((b + sq) > 0.0 && (b - sq) < tmax).then_some((b - sq, b + sq, *i))
+                        })
+                        .collect();
+                    cand.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    cand.truncate(kcap.max(4));
+                    let mut t = 0.1f32;
+                    let mut first = 0usize;
+                    for _ in 0..steps {
+                        let p = eye + dir * t;
+                        let mut d = p.y - w.ground_h(p.x, p.z);
+                        while first < cand.len() && cand[first].1 <= t {
+                            first += 1;
+                        }
+                        for (_, _, i) in cand[first..].iter() {
+                            let sh = &w.shapes[*i];
+                            let bd = p.distance(sh.pos) - crate::shape_bound(&sh.sdf).max(0.5);
+                            if bd >= d + 0.25 {
+                                continue;
+                            }
+                            evals += 1;
+                            d = d.min(w.shape_sdf_at(*i, p));
+                        }
+                        if d < 0.01 * t + 0.01 {
+                            break;
+                        }
+                        t += d.max(0.05) * 0.96;
+                        if t > tmax {
+                            break;
+                        }
+                    }
+                }
+                if base == 0 {
+                    base = evals;
+                }
+                // how much of the result is the traced ray, and how much is
+                // the blur standing in for it
+                let softness = (1.0 - q01) * 0.60;
+                let trust = (1.0 - softness) * 100.0;
+                println!(
+                    "{:>8.1} {:>7} {:>6} {:>7} {:>12} {:>8.0}% {:>8.0}%",
+                    q,
+                    steps,
+                    kcap.max(4),
+                    probes,
+                    evals,
+                    evals as f32 / base as f32 * 100.0,
+                    trust
+                );
+            }
         }
 
         // ---- ALL THREE RAY SYSTEMS ----
@@ -3670,6 +4571,32 @@ pub fn run(args: &[String]) {
             layouts_ok &= hit == Some(3);
         }
         check("both garage layouts hit-test where they draw", layouts_ok);
+        // ---- THE CATALOGUE'S HEADERS ----
+        // Its list interleaves family headers with cars, so a SCREEN row is
+        // not a car index. Getting that mapping wrong means clicking a name
+        // selects a different car — and it would look like an off-by-one
+        // that only appears further down the list.
+        {
+            let families = ["CLASSIC", "CLASSIC", "ODDITY", "ODDITY", "ELECTRIC"];
+            let mut rows: Vec<(bool, usize)> = Vec::new();
+            let mut last = "";
+            for (i, f) in families.iter().enumerate() {
+                if *f != last {
+                    rows.push((true, i));
+                    last = f;
+                }
+                rows.push((false, i));
+            }
+            // 5 cars in 3 families = 5 + 3 rows
+            println!("   catalogue list: {} cars -> {} screen rows", families.len(), rows.len());
+            let headers = rows.iter().filter(|r| r.0).count();
+            check("a header is inserted per family", headers == 3);
+            check("screen rows map back to the right car", {
+                // the row after each header must be that family's first car
+                rows.windows(2).all(|w| !w[0].0 || w[1].1 == w[0].1)
+            });
+            check("headers are not selectable", rows.iter().filter(|r| !r.0).count() == families.len());
+        }
         check(
             "the garage rows are hit-testable too",
             crate::hud::hit_row(
@@ -3900,6 +4827,64 @@ pub fn run(args: &[String]) {
             println!("{:<14} {:>10.2} {:>9.2}s {:>10.2}", nm, gap, settle_t, peak);
         }
         check("every hover chassis holds its ride height", all_settled);
+
+        // ---- NOSE UP, TAIL DOWN ----
+        // Point a hovercar up and its tail dips below the surface. With the
+        // cushion sampled only at the centre, nothing knew: the tail dug in
+        // and the car stuck there. Four thrusters should lift the low corner
+        // hardest, which levels the car and floats it clear.
+        println!();
+        println!("{:<12} {:>9} {:>9} {:>10} {:>9}", "pitch", "settled", "tail gap", "levelled", "stuck");
+        let mut all_free = true;
+        for pitch_deg in [20.0f32, 40.0, 60.0, 80.0] {
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let h = physics::Hover::default();
+            car.hover = Some(h);
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.5, 0.0);
+            // nose up: the tail end swings down toward the floor
+            car.rot = glam::Quat::from_rotation_x(-pitch_deg.to_radians());
+            car.sync_rot();
+            let ball = Ball::new();
+            let c = physics::Controls::default();
+            let start = car.pos;
+            // Watch the WHOLE recovery, not just the end: the question is
+            // whether the tail ever buries itself, not where the car sits
+            // once it has finished levelling.
+            let mut t = 0.0f32;
+            let mut worst_gap = f32::MAX;
+            let mut worst_at = 0.0f32;
+            while t < 3.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+                let tp = car.pos + car.rot * Vec3::new(0.0, -car.half_h, car.half_len * 0.80);
+                let g = world.sdf(tp);
+                if g < worst_gap {
+                    worst_gap = g;
+                    worst_at = t;
+                }
+            }
+            // where did the tail end up, and did the car level itself?
+            let tail = car.pos + car.rot * Vec3::new(0.0, -car.half_h, car.half_len * 0.80);
+            let tail_gap = world.sdf(tail);
+            let up = car.rot * Vec3::Y;
+            let level = up.dot(Vec3::Y).acos().to_degrees();
+            let moved = car.pos.distance(start);
+            // buried at any point during the recovery counts as stuck
+            let stuck = worst_gap < 0.0;
+            all_free &= !stuck;
+            println!(
+                "{:<11.0}d {:>8.2}m {:>8.2}m {:>9.0}d {:>9}   (closest {:.2} m at {:.2}s)",
+                pitch_deg,
+                moved,
+                tail_gap,
+                level,
+                if stuck { "STUCK" } else { "free" },
+                worst_gap,
+                worst_at
+            );
+        }
+        check("a nose-up hovercar never digs its tail in", all_free);
         // ---- does it slide where a tyre grips? ----
         let slide_of = |h: Option<physics::Hover>| -> f32 {
             let (mut car, world) = make(h);
@@ -3994,15 +4979,27 @@ pub fn run(args: &[String]) {
             }
             spent = t;
             c.boost = false;
+            // TIME TO USABLE, not time to full. With a large reserve, waiting
+            // for the whole tank is not the property that matters — you can
+            // spend it as it returns, so what counts is how soon there is
+            // enough for a correction (half a second of thrust).
+            let usable = physics::BOOST_DRAIN * 0.5;
+            let mut ready = 0.0f32;
             let mut back = 0.0f32;
-            while car.boost < h.base_tank * 0.95 && back < 10.0 {
+            while back < 10.0 {
                 physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
                 back += DT;
+                if ready == 0.0 && car.boost >= usable {
+                    ready = back;
+                }
+                if car.boost >= h.base_tank * 0.95 {
+                    break;
+                }
             }
             println!();
-            println!("base reserve: {spent:.2}s of thrust, back in {back:.2}s");
-            check("the base reserve refills faster than it drains", back < spent * 1.2);
-            check("and it is available again within about a second", back < 1.5);
+            println!("base reserve: {spent:.2}s of thrust, usable again in {ready:.2}s, full in {back:.2}s");
+            check("the reserve refills faster than it drains", back < spent * 1.2);
+            check("a correction is available again almost at once", ready < 0.35);
         }
         // pad charge must actually be an upgrade
         {
@@ -4057,6 +5054,69 @@ pub fn run(args: &[String]) {
             }
             println!("   available again after {waited:.2}s");
             check("but it always comes back", waited < h.pulse_cd + 0.2);
+            // ---- AND THROUGH THE REAL PATH ----
+            // Everything above calls hover_pulse directly, which proves the
+            // function and not the plumbing. This drives it the way the game
+            // does: a jump press through physics::step, with the ball where
+            // a hovercar actually carries it.
+            {
+                let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+                let mut car2 = physics::Car::new();
+                car2.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.9, 0.0);
+                car2.sync_rot();
+                car2.hover = Some(physics::Hover::default());
+                let mut b2 = Ball::new();
+                b2.pos = car2.pos + car2.forward() * 2.2 + Vec3::Y * 0.3;
+                b2.vel = Vec3::ZERO;
+                b2.prev = b2.pos;
+                let mut c2 = physics::Controls::default();
+                let mut ev2 = StepEvents::default();
+                // settle, with no jump
+                for _ in 0..30 {
+                    physics::step(&mut car2, &mut b2, &mut world, &c2, &cfg, DT, &mut ev2);
+                }
+                let before = b2.vel.length();
+                let cary = car2.vel.y;
+                c2.jump_pressed = true;
+                ev2.pulses.clear();
+                physics::step(&mut car2, &mut b2, &mut world, &c2, &cfg, DT, &mut ev2);
+                c2.jump_pressed = false;
+                let after = b2.vel.length();
+                println!(
+                    "   through physics::step: ball {before:.1} -> {after:.1} m/s, car lift {:+.1}, pulses {}",
+                    car2.vel.y - cary,
+                    ev2.pulses.len()
+                );
+                check("a jump press pulses through the real step path", ev2.pulses.len() == 1);
+                check("...and the ball is pushed by it", after > before + 1.0);
+                // ---- AND IT SURVIVES A RESET ----
+                // `reset` rebuilds the car from Car::new() and carries across
+                // only the fields it names, so anything describing the
+                // VEHICLE rather than its motion is lost on every kickoff.
+                // The hover chassis was, which is why the pulse worked once
+                // and then quietly became an ordinary jump.
+                car2.reset(&world);
+                println!(
+                    "   after a reset: still a hovercar: {}, drivetrain kept: {}",
+                    car2.hover.is_some(),
+                    car2.drive == crate::model::Drive::Electric || car2.drive == crate::model::Drive::Combustion
+                );
+                check("a reset does not turn a hovercar back into a car", car2.hover.is_some());
+                let mut b3 = Ball::new();
+                b3.pos = car2.pos + car2.forward() * 2.0 + Vec3::Y * 0.3;
+                b3.prev = b3.pos;
+                let mut ev3 = StepEvents::default();
+                let mut c3 = physics::Controls::default();
+                for _ in 0..20 {
+                    physics::step(&mut car2, &mut b3, &mut world, &c3, &cfg, DT, &mut ev3);
+                }
+                let v0 = b3.vel.length();
+                c3.jump_pressed = true;
+                ev3.pulses.clear();
+                physics::step(&mut car2, &mut b3, &mut world, &c3, &cfg, DT, &mut ev3);
+                println!("   pulse after reset: ball {v0:.1} -> {:.1} m/s", b3.vel.length());
+                check("and the pulse still pushes the ball afterwards", ev3.pulses.len() == 1 && b3.vel.length() > v0 + 1.0);
+            }
             // a redirect: the blast should ADD to a ball already moving
             let mut fast = Ball::new();
             fast.pos = car.pos + Vec3::new(1.6, 0.3, 0.0);
@@ -4068,6 +5128,123 @@ pub fn run(args: &[String]) {
             println!("   redirect: {before:.1} -> {:.1} m/s", fast.vel.length());
             check("a moving ball is sped up, not stopped", fast.vel.length() > before);
         }
+        // ---- THE MODEL SHOWS THE MECHANIC ----
+        // The cushion samples four corners of the underside; the nozzles are
+        // drawn at those same points, so what pushes back is visibly there.
+        // That correspondence is the reason to bother, and it is exactly the
+        // sort of thing that drifts the moment either number is tuned — so
+        // both are read from source and compared.
+        {
+            let phys = include_str!("physics.rs");
+            let art = include_str!("procars.rs");
+            let phys_pt = phys.contains("car.half_w * 0.78, -car.half_h, sz * car.half_len * 0.80");
+            let art_pt = art.contains("sx * hw * 0.78, -hh * 0.92, sz * hl * 0.80");
+            let four_art = art.matches("for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]").count();
+            println!();
+            println!("   cushion samples 4 corners at 0.78/0.80: {phys_pt}");
+            println!("   nozzles drawn at 0.78/0.80:             {art_pt}");
+            check("the nozzles sit where the cushion pushes", phys_pt && art_pt && four_art >= 1);
+        }
+        // ---- THE CHARGED PULSE ----
+        // Holding the jump winds the pulse up and brakes the car while it
+        // does. The mechanic only works if BOTH halves are real: a charge
+        // that does not add power is pointless, and one that costs no speed
+        // is a free upgrade rather than a decision.
+        println!();
+        println!("{:<12} {:>9} {:>10} {:>10} {:>10}", "hold", "charge", "ball out", "speed kept", "trade");
+        let mut powers = Vec::new();
+        let mut kept = Vec::new();
+        for hold in [0.0f32, 0.25, 0.5, 0.85] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.6, 0.0);
+            car.sync_rot();
+            car.hover = Some(physics::Hover::default());
+            car.vel = Vec3::new(0.0, 0.0, -16.0);
+            let mut ball = Ball::new();
+            ball.pos = car.pos + car.forward() * 2.0 + Vec3::Y * 0.3;
+            ball.prev = ball.pos;
+            let v_in = car.vel.length();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            // hold the jump for `hold` seconds, then let go
+            // hold the ball where it is while winding up: the repulsor
+            // field would otherwise push it out of range during the charge,
+            // and this measures the PULSE, not the field
+            c.jump_pressed = true;
+            c.jump_held = true;
+            // park it OUT of field range while winding up, then bring it back
+            // for the release: holding it close made the field shove the car
+            // backwards for the whole charge, so the "speed kept" column was
+            // measuring the field, not the brake
+            let park = car.pos + car.forward() * 60.0;
+            let mut t = 0.0f32;
+            while t < hold {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                c.jump_pressed = false;
+                ball.pos = park;
+                ball.vel = Vec3::ZERO;
+                ball.prev = park;
+                t += DT;
+            }
+            let speed_kept = car.vel.length() / v_in.max(0.01);
+            let charge = car.pulse_charge;
+            c.jump_held = false;
+            // relative to where the car IS at release: it has been travelling
+            // during the wind-up, so a fixed point would be behind it
+            let at_release = car.pos + car.forward() * 2.0 + Vec3::Y * 0.3;
+            ball.pos = at_release;
+            ball.vel = Vec3::ZERO;
+            ball.prev = at_release;
+            let before = ball.vel.length();
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            let out = ball.vel.length() - before;
+            powers.push(out);
+            kept.push(speed_kept);
+            println!(
+                "{:<11.2}s {:>8.2} {:>9.1} {:>9.0}% {:>10}",
+                hold,
+                charge,
+                out,
+                speed_kept * 100.0,
+                if out > 0.5 { "fired" } else { "-" }
+            );
+        }
+        // ---- THE BLAST'S SHAPE ----
+        // A wider pulse that is flat across its radius would make reach and
+        // accuracy the same thing. The extra radius should buy REACH at the
+        // rim while the core stays sharp, so being exactly right still pays.
+        println!();
+        println!("{:>9} {:>10} {:>10} {:>10}", "distance", "old shape", "new shape", "vs centre");
+        let h = physics::Hover::default();
+        let reach = h.pulse_r + 0.93;
+        let old_r = 5.0 + 0.93;
+        let mut prev_ratio = 1.0f32;
+        let mut monotonic = true;
+        for frac in [0.0f32, 0.2, 0.4, 0.6, 0.8, 0.95] {
+            let d = frac * reach;
+            let f = 1.0 - (d / reach).clamp(0.0, 1.0);
+            let new = f * f * (0.45 + 0.55 * f);
+            // the old curve at the old radius, for comparison
+            let fo = 1.0 - (d / old_r).clamp(0.0, 1.0);
+            let old = (fo * fo).max(0.0);
+            println!("{:>8.1}m {:>10.3} {:>10.3} {:>9.0}%", d, old, new, new / 1.0 * 100.0);
+            if new > prev_ratio + 1e-4 {
+                monotonic = false;
+            }
+            prev_ratio = new;
+        }
+        println!(
+            "   reach {:.2} m (was {:.2}), and the core is {:.0}% sharper at the half-radius",
+            reach,
+            old_r,
+            (1.0 - (0.25 * (0.45 + 0.55 * 0.5)) / 0.25) * 100.0
+        );
+        check("the blast still peaks hard at the centre", monotonic);
+        check("and reaches further than it did", reach > old_r);
+        check("a longer hold hits harder", powers[3] > powers[0] * 1.8);
+        check("and it costs real speed", kept[3] < kept[0] * 0.75);
+        check("a tap still fires at base strength", powers[0] > 2.0);
         println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
         return;
     }
@@ -4084,8 +5261,18 @@ pub fn run(args: &[String]) {
         };
         const CLASS_NAMES: [&str; 8] = ["block", "panel", "strut", "disc", "wheel", "barrel", "greeble", "tread"];
         println!("{:<11} {:>6} {:>7} {:>7} {:>7}  composition", "donor", "parts", "spread", "height", "front");
-        let donors: [(&str, &[(u8, f32, f32, f32, f32)]); 5] =
-            [("ROLLOUT", ROLLOUT), ("CRYOFIN", CRYOFIN), ("TL4", TL4), ("SPEARHEAD", SPEARHEAD), ("OUTBACK", OUTBACK)];
+        let donors: [(&str, &[(u8, f32, f32, f32, f32)]); 10] = [
+            ("ROLLOUT", ROLLOUT),
+            ("CRYOFIN", CRYOFIN),
+            ("TL4", TL4),
+            ("SPEARHEAD", SPEARHEAD),
+            ("OUTBACK", OUTBACK),
+            ("WIDOWMAKER", WIDOWMAKER),
+            ("MADCAR", MADCAR),
+            ("SPEEDRUNNER", SPEEDRUNNER),
+            ("ECLIPSE", ECLIPSE),
+            ("MACH6", MACH6),
+        ];
         let mut sigs: Vec<Vec<f32>> = Vec::new();
         for (nm, d) in donors {
             let mut counts = [0u32; 8];
@@ -4185,6 +5372,106 @@ pub fn run(args: &[String]) {
             }),
         );
         println!("{}", if pass { "PARTS: PASS" } else { "PARTS: FAIL" });
+        return;
+    }
+    if name == "target" {
+        // THE ART TARGET, MEASURED. Octane and Breakout are the reference, so
+        // rather than eyeball "make it look like those", take their actual
+        // proportions and shape profile and use those numbers to build the
+        // procedural cars.
+        let dir = std::path::Path::new("assets");
+        println!("{:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8}", "model", "L:W", "L:H", "wheel", "roof@", "widest@", "nose w");
+        let mut refs = Vec::new();
+        for (name, path) in [("octane", dir.join("octane/scene.gltf")), ("breakout", dir.join("cars/breakout.glb"))] {
+            let doc = if path.extension().map(|e| e == "glb").unwrap_or(false) {
+                gltf::Gltf::open(&path).ok()
+            } else {
+                gltf::Gltf::open(&path).ok()
+            };
+            let Some(d) = doc else { continue };
+            let blob = match d.blob.clone() {
+                Some(b) => b,
+                None => {
+                    let uri = d.buffers().next().and_then(|b| match b.source() {
+                        gltf::buffer::Source::Uri(u) => Some(u.to_string()),
+                        _ => None,
+                    });
+                    match uri.and_then(|u| std::fs::read(path.parent().unwrap().join(u)).ok()) {
+                        Some(b) => b,
+                        None => continue,
+                    }
+                }
+            };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let r = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = r.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.len() < 100 {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            // longest axis is length, shortest is height
+            let mut ord = [0usize, 1, 2];
+            ord.sort_by(|a, b| ext[*b].total_cmp(&ext[*a]));
+            let (li, wi, hi_) = (ord[0], ord[1], ord[2]);
+            let (l, w, hh) = (ext[li], ext[wi], ext[hi_]);
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            // where along the length is the roof, and where is it widest?
+            let mut roof_z = 0.0f32;
+            let mut best_y = f32::MIN;
+            let mut wid = [0.0f32; 9];
+            let mut nose_w = 0.0f32;
+            for p in &pts {
+                let z = (p[li] - mid[li]) / l * 2.0;
+                let x = (p[wi] - mid[wi]).abs() / w * 2.0;
+                let y = p[hi_] - mid[hi_];
+                if y > best_y {
+                    best_y = y;
+                    roof_z = z;
+                }
+                let k = (((z + 1.0) * 0.5 * 8.0).round() as usize).min(8);
+                wid[k] = wid[k].max(x);
+                if z < -0.85 {
+                    nose_w = nose_w.max(x);
+                }
+            }
+            let widest = wid.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as f32 / 8.0 * 2.0 - 1.0).unwrap_or(0.0);
+            println!(
+                "{:<10} {:>7.2} {:>7.2} {:>7} {:>+8.2} {:>+8.2} {:>8.2}",
+                name,
+                l / w,
+                l / hh,
+                "-",
+                roof_z,
+                widest,
+                nose_w
+            );
+            refs.push((l / w, l / hh, roof_z, widest, nose_w, wid));
+        }
+        if refs.len() == 2 {
+            println!();
+            println!("shape profile (half-width at nine stations, nose to tail):");
+            for (i, r) in refs.iter().enumerate() {
+                let nm = if i == 0 { "octane" } else { "breakout" };
+                let prof: Vec<String> = r.5.iter().map(|v| format!("{v:.2}")).collect();
+                println!("   {nm:<9} {}", prof.join(" "));
+            }
+            println!();
+            println!("   => a car is ~{:.1}x longer than wide, ~{:.1}x longer than tall,", (refs[0].0 + refs[1].0) * 0.5, (refs[0].1 + refs[1].1) * 0.5);
+            println!("      the roof sits {:+.2} along the length, and the nose is {:.0}% of full width", (refs[0].2 + refs[1].2) * 0.5, (refs[0].4 + refs[1].4) * 50.0);
+        }
         return;
     }
     if name == "glb" {
@@ -4287,6 +5574,104 @@ pub fn run(args: &[String]) {
                 off * 100.0,
                 if off > 0.02 { "OFF CENTRE" } else { "" }
             );
+        }
+
+        // ---- MODEL HEALTH ----
+        // "Missing triangles", "strange shapes" and "overbounded" are three
+        // different faults and want three different measurements:
+        //   * a mesh whose triangle WINDING is inconsistent renders with
+        //     holes under backface culling — the triangles are there, they
+        //     are simply facing away
+        //   * DEGENERATE triangles (zero area) are authoring debris
+        //   * a bounding box driven by a handful of STRAY vertices makes the
+        //     hitbox far bigger than the car, which reads as a wrong shape
+        println!();
+        println!("{:<12} {:>8} {:>9} {:>10} {:>11}", "model", "tris", "degen", "open edges", "bbox/p98");
+        let mut worst_slack = 0.0f32;
+        for n in ["vulcan.glb", "xdevil.glb", "backfire.glb", "guardian.glb", "orion.glb", "breakout.glb", "assael.glb"] {
+            let path = dir.join(n);
+            let Ok(d) = gltf::Gltf::open(&path) else { continue };
+            let Some(blob) = d.blob.clone() else { continue };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            let mut idx: Vec<u32> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let base = pts.len() as u32;
+                    let reader = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = reader.read_positions() {
+                        pts.extend(ps);
+                    }
+                    if let Some(is) = reader.read_indices() {
+                        idx.extend(is.into_u32().map(|i| i + base));
+                    }
+                }
+            }
+            if pts.is_empty() || idx.is_empty() {
+                continue;
+            }
+            let tris = idx.len() / 3;
+            // degenerate: two indices equal, or zero area
+            let mut degen = 0usize;
+            let mut edges: std::collections::HashMap<(u32, u32), i32> = std::collections::HashMap::new();
+            for t in idx.chunks_exact(3) {
+                if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                    degen += 1;
+                    continue;
+                }
+                let (a, b, c) = (
+                    Vec3::from_array(pts[t[0] as usize]),
+                    Vec3::from_array(pts[t[1] as usize]),
+                    Vec3::from_array(pts[t[2] as usize]),
+                );
+                if (b - a).cross(c - a).length() < 1e-12 {
+                    degen += 1;
+                    continue;
+                }
+                // an edge shared by two correctly wound triangles is seen
+                // once in each direction; anything else is a hole or a flip
+                for (u, v) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    let key = (u.min(v), u.max(v));
+                    *edges.entry(key).or_insert(0) += if u < v { 1 } else { -1 };
+                }
+            }
+            let open = edges.values().filter(|v| **v != 0).count();
+            // how much bigger is the box than the body it contains?
+            let mut slack = 0.0f32;
+            for ax in 0..3 {
+                let mut v: Vec<f32> = pts.iter().map(|p| p[ax]).collect();
+                v.sort_by(f32::total_cmp);
+                let lo = v[0];
+                let hi = v[v.len() - 1];
+                let p1 = v[v.len() / 100];
+                let p99 = v[v.len() * 99 / 100];
+                let full = (hi - lo).max(1e-6);
+                let inner = (p99 - p1).max(1e-6);
+                slack = slack.max(full / inner);
+            }
+            worst_slack = worst_slack.max(slack);
+            println!(
+                "{:<12} {:>8} {:>9} {:>10} {:>10.2}x {}",
+                n.trim_end_matches(".glb"),
+                tris,
+                degen,
+                open,
+                slack,
+                if open * 20 > tris { "OPEN SHELL" } else if slack > 1.5 { "stray verts" } else { "" }
+            );
+        }
+        println!("   (open edges are why triangles look missing: they face away, so culling hides them)");
+        // the two fixes, stated as the numbers they change
+        {
+            let src = include_str!("render.rs");
+            let double_sided = src.contains("cull_mode: None,\n                front_face");
+            let ldr = include_str!("model.rs");
+            let scrubs = ldr.contains("cross(c - a).length_squared() < 1e-20");
+            let p99 = ldr.contains("half_p99_raw");
+            println!(
+                "   car pipeline draws both sides: {}, loader drops degenerates: {}, hitbox uses p99: {}",
+                double_sided, scrubs, p99
+            );
+            ok_all &= double_sided && scrubs && p99;
         }
 
         // ---- ORIENTATION: which way did each model arrive? ----
@@ -5836,11 +7221,15 @@ pub fn run(args: &[String]) {
             continue;
         };
         let (mut goals, mut tt, mut at, mut rs, mut ps, mut dtr, mut st) = (0u64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut ph = [0.0f32; 6];
         for k in 0..trials {
             let o = run_one(1000 + k * 7, n, def, 28.0);
             if let Some(g) = o.goal_t {
                 goals += 1;
                 tt += g;
+            }
+            for k in 0..6 {
+                ph[k] += o.phase_t[k];
             }
             at += o.air_touches as f32;
             rs += o.resets as f32;
@@ -5860,6 +7249,20 @@ pub fn run(args: &[String]) {
             ps / f,
             dtr / f,
             st / f
+        );
+        // WHERE the state machine spent its time. "Zero goals" says a bot
+        // failed; this says which stage it never got past, which is the only
+        // form of the question that can be acted on. A sampled trace cannot
+        // answer it, because the transitions happen between samples.
+        let tot: f32 = ph.iter().sum::<f32>().max(0.01);
+        println!(
+            "   phases: approach {:.0}%  carry {:.0}%  pop {:.0}%  air {:.0}%  reset {:.0}%  flick {:.0}%",
+            ph[0] / tot * 100.0,
+            ph[1] / tot * 100.0,
+            ph[2] / tot * 100.0,
+            ph[3] / tot * 100.0,
+            ph[4] / tot * 100.0,
+            ph[5] / tot * 100.0
         );
     }
 }

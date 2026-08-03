@@ -123,6 +123,11 @@ pub struct VideoCfg {
     pub grain: f32,     // 0..1 film grain
     pub letterbox: bool,// cinema bars
     pub bloom: f32,     // bloom strength, 0..2
+    /// How far reflection rays are allowed to travel, as a multiplier. The
+    /// marcher's cost is candidates x steps and steps scale with distance,
+    /// so this is the most direct performance control there is — and unlike
+    /// quality it changes WHAT you see rather than how well.
+    pub ray_dist: f32,
     pub vsync: bool,
     pub screen_door: f32,
     /// 0 AUTO, 1 LOW, 2 MEDIUM, 3 HIGH
@@ -151,7 +156,7 @@ impl Default for Config {
             ball: BallCfg { size: 1.0, bounce: 1.0, friction: 1.0, weight: 1.0 },
             car: CarCfg { steer_rate: 0.9, input_ease: 1.1, size: 1.0, grip: 1.0, top_speed: 1.0, accel: 1.0, boost: 1.0, boost_regen: 0.0, boost_max: 1.0, unlimited_boost: false, jump: 1.0, analog: true, analog_soft: 0.45 , autotarget_hold: true },
             flip: FlipCfg { spin: 1.0, strength: 1.0, resets: true, strict: true, unlimited: false, cancel: true, land_assist: 0.0, air_roll_default: false },
-            video: VideoCfg { render_scale: 1.0, rays: true, quality: 1.0, filmic: true, exposure: 1.0, vignette: 0.32, grain: 0.12, letterbox: false, bloom: 0.7, vsync: true, screen_door: 0.05, tier: 0 },
+            video: VideoCfg { render_scale: 1.0, rays: true, quality: 1.0, filmic: true, exposure: 1.0, vignette: 0.32, grain: 0.12, letterbox: false, bloom: 0.7, ray_dist: 1.0, vsync: true, screen_door: 0.05, tier: 0 },
             touch: TouchCfg { enabled: false, scale: 1.0, tap_to_move: true },
             preset: 0,
         }

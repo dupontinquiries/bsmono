@@ -292,6 +292,78 @@ pub fn tram(gpu: &mut Gpu) -> Model {
 // an EV variant also pulls harder off the line.
 
 /// Turn any model into its electric variant.
+/// Give a hovercar the parts that explain how it works.
+///
+/// These arrive as raw imports with no house style at all, and worse, with
+/// nothing on them that says why they float. So: a SKIRT lofted around the
+/// lower body (the plenum a cushion needs to work), four THRUSTER NOZZLES,
+/// and an underglow strip.
+///
+/// The nozzles go exactly where the physics samples its cushion — the four
+/// corners of the underside at 0.78 and 0.80 of the half-extents. That is
+/// the point of doing it: the model then shows the mechanic rather than
+/// decorating around it, and when a corner dips and pushes back hard, the
+/// thing pushing is visibly there.
+pub fn hoverize(gpu: &mut Gpu, base: &Model, accent: [f32; 4], h: crate::physics::Hover) -> Model {
+    let mut prims = base.prims.clone();
+    let (hl, hh, hw) = (base.half_len, base.half_h, base.half_w);
+
+    // the skirt: a shallow lofted band round the underside, wider at the
+    // middle where a plenum would be
+    let skirt = [
+        (-hl * 0.82, hw * 0.66, -hh * 0.98, -hh * 0.52, 0.60),
+        (-hl * 0.30, hw * 0.94, -hh * 1.02, -hh * 0.46, 0.45),
+        (hl * 0.30, hw * 0.94, -hh * 1.02, -hh * 0.46, 0.45),
+        (hl * 0.82, hw * 0.70, -hh * 0.98, -hh * 0.52, 0.60),
+    ];
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::loft(&skirt, 20), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
+        [0.10, 0.11, 0.13, 1.0],
+    ));
+
+    // FOUR NOZZLES, at the cushion's own sample points
+    for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let at = Vec3::new(sx * hw * 0.78, -hh * 0.92, sz * hl * 0.80);
+        // the housing
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::wheel(0.5, 14), Vec3::splat(hh * 0.46), Quat::from_rotation_z(std::f32::consts::FRAC_PI_2), at),
+            [0.16, 0.17, 0.20, 1.0],
+        ));
+        // and the throat it blows through, lit
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::sphere(9, 12), Vec3::new(hh * 0.28, hh * 0.10, hh * 0.28), Quat::IDENTITY, at - Vec3::Y * hh * 0.10),
+            accent,
+        ));
+    }
+
+    // underglow along the sills, brighter on a stiffer cushion — a hovercar
+    // that rides hard should look like it
+    let glow = (h.stiff / 70.0).clamp(0.25, 1.0);
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::cbox(0.30), Vec3::new(0.012, 0.010, hl * 0.62), Quat::IDENTITY, Vec3::new(sx * hw * 0.92, -hh * 0.80, 0.0)),
+            [accent[0] * glow, accent[1] * glow, accent[2], 1.0],
+        ));
+    }
+
+    Model {
+        prims,
+        drive: base.drive,
+        hover: base.hover,
+        cloud: base.cloud.clone(),
+        cloud_n: base.cloud_n.clone(),
+        sdf_half: base.sdf_half,
+        half_len: hl,
+        half_h: hh,
+        half_w: hw,
+        wheel_r: base.wheel_r,
+    }
+}
+
 pub fn electrify(gpu: &mut Gpu, base: &Model, accent: [f32; 4]) -> Model {
     let mut prims = base.prims.clone();
     let (hl, hh) = (base.half_len, base.half_h);
@@ -618,45 +690,137 @@ pub fn aegis(gpu: &mut Gpu) -> Model {
     Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.205, half_w, wheel_r }
 }
 
-pub fn breadbox(gpu: &mut Gpu) -> Model {
-    let mut prims = Vec::new();
-    // tall van body + darker cab face + mint roof rail
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.30, 0.26, 0.52), Quat::IDENTITY, Vec3::new(0.0, 0.10, 0.02)), [0.62, 0.86, 0.72, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.27, 0.10, 0.10), Quat::IDENTITY, Vec3::new(0.0, 0.16, -0.50)), [0.16, 0.20, 0.24, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.24, 0.02, 0.40), Quat::IDENTITY, Vec3::new(0.0, 0.38, 0.04)), [0.93, 0.90, 0.80, 1.0]));
-    wheels(gpu, &mut prims, 0.115, 0.27, -0.36, 0.36, -0.10);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.30, half_w: 0.31, wheel_r: 0.115 }
+/// The house recipe, in one place.
+///
+/// Every car in the catalogue is now built the same way the references are:
+/// a CONTINUOUS lofted shell with a shoulder crease, a darker glasshouse set
+/// INTO it rather than perched on top, and a dark tub underneath. Octane and
+/// Dominus are four body meshes each — chassis, paint, body, window — and
+/// that is the structure, not a coincidence: the shell reads as one surface
+/// because it IS one, and the hard lines come from where the parts meet.
+pub fn shell_car(
+    gpu: &mut Gpu,
+    prims: &mut Vec<Prim>,
+    sections: &[(f32, f32, f32, f32, f32)],
+    paint: [f32; 4],
+    cabin: (f32, f32, f32, f32),
+    ring: u32,
+) {
+    prims.push(body_prim(gpu, part(meshgen::loft(sections, ring), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), paint));
+    // the glasshouse: its own loft, sunk into the shell so the join is a
+    // line rather than a lip
+    let (z0, z1, w, y) = cabin;
+    let glass = [
+        (z0, w * 0.70, y - 0.02, y + 0.02, 0.92),
+        (z0 + (z1 - z0) * 0.38, w, y - 0.03, y + 0.075, 0.86),
+        (z1, w * 0.78, y - 0.03, y + 0.045, 0.92),
+    ];
+    prims.push(body_prim(gpu, part(meshgen::loft(&glass, ring.max(16)), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), [0.06, 0.08, 0.11, 1.0]));
+    // and the tub: a dark floor that grounds the shell the way a chassis does
+    let nose = sections[0];
+    let tail = sections[sections.len() - 1];
+    let mid = sections[sections.len() / 2];
+    let tub = [
+        (nose.0 * 0.86, mid.1 * 0.62, mid.2 - 0.012, mid.2 + 0.030, 0.55),
+        (0.0, mid.1 * 0.80, mid.2 - 0.016, mid.2 + 0.040, 0.45),
+        (tail.0 * 0.86, mid.1 * 0.66, mid.2 - 0.012, mid.2 + 0.030, 0.55),
+    ];
+    prims.push(body_prim(gpu, part(meshgen::loft(&tub, 14), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), [0.09, 0.09, 0.11, 1.0]));
 }
 
-pub fn wedge(gpu: &mut Gpu) -> Model {
+pub fn breadbox(gpu: &mut Gpu) -> Model {
+    // tall, square-shouldered and stubby: the van of the catalogue. Boxy is
+    // a PROFILE choice (low roundness), not a reason to build it from boxes.
     let mut prims = Vec::new();
-    // long low doorstop: main slab pitched nose-down + tail block + red stripe
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.40, 0.075, 0.78), Quat::from_rotation_x(-0.10), Vec3::new(0.0, 0.015, 0.0)), [0.13, 0.13, 0.15, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.34, 0.055, 0.16), Quat::IDENTITY, Vec3::new(0.0, 0.10, 0.58)), [0.16, 0.16, 0.19, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.05, 0.078, 0.70), Quat::from_rotation_x(-0.10), Vec3::new(0.0, 0.02, 0.0)), [0.85, 0.16, 0.16, 1.0]));
+    shell_car(
+        gpu,
+        &mut prims,
+        &[
+            (-0.50, 0.24, -0.075, 0.145, 0.35),
+            (-0.28, 0.33, -0.105, 0.205, 0.22),
+            (0.02, 0.34, -0.115, 0.215, 0.18),
+            (0.30, 0.33, -0.105, 0.200, 0.22),
+            (0.50, 0.26, -0.080, 0.150, 0.35),
+        ],
+        [0.86, 0.74, 0.42, 1.0],
+        (-0.30, 0.16, 0.30, 0.185),
+        20,
+    );
+    wheels(gpu, &mut prims, 0.115, 0.30, -0.32, 0.32, -0.09);
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.25, half_w: 0.36, wheel_r: 0.115 }
+}
+
+
+pub fn wedge(gpu: &mut Gpu) -> Model {
+    // a doorstop: the nose is almost flat to the floor and the whole body is
+    // one rising plane to the tail
+    let mut prims = Vec::new();
+    shell_car(
+        gpu,
+        &mut prims,
+        &[
+            (-0.80, 0.16, -0.055, -0.020, 0.55),
+            (-0.44, 0.33, -0.075, 0.010, 0.40),
+            (-0.02, 0.40, -0.085, 0.055, 0.30),
+            (0.42, 0.39, -0.080, 0.085, 0.30),
+            (0.80, 0.28, -0.060, 0.060, 0.55),
+        ],
+        [0.13, 0.13, 0.15, 1.0],
+        (-0.10, 0.44, 0.30, 0.070),
+        22,
+    );
+    // the stripe, as a raised spine rather than paint
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.30), Vec3::new(0.045, 0.012, 0.62), Quat::from_rotation_x(-0.06), Vec3::new(0.0, 0.055, -0.05)), [0.85, 0.16, 0.16, 1.0]));
     wheels(gpu, &mut prims, 0.095, 0.36, -0.52, 0.52, -0.06);
     Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.80, half_h: 0.125, half_w: 0.42, wheel_r: 0.095 }
 }
 
+
 pub fn roller(gpu: &mut Gpu) -> Model {
+    // round in every section: a pebble on wheels, and the roundest thing
+    // the profile can produce
     let mut prims = Vec::new();
-    // skateboard deck + glass dome pod + banana stripe
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.24, 0.035, 0.46), Quat::IDENTITY, Vec3::new(0.0, -0.02, 0.0)), [0.94, 0.80, 0.30, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::sphere(16, 22), Vec3::new(0.20, 0.20, 0.22), Quat::IDENTITY, Vec3::new(0.0, 0.16, -0.02)), [0.55, 0.85, 0.92, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.25, 0.012, 0.10), Quat::IDENTITY, Vec3::new(0.0, 0.012, 0.34)), [0.95, 0.45, 0.25, 1.0]));
-    wheels(gpu, &mut prims, 0.13, 0.22, -0.30, 0.30, -0.05);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.22, half_w: 0.26, wheel_r: 0.13 }
+    shell_car(
+        gpu,
+        &mut prims,
+        &[
+            (-0.42, 0.14, -0.070, 0.040, 1.0),
+            (-0.22, 0.28, -0.130, 0.130, 1.0),
+            (0.02, 0.32, -0.145, 0.160, 1.0),
+            (0.24, 0.28, -0.130, 0.130, 1.0),
+            (0.42, 0.15, -0.075, 0.045, 1.0),
+        ],
+        [0.92, 0.44, 0.22, 1.0],
+        (-0.18, 0.20, 0.24, 0.130),
+        24,
+    );
+    wheels(gpu, &mut prims, 0.13, 0.29, -0.28, 0.28, -0.08);
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.48, half_h: 0.24, half_w: 0.34, wheel_r: 0.13 }
 }
 
+
 pub fn longboy(gpu: &mut Gpu) -> Model {
-    // the limousine plank: past-Wedge length, comedic reach, wobbly to spin
+    // absurdly long and low: a limousine hitbox, and the profile barely
+    // changes down its whole length
     let mut prims = Vec::new();
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.30, 0.085, 1.02), Quat::IDENTITY, Vec3::new(0.0, 0.02, 0.0)), [0.14, 0.15, 0.20, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.26, 0.07, 0.30), Quat::IDENTITY, Vec3::new(0.0, 0.13, -0.30)), [0.10, 0.10, 0.13, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.31, 0.012, 1.00), Quat::IDENTITY, Vec3::new(0.0, 0.105, 0.0)), [0.85, 0.78, 0.30, 1.0]));
-    wheels(gpu, &mut prims, 0.095, 0.27, -0.74, 0.74, -0.055);
-    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.04, half_h: 0.14, half_w: 0.32, wheel_r: 0.095 }
+    shell_car(
+        gpu,
+        &mut prims,
+        &[
+            (-1.00, 0.13, -0.045, 0.010, 0.70),
+            (-0.55, 0.25, -0.065, 0.065, 0.50),
+            (0.00, 0.27, -0.070, 0.080, 0.45),
+            (0.55, 0.26, -0.068, 0.072, 0.50),
+            (1.00, 0.16, -0.050, 0.020, 0.70),
+        ],
+        [0.24, 0.30, 0.52, 1.0],
+        (-0.34, 0.40, 0.22, 0.068),
+        20,
+    );
+    wheels(gpu, &mut prims, 0.09, 0.27, -0.72, 0.72, -0.05);
+    Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 1.00, half_h: 0.115, half_w: 0.30, wheel_r: 0.09 }
 }
+
 
 pub fn cube(gpu: &mut Gpu) -> Model {
     // the cube: equal in every direction, wrong in every situation. touches
@@ -689,11 +853,26 @@ pub fn cube(gpu: &mut Gpu) -> Model {
 }
 
 pub fn shark(gpu: &mut Gpu) -> Model {
-    // streamliner with a dorsal fin: mid hitbox, unmistakable silhouette
+    // a streamliner: round in section, tapered at both ends, with a dorsal
+    // fin that is the whole silhouette
     let mut prims = Vec::new();
-    prims.push(body_prim(gpu, part(meshgen::sphere(14, 20), Vec3::new(0.30, 0.16, 0.64), Quat::IDENTITY, Vec3::new(0.0, 0.03, 0.0)), [0.35, 0.48, 0.62, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.025, 0.17, 0.16), Quat::from_rotation_x(0.28), Vec3::new(0.0, 0.24, 0.14)), [0.30, 0.42, 0.55, 1.0]));
-    prims.push(body_prim(gpu, part(meshgen::boxx(), Vec3::new(0.30, 0.02, 0.10), Quat::IDENTITY, Vec3::new(0.0, -0.02, -0.60)), [0.92, 0.92, 0.95, 1.0]));
+    shell_car(
+        gpu,
+        &mut prims,
+        &[
+            (-0.66, 0.11, -0.055, 0.020, 0.95),
+            (-0.34, 0.26, -0.105, 0.090, 0.90),
+            (0.02, 0.30, -0.120, 0.130, 0.88),
+            (0.36, 0.27, -0.105, 0.105, 0.90),
+            (0.66, 0.14, -0.060, 0.040, 0.95),
+        ],
+        [0.35, 0.48, 0.62, 1.0],
+        (-0.24, 0.24, 0.22, 0.115),
+        24,
+    );
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.34), Vec3::new(0.022, 0.13, 0.15), Quat::from_rotation_x(0.28), Vec3::new(0.0, 0.22, 0.14)), [0.30, 0.42, 0.55, 1.0]));
+    prims.push(body_prim(gpu, part(meshgen::cbox(0.40), Vec3::new(0.24, 0.014, 0.02), Quat::IDENTITY, Vec3::new(0.0, -0.02, -0.63)), [0.92, 0.92, 0.95, 1.0]));
     wheels(gpu, &mut prims, 0.10, 0.28, -0.44, 0.44, -0.09);
     Model { prims, drive: Drive::Combustion, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.66, half_h: 0.20, half_w: 0.31, wheel_r: 0.10 }
 }
+

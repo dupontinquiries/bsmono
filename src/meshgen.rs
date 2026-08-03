@@ -430,6 +430,55 @@ pub fn loft(sections: &[(f32, f32, f32, f32, f32)], ring: u32) -> MeshData {
     if sections.len() < 2 {
         return m;
     }
+    // RESAMPLE ALONG THE LENGTH.
+    //
+    // Measured on the art target: Octane's painted shell has a median
+    // dihedral of about 2 degrees — neighbouring triangles are very nearly
+    // coplanar, which is what makes a surface read as continuous bodywork
+    // rather than as a low-poly prop. Five hand-placed control sections
+    // cannot do that however many segments the RING has: the ridges run the
+    // wrong way, across the car instead of around it.
+    //
+    // So the control sections are treated as a spline and resampled. A
+    // Catmull-Rom through them keeps every shape the author asked for and
+    // fills in the surface between.
+    let sections: Vec<(f32, f32, f32, f32, f32)> = if sections.len() >= 3 {
+        let n = sections.len();
+        let get = |i: isize| -> (f32, f32, f32, f32, f32) {
+            sections[(i.max(0) as usize).min(n - 1)]
+        };
+        // Seven samples per span. The references carry 6,000-10,000
+        // triangles in a body where ours had 884, and crease fraction scales
+        // with 1/resolution — the same two character lines are 10% of
+        // Dominus's edges and 18% of ours purely because it has more surface
+        // between them. More smooth surface is what makes a crease read as a
+        // line rather than as the shape.
+        let sub = 7;
+        let mut out = Vec::with_capacity((n - 1) * sub + 1);
+        for i in 0..(n - 1) {
+            let (p0, p1, p2, p3) = (get(i as isize - 1), get(i as isize), get(i as isize + 1), get(i as isize + 2));
+            for k in 0..sub {
+                let t = k as f32 / sub as f32;
+                let (t2, t3) = (t * t, t * t * t);
+                // Catmull-Rom on each of the five channels
+                let cr = |a: f32, b: f32, c: f32, d: f32| -> f32 {
+                    0.5 * ((2.0 * b) + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
+                };
+                out.push((
+                    cr(p0.0, p1.0, p2.0, p3.0),
+                    cr(p0.1, p1.1, p2.1, p3.1).max(0.001),
+                    cr(p0.2, p1.2, p2.2, p3.2),
+                    cr(p0.3, p1.3, p2.3, p3.3),
+                    cr(p0.4, p1.4, p2.4, p3.4).clamp(0.0, 1.0),
+                ));
+            }
+        }
+        out.push(sections[n - 1]);
+        out
+    } else {
+        sections.to_vec()
+    };
+    let sections = &sections[..];
     let n = ring.max(8);
     // a rounded-rectangle ring in the section's own space
     let ring_pt = |hw: f32, y0: f32, y1: f32, corner: f32, t: f32| -> Vec3 {
@@ -445,12 +494,65 @@ pub fn loft(sections: &[(f32, f32, f32, f32, f32)], ring: u32) -> MeshData {
             0.0,
         )
     };
-    let stride = n + 1;
-    for (si, &(z, hw, y0, y1, corner)) in sections.iter().enumerate() {
+    // ---- CHARACTER LINES ----
+    //
+    // Measured on the references: Dominus's painted shell is median 0.4 deg
+    // — almost perfectly continuous — but 10.4% of its edges are creases
+    // above 20 deg, and its p90 is 21.8. Octane is the same shape of number.
+    // A car body is not a smooth blob: it is a smooth surface INTERRUPTED by
+    // a few hard lines, and those lines are most of what makes it read as
+    // designed rather than extruded.
+    //
+    // A loft with shared vertices can only ever be smooth, because every
+    // vertex normal is the average of the faces around it. So the ring is
+    // walked once to find where the profile turns hardest — the shoulder and
+    // the lower edge on a rounded rectangle — and the vertices there are
+    // DUPLICATED. Each copy takes the normal of its own side, so the shading
+    // breaks along a line running the length of the car.
+    let crease_at: Vec<bool> = {
+        // use the widest section as the representative profile
+        let wide = sections
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1 .1.total_cmp(&b.1 .1))
+            .map(|(k, _)| k)
+            .unwrap_or(0);
+        let (_, hw, y0, y1, corner) = sections[wide];
+        let mut flags = vec![false; (n + 1) as usize];
         for i in 0..=n {
             let t = i as f32 / n as f32;
+            let prev = ring_pt(hw, y0, y1, corner, (t - 1.0 / n as f32).rem_euclid(1.0));
+            let here = ring_pt(hw, y0, y1, corner, t);
+            let next = ring_pt(hw, y0, y1, corner, (t + 1.0 / n as f32).rem_euclid(1.0));
+            let a = (here - prev).normalize_or(Vec3::X);
+            let b = (next - here).normalize_or(Vec3::X);
+            // a hard turn in the profile is a character line
+            // ...and only along the SHOULDER. A rounded section has four
+            // corners and creasing all of them gave twice the reference's
+            // crease fraction — but two of those are the floor edge, which no
+            // car has as a character line. A body creases where the flank
+            // turns over into the roof; underneath it is a smooth tub.
+            let above_waist = here.y > (y0 + y1) * 0.5;
+            if above_waist && a.dot(b).clamp(-1.0, 1.0).acos().to_degrees() > 26.0 {
+                flags[i as usize] = true;
+            }
+        }
+        flags
+    };
+    // the emission order: crease positions appear twice, so each side can
+    // carry its own normal
+    let mut order: Vec<(u32, bool)> = Vec::new(); // (ring index, second copy?)
+    for i in 0..=n {
+        order.push((i, false));
+        if crease_at[i as usize] && i != 0 && i != n {
+            order.push((i, true));
+        }
+    }
+    let stride = order.len() as u32;
+    for (si, &(z, hw, y0, y1, corner)) in sections.iter().enumerate() {
+        for &(i, second) in order.iter() {
+            let t = i as f32 / n as f32;
             let p = ring_pt(hw, y0, y1, corner, t);
-            // normal from neighbouring sections, so the skin shades smoothly
             let (zp, zn) = (
                 sections[si.saturating_sub(1)],
                 sections[(si + 1).min(sections.len() - 1)],
@@ -458,16 +560,23 @@ pub fn loft(sections: &[(f32, f32, f32, f32, f32)], ring: u32) -> MeshData {
             let a = ring_pt(zp.1, zp.2, zp.3, zp.4, t) + Vec3::new(0.0, 0.0, zp.0);
             let b = ring_pt(zn.1, zn.2, zn.3, zn.4, t) + Vec3::new(0.0, 0.0, zn.0);
             let along = (b - a).normalize_or(Vec3::Z);
-            let t2 = (i as f32 + 0.25) / n as f32;
-            let q = ring_pt(hw, y0, y1, corner, t2);
-            let tang = (q - p).normalize_or(Vec3::X);
+            // a creased vertex takes the tangent of ITS OWN side only, so
+            // the two copies disagree and the surface breaks between them
+            let step = 1.0 / n as f32;
+            let t2 = if second { t + step * 0.25 } else { t - step * 0.25 };
+            let q = ring_pt(hw, y0, y1, corner, t2.rem_euclid(1.0));
+            let tang = if second { (q - p).normalize_or(Vec3::X) } else { (p - q).normalize_or(Vec3::X) };
             let nrm = tang.cross(along).normalize_or(Vec3::Y);
             m.push(Vec3::new(p.x, p.y, z), nrm, Vec2::new(t, si as f32 / sections.len() as f32));
         }
     }
     for si in 0..sections.len() - 1 {
-        for i in 0..n {
-            let a = (si as u32) * stride + i;
+        for k in 0..(order.len() - 1) {
+            // no quad across a duplicated pair: they are the same edge
+            if order[k].0 == order[k + 1].0 {
+                continue;
+            }
+            let a = (si as u32) * stride + k as u32;
             let b = a + 1;
             let c = a + stride;
             let d = c + 1;
