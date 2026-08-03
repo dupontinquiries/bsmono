@@ -7867,7 +7867,28 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                     // RAM (Asahi BO VMA death on 40–70 GiB staged uploads). On UNIFIED memory the zero-copy
                     // map-at-creation arena doesn't stage, so the cap doesn't apply — the budget scales with
                     // physical RAM and a 62 GiB MoE loads resident on a 192 GiB box (no streaming needed).
-                    let gpu_budget = gpu_buffer_budget_uma(budget, self.conservative_vma, self.unified);
+                    // CLAMP TO WHAT THE DEVICE WILL HOLD AT ONCE, not to what it will accept once.
+            //
+            // --gate-vram measures the largest allocation the device ACCEPTS and reports 63 GiB here.
+            // Three runs show it will not HOLD more than ~31 GiB of buffers concurrently, mapped or
+            // unmapped. Budgeting against the first number picks a 56.6 GiB resident plan that cannot
+            // exist, and the failure arrives forty seconds into quantization as an invalid buffer.
+            //
+            // I added resident_fits_concurrent last commit and said it checked this before the load.
+            // It did not — nothing called it, and the next run picked q4-resident again. This is that
+            // call.
+            let mut gpu_budget = gpu_buffer_budget_uma(budget, self.conservative_vma, self.unified);
+            if self.conservative_vma {
+                let cap = (crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB * (1u64 << 30) as f64) as u64;
+                if gpu_budget > cap {
+                    eprintln!("loader: GPU budget {:.1} GiB clamped to {:.1} GiB — this driver \
+accepts a large single allocation but will not hold more than that in buffers at once (measured at \
+1 and 2 GiB slabs, mapped and unmapped). A plan above it fails mid-load rather than at planning time.",
+                        gpu_budget as f64 / (1u64 << 30) as f64,
+                        crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB);
+                    gpu_budget = cap;
+                }
+            }
                     match plan(&shape, gpu_budget, 4096, 2, 256 * (1 << 20)) {
                         Fit::Resident { fmt: Residency::Int8, .. } => {} // int8 fits — the default
                         Fit::Resident { fmt: Residency::Q4, weight_bytes, .. } => {
