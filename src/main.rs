@@ -1867,6 +1867,16 @@ impl Game {
             }
             let ids: Vec<usize> =
                 self.cars.models[base].prims.iter().map(|p| p.mesh_id).collect();
+            // A PARTIAL BLEND IS WORSE THAN NO BLEND. If the displayed model
+            // has more prims than the strip does, `take` would leave the
+            // extras holding their VEHICLE geometry while everything else
+            // folds — a shell of the old body left attached to the new one,
+            // thin and easy to miss from most angles. Refuse instead, and
+            // fall back to stepping, which at least shows one whole body.
+            if self.morph.as_ref().map_or(false, |m| m.prims() != ids.len()) {
+                self.morph = None;
+                self.toastf("strip prim mismatch — stepping");
+            }
             if let Some(m) = &mut self.morph {
                 for (p, mesh_id) in ids.iter().enumerate().take(m.prims()) {
                     let md = m.sample(p, t);
