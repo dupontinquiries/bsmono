@@ -360,3 +360,92 @@ mod alternator_tests {
         assert!(matches!(a.tick(1), Slot::Status(_)));
     }
 }
+
+/// Which part of the machine should be moving right now.
+///
+/// `Machine` describes three states in prose and nothing said which one applies. A landmark needs
+/// that: the clocktower has to know whether its pendulum swings or hangs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Motion { Fetching, Deciding, Stalled }
+
+impl Motion {
+    /// The description to render, from the scene's machine.
+    pub fn describe(self, m: &Machine) -> &'static str {
+        match self { Motion::Fetching => m.fetch, Motion::Deciding => m.decide, Motion::Stalled => m.stall }
+    }
+
+    /// How fast the mechanism should animate, as a multiplier on its resting rate.
+    ///
+    /// **Stalled is 0.0, not slow.** A mechanism creeping along reads as "working hard"; one that has
+    /// visibly stopped reads as stopped. That difference is the whole reason to draw this rather than
+    /// print a percentage, and softening it to a crawl would give back exactly what the visual buys.
+    pub fn rate(self) -> f32 {
+        match self { Motion::Fetching => 1.0, Motion::Deciding => 0.6, Motion::Stalled => 0.0 }
+    }
+}
+
+/// What the machine should be doing, given what the engine is doing.
+pub fn motion_for(c: &Concern) -> Motion {
+    match c {
+        // The stall is the state worth showing, and it outranks everything: a machine that fetched
+        // busily while the CPU waited would be telling the opposite of the truth.
+        Concern::SyncBound { .. } => Motion::Stalled,
+        // A clamped budget is not a stall — work continues, just less of it fits. Showing it as
+        // stopped would be alarming about the wrong thing.
+        Concern::MemoryClamped { .. } => Motion::Fetching,
+        Concern::ExpertChurn { .. } => Motion::Fetching,
+        Concern::TunerHeld { .. } => Motion::Deciding,
+        Concern::Healthy { .. } => Motion::Deciding,
+    }
+}
+
+#[cfg(test)]
+mod motion_tests {
+    use super::*;
+
+    #[test]
+    fn a_sync_bound_engine_shows_a_STOPPED_machine() {
+        assert_eq!(motion_for(&Concern::SyncBound { pct: 99 }), Motion::Stalled);
+        assert_eq!(Motion::Stalled.rate(), 0.0, "stopped, not slow");
+    }
+
+    #[test]
+    fn stalled_is_ZERO_rather_than_a_crawl() {
+        // A mechanism creeping along reads as "working hard"; one that has visibly stopped reads as
+        // stopped. Softening it gives back exactly what drawing this instead of a percentage buys.
+        assert!(Motion::Stalled.rate() < Motion::Deciding.rate());
+        assert_eq!(Motion::Stalled.rate(), 0.0);
+    }
+
+    #[test]
+    fn a_CLAMPED_budget_is_not_shown_as_a_stall() {
+        // Work continues, just less of it fits. Showing it stopped would alarm about the wrong thing.
+        assert_eq!(motion_for(&Concern::MemoryClamped { asked_gib: 48, held_gib: 31 }), Motion::Fetching);
+    }
+
+    #[test]
+    fn expert_churn_shows_the_FETCH_parts_moving() {
+        // Which is literally what is happening: the stream is doing the work.
+        assert_eq!(motion_for(&Concern::ExpertChurn { hit_pct: 46, pinned: 6, total: 16 }),
+                   Motion::Fetching);
+    }
+
+    #[test]
+    fn every_motion_has_a_description_in_every_theme() {
+        for scene in ["Old Library", "Canopy", "Cloudscape", "Treehouse", "Folding@home",
+                      "Mansion Garden", "Atlantis", "Somewhere New"] {
+            let m = machine_for(scene);
+            for mo in [Motion::Fetching, Motion::Deciding, Motion::Stalled] {
+                assert!(!mo.describe(&m).is_empty(), "{scene} {mo:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_clocktower_hangs_when_the_engine_waits() {
+        // The end-to-end claim, in one assertion: a real Scout run makes the pendulum stop.
+        let m = machine_for("Old Library");
+        let motion = motion_for(&Concern::SyncBound { pct: 99 });
+        assert!(motion.describe(&m).contains("does not fall"));
+    }
+}
