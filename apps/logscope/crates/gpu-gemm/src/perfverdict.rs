@@ -796,3 +796,38 @@ mod gate_list_tests {
         assert!(dispatched.len() > 40, "sanity: found only {} gates", dispatched.len());
     }
 }
+
+#[cfg(test)]
+mod logit_cmp_tests {
+    use crate::compare_logits;
+
+    #[test]
+    fn different_LENGTHS_are_not_a_zero_difference() {
+        // The int8-cache gate printed "argmax_match=false max|d|=0.00e0" — a contradiction on its
+        // face. `zip` truncated to the shorter vector so the difference was measured over a prefix,
+        // while the argmax scanned both in full.
+        let a = vec![1.0f32, 2.0, 9.0];
+        let b = vec![1.0f32, 2.0];
+        let c = compare_logits(&a, &b);
+        assert!(!c.argmax_match);
+        assert!(c.max_abs.is_infinite(), "a shape disagreement is the most severe kind, got {}", c.max_abs);
+    }
+
+    #[test]
+    fn identical_vectors_agree_on_BOTH_measures() {
+        // The property the gate was asserting and could not actually check.
+        let v = vec![0.5f32, -1.0, 3.25, 3.25];
+        let c = compare_logits(&v, &v);
+        assert!(c.argmax_match);
+        assert_eq!(c.max_abs, 0.0);
+    }
+
+    #[test]
+    fn a_TIE_resolves_to_the_same_index_on_both_sides() {
+        // Strict `>` means first-max wins, so equal values cannot make two identical vectors
+        // disagree — worth pinning, because "it was a tie" was the other candidate explanation and
+        // it was wrong.
+        let v = vec![1.0f32, 5.0, 5.0, 2.0];
+        assert!(compare_logits(&v, &v.clone()).argmax_match);
+    }
+}
