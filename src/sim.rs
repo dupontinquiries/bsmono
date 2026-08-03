@@ -579,6 +579,62 @@ pub fn run(args: &[String]) {
             }
         }
         println!();
+        // ---- IS THE CATALOGUE ACTUALLY VARIED? ----
+        // Rocket League ships six hitbox presets for dozens of cars, and
+        // that is a deliberate design: the SHAPES vary, the boxes do not,
+        // because players need to know what they are playing against. Ours
+        // grew organically, so the question worth asking is the opposite —
+        // do forty cars mean forty vehicles, or forty paint jobs on one box?
+        {
+            // the procedural cars' declared half-extents, read from source
+            let src = include_str!("procars.rs");
+            let mut boxes: Vec<(String, f32, f32, f32)> = Vec::new();
+            for line in src.lines() {
+                if let Some(i) = line.find("half_len:") {
+                    let rest = &line[i..];
+                    let nums: Vec<f32> = rest
+                        .split(|c: char| !c.is_ascii_digit() && c != '.')
+                        .filter(|t| !t.is_empty())
+                        .filter_map(|t| t.parse::<f32>().ok())
+                        .collect();
+                    if nums.len() >= 4 {
+                        boxes.push((format!("car{}", boxes.len()), nums[0], nums[1], nums[2]));
+                    }
+                }
+            }
+            if boxes.len() >= 4 {
+                // cluster by rounded shape: how many DISTINCT boxes are there
+                let mut sigs: Vec<(i32, i32, i32)> = boxes
+                    .iter()
+                    .map(|b| ((b.1 * 12.0) as i32, (b.2 * 12.0) as i32, (b.3 * 12.0) as i32))
+                    .collect();
+                sigs.sort();
+                sigs.dedup();
+                let (mut lmin, mut lmax) = (f32::MAX, 0.0f32);
+                let (mut hmin, mut hmax) = (f32::MAX, 0.0f32);
+                for b in &boxes {
+                    lmin = lmin.min(b.1);
+                    lmax = lmax.max(b.1);
+                    hmin = hmin.min(b.2);
+                    hmax = hmax.max(b.2);
+                }
+                println!(
+                    "   hitboxes: {} cars, {} distinct shapes; length {:.2}-{:.2}, height {:.2}-{:.2}",
+                    boxes.len(),
+                    sigs.len(),
+                    lmin,
+                    lmax,
+                    hmin,
+                    hmax
+                );
+                println!(
+                    "   spread: longest is {:.1}x the shortest, tallest {:.1}x the flattest",
+                    lmax / lmin.max(0.01),
+                    hmax / hmin.max(0.01)
+                );
+            }
+        }
+        println!();
         // ---- CATALOGUE AUDIT ----
         // A house style is only a style if the whole catalogue is built to
         // it. This reads the source and reports which cars are made from the
@@ -1625,6 +1681,62 @@ pub fn run(args: &[String]) {
             println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d {:>8.1}%", nm, t, mean, med, p90, creased(m));
             if nm == "our lofted hull" {
                 worst_median = med;
+            }
+        }
+        println!();
+        // ---- IS THE CATALOGUE ACTUALLY VARIED? ----
+        // Rocket League ships six hitbox presets for dozens of cars, and
+        // that is a deliberate design: the SHAPES vary, the boxes do not,
+        // because players need to know what they are playing against. Ours
+        // grew organically, so the question worth asking is the opposite —
+        // do forty cars mean forty vehicles, or forty paint jobs on one box?
+        {
+            // the procedural cars' declared half-extents, read from source
+            let src = include_str!("procars.rs");
+            let mut boxes: Vec<(String, f32, f32, f32)> = Vec::new();
+            for line in src.lines() {
+                if let Some(i) = line.find("half_len:") {
+                    let rest = &line[i..];
+                    let nums: Vec<f32> = rest
+                        .split(|c: char| !c.is_ascii_digit() && c != '.')
+                        .filter(|t| !t.is_empty())
+                        .filter_map(|t| t.parse::<f32>().ok())
+                        .collect();
+                    if nums.len() >= 4 {
+                        boxes.push((format!("car{}", boxes.len()), nums[0], nums[1], nums[2]));
+                    }
+                }
+            }
+            if boxes.len() >= 4 {
+                // cluster by rounded shape: how many DISTINCT boxes are there
+                let mut sigs: Vec<(i32, i32, i32)> = boxes
+                    .iter()
+                    .map(|b| ((b.1 * 12.0) as i32, (b.2 * 12.0) as i32, (b.3 * 12.0) as i32))
+                    .collect();
+                sigs.sort();
+                sigs.dedup();
+                let (mut lmin, mut lmax) = (f32::MAX, 0.0f32);
+                let (mut hmin, mut hmax) = (f32::MAX, 0.0f32);
+                for b in &boxes {
+                    lmin = lmin.min(b.1);
+                    lmax = lmax.max(b.1);
+                    hmin = hmin.min(b.2);
+                    hmax = hmax.max(b.2);
+                }
+                println!(
+                    "   hitboxes: {} cars, {} distinct shapes; length {:.2}-{:.2}, height {:.2}-{:.2}",
+                    boxes.len(),
+                    sigs.len(),
+                    lmin,
+                    lmax,
+                    hmin,
+                    hmax
+                );
+                println!(
+                    "   spread: longest is {:.1}x the shortest, tallest {:.1}x the flattest",
+                    lmax / lmin.max(0.01),
+                    hmax / hmin.max(0.01)
+                );
             }
         }
         println!();

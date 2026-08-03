@@ -3477,6 +3477,34 @@ they loft through a shared builder rather than calling it directly. Worth
 recording: a check that inspects source has to follow the indirection, or it
 will report drift that is not there.
 
+## v1.106.0 — the assembled cars join the house style, and the catalogue is measured
+
+THE PART-ASSEMBLED CARS had their own hull and glasshouse code, which meant
+they drifted away from the house style every time it improved — they missed
+the shoulder crease and the spline resampling entirely. They build through
+`shell_car` now, the same recipe as everything else, so they cannot fall
+behind again. The donor still decides the SHAPE (section widths come from
+where its parts sit); it no longer decides the construction.
+
+IS THE CATALOGUE ACTUALLY VARIED? Worth asking, because it grew a car or
+five at a time and nobody had checked. Reading the declared half-extents
+from source:
+
+    11 procedural cars, 10 DISTINCT hitbox shapes
+    length 0.34 to 1.00 (2.9x), height 0.12 to 0.34 (3.0x)
+
+So it is varied — genuinely so, and that is worth knowing rather than
+assuming in either direction.
+
+It is worth noting what that trades away. Rocket League ships SIX hitbox
+presets for dozens of cars, and that is deliberate: the shapes vary and the
+boxes do not, because a player has to know what they are playing against
+without learning every model. Ours does the opposite — almost every car is
+its own hitbox. For a sandbox that is the better answer, since the point is
+that the cars feel different to drive. For competitive play it would be the
+wrong one, and if that ever matters the fix is to snap the hitboxes onto a
+handful of presets while leaving the bodies alone.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

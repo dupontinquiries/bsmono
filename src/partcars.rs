@@ -103,17 +103,20 @@ pub fn assemble(
                 )
             })
             .collect();
-        let hull = crate::procars::part(meshgen::loft(&sec, 20), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO);
-        prims.push(Prim { mesh_id: gpu.add_mesh(&hull), tex_id: None, color: palette[0], tag: Tag::Body, pivot: Vec3::ZERO });
-        // a darker glasshouse over the middle, so it reads as a cabin rather
-        // than a loaf
-        let cab = [
-            (-env.z * 0.18, env.x * 0.52, env.y * 0.30, env.y * 0.62, 0.85),
-            (env.z * 0.10, env.x * 0.58, env.y * 0.28, env.y * 0.78, 0.80),
-            (env.z * 0.40, env.x * 0.46, env.y * 0.26, env.y * 0.58, 0.85),
-        ];
-        let glass = crate::procars::part(meshgen::loft(&cab, 18), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO);
-        prims.push(Prim { mesh_id: gpu.add_mesh(&glass), tex_id: None, color: [0.07, 0.09, 0.12, 1.0], tag: Tag::Body, pivot: Vec3::ZERO });
+        // THE SAME RECIPE AS EVERY OTHER CAR. These were building their own
+        // hull and glasshouse, which meant the assembled cars drifted from
+        // the house style every time it improved. `shell_car` is the
+        // reference structure — continuous shell, glasshouse sunk into it,
+        // dark tub underneath — so they get the shoulder crease and the
+        // spline resampling for free, and cannot fall behind again.
+        crate::procars::shell_car(
+            gpu,
+            &mut prims,
+            &sec,
+            palette[0],
+            (-env.z * 0.18, env.z * 0.40, env.x * 0.56, env.y * 0.42),
+            20,
+        );
     }
 
     // A donor can be MOSTLY wheel-class: the rocket's are rings down its

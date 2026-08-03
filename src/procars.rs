@@ -626,7 +626,7 @@ pub fn aegis(gpu: &mut Gpu) -> Model {
 /// Dominus are four body meshes each — chassis, paint, body, window — and
 /// that is the structure, not a coincidence: the shell reads as one surface
 /// because it IS one, and the hard lines come from where the parts meet.
-fn shell_car(
+pub fn shell_car(
     gpu: &mut Gpu,
     prims: &mut Vec<Prim>,
     sections: &[(f32, f32, f32, f32, f32)],
