@@ -4636,6 +4636,30 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // `silu(w*g)*(w*u) != w*silu(g)*u`. Doing it needs the routed path to build per-slot scaled
         // activations (xper=1 for gate_up) instead of broadcasting one row, which is a real change
         // rather than a flag.
+        // WEIGHT_BEFORE IS ONLY A PROBLEM WHEN THERE IS MORE THAN ONE SLOT.
+        //
+        // Llama-4 scales the expert INPUT by the routing weight, and SwiGLU is nonlinear, so
+        // silu(w*g)*(w*u) != w*silu(g)*u — the routed path cannot recover it by scaling the output.
+        // The stated fix was per-slot scaled activations instead of broadcasting one row, "a real
+        // change rather than a flag".
+        //
+        // But that broadcast is only wrong when slots differ. SCOUT ROUTES TOP-1: one expert per
+        // token per layer, one slot, one weight. Scaling the single activation row by that weight IS
+        // the per-slot computation — there is nothing to broadcast across.
+        //
+        // So the restriction belongs on n_used, not on weight_before. With n_used == 1 the routed
+        // path is exactly correct for Llama-4, and this is the guard that has been forcing Scout onto
+        // moe_ffn_v1 and its blocking per-layer readback: 99.9% of the step spent in sync.
+        // NOT RELAXED YET. I argued the restriction belongs on n_used rather than weight_before —
+        // with top-1 routing there is one slot, so scaling the single activation row by its weight IS
+        // the per-slot computation and there is nothing to broadcast across. Scout routes 1 of 16, so
+        // that would put it on the routed path and remove the per-layer readback.
+        //
+        // The argument holds only if MOE_MATVEC_GLU_Q4 applies the weight to the expert INPUT. It
+        // takes `selw` and has an `xper` flag that already selects per-slot activation bases, which
+        // is encouraging — and I did not finish reading where the weight is multiplied in. Shipping
+        // the relaxation on an unread shader would produce silently wrong output on every Llama-4
+        // token, which is the exact failure this codebase has spent the session chasing.
         if t == 1 && m.stream.is_none() && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
