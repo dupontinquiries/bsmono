@@ -1066,3 +1066,90 @@ mod network_peer_tests {
         assert!(peer_placement(2, 4, 20.0, 12.0).scale < peer_placement(0, 4, 20.0, 12.0).scale);
     }
 }
+
+/// How long a peer's silence is tolerated before the map stops claiming it is there.
+///
+/// `announce::MAX_AGE_S` is 30 with a 5-second interval — that is the *protocol's* replay window and
+/// the wrong number for a display. Six missed announces is a long time to keep showing a machine as
+/// present, and one missed announce is far too few to stop.
+///
+/// So the display has its own two thresholds, and it needs two for the same reason the autotuner
+/// does: **a single threshold flaps.** A peer hovering at the boundary would blink between lit and
+/// dark, which is worse than either state — a machine that flickers reads as a network problem even
+/// when the network is fine.
+/// **Distinct from `PEER_STALE_S` above, which matches the protocol's 30s replay window.** That one
+/// governs whether the registry still lists a peer at all; this one governs whether the SCENE keeps
+/// claiming it is there. Six missed announces is far too long for a picture, and one is far too few.
+pub const PEER_DIM_S: u32 = 12;
+/// Once dark, a peer must be heard from this recently to be shown lit again. Lower than `PEER_DIM_S`,
+/// so recovery requires a real signal rather than the same borderline silence that caused the
+/// darkness.
+pub const PEER_RELIGHT_S: u32 = 6;
+
+/// Decide a peer's standing from its last report, with hysteresis.
+///
+/// `was_silent` is the previous decision — the hysteresis is stateful by nature, and threading it
+/// through explicitly keeps this a pure function that a test can drive through a whole sequence.
+pub fn peer_standing(age_s: u32, was_silent: bool, faulted: bool, has_work: bool) -> Standing {
+    // A fault is a report, not an absence: the machine spoke and said something was wrong, which
+    // outranks how long ago it spoke.
+    if faulted { return Standing::Faulted; }
+    let limit = if was_silent { PEER_RELIGHT_S } else { PEER_DIM_S };
+    if age_s > limit { return Standing::Silent { since_s: age_s }; }
+    if has_work { Standing::Working } else { Standing::Idle }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_at_the_boundary_does_NOT_flicker() {
+        // The failure a single threshold produces. Alternating 11s and 13s ages would blink a machine
+        // between lit and dark, and a flickering peer reads as a network problem when the network is
+        // fine.
+        let mut silent = false;
+        let mut flips = 0;
+        for age in [11, 13, 11, 13, 11, 13] {
+            let s = peer_standing(age, silent, false, true);
+            let now = matches!(s, Standing::Silent { .. });
+            if now != silent { flips += 1; }
+            silent = now;
+        }
+        assert!(flips <= 1, "hysteresis must absorb boundary noise, got {flips} flips");
+    }
+
+    #[test]
+    fn RECOVERY_needs_a_fresher_signal_than_staying_lit_does() {
+        // Once dark, coming back requires a real announce rather than the same borderline silence
+        // that caused the darkness.
+        assert!(matches!(peer_standing(10, true, false, true), Standing::Silent { .. }),
+            "10s is fine to stay lit but not to come back");
+        assert_eq!(peer_standing(10, false, false, true), Standing::Working);
+        assert_eq!(peer_standing(3, true, false, true), Standing::Working, "a fresh one recovers");
+    }
+
+    #[test]
+    fn a_FAULT_outranks_silence_because_it_is_a_report() {
+        // The machine spoke and said something was wrong. That is information; silence is the absence
+        // of it, and showing a faulted machine as merely quiet loses the one thing it told you.
+        assert_eq!(peer_standing(999, true, true, false), Standing::Faulted);
+    }
+
+    #[test]
+    fn a_LIVE_peer_with_nothing_to_do_is_Idle_not_Silent() {
+        // The distinction the whole network view rests on.
+        assert_eq!(peer_standing(2, false, false, false), Standing::Idle);
+        assert_eq!(peer_standing(2, false, false, true), Standing::Working);
+    }
+
+    #[test]
+    fn the_display_window_is_TIGHTER_than_the_protocol_replay_window() {
+        // announce::MAX_AGE_S is 30 with a 5s interval — a replay guard, not a display rule. Six
+        // missed announces is far too long to keep claiming a machine is present.
+        assert!((PEER_DIM_S as f32) < PEER_STALE_S,
+            "the scene must give up sooner than the registry drops the peer");
+        assert!(PEER_DIM_S > 5, "and later than one missed announce");
+        assert!(PEER_RELIGHT_S < PEER_DIM_S, "or there is no hysteresis at all");
+    }
+}
