@@ -13,6 +13,7 @@ pub mod browse;
 pub mod queue;
 pub mod dial;
 pub mod channel;
+pub mod tags;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -61,7 +62,7 @@ pub const VIEWS: [&str; 6] = ["Devices", "Spaces", "Library", "Mixer", "Soundsca
 /// a six-page swipe with three more pages inside it is a maze — but the pages,
 /// their modes and their detail drill-downs are the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LibraryTab { Tracks, Albums, Artists }
+pub enum LibraryTab { Tracks, Albums, Artists, Tags }
 
 /// Move the view index by a swipe sign, clamped to the ends.
 pub fn page(idx: usize, sign: i32, n: usize) -> usize {
@@ -109,6 +110,13 @@ pub struct Controller {
     pub pending_volume: Option<f32>,
     /// The two mixer channels. Held separately rather than as one band list,
     /// because the whole point of the page is that they are independent.
+    /// The library's tags, and the per-track editor.
+    pub tags: Vec<crate::tags::Tag>,
+    pub tag_editor: crate::tags::TagEditor,
+    /// Ratings by track id, so a row can show one without owning it.
+    pub ratings: std::collections::HashMap<i64, crate::tags::StarRating>,
+    /// The tag whose tracks are being shown, if any.
+    pub open_tag: Option<i64>,
     pub speaker_col: crate::channel::ChannelColumn,
     pub instrumental_col: crate::channel::ChannelColumn,
     pub mixer: crate::device::Mixer,
@@ -151,6 +159,10 @@ impl Controller {
             now_playing: Default::default(),
             dial: crate::dial::VolumeDial::new(0.0),
             pending_volume: None,
+            tags: Vec::new(),
+            tag_editor: Default::default(),
+            ratings: Default::default(),
+            open_tag: None,
             // Frequencies and role hints come from the mixer's own band plan;
             // the column prints them so the choice is visible rather than
             // implied.
@@ -313,6 +325,32 @@ impl Controller {
         }
     }
 
+    /// Carry out a tag action. The view owns no storage; these are requests the
+    /// host performs, and the lists refresh when it publishes new state.
+    pub fn apply_tag(&mut self, a: crate::tags::TagAction) {
+        use crate::tags::TagAction;
+        match a {
+            TagAction::Create { name, color } => {
+                let id = self.tags.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+                self.tags.push(crate::tags::Tag { id, name, color, track_count: 0 });
+            }
+            TagAction::Attach(_, _) | TagAction::Detach(_, _) => {}
+        }
+    }
+
+    /// Rate a track. Optimistic: the star fills now, and the host's echo
+    /// reconciles it through `confirm_rating`.
+    pub fn rate(&mut self, track_id: i64, stars: u8) -> Option<u8> {
+        let r = self.ratings.entry(track_id)
+            .or_insert_with(|| crate::tags::StarRating::new(track_id, 0));
+        r.tap(stars)
+    }
+
+    /// The host confirmed a rating.
+    pub fn confirm_rating(&mut self, track_id: i64, stars: u8) {
+        if let Some(r) = self.ratings.get_mut(&track_id) { r.reconcile(track_id, stars); }
+    }
+
     /// Carry out what a browse surface asked for.
     ///
     /// The queue lives in bo-mux, not here, so the queue actions report rather
@@ -409,7 +447,8 @@ impl Controller {
         ui.horizontal(|ui| {
             for (tab, label) in [(LibraryTab::Tracks, "Tracks"),
                                  (LibraryTab::Albums, "Albums"),
-                                 (LibraryTab::Artists, "Artists")] {
+                                 (LibraryTab::Artists, "Artists"),
+                                 (LibraryTab::Tags, "Tags")] {
                 if ui.selectable_label(self.library_tab == tab, label).clicked()
                     && self.library_tab != tab {
                     self.library_tab = tab;
@@ -424,6 +463,28 @@ impl Controller {
                 }
             }
         });
+        if self.library_tab == LibraryTab::Tags {
+            // Drilled into a tag, or the grid.
+            match self.open_tag {
+                Some(id) => {
+                    let name = self.tags.iter().find(|t| t.id == id)
+                        .map(|t| t.name.clone()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        if ui.button("‹").clicked() { self.open_tag = None; }
+                        ui.strong(name);
+                    });
+                }
+                None => {
+                    if let Some(id) = crate::tags::tags_ui(ui, &self.tags, c) {
+                        self.open_tag = Some(id);
+                    }
+                }
+            }
+            if let Some(a) = crate::tags::tag_editor_ui(ui, &mut self.tag_editor, c) {
+                self.apply_tag(a);
+            }
+            return;
+        }
         if self.library_tab != LibraryTab::Tracks {
             ui.separator();
             self.browse.tab = match self.library_tab {
@@ -704,6 +765,43 @@ mod tests {
         assert_eq!(c.queue.len(), 1, "and the rest are really in the queue");
         assert_eq!(c.queue.up_next().unwrap().title, "Closer");
         assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn rating_a_track_is_optimistic_and_the_hosts_echo_reconciles_it() {
+        // The star fills now, because a control that pauses makes the user tap
+        // again and rate it twice. The echo then settles it on the truth.
+        let mut c = sample();
+        assert_eq!(c.rate(7, 4), Some(4));
+        assert!(c.ratings[&7].pending());
+        c.confirm_rating(7, 4);
+        assert!(!c.ratings[&7].pending());
+    }
+
+    #[test]
+    fn a_rejected_rating_pulls_the_stars_back() {
+        let mut c = sample();
+        c.rate(7, 5);
+        c.confirm_rating(7, 2);
+        assert_eq!(c.ratings[&7].value, 2);
+    }
+
+    #[test]
+    fn tapping_the_same_star_again_un_rates_the_track() {
+        let mut c = sample();
+        c.rate(7, 3);
+        assert_eq!(c.rate(7, 3), Some(0), "the only way back to unrated");
+    }
+
+    #[test]
+    fn the_library_gained_a_tags_tab_beside_the_browse_ones() {
+        let mut c = sample();
+        c.library_tab = LibraryTab::Tags;
+        assert_eq!(c.library_tab, LibraryTab::Tags);
+        c.apply_tag(crate::tags::TagAction::Create {
+            name: "Drive".into(), color: "#ff0000".into() });
+        assert_eq!(c.tags.len(), 1);
+        assert_eq!(c.tags[0].name, "Drive");
     }
 
     #[test]
