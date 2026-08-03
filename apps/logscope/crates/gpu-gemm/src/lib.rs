@@ -1602,7 +1602,8 @@ impl Gpu {
         padded.resize(need, 0);
         let (gx, gy) = wrapped_grid(nblk);
         // The converter's own dims layout, so the probe reads its inputs identically.
-        let dims: [u32; 8] = [total as u32, 0, gx, gy, 0, 0, 0, 0];
+        // The converter's D layout exactly: nblk, qs_off, qw_base, grid_w.
+        let dims: [u32; 4] = [nblk as u32, 0, 0, gx];
         let w = self.run_u32(Q4K_WQ_PROBE, &[bytemuck::cast_slice(&padded)], total,
                              bytemuck::cast_slice(&dims), (gx, gy, 1));
         w.iter().map(|b| f32::from_bits(*b)).collect()
@@ -14025,12 +14026,17 @@ fn wq(blk: u32, t: u32) -> f32 {
 }
 
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) g: vec3<u32>) {
-  let t = g.x;
-  if (t >= dims.n_weights) { return; }
-  let blk = t / 256u;
-  // EXACTLY the converter's wq, writing its result rather than feeding a reduction.
-  dst[t] = wq(blk, t % 256u);
+fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid: vec3<u32>) {
+  // The converter's own block addressing, so the probe reads exactly what it reads. `dims.nblk` and
+  // `grid_w` are its field names — my first attempt invented `n_weights`, the shader failed to
+  // compile, and the probe returned zeros that I would have read as evidence.
+  let blk = wg.x + wg.y * dims.grid_w;
+  if (blk >= dims.nblk) { return; }
+  // 64 threads cover 256 weights, 4 each.
+  for (var i = 0u; i < 4u; i = i + 1u) {
+    let t = lid.x * 4u + i;
+    dst[blk * 256u + t] = bitcast<u32>(wq(blk, t));
+  }
 }
 "#;
 
