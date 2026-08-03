@@ -11410,20 +11410,24 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     ///
     /// `queue` items are `(id, tokens, max_new)`; returns `(id, generated_tokens)` sorted
     /// by id. Greedy (temperature 0) output is identical to per-request `generate_kv`.
-    /// Generate several replies that share a prompt prefix.
+    /// Generate several replies that share a prompt prefix. **Both halves are batched.**
     ///
-    /// **The PREFILL is batched and the DECODE is not.** The shared prefix is computed once — which is
-    /// the large saving on a fan-out, and why a second turn reports "reused N anchor tokens" — but the
-    /// per-token loop drains the sessions and calls `session_step` on each in turn, so every branch
-    /// decodes at m=1 and reads the whole weight set for its own token.
+    /// The shared prefix is prefilled once — the large saving on a fan-out, and why a second turn
+    /// reports "reused N anchor tokens". Then every live session steps TOGETHER through
+    /// `decode_batched`, which runs one forward pass at m = live sessions rather than one pass each.
     ///
-    /// The name promises more than that, and it is worth being precise because the gap is the point:
-    /// four branches decoding at m=1 read the weights four times per token, where four rows in one
-    /// pass would read them once. That is not speculation and nothing is rejected — every branch needs
-    /// a real forward pass regardless, so batching them is certain work rather than a gamble.
+    /// Finished sessions are evicted before each step, so the width shrinks as branches complete
+    /// rather than padding out with rows nobody reads.
     ///
-    /// `ragged::Batch::plan_step` and `Gpu::batch_plan` exist to answer how wide that pass may be;
-    /// what is missing here is stepping the live sessions together instead of one at a time.
+    /// I documented the opposite of this one commit ago, having read a `session_step` call that turned
+    /// out to be inside `warm()`. Recording the correction here rather than only in a message, because
+    /// the wrong claim is the kind a reader would act on: it says the fan wastes N weight passes per
+    /// token when it does not.
+    ///
+    /// What `batchplan` adds is the WIDTH question this does not ask — `decode_batched` takes however
+    /// many sessions are live, and above m=8 the q4 path falls to the strided kernel that re-reads
+    /// weights per tile, while a wide dispatch is what the watchdog kills. A nine-branch fan is
+    /// currently one nine-row pass; it should be two.
     pub fn run_batched(
         &self, m: &Model, prefix: Option<(&KvCache, usize)>,
         mut queue: Vec<(usize, Vec<u32>, usize)>, sampler: &SamplerParams, eos: Option<u32>,
@@ -11463,7 +11467,32 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
                 else { ks.push(s); kid.push(id); kmx.push(mx); kout.push(o); ktok.push(t); }
             }
             sess = ks; ids = kid; maxn = kmx; out = kout;
-            if !sess.is_empty() { self.decode_batched(m, &mut sess, &ktok); }
+            // WIDTH-CAPPED. decode_batched took however many sessions were live, and above m=8 the q4
+            // path falls to the strided kernel that re-reads weights per tile — so a nine-branch fan
+            // was one nine-row pass that is SLOWER than two passes of five and four. A wide dispatch
+            // is also what the GPU watchdog kills, which on this hardware is a hang rather than a
+            // slowdown.
+            //
+            // batch_plan asks the device: the kernel's own limit, narrowed by a width the governor has
+            // actually survived. Splitting into chunks costs one extra weight pass and removes both
+            // failure modes.
+            if !sess.is_empty() {
+                let plan = self.batch_plan(sess.len());
+                if plan.width >= sess.len() {
+                    self.decode_batched(m, &mut sess, &ktok);
+                } else {
+                    // Chunked, in place, so every session still advances exactly one token this step —
+                    // a partial advance would desynchronise positions and attribute one branch's token
+                    // to another.
+                    let w = plan.width.max(1);
+                    let mut off = 0;
+                    while off < sess.len() {
+                        let end = (off + w).min(sess.len());
+                        self.decode_batched(m, &mut sess[off..end], &ktok[off..end]);
+                        off = end;
+                    }
+                }
+            }
         }
         done.sort_by_key(|r| r.0);
         done
