@@ -13877,7 +13877,19 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         let sm = scale_min(grp * 2u + half, sbase);
         let q = byte_at(qbase + grp * 32u + l);
         let nib = select(q & 0xFu, q >> 4u, half == 1u);
-        dst[blk * 256u + grp * 64u + half * 32u + l] = d * sm.x * f32(nib) - dmin * sm.y;
+        // THE SECOND SITE. The one below already binds these products, with a comment about FMA
+        // fusion — and this one was left as a single expression, so the compiler fused it here and
+        // not there. That is why 57 of 112 block scales came out an ULP from the CPU while the
+        // dequant itself was exact: two paths, one fixed.
+        //
+        // The rule is not "never fuse". Fusion is safe where the output is CONTINUOUS and unsafe
+        // where it feeds a DISCRETIZATION: an ULP changes nothing until the value crosses a
+        // quantization boundary, at which point it becomes a whole level. Q6K_DEQUANT outputs
+        // floats to be accumulated and fuses freely — faster AND more accurate, and bit-exact on
+        // hardware. This value feeds round(v / scale) in the re-quantizer, so it must not.
+        let ds = d * sm.x;
+        let dm = dmin * sm.y;
+        dst[blk * 256u + grp * 64u + half * 32u + l] = ds * f32(nib) - dm;
     }
 }
 "#;
@@ -13947,7 +13959,18 @@ fn wq(blk: u32, t: u32) -> f32 {
     let sm = scale_min(grp * 2u + half, bbase + 4u);
     let q = byte_at(bbase + 16u + grp * 32u + l);
     let nib = select(q & 0xFu, q >> 4u, half == 1u);
-    return d * sm.x * f32(nib) - dmin * sm.y;
+    // BIND THE INTERMEDIATES, the same rule Q6_K_DEQUANT already documents and follows.
+  //
+  // As one expression the compiler may fuse `d * sm.x * nib` and `dmin * sm.y` into FMAs, rounding
+  // ONCE where the CPU reference rounds twice. That is a one-ULP difference — gate-q4k saw
+  // 0.31525478 against 0.31525475, 1.192e-7 — and it is not corruption, but it is enough to move a
+  // weight across a quantization boundary and produce whole differing nibbles downstream.
+  //
+  // Q6_K binds d1..d4 for exactly this reason and is bit-exact everywhere. Q4_K never got the same
+  // treatment, which is why one gate passes and the other does not.
+  let dsc = d * sm.x;
+  let dm = dmin * sm.y;
+  return dsc * f32(nib) - dm;
 }
 
 @compute @workgroup_size(8)
