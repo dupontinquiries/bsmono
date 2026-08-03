@@ -6088,6 +6088,24 @@ if let Some(msg) = self.error_banner.clone() {
                     ui.label(RichText::new(format!("· {t} tok · {:.1} tok/s", t as f32 / secs.max(0.001))).color(theme::FAINT()).small());
                 } else {
                     ui.label(RichText::new(format!("· {t} tokens")).color(theme::FAINT()).small());
+                    // THE ENGINE'S OWN VERDICT, beside the token count. Every number behind this has been
+                    // going to stderr, which is why it has been read out of logs by hand rather than seen.
+                    //
+                    // The worst concern only, and only when there IS one: a row that always carries a
+                    // diagnostic is a row nobody reads, and a healthy engine has nothing to say here that
+                    // the token count does not already say.
+                    // Gated: gpu_kernels is only linked with the engine, and the gui-only build has no
+                    // counters to report — a status line that cannot be computed must not be compiled in.
+                    #[cfg(feature = "wgpu-engine")]
+                    {
+                        let (h, f, _b, _r, _) = gpu_kernels::moe_stream_stats();
+                        let (pin, tot) = gpu_kernels::moe_pin_counts();
+                        let rate = t as f32 / secs.max(0.001);
+                        let cs = crate::enginestrip::concerns(0, rate, h, f, pin, tot, None);
+                        if let Some(c) = cs.first() {
+                            ui.label(RichText::new(c.line()).color(theme::FAINT()).small());
+                        }
+                    }
                 }
                 // auto-verify verdict of the just-generated Rust, surfaced HERE (not just the buried Files
                 // panel) so it's obvious the model's code was actually build-checked.
