@@ -36,6 +36,7 @@ mod model;
 mod net;
 mod physics;
 mod platform;
+mod posture;
 mod procars;
 mod render;
 mod style;
