@@ -1093,14 +1093,130 @@ fn dither(frag: vec2<f32>) -> f32 {
     return (m[y * 4u + x] / 16.0 - 0.5) / 255.0;
 }
 
+// ---------------------------------------------------------------------
+// FAR-FIELD DOF — written out, deliberately NOT wired. Read this before
+// landing it; the wiring is five coordinated edits and one of them is not
+// obvious.
+//
+// The composite pass has no depth. Giving it depth means:
+//
+//   1. make_depth() adds TEXTURE_BINDING to its usage flags.
+//   2. post_layout gains binding 9. The depth texture is created with
+//      `sample_count: SAMPLES` and SAMPLES is 4, so the binding type is
+//      `texture_depth_multisampled_2d`, NOT `texture_depth_2d`, and it is
+//      read with textureLoad(t, coord, 0) rather than textureSample. A
+//      plain depth binding here compiles and then fails at pipeline
+//      creation.
+//   3. All FOUR post bind groups (bright, blurh, blurv, comp) share
+//      post_layout, so all four need the entry even though only the
+//      composite reads it.
+//   4. resize() reassigns self.depth and must rebuild the post bind groups
+//      AFTER it, or they hold a view of a destroyed texture.
+//   5. The depth buffer is at RENDER resolution and the composite runs at
+//      OUTPUT resolution. With render_scale < 1 those differ, so the
+//      textureLoad coordinate needs scaling by (render/output) — this is
+//      the one that will look fine at scale 1.0 and smear at 0.75.
+//
+// With that in place the effect itself is small — depth-weighted taps so a
+// sharp foreground silhouette does not bleed onto the blurred field:
+//
+//   fn lin_depth(d: f32) -> f32 {                     // near 0.05, far 4000
+//       return (2.0 * 0.05 * 4000.0) / (4000.0 + 0.05 - (d * 2.0 - 1.0) * (4000.0 - 0.05));
+//   }
+//   fn dof(uv: vec2<f32>, texel: vec2<f32>, base: vec3<f32>, px: vec2<i32>) -> vec3<f32> {
+//       let zc = lin_depth(textureLoad(t_depth, px, 0));
+//       let k = smoothstep(120.0, 500.0, zc);          // gameplay range stays sharp
+//       if (k < 0.01) { return base; }
+//       var acc = base; var wsum = 1.0;
+//       for (var i = 0; i < 8; i = i + 1) {
+//           let a = f32(i) * 0.785398;
+//           let o = vec2(cos(a), sin(a)) * texel * (1.0 + k * 3.0);
+//           let zs = lin_depth(textureLoad(t_depth, px + vec2<i32>(o / texel), 0));
+//           let w = smoothstep(100.0, 160.0, zs);      // only the far field contributes
+//           acc += textureSample(t_post, s_post, uv + o).rgb * w;
+//           wsum += w;
+//       }
+//       return mix(base, acc / wsum, k);
+//   }
+//
+// It is not in the module because a binding the layout does not have fails
+// at pipeline creation, and an unused one would too. I have no GPU here to
+// catch that, and blind-landing an unverifiable render change is exactly
+// how the facing bug got shipped earlier in this port.
+// ---------------------------------------------------------------------
+
+/// Chromatic aberration: the channels split radially toward the frame edges,
+/// the anamorphic-lens fringe. Centre stays perfectly sharp, so it never
+/// costs you clarity where you are actually looking — which is why it can be
+/// this cheap and still read as a lens rather than as a bug.
+fn chroma(uv: vec2<f32>, texel: vec2<f32>, k: f32) -> vec3<f32> {
+    let c = uv - vec2(0.5);
+    let r2 = dot(c, c);
+    // quadratic falloff: nothing at the centre, most of it in the corners
+    let off = c * r2 * k;
+    let rr = textureSample(t_post, s_post, uv - off).r;
+    let gg = textureSample(t_post, s_post, uv).g;
+    let bb = textureSample(t_post, s_post, uv + off).b;
+    return vec3(rr, gg, bb);
+}
+
+/// Where the sun lands on screen, and whether it is on screen at all.
+///
+/// The source engine passed this in as `u_sun_uv` / `u_sun_vis` uniforms.
+/// Nothing needs to be passed here: the sun direction and the view-projection
+/// are already in Globals, so the flare can project its own anchor. Returns
+/// uv in xy and visibility in z.
+fn sun_screen() -> vec3<f32> {
+    let world = G.cam.xyz + normalize(G.sun.xyz) * 4000.0;
+    let clip = G.view_proj * vec4(world, 1.0);
+    if (clip.w <= 0.0) {
+        return vec3(0.0, 0.0, 0.0); // behind the camera
+    }
+    let ndc = clip.xy / clip.w;
+    let uv = ndc * vec2(0.5, -0.5) + vec2(0.5);
+    // fade out as it leaves the frame rather than popping at the edge
+    let m = max(abs(ndc.x), abs(ndc.y));
+    let vis = 1.0 - smoothstep(0.85, 1.25, m);
+    return vec3(uv, vis);
+}
+
+/// Lens flare: a warm halo at the sun plus ghost dots mirrored through the
+/// frame centre, which is what a real multi-element lens does with a bright
+/// point source. Additive, so it only ever brightens.
+fn lens_flare(uv: vec2<f32>, sun: vec3<f32>, aspect: f32) -> vec3<f32> {
+    if (sun.z <= 0.001) {
+        return vec3(0.0);
+    }
+    let a = vec2(aspect, 1.0);
+    var acc = vec3(0.0);
+    // the halo, tight and warm
+    let dh = length((uv - sun.xy) * a);
+    acc += vec3(1.0, 0.86, 0.62) * (0.10 * sun.z) * exp(-dh * dh * 46.0);
+    // ghosts: the classic mirrored chain through the centre, alternating
+    // size and tint so it does not read as a row of identical dots
+    let dir = vec2(0.5) - sun.xy;
+    for (var i: i32 = 1; i <= 4; i = i + 1) {
+        let fi = f32(i);
+        let g = sun.xy + dir * (fi * 0.42);
+        let dg = length((uv - g) * a);
+        let sz = 24.0 + fi * 26.0;
+        let tint = mix(vec3(0.55, 0.75, 1.0), vec3(1.0, 0.72, 0.45), fract(fi * 0.5));
+        acc += tint * (0.030 * sun.z / fi) * exp(-dg * dg * sz);
+    }
+    return acc;
+}
+
 @fragment
 fn fs_composite(in: FullOut) -> @location(0) vec4<f32> {
     let texel = P.v.xy;
-    var hdr = textureSample(t_post, s_post, in.uv).rgb;
-
-    // quality tiers, as in the source engine: 0 mobile, 3 ultra. The edge
-    // taps are the expensive part and the ones a weak device should skip.
     let q = G.rt.y;
+    // quality tiers, as in the source engine: 0 mobile, 3 ultra. The extra
+    // taps are the expensive part and the ones a weak device should skip.
+    var hdr = select(
+        textureSample(t_post, s_post, in.uv).rgb,
+        chroma(in.uv, texel, 0.55),
+        q >= 3.0,
+    );
     if (q >= 2.0) {
         hdr = fxaa(in.uv, texel, hdr);
     }
@@ -1116,6 +1232,12 @@ fn fs_composite(in: FullOut) -> @location(0) vec4<f32> {
     // subtle screen-door: checker dim, configurable (post.z)
     let m = f32((u32(in.clip.x) + u32(in.clip.y)) & 1u);
     col *= 1.0 - G.post.z * 0.5 * m; // halved: the checker read too heavy on glass
+    // flare goes in BEFORE the grade, so exposure and the tonemap act on it
+    // like any other light in the frame rather than pasting it on top
+    if (q >= 1.0) {
+        let res = max(G.hmap.zw, vec2(1.0));
+        col += lens_flare(in.uv, sun_screen(), res.x / res.y);
+    }
     col = screen_fx(col, in.clip.xy);
     if (q >= 1.0) {
         col = split_tone(col, G.fog.rgb, G.misc.rgb, 0.10);
