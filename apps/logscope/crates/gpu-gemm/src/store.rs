@@ -83,7 +83,24 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 /// Per-system autotune cache: maps (adapter, k×n shape) → the winning decode tile, so the one-time
 /// benchmark on first model load is skipped on every load thereafter. A tiny TSV in the cache dir
 /// (adapter \t k \t n \t tile per line). Best-effort: any IO/parse failure just means "re-benchmark".
-fn autotune_file() -> PathBuf { cache_root().join("autotune-v3.tsv") } // v2: value is a packed (kernel,tile)
+/// The autotune cache, and the filename IS the epoch.
+///
+/// v2: the value became a packed (kernel, tile).
+///
+/// **v4: the probes that produce these verdicts were fed corrupt weights.** `QUANT_PACK` and
+/// `Q4K_TO_Q4` packed their bytes with a shift by a lane-varying amount, which returns zero on
+/// Honeykrisp for every lane whose shift is non-zero. Three probes depended on it — `self_check_sg`,
+/// `probe_valid_gemm_tiles`, `probe_expert_compute` — so every tile choice cached on that driver was
+/// made from a candidate set pruned by a broken fixture, and the subgroup kernel was excluded
+/// entirely.
+///
+/// A cached verdict outlives the code that produced it. I wrote that "one load re-answers all of
+/// them", which was wrong: the next load reads `autotune-v3.tsv` and never re-probes. Bumping the
+/// filename is what makes the fix reach a machine that has already run.
+///
+/// The rule this encodes: **changing a kernel invalidates every measurement taken against it.** The
+/// epoch is in the name so that is one edit rather than a cache-clearing instruction nobody follows.
+fn autotune_file() -> PathBuf { cache_root().join("autotune-v4.tsv") }
 pub fn autotune_get(adapter: &str, k: usize, n: usize) -> Option<u32> {
     let txt = std::fs::read_to_string(autotune_file()).ok()?;
     for line in txt.lines() {
@@ -134,7 +151,13 @@ pub fn flush_put(adapter: &str, flush: u32) {
     let _ = std::fs::write(flush_file(), out);
 }
 
-fn fast_ab_file() -> std::path::PathBuf { cache_root().join("fast_ab.tsv") }
+/// The fast-decode A/B verdict, cached per adapter — and versioned for the same reason as the
+/// autotune file.
+///
+/// The lever verdicts were measured against kernels whose byte unpacking returned zero for three
+/// lanes in four on Honeykrisp. "Levers OFF, cached" is a conclusion about a build that no longer
+/// exists, and a cached verdict outlives the code that produced it.
+fn fast_ab_file() -> std::path::PathBuf { cache_root().join("fast_ab-v2.tsv") }
 /// The persisted dispatch-lever A/B verdict for this adapter: Some(true)=ON, Some(false)=OFF, None=never
 /// measured (probe on next load). Keyed by adapter so each GPU keeps its own answer.
 pub fn fast_ab_get(adapter: &str) -> Option<bool> {
