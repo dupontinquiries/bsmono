@@ -39,6 +39,7 @@ pub mod ribbon;
 pub mod scroll_areas;
 pub mod mobile_dialog;
 pub mod glass;
+pub mod swipe_physics;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
