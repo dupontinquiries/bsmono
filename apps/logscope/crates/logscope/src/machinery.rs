@@ -1038,3 +1038,144 @@ mod layout_tests {
         assert!(min_gap > 0.3, "eight machines stay separable, gap {min_gap}");
     }
 }
+
+/// A machine building, weathering, or coming apart.
+///
+/// Presence as a number fades a landmark evenly and says only *how much*. Weathering says **how
+/// long** — vines and dust accumulate, and a mechanism half-swallowed by growth has visibly been
+/// silent a while rather than merely being drawn faint.
+///
+/// ## The flapping problem
+///
+/// A peer on a marginal link disconnects and reconnects repeatedly. If each transition restarts, the
+/// landmark strobes between assembling and collapsing and becomes the most distracting thing in the
+/// scene — while telling you less than a steady dim would have.
+///
+/// **So a reversal RESUMES rather than restarts.** A machine caught halfway through crumbling and
+/// then reconnected builds from where it stopped, and the visible result of a flapping peer is a
+/// mechanism that hovers around half-built. That reads correctly: it is not working and it is not
+/// gone, which is exactly the truth about a marginal link.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Weathering {
+    /// 0.0 = fully crumbled, 1.0 = whole and new.
+    pub built: f32,
+    /// 0.0 = clean, 1.0 = fully overgrown. Independent of `built`: a whole machine can be dusty and
+    /// a half-collapsed one can be freshly broken.
+    pub age: f32,
+}
+
+/// Seconds for a peer to build up or come apart. Slow enough to be watchable, fast enough that the
+/// scene settles before someone loses interest.
+pub const WEATHER_TRANSITION_S: f32 = 3.0;
+
+/// Seconds of silence before a machine is fully overgrown. Longer than the transition, because decay
+/// is a story about duration and a mechanism that ages in three seconds tells no story.
+pub const WEATHER_FULL_AGE_S: f32 = 90.0;
+
+impl Weathering {
+    /// A machine that has always been here.
+    pub fn present() -> Self { Weathering { built: 1.0, age: 0.0 } }
+    /// A machine not yet seen.
+    pub fn absent() -> Self { Weathering { built: 0.0, age: 0.0 } }
+
+    /// Advance by a frame.
+    ///
+    /// `connected` drives `built` toward 1 or 0; `silent_s` drives `age`. They are separate because a
+    /// connected machine can still be idle and dusty, and a crumbling one is freshly broken rather
+    /// than old.
+    pub fn tick(&mut self, dt_s: f32, connected: bool, silent_s: f32) {
+        let step = dt_s / WEATHER_TRANSITION_S.max(0.001);
+        // Resume, not restart: no branch resets `built` to an endpoint, so a reversal simply changes
+        // direction from wherever the transition had reached.
+        self.built = if connected { (self.built + step).min(1.0) } else { (self.built - step).max(0.0) };
+        // Age tracks silence directly rather than accumulating, so a peer that comes back is CLEAN
+        // again — the vines were about how long it had been quiet, and it has not been quiet since.
+        self.age = (silent_s / WEATHER_FULL_AGE_S.max(0.001)).clamp(0.0, 1.0);
+    }
+
+    /// Is the machine in transition? A scene can skip its expensive parts while a landmark is mostly
+    /// rubble.
+    pub fn transitioning(&self) -> bool { self.built > 0.001 && self.built < 0.999 }
+
+    /// Fraction of the mechanism's parts to draw. A crumbling machine loses pieces rather than
+    /// fading — **a half-transparent clocktower reads as a rendering bug; a half-collapsed one reads
+    /// as a ruin.**
+    pub fn parts_shown(&self, total: u32) -> u32 {
+        ((total as f32 * self.built).round() as u32).min(total)
+    }
+}
+
+#[cfg(test)]
+mod weathering_tests {
+    use super::*;
+
+    #[test]
+    fn a_connecting_machine_BUILDS_over_the_transition() {
+        let mut w = Weathering::absent();
+        w.tick(WEATHER_TRANSITION_S, true, 0.0);
+        assert!(w.built >= 0.999, "got {}", w.built);
+    }
+
+    #[test]
+    fn a_FLAPPING_peer_hovers_rather_than_strobing() {
+        // The property that makes this usable. A reversal resumes from where the transition reached,
+        // so a marginal link shows a machine hovering around half-built — which is the truth: not
+        // working, not gone.
+        let mut w = Weathering::present();
+        for i in 0..12 {
+            w.tick(0.5, i % 2 == 0, 0.0);
+            assert!(w.built > 0.2 && w.built < 1.01, "strobed to {} at step {i}", w.built);
+        }
+    }
+
+    #[test]
+    fn a_reversal_RESUMES_from_where_it_stopped() {
+        // Not from an endpoint. Restarting would make every brief drop cost a full rebuild.
+        let mut w = Weathering::present();
+        w.tick(1.0, false, 0.0);
+        let mid = w.built;
+        assert!(mid > 0.0 && mid < 1.0);
+        w.tick(0.1, true, 0.0);
+        assert!(w.built > mid && w.built < 1.0, "resumed from {mid} to {}", w.built);
+    }
+
+    #[test]
+    fn AGE_tracks_silence_and_CLEARS_when_the_peer_returns() {
+        // The vines were about how long it had been quiet, and it has not been quiet since. Letting
+        // age accumulate would leave a healthy machine permanently overgrown from one old outage.
+        let mut w = Weathering::present();
+        w.tick(1.0, true, WEATHER_FULL_AGE_S);
+        assert!(w.age >= 0.999);
+        w.tick(1.0, true, 0.0);
+        assert_eq!(w.age, 0.0, "a returned peer is clean again");
+    }
+
+    #[test]
+    fn age_and_built_are_INDEPENDENT() {
+        // A whole machine can be dusty and a half-collapsed one freshly broken. One number could not
+        // say both, and conflating them would make every long-idle peer look like it was falling
+        // apart.
+        let mut w = Weathering::present();
+        w.tick(0.1, true, WEATHER_FULL_AGE_S * 0.5);
+        assert!(w.built >= 0.999, "whole");
+        assert!(w.age > 0.4, "and dusty");
+    }
+
+    #[test]
+    fn a_crumbling_machine_LOSES_PARTS_rather_than_fading() {
+        // A half-transparent clocktower reads as a rendering bug; a half-collapsed one reads as a
+        // ruin.
+        let mut w = Weathering::present();
+        w.tick(WEATHER_TRANSITION_S * 0.5, false, 0.0);
+        let shown = w.parts_shown(20);
+        assert!(shown > 0 && shown < 20, "got {shown} of 20");
+    }
+
+    #[test]
+    fn a_fully_gone_machine_shows_NO_parts_and_is_not_transitioning() {
+        let mut w = Weathering::present();
+        w.tick(WEATHER_TRANSITION_S * 2.0, false, 0.0);
+        assert_eq!(w.parts_shown(20), 0);
+        assert!(!w.transitioning(), "settled, not mid-collapse");
+    }
+}
