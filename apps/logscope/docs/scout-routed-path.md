@@ -63,6 +63,15 @@ but not sufficient, which is worth knowing before building it.
 
 ## Do not skip the verification
 
-`--gate-moe-v2` exists to compare `moe_ffn_v1` against the routed path on the same inputs, and
-`LOGSCOPE_MOE_V2_CHECK=1` runs it inline. A wrong weight placement here is not a crash — it is
+**`--gate-moe-v2` does not exist — I invented it.** I read `LOGSCOPE_MOE_V2_CHECK` in the source and
+wrote down a matching gate name without checking the flag list, which is the same
+assert-then-don't-verify move that has cost this session five wrong kernel theories.
+
+The real mechanism is the env var, and it is enough: `LOGSCOPE_MOE_V2_CHECK=1` runs `moe_v2_check`,
+which computes `moe_ffn_v1` and the routed path on the same inputs and compares them inline during a
+real generation. That is a better check than a gate would be, because it uses the model's own
+activations rather than a fixture.
+
+The MoE gates that do exist: `--gate-moe-raw`, `--gate-moe-repin`, `--gate-moe-stream`,
+`--gate-moe-fusion`, `--gate-moe-prefetch`, `--gate-moe-cpu`. A wrong weight placement here is not a crash — it is
 plausible text from wrong math, which is the failure this codebase has spent the most time on.
