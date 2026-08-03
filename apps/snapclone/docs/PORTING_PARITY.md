@@ -49,7 +49,7 @@ starts hidden with the auto-login ordering rule.
 | PagePeelHint | pending |  |
 | PressGesture | pending |  |
 | QrCodeRenderer | pending |  |
-| QrScanDialog | pending |  |
+| QrScanDialog | ported | qr.rs `QrScan` — four payload forms, port-overflow rejection, decode latch, manual fallback |
 | RingtoneSynth | ported | ring.rs `render_mono` — E5-C#5-A4 bells, feedback comb, silent loop point |
 | ScrollAreas | pending |  |
 | SegmentedTabStrip | pending |  |
