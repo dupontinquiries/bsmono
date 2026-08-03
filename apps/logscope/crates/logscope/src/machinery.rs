@@ -646,3 +646,116 @@ mod parts_tests {
         assert_eq!(p.streaming(), 0);
     }
 }
+
+/// Where the landmark stands, and how big.
+///
+/// Scenes are generated, so a landmark cannot be authored into each one by hand — and dropping it at
+/// the origin puts it through the chat slab, which is the one object the person is actually reading.
+///
+/// ## Consistent bearing, varying distance
+///
+/// The landmark sits at **the same bearing in every scene** so a viewer learns where to look once
+/// rather than fifteen times. What varies is distance and height, from the scene's own extent: a
+/// cathedral-scale library wants its clocktower further out and taller than a treehouse wants its
+/// abacus-mill, or the same apparatus reads as a toy in one and a monolith in the other.
+///
+/// ## Behind and to the left
+///
+/// The slab occupies the centre and the composer the bottom. Behind-left is the largest area that is
+/// neither, and it is where peripheral vision already goes — the point is that a stopped mechanism is
+/// noticed without being looked at.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Placement {
+    /// World position, right-handed, +y up, camera looking down -z.
+    pub pos: [f32; 3],
+    /// Uniform scale, so the landmark subtends roughly the same angle in every scene.
+    pub scale: f32,
+    /// Radians to rotate about +y so the working face turns toward the viewer. A mechanism seen
+    /// edge-on shows nothing, which would waste the whole idea.
+    pub yaw: f32,
+}
+
+/// Fraction of the scene's radius at which the landmark stands.
+///
+/// Far enough to clear the slab, near enough to read the parts. Closer than this and a tall landmark
+/// crops at the top of the frame in the smaller scenes.
+const BEARING_DISTANCE: f32 = 0.62;
+
+/// Bearing in radians: back-left of the viewer.
+const BEARING_YAW: f32 = 2.36;   // ~135 degrees
+
+pub fn placement(scene_radius: f32, scene_height: f32) -> Placement {
+    // A degenerate extent must not produce a landmark at the origin, which is exactly where the slab
+    // is — a scene that failed to report its size should push the landmark out, not in.
+    let r = if scene_radius > 1.0 { scene_radius } else { 12.0 };
+    let d = r * BEARING_DISTANCE;
+    Placement {
+        pos: [d * BEARING_YAW.cos(), scene_height * 0.15, d * BEARING_YAW.sin()],
+        // Scaled from the scene rather than fixed: the same apparatus reads as a toy in a cathedral
+        // and a monolith in a treehouse if it does not grow with its surroundings.
+        scale: (r / 12.0).clamp(0.6, 2.4),
+        // Face the origin, where the viewer is. A mechanism seen edge-on shows nothing.
+        yaw: BEARING_YAW + std::f32::consts::PI,
+    }
+}
+
+#[cfg(test)]
+mod placement_tests {
+    use super::*;
+
+    #[test]
+    fn the_landmark_is_never_at_the_ORIGIN_where_the_slab_is() {
+        for (r, h) in [(12.0, 8.0), (40.0, 30.0), (4.0, 3.0)] {
+            let p = placement(r, h);
+            let d = (p.pos[0] * p.pos[0] + p.pos[2] * p.pos[2]).sqrt();
+            assert!(d > 2.0, "r={r}: landmark {d} from origin, through the reading surface");
+        }
+    }
+
+    #[test]
+    fn a_DEGENERATE_extent_still_pushes_it_out() {
+        // A scene that failed to report its size must not collapse the landmark onto the slab —
+        // falling back to a default radius is safe, falling back to zero is the worst case.
+        let p = placement(0.0, 0.0);
+        let d = (p.pos[0] * p.pos[0] + p.pos[2] * p.pos[2]).sqrt();
+        assert!(d > 2.0, "got {d}");
+    }
+
+    #[test]
+    fn the_BEARING_is_the_same_in_every_scene() {
+        // A viewer learns where to look once, not fifteen times. Distance varies; direction does not.
+        let a = placement(12.0, 8.0);
+        let b = placement(40.0, 30.0);
+        let ang = |p: &Placement| p.pos[2].atan2(p.pos[0]);
+        assert!((ang(&a) - ang(&b)).abs() < 1e-4, "bearing must not drift with scene size");
+    }
+
+    #[test]
+    fn it_stands_BEHIND_AND_LEFT_rather_than_in_front() {
+        // The slab is centre and the composer is bottom; behind-left is the largest area that is
+        // neither, and where peripheral vision already goes.
+        let p = placement(20.0, 12.0);
+        assert!(p.pos[0] < 0.0, "left");
+        assert!(p.pos[2] > 0.0, "behind the viewer's forward axis");
+    }
+
+    #[test]
+    fn SCALE_grows_with_the_scene_but_is_bounded() {
+        // The same apparatus reads as a toy in a cathedral and a monolith in a treehouse if it does
+        // not grow — and as absurd in either if it grows without limit.
+        assert!(placement(40.0, 30.0).scale > placement(8.0, 6.0).scale);
+        assert!(placement(400.0, 300.0).scale <= 2.4, "bounded above");
+        assert!(placement(1.5, 1.0).scale >= 0.6, "and below");
+    }
+
+    #[test]
+    fn the_working_face_turns_TOWARD_the_viewer() {
+        // A mechanism seen edge-on shows nothing, which would waste the whole idea.
+        let p = placement(20.0, 12.0);
+        let facing = [p.yaw.cos(), p.yaw.sin()];
+        // Pointing back at the origin means the dot with the outward radial is negative.
+        let radial = [p.pos[0], p.pos[2]];
+        let dot = facing[0] * radial[0] + facing[1] * radial[1];
+        assert!(dot < 0.0, "the face must look inward, got {dot}");
+    }
+}
