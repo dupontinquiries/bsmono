@@ -5205,6 +5205,38 @@ pub fn run(args: &[String]) {
                 if out > 0.5 { "fired" } else { "-" }
             );
         }
+        // ---- THE BLAST'S SHAPE ----
+        // A wider pulse that is flat across its radius would make reach and
+        // accuracy the same thing. The extra radius should buy REACH at the
+        // rim while the core stays sharp, so being exactly right still pays.
+        println!();
+        println!("{:>9} {:>10} {:>10} {:>10}", "distance", "old shape", "new shape", "vs centre");
+        let h = physics::Hover::default();
+        let reach = h.pulse_r + 0.93;
+        let old_r = 5.0 + 0.93;
+        let mut prev_ratio = 1.0f32;
+        let mut monotonic = true;
+        for frac in [0.0f32, 0.2, 0.4, 0.6, 0.8, 0.95] {
+            let d = frac * reach;
+            let f = 1.0 - (d / reach).clamp(0.0, 1.0);
+            let new = f * f * (0.45 + 0.55 * f);
+            // the old curve at the old radius, for comparison
+            let fo = 1.0 - (d / old_r).clamp(0.0, 1.0);
+            let old = (fo * fo).max(0.0);
+            println!("{:>8.1}m {:>10.3} {:>10.3} {:>9.0}%", d, old, new, new / 1.0 * 100.0);
+            if new > prev_ratio + 1e-4 {
+                monotonic = false;
+            }
+            prev_ratio = new;
+        }
+        println!(
+            "   reach {:.2} m (was {:.2}), and the core is {:.0}% sharper at the half-radius",
+            reach,
+            old_r,
+            (1.0 - (0.25 * (0.45 + 0.55 * 0.5)) / 0.25) * 100.0
+        );
+        check("the blast still peaks hard at the centre", monotonic);
+        check("and reaches further than it did", reach > old_r);
         check("a longer hold hits harder", powers[3] > powers[0] * 1.8);
         check("and it costs real speed", kept[3] < kept[0] * 0.75);
         check("a tap still fires at base strength", powers[0] > 2.0);

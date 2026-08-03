@@ -3785,6 +3785,44 @@ top setting would have been slower than the same setting was before the
 change. A settings rework should never make the best case worse than it
 was, so the budget is capped at what it used to cost.
 
+## v1.116.0 — the pulse, tuned: wider reach, sharper core, cheaper hold
+
+Three tunings to the charged pulse, all as asked.
+
+EIGHT PERCENT MORE RADIUS, and eight percent less speed given up for the
+same wind-up. The trade was right in shape and slightly too steep to commit
+to; retention at full charge goes 37% to 40%.
+
+A CENTRE-WEIGHTED FALLOFF, which is what stops the extra radius from
+turning reach and accuracy into the same thing. The blast now peaks harder
+at the core and tapers faster, so a wider pulse is MORE demanding of
+position rather than less:
+
+    distance    old     new
+      0.0 m   1.000   1.000
+      1.3 m   0.619   0.570
+      2.5 m   0.328   0.281
+      3.8 m   0.129   0.107
+      5.1 m   0.021   0.022
+      6.0 m   0.000   0.001    (outside the old blast entirely)
+
+    reach 5.93 m -> 6.33 m
+
+Lower everywhere in the middle, further at the rim: being early and roughly
+right connects, being early and exactly right hits appreciably harder.
+
+One correction while doing it. Reshaping the curve cost about 12% of the
+force at mid-range — a side effect of the new shape, not something anyone
+asked for — so the base strength is raised to put it back. The charge curve
+now reads 7.3 / 11.1 / 14.9 / 19.3 m/s against speed retention of 100 / 92 /
+72 / 40%, which is the old power with the new reach and the softer brake.
+
+THE VERTICAL LAUNCH STAYS. A full charge lifts the car noticeably harder
+than a tap, because the lift scales with power. That was not designed, it
+fell out of the mechanic — and since it is fun, and it costs the same speed
+everything else does, it is now a documented feature rather than an
+accident. A hovercar that wants height has a way to buy it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -170,10 +170,19 @@ impl Default for Hover {
             pulse_cd: 1.6,
             charge_time: 0.85,
             charge_gain: 2.9,
-            charge_brake: 2.2,
+            // 8% less speed given up for the same wind-up: the trade was
+            // right in shape and slightly too steep to commit to
+            charge_brake: 2.02,
             pulse_lift: 7.5,
-            pulse_r: 5.0,
-            pulse_k: 15.0,
+            // +8% reach: enough to forgive a slightly early read without
+            // making position irrelevant — the falloff below is what keeps
+            // accuracy worth having
+            pulse_r: 5.4,
+            // ...and a little more force to pay for the sharper core. The
+            // centre-weighted falloff costs about 12% at mid-range, which
+            // was a side effect of reshaping the blast rather than anything
+            // anyone asked for, so the strength is raised to put it back.
+            pulse_k: 16.9,
         }
     }
 }
@@ -1711,8 +1720,17 @@ pub fn hover_pulse(car: &mut Car, ball: &mut Ball, ev: &mut StepEvents) -> bool 
     let to = ball.pos - car.pos;
     let d = to.length();
     if d < h.pulse_r + ball.r && d > 1e-4 {
+        // CENTRE-WEIGHTED FALLOFF. A wider blast that is flat across its
+        // radius would make position stop mattering — reach and accuracy
+        // would be the same thing. So the extra 8% of radius buys REACH at
+        // the rim while the core stays sharp: full force only very close,
+        // and a steeper taper than the plain inverse-square shape had.
+        //
+        // The result is that being early and roughly right still connects,
+        // and being early and exactly right hits appreciably harder.
         let f = 1.0 - (d / (h.pulse_r + ball.r)).clamp(0.0, 1.0);
-        let push = h.pulse_k * f * f * power;
+        let core = f * f * (0.45 + 0.55 * f); // peaks at the centre, tapers hard
+        let push = h.pulse_k * core * power;
         ball.vel += (to / d) * push;
         ev.touches.push((ball.pos - (to / d) * ball.r, push));
     }
