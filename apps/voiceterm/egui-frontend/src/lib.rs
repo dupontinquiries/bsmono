@@ -16,6 +16,7 @@ pub mod pty_input;
 pub mod table_view;
 pub mod row_render;
 pub mod detect;
+pub mod explore;
 pub mod mail_view;
 pub mod archived_view;
 pub mod cards_view;
@@ -77,6 +78,22 @@ pub mod log;
 /// terminal-output-as-menu, `dumb_summary` spots ASCII progress bars. Both are
 /// Qt-free and both had no surface at all — `detect` is the views they were
 /// missing.
+/// session_walk's own header says the QML side consumes a
+/// wire string from it and "the camera animation + slider live in main.qml" —
+/// so the PLAYER is exactly what did not come across. It pulls in nlp for the
+/// word-smush, which is std-only apart from util::fnv1a — already here.
+///
+/// `sitemap` is deliberately NOT included: its link extractor uses the
+/// `scraper` crate, which is in the app's manifest and not this one, and adding
+/// html5ever to a frontend whose cold build is already ~97% dependencies is a
+/// real cost for one function. explore.rs mirrors its two small row types
+/// instead and says so — a documented duplication with a stated reason, which
+/// is a different thing from the sink picker I duplicated by accident.
+#[path = "../../src/nlp.rs"]
+pub mod nlp;
+#[path = "../../src/session_walk.rs"]
+pub mod session_walk;
+
 #[path = "../../src/entity_extract.rs"]
 pub mod entity_extract;
 #[path = "../../src/dumb_summary.rs"]
