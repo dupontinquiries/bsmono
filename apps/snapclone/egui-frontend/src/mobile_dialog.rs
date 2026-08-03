@@ -94,8 +94,9 @@ pub struct MobileDialog {
     pub form: Form,
     open: bool,
     result: Option<DialogResult>,
-    /// Sheet slide progress, 0 closed to 1 fully in.
-    t: f32,
+    /// Sheet slide. The shared ramp, so the "stays drawn while it leaves" rule
+    /// is the accordion's rule and not a second copy of it.
+    slide: uikit_egui::motion::Reveal,
 }
 
 /// The sheet's entry animation, in milliseconds.
@@ -103,7 +104,8 @@ pub const SHEET_MS: f32 = 220.0;
 
 impl MobileDialog {
     pub fn new(form: Form) -> Self {
-        MobileDialog { form, open: false, result: None, t: 0.0 }
+        MobileDialog { form, open: false, result: None,
+                       slide: uikit_egui::motion::Reveal::new(SHEET_MS) }
     }
 
     /// `open()`. Note there is no `exec()`: it spins a nested event loop, and a
@@ -114,7 +116,10 @@ impl MobileDialog {
         // The result is cleared on OPEN, not on close. A caller reading
         // result() after close must still see how it ended.
         self.result = None;
-        if !self.form.is_sheet() { self.t = 1.0; }
+        self.slide.open();
+        // A window form is either there or not: an OS window animating itself
+        // in fights the compositor's own animation.
+        if !self.form.is_sheet() { self.slide.jump(); }
     }
 
     pub fn is_open(&self) -> bool { self.open }
@@ -129,6 +134,8 @@ impl MobileDialog {
     fn finish(&mut self, r: DialogResult) -> bool {
         if !self.open { return false; }
         self.open = false;
+        self.slide.close();
+        if !self.form.is_sheet() { self.slide.jump(); }
         self.result = Some(r);
         true
     }
@@ -137,18 +144,15 @@ impl MobileDialog {
     /// or not, because an OS window animating itself in fights the
     /// compositor's own animation.
     pub fn tick(&mut self, dt_ms: f32) {
-        if !self.form.is_sheet() { self.t = if self.open { 1.0 } else { 0.0 }; return; }
-        let target = if self.open { 1.0 } else { 0.0 };
-        let step = dt_ms / SHEET_MS;
-        if self.t < target { self.t = (self.t + step).min(target); }
-        else if self.t > target { self.t = (self.t - step).max(target); }
+        if !self.form.is_sheet() { self.slide.jump(); return; }
+        self.slide.tick(dt_ms);
     }
 
     /// How far in the sheet is, eased.
-    pub fn slide(&self) -> f32 { uikit_egui::motion::ease::out_cubic(self.t.clamp(0.0, 1.0)) }
+    pub fn slide(&self) -> f32 { self.slide.eased() }
 
     /// Still drawn while sliding out, or the sheet vanishes instead of leaving.
-    pub fn drawn(&self) -> bool { self.open || self.t > 0.0 }
+    pub fn drawn(&self) -> bool { self.slide.visible() }
 
     /// Where the sheet sits: full width at the bottom, or a centred panel.
     ///

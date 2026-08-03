@@ -363,3 +363,246 @@ mod press_tests {
         assert_eq!(p.ripple_t(), 0.0);
     }
 }
+
+/// A one-dimensional reveal: something that eases in, and STAYS DRAWN while it
+/// eases out.
+///
+/// Written three times before it was noticed — snapclone's accordion card
+/// (`SUBMENU_MS`, 180), snapclone's bottom sheet (`SHEET_MS`, 220) and
+/// bo-suite's device panel (`UNFOLD_MS`, 220) all ran the same
+/// `if t < target { t += dt/ms } else if t > target { t -= dt/ms }` ramp and the
+/// same `t > 0.0` visibility test.
+///
+/// The visibility test is the part worth sharing. Dropping a panel the moment
+/// its flag goes false makes it VANISH rather than close, and every one of those
+/// three had to learn that separately. `visible()` is true while there is any
+/// reveal left, so the caller draws through the whole exit.
+///
+/// Durations stay with the caller: a submenu is quicker than a sheet, and
+/// flattening them would make everything move at one speed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Reveal {
+    t: f32,
+    open: bool,
+    duration_ms: f32,
+}
+
+impl Reveal {
+    pub fn new(duration_ms: f32) -> Self {
+        // A zero duration would divide by zero on the first tick; treat it as
+        // "instant" rather than as a bug the caller has to remember.
+        Reveal { t: 0.0, open: false, duration_ms: duration_ms.max(1.0) }
+    }
+
+    /// Start open, for things that are on screen before they animate.
+    pub fn new_open(duration_ms: f32) -> Self {
+        Reveal { t: 1.0, open: true, duration_ms: duration_ms.max(1.0) }
+    }
+
+    pub fn open(&mut self) { self.open = true; }
+    pub fn close(&mut self) { self.open = false; }
+    pub fn toggle(&mut self) { self.open = !self.open; }
+    pub fn set(&mut self, open: bool) { self.open = open; }
+    pub fn is_open(&self) -> bool { self.open }
+
+    /// Snap to the target without animating — for a resize or a state restore,
+    /// where animating from nothing would look like the thing just appeared.
+    pub fn jump(&mut self) { self.t = if self.open { 1.0 } else { 0.0 }; }
+
+    pub fn tick(&mut self, dt_ms: f32) {
+        let target = if self.open { 1.0 } else { 0.0 };
+        let step = dt_ms / self.duration_ms;
+        if self.t < target { self.t = (self.t + step).min(target); }
+        else if self.t > target { self.t = (self.t - step).max(target); }
+    }
+
+    /// Raw progress, 0..=1.
+    pub fn raw(&self) -> f32 { self.t }
+
+    /// Eased progress — what a caller should scale a height or an offset by.
+    pub fn eased(&self) -> f32 { ease::out_cubic(self.t.clamp(0.0, 1.0)) }
+
+    /// Still on screen? True through the whole exit, which is the rule all
+    /// three call sites had to discover independently.
+    pub fn visible(&self) -> bool { self.open || self.t > 0.0 }
+
+    /// Neither opening nor closing.
+    pub fn settled(&self) -> bool { self.t <= 0.0 || self.t >= 1.0 }
+}
+
+/// A slow oscillation between two levels — the "this is alive" glow.
+///
+/// Five independent implementations before this existed: bo-suite's dial idle
+/// glow and anticipation cue, bo-suite's queue equalizer, snapclone's peel hint
+/// and its voice-bar pulse. Every one was `sin` mapped into a floor..ceiling
+/// band; they differed only in period and in how loud they were allowed to get.
+///
+/// Period and levels stay with the caller for the same reason the press
+/// constants did. A container's glow must be slower and dimmer than a status
+/// pulse — a fast bright breath on a panel reads as an alert.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Breath {
+    phase: f32,
+    period_ms: f32,
+    floor: f32,
+    ceiling: f32,
+}
+
+impl Breath {
+    pub fn new(period_ms: f32, floor: f32, ceiling: f32) -> Self {
+        Breath { phase: 0.0, period_ms: period_ms.max(1.0), floor, ceiling }
+    }
+
+    pub fn tick(&mut self, dt_ms: f32) {
+        self.phase = (self.phase + dt_ms / self.period_ms).rem_euclid(1.0);
+    }
+
+    /// 0..=1 through the cycle, for callers that want to offset several
+    /// oscillators from one clock — an equalizer's bars rising in unison is a
+    /// progress bar, not an equalizer.
+    pub fn phase(&self) -> f32 { self.phase }
+
+    /// The level, between `floor` and `ceiling`.
+    pub fn value(&self) -> f32 { self.at(0.0) }
+
+    /// The level at a phase offset in turns, for those extra oscillators.
+    pub fn at(&self, offset_turns: f32) -> f32 {
+        let t = (self.phase + offset_turns) * std::f32::consts::TAU;
+        let unit = (t.sin() + 1.0) * 0.5;
+        self.floor + (self.ceiling - self.floor) * unit
+    }
+
+    /// Restart from the trough — so a thing that just became active begins by
+    /// brightening rather than at whatever level the clock happened to be at.
+    pub fn restart(&mut self) { self.phase = 0.75; }
+}
+
+#[cfg(test)]
+mod reveal_breath_tests {
+    use super::*;
+
+    #[test]
+    fn a_reveal_stays_visible_through_its_whole_exit() {
+        // The rule all three call sites had to learn separately: dropping it at
+        // open=false makes the panel VANISH rather than close.
+        let mut r = Reveal::new(200.0);
+        r.open();
+        r.tick(200.0);
+        assert_eq!(r.eased(), 1.0);
+        r.close();
+        r.tick(50.0);
+        assert!(r.visible(), "still leaving");
+        assert!(r.raw() > 0.0);
+        r.tick(200.0);
+        assert!(!r.visible());
+    }
+
+    #[test]
+    fn a_reveal_eases_rather_than_ramping_linearly() {
+        let mut r = Reveal::new(200.0);
+        r.open();
+        r.tick(50.0);
+        assert!(r.eased() > r.raw(), "out_cubic leads a linear ramp early");
+    }
+
+    #[test]
+    fn a_slow_frame_does_not_skip_the_whole_reveal() {
+        // Frame-time driven, so one hitch advances by its own duration rather
+        // than jumping to the end.
+        let mut r = Reveal::new(400.0);
+        r.open();
+        r.tick(100.0);
+        assert!(!r.settled());
+        assert!(r.raw() < 1.0);
+    }
+
+    #[test]
+    fn a_zero_duration_does_not_divide_by_zero() {
+        let mut r = Reveal::new(0.0);
+        r.open();
+        r.tick(16.0);
+        assert!(r.raw().is_finite());
+        assert_eq!(r.raw(), 1.0);
+    }
+
+    #[test]
+    fn jump_snaps_without_animating() {
+        // For a resize or a state restore, where animating from nothing looks
+        // like the thing just appeared.
+        let mut r = Reveal::new(200.0);
+        r.open();
+        r.jump();
+        assert_eq!(r.raw(), 1.0);
+        assert!(r.settled());
+    }
+
+    #[test]
+    fn reversing_mid_animation_starts_from_where_it_got_to() {
+        // Not from the beginning — a menu half-open that is closed again should
+        // close from half, or it jumps open first.
+        let mut r = Reveal::new(200.0);
+        r.open();
+        r.tick(100.0);
+        let half = r.raw();
+        r.close();
+        r.tick(10.0);
+        assert!(r.raw() < half && r.raw() > 0.0);
+    }
+
+    #[test]
+    fn a_breath_stays_inside_its_band() {
+        let mut b = Breath::new(1000.0, 0.35, 0.6);
+        for _ in 0..500 {
+            b.tick(7.0);
+            let v = b.value();
+            assert!((0.35..=0.6).contains(&v), "out of band: {v}");
+        }
+    }
+
+    #[test]
+    fn a_breath_actually_breathes() {
+        // A constant value would pass the band test and be useless.
+        let mut b = Breath::new(1000.0, 0.0, 1.0);
+        let mut lo = f32::INFINITY;
+        let mut hi: f32 = 0.0;
+        for _ in 0..200 { b.tick(10.0); lo = lo.min(b.value()); hi = hi.max(b.value()); }
+        assert!(hi - lo > 0.9, "range was {}", hi - lo);
+    }
+
+    #[test]
+    fn the_phase_wraps_rather_than_growing_without_bound() {
+        // A phase that accumulates for hours loses float precision and the
+        // glow starts stuttering.
+        let mut b = Breath::new(1000.0, 0.0, 1.0);
+        for _ in 0..100_000 { b.tick(16.0); }
+        assert!((0.0..1.0).contains(&b.phase()));
+    }
+
+    #[test]
+    fn offset_oscillators_do_not_move_in_unison() {
+        // Three bars rising together is a progress bar, not an equalizer.
+        let mut b = Breath::new(1000.0, 0.35, 0.8);
+        b.tick(120.0);
+        assert!((b.at(0.0) - b.at(0.33)).abs() > 0.05);
+    }
+
+    #[test]
+    fn restarting_begins_at_the_trough() {
+        // So a thing that just became active starts by brightening rather than
+        // at whatever level the clock happened to be at.
+        let mut b = Breath::new(1000.0, 0.2, 0.9);
+        b.tick(400.0);
+        b.restart();
+        assert!((b.value() - 0.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn two_callers_can_breathe_at_different_speeds_and_levels() {
+        // A container's glow must be slower and dimmer than a status pulse: a
+        // fast bright breath on a panel reads as an alert.
+        let card = Breath::new(1800.0, 0.0, 0.35);
+        let status = Breath::new(600.0, 0.0, 1.0);
+        assert!(card.period_ms > status.period_ms);
+        assert!(card.ceiling < status.ceiling);
+    }
+}

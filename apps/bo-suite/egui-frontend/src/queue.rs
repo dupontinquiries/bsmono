@@ -215,11 +215,14 @@ impl NowPlaying {
     /// and a still one beside a paused track would be a lie about it.
     pub fn show_equalizer(&self) -> bool { self.playing && !self.title.trim().is_empty() }
 
-    /// Bar heights for the equalizer, 0..=1, from a phase.
-    pub fn equalizer_bars(&self, phase: f32) -> [f32; 3] {
+    /// Bar heights for the equalizer, 0..=1.
+    ///
+    /// The three bars are phase-OFFSET taps on one shared oscillator — three
+    /// bars rising in unison is a progress bar, not an equalizer. `Breath::at`
+    /// exists for exactly this.
+    pub fn equalizer_bars(&self, breath: &uikit_egui::motion::Breath) -> [f32; 3] {
         if !self.show_equalizer() { return [0.0; 3]; }
-        let f = |o: f32| 0.35 + 0.45 * ((phase + o).sin() * 0.5 + 0.5);
-        [f(0.0), f(2.1), f(4.2)]
+        [breath.at(0.0), breath.at(0.33), breath.at(0.66)]
     }
 }
 
@@ -280,11 +283,12 @@ pub fn queue_ui(ui: &mut egui::Ui, q: &Queue,
 }
 
 /// Draw the now-playing strip.
-pub fn now_playing_ui(ui: &mut egui::Ui, n: &NowPlaying, phase: f32,
+pub fn now_playing_ui(ui: &mut egui::Ui, n: &NowPlaying,
+                      breath: &uikit_egui::motion::Breath,
                       c: &uikit_egui::PaletteColors) {
     ui.horizontal(|ui| {
         if n.show_equalizer() {
-            for h in n.equalizer_bars(phase) {
+            for h in n.equalizer_bars(breath) {
                 let (rect, _) = ui.allocate_exact_size(egui::vec2(3.0, 14.0), egui::Sense::hover());
                 let mut bar = rect;
                 bar.set_top(rect.bottom() - rect.height() * h);
@@ -476,7 +480,8 @@ mod tests {
         assert!(n.show_equalizer());
         n.playing = false;
         assert!(!n.show_equalizer());
-        assert_eq!(n.equalizer_bars(1.0), [0.0; 3]);
+        let b = uikit_egui::motion::Breath::new(1000.0, 0.35, 0.8);
+        assert_eq!(n.equalizer_bars(&b), [0.0; 3]);
     }
 
     #[test]
@@ -490,9 +495,11 @@ mod tests {
         // Three bars rising and falling in unison is a progress bar, not an
         // equalizer.
         let n = NowPlaying { title: "One".into(), playing: true, ..Default::default() };
+        let mut breath = uikit_egui::motion::Breath::new(1000.0, 0.35, 0.8);
         let mut ever_differed = false;
-        for i in 0..100 {
-            let b = n.equalizer_bars(i as f32 * 0.2);
+        for _ in 0..100 {
+            breath.tick(20.0);
+            let b = n.equalizer_bars(&breath);
             for h in b { assert!((0.0..=1.0).contains(&h), "bar out of range: {h}"); }
             if (b[0] - b[1]).abs() > 0.05 { ever_differed = true; }
         }

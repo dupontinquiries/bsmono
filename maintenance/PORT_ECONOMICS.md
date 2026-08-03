@@ -140,3 +140,35 @@ That projection excludes three things that are not going to be written by
 finishing the list: the codec backends (`V2Encoder`, `V8GpuRasterizer`), the
 Qt-side test harnesses, and `Dbus`. `PORT_STATUS.md`'s "what is actually left"
 section has the full accounting.
+
+## 7. Promotions, and what stayed put
+
+Three behaviours have now been lifted out of app code into
+`uikit_egui::motion`, each because it had been written more than once:
+
+| promoted | written independently in | what the copies had to learn separately |
+|---|---|---|
+| `PressFeedback` | snapclone `GlassButton`, bo-suite `StepKey` | the ripple must outlive the release |
+| `Reveal` | snapclone accordion + bottom sheet, bo-suite device panel | it must stay drawn while it LEAVES |
+| `Breath` | dial glow, anticipation cue, queue equalizer, peel hint, voice bar | phase must wrap; offset taps must not move in unison |
+
+The middle column is the argument. Each of those rules is a bug someone hits
+once and fixes locally, and the third implementation hits it again.
+
+**What deliberately did not move**, because "extract everything" is its own
+failure mode:
+
+* **Constants.** bo-suite's key dips 8% over 90ms, snapclone's 12% over 110ms;
+  a card breathes over 1.8s at 0.35 peak, a securing handshake over 1s at full.
+  Those are house feels. A kit that flattened them would make every app move the
+  same way, which is worse than the duplication it removed.
+* **`StepKey::flash`.** Tied to key-repeat — hold "−" and each step flashes
+  though there was one press. snapclone's buttons have no equivalent, so sharing
+  it would put a field in the kit that one consumer never sets.
+* **The `Card` chevron, the sheet geometry, the peel edges.** Each is one app's
+  reading of what the shared motion means, and that is where an app's character
+  actually lives.
+
+The test for whether a promotion is right is not "is this code identical" but
+"did the second author have to rediscover a rule". All three above pass it; the
+constants fail it.
