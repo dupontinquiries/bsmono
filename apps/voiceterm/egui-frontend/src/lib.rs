@@ -13,6 +13,7 @@
 //! rather than mis-rendered.
 
 pub mod pty_input;
+pub mod table_view;
 pub mod mail_view;
 pub mod archived_view;
 pub mod cards_view;
@@ -40,6 +41,17 @@ pub mod gesture_menus;
 /// egui 0.34 is available to validate the move.
 #[path = "../../src/terminal_workspace.rs"]
 pub mod terminal_workspace;
+
+/// The table engine, on the same terms. `table_ops` holds TableOp and the apply
+/// pipeline, `table_nlp` turns natural language into ops and meta-commands.
+/// Both are plain Rust with no Qt in them, and `table_view` is the surface over
+/// them — the view was what was missing, not the engine. Included rather than
+/// re-implemented so the two frontends parse the same vocabulary; a second
+/// parser would accept a slightly different English within a week.
+#[path = "../../src/table_ops.rs"]
+pub mod table_ops;
+#[path = "../../src/table_nlp.rs"]
+pub mod table_nlp;
 // The GestureHost+SlidePopup replacement (grid gesture menus with QML-parity variants) lives in
 // the shared kit; re-exported under a voiceterm-familiar name.
 pub use uikit_egui::slide_menu;
