@@ -3352,12 +3352,14 @@ impl Gpu {
             // the entire budget.
             // NOT UNMAPPED HERE. I tried exactly that — unmap the previous slab when opening a new
             // one, on the theory that fifteen simultaneously-mapped 2 GiB slabs were exhausting a
-            // mapped-buffer ceiling. It made things WORSE: the failure moved from slab 16 to SLAB 3.
+            // mapped-buffer ceiling. The next run failed at slab 3 and I read that as a regression.
+            // IT WAS NOT: that run took the EXPERT STREAMING path (LOGSCOPE_ARENA=1, no MOE_STREAM=0)
+            // and had quantized 36 of 48 layers, where the run before it was fully resident at 56.6 GiB.
+            // Two paths, different slab usage, and the slab numbers are not comparable — I compared
+            // them anyway.
             //
-            // So the accumulation was not the constraint, and unmapping early breaks something the
-            // arena still needs — a slab whose mapping is dropped while writes are outstanding, or
-            // one that is written again after the next has opened. Either way the theory was wrong
-            // and the evidence said so in one run.
+            // So the change is unevidenced in BOTH directions and is left out rather than kept on a
+            // reading that does not hold. Testing it properly needs the SAME levers on both runs.
             //
             // What remains true is the number from _517: fifteen slabs and 30.0 GiB placed before
             // slab 16 was refused, against a --gate-vram measurement of 63 GiB. Those two figures
