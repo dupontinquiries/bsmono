@@ -3982,6 +3982,22 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
                 .filter(|(_, v)| (v.abs() - want).abs() < 1e-5)
                 .map(|(i, v)| (i, *v)).take(4).collect::<Vec<_>>();
             println!("      elements anywhere in the tensor matching the GPU's implied amax: {near:?}");
+            // BITS, NOT DECIMALS. Printed decimals hide which bit moved and how far; to_bits() says
+            // whether this is one ULP or something structural, and the two want different fixes.
+            let g_amax = gs[0] * 7.0;
+            println!("      cpu amax bits 0x{:08X}   gpu implied amax bits 0x{:08X}   ulps apart: {}",
+                amax_cpu.to_bits(), g_amax.to_bits(),
+                (g_amax.to_bits() as i64 - amax_cpu.to_bits() as i64).abs());
+            println!("      cpu scale bits 0x{:08X}   gpu scale bits 0x{:08X}",
+                cs[0].to_bits(), gs[0].to_bits());
+            // The two nearly-equal elements the reduction chooses between. If they differ in bits,
+            // the max is picking a different one on each side and the decode is exact after all.
+            if blk0.len() > 20 {
+                println!("      element  8 bits 0x{:08X}   element 20 bits 0x{:08X}   {}",
+                    blk0[8].to_bits(), blk0[20].to_bits(),
+                    if blk0[8].to_bits() == blk0[20].to_bits() { "IDENTICAL — the max is ambiguous" }
+                    else { "distinct — the max is well-defined and the decode differs" });
+            }
             }
             let sdiff = gs.iter().zip(cs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             ck(&format!("block scales identical: max|diff|={sdiff:.3e}"), sdiff == 0.0);
@@ -4097,6 +4113,11 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             let (cpu_blob, _) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
             let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
             let diff = got.iter().zip(&cpu_words).filter(|(a, b)| a != b).count();
+            // A SEPARATE BUG FROM THE SCALE ULP, and conflating them is why "fix the scale" kept
+            // not fixing this. An ULP shifts a scale and flips the handful of nibbles sitting on a
+            // boundary — which is the SMALL-tensor result, where 0 words differ. At grid scale the
+            // count explodes to 297430, and that shape belongs to a dispatch or chunk-offset error,
+            // not to rounding. Two investigations, not one.
             ck(&format!("large tensor converts exactly across the whole grid ({diff} words differ)"), diff == 0);
         }
 
