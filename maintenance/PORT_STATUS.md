@@ -40,7 +40,7 @@ not see.
 | port | surfaces | covered | bin | catalogued | primary |
 |---|---|---|---|---|---|
 | bo-suite | 47 | 94% named / 34% code | yes | yes | — |
-| bot-arena | 2 | 50% | yes | yes | — |
+| bot-arena | 2 | 100% named / 50% code | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
 | snapclone | 51 | 80% named / 18% code | yes | yes | — |
@@ -173,3 +173,24 @@ The egui reader (`manpage_view.rs`) therefore takes documents from its host
 rather than fetching them — no registry duplicated, no converter duplicated. The
 split is the next real step for whoever has a Qt host, and it would let the
 frontend read the registry directly.
+
+## What is actually left
+
+The named-surface work is close to done, and the remainder is mostly not
+product code. Recorded so the next session does not re-derive it:
+
+* **rusty-board** reports 50%, but `MicrotermView` is already ported as
+  `microterm.rs` — the audit only misses the literal name. Its other three are
+  `Dbus` (an interface, not a surface) and two test harnesses
+  (`KeyboardBehaviorsTests`, `RustyBoardTestHarness`).
+* **voiceterm**'s `WorkspacesPage` is a phantom: nothing by that name exists in
+  the tree. It comes from the audit's filename rule. `MessageView` is covered by
+  `mail_view.rs`. `Manpages` is blocked on a Qt host — see above.
+* **snapclone**'s remainder includes `ComponentTestWindow` and
+  `ModalLayerTestPanel`, which are Qt-side harnesses rather than product.
+* **fao-codec**'s `V2Encoder` and `V8GpuRasterizer` are codec/render backends,
+  not UI.
+
+So the honest reading of the table is that the ports are further along than the
+percentages suggest, and what is left divides into: blocked (manpages), not-UI
+(Dbus, codecs, harnesses), and phantom (WorkspacesPage).
