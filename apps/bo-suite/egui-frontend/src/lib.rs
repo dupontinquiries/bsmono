@@ -11,6 +11,7 @@ pub mod spaces;
 pub mod library;
 pub mod browse;
 pub mod queue;
+pub mod dial;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -99,6 +100,12 @@ pub struct Controller {
     /// the tracks and reported them instead; this is that somewhere.
     pub queue: crate::queue::Queue,
     pub now_playing: crate::queue::NowPlaying,
+    /// The hero volume wheel. Held across frames so a flick keeps coasting
+    /// through the redraws it is animating.
+    pub dial: crate::dial::VolumeDial,
+    /// The volume the dial last reported, waiting for the host to debounce and
+    /// push. `None` once it has been sent.
+    pub pending_volume: Option<f32>,
     pub mixer: crate::device::Mixer,
     pub profile: crate::device::Profile,
     pub soundscape: crate::soundscape::Soundscape,
@@ -137,6 +144,8 @@ impl Controller {
             library_tab: LibraryTab::Tracks,
             queue: Default::default(),
             now_playing: Default::default(),
+            dial: crate::dial::VolumeDial::new(0.0),
+            pending_volume: None,
             mixer: Default::default(),
             profile: Default::default(),
             soundscape: Default::default(),
@@ -531,6 +540,15 @@ impl Controller {
 
     fn mixer_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
         ui.heading("Mixer");
+        // The hero control. It reports continuously; the parent debounces
+        // before pushing to the device, so a flick sends one command rather
+        // than a hundred.
+        if let Some(v) = crate::dial::dial_ui(ui, &mut self.dial, 140.0, c) {
+            self.pending_volume = Some(v);
+        }
+        if let Some(v) = self.pending_volume {
+            ui.colored_label(c.text_weak, format!("volume {v:.0}"));
+        }
         if self.mixer.is_flat() {
             ui.colored_label(c.text_weak, "flat — no correction applied");
         }
@@ -662,6 +680,30 @@ mod tests {
         assert_eq!(c.queue.len(), 1, "and the rest are really in the queue");
         assert_eq!(c.queue.up_next().unwrap().title, "Closer");
         assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn the_dial_reports_continuously_and_the_shell_holds_the_pending_value() {
+        // A dial that wrote to the network on every frame of a flick would send
+        // a hundred volume commands for one gesture; the parent debounces.
+        let mut c = sample();
+        c.dial.press(0.0, 200.0, 1.0, 100.0);
+        c.dial.drag(0.0, 100.0);
+        assert!(c.dial.value > 0.0);
+        c.pending_volume = Some(c.dial.value);
+        assert!(c.pending_volume.is_some());
+    }
+
+    #[test]
+    fn a_device_reported_volume_stops_the_wheel_fighting_it() {
+        let mut c = sample();
+        c.dial.press(0.0, 0.0, 90.0, 100.0);
+        c.dial.drag(30.0, 0.0);
+        c.dial.release();
+        assert!(c.dial.spinning());
+        c.dial.set_external(15.0);
+        assert_eq!(c.dial.value, 15.0);
+        assert!(!c.dial.spinning());
     }
 
     #[test]
