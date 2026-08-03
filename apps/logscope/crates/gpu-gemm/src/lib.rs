@@ -3364,6 +3364,34 @@ impl Gpu {
             // What remains true is the number from _517: fifteen slabs and 30.0 GiB placed before
             // slab 16 was refused, against a --gate-vram measurement of 63 GiB. Those two figures
             // still disagree and the reason is still unknown.
+            // STOP MAPPING PAST THE CEILING. Two runs settle what it is:
+            //
+            //     2048 MiB slabs -> refused at slab 16, 30.0 GiB placed
+            //     1024 MiB slabs -> refused at slab 32, 31.0 GiB placed
+            //
+            // Same TOTAL, different counts and different buffer sizes. So the cap is neither the
+            // number of buffer objects nor their individual size — it is total MAPPED BYTES, landing
+            // within a slab of 32 GiB = 2^35. An address-space limit, which is why --gate-vram
+            // measured this device honouring 63 GiB: the probe allocates and does not keep its
+            // buffers mapped.
+            //
+            // Rather than unmapping slabs behind us — which I tried and could not evidence, because
+            // the run I judged it by took a different code path — later slabs are simply created
+            // UNMAPPED. That is an existing mode (`a.mapped = false`, COPY_DST plus the staging
+            // write) already used when the arena seals on submit, so it is a path with mileage rather
+            // than a new one.
+            //
+            // The cost is a staging copy for weights past the ceiling instead of a zero-copy write.
+            // The benefit is that a model larger than 32 GiB resident can load at all.
+            const MAPPED_CEILING: u64 = 24 << 30;   // conservative against the observed ~31 GiB
+            if a.mapped && (a.slabs.len() as u64 + 1) * a.slab_size > MAPPED_CEILING {
+                eprintln!("wgpu-engine: arena reached {:.1} GiB of MAPPED slabs — the device refuses \
+mapped allocations past about 31 GiB regardless of slab size (measured at both 1 and 2 GiB). \
+Remaining slabs use the staged write instead of the zero-copy one.",
+                    (a.slabs.len() as u64 * a.slab_size) as f64 / (1u64 << 30) as f64);
+                a.mapped = false;
+                a.used = a.slab_size;   // force a fresh slab; the current one keeps its mapping
+            }
             let usage = if a.mapped { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC }
                         else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
