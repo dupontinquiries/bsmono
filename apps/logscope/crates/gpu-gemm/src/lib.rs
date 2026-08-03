@@ -20,6 +20,7 @@ pub mod rolequant;
 pub mod ragged;
 pub mod specverify;
 pub mod batchplan;
+pub mod q2demote;
 pub mod lookupdraft;
 pub mod specloop;
 pub mod gateclass;
