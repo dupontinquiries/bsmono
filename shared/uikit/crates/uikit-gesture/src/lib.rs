@@ -126,6 +126,81 @@ impl GestureConfig {
     }
 }
 
+/// Rubber-band resistance at an edge, in pixels.
+///
+/// Sub-linear so the page never runs away, scaled by page size so the
+/// resistance feels the same on a phone and a desktop, and never exceeding the
+/// drag itself — a page that outruns the finger at the very edge reads as the
+/// app grabbing the gesture.
+///
+/// Lives here rather than in an app because every scroller that can reach an
+/// end needs it, and the alternative to movement-with-resistance is a hard stop,
+/// which reads as a frozen app.
+pub fn rubber_band(drag: f64, page_size: f64, k: f64) -> f64 {
+    let d = drag.abs();
+    if d == 0.0 || page_size <= 0.0 { return 0.0; }
+    let banded = (d * page_size * k).sqrt().min(d);
+    banded * drag.signum()
+}
+
+/// Default rubber-band constant.
+pub const RUBBER_BAND_K: f64 = 0.40;
+
+/// One position sample for the velocity tracker.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sample { pub pos: f64, pub t_ms: f64 }
+
+/// Release velocity, weighted toward recent samples.
+///
+/// `on_release` takes a velocity and every caller had to invent one. Averaging
+/// the whole gesture flat is the obvious wrong answer: a swipe that SLOWS
+/// before release was aimed at stopping, and a flat mean reports the speed of
+/// the middle of the gesture and flings a page the user deliberately
+/// decelerated.
+///
+/// Samples older than the window are discarded rather than down-weighted — a
+/// finger that rested a second before moving would otherwise drag that pause
+/// into the average.
+#[derive(Debug, Clone, Default)]
+pub struct VelocityTracker {
+    samples: Vec<Sample>,
+}
+
+impl VelocityTracker {
+    /// Widened from 80ms to 120ms so slow deliberate swipes still register.
+    pub const WINDOW_MS: f64 = 120.0;
+    /// Ring depth. Bounded so a long drag cannot grow it without limit.
+    pub const MAX_SAMPLES: usize = 24;
+
+    pub fn push(&mut self, pos: f64, t_ms: f64) {
+        self.samples.push(Sample { pos, t_ms });
+        if self.samples.len() > Self::MAX_SAMPLES { self.samples.remove(0); }
+    }
+
+    pub fn clear(&mut self) { self.samples.clear(); }
+    pub fn len(&self) -> usize { self.samples.len() }
+    pub fn is_empty(&self) -> bool { self.samples.is_empty() }
+
+    /// Velocity in units per millisecond.
+    pub fn velocity(&self, now_ms: f64) -> f64 {
+        let recent: Vec<&Sample> = self.samples.iter()
+            .filter(|s| now_ms - s.t_ms <= Self::WINDOW_MS).collect();
+        if recent.len() < 2 { return 0.0; }
+        let (mut num, mut den) = (0.0, 0.0);
+        for pair in recent.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let dt = b.t_ms - a.t_ms;
+            // Two events in the same millisecond have an undefined velocity,
+            // not an infinite one.
+            if dt <= 0.0 { continue; }
+            let w = (-(now_ms - b.t_ms) / Self::WINDOW_MS).exp();
+            num += (b.pos - a.pos) / dt * w;
+            den += w;
+        }
+        if den == 0.0 { 0.0 } else { num / den }
+    }
+}
+
 /// The two-tier gesture state machine. One per gesture surface. Holds the
 /// detent accumulator + timing latches; the page tier is stateless (decided
 /// wholly at release).
@@ -244,12 +319,17 @@ impl TwoTierGesture {
         let is_drag_commit = abs_drag >= commit_px;
 
         if is_flick || is_drag_commit {
-            let dir = if is_flick {
-                Direction::from_sign(velocity)
-            } else {
-                Direction::from_sign(drag_distance)
-            };
-            ReleaseOutcome::PageJump { dir }
+            // DIRECTION COMES FROM THE DRAG, always — not from the velocity on
+            // the flick path, which is what this used to do.
+            //
+            // The two only disagree on a late reversal: the finger travels
+            // 100px left and snaps back a few px right just before lifting, so
+            // the drag says left and the final velocity says right. Taking the
+            // velocity's sign there turns the page the OPPOSITE way to how it
+            // visibly moved under the finger, which reads as the app fighting
+            // you. Found when snapclone's SwipeNavigator port was folded into
+            // this crate: that port had the rule and this one did not.
+            ReleaseOutcome::PageJump { dir: Direction::from_sign(drag_distance) }
         } else {
             ReleaseOutcome::Stay
         }
@@ -353,5 +433,92 @@ mod tests {
         let mut g = TwoTierGesture::new(cfg());
         // Fast but only 5px — below flick_min_px and below commit: no jump.
         assert_eq!(g.on_release(0.9, 5.0), ReleaseOutcome::Stay);
+    }
+}
+
+#[cfg(test)]
+mod folded_in_tests {
+    use super::*;
+
+    #[test]
+    fn flick_direction_follows_the_drag_not_a_late_reversal() {
+        // The bug this crate had. 100px left, then a 5px snap back right just
+        // before lifting: the drag says left, the final velocity says right.
+        // Turning the page right there is the opposite of what the user saw.
+        let mut g = TwoTierGesture::new(GestureConfig::for_page_size(390.0));
+        let out = g.on_release(0.5, -100.0);
+        assert_eq!(out, ReleaseOutcome::PageJump { dir: Direction::from_sign(-100.0) });
+    }
+
+    #[test]
+    fn a_plain_flick_is_unaffected() {
+        // Where velocity and drag agree — which is nearly always — nothing
+        // changes.
+        let mut g = TwoTierGesture::new(GestureConfig::for_page_size(390.0));
+        assert_eq!(g.on_release(-0.6, -40.0),
+                   ReleaseOutcome::PageJump { dir: Direction::from_sign(-40.0) });
+    }
+
+    #[test]
+    fn the_rubber_band_is_sub_linear_and_never_outruns_the_finger() {
+        let a = rubber_band(100.0, 390.0, RUBBER_BAND_K);
+        let b = rubber_band(400.0, 390.0, RUBBER_BAND_K);
+        assert!(b > a && b / a < 4.0, "{a} -> {b}");
+        for d in [1.0, 50.0, 300.0, 1000.0] {
+            assert!(rubber_band(d, 390.0, RUBBER_BAND_K) <= d, "at {d}");
+        }
+    }
+
+    #[test]
+    fn the_rubber_band_keeps_direction_and_handles_zero() {
+        assert!(rubber_band(-100.0, 390.0, RUBBER_BAND_K) < 0.0);
+        assert_eq!(rubber_band(0.0, 390.0, RUBBER_BAND_K), 0.0);
+        assert_eq!(rubber_band(50.0, 0.0, RUBBER_BAND_K), 0.0);
+    }
+
+    #[test]
+    fn resistance_feels_the_same_at_any_page_size() {
+        let phone = rubber_band(100.0, 390.0, RUBBER_BAND_K) / 390.0;
+        let desktop = rubber_band(100.0 * 1280.0 / 390.0, 1280.0, RUBBER_BAND_K) / 1280.0;
+        assert!((phone - desktop).abs() < 0.05, "{phone} vs {desktop}");
+    }
+
+    #[test]
+    fn a_decelerating_swipe_is_not_flung() {
+        // It was AIMED at stopping. A flat mean would report the speed of the
+        // middle of the gesture.
+        let mut fast = VelocityTracker::default();
+        for i in 0..=10 { fast.push(i as f64 * 10.0, i as f64 * 10.0); }
+        let mut slowing = VelocityTracker::default();
+        for i in 0..=5 { slowing.push(i as f64 * 10.0, i as f64 * 10.0); }
+        for i in 1..=5 { slowing.push(50.0 + i as f64 * 0.5, 50.0 + i as f64 * 10.0); }
+        assert!(slowing.velocity(100.0) < fast.velocity(100.0) * 0.5);
+    }
+
+    #[test]
+    fn a_pause_before_the_gesture_is_discarded_not_averaged_in() {
+        let mut t = VelocityTracker::default();
+        t.push(0.0, 0.0);
+        t.push(0.0, 1000.0);
+        t.push(30.0, 1010.0);
+        t.push(60.0, 1020.0);
+        assert!(t.velocity(1020.0) > 2.0, "got {}", t.velocity(1020.0));
+    }
+
+    #[test]
+    fn same_millisecond_samples_do_not_produce_infinity() {
+        let mut t = VelocityTracker::default();
+        t.push(0.0, 5.0);
+        t.push(50.0, 5.0);
+        t.push(60.0, 6.0);
+        assert!(t.velocity(6.0).is_finite());
+    }
+
+    #[test]
+    fn the_tracker_is_bounded_and_needs_two_samples() {
+        let mut t = VelocityTracker::default();
+        assert_eq!(t.velocity(0.0), 0.0);
+        for i in 0..200 { t.push(i as f64, i as f64); }
+        assert_eq!(t.len(), VelocityTracker::MAX_SAMPLES);
     }
 }
