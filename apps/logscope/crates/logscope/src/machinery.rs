@@ -901,312 +901,104 @@ mod peer_tests {
     }
 }
 
-/// Freshness for a machine in the network.
+/// What a peer's `Standing` means for its mechanism.
 ///
-/// # This overlaps `Peer` and `Standing` above, and the overlap is my fault
+/// The genuinely new idea from a parallel implementation I built without noticing this module already
+/// had one: **a stale peer must not animate its last reported motion.**
 ///
-/// I built this without noticing the module already had network types. They are not the same thing
-/// but they are not disjoint either:
-///
-/// * `Peer` carries identity, `Standing` and `Parts`; **this carries only AGE**. Those compose —
-///   a `Peer` needs to know how old its state is and had no way to say.
-/// * `Standing::Silent` and `Freshness::Stale` describe the same condition from different sides.
-///   Silent is about the peer (it has said nothing); Stale is about the DATA (what we hold is old).
-///   Keeping both is defensible; letting them disagree is not.
-/// * **`ring_yaws` and `peer_placement` are genuinely duplicated.** One arranges peers in a ring, the
-///   other fans them across a quarter turn beside the local machine. Both cannot be right, and a
-///   scene calling one while a legend calls the other would put a peer's label on another peer's
-///   mechanism.
-///
-/// `ring_yaws` came first and a ring is the better shape for many peers; the fan argument — that a
-/// machine behind you is one you never see — applies to a handful. **The test below asserts they are
-/// not both in use**, because the failure mode is silent and looks like a labelling bug.
-///
-/// Named RemoteMachine rather than reusing `Peer`: the clash is worth naming.
-///
-/// ## The problem a network adds
-///
-/// A local landmark reads live state. A peer's arrives by announce, at intervals, and goes stale
-/// between them. **A peer mechanism animating from thirty-second-old data is lying in exactly the way
-/// every label in this codebase has lied** — it looks like a live reading and is not one.
-///
-/// So freshness is a first-class property of a peer's machine, and a stale one must be visibly stale
-/// rather than visibly working.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct RemoteMachine {
-    /// Seconds since this peer's state last arrived. Zero for the local machine.
-    pub age_s: f32,
-    /// Whether this is the machine the viewer is sitting at.
-    pub local: bool,
-}
-
-/// Beyond this, a peer's state is old enough that showing it as live would be a claim rather than a
-/// reading. Matches `announce::MAX_AGE_S`, so the landmark and the discovery table agree about who is
-/// present — a peer the registry has dropped must not still be turning in the scene.
-pub const PEER_STALE_S: f32 = 30.0;
-
-/// A peer that has said nothing for this long is not slow, it is gone.
-pub const PEER_LOST_S: f32 = 120.0;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Freshness {
-    /// State arrived recently enough to animate.
-    Live,
-    /// Old enough that the mechanism should hold its last pose rather than animate a guess.
-    Stale,
-    /// Gone. Shown as a darkened frame, not removed — a landmark that vanishes reads as "I never had
-    /// that peer", and knowing a machine has dropped out is the more useful fact.
-    Lost,
-}
-
-impl RemoteMachine {
-    pub fn freshness(&self) -> Freshness {
-        if self.local || self.age_s < PEER_STALE_S { Freshness::Live }
-        else if self.age_s < PEER_LOST_S { Freshness::Stale }
-        else { Freshness::Lost }
-    }
-
-    /// The motion to render, given what the peer last reported.
+/// `Standing::Silent { since_s }` already carried the age, so the `RemoteMachine` type I added
+/// alongside it was entirely redundant and is gone. `ring_yaws` already placed peers, so the second
+/// layout is gone too. What is left is the rule, on the type that already existed.
+impl Standing {
+    /// The motion to draw, given what the peer last reported.
     ///
-    /// **Stale does not fall through to the reported motion.** A peer that was thriving when last
-    /// heard from is not thriving now — it is unknown — and animating the old value is the one thing
-    /// a network view must not do.
-    pub fn motion(&self, reported: Motion) -> Motion {
-        match self.freshness() {
-            Freshness::Live => reported,
-            // Held, not stopped: a stall means "this machine is waiting", and a stale peer means
-            // "we do not know". They must look different or a network partition reads as every peer
-            // simultaneously seizing.
-            Freshness::Stale | Freshness::Lost => Motion::Deciding,
+    /// **Silent does not fall through to the reported value.** A peer that was thriving when last
+    /// heard from is not thriving now — it is unknown — and animating the old value claims a reading
+    /// that did not happen, which is the failure mode every lying label in this codebase shares.
+    ///
+    /// Nor does it render as `Stalled`: "this machine is waiting" and "we do not know" are different
+    /// facts, and if they look the same a network partition reads as every peer simultaneously
+    /// seizing.
+    pub fn motion(self, reported: Motion) -> Motion {
+        match self {
+            Standing::Local | Standing::Working => reported,
+            Standing::Idle => Motion::Deciding,
+            Standing::Silent { .. } | Standing::Faulted => Motion::Deciding,
         }
     }
 
-    /// How strongly to draw it, 0..1. Fades with age so the network's edge is legible.
-    pub fn presence(&self) -> f32 {
-        match self.freshness() {
-            Freshness::Live => 1.0,
-            Freshness::Stale => 0.55,
-            Freshness::Lost => 0.2,
+    /// How strongly to draw it, 0..1, so the edge of the network is legible.
+    ///
+    /// A silent peer fades and a faulted one fades further, but neither reaches zero: **a landmark
+    /// that vanishes reads as "I never had that peer"**, and knowing a machine dropped out is the
+    /// more useful fact.
+    pub fn presence(self) -> f32 {
+        match self {
+            Standing::Local | Standing::Working => 1.0,
+            Standing::Idle => 0.8,
+            Standing::Silent { .. } => 0.5,
+            Standing::Faulted => 0.25,
         }
-    }
-}
-
-/// Where each machine in the network stands.
-///
-/// The local machine keeps the canonical bearing so it is where it has always been; peers fan out
-/// from there in registration order. **Order must be stable** — a peer that moved every time another
-/// joined would make the network unreadable, and the whole value is recognising a specific machine's
-/// mechanism by where it stands.
-pub fn peer_placement(index: usize, count: usize, scene_radius: f32, scene_height: f32) -> Placement {
-    let base = placement(scene_radius, scene_height);
-    if index == 0 || count <= 1 { return base; }
-    // Fan across a quarter turn, so peers stay in the same region of view rather than surrounding the
-    // reader — a machine behind you is a machine you never see.
-    let spread = 0.9_f32;
-    let t = index as f32 / (count.max(2) - 1) as f32;
-    let yaw = BEARING_YAW - spread * 0.5 + spread * t;
-    let d = (if scene_radius > 1.0 { scene_radius } else { 12.0 }) * BEARING_DISTANCE;
-    Placement {
-        pos: [d * yaw.cos(), base.pos[1], d * yaw.sin()],
-        // Peers are smaller: the local machine is the one whose numbers the reader can act on.
-        scale: base.scale * 0.7,
-        yaw: yaw + std::f32::consts::PI,
     }
 }
 
 #[cfg(test)]
-mod network_peer_tests {
+mod standing_motion_tests {
     use super::*;
 
     #[test]
-    fn a_STALE_peer_does_not_animate_its_last_known_motion() {
+    fn a_SILENT_peer_does_not_animate_its_last_known_motion() {
         // The lying-label class, in a scene. A peer thriving when last heard from is not thriving
         // now — it is unknown, and animating the old value claims a reading that did not happen.
-        let p = RemoteMachine { age_s: 45.0, local: false };
-        assert_eq!(p.freshness(), Freshness::Stale);
-        assert_ne!(p.motion(Motion::Thriving), Motion::Thriving);
+        assert_ne!(Standing::Silent { since_s: 45 }.motion(Motion::Thriving), Motion::Thriving);
     }
 
     #[test]
-    fn a_stale_peer_looks_DIFFERENT_from_a_stalled_one() {
-        // "This machine is waiting" and "we do not know" are different facts, and if they render the
-        // same a network partition reads as every peer simultaneously seizing.
-        let stale = RemoteMachine { age_s: 45.0, local: false }.motion(Motion::Stalled);
-        assert_ne!(stale, Motion::Stalled);
+    fn a_silent_peer_looks_DIFFERENT_from_a_stalled_one() {
+        // "This machine is waiting" and "we do not know" are different facts. If they render the
+        // same, a network partition reads as every peer simultaneously seizing.
+        assert_ne!(Standing::Silent { since_s: 45 }.motion(Motion::Stalled), Motion::Stalled);
     }
 
     #[test]
-    fn a_LOST_peer_is_dimmed_rather_than_removed() {
-        // A landmark that vanishes reads as "I never had that peer". Knowing a machine dropped out is
-        // the more useful fact and the one worth keeping on screen.
-        let p = RemoteMachine { age_s: 300.0, local: false };
-        assert_eq!(p.freshness(), Freshness::Lost);
-        assert!(p.presence() > 0.0, "still drawn");
-        assert!(p.presence() < 0.5, "but plainly gone");
+    fn a_FAULTED_peer_is_dimmed_rather_than_erased() {
+        // A landmark that vanishes reads as "I never had that peer", and knowing a machine dropped
+        // out is the more useful fact.
+        assert!(Standing::Faulted.presence() > 0.0);
+        assert!(Standing::Faulted.presence() < Standing::Silent { since_s: 40 }.presence());
     }
 
     #[test]
-    fn the_LOCAL_machine_is_never_stale() {
-        // Its state is read directly rather than announced, so age does not apply.
-        let p = RemoteMachine { age_s: 999.0, local: true };
-        assert_eq!(p.freshness(), Freshness::Live);
-        assert_eq!(p.motion(Motion::Thriving), Motion::Thriving);
+    fn the_LOCAL_machine_always_shows_what_it_reports() {
+        // Its state is read directly rather than announced, so freshness does not apply.
+        assert_eq!(Standing::Local.motion(Motion::Thriving), Motion::Thriving);
+        assert_eq!(Standing::Local.presence(), 1.0);
     }
 
     #[test]
-    fn the_stale_threshold_matches_the_ANNOUNCE_window() {
-        // The landmark and the discovery table must agree about who is present: a peer the registry
-        // has dropped must not still be turning in the scene.
-        assert_eq!(PEER_STALE_S, 30.0);
+    fn IDLE_is_not_dimmed_like_a_fault() {
+        // A spare machine is healthy. Fading it toward the faulted end would make every idle peer
+        // look like a problem, which is the same mistake as highlighting every resting machine.
+        assert!(Standing::Idle.presence() > Standing::Silent { since_s: 40 }.presence());
     }
-
-    #[test]
-    fn the_LOCAL_machine_keeps_the_canonical_bearing() {
-        // It is where it has always been; peers arrange around it rather than displacing it.
-        let solo = placement(20.0, 12.0);
-        let with_peers = peer_placement(0, 4, 20.0, 12.0);
-        assert_eq!(solo.pos, with_peers.pos);
-    }
-
-    #[test]
-    fn peers_stay_in_the_SAME_REGION_of_view_rather_than_surrounding_the_reader() {
-        // A machine behind you is a machine you never see.
-        for i in 1..5 {
-            let p = peer_placement(i, 5, 20.0, 12.0);
-            let yaw = p.pos[2].atan2(p.pos[0]);
-            assert!((yaw - BEARING_YAW).abs() < 0.6, "peer {i} at {yaw} strayed from the bearing");
-        }
-    }
-
-    #[test]
-    fn a_peer_is_drawn_SMALLER_than_the_local_machine() {
-        // The local one is the machine whose numbers the reader can act on.
-        assert!(peer_placement(2, 4, 20.0, 12.0).scale < peer_placement(0, 4, 20.0, 12.0).scale);
-    }
-}
-
-/// How long a peer's silence is tolerated before the map stops claiming it is there.
-///
-/// `announce::MAX_AGE_S` is 30 with a 5-second interval — that is the *protocol's* replay window and
-/// the wrong number for a display. Six missed announces is a long time to keep showing a machine as
-/// present, and one missed announce is far too few to stop.
-///
-/// So the display has its own two thresholds, and it needs two for the same reason the autotuner
-/// does: **a single threshold flaps.** A peer hovering at the boundary would blink between lit and
-/// dark, which is worse than either state — a machine that flickers reads as a network problem even
-/// when the network is fine.
-/// **Distinct from `PEER_STALE_S` above, which matches the protocol's 30s replay window.** That one
-/// governs whether the registry still lists a peer at all; this one governs whether the SCENE keeps
-/// claiming it is there. Six missed announces is far too long for a picture, and one is far too few.
-pub const PEER_DIM_S: u32 = 12;
-/// Once dark, a peer must be heard from this recently to be shown lit again. Lower than `PEER_DIM_S`,
-/// so recovery requires a real signal rather than the same borderline silence that caused the
-/// darkness.
-pub const PEER_RELIGHT_S: u32 = 6;
-
-/// Decide a peer's standing from its last report, with hysteresis.
-///
-/// `was_silent` is the previous decision — the hysteresis is stateful by nature, and threading it
-/// through explicitly keeps this a pure function that a test can drive through a whole sequence.
-pub fn peer_standing(age_s: u32, was_silent: bool, faulted: bool, has_work: bool) -> Standing {
-    // A fault is a report, not an absence: the machine spoke and said something was wrong, which
-    // outranks how long ago it spoke.
-    if faulted { return Standing::Faulted; }
-    let limit = if was_silent { PEER_RELIGHT_S } else { PEER_DIM_S };
-    if age_s > limit { return Standing::Silent { since_s: age_s }; }
-    if has_work { Standing::Working } else { Standing::Idle }
 }
 
 #[cfg(test)]
-mod liveness_tests {
+mod layout_tests {
     use super::*;
 
     #[test]
-    fn a_peer_at_the_boundary_does_NOT_flicker() {
-        // The failure a single threshold produces. Alternating 11s and 13s ages would blink a machine
-        // between lit and dark, and a flickering peer reads as a network problem when the network is
-        // fine.
-        let mut silent = false;
-        let mut flips = 0;
-        for age in [11, 13, 11, 13, 11, 13] {
-            let s = peer_standing(age, silent, false, true);
-            let now = matches!(s, Standing::Silent { .. });
-            if now != silent { flips += 1; }
-            silent = now;
-        }
-        assert!(flips <= 1, "hysteresis must absorb boundary noise, got {flips} flips");
-    }
-
-    #[test]
-    fn RECOVERY_needs_a_fresher_signal_than_staying_lit_does() {
-        // Once dark, coming back requires a real announce rather than the same borderline silence
-        // that caused the darkness.
-        assert!(matches!(peer_standing(10, true, false, true), Standing::Silent { .. }),
-            "10s is fine to stay lit but not to come back");
-        assert_eq!(peer_standing(10, false, false, true), Standing::Working);
-        assert_eq!(peer_standing(3, true, false, true), Standing::Working, "a fresh one recovers");
-    }
-
-    #[test]
-    fn a_FAULT_outranks_silence_because_it_is_a_report() {
-        // The machine spoke and said something was wrong. That is information; silence is the absence
-        // of it, and showing a faulted machine as merely quiet loses the one thing it told you.
-        assert_eq!(peer_standing(999, true, true, false), Standing::Faulted);
-    }
-
-    #[test]
-    fn a_LIVE_peer_with_nothing_to_do_is_Idle_not_Silent() {
-        // The distinction the whole network view rests on.
-        assert_eq!(peer_standing(2, false, false, false), Standing::Idle);
-        assert_eq!(peer_standing(2, false, false, true), Standing::Working);
-    }
-
-    #[test]
-    fn the_display_window_is_TIGHTER_than_the_protocol_replay_window() {
-        // announce::MAX_AGE_S is 30 with a 5s interval — a replay guard, not a display rule. Six
-        // missed announces is far too long to keep claiming a machine is present.
-        assert!((PEER_DIM_S as f32) < PEER_STALE_S,
-            "the scene must give up sooner than the registry drops the peer");
-        assert!(PEER_DIM_S > 5, "and later than one missed announce");
-        assert!(PEER_RELIGHT_S < PEER_DIM_S, "or there is no hysteresis at all");
-    }
-}
-
-
-#[cfg(test)]
-mod layout_conflict_tests {
-    use super::*;
-
-    /// **Two layouts exist for the same peers and only one may be used.**
-    ///
-    /// `ring_yaws` arranges peers around the viewer; `peer_placement` fans them beside the local
-    /// machine. A scene using one while a legend or a hit-test uses the other would put a peer's
-    /// label on another peer's mechanism — a silent failure that reads as a naming bug rather than a
-    /// geometry one.
-    ///
-    /// This asserts they actually disagree, so the conflict cannot be dismissed as cosmetic, and
-    /// records which is authoritative.
-    #[test]
-    fn the_two_layouts_genuinely_DISAGREE() {
-        let ring = ring_yaws(4);
-        let fan: Vec<f32> = (0..4).map(|i| {
-            let p = peer_placement(i, 4, 20.0, 12.0);
-            p.pos[2].atan2(p.pos[0])
-        }).collect();
-        assert_eq!(ring.len(), fan.len());
-        let differ = ring.iter().zip(&fan).any(|(a, b)| (a - b).abs() > 0.2);
-        assert!(differ, "if these ever agree the duplication is harmless; today it is not");
-    }
-
-    #[test]
-    fn RING_is_authoritative_for_more_than_a_handful_of_peers() {
-        // It came first, and a ring scales: eight machines fanned across a quarter turn overlap each
-        // other, while eight around a ring do not. The fan's argument — a machine behind you is one
-        // you never see — holds for two or three and stops holding past that.
+    fn ONE_layout_remains_and_it_scales() {
+        // I added a second (a fan beside the local machine) without noticing ring_yaws existed. Both
+        // could not be right: a scene using one while a legend used the other would put a peer's
+        // label on another peer's mechanism.
+        //
+        // The ring wins because it scales — eight machines fanned across a quarter turn overlap, and
+        // eight on a ring stay separable.
         let ring = ring_yaws(8);
         let mut sorted = ring.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let min_gap = sorted.windows(2).map(|w| w[1] - w[0]).fold(f32::MAX, f32::min);
-        assert!(min_gap > 0.3, "a ring keeps eight machines separable, gap {min_gap}");
+        assert!(min_gap > 0.3, "eight machines stay separable, gap {min_gap}");
     }
 }
