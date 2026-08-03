@@ -3684,6 +3684,41 @@ question is where it goes instead — the telemetry covers phases, not shot
 outcomes, so that wants a measurement of where the ball ends up after a
 flick before anything else is changed.
 
+## v1.113.0 — the charged pulse
+
+Holding jump on a hovercar now winds the pulse up instead of firing it, and
+BRAKES THE CAR while it does. The braking is the whole design: a charge that
+costs nothing is a free upgrade, and only a charge that costs you the ability
+to reposition turns a big hit into a decision. Committing early is what gets
+paid — you have to read where the ball will be before you can still move to
+meet it.
+
+    hold      charge   ball out   speed kept
+    tap         0.00      7.3        100%
+    0.25 s      0.31     11.1         91%
+    0.50 s      0.62     14.9         69%
+    0.85 s      1.00     19.4         37%
+
+Nearly three times the power for a bit over a third of your speed, and the
+curve in between is smooth enough to pick a point on.
+
+It fires on RELEASE, which took one correction: a pure tap accumulated no
+charge at all, so the release test saw zero and the old instant pulse was
+simply lost to the new mechanic. A press now ARMS it, so a tap is a
+full-strength quick pulse and a hold is the wind-up.
+
+The measurement took three corrections, which is worth recording because
+each was the harness lying rather than the code:
+
+  * holding the ball still during the wind-up let the repulsor field shove
+    the car backwards for the whole charge — "speed kept" was measuring the
+    field, not the brake, and read 3%
+  * parking the ball out of range fixed that but placed it back at a FIXED
+    point for the release, and the car had travelled 8 metres during a
+    0.5 second charge, so the pulse fired into empty air
+  * both only became visible because the numbers were absurd rather than
+    merely wrong: 3% of speed, and a charged pulse weaker than a tap
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -5053,6 +5053,74 @@ pub fn run(args: &[String]) {
             println!("   nozzles drawn at 0.78/0.80:             {art_pt}");
             check("the nozzles sit where the cushion pushes", phys_pt && art_pt && four_art >= 1);
         }
+        // ---- THE CHARGED PULSE ----
+        // Holding the jump winds the pulse up and brakes the car while it
+        // does. The mechanic only works if BOTH halves are real: a charge
+        // that does not add power is pointless, and one that costs no speed
+        // is a free upgrade rather than a decision.
+        println!();
+        println!("{:<12} {:>9} {:>10} {:>10} {:>10}", "hold", "charge", "ball out", "speed kept", "trade");
+        let mut powers = Vec::new();
+        let mut kept = Vec::new();
+        for hold in [0.0f32, 0.25, 0.5, 0.85] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.6, 0.0);
+            car.sync_rot();
+            car.hover = Some(physics::Hover::default());
+            car.vel = Vec3::new(0.0, 0.0, -16.0);
+            let mut ball = Ball::new();
+            ball.pos = car.pos + car.forward() * 2.0 + Vec3::Y * 0.3;
+            ball.prev = ball.pos;
+            let v_in = car.vel.length();
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            // hold the jump for `hold` seconds, then let go
+            // hold the ball where it is while winding up: the repulsor
+            // field would otherwise push it out of range during the charge,
+            // and this measures the PULSE, not the field
+            c.jump_pressed = true;
+            c.jump_held = true;
+            // park it OUT of field range while winding up, then bring it back
+            // for the release: holding it close made the field shove the car
+            // backwards for the whole charge, so the "speed kept" column was
+            // measuring the field, not the brake
+            let park = car.pos + car.forward() * 60.0;
+            let mut t = 0.0f32;
+            while t < hold {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                c.jump_pressed = false;
+                ball.pos = park;
+                ball.vel = Vec3::ZERO;
+                ball.prev = park;
+                t += DT;
+            }
+            let speed_kept = car.vel.length() / v_in.max(0.01);
+            let charge = car.pulse_charge;
+            c.jump_held = false;
+            // relative to where the car IS at release: it has been travelling
+            // during the wind-up, so a fixed point would be behind it
+            let at_release = car.pos + car.forward() * 2.0 + Vec3::Y * 0.3;
+            ball.pos = at_release;
+            ball.vel = Vec3::ZERO;
+            ball.prev = at_release;
+            let before = ball.vel.length();
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            let out = ball.vel.length() - before;
+            powers.push(out);
+            kept.push(speed_kept);
+            println!(
+                "{:<11.2}s {:>8.2} {:>9.1} {:>9.0}% {:>10}",
+                hold,
+                charge,
+                out,
+                speed_kept * 100.0,
+                if out > 0.5 { "fired" } else { "-" }
+            );
+        }
+        check("a longer hold hits harder", powers[3] > powers[0] * 1.8);
+        check("and it costs real speed", kept[3] < kept[0] * 0.75);
+        check("a tap still fires at base strength", powers[0] > 2.0);
         println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
         return;
     }

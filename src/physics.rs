@@ -73,6 +73,8 @@ pub struct Car {
     pub pulse_t: f32,
     /// counts up while a pulse is firing, for the effect
     pub pulse_fire: f32,
+    /// 0..1 wind-up on a held jump (hovercars)
+    pub pulse_charge: f32,
     pub wheel_spin: f32,
     pub steer_vis: f32,
     // jump / dodge state
@@ -122,6 +124,18 @@ pub struct Hover {
     // ---- PULSE ----
     /// seconds between pulses
     pub pulse_cd: f32,
+    // ---- CHARGED PULSE ----
+    // Holding the jump winds the pulse up instead of firing it. The trade is
+    // the point: while you hold it the car brakes, so committing early costs
+    // you the ability to reposition, and a player who reads the ball's
+    // arrival a second in advance is paid for it. A tap is still the old
+    // instant pulse.
+    /// seconds of hold for a full charge
+    pub charge_time: f32,
+    /// power multiplier at full charge
+    pub charge_gain: f32,
+    /// how hard the car brakes while winding up, per second at full charge
+    pub charge_brake: f32,
     /// upward impulse it gives the car
     pub pulse_lift: f32,
     /// radius and strength of the omnidirectional blast
@@ -154,6 +168,9 @@ impl Default for Hover {
             base_power: 0.55,
             charge_power: 1.25,
             pulse_cd: 1.6,
+            charge_time: 0.85,
+            charge_gain: 2.9,
+            charge_brake: 2.2,
             pulse_lift: 7.5,
             pulse_r: 5.0,
             pulse_k: 15.0,
@@ -179,6 +196,7 @@ impl Car {
             charge: 0.0,
             pulse_t: 0.0,
             pulse_fire: 0.0,
+            pulse_charge: 0.0,
             half_w: 0.32,
             susp: 0.0,
             prev: Vec3::ZERO,
@@ -415,7 +433,11 @@ pub fn step(
     collide_car_ball(car, ball, cfg, WHO_PLAYER, ev);
     hover_field(car, ball, dt, c.boost, ev);
     // A hovercar's jump is the pulse: it has no wheels to push off with.
-    if car.hover.is_some() && c.jump_pressed && hover_pulse(car, ball, ev) {
+    // FIRE ON RELEASE. A tap charges for a frame and goes off at base
+    // strength, which is the old behaviour; a hold winds up and lets go when
+    // you do. Firing on the press instead would make the charge unusable —
+    // there would be nothing left to release.
+    if car.hover.is_some() && !c.jump_held && car.pulse_charge > 0.0 && hover_pulse(car, ball, ev) {
         ev.jumped = true;
     }
 
@@ -1353,6 +1375,23 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
         // worse place to be than a wheeled car with an empty tank.
         car.pulse_t = (car.pulse_t - dt).max(0.0);
         car.pulse_fire = (car.pulse_fire - dt * 4.0).max(0.0);
+        // WIND-UP. Holding jump charges the pulse and brakes the car while
+        // it does. Braking is what makes the mechanic a decision rather than
+        // a free upgrade: a full charge costs you most of your ability to
+        // adjust, so it has to be committed to BEFORE you know exactly where
+        // the ball will be.
+        // A PRESS ARMS IT, even if the release comes the same frame. Without
+        // this a pure tap never accumulated any charge, so the release test
+        // below saw zero and the pulse simply never fired — the old instant
+        // pulse would have been lost to the new mechanic.
+        if c.jump_pressed && car.pulse_t <= 0.0 {
+            car.pulse_charge = car.pulse_charge.max(0.02);
+        }
+        if c.jump_held && car.pulse_t <= 0.0 {
+            car.pulse_charge = (car.pulse_charge + dt / h.charge_time.max(0.05)).min(1.0);
+            let brake = h.charge_brake * car.pulse_charge * dt;
+            car.vel -= car.vel * brake.clamp(0.0, 0.5);
+        }
         if c.boost {
             if car.charge > 0.0 {
                 car.vel += car.forward() * BOOST_ACCEL * cfg.car.boost * h.charge_power * dt;
@@ -1661,20 +1700,23 @@ pub fn hover_pulse(car: &mut Car, ball: &mut Ball, ev: &mut StepEvents) -> bool 
     if car.pulse_t > 0.0 {
         return false;
     }
+    // a held jump multiplies the blast; a tap fires at the base strength
+    let power = 1.0 + car.pulse_charge * (h.charge_gain - 1.0);
+    car.pulse_charge = 0.0;
     car.pulse_t = h.pulse_cd;
     car.pulse_fire = 1.0;
     // lift: straight up in the WORLD, so it works whatever the car is doing
-    car.vel += Vec3::Y * h.pulse_lift;
+    car.vel += Vec3::Y * h.pulse_lift * (1.0 + (power - 1.0) * 0.35);
     // and the blast, falling off to nothing at the rim
     let to = ball.pos - car.pos;
     let d = to.length();
     if d < h.pulse_r + ball.r && d > 1e-4 {
         let f = 1.0 - (d / (h.pulse_r + ball.r)).clamp(0.0, 1.0);
-        let push = h.pulse_k * f * f;
+        let push = h.pulse_k * f * f * power;
         ball.vel += (to / d) * push;
         ev.touches.push((ball.pos - (to / d) * ball.r, push));
     }
-    ev.pulses.push((car.pos, h.pulse_r, h.pulse_k));
+    ev.pulses.push((car.pos, h.pulse_r, h.pulse_k * power));
     true
 }
 
