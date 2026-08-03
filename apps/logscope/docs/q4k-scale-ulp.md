@@ -59,3 +59,61 @@ removes the converter, both dequant paths, this gate, and the 2.88x memory infla
 
 That is a larger job than one more diagnostic, and it is probably the better one. This bug is worth
 one more print; it is not worth a sixth guess.
+
+
+---
+
+# RESOLVED: the arithmetic is identical and the compiler is not
+
+The bit-level run closed the chain:
+
+```
+cpu amax bits 0x400D3BF0   gpu implied amax bits 0x400D3BF1   ulps apart: 1
+cpu scale bits 0x3EA16912  gpu scale bits 0x3EA16913
+element 8 bits 0x400D3BF0  element 20 bits 0x400D3BF0   IDENTICAL — the max is ambiguous
+```
+
+`0x400D3BF0 / 7 = 0x3EA16912` and `0x400D3BF1 / 7 = 0x3EA16913`, so **the GPU's amax is exactly one
+ULP above the CPU's** — and no element has that value. The GPU's `wq` produces a higher result than
+the standalone `Q4K_DEQUANT` for the same weight, while that standalone path matches the CPU exactly.
+
+**The two GPU dequant paths disagree with each other.**
+
+And a line-by-line comparison finds no difference to blame:
+
+* `scale_min` — byte-for-byte identical in both shaders
+* the `d` and `dmin` reads — identical
+* the final multiply-subtract — now explicit `fma` in both
+* the `f16` decoder — the standard bit-shuffle, exact for normals
+
+## Which is the finding
+
+Two textually identical computations in different shaders round differently on this driver.
+Contraction is decided per compilation unit, so the same source can fuse in one shader and not in
+another depending on surrounding loop structure, inlining and register pressure. **No amount of
+reading either shader will locate this, because the difference is not in either shader.**
+
+That also explains why six theories died: every one of them assumed the divergence was written down
+somewhere.
+
+## The fix is structural
+
+Stop computing the same thing twice.
+
+1. **One dequant, shared.** Extract the block into a single WGSL string concatenated into both
+   shaders, so there is one text and one compilation of it per pipeline — this reduces the exposure
+   but does not eliminate it, since they are still separate pipelines.
+2. **Or better: do not derive the scale on the GPU at all.** The converter needs `amax` only to pick a
+   q4 scale. If the CPU's scale is uploaded alongside the weights, the GPU never reduces and the
+   question cannot arise.
+3. **Or best: `MATVEC_Q4K`.** Consume the file's blocks directly and delete the converter, both
+   dequant paths, this gate, and the 2.88x memory inflation `conversion_cost` measured for IQ1_S.
+
+Option 2 is small and closes this specific bug. Option 3 is the one worth doing.
+
+## Still separate, still open
+
+`297430 words differ` at grid scale and `2771` across chunk boundaries are **not** this bug. An ULP
+flips the handful of nibbles sitting on a boundary — which is the small-tensor result, where 0 words
+differ. A count that explodes with grid size is a dispatch or chunk-offset error and wants its own
+investigation.
