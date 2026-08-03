@@ -17,6 +17,7 @@ pub mod table_view;
 pub mod row_render;
 pub mod detect;
 pub mod explore;
+pub mod manpage_view;
 pub mod mail_view;
 pub mod archived_view;
 pub mod cards_view;
