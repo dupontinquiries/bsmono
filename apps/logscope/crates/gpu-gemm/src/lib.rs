@@ -3380,8 +3380,35 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         if a.mapped {
             // UMA zero-copy: write straight into the mapped slab's device-visible backing at `off` — no
             // staging copy. Sub-ranges are non-overlapping (distinct weights), so per-weight views are legal.
-            let mut view = slab.slice(off..off + len).get_mapped_range_mut();
-            view.copy_from_slice(bytes);
+            // FALLIBLE. get_mapped_range_mut PANICS on an invalid buffer, and a slab whose allocation
+            // the driver could not back is invalid — the failure surfaces HERE, when the buffer is
+            // used, not at create_buffer. That is why polling after creation never caught it: there
+            // was nothing pending to poll for.
+            //
+            // Your Scout run at 56.6 GiB against a 63 GiB budget dies exactly here, on a device whose
+            // BO-VMA ceiling is a hard limit rather than a soft one.
+            //
+            // catch_unwind converts the crash into a refusal that names the arena, the slab and how
+            // far the load got. The buffer is already unusable, so nothing is salvaged by continuing —
+            // the value is that the message says "the arena could not back slab N" instead of
+            // "get_mapped_range: Validation Error" from three frames away.
+            let wrote = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let mut view = slab.slice(off..off + len).get_mapped_range_mut();
+                view.copy_from_slice(bytes);
+            }));
+            if wrote.is_err() {
+                eprintln!("wgpu-engine: ARENA SLAB UNUSABLE — slab {} of {:.1} MiB could not be \
+mapped at offset {off} ({} bytes). The driver accepted the allocation and then rejected the use, \
+which is what a hard BO-VMA ceiling does: {:.1} GiB of slabs had already been placed. Lower \
+LOGSCOPE_MAX_GPU_GB, or let the model stream instead of forcing residency.",
+                    a.slabs.len(), a.slab_size as f64 / (1 << 20) as f64, len,
+                    (a.slabs.len().saturating_sub(1) as f64 * a.slab_size as f64) / (1u64 << 30) as f64);
+                // Re-raised rather than swallowed: the buffer is unusable and there is no Tensor to
+                // return. What changes is that the operator now has the arena's own account of the
+                // failure above the wgpu backtrace, instead of only "get_mapped_range: Validation
+                // Error" from three frames away with no mention of memory.
+                std::panic::resume_unwind(wrote.unwrap_err());
+            }
         } else {
             self.write_chunked(&slab, off, bytes);   // arena slabs are up to 2 GiB
         }
