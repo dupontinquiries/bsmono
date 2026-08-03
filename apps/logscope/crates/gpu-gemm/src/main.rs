@@ -3992,6 +3992,27 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
                 cs[0].to_bits(), gs[0].to_bits());
             // The two nearly-equal elements the reduction chooses between. If they differ in bits,
             // the max is picking a different one on each side and the decode is exact after all.
+            // THE DIRECT TEST. Everything above is inferred from the scale; this runs the
+            // converter's OWN dequant and compares what it produces.
+            //
+            //   wq matches the CPU  -> the ULP enters in the amax REDUCTION, and the
+            //                          two-compilation-units theory is wrong like the six before it
+            //   wq differs by 1 ULP -> two textually identical dequants really do round differently,
+            //                          and no expression-level fix can reach it
+            let wq = gpu.q4k_wq_probe(&raw3, rows, k);
+            let wq_bad: Vec<usize> = wq.iter().zip(&f32ref)
+                .enumerate().filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+                .map(|(i, _)| i).take(6).collect();
+            println!("      wq probe vs cpu: {} of {} differ, first: {:?}",
+                wq.iter().zip(&f32ref).filter(|(a, b)| a.to_bits() != b.to_bits()).count(),
+                wq.len(), wq_bad);
+            if let Some(&i0) = wq_bad.first() {
+                println!("      wq[{i0}] = 0x{:08X}  cpu = 0x{:08X}  => THE DEQUANT DIFFERS",
+                    wq[i0].to_bits(), f32ref[i0].to_bits());
+            } else {
+                println!("      => wq matches the CPU exactly; the ULP enters in the REDUCTION, \
+not the dequant");
+            }
             if blk0.len() > 20 {
                 println!("      element  8 bits 0x{:08X}   element 20 bits 0x{:08X}   {}",
                     blk0[8].to_bits(), blk0[20].to_bits(),
