@@ -31,6 +31,7 @@ pub mod session;
 pub mod ring;
 pub mod qr;
 pub mod wayfinder;
+pub mod voicebar;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -133,6 +134,11 @@ pub struct Snapclone {
     /// `None` when it is not open — the scanner holds camera frames and should
     /// not exist while nobody is looking at it.
     pub qr: Option<crate::qr::QrScan>,
+    /// The on-air control surface (Qt GroupVoiceBar). Drawn above the nav
+    /// whenever a session is joined, which is where the join/mute/talk controls
+    /// live now — the previous commit took them off the Wayfinder page, where
+    /// they never belonged, and left them with no home.
+    pub voicebar: crate::voicebar::VoiceBar,
     /// Our own position, when the device has a fix. `None` is a real state, not
     /// a placeholder: without it nobody can be placed geographically.
     pub self_fix: Option<crate::wayfinder::Fix>,
@@ -181,6 +187,7 @@ impl Snapclone {
             incoming_call: None,
             missed_calls: Vec::new(),
             qr: None,
+            voicebar: crate::voicebar::VoiceBar::new(),
             self_fix: None,
             wayfinder_contacts: Vec::new(),
             wayfinder_snaps: Vec::new(),
@@ -303,6 +310,35 @@ impl Snapclone {
         if let Some(call) = self.incoming_call.as_mut() {
             let caller = call.caller_name.clone();
             if let Some(a) = call.tick(dt * 1000.0) { self.finish_call(&caller, a); }
+        }
+    }
+
+    /// Carry out what the voice bar asked for. The bar owns no audio and no
+    /// sockets; this is where its events meet the session.
+    pub fn apply_voice(&mut self, ev: crate::voicebar::Event) {
+        use crate::voicebar::Event;
+        match ev {
+            // Reflect the press locally AND ask the session. A talk button that
+            // waits for the round trip before lighting feels broken on a slow
+            // link, which is exactly when you are pressing it hardest.
+            Event::TalkPressed => self.voicebar.set_on_air(true),
+            Event::TalkReleased => self.voicebar.set_on_air(false),
+            // The request is ours to record; the TIER is the negotiation's to
+            // report, so this does not set Private itself.
+            Event::PrivateRequested(want) => {
+                self.voicebar.security = if want { crate::voicebar::Security::Securing }
+                                         else { crate::voicebar::Security::Public };
+            }
+        }
+    }
+
+    /// Join or leave the group voice channel.
+    pub fn toggle_voice(&mut self) {
+        if self.group_voice.joined {
+            self.group_voice.leave();
+            self.voicebar.set_on_air(false);
+        } else {
+            self.group_voice.join();
         }
     }
 
@@ -457,6 +493,17 @@ impl Snapclone {
             self.swipe_page(dir.sign());
         }
 
+        // The voice bar sits above the page content while a session is live, so
+        // the floor holder, the mic level and the talk button are reachable
+        // from wherever you are — the point of a single bar over per-page
+        // controls.
+        if self.group_voice.joined {
+            if let Some(ev) = crate::voicebar::voicebar_ui(ui, &mut self.voicebar, &colors) {
+                self.apply_voice(ev);
+            }
+            ui.separator();
+        }
+
         // page tabs on desktop; swipe hint on phone
         if !adaptive.is_compact() && !self.nav.can_go_back() {
             ui.horizontal(|ui| {
@@ -565,6 +612,16 @@ impl Snapclone {
             }
             return;
         }
+        // Join / leave lives here because Friends is where the people are; the
+        // rest of the voice controls are on the bar itself once a session is up.
+        ui.horizontal(|ui| {
+            let joined = self.group_voice.joined;
+            if ui.selectable_label(joined, if joined { "leave channel" } else { "join channel" })
+                .clicked() { self.toggle_voice(); }
+            if joined && ui.selectable_label(self.group_voice.muted, "mute").clicked() {
+                self.group_voice.muted = !self.group_voice.muted;
+            }
+        });
         // The real FriendListWidget: cards with an action menu, the empty state
         // that names the ports to open, and the add-peer form. The flat list of
         // names this replaced had no way to add anyone, which is the half of
@@ -703,6 +760,48 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn the_voice_controls_are_reachable_again_after_leaving_the_wayfinder_page() {
+        // The regression I introduced last commit: the controls came off the
+        // Wayfinder page, where they never belonged, and had no home.
+        let mut s = app();
+        assert!(!s.group_voice.joined);
+        s.toggle_voice();
+        assert!(s.group_voice.joined, "join is reachable from Friends");
+        s.toggle_voice();
+        assert!(!s.group_voice.joined);
+    }
+
+    #[test]
+    fn pressing_talk_lights_the_bar_without_waiting_for_the_session() {
+        // A talk button that waits for the round trip feels broken on a slow
+        // link, which is exactly when you are pressing it hardest.
+        let mut s = app();
+        s.apply_voice(crate::voicebar::Event::TalkPressed);
+        assert!(s.voicebar.on_air());
+        s.apply_voice(crate::voicebar::Event::TalkReleased);
+        assert!(!s.voicebar.on_air());
+    }
+
+    #[test]
+    fn requesting_privacy_shows_securing_not_private() {
+        // The request is ours to record; the TIER is the negotiation's to
+        // report. Claiming Private on request is the padlock lie.
+        let mut s = app();
+        s.apply_voice(crate::voicebar::Event::PrivateRequested(true));
+        assert_eq!(s.voicebar.security, crate::voicebar::Security::Securing);
+        assert!(!s.voicebar.security.locked());
+    }
+
+    #[test]
+    fn leaving_the_channel_takes_the_bar_off_air() {
+        let mut s = app();
+        s.toggle_voice();
+        s.apply_voice(crate::voicebar::Event::TalkPressed);
+        s.toggle_voice();
+        assert!(!s.voicebar.on_air(), "a left channel cannot still be transmitting");
     }
 
     #[test]

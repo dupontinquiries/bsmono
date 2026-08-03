@@ -32,7 +32,7 @@ starts hidden with the auto-login ordering rule.
 | DiagnosticsDialog | pending |  |
 | ExportReminderCard | pending |  |
 | FriendListWidget | ported | friends.rs `Roster` + `AddForm` — dedupe by id, empty state, three address formats |
-| GroupVoiceBar | pending |  |
+| GroupVoiceBar | ported | voicebar.rs — swipe-to-latch, eased transmit meter, Securing as its own tier |
 | GroupVoiceCoordinator | pending |  |
 | GroupVoiceRoster | pending |  |
 | HelpManualDialog | pending |  |
