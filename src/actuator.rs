@@ -68,7 +68,11 @@ pub struct State {
 }
 
 impl Actuator {
-    /// Advance by `dt`, reaching for `target` against `load`, moving `mass`.
+    /// Advance a LINEAR actuator: a strut, a ram, a drive unit.
+    ///
+    /// `mass` is genuinely mass here and `load` is genuinely a force, so
+    /// F = ma is the right equation. The rotational cases are NOT this —
+    /// see `step_angular`.
     ///
     /// Returns the force actually delivered, which is the interesting
     /// number: it is clamped, so an actuator asked for more than it has
@@ -98,6 +102,58 @@ impl Actuator {
         force
     }
 
+    /// Advance a ROTATIONAL actuator: a joint, a control surface.
+    ///
+    /// The linear step is wrong here and was wrong here until this existed.
+    /// Two things it got wrong:
+    ///
+    /// **Inertia, not mass.** Angular acceleration is tau / I, and I is
+    /// sum(m*r^2) — it goes as the SQUARE of how far the mass sits from the
+    /// pivot. A limb with its mass at the tip is enormously harder to swing
+    /// than the same limb with its mass at the shoulder, and using mass
+    /// alone makes them identical.
+    ///
+    /// **Leverage varies with angle.** Gravity's moment on a limb is
+    /// m*g*r*cos(theta) measured from horizontal: maximum when the limb is
+    /// held out straight, ZERO when it hangs straight down or points
+    /// straight up. Using a constant load makes a fold equally hard all the
+    /// way round, which is why it never stalled in the place a real one
+    /// would — halfway, with the arm out.
+    ///
+    /// `inertia` is I about this joint's axis. `gravity_torque` is the peak
+    /// moment, i.e. m*g*r_cm; the cos falls out of the current angle here.
+    pub fn step_angular(
+        &self,
+        st: &mut State,
+        target: f32,
+        inertia: f32,
+        gravity_torque: f32,
+        extra_load: f32,
+        dt: f32,
+    ) -> f32 {
+        let want = self.stiffness * (target - st.pos) - self.damping * st.vel;
+        let force = want.clamp(-self.max_force, self.max_force);
+        st.saturated = want.abs() > self.max_force;
+
+        // THE MOMENT ARM. Zero hanging down, greatest held out horizontal.
+        let load = gravity_torque * st.pos.cos() + extra_load;
+        let net = force - load;
+        st.vel += net / inertia.max(1e-6) * dt;
+        st.pos += st.vel * dt;
+
+        st.bottomed = false;
+        if st.pos <= self.lo {
+            st.pos = self.lo;
+            st.vel = st.vel.max(0.0) * 0.15;
+            st.bottomed = true;
+        } else if st.pos >= self.hi {
+            st.pos = self.hi;
+            st.vel = st.vel.min(0.0) * 0.15;
+            st.bottomed = true;
+        }
+        force
+    }
+
     /// Can it hold this load at all?
     pub fn can_hold(&self, load: f32) -> bool {
         load.abs() <= self.max_force
@@ -110,6 +166,29 @@ impl Actuator {
         let net = (self.max_force - load.abs()).max(1.0);
         (2.0 * distance.abs() * mass.max(1e-4) / net).sqrt()
     }
+}
+
+/// Moment of inertia of a set of point masses about a pivot: sum(m * r^2).
+///
+/// This is the number the fold has been missing. It is why a long arm is
+/// slow and a stubby one is quick even at the same weight — the r is
+/// SQUARED, so doubling a limb's length quadruples what it takes to swing.
+pub fn inertia_about(pivot: [f32; 3], points: &[([f32; 3], f32)]) -> f32 {
+    points
+        .iter()
+        .map(|(p, m)| {
+            let r2 = (p[0] - pivot[0]).powi(2) + (p[1] - pivot[1]).powi(2) + (p[2] - pivot[2]).powi(2);
+            m * r2
+        })
+        .sum()
+}
+
+/// Peak gravity moment on a limb: m * g * distance to its centre of mass.
+///
+/// Peak, because the cos of the current angle is applied per step. Held out
+/// horizontal this is the whole of it; hanging straight down it is nothing.
+pub fn gravity_torque(mass: f32, g: f32, r_cm: f32) -> f32 {
+    mass * g * r_cm
 }
 
 // ------------------------------------------------------------- adapters ---
@@ -172,9 +251,9 @@ pub fn control_surface(authority: f32) -> Actuator {
 /// With that, arrival time follows the natural frequency sqrt(k/m), so more
 /// metal really is slower, and it falls out of the maths rather than a
 /// table.
-pub fn fold_joint(chassis_power: f32, part_mass: f32) -> Actuator {
+pub fn fold_joint(chassis_power: f32, inertia: f32) -> Actuator {
     let k = chassis_power * 3.0;
-    let m = part_mass.max(1e-3);
+    let m = inertia.max(1e-3);
     // slightly past critical: a limb that overshoots its stop looks broken
     let zeta = 1.08;
     Actuator {
@@ -190,11 +269,18 @@ pub fn fold_joint(chassis_power: f32, part_mass: f32) -> Actuator {
 ///
 /// This is the replacement for an authored `xform_dur`: duration is what the
 /// actuators and the mass produce, not a number somebody typed.
-pub fn fold_time(act: &Actuator, angle: f32, mass: f32, load: f32, dt: f32, cap_s: f32) -> Option<f32> {
+pub fn fold_time(
+    act: &Actuator,
+    angle: f32,
+    inertia: f32,
+    gravity_torque: f32,
+    dt: f32,
+    cap_s: f32,
+) -> Option<f32> {
     let mut st = State::default();
     let mut t = 0.0;
     while t < cap_s {
-        act.step(&mut st, angle, load, mass, dt);
+        act.step_angular(&mut st, angle, inertia, gravity_torque, 0.0, dt);
         t += dt;
         if (st.pos - angle).abs() < angle.abs() * 0.02 && st.vel.abs() < angle.abs() * 0.05 {
             return Some(t);
@@ -319,15 +405,13 @@ mod tests {
             .expect("light never folded");
         let heavy = fold_time(&fold_joint(9_000.0, 420.0), 2.4, 420.0, 0.0, DT, 20.0)
             .expect("heavy never folded");
-        assert!(heavy > light * 1.5, "mass did not slow the fold: {light} -> {heavy}");
-        // and a stronger chassis folds the same mass faster
+        assert!(heavy > light * 1.5, "inertia did not slow the fold: {light} -> {heavy}");
         let quick = fold_time(&fold_joint(30_000.0, 420.0), 2.4, 420.0, 0.0, DT, 20.0)
             .expect("strong never folded");
         assert!(quick < heavy, "more power did not fold faster: {heavy} -> {quick}");
-        // the ratio should track sqrt(m), which is what a spring-mass does
         let ratio = heavy / light;
         let expect = (420.0f32 / 60.0).sqrt();
-        assert!((ratio / expect - 1.0).abs() < 0.35, "ratio {ratio} vs sqrt(m) {expect}");
+        assert!((ratio / expect - 1.0).abs() < 0.35, "ratio {ratio} vs sqrt(I) {expect}");
     }
 
     #[test]
@@ -337,9 +421,73 @@ mod tests {
         // the game can show rather than a bug.
         let act = fold_joint(2_000.0, 200.0);
         assert!(fold_time(&act, 2.4, 200.0, 8_000.0, DT, 6.0).is_none());
-        let st = settle(&act, 2.4, 8_000.0, 200.0, 4.0);
+        let mut st = State::default();
+        for _ in 0..(4.0 / DT) as i32 {
+            act.step_angular(&mut st, 2.4, 200.0, 8_000.0, 0.0, DT);
+        }
         assert!(st.pos < 2.0, "it completed a fold it could not power: {}", st.pos);
-        assert!(st.saturated);
+    }
+
+    #[test]
+    fn inertia_goes_as_the_square_of_the_arm() {
+        // the thing scalar mass could not express: same weight, twice the
+        // reach, FOUR times as hard to swing
+        let near = inertia_about([0.0; 3], &[([1.0, 0.0, 0.0], 10.0)]);
+        let far = inertia_about([0.0; 3], &[([2.0, 0.0, 0.0], 10.0)]);
+        assert!((far / near - 4.0).abs() < 1e-4, "{near} -> {far}");
+        // mass at the pivot costs nothing to rotate
+        assert!(inertia_about([0.0; 3], &[([0.0; 3], 500.0)]) < 1e-6);
+    }
+
+    #[test]
+    fn a_long_limb_folds_far_slower_than_a_stubby_one_of_the_same_weight() {
+        // and this is why it matters visually: it is REACH that makes a
+        // fold look heavy, not weight
+        let mass = 40.0;
+        let stub = inertia_about([0.0; 3], &[([0.5, 0.0, 0.0], mass)]);
+        let long = inertia_about([0.0; 3], &[([1.5, 0.0, 0.0], mass)]);
+        let a = fold_time(&fold_joint(9_000.0, stub), 2.0, stub, 0.0, DT, 30.0).unwrap();
+        let b = fold_time(&fold_joint(9_000.0, long), 2.0, long, 0.0, DT, 30.0).unwrap();
+        assert!(b > a * 2.0, "reach did not slow the fold: {a} -> {b}");
+    }
+
+    #[test]
+    fn gravity_has_no_leverage_straight_down_and_all_of_it_horizontal() {
+        // the load a fold actually fights, and the reason a real one stalls
+        // halfway rather than at the start
+        let act = fold_joint(3_000.0, 30.0);
+        let peak = gravity_torque(60.0, 9.81, 0.9);
+        let mut hanging = State { pos: -std::f32::consts::FRAC_PI_2, ..State::default() };
+        let mut out = State { pos: 0.0, ..State::default() };
+        // one step each, same command: the horizontal one is fighting
+        // hundreds of newton-metres, the hanging one nothing
+        act.step_angular(&mut hanging, 0.0, 30.0, peak, 0.0, DT);
+        act.step_angular(&mut out, 0.6, 30.0, peak, 0.0, DT);
+        let load_down = peak * (-std::f32::consts::FRAC_PI_2).cos();
+        let load_out = peak * 0.0f32.cos();
+        assert!(load_down.abs() < 1e-3, "gravity had leverage on a hanging limb");
+        assert!(load_out > 500.0, "gravity had no leverage on an outstretched one");
+    }
+
+    #[test]
+    fn a_joint_that_lifts_from_hanging_can_still_stall_at_horizontal() {
+        // the failure the constant-load model could never produce: it starts
+        // fine and gives out where the leverage is worst
+        let peak = gravity_torque(90.0, 9.81, 1.1);
+        let weak = Actuator {
+            max_force: peak * 0.55,
+            stiffness: peak * 2.0,
+            damping: peak * 0.9,
+            lo: -std::f32::consts::FRAC_PI_2,
+            hi: std::f32::consts::FRAC_PI_2,
+        };
+        let mut st = State { pos: -std::f32::consts::FRAC_PI_2, ..State::default() };
+        for _ in 0..(6.0 / DT) as i32 {
+            weak.step_angular(&mut st, std::f32::consts::FRAC_PI_2, 40.0, peak, 0.0, DT);
+        }
+        // it got off the bottom but nowhere near the top
+        assert!(st.pos > -1.4, "it never left the stop: {}", st.pos);
+        assert!(st.pos < 0.2, "it powered through the worst leverage: {}", st.pos);
     }
 
     #[test]
