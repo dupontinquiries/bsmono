@@ -5,7 +5,11 @@
 //! `gui`, which is what lets the CLI compile without pulling in eframe/vello.
 
 pub mod components;
-pub mod hud_pack;
+// GUI-gated: this is screen-space packing for the spatial view's HUD slabs and it
+// speaks in egui rects. Only tabs/chat.rs uses it, which is gui-only anyway —
+// declaring it unconditionally broke `--no-default-features`, the build the
+// features table advertises for a lean logscope-cli.
+#[cfg(feature = "gui")] pub mod hud_pack;
 pub mod gitmind_session;
 pub mod repo;
 // ── CLI closure (egui-free; always built) ────────────────────────────────────
@@ -103,7 +107,12 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] pub mod wizard;
 #[cfg(all(feature = "gui", feature = "gpu-scene"))] pub mod scene_preview;
 #[cfg(feature = "gui")] pub mod filepicker;
-#[cfg(feature = "gui")] pub mod workspace;
+// NOT gui-gated. workspace.rs imports `std::path` and nothing else — no egui, no
+// eframe — and diag.rs (which is deliberately ungated) calls its zip_store to
+// build the diagnostics bundle. Gating a pure-std module on the GUI meant the
+// diagnostics zip, the thing you most want when there is no GUI to look at,
+// could not be built in a lean build at all.
+pub mod workspace;
 #[cfg(feature = "gui")] pub mod vault;
 #[cfg(feature = "gui")] pub mod ast;
 #[cfg(feature = "gui")] pub mod vertices;
@@ -120,7 +129,10 @@ pub use logscope_fan::cmdpalette;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod genviz;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod palette;
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod corpus;
-#[cfg(feature = "gui")] #[allow(dead_code)] pub mod merge;
+// NOT gui-gated either: merge.rs describes itself as "pure, no deps" in its own
+// first line and has no egui reference in it, but workspace.rs calls
+// merge::scan_items — so the gate propagated up a chain of std-only modules.
+#[allow(dead_code)] pub mod merge;
 pub use logscope_fan::coordinator; // gui gate was vestigial: zero gui refs (fan compiles it standalone)
 #[cfg(feature = "gui")] #[allow(dead_code)] pub mod sandbox;
 #[allow(dead_code)] pub mod convograph; // pure (no egui) + imported by lean modules → not gui-gated
