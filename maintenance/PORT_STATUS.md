@@ -20,6 +20,13 @@ Snapshot of the last `parity_audit.py` run. It is a snapshot and it will drift �
 the tool is the truth, and this table exists so a reader who has not run it can
 see roughly where things stand.
 
+The table now reports TWO numbers. `named` is the upper bound — somebody at
+least knew the surface existed. `code` is the lower bound — something outside a
+comment references it. Neither is the truth, and the gap between them is where
+to go looking: WayfinderPage and GroupVoiceBar were both sitting at the top of
+that gap, counted as covered while one page drew a different feature and the
+other drew nothing.
+
 Read the percentage as a worklist, not a score. The detector matches a
 surface's NAME anywhere in the port, so it cannot tell a ported widget from a
 doc comment that mentions one; `parity_audit.py --why <Surface>` prints every
@@ -32,12 +39,12 @@ not see.
 
 | port | surfaces | covered | bin | catalogued | primary |
 |---|---|---|---|---|---|
-| bo-suite | 47 | 51% | yes | yes | — |
+| bo-suite | 47 | 51% named / 11% code | yes | yes | — |
 | bot-arena | 2 | 50% | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
-| snapclone | 51 | 57% | yes | yes | — |
-| voiceterm | 22 | 55% | yes | yes | **yes** |
+| snapclone | 51 | 59% named / 14% code | yes | yes | — |
+| voiceterm | 22 | 55% named / 41% code | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
 

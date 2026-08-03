@@ -163,6 +163,29 @@ def covered(name, text):
     reintroducing the transliteration bias."""
     return name in text or snake(name) in text
 
+
+def covered_in_code(name, text):
+    """The stricter reading: the name appears OUTSIDE a comment.
+
+    Two ports landed without moving the headline number, because both surfaces
+    were already "covered" by a mention — WayfinderPage counted while the page
+    drew the group-voice controls, and GroupVoiceBar counted while nothing drew
+    a bar at all.
+
+    But code-only is not the answer either, and the measurement says so: applied
+    alone it drops bo-suite from 51% to 11%, because the house style names the
+    Qt class in the MODULE DOC ("//! browse -- AlbumsPage, ArtistsPage") and
+    then uses idiomatic Rust names in the code. That is the same false negative
+    this tool already had once, in a new costume.
+
+    So neither number is the truth and the table reports BOTH. `named` is the
+    upper bound: somebody at least knew the surface existed. `code` is the lower
+    bound: something references it outside prose. A port sitting at a high
+    `named` and a low `code` is where to go looking — that gap is exactly where
+    WayfinderPage was hiding."""
+    code = '\n'.join(l for l in text.split('\n') if not l.lstrip().startswith(('//', '#', '*')))
+    return name in code or snake(name) in code
+
 def manifest_state(app_id):
     p = os.path.join(ROOT, 'manifest', 'projects.toml')
     try: t = open(p, encoding='utf8').read()
@@ -187,19 +210,24 @@ def main():
         surf = surfaces(d)
         text = port_text(d)
         hit = {s for s in surf if covered(s, text)}
+        wired = {s for s in surf if covered_in_code(s, text)}
         has_bin, app_default = cargo_state(d)
         in_man, primary, role = manifest_state(name + '-egui')
         rows.append({
             "app": name, "surfaces": len(surf), "covered": len(hit),
             "pct": round(100.0 * len(hit) / max(len(surf), 1)),
+            "wired": len(wired),
+            "wired_pct": round(100.0 * len(wired) / max(len(surf), 1)),
             "bin": has_bin, "app_default": app_default,
             "manifest": in_man, "primary": primary, "role": role,
             "missing": sorted(surf - hit)[:8],
         })
     w = max(len(r["app"]) for r in rows) if rows else 10
-    print(f"{'app':<{w}}  {'surfaces':>8} {'covered':>7} {'%':>4}  bin  app-def  manifest  primary")
+    print(f"{'app':<{w}}  {'surfaces':>8} {'named':>6} {'%':>4} {'code':>5} {'%':>4}  "
+          f"bin  app-def  manifest  primary")
     for r in rows:
-        print(f"{r['app']:<{w}}  {r['surfaces']:>8} {r['covered']:>7} {r['pct']:>3}%  "
+        print(f"{r['app']:<{w}}  {r['surfaces']:>8} {r['covered']:>6} {r['pct']:>3}% "
+              f"{r['wired']:>5} {r['wired_pct']:>3}%  "
               f"{'yes' if r['bin'] else ' no':>3}  {'yes' if r['app_default'] else ' no':>6}  "
               f"{'yes' if r['manifest'] else ' NO':>7}  {'yes' if r['primary'] else '  -':>6}")
     print()

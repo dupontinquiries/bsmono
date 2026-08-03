@@ -15,7 +15,7 @@ starts hidden with the auto-login ordering rule.
 
 | widget | status | notes |
 |---|---|---|
-| AddLandmarkDialog | pending |  |
+| AddLandmarkDialog | ported | landmark.rs — no-fix refusal, private-only V1, geohash7 helper |
 | AmbientBlobs | ported | uikit_egui::livebg (Aurora/Waves live background) |
 | AmbientCameraDriver | pending |  |
 | AmbientInboxDriver | pending |  |
