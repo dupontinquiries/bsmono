@@ -64,6 +64,7 @@ pub mod codefmt;
 pub mod docroute;
 pub mod manifest;
 pub mod interleave;
+pub mod dwell;
 pub mod panelvoice;
 pub mod injecttime;
 pub mod injectfork;
