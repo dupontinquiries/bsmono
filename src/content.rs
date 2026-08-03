@@ -71,6 +71,8 @@ pub struct Troop {
     /// which element it fights as, for `Element::advantage`
     pub element: Element,
     pub tint: [u8; 3],
+    /// ability ids; resolved through `ability()`
+    pub abilities: &'static [&'static str],
 }
 
 /// The `fire_mode` strings in the JSON, resolved. `suppress` and `beam` both
@@ -78,25 +80,25 @@ pub struct Troop {
 /// weapon-profile property rather than a different verb.
 pub const TROOPS: &[Troop] = &[
     // ---- player classes ----
-    Troop { id: "vanguard",    role: Role::PlayerClass, chassis: "standard",   fire: Verb::Push,   element: Element::Water,    tint: [150, 170, 200] },
-    Troop { id: "interceptor", role: Role::PlayerClass, chassis: "angular",    fire: Verb::Cone,   element: Element::Air,      tint: [170, 200, 190] },
-    Troop { id: "titan",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Chain,  element: Element::Electric, tint: [140, 150, 175] },
-    Troop { id: "specialist",  role: Role::PlayerClass, chassis: "strider",    fire: Verb::Beam,   element: Element::Ice,      tint: [160, 200, 220] },
-    Troop { id: "reaver",      role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Bank,   element: Element::Rock,     tint: [180, 165, 140] },
-    Troop { id: "warden",      role: Role::PlayerClass, chassis: "bruiser",    fire: Verb::Beam,   element: Element::Ice,      tint: [150, 185, 205] },
-    Troop { id: "pyre",        role: Role::PlayerClass, chassis: "angular",    fire: Verb::Flak,   element: Element::Fire,     tint: [220, 130, 70]  },
-    Troop { id: "prime",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210]  },
-    Troop { id: "scout",       role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Pool,   element: Element::Vine,     tint: [120, 180, 120] },
-    Troop { id: "siege",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Pool,   element: Element::Rock,     tint: [165, 150, 130] },
+    Troop { id: "vanguard",    role: Role::PlayerClass, chassis: "standard",   fire: Verb::Push,   element: Element::Water,    tint: [150, 170, 200], abilities: &["dash", "overclock"] },
+    Troop { id: "interceptor", role: Role::PlayerClass, chassis: "angular",    fire: Verb::Cone,   element: Element::Air,      tint: [170, 200, 190], abilities: &["dash", "cloak"] },
+    Troop { id: "titan",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Chain,  element: Element::Electric, tint: [140, 150, 175], abilities: &["shield", "turret"] },
+    Troop { id: "specialist",  role: Role::PlayerClass, chassis: "strider",    fire: Verb::Beam,   element: Element::Ice,      tint: [160, 200, 220], abilities: &["cloak", "blink"] },
+    Troop { id: "reaver",      role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Bank,   element: Element::Rock,     tint: [180, 165, 140], abilities: &["dash", "pulse"] },
+    Troop { id: "warden",      role: Role::PlayerClass, chassis: "bruiser",    fire: Verb::Beam,   element: Element::Ice,      tint: [150, 185, 205], abilities: &["shield", "resonance"] },
+    Troop { id: "pyre",        role: Role::PlayerClass, chassis: "angular",    fire: Verb::Flak,   element: Element::Fire,     tint: [220, 130, 70], abilities: &["overclock", "pulse"] },
+    Troop { id: "prime",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210], abilities: &["shield", "resonance"] },
+    Troop { id: "scout",       role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Pool,   element: Element::Vine,     tint: [120, 180, 120], abilities: &["hover", "dash"] },
+    Troop { id: "siege",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Pool,   element: Element::Rock,     tint: [165, 150, 130], abilities: &["turret", "shield"] },
     // ---- hostiles: what patrol has been missing ----
-    Troop { id: "grunt",            role: Role::Enemy, chassis: "standard", fire: Verb::Push,   element: Element::None,     tint: [130, 130, 140] },
-    Troop { id: "blackstar_raider", role: Role::Enemy, chassis: "angular",  fire: Verb::Pierce, element: Element::Electric, tint: [70, 70, 90]    },
-    Troop { id: "ravager",          role: Role::Enemy, chassis: "bruiser",  fire: Verb::Flak,   element: Element::Fire,     tint: [180, 90, 60]   },
-    Troop { id: "slipstream",       role: Role::Enemy, chassis: "raptor",   fire: Verb::Cone,   element: Element::Air,      tint: [160, 190, 200] },
+    Troop { id: "grunt",            role: Role::Enemy, chassis: "standard", fire: Verb::Push,   element: Element::None,     tint: [130, 130, 140], abilities: &[] },
+    Troop { id: "blackstar_raider", role: Role::Enemy, chassis: "angular",  fire: Verb::Pierce, element: Element::Electric, tint: [70, 70, 90], abilities: &["dash"] },
+    Troop { id: "ravager",          role: Role::Enemy, chassis: "bruiser",  fire: Verb::Flak,   element: Element::Fire,     tint: [180, 90, 60], abilities: &["shield"] },
+    Troop { id: "slipstream",       role: Role::Enemy, chassis: "raptor",   fire: Verb::Cone,   element: Element::Air,      tint: [160, 190, 200], abilities: &["hover", "dash"] },
     // ---- elemental variants ----
-    Troop { id: "ashfall_lancer",     role: Role::Variant, chassis: "raptor",   fire: Verb::Flak,     element: Element::Fire, tint: [210, 110, 60]  },
-    Troop { id: "hoarfrost_sentinel", role: Role::Variant, chassis: "sentinel", fire: Verb::Beam,     element: Element::Ice,  tint: [170, 215, 235] },
-    Troop { id: "magma_breaker",      role: Role::Variant, chassis: "bruiser",  fire: Verb::Pool,     element: Element::Fire, tint: [200, 80, 40]   },
+    Troop { id: "ashfall_lancer",     role: Role::Variant, chassis: "raptor",   fire: Verb::Flak,     element: Element::Fire, tint: [210, 110, 60], abilities: &["overclock"] },
+    Troop { id: "hoarfrost_sentinel", role: Role::Variant, chassis: "sentinel", fire: Verb::Beam,     element: Element::Ice,  tint: [170, 215, 235], abilities: &["shield", "resonance"] },
+    Troop { id: "magma_breaker",      role: Role::Variant, chassis: "bruiser",  fire: Verb::Pool,     element: Element::Fire, tint: [200, 80, 40], abilities: &["pulse"] },
 ];
 
 pub fn troop(id: &str) -> Option<&'static Troop> {
@@ -241,5 +243,245 @@ mod tests {
         let late: Vec<&str> = FILMS[3..].iter().flat_map(|f| f.theatres.iter().copied()).collect();
         let new = late.iter().filter(|t| !early.contains(t)).count();
         assert!(new >= 4, "trilogy two revisits trilogy one's map ({new} new theatres)");
+    }
+}
+
+// ----------------------------------------------------------- abilities ---
+//
+// Referenced by the troop records and dropped on the first pass. A perk is
+// always on and multiplies something; an active is a thing you press.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AbilityKind {
+    Perk,
+    Active,
+}
+
+pub struct Ability {
+    pub id: &'static str,
+    pub kind: AbilityKind,
+    /// what it multiplies or deploys, as the C engine named it
+    pub effect: &'static str,
+    pub value: f32,
+}
+
+pub const ABILITIES: &[Ability] = &[
+    Ability { id: "hover",     kind: AbilityKind::Perk,   effect: "jump_mul",     value: 1.25 },
+    Ability { id: "dash",      kind: AbilityKind::Perk,   effect: "move_mul",     value: 1.12 },
+    Ability { id: "shield",    kind: AbilityKind::Perk,   effect: "deploy_armor", value: 40.0 },
+    Ability { id: "cloak",     kind: AbilityKind::Perk,   effect: "detect_mul",   value: 0.60 },
+    // fire_mul below 1 is FASTER: it scales the cooldown, not the rate
+    Ability { id: "overclock", kind: AbilityKind::Perk,   effect: "fire_mul",     value: 0.80 },
+    Ability { id: "turret",    kind: AbilityKind::Active, effect: "deploy_sentry", value: 12.0 },
+    Ability { id: "resonance", kind: AbilityKind::Active, effect: "shock_pulse",  value: 1.0 },
+    Ability { id: "pulse",     kind: AbilityKind::Active, effect: "cone_blast",   value: 1.0 },
+    Ability { id: "blink",     kind: AbilityKind::Active, effect: "teleport",     value: 1.0 },
+];
+
+pub fn ability(id: &str) -> Option<&'static Ability> {
+    ABILITIES.iter().find(|a| a.id == id)
+}
+
+// ---------------------------------------------------------- commanders ---
+//
+// Five archetypes with four dials each. They are the reason a squad of
+// grunts is not just more grunts: the same troops under an aggressor and
+// under a baiter play differently. The C engine sourced the flavour from
+// Sun Tzu (Giles, 1910 — public domain), which is where the encirclement
+// and tempo principles come from too.
+
+pub struct Commander {
+    pub id: &'static str,
+    pub aggression: f32,
+    pub caution: f32,
+    /// how strongly the squad tries to get around you rather than at you
+    pub encircle: f32,
+    /// how readily it breaks off and reforms
+    pub regroup: f32,
+    pub desc: &'static str,
+}
+
+pub const COMMANDERS: &[Commander] = &[
+    Commander { id: "aggressor",  aggression: 0.85, caution: 0.15, encircle: 0.30, regroup: 0.20,
+        desc: "presses relentlessly; concentrates on the player and rarely yields ground" },
+    Commander { id: "surrounder", aggression: 0.60, caution: 0.30, encircle: 0.90, regroup: 0.40,
+        desc: "uses numbers to encircle, then closes the ring" },
+    Commander { id: "skirmisher", aggression: 0.55, caution: 0.55, encircle: 0.50, regroup: 0.75,
+        desc: "trades and withdraws; never commits to a line it cannot leave" },
+    Commander { id: "baiter",     aggression: 0.45, caution: 0.65, encircle: 0.65, regroup: 0.60,
+        desc: "offers a target worth chasing, and chooses the ground you chase it onto" },
+    Commander { id: "warden",     aggression: 0.35, caution: 0.85, encircle: 0.25, regroup: 0.85,
+        desc: "holds; gives ground slowly and makes every metre cost something" },
+];
+
+pub fn commander(id: &str) -> Option<&'static Commander> {
+    COMMANDERS.iter().find(|c| c.id == id)
+}
+
+// ------------------------------------------------------------- missions ---
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Objective {
+    Eliminate,
+    Survive,
+    Breach,
+    Control,
+    Protect,
+}
+
+pub struct Mission {
+    pub order: u8,
+    pub id: &'static str,
+    /// which film this beat belongs to
+    pub film: u8,
+    /// the patrol destination it is sited on
+    pub dest: &'static str,
+    /// the named place within it — the C engine's map names are locales, not
+    /// worlds, and four of the eight are somewhere on Earth
+    pub site: &'static str,
+    pub objective: Objective,
+    /// the troop that leads the opposition, if one does
+    pub champion: Option<&'static str>,
+    pub beat: &'static str,
+}
+
+pub const MISSIONS: &[Mission] = &[
+    Mission { order: 1, id: "the_pluto_line", film: 1, dest: "pluto", site: "the outer containment line",
+        objective: Objective::Eliminate, champion: Some("hoarfrost_sentinel"),
+        beat: "hold the outer containment line; Cryotek attacks" },
+    Mission { order: 2, id: "the_scavenger_king", film: 1, dest: "outer_rim", site: "the Kuiper drift",
+        objective: Objective::Eliminate, champion: Some("blackstar_raider"),
+        beat: "Blackstar, the Kuiper warlord" },
+    Mission { order: 3, id: "the_red_extraction", film: 1, dest: "mars", site: "the extraction rig",
+        objective: Objective::Breach, champion: None,
+        beat: "tear the Mars extraction rig apart; the shard is already gone" },
+    Mission { order: 4, id: "the_beach_opens", film: 1, dest: "earth", site: "the beach",
+        objective: Objective::Protect, champion: None,
+        beat: "Earth's shore tears open; get the civilians clear" },
+    Mission { order: 5, id: "what_jhiaxus_grew", film: 2, dest: "earth", site: "the vault",
+        objective: Objective::Eliminate, champion: None,
+        beat: "the architect of the Corrupted" },
+    Mission { order: 6, id: "the_mantle_dive", film: 2, dest: "earth", site: "the foundry",
+        objective: Objective::Control, champion: None,
+        beat: "Hot Rod becomes Rodimus" },
+    Mission { order: 7, id: "the_drowned_approach", film: 2, dest: "earth", site: "the trench",
+        objective: Objective::Survive, champion: None,
+        beat: "hold the descent as the Corrupted converge on the wound" },
+    Mission { order: 8, id: "beneath_the_pacific", film: 3, dest: "cybertron", site: "the gravity well",
+        objective: Objective::Eliminate, champion: None,
+        beat: "Unicron; the truce; the gravity well" },
+];
+
+pub fn missions_of(film: u8) -> impl Iterator<Item = &'static Mission> {
+    MISSIONS.iter().filter(move |m| m.film == film)
+}
+
+// ---------------------------------------------------------------- modes ---
+
+pub struct GameMode {
+    pub id: &'static str,
+    /// 0 means endless
+    pub waves: u32,
+    pub endless: bool,
+}
+
+pub const MODES: &[GameMode] = &[
+    GameMode { id: "arena_fight", waves: 8, endless: false },
+    GameMode { id: "survival",    waves: 0, endless: true },
+    GameMode { id: "stalkers",    waves: 0, endless: true },
+    GameMode { id: "defense",     waves: 10, endless: false },
+];
+
+#[cfg(test)]
+mod content2_tests {
+    use super::*;
+    use crate::patrol;
+
+    #[test]
+    fn every_troop_ability_exists() {
+        for t in TROOPS {
+            for a in t.abilities {
+                assert!(ability(a).is_some(), "{} has unknown ability {a}", t.id);
+            }
+            assert!(t.abilities.len() <= 3, "{} carries {} abilities", t.id, t.abilities.len());
+        }
+        // player classes should all bring something; a plain grunt need not
+        for t in TROOPS.iter().filter(|t| t.role == Role::PlayerClass) {
+            assert!(!t.abilities.is_empty(), "{} has no abilities at all", t.id);
+        }
+    }
+
+    #[test]
+    fn perks_and_actives_are_told_apart() {
+        assert_eq!(ABILITIES.len(), 9);
+        assert!(ABILITIES.iter().any(|a| a.kind == AbilityKind::Perk));
+        assert!(ABILITIES.iter().any(|a| a.kind == AbilityKind::Active));
+        // the one that reads backwards: fire_mul BELOW one is faster,
+        // because it scales the cooldown rather than the rate
+        let o = ability("overclock").unwrap();
+        assert!(o.value < 1.0 && o.effect == "fire_mul");
+        // and the multipliers are all sane rather than accidentally zero
+        for a in ABILITIES.iter().filter(|a| a.effect.ends_with("_mul")) {
+            assert!(a.value > 0.1 && a.value < 3.0, "{} has mul {}", a.id, a.value);
+        }
+    }
+
+    #[test]
+    fn commander_dials_are_in_range_and_actually_differ() {
+        for c in COMMANDERS {
+            for (n, v) in [("aggression", c.aggression), ("caution", c.caution),
+                           ("encircle", c.encircle), ("regroup", c.regroup)] {
+                assert!((0.0..=1.0).contains(&v), "{} {n} is {v}", c.id);
+            }
+        }
+        // aggression and caution should oppose, or the archetypes are noise
+        let agg = commander("aggressor").unwrap();
+        let war = commander("warden").unwrap();
+        assert!(agg.aggression > war.aggression && agg.caution < war.caution);
+        // and the surrounder should be the one that surrounds
+        assert!(COMMANDERS.iter().all(|c| c.id == "surrounder"
+            || c.encircle <= commander("surrounder").unwrap().encircle));
+    }
+
+    #[test]
+    fn every_mission_is_sited_somewhere_real() {
+        for m in MISSIONS {
+            assert!(patrol::find(m.dest).is_some(), "{} is sited on unknown {}", m.id, m.dest);
+            assert!(film(m.film).is_some(), "{} belongs to no film", m.id);
+            if let Some(c) = m.champion {
+                assert!(troop(c).is_some(), "{} is led by unknown troop {c}", m.id);
+            }
+        }
+    }
+
+    #[test]
+    fn the_campaign_is_ordered_and_unique() {
+        for (i, m) in MISSIONS.iter().enumerate() {
+            assert_eq!(m.order as usize, i + 1, "{} is out of order", m.id);
+            assert!(MISSIONS.iter().skip(i + 1).all(|o| o.id != m.id), "duplicate {}", m.id);
+        }
+        // films run forward: a later mission never belongs to an earlier film
+        let mut f = 0;
+        for m in MISSIONS {
+            assert!(m.film >= f, "{} goes back to film {}", m.id, m.film);
+            f = m.film;
+        }
+    }
+
+    #[test]
+    fn the_first_trilogy_has_missions_and_the_second_does_not_yet() {
+        for n in 1..=3u8 {
+            assert!(missions_of(n).count() > 0, "film {n} has no missions");
+        }
+        // trilogy two is scripted but unwritten as missions; asserting it so
+        // the gap is recorded rather than discovered
+        assert_eq!(missions_of(4).count() + missions_of(5).count() + missions_of(6).count(), 0);
+    }
+
+    #[test]
+    fn modes_agree_with_themselves() {
+        for m in MODES {
+            assert_eq!(m.endless, m.waves == 0, "{} disagrees about being endless", m.id);
+        }
     }
 }
