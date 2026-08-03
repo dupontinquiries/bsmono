@@ -3383,11 +3383,22 @@ impl Gpu {
             //
             // The cost is a staging copy for weights past the ceiling instead of a zero-copy write.
             // The benefit is that a model larger than 32 GiB resident can load at all.
-            const MAPPED_CEILING: u64 = 24 << 30;   // conservative against the observed ~31 GiB
+            // THE UNMAPPED FALLBACK DID NOT WORK EITHER. With slabs past 24 GiB created unmapped, the
+            // load failed in Queue::write_buffer on an unmapped `arena-slab` at the same total. So
+            // mapping was never the discriminator — the device will not hold more than ~31 GiB of
+            // buffers at once, however they are created.
+            //
+            // The switch is kept because it costs nothing and an unmapped slab is the right shape for
+            // a staged write, but it is NOT a fix and must not read as one. The real answer is that a
+            // resident plan over the concurrent ceiling does not fit, which memplan now checks before
+            // the load starts rather than discovering forty seconds in.
+            const MAPPED_CEILING: u64 = 24 << 30;
             if a.mapped && (a.slabs.len() as u64 + 1) * a.slab_size > MAPPED_CEILING {
                 eprintln!("wgpu-engine: arena reached {:.1} GiB of MAPPED slabs — the device refuses \
 mapped allocations past about 31 GiB regardless of slab size (measured at both 1 and 2 GiB). \
-Remaining slabs use the staged write instead of the zero-copy one.",
+Remaining slabs use the staged write instead of the zero-copy one — though a run with this fallback \
+active still failed in write_buffer at the same total, so this defers the wall rather than removing \
+it.",
                     (a.slabs.len() as u64 * a.slab_size) as f64 / (1u64 << 30) as f64);
                 a.mapped = false;
                 a.used = a.slab_size;   // force a fresh slab; the current one keeps its mapping
