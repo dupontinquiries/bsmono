@@ -566,6 +566,49 @@ mod doubt_tests {
 /// Uniform routing would give 6/16 = 37.5%. **Anything well above that is the LFRU policy earning its
 /// place**, and anything at or below it means the policy is not tracking the routing — a different
 /// and much worse problem than a small pin set.
+/// How well the routing PREDICTION did, which is a different lever from the pin set.
+///
+/// The pin set answers "which experts are always here"; prediction answers "which will be wanted
+/// next", and it is the one that can overlap a fetch with compute instead of stalling on it. Both
+/// counters exist (`prefetched`, `prefetch_hits`) behind `LOGSCOPE_MOE_PREFETCH`, and neither was
+/// reported — so the flag has never been judgeable.
+///
+/// **A mispredict is not free.** It spends a fill's bandwidth on an expert nobody wanted, and on a
+/// model streaming 10 of 16 that bandwidth is the scarce thing. So the useful threshold is not "is it
+/// above zero" but "does it beat the cost of being wrong".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PrefetchAccuracy {
+    pub issued: u64,
+    pub hits: u64,
+}
+
+impl PrefetchAccuracy {
+    pub fn rate(&self) -> f64 {
+        if self.issued == 0 { return 0.0; }
+        self.hits as f64 / self.issued as f64
+    }
+
+    /// A prefetch pays when a hit saves a stalled fetch and a miss costs a wasted one, so it is worth
+    /// having above 50% and actively harmful below — it is then spending bandwidth to slow the model
+    /// down.
+    pub fn verdict(&self) -> String {
+        if self.issued == 0 {
+            return "routing prefetch not enabled (LOGSCOPE_MOE_PREFETCH=1) — untested on this model"
+                .to_string();
+        }
+        let r = self.rate();
+        format!("routing prefetch — {:.0}% of {} speculative fills were wanted: {}",
+            r * 100.0, self.issued,
+            if r >= 0.7 {
+                "the coupling table is predicting well, and overlapping the fetch with compute is where the remaining decode time goes"
+            } else if r >= 0.5 {
+                "marginally worth its bandwidth — a hit saves a stalled fetch and a miss wastes one, so this is near the break-even"
+            } else {
+                "BELOW BREAK-EVEN — more fills are wasted than saved, so prefetch is spending scarce bandwidth to make decode slower and should be off until the table learns"
+            })
+    }
+}
+
 pub struct ExpertResidency {
     pub hits: u64,
     pub fills: u64,
@@ -610,6 +653,42 @@ more experts and should convert directly into tokens", base * 100.0)
             hr * 100.0, self.hits, self.fills,
             self.bytes as f64 / (1u64 << 30) as f64, self.repins, self.pinned, self.total,
             if tokens == 0 { 0.0 } else { self.bytes as f64 / tokens as f64 / (1u64 << 20) as f64 })
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    #[test]
+    fn below_half_is_named_as_ACTIVELY_HARMFUL() {
+        // A hit saves a stalled fetch and a miss wastes one, so under 50% it is spending the scarce
+        // resource to slow the model down. "Low accuracy" would read as merely unhelpful.
+        let v = PrefetchAccuracy { issued: 100, hits: 30 }.verdict();
+        assert!(v.contains("BELOW BREAK-EVEN"));
+        assert!(v.contains("slower"));
+    }
+
+    #[test]
+    fn a_good_rate_points_at_OVERLAP_as_the_next_lever() {
+        // If the table predicts well, the remaining cost is the fetch not being hidden behind
+        // compute — a structural change rather than a policy one.
+        assert!(PrefetchAccuracy { issued: 100, hits: 85 }.verdict().contains("overlapping the fetch"));
+    }
+
+    #[test]
+    fn a_disabled_prefetch_says_UNTESTED_rather_than_zero_percent() {
+        // 0% would read as a broken predictor on a model that never ran one.
+        let v = PrefetchAccuracy { issued: 0, hits: 0 }.verdict();
+        assert!(v.contains("not enabled"));
+        assert!(!v.contains("0%"));
+    }
+
+    #[test]
+    fn the_break_even_band_is_called_MARGINAL_not_good() {
+        // 55% is not a success; it is barely paying for itself, and reporting it as working would
+        // retire a question that is still open.
+        assert!(PrefetchAccuracy { issued: 100, hits: 55 }.verdict().contains("break-even"));
     }
 }
 
