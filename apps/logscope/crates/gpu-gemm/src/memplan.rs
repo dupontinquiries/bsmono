@@ -1362,6 +1362,34 @@ const _STREAM_PLAN_HAS_NO_EXECUTOR: () = ();
 /// the wrong one.
 pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
 
+/// The ceiling is on CONCURRENT BUFFER ALLOCATION, not on mapping.
+///
+/// I concluded "total mapped bytes" from two slab-size runs and shipped a fallback that creates later
+/// slabs unmapped. It failed too — in `Queue::write_buffer`, on an unmapped `arena-slab`, at the same
+/// total. So mapping was never the discriminator: the device will not hold more than about 31 GiB of
+/// buffers at once, however they are created.
+///
+/// Three measurements now agree on the total and disagree on everything else:
+///
+/// ```text
+/// 2048 MiB mapped slabs   refused at slab 16   30.0 GiB placed
+/// 1024 MiB mapped slabs   refused at slab 32   31.0 GiB placed
+/// 1024 MiB, unmapped past 24 GiB               failed in write_buffer at the same total
+/// ```
+///
+/// **`--gate-vram`'s 63 GiB is not reachable by a resident load.** The probe allocates and releases,
+/// so it measures the largest allocation the device will accept — not how much it will hold
+/// concurrently. Those are different questions and the loader has been asking the wrong one.
+///
+/// Consequence: a model needing more than this resident does not fit, and streaming is not a fallback
+/// but the only path. Scout at 56.6 GiB is comfortably over.
+pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
+
+/// Does a resident plan fit within what this device will hold at once?
+pub fn resident_fits_concurrent(resident_gib: f64, conservative_vma: bool) -> bool {
+    !conservative_vma || resident_gib <= ASAHI_CONCURRENT_BUFFER_GIB
+}
+
 #[cfg(test)]
 mod mapped_ceiling_tests {
     use super::*;
@@ -1375,6 +1403,17 @@ mod mapped_ceiling_tests {
         assert!((at_2gib - at_1gib).abs() <= 1.0,
             "{at_2gib} GiB and {at_1gib} GiB are the same ceiling within one slab");
         assert!(at_1gib <= ASAHI_MAPPED_CEILING_GIB);
+    }
+
+    #[test]
+    fn a_resident_plan_over_the_concurrent_ceiling_is_refused_EARLY() {
+        // Scout needs 56.6 GiB resident. Three runs proved the device holds about 31 GiB of buffers
+        // at once, mapped or not — so this is not a close call to be attempted and recovered from, it
+        // is a refusal to make before spending forty seconds of quantization on it.
+        assert!(!resident_fits_concurrent(56.6, true), "Scout does not fit resident on Honeykrisp");
+        assert!(resident_fits_concurrent(17.1, true), "Qwen3-30B does, which is why it loads");
+        // And a device without the constraint is unaffected.
+        assert!(resident_fits_concurrent(120.0, false));
     }
 
     #[test]
