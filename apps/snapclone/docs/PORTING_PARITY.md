@@ -46,13 +46,13 @@ starts hidden with the auto-login ordering rule.
 | ModalSurface | ported | modal.rs — six layers, derived scrim, tap-outside, dismissTopmost ordering |
 | MonthlyExportReminder | ported | export_reminder.rs `ReminderState` — pure should_show over month key |
 | OutboxWidget | ported | session.rs `Outbox` — transport phases, delivered is terminal, 24h prune of delivered only |
-| PagePeelHint | pending |  |
+| PagePeelHint | ported | nav_chrome.rs `PeelHint` — breath, duck-and-return, retires after 4 swipes |
 | PressGesture | pending |  |
 | QrCodeRenderer | pending |  |
 | QrScanDialog | ported | qr.rs `QrScan` — four payload forms, port-overflow rejection, decode latch, manual fallback |
 | RingtoneSynth | ported | ring.rs `render_mono` — E5-C#5-A4 bells, feedback comb, silent loop point |
 | ScrollAreas | pending |  |
-| SegmentedTabStrip | pending |  |
+| SegmentedTabStrip | ported | nav_chrome.rs `TabStrip` — equal segments, underline, badge pills |
 | SettingsPage | partial | sub-tab table only; 4680-line page body pending |
 | SmartRibbon | pending |  |
 | SnapComposerDialog | pending |  |

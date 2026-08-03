@@ -34,6 +34,7 @@ pub mod wayfinder;
 pub mod voicebar;
 pub mod landmark;
 pub mod export_reminder;
+pub mod nav_chrome;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -151,6 +152,8 @@ pub struct Snapclone {
     pub recent_snaps: Vec<String>,
     /// Set when the user asks to export; the host runs the actual zip.
     pub export_requested: bool,
+    /// The swipe affordance. Retires itself after four swipes.
+    pub peel: crate::nav_chrome::PeelHint,
     /// Our own position, when the device has a fix. `None` is a real state, not
     /// a placeholder: without it nobody can be placed geographically.
     pub self_fix: Option<crate::wayfinder::Fix>,
@@ -204,6 +207,7 @@ impl Snapclone {
             now_month: None,
             recent_snaps: Vec::new(),
             export_requested: false,
+            peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             self_fix: None,
             wayfinder_contacts: Vec::new(),
             wayfinder_snaps: Vec::new(),
@@ -293,6 +297,10 @@ impl Snapclone {
     /// Swipe between top-level pages (unless drilled into a subpage — then swipe is off so the
     /// content can scroll/interact).
     pub fn swipe_page(&mut self, sign: i32) {
+        // Counted here rather than at the gesture layer so a swipe that is
+        // REFUSED — blocked by a dialog, or at the end of the pages — does not
+        // count toward familiarity. The user has not learned anything from a
+        // gesture that did nothing.
         // A swipe under an open dialog would change the page out from under it
         // and leave the dialog floating over a screen it has nothing to do
         // with. This is what Qt's stackChanged signal exists to let callers
@@ -305,7 +313,9 @@ impl Snapclone {
         }
         let n = PAGES.len() as i32;
         let next = (self.nav.page() as i32 + sign).clamp(0, n - 1) as usize;
+        if next != self.nav.page() { self.peel.note_swipe(); }
         self.nav.go_page(next);
+        self.peel.set_page(next, PAGES.len());
     }
 
     /// Advance the animation; call once per frame with the frame delta.
@@ -523,6 +533,10 @@ impl Snapclone {
         if let Some(dir) = frame.page_jump {
             self.swipe_page(dir.sign());
         }
+
+        // The peel hints ride over the page area, under everything else.
+        self.peel.set_page(self.nav.page(), PAGES.len());
+        crate::nav_chrome::peel_ui(ui, &mut self.peel, surface, &colors);
 
         // The voice bar sits above the page content while a session is live, so
         // the floor holder, the mic level and the talk button are reachable
@@ -801,6 +815,32 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn a_refused_swipe_does_not_count_toward_learning_the_gesture() {
+        // The user has not learned anything from a gesture that did nothing.
+        let mut s = app();
+        assert_eq!(s.nav.page(), 0);
+        s.swipe_page(-1);
+        assert_eq!(s.peel.swipes(), 0, "swiping past the first page taught nothing");
+        s.swipe_page(1);
+        assert_eq!(s.peel.swipes(), 1);
+    }
+
+    #[test]
+    fn a_swipe_blocked_by_a_dialog_does_not_count_either() {
+        let mut s = app();
+        s.open_qr_scan(true);
+        s.swipe_page(1);
+        assert_eq!(s.peel.swipes(), 0);
+    }
+
+    #[test]
+    fn the_hint_retires_after_four_real_swipes() {
+        let mut s = app();
+        for _ in 0..4 { s.swipe_page(1); }
+        assert!(s.peel.retired(), "four pages in, the gesture is learned");
     }
 
     #[test]
