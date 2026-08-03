@@ -759,3 +759,144 @@ mod placement_tests {
         assert!(dot < 0.0, "the face must look inward, got {dot}");
     }
 }
+
+/// A peer machine's standing in the network.
+///
+/// **Three states look identical if drawn carelessly, and mean opposite things.** A machine that is
+/// stalled is working and waiting; one that is idle is reachable with nothing to do; one that is
+/// unreachable is telling you nothing at all. Drawing all three as "not moving" would make the
+/// network view actively misleading — you would go and check a machine that is fine, and ignore one
+/// that has fallen off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Standing {
+    /// This device. Always drawn, always trusted.
+    Local,
+    /// Paired, reporting, and doing work.
+    Working,
+    /// Paired, reporting, nothing to do. **Not a fault** — a spare machine looks like this.
+    Idle,
+    /// Paired and not heard from within the freshness window.
+    Silent { since_s: u32 },
+    /// Known, and its last report was an error.
+    Faulted,
+}
+
+impl Standing {
+    /// How the mechanism should read.
+    ///
+    /// Idle and Silent must not look the same, which is the entire reason this enum exists: a
+    /// mechanism at rest is a machine with nothing to do, and a mechanism that has gone DARK is one
+    /// nobody has heard from. Rest is a posture; dark is an absence.
+    pub fn appearance(self) -> &'static str {
+        match self {
+            Standing::Local => "lit and detailed, the one you are standing next to",
+            Standing::Working => "lit, its parts moving in time with its own load",
+            Standing::Idle => "lit and at rest — nothing to do, which is not the same as nothing working",
+            Standing::Silent { .. } => "unlit and translucent, present on the map but not reporting",
+            Standing::Faulted => "lit and askew, a part visibly out of place",
+        }
+    }
+
+    /// Should the viewer be drawn to it?
+    ///
+    /// Idle is deliberately NOT attention-worthy. A network view that highlights every resting
+    /// machine is one where the highlight means nothing.
+    pub fn wants_attention(self) -> bool {
+        matches!(self, Standing::Silent { .. } | Standing::Faulted)
+    }
+}
+
+/// One machine in the network, positioned relative to the local one.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Peer {
+    /// The pairing code's first group — what a person reads aloud to identify a machine.
+    pub short_id: String,
+    pub standing: Standing,
+    pub parts: Parts,
+}
+
+/// Arrange peers around the local machine.
+///
+/// A ring, at the same bearing rule as the solo landmark so the local machine stays where the eye
+/// already goes and peers fan out from it. Returns the yaw for each, in the order given.
+///
+/// **Stable ordering matters more than optimal spacing**: a machine that moves position between
+/// frames because another joined is a machine you cannot learn the location of, and the whole value
+/// of a spatial view is that position carries identity.
+pub fn ring_yaws(peers: usize) -> Vec<f32> {
+    if peers == 0 { return Vec::new(); }
+    // A lone peer belongs ON the bearing, not at the fan's left edge. My first version subtracted
+    // half the span unconditionally, so one machine sat 80 degrees off from where a viewer has
+    // learned to look — and the single-peer case is the common one on a two-machine setup.
+    if peers == 1 { return vec![BEARING_YAW]; }
+    let span = std::f32::consts::PI * 0.9;      // a fan behind-left, not a full circle
+    let step = span / (peers - 1) as f32;
+    (0..peers).map(|i| BEARING_YAW - span * 0.5 + step * i as f32).collect()
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+
+    #[test]
+    fn IDLE_and_SILENT_do_not_look_the_same() {
+        // The entire reason Standing exists. A mechanism at rest is a machine with nothing to do; one
+        // gone dark is one nobody has heard from. Rest is a posture, dark is an absence.
+        assert_ne!(Standing::Idle.appearance(), Standing::Silent { since_s: 60 }.appearance());
+        assert!(Standing::Idle.appearance().contains("at rest"));
+        assert!(Standing::Silent { since_s: 60 }.appearance().contains("not reporting"));
+    }
+
+    #[test]
+    fn IDLE_does_not_ask_for_attention_and_SILENT_does() {
+        // A network view that highlights every resting machine is one where the highlight means
+        // nothing — and a spare box sitting ready is the most common state in a small cluster.
+        assert!(!Standing::Idle.wants_attention());
+        assert!(!Standing::Working.wants_attention());
+        assert!(Standing::Silent { since_s: 30 }.wants_attention());
+        assert!(Standing::Faulted.wants_attention());
+    }
+
+    #[test]
+    fn a_STALLED_local_machine_is_still_Working() {
+        // Standing is about the NETWORK; Motion is about the work. A local machine 99% blocked on
+        // readbacks is present and busy, and conflating that with an unreachable peer would send
+        // someone to check the network when the problem is a kernel.
+        let p = Peer {
+            short_id: "K7M2P".into(),
+            standing: Standing::Local,
+            parts: Parts::from_state(6, 16, None, Motion::Stalled, 0.46),
+        };
+        assert!(!p.standing.wants_attention(), "a stall is a Motion concern, not a Standing one");
+        assert_eq!(p.parts.drive, 0.0);
+    }
+
+    #[test]
+    fn the_ring_ORDER_is_stable_for_a_given_count() {
+        // Position carries identity in a spatial view, so the same input must give the same layout.
+        assert_eq!(ring_yaws(4), ring_yaws(4));
+    }
+
+    #[test]
+    fn peers_fan_out_rather_than_encircling() {
+        // A full circle puts machines behind the viewer where they cannot be seen without turning,
+        // which defeats the point of glanceability.
+        let y = ring_yaws(5);
+        let spread = y.last().unwrap() - y.first().unwrap();
+        assert!(spread < std::f32::consts::PI, "a fan, not a ring: {spread}");
+        assert!(spread > 1.0, "and wide enough to tell them apart");
+    }
+
+    #[test]
+    fn a_SINGLE_peer_sits_on_the_bearing_itself() {
+        // With nothing to fan out from, the one peer belongs exactly where the eye already goes.
+        let y = ring_yaws(1);
+        assert_eq!(y.len(), 1);
+        assert!((y[0] - BEARING_YAW).abs() < 1e-4);
+    }
+
+    #[test]
+    fn no_peers_yields_no_positions_rather_than_one_at_the_origin() {
+        assert!(ring_yaws(0).is_empty());
+    }
+}
