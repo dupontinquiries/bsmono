@@ -31,6 +31,7 @@ mod procars;
 mod render;
 mod style;
 mod save;
+mod ship;
 mod sim;
 mod sound;
 mod terrain;
