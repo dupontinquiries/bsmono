@@ -238,3 +238,125 @@ mod tests {
         assert!(machine_for("Mansion Garden").landmark.contains("Antikythera"));
     }
 }
+
+/// How the strip shares its space with the token preview.
+///
+/// The preview shows what the model just wrote; the strip shows what the engine is doing. Both want
+/// the same row, and the split is not even: **the preview is what the person came for.**
+///
+/// So the strip takes a short slot on a long cycle, and — the part that matters — it takes a LONGER
+/// one when something is actually wrong. A rotation that gives a stall the same three seconds as
+/// "running clean" is a rotation that hides the stall in the noise of its own schedule.
+pub struct Alternator {
+    strip: Strip,
+    elapsed_ms: u64,
+}
+
+/// The preview's slot. Long, because it is the primary content.
+pub const PREVIEW_MS: u64 = 5_000;
+
+/// The strip's slot when nothing is wrong: brief, easily missed, and that is correct — there is
+/// nothing to act on.
+pub const STRIP_QUIET_MS: u64 = 1_500;
+
+/// The strip's slot when something is. Long enough to read twice, because the first read of
+/// "99% of each step is the CPU waiting" is usually not the one that lands.
+pub const STRIP_ALERT_MS: u64 = 4_000;
+
+/// What should occupy the row right now.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Slot {
+    /// Show the token preview.
+    Preview,
+    /// Show this line from the strip.
+    Status(String),
+}
+
+impl Alternator {
+    pub fn new(strip: Strip) -> Self { Alternator { strip, elapsed_ms: 0 } }
+
+    fn strip_ms(&self) -> u64 {
+        if matches!(self.strip.worst(), Concern::Healthy { .. }) { STRIP_QUIET_MS } else { STRIP_ALERT_MS }
+    }
+
+    /// Advance by a frame and say what to draw.
+    ///
+    /// Takes a delta rather than reading a clock so the behaviour is testable without waiting, which
+    /// is the only way a five-second cycle gets tested at all.
+    pub fn tick(&mut self, dt_ms: u64) -> Slot {
+        let cycle = PREVIEW_MS + self.strip_ms();
+        self.elapsed_ms = (self.elapsed_ms + dt_ms) % cycle.max(1);
+        if self.elapsed_ms < PREVIEW_MS {
+            Slot::Preview
+        } else {
+            Slot::Status(self.strip.next())
+        }
+    }
+
+    /// Skip straight to the status line — for when the worst concern has just changed and waiting
+    /// five seconds to mention it would be absurd.
+    pub fn interrupt(&mut self) -> Slot {
+        self.elapsed_ms = PREVIEW_MS;
+        Slot::Status(self.strip.next())
+    }
+}
+
+#[cfg(test)]
+mod alternator_tests {
+    use super::*;
+
+    fn alt(c: Vec<Concern>) -> Alternator { Alternator::new(Strip::new(c, 1.4)) }
+
+    #[test]
+    fn the_PREVIEW_holds_the_row_for_most_of_the_cycle() {
+        // It is what the person came for; the strip is an aside.
+        let mut a = alt(vec![Concern::SyncBound { pct: 99 }]);
+        assert_eq!(a.tick(0), Slot::Preview);
+        assert_eq!(a.tick(4_900), Slot::Preview);
+        assert!(matches!(a.tick(200), Slot::Status(_)));
+    }
+
+    #[test]
+    fn a_REAL_concern_gets_a_longer_slot_than_a_healthy_one() {
+        // A rotation giving a stall the same time as "running clean" hides the stall in the noise of
+        // its own schedule.
+        let mut bad = alt(vec![Concern::SyncBound { pct: 99 }]);
+        let mut good = alt(vec![]);
+        bad.tick(PREVIEW_MS); good.tick(PREVIEW_MS);
+        // After the quiet slot would have expired, the healthy strip is back on preview and the
+        // alerting one is still showing.
+        good.tick(STRIP_QUIET_MS);
+        assert_eq!(good.tick(1), Slot::Preview);
+        bad.tick(STRIP_QUIET_MS);
+        assert!(matches!(bad.tick(1), Slot::Status(_)), "an alert holds the row longer");
+    }
+
+    #[test]
+    fn it_CYCLES_rather_than_running_out() {
+        let mut a = alt(vec![Concern::SyncBound { pct: 99 }]);
+        let mut saw_preview_again = false;
+        for _ in 0..40 {
+            if matches!(a.tick(500), Slot::Preview) && a.elapsed_ms < 500 { saw_preview_again = true; }
+        }
+        assert!(saw_preview_again, "the row must return to the preview");
+    }
+
+    #[test]
+    fn INTERRUPT_shows_the_status_without_waiting() {
+        // When the worst concern has just changed, waiting five seconds to mention it is absurd.
+        let mut a = alt(vec![Concern::MemoryClamped { asked_gib: 48, held_gib: 31 }]);
+        match a.interrupt() {
+            Slot::Status(s) => assert!(s.contains("clamped")),
+            s => panic!("{s:?}"),
+        }
+    }
+
+    #[test]
+    fn a_healthy_engine_still_takes_its_turn() {
+        // Briefly, and it must still appear: a row that only ever shows the preview cannot tell you
+        // the engine is fine, which is information when you are wondering why it feels slow.
+        let mut a = alt(vec![]);
+        a.tick(PREVIEW_MS);
+        assert!(matches!(a.tick(1), Slot::Status(_)));
+    }
+}
