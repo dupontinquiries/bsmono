@@ -101,6 +101,16 @@ pub fn quantize(w: &[f32]) -> Vec<u8> {
 /// Dequantize one weight, for reference and for the error measurement.
 fn level(code: u8, scale: f32) -> f32 { (code as f32 - 1.5) * scale }
 
+/// Dequantize a single weight by flat index — for error measurement against the original.
+pub fn dequant_at(packed: &[u8], i: usize) -> f32 {
+    let gi = i / GROUP;
+    let base = gi * (GROUP / 4 + 2);
+    if base + GROUP / 4 + 2 > packed.len() { return 0.0; }
+    let scale = from_f16(u16::from_le_bytes([packed[base + 8], packed[base + 9]]));
+    let j = i % GROUP;
+    level((packed[base + j / 4] >> ((j % 4) * 2)) & 0x3, scale)
+}
+
 /// Dot product against the packed form, reading the source bytes directly.
 ///
 /// No dequantize pass: the same shape as `dot_iq1_s`, and the reference a GPU kernel must match
