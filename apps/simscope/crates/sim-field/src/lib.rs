@@ -1,13 +1,7 @@
-//! sim-field — Level 1: 2D field solve (Laplace/Poisson) on triangles -> RLGC extraction. The FEA on-ramp.
-//!
-//! Scaffolded so the layer boundaries are fixed before anything grows across them. See
-//! apps/simscope/PLAN.md for what this crate owes and what it may depend on.
+pub mod mesh;
+pub mod p1;
+pub mod rlgc;
 
-/// Which layer of the stack this crate implements.
-pub const LAYER: &str = "L1";
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffolded() { assert!(!super::LAYER.is_empty()); }
-}
+pub use mesh::Mesh;
+pub use rlgc::{coax_capacitance, extract, Rlgc, EPS0, MU0, C0};
+pub use p1::{assemble, energy, solve_dirichlet, Element, Fixed};

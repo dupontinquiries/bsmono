@@ -20,8 +20,8 @@ receiving them — which is why it is the right on-ramp from network analysis to
 |---|---|---|---|
 | `sim-num` | — | deterministic reductions, compensated arithmetic, f64 kernels, Newton | **built** |
 | `sim-power` | L0 | Ybus, polar Jacobian, AC power flow | **built** |
-| `sim-field` | L1 | 2D Laplace/Poisson on triangles → C, L per unit length → RLGC | next |
-| `sim-pcb` | L2 | stackup, PDN impedance, thermal; consumes `cad-nifty` geometry | planned |
+| `sim-field` | L1 | 2D Laplace on triangles → C, L, Z0 per unit length | **built** |
+| `sim-pcb` | L2 | stackup, PDN impedance, thermal; consumes `cad-nifty` geometry | next |
 | `sim-litho` | L3 | EUV imaging by Fourier optics; f32-safe, GPU-shaped | planned |
 | `sim-rtl` | L4 | logic evaluation; bit-exact, no floating point | planned |
 
@@ -92,3 +92,42 @@ rather than about a transformer model.
 - **No sparse Ybus.** Stored dense, O(n²), which caps us near a thousand buses.
 - **No DC power flow, no contingency batch.** N-1 screening across thousands of independent solves
   is the workload that actually justifies a GPU, and it is not written.
+
+
+## L1 status
+
+Coax cross-sections solved on a triangle mesh, matching the closed form to ~0.1% at 6400 nodes,
+and yielding **49.84 Ω** for PTFE dimensions chosen to be a 50 Ω cable — with no transmission-line
+formula anywhere in the code path. `cargo run -p simscope-cli` prints both tables.
+
+The element integral is the entire "lower-level integrals" gap, and for P1 it is exact: `grad N_i`
+is constant over a linear triangle, so `K_ij = eps (b_i b_j + c_i c_j) / 4A` with no quadrature at
+all. Everything harder in FEA is this same expression with a quadrature rule where the closed form
+used to be.
+
+Verification is layered, weakest to strongest:
+
+1. **Row sums vanish** — a constant potential produces no field, so `K·1 = 0` exactly. Catches most
+   sign and index errors in the gradient coefficients.
+2. **The patch test** — pin the boundary to a linear field, and the interior must reproduce it to
+   roundoff. A code failing this cannot represent a uniform field, which is what every problem
+   looks like locally under refinement, so it is a precondition for converging at all.
+3. **Analytic coax** — 0.06–0.12% at 6400 nodes.
+4. **Convergence rate** — O(h²) in energy, measured radially at fixed angular geometry.
+5. **The physical identity** — `LC = με`, so a homogeneous line's phase velocity must be `c₀/√εr`.
+   This ties two independent solves together and is sharper than comparing L to a formula.
+
+`L` comes from the vacuum solve (`L = 1/(c₀²C_vac)`), which stays valid for mixed dielectrics
+because the magnetic field does not see the dielectric — the reason a microstrip's phase velocity
+is neither `c₀` nor `c₀/√εr`.
+
+### L1 debts
+
+- **Structured meshes only.** Annulus and rectangle. Real cross-sections need a mesher, or
+  CADscope's SDF via an immersed-boundary formulation — which sidesteps meshing entirely and is
+  the more interesting option given what already exists.
+- **No microstrip validated.** The mixed-dielectric path is written and untested against published
+  Z₀ tables; only homogeneous coax is checked.
+- **No conductor loss, no skin effect.** `R` and `G` in "RLGC" are not computed; this is LC only.
+- **Jacobi-preconditioned CG.** Fine at this size; a graded or highly refined mesh wants
+  multigrid, which is also the form that ports to GPU as a matrix-free operator.

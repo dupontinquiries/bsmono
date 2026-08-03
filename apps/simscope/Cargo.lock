@@ -78,6 +78,9 @@ dependencies = [
 [[package]]
 name = "sim-field"
 version = "0.1.0"
+dependencies = [
+ "sim-num",
+]
 
 [[package]]
 name = "sim-litho"
@@ -109,6 +112,7 @@ name = "simscope-cli"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sim-field",
  "sim-num",
  "sim-power",
 ]

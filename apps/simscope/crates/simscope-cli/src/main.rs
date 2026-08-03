@@ -67,5 +67,69 @@ fn main() {
          Jacobian is right, and the finite-difference test in sim-power proves it directly."
     );
     println!("\nL0: {}", if failures == 0 { "PASS" } else { "FAIL" });
+
+    failures += l1();
     std::process::exit(if failures == 0 { 0 } else { 1 });
+}
+
+/// L1: a 2D field solve on a coax cross-section, checked against the closed form. The point of the
+/// table is that Z0 and v_phase come out of an energy integral over triangles, with no
+/// transmission-line formula anywhere in the code path — these are the numbers a network model
+/// takes as given.
+fn l1() -> usize {
+    use sim_field::{coax_capacitance, extract, Mesh, C0, MU0, EPS0};
+    println!("\nsimscope — L1 field solve against analytic coax\n");
+    println!(
+        "  {:<22} {:>5} {:>10} {:>10} {:>9} {:>9} {:>6}",
+        "geometry", "nodes", "C pF/m", "exact", "err", "Z0 ohm", ""
+    );
+    let mut failures = 0usize;
+    // (a, b, eps_r, label)
+    let geoms = [
+        (1.0e-3, 3.0e-3, 1.0, "air, b/a = 3"),
+        (0.45e-3, 1.503e-3, 2.1, "PTFE 50 ohm"),
+        (1.0e-3, 4.0e-3, 2.2, "FR4-ish, b/a = 4"),
+    ];
+    for (a, b, er, label) in geoms {
+        let (nr, nt) = (24, 256);
+        let m = Mesh::annulus(a, b, nr, nt);
+        let inner: Vec<usize> = Mesh::annulus_ring(nt, 0).collect();
+        let outer: Vec<usize> = Mesh::annulus_ring(nt, nr).collect();
+        let r = match extract(&m, &inner, &outer, |_| er) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  {label:<22} failed: {e}");
+                failures += 1;
+                continue;
+            }
+        };
+        let exact = coax_capacitance(a, b, er);
+        let z_exact = (MU0 / (EPS0 * er)).sqrt() * (b / a).ln() / std::f64::consts::TAU;
+        let err = (r.c - exact).abs() / exact;
+        let ok = err < 3e-3 && (r.z0 - z_exact).abs() / z_exact < 5e-3;
+        if !ok {
+            failures += 1;
+        }
+        println!(
+            "  {:<22} {:>5} {:>10.3} {:>10.3} {:>8.3}% {:>9.2} {:>6}",
+            label,
+            m.nodes(),
+            r.c * 1e12,
+            exact * 1e12,
+            err * 100.0,
+            r.z0,
+            if ok { "ok" } else { "FAIL" }
+        );
+        let v_err = (r.v_phase - C0 / er.sqrt()).abs() / (C0 / er.sqrt());
+        if v_err > 3e-3 {
+            println!("      phase velocity off by {:.3}%", v_err * 100.0);
+            failures += 1;
+        }
+    }
+    println!(
+        "\n  C from an energy integral; L from the vacuum solve via L = 1/(c0^2 C_vac);\n  \
+         Z0 and v_phase follow. No transmission-line formula is used to get them."
+    );
+    println!("\nL1: {}", if failures == 0 { "PASS" } else { "FAIL" });
+    failures
 }
