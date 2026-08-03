@@ -192,6 +192,84 @@ pub fn assemble(
     }
 }
 
+/// WIDOWMAKER — from a death-race car. Twenty-four blocks and thirteen
+/// tread links: it comes out armoured and tracked-looking, all mass and no
+/// aerodynamics.
+pub fn widowmaker(gpu: &mut Gpu) -> Model {
+    assemble(
+        gpu,
+        partdata::WIDOWMAKER,
+        Vec3::new(0.36, 0.23, 0.68),
+        [[0.34, 0.10, 0.10, 1.0], [0.26, 0.08, 0.08, 1.0], [0.14, 0.05, 0.05, 1.0]],
+        [1.00, 0.70, 0.15, 1.0],
+        0.140,
+        Drive::Combustion,
+        0.10,
+    )
+}
+
+/// MADCAR — from a wasteland truck. Twenty-nine of its parts are wheels, so
+/// it arrives ringed and cluttered: the most junkyard thing in the game.
+pub fn madcar(gpu: &mut Gpu) -> Model {
+    assemble(
+        gpu,
+        partdata::MADCAR,
+        Vec3::new(0.38, 0.27, 0.64),
+        [[0.42, 0.33, 0.20, 1.0], [0.33, 0.26, 0.16, 1.0], [0.22, 0.18, 0.12, 1.0]],
+        [0.90, 0.55, 0.12, 1.0],
+        0.155,
+        Drive::Combustion,
+        0.11,
+    )
+}
+
+/// SPEEDRUNNER — from a flyer. Nineteen barrels: it is mostly engine, and
+/// the pods sit where a car would keep its passengers.
+pub fn speedrunner(gpu: &mut Gpu) -> Model {
+    assemble(
+        gpu,
+        partdata::SPEEDRUNNER,
+        Vec3::new(0.33, 0.18, 0.78),
+        [[0.18, 0.22, 0.30, 1.0], [0.14, 0.30, 0.42, 1.0], [0.10, 0.14, 0.20, 1.0]],
+        [0.40, 0.95, 1.00, 1.0],
+        0.105,
+        Drive::Electric,
+        0.09,
+    )
+}
+
+/// ECLIPSE — from an attack helicopter. THIRTY-ONE struts, which is unlike
+/// anything else in the catalogue: it comes out as a spaceframe with a skin
+/// stretched over part of it.
+pub fn eclipse(gpu: &mut Gpu) -> Model {
+    assemble(
+        gpu,
+        partdata::ECLIPSE,
+        Vec3::new(0.32, 0.24, 0.72),
+        [[0.20, 0.24, 0.19, 1.0], [0.15, 0.18, 0.14, 1.0], [0.30, 0.34, 0.28, 1.0]],
+        [0.85, 0.90, 0.30, 1.0],
+        0.125,
+        Drive::Combustion,
+        0.10,
+    )
+}
+
+/// MACH 6 — from a classic racing car. The most evenly composed donor here:
+/// blocks, wheels, barrels and treads in almost equal measure, which gives
+/// it the busiest surface of the assembled set.
+pub fn mach6(gpu: &mut Gpu) -> Model {
+    assemble(
+        gpu,
+        partdata::MACH6,
+        Vec3::new(0.35, 0.19, 0.74),
+        [[0.92, 0.92, 0.94, 1.0], [0.80, 0.80, 0.84, 1.0], [0.40, 0.44, 0.50, 1.0]],
+        [0.95, 0.20, 0.20, 1.0],
+        0.115,
+        Drive::Combustion,
+        0.09,
+    )
+}
+
 /// ROLLOUT — from a sci-fi tank. Struts and sponsons over a low slab, with
 /// the mass carried at the back where a turret ring would sit.
 pub fn rollout(gpu: &mut Gpu) -> Model {

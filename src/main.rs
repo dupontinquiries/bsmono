@@ -901,6 +901,11 @@ fn main() {
     let tl4 = partcars::tl4(&mut gpu);
     let spearhead = partcars::spearhead(&mut gpu);
     let outback = partcars::outback(&mut gpu);
+    let widowmaker = partcars::widowmaker(&mut gpu);
+    let madcar = partcars::madcar(&mut gpu);
+    let speedrunner = partcars::speedrunner(&mut gpu);
+    let eclipse = partcars::eclipse(&mut gpu);
+    let mach6 = partcars::mach6(&mut gpu);
     // ---- HOVERCARS ----
     // Six of them, and the numbers are the design: ride height, cushion
     // stiffness, how much sideways motion they hold, and the reach and force
@@ -974,12 +979,14 @@ fn main() {
             volt, axion, hauler, pulse, tram, vipera, aegis,
             backfire, breakout, assael, guardian, orion, vulcan, xdevil,
             rollout, cryofin, tl4, spearhead, outback,
+            widowmaker, madcar, speedrunner, eclipse, mach6,
         ],
         names: vec![
             "Octane", "Fennec", "Dominus", "Breadbox", "Wedge", "Roller", "Longboy", "Cube", "Shark",
             "Volt EV", "Axion EV", "Hauler EV", "Pulse EV", "Tram EV", "Vipera", "Aegis",
             "Backfire", "Breakout", "Assael", "Guardian", "Orion", "Vulcan", "X-Devil",
             "Rollout", "Cryofin", "TL-4", "Spearhead", "Outback",
+            "Widowmaker", "Madcar", "Speedrunner", "Eclipse", "Mach 6",
         ],
         info: vec![
             ("CLASSIC", "the benchmark: neutral, forgiving, good at everything"),
@@ -1010,6 +1017,11 @@ fn main() {
             ("ASSEMBLED", "from a walking mech: plated and upright"),
             ("ASSEMBLED", "from a rocket: a spine with rings down it"),
             ("ASSEMBLED", "from a sci-fi jeep: boxy cabin, greebles everywhere"),
+            ("ASSEMBLED", "from a death-race car: armoured, tracked, all mass"),
+            ("ASSEMBLED", "from a wasteland truck: ringed and cluttered"),
+            ("ASSEMBLED", "from a flyer: mostly engine, pods where seats would be"),
+            ("ASSEMBLED", "from an attack helicopter: a spaceframe with a skin"),
+            ("ASSEMBLED", "from a classic racer: the busiest surface of the set"),
         ],
         active: 0,
     };

@@ -5023,8 +5023,18 @@ pub fn run(args: &[String]) {
         };
         const CLASS_NAMES: [&str; 8] = ["block", "panel", "strut", "disc", "wheel", "barrel", "greeble", "tread"];
         println!("{:<11} {:>6} {:>7} {:>7} {:>7}  composition", "donor", "parts", "spread", "height", "front");
-        let donors: [(&str, &[(u8, f32, f32, f32, f32)]); 5] =
-            [("ROLLOUT", ROLLOUT), ("CRYOFIN", CRYOFIN), ("TL4", TL4), ("SPEARHEAD", SPEARHEAD), ("OUTBACK", OUTBACK)];
+        let donors: [(&str, &[(u8, f32, f32, f32, f32)]); 10] = [
+            ("ROLLOUT", ROLLOUT),
+            ("CRYOFIN", CRYOFIN),
+            ("TL4", TL4),
+            ("SPEARHEAD", SPEARHEAD),
+            ("OUTBACK", OUTBACK),
+            ("WIDOWMAKER", WIDOWMAKER),
+            ("MADCAR", MADCAR),
+            ("SPEEDRUNNER", SPEEDRUNNER),
+            ("ECLIPSE", ECLIPSE),
+            ("MACH6", MACH6),
+        ];
         let mut sigs: Vec<Vec<f32>> = Vec::new();
         for (nm, d) in donors {
             let mut counts = [0u32; 8];

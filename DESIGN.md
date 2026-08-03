@@ -3563,6 +3563,33 @@ description. The second half matters more than it sounds — a table where
 everything is "fast and fun" is worse than no table, because it looks like
 information.
 
+## v1.109.0 — five more assembled cars, and the pipeline pays off
+
+The claim made when the part-mining pipeline was built was that adding
+another donor would be a DATA change rather than a code change. Five more
+cars, and it was: mine the layout, name it, describe it. The only Rust
+written was the five builder bodies choosing an envelope and a palette.
+
+    WIDOWMAKER   a death-race car   24 blocks, 13 tread links — armoured
+    MADCAR       a wasteland truck  29 rings — ringed and cluttered
+    SPEEDRUNNER  a flyer            19 barrels — mostly engine
+    ECLIPSE      an attack heli     31 STRUTS — a spaceframe with a skin
+    MACH 6       a classic racer    the busiest surface of the set
+
+ECLIPSE is the one that justifies the approach. Thirty-one of its
+fifty-four parts are struts, which is unlike anything else in the
+catalogue, and only 13% of its mass sits forward — so it comes out as an
+open frame rather than a body. Nobody designed that; it fell out of where a
+helicopter keeps its parts.
+
+`--sim parts` still finds every donor distinct, and they now build through
+`shell_car` like the rest of the catalogue, so they arrive with the house
+shell rather than as clouds of blocks.
+
+Thirty-four described entries across seven families, and the ASSEMBLED
+family has doubled to ten. There are 163 donors left in the library, which
+is now a matter of picking interesting ones rather than of writing anything.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
