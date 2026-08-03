@@ -41,6 +41,7 @@ pub mod mobile_dialog;
 pub mod glass;
 pub mod swipe_physics;
 pub mod video_viewer;
+pub mod posture;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -186,6 +187,11 @@ pub struct Snapclone {
     pub menu_target: Option<String>,
     /// Snaps the user asked to keep, for the host to write out.
     pub snaps_saved: Vec<String>,
+    /// The proximity screensaver and talk-mode flip. Sensors are the host's;
+    /// the arming rule is ours.
+    pub posture: crate::posture::PostureEngine,
+    /// When voice last arrived, for the five-minute arming window.
+    pub last_voice_at: Option<i64>,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -255,6 +261,8 @@ impl Snapclone {
             menu: Default::default(),
             menu_target: None,
             snaps_saved: Vec::new(),
+            posture: Default::default(),
+            last_voice_at: None,
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -543,6 +551,33 @@ impl Snapclone {
             Answer::Declined => {}
         }
         self.incoming_call = None;
+    }
+
+    /// Re-derive whether posture should be acting.
+    ///
+    /// Armed on the Inbox, or in a conversation with voice in the last five
+    /// minutes. This is the app's judgement and deliberately not the sensor's:
+    /// a phone in your pocket must not dim a page you were about to read.
+    pub fn refresh_posture_arming(&mut self, now_secs: i64) {
+        const VOICE_WINDOW_SECS: i64 = 300;
+        let on_inbox = self.nav.page() == 1;
+        let recent_voice = self.last_voice_at
+            .map(|t| now_secs.saturating_sub(t) <= VOICE_WINDOW_SECS)
+            .unwrap_or(false);
+        self.posture.set_armed(on_inbox || recent_voice);
+        self.posture.set_in_call(self.group_voice.joined);
+    }
+
+    /// Advance posture and apply what it asks for.
+    pub fn tick_posture(&mut self, dt_ms: f32) -> crate::posture::Output {
+        let out = self.posture.tick(dt_ms);
+        // The flip reaches the bar rather than being a number nobody reads:
+        // gated talk means the bar latches instead of requiring a held finger,
+        // which is the whole point of putting the phone to your ear.
+        if out.gated_talk && !self.voicebar.latched() && self.voicebar.on_air() {
+            self.voicebar.set_on_air(true);
+        }
+        out
     }
 
     /// Open the action menu for a snap tile.
@@ -1020,6 +1055,53 @@ mod tests {
     fn entry(id: &str) -> crate::snaps::FeedEntry {
         crate::snaps::FeedEntry { id: id.into(), sender_name: "Ada".into(), sent_at: 0,
             media: crate::snaps::Media::Image, thumb_path: String::new() }
+    }
+
+    #[test]
+    fn posture_arms_on_the_inbox_and_after_recent_voice_only() {
+        // Sensors say what the world is doing; arming says whether it matters
+        // here.
+        let mut s = app();
+        s.nav.go_page(0);
+        s.refresh_posture_arming(1000);
+        assert!(!s.posture.armed(), "the camera page is not a voice context");
+
+        s.nav.go_page(1);
+        s.refresh_posture_arming(1000);
+        assert!(s.posture.armed(), "the inbox is");
+
+        s.nav.go_page(0);
+        s.last_voice_at = Some(900);
+        s.refresh_posture_arming(1000);
+        assert!(s.posture.armed(), "voice 100s ago still counts");
+
+        s.last_voice_at = Some(100);
+        s.refresh_posture_arming(1000);
+        assert!(!s.posture.armed(), "900s ago does not");
+    }
+
+    #[test]
+    fn a_phone_with_no_sensors_never_dims() {
+        // The degradation contract, end to end through the shell.
+        let mut s = app();
+        s.nav.go_page(1);
+        s.refresh_posture_arming(0);
+        s.posture.observe(&crate::posture::NoSensors);
+        let out = s.tick_posture(120_000.0);
+        assert_eq!(out.dim, 0.0);
+        assert!(!out.screensaver);
+    }
+
+    #[test]
+    fn the_talk_flip_only_engages_in_a_call() {
+        let mut s = app();
+        s.nav.go_page(1);
+        s.refresh_posture_arming(0);
+        s.posture.set_proximity_near(true);
+        assert!(!s.tick_posture(16.0).gated_talk, "not in a call");
+        s.toggle_voice();
+        s.refresh_posture_arming(0);
+        assert!(s.tick_posture(16.0).gated_talk);
     }
 
     #[test]

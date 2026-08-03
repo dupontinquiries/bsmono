@@ -43,7 +43,7 @@ not see.
 | bot-arena | 2 | 100% named / 50% code | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
-| snapclone | 51 | 80% named / 18% code | yes | yes | — |
+| snapclone | 51 | 82% named / 20% code | yes | yes | — |
 | voiceterm | 22 | 91% named / 73% code | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
@@ -276,3 +276,38 @@ it is typed. snapclone already has DHT peering and voiceterm has a cross-app
 action protocol, so the pieces exist, but wiring them is a feature with a
 security surface (anyone on the network typing into your TV) rather than a
 refactor. Naming it here rather than half-building it.
+
+## Sensors: what exists, what is ported, what is not
+
+Asked about gyroscope integration. The ports had none; the ORIGINALS have two
+independent sensor users, and neither had been carried across.
+
+**snapclone's posture subsystem — now ported.** Proximity from
+`iio-sensor-proxy` over the system bus, motion from raw IIO accelerometer counts
+in sysfs. Two uses: a screensaver that dims when the phone is at your ear, and a
+flip from push-to-talk to gated talk mode when it gets there. `PostureEngine`,
+`PostureSource` and `DimOverlay` are in `posture.rs`; the D-Bus and sysfs source
+stays with the host, as it must.
+
+The Qt header is blunt that it is **unverified on hardware** — whether the FP5
+exposes proximity through iio-sensor-proxy, the exact IIO device path and the
+motion threshold all need on-device validation. What makes it shippable anyway
+is the degradation contract, ported exactly: **no sensor means far and still**,
+so the app behaves as though it had none. That inverts the usual default and is
+the right way round — a screensaver that dimmed when unsure would black out a
+phone with no proximity sensor at all.
+
+**`ambient-learner` has NOT been ported at all.** It is a whole app —
+`iio_proxy.rs`, `environment.rs`, `world_state.rs`, an animated background
+driven by real sensor readings — and it has no egui frontend and no row in the
+parity table. It is the largest genuinely unported thing found so far, and it is
+invisible to the audit because the audit only walks apps that already have a
+port directory.
+
+**There is still no gyroscope proper.** What exists is proximity plus an
+accelerometer-delta "moving / still" bit. Nothing reads rotation rate, and no
+surface would currently use one: the wayfinder takes its bearing from GPS
+positions rather than from a compass, and the dial reads touch, not tilt. A real
+gyroscope integration would be a new feature rather than a port — worth saying
+plainly, because "integrate the gyroscope" sounds like wiring up something that
+is already half there, and it is not.
