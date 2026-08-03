@@ -1,11 +1,20 @@
 //! LOCOMOTION — walking, running, boosting, falling.
 //!
-//! The honest position first, because it has been the same one for several
-//! sessions and it has not changed: **there is no gait data anywhere.** The
-//! reference glTFs carry transform clips only, 1012 of 1013 IQMs have no
-//! skeleton, and foldview's joint articulation lives in the `model-verify`
-//! crate rather than anywhere skydribble can reach. A walk cycle has to be
-//! authored or generated; it cannot be imported.
+//! CORRECTION, and it matters: I said several times there was no gait data
+//! anywhere. That was wrong. `exengine/robot_parts.c` has a complete
+//! procedural gait — `ex_gait_advance` plus a 17-slot part layout driven by
+//! phase and speed — and the numbers below are now ITS numbers rather than
+//! ones I made up. What is true is narrower: there are no gait CLIPS. There
+//! is a gait MODEL, and a model is better, because it scales with speed
+//! instead of being resampled.
+//!
+//! The cadence is the part worth reading. Stride frequency rises with the
+//! SQUARE ROOT of speed — the Froude relation for legged locomotion — and
+//! saturates at 7.4 rad/s, so a sprinting bot takes slower, longer strides
+//! rather than whirling its legs. Stride LENGTH grows to carry the ground
+//! the slower cadence no longer does. My first pass had cadence rising
+//! linearly with speed and capped nothing, which is exactly the whirling
+//! the C engine's comment says it fixed.
 //!
 //! So this is the half that does not need the art: the state machine that
 //! decides WHICH gait you are in, how far through its cycle, and how much of
@@ -44,14 +53,13 @@ impl Gait {
             Gait::Land => "LAND",
         }
     }
-    /// Strides per second at the gait's own reference speed. A run is not a
-    /// fast walk — the cadence steps up as well as the stride length, which
-    /// is why interpolating one into the other looks wrong and blending
-    /// between two cycles looks right.
+    /// Cadence multiplier on top of the Froude term. A run is not merely a
+    /// fast walk, but the difference is smaller than it looks: most of the
+    /// extra ground is covered by stride LENGTH.
     pub fn cadence(self) -> f32 {
         match self {
-            Gait::Walk => 1.6,
-            Gait::Run => 2.9,
+            Gait::Walk => 1.0,
+            Gait::Run => 1.12,
             _ => 0.0,
         }
     }
@@ -74,6 +82,30 @@ pub const FALL_SPEED: f32 = 3.0;
 /// How long the landing beat lasts.
 pub const LAND_SEC: f32 = 0.22;
 
+// ---- ported from exengine/robot_parts.h ----
+/// base cadence, before the Froude term
+pub const GAIT_CADENCE: f32 = 0.95;
+/// stride frequency saturates here: a sprint never spins the legs
+pub const GAIT_FREQ_MAX: f32 = 7.4;
+pub const LEG_SWING_MAX: f32 = 1.05;
+pub const ARM_SWING_MAX: f32 = 0.62;
+pub const BODY_BOB_MAX: f32 = 0.19;
+
+/// Stride frequency in radians per second at this speed.
+///
+/// `EX_GAIT_CADENCE * 1.70 * sqrt(speed)`, capped. Square root rather than
+/// linear because that is how legs work.
+pub fn stride_freq(speed: f32) -> f32 {
+    (GAIT_CADENCE * 1.70 * speed.max(0.0).sqrt()).min(GAIT_FREQ_MAX)
+}
+
+/// One leg's swing angle. `odd` is the other leg, half a cycle out.
+pub fn leg_swing(phase: f32, odd: bool, speed: f32) -> f32 {
+    let amp = (speed / 6.0).min(1.5) * LEG_SWING_MAX;
+    let p = phase + if odd { std::f32::consts::PI } else { 0.0 };
+    p.sin() * amp
+}
+
 /// Six numbers, all applicable to a body that has no skeleton.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Pose {
@@ -89,6 +121,14 @@ pub struct Pose {
     pub weight: f32,
     /// 0..1 compression, for a renderer that already bobs a body by this
     pub squash: f32,
+    /// limb swing in radians: legs, and arms counter-phase against them.
+    /// Nothing consumes these yet — the bodies are pose strips, not rigs —
+    /// but they are what a rigged bot would be driven by, and they are the
+    /// C engine's model rather than an approximation of it.
+    pub leg_l: f32,
+    pub leg_r: f32,
+    pub arm_l: f32,
+    pub arm_r: f32,
 }
 
 pub struct Locomotion {
@@ -163,9 +203,9 @@ impl Locomotion {
         if self.gait.cyclic() {
             // cadence scales with speed around the gait's reference, so
             // walking slowly does not run the same cycle faster
-            let reference = if self.gait == Gait::Run { 11.0 } else { 3.5 };
-            let rate = self.gait.cadence() * (0.55 + 0.45 * (self.speed / reference).clamp(0.0, 1.8));
-            self.phase = (self.phase + rate * dt).fract();
+            // radians per second, Froude-scaled and saturating
+            let rate = stride_freq(self.speed) * self.gait.cadence();
+            self.phase = (self.phase + rate * dt / std::f32::consts::TAU).fract();
         } else if self.gait == Gait::Fall {
             // not a cycle: wind up over the drop, so a long fall reads as
             // longer rather than looping
@@ -190,22 +230,26 @@ impl Locomotion {
             // two footfalls per stride, so the bob is at double frequency;
             // the sway is at stride frequency, which is what makes a walk
             // read as left-right rather than as a bounce
-            Gait::Walk => Pose {
-                bob: -(p * 2.0).cos().mul_add(0.5, 0.5) * 0.055,
-                lean: 0.045,
-                roll: p.sin() * 0.035,
-                phase: self.phase,
-                weight: self.blend,
-                squash: (p * 2.0).cos().mul_add(-0.5, 0.5) * 0.35,
-            },
-            Gait::Run => Pose {
-                bob: -(p * 2.0).cos().mul_add(0.5, 0.5) * 0.115,
-                lean: 0.16,
-                roll: p.sin() * 0.06,
-                phase: self.phase,
-                weight: self.blend,
-                squash: (p * 2.0).cos().mul_add(-0.5, 0.5) * 0.70,
-            },
+            // bob and roll are the C engine's: move_amp * BODY_BOB_MAX at
+            // twice stride frequency, and sin(phase) * 0.04 * move_amp
+            Gait::Walk | Gait::Run => {
+                let move_amp = (self.speed / 8.0).clamp(0.0, 1.0);
+                let ll = leg_swing(p, false, self.speed);
+                let lr = leg_swing(p, true, self.speed);
+                let k = ARM_SWING_MAX / LEG_SWING_MAX;
+                Pose {
+                    bob: -(2.0 * p).sin().abs() * move_amp * BODY_BOB_MAX * 0.5,
+                    lean: if self.gait == Gait::Run { 0.16 } else { 0.045 },
+                    roll: p.sin() * 0.04 * move_amp,
+                    phase: self.phase,
+                    weight: self.blend,
+                    squash: (2.0 * p).sin().abs() * move_amp * 0.7,
+                    leg_l: ll,
+                    leg_r: lr,
+                    arm_l: -ll * k,
+                    arm_r: -lr * k,
+                }
+            }
             // thrusters: the body hangs off them, nose up, feet trailing
             Gait::Boost => Pose {
                 bob: 0.06,
@@ -214,6 +258,10 @@ impl Locomotion {
                 phase: self.phase,
                 weight: self.blend,
                 squash: 0.0,
+                leg_l: 0.0,
+                leg_r: 0.0,
+                arm_l: 0.0,
+                arm_r: 0.0,
             },
             // falling with nothing lit: tuck, and lean further the longer it
             // goes on
@@ -224,6 +272,10 @@ impl Locomotion {
                 phase: self.phase,
                 weight: self.blend,
                 squash: 0.0,
+                leg_l: 0.0,
+                leg_r: 0.0,
+                arm_l: 0.0,
+                arm_r: 0.0,
             },
             // the impact beat: absorb, then recover over LAND_SEC
             Gait::Land => Pose {
@@ -233,6 +285,11 @@ impl Locomotion {
                 phase: self.phase,
                 weight: self.blend,
                 squash: 0.9 * (1.0 - self.phase),
+                // knees absorb the landing
+                leg_l: 0.5 * (1.0 - self.phase),
+                leg_r: 0.5 * (1.0 - self.phase),
+                arm_l: 0.0,
+                arm_r: 0.0,
             },
             Gait::Idle => Pose {
                 // a standing machine is not perfectly still
@@ -242,6 +299,10 @@ impl Locomotion {
                 phase: self.phase,
                 weight: self.blend,
                 squash: 0.0,
+                leg_l: 0.0,
+                leg_r: 0.0,
+                arm_l: 0.0,
+                arm_r: 0.0,
             },
         }
     }
@@ -356,6 +417,44 @@ mod tests {
         }
         assert!(rd < wd, "a run dips less than a walk ({rd} vs {wd})");
         assert!(r.pose().lean > w.pose().lean, "a run leans less than a walk");
+    }
+
+    #[test]
+    fn cadence_follows_the_froude_relation_and_saturates() {
+        // stride frequency rises with sqrt(speed), not with speed. Doubling
+        // pace must NOT double the leg rate, or a sprint whirls.
+        let a = stride_freq(4.0);
+        let b = stride_freq(16.0);
+        assert!((b / a - 2.0).abs() < 0.05, "4x the speed gave {:.2}x the cadence", b / a);
+        // and it stops: no matter how fast, the legs cap out
+        assert!((stride_freq(1e6) - GAIT_FREQ_MAX).abs() < 1e-3);
+        assert_eq!(stride_freq(0.0), 0.0);
+    }
+
+    #[test]
+    fn stride_length_takes_over_where_cadence_stops() {
+        // the other half of the Froude model: the amplitude keeps growing
+        // after the frequency has saturated, so speed becomes longer steps
+        let slow = leg_swing(1.0, false, 3.0).abs();
+        let fast = leg_swing(1.0, false, 9.0).abs();
+        assert!(fast > slow, "stride did not lengthen with speed");
+        // and it caps too, or the legs pass through each other
+        assert!(leg_swing(1.0, false, 1e6).abs() <= 1.5 * LEG_SWING_MAX + 1e-4);
+    }
+
+    #[test]
+    fn the_legs_are_half_a_cycle_apart_and_the_arms_oppose_them() {
+        let mut l = Locomotion::new();
+        run_for(&mut l, 2.0, 8.0, 0.0, true, false);
+        let p = l.update(1.0 / 60.0, 8.0, 0.0, true, false);
+        // opposite legs: a bot with both legs forward is falling over
+        assert!(p.leg_l * p.leg_r <= 1e-6, "legs in phase: {} {}", p.leg_l, p.leg_r);
+        // arms counter the legs, at the C engine's ratio
+        assert!(p.arm_l * p.leg_l <= 1e-6, "left arm swings with its own leg");
+        if p.leg_l.abs() > 0.05 {
+            let ratio = (p.arm_l / p.leg_l).abs();
+            assert!((ratio - ARM_SWING_MAX / LEG_SWING_MAX).abs() < 1e-4, "ratio {ratio}");
+        }
     }
 
     #[test]
