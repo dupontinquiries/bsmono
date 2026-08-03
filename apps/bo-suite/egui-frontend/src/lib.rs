@@ -17,6 +17,7 @@ pub mod tags;
 pub mod outputs;
 pub mod sources;
 pub mod fileproc;
+pub mod shell_bits;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -142,6 +143,11 @@ pub struct Controller {
     pub key_mute: crate::fileproc::StepKey,
     /// The processing request the host should perform.
     pub pending_proc: Option<crate::fileproc::ProcAction>,
+    /// The named page menu at the top of the canvas. PageDots stays the swipe
+    /// hint at the bottom; this is the jump-to menu.
+    pub page_bar: crate::shell_bits::PageBar,
+    /// The mixer page's cards, staggered so the page assembles.
+    pub cards: Vec<crate::shell_bits::ControlCard>,
     pub speaker_col: crate::channel::ChannelColumn,
     pub instrumental_col: crate::channel::ChannelColumn,
     pub mixer: crate::device::Mixer,
@@ -199,6 +205,12 @@ impl Controller {
             key_up: crate::fileproc::StepKey::new("+", false),
             key_mute: crate::fileproc::StepKey::new("MUTE", true),
             pending_proc: None,
+            page_bar: crate::shell_bits::PageBar::new(&VIEWS),
+            // The delay is per-card because only the page knows the order the
+            // cards read in.
+            cards: VIEWS.iter().enumerate()
+                .map(|(i, v)| crate::shell_bits::ControlCard::new(v, i as f32 * 60.0))
+                .collect(),
             // Frequencies and role hints come from the mixer's own band plan;
             // the column prints them so the choice is visible rather than
             // implied.
@@ -373,6 +385,13 @@ impl Controller {
         if let Some(s) = self.scenes.get(self.active_scene) {
             ui.colored_label(c.text_weak, format!("active: {}", s.name));
         }
+    }
+
+    /// Jump to a page from the named bar, keeping the swipe nav in step.
+    pub fn jump_to_page(&mut self, i: usize) -> bool {
+        if !self.page_bar.select(i) { return false; }
+        self.view_idx = i;
+        true
     }
 
     /// Start an offline processing run, if the section will allow it.
@@ -850,6 +869,26 @@ mod tests {
         assert_eq!(c.queue.len(), 1, "and the rest are really in the queue");
         assert_eq!(c.queue.up_next().unwrap().title, "Closer");
         assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn the_named_page_bar_and_the_swipe_nav_stay_in_step() {
+        // Two ways to change page that disagreed would leave the bar naming one
+        // screen while another is shown.
+        let mut c = sample();
+        assert!(c.jump_to_page(3));
+        assert_eq!(c.current(), VIEWS[3]);
+        assert_eq!(c.page_bar.active(), 3);
+        assert!(!c.jump_to_page(99), "out of range is refused");
+        assert_eq!(c.page_bar.active(), 3);
+    }
+
+    #[test]
+    fn the_page_cards_are_staggered_so_the_page_assembles() {
+        let mut c = sample();
+        for card in c.cards.iter_mut() { card.tick(80.0); }
+        assert!(c.cards[0].opacity() > 0.0, "the first has begun");
+        assert_eq!(c.cards[3].opacity(), 0.0, "a later one is still waiting");
     }
 
     #[test]
