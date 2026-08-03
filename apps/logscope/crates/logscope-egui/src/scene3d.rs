@@ -6333,6 +6333,10 @@ pub fn add_landmark(
     s: &mut Scene,
     parts: logscope::machinery::Parts,
     place: logscope::machinery::Placement,
+    // THE THEME'S SILHOUETTE. Without it every scene drew the same box and fifteen carefully written
+    // themes existed only as prose the renderer never saw — a clocktower and an abacus-mill are not
+    // the same shape, and the silhouette is most of what reads at landmark distance.
+    shape: logscope::machinery::Shape,
     resident: Color32,
     streaming: Color32,
     frame: Color32,
@@ -6344,13 +6348,14 @@ pub fn add_landmark(
     // moving parts are measured against, and a frame that drifted would make a stopped drive
     // ambiguous.
     s.add(box_slab(base, 1.6 * k, 0.12 * k, 0.9 * k, frame), Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
-    s.add(box_slab(v(base.x, base.y + 1.5 * k, base.z), 0.1 * k, 1.5 * k, 0.1 * k, frame),
+    let rise = 1.5 * k * shape.rise;
+    s.add(box_slab(v(base.x, base.y + rise, base.z), 0.1 * k, rise, 0.1 * k, frame),
           Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
 
     // The store: one marker per slot, laid along the plinth. Resident markers are solid and still;
     // streaming ones float, so the split is countable at a glance.
     let n = parts.slots.max(1);
-    let span = 2.8 * k;
+    let span = 2.8 * k * shape.spread;
     for i in 0..n {
         let t = if n == 1 { 0.5 } else { i as f32 / (n - 1) as f32 };
         let x = base.x - span * 0.5 + span * t;
@@ -6381,7 +6386,8 @@ pub fn add_landmark(
     // The drive: a wheel on the upright whose motion IS the rate. Zero amplitude at a stall — not a
     // slow wobble, which would read as "working hard" and is the one impression to avoid.
     let d = parts.drive;
-    s.add(box_slab(v(base.x, base.y + 2.6 * k, base.z), 0.5 * k, 0.5 * k, 0.06 * k, frame),
+    let dr = 0.5 * k * shape.drive;
+    s.add(box_slab(v(base.x, base.y + rise * 1.72, base.z), dr, dr, 0.06 * k, frame),
           Float { amp: if d > 0.0 { 0.09 * k * d } else { 0.0 },
                   speed: d * 1.6, phase: 0.0, drift: 0.0 });
 }
@@ -6394,6 +6400,7 @@ mod landmark_tests {
     fn built(parts: Parts) -> Scene {
         let mut s = Scene::new();
         add_landmark(&mut s, parts, placement(20.0, 12.0),
+                     logscope::machinery::machine_for("Old Library").shape,
                      Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
                      Color32::from_rgb(70, 70, 80));
         s
@@ -6452,5 +6459,69 @@ mod landmark_tests {
         let s = built(Parts::from_state(16, 16, Some(1), Motion::Thriving, 0.99));
         assert_eq!(s.floats[0].amp, 0.0, "the plinth is still");
         assert_eq!(s.floats[1].amp, 0.0, "and the upright");
+    }
+}
+
+#[cfg(test)]
+mod landmark_theme_tests {
+    use super::*;
+    use logscope::machinery::{Motion, Parts, machine_for, placement};
+
+    fn built_as(scene: &str) -> Scene {
+        let mut s = Scene::new();
+        add_landmark(&mut s, Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5),
+                     placement(20.0, 12.0), machine_for(scene).shape,
+                     Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
+                     Color32::from_rgb(70, 70, 80));
+        s
+    }
+
+    /// Height of the tallest vertex — the silhouette, which is all that reads at landmark distance.
+    fn top(s: &Scene) -> f32 {
+        s.meshes.iter().flat_map(|m| m.verts.iter()).map(|p| p.y).fold(f32::MIN, f32::max)
+    }
+    fn width(s: &Scene) -> f32 {
+        let (lo, hi) = s.meshes.iter().flat_map(|m| m.verts.iter())
+            .fold((f32::MAX, f32::MIN), |(l, h), p| (l.min(p.x), h.max(p.x)));
+        hi - lo
+    }
+
+    #[test]
+    fn a_CLOCKTOWER_is_taller_than_an_abacus_mill() {
+        // The distinction the shape table exists for. Before it, both drew the same box and the
+        // themes lived only in prose the renderer never saw.
+        assert!(top(&built_as("Old Library")) > top(&built_as("Treehouse")));
+    }
+
+    #[test]
+    fn an_ABACUS_MILL_is_wider_than_a_spire() {
+        assert!(width(&built_as("Treehouse")) > width(&built_as("Fractal Spires")));
+    }
+
+    #[test]
+    fn the_SPIRE_is_the_tallest_thing_in_the_table() {
+        let spire = top(&built_as("Fractal Spires"));
+        for other in ["Canopy", "Cloudscape", "Treehouse", "Mansion Garden", "Atlantis"] {
+            assert!(spire > top(&built_as(other)), "spire vs {other}");
+        }
+    }
+
+    #[test]
+    fn an_UNKNOWN_scene_still_builds_a_sane_machine() {
+        // Plain proportions rather than degenerate ones: a landmark of zero height would read as a
+        // rendering failure rather than as an unthemed scene.
+        let s = built_as("Somewhere New");
+        assert!(top(&s) > 0.0 && width(&s) > 0.0);
+        assert_eq!(s.meshes.len(), 20);
+    }
+
+    #[test]
+    fn the_theme_changes_the_SILHOUETTE_and_not_the_part_count() {
+        // Every theme is the same mechanism proportioned differently — so the reader learns one
+        // vocabulary of parts and applies it everywhere, and a stall looks like a stall in all
+        // fifteen worlds.
+        for scene in ["Old Library", "Canopy", "Treehouse", "Fractal Spires", "Mansion Garden"] {
+            assert_eq!(built_as(scene).meshes.len(), 20, "{scene}");
+        }
     }
 }
