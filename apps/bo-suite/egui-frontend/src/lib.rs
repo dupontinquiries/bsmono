@@ -14,6 +14,7 @@ pub mod queue;
 pub mod dial;
 pub mod channel;
 pub mod tags;
+pub mod outputs;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -117,6 +118,13 @@ pub struct Controller {
     pub ratings: std::collections::HashMap<i64, crate::tags::StarRating>,
     /// The tag whose tracks are being shown, if any.
     pub open_tag: Option<i64>,
+    /// The device switcher above the output controls. The sink picker itself
+    /// lives in settings_page as `SinkPicker` — see outputs.rs's note.
+    pub device_selector: crate::outputs::DeviceSelector,
+    /// The route the user last committed; the host applies it.
+    pub pending_route: Option<crate::settings_page::Route>,
+    /// The device the selector last switched to.
+    pub active_device_url: String,
     pub speaker_col: crate::channel::ChannelColumn,
     pub instrumental_col: crate::channel::ChannelColumn,
     pub mixer: crate::device::Mixer,
@@ -163,6 +171,9 @@ impl Controller {
             tag_editor: Default::default(),
             ratings: Default::default(),
             open_tag: None,
+            device_selector: Default::default(),
+            pending_route: None,
+            active_device_url: String::new(),
             // Frequencies and role hints come from the mixer's own band plan;
             // the column prints them so the choice is visible rather than
             // implied.
@@ -294,6 +305,20 @@ impl Controller {
     }
 
     fn devices_view(&mut self, ui: &mut Ui, c: &PaletteColors) {
+        // The product selector sits at the top, as in the Qt page.
+        if let Some(url) = crate::outputs::device_selector_ui(ui, &mut self.device_selector, c) {
+            self.active_device_url = url;
+        }
+        ui.separator();
+        // Output routing: which speaker, or which speakers. Committed through
+        // the existing SinkPicker, which now knows about drivers.
+        if self.sinks.open {
+            if ui.add_enabled(self.sinks.can_combine(),
+                egui::Button::new(self.sinks.combine_label())).clicked() {
+                self.pending_route = self.sinks.route();
+            }
+        }
+        ui.separator();
         ui.heading("Devices");
         // collect edits to avoid borrow issues while iterating
         let mut vol_edits: Vec<(usize, i32)> = Vec::new();

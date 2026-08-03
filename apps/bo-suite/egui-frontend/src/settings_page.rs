@@ -130,6 +130,23 @@ impl Sink {
     }
 }
 
+/// A combine-sink needs at least this many members to be worth its latency.
+pub const MIN_COMBINE: usize = 2;
+
+/// The empty state points at where pairing HAPPENS — a user who has never
+/// paired anything cannot pair from this dialog.
+pub const NO_SINKS_HINT: &str =
+    "No paired BT devices yet. Go to the Connect page to discover and pair speakers.";
+
+/// Which driver a committed selection goes through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// One sink, low latency.
+    Bluetooth(String),
+    /// A combine-sink fanning across all of these.
+    MultiRoom(Vec<String>),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SinkPicker {
     pub open: bool,
@@ -153,6 +170,45 @@ impl SinkPicker {
     }
 
     pub fn close(&mut self) { self.open = false; }
+
+    /// Where a committed selection routes.
+    ///
+    /// One speaker goes through the Bluetooth driver — a single sink, low
+    /// latency. Two or more needs a PulseAudio combine-sink through the
+    /// multi-room driver, which fans the audio out and costs latency to do it.
+    /// They are different drivers, not a preference.
+    pub fn route(&self) -> Option<Route> {
+        if self.multi {
+            // A combine-sink with one member is a slower path to the same
+            // speaker, so this is a routing rule rather than a UI nicety.
+            if !self.can_combine() { return None; }
+            return Some(Route::MultiRoom(self.checked.clone()));
+        }
+        self.checked.first().map(|m| Route::Bluetooth(m.clone()))
+    }
+
+    /// Can the combine button be pressed?
+    pub fn can_combine(&self) -> bool { self.multi && self.checked.len() >= MIN_COMBINE }
+
+    /// The combine button's label, naming the count so it can be checked
+    /// against the ticks before committing.
+    pub fn combine_label(&self) -> String {
+        if self.checked.len() < MIN_COMBINE { return "Select 2 or more".into(); }
+        format!("Combine {} speakers", self.checked.len())
+    }
+
+    /// Switch between single and multi. Returns how many ticks were dropped, so
+    /// the UI can say so — a selection that quietly shrinks is how a user ends
+    /// up playing to one speaker while looking at three ticks.
+    pub fn set_multi(&mut self, multi: bool) -> usize {
+        self.multi = multi;
+        if !multi && self.checked.len() > 1 {
+            let dropped = self.checked.len() - 1;
+            self.checked.truncate(1);
+            return dropped;
+        }
+        0
+    }
 
     pub fn toggle(&mut self, mac: &str) {
         if !self.devices.iter().any(|d| d.mac == mac) { return; }
