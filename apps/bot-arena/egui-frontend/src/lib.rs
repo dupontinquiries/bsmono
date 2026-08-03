@@ -5,7 +5,11 @@
 //! over `uikit-gesture`), laid out by the adaptive layer (a phone swipes between full-screen
 //! views; a desktop also shows a tab row), and voice/a11y-navigable. bot-arena's engine is
 //! already GTK-free, so on-device this front-end renders its live state directly; here it
+
 //! carries a small view model so the crate builds and the paging logic is unit-tested.
+
+/// CorpusStudio: the corpus-LM pipeline as a live stepper.
+pub mod studio;
 
 use egui::{Align, Layout, Ui};
 use uikit_egui::{Adaptive, GestureLayer, PaletteColors};
