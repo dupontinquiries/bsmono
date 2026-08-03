@@ -831,3 +831,33 @@ mod logit_cmp_tests {
         assert!(compare_logits(&v, &v.clone()).argmax_match);
     }
 }
+
+#[cfg(test)]
+mod gate_scope_tests {
+    /// A gate name is a claim about SCOPE and nothing checks it.
+    ///
+    /// Four times this week a green check turned out to be green about something adjacent:
+    ///
+    /// * `--gate-vram` measured the largest allocation the device ACCEPTS and was read as how much it
+    ///   will HOLD — two resources, one name, and a 56.6 GiB plan on a device that dies at 31.
+    /// * `--gate-q6k` was red for weeks because its fixture used random bytes as f16 scales.
+    /// * the fast-decode A/B reported "inconclusive" when the levers were unreachable.
+    /// * `moe llama4 gating (weight-before)` passed at **t=3**, the prefill shape, while the decode
+    ///   path it appears to cover is gated on `t == 1` and was never entered.
+    ///
+    /// The common shape: **the name describes the inputs and the coverage depends on a parameter
+    /// buried in the setup.** A reader cannot see the gap, and a passing line retires the question.
+    ///
+    /// The fix that scales is not more gates — it is names that carry the parameter that decides
+    /// which path runs. This test pins the two MoE gates that were misleading; it cannot pin all of
+    /// them, and saying so is more honest than a check that implies it did.
+    #[test]
+    fn the_moe_gates_state_the_token_count_that_selects_their_path() {
+        let src = include_str!("main.rs");
+        assert!(src.contains("at t={t} PREFILL shape"),
+            "the llama4 gating gate must say which shape it covers");
+        assert!(src.contains("routed decode path is gated on t==1 and is NOT covered"),
+            "and say plainly what it does NOT cover — an omission a reader cannot see is the whole \
+failure mode");
+    }
+}
