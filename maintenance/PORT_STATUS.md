@@ -234,3 +234,45 @@ right rather than like a gap: every field above is a bare `egui::TextEdit` with
 a hint and a width. There is no repeated behaviour to promote — no debounce, no
 validation, no shared focus rule. If one appears, this is the place to check
 before writing it twice.
+
+## Context menus, arrow keys, clipboard — and the one I did not build
+
+A second input audit, prompted by "there is no right-click action menu or tap
+and hold anywhere across egui". That was exactly right: **zero** matches for
+`secondary_clicked` or `context_menu` in any app or kit, and no arrow-key list
+navigation outside the terminal. Every action had to be a visible button, which
+is why several pages grew rows of them.
+
+`uikit_egui::menu` now carries all three:
+
+* **One menu, two ways in.** Right-click on a desktop, press-and-hold on a
+  phone. Those are the same intent on different hardware, and treating them as
+  two features grows two menus that drift — one gets a new action and the other
+  does not. `invoked()` asks "was I invoked?", not "was I right-clicked?".
+* **Long-press has a rule right-click does not: movement cancels it.** A finger
+  that drifts past 12px is scrolling, and a menu opening under a scroll makes a
+  list feel like it is grabbing at you. snapclone's snap tiles had the only
+  tuned hold in the fleet (450ms) and no slop at all; the kit took the timing
+  from them and gave the slop back.
+* **Keyboard.** Up/Down move, Enter chooses, Escape dismisses. Disabled entries
+  and separators are SKIPPED, because landing on something unpickable reads as
+  the keyboard being broken. Nothing is selected on open — a highlighted first
+  entry invites Enter, and the first entry is often the destructive one.
+* **Clipboard.** `copy_to_clipboard`, because nothing in the fleet could:
+  voiceterm had a `TermAction::Copy` that named the intent and never performed
+  it.
+
+Wired to snapclone's snap tiles rather than left as a kit feature nobody calls —
+the mistake this programme has now made three times. Entries are derived from
+the snap's state: "Save" is disabled on an expired snap, because the bytes are
+gone and offering it would fail after the tap.
+
+### Not built: phone-to-desktop field entry for TV mode
+
+Asked for and NOT attempted, deliberately. It is not a widget — it needs a
+transport between two devices, a pairing handshake, a focus protocol so the
+phone knows which field it is filling, and an echo so the TV shows the text as
+it is typed. snapclone already has DHT peering and voiceterm has a cross-app
+action protocol, so the pieces exist, but wiring them is a feature with a
+security surface (anyone on the network typing into your TV) rather than a
+refactor. Naming it here rather than half-building it.

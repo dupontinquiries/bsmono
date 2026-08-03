@@ -179,6 +179,13 @@ pub struct Snapclone {
     /// wrong one either destroys a video the user could keep or keeps an image
     /// they were promised would vanish.
     pub video: Option<crate::video_viewer::VideoViewer>,
+    /// The action menu, opened by right-click on a desktop and press-and-hold
+    /// on a phone. Before this the fleet had neither, anywhere.
+    pub menu: uikit_egui::menu::ContextMenu,
+    /// The snap the menu was opened on.
+    pub menu_target: Option<String>,
+    /// Snaps the user asked to keep, for the host to write out.
+    pub snaps_saved: Vec<String>,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -245,6 +252,9 @@ impl Snapclone {
             glass_shutter: Default::default(),
             shutter_pressed: false,
             video: None,
+            menu: Default::default(),
+            menu_target: None,
+            snaps_saved: Vec::new(),
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -533,6 +543,36 @@ impl Snapclone {
             Answer::Declined => {}
         }
         self.incoming_call = None;
+    }
+
+    /// Open the action menu for a snap tile.
+    ///
+    /// The entries are derived from the snap's own state rather than fixed:
+    /// "Save" is disabled for a snap that has already expired, because the
+    /// bytes are gone and offering it would fail after the tap.
+    pub fn open_snap_menu(&mut self, id: &str, at: (f32, f32)) -> bool {
+        use uikit_egui::menu::MenuItem;
+        let expired = self.snaps_expired.iter().any(|e| e == id);
+        let items = vec![
+            MenuItem::new("open", "View"),
+            if expired { MenuItem::new("save", "Save").disabled() }
+            else { MenuItem::new("save", "Save") },
+            MenuItem::separator(),
+            MenuItem::new("delete", "Delete").danger(),
+        ];
+        if !self.menu.open(items, at) { return false; }
+        self.menu_target = Some(id.to_string());
+        true
+    }
+
+    /// Carry out a menu choice against the snap it was opened on.
+    pub fn apply_menu(&mut self, id: &str) {
+        let Some(target) = self.menu_target.take() else { return };
+        match id {
+            "delete" => { self.feed.remove(&target); }
+            "save" => self.snaps_saved.push(target),
+            _ => {}
+        }
     }
 
     /// Open a snap from the feed, routing by MEDIA KIND.
@@ -975,6 +1015,50 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Video,
             duration_secs: 12, bytes: vec![1, 2, 3] }
+    }
+
+    fn entry(id: &str) -> crate::snaps::FeedEntry {
+        crate::snaps::FeedEntry { id: id.into(), sender_name: "Ada".into(), sent_at: 0,
+            media: crate::snaps::Media::Image, thumb_path: String::new() }
+    }
+
+    #[test]
+    fn a_tile_menu_offers_actions_derived_from_the_snap_not_a_fixed_list() {
+        // "Save" on an expired snap would fail after the tap: the bytes are
+        // gone. Disabled is the honest state.
+        let mut s = app();
+        s.feed.set_entries(vec![entry("s1")]);
+        assert!(s.open_snap_menu("s1", (10.0, 10.0)));
+        let save = s.menu.items().iter().find(|i| i.id == "save").unwrap();
+        assert!(save.enabled);
+
+        let mut t = app();
+        t.feed.set_entries(vec![entry("s2")]);
+        t.snaps_expired.push("s2".into());
+        t.open_snap_menu("s2", (10.0, 10.0));
+        let save = t.menu.items().iter().find(|i| i.id == "save").unwrap();
+        assert!(!save.enabled, "an expired snap cannot be saved");
+    }
+
+    #[test]
+    fn a_menu_choice_applies_to_the_snap_it_was_opened_on() {
+        // The target is captured at open. Deriving it later from a selection
+        // would act on whatever the user has since scrolled to.
+        let mut s = app();
+        s.feed.set_entries(vec![entry("s1"), entry("s2")]);
+        s.open_snap_menu("s1", (0.0, 0.0));
+        s.apply_menu("delete");
+        let ids: Vec<&str> = s.feed.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["s2"], "only the tile the menu was opened on went");
+    }
+
+    #[test]
+    fn a_menu_choice_with_no_target_does_nothing() {
+        // A stray activation after the menu closed must not delete a snap.
+        let mut s = app();
+        s.feed.set_entries(vec![entry("s1")]);
+        s.apply_menu("delete");
+        assert_eq!(s.feed.count(), 1, "a stray activation must not delete a snap");
     }
 
     #[test]
