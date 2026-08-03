@@ -3,6 +3,7 @@
 
 mod anim;
 mod analog;
+mod bigbody;
 mod bots;
 mod camera;
 mod config;

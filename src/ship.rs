@@ -21,6 +21,9 @@
 //! standing, and a state machine that can jump between them is a menu
 //! wearing a ship costume.
 
+use glam::Vec3;
+
+use crate::bigbody::{BigBody, Drive, Shape};
 use crate::menu::{Fmt, Item, Menu, Row};
 use crate::patrol;
 
@@ -133,6 +136,11 @@ pub enum Phase {
     /// in orbit with the navigation console live — this is where plotting
     /// happens, and it is a PLACE rather than a menu
     Plotting,
+    /// hit hard enough that nothing is flying it any more. Not a cutscene:
+    /// the hull is now a falling BigBody and the world's own physics has it.
+    Crashing,
+    /// down, in one piece or several. The hull is terrain from here.
+    Wrecked,
     /// under way
     Cruise,
     /// coming down, or holding while the hangar drops you
@@ -151,6 +159,8 @@ impl Phase {
             Phase::Plotting => "PLOTTING",
             Phase::Cruise => "CRUISE",
             Phase::Descent => "DESCENT",
+            Phase::Crashing => "GOING DOWN",
+            Phase::Wrecked => "WRECKED",
             Phase::Arrived => "ARRIVED",
         }
     }
@@ -198,12 +208,28 @@ pub struct Ship {
     /// 0..1
     pub fuel: f32,
     pub crew: u32,
+    /// the hull as a collider — solid to stand in, and an entity that can be
+    /// shot out of the sky
+    pub body: BigBody,
 }
 
 impl Ship {
     pub fn new(hull_id: &str, at: &'static str) -> Ship {
+        let h = hull(hull_id).unwrap_or(&HULLS[0]);
+        // a crude hull box scaled off the real length, with a hangar bay
+        // carved aft — the bay is what makes it a place rather than a rock
+        let half = Vec3::new(h.length * 0.16, h.length * 0.09, h.length * 0.5);
+        let shape = Shape {
+            half,
+            round: (h.length * 0.02).max(0.5),
+            bay: Some((
+                Vec3::new(0.0, -half.y * 0.35, half.z * 0.45),
+                Vec3::new(half.x * 0.5, half.y * 0.45, half.z * 0.22),
+            )),
+        };
         Ship {
-            hull: hull(hull_id).unwrap_or(&HULLS[0]),
+            body: BigBody::new(shape, Vec3::ZERO),
+            hull: h,
             phase: Phase::Docked,
             at,
             course: None,
@@ -211,6 +237,27 @@ impl Ship {
             fuel: 1.0,
             crew: 1,
         }
+    }
+
+    /// TAKE FIRE. Past its hit points the flight script stops and gravity
+    /// takes over — which is the whole design: crashing is not a special
+    /// mode, it is the absence of one.
+    pub fn hit(&mut self, amount: f32, at: Vec3) {
+        if matches!(self.phase, Phase::Wrecked | Phase::Docked) {
+            return;
+        }
+        self.body.damage(amount, at);
+        if self.body.drive == Drive::Falling && self.phase != Phase::Crashing {
+            self.phase = Phase::Crashing;
+            self.timer = 0.0;
+            self.course = None;
+        }
+    }
+
+    /// True while anything aboard should be under ordinary world physics
+    /// rather than being carried by a script.
+    pub fn uncontrolled(&self) -> bool {
+        matches!(self.phase, Phase::Crashing)
     }
 
     pub fn here(&self) -> Option<&'static patrol::Destination> {
@@ -289,6 +336,15 @@ impl Ship {
     }
 
     pub fn update(&mut self, dt: f32) -> Option<Phase> {
+        if self.phase == Phase::Crashing {
+            // nothing scripted left: the body is falling and the ground it
+            // meets is the world's, same as for any car
+            if self.body.drive == Drive::Wrecked {
+                self.phase = Phase::Wrecked;
+                return Some(Phase::Wrecked);
+            }
+            return None;
+        }
         if self.timer <= 0.0 {
             return None;
         }
@@ -500,6 +556,70 @@ mod tests {
         // the disabled ones still say why
         assert!(m.rows.iter().filter(|r| !r.enabled && r.item == Item::Action)
             .all(|r| r.hint.is_some()));
+    }
+
+    #[test]
+    fn being_shot_down_mid_ascent_hands_you_to_the_world() {
+        let mut s = Ship::new("spearhead", "earth");
+        s.plot("mars", Arrival::Land).unwrap();
+        s.launch().unwrap();
+        for _ in 0..600 {
+            s.update(1.0 / 60.0);
+            if s.phase == Phase::Ascent {
+                break;
+            }
+        }
+        assert_eq!(s.phase, Phase::Ascent);
+        assert!(!s.uncontrolled());
+
+        // hit it off the centreline
+        let flank = s.body.frame.to_world(Vec3::new(s.body.shape.half.x, 0.0, 0.0));
+        s.hit(2.0, flank);
+        assert_eq!(s.phase, Phase::Crashing);
+        assert!(s.uncontrolled(), "still being flown after being shot down");
+        assert!(s.course.is_none(), "it is still holding a course while falling");
+        assert_eq!(s.body.drive, crate::bigbody::Drive::Falling);
+
+        // the timer no longer advances anything: only the world does
+        for _ in 0..600 {
+            s.update(1.0 / 60.0);
+        }
+        assert_eq!(s.phase, Phase::Crashing, "a script finished the crash for us");
+
+        // now run it as a falling body against real ground
+        let g = Vec3::new(0.0, -9.81, 0.0);
+        s.body.frame.pos.y = 400.0;
+        for _ in 0..20000 {
+            s.body.step(1.0 / 60.0, g, &|p: Vec3| p.y);
+            s.update(1.0 / 60.0);
+            if s.phase == Phase::Wrecked {
+                break;
+            }
+        }
+        assert_eq!(s.phase, Phase::Wrecked, "never came down");
+        assert!(s.body.contains(s.body.frame.pos), "the wreck stopped being solid");
+    }
+
+    #[test]
+    fn a_docked_ship_cannot_be_shot_out_of_the_sky() {
+        let mut s = Ship::new("hawkdrop", "earth");
+        s.hit(99.0, Vec3::ZERO);
+        assert_eq!(s.phase, Phase::Docked);
+    }
+
+    #[test]
+    fn a_bigger_hull_is_a_bigger_place() {
+        // the collider is scaled off the real length, so a carrier really is
+        // somewhere you could walk around
+        let l = Ship::new("hawkdrop", "earth");
+        let c = Ship::new("widesky", "earth");
+        assert!(c.body.shape.half.z > l.body.shape.half.z * 20.0);
+        // and both have a bay you can be inside without being inside the hull
+        for s in [&l, &c] {
+            let (bc, _) = s.body.shape.bay.unwrap();
+            let p = s.body.frame.to_world(bc);
+            assert!(s.body.in_bay(p) && !s.body.contains(p));
+        }
     }
 
     #[test]
