@@ -154,6 +154,10 @@ pub struct PlaylistsPage {
     /// The playlist created most recently, so the page can scroll to it — a new
     /// row appearing off-screen looks like nothing happened.
     pub focus_id: Option<i64>,
+    /// The index filter. A collection you cannot search stops being a
+    /// collection somewhere around forty rows — which is where a playlist page
+    /// arrives after a couple of months.
+    pub filter: String,
 }
 
 pub const EMPTY_TEXT: &str = "No playlists yet. Create one to start collecting tracks.";
@@ -174,6 +178,27 @@ impl PlaylistsPage {
 
     /// Note a newly created playlist so the page can bring it into view.
     pub fn focus(&mut self, id: i64) { self.focus_id = Some(id); }
+
+    /// The visible rows, filtered.
+    ///
+    /// Matches the NAME and the DESCRIPTION, because "long roads" is how the
+    /// user thinks of the playlist they called "Drive" — the description is
+    /// where the memorable words usually are.
+    pub fn visible(&self) -> Vec<&PlaylistSummary> {
+        let f = self.filter.trim().to_lowercase();
+        self.playlists.iter()
+            .filter(|p| f.is_empty()
+                || p.name.to_lowercase().contains(&f)
+                || p.description.to_lowercase().contains(&f))
+            .collect()
+    }
+
+    /// True when a filter is hiding everything — distinct from having no
+    /// playlists at all, and the two need different messages or the user thinks
+    /// their collection vanished.
+    pub fn filtered_to_nothing(&self) -> bool {
+        !self.playlists.is_empty() && self.visible().is_empty()
+    }
 }
 
 /// What the pages ask the host to do.
@@ -244,16 +269,28 @@ pub fn playlists_ui(ui: &mut egui::Ui, p: &mut PlaylistsPage, now: i64,
                 if ui.button("Cancel").clicked() { p.create.reset(); }
             });
         });
-    } else if ui.button("+ New playlist").clicked() {
-        p.create.expand();
+    } else {
+        ui.horizontal(|ui| {
+            if ui.button("+ New playlist").clicked() { p.create.expand(); }
+            ui.add(egui::TextEdit::singleline(&mut p.filter)
+                .hint_text("Search playlists").desired_width(180.0));
+        });
     }
 
     if p.is_empty() {
         ui.colored_label(c.text_weak, EMPTY_TEXT);
         return act;
     }
+    if p.filtered_to_nothing() {
+        // Names the filter. "No playlists" here would tell the user their
+        // collection had gone.
+        ui.colored_label(c.text_weak,
+            format!("No playlist matching \"{}\"", p.filter.trim()));
+        return act;
+    }
+    let rows: Vec<PlaylistSummary> = p.visible().into_iter().cloned().collect();
     egui::ScrollArea::vertical().id_salt("playlists").show(ui, |ui| {
-        for pl in p.all() {
+        for pl in &rows {
             let fresh = p.focus_id == Some(pl.id);
             ui.horizontal(|ui| {
                 let text = egui::RichText::new(&pl.name)
@@ -411,6 +448,35 @@ mod tests {
         p.focus(2);
         p.set(vec![pl(1, "A", 0, 0)]);
         assert_eq!(p.focus_id, None);
+    }
+
+    #[test]
+    fn the_index_can_be_searched_by_name_or_description() {
+        // "long roads" is how the user thinks of the playlist they called
+        // "Drive" — the description is where the memorable words are.
+        let mut p = PlaylistsPage::default();
+        let mut a = pl(1, "Drive", 5, 0); a.description = "long roads".into();
+        p.set(vec![a, pl(2, "Focus", 3, 0)]);
+        p.filter = "drive".into();
+        assert_eq!(p.visible().len(), 1);
+        p.filter = "LONG ROADS".into();
+        assert_eq!(p.visible().len(), 1, "case-insensitive, and matches the description");
+        p.filter = "  ".into();
+        assert_eq!(p.visible().len(), 2, "a blank filter shows everything");
+    }
+
+    #[test]
+    fn a_filter_matching_nothing_is_distinct_from_having_nothing() {
+        // Otherwise the user thinks their collection vanished.
+        let mut p = PlaylistsPage::default();
+        p.set(vec![pl(1, "Drive", 5, 0)]);
+        p.filter = "zzzz".into();
+        assert!(p.visible().is_empty());
+        assert!(p.filtered_to_nothing());
+        assert!(!p.is_empty(), "the collection is still there");
+
+        let empty = PlaylistsPage::default();
+        assert!(!empty.filtered_to_nothing(), "nothing to filter is not a filter miss");
     }
 
     #[test]
