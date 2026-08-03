@@ -1151,6 +1151,14 @@ was evicted)", prompt_ids.len())
                 eprintln!("wgpu-engine: [{}] SHORT REPLY ({produced} tok) — stop: {why}; stop_set={:?}; next-token argmax={:?}",
                     self.name, self.stop_ids, next_argmax);
                 eprintln!("wgpu-engine: [{}]   generated text = {:?}", self.name, decoded);
+                // CODE CHECK, behind LOGSCOPE_DEBUG_FORMAT. Reports rather than rewrites: a formatter that
+                // silently repairs a model's output makes broken code LOOK correct, and the reader loses the
+                // one signal that something went wrong.
+                if logscope::codefmt::enabled() {
+                    if let Some(s) = logscope::codefmt::summary(&logscope::codefmt::check(&decoded)) {
+                        eprintln!("wgpu-engine: [{}] {s}", self.name);
+                    }
+                }
                 eprintln!("wgpu-engine: [{}]   generated ids (≤16) = {:?}", self.name, tail);
             }
             // This turn (prompt + what we generated) joins the pool as a branch tip; `prefill_len` is how
