@@ -1179,3 +1179,113 @@ mod weathering_tests {
         assert!(!w.transitioning(), "settled, not mid-collapse");
     }
 }
+
+/// When a peer that dropped is allowed back into the work pool.
+///
+/// The weathering above smooths the PICTURE of a flapping peer. It does not stop the flapping from
+/// costing anything, and smoothing a symptom is the wrong fix: a peer that keeps dropping is useless
+/// for a long generation whatever its landmark looks like.
+///
+/// So it waits. And the wait is not arbitrary — **the rebuild animation and the join-back delay are
+/// the same duration on purpose**. The tower finishing construction *is* the readiness signal, which
+/// makes the animation load-bearing rather than decorative: what you see is what the scheduler
+/// believes.
+///
+/// ## The delay depends on what a defection would cost
+///
+/// Mid-generation, a peer vanishing means its share of the work is lost and must be redone, so the
+/// bar to readmit is high. Idle, readmitting early costs nothing and the rebuild time is free — it
+/// overlaps with preloading, which has to happen anyway before that peer is useful.
+///
+/// A fixed delay would be wrong in both directions: too eager under load, too cautious at rest.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Rejoin {
+    /// Consecutive drops. A peer that has flapped repeatedly waits longer each time.
+    pub drops: u32,
+    /// Seconds since it came back.
+    pub steady_s: f32,
+}
+
+/// Base wait when the local machine is idle: exactly the rebuild, so the delay is invisible.
+pub const REJOIN_IDLE_S: f32 = WEATHER_TRANSITION_S;
+
+/// Base wait mid-generation. Longer, because a defection here costs work already done.
+pub const REJOIN_BUSY_S: f32 = 20.0;
+
+/// Beyond this many drops the extra caution stops growing — a peer flapping this hard is a link
+/// problem, and waiting ten minutes does not fix a link.
+pub const REJOIN_MAX_DROPS: u32 = 4;
+
+impl Rejoin {
+    /// How long this peer must stay up before it gets work again.
+    pub fn required_s(&self, busy: bool) -> f32 {
+        let base = if busy { REJOIN_BUSY_S } else { REJOIN_IDLE_S };
+        // Each drop doubles, to a ceiling. Linear would readmit a chronic flapper too often; growing
+        // without bound would exile a peer that had one bad minute.
+        base * (1u32 << self.drops.min(REJOIN_MAX_DROPS)) as f32
+    }
+
+    pub fn ready(&self, busy: bool) -> bool { self.steady_s >= self.required_s(busy) }
+
+    /// **Is the wait free?** When idle, the rebuild has to happen anyway and preloading fills the
+    /// same window, so nothing is lost by waiting — and a scene can say so rather than looking like
+    /// it is withholding a working machine.
+    pub fn wait_is_free(&self, busy: bool) -> bool {
+        !busy && self.required_s(busy) <= WEATHER_TRANSITION_S * 2.0
+    }
+}
+
+#[cfg(test)]
+mod rejoin_tests {
+    use super::*;
+
+    #[test]
+    fn an_IDLE_rejoin_costs_exactly_the_rebuild() {
+        // The coupling that makes the animation load-bearing: the tower finishing construction IS
+        // the readiness signal, so the delay is invisible and free.
+        let r = Rejoin { drops: 0, steady_s: 0.0 };
+        assert_eq!(r.required_s(false), WEATHER_TRANSITION_S);
+        assert!(r.wait_is_free(false));
+    }
+
+    #[test]
+    fn a_BUSY_rejoin_waits_much_longer() {
+        // Mid-generation a defection costs work already done, so the bar to readmit is high.
+        let r = Rejoin { drops: 0, steady_s: 0.0 };
+        assert!(r.required_s(true) > r.required_s(false) * 5.0);
+        assert!(!r.wait_is_free(true), "and the scene should not pretend it is free");
+    }
+
+    #[test]
+    fn repeated_drops_DOUBLE_the_wait_up_to_a_ceiling() {
+        // Linear would readmit a chronic flapper too often; unbounded would exile a peer that had one
+        // bad minute. A peer flapping this hard is a link problem, and waiting ten minutes does not
+        // fix a link.
+        let w = |d| Rejoin { drops: d, steady_s: 0.0 }.required_s(false);
+        assert!(w(1) > w(0) && w(2) > w(1));
+        assert_eq!(w(REJOIN_MAX_DROPS), w(REJOIN_MAX_DROPS + 9), "capped");
+    }
+
+    #[test]
+    fn a_peer_that_has_been_STEADY_is_readmitted() {
+        let r = Rejoin { drops: 1, steady_s: 100.0 };
+        assert!(r.ready(false));
+        assert!(r.ready(true));
+    }
+
+    #[test]
+    fn a_peer_that_just_returned_is_NOT_readmitted_mid_generation() {
+        // The case the whole policy exists for: it looks available and has proved nothing.
+        assert!(!Rejoin { drops: 0, steady_s: 2.0 }.ready(true));
+    }
+
+    #[test]
+    fn the_idle_wait_ends_when_the_TOWER_finishes() {
+        // Stated as an assertion rather than a comment, because the two constants living apart is
+        // exactly how they would drift.
+        let mut w = Weathering::absent();
+        w.tick(REJOIN_IDLE_S, true, 0.0);
+        assert!(w.built >= 0.999, "the rebuild completes exactly as the peer becomes ready");
+        assert!(Rejoin { drops: 0, steady_s: REJOIN_IDLE_S }.ready(false));
+    }
+}
