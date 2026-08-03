@@ -153,6 +153,7 @@ Three behaviours have now been lifted out of app code into
 | `Breath` | dial glow, anticipation cue, queue equalizer, peel hint, voice bar | phase must wrap; offset taps must not move in unison |
 | `fmt::relative_time` | bo-suite library + sources, snapclone outbox + snap feed | a future timestamp must not read as a negative age |
 | `fmt::plural` / `badge_count` | eight modules across three apps | zero is plural; a zero badge is absent |
+| `gesture::rubber_band`, `VelocityTracker` | snapclone `swipe_physics` | resistance must never outrun the finger; a decelerating swipe was aimed at stopping |
 
 The middle column is the argument. Each of those rules is a bug someone hits
 once and fixes locally, and the third implementation hits it again.
@@ -192,8 +193,23 @@ which is the strongest argument for doing them at all:
   unreported. Both now share one `is_noise_tag`, with a parity test that fails
   if they ever diverge again.
 
+* **`uikit-gesture` already had the page-commit rule, and the port re-derived
+  it.** `swipe_physics.rs` carried `COMMIT_FRACTION = 0.22`,
+  `FLICK_PX_PER_MS = 0.30` and `FLICK_MIN_PX = 14.0` — character for character
+  the values already in `GestureConfig`, whose own comment says it mirrors
+  snapclone's `Theme.hpp`. The port worked forward from the Qt source to
+  constants the kit had already been given. Now read from the kit, so a retune
+  lands once.
+
+  And the two disagreed about something real: the kit took flick direction from
+  the **velocity**, the port from the **drag**. They differ only on a late
+  reversal — 100px left then a 5px snap back right before lifting — where the
+  velocity's sign turns the page the opposite way to how it visibly moved. The
+  kit had no test covering that case, which is why it survived. The port's rule
+  won and is now the kit's.
+
 ### Kits still unaudited
 
-`uikit-gesture` and `uikit-term` have not had this sweep. `uikit-term` and
-`uikit-web` also still have one consumer each — they carry kit-shaped cost
-without kit-shaped payoff, and that stays true until a second app embeds them.
+`uikit-term` has not had this sweep. `uikit-term` and `uikit-web` also still
+have one consumer each — they carry kit-shaped cost without kit-shaped payoff,
+and that stays true until a second app embeds them.
