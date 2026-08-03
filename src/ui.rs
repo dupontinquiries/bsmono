@@ -337,6 +337,61 @@ impl Screen {
 ///
 /// Only the visible window is emitted: `Menu` already solved scrolling, and
 /// re-deciding it here is how the two would disagree.
+/// WHERE EACH ROW LANDS. One function, used by both the drawing and the
+/// hit-testing.
+///
+/// This is the fix for the thing that made the Maps menu unmigratable: its
+/// row geometry lives in `hud.rs` for drawing and again in `main.rs` for
+/// mouse hits, so a spacing change in one place silently stops the other
+/// from selecting the row under the cursor. Deriving both from this means
+/// the rectangle a row is DRAWN in is by construction the rectangle that
+/// SELECTS it, and a test asserts exactly that.
+pub fn menu_rows(
+    s: &Screen,
+    m: &crate::menu::Menu,
+    size: f32,
+) -> Vec<(usize, Rect)> {
+    let a = s.area();
+    let row_h = size * 2.4;
+    let mut out = Vec::new();
+    let mut y = a.y1 - row_h * 2.0;
+    for (i, _) in m.visible() {
+        out.push((
+            i,
+            Rect { x0: a.x0, y0: y - row_h * 0.15, x1: a.x1, y1: y + row_h * 0.85 },
+        ));
+        y -= row_h;
+    }
+    out
+}
+
+/// Which row is under the cursor, if any. NDC in, row index out.
+///
+/// Returns None over a heading or a gap, because pointing at a label is not
+/// pointing at a choice — and a menu that highlights a heading when you
+/// sweep past it looks broken.
+pub fn menu_hit(
+    s: &Screen,
+    m: &crate::menu::Menu,
+    size: f32,
+    cursor: (f32, f32),
+) -> Option<usize> {
+    for (i, r) in menu_rows(s, m, size) {
+        if cursor.0 >= r.x0 && cursor.0 <= r.x1 && cursor.1 >= r.y0 && cursor.1 <= r.y1 {
+            return m.rows.get(i).filter(|w| w.item.selectable()).map(|_| i);
+        }
+    }
+    None
+}
+
+/// Turn a `menu::Menu` into draw commands.
+///
+/// This is the half `menu.rs` was missing. It had rows, navigation,
+/// scrolling and a stack, and no way to appear on screen — so every screen
+/// kept its own draw function and the abstraction stayed unused. It uses the
+/// SAME anchoring and aspect correction as the HUD, so a menu cannot drift
+/// out of agreement with the rest of the interface, and the SAME geometry as
+/// the hit test, so it cannot drift out of agreement with the mouse.
 pub fn menu_cmds(
     s: &Screen,
     m: &crate::menu::Menu,
@@ -348,31 +403,31 @@ pub fn menu_cmds(
     use crate::menu::Item;
     let a = s.area();
     let row_h = size * 2.4;
-    let mut out = Vec::new();
-    let mut y = a.y1 - row_h * 2.0;
+    let mut out = vec![Cmd::Text {
+        x: a.x0,
+        y: a.y1 - row_h,
+        size: size * 1.3,
+        color: fg,
+        text: m.title.clone(),
+    }];
 
-    out.push(Cmd::Text { x: a.x0, y: a.y1 - row_h, size: size * 1.3, color: fg, text: m.title.clone() });
-
-    for (i, r) in m.visible() {
-        let selected = i == m.sel();
-        if selected {
-            out.push(Cmd::Quad {
-                r: Rect { x0: a.x0, y0: y - row_h * 0.15, x1: a.x1, y1: y + row_h * 0.85 },
-                color: sel_bg,
-            });
+    for (i, r) in menu_rows(s, m, size) {
+        let Some(row) = m.rows.get(i) else { continue };
+        if i == m.sel() {
+            out.push(Cmd::Quad { r, color: sel_bg });
         }
         // a disabled row is drawn dim rather than hidden, because "why can
         // I not press this" is better answered than avoided
-        let c = if r.enabled { fg } else { dim };
-        let indent = if matches!(r.item, Item::Heading) { 0.0 } else { size * 1.2 / s.aspect };
-        out.push(Cmd::Text { x: a.x0 + indent, y, size, color: c, text: r.label.clone() });
+        let c = if row.enabled { fg } else { dim };
+        let indent = if matches!(row.item, Item::Heading) { 0.0 } else { size * 1.2 / s.aspect };
+        let ty = r.y0 + row_h * 0.3;
+        out.push(Cmd::Text { x: a.x0 + indent, y: ty, size, color: c, text: row.label.clone() });
 
-        let v = r.item.value();
+        let v = row.item.value();
         if !v.is_empty() {
             let w = v.chars().count() as f32 * size * 1.15 / s.aspect;
-            out.push(Cmd::Text { x: a.x1 - w, y, size, color: c, text: v });
+            out.push(Cmd::Text { x: a.x1 - w, y: ty, size, color: c, text: v });
         }
-        y -= row_h;
     }
 
     // the hint for the selected row, pinned to the bottom, so it never
@@ -627,6 +682,66 @@ mod tests {
             let full = Rect { x0: -1.0, y0: -1.0, x1: 1.0, y1: 1.0 };
             assert!(full.contains_rect(&b), "the boost bar spilled at {aspect:.2}: {b:?}");
         }
+    }
+
+    #[test]
+    fn the_rect_a_row_is_drawn_in_is_the_rect_that_selects_it() {
+        // THE POINT OF menu_rows. Maps keeps its row geometry in hud.rs for
+        // drawing and again in main.rs for mouse hits, so a spacing change
+        // in one silently stops the other selecting what is under the
+        // cursor. Both now come from one function, and this proves it: every
+        // highlight quad the drawing emits must be hit by a click at its own
+        // centre.
+        use crate::menu::{Menu, Row};
+        let s = scr();
+        let rows: Vec<Row> = (0..14)
+            .map(|i| Row::toggle(Box::leak(format!("r{i}").into_boxed_str()), &format!("ROW {i}"), false))
+            .collect();
+        let mut m = Menu::new("HIT", rows);
+        m.view = 8;
+        for step in 0..14 {
+            let geom = menu_rows(&s, &m, 0.02);
+            let sel = m.sel();
+            let (_, r) = geom.iter().find(|(i, _)| *i == sel).expect("selected row not on screen");
+            let centre = ((r.x0 + r.x1) * 0.5, (r.y0 + r.y1) * 0.5);
+            assert_eq!(menu_hit(&s, &m, 0.02, centre), Some(sel),
+                "at step {step} the row drawn at {r:?} is not the row clicking it selects");
+            m.step(1);
+        }
+    }
+
+    #[test]
+    fn pointing_at_a_heading_or_off_the_list_selects_nothing() {
+        use crate::menu::{Menu, Row};
+        let s = scr();
+        let m = Menu::new("X", vec![Row::heading("SECTION"), Row::action("go", "GO")]);
+        let geom = menu_rows(&s, &m, 0.02);
+        let (_, head) = geom[0];
+        let mid = ((head.x0 + head.x1) * 0.5, (head.y0 + head.y1) * 0.5);
+        assert_eq!(menu_hit(&s, &m, 0.02, mid), None, "hovering a heading selected it");
+        // and far below the last row
+        assert_eq!(menu_hit(&s, &m, 0.02, (0.0, -0.98)), None);
+    }
+
+    #[test]
+    fn scrolling_moves_the_hit_boxes_with_the_rows() {
+        use crate::menu::{Menu, Row};
+        let s = scr();
+        let rows: Vec<Row> = (0..30)
+            .map(|i| Row::toggle(Box::leak(format!("s{i}").into_boxed_str()), &format!("ROW {i}"), false))
+            .collect();
+        let mut m = Menu::new("SCROLL", rows);
+        m.view = 6;
+        let top_before = menu_rows(&s, &m, 0.02)[0].0;
+        for _ in 0..12 {
+            m.step(1);
+        }
+        let geom = menu_rows(&s, &m, 0.02);
+        assert_ne!(geom[0].0, top_before, "the window never scrolled");
+        // the topmost drawn row is hit by a click at the top of the list
+        let (i, r) = geom[0];
+        let centre = ((r.x0 + r.x1) * 0.5, (r.y0 + r.y1) * 0.5);
+        assert_eq!(menu_hit(&s, &m, 0.02, centre), Some(i));
     }
 
     #[test]

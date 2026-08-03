@@ -509,3 +509,161 @@ mod tests {
         assert!(h.activate().is_none());
     }
 }
+
+// ============================================================ the host ===
+//
+// `Menu` knows how to navigate itself and `ui` knows how to draw it. What
+// was still missing is the thing between: something that takes what the
+// player did and turns it into those calls. Every screen in `Mode` writes
+// that branch by hand, which is why nine of them disagree about whether the
+// list wraps.
+
+/// What a player did, in menu terms rather than device terms.
+///
+/// Deliberately not keys: the same Move(-1) arrives from W, from up-arrow,
+/// from a stick and from a wheel, and a menu should not care which. It also
+/// means a test can drive a screen without inventing a keyboard.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Input {
+    /// -1 up, +1 down
+    Move(i32),
+    /// -1 left, +1 right on the selected row
+    Adjust(i32),
+    Activate,
+    Back,
+    /// the pointer moved to a row (from `ui::menu_hit`)
+    Point(usize),
+    /// the pointer was clicked on a row
+    Click(usize),
+}
+
+/// A stack of screens plus the rule for driving them.
+#[derive(Default)]
+pub struct Host {
+    pub stack: Stack,
+}
+
+impl Host {
+    pub fn new() -> Host {
+        Host { stack: Stack::new() }
+    }
+    pub fn open(&mut self, m: Menu) {
+        self.stack.push(m);
+    }
+    pub fn is_open(&self) -> bool {
+        self.stack.is_open()
+    }
+    pub fn top(&self) -> Option<&Menu> {
+        self.stack.peek()
+    }
+
+    /// Feed one input. Returns what happened, if anything.
+    ///
+    /// `Back` on the last screen yields `Event::Close` and closes the host,
+    /// so the caller has one thing to check rather than a depth counter —
+    /// which is what `menu_from_pause` was standing in for.
+    pub fn input(&mut self, i: Input) -> Option<Event> {
+        if !self.stack.is_open() {
+            return None;
+        }
+        if i == Input::Back {
+            let done = self.stack.back();
+            return done.then_some(Event::Close);
+        }
+        let m = self.stack.top()?;
+        match i {
+            Input::Move(d) => {
+                m.step(d);
+                None
+            }
+            Input::Adjust(d) => m.adjust(d),
+            Input::Activate => m.activate(),
+            Input::Point(row) => {
+                m.point_at(row);
+                None
+            }
+            Input::Click(row) => {
+                // pointing and pressing are one gesture with a mouse, and
+                // splitting them is how a click lands on the row you were
+                // previously on
+                m.point_at(row);
+                m.activate()
+            }
+            Input::Back => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    fn screen() -> Menu {
+        Menu::new(
+            "SETTINGS",
+            vec![
+                Row::heading("VIDEO"),
+                Row::toggle("vsync", "VSYNC", true),
+                Row::slider("fov", "FOV", 90.0, 60.0, 120.0, 5.0, Fmt::Degrees),
+                Row::submenu("audio", "AUDIO"),
+                Row::action("quit", "QUIT"),
+            ],
+        )
+    }
+
+    #[test]
+    fn one_input_vocabulary_serves_every_device() {
+        let mut h = Host::new();
+        h.open(screen());
+        // a menu should not know whether that was W, an arrow or a stick
+        assert!(h.input(Input::Move(1)).is_none());
+        assert_eq!(h.top().unwrap().selected().unwrap().id, "fov");
+        assert!(h.input(Input::Move(-1)).is_none());
+        assert_eq!(h.top().unwrap().selected().unwrap().id, "vsync");
+    }
+
+    #[test]
+    fn adjusting_reports_the_new_value_and_activating_reports_the_press() {
+        let mut h = Host::new();
+        h.open(screen());
+        assert_eq!(h.input(Input::Adjust(1)), Some(Event::Changed("vsync", Value::Bool(false))));
+        h.input(Input::Move(1));
+        assert_eq!(h.input(Input::Adjust(1)), Some(Event::Changed("fov", Value::Num(95.0))));
+        h.input(Input::Move(1));
+        assert_eq!(h.input(Input::Activate), Some(Event::Open("audio")));
+        h.input(Input::Move(1));
+        assert_eq!(h.input(Input::Activate), Some(Event::Pressed("quit")));
+    }
+
+    #[test]
+    fn a_click_lands_on_the_row_you_clicked_not_the_one_you_were_on() {
+        // the classic mouse-menu bug: point and press handled separately, so
+        // the first click after moving activates the old selection
+        let mut h = Host::new();
+        h.open(screen());
+        assert_eq!(h.top().unwrap().selected().unwrap().id, "vsync");
+        assert_eq!(h.input(Input::Click(4)), Some(Event::Pressed("quit")));
+    }
+
+    #[test]
+    fn back_unwinds_one_screen_and_only_closes_at_the_bottom() {
+        let mut h = Host::new();
+        h.open(screen());
+        h.open(Menu::new("AUDIO", vec![Row::toggle("mute", "MUTE", false)]));
+        assert_eq!(h.stack.depth(), 2);
+        assert_eq!(h.input(Input::Back), None, "backing out of a submenu closed everything");
+        assert_eq!(h.stack.depth(), 1);
+        assert_eq!(h.input(Input::Back), Some(Event::Close));
+        assert!(!h.is_open());
+        // and a closed host ignores everything rather than panicking
+        assert_eq!(h.input(Input::Activate), None);
+    }
+
+    #[test]
+    fn pointing_at_a_row_selects_it_without_pressing_it() {
+        let mut h = Host::new();
+        h.open(screen());
+        assert_eq!(h.input(Input::Point(4)), None, "hovering fired the button");
+        assert_eq!(h.top().unwrap().selected().unwrap().id, "quit");
+    }
+}
