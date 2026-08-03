@@ -6311,3 +6311,146 @@ mod tests {
         set_env_params(EnvParams::default()); // restore
     }
 }
+
+/// Add the diagnostic landmark to a scene.
+///
+/// This is the generic mechanism `machinery::Parts` was designed for: a **store** of slots with some
+/// filled, a **selector** pointing at one of them, and a **drive** turning at a rate. Every theme is
+/// this shape wearing different materials and proportions — writing it once and dressing it is why
+/// `Parts` carries numbers rather than each of fifteen scenes inventing its own geometry.
+///
+/// ## The stall has to read as stopped, not slow
+///
+/// Motion is expressed through `Float.amp` and `speed`, and a stalled drive gets **zero for both**.
+/// A mechanism creeping along reads as working hard; one that has visibly stopped reads as stopped,
+/// and that difference is the entire reason to draw this rather than print a percentage.
+///
+/// ## Filled and streaming slots must be distinguishable at a glance
+///
+/// A resident slot sits still and solid. A streaming one floats — it is in transit, and the reader
+/// should be able to count the difference across the room without reading a number.
+pub fn add_landmark(
+    s: &mut Scene,
+    parts: logscope::machinery::Parts,
+    place: logscope::machinery::Placement,
+    resident: Color32,
+    streaming: Color32,
+    frame: Color32,
+) {
+    let base = v(place.pos[0], place.pos[1], place.pos[2]);
+    let k = place.scale;
+
+    // The frame: a plinth and an upright the parts hang from. Still, always — it is the thing the
+    // moving parts are measured against, and a frame that drifted would make a stopped drive
+    // ambiguous.
+    s.add(box_slab(base, 1.6 * k, 0.12 * k, 0.9 * k, frame), Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+    s.add(box_slab(v(base.x, base.y + 1.5 * k, base.z), 0.1 * k, 1.5 * k, 0.1 * k, frame),
+          Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+
+    // The store: one marker per slot, laid along the plinth. Resident markers are solid and still;
+    // streaming ones float, so the split is countable at a glance.
+    let n = parts.slots.max(1);
+    let span = 2.8 * k;
+    for i in 0..n {
+        let t = if n == 1 { 0.5 } else { i as f32 / (n - 1) as f32 };
+        let x = base.x - span * 0.5 + span * t;
+        let home = i < parts.filled;
+        let c = if home { resident } else { streaming };
+        let m = box_slab(v(x, base.y + 0.28 * k, base.z), 0.055 * k, 0.16 * k, 0.16 * k, c);
+        // Streaming slots are in transit and say so; resident ones are still. The amplitude also
+        // scales with how much is MISSING, so a nearly-full store barely stirs and an empty one is
+        // visibly churning.
+        let f = if home || !parts.has_traffic() {
+            Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 }
+        } else {
+            let churn = 1.0 - parts.smoothness;
+            Float { amp: 0.06 * k * (0.4 + churn), speed: 1.1 + churn, phase: i as f32 * 0.7, drift: 0.0 }
+        };
+        s.add(m, f);
+    }
+
+    // The selector: an arm over the chosen slot. Absent entirely when nothing is selected, because a
+    // stalled machine is not mid-choice and an arm parked on a slot would read as deliberation.
+    if let Some(sel) = parts.selected {
+        let t = if n == 1 { 0.5 } else { (sel.min(n - 1)) as f32 / (n - 1) as f32 };
+        let x = base.x - span * 0.5 + span * t;
+        s.add(box_slab(v(x, base.y + 0.62 * k, base.z), 0.04 * k, 0.2 * k, 0.04 * k, frame),
+              Float { amp: 0.03 * k, speed: 0.8, phase: 0.0, drift: 0.0 });
+    }
+
+    // The drive: a wheel on the upright whose motion IS the rate. Zero amplitude at a stall — not a
+    // slow wobble, which would read as "working hard" and is the one impression to avoid.
+    let d = parts.drive;
+    s.add(box_slab(v(base.x, base.y + 2.6 * k, base.z), 0.5 * k, 0.5 * k, 0.06 * k, frame),
+          Float { amp: if d > 0.0 { 0.09 * k * d } else { 0.0 },
+                  speed: d * 1.6, phase: 0.0, drift: 0.0 });
+}
+
+#[cfg(test)]
+mod landmark_tests {
+    use super::*;
+    use logscope::machinery::{Motion, Parts, placement};
+
+    fn built(parts: Parts) -> Scene {
+        let mut s = Scene::new();
+        add_landmark(&mut s, parts, placement(20.0, 12.0),
+                     Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
+                     Color32::from_rgb(70, 70, 80));
+        s
+    }
+
+    #[test]
+    fn a_stalled_machine_has_NOTHING_moving() {
+        // The property the whole feature rests on. A creeping mechanism reads as working hard; a
+        // stopped one reads as stopped.
+        let s = built(Parts::from_state(6, 16, Some(3), Motion::Stalled, 0.46));
+        assert!(s.floats.iter().all(|f| f.amp == 0.0 && f.speed == 0.0),
+            "a stalled landmark must be completely still");
+    }
+
+    #[test]
+    fn a_thriving_machine_HAS_motion() {
+        let s = built(Parts::from_state(16, 16, Some(1), Motion::Thriving, 0.98));
+        assert!(s.floats.iter().any(|f| f.amp > 0.0), "thriving must visibly move");
+    }
+
+    #[test]
+    fn one_mesh_per_SLOT_plus_the_frame_and_drive() {
+        // 16 slots + plinth + upright + drive + selector = 20.
+        let s = built(Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.46));
+        assert_eq!(s.meshes.len(), 20, "got {}", s.meshes.len());
+    }
+
+    #[test]
+    fn NO_SELECTOR_mesh_when_nothing_is_selected() {
+        // A stalled machine is not mid-choice, and an arm parked over a slot would say it was.
+        let with = built(Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5)).meshes.len();
+        let without = built(Parts::from_state(6, 16, None, Motion::Fetching, 0.5)).meshes.len();
+        assert_eq!(with, without + 1);
+    }
+
+    #[test]
+    fn a_CHURNING_store_stirs_harder_than_a_clean_one() {
+        // Smoothness drives amplitude separately from speed, so a machine missing constantly looks
+        // frantic rather than merely busy.
+        //
+        // Measured over the SLOT floats only. My first version took the max across every float and
+        // compared the drive wheel to itself — the drive's amplitude dominates the slots and does not
+        // depend on smoothness at all, so the test was asserting nothing. The frame is floats[0..2]
+        // and the slots follow.
+        let amp = |sm: f32| {
+            let s = built(Parts::from_state(2, 16, Some(0), Motion::Fetching, sm));
+            s.floats[2..2 + 16].iter().map(|f| f.amp).fold(0.0f32, f32::max)
+        };
+        assert!(amp(0.1) > amp(0.9), "churn {} vs clean {}", amp(0.1), amp(0.9));
+    }
+
+    #[test]
+    fn the_FRAME_never_moves() {
+        // It is what the moving parts are measured against; a drifting frame would make a stopped
+        // drive ambiguous.
+        let s = built(Parts::from_state(16, 16, Some(1), Motion::Thriving, 0.99));
+        assert_eq!(s.floats[0].amp, 0.0, "the plinth is still");
+        assert_eq!(s.floats[1].amp, 0.0, "and the upright");
+    }
+}
