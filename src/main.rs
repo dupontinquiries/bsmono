@@ -244,8 +244,8 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("GRAPHICS PRESET", Slider { get: |c| c.video.tier as f32, set: |c, v| config::apply_gfx_tier(c, v as u8), min: 0.0, max: 3.0, step: 1.0, def: 0.0, fmt: 1 }),
             ("RAYS", Header),
             ("RAY TRACING", Toggle { get: |c| c.video.rays, set: |c, v| c.video.rays = v }),
-            ("RAY QUALITY", pct(|c| c.video.quality, |c, v| c.video.quality = v, 0.4, 1.8)),
-            ("RAY DISTANCE", pct(|c| c.video.ray_dist, |c, v| c.video.ray_dist = v, 0.25, 1.6)),
+            // one dial: steps, candidates, AO probes and range all follow it
+            ("RAYS", pct(|c| c.video.quality, |c, v| c.video.quality = v, 0.4, 1.8)),
             ("CINEMA", Header),
             ("FILMIC TONEMAP (ACES)", Toggle { get: |c| c.video.filmic, set: |c, v| c.video.filmic = v }),
             ("EXPOSURE", pct(|c| c.video.exposure, |c, v| c.video.exposure = v, 0.5, 1.8)),
@@ -3360,6 +3360,8 @@ impl Game {
             self.wx_rain = 0.0;
         }
 
+        // the single RAYS slider, normalised once and reused below
+        let q01 = ((self.cfg.video.quality - 0.4) / 1.4).clamp(0.0, 1.0);
         let globals = Globals {
             view_proj: vp.to_cols_array(),
             inv_view_proj: ivp.to_cols_array(),
@@ -3377,9 +3379,22 @@ impl Game {
             // enough to keep contact shadows readable, and the probes are
             // whole rays so halving them is a real saving rather than a
             // shorter version of the same work.
+            // ONE SLIDER, EVERYTHING DOWNSTREAM OF IT.
+            //
+            // Two dials for one concept is worse than one: nobody knows
+            // which to move, and the pair have a cheap-and-ugly corner
+            // (short rays, many steps) that no one wants. RAYS is the single
+            // control now, and it drives each cost in proportion to what
+            // that cost is worth:
+            //
+            //   step budget    strongly — it is where the time goes
+            //   candidates     strongly — cost is candidates x steps
+            //   AO probes      in two stages — each probe is a whole ray
+            //   ray range      only mildly — measured at 10% of the saving,
+            //                  so it is a look control wearing a perf hat
             ray2: [
-                self.cfg.video.ray_dist,
-                if self.cfg.video.quality < 0.55 { 2.0 } else { 4.0 },
+                0.55 + 0.60 * q01,
+                if q01 < 0.15 { 2.0 } else { 4.0 },
                 0.0,
                 0.0,
             ],

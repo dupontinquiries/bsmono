@@ -220,7 +220,11 @@ fn gather_try(c: ptr<function, Cands>, i: u32, ro: vec3<f32>, rd: vec3<f32>, tma
     if (-b + sq < 0.0 || -b - sq > tmax) { return; }
     // low quality gathers fewer candidates: the marcher's cost is
     // (candidates x steps), so this is the cheapest knob there is
-    let kcap = max(4u, u32(4.0 + 12.0 * clamp(G.rt.y, 0.0, 1.0)));
+    // the candidate cap follows the same dial. Cost is candidates x steps,
+    // so this and the step budget are the two things worth moving together —
+    // which is exactly why they are one slider and not two.
+    let q01 = clamp((G.rt.y - 0.4) / 1.4, 0.0, 1.0);
+    let kcap = max(4u, u32(4.0 + 12.0 * q01));
     let cap = min(KMAX, kcap);
     let e0 = -b - sq;
     let e1 = -b + sq;
@@ -687,7 +691,11 @@ fn trace_reflection_w(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32, w
     var hit = false;
     var hops = 0;
     // the reflection march takes the dial as well — it is the expensive one
-    let steps = max(8, i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn) * clamp(G.ray2.x, 0.25, 1.4)));
+    // ...capped at what the top setting cost BEFORE the dial existed. Making
+    // one slider drive four things compounds them, and at maximum that took
+    // the step budget from 48 to 71 — a settings change should not make the
+    // best case slower than it used to be.
+    let steps = clamp(i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn) * clamp(G.ray2.x, 0.25, 1.4)), 8, 48);
     let skip_ter = ro.y > 17.0 && rd.y > 0.05;
     var first = 0u;
     for (var i = 0; i < steps; i = i + 1) {

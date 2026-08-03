@@ -2726,11 +2726,12 @@ pub fn run(args: &[String]) {
             );
         }
 
-        // ---- WHAT THE RAY-DISTANCE DIAL BUYS ----
-        // A slider without a known cost curve is guesswork for whoever uses
-        // it. The marcher's cost is candidates x steps and steps scale with
-        // how far a ray may travel, so shortening rays should save close to
-        // linearly — this measures it rather than assuming.
+        // ---- WHAT THE ONE RAYS SLIDER BUYS ----
+        // Everything the marcher spends is downstream of this single
+        // control: the step budget, the candidate cap, the AO probe count
+        // and (mildly) how far a ray may travel. Worth measuring end to end,
+        // because a slider whose range nobody has measured is a slider
+        // people leave alone.
         {
             let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
             let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
@@ -2742,9 +2743,15 @@ pub fn run(args: &[String]) {
                 .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
                 .collect();
             println!();
-            println!("{:>10} {:>12} {:>10} {:>10}", "ray dist", "evaluations", "vs full", "reach");
+            println!("{:>8} {:>7} {:>6} {:>7} {:>12} {:>9}", "RAYS", "steps", "cand", "probes", "evaluations", "vs max");
             let mut base = 0u64;
-            for dist in [1.6f32, 1.0, 0.6, 0.25] {
+            for q in [1.8f32, 1.4, 1.0, 0.7, 0.4] {
+                // mirror the shader's derivations exactly
+                let q01 = ((q - 0.4) / 1.4).clamp(0.0, 1.0);
+                let dist = 0.55 + 0.60 * q01;
+                let kcap = (4.0 + 12.0 * q01) as usize;
+                let probes = if q01 < 0.15 { 2 } else { 4 };
+                let steps = ((((30.0 + 18.0 * q) * 0.5_f32.max(q01)) * dist).max(8.0) as i32).min(48);
                 let tmax = 260.0 * dist;
                 let mut evals = 0u64;
                 for k in 0..500 {
@@ -2764,13 +2771,10 @@ pub fn run(args: &[String]) {
                         })
                         .collect();
                     cand.sort_by(|a, b| a.0.total_cmp(&b.0));
-                    cand.truncate(16);
+                    cand.truncate(kcap.max(4));
                     let mut t = 0.1f32;
                     let mut first = 0usize;
-                    // the dial scales the STEP budget too — mirroring the
-                    // shader, because distance alone barely saved anything
-                    let budget = ((38.0 * dist).max(6.0)) as i32;
-                    for _ in 0..budget {
+                    for _ in 0..steps {
                         let p = eye + dir * t;
                         let mut d = p.y - w.ground_h(p.x, p.z);
                         while first < cand.len() && cand[first].1 <= t {
@@ -2798,11 +2802,13 @@ pub fn run(args: &[String]) {
                     base = evals;
                 }
                 println!(
-                    "{:>10.2} {:>12} {:>9.0}% {:>9.0}m",
-                    dist,
+                    "{:>8.1} {:>7} {:>6} {:>7} {:>12} {:>8.0}%",
+                    q,
+                    steps,
+                    kcap.max(4),
+                    probes,
                     evals,
-                    evals as f32 / base as f32 * 100.0,
-                    tmax
+                    evals as f32 / base as f32 * 100.0
                 );
             }
         }

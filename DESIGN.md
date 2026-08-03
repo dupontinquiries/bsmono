@@ -3757,6 +3757,34 @@ term rather than trusting a single sample. Two derivative instructions, no
 extra rays. The cheapest denoiser is the one that knows when a sample is not
 worth believing.
 
+## v1.115.0 — one RAYS slider
+
+Two dials for one concept is worse than one: nobody knows which to move, and
+the pair had a cheap-and-ugly corner — short rays with a full step budget —
+that nobody would ever want. RAY DISTANCE is gone. RAYS is the single control
+and everything follows from it, each in proportion to what it is worth:
+
+    step budget   strongly    it is where the time goes
+    candidates    strongly    cost is candidates x steps
+    AO probes     two stages  each probe is a whole ray
+    ray range     mildly      measured at a tenth of the saving, so it is a
+                              look control wearing a performance hat
+
+    RAYS   steps   cand  probes   evaluations   vs max
+     1.8      48     16      4        78,703      100%
+     1.4      38     12      4        76,676       97%
+     1.0      19      9      4        56,419       72%
+     0.7      14      6      4        34,524       44%
+     0.4      10      4      2        18,255       23%
+
+A four-fold range on one bar, which is what makes it worth touching.
+
+ONE THING THAT NEEDED CATCHING. Making a single slider drive four costs
+COMPOUNDS them, and at maximum that took the step budget from 48 to 71 — the
+top setting would have been slower than the same setting was before the
+change. A settings rework should never make the best case worse than it
+was, so the budget is capped at what it used to cost.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
