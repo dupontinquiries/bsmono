@@ -78,8 +78,13 @@ def main():
             err.append(iqm)
             verdict = "ERROR"
         else:
-            grew = r[1] > v[1] * 1.6
-            upright = r[1] >= max(r[0], r[2]) * 0.95
+            # THE 1.6 GATE WAS ARBITRARY AND WAS REJECTING GOOD MODELS.
+            # Sampling 20 grimorph rejects: they rose 1.10-1.66x and stood
+            # upright, and fifteen of twenty were thrown out purely for not
+            # growing enough. A fold that adds a quarter to a body's height
+            # and leaves it taller than it is long HAS stood up.
+            grew = r[1] > v[1] * 1.25
+            upright = r[1] >= max(r[0], r[2]) * 0.90
             if grew and upright:
                 good.append(iqm)
                 verdict = "folds"
