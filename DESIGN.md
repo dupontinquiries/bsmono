@@ -3649,6 +3649,41 @@ elsewhere each frame (resetting `phase_t` before the new exits can fire), or
 the arm being executed is not the one I edited. The telemetry is now in place
 to tell the difference.
 
+## v1.112.0 — the striker stops restarting itself, and aims its finish
+
+The phase telemetry added last version pointed at the answer, and following
+it found two faults that had nothing to do with flying.
+
+EVERY LANDING RESTARTED THE MOVE. The striker reset its phase and zeroed its
+phase timer on any touchdown — correct for a setup that fell apart, wrong for
+an air sequence that clipped the floor. A car carrying a ball brushes the
+ground constantly, so the sequence restarted over and over and could never
+accumulate the phase time a timed exit needs. That is precisely what the
+telemetry was showing: a third of its life in the air carry and one percent
+finishing. A landing mid-sequence with the ball still up is part of the
+move; only a landing with the ball DOWN means the setup is over.
+
+THE FINISH HAD NO TARGET. The flick aimed at the ball's CENTRE, which sends
+it wherever the car happened to be travelling — a striker could carry the
+ball the length of the pitch and flick it sideways. It aims at the back of
+the ball relative to the goal now, so the contact lands on the far side and
+the impulse goes through the ball toward the net.
+
+That second fix needed tuning rather than just applying: at 0.85 of the
+ball's radius the aim point sat far enough off centre that the dodge started
+MISSING (touches fell from 3.3 to 2.5). Two fifths of a radius keeps the
+contact and still points it goalward.
+
+    air touches   2.2 -> 4.3        style   7.7 -> 14.5
+    phases: approach 44% -> 35%, air 33% -> 36%, carry 17% -> 24%
+
+The striker now keeps the ball far more of the time and spends less of its
+life re-approaching. STILL ZERO GOALS, which is the honest headline: the
+shot is aimed and the ball is struck, and it does not go in. The next
+question is where it goes instead — the telemetry covers phases, not shot
+outcomes, so that wants a measurement of where the ball ends up after a
+flick before anything else is changed.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
