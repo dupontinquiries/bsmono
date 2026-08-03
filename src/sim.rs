@@ -4201,6 +4201,64 @@ pub fn run(args: &[String]) {
             println!("{:<14} {:>10.2} {:>9.2}s {:>10.2}", nm, gap, settle_t, peak);
         }
         check("every hover chassis holds its ride height", all_settled);
+
+        // ---- NOSE UP, TAIL DOWN ----
+        // Point a hovercar up and its tail dips below the surface. With the
+        // cushion sampled only at the centre, nothing knew: the tail dug in
+        // and the car stuck there. Four thrusters should lift the low corner
+        // hardest, which levels the car and floats it clear.
+        println!();
+        println!("{:<12} {:>9} {:>9} {:>10} {:>9}", "pitch", "settled", "tail gap", "levelled", "stuck");
+        let mut all_free = true;
+        for pitch_deg in [20.0f32, 40.0, 60.0, 80.0] {
+            let world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let h = physics::Hover::default();
+            car.hover = Some(h);
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.5, 0.0);
+            // nose up: the tail end swings down toward the floor
+            car.rot = glam::Quat::from_rotation_x(-pitch_deg.to_radians());
+            car.sync_rot();
+            let ball = Ball::new();
+            let c = physics::Controls::default();
+            let start = car.pos;
+            // Watch the WHOLE recovery, not just the end: the question is
+            // whether the tail ever buries itself, not where the car sits
+            // once it has finished levelling.
+            let mut t = 0.0f32;
+            let mut worst_gap = f32::MAX;
+            let mut worst_at = 0.0f32;
+            while t < 3.0 {
+                physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+                t += DT;
+                let tp = car.pos + car.rot * Vec3::new(0.0, -car.half_h, car.half_len * 0.80);
+                let g = world.sdf(tp);
+                if g < worst_gap {
+                    worst_gap = g;
+                    worst_at = t;
+                }
+            }
+            // where did the tail end up, and did the car level itself?
+            let tail = car.pos + car.rot * Vec3::new(0.0, -car.half_h, car.half_len * 0.80);
+            let tail_gap = world.sdf(tail);
+            let up = car.rot * Vec3::Y;
+            let level = up.dot(Vec3::Y).acos().to_degrees();
+            let moved = car.pos.distance(start);
+            // buried at any point during the recovery counts as stuck
+            let stuck = worst_gap < 0.0;
+            all_free &= !stuck;
+            println!(
+                "{:<11.0}d {:>8.2}m {:>8.2}m {:>9.0}d {:>9}   (closest {:.2} m at {:.2}s)",
+                pitch_deg,
+                moved,
+                tail_gap,
+                level,
+                if stuck { "STUCK" } else { "free" },
+                worst_gap,
+                worst_at
+            );
+        }
+        check("a nose-up hovercar never digs its tail in", all_free);
         // ---- does it slide where a tyre grips? ----
         let slide_of = |h: Option<physics::Hover>| -> f32 {
             let (mut car, world) = make(h);

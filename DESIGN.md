@@ -3327,6 +3327,43 @@ list that has to be maintained, and it fails SILENTLY when something new is
 added. Every field added to `Car` since that function was written was a
 candidate for this bug.
 
+## v1.102.0 — four thrusters instead of one
+
+Reported: a hovercar pointed upwards digs its tail into the ground and
+sticks.
+
+The cause is that the cushion sampled the surface at the car's CENTRE, so it
+knew nothing about attitude. Pitch the nose up and the tail swings below the
+surface while the centre still reads its target gap — nothing pushes back,
+and the tail buries itself.
+
+A real hovercraft is held up at several points, and that is also what levels
+it. The cushion now samples at four corners of the underside and pushes at
+each with a quarter of the car's weight. Two things fall out of that for
+free: the corner nearest the ground gets the hardest push, so a car floats
+HIGHER when something is close to any part of it rather than only its
+middle; and because those pushes act at an arm from the centre, they make a
+righting moment, so a pitched hovercar levels itself instead of pivoting on
+its tail.
+
+One shared surface normal serves all four samples. The surface does not
+change much across a car's length, and a gradient is four SDF evaluations —
+taking one per corner would have quadrupled the cost of the cheapest useful
+part of the chassis.
+
+Ride heights are unchanged to the centimetre (0.62, 0.55, 0.34 as set), and
+the pulse, field, thrust tiers and every wheeled-car harness still pass.
+
+WHAT IS NOT YET PROVEN. The new harness that pitches a hovercar nose-up and
+watches its tail cannot demonstrate the fix, because the car levels itself
+within a frame or two of the test starting — something upstairs is aligning
+it to the surface before the cushion gets a chance to matter. The tail never
+comes within half a metre of the ground in the test, which is the right
+ANSWER for the wrong REASON. The next thing to look at is that alignment: a
+hovercar that is aimed upwards should stay aimed upwards, and if the
+grounded align is snapping it level then it is both hiding this test and
+fighting the player.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

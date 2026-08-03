@@ -708,18 +708,49 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     // because a hovercar is never "grounded" in the wheeled sense — the
     // cushion IS its ground.
     if let Some(h) = car.hover {
-        let gap = world.sdf(car.pos);
-        let want = car.half_h + h.ride;
-        if gap < want * 3.0 {
-            let n = world.normal(car.pos);
-            let err = want - gap;
+        // FOUR THRUSTERS, NOT ONE.
+        //
+        // Sampling the cushion at the car's CENTRE meant it knew nothing
+        // about attitude: point the nose up and the tail dips below the
+        // surface, the centre still reads its target gap, nothing pushes
+        // back, and the tail digs in and sticks. A real hovercraft is held
+        // up at several points, and that is also what levels it — the corner
+        // that is closest to the ground gets the hardest push, which is a
+        // righting moment for free.
+        //
+        // One shared normal for all four: the surface does not change much
+        // across a car's length, and a gradient is four SDF evaluations, so
+        // sampling it per corner would quadruple the cost of the cheapest
+        // useful part of the chassis.
+        let n = world.normal(car.pos);
+        let damp = (h.stiff * 0.22).sqrt() * 2.0;
+        let mut lift = Vec3::ZERO;
+        let mut twist = Vec3::ZERO;
+        let mut any = false;
+        for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+            let local = Vec3::new(sx * car.half_w * 0.78, -car.half_h, sz * car.half_len * 0.80);
+            let arm = car.rot * local;
+            let p = car.pos + arm;
+            let gap = world.sdf(p);
+            if gap > h.ride * 3.0 {
+                continue; // this corner is nowhere near anything
+            }
+            any = true;
+            let err = h.ride - gap;
             let closing = -car.vel.dot(n);
-            // A proportional spring alone balances gravity at an OFFSET —
-            // every chassis floated a fixed distance below its ride height,
-            // by exactly g/stiffness. Carrying the car's weight explicitly
-            // leaves the spring to do only what it is for: correcting error.
-            let push = err * h.stiff + closing * (h.stiff * 0.22).sqrt() * 2.0 + GRAV;
-            car.vel += n * push.clamp(-30.0, 70.0) * dt;
+            // a quarter of the car's weight on each thruster
+            let push = (err * h.stiff + closing * damp + GRAV) * 0.25;
+            let f = n * push.clamp(-8.0, 20.0);
+            lift += f;
+            // the righting moment: a corner pushed up rotates the car about
+            // its centre, so a nose-up hovercar levels itself instead of
+            // pivoting on its tail
+            twist += arm.cross(f);
+        }
+        if any {
+            car.vel += lift * dt;
+            // into the body frame, which is where angular velocity lives
+            car.ang += (car.rot.inverse() * twist) * dt * 0.55;
         }
     }
     let d = world.sdf(car.pos);
