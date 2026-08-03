@@ -468,7 +468,20 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
             if std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_none() {
                 let shapes = gpu.model_decode_shapes(&model);
                 let safe: String = gpu.adapter_name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-                let cache = gpu_kernels::store::cache_root().join(format!("autotune-shapes-{safe}.bin"));
+                // VERSIONED IN THE NAME, like the other two caches. This is the per-shape file — a
+                // SEPARATE store from autotune-v4.tsv, which is why bumping that one did nothing and a
+                // run after the kernel fixes still reported "loaded 41 decode + 14 GEMM tiles from
+                // cache".
+                //
+                // Those verdicts were measured against kernels whose byte unpacking returned zero for
+                // three lanes in four, and against a candidate set that probe_valid_gemm_tiles pruned
+                // using the same corrupt weights. Every tile in that file is a conclusion about a
+                // build that no longer exists — and it is why LOGSCOPE_MATVEC_V3 could not take
+                // effect: a cached choice never re-enters the search.
+                //
+                // v2: kernels fixed (lane-varying shifts replaced with extractBits/insertBits).
+                let cache = gpu_kernels::store::cache_root()
+                    .join(format!("autotune-shapes-v2-{safe}.bin"));
                 let (dl, gl) = gpu.load_autotune(&cache).unwrap_or((0, 0));
                 if dl > 0 || gl > 0 { eprintln!("wgpu-engine: per-shape autotune — loaded {dl} decode + {gl} GEMM tiles from cache"); }
                 // Time-box the whole probe so a slow/large model can never stall the load (capped-width
