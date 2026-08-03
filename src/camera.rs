@@ -63,6 +63,14 @@ pub struct Camera {
     /// and the terrain clamp all keep working underneath it.
     pub look_yaw: f32,
     pub look_pitch: f32,
+    /// AUTOTARGET. Ball cam is a point-of-interest camera that happens to
+    /// have been given the ball; hand it something else and the same rig
+    /// becomes a combat camera. Set this and Ball mode follows it instead.
+    pub poi: Option<Vec3>,
+    /// true while the POI is an opponent rather than the ball: the boom
+    /// stops flattening itself into the horizontal plane, which is right for
+    /// a ground game and wrong for a dogfight
+    pub combat: bool,
 }
 
 impl Camera {
@@ -80,6 +88,8 @@ impl Camera {
             shake_t: 0.0,
             look_yaw: 0.0,
             look_pitch: 0.0,
+            poi: None,
+            combat: false,
         }
     }
 
@@ -166,7 +176,7 @@ impl Camera {
         let eye_h = car.half_h * 1.35;
         let lead = if car.robot { 2.6 } else { 12.0 };
         let target = match self.mode {
-            CamMode::Ball => ball.pos,
+            CamMode::Ball => self.poi.unwrap_or(ball.pos),
             CamMode::Chase | CamMode::First => {
                 car.pos + self.up * eye_h + self.heading * lead
             }
@@ -183,7 +193,20 @@ impl Camera {
         // camera down into the terrain clamp (which was eating the dist,
         // height and angle settings whole — the cam sim caught boom_up
         // pinned at the floor regardless of cfg). Only the LOOK tilts up.
-        let mut dir_flat = (dir - self.up * dir.dot(self.up)).normalize_or(self.heading);
+        // THE BOOM, and the one line that decides whether a dogfight works.
+        //
+        // Normally the boom lives in the up-plane: a high ball must not drag
+        // the camera down into the terrain clamp. In air-to-air that is
+        // exactly wrong — an opponent forty metres above you flattens to the
+        // same bearing as one level with you, so the camera never gets under
+        // you and you lose them behind your own body. In combat the boom
+        // takes the full 3D bearing, so the eye swings below when they are
+        // above and the pair stay in frame.
+        let mut dir_flat = if self.combat && self.mode == CamMode::Ball {
+            dir
+        } else {
+            (dir - self.up * dir.dot(self.up)).normalize_or(self.heading)
+        };
         // free look rides on the flattened boom direction: yaw about the
         // local up (so it still works upside down in a tube), pitch folded
         // into the height below
@@ -197,8 +220,17 @@ impl Camera {
         // pitch trades boom distance for height, so looking up does not push
         // the eye through the body
         let (pc, ps) = (self.look_pitch.cos(), self.look_pitch.sin());
-        let mut want =
-            car.pos - dir_flat * (cfg.dist * pc.max(0.25)) + self.up * (cfg.height + cfg.dist * ps);
+        // a close opponent needs a longer boom or the two of you do not fit
+        // in the shot; a distant one does not, and pulling back for it would
+        // just shrink them
+        let close = if self.combat {
+            let d = (target - car.pos).length();
+            1.0 + (1.0 - (d / 30.0).clamp(0.0, 1.0)) * 0.55
+        } else {
+            1.0
+        };
+        let mut want = car.pos - dir_flat * (cfg.dist * pc.max(0.25) * close)
+            + self.up * (cfg.height + cfg.dist * ps);
         if cfg.plat_bend > 0.01 {
             if let Some(pv) = world.platform_vel(car.pos, 6.0) {
                 self.plat_lag += (pv - self.plat_lag) * (1.0 - (-3.0 * dt).exp());

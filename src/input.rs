@@ -34,9 +34,11 @@ pub enum Action {
     Car3,
     /// vehicle <-> robot, for a blackstar chassis
     Transform,
+    /// hand the point-of-interest camera an opponent instead of the ball
+    AutoTarget,
 }
 
-pub const ACTIONS: [Action; 22] = [
+pub const ACTIONS: [Action; 23] = [
     Action::Forward,
     Action::Reverse,
     Action::SteerL,
@@ -59,6 +61,7 @@ pub const ACTIONS: [Action; 22] = [
     Action::Car2,
     Action::Car3,
     Action::Transform,
+    Action::AutoTarget,
 ];
 
 impl Action {
@@ -86,6 +89,7 @@ impl Action {
             Action::Car2 => "CAR: FENNEC",
             Action::Car3 => "CAR: DOMINUS",
             Action::Transform => "TRANSFORM (BOT <-> ROBOT)",
+            Action::AutoTarget => "AUTOTARGET",
         }
     }
     pub fn id(self) -> &'static str {
@@ -112,6 +116,7 @@ impl Action {
             Action::Car2 => "car2",
             Action::Car3 => "car3",
             Action::Transform => "transform",
+            Action::AutoTarget => "autotarget",
         }
     }
     pub fn from_id(s: &str) -> Option<Action> {
@@ -294,6 +299,8 @@ impl Bindings {
             // SHIFT, with G kept as the second binding for anyone already
             // used to it, and L-bumper on a pad.
             (Transform, vec![named(NamedKey::Shift), ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
+            // X, and the right stick click — where a lock-on lives on a pad
+            (AutoTarget, vec![ch("x"), Bind::Pad(crate::gamepad::PB_R3)]),
         ];
         Bindings { map: m }
     }

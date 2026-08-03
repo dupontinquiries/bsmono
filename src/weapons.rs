@@ -792,6 +792,57 @@ impl Weapons {
             .map(|(_, id)| id);
     }
 
+    /// AUTOTARGET, for air-to-air.
+    ///
+    /// `update_lock` scores by where you are AIMING, which is right when you
+    /// are choosing between two bosses standing still. It is wrong in a
+    /// dogfight: your nose is swinging constantly and a lock that follows it
+    /// drops every time you roll. So this scores by where you are GOING —
+    /// the velocity heading — with a wide acquisition cone and a much wider
+    /// retention cone, so an opponent you have committed to stays yours
+    /// through a manoeuvre that puts them briefly behind you.
+    ///
+    /// Ties break toward the closer target, because in a turning fight the
+    /// near one is the one that can kill you.
+    pub fn auto_acquire(
+        &mut self,
+        origin: Vec3,
+        vel: Vec3,
+        targets: &[Target],
+        max_range: f32,
+    ) {
+        if targets.is_empty() {
+            self.locked = None;
+            return;
+        }
+        let heading = vel.normalize_or(Vec3::NEG_Z);
+        // hold what we have while it is anywhere but directly astern
+        if let Some(id) = self.locked {
+            if let Some(t) = targets.iter().find(|t| t.id == id) {
+                let to = t.pos - origin;
+                let d = to.length();
+                if d <= max_range * 1.5 && to.normalize_or(heading).dot(heading) > -0.75 {
+                    return;
+                }
+            }
+        }
+        self.locked = targets
+            .iter()
+            .filter_map(|t| {
+                let to = t.pos - origin;
+                let d = to.length();
+                if d > max_range || d < 1e-3 {
+                    return None;
+                }
+                let cos = to.normalize().dot(heading);
+                // ~100-degree half-cone to acquire: a dogfight target is
+                // rarely dead ahead at the moment you want to commit
+                (cos > -0.17).then(|| (cos * 2.0 - d / max_range, t.id))
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|(_, id)| id);
+    }
+
     /// Where the camera should point, if anything is locked.
     pub fn lock_pos(&self, targets: &[Target]) -> Option<Vec3> {
         let id = self.locked?;
@@ -984,6 +1035,36 @@ mod tests {
             let o = w.fire(Vec3::ZERO, Vec3::NEG_Z, &[], 100.0);
             assert!(!o.fx.is_empty(), "{} fires invisibly", TABLE[i].name);
         }
+    }
+
+    #[test]
+    fn autotarget_tracks_where_you_are_going_and_holds_through_a_turn() {
+        let tg = [
+            Target { id: 1, pos: Vec3::new(0.0, 0.0, -40.0), r: 2.0 },
+            Target { id: 2, pos: Vec3::new(0.0, 0.0, 300.0), r: 2.0 },
+        ];
+        let mut w = Weapons::new();
+        // flying forward: the one ahead is the fight
+        w.auto_acquire(Vec3::ZERO, Vec3::NEG_Z * 40.0, &tg, 200.0);
+        assert_eq!(w.locked, Some(1));
+        // now bank hard — velocity swings 90 degrees and the target is off
+        // to one side. A lock that drops here is useless in a turning fight.
+        w.auto_acquire(Vec3::ZERO, Vec3::X * 40.0, &tg, 200.0);
+        assert_eq!(w.locked, Some(1), "the lock dropped during a bank");
+        // out of range entirely: let it go
+        w.auto_acquire(Vec3::new(0.0, 0.0, 4000.0), Vec3::NEG_Z * 40.0, &tg, 200.0);
+        assert_eq!(w.locked, None);
+    }
+
+    #[test]
+    fn autotarget_prefers_the_near_threat() {
+        let tg = [
+            Target { id: 1, pos: Vec3::new(0.0, 0.0, -150.0), r: 2.0 },
+            Target { id: 2, pos: Vec3::new(0.0, 0.0, -30.0), r: 2.0 },
+        ];
+        let mut w = Weapons::new();
+        w.auto_acquire(Vec3::ZERO, Vec3::NEG_Z * 40.0, &tg, 200.0);
+        assert_eq!(w.locked, Some(2), "picked the far one in a knife fight");
     }
 
     #[test]

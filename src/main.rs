@@ -470,6 +470,10 @@ struct Game {
     morph: Option<xform::Morph>,
     /// 0..1 health, which is what picks the fold's personality
     health: f32,
+    /// the weapons module owns the lock; the camera borrows it
+    wep: weapons::Weapons,
+    /// autotarget on: ball cam follows an opponent instead of the ball
+    autotarget: bool,
     ball_model: model::Model,
     decor_model: model::Model,
     fx: fx::Fx,
@@ -1164,6 +1168,8 @@ fn main() {
         xf: xform::Xform::new(),
         morph: None,
         health: 1.0,
+        wep: weapons::Weapons::new(),
+        autotarget: false,
         ball_model,
         decor_model,
         fx: fx::Fx::new(seed),
@@ -1633,6 +1639,15 @@ impl Game {
             }
             Action::FlipVis => self.flip_vis = !self.flip_vis,
             Action::Transform => self.transform(),
+            Action::AutoTarget => {
+                self.autotarget = !self.autotarget;
+                if !self.autotarget {
+                    self.wep.locked = None;
+                    self.cam.poi = None;
+                    self.cam.combat = false;
+                }
+                self.toastf(if self.autotarget { "AUTOTARGET ON" } else { "AUTOTARGET OFF" });
+            }
             Action::Car1 => self.switch_car(0),
             Action::Car2 => self.switch_car(1),
             Action::Car3 => self.switch_car(2),
@@ -1825,6 +1840,51 @@ impl Game {
         self.set_car_model(m);
         self.save.car = m;
         self.toastf(&format!("{} ({}/{})", self.cars.names[m], next + 1, n));
+    }
+
+    /// Point the camera at an opponent instead of the ball.
+    ///
+    /// Ball cam was always a point-of-interest rig; it simply had only ever
+    /// been given one point of interest. Handing it a target turns the same
+    /// camera into a combat camera with no new code path, which is why this
+    /// is short.
+    ///
+    /// Range scales with speed: at 40 m/s an opponent 200 m out is four
+    /// seconds away and worth watching, while the same target while parked
+    /// is scenery.
+    fn update_autotarget(&mut self, _dt: f32) {
+        if !self.autotarget || self.mode != Mode::Play {
+            return;
+        }
+        // bots are the opponents; the ball is not a target here
+        let mut targets: Vec<weapons::Target> = Vec::new();
+        for (i, b) in self.bots.iter().enumerate() {
+            targets.push(weapons::Target {
+                id: i as u32,
+                pos: b.car.pos,
+                r: b.car.half_len.max(b.car.half_h),
+            });
+        }
+        if targets.is_empty() {
+            self.cam.poi = None;
+            self.cam.combat = false;
+            return;
+        }
+        let sp = self.car.vel.length();
+        let range = 120.0 + sp * 4.0;
+        // parked, your nose is a better guess at intent than your velocity
+        let heading = if sp > 4.0 { self.car.vel } else { self.car.forward() };
+        self.wep.auto_acquire(self.car.pos, heading, &targets, range);
+        match self.wep.lock_pos(&targets) {
+            Some(p) => {
+                self.cam.poi = Some(p);
+                self.cam.combat = true;
+            }
+            None => {
+                self.cam.poi = None;
+                self.cam.combat = false;
+            }
+        }
     }
 
     fn open_menu(&mut self, m: Mode) {
@@ -3107,6 +3167,7 @@ impl Game {
             self.toast.clear();
         }
         self.advance_xform(dt);
+        self.update_autotarget(dt);
 
         // ---- controller ----
         let ps = self.pad.poll();
@@ -3939,7 +4000,13 @@ impl Game {
             frame_drops: self.frame_drops,
             car_name: self.cars.names[self.cars.active],
             ball_cam: self.cam.ball_cam,
-            cam_label: self.cam.mode.label(),
+            // ball cam with a target in it is not ball cam any more, and
+            // the readout should not claim it is
+            cam_label: if self.cam.poi.is_some() && self.cam.mode == camera::CamMode::Ball {
+                "TARGET CAM"
+            } else {
+                self.cam.mode.label()
+            },
             first_person: self.cam.mode == camera::CamMode::First,
             scores: if matches!(self.game_mode, 1 | 3..=7) { Some((self.scores[0], self.scores[1])) } else { None },
             minimap: self.save.minimap,
