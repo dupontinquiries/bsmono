@@ -3823,6 +3823,39 @@ fell out of the mechanic — and since it is fun, and it costs the same speed
 everything else does, it is now a documented feature rather than an
 accident. A hovercar that wants height has a way to buy it.
 
+## v1.117.0 — the slider can now buy blur
+
+The RAYS slider spent its budget on fewer, shorter rays. What it could not
+do was accept WORSE rays, which is the trade that actually unlocks the low
+end: a cheap ray is a noisy ray, and the honest response is to hide that
+rather than to pretend a handful of steps found the right answer.
+
+Three things now scale with the slider on the fidelity side:
+
+  THE DENOISE STRENGTHENS as the slider falls. At the bottom the reflection
+  is mostly the smooth sky term with a suggestion of the traced result in
+  it — blurry, stable and cheap. At the top the trace is trusted almost
+  completely.
+
+  THE GLASS ROUGHENS with it, so a low setting reads as a softer material
+  rather than as a broken mirror.
+
+  THE STEP FLOOR DROPS from 8 to 5, which is the point: the artifacts a
+  short march produces are exactly the ones a blur removes, so the budget
+  can go lower than it could when every ray had to stand on its own.
+
+    RAYS   steps   cand  probes   evaluations   vs max   traced
+     1.8      48     16      4        78,703      100%     100%
+     1.4      36     12      4        76,325       97%      83%
+     1.0      17      9      4        53,869       68%      66%
+     0.7      11      6      4        29,513       37%      53%
+     0.4       7      4      2        13,576       17%      40%
+
+"traced" is the new column and the honest one: how much of what you see is
+the ray, and how much is the blur standing in for it. The slider now spans
+nearly SIX times in cost rather than four, and the bottom of it is a
+deliberate look — soft reflections — instead of a broken version of the top.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -3393,7 +3393,9 @@ impl Game {
             //   ray range      only mildly — measured at 10% of the saving,
             //                  so it is a look control wearing a perf hat
             ray2: [
-                0.55 + 0.60 * q01,
+                // the bottom goes lower than it used to dare, because the
+                // blur that comes with it hides what a short march misses
+                0.40 + 0.75 * q01,
                 if q01 < 0.15 { 2.0 } else { 4.0 },
                 0.0,
                 0.0,

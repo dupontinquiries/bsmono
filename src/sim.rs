@@ -2743,15 +2743,15 @@ pub fn run(args: &[String]) {
                 .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
                 .collect();
             println!();
-            println!("{:>8} {:>7} {:>6} {:>7} {:>12} {:>9}", "RAYS", "steps", "cand", "probes", "evaluations", "vs max");
+            println!("{:>8} {:>7} {:>6} {:>7} {:>12} {:>9} {:>8}", "RAYS", "steps", "cand", "probes", "evaluations", "vs max", "traced");
             let mut base = 0u64;
             for q in [1.8f32, 1.4, 1.0, 0.7, 0.4] {
                 // mirror the shader's derivations exactly
                 let q01 = ((q - 0.4) / 1.4).clamp(0.0, 1.0);
-                let dist = 0.55 + 0.60 * q01;
+                let dist = 0.40 + 0.75 * q01;
                 let kcap = (4.0 + 12.0 * q01) as usize;
                 let probes = if q01 < 0.15 { 2 } else { 4 };
-                let steps = ((((30.0 + 18.0 * q) * 0.5_f32.max(q01)) * dist).max(8.0) as i32).min(48);
+                let steps = ((((30.0 + 18.0 * q) * 0.5_f32.max(q01)) * dist).max(5.0) as i32).min(48);
                 let tmax = 260.0 * dist;
                 let mut evals = 0u64;
                 for k in 0..500 {
@@ -2801,14 +2801,19 @@ pub fn run(args: &[String]) {
                 if base == 0 {
                     base = evals;
                 }
+                // how much of the result is the traced ray, and how much is
+                // the blur standing in for it
+                let softness = (1.0 - q01) * 0.60;
+                let trust = (1.0 - softness) * 100.0;
                 println!(
-                    "{:>8.1} {:>7} {:>6} {:>7} {:>12} {:>8.0}%",
+                    "{:>8.1} {:>7} {:>6} {:>7} {:>12} {:>8.0}% {:>8.0}%",
                     q,
                     steps,
                     kcap.max(4),
                     probes,
                     evals,
-                    evals as f32 / base as f32 * 100.0
+                    evals as f32 / base as f32 * 100.0,
+                    trust
                 );
             }
         }

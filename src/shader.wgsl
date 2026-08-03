@@ -695,7 +695,7 @@ fn trace_reflection_w(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32, w
     // one slider drive four things compounds them, and at maximum that took
     // the step budget from 48 to 71 — a settings change should not make the
     // best case slower than it used to be.
-    let steps = clamp(i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn) * clamp(G.ray2.x, 0.25, 1.4)), 8, 48);
+    let steps = clamp(i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn) * clamp(G.ray2.x, 0.25, 1.4)), 5, 48);
     let skip_ter = ro.y > 17.0 && rd.y > 0.05;
     var first = 0u;
     for (var i = 0; i < steps; i = i + 1) {
@@ -951,7 +951,10 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
                     sin(w.z * 2.1 + w.x * 1.9),
                     sin(w.x * 2.7 + w.y * 1.3)
                 );
-                rr = normalize(rr + rip * 0.055);
+                // ...and the glass roughens with it, so a low setting reads
+                // as a softer material rather than as a broken mirror
+                let q01g = clamp((G.rt.y - 0.4) / 1.4, 0.0, 1.0);
+                rr = normalize(rr + rip * (0.055 + (1.0 - q01g) * 0.075));
             }
             if (cheap_refl) {
                 col = mix(col, sky_color(rr), amount * 0.8);
@@ -970,8 +973,23 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
                 // It costs two derivative instructions and no extra rays,
                 // which is the point: the cheapest denoiser is the one that
                 // knows when a sample is not worth believing.
+                // BLUR IS THE CURRENCY AT THE LOW END.
+                //
+                // A cheap ray is a noisy ray, and the honest way to spend a
+                // small budget is to accept that and hide it rather than to
+                // pretend a handful of steps found the right answer. So the
+                // denoise gets stronger as the slider comes down: at the
+                // bottom the reflection is mostly the smooth sky term with a
+                // suggestion of the traced result in it — blurry, stable,
+                // and cheap. At the top it is trusted almost completely.
+                //
+                // This is what lets the step budget go lower than it other-
+                // wise could: the artifacts a short march produces are
+                // exactly the ones a blur removes.
+                let q01r = clamp((G.rt.y - 0.4) / 1.4, 0.0, 1.0);
+                let softness = (1.0 - q01r) * 0.60;
                 let spread = length(dpdx(rr)) + length(dpdy(rr));
-                let trust = 1.0 - clamp(spread * 5.5, 0.0, 0.75);
+                let trust = 1.0 - clamp(spread * 5.5 + softness, 0.0, 0.88);
                 let rc = mix(sky_color(rr), rc_raw, trust);
                 col = mix(col, rc, amount);
             }
