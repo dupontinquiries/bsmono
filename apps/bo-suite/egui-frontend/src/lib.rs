@@ -15,6 +15,7 @@ pub mod dial;
 pub mod channel;
 pub mod tags;
 pub mod outputs;
+pub mod sources;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -125,6 +126,12 @@ pub struct Controller {
     pub pending_route: Option<crate::settings_page::Route>,
     /// The device the selector last switched to.
     pub active_device_url: String,
+    /// What this device can play from, and what the user has collected.
+    pub sources_page: crate::sources::Sources,
+    pub playlists_page: crate::sources::PlaylistsPage,
+    /// Wall clock in seconds, for the "3d ago" column. Supplied by the host so
+    /// the page does not reach for a clock it cannot be tested with.
+    pub now_secs: i64,
     pub speaker_col: crate::channel::ChannelColumn,
     pub instrumental_col: crate::channel::ChannelColumn,
     pub mixer: crate::device::Mixer,
@@ -174,6 +181,9 @@ impl Controller {
             device_selector: Default::default(),
             pending_route: None,
             active_device_url: String::new(),
+            sources_page: Default::default(),
+            playlists_page: Default::default(),
+            now_secs: 0,
             // Frequencies and role hints come from the mixer's own band plan;
             // the column prints them so the choice is visible rather than
             // implied.
@@ -347,6 +357,22 @@ impl Controller {
         }
         if let Some(s) = self.scenes.get(self.active_scene) {
             ui.colored_label(c.text_weak, format!("active: {}", s.name));
+        }
+    }
+
+    /// Carry out a playlist action. The page owns no storage; the host performs
+    /// these and re-publishes, which is the only way the list changes.
+    pub fn apply_playlist(&mut self, a: crate::sources::PlaylistAction) {
+        use crate::sources::PlaylistAction;
+        if let PlaylistAction::Create { name, description } = a {
+            let id = self.playlists_page.all().iter().map(|p| p.id).max().unwrap_or(0) + 1;
+            let mut all = self.playlists_page.all().to_vec();
+            all.push(crate::sources::PlaylistSummary {
+                id, name, description, track_count: 0, updated_at: self.now_secs });
+            self.playlists_page.set(all);
+            // Bring it into view: a new row appearing off-screen looks like
+            // nothing happened.
+            self.playlists_page.focus(id);
         }
     }
 
@@ -790,6 +816,26 @@ mod tests {
         assert_eq!(c.queue.len(), 1, "and the rest are really in the queue");
         assert_eq!(c.queue.up_next().unwrap().title, "Closer");
         assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn creating_a_playlist_adds_it_and_brings_it_into_view() {
+        let mut c = sample();
+        c.apply_playlist(crate::sources::PlaylistAction::Create {
+            name: "Drive".into(), description: "long roads".into() });
+        assert_eq!(c.playlists_page.all().len(), 1);
+        assert_eq!(c.playlists_page.focus_id, Some(1));
+    }
+
+    #[test]
+    fn choosing_the_source_already_playing_does_nothing() {
+        let mut c = sample();
+        c.sources_page.set(vec![
+            crate::sources::Source { name: "Line In".into(), kind: "line".into() },
+            crate::sources::Source { name: "Spotify".into(), kind: "spotify".into() }],
+            "Line In");
+        assert_eq!(c.sources_page.choose("Line In"), None, "it is already playing");
+        assert_eq!(c.sources_page.choose("Spotify"), Some("Spotify".into()));
     }
 
     #[test]
