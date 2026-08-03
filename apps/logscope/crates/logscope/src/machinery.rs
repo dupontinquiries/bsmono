@@ -101,6 +101,10 @@ pub struct Machine {
     pub fetch: &'static str,
     /// The part that moves when the router chooses.
     pub decide: &'static str,
+    /// The machine at full song — everything nominal, and the state a viewer should most want to
+    /// watch. Distinct from `fetch` on purpose: "working" and "working beautifully" are different
+    /// pictures, and a landmark that cannot show the second has nothing to reward attention with.
+    pub thriving: &'static str,
     /// What it looks like when the CPU is waiting — the state that matters most and is hardest to
     /// show as a number.
     pub stall: &'static str,
@@ -110,36 +114,42 @@ pub struct Machine {
 pub fn machine_for(scene: &str) -> Machine {
     match scene {
         "Old Library" | "Archive" | "Reading Room" => Machine {
+            thriving: "every runner in motion at once, the escapement singing, chimes marking each completed turn",
             landmark: "a clocktower above the stacks, its face open to the works",
             fetch: "brass page-runners sliding volumes down the shelf-rails",
             decide: "the escapement ticking once per routed token",
             stall: "the pendulum hangs at the top of its arc and does not fall",
         },
         "Canopy" | "Forest" => Machine {
+            thriving: "the whole trellis in bloom, sap running bright, every leaf tracking its bough in sequence",
             landmark: "a solarpunk trellis-engine grown into the branches",
             fetch: "sap-lines drawing bright fluid up from the roots",
             decide: "leaves turning to face whichever bough is called",
             stall: "the whole canopy holds still, no leaf turning, light unspent",
         },
         "Cloudscape" | "Mistfall" => Machine {
+            thriving: "engines at full ahead, ballast cycling smoothly, the envelope taut and the wake clean",
             landmark: "a moored steampunk blimp, its gondola all exposed gearing",
             fetch: "ballast crates winched up through the cloud on cables",
             decide: "the rudder swinging to a new heading each token",
             stall: "propellers feathered, the envelope drifting without heading",
         },
         "Treehouse" => Machine {
+            thriving: "beads flying across every runner, baskets crossing in both directions, the whole mill drumming",
             landmark: "an ewok-built abacus-mill of rope, bark and counterweight",
             fetch: "woven baskets hauled hand-over-hand along the span",
             decide: "carved beads clacking across their runners to mark the choice",
             stall: "every rope slack, the beads resting mid-runner",
         },
         "Folding@home" => Machine {
+            thriving: "the chain folding cleanly domain by domain, each pocket closing into place with a settling shimmer",
             landmark: "a protein folding in a lattice of glass, one domain per layer",
             fetch: "side-chains swinging into place as their residues are called",
             decide: "the backbone kinking to admit the next fold",
             stall: "the chain frozen half-folded, hydrophobic core still open",
         },
         "Mansion Garden" => Machine {
+            thriving: "every engine on the terrace running together, the Antikythera at speed, the chariot true, the astrolabe wheeling through its houses",
             landmark: "a museum terrace of analog engines — an Antikythera of golden \
 gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
             fetch: "the chariot's differential holding its pointer true as trays are wheeled in",
@@ -147,18 +157,21 @@ gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
             stall: "every dial stopped mid-figure, the crank turning nothing",
         },
         "Atlantis" => Machine {
+            thriving: "the tide running strong, vanes wide, amphorae arriving on every swell in procession",
             landmark: "a tide-engine of bronze and coral in the flooded plaza",
             fetch: "current-vanes drawing sealed amphorae in on the swell",
             decide: "a shoal of fish wheeling as one toward the chosen gate",
             stall: "the water flat, vanes hanging, nothing carried in or out",
         },
         "Fractal Spires" | "Recursive Citadel" => Machine {
+            thriving: "every depth turning at once, each ring in phase with its own smaller copy",
             landmark: "a self-similar orrery, each arm a smaller copy of the whole",
             fetch: "sub-orreries unfolding to surface the arm being read",
             decide: "the outermost ring selecting which copy of itself to enter",
             stall: "the recursion halted at one depth, inner rings unmoving",
         },
         "Slate" | "Alley" => Machine {
+            thriving: "every indicator green, the loader cycling without pause, relays snapping cleanly",
             landmark: "a service panel open on the wall, guts exposed and labelled",
             fetch: "cartridges racking in and out of the loader",
             decide: "a relay board latching the next path closed",
@@ -167,6 +180,7 @@ gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
         // A scene with no theme gets the machine plainly rather than nothing: an unnamed mechanism
         // still shows state, and a blank landmark teaches the reader that the feature is broken.
         _ => Machine {
+            thriving: "every part moving in time, nothing waiting",
             landmark: "an open mechanism on a plinth",
             fetch: "carriers moving parts in from the store",
             decide: "a selector arm settling on the next path",
@@ -366,12 +380,17 @@ mod alternator_tests {
 /// `Machine` describes three states in prose and nothing said which one applies. A landmark needs
 /// that: the clocktower has to know whether its pendulum swings or hangs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Motion { Fetching, Deciding, Stalled }
+pub enum Motion { Thriving, Fetching, Deciding, Stalled }
 
 impl Motion {
     /// The description to render, from the scene's machine.
     pub fn describe(self, m: &Machine) -> &'static str {
-        match self { Motion::Fetching => m.fetch, Motion::Deciding => m.decide, Motion::Stalled => m.stall }
+        match self {
+            Motion::Thriving => m.thriving,
+            Motion::Fetching => m.fetch,
+            Motion::Deciding => m.decide,
+            Motion::Stalled => m.stall,
+        }
     }
 
     /// How fast the mechanism should animate, as a multiplier on its resting rate.
@@ -380,7 +399,17 @@ impl Motion {
     /// visibly stopped reads as stopped. That difference is the whole reason to draw this rather than
     /// print a percentage, and softening it to a crawl would give back exactly what the visual buys.
     pub fn rate(self) -> f32 {
-        match self { Motion::Fetching => 1.0, Motion::Deciding => 0.6, Motion::Stalled => 0.0 }
+        match self {
+            // Faster than merely working, because a landmark is something you CHOOSE to look at and
+            // a healthy engine should be the best-looking thing it does — not the absence of a
+            // problem. The strip and the landmark want opposite rules here: the strip stays quiet
+            // when all is well because a diagnostic that always fires is ignored, and the landmark
+            // does its finest work for exactly the same reason it is worth glancing at.
+            Motion::Thriving => 1.4,
+            Motion::Fetching => 1.0,
+            Motion::Deciding => 0.6,
+            Motion::Stalled => 0.0,
+        }
     }
 }
 
@@ -395,7 +424,9 @@ pub fn motion_for(c: &Concern) -> Motion {
         Concern::MemoryClamped { .. } => Motion::Fetching,
         Concern::ExpertChurn { .. } => Motion::Fetching,
         Concern::TunerHeld { .. } => Motion::Deciding,
-        Concern::Healthy { .. } => Motion::Deciding,
+        // NOT Deciding. The landmark's job when nothing is wrong is to be worth looking at, which
+        // is the opposite of the strip's job in the same situation.
+        Concern::Healthy { .. } => Motion::Thriving,
     }
 }
 
@@ -447,5 +478,61 @@ mod motion_tests {
         let m = machine_for("Old Library");
         let motion = motion_for(&Concern::SyncBound { pct: 99 });
         assert!(motion.describe(&m).contains("does not fall"));
+    }
+}
+
+#[cfg(test)]
+mod audience_tests {
+    use super::*;
+
+    /// **The strip and the landmark want OPPOSITE rules when nothing is wrong**, and I built the
+    /// landmark inheriting the strip's.
+    ///
+    /// The strip interrupts: it shares a row with content the reader came for, so staying quiet when
+    /// healthy is correct — a diagnostic that always fires is one nobody reads.
+    ///
+    /// The landmark is chosen: someone looked at it deliberately, so healthy has to be its most
+    /// watchable state. A mechanism that only does something interesting when broken teaches you to
+    /// hope for failure, and gives you nothing on the days it works.
+    #[test]
+    fn a_healthy_engine_makes_the_landmark_do_its_BEST_work() {
+        let m = motion_for(&Concern::Healthy { tok_s: 24.0 });
+        assert_eq!(m, Motion::Thriving);
+        assert!(m.rate() > Motion::Fetching.rate(), "thriving must out-move merely working");
+    }
+
+    #[test]
+    fn thriving_reads_DIFFERENTLY_from_working_in_every_theme() {
+        // "Working" and "working beautifully" are different pictures. A landmark that cannot show the
+        // second has nothing to reward attention with.
+        for scene in ["Old Library", "Canopy", "Cloudscape", "Treehouse", "Folding@home",
+                      "Mansion Garden", "Atlantis", "Fractal Spires", "Slate", "Elsewhere"] {
+            let m = machine_for(scene);
+            assert_ne!(m.thriving, m.fetch, "{scene}");
+            assert_ne!(m.thriving, m.stall, "{scene}");
+            assert!(!m.thriving.is_empty(), "{scene}");
+        }
+    }
+
+    #[test]
+    fn the_four_states_are_ORDERED_by_how_much_moves() {
+        // Stalled reads as stopped, thriving as fullest — and the two middle states sit between, so a
+        // viewer can rank what they are seeing without a legend.
+        assert!(Motion::Thriving.rate() > Motion::Fetching.rate());
+        assert!(Motion::Fetching.rate() > Motion::Deciding.rate());
+        assert!(Motion::Deciding.rate() > Motion::Stalled.rate());
+        assert_eq!(Motion::Stalled.rate(), 0.0);
+    }
+
+    #[test]
+    fn the_STRIP_still_stays_quiet_on_the_same_state() {
+        // The other half of the distinction: the same Healthy concern that makes the clocktower sing
+        // gives the strip one short line and a brief slot.
+        let mut s = Strip::new(vec![], 24.0);
+        assert!(s.next().contains("running clean"));
+        let mut a = Alternator::new(Strip::new(vec![], 24.0));
+        a.tick(PREVIEW_MS);
+        a.tick(STRIP_QUIET_MS);
+        assert_eq!(a.tick(1), Slot::Preview, "the healthy strip yields the row quickly");
     }
 }
