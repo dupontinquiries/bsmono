@@ -71,6 +71,10 @@ pub struct Car {
     /// grounded — which is precisely the state the aerial control block
     /// already handles. Setting this is most of what "flying" means here.
     pub flight: bool,
+    /// how this hull stays up. None means the flat legacy behaviour.
+    pub lift: Option<crate::lift::Lift>,
+    /// local atmosphere, 0 = vacuum. A wing and a rotor both need it.
+    pub air: f32,
     /// ROBOT MODE. A bot on its feet does not dodge — it jumps again. The
     /// flip is spent on a second jump instead, driven by the boost tank,
     /// which is the thruster now rather than a nozzle on somebody's back.
@@ -176,6 +180,8 @@ impl Car {
             drive: crate::model::Drive::Combustion,
             hover: None,
             flight: false,
+            lift: None,
+            air: 1.0,
             robot: false,
             charge: 0.0,
             pulse_t: 0.0,
@@ -796,13 +802,26 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
     // up climbs. Drag gives it a terminal speed of its own instead of
     // inheriting the car's.
     if car.flight {
-        const LIFT: f32 = 0.92;
         const THRUST: f32 = 26.0;
         const DRAG: f32 = 0.55;
-        car.vel -= gdir * GRAV * gmul * cfg.arena.gravity * LIFT * dt;
+        let g_here = GRAV * gmul * cfg.arena.gravity;
         let t = c.throttle.max(0.0) + if c.boost { 0.8 } else { 0.0 };
+        // HOW IT STAYS UP DEPENDS ON WHAT IT IS. A wing needs airspeed and
+        // air; a rotor needs throttle and air; only reaction thrust works in
+        // vacuum. Without a lift type it falls back to the old flat 92% of
+        // weight, so nothing that has not been classified changes.
+        let up = match car.lift {
+            Some(l) => {
+                let airspeed = (car.vel - gdir * car.vel.dot(gdir)).length();
+                l.lift_accel(airspeed, t.min(1.0), car.air, g_here)
+            }
+            None => g_here * 0.92,
+        };
+        car.vel -= gdir * up * dt;
         car.vel += car.forward() * t * THRUST * dt;
-        car.vel *= 1.0 - (DRAG * dt).min(0.9);
+        // a rotor is slow: it bleeds speed harder than a wing or a rocket
+        let top = car.lift.map_or(1.0, |l| l.top_speed_frac());
+        car.vel *= 1.0 - (DRAG / top.max(0.2) * dt).min(0.9);
     }
     // FLOODWATER: a flooded tube's current owns you — strong downstream
     // servo (buoyancy is implicit: the target velocity has no fall in it)

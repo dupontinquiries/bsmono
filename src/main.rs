@@ -25,6 +25,7 @@ mod academy;
 mod stream;
 mod hud;
 mod input;
+mod lift;
 mod interior;
 mod menu;
 mod meshgen;
@@ -487,6 +488,8 @@ struct Game {
     /// autotarget on: ball cam follows an opponent instead of the ball
     autotarget: bool,
 
+    /// how the current chassis stays up, when it flies at all
+    lift: Option<lift::Lift>,
     /// walk / run / boost / fall, for robot mode
     loco: anim::Locomotion,
     /// the pose it produced this frame
@@ -1187,6 +1190,7 @@ fn main() {
         health: 1.0,
         wep: weapons::Weapons::new(),
         autotarget: false,
+        lift: None,
         loco: anim::Locomotion::new(),
         loco_pose: anim::Pose::default(),
         ball_model,
@@ -1702,15 +1706,31 @@ impl Game {
             // Flight is a property of the CHASSIS, not of the pose, so it is
             // read from the registry rather than from the model. A jet stays
             // a jet through every frame of its fold.
-            self.car.flight = self
+            // FLIGHT BELONGS TO THE VEHICLE, NOT THE CHASSIS. A bot that
+            // has unfolded onto its legs is standing on the ground — it does
+            // not float, and leaving the flag set was why a transformed
+            // flyer hovered. The chassis says it CAN fly; the current mode
+            // says whether it is.
+            let chassis_flies = self
                 .cars
                 .xform
                 .get(&i)
                 .map_or(false, |&(c, _)| self.cars.chassis[c].flight);
+            let robot = self
+                .cars
+                .xform
+                .get(&i)
+                .map_or(false, |&(c, k)| k * 2 > self.cars.chassis[c].strip.len() - 1);
+            self.car.flight = chassis_flies && !robot;
+            self.cam.nose_cam = chassis_flies && !robot;
+            self.car.lift = None;
+            self.lift = chassis_flies.then(|| {
+                lift::Lift::classify(self.cars.names[i], self.cars.models[i].half_w / self.cars.models[i].half_len.max(0.01))
+            });
+            self.car.lift = self.lift;
             // ROBOT once past the halfway point of the strip: that is when
             // the body is on its feet, and it is what switches the flip into
             // a second jump and hands the camera to the mouse.
-            self.cam.nose_cam = self.car.flight;
             self.car.robot = self
                 .cars
                 .xform
@@ -1851,6 +1871,11 @@ impl Game {
         }
 
         self.car.robot = self.xf.is_robot();
+        // mid-fold the same rule applies: legs down means no lift
+        if self.car.robot {
+            self.car.flight = false;
+            self.cam.nose_cam = false;
+        }
         if !self.car.robot {
             self.cam.look_yaw = 0.0;
             self.cam.look_pitch = 0.0;
