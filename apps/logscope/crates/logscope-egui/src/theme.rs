@@ -848,7 +848,47 @@ pub fn ensure_contrast_accent(fg: Color32, bg: Color32, min: f32) -> Color32 {
 /// user messages render inside a frame filled with PANEL, so that's the surface to guarantee. PANEL() reads
 /// the LIVE day/night-adjusted palette, so these track the brightness curve. Accents use the hue-preserving
 /// adjuster (backticks stay cyan, not mud); body/ink use the plain one (a value shift is fine for text).
-fn md_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast(fg, PANEL(), min) }
+/// Guarantee `min` against EVERY surface markdown can land on, not just one.
+///
+/// This is the bug the earlier md_strong fixes did not reach, and the reason
+/// they "were never reflected in the GUI": the colour was ensured against
+/// PANEL(), while chat.rs draws user messages on PANEL2()
+/// (`Role::User => (…, theme::PANEL2())`) and blockquotes under an accent wash.
+/// A floor proved against a surface the text is not on is not a floor. Measured
+/// across the palette set, bold promised 7:1 and delivered as little as 5.42:1
+/// on the surface it was actually drawn on — brown on brown in the wood themes,
+/// which is exactly where it was reported.
+///
+/// Converging rather than picking one surface: pushing a colour clear of PANEL2
+/// can drop it back below the floor on PANEL, so the passes alternate until the
+/// result clears both. Panel and panel2 are always the same light/dark family in
+/// every palette here, so the two pulls are in the same direction and this
+/// settles quickly; the loop is bounded anyway, and the fallback is the pole,
+/// which is legible by construction.
+fn ensure_contrast_all(fg: Color32, surfaces: &[Color32], min: f32) -> Color32 {
+    let clears = |c: Color32| surfaces.iter().all(|b| contrast_ratio(c, *b) >= min);
+    let mut c = fg;
+    for _ in 0..4 {
+        if clears(c) { return c; }
+        for b in surfaces { c = ensure_contrast(c, *b, min); }
+    }
+    if clears(c) { return c; }
+    // No single colour clears every surface — take the pole that does best on
+    // the worst of them. Legible with some desaturation beats hue-faithful and
+    // unreadable, which is the same trade ensure_contrast_accent already makes.
+    let worst = |c: Color32| surfaces.iter()
+        .map(|b| contrast_ratio(c, *b))
+        .fold(f32::INFINITY, f32::min);
+    if worst(Color32::WHITE) >= worst(Color32::BLACK) { Color32::WHITE } else { Color32::BLACK }
+}
+
+/// The surfaces markdown is drawn on: the assistant panel and the user panel.
+/// If chat.rs ever renders a message on a third fill, it belongs here — that is
+/// the whole maintenance burden of this approach, and it is cheaper than a
+/// per-call-site colour that silently goes stale.
+fn md_surfaces() -> [Color32; 2] { [PANEL(), PANEL2()] }
+
+fn md_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast_all(fg, &md_surfaces(), min) }
 fn md_accent_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast_accent(fg, PANEL(), min) }
 /// Markdown body ink, ≥ 4.5:1 (WCAG AA) on the message panel.
 pub fn md_ink() -> Color32 { md_on_panel(INK(), 4.5) }
@@ -2198,5 +2238,81 @@ mod md_contrast_tests {
         let body = contrast_ratio(md_ink(), PANEL());
         assert!(strong >= body, "bold {strong:.2}:1 vs body {body:.2}:1 — bold must not read weaker");
         assert!(strong >= 6.9, "and it is held to 7:1, not the 4.5 floor: {strong:.2}");
+    }
+}
+
+#[cfg(test)]
+mod md_surface_tests {
+    use super::*;
+
+    /// The palettes whose PANEL2 physically cannot carry the 7:1 bold floor:
+    /// pure white on that surface reaches only 5.66:1 and 6.78:1 respectively.
+    /// No choice of ink fixes that, and darkening panel2 until it can costs the
+    /// user/assistant distinction — it collapses to 1.03:1 against panel, which
+    /// is the same colour to the eye. Recorded rather than silently mangled;
+    /// the list is asserted so a NEW palette cannot quietly join it.
+    const TIGHT_PANEL2: &[&str] = &["Recursive Citadel", "Yellow Brick Road"];
+
+    /// The maximum contrast any colour can reach against a surface.
+    fn ceiling(bg: Color32) -> f32 {
+        contrast_ratio(Color32::WHITE, bg).max(contrast_ratio(Color32::BLACK, bg))
+    }
+
+    /// Every markdown colour must clear its floor on EVERY surface a message can
+    /// be drawn on — or, where the surface cannot support the floor at all, come
+    /// within a hair of the best that surface allows.
+    ///
+    /// Guaranteeing against PANEL alone let bold reach 5.42:1 on PANEL2 in Rural
+    /// Commons and 5.52:1 in Yellow Brick Road while claiming 7:1. That is the
+    /// brown-on-brown report: the wood themes draw user messages on panel2, and
+    /// the floor was proved against a surface the text was not on.
+    #[test]
+    fn every_markdown_colour_clears_its_floor_on_every_surface() {
+        let mut bad = Vec::new();
+        for p in PALETTES {
+            let surfaces = [p.panel, p.panel2];
+            for (label, fg, min) in [("ink", p.ink, 4.5f32), ("dim", p.dim, 4.5), ("strong", p.ink, 7.0)] {
+                let c = ensure_contrast_all(fg, &surfaces, min);
+                for (i, b) in surfaces.iter().enumerate() {
+                    let r = contrast_ratio(c, *b);
+                    let reachable = ceiling(*b).min(min);
+                    if r < reachable - 0.01 {
+                        bad.push(format!("{} {} on panel{} = {:.2}:1 (want {:.2}, surface allows {:.2})",
+                            p.name, label, if i == 0 { "" } else { "2" }, r, min, ceiling(*b)));
+                    }
+                }
+            }
+        }
+        assert!(bad.is_empty(), "{} failures:\n{}", bad.len(), bad.join("\n"));
+    }
+
+    /// The palettes that cannot carry the bold floor are exactly the ones we
+    /// know about. A new palette with an unreadable panel2 fails here rather
+    /// than shipping.
+    #[test]
+    fn no_new_palette_joins_the_tight_list() {
+        let tight: Vec<&str> = PALETTES.iter()
+            .filter(|p| ceiling(p.panel2) < 7.0)
+            .map(|p| p.name).collect();
+        assert_eq!(tight, TIGHT_PANEL2,
+            "a palette's panel2 cannot support 7:1 bold — pick a darker or lighter panel2");
+    }
+
+    /// The convergence must not overshoot into a colour that fails the surface
+    /// it started from — the reason the passes alternate rather than run once.
+    #[test]
+    fn a_second_surface_does_not_undo_the_first() {
+        for p in PALETTES {
+            let one = ensure_contrast(p.ink, p.panel, 7.0);
+            let both = ensure_contrast_all(p.ink, &[p.panel, p.panel2], 7.0);
+            let cap = |bg: Color32| {
+                contrast_ratio(Color32::WHITE, bg).max(contrast_ratio(Color32::BLACK, bg)).min(7.0)
+            };
+            assert!(contrast_ratio(both, p.panel) >= cap(p.panel) - 0.01,
+                "{} regressed on panel", p.name);
+            assert!(contrast_ratio(both, p.panel2) >= cap(p.panel2) - 0.01,
+                "{} still fails panel2", p.name);
+            let _ = one;
+        }
     }
 }
