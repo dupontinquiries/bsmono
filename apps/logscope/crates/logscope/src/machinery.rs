@@ -1289,3 +1289,113 @@ mod rejoin_tests {
         assert!(Rejoin { drops: 0, steady_s: REJOIN_IDLE_S }.ready(false));
     }
 }
+
+/// What a machine is FOR, which decides whether it gets a mechanism at all.
+///
+/// A phone paired to the cluster is not a small worker. It runs no inference, so it has no store, no
+/// selector and no drive — **a miniature clocktower would imply work it is not doing**, and shrinking
+/// one until it fits makes it unfindable as well as wrong.
+///
+/// So a viewer is not a machine on the map. It is a **presence**: a lantern, a lit marker saying
+/// someone is watching from here.
+///
+/// ## Findability comes from light, not size
+///
+/// A small bright thing is easy to find; a small dull thing is not. Making the viewer marker
+/// self-lit means it can be a fraction of a landmark's size and still read across the scene — and
+/// light carries the right meaning, since attention is what a viewer contributes.
+///
+/// It also scales. Four phones are four lanterns and no clutter; four small clocktowers would be
+/// four things you have to inspect to discover none of them are working.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Role {
+    /// Runs inference. Gets the full mechanism.
+    Worker,
+    /// Watches. Gets a lantern.
+    Viewer,
+}
+
+/// How a role is drawn.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Marker {
+    /// Fraction of a worker landmark's scale.
+    pub scale: f32,
+    /// Emissive strength, 0..1. This is what makes a small marker findable.
+    pub glow: f32,
+    /// Whether to build the store/selector/drive at all.
+    pub mechanism: bool,
+    /// How close to the reader it stands, as a fraction of the peer ring's radius. A viewer is WITH
+    /// you rather than working elsewhere, and standing it out on the ring would say the opposite.
+    pub radius_frac: f32,
+}
+
+impl Role {
+    pub fn marker(self) -> Marker {
+        match self {
+            Role::Worker => Marker { scale: 1.0, glow: 0.0, mechanism: true, radius_frac: 1.0 },
+            Role::Viewer => Marker {
+                // A quarter the size and unmistakably lit. The glow does the finding.
+                scale: 0.25, glow: 0.9, mechanism: false,
+                // Nearer than the working ring: a viewer is present, not deployed.
+                radius_frac: 0.45,
+            },
+        }
+    }
+
+    /// Does an idle machine in this role warrant concern?
+    ///
+    /// **A viewer at rest is not a problem and must not read as one.** A phone sits idle by
+    /// definition — that is its normal state, and a marker that dimmed or aged for it would raise an
+    /// alarm about the expected case, which is the fastest way to make every alarm ignorable.
+    pub fn idle_is_normal(self) -> bool { matches!(self, Role::Viewer) }
+}
+
+#[cfg(test)]
+mod role_tests {
+    use super::*;
+
+    #[test]
+    fn a_VIEWER_gets_no_mechanism() {
+        // It runs no inference, so a store and a selector would be depicting work that does not
+        // happen — the marker would be lying in the same way a stale peer animating its last motion
+        // lies.
+        assert!(!Role::Viewer.marker().mechanism);
+        assert!(Role::Worker.marker().mechanism);
+    }
+
+    #[test]
+    fn a_viewer_is_SMALL_but_LIT() {
+        // Findability from light rather than size. A small dull marker is unfindable; a small bright
+        // one reads across the scene, and light carries the right meaning since attention is what a
+        // viewer contributes.
+        let m = Role::Viewer.marker();
+        assert!(m.scale < 0.4, "small");
+        assert!(m.glow > 0.5, "and bright enough to find");
+        assert_eq!(Role::Worker.marker().glow, 0.0, "a working machine is lit by the scene");
+    }
+
+    #[test]
+    fn a_viewer_stands_NEARER_than_the_working_ring() {
+        // It is present, not deployed. Placing it out on the ring with the workers would say it was
+        // one of them.
+        assert!(Role::Viewer.marker().radius_frac < Role::Worker.marker().radius_frac);
+    }
+
+    #[test]
+    fn an_IDLE_VIEWER_is_not_a_concern() {
+        // A phone sits idle by definition — that is its normal state. A marker that dimmed or aged
+        // for it would raise an alarm about the expected case, which is the fastest way to make every
+        // alarm ignorable.
+        assert!(Role::Viewer.idle_is_normal());
+        assert!(!Role::Worker.idle_is_normal());
+    }
+
+    #[test]
+    fn several_viewers_stay_legible_where_several_mini_towers_would_not() {
+        // Four phones are four lanterns and no clutter. Four small clocktowers would be four things
+        // you have to inspect to discover none of them are working.
+        let m = Role::Viewer.marker();
+        assert!(!m.mechanism, "nothing to inspect");
+        assert!(m.glow > 0.0, "and distinguishable at a glance");
+    }
+}
