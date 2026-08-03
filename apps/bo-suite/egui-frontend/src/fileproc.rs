@@ -217,77 +217,62 @@ pub const FLASH_MS: f32 = 140.0;
 /// The squash on press.
 pub const PRESS_SCALE: f32 = 0.92;
 
-/// A press key: −, +, MUTE.
+/// bo-suite's press feel: an 8% dip over 90ms, ripple 320ms.
+///
+/// Shares `uikit_egui::motion::PressFeedback` with snapclone's GlassButton —
+/// the two were written independently and came out identical. The constants
+/// differ on purpose: a B&O key is firmer than a snapclone one.
+pub const FEEL: uikit_egui::motion::PressFeel =
+    uikit_egui::motion::PressFeel::new(PRESS_MS, RIPPLE_MS, PRESS_SCALE);
+
+/// A press key: −, +, MUTE. Shared press behaviour, plus the FLASH, which is
+/// bo-suite's own — see `flash`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepKey {
     pub label: String,
     /// Pill-shaped rather than round.
     pub wide: bool,
-    scale: f32,
-    down: bool,
-    ripple_ms: Option<f32>,
-    ripple_at: (f32, f32),
+    feedback: uikit_egui::motion::PressFeedback,
     flash_ms: Option<f32>,
 }
 
 impl StepKey {
     pub fn new(label: &str, wide: bool) -> Self {
-        StepKey { label: label.into(), wide, scale: 1.0, down: false,
-                  ripple_ms: None, ripple_at: (0.0, 0.0), flash_ms: None }
+        StepKey { label: label.into(), wide,
+                  feedback: uikit_egui::motion::PressFeedback::new(FEEL), flash_ms: None }
     }
 
-    pub fn press(&mut self, x: f32, y: f32) {
-        self.down = true;
-        self.ripple_at = (x, y);
-        self.ripple_ms = Some(0.0);
-    }
-
-    pub fn release(&mut self) { self.down = false; }
+    pub fn press(&mut self, x: f32, y: f32) { self.feedback.press(x, y); }
+    pub fn release(&mut self) { self.feedback.release(); }
 
     /// Flash: the key PERFORMED its action.
     ///
-    /// Separate from the press because a key that only flashes on release
-    /// cannot show a repeat — hold `−` and the volume steps down repeatedly,
-    /// and each step should flash even though there was one press.
+    /// NOT in the shared type, and this is the reason the promotion stopped
+    /// where it did. Hold "−" and the volume steps down repeatedly; each step
+    /// should flash even though there was one press. That is a bo-suite
+    /// behaviour tied to key-repeat, and snapclone's glass buttons have no
+    /// equivalent — sharing it would have put a field in the kit that one
+    /// consumer never sets.
     pub fn flash(&mut self) { self.flash_ms = Some(0.0); }
 
     pub fn tick(&mut self, dt_ms: f32) {
-        let target = if self.down { PRESS_SCALE } else { 1.0 };
-        let step = (1.0 - PRESS_SCALE) * dt_ms / PRESS_MS;
-        if self.scale > target { self.scale = (self.scale - step).max(target); }
-        else if self.scale < target { self.scale = (self.scale + step).min(target); }
-
-        if let Some(t) = self.ripple_ms {
-            let t = t + dt_ms;
-            self.ripple_ms = if t >= RIPPLE_MS { None } else { Some(t) };
-        }
+        self.feedback.tick(dt_ms);
         if let Some(t) = self.flash_ms {
             let t = t + dt_ms;
             self.flash_ms = if t >= FLASH_MS { None } else { Some(t) };
         }
     }
 
-    pub fn scale(&self) -> f32 { self.scale }
-    pub fn rippling(&self) -> bool { self.ripple_ms.is_some() }
+    pub fn scale(&self) -> f32 { self.feedback.scale() }
+    pub fn rippling(&self) -> bool { self.feedback.rippling() }
     pub fn flashing(&self) -> bool { self.flash_ms.is_some() }
-    pub fn ripple_origin(&self) -> (f32, f32) { self.ripple_at }
-
-    /// Ripple radius fraction, eased so it blooms rather than expanding at a
-    /// constant rate.
-    pub fn ripple_t(&self) -> f32 {
-        self.ripple_ms.map(|t| ease::out_cubic((t / RIPPLE_MS).clamp(0.0, 1.0))).unwrap_or(0.0)
-    }
-
-    /// Ripple opacity — fades as it grows, or it ends as a hard disc.
-    pub fn ripple_alpha(&self) -> f32 {
-        if !self.rippling() { return 0.0; }
-        (1.0 - self.ripple_t()) * 0.3
-    }
-
-    /// Flash strength, 0..=1, falling.
+    pub fn ripple_origin(&self) -> (f32, f32) { self.feedback.ripple_origin() }
+    pub fn ripple_t(&self) -> f32 { self.feedback.ripple_t() }
+    pub fn ripple_alpha(&self) -> f32 { self.feedback.ripple_alpha(0.3) }
     pub fn flash_alpha(&self) -> f32 {
         self.flash_ms.map(|t| (1.0 - t / FLASH_MS).clamp(0.0, 1.0)).unwrap_or(0.0)
     }
+    fn down(&self) -> bool { self.feedback.is_down() }
 }
 
 /// Draw a step key. Returns true when it is clicked.
@@ -297,7 +282,7 @@ pub fn step_key_ui(ui: &mut egui::Ui, k: &mut StepKey, d: f32,
     let size = if k.wide { egui::vec2(d * 2.0, d) } else { egui::vec2(d, d) };
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
     if resp.is_pointer_button_down_on() {
-        if !k.down {
+        if !k.down() {
             let p = resp.interact_pointer_pos().unwrap_or(rect.center());
             k.press(p.x - rect.left(), p.y - rect.top());
         }
