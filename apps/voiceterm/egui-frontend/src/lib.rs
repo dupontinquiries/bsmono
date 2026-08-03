@@ -15,6 +15,7 @@
 pub mod pty_input;
 pub mod table_view;
 pub mod row_render;
+pub mod detect;
 pub mod mail_view;
 pub mod archived_view;
 pub mod cards_view;
@@ -54,6 +55,32 @@ pub mod terminal_workspace;
 /// what it saves here is text LAYOUT rather than serialisation.
 #[path = "../../src/row_cache.rs"]
 pub mod row_cache;
+
+/// The include chain terminates here: entity_extract needs clog!, log needs
+/// util, and util is std-only with no crate:: references at all. Worth naming
+/// as a cost — including a module drags its crate-internal dependencies with
+/// it. It is still the right trade against a second copy of a 1,900-line
+/// extractor that would accept slightly different output within a month.
+#[path = "../../src/util.rs"]
+pub mod util;
+
+/// entity_extract logs through `crate::clog!`, so the logger comes with it.
+/// log.rs is std-only as well, and including it rather than defining a stand-in
+/// macro keeps the same categories and the same VOICETERM_LOG filtering — a
+/// second logger would mean the two frontends disagreed about what is worth
+/// recording.
+#[macro_use]
+#[path = "../../src/log.rs"]
+pub mod log;
+
+/// The detection engines, same terms again: `entity_extract` is
+/// terminal-output-as-menu, `dumb_summary` spots ASCII progress bars. Both are
+/// Qt-free and both had no surface at all — `detect` is the views they were
+/// missing.
+#[path = "../../src/entity_extract.rs"]
+pub mod entity_extract;
+#[path = "../../src/dumb_summary.rs"]
+pub mod dumb_summary;
 
 #[path = "../../src/table_ops.rs"]
 pub mod table_ops;
