@@ -3955,6 +3955,19 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             ck(&format!("packed nibbles identical to the CPU path ({nib_bad} words differ)"), nib_bad == 0);
             let gs: &[f32] = bytemuck::cast_slice(&gpu_words[qw_n..]);
             let cs: &[f32] = bytemuck::cast_slice(&cpu_words[qw_n..]);
+            // SHOW THE INPUTS, not just the disagreement. I have proposed three mechanisms for this
+            // ULP and each was wrong, because I reasoned about the scale RULE instead of measuring
+            // what feeds it. The rule is amax/7 over 32 dequantized weights, and the dequant test
+            // passes exactly — so either those are not the values the converter used, or amax is not
+            // what it appears to be. Printing both settles it in one run instead of another guess.
+            if !gs.is_empty() && !cs.is_empty() && (gs[0] - cs[0]).abs() > 0.0 {
+                let blk0 = &f32ref[..32.min(f32ref.len())];
+                let amax_cpu = blk0.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+                println!("      block 0 inputs  cpu amax {amax_cpu:.9} -> /7 = {:.9}", amax_cpu / 7.0);
+                println!("      gpu scale {:.9} implies amax {:.9}", gs[0], gs[0] * 7.0);
+                println!("      cpu scale {:.9} implies amax {:.9}", cs[0], cs[0] * 7.0);
+                println!("      first 4 dequantized weights: {:?}", &blk0[..4.min(blk0.len())]);
+            }
             let sdiff = gs.iter().zip(cs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             ck(&format!("block scales identical: max|diff|={sdiff:.3e}"), sdiff == 0.0);
             if sdiff != 0.0 || nib_bad != 0 {
