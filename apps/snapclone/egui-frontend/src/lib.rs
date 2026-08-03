@@ -38,6 +38,7 @@ pub mod nav_chrome;
 pub mod ribbon;
 pub mod scroll_areas;
 pub mod mobile_dialog;
+pub mod glass;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -165,6 +166,12 @@ pub struct Snapclone {
     /// once per frame from the real surface rather than hardcoded, so the same
     /// build is correct on a phone and on a desktop.
     pub dialog_form: crate::mobile_dialog::Form,
+    /// Painted camera-chrome buttons. Held across frames so their press dip and
+    /// ripple survive the redraw they are animating through.
+    pub glass_flip: crate::glass::GlassButton,
+    pub glass_shutter: crate::glass::GlassButton,
+    /// Set when the shutter is tapped; the host captures the frame.
+    pub shutter_pressed: bool,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -227,6 +234,9 @@ impl Snapclone {
             bg_carousel: crate::scroll_areas::HScroll::new(0.0, 400.0),
             carousel_handoff: false,
             dialog_form: crate::mobile_dialog::Form::Sheet,
+            glass_flip: Default::default(),
+            glass_shutter: Default::default(),
+            shutter_pressed: false,
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -674,8 +684,16 @@ impl Snapclone {
                 ui.colored_label(c.warning, "no camera found");
             }
         }
+        // The camera chrome uses the painted glass buttons, not flat ones: the
+        // mottling and the tap-keyed ripple are the two things a stylesheet
+        // cannot express, which is why Qt paints them.
         ui.horizontal(|ui| {
-            if ui.button("flip").clicked() { self.viewfinder.flip(); }
+            if crate::glass::glass_button_ui(ui, &mut self.glass_flip, "⟲", 44.0, c) {
+                self.viewfinder.flip();
+            }
+            if crate::glass::glass_button_ui(ui, &mut self.glass_shutter, "◉", 56.0, c) {
+                self.shutter_pressed = true;
+            }
             if ui.selectable_label(self.viewfinder.full_bleed, "fill").clicked() {
                 self.viewfinder.full_bleed = !self.viewfinder.full_bleed;
             }
@@ -918,6 +936,21 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn a_glass_button_animates_across_frames_rather_than_resetting() {
+        // Held on the shell, not built per frame: a button rebuilt each redraw
+        // would restart its dip and its ripple every single frame, so neither
+        // would ever be visible.
+        let mut s = app();
+        s.glass_shutter.press(10.0, 10.0);
+        s.glass_shutter.tick(crate::glass::PRESS_MS);
+        assert!(s.glass_shutter.scale() < 1.0);
+        assert!(s.glass_shutter.rippling());
+        s.glass_shutter.release();
+        s.glass_shutter.tick(crate::glass::PRESS_MS);
+        assert!((s.glass_shutter.scale() - 1.0).abs() < 0.01, "sprang back");
     }
 
     #[test]
