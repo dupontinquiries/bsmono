@@ -1009,13 +1009,116 @@ fn fs_blur(in: FullOut) -> @location(0) vec4<f32> {
     return vec4(acc, 1.0);
 }
 
+fn luma601(c: vec3<f32>) -> f32 { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+/// FXAA, ported from the C engine's fboshader: luma edge-detect plus a
+/// directional two-tap blend. Cheap because it only pays on real edges — the
+/// contrast gate rejects flat interiors, and the overshoot check throws away
+/// the blend when it would introduce a value neither neighbour had.
+///
+/// Worth more here than it was there: this frame is raymarched SDF against
+/// rasterised meshes, and the seam between the two is exactly the kind of
+/// high-contrast geometric edge FXAA was designed for.
+fn fxaa(uv: vec2<f32>, texel: vec2<f32>, base: vec3<f32>) -> vec3<f32> {
+    let n = luma601(textureSample(t_post, s_post, uv + vec2(0.0, -texel.y)).rgb);
+    let s2 = luma601(textureSample(t_post, s_post, uv + vec2(0.0, texel.y)).rgb);
+    let w = luma601(textureSample(t_post, s_post, uv + vec2(-texel.x, 0.0)).rgb);
+    let e = luma601(textureSample(t_post, s_post, uv + vec2(texel.x, 0.0)).rgb);
+    let c = luma601(base);
+    let lmin = min(c, min(min(n, s2), min(w, e)));
+    let lmax = max(c, max(max(n, s2), max(w, e)));
+    if (lmax - lmin < 0.055) {
+        return base; // flat: not an edge, do not pay
+    }
+    var dir = vec2(-((n + s2) - (w + e)), ((n + s2) - (w + e)));
+    dir = normalize(dir + vec2(1e-6));
+    let d = clamp(dir, vec2(-1.0), vec2(1.0)) * texel;
+    let a = textureSample(t_post, s_post, uv + d * (1.0 / 3.0 - 0.5)).rgb;
+    let b = textureSample(t_post, s_post, uv + d * (2.0 / 3.0 - 0.5)).rgb;
+    let two = (a + b) * 0.5;
+    let l2 = luma601(two);
+    // reject overshoot: a blend outside the neighbourhood is a new artifact
+    if (l2 < lmin || l2 > lmax) { return (a + base) * 0.5; }
+    return two;
+}
+
+/// Contrast-adaptive sharpen, from the same source. When the frame was
+/// rendered below native (render scale < 1) the upsample is bilinear and
+/// soft; this recovers edge definition by weighting REAL neighbouring
+/// pixels — it copies, it never invents detail.
+///
+/// This is the performance lever rather than a look: with it, dropping
+/// render scale costs much less perceived sharpness, so the scale slider
+/// becomes usable on weak hardware instead of merely blurry.
+fn cas(uv: vec2<f32>, texel: vec2<f32>, base: vec3<f32>, amount: f32) -> vec3<f32> {
+    let n = textureSample(t_post, s_post, uv + vec2(0.0, -texel.y)).rgb;
+    let s2 = textureSample(t_post, s_post, uv + vec2(0.0, texel.y)).rgb;
+    let w = textureSample(t_post, s_post, uv + vec2(-texel.x, 0.0)).rgb;
+    let e = textureSample(t_post, s_post, uv + vec2(texel.x, 0.0)).rgb;
+    let mn = min(base, min(min(n, s2), min(w, e)));
+    let mx = max(base, max(max(n, s2), max(w, e)));
+    // adaptive: sharpen less where the neighbourhood is already extreme, so
+    // highlights do not ring
+    let amp = sqrt(clamp(min(mn, 1.0 - mx) / max(mx, vec3(1e-4)), vec3(0.0), vec3(1.0)));
+    let wgt = -amp * (amount * 0.2);
+    let sum = base + (n + s2 + w + e) * wgt;
+    let norm = 1.0 + 4.0 * wgt;
+    return clamp(sum / max(norm, vec3(1e-4)), mn, mx);
+}
+
+/// Split-tone grade: shadows lean cool, highlights lean warm. The C engine
+/// drove this per world; skydribble already has per-map-style colours in
+/// hand, so the fog colour serves as the shadow tint and the zenith as the
+/// highlight one. Costs nothing and ties the grade to the map rather than
+/// bolting a fixed look over every style.
+fn split_tone(c: vec3<f32>, cool: vec3<f32>, warm: vec3<f32>, k: f32) -> vec3<f32> {
+    let l = clamp(luma601(c), 0.0, 1.0);
+    let tint = mix(cool, warm, smoothstep(0.25, 0.85, l));
+    return mix(c, c * (tint * 1.6 + 0.35), k);
+}
+
+/// Ordered 4x4 Bayer dither before 8-bit output. A sky gradient across 1080
+/// rows crosses far fewer than 1080 representable values, and the banding
+/// that produces is the most visible artifact left in a clean HDR frame.
+/// Sub-LSB noise costs one modulo and removes it.
+fn dither(frag: vec2<f32>) -> f32 {
+    let x = u32(frag.x) & 3u;
+    let y = u32(frag.y) & 3u;
+    var m = array<f32, 16>(
+        0.0, 8.0, 2.0, 10.0,
+        12.0, 4.0, 14.0, 6.0,
+        3.0, 11.0, 1.0, 9.0,
+        15.0, 7.0, 13.0, 5.0,
+    );
+    return (m[y * 4u + x] / 16.0 - 0.5) / 255.0;
+}
+
 @fragment
 fn fs_composite(in: FullOut) -> @location(0) vec4<f32> {
-    let hdr = textureSample(t_post, s_post, in.uv).rgb;
+    let texel = P.v.xy;
+    var hdr = textureSample(t_post, s_post, in.uv).rgb;
+
+    // quality tiers, as in the source engine: 0 mobile, 3 ultra. The edge
+    // taps are the expensive part and the ones a weak device should skip.
+    let q = G.rt.y;
+    if (q >= 2.0) {
+        hdr = fxaa(in.uv, texel, hdr);
+    }
+    // reconstructing a sub-native frame: hmap.zw is the output size, so a
+    // post target smaller than it means we upscaled on the way here
+    let upscale = max(G.hmap.z * texel.x, 1.0);
+    if (upscale > 1.02 && q >= 1.0) {
+        hdr = cas(in.uv, texel, hdr, min(upscale - 1.0, 1.0));
+    }
+
     let bloom = textureSample(t_post2, s_post, in.uv).rgb;
     var col = hdr + bloom * G.post.x;
     // subtle screen-door: checker dim, configurable (post.z)
     let m = f32((u32(in.clip.x) + u32(in.clip.y)) & 1u);
     col *= 1.0 - G.post.z * 0.5 * m; // halved: the checker read too heavy on glass
-    return vec4(screen_fx(col, in.clip.xy), 1.0);
+    col = screen_fx(col, in.clip.xy);
+    if (q >= 1.0) {
+        col = split_tone(col, G.fog.rgb, G.misc.rgb, 0.10);
+    }
+    return vec4(col + vec3(dither(in.clip.xy)), 1.0);
 }
