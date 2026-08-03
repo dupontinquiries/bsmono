@@ -489,3 +489,90 @@ fn main() {}
             "a rule without its reason gets optimised away by the next model");
     }
 }
+
+impl PatchError {
+    /// What to change before asking again — and whether asking again is worth anything.
+    ///
+    /// A rejected patch is currently a dead end: correct, because applying an unverified edit is the
+    /// one thing this must never do, but a dead end. The three reasons are not interchangeable, and
+    /// each names a different repair:
+    ///
+    /// * **Stale** — the file moved under the model. Nothing is wrong with its reasoning; it was
+    ///   shown an old copy. Re-show and re-ask, and expect the same patch to work.
+    /// * **AnchorMismatch** — the model quoted context that is not in the file. That is a different
+    ///   failure entirely: it invented the surroundings, so re-showing the same region and asking
+    ///   again will usually reproduce it.
+    /// * **Range** — the addressing is wrong, not the content.
+    ///
+    /// This is the same shape as `debaterun::Reframe`: **a retry that changes nothing reproduces the
+    /// failure exactly**, because the model is deterministic given its input. Naming the adjustment is
+    /// what makes the retry worth spending a generation on.
+    pub fn retry(&self) -> Retry {
+        match self {
+            PatchError::Stale { .. } => Retry {
+                worth_retrying: true,
+                adjustment: "re-read the file and show the model the current content — its patch was \
+correct for what it was given, and the file moved underneath it",
+            },
+            PatchError::AnchorMismatch { .. } => Retry {
+                worth_retrying: true,
+                adjustment: "show a WIDER window around the target and ask for the edit again — the \
+model quoted context the file does not contain, so it was working from too little of it or from \
+memory, and re-showing the same narrow region reproduces the same guess",
+            },
+            PatchError::Range(_) => Retry {
+                worth_retrying: true,
+                adjustment: "ask for the edit anchored on surrounding TEXT rather than line numbers — \
+the content may be right and the addressing wrong",
+            },
+        }
+    }
+}
+
+/// Whether to ask again, and what to change first.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Retry {
+    pub worth_retrying: bool,
+    pub adjustment: &'static str,
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn a_STALE_file_means_the_model_was_right_and_the_file_moved() {
+        // The one case where the same patch, re-asked against current content, should just work —
+        // nothing was wrong with the model's reasoning.
+        let r = PatchError::Stale { expected: 1, actual: 2 }.retry();
+        assert!(r.worth_retrying);
+        assert!(r.adjustment.contains("moved underneath it"));
+    }
+
+    #[test]
+    fn an_ANCHOR_MISMATCH_needs_a_WIDER_window_not_the_same_one() {
+        // The model quoted context the file does not contain — it was working from too little or from
+        // memory. Re-showing the same narrow region reproduces the same guess, which is the trap.
+        let r = PatchError::AnchorMismatch {
+            at: 10, expected: "fn a()".into(), actual: "fn b()".into() }.retry();
+        assert!(r.adjustment.contains("WIDER"));
+    }
+
+    #[test]
+    fn the_three_reasons_give_THREE_different_adjustments() {
+        // If they collapsed to one, the distinction in PatchError would be decoration and every retry
+        // would repeat whichever failure came first.
+        let a = PatchError::Stale { expected: 1, actual: 2 }.retry().adjustment;
+        let b = PatchError::AnchorMismatch { at: 0, expected: String::new(), actual: String::new() }
+            .retry().adjustment;
+        let c = PatchError::Range("bad".into()).retry().adjustment;
+        assert_ne!(a, b); assert_ne!(b, c); assert_ne!(a, c);
+    }
+
+    #[test]
+    fn a_range_error_suggests_ANCHORING_rather_than_renumbering() {
+        // Line numbers are what the model is worst at and anchors are what apply_verified checks
+        // anyway, so the repair moves the edit onto the axis that is already verified.
+        assert!(PatchError::Range("out of bounds".into()).retry().adjustment.contains("anchored"));
+    }
+}
