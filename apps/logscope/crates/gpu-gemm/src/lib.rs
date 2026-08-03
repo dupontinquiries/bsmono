@@ -695,6 +695,9 @@ pub struct Gpu {
     /// separate flag the handler can flip without the whole Gpu). A decode step checks it and aborts the
     /// step gracefully instead of the process panicking through wgpu's default handler.
     oom_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Count of ANY uncaptured device error, so a guard can ask "did something go wrong" rather than
+    /// "did this specific thing go wrong".
+    dev_errors: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// One coherent decode-kernel configuration. Extend with new tuning dimensions (e.g. split-k warp
@@ -1122,8 +1125,10 @@ impl Gpu {
         // second-prompt prefill where per-layer expert scratch piled up in one unflushed window submit.
         let degrade_level = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         let oom_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // Any device error, not only OOM. See the handler below.
+        let dev_errors = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         {
-            let dl = degrade_level.clone(); let of = oom_flag.clone();
+            let dl = degrade_level.clone(); let of = oom_flag.clone(); let de = dev_errors.clone();
             device.on_uncaptured_error(std::sync::Arc::new(move |e: wgpu::Error| {
                 let msg = format!("{e}");
                 if matches!(e, wgpu::Error::OutOfMemory { .. }) || msg.contains("Out of Memory") || msg.contains("VMA") {
@@ -1132,7 +1137,15 @@ impl Gpu {
                     eprintln!("wgpu-engine: DEVICE OOM caught (VMA exhausted) — degrading + backing off this step instead of crashing. Free VRAM or lower context/window.");
                 } else {
                     // non-OOM validation/internal errors: log loudly (these were the old default-panic set)
-                    eprintln!("wgpu-engine: device error (non-fatal, logged): {msg}");
+                    // COUNTED, not just logged. A buffer whose allocation failed can surface as a
+            // VALIDATION error rather than OutOfMemory — "Buffer with 'arena-slab' label is invalid"
+            // — and the arena's guard checked oom_backoff() only, so it let an invalid buffer through
+            // and the panic landed three frames later in get_mapped_range.
+            //
+            // Same shape as the governor's pressure latch: a guard watching one failure mode on a
+            // device that produces another.
+            de.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("wgpu-engine: device error (non-fatal, logged): {msg}");
                 }
             }));
         }
@@ -1177,7 +1190,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, dev_errors, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -2819,6 +2832,14 @@ impl Gpu {
         self.sg_ok.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Has the device reported ANY uncaptured error?
+    ///
+    /// Broader than `oom_backoff` on purpose: an allocation that fails can surface as a validation
+    /// error rather than OutOfMemory, and a guard asking only about OOM misses it.
+    pub fn dev_error_count(&self) -> u64 {
+        self.dev_errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     pub fn oom_backoff(&self) -> bool { self.oom_flag.load(std::sync::atomic::Ordering::Relaxed) }
     pub fn clear_oom(&self) { self.oom_flag.store(false, std::sync::atomic::Ordering::Relaxed); }
     /// Test/validation hook: force the OOM-backoff flag so the download guards can be exercised without an
@@ -3331,8 +3352,15 @@ impl Gpu {
             // That is a Llama-3.3-70B load on a 48 GiB budget, and a crash is the worst possible
             // outcome for a condition the memory planner exists to report. Polling flushes the
             // pending device error so oom_flag is set before anything touches the buffer.
+            let errs_before = self.dev_errors.load(std::sync::atomic::Ordering::Relaxed);
             let _ = self.device.poll(wgpu::PollType::Poll);
-            if self.oom_backoff() {
+            // ANY device error, not only OOM. Your Scout run failed here as a VALIDATION error —
+            // "Buffer with 'arena-slab' label is invalid" — which never sets oom_flag, so this guard
+            // passed an unbacked buffer through and the panic landed in get_mapped_range three frames
+            // later. A guard that watches one failure mode on a device that produces another is the
+            // shape that has cost this codebase the most.
+            if self.oom_backoff()
+                || self.dev_errors.load(std::sync::atomic::Ordering::Relaxed) > errs_before {
                 // Leave the slab out of the arena and hand back a tensor over a minimal buffer. The
                 // OOM flag is already set, so the enclosing load discards this and reports device OOM
                 // through the path built for it — rather than aborting the process here.
