@@ -6337,6 +6337,9 @@ pub fn add_landmark(
     // themes existed only as prose the renderer never saw — a clocktower and an abacus-mill are not
     // the same shape, and the silhouette is most of what reads at landmark distance.
     shape: logscope::machinery::Shape,
+    // HOW BUILT AND HOW OVERGROWN. A disconnecting machine loses PARTS rather than fading — a
+    // half-transparent clocktower reads as a rendering bug and a half-collapsed one reads as a ruin.
+    weather: logscope::machinery::Weathering,
     resident: Color32,
     streaming: Color32,
     frame: Color32,
@@ -6356,7 +6359,11 @@ pub fn add_landmark(
     // streaming ones float, so the split is countable at a glance.
     let n = parts.slots.max(1);
     let span = 2.8 * k * shape.spread;
-    for i in 0..n {
+    // Crumble from the far end inward, so a collapsing machine visibly shortens rather than
+    // developing holes — a gap-toothed store reads as a missing expert, which is a different and
+    // wrong message.
+    let slots_kept = weather.parts_shown(n);
+    for i in 0..slots_kept {
         let t = if n == 1 { 0.5 } else { i as f32 / (n - 1) as f32 };
         let x = base.x - span * 0.5 + span * t;
         let home = i < parts.filled;
@@ -6376,7 +6383,8 @@ pub fn add_landmark(
 
     // The selector: an arm over the chosen slot. Absent entirely when nothing is selected, because a
     // stalled machine is not mid-choice and an arm parked on a slot would read as deliberation.
-    if let Some(sel) = parts.selected {
+    // The selector goes early: a machine that is coming apart is not choosing anything.
+    if let Some(sel) = parts.selected.filter(|_| weather.built > 0.5) {
         let t = if n == 1 { 0.5 } else { (sel.min(n - 1)) as f32 / (n - 1) as f32 };
         let x = base.x - span * 0.5 + span * t;
         s.add(box_slab(v(x, base.y + 0.62 * k, base.z), 0.04 * k, 0.2 * k, 0.04 * k, frame),
@@ -6385,7 +6393,8 @@ pub fn add_landmark(
 
     // The drive: a wheel on the upright whose motion IS the rate. Zero amplitude at a stall — not a
     // slow wobble, which would read as "working hard" and is the one impression to avoid.
-    let d = parts.drive;
+    // Age slows the drive independently of the engine's rate: an overgrown mechanism labours.
+    let d = parts.drive * (1.0 - 0.6 * weather.age);
     let dr = 0.5 * k * shape.drive;
     s.add(box_slab(v(base.x, base.y + rise * 1.72, base.z), dr, dr, 0.06 * k, frame),
           Float { amp: if d > 0.0 { 0.09 * k * d } else { 0.0 },
@@ -6401,6 +6410,7 @@ mod landmark_tests {
         let mut s = Scene::new();
         add_landmark(&mut s, parts, placement(20.0, 12.0),
                      logscope::machinery::machine_for("Old Library").shape,
+                     logscope::machinery::Weathering::present(),
                      Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
                      Color32::from_rgb(70, 70, 80));
         s
@@ -6471,6 +6481,7 @@ mod landmark_theme_tests {
         let mut s = Scene::new();
         add_landmark(&mut s, Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5),
                      placement(20.0, 12.0), machine_for(scene).shape,
+                     logscope::machinery::Weathering::present(),
                      Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
                      Color32::from_rgb(70, 70, 80));
         s
@@ -6523,5 +6534,78 @@ mod landmark_theme_tests {
         for scene in ["Old Library", "Canopy", "Treehouse", "Fractal Spires", "Mansion Garden"] {
             assert_eq!(built_as(scene).meshes.len(), 20, "{scene}");
         }
+    }
+}
+
+#[cfg(test)]
+mod landmark_weather_tests {
+    use super::*;
+    use logscope::machinery::{Motion, Parts, Weathering, machine_for, placement};
+
+    fn built_with(w: Weathering) -> Scene {
+        let mut s = Scene::new();
+        add_landmark(&mut s, Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5),
+                     placement(20.0, 12.0), machine_for("Old Library").shape, w,
+                     Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
+                     Color32::from_rgb(70, 70, 80));
+        s
+    }
+
+    #[test]
+    fn a_crumbling_machine_has_FEWER_MESHES() {
+        // Not fainter ones. A half-transparent clocktower reads as a rendering bug; a half-collapsed
+        // one reads as a ruin, and only the second is the message.
+        let whole = built_with(Weathering::present()).meshes.len();
+        let mut half = Weathering::present();
+        half.tick(logscope::machinery::WEATHER_TRANSITION_S * 0.5, false, 0.0);
+        assert!(built_with(half).meshes.len() < whole);
+    }
+
+    #[test]
+    fn a_fully_gone_machine_keeps_only_its_FRAME() {
+        // The plinth and upright remain so the site is still legible: a landmark that disappears
+        // entirely reads as "there was never a machine here", and a ruin says the opposite.
+        let mut gone = Weathering::present();
+        gone.tick(logscope::machinery::WEATHER_TRANSITION_S * 2.0, false, 0.0);
+        let s = built_with(gone);
+        assert_eq!(s.meshes.len(), 3, "plinth, upright, drive — no slots, no selector");
+    }
+
+    #[test]
+    fn the_SELECTOR_goes_before_the_store_is_empty() {
+        // A machine coming apart is not choosing anything, and an arm still pointing while the rack
+        // collapses around it would be the wrong picture.
+        let mut mid = Weathering::present();
+        mid.tick(logscope::machinery::WEATHER_TRANSITION_S * 0.6, false, 0.0);
+        assert!(mid.built < 0.5 && mid.built > 0.0);
+        let s = built_with(mid);
+        // frame(2) + drive(1) + some slots, and no selector.
+        assert!(s.meshes.len() > 3, "some store survives");
+        assert!(s.meshes.len() < 3 + 16, "and the selector is gone");
+    }
+
+    #[test]
+    fn an_OVERGROWN_machine_labours() {
+        // Age slows the drive independently of what the engine reports: a mechanism swallowed by
+        // vines should look like it is working against them.
+        let clean = Weathering { built: 1.0, age: 0.0 };
+        let mossy = Weathering { built: 1.0, age: 1.0 };
+        let drive_speed = |w| built_with(w).floats.last().unwrap().speed;
+        assert!(drive_speed(mossy) < drive_speed(clean));
+        assert!(drive_speed(mossy) > 0.0, "labouring, not stopped — a stall is a different message");
+    }
+
+    #[test]
+    fn the_store_shortens_from_the_END_rather_than_developing_holes() {
+        // A gap-toothed rack reads as a missing expert, which is a different and wrong message.
+        let mut mid = Weathering::present();
+        mid.tick(logscope::machinery::WEATHER_TRANSITION_S * 0.4, false, 0.0);
+        let s = built_with(mid);
+        let xs: Vec<f32> = s.meshes[2..].iter()
+            .map(|m| m.verts.iter().map(|p| p.x).sum::<f32>() / m.verts.len() as f32).collect();
+        let mut sorted = xs.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // The surviving slots occupy a contiguous run from the low end.
+        assert!(sorted.windows(2).all(|w| w[1] - w[0] < 1.0), "contiguous, not scattered");
     }
 }
