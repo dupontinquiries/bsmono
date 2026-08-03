@@ -1089,6 +1089,12 @@ was evicted)", prompt_ids.len())
                         pinned: gpu_kernels::moe_pin_counts().0, total: gpu_kernels::moe_pin_counts().1,
                     };
                     eprintln!("wgpu-engine: [{}] {}", self.name, r.report(per as u64));
+                    // Prediction is a DIFFERENT lever from the pin set: the pin set decides what is
+                    // always here, prediction decides what will be wanted next and is the only one
+                    // that can hide a fetch behind compute.
+                    let (issued, phits) = gpu_kernels::moe_prefetch_stats();
+                    eprintln!("wgpu-engine: [{}] {}", self.name,
+                        gpu_kernels::perfverdict::PrefetchAccuracy { issued, hits: phits }.verdict());
                 }
             }
             // THE PROFILE CHECKED AGAINST ITSELF. A line that contradicts itself is worse than no
