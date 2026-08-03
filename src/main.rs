@@ -19,6 +19,7 @@ mod academy;
 mod stream;
 mod hud;
 mod input;
+mod menu;
 mod meshgen;
 mod model;
 mod net;
