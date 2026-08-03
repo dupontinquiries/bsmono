@@ -29,6 +29,7 @@ pub mod modal;
 pub mod snaps;
 pub mod session;
 pub mod ring;
+pub mod qr;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -127,6 +128,10 @@ pub struct Snapclone {
     /// Calls that ended without being taken, for the missed-call list. A
     /// timeout and a decline are recorded apart: same effect, different history.
     pub missed_calls: Vec<String>,
+    /// The QR scanner sheet (Qt QrScanDialog), presented into the Dialog layer.
+    /// `None` when it is not open — the scanner holds camera frames and should
+    /// not exist while nobody is looking at it.
+    pub qr: Option<crate::qr::QrScan>,
     gesture: GestureLayer,
     palette: String,
 }
@@ -167,6 +172,7 @@ impl Snapclone {
             now_secs: 0,
             incoming_call: None,
             missed_calls: Vec::new(),
+            qr: None,
             conversation: Default::default(),
             conversation_peer: String::new(),
             bar: UnifiedNav::new(),
@@ -277,12 +283,40 @@ impl Snapclone {
         for ev in self.viewer.tick(dt * 1000.0) {
             self.apply_snap_event(ev);
         }
+        // The scanner's success hold runs on the frame clock too.
+        if let Some(c) = self.qr.as_mut().and_then(|q| q.tick(dt * 1000.0)) {
+            self.apply_scan(c);
+        }
         // The ring declines itself after thirty seconds whether or not anyone
         // is looking at this page.
         if let Some(call) = self.incoming_call.as_mut() {
             let caller = call.caller_name.clone();
             if let Some(a) = call.tick(dt * 1000.0) { self.finish_call(&caller, a); }
         }
+    }
+
+    /// Open the QR scanner. `camera` false lands straight on the manual field
+    /// rather than showing a viewfinder that will never produce a frame.
+    pub fn open_qr_scan(&mut self, camera: bool) {
+        self.qr = Some(if camera { crate::qr::QrScan::scanning() }
+                       else { crate::qr::QrScan::manual_only() });
+        self.modal.present_default("qr", crate::modal::Layer::Dialog,
+                                   crate::modal::Rect::new(20.0, 80.0, 340.0, 420.0));
+    }
+
+    /// A scanned or pasted code becomes a peer, through the SAME path a typed
+    /// address takes — so a contact added by camera and one added by hand are
+    /// the same kind of contact.
+    pub fn apply_scan(&mut self, c: crate::qr::ScannedContact) {
+        self.apply_friends(crate::friends::Action::Add(
+            crate::friends::AddPeer { host: c.sc_id, port: c.port }));
+        self.qr = None;
+        self.modal.dismiss("qr");
+    }
+
+    /// Feed a decoded frame from the camera. Returns true once it latches.
+    pub fn qr_frame(&mut self, payload: &str) -> bool {
+        self.qr.as_mut().map(|q| q.frame(payload)).unwrap_or(false)
     }
 
     /// A voice packet arrived for a conversation whose thread is not open.
@@ -658,6 +692,48 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn a_scanned_code_becomes_a_peer_through_the_same_path_as_a_typed_address() {
+        // A contact added by camera and one added by hand must be the same kind
+        // of contact — otherwise one of the two paths grows its own bugs.
+        let mut s = app();
+        s.open_qr_scan(true);
+        assert!(s.modal.blocks_input());
+        assert!(s.qr_frame("snapclone://sc-deadbeef:9000"));
+        // Held first, so the user sees what was found.
+        s.tick(0.3);
+        assert_eq!(s.roster.len(), 2, "not yet — the success state is showing");
+        s.tick(0.4);
+        assert_eq!(s.roster.len(), 3);
+        assert!(s.roster.get("sc-deadbeef").is_some());
+        assert!(s.qr.is_none());
+        assert!(s.modal.is_empty(), "and the sheet closes with it");
+    }
+
+    #[test]
+    fn scanning_the_same_code_twice_adds_one_peer() {
+        // At 8fps the code arrives repeatedly before the camera stops.
+        let mut s = app();
+        s.open_qr_scan(true);
+        assert!(s.qr_frame("sc-deadbeef"));
+        assert!(!s.qr_frame("sc-deadbeef"));
+        s.tick(1.0);
+        assert_eq!(s.roster.len(), 3);
+        assert!(!s.qr_frame("sc-deadbeef"), "the sheet is gone; no stray frame lands");
+        assert_eq!(s.roster.len(), 3);
+    }
+
+    #[test]
+    fn no_camera_opens_straight_on_the_manual_field() {
+        // A viewfinder that will never produce a frame is worse than no
+        // viewfinder.
+        let mut s = app();
+        s.open_qr_scan(false);
+        let q = s.qr.as_ref().unwrap();
+        assert!(!q.is_scanning());
+        assert!(q.status().contains("Camera unavailable"));
     }
 
     #[test]
