@@ -41,16 +41,18 @@ pub const REBOUND_SECS: f32 = 0.380;
 /// drag is allowed over the bound; a flick is not.
 pub const DRAG_OVERSHOOT: f32 = 0.18;
 
-/// OutCubic: `1 - (1-t)^3`.
+/// The rebound easing.
 ///
-/// Decelerating with no overshoot. An OutBack here would undershoot past the
-/// edge and come back, which is a second wobble on content that is already
-/// returning from one.
-pub fn out_cubic(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    let inv = 1.0 - t;
-    1.0 - inv * inv * inv
-}
+/// Decelerating with no overshoot: an OutBack here would undershoot past the
+/// edge and come back, which is a second wobble on content already returning
+/// from one.
+///
+/// This used to be a private copy — and it was the ONLY easing in the tree that
+/// clamped its input. The shared one did not, so `uikit-term`'s block slide
+/// could overshoot on a slow frame. The clamp now lives in the kit and this is
+/// a re-export, so the guard applies everywhere instead of here alone.
+pub use uikit_egui::motion::ease::out_cubic;
+
 
 /// Where a fling ends up, given a release velocity.
 ///
