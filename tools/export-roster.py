@@ -209,12 +209,17 @@ def main():
         good = True
         for k in range(POSES):
             t = k / (POSES - 1) if POSES > 1 else 0.0
-            r = subprocess.run(
-                [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
-                 "--veh", os.path.join(DATA, iqm),
-                 "--gltf", os.path.join(d, f"f{k:02d}"), "--gltf-merge",
-                 "--t", f"{t:.4f}"],
-                capture_output=True, text=True, timeout=180)
+            cmd = [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
+                   "--veh", os.path.join(DATA, iqm),
+                   "--gltf", os.path.join(d, f"f{k:02d}"), "--gltf-merge",
+                   "--t", f"{t:.4f}"]
+            # THE JOINTS, ONCE PER CHASSIS. They are a property of the rig
+            # rather than of a pose, so the robot end writes them and the
+            # engine loads one file per bot. --repair refits pivots to their
+            # seam first, so what ships is the corrected set.
+            if k == POSES - 1:
+                cmd += ["--repair", "--joints-json", os.path.join(d, "joints.json")]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
             if r.returncode != 0 or not os.path.isfile(os.path.join(d, f"f{k:02d}", "scene.gltf")):
                 good = False
                 fail.append((name, (r.stderr or "").strip().splitlines()[-1:] or ["?"]))

@@ -28,6 +28,7 @@ mod academy;
 mod stream;
 mod hud;
 mod input;
+mod joints;
 mod lift;
 mod interior;
 mod menu;
@@ -456,6 +457,9 @@ struct Chassis {
     /// means different target lengths), so the morph has to reload with the
     /// SAME numbers or the blend would rescale as it goes.
     dirs: Vec<(PathBuf, f32)>,
+    /// the fitted rig, for the catalogue's joint inspector. Empty when the
+    /// chassis shipped without a joints.json.
+    joints: Vec<joints::Joint>,
     /// jets fly instead of driving: never grounded, lift and nose thrust
     flight: bool,
 }
@@ -514,6 +518,11 @@ struct Game {
 
     /// how the current chassis stays up, when it flies at all
     lift: Option<lift::Lift>,
+    /// which joint the catalogue is pointing at
+    joint_sel: usize,
+    /// step only through the misparented ones — 306 joints is scrolling,
+    /// not inspection, and the faults are what we are looking at
+    joint_only_bad: bool,
     /// space, as a tap-or-hold whose meaning the form decides
     space: chord::Chord,
     /// right mouse: glance when held, latch when tapped
@@ -1231,7 +1240,12 @@ fn main() {
                 cars.xform.insert(idx, (cid, k));
             }
             println!("bots: {label} — {} poses{}", strip.len(), if flight { ", flight" } else { "" });
-            cars.chassis.push(Chassis { strip, dirs, flight });
+            cars.chassis.push(Chassis {
+                strip,
+                dirs,
+                joints: joints::load(&bdir.join("joints.json")),
+                flight,
+            });
         }
     }
 
@@ -1285,6 +1299,8 @@ fn main() {
         wep: weapons::Weapons::new(),
         autotarget: false,
         lift: None,
+        joint_sel: 0,
+        joint_only_bad: true,
         space: chord::Chord::new(),
         sight: chord::Sight::new(),
         loco: anim::Locomotion::new(),
@@ -2240,6 +2256,43 @@ impl Game {
         }
     }
 
+    /// The joints of whatever the catalogue is previewing.
+    fn joints_of(&self, model: usize) -> &[joints::Joint] {
+        match self.cars.xform.get(&model) {
+            Some(&(cid, _)) => &self.cars.chassis[cid].joints,
+            None => &[],
+        }
+    }
+
+    /// Move the joint cursor and say where it landed.
+    ///
+    /// The toast IS the readout — it names the joint by the same index
+    /// foldview prints, so a number said here is the number in joints.json
+    /// and in the tooling. That is the whole point of numbering them.
+    fn step_joint(&mut self, model: usize, d: i32) {
+        let js = self.joints_of(model);
+        if js.is_empty() {
+            self.toastf("no joint data for this chassis");
+            return;
+        }
+        let bad = js.iter().filter(|j| j.misparented).count();
+        if self.joint_only_bad && bad == 0 {
+            self.toastf(&format!("{} joints, none misparented", js.len()));
+            return;
+        }
+        let next = joints::step(js, self.joint_sel.min(js.len() - 1), d, self.joint_only_bad);
+        // summary BEFORE releasing the borrow, then assign — js borrows self
+        let line = js[next].summary();
+        let total = js.len();
+        self.joint_sel = next;
+        let scope = if self.joint_only_bad {
+            format!("{bad} bad")
+        } else {
+            format!("{total} joints")
+        };
+        self.toastf(&format!("[{scope}] {line}"));
+    }
+
     fn open_menu(&mut self, m: Mode) {
         self.menu_from_pause = self.mode == Mode::Pause;
         self.mode = m;
@@ -2868,6 +2921,18 @@ impl Game {
         if dy == 0.0 {
             return;
         }
+        // OVER THE MODEL, THE WHEEL WALKS THE RIG. The catalogue's preview
+        // occupies the right of a wide screen, so a wheel there is about the
+        // bot; over the list on the left it is still the list. One gesture,
+        // two meanings, decided by where the pointer is — which is what you
+        // want when the point is to be reading joints while talking.
+        if let Mode::Catalog { sel } = self.mode {
+            let over_preview = self.cursor.0 > 0.18;
+            if over_preview {
+                self.step_joint(sel, if dy > 0.0 { -1 } else { 1 });
+                return;
+            }
+        }
         if let Mode::Tweaks { menu, sel } = self.mode {
             let rows = tweak_rows(menu);
             if let Some((_, Row::Slider { get, set, min, max, step, .. })) = rows.get(sel) {
@@ -2896,6 +2961,21 @@ impl Game {
         };
         match self.mode {
             Mode::Catalog { sel } => {
+                // LEFT/RIGHT WALK THE RIG. Up and down already move between
+                // cars, so the other axis is free for the thing inside one:
+                // step joint by joint, with B toggling whether to stop at
+                // every joint or only the broken ones.
+                if matches!(key, Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight)) {
+                    let d = if key == Key::Named(NamedKey::ArrowRight) { 1 } else { -1 };
+                    self.step_joint(sel, d);
+                    return;
+                }
+                if ch.eq_ignore_ascii_case("b") {
+                    self.joint_only_bad = !self.joint_only_bad;
+                    self.joint_sel = 0;
+                    self.step_joint(sel, 0);
+                    return;
+                }
                 let n = self.cars.models.len();
                 match (&key, ch) {
                     (Key::Named(NamedKey::Escape), _) => self.close_menu(),
@@ -5018,8 +5098,13 @@ impl Game {
             let at = self.cam.pos + fwd * dist + off;
             // a slow turntable, so you see the whole car without touching it
             let spin = Quat::from_rotation_y(self.time * 0.5);
-            // stand it upright in the world, not in the camera's frame: a
-            // car leaning with the camera reads as broken
+
+            // NO 3D MARKER YET. It wants an ObjDraw with the renderer's raw
+            // object format and a mesh to point at, and guessing at that
+            // blind is how you get a marker in the wrong space that reads as
+            // a joint in the wrong place — the exact failure this tool
+            // exists to catch. The readout names the joint and its parts;
+            // the marker is the next piece, and it belongs beside a display.
             self.push_car(
                 &mut objs,
                 show,
