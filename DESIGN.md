@@ -3441,6 +3441,42 @@ by looking:
 `--sim shell` now fails in BOTH directions — faceted and soap are each
 wrong — so the shape of the reference is held, not just one number from it.
 
+## v1.105.0 — one house style, applied to the whole catalogue
+
+The shell work of the last two versions only reached the cars that happened
+to use the loft. An audit of the source found six still built as assemblies
+of boxes and squashed spheres — BREADBOX, WEDGE, ROLLER, LONGBOY, SHARK and
+the CUBE — which can never read as bodywork however carefully they are
+proportioned, because a box has no surface between its edges.
+
+There is now ONE RECIPE, `shell_car`, and it is the structure the references
+use rather than an invention: a continuous lofted shell with its shoulder
+crease, a darker glasshouse lofted separately and sunk INTO it so the join
+is a line rather than a lip, and a dark tub underneath that grounds the body
+the way a chassis does. Octane and Dominus are each four body meshes —
+chassis, paint, body, window — and that is not a coincidence, it is why the
+shell reads as one surface: because it is one, and the hard lines come from
+where the parts meet.
+
+Five cars rebuilt on it, with their silhouettes intact, because the
+silhouette was never the problem:
+
+  BREADBOX  tall and square-shouldered — boxy is a PROFILE choice (low
+            roundness in the section), not a reason to build it from boxes
+  WEDGE     one rising plane from a nose almost flat to the floor
+  ROLLER    round in every section: the roundest thing the profile allows
+  LONGBOY   a limousine that barely changes shape down its whole length
+  SHARK     tapered at both ends, with the dorsal fin left as its own part
+
+`--sim shell` now audits the catalogue from the source and reports which
+cars are built to the style: 12 of 13. The CUBE is the exception and stays
+one, because it is a joke about being a box.
+
+The audit was wrong on its first run — it read the EVs as assemblies because
+they loft through a shared builder rather than calling it directly. Worth
+recording: a check that inspects source has to follow the indirection, or it
+will report drift that is not there.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

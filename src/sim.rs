@@ -579,6 +579,50 @@ pub fn run(args: &[String]) {
             }
         }
         println!();
+        // ---- CATALOGUE AUDIT ----
+        // A house style is only a style if the whole catalogue is built to
+        // it. This reads the source and reports which cars are made from the
+        // reference recipe — a continuous lofted shell — and which are still
+        // assemblies of boxes, which can never read as bodywork however
+        // carefully they are proportioned.
+        {
+            let src = include_str!("procars.rs");
+            let names = [
+                "breadbox", "wedge", "roller", "longboy", "cube", "shark",
+                "volt", "axion", "hauler", "pulse", "tram", "vipera", "aegis",
+            ];
+            let mut lofted = 0;
+            let mut boxed: Vec<&str> = Vec::new();
+            for n in names {
+                let Some(i) = src.find(&format!("pub fn {n}(gpu")) else { continue };
+                let body = &src[i..src[i..].find("\nfn ").map(|j| i + j).unwrap_or(src.len())];
+                let end = body.find("\npub fn ").unwrap_or(body.len());
+                let body = &body[..end];
+                // a car counts as built to the style whether it lofts
+                // directly or through one of the shared builders — the
+                // EVs go via `ev_body`, which is the same recipe wearing a
+                // different name
+                if body.contains("shell_car(") || body.contains("meshgen::loft(") || body.contains("ev_body(") {
+                    lofted += 1;
+                } else {
+                    boxed.push(n);
+                }
+            }
+            println!(
+                "   catalogue: {lofted} of {} procedural cars use the lofted shell",
+                names.len()
+            );
+            if !boxed.is_empty() {
+                println!("   still assemblies: {boxed:?}");
+            }
+            // the cube is a joke about being a box and is allowed to stay one
+            let ok_cat = boxed.iter().all(|n| *n == "cube");
+            println!(
+                "   {}",
+                if ok_cat { "every car but the CUBE is built to the house style" } else { "STYLE DRIFT" }
+            );
+        }
+        println!();
         // The second half of the look is the CRISP BREAK, and on the target
         // it comes from separate material regions — Octane is Paint, Body,
         // Window and Chassis as four meshes, so the boundary between them is
@@ -1582,6 +1626,50 @@ pub fn run(args: &[String]) {
             if nm == "our lofted hull" {
                 worst_median = med;
             }
+        }
+        println!();
+        // ---- CATALOGUE AUDIT ----
+        // A house style is only a style if the whole catalogue is built to
+        // it. This reads the source and reports which cars are made from the
+        // reference recipe — a continuous lofted shell — and which are still
+        // assemblies of boxes, which can never read as bodywork however
+        // carefully they are proportioned.
+        {
+            let src = include_str!("procars.rs");
+            let names = [
+                "breadbox", "wedge", "roller", "longboy", "cube", "shark",
+                "volt", "axion", "hauler", "pulse", "tram", "vipera", "aegis",
+            ];
+            let mut lofted = 0;
+            let mut boxed: Vec<&str> = Vec::new();
+            for n in names {
+                let Some(i) = src.find(&format!("pub fn {n}(gpu")) else { continue };
+                let body = &src[i..src[i..].find("\nfn ").map(|j| i + j).unwrap_or(src.len())];
+                let end = body.find("\npub fn ").unwrap_or(body.len());
+                let body = &body[..end];
+                // a car counts as built to the style whether it lofts
+                // directly or through one of the shared builders — the
+                // EVs go via `ev_body`, which is the same recipe wearing a
+                // different name
+                if body.contains("shell_car(") || body.contains("meshgen::loft(") || body.contains("ev_body(") {
+                    lofted += 1;
+                } else {
+                    boxed.push(n);
+                }
+            }
+            println!(
+                "   catalogue: {lofted} of {} procedural cars use the lofted shell",
+                names.len()
+            );
+            if !boxed.is_empty() {
+                println!("   still assemblies: {boxed:?}");
+            }
+            // the cube is a joke about being a box and is allowed to stay one
+            let ok_cat = boxed.iter().all(|n| *n == "cube");
+            println!(
+                "   {}",
+                if ok_cat { "every car but the CUBE is built to the house style" } else { "STYLE DRIFT" }
+            );
         }
         println!();
         // The second half of the look is the CRISP BREAK, and on the target
