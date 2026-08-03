@@ -81,16 +81,10 @@ impl FeedEntry {
     pub fn has_thumb(&self) -> bool { !self.thumb_path.trim().is_empty() }
 }
 
-/// Coarse relative time. Coarse on purpose: a tile is glanced at, and "3h" is
-/// as much as anyone reads.
+/// Coarse relative time, via the shared helper. Coarse on purpose: a tile is
+/// glanced at, and "3h" is as much as anyone reads.
 pub fn ago(secs: i64) -> String {
-    match secs {
-        s if s < 0 => "now".into(),          // a clock skewed forward is not "in -4s"
-        s if s < 60 => format!("{s}s"),
-        s if s < 3600 => format!("{}m", s / 60),
-        s if s < 86_400 => format!("{}h", s / 3600),
-        s => format!("{}d", s / 86_400),
-    }
+    uikit_egui::fmt::relative_time(secs, uikit_egui::fmt::Style::Bare)
 }
 
 /// `kColumns` — two across.

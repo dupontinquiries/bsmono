@@ -112,15 +112,9 @@ impl PlaylistSummary {
     }
 }
 
-/// Coarse relative time, as elsewhere in the port.
+/// Relative time, via the shared helper.
 pub fn ago(secs: i64) -> String {
-    match secs {
-        s if s < 0 => "just now".into(),
-        s if s < 60 => "just now".into(),
-        s if s < 3600 => format!("{}m ago", s / 60),
-        s if s < 86_400 => format!("{}h ago", s / 3600),
-        s => format!("{}d ago", s / 86_400),
-    }
+    uikit_egui::fmt::relative_time(secs, uikit_egui::fmt::Style::Ago)
 }
 
 /// The inline create card.

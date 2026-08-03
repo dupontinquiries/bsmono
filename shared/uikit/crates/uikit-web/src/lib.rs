@@ -222,9 +222,26 @@ fn is_block(tag: &str) -> Option<BlockKind> {
 }
 
 /// Parse HTML into a flat [`RichDoc`] display list. Do this once, on content change.
+/// Tags whose CONTENTS are not content.
+///
+/// Shared with `doc::parse_page` deliberately. The two parsers here are
+/// different algorithms over different models — a flat block list and a tree —
+/// and that is fine, but they are not allowed to disagree about what counts as
+/// prose. `parse_html` used to have no notion of this at all and rendered
+/// `var x = 1;` and `p{color:red}` straight into the document; the browser view
+/// dropped them and the manual reader did not, which reads as a broken page
+/// rather than as a bug and so goes unreported.
+pub(crate) fn is_noise_tag(tag: &str) -> bool {
+    matches!(tag, "script" | "style" | "head" | "noscript" | "svg")
+}
+
 pub fn parse_html(html: &str) -> RichDoc {
     let toks = tokenize(html);
     let mut blocks: Vec<Block> = Vec::new();
+    /// While inside a noise element, text tokens are discarded. Depth-counted
+    /// rather than a flag, because `<svg><style>…</style></svg>` would
+    /// otherwise switch prose back on at the inner close.
+    let mut noise_depth: usize = 0;
     let mut cur: Option<Block> = None;
     let mut style = InlineStyle::default();
     let mut style_stack: Vec<InlineStyle> = Vec::new();
@@ -238,6 +255,17 @@ pub fn parse_html(html: &str) -> RichDoc {
     };
 
     for tok in toks {
+        // Handled before anything else: a noise element's own attributes and
+        // children must not reach the block builder either.
+        match &tok {
+            Token::Open { name, .. } if is_noise_tag(name) => { noise_depth += 1; continue; }
+            Token::Close(name) if is_noise_tag(name) => {
+                noise_depth = noise_depth.saturating_sub(1);
+                continue;
+            }
+            _ if noise_depth > 0 => continue,
+            _ => {}
+        }
         match tok {
             Token::Open { name, attrs } => {
                 if name == "hr" {
@@ -425,5 +453,35 @@ mod tests {
     fn unknown_tags_degrade_to_text() {
         let doc = parse_html("<section><span>kept</span></section>");
         assert!(doc.text().contains("kept"));
+    }
+}
+
+#[cfg(test)]
+mod noise_parity_tests {
+    use super::*;
+
+    /// The two parsers in this crate must agree about what is not content.
+    ///
+    /// `parse_html` (flat blocks, used by the manual reader and the mail view)
+    /// and `doc::parse_page` (a tree, used by the browser) are deliberately
+    /// different algorithms over different models. They are NOT allowed to
+    /// disagree about which tags are noise: the same page rendered in two views
+    /// showing JavaScript source in one of them is the kind of inconsistency
+    /// nobody reports because it looks like a broken page rather than a bug.
+    #[test]
+    fn neither_parser_renders_script_or_style_as_prose() {
+        let html = "<p>before</p><script>var x = 1;</script>\
+                    <style>p{color:red}</style><p>after</p>";
+        let flat = parse_html(html);
+        let text: String = flat.blocks.iter()
+            .flat_map(|b| b.inlines.iter().map(|r| r.text.clone()))
+            .collect::<Vec<_>>().join(" ");
+        assert!(!text.contains("var x"), "parse_html leaked script source: {text:?}");
+        assert!(!text.contains("color:red"), "parse_html leaked CSS: {text:?}");
+        assert!(text.contains("before") && text.contains("after"));
+
+        let tree = crate::doc::parse_page(html).root.text();
+        assert!(!tree.contains("var x"));
+        assert!(!tree.contains("color:red"));
     }
 }

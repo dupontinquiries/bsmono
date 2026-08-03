@@ -135,7 +135,7 @@ impl SmartRibbon {
     /// large count looks like.
     pub fn badge_text(&self, tab: usize) -> Option<String> {
         self.tabs.get(tab).and_then(|t| t.badge)
-            .map(|n| if n > 99 { "99+".into() } else { n.to_string() })
+            .and_then(|n| uikit_egui::fmt::badge_count(n, 99))
     }
 
     /// Do action labels fit, or is it icons only?

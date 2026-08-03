@@ -151,6 +151,8 @@ Three behaviours have now been lifted out of app code into
 | `PressFeedback` | snapclone `GlassButton`, bo-suite `StepKey` | the ripple must outlive the release |
 | `Reveal` | snapclone accordion + bottom sheet, bo-suite device panel | it must stay drawn while it LEAVES |
 | `Breath` | dial glow, anticipation cue, queue equalizer, peel hint, voice bar | phase must wrap; offset taps must not move in unison |
+| `fmt::relative_time` | bo-suite library + sources, snapclone outbox + snap feed | a future timestamp must not read as a negative age |
+| `fmt::plural` / `badge_count` | eight modules across three apps | zero is plural; a zero badge is absent |
 
 The middle column is the argument. Each of those rules is a bug someone hits
 once and fixes locally, and the third implementation hits it again.
@@ -170,5 +172,28 @@ failure mode:
   actually lives.
 
 The test for whether a promotion is right is not "is this code identical" but
-"did the second author have to rediscover a rule". All three above pass it; the
+"did the second author have to rediscover a rule". All of the above pass it; the
 constants fail it.
+
+### The audit finds bugs, not just duplication
+
+Two of these promotions turned up a real defect rather than mere repetition,
+which is the strongest argument for doing them at all:
+
+* **`relative_time`** — three of the four copies guarded against a negative
+  interval; snapclone's outbox did not. A device reporting a future timestamp
+  would have rendered "-4m ago". Nobody had seen it because you need a skewed
+  clock to reproduce it. Delegating fixed it; a test now pins it.
+* **`uikit-web` had two parsers that disagreed about what prose is.**
+  `doc::parse_page` drops `<script>` and `<style>`; `parse_html` — the path the
+  manual reader and the mail view use — had no notion of them and rendered
+  `var x = 1; p{color:red}` into the document. The same page shown in two views
+  would differ, which reads as a broken page rather than a bug and so goes
+  unreported. Both now share one `is_noise_tag`, with a parity test that fails
+  if they ever diverge again.
+
+### Kits still unaudited
+
+`uikit-gesture` and `uikit-term` have not had this sweep. `uikit-term` and
+`uikit-web` also still have one consumer each — they carry kit-shaped cost
+without kit-shaped payoff, and that stays true until a second app embeds them.

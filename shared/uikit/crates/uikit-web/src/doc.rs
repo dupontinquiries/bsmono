@@ -260,9 +260,9 @@ fn is_void(tag: &str) -> bool {
     matches!(tag, "br" | "hr" | "img" | "input" | "meta" | "link" | "source" | "wbr" | "col")
 }
 
-/// Tags whose contents are not content: dropping them is not filtering, it is
-/// refusing to render source code as prose.
-fn is_noise(tag: &str) -> bool { matches!(tag, "script" | "style" | "head" | "noscript" | "svg") }
+/// Tags whose contents are not content. Shared with `parse_html` so the flat
+/// and tree parsers cannot disagree about what is prose — see `is_noise_tag`.
+use crate::is_noise_tag as is_noise;
 
 impl<'a> Parser<'a> {
     fn take_id(&mut self) -> NodeId { let id = NodeId(self.next_id); self.next_id += 1; id }
