@@ -9789,7 +9789,10 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>){
   var packed=0u;
   for(var b=0u;b<4u;b=b+1u){
     let qi=clamp(i32(round(x[row*dd.c + w*4u + b]*inv)), -127, 127);
-    packed=packed | ((u32(qi) & 0xffu) << (b*8u));
+    // insertBits: `<< (b*8u)` is a shift by a lane-varying amount and yields zero for every lane
+    // whose shift is non-zero on Honeykrisp. This is the int8 pack, so a wrong result here is wrong
+    // weights for every int8-resident model on that driver.
+    packed = insertBits(packed, u32(qi) & 0xffu, b * 8u, 8u);
   }
   q[p]=packed;
 }"#;
@@ -13518,7 +13521,7 @@ struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, pad0:u32, pad1:u32, pad2:u32 };
 
 // Byte at absolute offset `i` of the weight blob. IQ1_S rows are 50-byte multiples, which is NOT a
 // multiple of 4, so a row does not start on a word boundary and every read must go through here.
-fn wbyte(i: u32) -> u32 { return (w[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+fn wbyte(i: u32) -> u32 { return extractBits(w[i >> 2u], (i & 3u) * 8u, 8u); }
 fn whalf(i: u32) -> u32 { return wbyte(i) | (wbyte(i + 1u) << 8u); }
 
 // f16 -> f32. The scale is the only float in the block and it is half-precision.
@@ -13607,7 +13610,11 @@ pub const BYTE_PROBE: &str = r#"
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
 @group(0) @binding(2) var<uniform> dims: vec4<u32>;
 
-fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+// extractBits, NOT shift-and-mask: a shift by a lane-varying amount returns zero on
+// Honeykrisp for every lane whose shift is non-zero (--gate-bytes, extractBits CORRECT
+// where this form is WRONG). Four consecutive threads select four different bytes of one
+// word here, so three of every four got zero.
+fn byte_at(i: u32) -> u32 { return extractBits(src[i >> 2u], (i & 3u) * 8u, 8u); }
 
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) g:vec3<u32>) {
@@ -13623,7 +13630,11 @@ struct D { n:u32, _a:u32, _b:u32, _c:u32 };
 @group(0)@binding(1) var<storage,read_write> dst: array<f32>;
 @group(0)@binding(2) var<uniform> dims: D;
 
-fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+// extractBits, NOT shift-and-mask: a shift by a lane-varying amount returns zero on
+// Honeykrisp for every lane whose shift is non-zero (--gate-bytes, extractBits CORRECT
+// where this form is WRONG). Four consecutive threads select four different bytes of one
+// word here, so three of every four got zero.
+fn byte_at(i: u32) -> u32 { return extractBits(src[i >> 2u], (i & 3u) * 8u, 8u); }
 
 fn f16(h: u32) -> f32 {
     let sign = (h >> 15u) & 1u;
@@ -13699,7 +13710,11 @@ struct D { n:u32, grid_w:u32, _b:u32, _c:u32 };
 @group(0)@binding(1) var<storage,read_write> dst: array<f32>;
 @group(0)@binding(2) var<uniform> dims: D;                  // n = super-block count
 
-fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+// extractBits, NOT shift-and-mask: a shift by a lane-varying amount returns zero on
+// Honeykrisp for every lane whose shift is non-zero (--gate-bytes, extractBits CORRECT
+// where this form is WRONG). Four consecutive threads select four different bytes of one
+// word here, so three of every four got zero.
+fn byte_at(i: u32) -> u32 { return extractBits(src[i >> 2u], (i & 3u) * 8u, 8u); }
 
 // half -> f32 (subnormals and inf/nan handled the same way the CPU helper does)
 // Bit-for-bit twin of the CPU gguf::f16_to_f32: construct the f32 bit pattern and bitcast, rather than
@@ -13783,7 +13798,11 @@ struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
 @group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
 @group(0)@binding(2) var<uniform> dims: D;
 
-fn byte_at(i: u32) -> u32 { return (src[i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+// extractBits, NOT shift-and-mask: a shift by a lane-varying amount returns zero on
+// Honeykrisp for every lane whose shift is non-zero (--gate-bytes, extractBits CORRECT
+// where this form is WRONG). Four consecutive threads select four different bytes of one
+// word here, so three of every four got zero.
+fn byte_at(i: u32) -> u32 { return extractBits(src[i >> 2u], (i & 3u) * 8u, 8u); }
 
 // Bit-for-bit twin of the CPU gguf::f16_to_f32 (see the note on the dequant kernel): construct the f32
 // bit pattern and bitcast, so Inf/NaN survive instead of being approximated away.
