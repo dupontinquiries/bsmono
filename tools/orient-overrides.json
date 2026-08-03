@@ -2,121 +2,123 @@
  "_doc": [
   "Per-chassis orientation corrections, applied by export-roster.py.",
   "",
-  "MEASURED, not guessed. Forward comes from the vector between the CHEST and",
-  "the SPINE of the robot pose: chest is the front of a torso and spine is the",
-  "back, so it points forward whatever the model is called and whatever its",
-  "parts are labelled. An earlier attempt used a left/right limb pair, which",
-  "was circular \u2014 it assumes which limb is which, so it agreed with itself on",
-  "all 28 and told us nothing.",
+  "MEASURED PER CHASSIS. Forward comes from the vector between the CHEST and",
+  "the SPINE of the robot pose, which points forward whatever the model is",
+  "called and however its parts are labelled.",
   "",
-  "`turn` spends the rotation ACROSS the fold, so the vehicle keeps the facing",
-  "it has and only the robot end moves. That is right here because the reading",
-  "is about the robot pose."
+  "The turn is the NEGATION of that reading. An earlier version applied a flat",
+  "180 to every chassis that read as 'backwards', which was wrong for any that",
+  "were not exactly backwards: a body measuring -91 became +89, which is a bot",
+  "facing left. Rounding a measurement to a convenient number throws the",
+  "measurement away.",
+  "",
+  "`turn` spends the rotation across the fold, so the vehicle keeps the facing",
+  "it has and only the robot end moves."
  ],
  "overrides": {
   "blackstar": {
-   "turn": 180.0,
-   "why": "robot faces -91deg by chest-spine"
+   "turn": 90.9,
+   "why": "robot chest-spine measured -91deg"
   },
   "rollout": {
-   "turn": 180.0,
-   "why": "robot faces -175deg by chest-spine"
+   "turn": 175.0,
+   "why": "robot chest-spine measured -175deg"
   },
   "hawkeye": {
-   "turn": 180.0,
-   "why": "robot faces -170deg by chest-spine"
+   "turn": 170.2,
+   "why": "robot chest-spine measured -170deg"
   },
   "chokepoint": {
-   "turn": 180.0,
-   "why": "robot faces +142deg by chest-spine"
+   "turn": -142.4,
+   "why": "robot chest-spine measured +142deg"
   },
   "ebr_105_mad_max_mod": {
-   "turn": 180.0,
-   "why": "robot faces -177deg by chest-spine"
+   "turn": 177.1,
+   "why": "robot chest-spine measured -177deg"
   },
   "jet_dawnshade": {
-   "turn": 180.0,
-   "why": "robot faces +180deg by chest-spine"
+   "turn": -179.9,
+   "why": "robot chest-spine measured +180deg"
   },
   "jet_hull": {
-   "turn": 180.0,
-   "why": "robot faces +127deg by chest-spine"
+   "turn": -126.7,
+   "why": "robot chest-spine measured +127deg"
   },
   "jet_freighter": {
-   "turn": 180.0,
-   "why": "robot faces +166deg by chest-spine"
+   "turn": -166.0,
+   "why": "robot chest-spine measured +166deg"
   },
   "jet_c_130j_super_hercules": {
-   "turn": 180.0,
-   "why": "robot faces +179deg by chest-spine"
+   "turn": -179.0,
+   "why": "robot chest-spine measured +179deg"
   },
   "grit": {
-   "turn": 180.0,
-   "why": "robot faces +138deg by chest-spine"
+   "turn": -138.2,
+   "why": "robot chest-spine measured +138deg"
   },
   "quickfire": {
-   "turn": 180.0,
-   "why": "robot faces +180deg by chest-spine"
+   "turn": -179.8,
+   "why": "robot chest-spine measured +180deg"
   },
   "cryofin": {
-   "turn": 180.0,
-   "why": "robot faces -142deg by chest-spine"
+   "turn": 142.0,
+   "why": "robot chest-spine measured -142deg"
   },
   "beetlejuice": {
    "turn": 180.0,
-   "why": "robot faces -180deg by chest-spine"
+   "why": "robot chest-spine measured -180deg"
   },
   "analog": {
-   "turn": 180.0,
-   "why": "robot faces +174deg by chest-spine"
+   "turn": -173.9,
+   "why": "robot chest-spine measured +174deg"
   },
   "jet_whistlewind": {
-   "turn": 180.0,
-   "why": "robot faces -173deg by chest-spine"
+   "turn": 172.8,
+   "why": "robot chest-spine measured -173deg"
   },
   "jet_alphastar": {
-   "turn": 180.0,
-   "why": "robot faces +180deg by chest-spine"
+   "turn": -179.8,
+   "why": "robot chest-spine measured +180deg"
   },
   "jet_bulwark": {
-   "turn": 180.0,
-   "why": "robot faces +179deg by chest-spine"
+   "turn": -178.9,
+   "why": "robot chest-spine measured +179deg"
   },
   "jet_darkguard": {
-   "turn": 180.0,
-   "why": "robot faces -180deg by chest-spine"
+   "turn": 179.9,
+   "why": "robot chest-spine measured -180deg"
   },
   "jet_2_modes_viper": {
-   "turn": 180.0,
-   "why": "robot faces -172deg by chest-spine"
+   "turn": 172.3,
+   "why": "robot chest-spine measured -172deg"
   },
   "lockon": {
-   "turn": 180.0,
-   "why": "robot faces +171deg by chest-spine"
+   "turn": -171.1,
+   "why": "robot chest-spine measured +171deg"
   },
   "patton": {
-   "turn": 180.0,
-   "why": "robot faces +153deg by chest-spine"
+   "turn": -153.2,
+   "why": "robot chest-spine measured +153deg"
   },
   "vanquish": {
-   "turn": 180.0,
-   "why": "robot faces -177deg by chest-spine"
+   "turn": 177.4,
+   "why": "robot chest-spine measured -177deg"
   },
   "lynx_6x6": {
-   "turn": 180.0,
-   "why": "robot faces +165deg by chest-spine"
+   "turn": -165.2,
+   "why": "robot chest-spine measured +165deg"
   },
   "boartail": {
-   "turn": 180.0,
-   "why": "robot faces -142deg by chest-spine"
+   "turn": 142.0,
+   "why": "robot chest-spine measured -142deg"
   },
   "jet_ventride": {
-   "turn": 180.0,
-   "why": "robot faces +175deg by chest-spine"
+   "turn": -175.2,
+   "why": "robot chest-spine measured +175deg"
   },
   "jet_vertigo": {
-   "turn": 180.0,
-   "why": "robot faces -178deg by chest-spine"
+   "turn": 178.4,
+   "why": "robot chest-spine measured -178deg"
   }
  },
  "_roll_candidates": [
