@@ -71,6 +71,10 @@ pub struct Car {
     /// grounded — which is precisely the state the aerial control block
     /// already handles. Setting this is most of what "flying" means here.
     pub flight: bool,
+    /// ROBOT MODE. A bot on its feet does not dodge — it jumps again. The
+    /// flip is spent on a second jump instead, driven by the boost tank,
+    /// which is the thruster now rather than a nozzle on somebody's back.
+    pub robot: bool,
     /// pad-collected charge, spent before the base reserve (hovercars)
     pub charge: f32,
     /// seconds until the pulse is available again
@@ -172,6 +176,7 @@ impl Car {
             drive: crate::model::Drive::Combustion,
             hover: None,
             flight: false,
+            robot: false,
             charge: 0.0,
             pulse_t: 0.0,
             pulse_fire: 0.0,
@@ -1139,7 +1144,31 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             car.jump_hold -= dt;
         }
 
-        if (c.jump_pressed && car.hover.is_none()) && car.has_dodge && car.dodge_window > 0.0 {
+        // ---- ROBOT: the flip becomes a thruster-fed second jump ----------
+        //
+        // Reusing the dodge's own gate (has_dodge + its window) means the
+        // second jump inherits everything already tuned about when a flip is
+        // available: it is granted on landing, spent once, and restored by a
+        // flip reset. The cost is boost, so the thrusters that push a vehicle
+        // forward lift a robot instead — one tank, two meanings, and no extra
+        // resource to explain.
+        if car.robot && c.jump_pressed && car.has_dodge && car.dodge_window > 0.0 {
+            const JUMP2_COST: f32 = 18.0;
+            const JUMP2_IMPULSE: f32 = 7.4;
+            if car.boost >= JUMP2_COST {
+                car.boost -= JUMP2_COST;
+                car.has_dodge = false;
+                car.dodge_window = 0.0;
+                car.jbuf = 0.0;
+                let up = -world.gravity_dir(car.pos);
+                // replace downward motion rather than adding to it, so a
+                // late second jump still saves you
+                let vd = car.vel.dot(up);
+                car.vel += up * (JUMP2_IMPULSE - vd.min(JUMP2_IMPULSE * 0.5));
+                car.ang = Vec3::ZERO;
+                ev.jumped = true;
+            }
+        } else if (c.jump_pressed && car.hover.is_none()) && car.has_dodge && car.dodge_window > 0.0 {
             car.jbuf = 0.0; // an intentional dodge shouldn't also hop on land
             // dodge direction in body frame: steer right = +x, throttle fwd = -z
             let d2 = Vec3::new(c.steer, 0.0, -c.throttle);

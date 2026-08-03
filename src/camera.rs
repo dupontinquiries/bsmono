@@ -22,6 +22,12 @@ pub struct Camera {
     reverse_t: f32, // how long the car has pointed "the other way"
     shake: f32,
     shake_t: f32,
+    /// FREE LOOK, used in robot mode. Yaw turns the boom around the body,
+    /// pitch raises and lowers it. Kept as an OFFSET on the chase camera
+    /// rather than a camera of its own, so ball cam, the gravity-aware up
+    /// and the terrain clamp all keep working underneath it.
+    pub look_yaw: f32,
+    pub look_pitch: f32,
 }
 
 impl Camera {
@@ -36,6 +42,8 @@ impl Camera {
             reverse_t: 0.0,
             shake: 0.0,
             shake_t: 0.0,
+            look_yaw: 0.0,
+            look_pitch: 0.0,
         }
     }
 
@@ -125,12 +133,22 @@ impl Camera {
         // camera down into the terrain clamp (which was eating the dist,
         // height and angle settings whole — the cam sim caught boom_up
         // pinned at the floor regardless of cfg). Only the LOOK tilts up.
-        let dir_flat = (dir - self.up * dir.dot(self.up)).normalize_or(self.heading);
+        let mut dir_flat = (dir - self.up * dir.dot(self.up)).normalize_or(self.heading);
+        // free look rides on the flattened boom direction: yaw about the
+        // local up (so it still works upside down in a tube), pitch folded
+        // into the height below
+        if self.look_yaw.abs() > 1e-4 {
+            dir_flat = Quat::from_axis_angle(self.up, self.look_yaw) * dir_flat;
+        }
         // MOVING-PLATFORM BEND: while you are near a fast deck, the camera
         // adopts a slice of its motion. The platform then reads as (nearly)
         // still and only your own approach moves — which is what makes a
         // small, rapidly moving target landable.
-        let mut want = car.pos - dir_flat * cfg.dist + self.up * cfg.height;
+        // pitch trades boom distance for height, so looking up does not push
+        // the eye through the body
+        let (pc, ps) = (self.look_pitch.cos(), self.look_pitch.sin());
+        let mut want =
+            car.pos - dir_flat * (cfg.dist * pc.max(0.25)) + self.up * (cfg.height + cfg.dist * ps);
         if cfg.plat_bend > 0.01 {
             if let Some(pv) = world.platform_vel(car.pos, 6.0) {
                 self.plat_lag += (pv - self.plat_lag) * (1.0 - (-3.0 * dt).exp());

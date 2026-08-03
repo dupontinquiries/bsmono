@@ -53,28 +53,47 @@ FLY = ("flyer", "hovertank")
 import math, struct
 
 
-def head_z(d):
-    """Mean Z of the head/visor/face parts of an unmerged foldview export."""
+def robot_yaw(d):
+    """Degrees the robot pose must turn to face -Z, from its own anatomy.
+
+    An earlier version of this read the head/visor part's Z SIGN, which was
+    wrong twice over: a folded-away head is not the nose, and a sign test
+    cannot tell 90 degrees from 180. Measured properly — left/right limb pair
+    gives the lateral axis, cross it with +Y for forward — every chassis in
+    the roster already faces -Z to within 7 degrees, so this returns ~0 and
+    nothing is rotated. It stays because the measurement is the thing worth
+    keeping: if a future import does arrive turned, this catches it.
+    """
     g = json.load(open(os.path.join(d, "scene.gltf")))
     buf = open(os.path.join(d, "scene.bin"), "rb").read()
-    best = None
-    for key in ("visor", "face", "head"):
-        zs = []
-        for n in g["nodes"]:
-            if not n.get("name", "").startswith(key):
+    cent = {}
+    for n in g["nodes"]:
+        m = re.match(r"[a-z]+", n.get("name", ""))
+        if not m:
+            continue
+        a = g["accessors"][g["meshes"][n["mesh"]]["primitives"][0]["attributes"]["POSITION"]]
+        bv = g["bufferViews"][a["bufferView"]]
+        off = bv.get("byteOffset", 0) + a.get("byteOffset", 0)
+        sx = sz = 0.0
+        for i in range(a["count"]):
+            x, _, z = struct.unpack_from("<3f", buf, off + i * 12)
+            sx += x
+            sz += z
+        c = a["count"] or 1
+        cent.setdefault(m.group(0), []).append((sx / c, sz / c))
+    avg = {k: (sum(p[0] for p in v) / len(v), sum(p[1] for p in v) / len(v))
+           for k, v in cent.items()}
+    for l, r in (("uarml", "uarmr"), ("clavl", "clavr"), ("shinl", "shinr"), ("thighl", "thighr")):
+        if l in avg and r in avg:
+            lx, lz = avg[l][0] - avg[r][0], avg[l][1] - avg[r][1]
+            n = math.hypot(lx, lz)
+            if n < 1e-4:
                 continue
-            a = g["accessors"][g["meshes"][n["mesh"]]["primitives"][0]["attributes"]["POSITION"]]
-            bv = g["bufferViews"][a["bufferView"]]
-            off = bv.get("byteOffset", 0) + a.get("byteOffset", 0)
-            n3 = a["count"]
-            tot = 0.0
-            for i in range(n3):
-                tot += struct.unpack_from("<f", buf, off + i * 12 + 8)[0]
-            zs.append(tot / max(n3, 1))
-        if zs:
-            best = sum(zs) / len(zs)
-            break
-    return best
+            lx, lz = lx / n, lz / n
+            # forward = lateral x up, with up = +Y
+            fx, fz = -lz, lx
+            return math.degrees(math.atan2(fx, -fz))
+    return None
 
 
 def yaw_pose(d, deg):
@@ -142,19 +161,17 @@ def main():
 
         # probe the facing, unmerged, so part names survive
         turn = 0.0
-        probe = {}
-        for t, tag in ((0.0, "v"), (1.0, "r")):
-            subprocess.run(
-                [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
-                 "--veh", os.path.join(DATA, iqm), "--gltf", f"/tmp/_probe_{tag}",
-                 "--t", f"{t:.4f}"], capture_output=True, timeout=180)
-            try:
-                probe[tag] = head_z(f"/tmp/_probe_{tag}")
-            except Exception:
-                probe[tag] = None
-        if probe.get("v") is not None and probe.get("r") is not None:
-            if probe["v"] * probe["r"] < 0:
-                turn = 180.0
+        subprocess.run(
+            [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
+             "--veh", os.path.join(DATA, iqm), "--gltf", "/tmp/_probe_r", "--t", "1.0"],
+            capture_output=True, timeout=180)
+        try:
+            y = robot_yaw("/tmp/_probe_r")
+        except Exception:
+            y = None
+        # only act on a real misalignment; a few degrees is pose, not framing
+        if y is not None and abs(y) > 20.0:
+            turn = round(y / 90.0) * 90.0
 
         good = True
         for k in range(POSES):

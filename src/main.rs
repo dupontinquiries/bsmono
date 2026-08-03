@@ -1259,6 +1259,28 @@ fn main() {
     let win = window.clone();
     event_loop
         .run(move |event, elwt| match event {
+            // RAW MOUSE MOTION, for robot free look. CursorMoved reports a
+            // position and stops at the edge of the window; a look-around
+            // needs the delta, which only DeviceEvent carries.
+            Event::DeviceEvent {
+                event: winit::event::DeviceEvent::MouseMotion { delta },
+                ..
+            } => {
+                if game.car.robot && game.mode == Mode::Play {
+                    const SENS: f32 = 0.0022;
+                    game.cam.look_yaw -= delta.0 as f32 * SENS;
+                    game.cam.look_pitch = (game.cam.look_pitch - delta.1 as f32 * SENS)
+                        .clamp(-0.55, 1.05);
+                    // wrap so the yaw cannot wind up to a huge number over a
+                    // long session
+                    let tau = std::f32::consts::TAU;
+                    if game.cam.look_yaw > std::f32::consts::PI {
+                        game.cam.look_yaw -= tau;
+                    } else if game.cam.look_yaw < -std::f32::consts::PI {
+                        game.cam.look_yaw += tau;
+                    }
+                }
+            }
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
                     game.net.leave();
@@ -1594,6 +1616,18 @@ impl Game {
                 .xform
                 .get(&i)
                 .map_or(false, |&(c, _)| self.cars.chassis[c].flight);
+            // ROBOT once past the halfway point of the strip: that is when
+            // the body is on its feet, and it is what switches the flip into
+            // a second jump and hands the camera to the mouse.
+            self.car.robot = self
+                .cars
+                .xform
+                .get(&i)
+                .map_or(false, |&(c, k)| k * 2 > self.cars.chassis[c].strip.len() - 1);
+            if !self.car.robot {
+                self.cam.look_yaw = 0.0;
+                self.cam.look_pitch = 0.0;
+            }
         }
     }
 
