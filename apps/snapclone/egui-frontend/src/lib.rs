@@ -30,6 +30,7 @@ pub mod snaps;
 pub mod session;
 pub mod ring;
 pub mod qr;
+pub mod wayfinder;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -132,6 +133,13 @@ pub struct Snapclone {
     /// `None` when it is not open — the scanner holds camera frames and should
     /// not exist while nobody is looking at it.
     pub qr: Option<crate::qr::QrScan>,
+    /// Our own position, when the device has a fix. `None` is a real state, not
+    /// a placeholder: without it nobody can be placed geographically.
+    pub self_fix: Option<crate::wayfinder::Fix>,
+    /// Contacts as the wayfinder sees them — id, name, online, position.
+    pub wayfinder_contacts: Vec<crate::wayfinder::Contact>,
+    /// (sender id, caption) for the snaps floating on the map, newest first.
+    pub wayfinder_snaps: Vec<(String, String)>,
     gesture: GestureLayer,
     palette: String,
 }
@@ -173,6 +181,9 @@ impl Snapclone {
             incoming_call: None,
             missed_calls: Vec::new(),
             qr: None,
+            self_fix: None,
+            wayfinder_contacts: Vec::new(),
+            wayfinder_snaps: Vec::new(),
             conversation: Default::default(),
             conversation_peer: String::new(),
             bar: UnifiedNav::new(),
@@ -599,22 +610,22 @@ impl Snapclone {
     /// tab.
     fn wayfinder_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Wayfinder");
-        ui.horizontal(|ui| {
-            if ui.selectable_label(self.group_voice.joined, "join channel").clicked() {
-                if self.group_voice.joined { self.group_voice.leave(); }
-                else { self.group_voice.join(); }
-            }
-            if ui.selectable_label(self.group_voice.muted, "mute").clicked() {
-                self.group_voice.muted = !self.group_voice.muted;
-            }
-            let ptt = self.group_voice.mode == crate::group_voice::TalkMode::PushToTalk;
-            if ui.selectable_label(ptt, "push to talk").clicked() {
-                self.group_voice.mode = if ptt { crate::group_voice::TalkMode::Open }
-                                        else { crate::group_voice::TalkMode::PushToTalk };
-            }
-        });
-        ui.separator();
-        crate::group_voice::roster_ui(ui, &self.group_voice, c);
+        // This page used to draw the group-voice controls — join / mute / push
+        // to talk. Not a stub of the wayfinder: a different feature under its
+        // name, which is worse than an empty page because nothing looks
+        // missing. Those controls live on the voice bar, which is where the Qt
+        // app puts them.
+        let nodes = crate::wayfinder::build_nodes(self.self_fix, &self.wayfinder_contacts);
+        let photos = crate::wayfinder::place_photos(&nodes, &self.wayfinder_snaps);
+        if let Some(id) = crate::wayfinder::wayfinder_ui(ui, &nodes, &photos, c) {
+            // Tapping a contact jumps to Friends with them selected, per the
+            // Qt page: the map is a way IN to a conversation, not a dead end.
+            self.apply_friends(crate::friends::Action::Selected(id));
+            self.nav.go_page(2);
+        }
+        if nodes.is_empty() {
+            ui.colored_label(c.text_weak, "No contacts to place yet.");
+        }
     }
 
     /// The inbox, on its own page. Was absent entirely: the app had a Peers
@@ -692,6 +703,33 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn the_wayfinder_page_draws_the_wayfinder_and_not_the_voice_controls() {
+        // The regression this replaced: PAGES[3] is "Wayfinder" and it drew
+        // join/mute/push-to-talk. Nothing looked missing, which is why it
+        // survived.
+        assert_eq!(PAGES[3], "Wayfinder");
+        let mut s = app();
+        s.self_fix = Some(crate::wayfinder::Fix { lat: 51.5074, lon: -0.1278 });
+        s.wayfinder_contacts = vec![crate::wayfinder::Contact {
+            id: "paris".into(), display_name: "Paris".into(), online: true,
+            loc: Some(crate::wayfinder::Fix { lat: 48.8566, lon: 2.3522 }) }];
+        let nodes = crate::wayfinder::build_nodes(s.self_fix, &s.wayfinder_contacts);
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].distance_label().ends_with("SE"));
+    }
+
+    #[test]
+    fn contacts_without_a_fix_still_appear_on_the_map() {
+        let mut s = app();
+        s.self_fix = None;
+        s.wayfinder_contacts = vec![crate::wayfinder::Contact {
+            id: "ada".into(), display_name: "Ada".into(), online: true, loc: None }];
+        let nodes = crate::wayfinder::build_nodes(s.self_fix, &s.wayfinder_contacts);
+        assert_eq!(nodes.len(), 1, "a contact with no GPS is not a missing contact");
+        assert_eq!(nodes[0].distance_label(), "Nearby");
     }
 
     #[test]
