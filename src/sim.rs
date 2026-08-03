@@ -23,6 +23,10 @@ const DT: f32 = 1.0 / 120.0;
 const ARENA: usize = 20; // ARENA CLASSIC: flat pitch, paired goals
 
 pub struct Outcome {
+    /// seconds spent in each striker phase, summed over bots — the answer to
+    /// "where does the state machine stall?", which a sampled trace cannot
+    /// give because the interesting transitions happen between samples
+    pub phase_t: [f32; 6],
     pub goal_t: Option<f32>,
     pub air_touches: u32,
     pub resets: u32,
@@ -91,6 +95,7 @@ fn rig(seed: u64, n_strikers: usize, defender: bool) -> Rig {
 fn run_one(seed: u64, n_strikers: usize, defender: bool, secs: f32) -> Outcome {
     let mut r = rig(seed, n_strikers, defender);
     let mut o = Outcome {
+        phase_t: [0.0; 6],
         goal_t: None,
         air_touches: 0,
         resets: 0,
@@ -143,6 +148,21 @@ fn run_one(seed: u64, n_strikers: usize, defender: bool, secs: f32) -> Outcome {
                 o.defender_travel += (d.car.pos - def_prev).length().min(1.0);
                 def_prev = d.car.pos;
             }
+        }
+        // PHASE TELEMETRY. A striker is a state machine and the useful
+        // question is always "where does it stall?" — which a sampled trace
+        // cannot answer, because the interesting transitions happen between
+        // samples. Accumulate the time every bot spends in every phase.
+        for b in r.bots.iter().filter(|b| b.team < 8) {
+            let k = match b.phase {
+                crate::bots::Phase::Approach => 0,
+                crate::bots::Phase::Carry => 1,
+                crate::bots::Phase::Pop => 2,
+                crate::bots::Phase::AirCarry => 3,
+                crate::bots::Phase::Reset => 4,
+                crate::bots::Phase::Flick => 5,
+            };
+            o.phase_t[k] += DT;
         }
         if std::env::var("SIM_DEBUG").is_ok() && (t * 2.0).fract() < DT * 2.0 {
             let b0 = &r.bots[0];
@@ -7009,11 +7029,15 @@ pub fn run(args: &[String]) {
             continue;
         };
         let (mut goals, mut tt, mut at, mut rs, mut ps, mut dtr, mut st) = (0u64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let mut ph = [0.0f32; 6];
         for k in 0..trials {
             let o = run_one(1000 + k * 7, n, def, 28.0);
             if let Some(g) = o.goal_t {
                 goals += 1;
                 tt += g;
+            }
+            for k in 0..6 {
+                ph[k] += o.phase_t[k];
             }
             at += o.air_touches as f32;
             rs += o.resets as f32;
@@ -7033,6 +7057,20 @@ pub fn run(args: &[String]) {
             ps / f,
             dtr / f,
             st / f
+        );
+        // WHERE the state machine spent its time. "Zero goals" says a bot
+        // failed; this says which stage it never got past, which is the only
+        // form of the question that can be acted on. A sampled trace cannot
+        // answer it, because the transitions happen between samples.
+        let tot: f32 = ph.iter().sum::<f32>().max(0.01);
+        println!(
+            "   phases: approach {:.0}%  carry {:.0}%  pop {:.0}%  air {:.0}%  reset {:.0}%  flick {:.0}%",
+            ph[0] / tot * 100.0,
+            ph[1] / tot * 100.0,
+            ph[2] / tot * 100.0,
+            ph[3] / tot * 100.0,
+            ph[4] / tot * 100.0,
+            ph[5] / tot * 100.0
         );
     }
 }

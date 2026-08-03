@@ -508,7 +508,15 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
                 && flat_d < 1.3
                 && (ball.vel - car.vel).length() < 4.5;
             let bounced_high = ball_rel.y > 1.2 && flat_d < 1.7 && ball.vel.y > -2.0;
-            if (settled && b.phase_t > 0.30 || bounced_high) && car.on_ground {
+            // A CARRY IS NOT ALWAYS GROUNDED. Requiring `on_ground` here
+            // sounded obvious and was the thing blocking the whole state
+            // machine: a car carrying a ball is repeatedly lifted a few
+            // centimetres by the contact, so the flag flickers off exactly
+            // when the ball is most settled. Traced: the bot held the ball
+            // for two full seconds and never popped, because every frame it
+            // qualified it happened to be airborne by a hand's width.
+            let near_ground = car.on_ground || world.sdf(car.pos) < car.half_h + 0.45;
+            if (settled && b.phase_t > 0.30 || bounced_high) && near_ground {
                 b.phase = Phase::Pop;
                 b.phase_t = 0.0;
             }
@@ -548,7 +556,17 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
             if !b.got_reset && b.phase_t > 0.7 && dist < 2.2 && ball_rel.y > 0.3 {
                 b.phase = Phase::Reset;
                 b.phase_t = 0.0;
-            } else if goal_d < 13.0 && dist < 2.4 {
+            } else if (goal_d < 13.0 && dist < 2.4)
+                // FINISH THE CARRY. Telemetry: the striker spends a THIRD of
+                // its life in AirCarry and 1% in Flick — it carries the ball
+                // beautifully and then carries it some more, because the only
+                // way out was being within 13 m of the goal with the ball
+                // still glued on. A carry that has gone on long enough, or
+                // that has drifted out of touch, should be spent rather than
+                // nursed: take the shot from wherever you are.
+                || (b.phase_t > 1.6 && dist < 3.0)
+                || (goal_d < 26.0 && b.phase_t > 0.9 && dist < 2.8)
+            {
                 b.phase = Phase::Flick;
                 b.phase_t = 0.0;
             }

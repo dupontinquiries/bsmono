@@ -3613,6 +3613,42 @@ further down a list, so `--sim menus` builds the same display list and checks
 it: a header per family, headers not selectable, and every screen row
 resolving back to the car it names.
 
+## v1.111.0 — phase telemetry, and what it says about the striker
+
+The bot scenario reports zero goals, and has for a while. "Zero goals" says
+a bot failed; it does not say which stage it never got past, which is the
+only form of the question that can be acted on. The existing SIM_DEBUG trace
+samples every half second and the interesting transitions happen between
+samples — twice this session it led me to a confident wrong conclusion.
+
+So the scenario now accumulates the time every bot spends in every phase:
+
+    approach 46%   carry 17%   pop 3%   air 33%   reset 0%   flick 1%
+
+That is a diagnosis. The striker is NOT failing to get airborne — it spends
+a third of its life in AirCarry, which is the hard part. It is failing to
+FINISH: one percent in Flick and none at all in Reset. It carries the ball
+beautifully and then carries it some more.
+
+A REGRESSION IS ALSO VISIBLE. Earlier in the project this scenario measured
+6.0 air touches and 18.6 style; it now measures 2.2 and 7.7. The physics has
+moved a long way since — carry friction, the flick throw gate, the sweep
+discount, contact restitution — and the striker's thresholds were tuned
+against the old numbers.
+
+WHAT I TRIED AND WHAT IT DID. The only exit from AirCarry was being within
+13 m of the goal with the ball still glued on, so I added two more: a carry
+that has run long enough, and one near enough to goal to be worth spending.
+The phase distribution did not move by a single percent, which — as this
+project keeps demonstrating — means the change is not reaching the code path
+that matters, not that the idea is wrong. I am recording that rather than
+claiming a fix.
+
+The next step is to find out why: either AirCarry is being re-entered from
+elsewhere each frame (resetting `phase_t` before the new exits can fire), or
+the arm being executed is not the one I edited. The telemetry is now in place
+to tell the difference.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
