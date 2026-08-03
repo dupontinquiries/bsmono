@@ -47,7 +47,6 @@
 //!   same drag is not also read as a page swipe. Without the consume you close
 //!   a card and change page in one gesture.
 
-use uikit_egui::motion::ease;
 
 /// `kTapSlopPx` — travel below this is a tap, not a drag.
 pub const TAP_SLOP: f32 = 10.0;
@@ -249,41 +248,37 @@ impl CardAction {
 }
 
 /// The accordion state of one row.
-#[derive(Debug, Clone, Default)]
+///
+/// The reveal itself is `uikit_egui::motion::Reveal` — the same ramp, and the
+/// same "stays drawn while it leaves" rule, that the bottom sheet and the
+/// device panel each rediscovered. Only the 180ms is ours: a submenu should be
+/// quicker than a sheet.
+#[derive(Debug, Clone)]
 pub struct Card {
-    pub expanded: bool,
-    /// 0..=1 progress of the reveal, eased on read.
-    t: f32,
+    reveal: uikit_egui::motion::Reveal,
+}
+
+impl Default for Card {
+    fn default() -> Self { Card { reveal: uikit_egui::motion::Reveal::new(SUBMENU_MS) } }
 }
 
 impl Card {
-    pub fn expand(&mut self) { self.expanded = true; }
-    pub fn collapse(&mut self) { self.expanded = false; }
-    pub fn toggle(&mut self) { self.expanded = !self.expanded; }
-
-    /// Advance the 180ms animation. Driven by frame time rather than a wall
-    /// clock so a slow frame does not skip the whole reveal.
-    pub fn tick(&mut self, dt_ms: f32) {
-        let target = if self.expanded { 1.0 } else { 0.0 };
-        let step = dt_ms / SUBMENU_MS;
-        if self.t < target { self.t = (self.t + step).min(target); }
-        else if self.t > target { self.t = (self.t - step).max(target); }
-    }
+    pub fn expand(&mut self) { self.reveal.open(); }
+    pub fn collapse(&mut self) { self.reveal.close(); }
+    pub fn toggle(&mut self) { self.reveal.toggle(); }
+    pub fn tick(&mut self, dt_ms: f32) { self.reveal.tick(dt_ms); }
 
     /// Eased height fraction for the submenu.
-    pub fn reveal(&self) -> f32 { ease::out_cubic(self.t.clamp(0.0, 1.0)) }
+    pub fn reveal(&self) -> f32 { self.reveal.eased() }
 
-    /// The submenu is drawn whenever it has any height at all, not only when
-    /// expanded — it must stay visible for the whole collapse animation or the
-    /// card snaps shut instead of closing.
-    pub fn submenu_visible(&self) -> bool { self.t > 0.0 }
+    /// Drawn for the whole collapse, or the card snaps shut instead of closing.
+    pub fn submenu_visible(&self) -> bool { self.reveal.visible() }
 
     /// `▾` collapsed, `▴` expanded.
-    pub fn chevron(&self) -> &'static str { if self.expanded { "▴" } else { "▾" } }
+    pub fn chevron(&self) -> &'static str { if self.expanded() { "▴" } else { "▾" } }
 
-    pub fn settled(&self) -> bool {
-        self.t <= 0.0 || self.t >= 1.0
-    }
+    pub fn expanded(&self) -> bool { self.reveal.is_open() }
+    pub fn settled(&self) -> bool { self.reveal.settled() }
 }
 
 /// The accordion: at most one card open at a time.
@@ -697,7 +692,7 @@ mod tests {
         a.open_only("sc-2");
         assert!(!a.is_open("sc-1"));
         assert!(a.is_open("sc-2"));
-        assert!(!a.card("sc-1").expanded);
+        assert!(!a.card("sc-1").expanded());
     }
 
     #[test]

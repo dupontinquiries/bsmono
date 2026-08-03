@@ -197,9 +197,12 @@ impl VolumeDial {
 
     /// The idle breathing glow, 0..=1 — only at rest, so the "alive" signal is
     /// not competing with actual motion.
-    pub fn idle_glow(&self, phase: f32) -> f32 {
+    ///
+    /// Takes a shared `Breath` rather than a raw phase: the caller owns the
+    /// clock, and the oscillator is the one every other glow in the fleet uses.
+    pub fn idle_glow(&self, breath: &uikit_egui::motion::Breath) -> f32 {
         if self.dragging() || self.spinning() { return 0.0; }
-        0.5 + 0.5 * phase.sin()
+        breath.value()
     }
 }
 
@@ -439,12 +442,14 @@ mod tests {
     fn the_idle_glow_only_breathes_at_rest() {
         // An "alive" signal competing with actual motion is noise.
         let mut d = VolumeDial::new(50.0);
-        assert!(d.idle_glow(1.0) > 0.0);
+        let mut b = uikit_egui::motion::Breath::new(1000.0, 0.2, 1.0);
+        b.tick(250.0);   // a quarter turn: near the top of the cycle
+        assert!(d.idle_glow(&b) > 0.0);
         d.press(0.0, 0.0, 90.0, 100.0);
-        assert_eq!(d.idle_glow(1.0), 0.0, "not while dragging");
+        assert_eq!(d.idle_glow(&b), 0.0, "not while dragging");
         d.drag(10.0, 0.0);
         d.release();
-        assert_eq!(d.idle_glow(1.0), 0.0, "nor while spinning");
+        assert_eq!(d.idle_glow(&b), 0.0, "nor while spinning");
     }
 
     #[test]

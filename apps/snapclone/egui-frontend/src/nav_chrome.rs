@@ -118,22 +118,33 @@ impl TabStrip {
 pub struct Edges { pub left: bool, pub right: bool }
 
 /// The hint's state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct PeelHint {
     page: usize,
     pages: usize,
     swipes: u32,
     /// Time since the last swipe; the hint stays ducked until this passes.
     since_swipe_ms: f32,
-    phase_ms: f32,
+    /// The shared oscillator. Slow and dim on purpose — see BREATH_MS.
+    breath: uikit_egui::motion::Breath,
     /// Once true, permanently so: the user has learned the gesture.
     retired: bool,
     ducked: bool,
 }
 
+impl Default for PeelHint {
+    fn default() -> Self {
+        PeelHint { page: 0, pages: 0, swipes: 0, since_swipe_ms: 0.0,
+                   breath: uikit_egui::motion::Breath::new(BREATH_MS, 0.35, 0.60),
+                   retired: false, ducked: false }
+    }
+}
+
 impl PeelHint {
     pub fn new(pages: usize) -> Self {
-        PeelHint { pages, since_swipe_ms: IDLE_RETURN_MS, ..Default::default() }
+        PeelHint { pages, since_swipe_ms: IDLE_RETURN_MS,
+                   breath: uikit_egui::motion::Breath::new(BREATH_MS, 0.35, 0.60),
+                   ..Default::default() }
     }
 
     /// `setPageState`.
@@ -152,7 +163,7 @@ impl PeelHint {
     }
 
     pub fn tick(&mut self, dt_ms: f32) {
-        self.phase_ms = (self.phase_ms + dt_ms) % BREATH_MS;
+        self.breath.tick(dt_ms);
         if self.ducked {
             self.since_swipe_ms += dt_ms;
             if self.since_swipe_ms >= IDLE_RETURN_MS { self.ducked = false; }
@@ -180,8 +191,7 @@ impl PeelHint {
     /// pulse.
     pub fn opacity(&self) -> f32 {
         if !self.visible() { return 0.0; }
-        let t = self.phase_ms / BREATH_MS * std::f32::consts::TAU;
-        0.35 + 0.25 * ((t.sin() + 1.0) / 2.0)
+        self.breath.value()
     }
 }
 

@@ -81,7 +81,7 @@ pub enum Event {
 }
 
 /// The bar's state.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct VoiceBar {
     pub security: Security,
     /// Who holds the floor. Empty means the floor is open.
@@ -95,11 +95,26 @@ pub struct VoiceBar {
     press_y: f32,
     /// Talk-button size factor.
     talk_scale: f32,
-    phase: f32,
+    /// Shared oscillator; faster and brighter than a container's glow, because
+    /// a securing handshake is a status and not a decoration.
+    breath: uikit_egui::motion::Breath,
+}
+
+impl Default for VoiceBar {
+    fn default() -> Self {
+        VoiceBar { security: Security::default(), talker: String::new(), talker_is_self: false,
+                   mic_level: 0.0, display_level: 0.0, on_air: false, ptt_down: false,
+                   latched: false, press_y: 0.0, talk_scale: GRAND_SCALE,
+                   breath: uikit_egui::motion::Breath::new(1000.0, 0.0, 1.0) }
+    }
 }
 
 impl VoiceBar {
-    pub fn new() -> Self { VoiceBar { talk_scale: GRAND_SCALE, ..Default::default() } }
+    pub fn new() -> Self {
+        VoiceBar { talk_scale: GRAND_SCALE,
+                   breath: uikit_egui::motion::Breath::new(1000.0, 0.0, 1.0),
+                   ..Default::default() }
+    }
 
     /// `setTalker`. `is_self` styles it as "You".
     pub fn set_talker(&mut self, name: &str, is_self: bool) {
@@ -140,7 +155,7 @@ impl VoiceBar {
 
     /// Advance the eased level and the pulse phase.
     pub fn tick(&mut self) {
-        self.phase = (self.phase + PULSE_STEP) % std::f32::consts::TAU;
+        self.breath.tick(PULSE_STEP * 1000.0 / std::f32::consts::TAU);
         // Target zero when off air: a meter still moving after you stop
         // transmitting is showing the room the mic can hear, which is not what
         // a TRANSMIT meter means.
@@ -152,7 +167,7 @@ impl VoiceBar {
     pub fn meter(&self) -> f32 { if self.on_air { self.display_level.clamp(0.0, 1.0) } else { 0.0 } }
 
     /// 0..=1 pulse, for the securing lock and the on-air glow.
-    pub fn pulse(&self) -> f32 { (self.phase.sin() + 1.0) / 2.0 }
+    pub fn pulse(&self) -> f32 { self.breath.value() }
 
     /// True while anything is live, which is what the glow follows.
     pub fn live(&self) -> bool { self.on_air || self.ptt_down || self.latched }

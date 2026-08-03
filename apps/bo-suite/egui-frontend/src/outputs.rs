@@ -27,17 +27,24 @@ impl Device {
 }
 
 /// The top-area product selector.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceSelector {
     devices: Vec<Device>,
     active_url: String,
     pub expanded: bool,
-    /// 0..=1 unfold progress.
-    t: f32,
+    /// The shared ramp — third call site, first time it is not a copy.
+    unfold: uikit_egui::motion::Reveal,
 }
 
 /// The panel's unfold, in milliseconds.
 pub const UNFOLD_MS: f32 = 220.0;
+
+impl Default for DeviceSelector {
+    fn default() -> Self {
+        DeviceSelector { devices: Vec::new(), active_url: String::new(), expanded: false,
+                         unfold: uikit_egui::motion::Reveal::new(UNFOLD_MS) }
+    }
+}
 
 impl DeviceSelector {
     pub fn set_devices(&mut self, devices: Vec<Device>) {
@@ -75,17 +82,15 @@ impl DeviceSelector {
     }
 
     pub fn tick(&mut self, dt_ms: f32) {
-        let target = if self.expanded { 1.0 } else { 0.0 };
-        let step = dt_ms / UNFOLD_MS;
-        if self.t < target { self.t = (self.t + step).min(target); }
-        else if self.t > target { self.t = (self.t - step).max(target); }
+        self.unfold.set(self.expanded);
+        self.unfold.tick(dt_ms);
     }
 
     /// Eased unfold.
-    pub fn unfold(&self) -> f32 { uikit_egui::motion::ease::out_cubic(self.t.clamp(0.0, 1.0)) }
+    pub fn unfold(&self) -> f32 { self.unfold.eased() }
 
     /// Still drawn while folding away, or the panel vanishes instead of closing.
-    pub fn panel_visible(&self) -> bool { self.expanded || self.t > 0.0 }
+    pub fn panel_visible(&self) -> bool { self.unfold.visible() }
 
     /// The chevron's rotation in degrees — it points down closed and up open,
     /// and rotates WITH the unfold so the two read as one movement.
