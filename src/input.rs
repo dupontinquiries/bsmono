@@ -272,7 +272,12 @@ impl Bindings {
             (RollL, vec![ch("q")]),
             (RollR, vec![ch("e")]),
             (Jump, vec![named(NamedKey::Space), Bind::Pad(crate::gamepad::PB_SOUTH)]),
-            (Boost, vec![named(NamedKey::Shift), Bind::Pad(crate::gamepad::PB_EAST), Bind::Pad(crate::gamepad::PB_RB)]),
+            // BOOST LOSES SHIFT. Transform was asked for on Shift, and two
+            // actions on one key is worse than moving one of them. V is the
+            // boost key the Dvorak scheme already uses, so it is not a new
+            // idea to anyone, and both pad bindings are untouched — on a
+            // controller nothing about boost changes at all.
+            (Boost, vec![ch("v"), Bind::Pad(crate::gamepad::PB_EAST), Bind::Pad(crate::gamepad::PB_RB)]),
             (Slide, vec![named(NamedKey::Control), Bind::Pad(crate::gamepad::PB_WEST)]),
             (BallCam, vec![ch("c"), Bind::Pad(crate::gamepad::PB_NORTH)]),
             (Toss, vec![ch("t")]),
@@ -286,9 +291,9 @@ impl Bindings {
             (Car1, vec![ch("1")]),
             (Car2, vec![ch("2")]),
             (Car3, vec![ch("3")]),
-            // G, and L-bumper on a pad. T is Toss and F is FlipVis, so the
-            // two keys that read as "transform" were both already spoken for.
-            (Transform, vec![ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
+            // SHIFT, with G kept as the second binding for anyone already
+            // used to it, and L-bumper on a pad.
+            (Transform, vec![named(NamedKey::Shift), ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
         ];
         Bindings { map: m }
     }
