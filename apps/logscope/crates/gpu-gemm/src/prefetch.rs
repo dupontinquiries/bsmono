@@ -104,9 +104,21 @@ pub fn hint(map: &[u8], r: Range) {
 /// will hold, evicting the very pages the current layer is reading. Colibri's LRU bounds what is
 /// resident; this bounds what is *requested*, which is the same argument one step earlier.
 pub fn hint_all(map: &[u8], ranges: &[Range], budget_bytes: usize) {
+    // A RANGE MUST FIT THE MAP IT DESCRIBES. Ranges are computed from the tensor's declared expert
+    // stride and the map is whatever the file view actually produced — and those can disagree. A real
+    // Scout run panicked here with "range end index 16 out of range for slice of length 0": gate and
+    // up had views, `down` did not, and the ranges were built for it anyway.
+    //
+    // An empty map is the loud case; a SHORT one is worse, because it would hint real bytes belonging
+    // to a different tensor and only show up as wrong output. Both are skipped.
+    //
+    // Skipping is right rather than clamping: a prefetch hint is advisory, so declining to issue one
+    // costs a possible stall, while issuing a wrong one reads memory that is not the caller's.
+    if map.is_empty() { return; }
     let mut spent = 0usize;
     for r in ranges {
         if spent + r.len > budget_bytes { break; }
+        if r.offset.saturating_add(r.len) > map.len() { continue; }
         hint(map, *r);
         spent += r.len;
     }
@@ -168,5 +180,37 @@ mod tests {
         let mut spent = 0usize; let mut n = 0;
         for r in &ranges { if spent + r.len > 350 { break; } spent += r.len; n += 1; }
         assert_eq!(n, 3, "three 100-byte ranges fit in 350, the fourth does not");
+    }
+}
+
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    #[test]
+    fn an_EMPTY_map_is_skipped_rather_than_panicking() {
+        // The real crash: gate and up had file views, `down` did not, and ranges were built for it
+        // anyway. "range end index 16 out of range for slice of length 0" at lib.rs:4733.
+        hint_all(&[], &[Range { offset: 0, len: 16 }], BUDGET);
+    }
+
+    #[test]
+    fn a_range_past_the_end_is_skipped_and_the_REST_still_issue() {
+        // Skipping the bad one rather than aborting the loop: the ranges are independent, and one
+        // wrong stride should not cost every other hint.
+        let map = vec![0u8; 64];
+        hint_all(&map, &[
+            Range { offset: 0, len: 16 },
+            Range { offset: 60, len: 16 },   // past the end
+            Range { offset: 32, len: 16 },
+        ], BUDGET);
+    }
+
+    #[test]
+    fn a_range_ending_exactly_at_the_end_is_VALID() {
+        // Off-by-one in the guard would silently stop prefetching the last expert of every tensor.
+        let map = vec![0u8; 64];
+        hint_all(&map, &[Range { offset: 48, len: 16 }], BUDGET);
     }
 }
