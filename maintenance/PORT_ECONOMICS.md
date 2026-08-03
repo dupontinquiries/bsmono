@@ -103,15 +103,30 @@ Weak evidence, stated as such.
 * **Kit usage per module** rose from ~1.1 direct references to ~1.9 between the
   first and last eight. Real but small, and a low absolute number either way —
   most kit use is indirect, through `PaletteColors` and the gesture layer.
-* **The strongest evidence is qualitative and worth more than either number:**
-  the last six ports needed no new drawing primitives. They compose what is
-  already there. `table_view`, `row_render`, `detect`, `explore`, `manpage_view`
-  and `studio` are all *views over existing engines* — which is what the port
-  becoming easier actually looks like from the inside.
+* **The qualitative claim I first made here was wrong**, and checking it is what
+  produced this section's most useful finding. I wrote that "the last six ports
+  needed no new drawing primitives". Two counts say otherwise:
+  - The kits WERE extended during the programme, twice, and I had not counted
+    it: `uikit-web/doc.rs` (a whole new document model) and `uikit-term/keys.rs`
+    (DECCKM, bracketed paste, canonical line endings).
+  - Worse, generic widget behaviour was written into APP code rather than the
+    kit. `grep -l ripple` finds it in two apps; `breath|pulse` in eight modules;
+    `ease::out_cubic` entrances in five. snapclone's `GlassButton` and
+    bo-suite's `StepKey` came out **line-for-line identical** — same fields,
+    same tick, byte-identical `(1.0 - press_scale) * dt / press_ms` ramp —
+    written three sessions apart without either noticing.
 
-The reason it got easier is therefore only partly eguikit. The larger part is
-that the engines underneath were already Qt-free, and the port could spend its
-time on the surface rather than on re-deriving behaviour.
+  That is the "two lists of the same thing" failure this programme keeps finding
+  in the Qt code, committed in the port itself. It is now fixed:
+  `uikit_egui::motion::PressFeedback` holds the behaviour and both apps delegate
+  to it, keeping their own constants — a B&O key is firmer than a snapclone one,
+  and a kit that flattened that would be the opposite mistake.
+
+So the honest answer is that the port got easier for two reasons and neither is
+"the kit is finished". The engines underneath were already Qt-free, which is the
+larger effect; and where the kit was genuinely short, I routed around it instead
+of extending it. The remaining duplication above — breathing glows, entrance
+easings — is the same smell and has not been promoted yet.
 
 ## 6. Projected finish
 

@@ -181,65 +181,38 @@ pub fn frost(backdrop: &Img, downscale_factor: usize, shift_px: usize) -> Img {
 
 // ── glass icon button ───────────────────────────────────────────────────────
 
-/// The button's press animation and ripple.
+/// snapclone's press feel: a 12% dip over 110ms, ripple 340ms.
+///
+/// The BEHAVIOUR lives in `uikit_egui::motion::PressFeedback` — this was
+/// written here and again in bo-suite's StepKey, line for line, before either
+/// of us noticed. The constants stay local because they are a house feel, not a
+/// shared one.
+pub const FEEL: uikit_egui::motion::PressFeel =
+    uikit_egui::motion::PressFeel::new(PRESS_MS, RIPPLE_MS, PRESS_SCALE);
+
+/// The glass icon button: shared press behaviour, local look.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GlassButton {
-    /// 1.0 at rest, dips to PRESS_SCALE on press.
-    scale: f32,
-    down: bool,
-    /// Ripple progress; `None` when no ripple is running.
-    ripple_ms: Option<f32>,
-    /// Where the ripple started, in button-local coordinates.
-    ripple_at: (f32, f32),
+    feedback: uikit_egui::motion::PressFeedback,
 }
 
 impl Default for GlassButton {
     fn default() -> Self {
-        GlassButton { scale: 1.0, down: false, ripple_ms: None, ripple_at: (0.0, 0.0) }
+        GlassButton { feedback: uikit_egui::motion::PressFeedback::new(FEEL) }
     }
 }
 
 impl GlassButton {
-    /// Press at a point. The ripple is keyed to the ACTUAL coordinate, which is
-    /// what a stylesheet `:pressed` state cannot know and what makes the
-    /// feedback feel like it came from your finger.
-    pub fn press(&mut self, x: f32, y: f32) {
-        self.down = true;
-        self.ripple_at = (x, y);
-        self.ripple_ms = Some(0.0);
-    }
-
-    pub fn release(&mut self) { self.down = false; }
-
-    pub fn tick(&mut self, dt_ms: f32) {
-        // Dip fast, spring back over the same window.
-        let target = if self.down { PRESS_SCALE } else { 1.0 };
-        let step = (1.0 - PRESS_SCALE) * dt_ms / PRESS_MS;
-        if self.scale > target { self.scale = (self.scale - step).max(target); }
-        else if self.scale < target { self.scale = (self.scale + step).min(target); }
-
-        if let Some(t) = self.ripple_ms {
-            let t = t + dt_ms;
-            // The ripple outlives the release on purpose: cutting it short on
-            // finger-up makes a quick tap produce no visible feedback at all.
-            self.ripple_ms = if t >= RIPPLE_MS { None } else { Some(t) };
-        }
-    }
-
-    pub fn scale(&self) -> f32 { self.scale }
-    pub fn rippling(&self) -> bool { self.ripple_ms.is_some() }
-    pub fn ripple_origin(&self) -> (f32, f32) { self.ripple_at }
-
-    /// Ripple radius as a fraction of its final size, 0..=1.
-    pub fn ripple_t(&self) -> f32 {
-        self.ripple_ms.map(|t| (t / RIPPLE_MS).clamp(0.0, 1.0)).unwrap_or(0.0)
-    }
-
-    /// Ripple opacity — fades as it expands, or it ends as a hard disc.
-    pub fn ripple_alpha(&self) -> f32 {
-        if !self.rippling() { return 0.0; }
-        (1.0 - self.ripple_t()) * 0.35
-    }
+    pub fn press(&mut self, x: f32, y: f32) { self.feedback.press(x, y); }
+    pub fn release(&mut self) { self.feedback.release(); }
+    pub fn tick(&mut self, dt_ms: f32) { self.feedback.tick(dt_ms); }
+    pub fn scale(&self) -> f32 { self.feedback.scale() }
+    pub fn rippling(&self) -> bool { self.feedback.rippling() }
+    pub fn ripple_origin(&self) -> (f32, f32) { self.feedback.ripple_origin() }
+    pub fn ripple_t(&self) -> f32 { self.feedback.ripple_t() }
+    /// Peaks lower than bo-suite's: glass already carries its own highlight.
+    pub fn ripple_alpha(&self) -> f32 { self.feedback.ripple_alpha(0.35) }
+    fn down(&self) -> bool { self.feedback.is_down() }
 }
 
 /// Draw a glass icon button. Returns true on click.
@@ -248,7 +221,7 @@ pub fn glass_button_ui(ui: &mut egui::Ui, b: &mut GlassButton, glyph: &str, d: f
     b.tick(ui.input(|i| i.stable_dt) * 1000.0);
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(d, d), egui::Sense::click());
     if resp.is_pointer_button_down_on() {
-        if !b.down {
+        if !b.down() {
             let p = resp.interact_pointer_pos().unwrap_or(rect.center());
             b.press(p.x - rect.left(), p.y - rect.top());
         }
