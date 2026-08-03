@@ -1590,6 +1590,24 @@ impl Gpu {
     /// words (`qs` starts at word `n*k/8`). No host dequantization and no f32 intermediate — this is what
     /// lets the loader stop building a ~50 GiB host copy and lets an expert slot be filled from mmap'd
     /// file bytes. `k` must be a multiple of 256 (one Q4_K super-block).
+    /// Run the converter's OWN dequant and return what it produces.
+    ///
+    /// The direct test for the per-compilation-unit theory. Everything else about `wq` has been
+    /// INFERRED from the scale it feeds, and inference is what has been wrong six times here.
+    pub fn q4k_wq_probe(&self, raw: &[u8], n: usize, k: usize) -> Vec<f32> {
+        let total = n * k;
+        let nblk = total / 256;
+        let need = nblk * 144;
+        let mut padded = raw[..need.min(raw.len())].to_vec();
+        padded.resize(need, 0);
+        let (gx, gy) = wrapped_grid(nblk);
+        // The converter's own dims layout, so the probe reads its inputs identically.
+        let dims: [u32; 8] = [total as u32, 0, gx, gy, 0, 0, 0, 0];
+        let w = self.run_u32(Q4K_WQ_PROBE, &[bytemuck::cast_slice(&padded)], total,
+                             bytemuck::cast_slice(&dims), (gx, gy, 1));
+        w.iter().map(|b| f32::from_bits(*b)).collect()
+    }
+
     pub fn q4k_to_q4_words(&self, raw: &[u8], n: usize, k: usize) -> Vec<u32> {
         assert!(k % 256 == 0, "q4_k conversion needs k % 256 == 0 (got {k})");
         let total = n * k;
@@ -13908,6 +13926,114 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 /// wraps it unchanged. One workgroup per 256-weight super-block; its 8 lanes each own one 32-element
 /// block, computing that block's absmax scale and packing 8 nibbles per word exactly as the CPU
 /// `quantize_q4_resident_cpu` does (scale = amax/7, nibble = round(w/scale) + 8).
+/// The converter's OWN dequant, writing its results instead of nibbles.
+///
+/// The test for the per-compilation-unit theory. `Q4K_DEQUANT` matches the CPU exactly and the
+/// converter's inline `wq` implies an amax one ULP higher — but that is INFERRED from the scale, and
+/// an inference is what has misled this investigation six times.
+///
+/// This runs the converter's dequant and writes what it produces, so `wq`'s output can be compared
+/// against the CPU directly:
+///
+/// * **wq matches the CPU** — then the ULP enters in the amax REDUCTION, not the dequant, and the
+///   two-compilation-units theory is wrong like the other six.
+/// * **wq differs by one ULP** — then two textually identical dequants really do round differently,
+///   and the fix has to be structural rather than another expression.
+///
+/// Built by taking Q4K_TO_Q4's source and replacing only its output statement, so the surrounding
+/// code — and therefore the compiler's contraction decisions — stay as close as a separate shader can
+/// get.
+pub const Q4K_WQ_PROBE: &str = r#"
+struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
+@group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
+@group(0)@binding(1) var<storage,read_write> dst: array<u32>; // qw words, then qs (bitcast f32)
+@group(0)@binding(2) var<uniform> dims: D;
+
+// extractBits, NOT shift-and-mask: a shift by a lane-varying amount returns zero on
+// Honeykrisp for every lane whose shift is non-zero (--gate-bytes, extractBits CORRECT
+// where this form is WRONG). Four consecutive threads select four different bytes of one
+// word here, so three of every four got zero.
+fn byte_at(i: u32) -> u32 { return extractBits(src[i >> 2u], (i & 3u) * 8u, 8u); }
+
+// Bit-for-bit twin of the CPU gguf::f16_to_f32 (see the note on the dequant kernel): construct the f32
+// bit pattern and bitcast, so Inf/NaN survive instead of being approximated away.
+fn f16(h: u32) -> f32 {
+    let sign = (h >> 15u) & 1u;
+    let exp  = (h >> 10u) & 0x1Fu;
+    let mant = h & 0x3FFu;
+    var bits: u32;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign << 31u;
+        } else {
+            var e: i32 = -14; var m: u32 = mant;
+            loop { if ((m & 0x400u) != 0u) { break; } m = m << 1u; e = e - 1; }
+            bits = (sign << 31u) | (u32(e + 127) << 23u) | ((m & 0x3FFu) << 13u);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = (sign << 31u) | (0xFFu << 23u) | (mant << 13u);
+    } else {
+        bits = (sign << 31u) | (u32(i32(exp) + 127 - 15) << 23u) | (mant << 13u);
+    }
+    return bitcast<f32>(bits);
+}
+
+fn scale_min(j: u32, base: u32) -> vec2<f32> {
+    var sc: u32; var mn: u32;
+    if (j < 4u) { sc = byte_at(base + j) & 63u; mn = byte_at(base + j + 4u) & 63u; }
+    else {
+        sc = (byte_at(base + j + 4u) & 0x0Fu) | ((byte_at(base + j - 4u) >> 6u) << 4u);
+        mn = (byte_at(base + j + 4u) >> 4u) | ((byte_at(base + j) >> 6u) << 4u);
+    }
+    return vec2<f32>(f32(sc), f32(mn));
+}
+
+/// weight at position `t` (0..256) of super-block `blk`
+fn wq(blk: u32, t: u32) -> f32 {
+    let bbase = blk * 144u;
+    let d    = f16(byte_at(bbase) | (byte_at(bbase + 1u) << 8u));
+    let dmin = f16(byte_at(bbase + 2u) | (byte_at(bbase + 3u) << 8u));
+    let grp = t / 64u; let idx = t % 64u; let half = idx / 32u; let l = idx % 32u;
+    let sm = scale_min(grp * 2u + half, bbase + 4u);
+    let q = byte_at(bbase + 16u + grp * 32u + l);
+    let nib = select(q & 0xFu, q >> 4u, half == 1u);
+    // BIND THE INTERMEDIATES, the same rule Q6_K_DEQUANT already documents and follows.
+  //
+  // As one expression the compiler may fuse `d * sm.x * nib` and `dmin * sm.y` into FMAs, rounding
+  // ONCE where the CPU reference rounds twice. That is a one-ULP difference — gate-q4k saw
+  // 0.31525478 against 0.31525475, 1.192e-7 — and it is not corruption, but it is enough to move a
+  // weight across a quantization boundary and produce whole differing nibbles downstream.
+  //
+  // Q6_K binds d1..d4 for exactly this reason and is bit-exact everywhere. Q4_K never got the same
+  // treatment, which is why one gate passes and the other does not.
+  let dsc = d * sm.x;
+  let dm = dmin * sm.y;
+  // EXPLICIT fma, not a hope that the compiler contracts.
+  //
+  // The measurement: gate-q4k printed the amax each side's scale implies — gpu 2.206783533 against
+  // cpu 2.206783295 — while "GPU dequant == CPU dequant" passed with 0 differing. Both are true
+  // because there are TWO GPU dequant paths: the standalone Q4K_DEQUANT the gate exercises, and this
+  // one inside the converter. The compiler contracted one and not the other, so they disagreed by an
+  // ULP and the gate could not see it.
+  //
+  // Writing `dsc * nib - dm` leaves that to the compiler. `fma` states it, and matches the CPU
+  // reference's `mul_add` exactly — one rounding on both sides, by construction rather than by luck.
+  //
+  // Three fixes before this one reasoned about the rule instead of reading the inputs, and all three
+  // were wrong. The print that settled it took four lines.
+  return fma(dsc, f32(nib), -dm);
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let t = g.x;
+  if (t >= dims.n_weights) { return; }
+  let blk = t / 256u;
+  // EXACTLY the converter's wq, writing its result rather than feeding a reduction.
+  dst[t] = wq(blk, t % 256u);
+}
+"#;
+
 pub const Q4K_TO_Q4: &str = r#"
 struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
