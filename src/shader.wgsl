@@ -15,6 +15,7 @@ struct Globals {
     fog: vec4<f32>,        // rgb fog/horizon color, w fog density
     misc: vec4<f32>,       // xyz zenith color (per map style), w spare
     rt: vec4<f32>,         // x rays on, y quality, z spare, w ground wetness
+    ray2: vec4<f32>,       // x ray distance, y AO probes, z/w spare
     hmap: vec4<f32>,       // x half extent, y texels, zw = screen w,h in px
     gcol: vec4<f32>,       // rgb terrain base color, w shape count
     cine: vec4<f32>,       // x exposure, y vignette, z grain, w filmic tonemap
@@ -580,7 +581,12 @@ fn soft_shadow(p: vec3<f32>, l: vec3<f32>, pdist: f32) -> f32 {
     var res = 1.0;
     var t = 0.12;
     let lod = clamp(pdist / 150.0, 0.0, 1.0);
-    let steps = i32(mix(20.0 + 14.0 * G.rt.y, 9.0, lod));
+    // the dial scales the STEP budget, which is what actually costs:
+    // measured, shortening rays to a quarter of their range saved only 10%
+    // of the evaluations, because a ray terminates on a HIT long before it
+    // reaches tmax. A control that moved only tmax would change what you see
+    // and not what you pay for it.
+    let steps = max(6, i32(mix(20.0 + 14.0 * G.rt.y, 9.0, lod) * clamp(G.ray2.x, 0.25, 1.4)));
     let skip_ter = p.y > 17.0 && l.y > 0.05;
     // The shadow march is monotonic in t, exactly like the reflection, so it
     // can retire candidates it has already gone past. It never did — the
@@ -610,12 +616,24 @@ fn calc_ao(p: vec3<f32>, n: vec3<f32>, pdist: f32) -> f32 {
     if (c.n == 0u && p.y > terrain_h(p.x, p.z) + 3.0) { return 1.0; }
     var occ = 0.0;
     var w = 1.0;
-    for (var i = 1; i <= 4; i = i + 1) {
+    // FEWER RAYS AT LOW QUALITY. Each probe is a whole ray, so dropping to
+    // two halves this system's cost outright — unlike a step-count change,
+    // which only makes each ray cheaper.
+    let probes = i32(clamp(G.ray2.y, 2.0, 4.0));
+    // The probes are weighted 1, 0.6, 0.36, 0.216 — so two of them collect
+    // only 62% of the occlusion four would. Without correcting for that,
+    // turning quality down would visibly BRIGHTEN every contact shadow
+    // instead of simply approximating it more coarsely.
+    var wsum = 0.0;
+    for (var i = 1; i <= probes; i = i + 1) {
         let h = 0.15 + 0.5 * f32(i);
         let d = map_d(p + n * h, &c, false);
         occ = occ + (h - d) * w;
+        wsum = wsum + w;
         w = w * 0.6;
     }
+    let full = 1.0 + 0.6 + 0.36 + 0.216;
+    occ = occ * (full / max(wsum, 0.001));
     return clamp(1.0 - occ * 0.55, 0.25, 1.0);
 }
 
@@ -632,7 +650,15 @@ fn trace_reflection_w(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32, w
     let qn = clamp(G.rt.y, 0.0, 1.0);
     if (qn < 0.35 && base_dist > 70.0) { return sky_color(rd); }
     let lod = clamp(base_dist / 150.0, 0.0, 1.0);
-    let tmax = mix(260.0, 90.0, lod) * mix(0.4, 1.0, qn) * mix(0.35, 1.0, clamp(weight * 2.2, 0.0, 1.0));
+    // RAY DISTANCE is a direct control, not a quality tier: the march costs
+    // candidates x steps and steps scale with how far a ray may travel, so
+    // this is the most immediate performance dial in the renderer. Turning
+    // it down shortens what reflections can SEE — distant geometry fades to
+    // sky — rather than making everything blurrier.
+    let tmax = mix(260.0, 90.0, lod)
+        * mix(0.4, 1.0, qn)
+        * mix(0.35, 1.0, clamp(weight * 2.2, 0.0, 1.0))
+        * clamp(G.ray2.x, 0.2, 2.0);
     // PORTAL-AWARE MARCH: the ray walks in its own frame (ro2/rd2) so that
     // when a step crosses a portal face the ray is teleported and simply
     // keeps going — the far side is then genuinely visible THROUGH the
@@ -660,7 +686,8 @@ fn trace_reflection_w(ro: vec3<f32>, rd: vec3<f32>, skip: i32, base_dist: f32, w
     var t = 0.06;
     var hit = false;
     var hops = 0;
-    let steps = i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn));
+    // the reflection march takes the dial as well — it is the expensive one
+    let steps = max(8, i32(mix(30.0 + 18.0 * G.rt.y, 14.0, lod) * mix(0.5, 1.0, qn) * clamp(G.ray2.x, 0.25, 1.4)));
     let skip_ter = ro.y > 17.0 && rd.y > 0.05;
     var first = 0u;
     for (var i = 0; i < steps; i = i + 1) {
@@ -921,7 +948,23 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
             if (cheap_refl) {
                 col = mix(col, sky_color(rr), amount * 0.8);
             } else {
-                let rc = trace_reflection_w(in.wpos + n * 0.05, rr, self_id, dist0, amount);
+                let rc_raw = trace_reflection_w(in.wpos + n * 0.05, rr, self_id, dist0, amount);
+                // DENOISE BY CURVATURE.
+                //
+                // One reflection ray per pixel is exact where the surface is
+                // flat and noisy where it is not: on a curved panel adjacent
+                // pixels shoot in visibly different directions and the result
+                // sparkles. Screen-space derivatives measure exactly that —
+                // how fast the reflected direction is changing ACROSS the
+                // pixel — so where it changes fast, fall back toward the
+                // smooth sky term rather than trusting one sample.
+                //
+                // It costs two derivative instructions and no extra rays,
+                // which is the point: the cheapest denoiser is the one that
+                // knows when a sample is not worth believing.
+                let spread = length(dpdx(rr)) + length(dpdy(rr));
+                let trust = 1.0 - clamp(spread * 5.5, 0.0, 0.75);
+                let rc = mix(sky_color(rr), rc_raw, trust);
                 col = mix(col, rc, amount);
             }
         }

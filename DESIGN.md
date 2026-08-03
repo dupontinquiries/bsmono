@@ -3719,6 +3719,44 @@ each was the harness lying rather than the code:
   * both only became visible because the numbers were absurd rather than
     merely wrong: 3% of speed, and a charged pulse weaker than a tap
 
+## v1.114.0 — a ray-distance dial that actually costs something
+
+A RAY DISTANCE slider joins ray quality in the video settings, and building
+it turned up the more interesting result.
+
+The obvious implementation is to scale `tmax` — how far a reflection ray may
+travel. Measured, that saves almost nothing: at a QUARTER of full range the
+marcher still did 90% of its evaluations. The reason is that a ray
+terminates on a HIT long before it reaches its distance limit, so the limit
+only binds for rays that hit nothing — and those run out of STEPS first
+anyway. A slider like that changes what you see and not what you pay for it,
+which is the worst kind of control.
+
+So the dial scales the step budget as well, in both the reflection and
+shadow marches:
+
+    ray dist   evaluations   vs full   reach
+       1.60        78,865      100%     416 m
+       1.00        78,195       99%     260 m
+       0.60        69,938       89%     156 m
+       0.25        41,504       53%      65 m
+
+FEWER RAYS AT LOW QUALITY. Ambient occlusion drops from four probes to two
+below 0.55 quality. Each probe is a whole ray, so that halves the system
+outright rather than making each ray cheaper. The probes are weighted 1,
+0.6, 0.36, 0.216, so two collect only 62% of what four would — without
+correcting for that, turning quality down would visibly BRIGHTEN every
+contact shadow instead of approximating it. The sum is renormalised.
+
+DENOISING BY CURVATURE. One reflection ray per pixel is exact on a flat
+surface and noisy on a curved one: adjacent pixels shoot in visibly
+different directions and the result sparkles. Screen-space derivatives
+measure precisely that — how fast the reflected direction changes ACROSS the
+pixel — so where it changes fast, the result falls back toward the smooth sky
+term rather than trusting a single sample. Two derivative instructions, no
+extra rays. The cheapest denoiser is the one that knows when a sample is not
+worth believing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

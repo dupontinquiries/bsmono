@@ -245,6 +245,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("RAYS", Header),
             ("RAY TRACING", Toggle { get: |c| c.video.rays, set: |c, v| c.video.rays = v }),
             ("RAY QUALITY", pct(|c| c.video.quality, |c, v| c.video.quality = v, 0.4, 1.8)),
+            ("RAY DISTANCE", pct(|c| c.video.ray_dist, |c, v| c.video.ray_dist = v, 0.25, 1.6)),
             ("CINEMA", Header),
             ("FILMIC TONEMAP (ACES)", Toggle { get: |c| c.video.filmic, set: |c, v| c.video.filmic = v }),
             ("EXPOSURE", pct(|c| c.video.exposure, |c, v| c.video.exposure = v, 0.5, 1.8)),
@@ -3372,6 +3373,16 @@ impl Game {
             ],
             misc: [st.zenith[0], st.zenith[1], st.zenith[2], 0.0],
             rt: [if self.cfg.video.rays { 1.0 } else { 0.0 }, self.cfg.video.quality, rt_ids.static_n as f32, st.wet.max(wx_wet)],
+            // AO probe count follows quality: four is the full set, two is
+            // enough to keep contact shadows readable, and the probes are
+            // whole rays so halving them is a real saving rather than a
+            // shorter version of the same work.
+            ray2: [
+                self.cfg.video.ray_dist,
+                if self.cfg.video.quality < 0.55 { 2.0 } else { 4.0 },
+                0.0,
+                0.0,
+            ],
             pcount: [self.world.portals.len().min(8) as f32, 0.0, 0.0, 0.0],
             portals: {
                 // up to four portals for the marcher; pairs are adjacent, so

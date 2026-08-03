@@ -2726,6 +2726,87 @@ pub fn run(args: &[String]) {
             );
         }
 
+        // ---- WHAT THE RAY-DISTANCE DIAL BUYS ----
+        // A slider without a known cost curve is guesswork for whoever uses
+        // it. The marcher's cost is candidates x steps and steps scale with
+        // how far a ray may travel, so shortening rays should save close to
+        // linearly — this measures it rather than assuming.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            println!();
+            println!("{:>10} {:>12} {:>10} {:>10}", "ray dist", "evaluations", "vs full", "reach");
+            let mut base = 0u64;
+            for dist in [1.6f32, 1.0, 0.6, 0.25] {
+                let tmax = 260.0 * dist;
+                let mut evals = 0u64;
+                for k in 0..500 {
+                    let a = k as f32 * 0.7548;
+                    let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.08 - 0.3, a.sin()).normalize();
+                    let mut cand: Vec<(f32, f32, usize)> = shapes
+                        .iter()
+                        .filter_map(|(c, r, i)| {
+                            let to = *c - eye;
+                            let b = to.dot(dir);
+                            let disc = b * b - (to.length_squared() - r * r);
+                            if disc < 0.0 {
+                                return None;
+                            }
+                            let sq = disc.sqrt();
+                            ((b + sq) > 0.0 && (b - sq) < tmax).then_some((b - sq, b + sq, *i))
+                        })
+                        .collect();
+                    cand.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    cand.truncate(16);
+                    let mut t = 0.1f32;
+                    let mut first = 0usize;
+                    // the dial scales the STEP budget too — mirroring the
+                    // shader, because distance alone barely saved anything
+                    let budget = ((38.0 * dist).max(6.0)) as i32;
+                    for _ in 0..budget {
+                        let p = eye + dir * t;
+                        let mut d = p.y - w.ground_h(p.x, p.z);
+                        while first < cand.len() && cand[first].1 <= t {
+                            first += 1;
+                        }
+                        for (_, _, i) in cand[first..].iter() {
+                            let sh = &w.shapes[*i];
+                            let bd = p.distance(sh.pos) - crate::shape_bound(&sh.sdf).max(0.5);
+                            if bd >= d + 0.25 {
+                                continue;
+                            }
+                            evals += 1;
+                            d = d.min(w.shape_sdf_at(*i, p));
+                        }
+                        if d < 0.01 * t + 0.01 {
+                            break;
+                        }
+                        t += d.max(0.05) * 0.96;
+                        if t > tmax {
+                            break;
+                        }
+                    }
+                }
+                if base == 0 {
+                    base = evals;
+                }
+                println!(
+                    "{:>10.2} {:>12} {:>9.0}% {:>9.0}m",
+                    dist,
+                    evals,
+                    evals as f32 / base as f32 * 100.0,
+                    tmax
+                );
+            }
+        }
+
         // ---- ALL THREE RAY SYSTEMS ----
         // A fragment pays for a shadow ray, four AO probes and a reflection.
         // Optimising only the reflection optimises part of the bill, so

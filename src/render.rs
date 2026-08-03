@@ -25,6 +25,8 @@ pub struct Globals {
     pub fog: [f32; 4],
     pub misc: [f32; 4],
     pub rt: [f32; 4],   // x rays on, y quality, z spare, w ground wetness
+    /// x ray distance multiplier, y AO probe count, z spare, w spare
+    pub ray2: [f32; 4],
     pub hmap: [f32; 4], // x half extent, y texels
     pub gcol: [f32; 4], // rgb terrain base color, w rt shape count
     pub cine: [f32; 4], // x exposure, y vignette, z grain, w filmic
