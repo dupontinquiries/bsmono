@@ -54,7 +54,7 @@ starts hidden with the auto-login ordering rule.
 | ScrollAreas | pending |  |
 | SegmentedTabStrip | ported | nav_chrome.rs `TabStrip` — equal segments, underline, badge pills |
 | SettingsPage | partial | sub-tab table only; 4680-line page body pending |
-| SmartRibbon | pending |  |
+| SmartRibbon | ported | ribbon.rs — per-tab contextual actions, re-derived enablement, natural segments |
 | SnapComposerDialog | pending |  |
 | SnapExporter | pending |  |
 | SnapFeedWidget | ported | snaps.rs `SnapFeed` — sealed tiles, 2 columns, order as supplied |
