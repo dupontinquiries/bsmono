@@ -36,6 +36,7 @@ pub mod landmark;
 pub mod export_reminder;
 pub mod nav_chrome;
 pub mod ribbon;
+pub mod scroll_areas;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -155,6 +156,10 @@ pub struct Snapclone {
     pub export_requested: bool,
     /// Set when the user asks to retry failed sends; the host owns the retry.
     pub retry_requested: bool,
+    /// Scroll position of the background carousel, and whether its last wheel
+    /// event ran off the end and was handed to the page nav.
+    pub bg_carousel: crate::scroll_areas::HScroll,
+    pub carousel_handoff: bool,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -214,6 +219,8 @@ impl Snapclone {
             recent_snaps: Vec::new(),
             export_requested: false,
             retry_requested: false,
+            bg_carousel: crate::scroll_areas::HScroll::new(0.0, 400.0),
+            carousel_handoff: false,
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -748,14 +755,33 @@ impl Snapclone {
             ui.colored_label(c.warning, err);
         }
         ui.separator();
-        ui.horizontal_wrapped(|ui| {
-            ui.colored_label(c.text_weak, "background:");
-            for s in BgStyle::all() {
-                if ui.selectable_label(self.bg.style == s, s.as_str()).clicked() {
-                    self.bg.style = s;
+        // The background styles are a horizontal CAROUSEL, not a wrapped row:
+        // a wheel over it scrolls sideways, and at either end continued
+        // scrolling hands off to the page nav rather than dying silently.
+        ui.colored_label(c.text_weak, "background:");
+        let strip = egui::ScrollArea::horizontal().id_salt("bg_carousel").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for s in BgStyle::all() {
+                    if ui.selectable_label(self.bg.style == s, s.as_str()).clicked() {
+                        self.bg.style = s;
+                    }
+                }
+            });
+        });
+        let over = strip.inner_rect.contains(
+            ui.input(|i| i.pointer.hover_pos()).unwrap_or(egui::pos2(-1e6, -1e6)));
+        if over {
+            let (dx, dy) = ui.input(|i| (i.smooth_scroll_delta.x, i.smooth_scroll_delta.y));
+            if dx != 0.0 || dy != 0.0 {
+                let w = crate::scroll_areas::Wheel::pixels(dx, dy);
+                if self.bg_carousel.wheel(w) == crate::scroll_areas::Wheeled::PassThrough {
+                    // Clamped and still pushing: this is the handoff the Qt
+                    // comment describes — the carousel declines so the page
+                    // swipe can take it.
+                    self.carousel_handoff = true;
                 }
             }
-        });
+        }
     }
 
     /// Wayfinder: the group voice channel and the landmark tools. Was a dead
@@ -868,6 +894,32 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn the_background_carousel_scrolls_then_hands_off_at_its_end() {
+        // The Qt bug this reproduces the fix for: the carousel silently ate the
+        // wheel at its edge, so "keep scrolling to reach the next page" did
+        // nothing at all.
+        use crate::scroll_areas::{Wheel, Wheeled};
+        let mut s = app();
+        s.bg_carousel.value = 200.0;
+        assert_eq!(s.bg_carousel.wheel(Wheel::pixels(-50.0, 0.0)), Wheeled::Consumed);
+        // Run it to the end, then keep pushing.
+        for _ in 0..20 { s.bg_carousel.wheel(Wheel::pixels(-50.0, 0.0)); }
+        assert!(s.bg_carousel.at_max());
+        assert_eq!(s.bg_carousel.wheel(Wheel::pixels(-50.0, 0.0)), Wheeled::PassThrough);
+    }
+
+    #[test]
+    fn a_vertical_wheel_still_moves_the_carousel_sideways() {
+        // A default scroll area has no vertical range here, so the wheel would
+        // otherwise do nothing rather than the wrong thing.
+        use crate::scroll_areas::{Wheel, Wheeled};
+        let mut s = app();
+        s.bg_carousel.value = 200.0;
+        assert_eq!(s.bg_carousel.wheel(Wheel::degrees(0.0, 15.0)), Wheeled::Consumed);
+        assert_ne!(s.bg_carousel.value, 200.0);
     }
 
     #[test]
