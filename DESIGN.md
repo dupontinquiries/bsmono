@@ -3403,6 +3403,44 @@ Every procedural and assembled car is built on that loft, so all of them
 improved at once. `--sim shell` keeps the comparison against the target's own
 numbers.
 
+## v1.104.0 — character lines
+
+Last version matched the references' SMOOTHNESS. This one adds the other
+half of what makes them look designed, and measuring Dominus is what named
+it:
+
+    Dominus Paint   median 0.4 deg   p90 21.8 deg   10.4% of edges creased
+    Dominus Body    median 0.6 deg   p90 21.1 deg   10.4% creased
+    Octane  Paint   median 2.2 deg   p90 79.4 deg
+
+A car body is not a smooth blob. It is a smooth surface INTERRUPTED by a few
+hard lines, and roughly a tenth of the edges are those lines. Ours had
+essentially none: continuous everywhere, which reads as extruded.
+
+A loft with shared vertices can only ever be smooth, because every vertex
+normal is the average of the faces around it. So the ring is walked to find
+where the profile turns hardest and the vertices there are DUPLICATED, each
+copy taking the normal of its own side, which breaks the shading along a
+line running the length of the car.
+
+Two things had to be got right, and both were found by measuring rather than
+by looking:
+
+  * ONLY THE SHOULDER. Creasing every corner of a rounded section gave twice
+    the reference's crease fraction — but two of those corners are the floor
+    edge, and no car has a character line under the sills. A body creases
+    where the flank turns over into the roof; underneath it is a smooth tub.
+  * MORE SURFACE BETWEEN THE LINES. Crease fraction scales with
+    1/resolution: the same two lines are 10% of Dominus's edges and 18% of
+    ours purely because it carries 6,000-10,000 triangles in a body where we
+    had 884. At seven spline samples per control span we are at 1,508, and
+    15%.
+
+    our hull   median 1.3 deg   creased 15.0%   (refs 0.4-2.2 deg, 10.4%)
+
+`--sim shell` now fails in BOTH directions — faceted and soap are each
+wrong — so the shape of the reference is held, not just one number from it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

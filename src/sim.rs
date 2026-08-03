@@ -522,9 +522,40 @@ pub fn run(args: &[String]) {
             let mean = angs.iter().sum::<f32>() / angs.len() as f32;
             (tri, mean, angs[angs.len() / 2], angs[angs.len() * 9 / 10])
         };
-        println!("{:<20} {:>7} {:>8} {:>8} {:>8}", "surface", "tris", "mean", "median", "p90");
-        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4");
-        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE body  (ref)", 7858, "10.4", "2.0", "31.4");
+        // add the creased fraction: the references are ~10% of edges above
+        // 20 degrees, which is the difference between a designed body and an
+        // extruded one
+        let creased = |m: &crate::meshgen::MeshData| -> f32 {
+            let mut face: Vec<Vec3> = Vec::new();
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            // creases show up as edges whose two faces disagree, AND as
+            // boundary edges where the surface was split apart on purpose
+            let shared: Vec<&Vec<usize>> = edge.values().filter(|f| f.len() == 2).collect();
+            if shared.is_empty() {
+                return 0.0;
+            }
+            let hard = shared
+                .iter()
+                .filter(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees() > 20.0)
+                .count();
+            let split = edge.values().filter(|f| f.len() == 1).count();
+            (hard + split) as f32 / edge.len() as f32 * 100.0
+        };
+        println!("{:<20} {:>7} {:>8} {:>8} {:>8} {:>9}", "surface", "tris", "mean", "median", "p90", "creased");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8}", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4", "n/a");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS paint (ref)", 5995, "3.4", "0.4", "21.8", 10.4);
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS body  (ref)", 10102, "2.1", "0.6", "21.1", 10.4);
         let hull = crate::meshgen::loft(
             &[
                 (-0.77, 0.13, -0.035, 0.010, 0.95),
@@ -542,7 +573,7 @@ pub fn run(args: &[String]) {
             ("plain box", &crate::meshgen::boxx()),
         ] {
             let (t, mean, med, p90) = dihedral(m);
-            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d", nm, t, mean, med, p90);
+            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d {:>8.1}%", nm, t, mean, med, p90, creased(m));
             if nm == "our lofted hull" {
                 worst_median = med;
             }
@@ -557,8 +588,12 @@ pub fn run(args: &[String]) {
         // feature lines fall where the parts meet.
         println!("   a car body = one continuous shell + separate parts for the breaks:");
         println!("   OCTANE ships 4 body meshes (chassis, paint, body, window) + 8 wheel meshes");
-        let ok = worst_median <= 2.5;
-        println!("   our hull median {worst_median:.1}d against the target's 2.0-2.2d");
+        // Both halves have to hold: continuous enough to read as bodywork,
+        // creased enough to read as designed. Faceted (creases everywhere)
+        // and soap (no creases) both fail.
+        let hull_creased = creased(&hull);
+        let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
+        println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
         println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
         return;
     }
@@ -1492,9 +1527,40 @@ pub fn run(args: &[String]) {
             let mean = angs.iter().sum::<f32>() / angs.len() as f32;
             (tri, mean, angs[angs.len() / 2], angs[angs.len() * 9 / 10])
         };
-        println!("{:<20} {:>7} {:>8} {:>8} {:>8}", "surface", "tris", "mean", "median", "p90");
-        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4");
-        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE body  (ref)", 7858, "10.4", "2.0", "31.4");
+        // add the creased fraction: the references are ~10% of edges above
+        // 20 degrees, which is the difference between a designed body and an
+        // extruded one
+        let creased = |m: &crate::meshgen::MeshData| -> f32 {
+            let mut face: Vec<Vec3> = Vec::new();
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            // creases show up as edges whose two faces disagree, AND as
+            // boundary edges where the surface was split apart on purpose
+            let shared: Vec<&Vec<usize>> = edge.values().filter(|f| f.len() == 2).collect();
+            if shared.is_empty() {
+                return 0.0;
+            }
+            let hard = shared
+                .iter()
+                .filter(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees() > 20.0)
+                .count();
+            let split = edge.values().filter(|f| f.len() == 1).count();
+            (hard + split) as f32 / edge.len() as f32 * 100.0
+        };
+        println!("{:<20} {:>7} {:>8} {:>8} {:>8} {:>9}", "surface", "tris", "mean", "median", "p90", "creased");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8}", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4", "n/a");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS paint (ref)", 5995, "3.4", "0.4", "21.8", 10.4);
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d {:>8.1}%", "DOMINUS body  (ref)", 10102, "2.1", "0.6", "21.1", 10.4);
         let hull = crate::meshgen::loft(
             &[
                 (-0.77, 0.13, -0.035, 0.010, 0.95),
@@ -1512,7 +1578,7 @@ pub fn run(args: &[String]) {
             ("plain box", &crate::meshgen::boxx()),
         ] {
             let (t, mean, med, p90) = dihedral(m);
-            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d", nm, t, mean, med, p90);
+            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d {:>8.1}%", nm, t, mean, med, p90, creased(m));
             if nm == "our lofted hull" {
                 worst_median = med;
             }
@@ -1527,8 +1593,12 @@ pub fn run(args: &[String]) {
         // feature lines fall where the parts meet.
         println!("   a car body = one continuous shell + separate parts for the breaks:");
         println!("   OCTANE ships 4 body meshes (chassis, paint, body, window) + 8 wheel meshes");
-        let ok = worst_median <= 2.5;
-        println!("   our hull median {worst_median:.1}d against the target's 2.0-2.2d");
+        // Both halves have to hold: continuous enough to read as bodywork,
+        // creased enough to read as designed. Faceted (creases everywhere)
+        // and soap (no creases) both fail.
+        let hull_creased = creased(&hull);
+        let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
+        println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
         println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
         return;
     }
