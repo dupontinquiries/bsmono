@@ -48,3 +48,42 @@ the `decode tile = N (kernel ...)` line names the winner.
 That would make the first honest measurement of the 6–10× decode gap possible — every previous number
 was taken with the two candidate kernels excluded, one by a broken fixture and one by never being in
 the candidate list.
+
+
+---
+
+# Three probes shared the poisoned packer, not one
+
+Sweeping for everything that packs weights and then judges a result found two more:
+
+| probe | decides | failure mode |
+|---|---|---|
+| `self_check_sg` | whether the subgroup matvec is usable | **loud** — prints "subgroup decode kernel DISABLED" |
+| `probe_valid_gemm_tiles` | which GEMM tiles enter the autotune | **silent** — a smaller candidate set still works, just slower |
+| `probe_expert_compute` | the MoE expert compute path | quiet |
+
+All three pack through `QUANT_PACK` or `Q4K_TO_Q4`, both of which wrote bytes with a lane-varying
+shift until `_526`.
+
+**The GEMM tile one is the worst of the three**, because it fails without saying so. A tile that
+produced a "wrong" answer over corrupt weights was dropped from the candidate set, the autotune chose
+from what remained, and the log reports a tile as though the search had been complete. That is the
+same structure as `V3` being absent from the decode candidate list — *an autotune result reads as
+evidence, and it is only evidence about its candidate list.*
+
+It also means the prefill measurement is suspect from the other end. Prefill runs the register-blocked
+GEMM at a tile the autotune picked, and on this driver that pick came from a set that may have been
+pruned by corrupt fixtures. The **4% of device bandwidth** figure in `prefill-q4-gap.md` was measured
+under that condition.
+
+## What one load now re-decides
+
+All three probes run at load and all three are now fed correctly packed weights. So the next run
+re-answers, for free:
+
+* whether the subgroup kernel is usable (loud, in the preflight line);
+* which GEMM tiles are valid (silent — visible only as a different tile in `per-shape autotune`);
+* and what the expert compute probe concludes.
+
+None of that required new code. It required the fixtures to stop lying, which took finding one
+misbehaving shift.
