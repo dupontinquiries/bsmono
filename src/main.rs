@@ -16,6 +16,7 @@ mod fx;
 mod gamepad;
 mod gyro;
 mod content;
+mod cyber;
 mod custom;
 mod partcars;
 mod partdata;
