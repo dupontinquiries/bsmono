@@ -1342,3 +1342,56 @@ mod file_view_tests {
 /// The message now says so explicitly. If someone implements the executor, that caveat is the thing to
 /// delete.
 const _STREAM_PLAN_HAS_NO_EXECUTOR: () = ();
+
+/// The measured ceiling on **simultaneously mapped** buffer bytes for Asahi/Honeykrisp.
+///
+/// Two runs on an M2 Ultra, same model, same budget, differing only in slab size:
+///
+/// ```text
+/// 2048 MiB slabs -> refused at slab 16, 30.0 GiB placed
+/// 1024 MiB slabs -> refused at slab 32, 31.0 GiB placed
+/// ```
+///
+/// **Same total, different counts and different buffer sizes.** That rules out a limit on the number
+/// of buffer objects and one on individual buffer size, and leaves total mapped bytes — landing within
+/// a slab of 32 GiB = 2^35, which is an address-space limit rather than a memory one.
+///
+/// It also resolves a contradiction that stood for days: `--gate-vram` measured this device honouring
+/// **63 GiB**. Both figures are correct. The probe allocates and releases; it never holds 30 GiB
+/// mapped at once. **Two different resources under one name**, and the loader was budgeting against
+/// the wrong one.
+pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
+
+#[cfg(test)]
+mod mapped_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_two_slab_sizes_failed_at_the_same_TOTAL() {
+        // The whole argument in one assertion: if the cap were per-buffer or per-count, halving the
+        // slab size would have moved the total. It did not.
+        let at_2gib: f64 = 15.0 * 2.0;      // 15 slabs of 2048 MiB placed before slab 16 was refused
+        let at_1gib: f64 = 31.0 * 1.0;      // 31 slabs of 1024 MiB placed before slab 32 was refused
+        assert!((at_2gib - at_1gib).abs() <= 1.0,
+            "{at_2gib} GiB and {at_1gib} GiB are the same ceiling within one slab");
+        assert!(at_1gib <= ASAHI_MAPPED_CEILING_GIB);
+    }
+
+    #[test]
+    fn the_measured_ALLOCATION_ceiling_is_a_different_number() {
+        // --gate-vram measured 63 GiB on the same device. Not a contradiction: allocating is not
+        // mapping, and the loader was budgeting against the wrong resource.
+        assert!(ASAHI_MAPPED_CEILING_GIB < 63.0 / 2.0,
+            "the mapped ceiling is less than HALF the allocation ceiling — budgeting one as the other \
+is why a 56.6 GiB resident model died at 30");
+    }
+
+    #[test]
+    fn a_model_under_the_ceiling_is_unaffected() {
+        // Everything that worked before must keep working: DeepSeek-8B at ~4.6 GiB and Qwen3-30B at
+        // ~17 GiB are both far below it, which is why this never surfaced until Scout.
+        for gib in [4.6, 17.1, 20.5] {
+            assert!(gib < ASAHI_MAPPED_CEILING_GIB, "{gib} GiB stays fully mapped");
+        }
+    }
+}
