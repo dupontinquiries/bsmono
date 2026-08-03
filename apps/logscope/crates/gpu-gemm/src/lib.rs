@@ -10492,6 +10492,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     /// `byte_at` with the shared word staged through workgroup memory — the lane-broadcast workaround.
+    /// `byte_at` via `extractBits` — same shared read, different extraction.
+    pub fn byte_probe_extract(&self, raw: &[u8]) -> Vec<f32> {
+        self.byte_probe_with(raw, BYTE_PROBE_EXTRACT)
+    }
+
     pub fn byte_probe_staged(&self, raw: &[u8]) -> Vec<f32> {
         self.byte_probe_with(raw, BYTE_PROBE_STAGED)
     }
@@ -13227,6 +13232,49 @@ pub fn watchdog_prone_name(adapter: &str) -> bool {
 ///
 /// It costs a barrier and a small threadgroup array per workgroup. On a latency-bound decode that is
 /// cheap; on this driver it is the difference between a correct kernel and a silent one.
+/// `byte_at` using `extractBits` instead of shift-and-mask.
+///
+/// ## What the evidence actually says
+///
+/// Three variants fail identically — plain, vec4, and workgroup-staged — and `word_probe`
+/// (`dst[i] = src[i]`) is correct for all 64. The staged form ruled out a shared read: it loads each
+/// word once from a distinct thread, barriers, then reads workgroup memory, and still returns one lane
+/// in four.
+///
+/// So the shared read was never the fault. What every failing variant has and `word_probe` does not is
+/// a **dynamic shift derived from the invocation id**:
+///
+/// ```wgsl
+/// (w >> ((i & 3u) * 8u)) & 0xFFu
+/// ```
+///
+/// Lanes 0..3 shift by 0, 8, 16, 24 — and correctness follows the lane that shifts by ZERO. A shift
+/// by a non-uniform amount appears to yield zero on this driver.
+///
+/// ## The corroboration that was already in the tree
+///
+/// `MATVEC_Q4` unpacks its nibbles with `extractBits(word, (kk%8u)*4u, 4u)` and the comment beside it
+/// reads "AGX-safe dynamic offset". Someone hit this before, worked around it, and recorded the
+/// workaround without naming the fault — which is why the kernels that work, work.
+///
+/// If this variant is correct where the others fail, the rule is mechanical: **no shift by a
+/// lane-varying amount; use `extractBits`.** That is a grep away in every dequantizer.
+pub const BYTE_PROBE_EXTRACT: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    let w = src[i >> 2u];
+    // Same shared read as the failing version, same byte selected — only the EXTRACTION differs.
+    // If this is correct, the shared read was never the problem and the dynamic shift was.
+    dst[i] = f32(extractBits(w, (i & 3u) * 8u, 8u));
+}
+"#;
+
 pub const BYTE_PROBE_STAGED: &str = r#"
 @group(0) @binding(0) var<storage, read> src: array<u32>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
