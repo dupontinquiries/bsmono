@@ -9,6 +9,7 @@ use sim_power::Case;
 const CASES: [&str; 6] = ["case9", "case14", "case30", "case57", "case118", "case300"];
 
 fn main() {
+    materials();
     let root = std::env::args().nth(1).unwrap_or_else(|| "fixtures".into());
     println!("simscope — L0 power flow against pandapower\n");
     println!(
@@ -274,4 +275,51 @@ fn l3() -> usize {
     );
     println!("\nL3: {}", if failures == 0 { "PASS" } else { "FAIL" });
     failures
+}
+
+
+/// The materials table. Printed first because every layer below now draws from it, and because the
+/// soft-property column is the thing a reader should see before trusting anything downstream.
+fn materials() {
+    use sim_mat::{library, Class};
+    println!("simscope — materials\n");
+    println!(
+        "  {:<28} {:>9} {:>8} {:>8} {:>10} {:>9}  {}",
+        "material", "rho", "E GPa", "k W/mK", "K_Ic MPa√m", "c m/s", "soft"
+    );
+    for m in library::all() {
+        let k = m.thermal.map(|t| t.k.value).unwrap_or(f64::NAN);
+        let kic = m.fracture.map(|f| f.k_ic.value / 1e6).unwrap_or(f64::NAN);
+        let soft = m.soft_properties();
+        let flag = if soft.is_empty() {
+            String::new()
+        } else {
+            format!("{} estimated", soft.len())
+        };
+        println!(
+            "  {:<28} {:>9.0} {:>8.0} {:>8.1} {:>10.2} {:>9.0}  {}",
+            m.name,
+            m.density.value,
+            m.elastic.e_inplane() / 1e9,
+            k,
+            kic,
+            m.wave_speed(),
+            flag
+        );
+    }
+    let n = library::nacre();
+    let a = library::aragonite();
+    println!(
+        "\n  nacre is {:.0}x tougher than the aragonite it is {}% made of, and none of that\n  \
+         toughness is in the constituents — it is interfacial. A continuum model using these\n  \
+         bulk constants will predict a stiff brittle ceramic, convincingly and wrongly.",
+        n.fracture.unwrap().k_ic.value / a.fracture.unwrap().k_ic.value,
+        95
+    );
+    for m in library::all().into_iter().filter(|m| m.class == Class::Biogenic) {
+        if let Some(c) = m.caveat {
+            println!("\n  {}: {}", m.name, c);
+        }
+    }
+    println!();
 }

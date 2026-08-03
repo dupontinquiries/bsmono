@@ -45,6 +45,21 @@ impl Stackup {
         Stackup { layers: vec![Layer { thickness: h, eps_r }], air_above: air, ground_top: true }
     }
 
+    /// A microstrip on a named material from `sim-mat`, using its **in-plane** permittivity.
+    ///
+    /// Which permittivity is the point. FR-4 is a woven composite and its in-plane and
+    /// through-plane values differ by about 10%; a microstrip's field runs mostly vertically
+    /// through the substrate, so through-plane is arguably the better choice, and the fact that
+    /// there is a choice at all is invisible when the number is a bare `4.4` in a struct literal.
+    /// Taking it from the material makes the assumption nameable.
+    pub fn from_material(h: f64, mat: &sim_mat::Material, air: f64) -> Result<Stackup, String> {
+        let e = mat.electrical.ok_or_else(|| format!("{} has no electrical data", mat.name))?;
+        let eps = e
+            .eps_r
+            .ok_or_else(|| format!("{} has no permittivity; it is not a dielectric", mat.name))?;
+        Ok(Stackup { layers: vec![Layer { thickness: h, eps_r: eps.value }], air_above: air, ground_top: true })
+    }
+
     /// A stripline: trace centred between two ground planes, fully embedded.
     pub fn stripline(b: f64, eps_r: f64) -> Stackup {
         Stackup {
@@ -303,6 +318,21 @@ mod tests {
             assert!(r.z0 < last, "Z0 rose with width: {} after {last}", r.z0);
             last = r.z0;
         }
+    }
+
+    #[test]
+    fn a_stackup_can_be_built_from_the_material_library() {
+        // The cross-layer join: L2 no longer carries its own idea of what FR-4 is.
+        let fr4 = sim_mat::library::fr4();
+        let stack = Stackup::from_material(0.2e-3, &fr4, 0.2e-3 * 12.0).unwrap();
+        let r = solve(&stack, &Trace { width: 0.38e-3, on_layer: 0 }, &MeshOpts::default()).unwrap();
+        assert!(r.z0 > 30.0 && r.z0 < 70.0, "FR-4 microstrip Z0 came out {:.1}", r.z0);
+        assert!(r.eps_eff > 1.0 && r.eps_eff < 4.4);
+
+        // A conductor is not a dielectric, and asking for its permittivity must fail rather than
+        // silently returning a default.
+        let cu = sim_mat::library::copper();
+        assert!(Stackup::from_material(1e-3, &cu, 0.0).is_err());
     }
 
     #[test]

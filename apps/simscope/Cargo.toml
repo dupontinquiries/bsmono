@@ -13,6 +13,7 @@ rust-version = "1.96"
 # dependency that reassociates sums would silently break reproducibility.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sim-mat = { path = "crates/sim-mat" }
 sim-num = { path = "crates/sim-num" }
 sim-power = { path = "crates/sim-power" }
 sim-field = { path = "crates/sim-field" }

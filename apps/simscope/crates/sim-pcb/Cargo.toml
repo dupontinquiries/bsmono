@@ -7,4 +7,5 @@ description = "Level 2: PCB stackups and cross-sections. Turns a board descripti
 
 [dependencies]
 sim-field.workspace = true
+sim-mat.workspace = true
 sim-num.workspace = true

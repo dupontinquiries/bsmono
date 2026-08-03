@@ -90,6 +90,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "sim-mat"
+version = "0.1.0"
+
+[[package]]
 name = "sim-num"
 version = "0.1.0"
 
@@ -98,6 +102,7 @@ name = "sim-pcb"
 version = "0.1.0"
 dependencies = [
  "sim-field",
+ "sim-mat",
  "sim-num",
 ]
 
@@ -107,6 +112,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "sim-mat",
  "sim-num",
 ]
 
@@ -121,6 +127,7 @@ dependencies = [
  "serde_json",
  "sim-field",
  "sim-litho",
+ "sim-mat",
  "sim-num",
  "sim-pcb",
  "sim-power",

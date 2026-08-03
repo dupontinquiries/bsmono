@@ -18,7 +18,8 @@ receiving them — which is why it is the right on-ramp from network analysis to
 
 | crate | layer | owns | status |
 |---|---|---|---|
-| `sim-num` | — | deterministic reductions, compensated arithmetic, f64 kernels, Newton | **built** |
+| `sim-num` | — | deterministic reductions, compensated arithmetic, f64 kernels, sparse+CG, FFT, Newton | **built** |
+| `sim-mat` | — | material properties with provenance; every layer draws from it | **built** |
 | `sim-power` | L0 | Ybus, polar Jacobian, AC power flow | **built** |
 | `sim-field` | L1 | 2D Laplace on triangles → C, L, Z0 per unit length | **built** |
 | `sim-pcb` | L2 | stackups, cross-sections → Z0, eps_eff, delay | **built** |
@@ -201,3 +202,61 @@ FFT is the one genuinely GPU-shaped workload in the stack.
 - **No aberrations.** Only defocus; Zernike terms are not implemented.
 - **Periodic-only masks.** `Mask::grating` now *asserts* whole-pixel periodicity rather than
   quietly aliasing, but a real layout needs padding and windowing.
+
+
+## Materials (`sim-mat`)
+
+Cross-cutting rather than a layer: it sits beside `sim-num` and everything depends on it. Before
+it, permittivity lived as a bare closure in `sim-field` and a bare field in `sim-pcb`, and neither
+knew anything about conductivity, stiffness or expansion. That works while a layer needs one
+property and fails the moment the same FR-4 needs ε for L2, k and α for a thermal solve, and E and
+ν for warp.
+
+**A property is not an `f64`.** It carries provenance, reported spread and a temperature window,
+and there is no `Default` and no way to build one without saying where it came from. Material data
+is where a fabricated number does the most damage: a coarse mesh shows up in a convergence study,
+but a modulus 30% off shows up nowhere — every solver downstream propagates it faithfully. Same
+rule as `cad-ref` refusing to invent a volume.
+
+**Anisotropy is first-class**, because the materials here are anisotropic in the way that breaks
+things. FR-4's through-plane CTE is ~5× its in-plane value, which is what cracks vias at reflow; a
+scalar α cannot express the failure mode.
+
+The validation worth having is **Wiedemann–Franz**: in a metal, heat and charge ride the same
+electrons, so `k/(σT)` must equal 2.44e-8. That is a cross-check between two *independently
+sourced* numbers, which no amount of internal consistency checking can substitute for. Copper and
+aluminium pass within 10%. Stainless 304 came out 60% high — and that is the law's domain, not a
+bad entry: in a disordered alloy the lattice carries a large share of the heat, so total `k`
+exceeds the electronic prediction. Asserting that excess is a stronger test than exempting the
+material.
+
+### Nacre, and why it is the least confident entry
+
+~95% aragonite by volume, yet **24× the fracture toughness** of the mineral it is made of, at
+comparable stiffness. None of that toughness is in the constituents — it comes from crack
+deflection at platelet boundaries, platelet pull-out, mineral bridges and viscoelastic dissipation
+in the organic matrix. All interfacial.
+
+Two consequences, both recorded in the library entry rather than left implicit:
+
+- **A bulk continuum model cannot produce it.** Feeding these constants to an elasticity solver
+  predicts a stiff brittle ceramic, convincingly. The toughness needs cohesive interfaces, and
+  `K_Ic` here should be read as a *target for* such a model rather than an input to one.
+- **Dry nacre is brittle.** The organic matrix's dissipation requires water. Any property without a
+  hydration state is misleading, and the published scatter is a factor of five.
+
+Effective properties for a microstructure are a solver output, not a lookup — homogenization on a
+representative volume element, structurally the same operation as capacitance extraction (apply
+unit loads, integrate energy, divide). `Provenance::Computed` exists for exactly those values so
+they are never confused with measured ones. Not implemented.
+
+### Materials debts
+
+- **No homogenization.** The RVE driver, periodic boundary conditions and the Voigt/Reuss bracket
+  test are the next piece, and the bracket is unusually strong: any effective modulus falling
+  outside those bounds is provably wrong with no reference data needed.
+- **No elasticity solver yet**, so stiffness data is stored and unused. 2D plane stress/strain on
+  triangles is the load-bearing dependency for fracture, impact and homogenization alike.
+- **No temperature dependence beyond resistivity.** `k`, `E` and `α` all vary and are stored as
+  single values with a validity window.
+- **Transverse isotropy only.** Full anisotropy is not modelled.
