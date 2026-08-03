@@ -6609,3 +6609,116 @@ mod landmark_weather_tests {
         assert!(sorted.windows(2).all(|w| w[1] - w[0] < 1.0), "contiguous, not scattered");
     }
 }
+
+/// Add a viewer's beacon — a lighthouse, lantern or lamp depending on the world.
+///
+/// Distinct from `add_landmark` on purpose. A worker gets a mechanism because it does work; a viewer
+/// gets a **signal**, because what it contributes is presence. Drawing a phone as a small mechanism
+/// would depict inference that never happens.
+///
+/// Three channels, three visible properties:
+///
+/// * `Lighthouse::height` — the tower, from capability. Stable across a session.
+/// * `Lighthouse::lamp` and `sweep` — the light, from link recency.
+/// * `Lighthouse::vines` — accretion on the structure, from silence.
+///
+/// The lamp is a separate mesh from the tower so **the light can fail while the tower stands**, which
+/// is the whole reason a viewer got three channels: a dark lamp on a tall clean tower says "good
+/// device, bad link", and one mesh could not say it.
+pub fn add_beacon(
+    s: &mut Scene,
+    lh: logscope::machinery::Lighthouse,
+    place: logscope::machinery::Placement,
+    tower: Color32,
+    lamp_lit: Color32,
+    accretion: Color32,
+) {
+    let base = v(place.pos[0], place.pos[1], place.pos[2]);
+    let k = place.scale * 0.55;               // a beacon is slighter than a worker's mechanism
+    let h = 2.2 * k * lh.height;
+
+    // The tower. Always drawn at full solidity: a viewer that is merely unreachable has not fallen
+    // down, and crumbling it would say the device was gone rather than quiet.
+    s.add(box_slab(v(base.x, base.y + h * 0.5, base.z), 0.18 * k, h * 0.5, 0.18 * k, tower),
+          Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+
+    // The lamp: separate, so the light fails independently of the structure. Amplitude carries
+    // brightness and speed carries the sweep — and sweep falls faster, so a marginal link LOOKS
+    // marginal before it looks dark.
+    if lh.lamp > 0.02 {
+        s.add(box_slab(v(base.x, base.y + h + 0.22 * k, base.z), 0.3 * k, 0.22 * k, 0.3 * k, lamp_lit),
+              Float { amp: 0.12 * k * lh.lamp, speed: 2.4 * lh.sweep, phase: 0.0, drift: 0.0 });
+    }
+
+    // Accretion: coral, soot, rust, creeper — whatever the skin calls it. Bands up the tower, more of
+    // them the longer the silence, so age is COUNTABLE rather than a shade.
+    let bands = (lh.vines * 5.0).round() as u32;
+    for i in 0..bands {
+        let y = base.y + h * (0.12 + 0.16 * i as f32);
+        s.add(box_slab(v(base.x, y, base.z), 0.23 * k, 0.05 * k, 0.23 * k, accretion),
+              Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+    }
+}
+
+#[cfg(test)]
+mod beacon_render_tests {
+    use super::*;
+    use logscope::machinery::{Lighthouse, placement};
+
+    fn built(lh: Lighthouse) -> Scene {
+        let mut s = Scene::new();
+        add_beacon(&mut s, lh, placement(20.0, 12.0),
+                   Color32::from_rgb(120, 120, 130), Color32::from_rgb(255, 230, 160),
+                   Color32::from_rgb(70, 110, 70));
+        s
+    }
+
+    #[test]
+    fn a_DARK_beacon_still_has_its_tower() {
+        // A viewer that is unreachable has not fallen down. Crumbling it would say the device was
+        // gone rather than quiet, and those are different facts.
+        let s = built(Lighthouse::of(10.0, 16.0, 60.0, 0.0));
+        assert_eq!(s.meshes.len(), 1, "tower only — no lamp, no accretion");
+    }
+
+    #[test]
+    fn the_LAMP_is_a_separate_mesh_from_the_tower() {
+        // So the light can fail while the tower stands — the whole reason a viewer got three
+        // channels. One mesh could not say "good device, bad link".
+        let lit = built(Lighthouse::of(10.0, 16.0, 0.0, 0.0)).meshes.len();
+        let dark = built(Lighthouse::of(10.0, 16.0, 60.0, 0.0)).meshes.len();
+        assert_eq!(lit, dark + 1);
+    }
+
+    #[test]
+    fn a_CAPABLE_device_builds_a_taller_tower_in_the_geometry() {
+        let top = |lh| built(lh).meshes.iter().flat_map(|m| m.verts.iter())
+            .map(|p| p.y).fold(f32::MIN, f32::max);
+        assert!(top(Lighthouse::of(20.0, 32.0, 0.0, 0.0)) > top(Lighthouse::of(2.0, 4.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn AGE_is_countable_rather_than_a_shade() {
+        // Bands accumulate, so "how long" can be read at a glance without comparing colours across
+        // the scene — which is exactly what a shade would require.
+        let fresh = built(Lighthouse::of(10.0, 16.0, 0.0, 0.0)).meshes.len();
+        let old = built(Lighthouse::of(10.0, 16.0, 0.0, 1e6)).meshes.len();
+        assert!(old > fresh + 3, "{old} vs {fresh}");
+    }
+
+    #[test]
+    fn a_marginal_link_SWEEPS_slower_than_a_good_one() {
+        // Sweep falls faster than brightness, so marginal looks marginal before it looks dark.
+        let speed = |since| built(Lighthouse::of(10.0, 16.0, since, 0.0))
+            .floats.iter().map(|f| f.speed).fold(0.0f32, f32::max);
+        assert!(speed(15.0) < speed(0.0) * 0.5, "{} vs {}", speed(15.0), speed(0.0));
+    }
+
+    #[test]
+    fn a_beacon_is_SLIGHTER_than_a_worker_mechanism() {
+        // A viewer contributes presence, not labour, and a beacon the size of a clocktower would
+        // claim otherwise.
+        let b = built(Lighthouse::of(10.0, 16.0, 0.0, 0.0));
+        assert!(b.meshes.len() < 20, "far fewer parts than a mechanism's 20");
+    }
+}
