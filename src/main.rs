@@ -31,6 +31,7 @@ mod sim;
 mod sound;
 mod touch;
 mod weapons;
+mod xform;
 mod world;
 
 use std::collections::{HashMap, HashSet};
@@ -428,6 +429,11 @@ struct RtIds {
 /// concept.
 struct Chassis {
     strip: Vec<usize>,
+    /// pose directory + the target length it was loaded at. The scale is
+    /// per pose (the whole strip shares one metres-per-source-unit, which
+    /// means different target lengths), so the morph has to reload with the
+    /// SAME numbers or the blend would rescale as it goes.
+    dirs: Vec<(PathBuf, f32)>,
     /// jets fly instead of driving: never grounded, lift and nose thrust
     flight: bool,
 }
@@ -455,12 +461,14 @@ struct Game {
     ball: Ball,
     cam: camera::Camera,
     cars: CarModels,
-    /// seconds left in a running transform; 0 when settled in a pose
-    xform_t: f32,
-    /// which end of the strip we are heading for (+1 robot, -1 vehicle)
-    xform_dir: i32,
-    /// where in the strip the current transform started
-    xform_from: usize,
+    /// the fold, as a state machine (see xform.rs)
+    xf: xform::Xform,
+    /// CPU-side strip vertices for the active chassis, so the fold can be
+    /// BLENDED rather than stepped. Only the active chassis is kept — the
+    /// whole roster would be ~130 MB of vertices resident for no reason.
+    morph: Option<xform::Morph>,
+    /// 0..1 health, which is what picks the fold's personality
+    health: f32,
     ball_model: model::Model,
     decor_model: model::Model,
     fx: fx::Fx,
@@ -1061,6 +1069,7 @@ fn main() {
             let label = bot.trim_start_matches("jet_").to_string();
             let cid = cars.chassis.len();
             let mut strip = Vec::new();
+            let mut dirs: Vec<(PathBuf, f32)> = Vec::new();
 
             // ONE SCALE FOR THE WHOLE STRIP.
             //
@@ -1085,6 +1094,7 @@ fn main() {
 
             for (k, pose) in poses.iter().enumerate() {
                 let target = 1.32 * raw_span(pose) / span0.max(1e-6);
+                dirs.push((pose.clone(), target));
                 let m = model::load(pose, &mut gpu, target);
                 let idx = cars.models.len();
                 strip.push(idx);
@@ -1102,7 +1112,7 @@ fn main() {
                 cars.xform.insert(idx, (cid, k));
             }
             println!("bots: {label} — {} poses{}", strip.len(), if flight { ", flight" } else { "" });
-            cars.chassis.push(Chassis { strip, flight });
+            cars.chassis.push(Chassis { strip, dirs, flight });
         }
     }
 
@@ -1150,9 +1160,9 @@ fn main() {
         ball,
         cam,
         cars,
-        xform_t: 0.0,
-        xform_dir: 1,
-        xform_from: 0,
+        xf: xform::Xform::new(),
+        morph: None,
+        health: 1.0,
         ball_model,
         decor_model,
         fx: fx::Fx::new(seed),
@@ -1678,47 +1688,104 @@ impl Game {
         if self.net.online() || self.mode != Mode::Play {
             return;
         }
-        let Some(&(cid, pos)) = self.cars.xform.get(&self.cars.active) else {
+        if self.cars.xform.get(&self.cars.active).is_none() {
             self.toastf("this chassis does not transform");
             return;
-        };
-        if self.xform_t > 0.0 {
-            return; // already folding
         }
-        let n = self.cars.chassis[cid].strip.len();
-        self.xform_dir = if pos * 2 < n { 1 } else { -1 };
-        self.xform_from = pos;
-        self.xform_t = XFORM_DUR;
+        if self.morph.is_none() {
+            self.build_morph();
+        }
+        if !self.xf.request(self.health) {
+            // denied rather than ignored: say which, because "nothing
+            // happened" is the worst feedback a button can give
+            if self.xf.locked() {
+                self.toastf("TRANSFORM LOCKED");
+            }
+            return;
+        }
     }
 
-    /// Step the running fold, swapping the body when the strip index changes.
+    /// Load the active chassis' strip vertices so the fold can blend.
+    ///
+    /// One parse per pose (~3 ms each measured), done on demand rather than
+    /// at startup, so a player who never transforms never pays for it.
+    fn build_morph(&mut self) {
+        let Some(&(cid, _)) = self.cars.xform.get(&self.cars.active) else { return };
+        let dirs = self.cars.chassis[cid].dirs.clone();
+        if dirs.len() < 2 {
+            return;
+        }
+        let mut poses: Vec<Vec<Vec<meshgen::Vertex>>> = Vec::new();
+        let mut idx: Vec<Vec<u32>> = Vec::new();
+        for (k, (d, target)) in dirs.iter().enumerate() {
+            let (raws, _) = model::load_raw(d, *target);
+            if k == 0 {
+                idx = raws.iter().map(|r| r.idx.clone()).collect();
+            }
+            poses.push(raws.into_iter().map(|r| r.verts).collect());
+        }
+        self.morph = xform::Morph::build(poses, idx);
+        if self.morph.is_none() {
+            // a strip whose poses disagree cannot be blended; stepping it is
+            // still better than blending garbage
+            self.toastf("strip mismatch — stepping");
+        }
+    }
+
+    /// Step the running fold    /// Step the running fold, swapping the body when the strip index changes.
     fn advance_xform(&mut self, dt: f32) {
-        if self.xform_t <= 0.0 {
+        self.xf.update(dt);
+        if self.xf.state != xform::State::Transforming {
             return;
         }
-        let Some(&(cid, pos)) = self.cars.xform.get(&self.cars.active) else {
-            self.xform_t = 0.0;
-            return;
-        };
-        self.xform_t = (self.xform_t - dt).max(0.0);
-        let n = self.cars.chassis[cid].strip.len();
-        let end = if self.xform_dir > 0 { n - 1 } else { 0 };
-        // eased so the fold starts and finishes gently rather than stepping
-        // at a constant rate through the strip
-        let raw = (1.0 - self.xform_t / XFORM_DUR).clamp(0.0, 1.0);
-        let f = raw * raw * (3.0 - 2.0 * raw);
-        let from = self.xform_from as f32;
-        let want = (from + (end as f32 - from) * f).round().clamp(0.0, (n - 1) as f32) as usize;
-        if want != pos {
-            let m = self.cars.chassis[cid].strip[want];
-            self.set_car_model(m);
+        let t = self.xf.eased();
+        let Some(&(cid, _)) = self.cars.xform.get(&self.cars.active) else { return };
+
+        // BLENDED PATH: rewrite the displayed model's meshes each frame, so
+        // the body moves continuously instead of snapping between poses.
+        if self.morph.is_some() {
+            let base = self.cars.chassis[cid].strip[0];
+            if self.cars.active != base {
+                self.set_car_model(base);
+            }
+            let ids: Vec<usize> =
+                self.cars.models[base].prims.iter().map(|p| p.mesh_id).collect();
+            if let Some(m) = &mut self.morph {
+                for (p, mesh_id) in ids.iter().enumerate().take(m.prims()) {
+                    let md = m.sample(p, t);
+                    self.gpu.replace_mesh(*mesh_id, &md);
+                    let _ = mesh_id;
+                }
+                // the hitbox tracks the blended body rather than jumping at
+                // pose boundaries
+                let h = m.half_at(t) * self.cfg.car.size;
+                self.car.half_w = h.x.max(0.12);
+                self.car.half_h = h.y.max(0.10);
+                self.car.half_len = h.z.max(0.10);
+            }
+        } else {
+            // FALLBACK: no morph built, step the strip as before
+            let n = self.cars.chassis[cid].strip.len();
+            let want = ((t * (n - 1) as f32).round() as usize).min(n - 1);
+            let mm = self.cars.chassis[cid].strip[want];
+            if mm != self.cars.active {
+                self.set_car_model(mm);
+            }
         }
-        if self.xform_t <= 0.0 {
-            let m = self.cars.chassis[cid].strip[end];
-            self.set_car_model(m);
-            self.save.car = m;
-            let nm = self.cars.names[m];
-            self.toastf(&format!("{nm}"));
+
+        self.car.robot = self.xf.is_robot();
+        if !self.car.robot {
+            self.cam.look_yaw = 0.0;
+            self.cam.look_pitch = 0.0;
+        }
+        // lift clear as the body grows, or a standing robot ends up buried
+        let d = self.world.sdf(self.car.pos);
+        if d < self.car.half_h {
+            self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
+        }
+        if self.xf.state == xform::State::Idle {
+            let nm = if self.xf.mode == xform::Mode::Robot { "ROBOT" } else { "VEHICLE" };
+            self.toastf(nm);
         }
     }
 
@@ -1750,7 +1817,10 @@ impl Game {
             .unwrap_or(0);
         let next = ((cur as i32 + dir).rem_euclid(n as i32)) as usize;
         let m = self.cars.cycle[next];
-        self.xform_t = 0.0; // cycling away abandons any fold in progress
+        // changing chassis abandons any fold AND its morph: the strip we
+        // had loaded belongs to a body we are no longer wearing
+        self.xf = xform::Xform::new();
+        self.morph = None;
         self.set_car_model(m);
         self.save.car = m;
         self.toastf(&format!("{} ({}/{})", self.cars.names[m], next + 1, n));
