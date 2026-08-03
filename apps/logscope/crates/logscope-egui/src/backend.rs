@@ -725,7 +725,28 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 &self.gpu.adapter_name, self.model.decode_class(),
                 self.model.residency_class());
             if prof.record(&tkey, v.clone()) {
-                gpu_kernels::store::fast_ab_put(&key, decision);
+                // MARGIN BEFORE PERSISTING. The A/B measures two timings and picks the faster, and
+                // "faster" over a short sample includes noise — a verdict written from a 2% win gets
+                // cached and applied to every later run on this GPU and decode class.
+                //
+                // dwell::Verdict answers whether the win pays for taking it. There is no dwell here
+                // because this decides once per model load rather than continuously; the margin is
+                // the half that applies, and it is the half that stops a coin-flip becoming a
+                // persisted policy.
+                //
+                // Scores are inverted from times: the levers "win" by being FASTER, so the challenger
+                // score is off_ms and the incumbent is on_ms when decision is true.
+                let (incumbent_ms, challenger_ms) = if decision { (off * 1000.0, on * 1000.0) }
+                                                    else { (on * 1000.0, off * 1000.0) };
+                let mut d = logscope::dwell::Dwelling::new(
+                    std::time::Duration::from_secs(0), logscope::dwell::DEFAULT_MARGIN);
+                let verdict = d.consider(1.0 / incumbent_ms.max(1e-6),
+                                         1.0 / challenger_ms.max(1e-6), false);
+                if verdict.switches() {
+                    gpu_kernels::store::fast_ab_put(&key, decision);
+                } else {
+                    eprintln!("wgpu-engine: A/B verdict NOT persisted — {}", verdict.explain());
+                }
                 if let Err(e) = prof.save(&prof_path) { eprintln!("wgpu-engine: tuning profile not saved: {e}"); }
                 eprintln!("wgpu-engine: fast-decode A/B — {} by {:+.0}% ({:.1} vs {:.1} ms/tok), cached for [{}]",
                     if decision { "ON" } else { "off" }, v.margin() * 100.0,
