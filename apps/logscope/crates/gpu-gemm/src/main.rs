@@ -3967,6 +3967,21 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
                 println!("      gpu scale {:.9} implies amax {:.9}", gs[0], gs[0] * 7.0);
                 println!("      cpu scale {:.9} implies amax {:.9}", cs[0], cs[0] * 7.0);
                 println!("      first 4 dequantized weights: {:?}", &blk0[..4.min(blk0.len())]);
+            // WHICH ELEMENT CARRIES THE AMAX, on each side.
+            //
+            // The contradiction to resolve: "GPU dequant == CPU dequant, 0 differing" over the whole
+            // tensor, yet the max over 32 of those values disagrees. Both cannot be true of the SAME
+            // 32 values — so the converter is probably reducing over a different set than this test
+            // compares, and an indexing difference would produce exactly this: matching weights,
+            // matching nibbles, mismatched per-block scales.
+            let (ai, av) = blk0.iter().enumerate()
+                .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap()).unwrap();
+            println!("      cpu amax is element {ai} of block 0, value {av:.9}");
+            let want = gs[0] * 7.0;
+            let near = f32ref.iter().enumerate()
+                .filter(|(_, v)| (v.abs() - want).abs() < 1e-5)
+                .map(|(i, v)| (i, *v)).take(4).collect::<Vec<_>>();
+            println!("      elements anywhere in the tensor matching the GPU's implied amax: {near:?}");
             }
             let sdiff = gs.iter().zip(cs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             ck(&format!("block scales identical: max|diff|={sdiff:.3e}"), sdiff == 0.0);
