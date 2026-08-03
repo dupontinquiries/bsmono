@@ -10491,6 +10491,11 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         self.byte_probe_with(&vec![0u8; n], ID_PROBE)
     }
 
+    /// `byte_at` with the shared word staged through workgroup memory — the lane-broadcast workaround.
+    pub fn byte_probe_staged(&self, raw: &[u8]) -> Vec<f32> {
+        self.byte_probe_with(raw, BYTE_PROBE_STAGED)
+    }
+
     pub fn byte_probe_vec4(&self, raw: &[u8]) -> Vec<f32> {
         self.byte_probe_with(raw, BYTE_PROBE_VEC4)
     }
@@ -13201,6 +13206,51 @@ pub fn watchdog_prone_name(adapter: &str) -> bool {
 /// cause and the fix is mechanical: every `array<u32>` storage binding becomes `array<vec4<u32>>`
 /// with the component selected by hand. If BOTH fail, the stride theory is wrong and the fault is
 /// elsewhere — which is why this ships as a probe rather than as a rewrite of every kernel.
+/// `byte_at` with the shared word STAGED through workgroup memory instead of read by four threads.
+///
+/// ## The fault this works around
+///
+/// On Honeykrisp/Asahi, `word_probe` (`dst[i] = src[i]`, every thread a distinct index) is correct for
+/// all 64 words, while `byte_at` (`src[i >> 2]`, four consecutive threads reading ONE word) returns
+/// the value to one lane and zero to the other three. Distinct reads work; a shared read does not.
+///
+/// That is a lane-broadcast fault, not a binding, layout, upload or index problem — each of those was
+/// tested and cleared. And it explains the rest of the board at once: Q4_K and Q6_K dequantization
+/// have every thread in a block read the same scale bytes, and a subgroup reduction is shared-value by
+/// definition, which is why the subgroup matvec is wrong here and disabled.
+///
+/// ## The shape of the fix
+///
+/// One thread reads each distinct word into workgroup memory, a barrier, then every thread reads from
+/// there. The broadcast becomes explicit instead of relying on the compiler to scalarize a uniform
+/// load — which is the operation that is failing.
+///
+/// It costs a barrier and a small threadgroup array per workgroup. On a latency-bound decode that is
+/// cheap; on this driver it is the difference between a correct kernel and a silent one.
+pub const BYTE_PROBE_STAGED: &str = r#"
+@group(0) @binding(0) var<storage, read> src: array<u32>;
+@group(0) @binding(1) var<storage, read_write> dst: array<f32>;
+@group(0) @binding(2) var<uniform> dims: vec4<u32>;
+
+// One slot per word this workgroup needs: 64 threads cover 64 bytes = 16 words.
+var<workgroup> staged: array<u32, 16>;
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>,
+        @builtin(local_invocation_id) l:vec3<u32>) {
+    // EXACTLY ONE thread loads each word — every load is a distinct index, which is the access
+    // pattern that works.
+    if (l.x < 16u) { staged[l.x] = src[l.x]; }
+    workgroupBarrier();
+
+    let i = g.x;
+    if (i >= dims.x) { return; }
+    // Now the shared read is from workgroup memory, where the broadcast is explicit.
+    let w = staged[(i >> 2u) & 15u];
+    dst[i] = f32((w >> ((i & 3u) * 8u)) & 0xFFu);
+}
+"#;
+
 pub const BYTE_PROBE_VEC4: &str = r#"
 @group(0) @binding(0) var<storage, read> src: array<vec4<u32>>;
 @group(0) @binding(1) var<storage, read_write> dst: array<f32>;
