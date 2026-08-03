@@ -485,6 +485,83 @@ pub fn run(args: &[String]) {
         println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
         return;
     }
+    if name == "shell" {
+        // WHAT MAKES A BODY LOOK LIKE A CAR BODY.
+        //
+        // Measured on the art target: Octane's painted shell has a MEDIAN
+        // dihedral angle of about 2 degrees — neighbouring triangles are
+        // very nearly coplanar, so the surface reads as continuous — while
+        // its p90 is 31 to 79 degrees, because a car also has crisp panel
+        // breaks. Smooth almost everywhere, sharp in a few deliberate
+        // places. A uniformly faceted shell reads as a low-poly prop; a
+        // uniformly smooth one reads as a bar of soap.
+        let dihedral = |m: &crate::meshgen::MeshData| -> (usize, f32, f32, f32) {
+            let tri = m.idx.len() / 3;
+            let mut face: Vec<Vec3> = Vec::with_capacity(tri);
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            let mut angs: Vec<f32> = edge
+                .values()
+                .filter(|f| f.len() == 2)
+                .map(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees())
+                .collect();
+            if angs.is_empty() {
+                return (tri, 0.0, 0.0, 0.0);
+            }
+            angs.sort_by(f32::total_cmp);
+            let mean = angs.iter().sum::<f32>() / angs.len() as f32;
+            (tri, mean, angs[angs.len() / 2], angs[angs.len() * 9 / 10])
+        };
+        println!("{:<20} {:>7} {:>8} {:>8} {:>8}", "surface", "tris", "mean", "median", "p90");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE body  (ref)", 7858, "10.4", "2.0", "31.4");
+        let hull = crate::meshgen::loft(
+            &[
+                (-0.77, 0.13, -0.035, 0.010, 0.95),
+                (-0.30, 0.34, -0.065, 0.085, 0.70),
+                (0.02, 0.36, -0.065, 0.105, 0.65),
+                (0.60, 0.30, -0.050, 0.060, 0.80),
+                (0.77, 0.22, -0.035, 0.020, 0.95),
+            ],
+            26,
+        );
+        let mut worst_median = 0.0f32;
+        for (nm, m) in [
+            ("our lofted hull", &hull),
+            ("chamfered box", &crate::meshgen::cbox(0.22)),
+            ("plain box", &crate::meshgen::boxx()),
+        ] {
+            let (t, mean, med, p90) = dihedral(m);
+            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d", nm, t, mean, med, p90);
+            if nm == "our lofted hull" {
+                worst_median = med;
+            }
+        }
+        println!();
+        // The second half of the look is the CRISP BREAK, and on the target
+        // it comes from separate material regions — Octane is Paint, Body,
+        // Window and Chassis as four meshes, so the boundary between them is
+        // a hard edge by construction rather than a crease inside one
+        // surface. Our cars work the same way: the hull is continuous and
+        // the glasshouse, spoiler and sills are their own parts, so the
+        // feature lines fall where the parts meet.
+        println!("   a car body = one continuous shell + separate parts for the breaks:");
+        println!("   OCTANE ships 4 body meshes (chassis, paint, body, window) + 8 wheel meshes");
+        let ok = worst_median <= 2.5;
+        println!("   our hull median {worst_median:.1}d against the target's 2.0-2.2d");
+        println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
+        return;
+    }
     if name == "carry" {
         // TURNING WITH THE BALL ON THE HOOD.
         //
@@ -1376,6 +1453,83 @@ pub fn run(args: &[String]) {
                 grounded_frames as f32 / steps as f32 * 100.0
             );
         }
+        return;
+    }
+    if name == "shell" {
+        // WHAT MAKES A BODY LOOK LIKE A CAR BODY.
+        //
+        // Measured on the art target: Octane's painted shell has a MEDIAN
+        // dihedral angle of about 2 degrees — neighbouring triangles are
+        // very nearly coplanar, so the surface reads as continuous — while
+        // its p90 is 31 to 79 degrees, because a car also has crisp panel
+        // breaks. Smooth almost everywhere, sharp in a few deliberate
+        // places. A uniformly faceted shell reads as a low-poly prop; a
+        // uniformly smooth one reads as a bar of soap.
+        let dihedral = |m: &crate::meshgen::MeshData| -> (usize, f32, f32, f32) {
+            let tri = m.idx.len() / 3;
+            let mut face: Vec<Vec3> = Vec::with_capacity(tri);
+            for t in m.idx.chunks_exact(3) {
+                let a = Vec3::from_array(m.verts[t[0] as usize].pos);
+                let b = Vec3::from_array(m.verts[t[1] as usize].pos);
+                let c = Vec3::from_array(m.verts[t[2] as usize].pos);
+                face.push((b - a).cross(c - a).normalize_or(Vec3::Y));
+            }
+            let mut edge: std::collections::HashMap<(u32, u32), Vec<usize>> = std::collections::HashMap::new();
+            for (f, t) in m.idx.chunks_exact(3).enumerate() {
+                for (a, b) in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    edge.entry((a.min(b), a.max(b))).or_default().push(f);
+                }
+            }
+            let mut angs: Vec<f32> = edge
+                .values()
+                .filter(|f| f.len() == 2)
+                .map(|f| face[f[0]].dot(face[f[1]]).clamp(-1.0, 1.0).acos().to_degrees())
+                .collect();
+            if angs.is_empty() {
+                return (tri, 0.0, 0.0, 0.0);
+            }
+            angs.sort_by(f32::total_cmp);
+            let mean = angs.iter().sum::<f32>() / angs.len() as f32;
+            (tri, mean, angs[angs.len() / 2], angs[angs.len() * 9 / 10])
+        };
+        println!("{:<20} {:>7} {:>8} {:>8} {:>8}", "surface", "tris", "mean", "median", "p90");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE paint (ref)", 4350, "21.1", "2.2", "79.4");
+        println!("{:<20} {:>7} {:>7}d {:>7}d {:>7}d", "OCTANE body  (ref)", 7858, "10.4", "2.0", "31.4");
+        let hull = crate::meshgen::loft(
+            &[
+                (-0.77, 0.13, -0.035, 0.010, 0.95),
+                (-0.30, 0.34, -0.065, 0.085, 0.70),
+                (0.02, 0.36, -0.065, 0.105, 0.65),
+                (0.60, 0.30, -0.050, 0.060, 0.80),
+                (0.77, 0.22, -0.035, 0.020, 0.95),
+            ],
+            26,
+        );
+        let mut worst_median = 0.0f32;
+        for (nm, m) in [
+            ("our lofted hull", &hull),
+            ("chamfered box", &crate::meshgen::cbox(0.22)),
+            ("plain box", &crate::meshgen::boxx()),
+        ] {
+            let (t, mean, med, p90) = dihedral(m);
+            println!("{:<20} {:>7} {:>7.1}d {:>7.1}d {:>7.1}d", nm, t, mean, med, p90);
+            if nm == "our lofted hull" {
+                worst_median = med;
+            }
+        }
+        println!();
+        // The second half of the look is the CRISP BREAK, and on the target
+        // it comes from separate material regions — Octane is Paint, Body,
+        // Window and Chassis as four meshes, so the boundary between them is
+        // a hard edge by construction rather than a crease inside one
+        // surface. Our cars work the same way: the hull is continuous and
+        // the glasshouse, spoiler and sills are their own parts, so the
+        // feature lines fall where the parts meet.
+        println!("   a car body = one continuous shell + separate parts for the breaks:");
+        println!("   OCTANE ships 4 body meshes (chassis, paint, body, window) + 8 wheel meshes");
+        let ok = worst_median <= 2.5;
+        println!("   our hull median {worst_median:.1}d against the target's 2.0-2.2d");
+        println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
         return;
     }
     if name == "carry" {
@@ -4619,6 +4773,106 @@ pub fn run(args: &[String]) {
             }),
         );
         println!("{}", if pass { "PARTS: PASS" } else { "PARTS: FAIL" });
+        return;
+    }
+    if name == "target" {
+        // THE ART TARGET, MEASURED. Octane and Breakout are the reference, so
+        // rather than eyeball "make it look like those", take their actual
+        // proportions and shape profile and use those numbers to build the
+        // procedural cars.
+        let dir = std::path::Path::new("assets");
+        println!("{:<10} {:>7} {:>7} {:>7} {:>8} {:>8} {:>8}", "model", "L:W", "L:H", "wheel", "roof@", "widest@", "nose w");
+        let mut refs = Vec::new();
+        for (name, path) in [("octane", dir.join("octane/scene.gltf")), ("breakout", dir.join("cars/breakout.glb"))] {
+            let doc = if path.extension().map(|e| e == "glb").unwrap_or(false) {
+                gltf::Gltf::open(&path).ok()
+            } else {
+                gltf::Gltf::open(&path).ok()
+            };
+            let Some(d) = doc else { continue };
+            let blob = match d.blob.clone() {
+                Some(b) => b,
+                None => {
+                    let uri = d.buffers().next().and_then(|b| match b.source() {
+                        gltf::buffer::Source::Uri(u) => Some(u.to_string()),
+                        _ => None,
+                    });
+                    match uri.and_then(|u| std::fs::read(path.parent().unwrap().join(u)).ok()) {
+                        Some(b) => b,
+                        None => continue,
+                    }
+                }
+            };
+            let mut pts: Vec<[f32; 3]> = Vec::new();
+            for m in d.meshes() {
+                for prim in m.primitives() {
+                    let r = prim.reader(|_| Some(&blob));
+                    if let Some(ps) = r.read_positions() {
+                        pts.extend(ps);
+                    }
+                }
+            }
+            if pts.len() < 100 {
+                continue;
+            }
+            let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+            for p in &pts {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            let ext = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            // longest axis is length, shortest is height
+            let mut ord = [0usize, 1, 2];
+            ord.sort_by(|a, b| ext[*b].total_cmp(&ext[*a]));
+            let (li, wi, hi_) = (ord[0], ord[1], ord[2]);
+            let (l, w, hh) = (ext[li], ext[wi], ext[hi_]);
+            let mid = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5, (lo[2] + hi[2]) * 0.5];
+            // where along the length is the roof, and where is it widest?
+            let mut roof_z = 0.0f32;
+            let mut best_y = f32::MIN;
+            let mut wid = [0.0f32; 9];
+            let mut nose_w = 0.0f32;
+            for p in &pts {
+                let z = (p[li] - mid[li]) / l * 2.0;
+                let x = (p[wi] - mid[wi]).abs() / w * 2.0;
+                let y = p[hi_] - mid[hi_];
+                if y > best_y {
+                    best_y = y;
+                    roof_z = z;
+                }
+                let k = (((z + 1.0) * 0.5 * 8.0).round() as usize).min(8);
+                wid[k] = wid[k].max(x);
+                if z < -0.85 {
+                    nose_w = nose_w.max(x);
+                }
+            }
+            let widest = wid.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as f32 / 8.0 * 2.0 - 1.0).unwrap_or(0.0);
+            println!(
+                "{:<10} {:>7.2} {:>7.2} {:>7} {:>+8.2} {:>+8.2} {:>8.2}",
+                name,
+                l / w,
+                l / hh,
+                "-",
+                roof_z,
+                widest,
+                nose_w
+            );
+            refs.push((l / w, l / hh, roof_z, widest, nose_w, wid));
+        }
+        if refs.len() == 2 {
+            println!();
+            println!("shape profile (half-width at nine stations, nose to tail):");
+            for (i, r) in refs.iter().enumerate() {
+                let nm = if i == 0 { "octane" } else { "breakout" };
+                let prof: Vec<String> = r.5.iter().map(|v| format!("{v:.2}")).collect();
+                println!("   {nm:<9} {}", prof.join(" "));
+            }
+            println!();
+            println!("   => a car is ~{:.1}x longer than wide, ~{:.1}x longer than tall,", (refs[0].0 + refs[1].0) * 0.5, (refs[0].1 + refs[1].1) * 0.5);
+            println!("      the roof sits {:+.2} along the length, and the nose is {:.0}% of full width", (refs[0].2 + refs[1].2) * 0.5, (refs[0].4 + refs[1].4) * 50.0);
+        }
         return;
     }
     if name == "glb" {

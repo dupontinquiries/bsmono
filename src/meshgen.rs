@@ -430,6 +430,49 @@ pub fn loft(sections: &[(f32, f32, f32, f32, f32)], ring: u32) -> MeshData {
     if sections.len() < 2 {
         return m;
     }
+    // RESAMPLE ALONG THE LENGTH.
+    //
+    // Measured on the art target: Octane's painted shell has a median
+    // dihedral of about 2 degrees — neighbouring triangles are very nearly
+    // coplanar, which is what makes a surface read as continuous bodywork
+    // rather than as a low-poly prop. Five hand-placed control sections
+    // cannot do that however many segments the RING has: the ridges run the
+    // wrong way, across the car instead of around it.
+    //
+    // So the control sections are treated as a spline and resampled. A
+    // Catmull-Rom through them keeps every shape the author asked for and
+    // fills in the surface between.
+    let sections: Vec<(f32, f32, f32, f32, f32)> = if sections.len() >= 3 {
+        let n = sections.len();
+        let get = |i: isize| -> (f32, f32, f32, f32, f32) {
+            sections[(i.max(0) as usize).min(n - 1)]
+        };
+        let sub = 4; // four samples per control span
+        let mut out = Vec::with_capacity((n - 1) * sub + 1);
+        for i in 0..(n - 1) {
+            let (p0, p1, p2, p3) = (get(i as isize - 1), get(i as isize), get(i as isize + 1), get(i as isize + 2));
+            for k in 0..sub {
+                let t = k as f32 / sub as f32;
+                let (t2, t3) = (t * t, t * t * t);
+                // Catmull-Rom on each of the five channels
+                let cr = |a: f32, b: f32, c: f32, d: f32| -> f32 {
+                    0.5 * ((2.0 * b) + (-a + c) * t + (2.0 * a - 5.0 * b + 4.0 * c - d) * t2 + (-a + 3.0 * b - 3.0 * c + d) * t3)
+                };
+                out.push((
+                    cr(p0.0, p1.0, p2.0, p3.0),
+                    cr(p0.1, p1.1, p2.1, p3.1).max(0.001),
+                    cr(p0.2, p1.2, p2.2, p3.2),
+                    cr(p0.3, p1.3, p2.3, p3.3),
+                    cr(p0.4, p1.4, p2.4, p3.4).clamp(0.0, 1.0),
+                ));
+            }
+        }
+        out.push(sections[n - 1]);
+        out
+    } else {
+        sections.to_vec()
+    };
+    let sections = &sections[..];
     let n = ring.max(8);
     // a rounded-rectangle ring in the section's own space
     let ring_pt = |hw: f32, y0: f32, y1: f32, corner: f32, t: f32| -> Vec3 {

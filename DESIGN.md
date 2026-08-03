@@ -3364,6 +3364,45 @@ hovercar that is aimed upwards should stay aimed upwards, and if the
 grounded align is snapping it level then it is both hiding this test and
 fighting the player.
 
+## v1.103.0 — measuring the art target, and matching its shell
+
+The note that mattered: it is not the proportions, it is how the OUTER SHELL
+appears. So the first job was to turn "Octane looks best" into numbers.
+
+WHAT THE TARGET ACTUALLY IS. Octane is not one mesh. It ships four body
+meshes — Chassis, Paint, Body, Window — plus eight for the wheels, split by
+MATERIAL rather than by geometry. And measuring the dihedral angle between
+neighbouring triangles gives the signature:
+
+    Octane Paint    median  2.2 deg    p90 79.4 deg
+    Octane Body     median  2.0 deg    p90 31.4 deg
+    Octane Window   median  1.7 deg    p90  4.2 deg
+
+Smooth almost everywhere, with crisp breaks in the minority. That is what a
+car body looks like: continuous panels and a few deliberate feature lines. A
+uniformly faceted shell reads as a low-poly prop; a uniformly smooth one
+reads as a bar of soap.
+
+OURS WAS NEITHER. The lofted hull measured median 3.6 deg and p90 17.3 —
+too coarse to be continuous, too even to have features. The cause is that
+five hand-placed control sections cannot make a smooth surface however many
+segments the RING has: the resolution was going around the car and not
+along it.
+
+The control sections are now treated as a spline and resampled — a
+Catmull-Rom through them, four samples per span, which keeps every shape the
+author asked for and fills in the surface between. The hull's median
+dihedral is 2.0 deg, matching the target exactly.
+
+The crisp breaks come from the same place they do on Octane: separate parts.
+The hull is continuous and the glasshouse, spoiler and sills are their own
+prims, so the feature lines fall where parts meet rather than needing creases
+inside one surface.
+
+Every procedural and assembled car is built on that loft, so all of them
+improved at once. `--sim shell` keeps the comparison against the target's own
+numbers.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

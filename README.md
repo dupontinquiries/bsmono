@@ -463,3 +463,5 @@ Six hovercars: a cushion instead of wheels, momentum instead of grip, and a repu
 Hovercars run a fast-regenerating base thrust plus stronger pad charge, and pulse instead of jumping.
 
 `--sim carry` measures what the ball does when you turn with it on the hood.
+
+`--sim shell` measures body-surface continuity against the Octane reference.
