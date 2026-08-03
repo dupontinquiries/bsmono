@@ -9,6 +9,7 @@ mod bots;
 mod camera;
 mod clinch;
 mod config;
+mod drop;
 mod font;
 mod fx;
 mod gamepad;
