@@ -3337,6 +3337,22 @@ impl Gpu {
             // above are 256-aligned so this is a no-op today, but it guards any future unaligned size source.
             let size = a.slab_size.max(len.next_multiple_of(ALIGN)).next_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT);
             // mapped slabs are filled by memcpy into their mapped range (no COPY_DST); staged slabs need COPY_DST
+            // UNMAP THE PREVIOUS SLAB BEFORE OPENING A NEW ONE.
+            //
+            // Slabs are created mapped_at_creation for the UMA zero-copy write, and only the LAST one
+            // was ever unmapped — at seal time, on submit. So every earlier slab stayed mapped for the
+            // whole load, and a Scout run accumulated fifteen 2 GiB mappings before the sixteenth was
+            // rejected: "30.0 GiB of slabs had already been placed".
+            //
+            // The ceiling is on SIMULTANEOUSLY MAPPED buffers, not on allocation — which is why
+            // --gate-vram measured 63 GiB and the arena died at 30. The probe allocates; it does not
+            // keep its buffers mapped.
+            //
+            // Only one slab is written at a time, so holding the others mapped bought nothing and cost
+            // the entire budget.
+            if a.mapped {
+                if let Some(prev) = a.slabs.last() { prev.unmap(); }
+            }
             let usage = if a.mapped { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC }
                         else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
