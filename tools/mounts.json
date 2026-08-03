@@ -29,7 +29,12 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "hover"
+   }
   },
   "tank_rollout": {
    "mounts": [
@@ -47,7 +52,15 @@
      ],
      "plateau": 0.213
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "treads",
+    "drive_src": "category",
+    "turret_traverse": "full",
+    "turret_ratio": 0.662
+   }
   },
   "tank_hawkeye": {
    "mounts": [
@@ -65,7 +78,15 @@
      ],
      "plateau": 0.169
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "treads",
+    "drive_src": "category",
+    "turret_traverse": "full",
+    "turret_ratio": 0.693
+   }
   },
   "tank_chokepoint": {
    "mounts": [
@@ -83,7 +104,15 @@
      ],
      "plateau": 0.163
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "treads",
+    "drive_src": "category",
+    "turret_traverse": "full",
+    "turret_ratio": 0.648
+   }
   },
   "tank_ebr_105_mad_max_mod": {
    "mounts": [
@@ -101,10 +130,47 @@
      ],
      "plateau": 0.191
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 2,
+    "wheel_y": 0.437,
+    "wheel_x_off": 0.038,
+    "confidence": "thin",
+    "up": "ok",
+    "wheel_span": 0.112,
+    "drive": "tyres",
+    "turret_traverse": "limited",
+    "turret_ratio": 0.433
+   }
   },
   "flyer_dawnshade": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.1314,
+      0.0641,
+      1.0466
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.1314,
+      0.0641,
+      1.0466
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -157,10 +223,54 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "thruster",
+    "span_ratio": 0.613,
+    "thrusters": [
+     [
+      0.1314,
+      0.0641,
+      1.0466
+     ],
+     [
+      -0.1314,
+      0.0641,
+      1.0466
+     ]
+    ]
+   }
   },
   "flyer_hull": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.2055,
+      -0.0452,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.2055,
+      -0.0452,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -213,16 +323,60 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "thruster",
+    "span_ratio": 0.74,
+    "thrusters": [
+     [
+      0.2055,
+      -0.0452,
+      1.0
+     ],
+     [
+      -0.2055,
+      -0.0452,
+      1.0
+     ]
+    ]
+   }
   },
   "flyer_freighter": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.304,
+      0.0159,
+      1.0525
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.304,
+      0.0159,
+      1.0525
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
       0.5612,
       -0.0998,
-      0.0041
+      0.0012
      ],
      "aim": [
       0,
@@ -235,7 +389,7 @@
      "pos": [
       -0.5612,
       -0.0998,
-      0.0041
+      0.0012
      ],
      "aim": [
       0,
@@ -269,10 +423,54 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "thruster",
+    "span_ratio": 0.68,
+    "thrusters": [
+     [
+      0.304,
+      0.0159,
+      1.0525
+     ],
+     [
+      -0.304,
+      0.0159,
+      1.0525
+     ]
+    ]
+   }
   },
   "flyer_c_130j_super_hercules": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.2116,
+      -0.0824,
+      0.7252
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.2116,
+      -0.0824,
+      0.7252
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -325,7 +523,25 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "turbine",
+    "span_ratio": 1.402,
+    "thrusters": [
+     [
+      0.2116,
+      -0.0824,
+      0.7252
+     ],
+     [
+      -0.2116,
+      -0.0824,
+      0.7252
+     ]
+    ]
+   }
   },
   "racer_grit": {
    "mounts": [
@@ -355,7 +571,16 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 2,
+    "wheel_y": 0.398,
+    "wheel_x_off": 0.336,
+    "confidence": "thin",
+    "up": "SIDEWAYS?",
+    "wheel_span": 0.11,
+    "drive": "tyres"
+   }
   },
   "racer_nightvent": {
    "mounts": [
@@ -385,7 +610,16 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 2,
+    "wheel_y": 0.458,
+    "wheel_x_off": 0.005,
+    "confidence": "thin",
+    "up": "unclear",
+    "wheel_span": 0.107,
+    "drive": "tyres"
+   }
   },
   "racer_quickfire": {
    "mounts": [
@@ -415,7 +649,16 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 2,
+    "wheel_y": 0.392,
+    "wheel_x_off": 0.006,
+    "confidence": "thin",
+    "up": "ok",
+    "wheel_span": 0.136,
+    "drive": "tyres"
+   }
   },
   "racer_cryofin": {
    "mounts": [
@@ -445,7 +688,16 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 2,
+    "wheel_y": 0.404,
+    "wheel_x_off": 0.01,
+    "confidence": "thin",
+    "up": "ok",
+    "wheel_span": 0.091,
+    "drive": "tyres"
+   }
   },
   "hoverer_brutis": {
    "mounts": [
@@ -475,7 +727,12 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "hover"
+   }
   },
   "hoverer_beetlejuice": {
    "mounts": [
@@ -505,7 +762,12 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "hover"
+   }
   },
   "hoverer_analog": {
    "mounts": [
@@ -535,7 +797,12 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "hover"
+   }
   },
   "hovertank_whistlewind": {
    "mounts": [
@@ -553,10 +820,43 @@
      ],
      "plateau": 0.178
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "hover",
+    "turret_traverse": "limited",
+    "turret_ratio": 0.348
+   }
   },
   "flyer_alphastar": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.3636,
+      -0.0337,
+      1.0466
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.3636,
+      -0.0337,
+      1.0466
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -609,10 +909,54 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "thruster",
+    "span_ratio": 0.673,
+    "thrusters": [
+     [
+      0.3636,
+      -0.0337,
+      1.0466
+     ],
+     [
+      -0.3636,
+      -0.0337,
+      1.0466
+     ]
+    ]
+   }
   },
   "flyer_bulwark": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.0771,
+      -0.1668,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.0771,
+      -0.1668,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -665,10 +1009,54 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "thruster",
+    "span_ratio": 0.537,
+    "thrusters": [
+     [
+      0.0771,
+      -0.1668,
+      1.0
+     ],
+     [
+      -0.0771,
+      -0.1668,
+      1.0
+     ]
+    ]
+   }
   },
   "flyer_darkguard": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.4745,
+      -0.0738,
+      1.0275
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.4745,
+      -0.0738,
+      1.0275
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -721,10 +1109,54 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "thruster",
+    "span_ratio": 0.544,
+    "thrusters": [
+     [
+      0.4745,
+      -0.0738,
+      1.0275
+     ],
+     [
+      -0.4745,
+      -0.0738,
+      1.0275
+     ]
+    ]
+   }
   },
   "flyer_2_modes_viper": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.1309,
+      -0.1973,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.1309,
+      -0.1973,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -777,7 +1209,25 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "turbine",
+    "span_ratio": 0.826,
+    "thrusters": [
+     [
+      0.1309,
+      -0.1973,
+      1.0
+     ],
+     [
+      -0.1309,
+      -0.1973,
+      1.0
+     ]
+    ]
+   }
   },
   "tank_lockon": {
    "mounts": [
@@ -795,7 +1245,15 @@
      ],
      "plateau": 0.315
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "treads",
+    "drive_src": "category",
+    "turret_traverse": "full",
+    "turret_ratio": 0.904
+   }
   },
   "tank_patton": {
    "mounts": [
@@ -813,7 +1271,15 @@
      ],
      "plateau": 0.403
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "treads",
+    "drive_src": "category",
+    "turret_traverse": "full",
+    "turret_ratio": 0.742
+   }
   },
   "tank_vanquish": {
    "mounts": [
@@ -831,7 +1297,15 @@
      ],
      "plateau": 0.283
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "treads",
+    "drive_src": "category",
+    "turret_traverse": "full",
+    "turret_ratio": 0.578
+   }
   },
   "tank_lynx_6x6": {
    "mounts": [
@@ -849,7 +1323,16 @@
      ],
      "plateau": 0.52
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 2,
+    "wheel_y": 0.392,
+    "wheel_x_off": 0.006,
+    "confidence": "thin",
+    "up": "ok",
+    "wheel_span": 0.14,
+    "drive": "tyres"
+   }
   },
   "tank_boartail": {
    "mounts": [
@@ -867,10 +1350,44 @@
      ],
      "plateau": 0.402
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "treads",
+    "drive_src": "category",
+    "turret_traverse": "limited",
+    "turret_ratio": 0.363
+   }
   },
   "flyer_ventride": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.1443,
+      0.0727,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.1443,
+      0.0727,
+      1.0
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -923,10 +1440,54 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "turbine",
+    "span_ratio": 0.827,
+    "thrusters": [
+     [
+      0.1443,
+      0.0727,
+      1.0
+     ],
+     [
+      -0.1443,
+      0.0727,
+      1.0
+     ]
+    ]
+   }
   },
   "flyer_vertigo": {
    "mounts": [
+    {
+     "kind": "thruster",
+     "pos": [
+      0.2852,
+      0.0226,
+      1.0162
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
+    {
+     "kind": "thruster",
+     "pos": [
+      -0.2852,
+      0.0226,
+      1.0162
+     ],
+     "aim": [
+      0,
+      0,
+      1
+     ]
+    },
     {
      "kind": "hardpoint",
      "pos": [
@@ -979,7 +1540,25 @@
       -1
      ]
     }
-   ]
+   ],
+   "profile": {
+    "wheels": 0,
+    "up": "no wheels",
+    "drive": "turbine",
+    "span_ratio": 0.964,
+    "thrusters": [
+     [
+      0.2852,
+      0.0226,
+      1.0162
+     ],
+     [
+      -0.2852,
+      0.0226,
+      1.0162
+     ]
+    ]
+   }
   }
  }
 }

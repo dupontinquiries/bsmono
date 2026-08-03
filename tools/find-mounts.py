@@ -190,12 +190,102 @@ def find_popouts(all_pts, ext, mn):
     return [[x, y, z], [-x, y, z]]
 
 
+def profile(ps, allp, mn, ext, cat):
+    """What this thing stands on, and whether it is the right way up.
+
+    WHEELS ARE THE HONEST UP-TEST. Every earlier attempt inferred the frame
+    from silhouette — extents, taper, head position — and all of them were
+    weak or contradictory. A wheel is different: it is a part whose whole
+    job is to touch the ground, so if the wheels are at the TOP of the hull
+    the vehicle is upside down, and if they are all to one side it is on its
+    side. No heuristic needed, just where they are.
+    """
+    wheels = [p for n, p in ps if n.startswith("wheel")]
+    out = {"wheels": len(wheels)}
+    if wheels:
+        w = np.vstack(wheels)
+        wc = w.mean(0)
+        # where the wheel mass sits within the hull, 0 = floor, 1 = roof
+        fy = float((wc[1] - mn[1]) / max(ext[1], 1e-6))
+        fx = float(abs(wc[0] - (mn[0] + ext[0] * 0.5)) / max(ext[0], 1e-6))
+        out["wheel_y"] = round(fy, 3)
+        out["wheel_x_off"] = round(fx, 3)
+        # CONFIDENCE MATTERS MORE THAN THE VERDICT. Only six chassis name
+        # any part `wheel` at all and those name two, so a "sideways" call
+        # off two wheels may just mean the naming caught one side's pair.
+        # Four or more is a real axle set and worth acting on; two is a
+        # flag to go and look.
+        out["confidence"] = "firm" if len(wheels) >= 4 else "thin"
+        if fx > 0.28:
+            out["up"] = "SIDEWAYS?" if len(wheels) < 4 else "SIDEWAYS"
+        elif fy > 0.62:
+            out["up"] = "UPSIDE DOWN?" if len(wheels) < 4 else "UPSIDE DOWN"
+        elif fy < 0.45:
+            out["up"] = "ok"
+        else:
+            out["up"] = "unclear"
+        # roadwheels in a line under a long hull read as treads; a handful of
+        # big ones at the corners read as tyres
+        span = float((w[:, 2].max() - w[:, 2].min()) / max(ext[2], 1e-6))
+        out["wheel_span"] = round(span, 3)
+        out["drive"] = "treads" if (len(wheels) >= 6 and span > 0.55) else "tyres"
+    else:
+        out["up"] = "no wheels"
+        out["drive"] = None
+
+    # no wheels at all: it either hovers, floats or burns something
+    if out["drive"] is None:
+        if cat in ("hoverer", "hovertank"):
+            out["drive"] = "hover"
+        elif cat == "tank":
+            # treads are not named parts anywhere in the decomposition, so
+            # a tank with no `wheel` parts runs on tracks by category. That
+            # is an assumption, and it is recorded as one.
+            out["drive"] = "treads"
+            out["drive_src"] = "category"
+        elif cat == "flyer":
+            # a long body with real span glides on wings and is driven by
+            # turbines; a compact one with no span is on thrust
+            span = ext[0] / max(ext[2], 1e-6)
+            out["drive"] = "turbine" if span > 0.75 else "thruster"
+            out["span_ratio"] = round(float(span), 3)
+        else:
+            out["drive"] = "unknown"
+
+    # a turret only makes sense on something that can carry one, and only
+    # rotates if there is room to swing it
+    if cat in ("tank", "hovertank"):
+        top = allp[allp[:, 1] > mn[1] + ext[1] * 0.62]
+        if len(top) > 20:
+            # how round is the upper deck in plan? a square-ish footprint
+            # can take a full traverse; a narrow spine cannot
+            sx = float(top[:, 0].max() - top[:, 0].min())
+            sz = float(top[:, 2].max() - top[:, 2].min())
+            ratio = min(sx, sz) / max(max(sx, sz), 1e-6)
+            out["turret_traverse"] = "full" if ratio > 0.55 else "limited"
+            out["turret_ratio"] = round(ratio, 3)
+
+    # thrust exits the back, low and near the centre — and only for the
+    # things that actually have thrust. A hovercar has no nozzle and putting
+    # one on it would be wrong in a way nobody could unsee.
+    if out["drive"] in ("thruster", "turbine"):
+        rear = allp[allp[:, 2] > mn[2] + ext[2] * 0.82]
+        if len(rear) > 12:
+            x = float(np.percentile(np.abs(rear[:, 0]), 55))
+            y = float(np.percentile(rear[:, 1], 45))
+            z = float(rear[:, 2].max())
+            out["thrusters"] = [[round(x, 4), round(y, 4), round(z, 4)],
+                                [round(-x, 4), round(y, 4), round(z, 4)]]
+    return out
+
+
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "mounts.json")
     tuning = json.load(open(os.path.join(FV, "foldview_tuning.json")))
     fv = os.path.join(FV, "target", "release", "foldview")
     result = {}
-    print(f"{'chassis':26s} {'cat':9s} {'barrel':>22s} {'wing pts':>8s} {'popout':>8s}")
+    print(f"{'chassis':26s} {'drive':9s} {'up':>12s} {'whl':>4s} "
+          f"{'turret':>7s} {'pyl':>4s} {'pop':>4s} {'thr':>4s}")
     for iqm in tuning:
         if any(w in iqm for w in WELDED) or not os.path.isfile(os.path.join(DATA, iqm)):
             continue
@@ -215,6 +305,9 @@ def main():
         hull_mid_y = mn[1] + ext[1] * 0.5
 
         entry = {"mounts": []}
+        entry["profile"] = profile(ps, allp, mn, ext, cat)
+        for t in entry["profile"].get("thrusters", []):
+            entry["mounts"].append({"kind": "thruster", "pos": t, "aim": [0, 0, 1]})
         # a gun platform for anything that fights from a hull
         b = None
         if cat in ("tank", "hovertank"):
@@ -241,10 +334,12 @@ def main():
                 entry["mounts"].append({"kind": "popout",
                                         "pos": [round(v, 4) for v in po], "aim": [0, 0, -1]})
         result[nm] = entry
-        nb = "turret" if b else "-"
+        pr = entry["profile"]
         nh = sum(1 for m in entry["mounts"] if m["kind"] == "hardpoint")
         np_ = sum(1 for m in entry["mounts"] if m["kind"] == "popout")
-        print(f"  {nm:26s} {cat:9s} {nb:>22s} {nh:>8d} {np_:>8d}")
+        nt = sum(1 for m in entry["mounts"] if m["kind"] == "thruster")
+        print(f"  {nm:26s} {str(pr['drive']):9s} {pr['up']:>12s} {pr['wheels']:>4d} "
+              f"{('yes' if b else '-'):>7s} {nh:>4d} {np_:>4d} {nt:>4d}")
 
     json.dump({"_doc": "generated by tools/find-mounts.py; positions are in "
                        "the vehicle pose's own space, +Y up, nose at -Z",
