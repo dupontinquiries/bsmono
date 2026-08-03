@@ -10,6 +10,7 @@ pub mod transport;
 pub mod spaces;
 pub mod library;
 pub mod browse;
+pub mod queue;
 pub mod catalog_source;
 pub mod device;
 pub mod settings_page;
@@ -94,6 +95,10 @@ pub struct Controller {
     pub browse_tracks: Vec<crate::browse::BrowseTrack>,
     /// Which of the three library surfaces is showing.
     pub library_tab: LibraryTab,
+    /// The play queue. When browse was ported, "play all" had nowhere to put
+    /// the tracks and reported them instead; this is that somewhere.
+    pub queue: crate::queue::Queue,
+    pub now_playing: crate::queue::NowPlaying,
     pub mixer: crate::device::Mixer,
     pub profile: crate::device::Profile,
     pub soundscape: crate::soundscape::Soundscape,
@@ -130,6 +135,8 @@ impl Controller {
             browse: Default::default(),
             browse_tracks: Vec::new(),
             library_tab: LibraryTab::Tracks,
+            queue: Default::default(),
+            now_playing: Default::default(),
             mixer: Default::default(),
             profile: Default::default(),
             soundscape: Default::default(),
@@ -306,23 +313,59 @@ impl Controller {
             Action::Back => self.browse.back(),
             Action::Play(id) => self.play_browse_track(id),
             Action::PlayAll(ids) => {
-                // Play the first, report the rest. Claiming to have queued
-                // tracks the engine has not been told about is the failure mode
-                // this whole port has been avoiding.
-                if let Some(first) = ids.first().copied() { self.play_browse_track(first); }
-                if ids.len() > 1 {
-                    self.toast.show(&format!("queued {}", crate::browse::plural(ids.len() as i64 - 1, "more track")));
+                // NOW it actually queues. When browse was ported this reported
+                // the tracks instead, because the queue lived only in bo-mux
+                // and claiming to have queued what the engine had never heard
+                // of was the failure this port has been avoiding throughout.
+                // The queue is here now, so the claim is true.
+                let tracks = self.tracks_for(&ids);
+                self.queue.mode = crate::queue::EnqueueMode::Replace;
+                self.queue.add_all(&tracks);
+                if let Some(first) = self.queue.advance() { self.start_playing(&first); }
+                if !self.queue.is_empty() {
+                    self.toast.show(&format!("queued {}",
+                        crate::browse::plural(self.queue.len() as i64, "more track")));
                 }
             }
-            Action::Queue(_) => self.toast.show("queued 1 track"),
+            Action::Queue(id) => {
+                let t = self.tracks_for(&[id]);
+                self.queue.mode = crate::queue::EnqueueMode::Stack;
+                self.queue.add_all(&t);
+                self.toast.show("queued 1 track");
+            }
             Action::QueueAll(ids) => {
-                self.toast.show(&format!("queued {}", crate::browse::plural(ids.len() as i64, "track")));
+                let tracks = self.tracks_for(&ids);
+                self.queue.mode = crate::queue::EnqueueMode::Stack;
+                let n = tracks.len();
+                self.queue.add_all(&tracks);
+                self.toast.show(&format!("queued {}", crate::browse::plural(n as i64, "track")));
             }
             // With a local source there is nothing to re-fetch: the aggregates
             // are already in memory and the mode/sort read straight off them.
             // On device this is where the host reissues the query.
             Action::Reload => {}
         }
+    }
+
+    /// Look up browse tracks by id, in the order given — "play all" on an album
+    /// means the album, in its order, not in id order.
+    fn tracks_for(&self, ids: &[i64]) -> Vec<(i64, String, String)> {
+        ids.iter().filter_map(|id| self.browse_tracks.iter().find(|t| t.id == *id))
+            .map(|t| (t.id, t.title.clone(), t.primary_artist.clone()))
+            .collect()
+    }
+
+    /// Reflect a queue entry as the thing now playing.
+    fn start_playing(&mut self, e: &crate::queue::QueueEntry) {
+        self.now.title = e.title.clone();
+        self.now.artist = e.artist.clone();
+        self.transport.title = e.title.clone();
+        self.transport.artist = e.artist.clone();
+        self.transport.playing = true;
+        self.now_playing = crate::queue::NowPlaying {
+            title: e.title.clone(), artist: e.artist.clone(),
+            source: String::new(), playing: true,
+        };
     }
 
     fn play_browse_track(&mut self, id: i64) {
@@ -601,15 +644,44 @@ mod tests {
     }
 
     #[test]
-    fn play_all_plays_the_first_and_reports_the_rest_rather_than_claiming_to_queue_them() {
-        // The queue is bo-mux's. Saying "queued 2 tracks" when nothing was told
-        // to the engine is the placeholder failure in a different costume.
+    fn play_all_now_actually_queues_the_rest() {
+        // This test used to be called "...reports the rest rather than claiming
+        // to queue them", and asserted exactly that: browse had no queue to
+        // put tracks in, so saying "queued 2 tracks" would have been a lie
+        // about state the engine had never been told about.
+        //
+        // queue.rs exists now, so the claim is true and the test says the true
+        // thing. Renaming rather than leaving a name that describes a
+        // limitation which no longer applies — a stale test name is a stale
+        // comment with a green tick beside it.
         let mut c = with_library();
         c.apply_browse(crate::browse::Action::OpenArtist { id: 1, name: "Ada".into() });
         let ids: Vec<i64> = c.browse.detail_tracks.iter().map(|t| t.id).collect();
         c.apply_browse(crate::browse::Action::PlayAll(ids));
-        assert_eq!(c.transport.title, "Opener", "the first track actually plays");
+        assert_eq!(c.transport.title, "Opener", "the first track plays");
+        assert_eq!(c.queue.len(), 1, "and the rest are really in the queue");
+        assert_eq!(c.queue.up_next().unwrap().title, "Closer");
         assert_eq!(c.toast.visible(), Some("queued 1 more track"));
+    }
+
+    #[test]
+    fn queueing_a_single_track_appends_without_interrupting() {
+        let mut c = with_library();
+        c.apply_browse(crate::browse::Action::OpenArtist { id: 1, name: "Ada".into() });
+        c.apply_browse(crate::browse::Action::Queue(2));
+        assert_eq!(c.queue.len(), 1);
+        assert_eq!(c.transport.title, "", "nothing started playing");
+    }
+
+    #[test]
+    fn play_all_replaces_the_queue_rather_than_piling_onto_it() {
+        // "Play this album" means this album, not this album after whatever was
+        // already lined up.
+        let mut c = with_library();
+        c.apply_browse(crate::browse::Action::QueueAll(vec![1, 2]));
+        assert_eq!(c.queue.len(), 2);
+        c.apply_browse(crate::browse::Action::PlayAll(vec![1, 2]));
+        assert_eq!(c.queue.len(), 1, "the first plays, one remains, the old two are gone");
     }
 
     #[test]
