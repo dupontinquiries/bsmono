@@ -1,29 +1,132 @@
 {
-  "_doc": [
-    "Per-chassis orientation corrections, applied by export-roster.py.",
-    "",
-    "WHY THIS IS A FILE AND NOT AN ALGORITHM: a vehicle's NOSE cannot be",
-    "determined reliably from geometry. Two independent measures were tried",
-    "across the roster and disagreed with each other — a head/visor part-Z",
-    "test called 22 of 28 reversed, a taper-and-height asymmetry test called",
-    "16 reversed, and the two sets did not match. The robot pose IS",
-    "determinable (feet-to-head gives up, a left/right limb pair gives",
-    "forward, and all 28 measure +Y up and within 11 degrees of -Z), but a",
-    "car is roughly symmetric front to back and the asymmetries that do",
-    "exist are small and contradictory.",
-    "",
-    "So: the engine declares rather than guesses. Put a chassis in here and",
-    "its whole strip is turned by `yaw` degrees about Y.",
-    "",
-    "  yaw   turn the WHOLE strip, keeping vehicle and robot consistent with",
-    "        each other. Use when both modes face the same wrong way.",
-    "  turn  spend the rotation ACROSS the fold instead: the vehicle keeps",
-    "        its facing, the robot lands on the turned one, and the poses",
-    "        between carry the difference. Use when the vehicle looks right",
-    "        and the robot does not, or the reverse.",
-    "",
-    "Both are in degrees. Empty means the export is unmodified, which is the",
-    "current state — nothing here is a guess I could not verify."
-  ],
-  "overrides": {}
+ "_doc": [
+  "Per-chassis orientation corrections, applied by export-roster.py.",
+  "",
+  "MEASURED, not guessed. Forward comes from the vector between the CHEST and",
+  "the SPINE of the robot pose: chest is the front of a torso and spine is the",
+  "back, so it points forward whatever the model is called and whatever its",
+  "parts are labelled. An earlier attempt used a left/right limb pair, which",
+  "was circular \u2014 it assumes which limb is which, so it agreed with itself on",
+  "all 28 and told us nothing.",
+  "",
+  "`turn` spends the rotation ACROSS the fold, so the vehicle keeps the facing",
+  "it has and only the robot end moves. That is right here because the reading",
+  "is about the robot pose."
+ ],
+ "overrides": {
+  "blackstar": {
+   "turn": 180.0,
+   "why": "robot faces -91deg by chest-spine"
+  },
+  "rollout": {
+   "turn": 180.0,
+   "why": "robot faces -175deg by chest-spine"
+  },
+  "hawkeye": {
+   "turn": 180.0,
+   "why": "robot faces -170deg by chest-spine"
+  },
+  "chokepoint": {
+   "turn": 180.0,
+   "why": "robot faces +142deg by chest-spine"
+  },
+  "ebr_105_mad_max_mod": {
+   "turn": 180.0,
+   "why": "robot faces -177deg by chest-spine"
+  },
+  "jet_dawnshade": {
+   "turn": 180.0,
+   "why": "robot faces +180deg by chest-spine"
+  },
+  "jet_hull": {
+   "turn": 180.0,
+   "why": "robot faces +127deg by chest-spine"
+  },
+  "jet_freighter": {
+   "turn": 180.0,
+   "why": "robot faces +166deg by chest-spine"
+  },
+  "jet_c_130j_super_hercules": {
+   "turn": 180.0,
+   "why": "robot faces +179deg by chest-spine"
+  },
+  "grit": {
+   "turn": 180.0,
+   "why": "robot faces +138deg by chest-spine"
+  },
+  "quickfire": {
+   "turn": 180.0,
+   "why": "robot faces +180deg by chest-spine"
+  },
+  "cryofin": {
+   "turn": 180.0,
+   "why": "robot faces -142deg by chest-spine"
+  },
+  "beetlejuice": {
+   "turn": 180.0,
+   "why": "robot faces -180deg by chest-spine"
+  },
+  "analog": {
+   "turn": 180.0,
+   "why": "robot faces +174deg by chest-spine"
+  },
+  "jet_whistlewind": {
+   "turn": 180.0,
+   "why": "robot faces -173deg by chest-spine"
+  },
+  "jet_alphastar": {
+   "turn": 180.0,
+   "why": "robot faces +180deg by chest-spine"
+  },
+  "jet_bulwark": {
+   "turn": 180.0,
+   "why": "robot faces +179deg by chest-spine"
+  },
+  "jet_darkguard": {
+   "turn": 180.0,
+   "why": "robot faces -180deg by chest-spine"
+  },
+  "jet_2_modes_viper": {
+   "turn": 180.0,
+   "why": "robot faces -172deg by chest-spine"
+  },
+  "lockon": {
+   "turn": 180.0,
+   "why": "robot faces +171deg by chest-spine"
+  },
+  "patton": {
+   "turn": 180.0,
+   "why": "robot faces +153deg by chest-spine"
+  },
+  "vanquish": {
+   "turn": 180.0,
+   "why": "robot faces -177deg by chest-spine"
+  },
+  "lynx_6x6": {
+   "turn": 180.0,
+   "why": "robot faces +165deg by chest-spine"
+  },
+  "boartail": {
+   "turn": 180.0,
+   "why": "robot faces -142deg by chest-spine"
+  },
+  "jet_ventride": {
+   "turn": 180.0,
+   "why": "robot faces +175deg by chest-spine"
+  },
+  "jet_vertigo": {
+   "turn": 180.0,
+   "why": "robot faces -178deg by chest-spine"
+  }
+ },
+ "_roll_candidates": [
+  "These three vehicle poses are NOT flattest along Y, which is what a body",
+  "sitting on the ground should be. They may be rolled 90 degrees. The",
+  "measurement cannot tell a rolled hull from a genuinely tall narrow one, so",
+  "they are recorded rather than corrected \u2014 add {\"yaw\": ...} or a roll here",
+  "once someone has looked at them.",
+  "  jet_darkguard   X 1.10  Y 1.58  Z 2.03",
+  "  lynx_6x6        X 0.99  Y 1.03  Z 1.62",
+  "  boartail        X 0.93  Y 0.98  Z 2.00"
+ ]
 }
