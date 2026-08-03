@@ -14,6 +14,7 @@
 
 pub mod pty_input;
 pub mod table_view;
+pub mod row_render;
 pub mod mail_view;
 pub mod archived_view;
 pub mod cards_view;
@@ -48,6 +49,12 @@ pub mod terminal_workspace;
 /// them — the view was what was missing, not the engine. Included rather than
 /// re-implemented so the two frontends parse the same vocabulary; a second
 /// parser would accept a slightly different English within a week.
+/// The dirty-row tracker, on the same terms — pure, dependency-free, and fed by
+/// the grid. `row_render` is the egui-side use of it; see that module for why
+/// what it saves here is text LAYOUT rather than serialisation.
+#[path = "../../src/row_cache.rs"]
+pub mod row_cache;
+
 #[path = "../../src/table_ops.rs"]
 pub mod table_ops;
 #[path = "../../src/table_nlp.rs"]
