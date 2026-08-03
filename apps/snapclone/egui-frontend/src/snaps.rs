@@ -89,8 +89,9 @@ pub fn ago(secs: i64) -> String {
 
 /// `kColumns` — two across.
 pub const COLUMNS: usize = 2;
-/// The long-press threshold, `m_holdTimer->setInterval(450)`.
-pub const HOLD_MS: f32 = 450.0;
+/// The long-press threshold, `m_holdTimer->setInterval(450)`. Now the kit's,
+/// because this was the only place in the fleet that had tuned it.
+pub use uikit_egui::menu::HOLD_MS;
 /// Default view duration when a snap does not carry one.
 pub const DEFAULT_DURATION_SECS: u32 = 5;
 
@@ -127,12 +128,16 @@ impl SnapFeed {
 /// that everything has been opened, and opened snaps are gone by design.
 pub const EMPTY_TEXT: &str = "No new snaps.\nOpened snaps are gone — that's the point.";
 
-/// Press tracking for tap vs long-press on a tile.
-#[derive(Debug, Clone, Default)]
+/// A press on a tile. The timing lives in `uikit_egui::menu::HoldTracker`.
+///
+/// This module had the only tuned long-press in the fleet — 450ms, from
+/// `m_holdTimer->setInterval(450)` — and the kit had none at all, so the shared
+/// tracker took this value. What the kit adds and this did not have is the
+/// SLOP: a finger that drifts more than a few pixels is scrolling, and a hold
+/// that fires under a scroll makes the grid feel like it is grabbing at you.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Press {
-    held_ms: f32,
-    down: bool,
-    fired: bool,
+    hold: uikit_egui::menu::HoldTracker,
 }
 
 /// What a press on a tile resolved to.
@@ -140,27 +145,29 @@ pub struct Press {
 pub enum Gesture { None, Tap, Hold }
 
 impl Press {
-    pub fn down(&mut self) { self.down = true; self.held_ms = 0.0; self.fired = false; }
+    pub fn down(&mut self) { self.hold.press(0.0, 0.0); }
+
+    /// Position-aware press, for callers that can supply one — the slop needs
+    /// somewhere to measure from.
+    pub fn down_at(&mut self, x: f32, y: f32) { self.hold.press(x, y); }
+
+    /// The finger moved. Past the slop this is a scroll, not a hold.
+    pub fn moved(&mut self, x: f32, y: f32) { self.hold.moved(x, y); }
 
     /// Advance while held. Fires `Hold` once, at the threshold, WITHOUT waiting
     /// for release — a long-press that only resolves on release feels broken,
     /// because the user is already holding and nothing has happened.
     pub fn tick(&mut self, dt_ms: f32) -> Gesture {
-        if !self.down || self.fired { return Gesture::None; }
-        self.held_ms += dt_ms;
-        if self.held_ms >= HOLD_MS { self.fired = true; return Gesture::Hold; }
-        Gesture::None
+        if self.hold.tick(dt_ms) { Gesture::Hold } else { Gesture::None }
     }
 
-    /// Release. A tap only if the hold never fired.
+    /// Lift. A press that ended before the hold fired is a tap.
     pub fn up(&mut self) -> Gesture {
-        let was_down = self.down;
-        let fired = self.fired;
-        self.down = false;
-        self.fired = false;
-        if !was_down || fired { return Gesture::None; }
-        Gesture::Tap
+        if self.hold.release() { Gesture::Tap } else { Gesture::None }
     }
+
+    pub fn cancel(&mut self) { self.hold.cancel(); }
+    pub fn progress(&self) -> f32 { self.hold.progress() }
 }
 
 // ── the viewer ──────────────────────────────────────────────────────────────
