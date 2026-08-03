@@ -93,7 +93,7 @@ impl Strip {
 /// Same machine everywhere — a thing that fetches, a thing that decides, a thing that waits — dressed
 /// for the scene it stands in. The point is that state is legible at a glance: a mechanism visibly
 /// stalled reads as stalled without anyone parsing a percentage.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Machine {
     /// What the landmark IS.
     pub landmark: &'static str,
@@ -101,6 +101,15 @@ pub struct Machine {
     pub fetch: &'static str,
     /// The part that moves when the router chooses.
     pub decide: &'static str,
+    /// Proportions, so the theme is visible in the GEOMETRY and not only in the prose.
+    ///
+    /// `add_landmark` took Parts and Placement and never saw a Machine, so fifteen themes existed as
+    /// descriptions a renderer could not use — every scene drew the same box. These are the three
+    /// numbers that make a clocktower read as a clocktower and an abacus-mill as an abacus-mill.
+    ///
+    /// **Tall-and-narrow versus wide-and-low is most of the silhouette**, which is all you get at the
+    /// distance a landmark stands.
+    pub shape: Shape,
     /// The machine at full song — everything nominal, and the state a viewer should most want to
     /// watch. Distinct from `fetch` on purpose: "working" and "working beautifully" are different
     /// pictures, and a landmark that cannot show the second has nothing to reward attention with.
@@ -110,10 +119,28 @@ pub struct Machine {
     pub stall: &'static str,
 }
 
+/// The silhouette of a themed machine.
+///
+/// Deliberately three numbers rather than a mesh: a scene builds ONE mechanism and proportions it, so
+/// adding a theme is a table entry rather than new geometry. Fifteen bespoke models would each need
+/// their own stall state, and getting that wrong in one of them is worse than a plainer landmark
+/// everywhere.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Shape {
+    /// Height of the upright, in plinth-widths. A clocktower is tall; a workbench is not.
+    pub rise: f32,
+    /// Width of the store relative to the plinth. Wide reads as a rack or a runner of beads.
+    pub spread: f32,
+    /// Size of the drive relative to the upright. A blimp's propellers are large; an escapement is
+    /// small and fast.
+    pub drive: f32,
+}
+
 /// Themed per scene. Unknown scenes get a plain mechanism rather than nothing.
 pub fn machine_for(scene: &str) -> Machine {
     match scene {
         "Old Library" | "Archive" | "Reading Room" => Machine {
+            shape: Shape { rise: 2.4, spread: 0.8, drive: 0.5 },
             thriving: "every runner in motion at once, the escapement singing, chimes marking each completed turn",
             landmark: "a clocktower above the stacks, its face open to the works",
             fetch: "brass page-runners sliding volumes down the shelf-rails",
@@ -121,6 +148,7 @@ pub fn machine_for(scene: &str) -> Machine {
             stall: "the pendulum hangs at the top of its arc and does not fall",
         },
         "Canopy" | "Forest" => Machine {
+            shape: Shape { rise: 1.6, spread: 1.3, drive: 0.7 },
             thriving: "the whole trellis in bloom, sap running bright, every leaf tracking its bough in sequence",
             landmark: "a solarpunk trellis-engine grown into the branches",
             fetch: "sap-lines drawing bright fluid up from the roots",
@@ -128,6 +156,7 @@ pub fn machine_for(scene: &str) -> Machine {
             stall: "the whole canopy holds still, no leaf turning, light unspent",
         },
         "Cloudscape" | "Mistfall" => Machine {
+            shape: Shape { rise: 1.2, spread: 1.1, drive: 1.4 },
             thriving: "engines at full ahead, ballast cycling smoothly, the envelope taut and the wake clean",
             landmark: "a moored steampunk blimp, its gondola all exposed gearing",
             fetch: "ballast crates winched up through the cloud on cables",
@@ -135,6 +164,7 @@ pub fn machine_for(scene: &str) -> Machine {
             stall: "propellers feathered, the envelope drifting without heading",
         },
         "Treehouse" => Machine {
+            shape: Shape { rise: 0.8, spread: 1.6, drive: 0.6 },
             thriving: "beads flying across every runner, baskets crossing in both directions, the whole mill drumming",
             landmark: "an ewok-built abacus-mill of rope, bark and counterweight",
             fetch: "woven baskets hauled hand-over-hand along the span",
@@ -142,6 +172,7 @@ pub fn machine_for(scene: &str) -> Machine {
             stall: "every rope slack, the beads resting mid-runner",
         },
         "Folding@home" => Machine {
+            shape: Shape { rise: 1.4, spread: 1.4, drive: 0.4 },
             thriving: "the chain folding cleanly domain by domain, each pocket closing into place with a settling shimmer",
             landmark: "a protein folding in a lattice of glass, one domain per layer",
             fetch: "side-chains swinging into place as their residues are called",
@@ -149,6 +180,7 @@ pub fn machine_for(scene: &str) -> Machine {
             stall: "the chain frozen half-folded, hydrophobic core still open",
         },
         "Mansion Garden" => Machine {
+            shape: Shape { rise: 1.0, spread: 1.5, drive: 1.1 },
             thriving: "every engine on the terrace running together, the Antikythera at speed, the chariot true, the astrolabe wheeling through its houses",
             landmark: "a museum terrace of analog engines — an Antikythera of golden \
 gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
@@ -157,6 +189,7 @@ gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
             stall: "every dial stopped mid-figure, the crank turning nothing",
         },
         "Atlantis" => Machine {
+            shape: Shape { rise: 1.3, spread: 1.2, drive: 1.0 },
             thriving: "the tide running strong, vanes wide, amphorae arriving on every swell in procession",
             landmark: "a tide-engine of bronze and coral in the flooded plaza",
             fetch: "current-vanes drawing sealed amphorae in on the swell",
@@ -164,6 +197,7 @@ gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
             stall: "the water flat, vanes hanging, nothing carried in or out",
         },
         "Fractal Spires" | "Recursive Citadel" => Machine {
+            shape: Shape { rise: 2.8, spread: 0.6, drive: 0.8 },
             thriving: "every depth turning at once, each ring in phase with its own smaller copy",
             landmark: "a self-similar orrery, each arm a smaller copy of the whole",
             fetch: "sub-orreries unfolding to surface the arm being read",
@@ -171,6 +205,7 @@ gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
             stall: "the recursion halted at one depth, inner rings unmoving",
         },
         "Slate" | "Alley" => Machine {
+            shape: Shape { rise: 1.0, spread: 1.0, drive: 0.7 },
             thriving: "every indicator green, the loader cycling without pause, relays snapping cleanly",
             landmark: "a service panel open on the wall, guts exposed and labelled",
             fetch: "cartridges racking in and out of the loader",
@@ -180,6 +215,7 @@ gears beside a Chinese south-pointing chariot and an astrolabe on its stand",
         // A scene with no theme gets the machine plainly rather than nothing: an unnamed mechanism
         // still shows state, and a blank landmark teaches the reader that the feature is broken.
         _ => Machine {
+            shape: Shape { rise: 1.0, spread: 1.0, drive: 1.0 },
             thriving: "every part moving in time, nothing waiting",
             landmark: "an open mechanism on a plinth",
             fetch: "carriers moving parts in from the store",
