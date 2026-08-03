@@ -3531,6 +3531,38 @@ either number is tuned, so `--sim hover` reads BOTH the physics and the art
 from source and fails if they stop agreeing. It is a cheap check for a
 detail that would otherwise quietly become a lie.
 
+## v1.108.0 — a catalogue you can read
+
+Forty-odd vehicles in a flat list of names is not a catalogue, it is an
+inventory: the only way to learn what TRIFANG was, or how it differed from
+BLACKSTAR beside it, was to drive both. The style work of the last few
+versions made them look like a family; this makes the family legible.
+
+Every entry now carries a CLASS and one line on what it is like to drive:
+
+    CLASSIC    the three references and their handling
+    ODDITY     the shapes that exist to be awkward
+    ELECTRIC   torque off the line, less at the top
+    CONCEPT    VIPERA and AEGIS, built from written specifications
+    IMPORT     authored bodies, with their own art
+    ASSEMBLED  built from mined vehicle part layouts
+    HOVER      cushion, no grip, repulsor field
+
+Seven families, twenty-nine described entries, and every EV variant inherits
+its parent's line with the drivetrain difference appended rather than
+repeating it.
+
+The class shows in the car picker beside the name, so the list reads as six
+families instead of one undifferentiated run. And cycling with [ and ]
+announces the class and the line — which is the point of having those keys
+at all: trying things without opening a menu is only useful if the game
+tells you what you just picked up.
+
+`--sim shell` audits it: every family represented, and no two cars sharing a
+description. The second half matters more than it sounds — a table where
+everything is "fast and fun" is worse than no table, because it looks like
+information.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

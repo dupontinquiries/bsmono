@@ -635,6 +635,38 @@ pub fn run(args: &[String]) {
             }
         }
         println!();
+        // ---- IS THE CATALOGUE DESCRIBED? ----
+        // Forty vehicles in a flat list of names is a catalogue nobody can
+        // navigate: the only way to learn what a car is was to drive it. Every
+        // entry needs a class and a line, and the lines have to be DIFFERENT
+        // — a table of "fast and fun" tells you nothing.
+        {
+            let src = include_str!("main.rs");
+            let classes = ["CLASSIC", "ODDITY", "ELECTRIC", "CONCEPT", "IMPORT", "ASSEMBLED", "HOVER"];
+            let mut counts: Vec<(&str, usize)> = classes
+                .iter()
+                .map(|c| (*c, src.matches(&format!("(\"{c}\",")).count()))
+                .collect();
+            counts.retain(|(_, n)| *n > 0);
+            let total: usize = counts.iter().map(|(_, n)| n).sum();
+            println!("   catalogue classes: {counts:?}");
+            println!("   {total} described entries across {} families", counts.len());
+            // and the descriptions must not repeat
+            let mut lines: Vec<&str> = Vec::new();
+            for l in src.lines() {
+                let t = l.trim();
+                if t.starts_with('"') && t.ends_with("\",") && t.len() > 30 {
+                    lines.push(t);
+                }
+            }
+            let before = lines.len();
+            lines.sort();
+            lines.dedup();
+            println!("   {} description lines, {} distinct", before, lines.len());
+            let ok_desc = counts.len() >= 6 && lines.len() == before;
+            println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
+        }
+        println!();
         // ---- CATALOGUE AUDIT ----
         // A house style is only a style if the whole catalogue is built to
         // it. This reads the source and reports which cars are made from the
@@ -1738,6 +1770,38 @@ pub fn run(args: &[String]) {
                     hmax / hmin.max(0.01)
                 );
             }
+        }
+        println!();
+        // ---- IS THE CATALOGUE DESCRIBED? ----
+        // Forty vehicles in a flat list of names is a catalogue nobody can
+        // navigate: the only way to learn what a car is was to drive it. Every
+        // entry needs a class and a line, and the lines have to be DIFFERENT
+        // — a table of "fast and fun" tells you nothing.
+        {
+            let src = include_str!("main.rs");
+            let classes = ["CLASSIC", "ODDITY", "ELECTRIC", "CONCEPT", "IMPORT", "ASSEMBLED", "HOVER"];
+            let mut counts: Vec<(&str, usize)> = classes
+                .iter()
+                .map(|c| (*c, src.matches(&format!("(\"{c}\",")).count()))
+                .collect();
+            counts.retain(|(_, n)| *n > 0);
+            let total: usize = counts.iter().map(|(_, n)| n).sum();
+            println!("   catalogue classes: {counts:?}");
+            println!("   {total} described entries across {} families", counts.len());
+            // and the descriptions must not repeat
+            let mut lines: Vec<&str> = Vec::new();
+            for l in src.lines() {
+                let t = l.trim();
+                if t.starts_with('"') && t.ends_with("\",") && t.len() > 30 {
+                    lines.push(t);
+                }
+            }
+            let before = lines.len();
+            lines.sort();
+            lines.dedup();
+            println!("   {} description lines, {} distinct", before, lines.len());
+            let ok_desc = counts.len() >= 6 && lines.len() == before;
+            println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
         }
         println!();
         // ---- CATALOGUE AUDIT ----

@@ -420,7 +420,23 @@ struct RtIds {
 struct CarModels {
     models: Vec<model::Model>,
     names: Vec<&'static str>,
+    /// What kind of vehicle it is, and one line on what it is like to drive.
+    ///
+    /// Forty-odd cars in a flat list of names is a catalogue you cannot
+    /// navigate: the only way to learn what "Trifang" is was to drive it.
+    /// The class says which family it belongs to, the line says why you
+    /// would pick it over its neighbours.
+    info: Vec<(&'static str, &'static str)>,
     active: usize,
+}
+
+impl CarModels {
+    fn class_of(&self, i: usize) -> &'static str {
+        self.info.get(i).map(|x| x.0).unwrap_or("")
+    }
+    fn blurb_of(&self, i: usize) -> &'static str {
+        self.info.get(i).map(|x| x.1).unwrap_or("")
+    }
 }
 
 struct Game {
@@ -965,11 +981,57 @@ fn main() {
             "Backfire", "Breakout", "Assael", "Guardian", "Orion", "Vulcan", "X-Devil",
             "Rollout", "Cryofin", "TL-4", "Spearhead", "Outback",
         ],
+        info: vec![
+            ("CLASSIC", "the benchmark: neutral, forgiving, good at everything"),
+            ("CLASSIC", "flat-nosed and low — the ball sits where you put it"),
+            ("CLASSIC", "long and low, built to scoop and carry"),
+            ("ODDITY", "tall and square: terrible aerials, unbeatable bumps"),
+            ("ODDITY", "a doorstop — the nose is almost on the floor"),
+            ("ODDITY", "a pebble: round in every direction, predictable nowhere"),
+            ("ODDITY", "a limousine hitbox; turns like one too"),
+            ("ODDITY", "a joke about being a box, kept because it is funny"),
+            ("ODDITY", "a streamliner with a fin you can feel in the air"),
+            ("ELECTRIC", "compact hatch — dribbles like an Octane"),
+            ("ELECTRIC", "low hypercar, the flick blade of the catalogue"),
+            ("ELECTRIC", "a pickup with a bed the ball settles into"),
+            ("ELECTRIC", "rally stance on tall tyres: lands well, shrugs off bad ones"),
+            ("ELECTRIC", "a shuttle with an enormous roof shelf"),
+            ("CONCEPT", "continuous shell, bubble canopy, muscular haunches"),
+            ("CONCEPT", "armoured wedge of interlocking plates"),
+            ("IMPORT", "digital camo, compact and squat"),
+            ("IMPORT", "the second art reference: crisp panels, clean shoulder"),
+            ("IMPORT", "a Dominus variant with a heavier tail"),
+            ("IMPORT", "broad and armoured, the widest of the imports"),
+            ("IMPORT", "long GT nose, the most detailed body here"),
+            ("IMPORT", "aggressive and angular; static wheels by choice"),
+            ("IMPORT", "horned and mean, a devil in profile"),
+            ("ASSEMBLED", "from a sci-fi tank: sponsons and a heavy tail"),
+            ("ASSEMBLED", "from a slick racer: spine and shell, the lightest"),
+            ("ASSEMBLED", "from a walking mech: plated and upright"),
+            ("ASSEMBLED", "from a rocket: a spine with rings down it"),
+            ("ASSEMBLED", "from a sci-fi jeep: boxy cabin, greebles everywhere"),
+        ],
         active: 0,
     };
     for (i, m) in hovercars.into_iter().enumerate() {
         cars.models.push(m);
         cars.names.push(["Brutis", "Akimbo", "Matris", "Vectorzoid", "Tempest", "Contingency", "Blackstar", "Elegance", "Trifang", "Echotron", "Hardwall", "Folly", "Lineback", "Whistlewind"][i]);
+        cars.info.push(("HOVER", [
+            "a hover tank: leans on the ball with an enormous soft field",
+            "stiff and slippery — slides like a puck, has to be flown",
+            "the balanced hovercar, and the place to start",
+            "shielded: the strongest repulsor field in the game",
+            "rides high enough to clear things, and can actually turn",
+            "motorcycle-sized, with a lance of a field: it pokes",
+            "shortest pulse cooldown here — it fights by shoving",
+            "long and floaty, with a reserve that never quite runs out",
+            "three-pronged and stiff: a narrow, hard field that stabs",
+            "a civilian runabout, the most forgiving of them",
+            "police interceptor: the hardest pulse, and a long wait for it",
+            "a land surfer — carves in long arcs and cannot stop",
+            "modular racer: a pad turns it into something else",
+            "a hover IFV, heavy and high, and it leans on the ball",
+        ][i]));
     }
     // EVERY car gets an electric variant. Rather than model them twice, the
     // petrol body is converted: light bars, blanked grille, battery sills and
@@ -984,6 +1046,10 @@ fn main() {
             let ev = procars::electrify(&mut gpu, &cars.models[i], accent);
             cars.models.push(ev);
             cars.names.push(Box::leak(format!("{} EV", cars.names[i]).into_boxed_str()));
+            cars.info.push((
+                "ELECTRIC",
+                Box::leak(format!("{} — electric: harder off the line, lower top end", cars.blurb_of(i)).into_boxed_str()) as &str,
+            ));
         }
         cars.active = sv.car.min(cars.models.len() - 1);
     }
@@ -1477,7 +1543,16 @@ impl Game {
         if d < self.car.half_h {
             self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
         }
-        self.toastf(&format!("{} ({}/{})", self.cars.names[next], next + 1, n));
+        // cycling in play says what you just picked up, because the whole
+        // point of [ and ] is trying things without opening a menu
+        self.toastf(&format!(
+            "{} [{}] {}/{} - {}",
+            self.cars.names[next],
+            self.cars.class_of(next),
+            next + 1,
+            n,
+            self.cars.blurb_of(next)
+        ));
     }
 
     fn open_menu(&mut self, m: Mode) {
@@ -3123,8 +3198,15 @@ impl Game {
                             r,
                             Row::Link(_) | Row::Controls | Row::Fullscreen | Row::Back | Row::Preset | Row::GameMode(_) | Row::CarPick
                         );
+                        // the picker names the CLASS as well as the car, so
+                        // forty entries read as six families rather than one
+                        // undifferentiated list
                         let value = if matches!(r, Row::CarPick) {
-                            self.cars.names[self.cars.active].to_uppercase()
+                            format!(
+                                "{}  [{}]",
+                                self.cars.names[self.cars.active].to_uppercase(),
+                                self.cars.class_of(self.cars.active)
+                            )
                         } else {
                             value
                         };
