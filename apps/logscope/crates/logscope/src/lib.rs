@@ -60,6 +60,7 @@ pub mod rolequant_hint;
 pub mod deliberate;
 pub mod panelmode;
 pub mod debaterun;
+pub mod codefmt;
 pub mod panelvoice;
 pub mod injecttime;
 pub mod injectfork;
