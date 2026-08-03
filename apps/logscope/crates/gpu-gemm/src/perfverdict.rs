@@ -762,3 +762,37 @@ mod residency_tests {
         assert!(r(0, 0).report(100).contains("not streaming"));
     }
 }
+
+#[cfg(test)]
+mod gate_list_tests {
+    /// The advertised gate list must match the gates the binary dispatches.
+    ///
+    /// It was a hand-maintained string listing 18 while the binary had 46 — **28 working gates
+    /// invisible**, including `--gate-bytes`, `--gate-q4k` and `--gate-q6k`, which are the three that
+    /// mattered most this month. `--gate-bytes` is what found the lane-varying shift.
+    ///
+    /// A help text that disagrees with the code is worse than none. It does not merely omit, it
+    /// **asserts absence**: someone reading it concludes the gate was never written and goes looking
+    /// for the wrong thing.
+    ///
+    /// Checked by reading main.rs rather than by calling the binary, so the test fails at build time
+    /// when someone adds a gate and forgets the list — which is exactly how it drifted by 28.
+    #[test]
+    fn every_dispatched_gate_is_advertised() {
+        let src = include_str!("main.rs");
+        let dispatched: std::collections::BTreeSet<&str> = src
+            .match_indices("\"--gate-").map(|(i, _)| {
+                let rest = &src[i + 1..];
+                &rest[..rest.find('"').unwrap_or(0)]
+            }).collect();
+        // The advertised block is the one printed for an unknown gate.
+        let start = src.find("unknown gate ").expect("the message exists");
+        let end = src[start..].find(");").map(|e| start + e).unwrap_or(src.len());
+        let advertised = &src[start..end];
+        let missing: Vec<&&str> = dispatched.iter()
+            .filter(|g| !advertised.contains(**g)).collect();
+        assert!(missing.is_empty(),
+            "{} gate(s) are dispatched and not advertised: {:?}", missing.len(), missing);
+        assert!(dispatched.len() > 40, "sanity: found only {} gates", dispatched.len());
+    }
+}
