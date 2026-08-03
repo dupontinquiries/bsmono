@@ -58,17 +58,41 @@ def read_joints(path):
         return []
 
 
-def project(pts, yaw, pitch):
-    """Orthographic projection. Orthographic on purpose: a perspective divide
-    would make a marker's apparent position depend on depth, and the one
-    thing this tool must not do is put a dot somewhere the joint is not."""
+def basis(yaw, pitch):
+    """Camera axes for a spherical orbit: (right, up, forward).
+
+    The first version sheared yaw and pitch by hand, which is fine at small
+    angles and wrong at large ones — pitch past about a radian starts
+    skewing the silhouette because the two rotations were never composed
+    into an orthonormal frame. Building the frame properly makes the orbit
+    behave the same everywhere, and a test asserts the axes stay unit-length
+    and mutually perpendicular at extreme angles.
+    """
     cy, sy = math.cos(yaw), math.sin(yaw)
     cp, sp = math.cos(pitch), math.sin(pitch)
-    x = pts[:, 0] * cy + pts[:, 2] * sy
-    z = -pts[:, 0] * sy + pts[:, 2] * cy
-    y = pts[:, 1] * cp - z * sp
-    depth = pts[:, 1] * sp + z * cp
-    return np.stack([x, y], 1), depth
+    # eye direction on the unit sphere, then a right/up pair around it
+    fwd = np.array([cp * sy, sp, cp * cy])
+    world_up = np.array([0.0, 1.0, 0.0])
+    right = np.cross(world_up, fwd)
+    n = np.linalg.norm(right)
+    if n < 1e-6:                       # looking straight up or down
+        right = np.array([1.0, 0.0, 0.0])
+    else:
+        right = right / n
+    up = np.cross(fwd, right)
+    return right, up, fwd
+
+
+def project(pts, yaw, pitch, zoom=1.0):
+    """Orthographic projection onto the orbit frame.
+
+    Orthographic on purpose: a perspective divide would make a marker's
+    apparent position depend on depth, and the one thing this tool must not
+    do is put a dot somewhere the joint is not.
+    """
+    right, up, fwd = basis(yaw, pitch)
+    xy = np.stack([pts @ right, pts @ up], 1) * zoom
+    return xy, pts @ fwd
 
 
 def pick(joints, cur, d, only_bad):
@@ -101,7 +125,11 @@ class View:
         self.bad = [k for k, j in enumerate(self.joints) if j.get("misparented")]
         self.only_bad = bool(self.bad)
         self.sel = self.bad[0] if self.bad else 0
-        self.yaw, self.pitch = 0.6, 0.25
+        self.yaw, self.pitch, self.zoom = 0.6, 0.25, 1.0
+        # the animation the buttons ask for. No clip data exists yet — gait
+        # strips are still unbuilt — so this names what was requested and the
+        # title says so, rather than pretending to play something.
+        self.clip = None
         self.load()
 
     def load(self):
@@ -137,11 +165,11 @@ class View:
     def frame(self):
         """(mesh_xy, mesh_depth, marker_xy) in view space, centred."""
         p = self.pts - self.centre
-        xy, dep = project(p, self.yaw, self.pitch)
+        xy, dep = project(p, self.yaw, self.pitch, self.zoom)
         m = self.marker()
         mxy = None
         if m is not None:
-            mxy, _ = project((m - self.centre)[None, :], self.yaw, self.pitch)
+            mxy, _ = project((m - self.centre)[None, :], self.yaw, self.pitch, self.zoom)
             mxy = mxy[0]
         return xy, dep, mxy
 
@@ -186,15 +214,26 @@ def draw(v, ax):
     j = v.cur()
     scope = f"{len(v.bad)} bad" if v.only_bad else f"{len(v.joints)} joints"
     mode = "ROBOT (pivots are NOT in this frame)" if v.pose == "f04" else "VEHICLE — pivot frame"
-    ax.set_title(f"{v.name}  [{mode}]  [{scope}]\n{describe(j) if j else 'no joint data'}",
+    clip = f"  clip:{v.clip}" if v.clip else ""
+    ax.set_title(f"{v.name}  [{mode}]  [{scope}]{clip}\n{describe(j) if j else 'no joint data'}",
                  color="#d8dee9", fontsize=11, loc="left", family="monospace")
+
+
+# The clips the viewer will eventually play. Named now so the buttons exist
+# and the wiring is settled; none of them has pose data yet, because gait
+# strips are still unbuilt. Pressing one names it in the title rather than
+# faking a motion — a viewer that lies about what it is showing is worse
+# than one that admits it has nothing.
+CLIPS = ["DRIVE", "BRAKE", "WALK", "RUN", "FIRE", "LAND"]
 
 
 def interactive(v):
     import matplotlib.pyplot as plt
+    from matplotlib.widgets import Button
 
-    fig, ax = plt.subplots(figsize=(9, 9))
+    fig, ax = plt.subplots(figsize=(9, 9.6))
     fig.patch.set_facecolor("#0d0f14")
+    fig.subplots_adjust(bottom=0.12)
 
     def redraw():
         draw(v, ax)
@@ -232,21 +271,50 @@ def interactive(v):
         print(describe(v.cur()) if v.cur() else "no joints")
         redraw()
 
-    drag = {"on": False, "x": 0, "y": 0}
+    drag = {"on": 0, "x": 0, "y": 0}
 
     def on_press(e):
-        drag.update(on=True, x=e.x or 0, y=e.y or 0)
+        if e.inaxes is not ax:
+            return          # a click on a button is not a drag
+        drag.update(on=e.button, x=e.x or 0, y=e.y or 0)
 
     def on_release(_):
-        drag["on"] = False
+        drag["on"] = 0
 
     def on_move(e):
         if not drag["on"] or e.x is None:
             return
-        v.yaw += (e.x - drag["x"]) * 0.01
-        v.pitch = max(-1.4, min(1.4, v.pitch + (e.y - drag["y"]) * 0.01))
+        dx, dy = e.x - drag["x"], e.y - drag["y"]
+        if drag["on"] == 1:
+            # ORBIT. Pitch is clamped just shy of the poles: at exactly
+            # straight up the right vector is undefined and the model spins
+            # about nothing.
+            v.yaw += dx * 0.01
+            v.pitch = max(-1.5, min(1.5, v.pitch + dy * 0.01))
+        else:
+            # right-drag zooms, because the wheel is spoken for by the joints
+            v.zoom = max(0.25, min(6.0, v.zoom * (1.0 + dy * 0.006)))
         drag.update(x=e.x, y=e.y)
         redraw()
+
+    # ---- clip buttons ----
+    def make_clip(name):
+        def go(_):
+            v.clip = None if v.clip == name else name
+            print(f"clip: {v.clip or 'none'} (no pose data yet — naming only)")
+            redraw()
+        return go
+
+    buttons = []
+    w = 0.13
+    for i, name in enumerate(CLIPS):
+        bax = fig.add_axes([0.055 + i * (w + 0.012), 0.03, w, 0.05])
+        b = Button(bax, name, color="#1b2029", hovercolor="#2a3340")
+        b.label.set_color("#d8dee9")
+        b.label.set_fontsize(9)
+        b.on_clicked(make_clip(name))
+        buttons.append(b)   # keep them alive; matplotlib drops unreferenced
+    fig._clip_buttons = buttons
 
     fig.canvas.mpl_connect("key_press_event", on_key)
     fig.canvas.mpl_connect("scroll_event", on_scroll)
