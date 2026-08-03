@@ -551,3 +551,113 @@ mod doubt_tests {
         assert!(profile_doubts(0, 0, 500.0, 5000.0).is_empty());
     }
 }
+
+/// What the expert cache actually achieved, in the terms that decide what to do next.
+///
+/// The streaming counters — hits, fills, bytes, repins — are tracked and were reported nowhere, so
+/// there has been no way to tell whether pinning more experts would help or whether the cache is
+/// already saturated and the remaining cost is elsewhere.
+///
+/// That distinction is the whole question for a streaming MoE. Scout pins 6 of 16 and routes to 1 per
+/// layer per token: if the hit rate is near 40% the pin set is the lever and more budget buys tokens
+/// directly; if it is near 95% the cache has already done its work and more pinning buys almost
+/// nothing, which points at the kernels instead.
+///
+/// Uniform routing would give 6/16 = 37.5%. **Anything well above that is the LFRU policy earning its
+/// place**, and anything at or below it means the policy is not tracking the routing — a different
+/// and much worse problem than a small pin set.
+pub struct ExpertResidency {
+    pub hits: u64,
+    pub fills: u64,
+    pub bytes: u64,
+    pub repins: u64,
+    pub pinned: usize,
+    pub total: usize,
+}
+
+impl ExpertResidency {
+    pub fn hit_rate(&self) -> f64 {
+        let n = self.hits + self.fills;
+        if n == 0 { return 0.0; }
+        self.hits as f64 / n as f64
+    }
+
+    /// What uniform routing would give with this pin set — the floor a policy must beat to be worth
+    /// having.
+    pub fn uniform_baseline(&self) -> f64 {
+        if self.total == 0 { return 0.0; }
+        self.pinned as f64 / self.total as f64
+    }
+
+    pub fn report(&self, tokens: u64) -> String {
+        let hr = self.hit_rate();
+        let base = self.uniform_baseline();
+        let verdict = if self.hits + self.fills == 0 {
+            "no expert traffic recorded — this model is not streaming".to_string()
+        } else if hr <= base + 0.02 {
+            format!("at or below the {:.0}% uniform baseline — the LFRU policy is NOT tracking the \
+routing, which is worse than a small pin set and is the thing to fix before raising the budget",
+                base * 100.0)
+        } else if hr > 0.90 {
+            format!("well above the {:.0}% uniform baseline and near saturation — more pinning buys \
+little, so the remaining decode cost is in the kernels rather than in expert traffic", base * 100.0)
+        } else {
+            format!("above the {:.0}% uniform baseline with room left — raising the GPU budget pins \
+more experts and should convert directly into tokens", base * 100.0)
+        };
+        format!("expert residency — {:.1}% hit ({} hits / {} fills), {:.1} GiB moved, {} repins, \
+{}/{} pinned, {:.0} MiB per token | {verdict}",
+            hr * 100.0, self.hits, self.fills,
+            self.bytes as f64 / (1u64 << 30) as f64, self.repins, self.pinned, self.total,
+            if tokens == 0 { 0.0 } else { self.bytes as f64 / tokens as f64 / (1u64 << 20) as f64 })
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+
+    fn r(hits: u64, fills: u64) -> ExpertResidency {
+        ExpertResidency { hits, fills, bytes: 123 << 30, repins: 40, pinned: 6, total: 16 }
+    }
+
+    #[test]
+    fn a_saturated_cache_points_at_the_KERNELS_not_the_budget() {
+        // The case where raising the GPU budget is wasted effort, and saying so is the point of
+        // reporting this at all.
+        let s = r(950, 50).report(661);
+        assert!(s.contains("near saturation"));
+        assert!(s.contains("in the kernels"));
+    }
+
+    #[test]
+    fn a_hit_rate_at_the_UNIFORM_BASELINE_means_the_policy_is_not_tracking() {
+        // 6 pinned of 16 is 37.5% by luck alone. A policy achieving only that is not learning the
+        // routing — a different and worse problem than a small pin set, and one more budget would not
+        // fix.
+        let s = r(375, 625).report(100);
+        assert!(s.contains("NOT tracking"), "{s}");
+        assert!(s.contains("before raising the budget"));
+    }
+
+    #[test]
+    fn a_middling_rate_says_the_budget_IS_the_lever() {
+        let s = r(700, 300).report(100);
+        assert!(s.contains("room left"));
+        assert!(s.contains("raising the GPU budget"));
+    }
+
+    #[test]
+    fn bytes_per_token_is_reported_because_it_is_the_number_that_moves() {
+        // 123 GiB over 661 tokens is ~190 MiB/token — which sounds enormous and is in fact one and a
+        // third expert fetches across 48 layers, i.e. the cache eliminating ~97% of the traffic.
+        let s = r(900, 100).report(661);
+        assert!(s.contains("MiB per token"));
+    }
+
+    #[test]
+    fn a_dense_model_reports_no_traffic_rather_than_a_zero_rate() {
+        // 0% hit rate would read as a broken cache on a model that has no experts at all.
+        assert!(r(0, 0).report(100).contains("not streaming"));
+    }
+}
