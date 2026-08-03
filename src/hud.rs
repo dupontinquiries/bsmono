@@ -393,6 +393,98 @@ pub fn lesson_banner(ui: &mut Vec<UiVert>, a: f32, name: &str, hint: &str, progr
 
 /// The garage. Four slots, the current pick, and what it does — the blurb
 /// matters here because "MOIRE" tells you nothing on its own.
+/// The catalogue: every vehicle, grouped by family, with the highlighted one
+/// on the stage beside it.
+///
+/// The picker was a single row you cycled through — fine for nine cars and
+/// useless for forty. Grouping by family turns one long run into seven short
+/// ones, and showing the description of whatever is highlighted means you can
+/// read the catalogue instead of driving it to find out.
+#[allow(clippy::too_many_arguments)]
+pub fn catalog_menu(
+    ui: &mut Vec<UiVert>,
+    a: f32,
+    sel: usize,
+    active: usize,
+    names: &[&str],
+    info: &[(&str, &str)],
+    scroll: usize,
+    cur: (f32, f32),
+) {
+    let wide = a > 1.25;
+    let (px0, px1, py0, py1) = if wide {
+        (-0.98, 0.10, -0.985, 0.955)
+    } else {
+        (-0.92, 0.92, -0.985, 0.42)
+    };
+    let (rx0, rx1) = (px0 + 0.07, px1 - 0.07);
+    if wide {
+        quad(ui, -1.0, -1.0, 0.14, 1.0, [0.05, 0.04, 0.09, 0.45]);
+    } else {
+        quad(ui, -1.0, -1.0, 1.0, 0.46, [0.05, 0.04, 0.09, 0.45]);
+    }
+    panel(ui, a, py1, py0, px1, px0);
+    let k = ui_k(a);
+    let title_y = if wide { 0.885 } else { 0.35 };
+    label_c_at(ui, (px0 + px1) * 0.5, title_y, T_TITLE * k, a, PAPER, "CATALOGUE");
+    label_c_at(
+        ui,
+        (px0 + px1) * 0.5,
+        title_y - 0.052,
+        T_HINT * k,
+        a,
+        DIM,
+        &fit(&format!("{} VEHICLES", names.len()), (rx1 - rx0) * 0.9, T_HINT * k, a),
+    );
+
+    // build the display list: a header wherever the family changes
+    let mut rows: Vec<(bool, usize)> = Vec::new(); // (is_header, car index)
+    let mut last = "";
+    for i in 0..names.len() {
+        let cls = info.get(i).map(|x| x.0).unwrap_or("");
+        if cls != last {
+            rows.push((true, i));
+            last = cls;
+        }
+        rows.push((false, i));
+    }
+    let row_h = if wide { 0.052 } else { 0.046 };
+    let top = if wide { 0.72 } else { 0.26 };
+    let vis = ((top - TW_BOTTOM) / row_h) as usize;
+    let start = scroll.min(rows.len().saturating_sub(vis.min(rows.len())));
+    let end = (start + vis).min(rows.len());
+    scrollbar(ui, a, px1 - 0.03, TW_BOTTOM, top + 0.02, rows.len(), vis, start);
+    for r in start..end {
+        let (is_head, ci) = rows[r];
+        let y = top - (r - start) as f32 * row_h;
+        if is_head {
+            font::text(ui, rx0, y, T_HINT * k, a, GOLD, info.get(ci).map(|x| x.0).unwrap_or(""));
+            continue;
+        }
+        let picked = ci == sel;
+        if picked {
+            quad(ui, rx0 - 0.02, y - row_h + 0.022, rx1 + 0.02, y + 0.020, SEL);
+            quad(ui, rx0 - 0.035, y - row_h + 0.022, rx0 - 0.024, y + 0.020, GOLD);
+        }
+        let col = if picked { GOLD } else if ci == active { CYAN } else { PAPER };
+        let mark = if ci == active { "IN USE" } else { "" };
+        row_pair(ui, rx0, rx1, y, names[ci], col, mark, CYAN, T_BODY * k, a);
+    }
+    // what the highlighted car is like
+    let blurb = info.get(sel).map(|x| x.1).unwrap_or("");
+    label_c_at(
+        ui,
+        (px0 + px1) * 0.5,
+        TW_BOTTOM - 0.045,
+        T_HINT * k,
+        a,
+        DIM,
+        &fit(blurb, (rx1 - rx0) * 0.98, T_HINT * k, a),
+    );
+    nav_strip(ui, a, cur, 0);
+    legend(ui, -0.93, a, T_HINT, &[("ENTER", "DRIVE IT"), ("ESC", "BACK")]);
+}
+
 /// The garage. The car itself is on stage beside (or above) this panel —
 /// see the live view in `main.rs` — so the panel deliberately does NOT fill
 /// the screen: it takes the left half on a wide window and the lower part of
@@ -498,6 +590,11 @@ pub const ACADEMY_ROW_H: f32 = 0.062;
 pub const GARAGE_TOP: f32 = 0.66;
 /// the tall-window layout puts the rows lower, under the stage
 pub const GARAGE_TOP_TALL: f32 = 0.22;
+/// catalogue rows: the same numbers the drawing uses, so hit-testing agrees
+pub const CAT_TOP: f32 = 0.72;
+pub const CAT_TOP_TALL: f32 = 0.26;
+pub const CAT_ROW_H: f32 = 0.052;
+pub const CAT_ROW_H_TALL: f32 = 0.046;
 pub const GARAGE_ROW_H: f32 = 0.082;
 
 /// The trials list: name, what it asks, which map, and your best.

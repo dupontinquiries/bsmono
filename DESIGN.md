@@ -3590,6 +3590,29 @@ Thirty-four described entries across seven families, and the ASSEMBLED
 family has doubled to ten. There are 163 donors left in the library, which
 is now a matter of picking interesting ones rather than of writing anything.
 
+## v1.110.0 — a catalogue screen, so the catalogue is visible
+
+The classes and character lines added last version were only reachable from
+a cycling row and a toast — the information existed and nobody could browse
+it. Forty-four vehicles want a page, not a spinner.
+
+CATALOGUE is its own screen now: every vehicle grouped under its family
+heading, the one you are driving marked IN USE, and the description of
+whatever is highlighted along the bottom. Seven short lists instead of one
+long run.
+
+THE STAGE FOLLOWS THE HIGHLIGHT. The live view already existed for the
+garage, and it shows the SELECTED car here rather than the active one —
+otherwise browsing forty vehicles shows you the same car forty times. Arrow
+through the list and each one turns on the stand with its real skin, rig and
+reflections; Enter drives it.
+
+The list interleaves headers with cars, so a screen row is not a car index.
+That mapping is the kind of thing that silently selects the wrong vehicle
+further down a list, so `--sim menus` builds the same display list and checks
+it: a header per family, headers not selectable, and every screen row
+resolving back to the car it names.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

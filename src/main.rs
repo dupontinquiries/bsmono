@@ -56,6 +56,7 @@ const COMBO_WINDOW: f32 = 7.0;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Mode {
+    Catalog { sel: usize },
     Garage { sel: usize },
     Academy { sel: usize },
     Trials { sel: usize },
@@ -90,6 +91,7 @@ enum Row {
     Trials,
     Academy,
     Garage,
+    Catalog,
     Fullscreen,
     Header,
     GameMode(u8), // 0 free, 1 sparta 50v50, 2 sparta 300
@@ -285,6 +287,7 @@ fn tweak_rows(menu: u8) -> Vec<(&'static str, Row)> {
             ("BACK", Back),
         ],
         _ => vec![
+            ("CATALOGUE - EVERY VEHICLE", Catalog),
             ("GARAGE - SKINS, WHEELS, TRAILS", Garage),
             ("ACADEMY - LEARN THE TRICKS", Academy),
             ("TRIALS", Trials),
@@ -335,7 +338,7 @@ fn row_value(cfg: &Config, row: &Row) -> (String, Option<f32>) {
         }
         Row::Toggle { get, .. } => ((if get(cfg) { "ON" } else { "OFF" }).into(), None),
         Row::Preset => (PRESETS[cfg.preset % PRESETS.len()].into(), None),
-        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::GameMode(_) => (String::new(), None),
+        Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::Catalog | Row::GameMode(_) => (String::new(), None),
         Row::CarPick => ("<see below>".into(), None),
         Row::Fullscreen => ("TOGGLE".into(), None),
         Row::Header | Row::Back => (String::new(), None),
@@ -1592,6 +1595,17 @@ impl Game {
         let esc = Key::Named(NamedKey::Escape);
         let enter = Key::Named(NamedKey::Enter);
         match self.mode {
+            Mode::Catalog { .. } => {
+                if let Some(i) = self.hover_row() {
+                    if let Mode::Catalog { sel } = self.mode {
+                        if sel == i {
+                            self.switch_car(i);
+                            self.save.car = i;
+                        }
+                    }
+                    self.mode = Mode::Catalog { sel: i };
+                }
+            }
             Mode::Garage { .. } => {
                 if let Some(i) = self.hover_row() {
                     self.mode = Mode::Garage { sel: i };
@@ -2065,6 +2079,23 @@ impl Game {
         self.trial = Some(run);
     }
 
+    /// The catalogue's display list: a header wherever the family changes,
+    /// then its cars. Built the same way the drawing builds it, so a click
+    /// lands on the row it appears to be over.
+    fn catalog_rows(&self) -> Vec<(bool, usize)> {
+        let mut rows = Vec::new();
+        let mut last = "";
+        for i in 0..self.cars.names.len() {
+            let cls = self.cars.class_of(i);
+            if cls != last {
+                rows.push((true, i));
+                last = cls;
+            }
+            rows.push((false, i));
+        }
+        rows
+    }
+
     fn hover_row(&self) -> Option<usize> {
         let y = self.cursor.1;
         match self.mode {
@@ -2102,6 +2133,23 @@ impl Game {
                 let start = self.mscroll.max(0.0) as usize;
                 hud::hit_row_scrolled(hud::LIST_TOP, hud::ACADEMY_ROW_H, n, vis, start, y)
             }
+            Mode::Catalog { .. } => {
+                // the catalogue's rows include family headers, so a screen
+                // row is not a car index — the caller maps it back
+                let a = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
+                let wide = a > 1.25;
+                let (top, rh) = if wide {
+                    (hud::CAT_TOP, hud::CAT_ROW_H)
+                } else {
+                    (hud::CAT_TOP_TALL, hud::CAT_ROW_H_TALL)
+                };
+                let rows = self.catalog_rows();
+                let vis = ((top - hud::TW_BOTTOM) / rh) as usize;
+                let start = (self.mscroll.max(0.0) as usize).min(rows.len().saturating_sub(vis.min(rows.len())));
+                hud::hit_row_scrolled(top, rh, rows.len(), vis, start, y)
+                    .and_then(|r| rows.get(r).copied())
+                    .and_then(|(is_head, ci)| (!is_head).then_some(ci))
+            }
             Mode::Garage { .. } => {
                 // the panel drops below the stage on a tall window, so the
                 // rows are somewhere else and hit-testing has to know
@@ -2134,7 +2182,7 @@ impl Game {
             Row::Preset | Row::CarPick => {
                 self.tweaks_key(&Key::Named(NamedKey::ArrowRight), menu, i, win);
             }
-            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage => {
+            Row::Link(_) | Row::Controls | Row::Trials | Row::Academy | Row::Garage | Row::Catalog => {
                 self.mscroll = 0.0;
                 self.mfling = 0.0;
                 self.tweaks_key(&Key::Named(NamedKey::Enter), menu, i, win);
@@ -2177,6 +2225,26 @@ impl Game {
             _ => "",
         };
         match self.mode {
+            Mode::Catalog { sel } => {
+                let n = self.cars.models.len();
+                match (&key, ch) {
+                    (Key::Named(NamedKey::Escape), _) => self.close_menu(),
+                    (Key::Named(NamedKey::ArrowUp), _) | (_, "w") => {
+                        self.mode = Mode::Catalog { sel: (sel + n - 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::ArrowDown), _) | (_, "s") => {
+                        self.mode = Mode::Catalog { sel: (sel + 1) % n };
+                        self.follow_selection();
+                    }
+                    (Key::Named(NamedKey::Enter), _) => {
+                        self.switch_car(sel);
+                        self.save.car = sel;
+                        self.toastf(&format!("{} - {}", self.cars.names[sel], self.cars.blurb_of(sel)));
+                    }
+                    _ => {}
+                }
+            }
             Mode::Garage { sel } => {
                 let slots = custom::slots();
                 let n = slots.len();
@@ -2488,6 +2556,10 @@ impl Game {
             Row::Garage => {
                 self.mscroll = 0.0;
                 self.mode = Mode::Garage { sel: self.look_sel };
+            }
+            Row::Catalog => {
+                self.mscroll = 0.0;
+                self.mode = Mode::Catalog { sel: self.cars.active };
             }
             Row::Fullscreen => {
                 if matches!(key, Key::Named(NamedKey::Enter)) || dir != 0 {
@@ -3170,6 +3242,16 @@ impl Game {
         let mut ui: Vec<UiVert> = Vec::new();
         self.peer_tags(&mut ui, vp, aspect);
         match self.mode {
+            Mode::Catalog { sel } => hud::catalog_menu(
+                &mut ui,
+                aspect,
+                sel,
+                self.cars.active,
+                &self.cars.names,
+                &self.cars.info,
+                self.mscroll.max(0.0) as usize,
+                self.cursor,
+            ),
             Mode::Garage { sel } => hud::garage_menu(&mut ui, aspect, sel, &self.look, self.cursor),
             Mode::Academy { sel } => hud::academy_menu(
                 &mut ui,
@@ -4193,7 +4275,14 @@ impl Game {
         // real skin, the real rig motion, the real reflections and the real
         // lighting rather than a flat thumbnail that would have to be kept
         // in sync with all four.
-        if let Mode::Garage { .. } = self.mode {
+        // the catalogue previews what you are HIGHLIGHTING, not what you are
+        // driving — otherwise browsing shows you the same car forty times
+        let stage_car = match self.mode {
+            Mode::Catalog { sel } => Some(sel.min(self.cars.models.len() - 1)),
+            Mode::Garage { .. } => Some(self.cars.active),
+            _ => None,
+        };
+        if let Some(show) = stage_car {
             let aspect = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
             // camera basis, so the stand follows wherever you are looking
             let fwd = (self.cam.look - self.cam.pos).normalize_or(Vec3::NEG_Z);
@@ -4217,7 +4306,7 @@ impl Game {
             // car leaning with the camera reads as broken
             self.push_car(
                 &mut objs,
-                self.cars.active,
+                show,
                 at,
                 spin,
                 false,

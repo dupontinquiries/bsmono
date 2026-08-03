@@ -4459,6 +4459,32 @@ pub fn run(args: &[String]) {
             layouts_ok &= hit == Some(3);
         }
         check("both garage layouts hit-test where they draw", layouts_ok);
+        // ---- THE CATALOGUE'S HEADERS ----
+        // Its list interleaves family headers with cars, so a SCREEN row is
+        // not a car index. Getting that mapping wrong means clicking a name
+        // selects a different car — and it would look like an off-by-one
+        // that only appears further down the list.
+        {
+            let families = ["CLASSIC", "CLASSIC", "ODDITY", "ODDITY", "ELECTRIC"];
+            let mut rows: Vec<(bool, usize)> = Vec::new();
+            let mut last = "";
+            for (i, f) in families.iter().enumerate() {
+                if *f != last {
+                    rows.push((true, i));
+                    last = f;
+                }
+                rows.push((false, i));
+            }
+            // 5 cars in 3 families = 5 + 3 rows
+            println!("   catalogue list: {} cars -> {} screen rows", families.len(), rows.len());
+            let headers = rows.iter().filter(|r| r.0).count();
+            check("a header is inserted per family", headers == 3);
+            check("screen rows map back to the right car", {
+                // the row after each header must be that family's first car
+                rows.windows(2).all(|w| !w[0].0 || w[1].1 == w[0].1)
+            });
+            check("headers are not selectable", rows.iter().filter(|r| !r.0).count() == families.len());
+        }
         check(
             "the garage rows are hit-testable too",
             crate::hud::hit_row(
