@@ -41,6 +41,7 @@ mod sim;
 mod sound;
 mod terrain;
 mod touch;
+mod ui;
 mod weapons;
 mod xform;
 mod world;
