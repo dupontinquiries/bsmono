@@ -2,6 +2,7 @@
 //! Rust + wgpu 22 + winit 0.29 (the same stack as the reference repo's games).
 
 mod anim;
+mod actuator;
 mod airlock;
 mod analog;
 mod bigbody;
