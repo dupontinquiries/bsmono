@@ -20,6 +20,7 @@ pub mod tab_layout;
 pub mod log_gestures;
 pub mod chat_layout;
 pub mod backend;
+pub mod enginestrip;
 #[allow(dead_code)] pub mod fabric;
 pub mod genguard;
 pub mod patchmode; // unified-diff patch mode: model edits via diffs instead of full-file rewrites
