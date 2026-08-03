@@ -3350,9 +3350,18 @@ impl Gpu {
             //
             // Only one slab is written at a time, so holding the others mapped bought nothing and cost
             // the entire budget.
-            if a.mapped {
-                if let Some(prev) = a.slabs.last() { prev.unmap(); }
-            }
+            // NOT UNMAPPED HERE. I tried exactly that — unmap the previous slab when opening a new
+            // one, on the theory that fifteen simultaneously-mapped 2 GiB slabs were exhausting a
+            // mapped-buffer ceiling. It made things WORSE: the failure moved from slab 16 to SLAB 3.
+            //
+            // So the accumulation was not the constraint, and unmapping early breaks something the
+            // arena still needs — a slab whose mapping is dropped while writes are outstanding, or
+            // one that is written again after the next has opened. Either way the theory was wrong
+            // and the evidence said so in one run.
+            //
+            // What remains true is the number from _517: fifteen slabs and 30.0 GiB placed before
+            // slab 16 was refused, against a --gate-vram measurement of 63 GiB. Those two figures
+            // still disagree and the reason is still unknown.
             let usage = if a.mapped { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC }
                         else { wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST };
             let slab = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("arena-slab"), size,
