@@ -1,4 +1,9 @@
-# The Honeykrisp lane-broadcast fault
+# The Honeykrisp dynamic-shift fault
+
+> **Superseded title.** This was filed as a "lane broadcast" fault. The workgroup-staged probe
+> disproved that — it loads each word once from a distinct thread, barriers, reads workgroup memory,
+> and still fails identically. The shared read was never the cause. See the correction at the end.
+
 
 **Four threads reading one word return the value to one lane and zero to the other three.**
 
@@ -68,3 +73,51 @@ fails, the fault is deeper than a scalarized load and the workaround is wrong.
   decode — the 182 ms/token against a 10 ms roofline
 - and **Llama-4 Scout's gibberish** is no longer necessarily a Scout bug: every kernel indexing through
   a shared read is affected, on every model
+
+
+---
+
+# Correction: it is the DYNAMIC SHIFT, not the shared read
+
+The workgroup-staged variant fails with the same 4-of-16 pattern. That form has **no shared storage
+read at all** — one distinct load per thread into `var<workgroup>`, a barrier, then a workgroup-memory
+read. If a shared read were the fault, staging would fix it. It does not.
+
+So the shared-read theory joins the other four in the bin.
+
+## What is actually common to every failing variant
+
+```wgsl
+word_probe   dst[i] = f32(src[i])                 no bit manipulation        CORRECT
+byte_at      (w >> ((i & 3u) * 8u)) & 0xFFu       shift by a LANE-VARYING    WRONG
+vec4         same expression, vec4 source         amount                     WRONG
+staged       same expression, workgroup source                               WRONG
+```
+
+Lanes 0..3 shift by 0, 8, 16, 24 — and **correctness follows the lane whose shift is zero**. A shift by
+a non-uniform amount yields zero on this driver.
+
+## The corroboration that was already in the tree
+
+`MATVEC_Q4` unpacks nibbles with `extractBits(word, (kk % 8u) * 4u, 4u)` and the comment beside it
+reads **"AGX-safe dynamic offset"**. Someone hit this, worked around it, and recorded the workaround
+without naming the fault. That is why the kernels that work, work — and why a "cleaner" rewrite to
+shift-and-mask would silently break them.
+
+## The test that settles it
+
+`BYTE_PROBE_EXTRACT` keeps the shared read and the same byte, and changes **only** the extraction to
+`extractBits`. `--gate-bytes` reports it.
+
+* **`extractBits form CORRECT`** while the others are WRONG → the fault is the dynamic shift, and the
+  rule is mechanical: *no shift by a lane-varying amount anywhere in a kernel*. That is a grep, not an
+  investigation.
+* **also WRONG** → the extraction is not it either, and what remains is the `& 0xFFu` mask or something
+  about how the compiler lowers this whole expression class.
+
+## Why this changes the outlook
+
+A dynamic shift is a small, greppable pattern with a drop-in replacement that this codebase already
+uses elsewhere. A lane-broadcast fault would have meant restructuring every kernel that reads a shared
+scale. If the extractBits form is correct, the Q4_K and Q6_K dequantizers and the subgroup matvec need
+an expression swap rather than a redesign.
