@@ -11,6 +11,40 @@ use crate::config::CamCfg;
 use crate::physics::{Ball, Car};
 use crate::world::World;
 
+/// Which camera you are looking through.
+///
+/// This was a bool — ball cam on or off — and "off" meant a chase camera
+/// aimed twelve metres ahead of the car. That framing works for a car,
+/// which is low and wide and reads fine at the bottom of frame. It does not
+/// work for a robot: the subject leaves the shot entirely and you are
+/// looking at empty ground with your own feet somewhere below the bezel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CamMode {
+    /// look at the ball / locked target
+    Ball,
+    /// proper third person: the body is the subject
+    Chase,
+    /// from the head
+    First,
+}
+
+impl CamMode {
+    pub fn next(self) -> CamMode {
+        match self {
+            CamMode::Ball => CamMode::Chase,
+            CamMode::Chase => CamMode::First,
+            CamMode::First => CamMode::Ball,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            CamMode::Ball => "BALL CAM",
+            CamMode::Chase => "CHASE CAM",
+            CamMode::First => "FIRST PERSON",
+        }
+    }
+}
+
 pub struct Camera {
     /// smoothed velocity of the platform under the car (bend)
     plat_lag: Vec3,
@@ -18,6 +52,7 @@ pub struct Camera {
     pub look: Vec3,
     pub up: Vec3, // smoothed local up used for the view basis
     pub ball_cam: bool,
+    pub mode: CamMode,
     heading: Vec3,  // smoothed forward, kept in the up-plane
     reverse_t: f32, // how long the car has pointed "the other way"
     shake: f32,
@@ -38,6 +73,7 @@ impl Camera {
             look: Vec3::ZERO,
             up: Vec3::Y,
             ball_cam: true,
+            mode: CamMode::Ball,
             heading: Vec3::NEG_Z,
             reverse_t: 0.0,
             shake: 0.0,
@@ -116,10 +152,24 @@ impl Camera {
 
         self.update_heading(car, flipping, dt);
 
-        let target = if self.ball_cam {
-            ball.pos
-        } else {
-            car.pos + self.heading * 12.0
+        // FRAME THE SUBJECT.
+        //
+        // Chase used to aim `car.pos + heading * 12`, which puts the look
+        // point twelve metres past the thing you are driving — fine for a
+        // low wide car sitting at the bottom of frame, wrong for a robot,
+        // which walks straight out of the shot.
+        //
+        // A third-person camera looks at the BODY with a little lead, not at
+        // a patch of ground ahead of it. The lead shrinks and the look point
+        // rises with the body's own height, so a tall subject is centred and
+        // a flat one still shows the road.
+        let eye_h = car.half_h * 1.35;
+        let lead = if car.robot { 2.6 } else { 12.0 };
+        let target = match self.mode {
+            CamMode::Ball => ball.pos,
+            CamMode::Chase | CamMode::First => {
+                car.pos + self.up * eye_h + self.heading * lead
+            }
         };
         let mut dir = target - car.pos;
         if dir.length_squared() < 1e-4 {
@@ -167,10 +217,28 @@ impl Camera {
             }
         }
         let k = 1.0 - (-9.0 * cfg.stiffness * dt).exp();
-        self.pos += (want - self.pos) * k;
+        if self.mode == CamMode::First {
+            // ATTACHED TO THE HEAD. No boom, no smoothing on position — a
+            // first-person eye that lags its own body reads as seasickness,
+            // so this snaps and only the LOOK is smoothed.
+            //
+            // Nudged forward of the head rather than sat inside it: the
+            // player's own model is still drawn, and an eye at the exact
+            // head centre looks at the inside of its own face.
+            let f = (self.heading - self.up * self.heading.dot(self.up)).normalize_or(self.heading);
+            self.pos = car.pos + self.up * (car.half_h * 1.55) + f * (car.half_len * 0.55 + 0.25);
+        } else {
+            self.pos += (want - self.pos) * k;
+        }
 
         let aim = if rear { car.pos - (target - car.pos) } else { target };
-        let tilt = cfg.dist * (-cfg.angle_deg.to_radians()).tan();
+        // the boom's downward tilt is a third-person framing device; from
+        // the head there is no boom, so there is nothing to tilt
+        let tilt = if self.mode == CamMode::First {
+            0.0
+        } else {
+            cfg.dist * (-cfg.angle_deg.to_radians()).tan()
+        };
         let want_look = aim + self.up * (0.35 - tilt);
         self.look += (want_look - self.look) * (1.0 - (-14.0 * cfg.stiffness * dt).exp());
 

@@ -35,6 +35,10 @@ pub struct HudInfo<'a> {
     pub frame_drops: u32,
     pub car_name: &'a str,
     pub ball_cam: bool,
+    /// which camera, spelled out — there are three now
+    pub cam_label: &'static str,
+    /// first person wants a reticle and does not want a car-name card
+    pub first_person: bool,
     pub minimap: bool,
     pub air_roll: bool,
     pub map_name: &'a str,
@@ -690,7 +694,20 @@ pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball:
     label(ui, -0.975, 0.975, 0.017, a, PAPER, &format!("RINGS {}", info.rings));
     label(ui, -0.975, 0.942, 0.013, a, GOLD, &format!("GOALS {}", info.goals));
     label(ui, -0.975, 0.913, 0.011, a, DIM, &format!("CAR-THROUGHS {}", info.car_rings));
-    label(ui, -0.975, 0.888, 0.010, a, DIM, &format!("{}  ({})", info.car_name, if info.ball_cam { "BALL CAM" } else { "CAR CAM" }));
+    label(ui, -0.975, 0.888, 0.010, a, DIM, &format!("{}  ({})", info.car_name, info.cam_label));
+    // FIRST-PERSON RETICLE. From the head there is no body on screen to aim
+    // relative to, so the frame needs a centre. Four ticks around a gap
+    // rather than a dot: it reads at any background brightness and does not
+    // sit on top of the thing you are aiming at.
+    if info.first_person {
+        let (t, g, w) = (0.030f32, 0.009f32, 0.0016f32);
+        let ar = 0.5625; // the ticks are in NDC, so the vertical pair is scaled
+        let c = [0.85, 0.90, 1.0, 0.55];
+        quad(ui, -g - t, -w, -g, w, c);
+        quad(ui, g, -w, g + t, w, c);
+        quad(ui, -w * ar, (g + t) * ar, w * ar, g * ar, c);
+        quad(ui, -w * ar, -(g + t) * ar, w * ar, -g * ar, c);
+    }
     label(ui, -0.975, 0.864, 0.010, a, DIM, info.map_name);
     let mut y = 0.838;
     if let Some((n, status)) = &info.online {

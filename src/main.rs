@@ -1130,6 +1130,10 @@ fn main() {
 
     let mut cam = camera::Camera::new();
     cam.ball_cam = sv.ball_cam;
+    // the save predates the third mode, so it round-trips ball vs chase and
+    // first person always starts off — a saved first-person view that you
+    // cannot see yourself in is a confusing thing to boot into
+    cam.mode = if sv.ball_cam { camera::CamMode::Ball } else { camera::CamMode::Chase };
     let snd = sound::Sound::new(sv.volume, sv.music, opts.mute);
 
     let (pv_cp, pv_cr, pv_bp, pv_br) = (car.pos, car.rot, ball.pos, ball.rot);
@@ -1267,11 +1271,20 @@ fn main() {
                 event: winit::event::DeviceEvent::MouseMotion { delta },
                 ..
             } => {
-                if game.car.robot && game.mode == Mode::Play {
+                let looking = game.car.robot || game.cam.mode == camera::CamMode::First;
+                if looking && game.mode == Mode::Play {
                     const SENS: f32 = 0.0022;
                     game.cam.look_yaw -= delta.0 as f32 * SENS;
-                    game.cam.look_pitch = (game.cam.look_pitch - delta.1 as f32 * SENS)
-                        .clamp(-0.55, 1.05);
+                    // from the head you can look almost straight up and down;
+                    // on a boom, looking far up shoves the eye through the
+                    // body, so third person keeps the tighter clamp
+                    let (lo, hi) = if game.cam.mode == camera::CamMode::First {
+                        (-1.35, 1.35)
+                    } else {
+                        (-0.55, 1.05)
+                    };
+                    game.cam.look_pitch =
+                        (game.cam.look_pitch - delta.1 as f32 * SENS).clamp(lo, hi);
                     // wrap so the yaw cannot wind up to a huge number over a
                     // long session
                     let tau = std::f32::consts::TAU;
@@ -1575,7 +1588,18 @@ impl Game {
     fn one_shot(&mut self, a: Action) {
         match a {
             Action::Jump => self.jump_edge = true,
-            Action::BallCam => self.cam.ball_cam = !self.cam.ball_cam,
+            Action::BallCam => {
+                // three states now, not two. ball_cam is kept in step so the
+                // HUD and the save file, which both predate the enum, still
+                // mean what they meant.
+                self.cam.mode = self.cam.mode.next();
+                self.cam.ball_cam = self.cam.mode == camera::CamMode::Ball;
+                if self.cam.mode != camera::CamMode::First {
+                    self.cam.look_pitch = self.cam.look_pitch.clamp(-0.55, 1.05);
+                }
+                let m = self.cam.mode.label();
+                self.toastf(m);
+            }
             Action::Toss => self.ball.toss(&self.car),
             Action::BallFront => self.ball.reset_in_front(&self.car),
             Action::ResetCar => {
@@ -3844,6 +3868,8 @@ impl Game {
             frame_drops: self.frame_drops,
             car_name: self.cars.names[self.cars.active],
             ball_cam: self.cam.ball_cam,
+            cam_label: self.cam.mode.label(),
+            first_person: self.cam.mode == camera::CamMode::First,
             scores: if matches!(self.game_mode, 1 | 3..=7) { Some((self.scores[0], self.scores[1])) } else { None },
             minimap: self.save.minimap,
             air_roll: !self.car.on_ground && self.roll_mix_s > 0.5,
