@@ -1648,6 +1648,12 @@ impl Game {
             }
             Action::FlipVis => self.flip_vis = !self.flip_vis,
             Action::Transform => self.transform(),
+            Action::Fire => self.fire_weapon(),
+            Action::CycleForm => {
+                if self.wep.watch.cycle() {
+                    self.toastf(&format!("ATTUNING: {}", self.wep.watch.active().name()));
+                }
+            }
             Action::AutoTarget => {
                 self.autotarget = !self.autotarget;
                 if !self.autotarget {
@@ -1869,6 +1875,44 @@ impl Game {
         self.set_car_model(m);
         self.save.car = m;
         self.toastf(&format!("{} ({}/{})", self.cars.names[m], next + 1, n));
+    }
+
+    /// Pull the trigger.
+    ///
+    /// Robot mode only: a car has no arms. Boost is the ammunition, which is
+    /// the same tank the thrusters and the second jump draw from — shooting
+    /// costs you mobility, which is a decision rather than a resource.
+    fn fire_weapon(&mut self) {
+        if !self.car.robot || self.mode != Mode::Play {
+            return;
+        }
+        let origin = self.car.pos + self.car.up() * (self.car.half_h * 0.8);
+        // aim down the camera, not down the chassis: with free look the two
+        // differ, and you shoot where you are looking
+        let aim = (self.cam.look - self.cam.pos).normalize_or(self.car.forward());
+        let targets: Vec<weapons::Target> = self
+            .bots
+            .iter()
+            .enumerate()
+            .map(|(i, b)| weapons::Target {
+                id: i as u32,
+                pos: b.car.pos,
+                r: b.car.half_len.max(b.car.half_h),
+            })
+            .collect();
+        let cost = self.wep.effective().cost;
+        let out = self.wep.fire(origin, aim, &targets, self.car.boost);
+        if !out.fired {
+            return;
+        }
+        self.car.boost = (self.car.boost - cost).max(0.0);
+        self.car.vel += out.self_impulse;
+        if let Some(p) = out.teleport {
+            self.car.pos = p;
+        }
+        for e in &out.fx {
+            self.fx.ring_burst(e.pos, e.color, e.scale > 1.5);
+        }
     }
 
     /// Drive the gait, and put its body motion somewhere the renderer

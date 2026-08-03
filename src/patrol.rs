@@ -61,6 +61,14 @@ pub struct Destination {
     /// does air move? The gate that decides whether dunes are possible.
     pub weather: bool,
     pub hostiles: Faction,
+    /// what the place is like to be in when nothing is attacking you
+    pub sky: Sky,
+    /// how long a full day is, in seconds. 0 means the light never changes —
+    /// tidally locked, or too far out for a sun to matter.
+    pub day_len: f32,
+    /// ambient beats that fire on their own timer, so the world has
+    /// something to say between public events
+    pub ambient: &'static [&'static str],
     /// what the archive says about it, surfaced on arrival
     pub note: &'static str,
 }
@@ -72,47 +80,151 @@ pub struct Destination {
 pub const ROUTE: &[Destination] = &[
     Destination { id: "earth", name: "EARTH", terrain: Terrain::Surface, gravity: 1.00, weather: true,
         hostiles: Faction::Corrupted,
-        note: "the core holds cosmic significance; the humans have been sitting on top of it" },
+        note: "the core holds cosmic significance; the humans have been sitting on top of it",
+        sky: Sky::Atmosphere, day_len: 1200.0, ambient: &[
+            "a container ship crosses the bay, running dark", 
+            "gulls, then nothing; the birds left this coast months ago", 
+            "the ground ticks — something under the crust is still cooling"
+        ],
+    },
     Destination { id: "mars", name: "MARS", terrain: Terrain::Surface, gravity: 0.38, weather: true,
         hostiles: Faction::Hijacks,
-        note: "thin air, but air: the dunes are real and the craters go central-peak early" },
+        note: "thin air, but air: the dunes are real and the craters go central-peak early",
+        sky: Sky::Murk, day_len: 1230.0, ambient: &[
+            "dust rises without wind, then settles wrong", 
+            "a survey drone answers a ping it was not sent", 
+            "the rig groans; nobody has maintained it since the shard went"
+        ],
+    },
     Destination { id: "luna", name: "LUNA", terrain: Terrain::Surface, gravity: 0.17, weather: false,
         hostiles: Faction::Hijacks,
-        note: "no weather, so no dunes; the tubes run kilometres, and GRAIL says the voids are there" },
+        note: "no weather, so no dunes; the tubes run kilometres, and GRAIL says the voids are there",
+        sky: Sky::Vacuum, day_len: 0.0, ambient: &[
+            "regolith drifts and does not fall", 
+            "a tube mouth exhales cold from a void GRAIL mapped and nobody entered", 
+            "Earth hangs in the same place it hung an hour ago"
+        ],
+    },
     Destination { id: "europa", name: "EUROPA", terrain: Terrain::Surface, gravity: 0.13, weather: false,
         hostiles: Faction::Corrupted,
-        note: "listening post, final log — 'something answered from below the ice'" },
+        note: "listening post, final log — 'something answered from below the ice'",
+        sky: Sky::Glare, day_len: 0.0, ambient: &[
+            "the ice booms, a long way down", 
+            "the listening post still transmits; nothing is left to transmit", 
+            "something answered from below, and the log ends there"
+        ],
+    },
     Destination { id: "io", name: "IO", terrain: Terrain::Surface, gravity: 0.18, weather: false,
         hostiles: Faction::BlackstarClans,
-        note: "the tide-forges never cool; the magma-clone fires have burned since before the war" },
+        note: "the tide-forges never cool; the magma-clone fires have burned since before the war",
+        sky: Sky::Ember, day_len: 0.0, ambient: &[
+            "a fountain goes up over the horizon, silently", 
+            "the tide-forges pull the crust and the crust gives", 
+            "magma-clone fires, burning since before the war"
+        ],
+    },
     Destination { id: "titan", name: "TITAN", terrain: Terrain::Surface, gravity: 0.14, weather: true,
         hostiles: Faction::BlackstarClans,
-        note: "tithe-ledger — Blackstar's clans tax the only world where fuel falls as rain" },
+        note: "tithe-ledger — Blackstar's clans tax the only world where fuel falls as rain",
+        sky: Sky::Murk, day_len: 0.0, ambient: &[
+            "it is raining fuel, and the rain is warm", 
+            "a tithe barge lifts, heavy, tax paid", 
+            "the lakes are flat; there is no wind tonight"
+        ],
+    },
     Destination { id: "glaciem", name: "GLACIEM", terrain: Terrain::Surface, gravity: 0.44, weather: false,
         hostiles: Faction::Coalition,
-        note: "the ice-clones grow slow in lattice pools; nothing is hurried, nothing thrown away" },
+        note: "the ice-clones grow slow in lattice pools; nothing is hurried, nothing thrown away",
+        sky: Sky::Glare, day_len: 1500.0, ambient: &[
+            "a lattice pool cracks, grows, seals", 
+            "nothing here is hurried", 
+            "ice-clones pass and do not look up"
+        ],
+    },
     Destination { id: "carrion", name: "CARRION DRIFT", terrain: Terrain::AsteroidField, gravity: 0.02, weather: false,
         hostiles: Faction::BlackstarClans,
-        note: "every body a patchwork of salvage; status is the rarest wreck worn openly" },
+        note: "every body a patchwork of salvage; status is the rarest wreck worn openly",
+        sky: Sky::Starfield, day_len: 0.0, ambient: &[
+            "a hull tumbles past, older than the war", 
+            "somebody is wearing a wreck you recognise", 
+            "the drift closes; then it opens again"
+        ],
+    },
     Destination { id: "helix", name: "HELIX", terrain: Terrain::Surface, gravity: 0.90, weather: true,
         hostiles: Faction::Coalition,
-        note: "the architect's clones are re-engineered between lives, perfected past identity" },
+        note: "the architect's clones are re-engineered between lives, perfected past identity",
+        sky: Sky::Atmosphere, day_len: 900.0, ambient: &[
+            "a clone walks out of the vats already knowing you", 
+            "the architect has improved something past recognising itself", 
+            "between lives, they are re-engineered"
+        ],
+    },
     Destination { id: "pluto", name: "PLUTO", terrain: Terrain::Surface, gravity: 0.06, weather: true,
         hostiles: Faction::Hijacks,
-        note: "the outer containment line; where the defense ring stood, and did not hold" },
+        note: "the outer containment line; where the defense ring stood, and did not hold",
+        sky: Sky::Vacuum, day_len: 0.0, ambient: &[
+            "methane dunes march, one grain at a time", 
+            "the containment line is still marked, and no longer held", 
+            "Charon fills a third of the sky"
+        ],
+    },
     Destination { id: "cybertron", name: "CYBERTRON", terrain: Terrain::Surface, gravity: 1.15, weather: false,
         hostiles: Faction::Corrupted,
-        note: "the Silent Century — Cybertron went dark; no record says why" },
+        note: "the Silent Century — Cybertron went dark; no record says why",
+        sky: Sky::Vacuum, day_len: 0.0, ambient: &[
+            "a forge-song, one voice, a thousand cities gone", 
+            "the Silent Century left no record of why", 
+            "the metal underfoot remembers being a road"
+        ],
+    },
     Destination { id: "outer_rim", name: "THE OUTER RIM", terrain: Terrain::DeepSpace, gravity: 0.0, weather: false,
         hostiles: Faction::BlackstarClans,
-        note: "the dreadnought is already moving; he has had the coordinates longer" },
+        note: "the dreadnought is already moving; he has had the coordinates longer",
+        sky: Sky::Starfield, day_len: 0.0, ambient: &[
+            "a dreadnought passes, unhurried", 
+            "the array is projecting a star map you are on", 
+            "he has had the coordinates longer than you have"
+        ],
+    },
     Destination { id: "shield_edge", name: "THE SHIELD BOUNDARY", terrain: Terrain::DeepSpace, gravity: 0.0, weather: false,
         hostiles: Faction::Hijacks,
-        note: "a vast elemental barrier — the coalition built it to hold the Hijacks out" },
+        note: "a vast elemental barrier — the coalition built it to hold the Hijacks out",
+        sky: Sky::Lattice, day_len: 0.0, ambient: &[
+            "the barrier flexes where something leans on it", 
+            "the coalition built this to hold, and it is holding", 
+            "past it, the Hijacks are still gathering"
+        ],
+    },
     Destination { id: "uncharted", name: "UNCHARTED", terrain: Terrain::Procedural, gravity: 0.55, weather: true,
         hostiles: Faction::Hijacks,
-        note: "no record; the bridge opened anyway" },
+        note: "no record; the bridge opened anyway",
+        sky: Sky::Atmosphere, day_len: 800.0, ambient: &[
+            "no record; the bridge opened anyway", 
+            "the sky here has a colour nobody has named", 
+            "something built this and did not stay"
+        ],
+    },
 ];
+
+/// The look of the place. Not a material — a mood the renderer can read off
+/// and the sound bed can follow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Sky {
+    /// blue, clouded, a sun you can point at
+    Atmosphere,
+    /// airless: black sky, hard shadows, stars at noon
+    Vacuum,
+    /// ice haze; the sun is a bright smudge
+    Glare,
+    /// volcanic: the ground is the light source
+    Ember,
+    /// storm-lit, thick, orange
+    Murk,
+    /// deep space with the galaxy across it
+    Starfield,
+    /// the coalition barrier, visible as a lattice on the sky
+    Lattice,
+}
 
 pub fn find(id: &str) -> Option<&'static Destination> {
     ROUTE.iter().find(|d| d.id == id)
@@ -189,6 +301,9 @@ pub struct Tick {
     pub completed: Option<(u32, bool)>,
     pub failed: bool,
     pub lore: Option<&'static str>,
+    /// a beat from the place itself, distinct from the archive: the archive
+    /// is history, this is now, and mixing them would flatten both
+    pub ambient: Option<&'static str>,
     pub arrived: Option<&'static str>,
 }
 
@@ -219,6 +334,8 @@ pub struct Patrol {
     pub credits: u32,
     lore_cd: f32,
     lore_idx: usize,
+    amb_cd: f32,
+    amb_idx: usize,
     rng: u64,
 }
 
@@ -238,6 +355,8 @@ impl Patrol {
             credits: 0,
             lore_cd: 40.0,
             lore_idx: 0,
+            amb_cd: 12.0,
+            amb_idx: 0,
             rng: seed | 1,
         }
     }
@@ -261,6 +380,9 @@ impl Patrol {
         self.dest = i;
         self.event = None;
         self.cooldown = FIRST_EVENT_CD;
+        // a new world introduces itself promptly
+        self.amb_cd = 3.0;
+        self.amb_idx = 0;
         Some(&ROUTE[i])
     }
 
@@ -269,6 +391,20 @@ impl Patrol {
     /// make a day cycle mean something.
     pub fn update(&mut self, dt: f32, player: [f32; 2], night: f32) -> Tick {
         let mut out = Tick::default();
+
+        // AMBIENT: the world says something about itself, roughly three
+        // times as often as the archive says something about the past. A
+        // place you are standing in should be more present than a place you
+        // are reading about.
+        self.amb_cd -= dt;
+        if self.amb_cd <= 0.0 {
+            let a = ROUTE[self.dest].ambient;
+            if !a.is_empty() {
+                out.ambient = Some(a[self.amb_idx % a.len()]);
+                self.amb_idx += 1;
+            }
+            self.amb_cd = 18.0 + self.next_rand() * 14.0;
+        }
 
         self.lore_cd -= dt;
         if self.lore_cd <= 0.0 {
@@ -370,6 +506,52 @@ mod tests {
         assert!(ROUTE.iter().any(|d| d.terrain == Terrain::AsteroidField));
         assert!(ROUTE.iter().any(|d| d.terrain == Terrain::DeepSpace));
         assert!(ROUTE.iter().any(|d| d.terrain == Terrain::Procedural));
+    }
+
+    #[test]
+    fn every_destination_has_a_mood_and_something_to_say() {
+        for d in ROUTE {
+            assert!(d.ambient.len() >= 3, "{} has {} ambient beats", d.id, d.ambient.len());
+            assert!(d.ambient.iter().all(|a| a.len() > 12), "{} has a stub beat", d.id);
+            assert!(d.day_len >= 0.0);
+            // an airless body cannot have a blue sky, and a gas-hazed one
+            // cannot have hard vacuum shadows
+            match d.terrain {
+                Terrain::DeepSpace => assert!(matches!(d.sky, Sky::Starfield | Sky::Lattice), "{}", d.id),
+                Terrain::AsteroidField => assert_eq!(d.sky, Sky::Starfield, "{}", d.id),
+                _ => {}
+            }
+            if !d.weather && d.terrain == Terrain::Surface {
+                assert_ne!(d.sky, Sky::Atmosphere, "{} is airless but has an atmosphere sky", d.id);
+            }
+        }
+        // ambient lines should be unique across the route, or the setting
+        // reads as one place with different gravity
+        let all: Vec<&str> = ROUTE.iter().flat_map(|d| d.ambient.iter().copied()).collect();
+        for (i, a) in all.iter().enumerate() {
+            assert!(all.iter().skip(i + 1).all(|b| b != a), "duplicate ambient line: {a}");
+        }
+    }
+
+    #[test]
+    fn ambient_speaks_more_often_than_the_archive() {
+        let mut p = Patrol::new(0, 17);
+        let t = run(&mut p, 300.0, [0.0, 0.0], 0.0);
+        let amb = t.iter().filter(|x| x.ambient.is_some()).count();
+        let lore = t.iter().filter(|x| x.lore.is_some()).count();
+        assert!(amb > lore, "the place said less than the archive ({amb} vs {lore})");
+        assert!((8..=20).contains(&amb), "{amb} ambient beats in five minutes");
+    }
+
+    #[test]
+    fn a_new_world_introduces_itself() {
+        let mut p = Patrol::new(0, 4);
+        run(&mut p, 60.0, [0.0, 0.0], 0.0);
+        p.bridge_to("io").unwrap();
+        let t = run(&mut p, 4.0, [0.0, 0.0], 0.0);
+        let first = t.iter().find_map(|x| x.ambient);
+        assert!(first.is_some(), "arrived and the world said nothing");
+        assert!(ROUTE.iter().find(|d| d.id == "io").unwrap().ambient.contains(&first.unwrap()));
     }
 
     #[test]

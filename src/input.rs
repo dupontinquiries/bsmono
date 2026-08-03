@@ -36,9 +36,13 @@ pub enum Action {
     Transform,
     /// hand the point-of-interest camera an opponent instead of the ball
     AutoTarget,
+    /// pull the trigger
+    Fire,
+    /// step the Watch to the next elemental form
+    CycleForm,
 }
 
-pub const ACTIONS: [Action; 23] = [
+pub const ACTIONS: [Action; 25] = [
     Action::Forward,
     Action::Reverse,
     Action::SteerL,
@@ -62,6 +66,8 @@ pub const ACTIONS: [Action; 23] = [
     Action::Car3,
     Action::Transform,
     Action::AutoTarget,
+    Action::Fire,
+    Action::CycleForm,
 ];
 
 impl Action {
@@ -90,6 +96,8 @@ impl Action {
             Action::Car3 => "CAR: DOMINUS",
             Action::Transform => "TRANSFORM (BOT <-> ROBOT)",
             Action::AutoTarget => "AUTOTARGET",
+            Action::Fire => "FIRE",
+            Action::CycleForm => "WATCH: NEXT FORM",
         }
     }
     pub fn id(self) -> &'static str {
@@ -117,6 +125,8 @@ impl Action {
             Action::Car3 => "car3",
             Action::Transform => "transform",
             Action::AutoTarget => "autotarget",
+            Action::Fire => "fire",
+            Action::CycleForm => "cycle_form",
         }
     }
     pub fn from_id(s: &str) -> Option<Action> {
@@ -276,13 +286,13 @@ impl Bindings {
             (SteerR, vec![ch("d")]),
             (RollL, vec![ch("q")]),
             (RollR, vec![ch("e")]),
-            (Jump, vec![named(NamedKey::Space), Bind::Pad(crate::gamepad::PB_SOUTH)]),
+            (Jump, vec![named(NamedKey::Space), Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_SOUTH)]),
             // BOOST LOSES SHIFT. Transform was asked for on Shift, and two
             // actions on one key is worse than moving one of them. V is the
             // boost key the Dvorak scheme already uses, so it is not a new
             // idea to anyone, and both pad bindings are untouched — on a
             // controller nothing about boost changes at all.
-            (Boost, vec![ch("v"), Bind::Pad(crate::gamepad::PB_EAST), Bind::Pad(crate::gamepad::PB_RB)]),
+            (Boost, vec![ch("v"), Bind::Mouse(MouseButton::Right), Bind::Pad(crate::gamepad::PB_EAST), Bind::Pad(crate::gamepad::PB_RB)]),
             (Slide, vec![named(NamedKey::Control), Bind::Pad(crate::gamepad::PB_WEST)]),
             (BallCam, vec![ch("c"), Bind::Pad(crate::gamepad::PB_NORTH)]),
             (Toss, vec![ch("t")]),
@@ -301,6 +311,14 @@ impl Bindings {
             (Transform, vec![named(NamedKey::Shift), ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
             // X, and the right stick click — where a lock-on lives on a pad
             (AutoTarget, vec![ch("x"), Bind::Pad(crate::gamepad::PB_R3)]),
+            // MOUSE. Shooting belongs under the trigger finger, so Fire is
+            // left mouse and the right trigger. Boost and jump pick up right
+            // and middle as SECOND bindings rather than replacements — the
+            // keyboard ones still work, and on foot the mouse hand is
+            // already doing the aiming, so putting thrust and hop under it
+            // means a robot fight needs one hand less travel.
+            (Fire, vec![Bind::Mouse(MouseButton::Left), Bind::Pad(crate::gamepad::PB_RT)]),
+            (CycleForm, vec![ch("z"), Bind::Pad(crate::gamepad::PB_DUP)]),
         ];
         Bindings { map: m }
     }

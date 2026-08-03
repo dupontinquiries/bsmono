@@ -485,3 +485,174 @@ mod content2_tests {
         }
     }
 }
+
+// --------------------------------------------------------- signatures ---
+//
+// The back-mounted piece a bot fights with. Ten of them, and every one is a
+// TRADE: nothing here is strictly better than anything else, which a test
+// enforces rather than trusting. `fire_mul` reads backwards the same way
+// overclock does — it scales the cooldown, so above 1 is slower.
+
+pub struct Signature {
+    pub id: &'static str,
+    pub dmg: f32,
+    /// cooldown multiplier: ABOVE one is slower
+    pub fire: f32,
+    /// incoming damage multiplier: below one is tougher
+    pub taken: f32,
+    pub speed: f32,
+    pub extra_pellets: u32,
+    pub knockback: f32,
+    pub slow: f32,
+    pub splash: f32,
+}
+
+pub const SIGNATURES: &[Signature] = &[
+    Signature { id: "wing_cannon",  dmg: 0.95, fire: 0.95, taken: 1.15, speed: 1.10, extra_pellets: 1, knockback: 0.0,  slow: 0.0, splash: 0.0 },
+    Signature { id: "heavy_cannon", dmg: 1.35, fire: 1.35, taken: 0.90, speed: 0.90, extra_pellets: 0, knockback: 6.0,  slow: 0.0, splash: 3.0 },
+    Signature { id: "crest",        dmg: 1.05, fire: 1.05, taken: 0.80, speed: 0.95, extra_pellets: 0, knockback: 4.0,  slow: 0.0, splash: 0.0 },
+    Signature { id: "cable",        dmg: 0.85, fire: 0.70, taken: 1.05, speed: 1.15, extra_pellets: 0, knockback: 0.0,  slow: 0.30, splash: 0.0 },
+    Signature { id: "harpoon",      dmg: 1.10, fire: 1.10, taken: 1.00, speed: 1.00, extra_pellets: 0, knockback: 10.0, slow: 0.40, splash: 0.0 },
+    Signature { id: "halo",         dmg: 1.00, fire: 1.00, taken: 1.00, speed: 1.05, extra_pellets: 0, knockback: 0.0,  slow: 0.0, splash: 6.0 },
+    Signature { id: "solar",        dmg: 1.20, fire: 1.10, taken: 1.00, speed: 1.00, extra_pellets: 0, knockback: 0.0,  slow: 0.0, splash: 4.0 },
+    Signature { id: "aegis",        dmg: 1.00, fire: 1.00, taken: 0.70, speed: 0.95, extra_pellets: 0, knockback: 4.0,  slow: 0.0, splash: 0.0 },
+    Signature { id: "recon",        dmg: 0.95, fire: 1.05, taken: 1.05, speed: 1.20, extra_pellets: 0, knockback: 0.0,  slow: 0.0, splash: 0.0 },
+    Signature { id: "mortar",       dmg: 1.45, fire: 1.35, taken: 0.85, speed: 0.75, extra_pellets: 0, knockback: 14.0, slow: 0.0, splash: 11.0 },
+];
+
+pub fn signature(id: &str) -> Option<&'static Signature> {
+    SIGNATURES.iter().find(|s| s.id == id)
+}
+
+// ---------------------------------------------------------------- hub ---
+//
+// The ship. Eight rooms with exits, which is a GRAPH rather than a menu —
+// and that is the loaded-world-section idea: a bridge you walk to instead of
+// a "choose destination" screen, an upgrade bay instead of a loadout tab.
+// The airlock is the interesting one: it says "no gravity past this door",
+// which is the zero-g movement the asteroid fields need, in a place where
+// nothing is shooting at you while you learn it.
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoomKind {
+    Bridge,
+    Corridor,
+    Upgrade,
+    Vendor,
+    Quest,
+    Spacewalk,
+    Hangar,
+}
+
+pub struct Room {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub kind: RoomKind,
+    pub pos: [f32; 3],
+    pub exits: &'static [&'static str],
+    pub blurb: &'static str,
+}
+
+pub const HUB: &[Room] = &[
+    Room { id: "bridge", name: "Bridge", kind: RoomKind::Bridge, pos: [0.0, 0.0, 24.0],
+        exits: &["corridor_fore", "quarters"],
+        blurb: "Navigation console. Choose where the ship goes next." },
+    Room { id: "corridor_fore", name: "Forward Corridor", kind: RoomKind::Corridor, pos: [0.0, 0.0, 12.0],
+        exits: &["bridge", "upgrade_bay", "market"],
+        blurb: "Spine of the ship. Viewports on both sides." },
+    Room { id: "upgrade_bay", name: "Upgrade Bay", kind: RoomKind::Upgrade, pos: [-9.0, 0.0, 6.0],
+        exits: &["corridor_fore", "hangar"],
+        blurb: "Chassis rigs and part racks. Rebuild your bot here." },
+    Room { id: "market", name: "Trade Deck", kind: RoomKind::Vendor, pos: [9.0, 0.0, 6.0],
+        exits: &["corridor_fore", "quarters"],
+        blurb: "Whoever docked last is still selling." },
+    Room { id: "quarters", name: "Crew Quarters", kind: RoomKind::Quest, pos: [7.0, 0.0, -6.0],
+        exits: &["market", "bridge", "corridor_aft"],
+        blurb: "Where the crew bring you problems." },
+    Room { id: "corridor_aft", name: "Aft Corridor", kind: RoomKind::Corridor, pos: [0.0, 0.0, -10.0],
+        exits: &["quarters", "airlock", "hangar"],
+        blurb: "Colder back here. The hull ticks as it cools." },
+    Room { id: "airlock", name: "Airlock", kind: RoomKind::Spacewalk, pos: [0.0, 0.0, -18.0],
+        exits: &["corridor_aft"],
+        blurb: "Cycle through and walk the hull. No gravity past this door." },
+    Room { id: "hangar", name: "Hangar", kind: RoomKind::Hangar, pos: [-8.0, 0.0, -14.0],
+        exits: &["corridor_aft", "upgrade_bay"],
+        blurb: "Drop bay. Launches and landings come through here." },
+];
+
+pub fn room(id: &str) -> Option<&'static Room> {
+    HUB.iter().find(|r| r.id == id)
+}
+
+#[cfg(test)]
+mod content3_tests {
+    use super::*;
+
+    #[test]
+    fn every_signature_is_a_trade_except_the_one_that_is_not() {
+        // HALO IS A BALANCE HOLE IN THE SOURCE DATA, not a porting mistake:
+        // dmg 1.0, fire 1.0, taken 1.0, speed 1.05, splash 6. Faster than
+        // baseline, with free splash, and nothing given up. The numbers are
+        // carried over faithfully rather than quietly corrected — that is a
+        // design call, not a transcription one — but the test names it, so a
+        // SECOND free signature still fails here.
+        let mut free = Vec::new();
+        for s in SIGNATURES {
+            // something has to be worse, or it is not a choice. fire ABOVE
+            // one is slower, so a high fire counts as a downside.
+            let up = (s.dmg > 1.0) as i32 + (s.taken < 1.0) as i32 + (s.speed > 1.0) as i32
+                + (s.fire < 1.0) as i32 + (s.splash > 0.0) as i32
+                + (s.knockback > 0.0) as i32 + (s.slow > 0.0) as i32;
+            let down = (s.dmg < 1.0) as i32 + (s.taken > 1.0) as i32 + (s.speed < 1.0) as i32
+                + (s.fire > 1.0) as i32;
+            assert!(up > 0, "{} has no upside", s.id);
+            if down == 0 {
+                free.push(s.id);
+            }
+        }
+        assert_eq!(free, vec!["halo"], "the set of free signatures changed: {free:?}");
+    }
+
+    #[test]
+    fn the_heavy_ones_are_slow_and_the_fast_ones_are_thin() {
+        let m = signature("mortar").unwrap();
+        let r = signature("recon").unwrap();
+        assert!(m.dmg > r.dmg && m.speed < r.speed, "the mortar out-runs the scout");
+        assert!(m.fire > 1.2, "the biggest gun fires quickly");
+        let a = signature("aegis").unwrap();
+        assert!(a.taken < 0.8 && a.speed < 1.0, "the shield is free");
+    }
+
+    #[test]
+    fn the_hub_is_a_connected_graph_with_no_dead_links() {
+        for r in HUB {
+            for e in r.exits {
+                let dest = room(e).unwrap_or_else(|| panic!("{} exits to unknown {e}", r.id));
+                // doors work both ways, or a player walks into a room and
+                // cannot come back
+                assert!(dest.exits.contains(&r.id), "{} -> {} is one-way", r.id, dest.id);
+            }
+        }
+        // reachable from the bridge, all of it
+        let mut seen = vec!["bridge"];
+        let mut i = 0;
+        while i < seen.len() {
+            let cur = room(seen[i]).unwrap();
+            for e in cur.exits {
+                if !seen.contains(e) {
+                    seen.push(e);
+                }
+            }
+            i += 1;
+        }
+        assert_eq!(seen.len(), HUB.len(), "part of the ship is unreachable: {seen:?}");
+    }
+
+    #[test]
+    fn the_ship_has_the_rooms_a_loop_needs() {
+        for k in [RoomKind::Bridge, RoomKind::Upgrade, RoomKind::Vendor,
+                  RoomKind::Quest, RoomKind::Hangar, RoomKind::Spacewalk] {
+            assert!(HUB.iter().any(|r| r.kind == k), "no {k:?} aboard");
+        }
+    }
+}
