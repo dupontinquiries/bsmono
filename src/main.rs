@@ -33,6 +33,7 @@ mod style;
 mod save;
 mod sim;
 mod sound;
+mod terrain;
 mod touch;
 mod weapons;
 mod xform;
