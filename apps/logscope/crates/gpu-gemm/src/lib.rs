@@ -1289,6 +1289,19 @@ impl Gpu {
             let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
             let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
             let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
+            // NOTE ON WHAT THIS CHECK DEPENDS ON. It packs weights with quantize_q8_resident, which
+            // uses QUANT_PACK — a shader that until _526 wrote its bytes with `<< (b*8u)`, a shift by
+            // a lane-varying amount, which returns zero on Honeykrisp for every lane whose shift is
+            // non-zero.
+            //
+            // So on that driver this check has been comparing V1 against the subgroup kernel over
+            // CORRUPT WEIGHTS. If the two kernels unpack those bytes by different routes — and they
+            // do, V1 through a byte_at helper that had the same fault — they disagree, sg_ok goes
+            // false, and the subgroup matvec is disabled BECAUSE THE FIXTURE WAS BROKEN rather than
+            // because the kernel is wrong.
+            //
+            // The subgroup kernel itself contains no lane-varying shift. That is worth knowing before
+            // concluding anything from a red result here.
             let qw = self.quantize_q8_resident(&w, n, k);
             let a = self.upload(&act, 1, k);
             let base = self.download(&self.matvec_decode_v1(&a, &qw, 1));
