@@ -9,6 +9,7 @@
 use glam::Vec3;
 
 use crate::font;
+use crate::ui as ui_layout;
 use crate::input::{Bindings, ACTIONS};
 use crate::physics::{Ball, Car, CAR_MAX};
 use crate::render::UiVert;
@@ -97,6 +98,39 @@ pub fn label(ui: &mut Vec<UiVert>, x: f32, y: f32, px: f32, a: f32, c: [f32; 4],
     font::text(ui, x, y, px, a, c, s);
 }
 /// Centre a label on an arbitrary x (buttons, not just the screen middle).
+/// RENDER A LAYOUT'S OUTPUT. The bridge between `ui.rs` and the primitives
+/// this file already has.
+///
+/// `ui.rs` decides WHERE things go and never draws; this turns its answer
+/// into quads and text. It is four lines, and it is what makes the layout
+/// layer adoptable one panel at a time instead of as a rewrite — a migrated
+/// panel and a hand-placed one sit side by side and neither knows.
+pub fn draw_cmds(ui: &mut Vec<UiVert>, a: f32, cmds: &[ui_layout::Cmd]) {
+    for c in cmds {
+        match c {
+            ui_layout::Cmd::Quad { r, color } => quad(ui, r.x0, r.y0, r.x1, r.y1, *color),
+            ui_layout::Cmd::Text { x, y, size, color, text } => {
+                label(ui, *x, *y, *size, a, *color, text)
+            }
+        }
+    }
+}
+
+/// DRAW A MENU, end to end, through the abstractions.
+///
+/// `menu::Menu` -> `ui::menu_cmds` (layout) -> `draw_cmds` (primitives).
+/// This is the first screen in the game that is native to the layer rather
+/// than hand-placed: `Ship::bridge_menu` builds rows, this draws them, and
+/// nobody wrote a coordinate. Adding a row to the bridge is now adding a
+/// row, not editing a draw function and an input branch and hoping they
+/// still agree.
+pub fn draw_menu(ui: &mut Vec<UiVert>, a: f32, m: &crate::menu::Menu) {
+    quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.55]);
+    let scr = ui_layout::Screen::new(a);
+    let cmds = ui_layout::menu_cmds(&scr, m, T_BODY, PAPER, DIM, [0.22, 0.34, 0.58, 0.55]);
+    draw_cmds(ui, a, &cmds);
+}
+
 fn label_c_at(ui: &mut Vec<UiVert>, cx: f32, y: f32, px: f32, a: f32, c: [f32; 4], s: &str) {
     let w = font::width(s, px, a);
     label(ui, cx - w * 0.5, y, px, a, c, s);
@@ -664,12 +698,35 @@ pub fn hit_row(top: f32, row_h: f32, n: usize, y: f32) -> Option<usize> {
 pub fn hud(ui: &mut Vec<UiVert>, info: &HudInfo, world: &World, car: &Car, ball: &Ball, bots: &[(Vec3, u8)]) {
     let a = info.aspect;
 
-    // ---- boost bar (bottom center) ----
-    quad(ui, -0.285, -0.955, 0.285, -0.895, [0.05, 0.05, 0.08, 0.62]);
-    let f = (info.boost / 100.0).clamp(0.0, 1.0);
-    let col = if info.supersonic { [1.0, 0.95, 0.75, 0.95] } else { [0.98, 0.68, 0.12, 0.92] };
-    quad(ui, -0.28, -0.948, -0.28 + 0.56 * f, -0.902, col);
-    font::text(ui, -0.275, -0.906, 0.015, a, INK, &format!("BOOST {:>3.0}", info.boost));
+    // ---- boost bar (bottom centre) — MIGRATED to the layout layer ----
+    //
+    // This used to be four hand-placed quads whose numbers only worked at
+    // one aspect ratio. It is now a panel: anchored, inside the safe area,
+    // and it cannot silently land on top of whatever gets added next to it.
+    // The rest of this function is still hand-placed, which is the point —
+    // the two coexist.
+    {
+        let scr = ui_layout::Screen::new(a);
+        let col = if info.supersonic {
+            [1.0, 0.95, 0.75, 0.95]
+        } else {
+            [0.98, 0.68, 0.12, 0.92]
+        };
+        let p = ui_layout::Panel::new(ui_layout::Anchor::BottomCentre)
+            .push(ui_layout::Widget::label(
+                &format!("BOOST {:>3.0}", info.boost),
+                0.015,
+                INK,
+            ))
+            .push(ui_layout::Widget::bar(
+                info.boost / 100.0,
+                0.56,
+                0.045,
+                col,
+                [0.05, 0.05, 0.08, 0.62],
+            ));
+        draw_cmds(ui, a, &scr.emit(&p));
+    }
 
     // flip pip: shows in the air, gold while a flip is banked
     if info.airborne {

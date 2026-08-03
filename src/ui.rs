@@ -592,6 +592,44 @@ mod tests {
     }
 
     #[test]
+    fn the_bridge_menu_lays_out_without_a_single_coordinate_being_written() {
+        // the end-to-end check: a screen built entirely from the layers.
+        // Ship::bridge_menu makes rows, menu_cmds places them, and nothing
+        // in either wrote an NDC number by hand.
+        let s = Screen::new(16.0 / 9.0);
+        let ship = crate::ship::Ship::new("spearhead", "earth");
+        let m = ship.bridge_menu();
+        let cmds = menu_cmds(&s, &m, 0.02, W, D, [0.2, 0.3, 0.5, 0.5]);
+        assert!(!cmds.is_empty(), "the bridge drew nothing");
+        // the title is there, and so is at least one destination
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Text { text, .. } if text.contains("BRIDGE"))));
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::Text { text, .. } if text == "MARS")));
+        // and it all lands inside the safe area on a wide screen too
+        let wide = Screen::new(21.0 / 9.0);
+        let a = wide.area();
+        for c in menu_cmds(&wide, &m, 0.02, W, D, [0.2, 0.3, 0.5, 0.5]) {
+            if let Cmd::Text { x, y, .. } = c {
+                assert!(x >= a.x0 - 1e-4 && y >= a.y0 - 1e-4 && y <= a.y1 + 1e-4,
+                    "bridge text escaped at ({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn a_migrated_hud_panel_stays_inside_the_safe_area() {
+        // the boost bar, as hud.rs now builds it
+        for aspect in [4.0 / 3.0, 16.0 / 9.0, 21.0 / 9.0] {
+            let s = Screen::new(aspect);
+            let p = Panel::new(Anchor::BottomCentre)
+                .push(Widget::label("BOOST 100", 0.015, W))
+                .push(Widget::bar(1.0, 0.56, 0.045, W, D));
+            let b = s.bounds(&p);
+            let full = Rect { x0: -1.0, y0: -1.0, x1: 1.0, y1: 1.0 };
+            assert!(full.contains_rect(&b), "the boost bar spilled at {aspect:.2}: {b:?}");
+        }
+    }
+
+    #[test]
     fn an_empty_panel_is_harmless() {
         let s = scr();
         let p = Panel::new(Anchor::Centre);
