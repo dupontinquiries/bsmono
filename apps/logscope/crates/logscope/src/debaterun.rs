@@ -204,3 +204,127 @@ mod tests {
         assert_eq!(r.blind()[0].name, "m0");
     }
 }
+
+/// Why a voice was restarted rather than accepted.
+///
+/// **The debate group's real advantage is not N opinions — it is N cheap RESTARTS.** A small model can
+/// be thrown away and re-run with a different framing for a fraction of what it costs to nudge a large
+/// one, and the evidence for that is direct: a 3B model continuing Scout's output produced better code
+/// than Scout continuing itself, because Scout was three steps into a decaying trajectory and the 3B
+/// entered clean.
+///
+/// That is a context-rot result rather than a model-size one, and it means a seat that has gone wrong
+/// should be RESTARTED, not coaxed. These are the conditions worth restarting on — each detectable
+/// without reading the content.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Reframe {
+    /// Produced nothing usable.
+    Empty,
+    /// Repeated itself — the clearest sign a small model has lost the thread.
+    Looping { repeated: String },
+    /// Answered a different question than the one asked, detectable when it echoes the frame back.
+    EchoedThePrompt,
+}
+
+impl Reframe {
+    /// What to change about the prompt on the retry.
+    ///
+    /// Restarting with the SAME frame reproduces the same failure — the model is deterministic given
+    /// its input, so a retry that changes nothing is a wasted generation. Each condition implies a
+    /// different edit.
+    pub fn adjustment(&self) -> &'static str {
+        match self {
+            Reframe::Empty =>
+                "ask for the answer directly, without the framing that produced nothing",
+            Reframe::Looping { .. } =>
+                "shorten the context — a loop usually means the window is full of its own output",
+            Reframe::EchoedThePrompt =>
+                "state the question as an instruction rather than a description of the task",
+        }
+    }
+}
+
+/// Does this voice need restarting?
+///
+/// Deliberately cheap and content-blind: a judgement about quality needs another model, and a debate
+/// that needs a referee to decide who to re-run has spent the saving it was supposed to make.
+pub fn needs_reframe(text: &str, prompt: &str) -> Option<Reframe> {
+    let t = text.trim();
+    if t.is_empty() { return Some(Reframe::Empty); }
+
+    // A line repeated three times or more. Two is a coincidence — a list can legitimately repeat a
+    // stem — and three is a loop.
+    let lines: Vec<&str> = t.lines().map(|l| l.trim()).filter(|l| l.len() > 8).collect();
+    for l in &lines {
+        if lines.iter().filter(|x| x == &l).count() >= 3 {
+            return Some(Reframe::Looping { repeated: l.to_string() });
+        }
+    }
+
+    // Echoing back a distinctive chunk of the prompt rather than answering it.
+    let p = prompt.trim();
+    if p.len() >= 40 && t.contains(&p[..40]) { return Some(Reframe::EchoedThePrompt); }
+
+    None
+}
+
+#[cfg(test)]
+mod reframe_tests {
+    use super::*;
+
+    #[test]
+    fn a_looping_voice_is_caught_and_names_what_repeated() {
+        let t = "considering the options\nconsidering the options\nconsidering the options";
+        match needs_reframe(t, "q") {
+            Some(Reframe::Looping { repeated }) => assert!(repeated.contains("considering")),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn TWO_repeats_is_not_a_loop() {
+        // A list can legitimately repeat a stem, and restarting a working voice costs a whole
+        // generation to fix nothing.
+        let t = "step: parse the file\nstep: parse the file\nthen we are done";
+        assert!(needs_reframe(t, "q").is_none());
+    }
+
+    #[test]
+    fn an_ECHOED_prompt_is_distinguished_from_a_real_answer() {
+        let p = "Compare the arena allocator against the streaming path and say which fits better";
+        assert_eq!(needs_reframe(&format!("{p} — here is my view"), p),
+                   Some(Reframe::EchoedThePrompt));
+    }
+
+    #[test]
+    fn a_short_prompt_cannot_trigger_the_echo_rule() {
+        // Otherwise "yes" answering "yes?" is an echo, and the rule fires on the shortest exchanges
+        // where it is least likely to be right.
+        assert!(needs_reframe("ok that works", "ok").is_none());
+    }
+
+    #[test]
+    fn every_reason_implies_a_DIFFERENT_adjustment() {
+        // Restarting with the same frame reproduces the same failure — the model is deterministic
+        // given its input, so a retry that changes nothing is a wasted generation.
+        let a = Reframe::Empty.adjustment();
+        let b = Reframe::Looping { repeated: "x".into() }.adjustment();
+        let c = Reframe::EchoedThePrompt.adjustment();
+        assert_ne!(a, b); assert_ne!(b, c); assert_ne!(a, c);
+        assert!(b.contains("shorten"), "a loop means the window is full of its own output");
+    }
+
+    #[test]
+    fn a_healthy_voice_is_left_alone() {
+        assert!(needs_reframe("The arena fits better because slabs are contiguous.", "which fits?")
+            .is_none());
+    }
+
+    #[test]
+    fn the_check_is_CONTENT_BLIND() {
+        // A judgement about quality needs another model, and a debate that needs a referee to decide
+        // who to re-run has spent the saving it was supposed to make. Nonsense that does not loop or
+        // echo passes — that is the panel's job, not this function's.
+        assert!(needs_reframe("purple monday runs the compiler sideways", "q").is_none());
+    }
+}
