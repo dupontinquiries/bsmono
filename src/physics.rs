@@ -67,6 +67,10 @@ pub struct Car {
     /// car does is wrong for it: it does not sit ON the ground, it does not
     /// grip sideways, and it does not strike the ball with its bodywork.
     pub hover: Option<Hover>,
+    /// FLIGHT CHASSIS. A jet has no wheels to put down, so it is never
+    /// grounded — which is precisely the state the aerial control block
+    /// already handles. Setting this is most of what "flying" means here.
+    pub flight: bool,
     /// pad-collected charge, spent before the base reserve (hovercars)
     pub charge: f32,
     /// seconds until the pulse is available again
@@ -167,6 +171,7 @@ impl Car {
             wheel_r: 0.11,
             drive: crate::model::Drive::Combustion,
             hover: None,
+            flight: false,
             charge: 0.0,
             pulse_t: 0.0,
             pulse_fire: 0.0,
@@ -741,6 +746,13 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
             // the ground catches cleanly: that's the wave dash.
             nyy > 0.35 && (ori > 0.12 || car.dodge_timer > 0.0)
         });
+    // A FLYER IS NEVER GROUNDED. Everything below that reads `grounded`
+    // — the landing event, the wave dash, the upright snap, drive and grip
+    // — is about wheels on a surface, and a jet has none. Gating it here
+    // rather than at each site means flight reuses the aerial control path
+    // (pitch/yaw/roll torque) exactly as an airborne car already does,
+    // which is the whole trick: no second control scheme to write.
+    let grounded = grounded && !car.flight;
     if grounded && !car.on_ground {
         ev.landed = Some((-car.vel.dot(n)).max(0.0));
         // WAVE DASH: landing while the dodge is still playing converts the
@@ -768,6 +780,25 @@ fn step_car(car: &mut Car, ball: &Ball, world: &World, c: &Controls, cfg: &Confi
 
     // gravity
     car.vel += gdir * GRAV * gmul * cfg.arena.gravity * dt;
+
+    // ---- FLIGHT: hold the sky up, push along the nose ------------------
+    //
+    // Marking a jet airborne buys the aerial controls but not the altitude:
+    // left alone it flies beautifully into the floor. So carry most of its
+    // own weight (not all — LIFT < 1 means it still sinks with the throttle
+    // shut, which is what makes the throttle mean something), and put the
+    // thrust along the nose rather than along the ground plane, so pitching
+    // up climbs. Drag gives it a terminal speed of its own instead of
+    // inheriting the car's.
+    if car.flight {
+        const LIFT: f32 = 0.92;
+        const THRUST: f32 = 26.0;
+        const DRAG: f32 = 0.55;
+        car.vel -= gdir * GRAV * gmul * cfg.arena.gravity * LIFT * dt;
+        let t = c.throttle.max(0.0) + if c.boost { 0.8 } else { 0.0 };
+        car.vel += car.forward() * t * THRUST * dt;
+        car.vel *= 1.0 - (DRAG * dt).min(0.9);
+    }
     // FLOODWATER: a flooded tube's current owns you — strong downstream
     // servo (buoyancy is implicit: the target velocity has no fall in it)
     if let Some(cv) = world.current(car.pos) {

@@ -7,9 +7,32 @@ use std::path::PathBuf;
 use wgpu::util::DeviceExt;
 
 fn main() {
-    let dir = PathBuf::from(std::env::args().nth(1).expect("usage: botshot <asset dir> <out.png>"));
+    let dir = PathBuf::from(std::env::args().nth(1).expect("usage: botshot <asset dir> <out.png> [strip ref dir]"));
     let out = PathBuf::from(std::env::args().nth(2).unwrap_or("botshot.png".into()));
-    let (raws, half) = model::load_raw(&dir, 4.2);
+    // OPTIONAL THIRD ARG: a reference pose to scale and frame against.
+    //
+    // Without it each asset is normalized to its own longest axis, which is
+    // what the loader does for unrelated cars and what makes a fold strip
+    // useless to look at: every pose comes back the same size, so the robot
+    // and the car it unfolded from render identically large. Pass the
+    // vehicle pose as the reference and the whole strip is measured in one
+    // scale with one camera — the same thing the game does when it loads a
+    // chassis, and the only way a still shows the real proportions.
+    let refdir = std::env::args().nth(3).map(PathBuf::from);
+    let span = |p: &PathBuf| -> f32 {
+        let (_, _, _, s) = model::load_raw_at(p, 1.0, false);
+        if s > 1e-9 { 1.0 / s } else { 1.0 }
+    };
+    let (raws, half) = match &refdir {
+        None => model::load_raw(&dir, 4.2),
+        Some(r) => {
+            let s0 = span(r);
+            let target = 4.2 * span(&dir) / s0.max(1e-6);
+            let (raws, _) = model::load_raw(&dir, target);
+            let (_, rhalf) = model::load_raw(r, 4.2);
+            (raws, rhalf) // frame on the reference so the camera never moves
+        }
+    };
 
     let instance = wgpu::Instance::default();
     let adapter = match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {

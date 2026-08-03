@@ -32,7 +32,7 @@ mod sound;
 mod touch;
 mod world;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -417,10 +417,34 @@ struct RtIds {
     static_n: usize, // world shapes occupy RTS[0..static_n] in stable order
 }
 
+/// A BLACKSTAR CHASSIS: the same machine in several poses.
+///
+/// foldview exports the vehicle-to-robot fold as a strip of glTF poses. The
+/// engine has no skeleton to drive, so the transform here is the strip played
+/// back — `strip[0]` is the vehicle, `strip[last]` is the robot, and the
+/// frames between are the fold. Every pose is an ordinary `model::Model`, so
+/// nothing in the renderer, the hitbox or the SDF bake needed to learn a new
+/// concept.
+struct Chassis {
+    strip: Vec<usize>,
+    /// jets fly instead of driving: never grounded, lift and nose thrust
+    flight: bool,
+}
+
 struct CarModels {
     models: Vec<model::Model>,
     names: Vec<&'static str>,
     active: usize,
+    /// model index -> (chassis, position in that chassis' strip). Only bot
+    /// poses appear here; an ordinary car is absent and simply cannot
+    /// transform.
+    xform: HashMap<usize, (usize, usize)>,
+    chassis: Vec<Chassis>,
+    /// what `[` and `]` step through. Bot fold frames are deliberately NOT
+    /// in here — a chassis appears once, as its vehicle pose, and the robot
+    /// is reached by transforming rather than by cycling past six
+    /// half-folded copies of it.
+    cycle: Vec<usize>,
 }
 
 struct Game {
@@ -430,6 +454,12 @@ struct Game {
     ball: Ball,
     cam: camera::Camera,
     cars: CarModels,
+    /// seconds left in a running transform; 0 when settled in a pose
+    xform_t: f32,
+    /// which end of the strip we are heading for (+1 robot, -1 vehicle)
+    xform_dir: i32,
+    /// where in the strip the current transform started
+    xform_from: usize,
     ball_model: model::Model,
     decor_model: model::Model,
     fx: fx::Fx,
@@ -962,6 +992,9 @@ fn main() {
             "Rollout", "Cryofin", "TL-4", "Spearhead", "Outback",
         ],
         active: 0,
+        xform: HashMap::new(),
+        chassis: Vec::new(),
+        cycle: Vec::new(),
     };
     for (i, m) in hovercars.into_iter().enumerate() {
         cars.models.push(m);
@@ -983,6 +1016,103 @@ fn main() {
         }
         cars.active = sv.car.min(cars.models.len() - 1);
     }
+
+    // ---- BLACKSTAR BOTS -------------------------------------------------
+    //
+    // assets/bots/<name>/f00, f01, ... — a fold strip written by
+    //   foldview --veh <model>.iqm --gltf <dir> --gltf-merge --t <t>
+    // one directory per pose, vehicle first, robot last. Anything with at
+    // least two poses is a chassis; a single directory would just be a car,
+    // and is skipped rather than half-registered.
+    //
+    // A name starting `jet_` flies (see physics: never grounded, lift and
+    // nose thrust) — the category is in the filename because the fold strip
+    // itself carries no metadata, and a marker in the path is a great deal
+    // simpler than a sidecar nobody will remember to write.
+    //
+    // Every pose is a real model and gets a real SDF bake below, so poses
+    // cost startup time: keep strips short (5-7) rather than smooth.
+    let bots_dir = dir.join("bots");
+    if bots_dir.is_dir() {
+        let mut bots: Vec<String> = std::fs::read_dir(&bots_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.path().is_dir())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        bots.sort();
+        for bot in bots {
+            let bdir = bots_dir.join(&bot);
+            let mut poses: Vec<PathBuf> = std::fs::read_dir(&bdir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir() && p.join("scene.gltf").is_file())
+                .collect();
+            poses.sort();
+            if poses.len() < 2 {
+                eprintln!("bots: {bot} has {} pose(s), need 2+ — skipped", poses.len());
+                continue;
+            }
+            let flight = bot.starts_with("jet_");
+            let label = bot.trim_start_matches("jet_").to_string();
+            let cid = cars.chassis.len();
+            let mut strip = Vec::new();
+
+            // ONE SCALE FOR THE WHOLE STRIP.
+            //
+            // `load` normalizes each model so its LONGEST axis spans
+            // target_len. That is right for a garage full of unrelated cars
+            // and wrong for five poses of one machine: the fold changes which
+            // axis is longest — Z while it is a car, Y once it stands up — so
+            // pose-by-pose normalization shrinks the robot to the length of
+            // the vehicle and the bot visibly breathes as it transforms.
+            //
+            // Measure the vehicle pose once, then ask each pose for the
+            // target_len that reproduces the vehicle's metres-per-source-unit.
+            // `load_raw_at` hands back the scale it would have used, and
+            // longest/scale recovers the raw span; axis-aligned reorientation
+            // permutes the extents but cannot change which is biggest, so the
+            // measurement survives the loader's own orientation search.
+            let raw_span = |p: &PathBuf| -> f32 {
+                let (_, _, _, s) = model::load_raw_at(p, 1.0, false);
+                if s > 1e-9 { 1.0 / s } else { 1.0 }
+            };
+            let span0 = raw_span(&poses[0]);
+
+            for (k, pose) in poses.iter().enumerate() {
+                let target = 1.32 * raw_span(pose) / span0.max(1e-6);
+                let m = model::load(pose, &mut gpu, target);
+                let idx = cars.models.len();
+                strip.push(idx);
+                cars.models.push(m);
+                // Only the two ends are ever named in the HUD; the fold
+                // frames are named too so a toast mid-transform is not blank.
+                let nm = if k == 0 {
+                    label.to_uppercase()
+                } else if k == poses.len() - 1 {
+                    format!("{} ROBOT", label.to_uppercase())
+                } else {
+                    format!("{} FOLD {k}", label.to_uppercase())
+                };
+                cars.names.push(Box::leak(nm.into_boxed_str()));
+                cars.xform.insert(idx, (cid, k));
+            }
+            println!("bots: {label} — {} poses{}", strip.len(), if flight { ", flight" } else { "" });
+            cars.chassis.push(Chassis { strip, flight });
+        }
+    }
+
+    // `[` and `]` walk this: every ordinary car, plus each bot ONCE at its
+    // vehicle pose. Without the filter a single seven-pose chassis would put
+    // six half-folded bodies into the garage rotation.
+    cars.cycle = (0..cars.models.len())
+        .filter(|i| cars.xform.get(i).map_or(true, |&(_, k)| k == 0))
+        .collect();
+    cars.active = cars.active.min(cars.models.len() - 1);
+
     gpu.set_car_sdfs(&bake_car_sdfs(&mut cars.models));
     let cars = cars;
 
@@ -1015,6 +1145,9 @@ fn main() {
         ball,
         cam,
         cars,
+        xform_t: 0.0,
+        xform_dir: 1,
+        xform_from: 0,
         ball_model,
         decor_model,
         fx: fx::Fx::new(seed),
@@ -1253,6 +1386,11 @@ fn main() {
         .unwrap();
 }
 
+/// How long a vehicle<->robot fold takes. Blackstar's own `xform_dur` is
+/// per-chassis in `content/chassis.json`; nothing carries that across the
+/// glTF strip, so the engine uses one duration for every bot until it does.
+const XFORM_DUR: f32 = 0.9;
+
 fn apply_car_dims(car: &mut Car, m: &model::Model, size: f32) {
     car.half_len = m.half_len * size;
     car.half_h = (m.half_h * size).max(0.10);
@@ -1436,6 +1574,7 @@ impl Game {
                 self.snd.set_volume(v);
             }
             Action::FlipVis => self.flip_vis = !self.flip_vis,
+            Action::Transform => self.transform(),
             Action::Car1 => self.switch_car(0),
             Action::Car2 => self.switch_car(1),
             Action::Car3 => self.switch_car(2),
@@ -1447,6 +1586,80 @@ impl Game {
         if i < self.cars.models.len() {
             self.cars.active = i;
             apply_car_dims(&mut self.car, &self.cars.models[i], self.cfg.car.size);
+            // Flight is a property of the CHASSIS, not of the pose, so it is
+            // read from the registry rather than from the model. A jet stays
+            // a jet through every frame of its fold.
+            self.car.flight = self
+                .cars
+                .xform
+                .get(&i)
+                .map_or(false, |&(c, _)| self.cars.chassis[c].flight);
+        }
+    }
+
+    /// Swap the body under the player, then make room for it.
+    ///
+    /// A robot pose is roughly twice the height of the vehicle it folded out
+    /// of, so the new hitbox will be buried in whatever the old one was
+    /// resting on. Same lift `cycle_car` does — factored out because the
+    /// transform needs it on every frame of the fold, not just once.
+    fn set_car_model(&mut self, m: usize) {
+        self.switch_car(m);
+        let d = self.world.sdf(self.car.pos);
+        if d < self.car.half_h {
+            self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
+        }
+    }
+
+    /// Vehicle <-> robot. Starts the fold; `advance_xform` plays it.
+    ///
+    /// Direction is decided by which end of the strip we are nearer, so the
+    /// key is a toggle even if a previous transform was interrupted halfway.
+    fn transform(&mut self) {
+        if self.net.online() || self.mode != Mode::Play {
+            return;
+        }
+        let Some(&(cid, pos)) = self.cars.xform.get(&self.cars.active) else {
+            self.toastf("this chassis does not transform");
+            return;
+        };
+        if self.xform_t > 0.0 {
+            return; // already folding
+        }
+        let n = self.cars.chassis[cid].strip.len();
+        self.xform_dir = if pos * 2 < n { 1 } else { -1 };
+        self.xform_from = pos;
+        self.xform_t = XFORM_DUR;
+    }
+
+    /// Step the running fold, swapping the body when the strip index changes.
+    fn advance_xform(&mut self, dt: f32) {
+        if self.xform_t <= 0.0 {
+            return;
+        }
+        let Some(&(cid, pos)) = self.cars.xform.get(&self.cars.active) else {
+            self.xform_t = 0.0;
+            return;
+        };
+        self.xform_t = (self.xform_t - dt).max(0.0);
+        let n = self.cars.chassis[cid].strip.len();
+        let end = if self.xform_dir > 0 { n - 1 } else { 0 };
+        // eased so the fold starts and finishes gently rather than stepping
+        // at a constant rate through the strip
+        let raw = (1.0 - self.xform_t / XFORM_DUR).clamp(0.0, 1.0);
+        let f = raw * raw * (3.0 - 2.0 * raw);
+        let from = self.xform_from as f32;
+        let want = (from + (end as f32 - from) * f).round().clamp(0.0, (n - 1) as f32) as usize;
+        if want != pos {
+            let m = self.cars.chassis[cid].strip[want];
+            self.set_car_model(m);
+        }
+        if self.xform_t <= 0.0 {
+            let m = self.cars.chassis[cid].strip[end];
+            self.set_car_model(m);
+            self.save.car = m;
+            let nm = self.cars.names[m];
+            self.toastf(&format!("{nm}"));
         }
     }
 
@@ -1459,21 +1672,29 @@ impl Game {
         if self.net.online() || self.mode != Mode::Play {
             return;
         }
-        let n = self.cars.models.len();
+        let n = self.cars.cycle.len();
         if n == 0 {
             return;
         }
-        let cur = self.cars.active;
+        // Mid-fold, `[`/`]` should still land somewhere sensible, so an
+        // unlisted pose resolves to its chassis' vehicle pose first.
+        let cur = self
+            .cars
+            .cycle
+            .iter()
+            .position(|&m| m == self.cars.active)
+            .or_else(|| {
+                let &(cid, _) = self.cars.xform.get(&self.cars.active)?;
+                let veh = self.cars.chassis[cid].strip[0];
+                self.cars.cycle.iter().position(|&m| m == veh)
+            })
+            .unwrap_or(0);
         let next = ((cur as i32 + dir).rem_euclid(n as i32)) as usize;
-        self.switch_car(next);
-        self.save.car = next;
-        // the hitbox changed under the car, so lift it clear of the floor
-        // rather than leaving a taller model half-buried in it
-        let d = self.world.sdf(self.car.pos);
-        if d < self.car.half_h {
-            self.car.pos += self.world.normal(self.car.pos) * (self.car.half_h - d + 0.02);
-        }
-        self.toastf(&format!("{} ({}/{})", self.cars.names[next], next + 1, n));
+        let m = self.cars.cycle[next];
+        self.xform_t = 0.0; // cycling away abandons any fold in progress
+        self.set_car_model(m);
+        self.save.car = m;
+        self.toastf(&format!("{} ({}/{})", self.cars.names[m], next + 1, n));
     }
 
     fn open_menu(&mut self, m: Mode) {
@@ -2755,6 +2976,7 @@ impl Game {
         if self.toast_t <= 0.0 {
             self.toast.clear();
         }
+        self.advance_xform(dt);
 
         // ---- controller ----
         let ps = self.pad.poll();

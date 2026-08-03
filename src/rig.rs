@@ -76,6 +76,9 @@ pub struct RigPrim {
 }
 
 pub struct Rig {
+    pub names: Vec<String>,
+    /// joints of skin 0, in skin order — the named skeleton
+    pub joint_nodes: Vec<usize>,
     parent: Vec<Option<usize>>,
     /// bind-pose local transform of every node
     local_t: Vec<Vec3>,
@@ -256,6 +259,8 @@ impl Rig {
         }
 
         Some(Rig {
+            names: doc.nodes().map(|n| n.name().unwrap_or("").to_string()).collect(),
+            joint_nodes: doc.skins().next().map(|s| s.joints().map(|j| j.index()).collect()).unwrap_or_default(),
             parent,
             local_t: lt,
             local_r: lr,
@@ -265,6 +270,10 @@ impl Rig {
             clips,
             prims,
         })
+    }
+
+    pub fn parent_of(&self, i: usize) -> Option<usize> {
+        self.parent[i]
     }
 
     /// Global transform of every node, with `clip` evaluated at `t` seconds.
@@ -382,6 +391,44 @@ fn sample(ch: &Channel, t: f32, tt: &mut [Vec3], rr: &mut [Quat], ss: &mut [Vec3
             rr[ch.node] = qa.slerp(if qa.dot(qb) < 0.0 { -qb } else { qb }, f);
         }
     }
+}
+
+/// WHICH WAY IS UP, READ OFF THE SKELETON.
+///
+/// A humanoid rig already knows its own frame and nobody ever writes it
+/// down: up is feet to head, right is one hip to the other, forward is what
+/// is left. Guessing it downstream from a bounding box is what puts a robot
+/// on its side — skydribble scores candidate frames by how well four wheels
+/// fall out at the corners, and a legless body has none.
+///
+/// Matches the Biped names both reference rigs use (`Bip001 Pelvis`,
+/// `Bip001 L Foot`, `Bip001 Head`), loosely enough to survive renaming.
+/// Returns None when the rig is not humanoid enough to be certain: a wrong
+/// answer is worse than none, because none just restores the old guess.
+pub fn skeleton_frame(rig: &Rig, clip: usize, t: f32) -> Option<(Vec3, Vec3)> {
+    let g = rig.pose(clip, t);
+    let find = |want: &[&str]| -> Option<Vec3> {
+        let k = rig.joint_nodes.iter().find(|&&j| {
+            let l = rig.names.get(j).map(|n| n.to_lowercase()).unwrap_or_default();
+            want.iter().all(|w| l.contains(w))
+        })?;
+        Some(g[*k].w_axis.truncate())
+    };
+    let head = find(&["head"])?;
+    let lf = find(&["l ", "foot"])?;
+    let rf = find(&["r ", "foot"])?;
+    let up = (head - (lf + rf) * 0.5).normalize_or_zero();
+    // hip to hip gives the lateral axis without needing a chest or a nose
+    let lt = find(&["l ", "thigh"])?;
+    let rt = find(&["r ", "thigh"])?;
+    let right = (lt - rt).normalize_or_zero();
+    if up.length_squared() < 0.5 || right.length_squared() < 0.5 {
+        return None;
+    }
+    // forward completes a right-handed frame, re-derived from the
+    // orthogonalized right so a slouched pose cannot skew it
+    let f = right.cross(up).normalize_or_zero();
+    (f.length_squared() > 0.5).then_some((up, f))
 }
 
 /// Poses a rig into the format the harnesses and the loader already read.

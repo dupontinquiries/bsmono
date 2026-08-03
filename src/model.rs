@@ -508,6 +508,41 @@ pub fn load(dir: &Path, gpu: &mut Gpu, target_len: f32) -> Model {
     load_oriented(dir, gpu, target_len, false)
 }
 
+/// Read `orient.json` beside the geometry, if the asset ships one.
+///
+/// Returns the rotation that carries the asset's declared frame onto the
+/// engine's: +Y up, nose at -Z. Malformed or degenerate files are ignored
+/// rather than fatal — a bad sidecar should cost the guess, not the load.
+fn declared_orientation(dir: &Path) -> Option<Quat> {
+    let txt = std::fs::read_to_string(dir.join("orient.json")).ok()?;
+    let num3 = |key: &str| -> Option<Vec3> {
+        let i = txt.find(key)?;
+        let open = txt[i..].find('[')? + i;
+        let close = txt[open..].find(']')? + open;
+        let v: Vec<f32> = txt[open + 1..close]
+            .split(',')
+            .filter_map(|t| t.trim().parse::<f32>().ok())
+            .collect();
+        (v.len() == 3).then(|| Vec3::new(v[0], v[1], v[2]))
+    };
+    let up = num3("\"up\"")?.normalize_or_zero();
+    let fwd = num3("\"forward\"")?.normalize_or_zero();
+    if up.length_squared() < 0.5 || fwd.length_squared() < 0.5 {
+        return None;
+    }
+    // orthonormalize: the forward the asset declares need not be exactly
+    // perpendicular to its up, and a skew basis would shear the model
+    let f = (fwd - up * fwd.dot(up)).normalize_or_zero();
+    if f.length_squared() < 0.5 {
+        return None; // forward parallel to up: no frame to build
+    }
+    let r = f.cross(up).normalize_or_zero();
+    // rows are the asset's axes, so the matrix maps asset space -> engine
+    // space, where up becomes +Y and forward becomes -Z
+    let m = Mat3::from_cols(r, up, -f).transpose();
+    Some(Quat::from_mat3(&m).normalize())
+}
+
 /// Everything `load` does before touching the GPU: parse (.gltf folder or
 /// .glb), bake node transforms, find the car's frame, split the wheels,
 /// orient, centre and scale. Harnesses and tools can accept an asset exactly
@@ -646,8 +681,30 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
     // way (on their side, nose-aft, back upward), so put them in that frame
     // before anything reads them.
     {
-        let all: Vec<Vertex> = raws.iter().flat_map(|r| r.verts.iter().copied()).collect();
-        let q = find_orientation(&all);
+        // LET THE ASSET SAY WHICH WAY IS UP.
+        //
+        // `find_orientation` scores candidate frames by how well four
+        // same-size wheels fall out at the corners. That is a good guess for
+        // a car and a bad one for anything else: a legless robot has no
+        // wheels to find, so the search picks whatever reads most car-like,
+        // which is the robot lying on its side — long and low scores well.
+        //
+        // An `orient.json` beside the geometry ends the guessing. It is two
+        // vectors in the asset's own space, and the exporter that knows the
+        // answer writes it: `rigpose` reads up straight off the skeleton
+        // (feet to head) and right off the hips, so a rigged model never
+        // has to be guessed about at all.
+        //
+        //     { "up": [0,1,0], "forward": [0,0,-1] }
+        //
+        // Absent, nothing changes and the search runs as before.
+        let q = match declared_orientation(dir) {
+            Some(q) => q,
+            None => {
+                let all: Vec<Vertex> = raws.iter().flat_map(|r| r.verts.iter().copied()).collect();
+                find_orientation(&all)
+            }
+        };
         if q != Quat::IDENTITY {
             for r in raws.iter_mut() {
                 for v in r.verts.iter_mut() {

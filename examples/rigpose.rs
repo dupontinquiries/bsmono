@@ -12,6 +12,7 @@ include!("shim.rs");
 #[path = "../src/rig.rs"]
 pub mod rig;
 
+use glam::Vec3;
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -24,6 +25,23 @@ fn main() {
         eprintln!("rigpose: {dir:?} has no readable glTF");
         std::process::exit(1);
     };
+
+    if a1 == "--joints" {
+        // Where the named skeleton actually is at this time. Feet below
+        // pelvis below head means the pose stands up; anything else and the
+        // model is lying down, and no amount of camera work will hide it.
+        let clip: usize = args.next().unwrap_or_else(|| "0".into()).parse().unwrap_or(0);
+        let frac: f32 = args.next().unwrap_or_else(|| "1".into()).parse().unwrap_or(1.0);
+        let dur = r.clips.get(clip).map(|c| c.duration).unwrap_or(0.0);
+        let g = r.pose(clip, frac.clamp(0.0, 1.0) * dur);
+        for &j in &r.joint_nodes {
+            let n = &r.names[j];
+            if n.is_empty() { continue; }
+            let p = g[j].to_scale_rotation_translation().2;
+            println!("{:34} x {:9.2}  y {:9.2}  z {:9.2}", n, p.x, p.y, p.z);
+        }
+        return;
+    }
 
     if a1 == "--list" {
         println!("{:?}: {} prims, {} clips", dir.file_name().unwrap_or_default(), r.prims.len(), r.clips.len());
@@ -119,6 +137,20 @@ fn main() {
         nodes.join(","),
         scene.join(",")
     );
+    // Write down which way is up, so the loader never has to guess. The
+    // frame is taken from the ROBOT pose (t = end of the clip) rather than
+    // this one: a truck half-way through unfolding has no meaningful "up",
+    // but the thing it becomes does, and the whole strip shares a frame.
+    let dur_end = r.clips.get(clip).map(|c| c.duration).unwrap_or(0.0);
+    if let Some((up, fwd)) = rig::skeleton_frame(&r, clip, dur_end) {
+        let j = format!(
+            "{{\"up\":[{},{},{}],\"forward\":[{},{},{}],\"source\":\"skeleton\"}}",
+            up.x, up.y, up.z, fwd.x, fwd.y, fwd.z
+        );
+        std::fs::write(out.join("orient.json"), j).ok();
+        println!("   orient.json: up [{:.2} {:.2} {:.2}] forward [{:.2} {:.2} {:.2}] (from skeleton)",
+            up.x, up.y, up.z, fwd.x, fwd.y, fwd.z);
+    }
     std::fs::File::create(out.join("scene.bin")).unwrap().write_all(&bin).unwrap();
     std::fs::File::create(out.join("scene.gltf")).unwrap().write_all(doc.as_bytes()).unwrap();
 

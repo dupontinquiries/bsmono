@@ -32,9 +32,11 @@ pub enum Action {
     Car1,
     Car2,
     Car3,
+    /// vehicle <-> robot, for a blackstar chassis
+    Transform,
 }
 
-pub const ACTIONS: [Action; 21] = [
+pub const ACTIONS: [Action; 22] = [
     Action::Forward,
     Action::Reverse,
     Action::SteerL,
@@ -56,6 +58,7 @@ pub const ACTIONS: [Action; 21] = [
     Action::Car1,
     Action::Car2,
     Action::Car3,
+    Action::Transform,
 ];
 
 impl Action {
@@ -82,6 +85,7 @@ impl Action {
             Action::Car1 => "CAR: OCTANE",
             Action::Car2 => "CAR: FENNEC",
             Action::Car3 => "CAR: DOMINUS",
+            Action::Transform => "TRANSFORM (BOT <-> ROBOT)",
         }
     }
     pub fn id(self) -> &'static str {
@@ -107,6 +111,7 @@ impl Action {
             Action::Car1 => "car1",
             Action::Car2 => "car2",
             Action::Car3 => "car3",
+            Action::Transform => "transform",
         }
     }
     pub fn from_id(s: &str) -> Option<Action> {
@@ -281,6 +286,9 @@ impl Bindings {
             (Car1, vec![ch("1")]),
             (Car2, vec![ch("2")]),
             (Car3, vec![ch("3")]),
+            // G, and L-bumper on a pad. T is Toss and F is FlipVis, so the
+            // two keys that read as "transform" were both already spoken for.
+            (Transform, vec![ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
         ];
         Bindings { map: m }
     }
