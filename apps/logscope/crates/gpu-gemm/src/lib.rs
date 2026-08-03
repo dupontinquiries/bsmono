@@ -1257,6 +1257,16 @@ impl Gpu {
         let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
         let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
         let act: Vec<f32> = (0..m * k).map(|_| rnd()).collect();
+        // POISONED UNTIL _526, like self_check_sg. This probe decides which GEMM tiles are VALID by
+        // packing weights and comparing results — and QUANT_PACK wrote its bytes with a lane-varying
+        // shift, which returns zero on Honeykrisp for every lane whose shift is non-zero.
+        //
+        // A tile that produced a "wrong" answer over corrupt weights was excluded from the autotune.
+        // So the prefill GEMM may have been choosing from a restricted tile set on that driver, and
+        // the tiles it rejected were not necessarily bad ones.
+        //
+        // Unlike the subgroup case this fails QUIETLY: a smaller candidate set still yields a working
+        // kernel, just possibly a slower one, and nothing in the log says a tile was dropped.
         let qw = self.quantize_q8_resident(&w, n, k);
         let a = self.upload(&act, m, k);
         let naive = self.download(&self.linear_q8_0_naive(&a, &qw, m));
@@ -2619,6 +2629,9 @@ impl Gpu {
     /// from probe_expert_stream can be judged against a MEASURED budget instead of a guessed --token-ms.
     /// Returns ms for ONE expert's 3 matvecs. Scout dims: d=5120, ff=8192.
     pub fn probe_expert_compute(&self, d: usize, ff: usize, iters: usize) -> f64 {
+        // Same dependency: this probe packs through quantize_q4_resident, whose Q4K_TO_Q4 byte_at
+        // helper carried the lane-varying shift until _526. Whatever it concluded about expert
+        // compute on Honeykrisp was concluded over corrupt weights.
         let gate = self.quantize_q4_resident(&vec![0.05f32; ff * d], ff, d);
         let up = self.quantize_q4_resident(&vec![0.05f32; ff * d], ff, d);
         let down = self.quantize_q4_resident(&vec![0.05f32; d * ff], d, ff);
