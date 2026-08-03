@@ -7,6 +7,7 @@ mod analog;
 mod bigbody;
 mod bots;
 mod camera;
+mod chord;
 mod clinch;
 mod config;
 mod drop;
@@ -490,6 +491,10 @@ struct Game {
 
     /// how the current chassis stays up, when it flies at all
     lift: Option<lift::Lift>,
+    /// space, as a tap-or-hold whose meaning the form decides
+    space: chord::Chord,
+    /// right mouse: glance when held, latch when tapped
+    sight: chord::Sight,
     /// walk / run / boost / fall, for robot mode
     loco: anim::Locomotion,
     /// the pose it produced this frame
@@ -1191,6 +1196,8 @@ fn main() {
         wep: weapons::Weapons::new(),
         autotarget: false,
         lift: None,
+        space: chord::Chord::new(),
+        sight: chord::Sight::new(),
         loco: anim::Locomotion::new(),
         loco_pose: anim::Pose::default(),
         ball_model,
@@ -1376,10 +1383,23 @@ fn main() {
                             } else if let Mode::Online { .. } = game.mode {
                                 game.key_down(key.clone(), elwt, &win); // key repeat in text fields
                             }
+                            if game.binds.is_bound(Action::Jump, &input::Bind::Key(key.clone()))
+                                && !game.held.contains(&key)
+                            {
+                                game.space.press();
+                            }
                             game.held.insert(key);
                         }
                         ElementState::Released => {
+                            let was_space =
+                                game.binds.is_bound(Action::Jump, &input::Bind::Key(key.clone()));
                             game.held.remove(&key);
+                            if was_space {
+                                if let Some(p) = game.space.release() {
+                                    game.space_intent(p);
+                                }
+                                game.autotarget_release();
+                            }
                             // HOLD MODE releases the lock with the key. Done
                             // here rather than in one_shot because releases
                             // are not shots — nothing else in the game needs
@@ -1990,6 +2010,45 @@ impl Game {
         // element movement also belongs here: Air runs, Rock does not
         let _ = self.wep.move_mul();
         self.car.susp = (self.loco_pose.squash * self.loco_pose.weight).clamp(0.0, 1.0);
+    }
+
+    /// What this chassis is, for the binding resolver.
+    fn chassis_class(&self) -> chord::Class {
+        let n = self.cars.names[self.cars.active].to_ascii_lowercase();
+        if self.car.flight || n.starts_with("jet") {
+            chord::Class::Flyer
+        } else if self.car.hover.is_some() || n.contains("hover") {
+            chord::Class::Hoverer
+        } else if n.contains("tank") || n.contains("patton") || n.contains("lynx") {
+            chord::Class::Tank
+        } else {
+            chord::Class::Racer
+        }
+    }
+
+    /// Act on what a space press turned out to mean.
+    fn space_intent(&mut self, press: chord::Press) {
+        if self.mode != Mode::Play {
+            return;
+        }
+        let form = if self.car.robot { chord::Form::Robot } else { chord::Form::Vehicle };
+        match chord::resolve(form, self.chassis_class(), press) {
+            chord::Intent::Jump => self.one_shot(Action::Jump),
+            chord::Intent::CycleTarget => {
+                self.autotarget = true;
+                self.wep.locked = None; // step off the current one
+                self.toastf("NEXT TARGET");
+            }
+            chord::Intent::HoldTarget => {
+                self.autotarget = true;
+            }
+            chord::Intent::Weapons => {
+                self.autotarget = true;
+                self.toastf(&format!("WEAPONS: {}", self.wep.profile().name));
+            }
+            chord::Intent::Flare => self.toastf("FLARES"),
+            chord::Intent::None => {}
+        }
     }
 
     /// Let go of the target, if the lock was being held.
@@ -3349,6 +3408,14 @@ impl Game {
         if self.toast_t <= 0.0 {
             self.toast.clear();
         }
+        // a hold has to fire while the key is DOWN, not on release
+        if let Some(p) = self.space.update(dt) {
+            self.space_intent(p);
+        }
+        if !self.space.down() && !self.cfg.car.autotarget_hold {
+            // cycle mode leaves the lock where it was
+        }
+        self.sight.update(dt);
         self.advance_xform(dt);
         self.update_autotarget(dt);
         self.update_locomotion(dt);

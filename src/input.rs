@@ -286,19 +286,19 @@ impl Bindings {
             (SteerR, vec![ch("d")]),
             (RollL, vec![ch("q")]),
             (RollR, vec![ch("e")]),
-            // JUMP LOSES SPACE. Autotarget was asked for on space as a
-            // hold, and two actions on one key is worse than moving one.
-            // Jump keeps middle mouse and the pad's south button — so
-            // NOTHING CHANGES ON A CONTROLLER — and takes J on the keyboard.
-            // Rebindable, and if the trade is wrong it is one line in the
-            // Binds menu.
-            (Jump, vec![ch("j"), Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_SOUTH)]),
+            // JUMP GETS SPACE BACK. Moving it off was the wrong fix: jump
+            // and autotarget want space for the SAME reason — it is the
+            // thing your thumb is on — and they never want it at the same
+            // moment. chord::resolve decides which one a press means from
+            // the form and the chassis, so the key is contextual rather than
+            // overloaded. J stays as a second binding.
+            (Jump, vec![named(NamedKey::Space), ch("j"), Bind::Mouse(MouseButton::Middle), Bind::Pad(crate::gamepad::PB_SOUTH)]),
             // BOOST LOSES SHIFT. Transform was asked for on Shift, and two
             // actions on one key is worse than moving one of them. V is the
             // boost key the Dvorak scheme already uses, so it is not a new
             // idea to anyone, and both pad bindings are untouched — on a
             // controller nothing about boost changes at all.
-            (Boost, vec![ch("v"), Bind::Mouse(MouseButton::Right), Bind::Pad(crate::gamepad::PB_EAST), Bind::Pad(crate::gamepad::PB_RB)]),
+            (Boost, vec![ch("v"), Bind::Pad(crate::gamepad::PB_EAST), Bind::Pad(crate::gamepad::PB_RB)]),
             (Slide, vec![named(NamedKey::Control), Bind::Pad(crate::gamepad::PB_WEST)]),
             (BallCam, vec![ch("c"), Bind::Pad(crate::gamepad::PB_NORTH)]),
             (Toss, vec![ch("t")]),
@@ -316,9 +316,11 @@ impl Bindings {
             // used to it, and L-bumper on a pad.
             (Transform, vec![named(NamedKey::Shift), ch("g"), Bind::Pad(crate::gamepad::PB_LB)]),
             // X, and the right stick click — where a lock-on lives on a pad
-            // HOLD to hold a target, by default. X stays as a second
-            // binding for anyone who preferred it.
-            (AutoTarget, vec![named(NamedKey::Space), ch("x"), Bind::Pad(crate::gamepad::PB_R3)]),
+            // Autotarget's own binding is the SCOPE: right mouse, held for
+            // a glance and tapped to latch. Space reaches it too, through
+            // the context resolver, on the chassis that have no jump to
+            // spend it on.
+            (AutoTarget, vec![Bind::Mouse(MouseButton::Right), ch("x"), Bind::Pad(crate::gamepad::PB_R3)]),
             // MOUSE. Shooting belongs under the trigger finger, so Fire is
             // left mouse and the right trigger. Boost and jump pick up right
             // and middle as SECOND bindings rather than replacements — the
@@ -364,6 +366,15 @@ impl Bindings {
             self.map.len() - 1
         });
         &mut self.map[i].1
+    }
+
+    /// Is this exact input bound to that action?
+    ///
+    /// Needed by the context resolver: space has to know it is space
+    /// WITHOUT hard-coding the key, or rebinding jump in the Binds menu
+    /// silently stops the tap-and-hold from working.
+    pub fn is_bound(&self, a: Action, b: &Bind) -> bool {
+        self.binds(a).iter().any(|x| x == b)
     }
 
     pub fn binds(&self, a: Action) -> &[Bind] {
