@@ -9,6 +9,7 @@ mod font;
 mod fx;
 mod gamepad;
 mod gyro;
+mod content;
 mod custom;
 mod partcars;
 mod partdata;
@@ -1712,6 +1713,11 @@ impl Game {
         if self.morph.is_none() {
             self.build_morph();
         }
+        // FOLD SPEED FROM THE CHASSIS. dur_mul has existed since the state
+        // machine landed and nothing set it, so every bot folded at the same
+        // rate. content::CHASSIS is where those numbers were: a juggernaut
+        // takes 1.35x as long as standard, a raptor 0.8x.
+        self.xf.dur_mul = self.chassis_fold_mul();
         if !self.xf.request(self.health) {
             // denied rather than ignored: say which, because "nothing
             // happened" is the worst feedback a button can give
@@ -1720,6 +1726,21 @@ impl Game {
             }
             return;
         }
+    }
+
+    /// Which content chassis this bot fights as, by name match, falling back
+    /// to `standard`. The bot strips are named for their source model, and
+    /// the content table is named for body shapes, so this is a lookup that
+    /// will want a real mapping once chassis assignment is authored rather
+    /// than guessed.
+    fn chassis_fold_mul(&self) -> f32 {
+        let name = self.cars.names[self.cars.active].to_ascii_lowercase();
+        content::CHASSIS
+            .iter()
+            .find(|c| name.contains(c.id))
+            .or_else(|| content::chassis("standard"))
+            .map(|c| c.xform_dur)
+            .unwrap_or(1.0)
     }
 
     /// Load the active chassis' strip vertices so the fold can blend.
