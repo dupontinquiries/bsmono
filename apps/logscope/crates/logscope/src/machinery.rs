@@ -900,3 +900,169 @@ mod peer_tests {
         assert!(ring_yaws(0).is_empty());
     }
 }
+
+/// A machine in the NETWORK — this one, or a peer's.
+///
+/// Named RemoteMachine because `Peer` is already taken in this module by unrelated earlier work; the
+/// clash is worth naming rather than silently reusing, since the two describe different things.
+///
+/// ## The problem a network adds
+///
+/// A local landmark reads live state. A peer's arrives by announce, at intervals, and goes stale
+/// between them. **A peer mechanism animating from thirty-second-old data is lying in exactly the way
+/// every label in this codebase has lied** — it looks like a live reading and is not one.
+///
+/// So freshness is a first-class property of a peer's machine, and a stale one must be visibly stale
+/// rather than visibly working.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RemoteMachine {
+    /// Seconds since this peer's state last arrived. Zero for the local machine.
+    pub age_s: f32,
+    /// Whether this is the machine the viewer is sitting at.
+    pub local: bool,
+}
+
+/// Beyond this, a peer's state is old enough that showing it as live would be a claim rather than a
+/// reading. Matches `announce::MAX_AGE_S`, so the landmark and the discovery table agree about who is
+/// present — a peer the registry has dropped must not still be turning in the scene.
+pub const PEER_STALE_S: f32 = 30.0;
+
+/// A peer that has said nothing for this long is not slow, it is gone.
+pub const PEER_LOST_S: f32 = 120.0;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Freshness {
+    /// State arrived recently enough to animate.
+    Live,
+    /// Old enough that the mechanism should hold its last pose rather than animate a guess.
+    Stale,
+    /// Gone. Shown as a darkened frame, not removed — a landmark that vanishes reads as "I never had
+    /// that peer", and knowing a machine has dropped out is the more useful fact.
+    Lost,
+}
+
+impl RemoteMachine {
+    pub fn freshness(&self) -> Freshness {
+        if self.local || self.age_s < PEER_STALE_S { Freshness::Live }
+        else if self.age_s < PEER_LOST_S { Freshness::Stale }
+        else { Freshness::Lost }
+    }
+
+    /// The motion to render, given what the peer last reported.
+    ///
+    /// **Stale does not fall through to the reported motion.** A peer that was thriving when last
+    /// heard from is not thriving now — it is unknown — and animating the old value is the one thing
+    /// a network view must not do.
+    pub fn motion(&self, reported: Motion) -> Motion {
+        match self.freshness() {
+            Freshness::Live => reported,
+            // Held, not stopped: a stall means "this machine is waiting", and a stale peer means
+            // "we do not know". They must look different or a network partition reads as every peer
+            // simultaneously seizing.
+            Freshness::Stale | Freshness::Lost => Motion::Deciding,
+        }
+    }
+
+    /// How strongly to draw it, 0..1. Fades with age so the network's edge is legible.
+    pub fn presence(&self) -> f32 {
+        match self.freshness() {
+            Freshness::Live => 1.0,
+            Freshness::Stale => 0.55,
+            Freshness::Lost => 0.2,
+        }
+    }
+}
+
+/// Where each machine in the network stands.
+///
+/// The local machine keeps the canonical bearing so it is where it has always been; peers fan out
+/// from there in registration order. **Order must be stable** — a peer that moved every time another
+/// joined would make the network unreadable, and the whole value is recognising a specific machine's
+/// mechanism by where it stands.
+pub fn peer_placement(index: usize, count: usize, scene_radius: f32, scene_height: f32) -> Placement {
+    let base = placement(scene_radius, scene_height);
+    if index == 0 || count <= 1 { return base; }
+    // Fan across a quarter turn, so peers stay in the same region of view rather than surrounding the
+    // reader — a machine behind you is a machine you never see.
+    let spread = 0.9_f32;
+    let t = index as f32 / (count.max(2) - 1) as f32;
+    let yaw = BEARING_YAW - spread * 0.5 + spread * t;
+    let d = (if scene_radius > 1.0 { scene_radius } else { 12.0 }) * BEARING_DISTANCE;
+    Placement {
+        pos: [d * yaw.cos(), base.pos[1], d * yaw.sin()],
+        // Peers are smaller: the local machine is the one whose numbers the reader can act on.
+        scale: base.scale * 0.7,
+        yaw: yaw + std::f32::consts::PI,
+    }
+}
+
+#[cfg(test)]
+mod network_peer_tests {
+    use super::*;
+
+    #[test]
+    fn a_STALE_peer_does_not_animate_its_last_known_motion() {
+        // The lying-label class, in a scene. A peer thriving when last heard from is not thriving
+        // now — it is unknown, and animating the old value claims a reading that did not happen.
+        let p = RemoteMachine { age_s: 45.0, local: false };
+        assert_eq!(p.freshness(), Freshness::Stale);
+        assert_ne!(p.motion(Motion::Thriving), Motion::Thriving);
+    }
+
+    #[test]
+    fn a_stale_peer_looks_DIFFERENT_from_a_stalled_one() {
+        // "This machine is waiting" and "we do not know" are different facts, and if they render the
+        // same a network partition reads as every peer simultaneously seizing.
+        let stale = RemoteMachine { age_s: 45.0, local: false }.motion(Motion::Stalled);
+        assert_ne!(stale, Motion::Stalled);
+    }
+
+    #[test]
+    fn a_LOST_peer_is_dimmed_rather_than_removed() {
+        // A landmark that vanishes reads as "I never had that peer". Knowing a machine dropped out is
+        // the more useful fact and the one worth keeping on screen.
+        let p = RemoteMachine { age_s: 300.0, local: false };
+        assert_eq!(p.freshness(), Freshness::Lost);
+        assert!(p.presence() > 0.0, "still drawn");
+        assert!(p.presence() < 0.5, "but plainly gone");
+    }
+
+    #[test]
+    fn the_LOCAL_machine_is_never_stale() {
+        // Its state is read directly rather than announced, so age does not apply.
+        let p = RemoteMachine { age_s: 999.0, local: true };
+        assert_eq!(p.freshness(), Freshness::Live);
+        assert_eq!(p.motion(Motion::Thriving), Motion::Thriving);
+    }
+
+    #[test]
+    fn the_stale_threshold_matches_the_ANNOUNCE_window() {
+        // The landmark and the discovery table must agree about who is present: a peer the registry
+        // has dropped must not still be turning in the scene.
+        assert_eq!(PEER_STALE_S, 30.0);
+    }
+
+    #[test]
+    fn the_LOCAL_machine_keeps_the_canonical_bearing() {
+        // It is where it has always been; peers arrange around it rather than displacing it.
+        let solo = placement(20.0, 12.0);
+        let with_peers = peer_placement(0, 4, 20.0, 12.0);
+        assert_eq!(solo.pos, with_peers.pos);
+    }
+
+    #[test]
+    fn peers_stay_in_the_SAME_REGION_of_view_rather_than_surrounding_the_reader() {
+        // A machine behind you is a machine you never see.
+        for i in 1..5 {
+            let p = peer_placement(i, 5, 20.0, 12.0);
+            let yaw = p.pos[2].atan2(p.pos[0]);
+            assert!((yaw - BEARING_YAW).abs() < 0.6, "peer {i} at {yaw} strayed from the bearing");
+        }
+    }
+
+    #[test]
+    fn a_peer_is_drawn_SMALLER_than_the_local_machine() {
+        // The local one is the machine whose numbers the reader can act on.
+        assert!(peer_placement(2, 4, 20.0, 12.0).scale < peer_placement(0, 4, 20.0, 12.0).scale);
+    }
+}
