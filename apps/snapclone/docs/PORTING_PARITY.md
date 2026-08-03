@@ -41,7 +41,7 @@ starts hidden with the auto-login ordering rule.
 | LoginWidget | ported | session.rs `Login` — optional password, Enter-moves-focus, error clears the password |
 | MainWindow | partial | 5-page shell + login-overlay ordering rule in lib.rs; status bar/export gate pending |
 | MediaSendSummary | pending |  |
-| MobileDialog | pending |  |
+| MobileDialog | ported | mobile_dialog.rs — form-factor ladder, sheet slide, result lifecycle |
 | ModalLayerTestPanel | pending |  |
 | ModalSurface | ported | modal.rs — six layers, derived scrim, tap-outside, dismissTopmost ordering |
 | MonthlyExportReminder | ported | export_reminder.rs `ReminderState` — pure should_show over month key |

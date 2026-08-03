@@ -37,6 +37,7 @@ pub mod export_reminder;
 pub mod nav_chrome;
 pub mod ribbon;
 pub mod scroll_areas;
+pub mod mobile_dialog;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -160,6 +161,10 @@ pub struct Snapclone {
     /// event ran off the end and was handed to the page nav.
     pub bg_carousel: crate::scroll_areas::HScroll,
     pub carousel_handoff: bool,
+    /// Whether dialogs present as bottom sheets or floating windows. Decided
+    /// once per frame from the real surface rather than hardcoded, so the same
+    /// build is correct on a phone and on a desktop.
+    pub dialog_form: crate::mobile_dialog::Form,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -221,6 +226,7 @@ impl Snapclone {
             retry_requested: false,
             bg_carousel: crate::scroll_areas::HScroll::new(0.0, 400.0),
             carousel_handoff: false,
+            dialog_form: crate::mobile_dialog::Form::Sheet,
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -440,6 +446,18 @@ impl Snapclone {
         }
     }
 
+    /// Where a dialog of this height should sit, given the current form factor.
+    /// Replaces the hardcoded rectangles the modal layer was being handed —
+    /// those were phone-shaped constants that would have put a 340px sheet in
+    /// the corner of a desktop window.
+    pub fn dialog_rect(&self, surface: egui::Rect, content_h: f32) -> crate::modal::Rect {
+        let mut d = crate::mobile_dialog::MobileDialog::new(self.dialog_form);
+        d.open();
+        d.tick(crate::mobile_dialog::SHEET_MS * 2.0);
+        let (x, y, w, h) = d.geometry(surface.width(), surface.height(), content_h);
+        crate::modal::Rect::new(x, y, w, h)
+    }
+
     /// Open the QR scanner. `camera` false lands straight on the manual field
     /// rather than showing a viewfinder that will never produce a frame.
     pub fn open_qr_scan(&mut self, camera: bool) {
@@ -590,6 +608,12 @@ impl Snapclone {
         if let Some(dir) = frame.page_jump {
             self.swipe_page(dir.sign());
         }
+
+        // Form factor first: every dialog opened this frame is placed by it.
+        // The environment is the host's to report; what this view can see is
+        // the surface it was handed, which is the width branch of the ladder.
+        self.dialog_form = crate::mobile_dialog::form_factor(
+            &Default::default(), surface.width(), adaptive.is_compact());
 
         // The peel hints ride over the page area, under everything else.
         self.peel.set_page(self.nav.page(), PAGES.len());
@@ -894,6 +918,32 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn a_desktop_surface_gets_a_centred_window_and_a_phone_gets_a_full_width_sheet() {
+        // The hardcoded rectangles this replaced were phone-shaped constants —
+        // a 340px sheet dropped in the corner of a desktop window.
+        let mut s = app();
+        let wide = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1600.0, 900.0));
+        s.dialog_form = crate::mobile_dialog::Form::Window;
+        let r = s.dialog_rect(wide, 400.0);
+        assert!(r.w <= 480.0, "a dialog does not grow with the monitor");
+        assert!((r.x + r.w / 2.0 - 800.0).abs() < 1.0, "centred");
+
+        s.dialog_form = crate::mobile_dialog::Form::Sheet;
+        let narrow = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(360.0, 780.0));
+        let r = s.dialog_rect(narrow, 400.0);
+        assert_eq!(r.x, 0.0);
+        assert_eq!(r.w, 360.0, "full width");
+        assert!((r.y + r.h - 780.0).abs() < 1.0, "flush with the bottom");
+    }
+
+    #[test]
+    fn a_narrow_surface_chooses_the_sheet_form_on_its_own() {
+        use crate::mobile_dialog::{form_factor, Form};
+        assert_eq!(form_factor(&Default::default(), 360.0, false), Form::Sheet);
+        assert_eq!(form_factor(&Default::default(), 1600.0, false), Form::Window);
     }
 
     #[test]
