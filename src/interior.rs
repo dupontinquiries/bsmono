@@ -26,6 +26,7 @@
 
 use glam::Vec3;
 
+use crate::airlock::{Airlock, Door, Gauge, Kind};
 use crate::content::{RoomKind, HUB};
 
 /// Smallest corridor a vehicle can use, half-extents in metres. A skydribble
@@ -97,13 +98,15 @@ pub struct Cell {
     pub blurb: &'static str,
 }
 
-/// A corridor between two rooms, as a box.
+/// A corridor between two rooms, as a box, with the door in it.
 #[derive(Clone, Copy, Debug)]
 pub struct Link {
     pub a: usize,
     pub b: usize,
     pub centre: Vec3,
     pub half: Vec3,
+    /// every doorway has a door; a corridor with no door is a tube
+    pub door: Door,
 }
 
 pub struct Interior {
@@ -116,6 +119,9 @@ pub struct Interior {
     /// false when the hull is too small to hold a corridor a vehicle fits
     /// down — a lander is walk-only and that is not a bug
     pub drive_clearance: bool,
+    /// the ship's airlock, sited at the spacewalk room. This is the one
+    /// door pair that is a mechanic rather than a passage.
+    pub lock: Airlock,
 }
 
 fn axis_box(a: Vec3, b: Vec3, half_w: f32, half_h: f32) -> (Vec3, Vec3) {
@@ -214,10 +220,43 @@ impl Interior {
                     continue; // doors are two-way; carve each once
                 }
                 let (centre, half) = axis_box(cells[i].centre, cells[j].centre, cw, ch);
-                links.push(Link { a: i, b: j, centre, half });
+                // GAUGE FOLLOWS THE ROOMS IT JOINS. A door onto the hangar
+                // has to pass what the hangar launches; a door into crew
+                // quarters does not, and a corridor nobody could drive gets
+                // a crew hatch regardless of what it connects.
+                let touches = |k: RoomKind| cells[i].kind == k || cells[j].kind == k;
+                let gauge = if !drive_clearance {
+                    Gauge::Personnel
+                } else if touches(RoomKind::Hangar) {
+                    Gauge::Launch
+                } else if touches(RoomKind::Upgrade) || touches(RoomKind::Corridor) {
+                    Gauge::Vehicle
+                } else {
+                    Gauge::Personnel
+                };
+                let kind = if touches(RoomKind::Spacewalk) {
+                    Kind::Bulkhead
+                } else if touches(RoomKind::Hangar) {
+                    Kind::Launch
+                } else {
+                    Kind::Hatch
+                };
+                let door = Door::new(kind, gauge, centre, half * 0.8);
+                links.push(Link { a: i, b: j, centre, half, door });
             }
         }
-        Interior { cells, links, hull_half, deck_y, drive_clearance }
+        // the lock sits at the spacewalk room, outboard, and is sized to
+        // what the ship can launch: a carrier's is a room you fly out of
+        let air = cells.iter().find(|c| c.kind == RoomKind::Spacewalk);
+        let lock = match air {
+            Some(c) => Airlock::new(
+                c.centre + Vec3::new(c.half.x, 0.0, 0.0),
+                c.half * 0.8,
+                if drive_clearance { Gauge::Vehicle } else { Gauge::Personnel },
+            ),
+            None => Airlock::new(Vec3::ZERO, Vec3::ONE, Gauge::Personnel),
+        };
+        Interior { cells, links, hull_half, deck_y, drive_clearance, lock }
     }
 
     fn box_sdf(p: Vec3, c: Vec3, h: Vec3) -> f32 {
@@ -237,9 +276,45 @@ impl Interior {
             d = d.max(-Self::box_sdf(p, c.centre, c.half));
         }
         for l in &self.links {
-            d = d.max(-Self::box_sdf(p, l.centre, l.half));
+            // A SHUT DOOR IS HULL. The corridor is only carved as far as its
+            // door has travelled, so walking into a closed one is walking
+            // into structure rather than through a picture of a door.
+            match l.door.void() {
+                Some((c, h)) => {
+                    d = d.max(-Self::box_sdf(p, l.centre, l.half.min(h * 4.0)));
+                    let _ = c;
+                }
+                None => {}
+            }
         }
         d
+    }
+
+    /// Open every internal door — the state a ship sits in at rest, and what
+    /// the layout tests want to reason about.
+    pub fn unseal(&mut self) {
+        for l in self.links.iter_mut() {
+            l.door.open();
+            l.door.travel = 1.0;
+            l.door.state = crate::airlock::State::Open;
+        }
+    }
+
+    /// Cut power to everything. Hatches and bulkheads shut; the launch bay
+    /// opens. That divergence is the whole point of the failure modes.
+    pub fn depower(&mut self) {
+        for l in self.links.iter_mut() {
+            l.door.depower();
+        }
+        self.lock.inner.depower();
+        self.lock.outer.depower();
+    }
+
+    pub fn step_doors(&mut self, dt: f32) {
+        for l in self.links.iter_mut() {
+            l.door.update(dt);
+        }
+        self.lock.update(dt);
     }
 
     /// Can something stand here? Inside the hull, but in open volume.
@@ -439,6 +514,49 @@ mod tests {
             }
             assert!(pos.abs().cmple(i.hull_half).all(), "{} {:?} is outside", c.id, f);
         }
+    }
+
+    #[test]
+    fn a_shut_door_is_a_wall_and_an_open_one_is_a_way_through() {
+        let mut i = Interior::generate(480.0);
+        // find a corridor midpoint that is not inside either room it joins
+        let l = i.links[0];
+        let mid = l.centre;
+        let shut = i.walkable(mid);
+        i.unseal();
+        let open = i.walkable(mid);
+        assert!(open, "opening every door did not make the corridor passable");
+        assert!(!shut || l.half.length() < 1.0,
+            "a shut door was already walkable straight through");
+    }
+
+    #[test]
+    fn losing_power_shuts_the_ship_and_opens_the_bay() {
+        let mut i = Interior::generate(480.0);
+        i.unseal();
+        i.depower();
+        for _ in 0..900 {
+            i.step_doors(1.0 / 60.0);
+        }
+        // the launch door is the one that must NOT trap anything
+        let bay = i.links.iter().find(|l| l.door.kind == Kind::Launch).unwrap();
+        assert!(bay.door.passable(), "the launch bay sealed itself shut");
+        // and the airlock is the one that must
+        assert_eq!(i.lock.inner.state, crate::airlock::State::Shut);
+        assert!(i.lock.interlock_held());
+    }
+
+    #[test]
+    fn doors_are_gauged_for_what_has_to_pass_them() {
+        let big = Interior::generate(480.0);
+        assert!(big.drive_clearance);
+        let bay = big.links.iter().find(|l| l.door.kind == Kind::Launch).unwrap();
+        assert!(bay.door.admits(Gauge::Launch), "a flyer cannot leave the hangar");
+        // a walk-only lander fits nothing but crew, and says so consistently
+        let small = Interior::generate(28.0);
+        assert!(!small.drive_clearance);
+        assert!(small.links.iter().all(|l| !l.door.admits(Gauge::Vehicle)),
+            "a walk-only ship has a vehicle door");
     }
 
     #[test]
