@@ -35,6 +35,7 @@ pub mod voicebar;
 pub mod landmark;
 pub mod export_reminder;
 pub mod nav_chrome;
+pub mod ribbon;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -152,8 +153,13 @@ pub struct Snapclone {
     pub recent_snaps: Vec<String>,
     /// Set when the user asks to export; the host runs the actual zip.
     pub export_requested: bool,
+    /// Set when the user asks to retry failed sends; the host owns the retry.
+    pub retry_requested: bool,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
+    /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
+    /// those tabs can actually offer.
+    pub ribbon: crate::ribbon::SmartRibbon,
     /// Our own position, when the device has a fix. `None` is a real state, not
     /// a placeholder: without it nobody can be placed geographically.
     pub self_fix: Option<crate::wayfinder::Fix>,
@@ -207,7 +213,18 @@ impl Snapclone {
             now_month: None,
             recent_snaps: Vec::new(),
             export_requested: false,
+            retry_requested: false,
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
+            ribbon: {
+                // The tab labels are the nav's own, so the ribbon and the
+                // sub-tab table cannot drift apart.
+                let mut r = crate::ribbon::SmartRibbon::new(sub_tabs(1));
+                r.set_tab_actions(1, vec![
+                    crate::ribbon::Action::new("read_all", "check", "Mark all read")]);
+                r.set_tab_actions(2, vec![
+                    crate::ribbon::Action::new("retry_failed", "refresh", "Retry failed")]);
+                r
+            },
             self_fix: None,
             wayfinder_contacts: Vec::new(),
             wayfinder_snaps: Vec::new(),
@@ -336,6 +353,39 @@ impl Snapclone {
         if let Some(call) = self.incoming_call.as_mut() {
             let caller = call.caller_name.clone();
             if let Some(a) = call.tick(dt * 1000.0) { self.finish_call(&caller, a); }
+        }
+    }
+
+    /// Re-derive which ribbon actions are available. Called before drawing, so
+    /// enablement always reflects the state on screen rather than the state
+    /// when the tab was opened.
+    pub fn refresh_ribbon(&mut self) {
+        let unread = self.inbox.unread_count();
+        let failed = self.outbox.rows().iter()
+            .filter(|r| !r.delivered && r.phase.is_failure()).count();
+        self.ribbon.refresh(|id| match id {
+            // Nothing to mark, nothing to press. An always-enabled "mark all
+            // read" on an empty inbox is a button that lies about having work.
+            "read_all" => unread > 0,
+            "retry_failed" => failed > 0,
+            _ => true,
+        });
+    }
+
+    /// Carry out a ribbon action.
+    pub fn apply_ribbon(&mut self, ev: crate::ribbon::RibbonEvent) {
+        use crate::ribbon::RibbonEvent;
+        match ev {
+            RibbonEvent::TabSelected(i) => { self.bar.sub[1] = i; }
+            RibbonEvent::Triggered(id) => match id.as_str() {
+                "read_all" => {
+                    for id in self.inbox.unread_ids() { self.inbox.mark_read(id); }
+                }
+                // Retry is the host's: this view does not own the transport.
+                // Recorded so the host can act and the test can see it.
+                "retry_failed" => self.retry_requested = true,
+                _ => {}
+            },
         }
     }
 
@@ -745,6 +795,9 @@ impl Snapclone {
                 self.apply_export_card(a, month);
             }
         }
+        // The ribbon sits at the BOTTOM of the inbox, where a thumb reaches it.
+        self.refresh_ribbon();
+        self.ribbon.set_current(self.bar.sub[1]);
         // The nav has declared an Inbox "Sent" sub-tab since the shell was
         // ported, with nothing behind it. That is the outbox.
         if self.bar.sub[1] == 2 {
@@ -815,6 +868,66 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn the_ribbon_tabs_are_the_navs_own_so_they_cannot_drift() {
+        let s = app();
+        let labels: Vec<&str> = s.ribbon.tabs().iter().map(|t| t.label.as_str()).collect();
+        assert_eq!(labels, sub_tabs(1));
+    }
+
+    #[test]
+    fn mark_all_read_is_disabled_with_nothing_to_mark() {
+        // An always-enabled action on an empty inbox is a button that lies
+        // about having work.
+        let mut s = app();
+        s.refresh_ribbon();
+        s.ribbon.set_current(1);
+        assert!(s.ribbon.trigger("read_all").is_none(), "nothing unread");
+    }
+
+    #[test]
+    fn mark_all_read_clears_the_unread_count() {
+        let mut s = app();
+        s.inbox = Default::default();
+        for (id, peer) in [(1u64, "ada"), (2, "bo")] {
+            s.inbox.add(crate::inbox::Entry { id, peer: peer.into(),
+                preview: "hi".into(), at: 0, unread: true, outgoing: false,
+                kind: crate::inbox::Kind::Message });
+        }
+        assert_eq!(s.inbox.unread_count(), 2);
+        s.refresh_ribbon();
+        s.ribbon.set_current(1);
+        assert!(s.ribbon.trigger("read_all").is_some(), "there is work to do");
+        s.apply_ribbon(crate::ribbon::RibbonEvent::Triggered("read_all".into()));
+        assert_eq!(s.inbox.unread_count(), 0);
+    }
+
+    #[test]
+    fn retry_failed_only_lights_when_a_send_has_actually_failed() {
+        let mut s = app();
+        s.outbox.add("s1", "ada", 0);
+        s.refresh_ribbon();
+        s.ribbon.set_current(2);
+        assert!(s.ribbon.trigger("retry_failed").is_none(), "still connecting, not failed");
+        s.outbox.update("s1", crate::session::Phase::Failed, "no route");
+        s.refresh_ribbon();
+        assert!(s.ribbon.trigger("retry_failed").is_some());
+        s.apply_ribbon(crate::ribbon::RibbonEvent::Triggered("retry_failed".into()));
+        assert!(s.retry_requested, "the host owns the retry; the view reports it");
+    }
+
+    #[test]
+    fn a_delivered_send_is_not_a_failed_one() {
+        let mut s = app();
+        s.outbox.add("s1", "ada", 0);
+        s.outbox.update("s1", crate::session::Phase::Failed, "no route");
+        s.outbox.mark_delivered("s1");
+        s.refresh_ribbon();
+        s.ribbon.set_current(2);
+        assert!(s.ribbon.trigger("retry_failed").is_none(),
+                "it arrived in the end; there is nothing to retry");
     }
 
     #[test]

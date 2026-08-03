@@ -102,6 +102,15 @@ impl Inbox {
         if let Some(e) = self.entries.iter_mut().find(|e| e.id == id) { e.unread = false; }
     }
 
+    /// The ids of every unread row, for a bulk "mark all read".
+    ///
+    /// Narrower than exposing `entries`: the caller gets exactly what the
+    /// action needs and cannot reach in and mutate a row directly, which is how
+    /// the unread count and the rows drift apart.
+    pub fn unread_ids(&self) -> Vec<u64> {
+        self.entries.iter().filter(|e| e.unread).map(|e| e.id).collect()
+    }
+
     pub fn unread_count(&self) -> usize { self.entries.iter().filter(|e| e.unread).count() }
 
     /// A connection request lands in the list like anything else.
