@@ -21,7 +21,7 @@ receiving them — which is why it is the right on-ramp from network analysis to
 | `sim-num` | — | deterministic reductions, compensated arithmetic, f64 kernels, sparse+CG, FFT, Newton | **built** |
 | `sim-mat` | — | material properties with provenance; every layer draws from it | **built** |
 | `sim-power` | L0 | Ybus, polar Jacobian, AC power flow | **built** |
-| `sim-field` | L1 | 2D Laplace on triangles → C, L, Z0 per unit length | **built** |
+| `sim-field` | L1 | 2D Laplace → C, L, Z0; 2D linear elasticity → stress, strain | **built** |
 | `sim-pcb` | L2 | stackups, cross-sections → Z0, eps_eff, delay | **built** |
 | `sim-litho` | L3 | EUV aerial imaging by Fourier optics | **built** |
 | `sim-rtl` | L4 | logic evaluation; bit-exact, no floating point | next |
@@ -260,3 +260,39 @@ they are never confused with measured ones. Not implemented.
 - **No temperature dependence beyond resistivity.** `k`, `E` and `α` all vary and are stored as
   single values with a validity window.
 - **Transverse isotropy only.** Full anisotropy is not modelled.
+
+
+## Elasticity
+
+Two unknowns per node on the same triangle. The geometric coefficients `b_i`, `c_i` are *identical*
+to the Laplace case — they are shape-function gradients either way — and Laplace contracts them
+into a scalar while elasticity arranges them into `B`. Assembly, Dirichlet elimination and the CG
+solve are reused unchanged, which is the clearest evidence so far that the shared-core bet was
+right.
+
+Verified by, in order of strength:
+
+1. **The patch test**, now in two parts: a linear displacement field must be reproduced exactly
+   *and* the resulting stress must be uniform across every element. The second half is what catches
+   a wrong constitutive matrix, since a bad `D` can still pass a displacement check.
+2. **Rigid-body motion produces no stress.** Infinitesimal rotation is the sharp case: `γ_xy =
+   −θ + θ` vanishes only if the two off-diagonal terms of `B` carry opposite signs correctly.
+3. **Uniaxial tension recovers E and ν** from the solve rather than assuming them, with the free
+   lateral edge coming out unstressed.
+4. **Plane strain is stiffer than plane stress**, and the two coincide at ν = 0 — an ordering that
+   would reverse if the matrices were swapped, and which no single-mode test would notice.
+5. **Cantilever convergence.** Constant-strain triangles cannot represent bending curvature, so a
+   coarse mesh is too stiff. The test asserts the trend — refinement softens it monotonically
+   toward `PL³/3EI` and never overshoots — because asserting the value would be dishonest about a
+   known property of the element.
+
+### Elasticity debts
+
+- **Constant-strain triangles.** Poor in bending; the finest mesh tested reaches ~85% of the beam
+  solution. Quadratic (T6) elements or incompatible modes are the fix, and both need real
+  quadrature — which is where the closed-form element integral finally ends.
+- **In-plane isotropy only.** `constitutive_of` uses a transversely isotropic material's in-plane
+  constants, which is exact for in-plane loading and silently wrong for anything involving z. A
+  full orthotropic `D` is needed before FR-4 warp or nacre stacking can be modelled.
+- **No thermal coupling**, so `α` is stored and unused and thermal stress cannot be computed.
+- **No body forces, no traction boundary conditions.** Loads are nodal only.

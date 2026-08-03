@@ -79,6 +79,7 @@ dependencies = [
 name = "sim-field"
 version = "0.1.0"
 dependencies = [
+ "sim-mat",
  "sim-num",
 ]
 
