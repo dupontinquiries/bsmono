@@ -1399,3 +1399,156 @@ mod role_tests {
         assert!(m.glow > 0.0, "and distinguishable at a glance");
     }
 }
+
+/// A viewer's beacon: what it looks like, how big, and how brightly it burns.
+///
+/// I gave every viewer the same quarter-scale lantern at a fixed glow. Three different facts were
+/// being collapsed into one marker, and they belong on three channels:
+///
+/// | channel | fact | changes |
+/// |---|---|---|
+/// | **form and size** | what this device could do | rarely — capability is near-static |
+/// | **weathering** | how long since it was heard | over minutes |
+/// | **light** | connection strength and recency | continuously |
+///
+/// **Keeping them separate is the whole point.** A dim beacon must mean a weak link, never a small
+/// device — otherwise a capable phone on bad wifi looks identical to a weak phone on good wifi, and
+/// the two call for opposite responses.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Beacon {
+    /// What it is, in this world.
+    pub form: &'static str,
+    /// Size from capability, not from link quality.
+    pub scale: f32,
+    /// Emissive strength from connection, not from capability.
+    pub glow: f32,
+    /// Overgrowth from silence — the same weathering a worker gets.
+    pub age: f32,
+}
+
+/// Themed per scene, matching the worker landmark's world.
+///
+/// A lighthouse in Atlantis and a paper lantern in the treehouse are the same object doing the same
+/// job — the scene chooses the noun, and the reader learns one meaning: **a light is someone
+/// present**.
+pub fn beacon_form(scene: &str) -> &'static str {
+    match scene {
+        "Old Library" | "Archive" | "Reading Room" => "a reading-lamp on a carrel, shade tilted toward the aisle",
+        "Canopy" | "Forest" => "a glowing seed-pod hung from a low branch",
+        "Cloudscape" | "Mistfall" => "a signal-lamp on a mooring mast, blinking across the cloud",
+        "Treehouse" => "a paper lantern strung between two rope-rails",
+        "Folding@home" => "a fluorescent tag bound to one residue, pulsing where it sits",
+        "Mansion Garden" => "a bronze lamp on the terrace balustrade, wick trimmed",
+        "Atlantis" => "a lighthouse on the reef, its lens turning slow above the water",
+        "Fractal Spires" | "Recursive Citadel" => "a lit window in one recursion, small and unmistakable",
+        "Slate" | "Alley" => "a service lamp clipped to the conduit",
+        _ => "a lantern on a post",
+    }
+}
+
+/// Build a viewer's beacon from what the device is and how well it is heard.
+///
+/// `gflops` and `mem_gib` come from the same autotune measurements the engine already takes for
+/// itself — a device that has been probed reports what it can do, and one that has not gets the
+/// smallest form rather than an assumed one. **An unmeasured device must not look capable.**
+///
+/// `link` is 0..1 from announce recency and delivery: 1.0 is arriving on time, 0.0 is silence.
+pub fn beacon(scene: &str, gflops: f32, mem_gib: f32, link: f32, age: f32) -> Beacon {
+    // Capability on a log scale: the difference between a phone and a workstation is worth showing,
+    // and the difference between two phones is not. Linear would make one beacon dwarf the rest.
+    // Coefficients chosen so a phone lands near 0.36 and a workstation near 0.53 — both inside the
+    // range, which is the point. My first pair (0.10 and 0.06) put BOTH above the ceiling, so every
+    // beacon clamped to maximum size and capability stopped being visible at all. The test caught it
+    // by comparing two devices and finding them equal, which is the only way a saturated scale shows
+    // up: it looks fine in isolation.
+    let cap = (1.0 + gflops.max(0.0)).ln() * 0.03 + (1.0 + mem_gib.max(0.0)).ln() * 0.01;
+    Beacon {
+        form: beacon_form(scene),
+        // Floors at a findable size: an unmeasured or tiny device is still SOMEBODY, and a beacon too
+        // small to see is the same as no beacon.
+        scale: (0.18 + cap).clamp(0.18, 0.75),
+        // Never fully dark while paired. A beacon at zero is indistinguishable from a device that was
+        // never there, and "present but unreachable" is the more useful reading.
+        glow: (0.15 + 0.85 * link.clamp(0.0, 1.0)).clamp(0.15, 1.0),
+        age: age.clamp(0.0, 1.0),
+    }
+}
+
+#[cfg(test)]
+mod beacon_tests {
+    use super::*;
+
+    #[test]
+    fn a_weak_LINK_dims_the_light_and_leaves_the_SIZE_alone() {
+        // The distinction the whole split exists for. A capable phone on bad wifi must not look like
+        // a weak phone on good wifi — the two call for opposite responses.
+        let good = beacon("Atlantis", 200.0, 8.0, 1.0, 0.0);
+        let bad = beacon("Atlantis", 200.0, 8.0, 0.1, 0.0);
+        assert!(bad.glow < good.glow, "the link shows in the light");
+        assert_eq!(bad.scale, good.scale, "and not in the size");
+    }
+
+    #[test]
+    fn nothing_SATURATES_the_scale() {
+        // The failure my first coefficients had: a phone and a workstation both clamped to the
+        // ceiling, so capability was invisible while each looked reasonable alone. Asserting the
+        // extremes stay inside the range is what catches that.
+        let phone = beacon("Slate", 200.0, 8.0, 1.0, 0.0).scale;
+        let station = beacon("Slate", 20_000.0, 128.0, 1.0, 0.0).scale;
+        assert!(phone > 0.18 && phone < 0.75, "phone at {phone}");
+        assert!(station > phone && station < 0.75, "station at {station}");
+    }
+
+    #[test]
+    fn a_bigger_device_gets_a_bigger_beacon_at_the_SAME_brightness() {
+        let phone = beacon("Atlantis", 200.0, 8.0, 1.0, 0.0);
+        let station = beacon("Atlantis", 20_000.0, 128.0, 1.0, 0.0);
+        assert!(station.scale > phone.scale);
+        assert_eq!(station.glow, phone.glow, "capability is not brightness");
+    }
+
+    #[test]
+    fn capability_is_LOGARITHMIC_so_one_beacon_cannot_dwarf_the_rest() {
+        // The gap between a phone and a workstation is worth showing; the gap between two phones is
+        // not. Linear scaling would make the map unreadable the moment a real machine joined.
+        let a = beacon("Slate", 200.0, 8.0, 1.0, 0.0).scale;
+        let b = beacon("Slate", 20_000.0, 128.0, 1.0, 0.0).scale;
+        assert!(b < a * 3.0, "{a} vs {b}: a hundredfold in compute must not be a hundredfold in size");
+    }
+
+    #[test]
+    fn an_UNMEASURED_device_gets_the_smallest_form_not_an_assumed_one() {
+        // A device that has not been probed must not look capable — the same rule as never claiming
+        // a gate is green when it has not run.
+        let unknown = beacon("Canopy", 0.0, 0.0, 1.0, 0.0);
+        assert!(unknown.scale <= 0.19);
+        assert!(unknown.scale > 0.0, "but still findable: it is somebody");
+    }
+
+    #[test]
+    fn a_silent_beacon_never_goes_FULLY_DARK() {
+        // Zero is indistinguishable from a device that was never there, and "present but unreachable"
+        // is the more useful reading.
+        assert!(beacon("Treehouse", 200.0, 8.0, 0.0, 1.0).glow > 0.0);
+    }
+
+    #[test]
+    fn AGE_is_carried_separately_from_both() {
+        // Three facts, three channels. An old-but-reachable device and a fresh-but-unreachable one
+        // must not look the same.
+        let old_reachable = beacon("Old Library", 200.0, 8.0, 1.0, 0.9);
+        let fresh_unreachable = beacon("Old Library", 200.0, 8.0, 0.1, 0.0);
+        assert!(old_reachable.age > fresh_unreachable.age);
+        assert!(old_reachable.glow > fresh_unreachable.glow);
+    }
+
+    #[test]
+    fn every_scene_names_its_own_light() {
+        for s in ["Old Library", "Canopy", "Cloudscape", "Treehouse", "Folding@home",
+                  "Mansion Garden", "Atlantis", "Fractal Spires", "Slate", "Elsewhere"] {
+            assert!(!beacon_form(s).is_empty(), "{s}");
+        }
+        assert!(beacon_form("Atlantis").contains("lighthouse"));
+        assert!(beacon_form("Treehouse").contains("paper lantern"));
+    }
+}
