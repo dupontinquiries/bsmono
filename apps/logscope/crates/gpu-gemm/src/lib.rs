@@ -13413,13 +13413,18 @@ fn main(@builtin(global_invocation_id) g: vec3<u32>) {
             if ((h & 0x8000u) != 0u) { delta = -0.125; }
             for (var l = 0u; l < 4u; l = l + 1u) {
                 // 11-bit index: 8 bits from qs, 3 from qh at this group's offset.
-                let idx = wbyte(blk + 2u + ib * 4u + l) | (((h >> (3u * l)) & 7u) << 8u);
+                // extractBits throughout: `h >> (3u * l)` is a shift by a lane-varying amount, which
+                // returns zero on Honeykrisp for every lane whose shift is non-zero.
+                let idx = wbyte(blk + 2u + ib * 4u + l) | (extractBits(h, 3u * l, 3u) << 8u);
                 let lo = grid[idx * 2u];
                 let hi = grid[idx * 2u + 1u];
                 let base = b * 256u + ib * 32u + l * 8u;
                 for (var j = 0u; j < 4u; j = j + 1u) {
-                    let tl = f32(i32((lo >> (8u * j)) & 0xFFu) << 24u >> 24u);
-                    let th = f32(i32((hi >> (8u * j)) & 0xFFu) << 24u >> 24u);
+                    // Same rule for the byte selects. The trailing `<< 24u >> 24u` is a sign
+                    // extension by CONSTANT amounts and is unaffected — it is the varying shift that
+                    // fails, not shifting as such.
+                    let tl = f32(i32(extractBits(lo, 8u * j, 8u)) << 24u >> 24u);
+                    let th = f32(i32(extractBits(hi, 8u * j, 8u)) << 24u >> 24u);
                     acc0 = acc0 + a[base + j] * (tl + delta) * dl;
                     acc1 = acc1 + a[base + 4u + j] * (th + delta) * dl;
                 }
@@ -13718,7 +13723,13 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
                 qv = clamp(r, -7.0, 7.0);
             }
             let nib = u32(i32(qv) + 8) & 0xFu;
-            acc = acc | (nib << (b * 4u));
+            // insertBits, NOT a shift by a lane-varying amount. `nib << (b * 4u)` yields zero for
+            // every lane whose shift is non-zero on Honeykrisp/Asahi — confirmed by --gate-bytes,
+            // where extractBits with the same varying offset is correct and shift-and-mask is not.
+            //
+            // This is the conversion EVERY Q4_K model runs at load, so a silently wrong pack here is
+            // wrong weights for every such checkpoint on this driver.
+            acc = insertBits(acc, nib, b * 4u, 4u);
         }
         dst[dims.qw_base + bi * 4u + w] = acc;
     }
