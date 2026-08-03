@@ -44,7 +44,7 @@ not see.
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
 | snapclone | 51 | 80% named / 18% code | yes | yes | — |
-| voiceterm | 22 | 86% named / 73% code | yes | yes | **yes** |
+| voiceterm | 22 | 91% named / 73% code | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
 
@@ -156,3 +156,20 @@ Still to port, named rather than left as a TODO in a file nobody opens: ad and
 tracker filtering, island placeholders for canvas/video/iframe (the node kind
 exists, the placeholder UI does not), hydration extraction (JSON-LD,
 `__NEXT_DATA__`), SPA and challenge detection, and a real box-model layout pass.
+
+## Blocked: sharing manpages.rs needs a Qt host
+
+`manpages.rs` is 4,104 lines and splits cleanly in principle — `get`,
+`list_names` and `to_html` are Qt-free, while `to_qml` pulls in `qml_gen` (5,880
+lines) and `scraper`. A module cannot be half-included with `#[path]`, so
+sharing it needs the Qt-free half lifted into its own file in the app crate.
+
+That refactor is NOT done, and deliberately: **the app crate cannot be built in
+this container.** `cargo check --bin web2qml` fails in the build script, which
+shells out to `qmake`, and there is no Qt here. Refactoring a 4,000-line module
+that cannot be compiled is a guess, not a refactor.
+
+The egui reader (`manpage_view.rs`) therefore takes documents from its host
+rather than fetching them — no registry duplicated, no converter duplicated. The
+split is the next real step for whoever has a Qt host, and it would let the
+frontend read the registry directly.
