@@ -75,3 +75,39 @@ activations rather than a fixture.
 The MoE gates that do exist: `--gate-moe-raw`, `--gate-moe-repin`, `--gate-moe-stream`,
 `--gate-moe-fusion`, `--gate-moe-prefetch`, `--gate-moe-cpu`. A wrong weight placement here is not a crash — it is
 plausible text from wrong math, which is the failure this codebase has spent the most time on.
+
+
+---
+
+# Correction: the passing llama4 gate does NOT cover the routed path
+
+I read `moe llama4 gating (raw-sigmoid top-1, weight-before-FFN, + shared) = 9.537e-7 OK` in a full
+suite run and said there was already a validated GPU path doing Llama-4's weight-before gating —
+"a better starting point than I assumed".
+
+**It runs at `t = 3`.** `let (d, ff, sff, ne, t) = (8, 6, 10, 4, 3);` — three tokens, which is the
+prefill-shaped path. The routed decode path is gated on `t == 1`, so the gate never enters it.
+
+So the gate proves that `moe_ffn_t` handles `weight_before` correctly for a multi-token batch. It
+proves nothing about the single-token routed path, which is the one Scout spends 99.9% of its step
+avoiding.
+
+## But it does give a reference implementation
+
+That is the useful part of the correction. Something in the `t > 1` path already scales the expert
+input by the routing weight and matches CPU to 1e-7. **Whatever it does is the thing the routed path
+needs to do at `t == 1`** — and it is validated, so it is a specification rather than a guess.
+
+The pre-scale described above should be written against that code, not invented. And
+`LOGSCOPE_MOE_V2_CHECK=1` compares v1 to the routed path on real activations, which is the test that
+would catch a mistake in porting it.
+
+## The pattern, again
+
+A gate name that says "llama4 gating, weight-before" reads as covering Llama-4's gating with
+weight-before. It covers it *at one token count*, and the count is the thing that decides which path
+runs. **The name describes the inputs and the coverage depends on a parameter buried in a tuple.**
+
+That is the fourth time this week a green check turned out to be green about something adjacent:
+`--gate-vram` measured allocation and was read as residency, `--gate-q6k` was red for a fixture, the
+A/B said "inconclusive" when the levers were unreachable, and now this.
