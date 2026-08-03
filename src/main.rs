@@ -30,6 +30,7 @@ mod save;
 mod sim;
 mod sound;
 mod touch;
+mod weapons;
 mod world;
 
 use std::collections::{HashMap, HashSet};
