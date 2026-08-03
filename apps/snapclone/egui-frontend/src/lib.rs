@@ -33,6 +33,7 @@ pub mod qr;
 pub mod wayfinder;
 pub mod voicebar;
 pub mod landmark;
+pub mod export_reminder;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -140,6 +141,16 @@ pub struct Snapclone {
     /// live now — the previous commit took them off the Wayfinder page, where
     /// they never belonged, and left them with no home.
     pub voicebar: crate::voicebar::VoiceBar,
+    /// Monthly export-reminder bookkeeping. Host-persisted in Qt (QSettings);
+    /// held here so the decision stays a pure function of state + clock.
+    pub reminder: crate::export_reminder::ReminderState,
+    /// The current month, supplied by the host — the rule must not reach for a
+    /// clock, or it cannot be tested.
+    pub now_month: Option<crate::export_reminder::Month>,
+    /// Recent snap paths for the "remember when?" strip.
+    pub recent_snaps: Vec<String>,
+    /// Set when the user asks to export; the host runs the actual zip.
+    pub export_requested: bool,
     /// Our own position, when the device has a fix. `None` is a real state, not
     /// a placeholder: without it nobody can be placed geographically.
     pub self_fix: Option<crate::wayfinder::Fix>,
@@ -189,6 +200,10 @@ impl Snapclone {
             missed_calls: Vec::new(),
             qr: None,
             voicebar: crate::voicebar::VoiceBar::new(),
+            reminder: Default::default(),
+            now_month: None,
+            recent_snaps: Vec::new(),
+            export_requested: false,
             self_fix: None,
             wayfinder_contacts: Vec::new(),
             wayfinder_snaps: Vec::new(),
@@ -311,6 +326,21 @@ impl Snapclone {
         if let Some(call) = self.incoming_call.as_mut() {
             let caller = call.caller_name.clone();
             if let Some(a) = call.tick(dt * 1000.0) { self.finish_call(&caller, a); }
+        }
+    }
+
+    /// Handle the export card. Either action marks the month shown — the card
+    /// was on screen and answered, and re-offering it after an explicit answer
+    /// is the nag this feature is built to avoid.
+    pub fn apply_export_card(&mut self, a: crate::export_reminder::CardAction,
+                             month: crate::export_reminder::Month) {
+        use crate::export_reminder::CardAction;
+        match a {
+            CardAction::ExportRequested => {
+                self.export_requested = true;
+                self.reminder.mark_shown(month);
+            }
+            CardAction::Dismissed => self.reminder.snooze(month),
         }
     }
 
@@ -691,6 +721,16 @@ impl Snapclone {
     /// messaging app read as a demo.
     fn inbox_page(&mut self, ui: &mut Ui, c: &PaletteColors) {
         self.nav.title_bar(ui, "Messages");
+        // The monthly card sits at the top of the Inbox, per the Qt page. It
+        // gates itself: no month from the host means no card, rather than a
+        // guess at what month it is.
+        if let Some(month) = self.now_month {
+            let card = crate::export_reminder::ExportCard::for_month(
+                &self.reminder, month, self.recent_snaps.clone());
+            if let Some(a) = crate::export_reminder::export_card_ui(ui, &card, c) {
+                self.apply_export_card(a, month);
+            }
+        }
         // The nav has declared an Inbox "Sent" sub-tab since the shell was
         // ported, with nothing behind it. That is the outbox.
         if self.bar.sub[1] == 2 {
@@ -761,6 +801,32 @@ mod tests {
         crate::snaps::Snap { id: id.into(), sender_id: "ada@10.0.0.2".into(),
             sender_name: "Ada".into(), sent_at: 0, media: crate::snaps::Media::Image,
             duration_secs: 5, bytes: vec![9, 9, 9] }
+    }
+
+    #[test]
+    fn exporting_and_dismissing_both_close_the_month() {
+        // Either way the card was on screen and answered; re-offering it after
+        // an explicit answer is the nag this feature exists to avoid.
+        use crate::export_reminder::{CardAction, Month};
+        let aug = Month { year: 2026, month: 8 };
+        let mut s = app();
+        s.apply_export_card(CardAction::ExportRequested, aug);
+        assert!(s.export_requested);
+        assert!(!s.reminder.should_show(aug, 50));
+
+        let mut t = app();
+        t.apply_export_card(CardAction::Dismissed, aug);
+        assert!(!t.export_requested, "maybe later is not an export");
+        assert!(!t.reminder.should_show(aug, 50));
+    }
+
+    #[test]
+    fn no_month_from_the_host_means_no_card_rather_than_a_guess() {
+        let s = app();
+        assert!(s.now_month.is_none());
+        // The gate is the host's month; without one the Inbox simply draws no
+        // card, instead of inventing a date to compare against.
+        assert!(s.recent_snaps.is_empty());
     }
 
     #[test]
