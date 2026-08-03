@@ -1077,6 +1077,20 @@ was evicted)", prompt_ids.len())
             // submits rather than the process lifetime's.
             let attr = format!("wgpu-engine: [{}] {}", self.name,
                 gpu_kernels::submit_attribution_since(cause0, ds as u64));
+            // EXPERT RESIDENCY. These counters have been tracked and reported nowhere, so there has
+            // been no way to tell whether pinning more experts would help or whether the cache is
+            // already saturated and the cost is in the kernels. For a streaming MoE that is the whole
+            // question, and it decides whether the next move is budget or a kernel.
+            {
+                let (hits, fills, bytes, repins, _) = gpu_kernels::moe_stream_stats();
+                if hits + fills > 0 {
+                    let r = gpu_kernels::perfverdict::ExpertResidency {
+                        hits, fills, bytes, repins,
+                        pinned: gpu_kernels::moe_pin_counts().0, total: gpu_kernels::moe_pin_counts().1,
+                    };
+                    eprintln!("wgpu-engine: [{}] {}", self.name, r.report(per as u64));
+                }
+            }
             // THE PROFILE CHECKED AGAINST ITSELF. A line that contradicts itself is worse than no
             // line: every number in it gets used to reason about where time goes, and one that cannot
             // be true poisons the conclusions drawn from the rest.

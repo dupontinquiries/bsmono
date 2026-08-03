@@ -2444,6 +2444,18 @@ pub fn moe_stream_stats_reset() {
 }
 
 /// Snapshot of the streaming residency counters: (hits, fills, bytes moved, repins, hit rate).
+/// How many experts are pinned, and how many exist.
+///
+/// Needed alongside the hit counters to say anything useful: a 40% hit rate is excellent with 2 of 16
+/// pinned and means the policy has failed with 12 of 16. Without the denominators the rate cannot be
+/// judged, which is why the counters went unreported for so long — there was nothing to compare them
+/// against.
+pub fn moe_pin_counts() -> (usize, usize) {
+    MOE_PIN_COUNTS.lock().map(|g| *g).unwrap_or((0, 0))
+}
+
+pub(crate) static MOE_PIN_COUNTS: std::sync::Mutex<(usize, usize)> = std::sync::Mutex::new((0, 0));
+
 pub fn moe_stream_stats() -> (u64, u64, u64, u64, f64) {
     use std::sync::atomic::Ordering::Relaxed;
     let (h, f) = (MOE_HITS.load(Relaxed), MOE_FILLS.load(Relaxed));
@@ -8010,6 +8022,9 @@ format would save ~{:.1} GiB and is what would make this fit.",
                                 }
                                 let pin_fit = ((gpu_budget - dense - ring_cost) / per_expert_all_layers) as usize;
                                 let pin = std::env::var("LOGSCOPE_MOE_PIN").ok().and_then(|s| s.parse().ok()).unwrap_or(pin_fit).min(pin_fit).min(n_expert);
+                                // Recorded so the residency report can judge its own hit rate: 40% is excellent with
+                                // 2 of 16 pinned and a failure with 12 of 16, and the counters alone cannot say which.
+                                if let Ok(mut g) = MOE_PIN_COUNTS.lock() { *g = (pin, n_expert as usize); }
                                 // HOST COST, stated before any work happens. Streaming keeps every routed
                                 // expert's requantized weights in host RAM, and the loader also touches the
                                 // whole GGUF (so the file lands in page cache). Both are large, and the
