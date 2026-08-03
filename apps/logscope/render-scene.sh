@@ -6,7 +6,7 @@ THEME="${1:-Atlantis}"; OUT="${2:-/tmp/scene.png}"
 CONVO="${LOGSCOPE_CONVO:-examples/ladder/99-fullspine-marathon.logscope}"
 export PATH=/usr/local/bin:$PATH
 export LD_LIBRARY_PATH=/usr/local/lib/rustlib/x86_64-unknown-linux-gnu/lib
-cargo build --features gpu-scene --bin scene-view 2>&1 | tail -1
+cargo build --features gpu-scene,dev-views --bin scene-view 2>&1 | tail -1
 pkill -9 Xvfb 2>/dev/null || true; sleep 1
 Xvfb :99 -screen 0 1280x820x24 -ac +extension GLX +render -noreset >/tmp/xvfb.log 2>&1 &
 sleep 2
