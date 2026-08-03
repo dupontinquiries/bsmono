@@ -13889,7 +13889,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         // hardware. This value feeds round(v / scale) in the re-quantizer, so it must not.
         let ds = d * sm.x;
         let dm = dmin * sm.y;
-        dst[blk * 256u + grp * 64u + half * 32u + l] = ds * f32(nib) - dm;
+        // Same explicit fma as the converter's wq, so the two GPU dequant paths cannot diverge —
+        // which is exactly how this bug hid: the gate tested this one and the converter used the
+        // other.
+        dst[blk * 256u + grp * 64u + half * 32u + l] = fma(ds, f32(nib), -dm);
     }
 }
 "#;
@@ -13970,7 +13973,20 @@ fn wq(blk: u32, t: u32) -> f32 {
   // treatment, which is why one gate passes and the other does not.
   let dsc = d * sm.x;
   let dm = dmin * sm.y;
-  return dsc * f32(nib) - dm;
+  // EXPLICIT fma, not a hope that the compiler contracts.
+  //
+  // The measurement: gate-q4k printed the amax each side's scale implies — gpu 2.206783533 against
+  // cpu 2.206783295 — while "GPU dequant == CPU dequant" passed with 0 differing. Both are true
+  // because there are TWO GPU dequant paths: the standalone Q4K_DEQUANT the gate exercises, and this
+  // one inside the converter. The compiler contracted one and not the other, so they disagreed by an
+  // ULP and the gate could not see it.
+  //
+  // Writing `dsc * nib - dm` leaves that to the compiler. `fma` states it, and matches the CPU
+  // reference's `mul_add` exactly — one rounding on both sides, by construction rather than by luck.
+  //
+  // Three fixes before this one reasoned about the rule instead of reading the inputs, and all three
+  // were wrong. The print that settled it took four lines.
+  return fma(dsc, f32(nib), -dm);
 }
 
 @compute @workgroup_size(8)
