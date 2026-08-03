@@ -994,7 +994,20 @@ impl App {
                         let page = self.terminal.grid.rows.saturating_sub(1).max(1);
                         self.terminal.grid.page_down(page);
                     }
-                    egui::Event::Paste(t) => self.terminal.paste(t),
+                    egui::Event::Paste(t) => {
+                        // Two destinations on purpose, because there are two
+                        // hosts: the demo consumes `terminal.input` as a
+                        // command line, while a host with a real PTY drains
+                        // `pending_bytes`. A host wires ONE of them.
+                        //
+                        // The PTY copy is bracketed when the program asked for
+                        // it (DEC 2004). Without that, pasting a block of text
+                        // into vim runs every line through its keymap — the
+                        // classic wall of autoindent.
+                        self.terminal.paste(t);
+                        pending.extend_from_slice(
+                            &keys::paste(t, self.terminal.grid.key_mode()));
+                    }
                     egui::Event::Key { key: egui::Key::Backspace, pressed: true, .. } => {
                         self.terminal.input.pop();
                     }
@@ -1039,7 +1052,15 @@ impl App {
                             }
                         };
                         if let Some(mk) = mapped {
-                            if let Some(bytes) = keys::encode(mk, m) {
+                            // MODE-AWARE. This used to call `keys::encode`,
+                            // which always emits CSI for the arrows — so the
+                            // application-cursor branch added to keys.rs, and
+                            // the DECCKM tracking added to the parser, were
+                            // both real and both unreachable from here. Three
+                            // pieces of one fix, each landed separately, and
+                            // the chain was only complete at the third.
+                            let mode = self.terminal.grid.key_mode();
+                            if let Some(bytes) = keys::encode_mode(mk, m, mode) {
                                 self.terminal.grid.scroll_to_bottom();
                                 pending.extend_from_slice(&bytes);
                             }
@@ -1905,5 +1926,56 @@ mod private_mode_tests {
         let g = feed("\x1b[?1h\x1b[?2004h");
         let m = g.key_mode();
         assert!(m.app_cursor && m.bracketed_paste);
+    }
+}
+
+#[cfg(test)]
+mod input_wiring_tests {
+    use super::*;
+
+    /// Feed a DEC private sequence straight into an App's grid, as a program
+    /// running in the terminal would.
+    fn app_with(seq: &str) -> App {
+        let mut a = App::new(80, 24);
+        a.terminal.feed(seq);
+        a
+    }
+
+    #[test]
+    fn the_encoded_arrow_follows_the_mode_the_program_set() {
+        // The chain this completes: keys::encode_mode gained the SS3 branch,
+        // then the parser learned DECCKM, and handle_input was still calling
+        // the mode-unaware encoder. Each piece was tested in isolation and the
+        // path was broken end to end.
+        let plain = App::new(80, 24);
+        assert_eq!(keys::encode_mode(keys::Key::Up, keys::Mods::none(),
+                                     plain.terminal.grid.key_mode()).unwrap(),
+                   b"\x1b[A");
+
+        let app = app_with("\x1b[?1h");
+        assert_eq!(keys::encode_mode(keys::Key::Up, keys::Mods::none(),
+                                     app.terminal.grid.key_mode()).unwrap(),
+                   b"\x1bOA");
+    }
+
+    #[test]
+    fn a_paste_is_bracketed_only_when_the_program_asked_for_it() {
+        // Pasting a block into vim without brackets runs every line through
+        // its keymap — the classic wall of autoindent.
+        let plain = App::new(80, 24);
+        assert_eq!(keys::paste("a\nb", plain.terminal.grid.key_mode()), b"a\rb");
+
+        let app = app_with("\x1b[?2004h");
+        let out = keys::paste("a\nb", app.terminal.grid.key_mode());
+        assert!(out.starts_with(b"\x1b[200~") && out.ends_with(b"\x1b[201~"));
+    }
+
+    #[test]
+    fn pending_bytes_is_the_pty_path_and_starts_empty() {
+        // Documented here because nothing in the tree drains it yet — see
+        // PORT_STATUS. The bytes are computed correctly and discarded, which is
+        // why control keys appear to do nothing.
+        let mut a = App::new(80, 24);
+        assert!(a.take_pending_bytes().is_empty());
     }
 }

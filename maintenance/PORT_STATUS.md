@@ -194,3 +194,43 @@ product code. Recorded so the next session does not re-derive it:
 So the honest reading of the table is that the ports are further along than the
 percentages suggest, and what is left divides into: blocked (manpages), not-UI
 (Dbus, codecs, harnesses), and phantom (WorkspacesPage).
+
+## Text input: what works, and the one thing that does not
+
+Audited after a report that voiceterm "was not taking input". The answer is
+partly yes and partly no, and the no is the interesting half.
+
+**Terminal (voiceterm).** Typing, Backspace, Enter and paste all reach
+`uikit_term::App::handle_input`, which the main binary calls each frame; split
+panes work because the focused pane's `App` is SWAPPED into the drawn one, so
+there is only ever one input path. `terminal_standalone` calls it too.
+
+But control keys are a different story. Arrows, Ctrl-C, Tab and the rest are
+encoded correctly into `App::pending_bytes` — and **nothing in the tree drains
+them**. `take_pending_bytes()` has no caller. The bytes are computed every frame
+and thrown away, which is exactly why plain typing works while Ctrl-C appears
+dead. The demo has no PTY to write them to; a host that grows one must call
+`take_pending_bytes` after `handle_input`, and that is the single remaining
+wire.
+
+Two links in that chain were also broken and are now fixed: `handle_input` was
+calling the mode-UNAWARE `keys::encode`, so the application-cursor branch in
+`keys.rs` and the DECCKM tracking in the parser — landed in separate sessions,
+each tested in isolation — never met. Paste now also emits bracketed bytes when
+the program asked for DEC 2004.
+
+**Search and text fields elsewhere.** All present and wired: snapclone's contact
+filter, add-peer host/port, landmark name, QR manual entry, login; bo-suite's
+tag editor and playlist create; voiceterm's manual-page filter and table command
+line; fao-codec's paths; krapper's lyrics box.
+
+**bo-suite's playlist search did not exist** and now does — matched against name
+AND description, because "long roads" is how someone thinks of the playlist they
+called "Drive". A filter that hides everything says so distinctly from an empty
+collection, or the user thinks their playlists vanished.
+
+**eguikit has no shared text-field widget**, and after this audit that looks
+right rather than like a gap: every field above is a bare `egui::TextEdit` with
+a hint and a width. There is no repeated behaviour to promote — no debounce, no
+validation, no shared focus rule. If one appears, this is the place to check
+before writing it twice.
