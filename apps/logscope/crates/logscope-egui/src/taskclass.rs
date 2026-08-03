@@ -46,6 +46,14 @@ impl TaskClass {
 }
 
 /// Words that signal BUILDING SOMETHING NEW (greenfield) rather than editing existing code.
+/// Build verbs with no article, for named products: "write smite 2", "build tetris", "make doom".
+///
+/// Weaker than GREENFIELD_VERBS by construction — they only count when nothing maintenance-shaped is
+/// present, since "write", "build" and "implement" all appear in maintenance requests too.
+const BARE_BUILD_VERBS: &[&str] = &[
+    "write ", "build ", "create ", "make ", "implement ", "clone ", "port ", "recreate ",
+];
+
 const GREENFIELD_VERBS: &[&str] = &[
     "write a", "build a", "build me", "create a", "make a", "implement a", "develop a", "design a",
     "write an", "build an", "create an", "make an", "implement an", "from scratch", "new project",
@@ -75,8 +83,23 @@ const SMALL_WORDS: &[&str] = &[
 /// present or the ask is a build, short when small-signals dominate.
 pub fn classify(request: &str) -> TaskClass {
     let r = request.to_ascii_lowercase();
-    let greenfield_hits = GREENFIELD_VERBS.iter().filter(|w| r.contains(**w)).count();
+    let mut greenfield_hits = GREENFIELD_VERBS.iter().filter(|w| r.contains(**w)).count();
     let maintenance_hits = MAINTENANCE_VERBS.iter().filter(|w| r.contains(**w)).count();
+    // ARTICLE-FREE BUILD VERBS. Every entry in GREENFIELD_VERBS carries an article — "write a",
+    // "build a", "create a" — and a NAMED PRODUCT does not take one. "write smite 2 in rust and
+    // bevy" scored zero greenfield hits and was classified as maintenance, so the model got the
+    // preserve-architecture posture for a project that did not exist and recited "minimal edit
+    // distance" at a blank directory.
+    //
+    // GREENFIELD_BUILD_POSTURE was written for exactly that and never fired. A posture that exists
+    // and does not trigger is indistinguishable from one nobody wrote.
+    //
+    // Counted only when NO maintenance verb is present, because a bare "write" appears in "write the
+    // fix for this bug" too, and the tie-break favours greenfield — so a weak signal has to be
+    // weaker, not merely equal.
+    if maintenance_hits == 0 {
+        greenfield_hits += BARE_BUILD_VERBS.iter().filter(|w| r.contains(**w)).count();
+    }
     let scale_hits = SCALE_WORDS.iter().filter(|w| r.contains(**w)).count();
     let small_hits = SMALL_WORDS.iter().filter(|w| r.contains(**w)).count();
 
@@ -255,5 +278,49 @@ mod tests {
         let prev = "I must clarify this is outside my role and would introduce a large new subsystem.";
         let user = "I understand, proceed anyway";
         assert!(reaffirmed_after_pushback(prev, user));
+    }
+}
+
+#[cfg(test)]
+mod real_prompt_tests {
+    use super::*;
+
+    /// The exact prompts from a session that went wrong, run through the classifier.
+    ///
+    /// An external review scored that conversation 3/10 and singled out the model reciting
+    /// "minimal edit distance" at a greenfield request. The posture that fixes it —
+    /// `GREENFIELD_BUILD_POSTURE` — already existed. The open question was whether it FIRED.
+    ///
+    /// That distinction matters more than the fix: a posture that exists and does not trigger looks
+    /// exactly like one that was never written, and every symptom is identical.
+    #[test]
+    fn write_smite_2_is_classified_as_a_NEW_BUILD() {
+        let c = classify("write smite 2 in rust and bevy");
+        assert_eq!(c.domain, Domain::Greenfield,
+            "a greenfield request must not get the maintenance posture: {c:?}");
+    }
+
+    #[test]
+    fn the_FOLLOW_UP_stays_a_new_build() {
+        // "keep working on planning the game then implement it" — the turn where the model produced
+        // another outline instead of code. If the follow-up reclassifies as maintenance, the posture
+        // is lost exactly when the user is asking for the build.
+        let c = classify("keep working on planning the game then implement it in rust code");
+        assert_ne!(c.domain, Domain::Maintenance,
+            "a continuation of a build request is still a build: {c:?}");
+    }
+
+    #[test]
+    fn a_real_maintenance_request_is_still_maintenance() {
+        // The posture must not fire on everything, or it removes the caution it was carved out of.
+        let c = classify("fix the off-by-one in arena_place and keep the change small");
+        assert_eq!(c.domain, Domain::Maintenance, "{c:?}");
+    }
+
+    #[test]
+    fn a_greenfield_request_gets_a_posture_at_all() {
+        // The end-to-end check: classification is only useful if it reaches a prompt.
+        let c = classify("write a tui dashboard for managing these logs as a new rust crate");
+        assert!(posture(c).is_some(), "a new build must get an explicit posture: {c:?}");
     }
 }
