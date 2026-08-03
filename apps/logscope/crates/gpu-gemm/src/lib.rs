@@ -10224,6 +10224,20 @@ pub struct LogitCmp { pub argmax_match: bool, pub max_abs: f32, pub cosine: f32,
 /// Compare a candidate logit vector against a reference. See `LogitCmp`.
 pub fn compare_logits(reference: &[f32], candidate: &[f32]) -> LogitCmp {
     let am = |v: &[f32]| { let (mut bi, mut bv) = (0usize, f32::MIN); for (i, &x) in v.iter().enumerate() { if x > bv { bv = x; bi = i; } } bi };
+    // A LENGTH MISMATCH IS NOT A ZERO DIFFERENCE. `zip` stops at the shorter vector, so comparing a
+    // 1000-element reference against a 500-element candidate reported max|d| = 0.000 over the common
+    // prefix — while `am` scanned both in full and disagreed.
+    //
+    // That is exactly what the int8-cache gate printed: "argmax_match=false max|d|=0.00e0", a
+    // contradiction on its face, and the reason it read as a cache bug rather than a check bug for
+    // however long it has been failing.
+    //
+    // Infinity rather than a flag: every caller already treats max_abs as the severity, and a
+    // mismatch in length is the most severe disagreement there is — the two runs did not even
+    // produce the same shape.
+    if reference.len() != candidate.len() {
+        return LogitCmp { argmax_match: false, max_abs: f32::INFINITY, cosine: 0.0, kl: f32::INFINITY };
+    }
     let max_abs = reference.iter().zip(candidate).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
     let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
     for (a, b) in reference.iter().zip(candidate) {
