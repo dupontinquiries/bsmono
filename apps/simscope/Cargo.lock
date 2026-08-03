@@ -85,6 +85,9 @@ dependencies = [
 [[package]]
 name = "sim-litho"
 version = "0.1.0"
+dependencies = [
+ "sim-num",
+]
 
 [[package]]
 name = "sim-num"
@@ -117,6 +120,7 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "sim-field",
+ "sim-litho",
  "sim-num",
  "sim-pcb",
  "sim-power",

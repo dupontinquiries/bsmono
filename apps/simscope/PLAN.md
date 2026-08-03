@@ -22,8 +22,8 @@ receiving them — which is why it is the right on-ramp from network analysis to
 | `sim-power` | L0 | Ybus, polar Jacobian, AC power flow | **built** |
 | `sim-field` | L1 | 2D Laplace on triangles → C, L, Z0 per unit length | **built** |
 | `sim-pcb` | L2 | stackups, cross-sections → Z0, eps_eff, delay | **built** |
-| `sim-litho` | L3 | EUV imaging by Fourier optics; f32-safe, GPU-shaped | next |
-| `sim-rtl` | L4 | logic evaluation; bit-exact, no floating point | planned |
+| `sim-litho` | L3 | EUV aerial imaging by Fourier optics | **built** |
+| `sim-rtl` | L4 | logic evaluation; bit-exact, no floating point | next |
 
 Dependencies point down only. Nothing above `sim-num` may implement its own reduction.
 
@@ -165,3 +165,39 @@ that on trust.
 - **Not yet reading `cad-nifty`.** The `%kind: hardware` diagrams carry trace widths and layers in
   millimetres, which is exactly this crate's input. Wiring the two is a path dependency across
   workspaces and is the obvious next join.
+
+
+## L3 status
+
+EUV aerial imaging by partially coherent Abbe summation. λ = 13.5 nm, NA 0.33 gives a coherent
+pitch limit of 40.9 nm; High-NA at 0.55 gives 24.5 nm and costs 2.8× the depth of focus.
+
+```
+     pitch      hp    coherent   sigma 0.5      dipole
+     49.1n   24.5n      0.9983      0.9284      0.8910    ok
+     38.9n   19.4n      0.0000      0.7348      0.8910    ok
+```
+
+**The cutoff is the test worth having.** Below `λ/NA` only the zeroth order reaches the wafer, and
+one plane wave has uniform intensity — so coherent contrast is not poor, it is *exactly zero*. No
+reference data, no fitted constant, no tolerance to argue about. Off-axis illumination shifts the
+pupil onto an order that missed, which is why the dipole column still prints at 38.9 nm, and why
+dipole illumination exists.
+
+Precision note: this layer is f32-safe by the policy in this document — a bounded feed-forward map
+with no ill-conditioned inverse and no long accumulation, ending in a threshold decision. It is
+written in f64 because that is free on a CPU; a GPU port drops to f32 without consequence, and the
+FFT is the one genuinely GPU-shaped workload in the stack.
+
+### L3 debts
+
+- **Scalar imaging, not vector.** At NA 0.55 polarisation matters materially and is ignored.
+- **No mask 3D.** EUV masks are reflective multilayers with real topography; treating them as thin
+  transmission functions misses shadowing and best-focus shift, which are first-order effects at
+  High-NA.
+- **No resist model.** The aerial image is not the printed feature. Acid diffusion, blur and the
+  stochastics that dominate EUV are absent — and stochastics is the Monte Carlo workload the
+  precision policy flagged as genuinely GPU-shaped.
+- **No aberrations.** Only defocus; Zernike terms are not implemented.
+- **Periodic-only masks.** `Mask::grating` now *asserts* whole-pixel periodicity rather than
+  quietly aliasing, but a real layout needs padding and windowing.

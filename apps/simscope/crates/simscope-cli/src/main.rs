@@ -207,5 +207,71 @@ fn l2() -> usize {
          the lid, not an error."
     );
     println!("\nL2: {}", if failures == 0 { "PASS" } else { "FAIL" });
+    failures + l3()
+}
+
+/// L3: EUV aerial imaging. The table is a resolution study — the same mask through pupils of
+/// different size and illumination of different shape, with the coherent cutoff marked, because
+/// that edge is exact physics and everything else in lithography is negotiating with it.
+fn l3() -> usize {
+    use sim_litho::{aerial_image, contrast, Illumination, Mask, Optics};
+    println!("\nsimscope — L3 EUV aerial imaging\n");
+    let euv = Optics::euv();
+    let hna = Optics::high_na_euv();
+    println!(
+        "  lambda {:.1} nm; NA {:.2} -> coherent pitch limit {:.1} nm (half-pitch {:.1} nm)",
+        euv.lambda * 1e9,
+        euv.na,
+        euv.coherent_pitch_limit() * 1e9,
+        euv.coherent_pitch_limit() * 0.5e9
+    );
+    println!(
+        "  High-NA {:.2} -> {:.1} nm pitch, but depth of focus falls {:.1}x\n",
+        hna.na,
+        hna.coherent_pitch_limit() * 1e9,
+        euv.depth_of_focus(1.0) / hna.depth_of_focus(1.0)
+    );
+    println!(
+        "  {:>8} {:>7} {:>11} {:>11} {:>11} {:>7}",
+        "pitch", "hp", "coherent", "sigma 0.5", "dipole", ""
+    );
+
+    let n = 128;
+    let mut failures = 0usize;
+    let limit = euv.coherent_pitch_limit();
+    // Any pitch is fine as long as it lands on a whole number of pixels; fixing 16 pixels per
+    // period and deriving dx from the pitch guarantees that for every pitch we ask for.
+    for k in [1.6f64, 1.2, 0.95, 0.8] {
+        let pitch = limit * k;
+        let dx = pitch / 16.0;
+        let m = Mask::grating(n, dx, pitch, 0.5);
+        let coh = contrast(&aerial_image(&m, &euv, &Illumination::Conventional { sigma: 0.0 }, 8), n);
+        let par = contrast(&aerial_image(&m, &euv, &Illumination::Conventional { sigma: 0.5 }, 16), n);
+        let dip = contrast(
+            &aerial_image(&m, &euv, &Illumination::Dipole { sigma: 0.7, radius: 0.2 }, 24),
+            n,
+        );
+        // Below the cutoff coherent illumination must give exactly nothing, and off-axis must not.
+        let below_cutoff = pitch < limit;
+        let ok = if below_cutoff { coh < 1e-9 && dip > 0.1 } else { coh > 0.1 };
+        if !ok {
+            failures += 1;
+        }
+        println!(
+            "  {:>7.1}n {:>6.1}n {:>11.4} {:>11.4} {:>11.4} {:>7}",
+            pitch * 1e9,
+            pitch * 0.5e9,
+            coh,
+            par,
+            dip,
+            if ok { "ok" } else { "FAIL" }
+        );
+    }
+    println!(
+        "\n  Below the cutoff coherent contrast is exactly zero — one diffraction order is one\n  \
+         plane wave, and a plane wave has uniform intensity. Off-axis illumination shifts the\n  \
+         pupil onto an order that missed, which is why dipole still prints there."
+    );
+    println!("\nL3: {}", if failures == 0 { "PASS" } else { "FAIL" });
     failures
 }

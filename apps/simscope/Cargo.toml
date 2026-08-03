@@ -17,6 +17,7 @@ sim-num = { path = "crates/sim-num" }
 sim-power = { path = "crates/sim-power" }
 sim-field = { path = "crates/sim-field" }
 sim-pcb = { path = "crates/sim-pcb" }
+sim-litho = { path = "crates/sim-litho" }
 
 [profile.dev]
 opt-level = 2          # numeric kernels at opt 0 are unusable; same lesson as cadscope
