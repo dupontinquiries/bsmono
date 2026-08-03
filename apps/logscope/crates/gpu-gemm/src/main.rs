@@ -3647,8 +3647,7 @@ dequantizer, so a divergence here is the kernel's arithmetic or its indexing, no
             println!("  word_probe dst[i]=src[i] : {} ({correct} of 64 correct)",
                 if ok { "CORRECT" } else { "wrong" });
             if ok {
-                println!("  => DISTINCT indices read fine; the fault is the SHARED-index pattern in \
-byte_at, not storage reads. Every kernel that works avoids reading one word from four threads.");
+                println!("  => DISTINCT indices read fine, so the fault is not storage reads. NOT the shared index either (the staged form has no shared read and fails the same). It is the DYNAMIC SHIFT: see the extractBits line.");
             } else {
                 println!("  => distinct indices fail too, so the fault is storage reads themselves \
 and the working kernels need explaining, not the probe.");
