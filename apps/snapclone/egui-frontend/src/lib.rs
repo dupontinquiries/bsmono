@@ -32,6 +32,7 @@ pub mod ring;
 pub mod qr;
 pub mod wayfinder;
 pub mod voicebar;
+pub mod landmark;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
