@@ -6722,3 +6722,134 @@ mod beacon_render_tests {
         assert!(b.meshes.len() < 20, "far fewer parts than a mechanism's 20");
     }
 }
+
+/// Colours for a scene's beacon: tower, lit lamp, and accretion.
+///
+/// `machinery::beacon_skin` names each scene's aging in prose — coral, soot, rust, verdigris,
+/// photobleaching. **This has to agree with it.** A skin that says coral and renders moss-green is
+/// two stories about one object, and the reader trusts whichever they saw first.
+///
+/// The accretion colour is the one that carries meaning, so it is chosen from the material rather
+/// than from the scene's general palette: rust is orange-brown wherever it appears, and tinting it to
+/// match an alley's grey would make it read as shadow.
+pub fn beacon_palette(scene: &str) -> (Color32, Color32, Color32) {
+    match scene {
+        "Canopy" | "Forest" | "Treehouse" => (
+            Color32::from_rgb(96, 74, 52),      // weathered trunk
+            Color32::from_rgb(255, 224, 150),   // warm lamp between the boughs
+            Color32::from_rgb(74, 128, 62),     // creeper
+        ),
+        "Atlantis" => (
+            Color32::from_rgb(104, 118, 124),   // wet stone
+            Color32::from_rgb(150, 255, 214),   // green shaft through water
+            Color32::from_rgb(224, 122, 132),   // coral, pink — not algae green
+        ),
+        "Cloudscape" | "Mistfall" => (
+            Color32::from_rgb(214, 198, 170),   // paper
+            Color32::from_rgb(255, 206, 128),   // flame through paper
+            Color32::from_rgb(58, 52, 50),      // soot, near-black
+        ),
+        "Alley" | "Slate" => (
+            Color32::from_rgb(72, 74, 80),      // cast iron
+            Color32::from_rgb(255, 214, 140),   // sodium
+            Color32::from_rgb(170, 92, 46),     // rust, orange-brown
+        ),
+        "Fractal Spires" | "Recursive Citadel" => (
+            Color32::from_rgb(148, 156, 176),   // hull
+            Color32::from_rgb(176, 214, 255),   // cold underside pulse
+            Color32::from_rgb(96, 100, 112),    // dulling — the hull losing its finish
+        ),
+        "Old Library" | "Archive" | "Reading Room" => (
+            Color32::from_rgb(158, 126, 62),    // brass
+            Color32::from_rgb(255, 232, 176),   // reading-lamp cone
+            Color32::from_rgb(154, 140, 116),   // dust, warm grey
+        ),
+        "Folding@home" => (
+            Color32::from_rgb(120, 140, 168),   // lattice
+            // Brighter than the bleached tag it sits on. Bleaching correctly goes toward TRANSPARENT,
+            // which made the accretion paler than the lamp and broke the rule that the light must be
+            // the findable thing — the two rules are each right and collided here. An emitting
+            // fluorophore out-shining a bleached one is also the correct physics, so the lamp moved.
+            Color32::from_rgb(190, 255, 236),   // fluorophore emission
+            Color32::from_rgb(196, 204, 212),   // bleaching — toward transparent, not toward dark
+        ),
+        "Mansion Garden" => (
+            Color32::from_rgb(168, 138, 74),    // brass tripod
+            Color32::from_rgb(255, 250, 224),   // heliograph flash, near-white
+            Color32::from_rgb(86, 156, 134),    // verdigris
+        ),
+        _ => (
+            Color32::from_rgb(120, 120, 130),
+            Color32::from_rgb(255, 230, 160),
+            Color32::from_rgb(110, 110, 110),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod beacon_palette_tests {
+    use super::*;
+    use logscope::machinery::beacon_skin;
+
+    fn hue_family(c: Color32) -> &'static str {
+        let (r, g, b) = (c.r() as i32, c.g() as i32, c.b() as i32);
+        if r > g + 30 && r > b + 30 { "warm" }
+        else if g > r + 20 && g > b + 10 { "green" }
+        else if b > r + 20 { "cool" }
+        else if r > 200 && g > 200 && b > 200 { "pale" }
+        else { "neutral" }
+    }
+
+    #[test]
+    fn the_palette_AGREES_with_the_prose() {
+        // A skin that says coral and renders moss-green is two stories about one object, and the
+        // reader trusts whichever they saw first.
+        let (_, _, coral) = beacon_palette("Atlantis");
+        assert!(beacon_skin("Atlantis").aging.contains("oral"));
+        assert_eq!(hue_family(coral), "warm", "coral is pink, not algae");
+
+        let (_, _, soot) = beacon_palette("Cloudscape");
+        assert!(beacon_skin("Cloudscape").aging.contains("oot"));
+        assert!(soot.r() < 80 && soot.g() < 80, "soot is near-black");
+
+        let (_, _, verdigris) = beacon_palette("Mansion Garden");
+        assert!(beacon_skin("Mansion Garden").aging.contains("erdigris"));
+        assert_eq!(hue_family(verdigris), "green");
+    }
+
+    #[test]
+    fn BLEACHING_goes_toward_transparent_rather_than_toward_dark() {
+        // The one accretion that lightens. Every other material darkens its object, and rendering a
+        // photobleached tag as sooty would invert what the process is.
+        let (_, _, bleach) = beacon_palette("Folding@home");
+        assert!(bleach.r() > 180 && bleach.g() > 180 && bleach.b() > 180, "pale, not dark");
+    }
+
+    #[test]
+    fn RUST_is_orange_brown_wherever_it_appears() {
+        // Chosen from the MATERIAL rather than the scene's palette. Tinting it to match an alley's
+        // grey would make it read as shadow, which says nothing about time.
+        let (_, _, rust) = beacon_palette("Alley");
+        assert_eq!(hue_family(rust), "warm");
+        assert!(rust.r() > rust.b() + 80, "orange-brown");
+    }
+
+    #[test]
+    fn the_LAMP_is_always_the_brightest_of_the_three() {
+        // It is the channel that has to be findable across the scene; a lamp dimmer than its own
+        // tower would defeat the reason a viewer gets a beacon at all.
+        for s in ["Canopy", "Atlantis", "Cloudscape", "Alley", "Fractal Spires",
+                  "Old Library", "Folding@home", "Mansion Garden", "Somewhere New"] {
+            let (t, l, a) = beacon_palette(s);
+            let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+            assert!(lum(l) > lum(t) && lum(l) > lum(a), "{s}: the lamp must be brightest");
+        }
+    }
+
+    #[test]
+    fn an_unthemed_scene_gets_a_usable_palette() {
+        let (t, l, a) = beacon_palette("Somewhere New");
+        assert_ne!(t, l);
+        assert_ne!(l, a);
+    }
+}
