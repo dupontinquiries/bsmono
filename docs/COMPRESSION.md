@@ -88,3 +88,74 @@ Voxel rebuilds and curve-profile refitting. Both discard the original
 geometry for a reconstruction, which is a one-way door, and the measurements
 say the win is 1.2x before residuals. Quantisation gets 2x for none of that
 risk. Revisit if step 4 stalls.
+
+---
+
+# OCTREES, and where they would actually fit
+
+Measured, since the question was whether they fit anywhere rather than
+whether they are nice.
+
+## The engine already has a voxel collider, and it is capped
+
+`render.rs`:
+
+```
+CSDF_W 36  CSDF_H 24  CSDF_SLAB 44   = 38,016 voxels per model
+CSDF_MAXM 12                          <- twelve models. Total.
+```
+
+That cap is not a tuning choice, it is what a DENSE grid costs: every model
+pays for its whole bounding box whether or not there is anything in it. With
+28 chassis, sixteen of them already have no exact collider. With the 216 the
+survey found, the number is 204.
+
+## How empty a bot actually is
+
+Occupancy of the robot pose in that same 36x24x44 grid:
+
+```
+analog      10.1%    boartail     8.0%    brutis      11.9%
+beetlejuice 12.6%    blackstar   13.6%    chokepoint  16.0%
+cryofin      7.9%    ebr_105     14.2%
+mean 11.8%
+```
+
+A bot is a shell. Seven-eighths of its bounding box is air, and the dense
+grid stores that air at full price.
+
+## What an octree gives
+
+Building the occupancy pyramid at depth 6 — a 64³ effective resolution,
+which is EIGHT TIMES the linear resolution of the current slab — and
+collapsing any node whose eight children are all present:
+
+```
+analog       4.7% of dense      boartail     3.5%
+beetlejuice  5.7%               brutis       5.7%
+blackstar    7.0%               chokepoint   8.4%
+mean 5.8%  ->  17x smaller, at 8x the resolution
+```
+
+So the trade is not "octree or grid". It is that an octree buys BOTH: finer
+collision and enough headroom to give every chassis an exact collider rather
+than twelve of them.
+
+## Why this is the same structure as the atlas
+
+An octree of a part is a shape descriptor. The 8³ occupancy signature used
+for atlas dedup IS an octree truncated at depth 3. One structure serves
+both: dedupe by comparing subtrees, collide by descending them, and a part
+that matches an exemplar shares its tree rather than storing a second copy.
+
+That is also why poses fit the graph. A pose does not change a part's tree,
+only its transform — so poses are edges, parts are nodes, and the collider
+is the node's own contents. Same graph, three uses.
+
+## Order
+
+Octrees go AFTER the joints and the pose-angle representation, for the same
+reason as everything else: a collider tree is per-part, and per-part
+transforms come from joints. But unlike the residual work, this one has a
+number that stands on its own — 17x at 8x resolution — and it lifts a
+current hard cap of twelve.
