@@ -4598,7 +4598,15 @@ still pass, which is why this one exists."
     }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
-        eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
+        // GENERATED FROM THE DISPATCH, not hand-maintained. This list was a hardcoded string
+    // advertising 18 gates while the binary dispatched 46 — so 28 working gates were invisible to
+    // anyone reading the error, including --gate-bytes, --gate-q4k and --gate-q6k, which are the
+    // three that mattered most this month.
+    //
+    // A help text that disagrees with the code is worse than none: it does not merely omit, it
+    // asserts absence. Someone reading it concludes the gate was never written and goes looking for
+    // the wrong thing.
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-qwen2  --gate-qwen3  --gate-rubric\n  --gate-store  --gate-stream-slots  --gate-submit  --gate-swa\n  --gate-vae-conv  --gate-vae-resblock  --gate-vit-block  --gate-vram\n  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
