@@ -67,6 +67,18 @@ pub struct Grid {
     /// Lines that scrolled off the top (most-recent last), capped.
     pub scrollback: Vec<Vec<Cell>>,
     scrollback_cap: usize,
+    /// DEC private modes the KEY ENCODER needs.
+    ///
+    /// These live on the grid because the program running in the terminal sets
+    /// them (`CSI ? 1 h`, `CSI ? 2004 h`) and the encoder reads them: the same
+    /// arrow key is two different byte sequences depending on what the
+    /// foreground process asked for. Before this, the parser dropped the `?`
+    /// as an "intermediate byte" and dispatched `CSI ? 1 h` as a plain
+    /// `CSI 1 h`, so DECCKM never arrived — and `keys::encode_mode`'s
+    /// application-cursor branch, ported specifically to fix arrow navigation
+    /// inside fzf and vim, could never be reached.
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
     /// Scrollback view: how many lines ABOVE the live bottom the viewport is showing.
     /// 0 = live. While scrolled back, new output does not move the view (the offset is bumped
     /// as lines enter scrollback — the standard terminal pin), and the cursor is hidden.
@@ -74,6 +86,17 @@ pub struct Grid {
 }
 
 impl Grid {
+    /// The modes the key encoder needs, in the shape it wants them.
+    ///
+    /// One accessor so a caller cannot read one flag and forget the other —
+    /// which is how a terminal ends up with correct arrows and broken paste.
+    pub fn key_mode(&self) -> crate::keys::TermMode {
+        crate::keys::TermMode {
+            app_cursor: self.app_cursor,
+            bracketed_paste: self.bracketed_paste,
+        }
+    }
+
     pub fn new(cols: usize, rows: usize) -> Grid {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -86,6 +109,8 @@ impl Grid {
             pen: Style::default(),
             scrollback: Vec::new(),
             scrollback_cap: 1000,
+            app_cursor: false,
+            bracketed_paste: false,
             view_offset: 0,
         }
     }
@@ -331,12 +356,14 @@ enum State {
 pub struct Parser {
     state: State,
     params: Vec<u16>,
+    /// True when the current CSI began `CSI ?` — a DEC PRIVATE sequence.
+    private: bool,
     cur: Option<u16>,
 }
 
 impl Default for Parser {
     fn default() -> Self {
-        Parser { state: State::Ground, params: Vec::new(), cur: None }
+        Parser { state: State::Ground, params: Vec::new(), cur: None, private: false }
     }
 }
 
@@ -377,6 +404,7 @@ impl Parser {
             State::Esc => match ch {
                 '[' => {
                     self.params.clear();
+                    self.private = false;
                     self.cur = None;
                     self.state = State::Csi;
                 }
@@ -391,13 +419,45 @@ impl Parser {
                     ';' => {
                         self.params.push(self.cur.take().unwrap_or(0));
                     }
+                    '?' => { self.private = true; }
                     '@'..='~' => {
                         let params = self.take_params();
-                        self.dispatch_csi(ch, &params, grid);
+                        if self.private {
+                            self.dispatch_private(ch, &params, grid);
+                        } else {
+                            self.dispatch_csi(ch, &params, grid);
+                        }
                         self.state = State::Ground;
                     }
-                    _ => { /* intermediate bytes ignored */ }
+                    _ => { /* other intermediate bytes ignored */ }
                 }
+            }
+        }
+    }
+
+    /// `CSI ? Pm h` / `CSI ? Pm l` — DEC private mode set/reset.
+    ///
+    /// Only the modes this renderer can honour are acted on. An unrecognised
+    /// one is IGNORED rather than falling through to `dispatch_csi`, which is
+    /// what used to happen: `CSI ? 25 l` (hide cursor) was arriving as
+    /// `CSI 25 l` and being interpreted as an ANSI mode reset. Silently doing
+    /// the wrong thing is worse than doing nothing, because nothing is
+    /// debuggable.
+    fn dispatch_private(&mut self, final_byte: char, params: &[u16], grid: &mut Grid) {
+        let set = match final_byte {
+            'h' => true,
+            'l' => false,
+            // Other private finals (DECRQM and friends) are not answered.
+            _ => return,
+        };
+        for p in params {
+            match p {
+                // DECCKM — application cursor keys. fzf, vim and less set it,
+                // and the key encoder sends SS3 rather than CSI while it holds.
+                1 => grid.app_cursor = set,
+                // DEC 2004 — bracketed paste.
+                2004 => grid.bracketed_paste = set,
+                _ => {}
             }
         }
     }
@@ -1754,3 +1814,96 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod private_mode_tests {
+    use super::*;
+    use crate::keys::{encode_mode, Key, Mods};
+
+    fn feed(seq: &str) -> Grid {
+        let mut g = Grid::new(80, 24);
+        let mut p = Parser::new();
+        p.feed(seq, &mut g);
+        g
+    }
+
+    #[test]
+    fn the_question_mark_is_no_longer_dropped_as_an_intermediate_byte() {
+        // It used to be: `CSI ? 1 h` dispatched as a plain `CSI 1 h`, so DECCKM
+        // never arrived and the encoder's application-cursor branch — ported
+        // specifically to fix arrow navigation inside fzf and vim — could never
+        // be reached.
+        let g = feed("\x1b[?1h");
+        assert!(g.app_cursor);
+    }
+
+    #[test]
+    fn decckm_reaches_the_key_encoder_which_is_the_whole_point() {
+        // The fix shipped in keys.rs was wired to nothing until now. This is
+        // the end-to-end path: program sets the mode, arrow changes shape.
+        let plain = feed("");
+        assert_eq!(encode_mode(Key::Up, Mods::none(), plain.key_mode()).unwrap(), b"\x1b[A");
+
+        let app = feed("\x1b[?1h");
+        assert_eq!(encode_mode(Key::Up, Mods::none(), app.key_mode()).unwrap(), b"\x1bOA");
+    }
+
+    #[test]
+    fn a_program_that_exits_restores_the_normal_arrows() {
+        // fzf sets DECCKM on entry and resets it on exit. A terminal that kept
+        // it would leave every later arrow key sending SS3 to a shell that does
+        // not expect it.
+        let mut g = Grid::new(80, 24);
+        let mut p = Parser::new();
+        p.feed("\x1b[?1h", &mut g);
+        assert!(g.app_cursor);
+        p.feed("\x1b[?1l", &mut g);
+        assert!(!g.app_cursor);
+        assert_eq!(encode_mode(Key::Up, Mods::none(), g.key_mode()).unwrap(), b"\x1b[A");
+    }
+
+    #[test]
+    fn bracketed_paste_is_tracked_too() {
+        let g = feed("\x1b[?2004h");
+        assert!(g.bracketed_paste);
+        assert_eq!(crate::keys::paste("hi", g.key_mode()), b"\x1b[200~hi\x1b[201~");
+    }
+
+    #[test]
+    fn several_modes_in_one_sequence_all_apply() {
+        // `CSI ? 1 ; 2004 h` is legal and programs do send it.
+        let g = feed("\x1b[?1;2004h");
+        assert!(g.app_cursor && g.bracketed_paste);
+    }
+
+    #[test]
+    fn an_unhandled_private_mode_does_nothing_rather_than_the_wrong_thing() {
+        // `CSI ? 25 l` (hide cursor) used to arrive as `CSI 25 l` and be taken
+        // for an ANSI mode reset. Silently doing the wrong thing is worse than
+        // doing nothing, because nothing is debuggable.
+        let g = feed("\x1b[?25l");
+        assert!(!g.app_cursor && !g.bracketed_paste);
+    }
+
+    #[test]
+    fn a_private_sequence_does_not_leak_into_the_next_one() {
+        // The flag has to reset at the next CSI, or an ordinary `CSI 2 J`
+        // following a private sequence would be swallowed as a private mode.
+        let mut g = Grid::new(80, 24);
+        let mut p = Parser::new();
+        p.feed("\x1b[?1h", &mut g);
+        p.feed("Hello", &mut g);
+        p.feed("\x1b[2J", &mut g);      // clear, an ORDINARY csi
+        assert!(g.app_cursor, "the mode survives");
+        assert!(g.row_text(0).trim().is_empty(), "and the clear actually cleared");
+    }
+
+    #[test]
+    fn one_accessor_hands_over_both_modes() {
+        // So a caller cannot read one and forget the other — which is how a
+        // terminal ends up with correct arrows and broken paste.
+        let g = feed("\x1b[?1h\x1b[?2004h");
+        let m = g.key_mode();
+        assert!(m.app_cursor && m.bracketed_paste);
+    }
+}

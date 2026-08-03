@@ -221,10 +221,32 @@ which is the strongest argument for doing them at all:
   a defect on screen today. `out_back` still overshoots above 1 on the way,
   because that is the effect; what is clamped is the input, not the output.
 
+* **A fix shipped into a kit that nothing could reach.** `keys::encode_mode`
+  gained an application-cursor branch — the DECCKM split, ported specifically to
+  fix arrow navigation inside fzf, vim and less. But `uikit-term`'s parser
+  dropped the `?` in `CSI ? 1 h` as an "intermediate byte" and dispatched it as
+  a plain `CSI 1 h`, so the mode never arrived. `app_cursor: true` existed
+  **only in test constants**. The branch was unreachable in production from the
+  day it was written, by me.
+
+  Same class as `WayfinderPage` — a name that counts as covered while nothing
+  runs — except here it was a kit feature rather than an app surface, and no
+  audit would have caught it: the code was present, tested, and wired to
+  nothing. The parser now tracks DEC private modes, `Grid::key_mode()` hands
+  both flags over in one call, and a test walks the whole path from
+  `CSI ? 1 h` to an arrow changing shape.
+
+  It also fixed a quieter bug: `CSI ? 25 l` (hide cursor) had been arriving as
+  `CSI 25 l` and being taken for an ANSI mode reset. Unhandled private modes are
+  now ignored rather than mis-dispatched, because doing nothing is debuggable
+  and doing the wrong thing is not.
+
 ### Kits still unaudited
 
-`uikit-term` has had a partial sweep — its easing call site was checked and its
-`keys` module was extended earlier — but its grid and parser have not been
-compared against voiceterm's own. `uikit-term` and `uikit-web` also still
+`uikit-term`'s grid and parser have now been compared against voiceterm's
+`pty_term.rs`. They are NOT duplicates: `pty_term` is a full emulator (alt
+screen, scrollback, full SGR) and `uikit-term`'s is a renderer-side subset. The
+gap that mattered was the private modes, above. Alt-screen (`CSI ? 1049 h`)
+remains unhandled in the kit and is the next real difference. `uikit-term` and `uikit-web` also still
 have one consumer each — they carry kit-shaped cost without kit-shaped payoff,
 and that stays true until a second app embeds them.
