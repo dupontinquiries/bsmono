@@ -117,3 +117,39 @@ Option 2 is small and closes this specific bug. Option 3 is the one worth doing.
 flips the handful of nibbles sitting on a boundary — which is the small-tensor result, where 0 words
 differ. A count that explodes with grid size is a dispatch or chunk-offset error and wants its own
 investigation.
+
+
+---
+
+# FIXED, and the separate-bug claim was mostly wrong
+
+The reciprocal fix landed:
+
+```
+[✓] block scales identical: max|diff|=0.000e0
+[✓] matvec through GPU-converted weights == CPU-converted: max|diff|=0.000e0
+[✗] large tensor:  297430 -> 1104 words differ
+[✗] chunk boundaries: 2771 -> 114 words differ
+```
+
+**99.6% of the grid failures were downstream of the ULP.** I argued twice that they had to be a
+separate bug because "an ULP cannot produce 297430 words", and that reasoning was wrong: at 70000
+super-blocks, enough values sit near a quantization boundary that a single-ULP scale shift flips
+hundreds of thousands of nibbles. The small tensor showed 0 differing words only because 112 blocks is
+too few for any of them to land there.
+
+The lesson is the same one as the seven theories, in a different costume: **I reasoned about what an
+ULP "could" produce instead of measuring what it did.** The measurement was one fix away the whole
+time.
+
+## What actually remains
+
+1104 words at 70000 super-blocks, 114 across chunk boundaries. Small enough to locate rather than
+theorise about, and the gate now prints their indices, the gaps between them, the last one, and their
+positions within a 32-word block.
+
+The pattern names the class without another guess:
+
+* **regular gaps** — a boundary or stride error
+* **all past a fixed index** — a dispatch or grid-limit error
+* **scattered, one position per block** — a rounding straggler after all

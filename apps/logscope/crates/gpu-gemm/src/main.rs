@@ -4139,6 +4139,23 @@ not the dequant");
             // boundary — which is the SMALL-tensor result, where 0 words differ. At grid scale the
             // count explodes to 297430, and that shape belongs to a dispatch or chunk-offset error,
             // not to rounding. Two investigations, not one.
+            // WHERE the survivors are, now that there are few enough to see. 297430 -> 1104 after the
+            // reciprocal fix, so most of this WAS downstream of the ULP and my "separate bug" claim was
+            // wrong about the magnitude. What is left is real and small enough to locate.
+            //
+            // Printing the indices and their spacing rather than the count: a boundary error clusters at
+            // regular intervals, a dispatch error clusters past a grid limit, and a rounding straggler
+            // scatters. The pattern names the class without another theory.
+            if diff > 0 {
+                let bad: Vec<usize> = got.iter().zip(&cpu_words).enumerate()
+                    .filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
+                let gaps: Vec<usize> = bad.windows(2).map(|w| w[1] - w[0]).take(8).collect();
+                println!("      first differing words: {:?}", &bad[..8.min(bad.len())]);
+                println!("      gaps between them: {gaps:?}");
+                println!("      last differing word: {:?} of {}", bad.last(), got.len());
+                let per_block: std::collections::BTreeSet<usize> = bad.iter().map(|i| i % 32).collect();
+                println!("      positions within a 32-word block: {:?}", per_block);
+            }
             ck(&format!("large tensor converts exactly across the whole grid ({diff} words differ)"), diff == 0);
         }
 
