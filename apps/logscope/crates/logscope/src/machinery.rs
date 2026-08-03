@@ -536,3 +536,113 @@ mod audience_tests {
         assert_eq!(a.tick(1), Slot::Preview, "the healthy strip yields the row quickly");
     }
 }
+
+/// The machine's moving parts as NUMBERS, for a renderer.
+///
+/// `Machine` describes the apparatus in prose, which is what a reader needs and nothing a renderer
+/// can use: "beads clacking across their runners" does not say there are sixteen beads and six of
+/// them are home. This is that.
+///
+/// **Structure is theme-independent and naming is not.** Every theme is the same three mechanisms —
+/// a store with some slots filled, a selector pointing somewhere, and a drive turning at some rate —
+/// so a scene implements one layout and dresses it, rather than each scene inventing its own.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Parts {
+    /// Total slots in the store — experts, shelves, beads on the runner.
+    pub slots: u32,
+    /// How many are currently resident. The gap between this and `slots` is what streams.
+    pub filled: u32,
+    /// Which slot the selector points at, if the engine has chosen one.
+    pub selected: Option<u32>,
+    /// Drive speed, 0.0 when stalled. Straight from `Motion::rate`.
+    pub drive: f32,
+    /// 0..1, how much of the work is landing without a fetch. Drives how bright or settled the
+    /// mechanism looks, separately from how fast it moves.
+    pub smoothness: f32,
+}
+
+impl Parts {
+    /// Build from what the engine reports.
+    ///
+    /// `hit_rate` and the pin counts are already computed for the strip; this is the same state in a
+    /// form a scene can draw, so the landmark and the status line cannot disagree.
+    pub fn from_state(pinned: u32, total: u32, selected: Option<u32>, motion: Motion, hit_rate: f32)
+        -> Parts
+    {
+        Parts {
+            // A dense model has no store, and drawing an empty rack would read as a broken cache
+            // rather than as a model that has no experts. One slot, filled, is the honest picture.
+            slots: if total == 0 { 1 } else { total },
+            filled: if total == 0 { 1 } else { pinned.min(total) },
+            // A stalled machine's selector points nowhere: it is not mid-choice, it is waiting.
+            selected: if motion == Motion::Stalled { None } else { selected },
+            drive: motion.rate(),
+            smoothness: hit_rate.clamp(0.0, 1.0),
+        }
+    }
+
+    /// Slots that are not resident — the ones a scene should show arriving and leaving.
+    pub fn streaming(&self) -> u32 { self.slots.saturating_sub(self.filled) }
+
+    /// Is there anything to animate? A machine with every slot filled and nothing streaming should
+    /// look settled rather than busy, however fast the drive turns.
+    pub fn has_traffic(&self) -> bool { self.streaming() > 0 && self.drive > 0.0 }
+}
+
+#[cfg(test)]
+mod parts_tests {
+    use super::*;
+
+    #[test]
+    fn a_real_scout_state_becomes_six_of_sixteen_and_a_STOPPED_drive() {
+        let p = Parts::from_state(6, 16, Some(3), Motion::Stalled, 0.46);
+        assert_eq!((p.slots, p.filled, p.streaming()), (16, 6, 10));
+        assert_eq!(p.drive, 0.0);
+        assert!(!p.has_traffic(), "a stopped drive has no traffic however many slots stream");
+    }
+
+    #[test]
+    fn a_STALLED_machine_points_its_selector_NOWHERE() {
+        // It is not mid-choice, it is waiting — and a selector frozen on a slot reads as deliberation
+        // rather than as a stall, which is the one impression this must not give.
+        assert_eq!(Parts::from_state(6, 16, Some(3), Motion::Stalled, 0.46).selected, None);
+        assert_eq!(Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.46).selected, Some(3));
+    }
+
+    #[test]
+    fn a_DENSE_model_shows_one_filled_slot_not_an_empty_rack() {
+        // An empty store would read as a broken cache rather than as a model with no experts.
+        let p = Parts::from_state(0, 0, None, Motion::Thriving, 1.0);
+        assert_eq!((p.slots, p.filled, p.streaming()), (1, 1, 0));
+        assert!(!p.has_traffic());
+    }
+
+    #[test]
+    fn a_FULLY_PINNED_machine_looks_settled_rather_than_busy() {
+        // Nothing streams, so however fast the drive turns there is no traffic to draw — and showing
+        // carriers moving in from an empty queue would be inventing work.
+        let p = Parts::from_state(16, 16, Some(1), Motion::Thriving, 0.99);
+        assert_eq!(p.streaming(), 0);
+        assert!(!p.has_traffic());
+        assert!(p.drive > 1.0, "still turning fast, just not fetching");
+    }
+
+    #[test]
+    fn SMOOTHNESS_is_separate_from_speed() {
+        // Two different facts: how fast it moves and how much of the work lands without a fetch. A
+        // fast machine missing constantly should look frantic, not healthy, and one number cannot
+        // carry both.
+        let churny = Parts::from_state(2, 16, Some(0), Motion::Fetching, 0.15);
+        let clean = Parts::from_state(2, 16, Some(0), Motion::Fetching, 0.95);
+        assert_eq!(churny.drive, clean.drive);
+        assert!(churny.smoothness < clean.smoothness);
+    }
+
+    #[test]
+    fn pinned_beyond_the_total_is_CLAMPED_rather_than_overflowing() {
+        // A bad count from the engine should not make a scene draw more beads than it has runners.
+        let p = Parts::from_state(99, 16, None, Motion::Fetching, 0.5);
+        assert_eq!(p.filled, 16);
+        assert_eq!(p.streaming(), 0);
+    }
+}
