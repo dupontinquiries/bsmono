@@ -94,7 +94,9 @@ impl TabStrip {
     /// The badge's text. Large counts cap rather than widening the pill past
     /// the tab it sits on.
     pub fn badge_text(&self, i: usize) -> Option<String> {
-        self.badge(i).map(|n| if n > 99 { "99+".into() } else { n.to_string() })
+        // Shared cap: two bars in one app disagreeing about what a large count
+        // looks like is visible on a single screen.
+        self.badge(i).and_then(|n| uikit_egui::fmt::badge_count(n, 99))
     }
 
     /// Equal widths, which is what makes it a SEGMENTED strip rather than a row

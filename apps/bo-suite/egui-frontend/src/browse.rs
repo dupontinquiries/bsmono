@@ -150,10 +150,9 @@ impl Artist {
     }
 }
 
-/// `N thing` / `N things`.
-pub fn plural(n: i64, word: &str) -> String {
-    if n == 1 { format!("1 {word}") } else { format!("{n} {word}s") }
-}
+/// `N thing` / `N things`, via the shared helper — which carries the rule that
+/// zero is plural.
+pub fn plural(n: i64, word: &str) -> String { uikit_egui::fmt::plural(n, word) }
 
 // ── modes and sorts ─────────────────────────────────────────────────────────
 

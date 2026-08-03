@@ -33,6 +33,7 @@ pub mod livebg;
 pub mod nav;
 pub mod scroll;
 pub mod fuzzy;
+pub mod fmt;
 pub mod motion;
 pub mod confirm_dialog;
 pub mod repl_voice_glow;

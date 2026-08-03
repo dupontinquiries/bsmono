@@ -352,14 +352,13 @@ impl Outbox {
     }
 }
 
-/// `relativeTime`.
+/// `relativeTime`, via the shared helper.
+///
+/// This copy was missing the clock-skew guard its three siblings had — a device
+/// reporting a future timestamp would have rendered "-4m ago" in the outbox.
+/// Delegating fixed that without anyone having to notice it here.
 pub fn relative_time(secs: i64) -> String {
-    match secs {
-        s if s < 60 => "just now".into(),
-        s if s < 3600 => format!("{}m ago", s / 60),
-        s if s < 86_400 => format!("{}h ago", s / 3600),
-        s => format!("{}d ago", s / 86_400),
-    }
+    uikit_egui::fmt::relative_time(secs, uikit_egui::fmt::Style::Ago)
 }
 
 // ── drawing ─────────────────────────────────────────────────────────────────
@@ -674,6 +673,16 @@ mod tests {
     #[test]
     fn the_empty_state_says_where_to_send_one_from() {
         assert!(OUTBOX_EMPTY_TEXT.contains("Camera"));
+    }
+
+    #[test]
+    fn a_device_with_a_fast_clock_does_not_render_a_negative_age() {
+        // This copy was the one MISSING the guard its three siblings had. A
+        // send whose timestamp lands in the future would have shown "-4m ago"
+        // in the outbox, which reads as the app being broken rather than the
+        // clock. Delegating to the shared helper fixed it; this pins it.
+        assert_eq!(relative_time(-240), "just now");
+        assert!(!relative_time(-1).contains('-'));
     }
 
     #[test]
