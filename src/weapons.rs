@@ -45,7 +45,7 @@
 
 use glam::Vec3;
 
-pub const FORMS: usize = 12;
+pub const FORMS: usize = 13;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verb {
@@ -61,6 +61,7 @@ pub enum Verb {
     Thrust,
     Vortex,
     Beam,
+    Grapple,
 }
 
 pub struct Form {
@@ -84,6 +85,10 @@ pub struct Form {
     /// 0..1 slow applied to what it hits
     pub slow: f32,
     pub color: [f32; 4],
+    /// what firing this looks like
+    pub muzzle: FxKind,
+    /// what a hit looks like
+    pub impact: FxKind,
 }
 
 const fn f(
@@ -98,25 +103,34 @@ const fn f(
     pellets: u32,
     slow: f32,
     color: [f32; 4],
+    muzzle: FxKind,
+    impact: FxKind,
 ) -> Form {
-    Form { name, verb, cooldown, cost, impulse, reach, speed, spread, pellets, slow, color }
+    Form { name, verb, cooldown, cost, impulse, reach, speed, spread, pellets, slow, color, muzzle, impact }
 }
 
 /// Colours are carried over from `ex_weapon_profile` so the forms still read
 /// as themselves; everything else is rebuilt around the verb.
 pub const TABLE: [Form; FORMS] = [
-    f("WATER", Verb::Push, 0.06, 1.2, 1.6, 34.0, 46.0, 0.0, 1, 0.0, [0.35, 0.67, 1.0, 1.0]),
-    f("TSUNAMI", Verb::Shove, 0.85, 14.0, 15.0, 9.0, 0.0, 0.0, 1, 0.0, [0.27, 0.59, 0.90, 1.0]),
-    f("ICE", Verb::Blink, 3.20, 26.0, 9.0, 26.0, 0.0, 0.0, 1, 0.55, [0.59, 0.86, 1.0, 1.0]),
-    f("FIRE", Verb::Flak, 0.55, 8.0, 9.5, 40.0, 30.0, 0.0, 1, 0.0, [1.0, 0.47, 0.16, 1.0]),
-    f("MAGMA", Verb::Pool, 1.30, 16.0, 4.0, 26.0, 20.0, 0.0, 1, 0.45, [0.90, 0.35, 0.12, 1.0]),
-    f("BLIZZARD", Verb::Cone, 0.70, 10.0, 2.4, 18.0, 32.0, 14.0, 7, 0.35, [0.75, 0.90, 1.0, 1.0]),
-    f("METAL", Verb::Bank, 0.30, 5.0, 7.0, 60.0, 40.0, 0.0, 1, 0.0, [0.71, 0.73, 0.76, 1.0]),
-    f("TITANIUM", Verb::Pierce, 1.10, 20.0, 13.0, 70.0, 0.0, 0.0, 1, 0.0, [0.59, 0.63, 0.69, 1.0]),
-    f("ELECTRICITY", Verb::Chain, 0.90, 15.0, 8.0, 45.0, 34.0, 0.0, 1, 0.20, [0.55, 0.71, 1.0, 1.0]),
-    f("WIND", Verb::Thrust, 0.22, 3.0, 3.0, 22.0, 55.0, 0.0, 1, 0.0, [0.82, 0.92, 0.84, 1.0]),
-    f("TORNADO", Verb::Vortex, 2.60, 22.0, 0.0, 11.0, 26.0, 0.0, 1, 0.0, [0.78, 0.86, 0.82, 1.0]),
-    f("PHOTON", Verb::Beam, 2.40, 34.0, 26.0, 120.0, 0.0, 0.0, 1, 0.0, [1.0, 0.98, 0.90, 1.0]),
+    // effects are chosen to read as the VERB: a jet looks like a push, a
+    // swirl looks like a pull, a cable looks like a thing you can climb
+    f("WATER", Verb::Push, 0.06, 1.2, 1.6, 34.0, 46.0, 0.0, 1, 0.0, [0.35, 0.67, 1.0, 1.0], FxKind::Jet, FxKind::Spark),
+    f("TSUNAMI", Verb::Shove, 0.85, 14.0, 15.0, 9.0, 0.0, 0.0, 1, 0.0, [0.27, 0.59, 0.90, 1.0], FxKind::Ripple, FxKind::Ripple),
+    f("ICE", Verb::Blink, 3.20, 26.0, 9.0, 1.0e9, 0.0, 0.0, 1, 0.55, [0.59, 0.86, 1.0, 1.0], FxKind::Distort, FxKind::GroundWave),
+    f("FIRE", Verb::Flak, 0.55, 8.0, 9.5, 40.0, 30.0, 0.0, 1, 0.0, [1.0, 0.47, 0.16, 1.0], FxKind::Muzzle, FxKind::Ripple),
+    f("MAGMA", Verb::Pool, 1.30, 16.0, 4.0, 26.0, 20.0, 0.0, 1, 0.45, [0.90, 0.35, 0.12, 1.0], FxKind::Muzzle, FxKind::Patch),
+    f("BLIZZARD", Verb::Cone, 0.70, 10.0, 2.4, 18.0, 32.0, 14.0, 7, 0.35, [0.75, 0.90, 1.0, 1.0], FxKind::Jet, FxKind::Spark),
+    f("METAL", Verb::Bank, 0.30, 5.0, 7.0, 60.0, 40.0, 0.0, 1, 0.0, [0.71, 0.73, 0.76, 1.0], FxKind::Muzzle, FxKind::Spark),
+    f("TITANIUM", Verb::Pierce, 1.10, 20.0, 13.0, 70.0, 0.0, 0.0, 1, 0.0, [0.59, 0.63, 0.69, 1.0], FxKind::Beam, FxKind::Spark),
+    f("ELECTRICITY", Verb::Chain, 0.90, 15.0, 8.0, 45.0, 34.0, 0.0, 1, 0.20, [0.55, 0.71, 1.0, 1.0], FxKind::Muzzle, FxKind::Arc),
+    f("WIND", Verb::Thrust, 0.22, 3.0, 3.0, 22.0, 55.0, 0.0, 1, 0.0, [0.82, 0.92, 0.84, 1.0], FxKind::Jet, FxKind::Spark),
+    f("TORNADO", Verb::Vortex, 2.60, 22.0, 0.0, 11.0, 26.0, 0.0, 1, 0.0, [0.78, 0.86, 0.82, 1.0], FxKind::Muzzle, FxKind::Swirl),
+    f("PHOTON", Verb::Beam, 2.40, 34.0, 26.0, 120.0, 0.0, 0.0, 1, 0.0, [1.0, 0.98, 0.90, 1.0], FxKind::Beam, FxKind::Ripple),
+    // GRAPPLE is not a Watch form — it is the traversal tool the raid docs
+    // already assume exists ("AIR: reachable only by flight or grapple").
+    // Light things come to you; heavy things pull you to them, which makes
+    // one button both a weapon and a way up.
+    f("GRAPPLE", Verb::Grapple, 0.45, 6.0, 22.0, 55.0, 0.0, 0.0, 1, 0.0, [0.85, 0.78, 0.45, 1.0], FxKind::Cable, FxKind::Cable),
 ];
 
 /// A shot in flight. Hitscan verbs never make one.
@@ -154,6 +168,46 @@ pub struct Wave {
     pub r: f32,
 }
 
+/// What the renderer should spawn. The weapons decide WHAT happens and
+/// where; how it looks is the renderer's business, so this is a vocabulary
+/// rather than a pile of particle parameters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FxKind {
+    /// space itself bending — the leap's aim and its arrival
+    Distort,
+    /// an expanding ring on the ground
+    Ripple,
+    /// the leap's late wave: a ring that arrives without a source
+    GroundWave,
+    /// a jet or continuous stream
+    Jet,
+    /// hard directional flash at a muzzle
+    Muzzle,
+    /// impact spark
+    Spark,
+    /// lingering surface patch
+    Patch,
+    /// swirling well
+    Swirl,
+    /// a straight line drawn for one frame
+    Beam,
+    /// an arc between two points
+    Arc,
+    /// a taut line to an anchor
+    Cable,
+}
+
+/// One thing to draw, this frame.
+#[derive(Clone, Copy, Debug)]
+pub struct FxEvent {
+    pub kind: FxKind,
+    pub pos: Vec3,
+    /// direction for beams/jets, or the far end for arcs and cables
+    pub dir: Vec3,
+    pub scale: f32,
+    pub color: [f32; 4],
+}
+
 /// Anything a shot can hit. Anonymous on purpose — a raid boss, a rival, a
 /// prop. The weapon does not ask what it is.
 #[derive(Clone, Copy, Debug)]
@@ -177,12 +231,17 @@ pub struct Outcome {
     pub slowed: Vec<(u32, f32)>,
     /// where a visible impact happened, for effects
     pub hits: Vec<Vec3>,
+    /// what to draw
+    pub fx: Vec<FxEvent>,
     pub fired: bool,
 }
 
 impl Outcome {
     fn hit(&mut self, id: u32, dv: Vec3) {
         self.hits_on.push((id, dv));
+    }
+    fn spawn(&mut self, kind: FxKind, pos: Vec3, dir: Vec3, scale: f32, color: [f32; 4]) {
+        self.fx.push(FxEvent { kind, pos, dir, scale, color });
     }
     /// total delta-v this outcome applied, for tests and HUD feedback
     pub fn total_impulse(&self) -> f32 {
@@ -199,6 +258,33 @@ pub struct Weapons {
     pub wave: Option<Wave>,
     /// the target the camera and the aim assist are following, if any
     pub locked: Option<u32>,
+    /// ICE's targeting freecam. The leap has no range limit — "one moment
+    /// they aren't there, then they are" — so it cannot be aimed down a
+    /// barrel. You detach the view, fly it to where you want to arrive, and
+    /// commit. That IS the weapon's interface.
+    pub aim: Option<Aim>,
+    /// the live grapple line, if one is out
+    pub hook: Option<Hook>,
+}
+
+/// The detached targeting view for the leap.
+#[derive(Clone, Copy)]
+pub struct Aim {
+    pub pos: Vec3,
+    pub from: Vec3,
+    /// 0..1, how far the space-bend has wound up — the distortion grows the
+    /// longer you hold, which is also the tell that gives you away
+    pub charge: f32,
+}
+
+#[derive(Clone, Copy)]
+pub struct Hook {
+    pub anchor: Vec3,
+    /// which target it bit into, if it caught something rather than terrain
+    pub on: Option<u32>,
+    /// true when the anchor is heavier than you, so YOU travel
+    pub reel_self: bool,
+    pub life: f32,
 }
 
 impl Default for Weapons {
@@ -217,6 +303,8 @@ impl Weapons {
             vortex: None,
             wave: None,
             locked: None,
+            aim: None,
+            hook: None,
         }
     }
 
@@ -250,6 +338,7 @@ impl Weapons {
         let d = dir.normalize_or(Vec3::NEG_Z);
         self.cool = p.cooldown;
         out.fired = true;
+        out.spawn(p.muzzle, origin, d, 1.0, p.color);
 
         // every target the ray passes through, nearest first — PIERCE and
         // BEAM want all of them, not just the first
@@ -277,6 +366,7 @@ impl Weapons {
                     out.hits.push(origin + d * p.reach.min(40.0));
                 }
                 for (i, (along, t)) in line.iter().enumerate() {
+                    out.spawn(p.impact, origin + d * *along, d, 1.0, p.color);
                     // PIERCE keeps its force through the whole line; BEAM is
                     // the apex form and does not care either way
                     let falloff = if p.verb == Verb::Pierce { 1.0 } else { 1.0 / (1.0 + i as f32 * 0.35) };
@@ -301,6 +391,7 @@ impl Weapons {
                     out.hit(t.id, n * p.impulse * falloff);
                     out.self_impulse -= n * p.impulse * 0.45 * falloff;
                     out.hits.push(t.pos);
+                    out.spawn(p.impact, t.pos, n, falloff, p.color);
                     any = true;
                 }
                 if !any {
@@ -311,10 +402,27 @@ impl Weapons {
             // THE QUANTUM GRAVITY LEAP. Silent, instant, no flash at the
             // origin — and a ground wave scheduled where you land, which you
             // can warn about and cannot stop.
+            // pulling the trigger on ICE OPENS the targeting view rather
+            // than firing; committing is a separate act (see aim_commit)
             Verb::Blink => {
-                let to = origin + d * p.reach;
-                out.teleport = Some(to);
-                self.wave = Some(Wave { pos: to, timer: 2.2, r: 14.0 });
+                self.aim = Some(Aim { pos: origin + d * 12.0, from: origin, charge: 0.0 });
+                out.spawn(FxKind::Distort, origin, d, 1.0, p.color);
+                self.cool = 0.0; // the cooldown starts when you actually leap
+            }
+            // the hook: first target on the line, else the surface it meets.
+            // Terrain resolution is the caller's (it owns the field), so a
+            // miss on targets reports the ray and lets the caller anchor it.
+            Verb::Grapple => {
+                let line = along_ray(p.reach);
+                if let Some((along, t)) = line.first() {
+                    self.hook = Some(Hook { anchor: t.pos, on: Some(t.id), reel_self: false, life: 2.5 });
+                    out.spawn(FxKind::Cable, origin, t.pos, 1.0, p.color);
+                    let _ = along;
+                } else {
+                    let anchor = origin + d * p.reach;
+                    self.hook = Some(Hook { anchor, on: None, reel_self: true, life: 2.5 });
+                    out.spawn(FxKind::Cable, origin, anchor, 1.0, p.color);
+                }
             }
             // recoil weapon: firing backwards is the fastest way to move
             Verb::Thrust => {
@@ -325,6 +433,7 @@ impl Weapons {
                 let at = origin + d * (p.reach * 0.9);
                 self.vortex = Some(Vortex { pos: at, r: p.reach, life: 4.5 });
                 out.hits.push(at);
+                out.spawn(FxKind::Swirl, at, Vec3::Y, p.reach, p.color);
             }
             Verb::Cone => {
                 // deterministic fan rather than random spread: a cone you can
@@ -483,6 +592,96 @@ impl Weapons {
         out
     }
 
+    // ------------------------------------------------------------ leap ---
+
+    /// Fly the targeting view. Free in every direction and UNBOUNDED, because
+    /// the leap is: the script has Ice Clones crossing lightyears. Holding it
+    /// winds up `charge`, which is what drives the distortion — and the
+    /// distortion is the tell, so a long, careful aim is a loud one.
+    pub fn aim_move(&mut self, delta: Vec3, dt: f32) -> Vec<FxEvent> {
+        let Some(a) = &mut self.aim else { return Vec::new() };
+        a.pos += delta;
+        a.charge = (a.charge + dt * 0.55).min(1.0);
+        let p = &TABLE[2];
+        // space bends around both ends: where you are and where you are going
+        vec![
+            FxEvent { kind: FxKind::Distort, pos: a.pos, dir: Vec3::Y, scale: 0.5 + a.charge * 2.5, color: p.color },
+            FxEvent { kind: FxKind::Distort, pos: a.from, dir: Vec3::Y, scale: 0.3 + a.charge * 1.2, color: p.color },
+        ]
+    }
+
+    /// Commit the leap. Silent and instant at the origin — no flash, nothing
+    /// to react to — and it schedules the wave that arrives 2.2 s later at
+    /// the ARRIVAL point, which the jumper can warn about and cannot stop.
+    pub fn aim_commit(&mut self, boost: f32) -> Outcome {
+        let mut out = Outcome::default();
+        let p = &TABLE[2];
+        let Some(a) = self.aim.take() else { return out };
+        if boost < p.cost {
+            return out; // not enough to make the jump; the view just closes
+        }
+        out.fired = true;
+        out.teleport = Some(a.pos);
+        self.cool = p.cooldown;
+        // radius grows with the distance travelled: a longer jump displaces
+        // more, which is the only way the wave scales with anything
+        let dist = (a.pos - a.from).length();
+        let r = (10.0 + dist * 0.10).min(40.0);
+        self.wave = Some(Wave { pos: a.pos, timer: 2.2, r });
+        // the arrival itself is a ripple, not a bang — the bang is late
+        out.spawn(FxKind::Distort, a.pos, Vec3::Y, 1.0 + a.charge, p.color);
+        out.spawn(FxKind::Ripple, a.pos, Vec3::Y, r * 0.25, p.color);
+        out
+    }
+
+    pub fn aim_cancel(&mut self) {
+        self.aim = None;
+    }
+
+    // --------------------------------------------------------- grapple ---
+
+    /// Anchor the live hook to a point the caller resolved against terrain.
+    /// The weapon cannot see the world; the caller can.
+    pub fn hook_anchor_at(&mut self, p: Vec3) {
+        if let Some(h) = &mut self.hook {
+            if h.on.is_none() {
+                h.anchor = p;
+            }
+        }
+    }
+
+    pub fn hook_release(&mut self) {
+        self.hook = None;
+    }
+
+    /// Reel. A light target comes to you; a heavy one — or bare terrain —
+    /// pulls you to it, which is the traversal half of the tool.
+    pub fn hook_step(&mut self, dt: f32, self_pos: Vec3, targets: &[Target]) -> Outcome {
+        let mut out = Outcome::default();
+        let p = &TABLE[12];
+        let Some(h) = &mut self.hook else { return out };
+        h.life -= dt;
+        let anchor = match h.on.and_then(|id| targets.iter().find(|t| t.id == id)) {
+            Some(t) => t.pos,
+            None => h.anchor,
+        };
+        let to = anchor - self_pos;
+        let d = to.length();
+        out.spawn(FxKind::Cable, self_pos, anchor, 1.0, p.color);
+        if d > 1.5 {
+            let dir = to / d;
+            if h.reel_self || h.on.is_none() {
+                out.self_impulse += dir * p.impulse * dt;
+            } else if let Some(id) = h.on {
+                out.hit(id, -dir * p.impulse * dt);
+            }
+        }
+        if h.life <= 0.0 || d <= 1.5 {
+            self.hook = None;
+        }
+        out
+    }
+
     /// LOCK ON. The camera and the aim want a subject, and picking it by
     /// "nearest to where you are looking" beats "nearest to you" — you can
     /// choose, and choosing between two bosses is a decision worth having.
@@ -567,16 +766,39 @@ mod tests {
             assert!(o.fired, "{} refused to fire with a full tank", p.name);
             // check the wave BEFORE stepping: it lands at 2.2 s and the loop
             // below runs six seconds, so by the end it has already gone
-            let scheduled = w.wave_eta().is_some();
+            // ICE opens the targeting view rather than firing; committing
+            // is the second act, so drive it that way
+            if p.verb == Verb::Blink {
+                assert!(w.aim.is_some(), "ICE did not open the targeting view");
+                w.aim_move(Vec3::new(0.0, 0.0, -18.0), 0.5);
+                let c = w.aim_commit(100.0);
+                assert!(c.teleport.is_some(), "ICE did not leap on commit");
+                assert!(w.wave_eta().is_some(), "ICE scheduled no wave");
+                let mut late = 0.0f32;
+                for _ in 0..360 {
+                    late += w.step(1.0 / 60.0, &tg, &sdf, &nrm).total_impulse();
+                }
+                assert!(late > 0.5, "the ICE wave never arrived ({late})");
+                continue;
+            }
+            // the hook does its work by reeling, not by the shot
+            if p.verb == Verb::Grapple {
+                assert!(w.hook.is_some(), "GRAPPLE put no line out");
+                // a target on the line gets reeled IN; bare terrain reels
+                // YOU. Either counts as the hook doing its job.
+                let mut pull = 0.0f32;
+                for _ in 0..120 {
+                    let o = w.hook_step(1.0 / 60.0, Vec3::new(0.0, 1.0, 0.0), &tg);
+                    pull += o.self_impulse.length() + o.total_impulse();
+                }
+                assert!(pull > 0.5, "the hook never pulled ({pull})");
+                continue;
+            }
             let mut moved = o.total_impulse();
             for _ in 0..360 {
                 moved += w.step(1.0 / 60.0, &tg, &sdf, &nrm).total_impulse();
             }
-            if p.verb == Verb::Blink {
-                assert!(o.teleport.is_some(), "ICE did not leap");
-                assert!(scheduled, "ICE scheduled no wave");
-                assert!(moved > 0.5, "the ICE wave never arrived ({moved})");
-            } else {
+            {
                 assert!(moved > 0.5, "{} never touched the target ({moved})", p.name);
             }
         }
@@ -629,6 +851,68 @@ mod tests {
     }
 
     #[test]
+    fn the_leap_has_no_range_limit() {
+        let mut w = Weapons::new();
+        w.form = 2;
+        w.fire(Vec3::ZERO, Vec3::NEG_Z, &[], 100.0);
+        // fly the targeting view an absurd distance: the script has Ice
+        // Clones crossing lightyears, so nothing here may clamp it
+        for _ in 0..500 {
+            w.aim_move(Vec3::new(0.0, 0.0, -400.0), 1.0 / 60.0);
+        }
+        let o = w.aim_commit(100.0);
+        let at = o.teleport.expect("no leap");
+        assert!(at.z < -100_000.0, "the leap was clamped at {at:?}");
+        assert!(w.wave_eta().is_some());
+    }
+
+    #[test]
+    fn aiming_the_leap_distorts_at_both_ends() {
+        let mut w = Weapons::new();
+        w.form = 2;
+        w.fire(Vec3::ZERO, Vec3::NEG_Z, &[], 100.0);
+        let fx = w.aim_move(Vec3::new(0.0, 0.0, -5.0), 0.25);
+        assert_eq!(fx.len(), 2, "space should bend at both ends of the jump");
+        assert!(fx.iter().all(|e| e.kind == FxKind::Distort));
+        // holding winds the distortion up — the tell that gives you away
+        let a = fx[0].scale;
+        for _ in 0..60 {
+            w.aim_move(Vec3::ZERO, 1.0 / 60.0);
+        }
+        let b = w.aim_move(Vec3::ZERO, 0.0)[0].scale;
+        assert!(b > a, "the distortion did not grow while held ({a} -> {b})");
+    }
+
+    #[test]
+    fn a_heavy_anchor_pulls_you_and_a_light_one_comes_to_you() {
+        let mut w = Weapons::new();
+        w.form = 12; // GRAPPLE
+        // no target on the line: it bites terrain, so YOU travel
+        w.fire(Vec3::ZERO, Vec3::NEG_Z, &[], 100.0);
+        let trav = w.hook_step(0.1, Vec3::ZERO, &[]);
+        assert!(trav.self_impulse.length() > 0.0, "terrain hook did not pull you");
+
+        // a target on the line: it comes to you instead
+        let tg = [Target { id: 3, pos: Vec3::new(0.0, 0.0, -20.0), r: 1.6 }];
+        let mut w2 = Weapons::new();
+        w2.form = 12;
+        w2.fire(Vec3::ZERO, Vec3::NEG_Z, &tg, 100.0);
+        let o = w2.hook_step(0.1, Vec3::ZERO, &tg);
+        assert!(!o.hits_on.is_empty(), "target hook pulled nothing");
+        assert!(o.hits_on[0].1.z > 0.0, "the target was pushed away, not reeled in");
+    }
+
+    #[test]
+    fn every_form_draws_something() {
+        for i in 0..FORMS {
+            let mut w = Weapons::new();
+            w.form = i;
+            let o = w.fire(Vec3::ZERO, Vec3::NEG_Z, &[], 100.0);
+            assert!(!o.fx.is_empty(), "{} fires invisibly", TABLE[i].name);
+        }
+    }
+
+    #[test]
     fn wind_pushes_the_shooter_backwards() {
         let mut w = Weapons::new();
         w.form = 9; // WIND
@@ -651,6 +935,8 @@ mod tests {
         w.form = 2; // ICE
         let tg = [Target { id: 1, pos: Vec3::new(0.0, 1.0, -26.0), r: 1.6 }];
         w.fire(Vec3::new(0.0, 1.0, 0.0), Vec3::NEG_Z, &tg, 100.0);
+        w.aim_move(Vec3::new(0.0, 0.0, -14.0), 0.5);
+        w.aim_commit(100.0);
         let mut early = 0.0f32;
         for _ in 0..120 {
             early += w.step(1.0 / 60.0, &tg, &sdf, &nrm).total_impulse();

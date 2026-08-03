@@ -140,7 +140,19 @@ def label(iqm):
 
 
 def main():
-    tuning = json.load(open(os.path.join(FV, "foldview_tuning.json")))
+    # ROSTER SOURCE. foldview_tuning.json is a list of models someone sat
+    # down and tuned, not a list of models that work — and there are over a
+    # thousand imports. tools/screen-foldable.py measures which actually
+    # stand up (robot height clearly above vehicle height, AND height as its
+    # own longest axis, so a body on a diagonal does not pass). Its output
+    # is used when present; the tuned list is the fallback.
+    screened = os.environ.get("ROSTER", "/tmp/foldable.json")
+    if os.path.isfile(screened):
+        tuning = json.load(open(screened))
+        print(f"roster from {screened}: {len(tuning)} screened chassis")
+    else:
+        tuning = json.load(open(os.path.join(FV, "foldview_tuning.json")))
+        print(f"roster from foldview_tuning.json: {len(tuning)} tuned chassis")
     todo = []
     for iqm in tuning:
         if any(w in iqm for w in WELDED):
