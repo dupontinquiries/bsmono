@@ -3424,10 +3424,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 view.copy_from_slice(bytes);
             }));
             if wrote.is_err() {
-                eprintln!("wgpu-engine: ARENA SLAB UNUSABLE — slab {} of {:.1} MiB could not be \
-mapped at offset {off} ({} bytes). The driver accepted the allocation and then rejected the use, \
-which is what a hard BO-VMA ceiling does: {:.1} GiB of slabs had already been placed. Lower \
-LOGSCOPE_MAX_GPU_GB, or let the model stream instead of forcing residency.",
+                eprintln!("wgpu-engine: ARENA SLAB UNUSABLE — slab {} of {:.1} MiB could not be mapped at offset {off} ({} bytes). {:.1} GiB of slabs had already been placed, all still mapped. NEXT DIAGNOSTIC: rerun with LOGSCOPE_ARENA_SLAB_MB=1024 — failing again at the same TOTAL means the cap is on mapped bytes and a smaller slab cannot help; getting past it means the cap is per-buffer or per-count and the slab size IS the fix. Meanwhile lower LOGSCOPE_MAX_GPU_GB, or let the model stream instead of forcing residency.",
                     a.slabs.len(), a.slab_size as f64 / (1 << 20) as f64, len,
                     (a.slabs.len().saturating_sub(1) as f64 * a.slab_size as f64) / (1u64 << 30) as f64);
                 // Re-raised rather than swallowed: the buffer is unusable and there is no Tensor to
