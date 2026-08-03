@@ -44,7 +44,7 @@ not see.
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
 | snapclone | 51 | 80% named / 18% code | yes | yes | — |
-| voiceterm | 22 | 55% named / 41% code | yes | yes | **yes** |
+| voiceterm | 22 | 64% named / 50% code | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |
 
