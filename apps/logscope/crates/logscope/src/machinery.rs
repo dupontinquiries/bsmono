@@ -1684,3 +1684,140 @@ mod lighthouse_tests {
         assert!(!Lighthouse::of(20.0, 32.0, LIGHTHOUSE_DARK_S, 0.0).reachable());
     }
 }
+
+/// The VOCABULARY for a beacon's channels, per scene.
+///
+/// `Beacon` above already carries form, scale, glow and age, and `beacon_form` already names the
+/// structure per scene — I appended this without reading either, for the second time in three
+/// commits. What survives is the part they lack.
+///
+/// `Lighthouse` computes three channels — height from capability, light from link, age from silence.
+/// This says what they LOOK like in a given scene, and the interesting constraint is that **the third
+/// channel does not survive a naive port**: vines climbing a stone tower are obvious, and vines on a
+/// lantern floating in cloud are nonsense. A drowned tower gains coral, a streetlamp gains rust, a
+/// paper lantern gains soot and creases.
+///
+/// So each skin names its own aging. Getting that wrong is worse than a plain beacon everywhere,
+/// because an aging metaphor that does not fit reads as decoration and stops being read at all.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BeaconSkin {
+    /// The lamp, and how it behaves on a strong link.
+    pub lamp: &'static str,
+    /// What a weak, guttering link looks like here.
+    pub failing: &'static str,
+    /// How long silence shows on THIS structure. Never vines by default — see above.
+    pub aging: &'static str,
+}
+
+/// Skins per scene. Same three channels, fifteen vocabularies.
+pub fn beacon_skin(scene: &str) -> BeaconSkin {
+    match scene {
+        "Canopy" | "Forest" | "Treehouse" => BeaconSkin {
+            lamp: "warm light turning slowly between the boughs, visible down every avenue of trees",
+            failing: "the light guttering behind moving leaves, catching and losing you",
+            aging: "creeper swallowing the trunk and closing over the lamp room's windows",
+        },
+        "Atlantis" => BeaconSkin {
+            lamp: "a green shaft of light sweeping through the water, silt turning in the beam",
+            failing: "the beam scattering into murk a few fathoms out",
+            aging: "coral and barnacle crusting up the tower, encrusting the cage",
+        },
+        "Cloudscape" | "Mistfall" => BeaconSkin {
+            lamp: "a steady warm glow through the paper, the whole lantern lit from within",
+            failing: "the flame stuttering, the lantern dipping and lifting on the tether",
+            aging: "soot darkening the paper, creases deepening where the wind has worked it",
+        },
+        "Alley" | "Slate" => BeaconSkin {
+            lamp: "a clean sodium pool of light and a halo in the damp air",
+            failing: "the filament buzzing and dropping to half, the halo shrinking",
+            aging: "rust blooming up the post, the glass gone yellow and flyblown",
+        },
+        "Fractal Spires" | "Recursive Citadel" => BeaconSkin {
+            lamp: "a slow underside pulse that lights the towers beneath it in sequence",
+            failing: "the pulse arrhythmic, the craft drifting off station between beats",
+            aging: "its hull dulling, the pulse falling out of step with the towers",
+        },
+        "Old Library" | "Archive" | "Reading Room" => BeaconSkin {
+            lamp: "a wide steady cone lighting the length of the stacks",
+            failing: "the wick lowering, the cone pulling back to the nearest shelves",
+            aging: "dust thickening on the shade until the light comes through amber",
+        },
+        "Folding@home" => BeaconSkin {
+            lamp: "a clear pulse of emission each time it is excited",
+            failing: "the emission red-shifting and blurring, the reading uncertain",
+            aging: "photobleaching — the tag fading toward transparency the longer it goes unread",
+        },
+        "Mansion Garden" => BeaconSkin {
+            lamp: "flashes relayed cleanly across the garden, sharp and evenly spaced",
+            failing: "the mirror shaking, flashes arriving unevenly and out of sequence",
+            aging: "verdigris creeping over the brass, the mirror silvering over",
+        },
+        // A scene with no skin gets the plain structure. An unthemed beacon that still reads correctly
+        // is better than a themed one whose aging metaphor does not fit its form.
+        _ => BeaconSkin {
+            lamp: "a steady light turning",
+            failing: "the light dimming and slowing",
+            aging: "weathering on the structure",
+        },
+    }
+}
+
+#[cfg(test)]
+mod beacon_skin_tests {
+    use super::*;
+
+    const SCENES: [&str; 10] = ["Canopy", "Treehouse", "Atlantis", "Cloudscape", "Alley",
+        "Fractal Spires", "Old Library", "Folding@home", "Mansion Garden", "Somewhere New"];
+
+    #[test]
+    fn no_skin_ages_with_VINES_where_vines_make_no_sense() {
+        // The constraint that makes this more than a rename. Creeper on a trunk is obvious; creeper on
+        // a lantern floating in cloud is nonsense, and an aging metaphor that does not fit reads as
+        // decoration and stops being read at all.
+        for s in ["Cloudscape", "Atlantis", "Alley", "Folding@home", "Fractal Spires"] {
+            let b = beacon_skin(s);
+            assert!(!b.aging.contains("vine") && !b.aging.contains("creeper"),
+                "{s} ages by {}", b.aging);
+        }
+        // And where it DOES fit, it is used.
+        assert!(beacon_skin("Canopy").aging.contains("reeper"));
+    }
+
+    #[test]
+    fn every_skin_distinguishes_a_WEAK_link_from_a_dark_one() {
+        // The lamp channel needs a middle state or a marginal link looks like an absent one — the
+        // whole reason sweep falls faster than brightness.
+        for s in SCENES {
+            let b = beacon_skin(s);
+            assert!(!b.failing.is_empty(), "{s}");
+            assert_ne!(b.failing, b.lamp, "{s}: failing must not read as working");
+        }
+    }
+
+    #[test]
+    fn the_skins_are_actually_DIFFERENT() {
+        // The FORM comes from the existing beacon_form; what this table adds is the vocabulary for
+        // the other two channels, so distinctness is checked on those.
+        let aging: std::collections::HashSet<&str> = SCENES.iter().map(|s| beacon_skin(s).aging).collect();
+        assert!(aging.len() >= 8, "got {} distinct aging metaphors", aging.len());
+    }
+
+    #[test]
+    fn an_unthemed_scene_still_reads_CORRECTLY() {
+        // Plain is fine; wrong is not. A themed beacon whose aging does not fit its form is worse than
+        // an unthemed one that does.
+        let b = beacon_skin("Somewhere New");
+        assert!(!b.aging.is_empty() && !b.failing.is_empty());
+    }
+
+    #[test]
+    fn the_aging_is_specific_to_the_STRUCTURE_not_the_scene() {
+        // Coral belongs to a drowned tower, soot to paper, rust to iron, photobleaching to a
+        // fluorophore. Each is a property of what the thing is MADE of, which is what makes it read
+        // without a legend.
+        assert!(beacon_skin("Atlantis").aging.contains("oral"));
+        assert!(beacon_skin("Cloudscape").aging.contains("oot"));
+        assert!(beacon_skin("Alley").aging.contains("ust"));
+        assert!(beacon_skin("Folding@home").aging.contains("bleach"));
+    }
+}
