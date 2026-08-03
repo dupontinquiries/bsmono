@@ -240,7 +240,16 @@ pub(crate) mod engine {
                 if asahi {
                     // Honeykrisp/Asahi: the fragile path we've hardened against (subgroup hangs, unreliable
                     // completion callbacks → bounded submits, watchdog-sensitive dispatches).
-                    notes.push("Asahi/Honeykrisp Vulkan detected → subgroup matvec OFF, decode window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan budget".into());
+                    // REPORT THE ACTUAL STATE, not the default. This was a static string keyed on
+                    // conservative_vma and said "subgroup matvec OFF" whether or not it was — so a run
+                    // with LOGSCOPE_MATVEC_SG=1 printed the same line as one without, and there was no
+                    // way to tell from the log whether the override took.
+                    //
+                    // A preflight summary that reports intent rather than outcome is worse than none:
+                    // it is read as confirmation.
+                    notes.push(format!("Asahi/Honeykrisp Vulkan detected → subgroup matvec {}, decode \
+window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan budget",
+                        if gpu.subgroup_kernel_ok() { "ON (LOGSCOPE_MATVEC_SG override)" } else { "OFF" }));
                 }
                 // Report env overrides and whether each PARSED (the PREFILL_CHUNK-vs-LOGSCOPE_PREFILL_CHUNK
                 // class of silent-ignore cost real test cycles; make it visible).
