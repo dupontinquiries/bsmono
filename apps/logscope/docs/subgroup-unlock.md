@@ -1,4 +1,13 @@
-# The subgroup matvec may have been disabled by a broken fixture
+# The subgroup matvec is disabled by a NAME CHECK — the fixture theory was wrong
+
+> **Correction, from the first working Scout run.** I theorised that a corrupt fixture had disabled the
+> subgroup kernel through `self_check_sg`. It cannot have. `sg_ok` is forced false by a preflight
+> **adapter-name check** — `if (asahi_vulkan || cfg_off) && !force_sg` — *before* `self_check_sg` runs.
+> The self-check's verdict on this hardware has never mattered.
+>
+> I wrote a commit about a mechanism without reading what actually sets the flag. The rest of this
+> document still holds for the two probes that are genuinely fixture-dependent.
+
 
 ## The chain
 
@@ -87,3 +96,38 @@ re-answers, for free:
 
 None of that required new code. It required the fixtures to stop lying, which took finding one
 misbehaving shift.
+
+
+---
+
+# What the working run actually says about speed
+
+Scout, `slab=1024 GB=28`, correct output:
+
+```
+produced 661 tokens in 529.0s = 1.25 tok/s
+phase balance — decode is 7.3x SLOWER PER TOKEN than this model's own prefill
+(an earlier turn in the same run: 76.2x)
+bind-group cache — 137895 hits / 6890 misses
+```
+
+**The 7.3× is the number to chase, and it is now measured on a build that produces correct text** —
+every previous decode figure was taken on kernels that mis-unpacked three bytes in four.
+
+**The bind-group cache is doing its job**: 95% hit rate, so dispatch setup is not the cost.
+
+**The subgroup kernel is still off, and by a name check rather than a measurement.** Its stated reason
+— "can hang large matmuls" — predates the discovery that this driver mis-executes shifts by a
+lane-varying amount, which made every kernel comparison on it unreliable. `LOGSCOPE_MATVEC_SG=1` is
+now worth trying on a build where the packers are correct.
+
+**The per-shape autotune still reported loading 41 decode + 14 GEMM tiles from cache**, despite the
+epoch bump in `_529`. Either that line reads a different file from `autotune_file()`, or the bump did
+not reach the path that logs it. Worth checking before trusting any tile the log reports.
+
+## Order for the next speed run
+
+1. `LOGSCOPE_MATVEC_SG=1` — the guard is unmeasured on a correct build, and the subgroup kernel is the
+   one the in-tree analysis expects to win a latency-bound decode.
+2. Check whether the per-shape cache is genuinely cold; if not, find the second cache file.
+3. `LOGSCOPE_MATVEC_V3=1` — vec4 loads, in the autotune since `_415`, still never measured on hardware.

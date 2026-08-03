@@ -1235,7 +1235,19 @@ impl Gpu {
             let cfg_off = !engine_config().subgroup_matvec;
             if (asahi_vulkan || cfg_off) && !force_sg {
                 let why = if mobile_gpu { "mobile GPUs often cannot schedule enough subgroups per workgroup for this kernel" }
-                else if asahi_vulkan { "Asahi/Honeykrisp subgroup support can hang large matmuls" }
+                // NOT RE-EXAMINED SINCE IT WAS WRITTEN, and worth flagging now. This is a NAME CHECK, not
+            // a measurement: sg_ok is forced false before self_check_sg ever runs, so the self-check's
+            // verdict on this hardware has never mattered.
+            //
+            // I spent a commit theorising that a corrupt fixture had disabled the subgroup kernel via
+            // that check. It cannot have: the check is not the gate here. The theory was untestable
+            // and I did not look at what actually sets the flag before writing it down.
+            //
+            // The claim itself — "can hang large matmuls" — predates the discovery that this driver
+            // mis-executes shifts by a lane-varying amount, which made every kernel comparison on it
+            // unreliable. LOGSCOPE_MATVEC_SG=1 is now worth trying on a build where the packers are
+            // correct, because the evidence for this guard was gathered when they were not.
+            else if asahi_vulkan { "Asahi/Honeykrisp subgroup support can hang large matmuls" }
                           else { "disabled by engine config" };
                 eprintln!("wgpu-engine: subgroup decode kernel DISABLED on {} ({why}; LOGSCOPE_MATVEC_SG=1 re-enables)", gpu.adapter_name);
                 gpu.sg_ok.store(false, std::sync::atomic::Ordering::Relaxed);
