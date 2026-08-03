@@ -208,8 +208,23 @@ which is the strongest argument for doing them at all:
   kit had no test covering that case, which is why it survived. The port's rule
   won and is now the kit's.
 
+* **The easing guard was in a private copy.** bo-suite's scroll module had its
+  own `out_cubic` that clamped `t` to 0..=1; the shared one did not, so every
+  caller had to remember — and several were writing
+  `out_cubic(x.clamp(0.0, 1.0))`, which is the tell. The clamp now lives in the
+  easing itself and the redundant call-site clamps are gone.
+
+  **No live bug was found here**, and that is worth stating plainly rather than
+  dressing the change up: both unguarded call sites — `uikit-term`'s block slide
+  and the confirm dialog's appear — bounded their input by other means. The
+  change removes a class of future bug and a thing every caller had to know, not
+  a defect on screen today. `out_back` still overshoots above 1 on the way,
+  because that is the effect; what is clamped is the input, not the output.
+
 ### Kits still unaudited
 
-`uikit-term` has not had this sweep. `uikit-term` and `uikit-web` also still
+`uikit-term` has had a partial sweep — its easing call site was checked and its
+`keys` module was extended earlier — but its grid and parser have not been
+compared against voiceterm's own. `uikit-term` and `uikit-web` also still
 have one consumer each — they carry kit-shaped cost without kit-shaped payoff,
 and that stays true until a second app embeds them.

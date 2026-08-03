@@ -88,7 +88,7 @@ impl ControlCard {
         if !self.active { return 0.0; }
         let t = self.breath / BREATH_MS;
         let phase = if t <= 1.0 { t } else { 2.0 - t };
-        GLOW_PEAK * ease::out_cubic(phase.clamp(0.0, 1.0))
+        GLOW_PEAK * ease::out_cubic(phase)
     }
 
     /// The label's presentation: wide uppercase tracking, per the B&O type.

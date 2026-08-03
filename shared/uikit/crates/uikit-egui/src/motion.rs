@@ -27,8 +27,28 @@ pub mod ease {
     pub fn in_quad(t: f32) -> f32 {
         t * t
     }
+    /// Clamp the input to 0..=1.
+    ///
+    /// Every easing here takes it, and that is the point: `t` is almost always
+    /// `elapsed / duration`, and a slow frame pushes it past 1. Unclamped,
+    /// `out_cubic(1.2)` returns 1.06 and a panel slides PAST its resting place
+    /// before snapping back — a wobble that only appears on a hitch, which is
+    /// the hardest kind of glitch to reproduce and report.
+    ///
+    /// bo-suite's scroll module had this guard in a private copy of
+    /// `out_cubic`; the shared version did not, and `uikit-term`'s block-slide
+    /// called it with a raw ratio. Putting the clamp in one place is cheaper
+    /// than every caller remembering — several already write
+    /// `out_cubic(x.clamp(0.0, 1.0))`, which is the tell.
+    ///
+    /// `out_back` deliberately still overshoots ABOVE 1 on the way: that is the
+    /// effect. What is clamped is the input, not the output.
+    #[inline]
+    fn t01(t: f32) -> f32 { t.clamp(0.0, 1.0) }
+
     /// Ease in then out. QML `Easing.InOutQuad`.
     pub fn in_out_quad(t: f32) -> f32 {
+        let t = t01(t);
         if t < 0.5 {
             2.0 * t * t
         } else {
@@ -37,26 +57,29 @@ pub mod ease {
     }
     /// Strong deceleration — the workhorse for fades/expands. QML `Easing.OutCubic`.
     pub fn out_cubic(t: f32) -> f32 {
+        let t = t01(t);
         1.0 - (1.0 - t).powi(3)
     }
     /// Accelerating cubic. QML `Easing.InCubic`.
     pub fn in_cubic(t: f32) -> f32 {
+        let t = t01(t);
         t * t * t
     }
     /// Springy overshoot past 1 then settles — great for pop-ins. QML `Easing.OutBack`.
     pub fn out_back(t: f32) -> f32 {
+        let t = t01(t);
         const C1: f32 = 1.70158;
         const C3: f32 = C1 + 1.0;
         1.0 + C3 * (t - 1.0).powi(3) + C1 * (t - 1.0).powi(2)
     }
     /// Gentle sine ease-out — soft, used for breathing/idle motion.
     pub fn out_sine(t: f32) -> f32 {
-        (t * std::f32::consts::FRAC_PI_2).sin()
+        (t01(t) * std::f32::consts::FRAC_PI_2).sin()
     }
 
     /// QML `Easing.InSine`.
     pub fn in_sine(t: f32) -> f32 {
-        1.0 - (t * std::f32::consts::FRAC_PI_2).cos()
+        1.0 - (t01(t) * std::f32::consts::FRAC_PI_2).cos()
     }
     /// QML `Easing.InOutSine` — the smooth breathing/ambient curve the Qt apps lean on (bo-controller
     /// uses it 16×). Symmetric ease-in-out.
@@ -271,7 +294,8 @@ impl PressFeedback {
     /// Ripple radius fraction, eased so it blooms rather than expanding evenly.
     pub fn ripple_t(&self) -> f32 {
         self.ripple_ms
-            .map(|t| ease::out_cubic((t / self.feel.ripple_ms).clamp(0.0, 1.0)))
+            // No clamp needed: the easing guards its own input now.
+            .map(|t| ease::out_cubic(t / self.feel.ripple_ms))
             .unwrap_or(0.0)
     }
 
@@ -420,7 +444,7 @@ impl Reveal {
     pub fn raw(&self) -> f32 { self.t }
 
     /// Eased progress — what a caller should scale a height or an offset by.
-    pub fn eased(&self) -> f32 { ease::out_cubic(self.t.clamp(0.0, 1.0)) }
+    pub fn eased(&self) -> f32 { ease::out_cubic(self.t) }
 
     /// Still on screen? True through the whole exit, which is the rule all
     /// three call sites had to discover independently.
@@ -604,5 +628,53 @@ mod reveal_breath_tests {
         let status = Breath::new(600.0, 0.0, 1.0);
         assert!(card.period_ms > status.period_ms);
         assert!(card.ceiling < status.ceiling);
+    }
+}
+
+#[cfg(test)]
+mod easing_guard_tests {
+    use super::ease::*;
+
+    #[test]
+    fn a_slow_frame_cannot_push_an_easing_past_its_end() {
+        // t is almost always elapsed/duration, and a hitch makes it > 1.
+        // Unclamped, out_cubic(1.2) = 1.06 and a panel slides PAST its resting
+        // place before snapping back — a wobble that only appears on a hitch.
+        for t in [1.0, 1.2, 5.0, f32::INFINITY] {
+            assert!((out_cubic(t) - 1.0).abs() < 1e-6, "out_cubic({t}) = {}", out_cubic(t));
+            assert!((in_cubic(t) - 1.0).abs() < 1e-6);
+            assert!((in_out_quad(t) - 1.0).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_negative_t_cannot_run_an_animation_backwards() {
+        // A clock that jumps back, or a delay subtracted from elapsed, yields a
+        // negative ratio. Unclamped that is a value below zero, which reads as
+        // the panel starting from the wrong side.
+        for t in [-0.0001, -1.0, -100.0] {
+            assert!(out_cubic(t).abs() < 1e-6, "out_cubic({t}) = {}", out_cubic(t));
+            assert!(in_cubic(t).abs() < 1e-6);
+            assert!(out_sine(t).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn the_curves_still_curve() {
+        // A clamp that flattened the easing would pass the tests above and be
+        // useless.
+        assert!(out_cubic(0.25) > 0.25, "out_cubic leads a linear ramp");
+        assert!(in_cubic(0.25) < 0.25, "in_cubic lags it");
+        assert!((out_cubic(0.0)).abs() < 1e-6);
+        assert!((out_cubic(1.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn out_back_still_overshoots_because_that_is_the_effect() {
+        // The INPUT is clamped, not the output. A pop-in that no longer
+        // overshoots is not a pop-in.
+        let peak = (1..100).map(|i| out_back(i as f32 / 100.0)).fold(0.0f32, f32::max);
+        assert!(peak > 1.0, "out_back peaked at {peak}");
+        assert!((out_back(5.0) - 1.0).abs() < 1e-6, "but it still settles at 1");
     }
 }
