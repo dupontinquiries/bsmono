@@ -3,6 +3,8 @@ name = "sim-pcb"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-description = "Level 2: PCB stackup, PDN impedance, thermal. Consumes cad-nifty hardware geometry."
+description = "Level 2: PCB stackups and cross-sections. Turns a board description into transmission line parameters via a field solve."
 
 [dependencies]
+sim-field.workspace = true
+sim-num.workspace = true

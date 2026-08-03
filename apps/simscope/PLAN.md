@@ -21,8 +21,8 @@ receiving them — which is why it is the right on-ramp from network analysis to
 | `sim-num` | — | deterministic reductions, compensated arithmetic, f64 kernels, Newton | **built** |
 | `sim-power` | L0 | Ybus, polar Jacobian, AC power flow | **built** |
 | `sim-field` | L1 | 2D Laplace on triangles → C, L, Z0 per unit length | **built** |
-| `sim-pcb` | L2 | stackup, PDN impedance, thermal; consumes `cad-nifty` geometry | next |
-| `sim-litho` | L3 | EUV imaging by Fourier optics; f32-safe, GPU-shaped | planned |
+| `sim-pcb` | L2 | stackups, cross-sections → Z0, eps_eff, delay | **built** |
+| `sim-litho` | L3 | EUV imaging by Fourier optics; f32-safe, GPU-shaped | next |
 | `sim-rtl` | L4 | logic evaluation; bit-exact, no floating point | planned |
 
 Dependencies point down only. Nothing above `sim-num` may implement its own reduction.
@@ -131,3 +131,37 @@ is neither `c₀` nor `c₀/√εr`.
 - **No conductor loss, no skin effect.** `R` and `G` in "RLGC" are not computed; this is LC only.
 - **Jacobi-preconditioned CG.** Fine at this size; a graded or highly refined mesh wants
   multigrid, which is also the form that ports to GPU as a matrix-free operator.
+
+
+## L2 status
+
+Board cross-sections solved with the L1 machinery unchanged — only the geometry and the material
+map differ.
+
+```
+  stripline w=0.50mm b=1.0mm       46.94   ref 48.87   eps_eff 4.199   6.83 ps/mm
+  microstrip w=0.38mm h=0.20mm     48.28   ref 50.42   eps_eff 3.323   6.08 ps/mm
+```
+
+**Stripline is the sharp test.** It is homogeneous, so its effective permittivity must equal the
+substrate exactly — 4.199 against 4.200, and 2.999 against 3.000. That is physics rather than a
+curve fit, and any leak in the mixed-dielectric path would show there first.
+
+Microstrip is checked against Hammerstad, which is itself a ~1% fit to an *open* geometry while the
+solver models a shielded box. The consistent ~4% shortfall is the lid adding capacitance, and
+`sweep_box_height` shows it converging upward as the box grows rather than asking anyone to take
+that on trust.
+
+### L2 debts
+
+- **Zero-thickness traces.** Finite copper raises capacitance a few percent; the tensor grid can
+  represent the sides but does not.
+- **Shielded box, not open.** A finite domain cannot represent an open microstrip. The sweep shows
+  convergence; a proper treatment wants an absorbing or asymptotic boundary condition.
+- **No R or G.** Conductor loss, skin effect and dielectric loss are absent — this is LC, and
+  calling the crate's output "RLGC" would be overclaiming.
+- **Single trace only.** No coupled pairs, so no differential impedance and no crosstalk, which is
+  most of what a signal integrity tool is for. The capacitance *matrix* is the generalisation.
+- **Not yet reading `cad-nifty`.** The `%kind: hardware` diagrams carry trace widths and layers in
+  millimetres, which is exactly this crate's input. Wiring the two is a path dependency across
+  workspaces and is the obvious next join.

@@ -93,6 +93,10 @@ version = "0.1.0"
 [[package]]
 name = "sim-pcb"
 version = "0.1.0"
+dependencies = [
+ "sim-field",
+ "sim-num",
+]
 
 [[package]]
 name = "sim-power"
@@ -114,6 +118,7 @@ dependencies = [
  "serde_json",
  "sim-field",
  "sim-num",
+ "sim-pcb",
  "sim-power",
 ]
 

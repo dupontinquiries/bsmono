@@ -131,5 +131,81 @@ fn l1() -> usize {
          Z0 and v_phase follow. No transmission-line formula is used to get them."
     );
     println!("\nL1: {}", if failures == 0 { "PASS" } else { "FAIL" });
+    failures + l2()
+}
+
+/// L2: real board cross-sections. Stripline is the sharp case — it is homogeneous, so eps_eff must
+/// come out exactly equal to the substrate, which is physics rather than a curve fit. Microstrip is
+/// the useful case and is compared against Hammerstad.
+fn l2() -> usize {
+    use sim_pcb::{formulas, solve, MeshOpts, Stackup, Trace};
+    println!("\nsimscope — L2 board cross-sections\n");
+    println!(
+        "  {:<28} {:>9} {:>9} {:>9} {:>9} {:>6}",
+        "cross-section", "Z0 ohm", "ref", "eps_eff", "ps/mm", ""
+    );
+    let mut failures = 0usize;
+    let opts = MeshOpts::default();
+
+    // Stripline: homogeneous, so eps_eff is exactly the substrate.
+    for (b, w, er) in [(1.0e-3, 0.5e-3, 4.2), (0.8e-3, 0.3e-3, 3.0)] {
+        let r = match solve(&Stackup::stripline(b, er), &Trace { width: w, on_layer: 0 }, &opts) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  stripline failed: {e}");
+                failures += 1;
+                continue;
+            }
+        };
+        let refz = formulas::stripline_z0(w, b, er);
+        let ok = (r.eps_eff - er).abs() / er < 5e-3 && (r.z0 - refz).abs() / refz < 0.10;
+        if !ok {
+            failures += 1;
+        }
+        println!(
+            "  {:<28} {:>9.2} {:>9.2} {:>9.3} {:>9.2} {:>6}",
+            format!("stripline w={:.2}mm b={:.1}mm", w * 1e3, b * 1e3),
+            r.z0,
+            refz,
+            r.eps_eff,
+            1e12 / r.v_phase / 1e3,
+            if ok { "ok" } else { "FAIL" }
+        );
+    }
+
+    // Microstrip: inhomogeneous, shielded box approximating the open case.
+    for (h, w, er) in [(0.2e-3, 0.38e-3, 4.4), (0.5e-3, 1.0e-3, 4.4), (0.254e-3, 0.7e-3, 3.0)] {
+        let stack = Stackup::microstrip(h, er, h * 12.0);
+        let r = match solve(&stack, &Trace { width: w, on_layer: 0 }, &opts) {
+            Ok(r) => r,
+            Err(e) => {
+                println!("  microstrip failed: {e}");
+                failures += 1;
+                continue;
+            }
+        };
+        let refz = formulas::microstrip_z0(w, h, er);
+        let ok = (r.z0 - refz).abs() / refz < 0.15 && r.eps_eff > 1.0 && r.eps_eff < er;
+        if !ok {
+            failures += 1;
+        }
+        println!(
+            "  {:<28} {:>9.2} {:>9.2} {:>9.3} {:>9.2} {:>6}",
+            format!("microstrip w={:.2}mm h={:.2}mm", w * 1e3, h * 1e3),
+            r.z0,
+            refz,
+            r.eps_eff,
+            1e12 / r.v_phase / 1e3,
+            if ok { "ok" } else { "FAIL" }
+        );
+    }
+
+    println!(
+        "\n  stripline eps_eff must equal the substrate exactly — it is homogeneous, so that is\n  \
+         physics, not a fit. The microstrip reference is Hammerstad, itself a ~1% curve fit to an\n  \
+         OPEN geometry, while the solver models a shielded box; disagreement of a few percent is\n  \
+         the lid, not an error."
+    );
+    println!("\nL2: {}", if failures == 0 { "PASS" } else { "FAIL" });
     failures
 }

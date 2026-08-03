@@ -99,6 +99,63 @@ impl Mesh {
         Mesh { xy, tri }
     }
 
+    /// A structured mesh on an explicit tensor grid.
+    ///
+    /// The caller supplies the exact x and y coordinate lines, which is what a layered
+    /// cross-section needs: a dielectric interface or a conductor edge that falls *between* nodes
+    /// cannot be represented, and the resulting error looks like a physics result rather than a
+    /// meshing mistake. Passing the lines explicitly makes "the interface is on a node" a
+    /// precondition the caller can guarantee instead of a coincidence.
+    ///
+    /// Node (i, j) is at index `j * xs.len() + i`.
+    pub fn structured(xs: &[f64], ys: &[f64]) -> Mesh {
+        let (nx, ny) = (xs.len(), ys.len());
+        let mut xy = Vec::with_capacity(nx * ny);
+        for &y in ys {
+            for &x in xs {
+                xy.push([x, y]);
+            }
+        }
+        let idx = |i: usize, j: usize| j * nx + i;
+        let mut tri = Vec::with_capacity((nx - 1) * (ny - 1) * 2);
+        for j in 0..ny - 1 {
+            for i in 0..nx - 1 {
+                // Alternate the diagonal so the mesh has no systematic directional bias, which
+                // would show up as a small anisotropy in the extracted capacitance.
+                if (i + j) % 2 == 0 {
+                    tri.push([idx(i, j), idx(i + 1, j), idx(i + 1, j + 1)]);
+                    tri.push([idx(i, j), idx(i + 1, j + 1), idx(i, j + 1)]);
+                } else {
+                    tri.push([idx(i, j), idx(i + 1, j), idx(i, j + 1)]);
+                    tri.push([idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1)]);
+                }
+            }
+        }
+        Mesh { xy, tri }
+    }
+
+    /// Every node lying on the axis-aligned segment from `p0` to `p1`, within `tol`.
+    /// Used to name conductor surfaces; an empty result means the geometry missed the grid.
+    pub fn nodes_on_segment(&self, p0: [f64; 2], p1: [f64; 2], tol: f64) -> Vec<usize> {
+        let (lo_x, hi_x) = (p0[0].min(p1[0]) - tol, p0[0].max(p1[0]) + tol);
+        let (lo_y, hi_y) = (p0[1].min(p1[1]) - tol, p0[1].max(p1[1]) + tol);
+        (0..self.xy.len())
+            .filter(|&i| {
+                let p = self.xy[i];
+                p[0] >= lo_x && p[0] <= hi_x && p[1] >= lo_y && p[1] <= hi_y
+            })
+            .collect()
+    }
+
+    /// Centroid of an element, for deciding which material region it belongs to.
+    pub fn centroid(&self, t: usize) -> [f64; 2] {
+        let [a, b, c] = self.tri[t];
+        [
+            (self.xy[a][0] + self.xy[b][0] + self.xy[c][0]) / 3.0,
+            (self.xy[a][1] + self.xy[b][1] + self.xy[c][1]) / 3.0,
+        ]
+    }
+
     /// Ring `i` of an annulus mesh: inner boundary is 0, outer is `nr`.
     pub fn annulus_ring(nt: usize, ring: usize) -> std::ops::Range<usize> {
         ring * nt..(ring + 1) * nt
@@ -140,6 +197,25 @@ mod tests {
         }
         for i in Mesh::annulus_ring(nt, nr) {
             assert!((m.xy[i][0].hypot(m.xy[i][1]) - b).abs() < 1e-12, "outer ring");
+        }
+    }
+
+    #[test]
+    fn a_structured_grid_is_well_formed_and_lands_on_its_lines() {
+        let xs: Vec<f64> = vec![0.0, 0.3, 0.5, 0.9, 1.4];
+        let ys: Vec<f64> = vec![0.0, 0.2, 0.7];
+        let m = Mesh::structured(&xs, &ys);
+        assert_eq!(m.nodes(), 15);
+        assert_eq!(m.tri.len(), 4 * 2 * 2);
+        for t in 0..m.tri.len() {
+            assert!(m.double_area(t) > 0.0, "element {t} inverted");
+        }
+        // The interface line y = 0.2 must be findable, which is the whole point of naming the
+        // grid explicitly.
+        let seg = m.nodes_on_segment([0.3, 0.2], [0.9, 0.2], 1e-12);
+        assert_eq!(seg.len(), 3, "expected nodes at x = 0.3, 0.5, 0.9");
+        for i in seg {
+            assert!((m.xy[i][1] - 0.2).abs() < 1e-12);
         }
     }
 
