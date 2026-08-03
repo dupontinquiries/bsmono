@@ -292,6 +292,78 @@ pub fn tram(gpu: &mut Gpu) -> Model {
 // an EV variant also pulls harder off the line.
 
 /// Turn any model into its electric variant.
+/// Give a hovercar the parts that explain how it works.
+///
+/// These arrive as raw imports with no house style at all, and worse, with
+/// nothing on them that says why they float. So: a SKIRT lofted around the
+/// lower body (the plenum a cushion needs to work), four THRUSTER NOZZLES,
+/// and an underglow strip.
+///
+/// The nozzles go exactly where the physics samples its cushion — the four
+/// corners of the underside at 0.78 and 0.80 of the half-extents. That is
+/// the point of doing it: the model then shows the mechanic rather than
+/// decorating around it, and when a corner dips and pushes back hard, the
+/// thing pushing is visibly there.
+pub fn hoverize(gpu: &mut Gpu, base: &Model, accent: [f32; 4], h: crate::physics::Hover) -> Model {
+    let mut prims = base.prims.clone();
+    let (hl, hh, hw) = (base.half_len, base.half_h, base.half_w);
+
+    // the skirt: a shallow lofted band round the underside, wider at the
+    // middle where a plenum would be
+    let skirt = [
+        (-hl * 0.82, hw * 0.66, -hh * 0.98, -hh * 0.52, 0.60),
+        (-hl * 0.30, hw * 0.94, -hh * 1.02, -hh * 0.46, 0.45),
+        (hl * 0.30, hw * 0.94, -hh * 1.02, -hh * 0.46, 0.45),
+        (hl * 0.82, hw * 0.70, -hh * 0.98, -hh * 0.52, 0.60),
+    ];
+    prims.push(body_prim(
+        gpu,
+        part(meshgen::loft(&skirt, 20), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO),
+        [0.10, 0.11, 0.13, 1.0],
+    ));
+
+    // FOUR NOZZLES, at the cushion's own sample points
+    for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+        let at = Vec3::new(sx * hw * 0.78, -hh * 0.92, sz * hl * 0.80);
+        // the housing
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::wheel(0.5, 14), Vec3::splat(hh * 0.46), Quat::from_rotation_z(std::f32::consts::FRAC_PI_2), at),
+            [0.16, 0.17, 0.20, 1.0],
+        ));
+        // and the throat it blows through, lit
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::sphere(9, 12), Vec3::new(hh * 0.28, hh * 0.10, hh * 0.28), Quat::IDENTITY, at - Vec3::Y * hh * 0.10),
+            accent,
+        ));
+    }
+
+    // underglow along the sills, brighter on a stiffer cushion — a hovercar
+    // that rides hard should look like it
+    let glow = (h.stiff / 70.0).clamp(0.25, 1.0);
+    for sx in [-1.0f32, 1.0] {
+        prims.push(body_prim(
+            gpu,
+            part(meshgen::cbox(0.30), Vec3::new(0.012, 0.010, hl * 0.62), Quat::IDENTITY, Vec3::new(sx * hw * 0.92, -hh * 0.80, 0.0)),
+            [accent[0] * glow, accent[1] * glow, accent[2], 1.0],
+        ));
+    }
+
+    Model {
+        prims,
+        drive: base.drive,
+        hover: base.hover,
+        cloud: base.cloud.clone(),
+        cloud_n: base.cloud_n.clone(),
+        sdf_half: base.sdf_half,
+        half_len: hl,
+        half_h: hh,
+        half_w: hw,
+        wheel_r: base.wheel_r,
+    }
+}
+
 pub fn electrify(gpu: &mut Gpu, base: &Model, accent: [f32; 4]) -> Model {
     let mut prims = base.prims.clone();
     let (hl, hh) = (base.half_len, base.half_h);

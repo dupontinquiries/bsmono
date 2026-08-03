@@ -4926,6 +4926,23 @@ pub fn run(args: &[String]) {
             println!("   redirect: {before:.1} -> {:.1} m/s", fast.vel.length());
             check("a moving ball is sped up, not stopped", fast.vel.length() > before);
         }
+        // ---- THE MODEL SHOWS THE MECHANIC ----
+        // The cushion samples four corners of the underside; the nozzles are
+        // drawn at those same points, so what pushes back is visibly there.
+        // That correspondence is the reason to bother, and it is exactly the
+        // sort of thing that drifts the moment either number is tuned — so
+        // both are read from source and compared.
+        {
+            let phys = include_str!("physics.rs");
+            let art = include_str!("procars.rs");
+            let phys_pt = phys.contains("car.half_w * 0.78, -car.half_h, sz * car.half_len * 0.80");
+            let art_pt = art.contains("sx * hw * 0.78, -hh * 0.92, sz * hl * 0.80");
+            let four_art = art.matches("for (sx, sz) in [(-1.0f32, -1.0f32), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]").count();
+            println!();
+            println!("   cushion samples 4 corners at 0.78/0.80: {phys_pt}");
+            println!("   nozzles drawn at 0.78/0.80:             {art_pt}");
+            check("the nozzles sit where the cushion pushes", phys_pt && art_pt && four_art >= 1);
+        }
         println!("{}", if pass { "HOVER: PASS" } else { "HOVER: FAIL" });
         return;
     }

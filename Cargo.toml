@@ -1,6 +1,6 @@
 [package]
 name = "skydribble"
-version = "1.106.0"
+version = "1.107.0"
 edition = "2021"
 description = "Rocket-League-inspired open-world air-dribble playground: Rust + wgpu, SDF-generated playful shapes, real RL car/ball models."
 

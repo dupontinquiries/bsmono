@@ -3505,6 +3505,32 @@ that the cars feel different to drive. For competitive play it would be the
 wrong one, and if that ever matters the fix is to snap the hitboxes onto a
 handful of presets while leaving the bodies alone.
 
+## v1.107.0 — the hovercars show how they work
+
+The fourteen hovercars were the last part of the catalogue with no house
+style on them at all: raw imports, and worse, with nothing about them
+saying WHY they float. A car that hovers should look like it hovers.
+
+`hoverize` gives every one of them the same three things, the way
+`electrify` does for EVs:
+
+  A SKIRT — a shallow lofted band round the underside, wider at the middle,
+  which is where a cushion's plenum would be.
+
+  FOUR NOZZLES — and this is the point of the exercise. They are drawn at
+  exactly the four points where the physics samples its cushion: 0.78 of the
+  half-width, 0.80 of the half-length, on the underside. So when a corner
+  dips and pushes back hardest, the thing doing the pushing is visibly
+  there. The model explains the mechanic instead of decorating around it.
+
+  UNDERGLOW along the sills, brighter on a stiffer cushion — a hovercar that
+  rides hard looks like it does.
+
+That correspondence is exactly the sort of thing that drifts the moment
+either number is tuned, so `--sim hover` reads BOTH the physics and the art
+from source and fails if they stop agreeing. It is a cheap check for a
+detail that would otherwise quietly become a lie.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -937,6 +937,10 @@ fn main() {
         let mut m = model::load(&hover_dir.join(name), &mut gpu, *len);
         m.hover = Some(*h);
         m.drive = model::Drive::Electric; // nothing here burns fuel
+        // the parts that explain the chassis: skirt, four nozzles at the
+        // cushion's own sample points, and underglow
+        let accent = [0.35, 0.85, 1.0, 1.0];
+        m = procars::hoverize(&mut gpu, &m, accent, *h);
         hovercars.push(m);
     }
     // imported bodies (single-file .glb, geometry and materials inline)
