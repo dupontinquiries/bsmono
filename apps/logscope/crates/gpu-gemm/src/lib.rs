@@ -3662,7 +3662,10 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             let base = r * k + b * 32;
                             let mut amax = 0f32;
                             for j in 0..32 { amax = amax.max(w[base + j].abs()); }
-                            let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                            // The GPU cannot divide exactly here — see Q4K_TO_Q4: this driver
+                            // lowers `/` to a multiply by an f32-rounded reciprocal. Matching it is
+                            // the only way the two agree, and the reference is what moves.
+                            let scale = if amax > 0.0 { amax * (1.0f32 / 7.0) } else { 1.0 };
                             qs_c[lr * kb + b] = scale;
                             for j in 0..32 {
                                 let q = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
@@ -4050,7 +4053,10 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                                 let base = r * k + b * 32;
                                 let mut amax = 0f32;
                                 for j in 0..32 { amax = amax.max(w[base + j].abs()); }
-                                let scale = if amax > 0.0 { amax / 7.0 } else { 1.0 };
+                                // The GPU cannot divide exactly here — see Q4K_TO_Q4: this driver
+                            // lowers `/` to a multiply by an f32-rounded reciprocal. Matching it is
+                            // the only way the two agree, and the reference is what moves.
+                            let scale = if amax > 0.0 { amax * (1.0f32 / 7.0) } else { 1.0 };
                                 qs_c[rr * kb + b] = scale;
                                 for j in 0..32 {
                                     let qv = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
@@ -14135,7 +14141,23 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
         if (v == v) { amax = max(amax, v); }   // NaN-skipping, matching Rust's f32::max
     }
     var scale = 1.0;
-    if (amax > 0.0) { scale = amax / 7.0; }
+    // MULTIPLY BY THE RECIPROCAL, matching what this driver does to `/` anyway.
+  //
+  // Metal's default fast-math lowers float division to a multiply by an f32-rounded reciprocal,
+  // which is allowed 2.5 ULP and is NOT correctly rounded. That is the entire bug:
+  //
+  //     amax               0x400D3BF0
+  //     amax / 7.0         0x3EA16912   <- what the CPU computes
+  //     amax * f32(1/7)    0x3EA16913   <- what the GPU actually computed
+  //
+  // Both reproduce exactly, so there is nothing left to guess. The dequant was always exact (the wq
+  // probe: 0 of 3584 differ), the reduction is `max` and therefore exact, and division was the one
+  // operation in the chain I never tested — because I checked the reciprocal in DOUBLE precision,
+  // where it round-trips and hides this.
+  //
+  // Written as an explicit reciprocal so the source says what the hardware does. The CPU reference is
+  // changed to match in the same commit; a division here would keep silently becoming this anyway.
+  if (amax > 0.0) { scale = amax * 0.14285714285714285; }
     let bi = blk * 8u + j;               // global index of this 32-block
     dst[dims.qs_off + bi] = bitcast<u32>(scale);
     // pack 8 nibbles per word, 4 words per 32-block
