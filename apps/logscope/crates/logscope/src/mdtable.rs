@@ -1,5 +1,30 @@
 //! mdtable.rs — recovering a table from output that nearly is one.
 //!
+//! # THIS DUPLICATES `voiceterm/src/table_ops.rs` AND SHOULD NOT SURVIVE
+//!
+//! `parse_markdown_table` there already does this, and does one thing better: it handles ESCAPED
+//! pipes (`\|`) inside cells, which this does not. By inspection it also handles the Qwen case that
+//! motivated this module — `split_md_row` STRIPS a leading pipe rather than requiring one, so a row
+//! that lost its leading pipe parses correctly.
+//!
+//! I could not run its tests to confirm: voiceterm needs Qt to build and this container has no Qt.
+//! So that is a reading, not a measurement, and the tests I added there are unverified.
+//!
+//! **The right fix is to move `table_ops` into `shared/` and delete this.** It lives in an app, so
+//! logscope cannot use it today; that is the only reason this exists at all.
+//!
+//! Two behaviours here differ and are worth carrying over rather than losing:
+//!
+//! * an overlong row is MERGED into the last cell rather than truncated — the surplus is nearly
+//!   always an unescaped pipe, so truncating drops text the model meant to convey
+//! * repairs are REPORTED, so a renderer can show the table and still be honest the source was
+//!   malformed
+//!
+//! This is the fifth duplicate implementation found in this session. The previous four —
+//! `Peer`, `Beacon`, two Q4_K dequant paths, two CPU quantizers — were each found by a compiler
+//! error or a failing gate. This one was found by being asked to look, which is cheaper and should
+//! have been the first move.
+//!
 //! A small model asked for a table produces something table-shaped and not quite valid. From a real
 //! Qwen transcript:
 //!
