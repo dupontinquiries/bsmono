@@ -390,6 +390,160 @@ PLACEMENT = {
 }
 
 
+# =====================================================================
+# AERODYNAMICS PER PART
+#
+# lift.rs classifies a whole chassis as Wing, Rotor or Thrust. That is the
+# right model-level answer and it is far too coarse to route air: a hovercar
+# with its wheels tucked inside has different drag from the same body with
+# them hanging out, a duct passes air through rather than around, and a
+# spoiler and a wing are the same plate at opposite angles of attack.
+#
+# All of it is computable from the point cloud, and none of it needs a wind
+# tunnel — what a part does to air is decided by its projected area, the
+# asymmetry of its surface about the flow, and whether the flow can get
+# THROUGH it.
+# =====================================================================
+
+def frontal_area(pts, d, cells=28):
+    """Projected area along `d`, by occupancy of the shadow it casts.
+
+    A silhouette rather than a sum of facet areas: a hollow duct casts a RING
+    and a solid cylinder casts a disc, and that difference is the whole point
+    of the duct.
+    """
+    d = np.asarray(d, float)
+    d = d / max(np.linalg.norm(d), 1e-9)
+    a = np.array([0.0, 1.0, 0.0])
+    if abs(a @ d) > 0.9:
+        a = np.array([1.0, 0.0, 0.0])
+    u = np.cross(a, d); u /= max(np.linalg.norm(u), 1e-9)
+    v = np.cross(d, u)
+    p = np.stack([pts @ u, pts @ v], 1)
+    lo, hi = p.min(0), p.max(0)
+    span = np.maximum(hi - lo, 1e-9)
+    idx = np.clip(((p - lo) / span * cells).astype(int), 0, cells - 1)
+    mask = np.zeros((cells, cells), bool)
+    mask[idx[:, 0], idx[:, 1]] = True
+    # FILL FRACTION MUST BE DENSITY-INDEPENDENT. Counting occupied cells
+    # against the whole grid measures how many points were sampled, not
+    # whether there is a hole: 900 shell points over 784 cells fills about
+    # half of them whatever the shape, so a solid box read 0.61 "through"
+    # and a duct 0.86 — the same number, differently rounded.
+    #
+    # A hole is a gap BETWEEN the extremes of a row. Scan each row and each
+    # column, count cells that lie inside the silhouette's span but are
+    # empty, and that is the hole — density cancels because both the span
+    # and the gaps scale with it.
+    inside = 0
+    empty = 0
+    for axis in (0, 1):
+        m = mask if axis == 0 else mask.T
+        for row in m:
+            hit = np.nonzero(row)[0]
+            if len(hit) < 2:
+                continue
+            seg = row[hit[0]:hit[-1] + 1]
+            inside += len(seg)
+            empty += int((~seg).sum())
+    hole = empty / max(inside, 1)
+    area = float(span[0] * span[1]) * (inside / max(2 * cells * cells, 1)) * 2.0
+    return area, 1.0 - hole
+
+
+def aero(pts, flow=(0.0, 0.0, -1.0)):
+    """What this part does to air moving along `flow` (default: nose-first).
+
+    Returns drag area, lift coefficient, through-flow, blade count and the
+    angle of attack. Every one is a measurement, not a lookup.
+    """
+    c = pts.mean(0)
+    q = pts - c
+    f = np.asarray(flow, float); f /= max(np.linalg.norm(f), 1e-9)
+    up = np.array([0.0, 1.0, 0.0])
+    side = np.cross(up, f); side /= max(np.linalg.norm(side), 1e-9)
+
+    a_front, fill_front = frontal_area(q, f)
+    a_side, _ = frontal_area(q, side)
+    a_top, _ = frontal_area(q, up)
+
+    # THROUGH-FLOW: how much of the frontal silhouette is hole. A duct's
+    # shadow is a ring, so its filled fraction is low while its bounding
+    # area is large; a solid box fills its shadow completely.
+    through = float(1.0 - fill_front)
+
+    # CAMBER, hence lift. Split the cloud above and below the chord plane and
+    # compare how far each side bulges. A symmetric plate gives 0; a wing
+    # section gives a signed number, and the sign is which way it pushes.
+    h = q @ up
+    span_ax = q @ side
+    band = np.abs(span_ax) < (np.abs(span_ax).max() * 0.6 + 1e-9)
+    if band.sum() > 12:
+        hi = h[band][h[band] > 0]
+        lo = h[band][h[band] < 0]
+        camber = float((hi.mean() if len(hi) else 0.0) + (lo.mean() if len(lo) else 0.0))
+        camber /= max(np.abs(h).max(), 1e-9)
+    else:
+        camber = 0.0
+
+    # ANGLE OF ATTACK: the plate's own normal against the flow. For a thin
+    # part the normal is its shortest principal axis.
+    e = q.max(0) - q.min(0)
+    nrm = np.zeros(3)
+    nrm[int(np.argmin(e))] = 1.0
+    aoa = float(math.degrees(math.asin(min(1.0, abs(nrm @ f)))))
+
+    # BLADES: angular clustering about the flow axis. A propeller has mass in
+    # a few sectors and nothing between; a disc has mass everywhere.
+    # A PLATE IS NOT A PROPELLER. Angular occupancy alone flagged plates,
+    # fins and hover pads at four "blades" — the corners of a rectangle sit
+    # in four sectors. A propeller also needs its mass at a CONSISTENT
+    # RADIUS (blades reach out equally) and a disc-like footprint, so both
+    # are required before the count means anything.
+    ang = np.arctan2(q @ side, q @ up)
+    rad_f = np.linalg.norm(q - np.outer(q @ f, f), axis=1)
+    hist, _ = np.histogram(ang, bins=24, range=(-math.pi, math.pi))
+    occupied = int((hist > hist.max() * 0.25).sum()) if hist.max() > 0 else 0
+    outer = rad_f > rad_f.max() * 0.6
+    radial_even = outer.sum() > 20 and float(rad_f[outer].std() / max(rad_f.max(), 1e-9)) < 0.12
+    # a DISC, not a strip: thin in one axis and roughly equal in the other
+    # two. Without the second condition a fin passes — it is thin, and its
+    # corners land in enough angular sectors to look like blades.
+    so = np.sort(e)
+    disc_like = so[0] / max(so[2], 1e-9) < 0.5 and so[1] / max(so[2], 1e-9) > 0.55
+    # PROPELLER DETECTION IS DISABLED, and honestly so. Three attempts:
+    # angular occupancy alone flagged every rectangle (four corners, four
+    # sectors); adding a constant-radius test and a disc test fixed the
+    # plates and then rejected an actual four-bladed rotor, which reads 0.
+    # Wrong in both directions is worse than absent — a false propeller
+    # would put rotational force on a spoiler.
+    #
+    # The measure it wants is angular occupancy of the OUTER ANNULUS only,
+    # where blades are and a plate's corners are not, and it needs testing
+    # against real rotor geometry rather than my synthetic disc. Until then
+    # this reports 0 and the caller can see there is no propeller data,
+    # instead of trusting a number that is noise.
+    _ = (occupied, radial_even, disc_like)
+    bladed = False
+
+    # drag area: frontal silhouette scaled by how bluff it is. A round nose
+    # sheds; a flat face does not.
+    r = np.linalg.norm(q - np.outer(q @ f, f), axis=1)
+    bluff = float(r.mean() / max(r.max(), 1e-9))
+    cd = 1.05 - 0.6 * bluff
+    return {
+        "drag_area": a_front * cd * (1.0 - through),
+        "cd": cd,
+        "frontal": a_front,
+        "side": a_side,
+        "plan": a_top,
+        "through": through,
+        "camber": camber,
+        "aoa": aoa,
+        "blades": occupied if bladed else 0,
+    }
+
+
 def synth(n_each=18, seed=7):
     """Build the exemplar table: features + label, measured by describe()."""
     g = _rng(seed)
