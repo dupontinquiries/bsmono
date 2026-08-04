@@ -7,6 +7,10 @@
 //!
 //! The display maths are pure and unit-tested; only the drawing needs egui.
 
+/// The barometric gauge — absolute reading plus the trend that actually
+/// predicts weather.
+pub mod pressure;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
@@ -24,6 +28,13 @@ pub struct LiveSnapshot {
     pub series: Vec<f32>,
     pub condition: String,
     pub updated: u64,
+    /// Barometric pressure and its trend, when the device has a sensor.
+    ///
+    /// `None` means no barometer — distinct from a reading with an unknown
+    /// trend, and the view draws nothing rather than an empty gauge. A dial
+    /// pinned at its minimum is indistinguishable from a real low-pressure
+    /// reading, which is the worst way to say "no sensor".
+    pub pressure: Option<pressure::Pressure>,
 }
 
 impl LiveSnapshot {
@@ -79,6 +90,7 @@ impl LiveView {
         snap: &LiveSnapshot,
         contacts: &[(String, String)],
         share: &mut WeatherShare,
+        colors: &uikit_egui::PaletteColors,
     ) {
         // Focal temperature — eased toward the latest reading so it glides rather than snaps.
         let shown = ui.ctx().animate_value_with_time(
@@ -91,6 +103,15 @@ impl LiveView {
                 ui.label(egui::RichText::new(&snap.location).weak());
             }
             ui.label(egui::RichText::new(format_temp(shown)).size(72.0).strong());
+
+            // The gauge eases like the temperature does, so the whole page
+            // moves at one speed rather than the number gliding while the
+            // needle jumps.
+            if let Some(p) = snap.pressure {
+                let eased = ui.ctx().animate_value_with_time(
+                    egui::Id::new("ambient_pressure_needle"), p.needle(), 0.4);
+                pressure::gauge_ui(ui, p, eased, colors);
+            }
 
             let (clabel, ctarget) = confidence_tint(snap.confidence);
             let ccol = motion::animate_color(ui.ctx(), egui::Id::new("ambient_conf_col"), ctarget, 0.2);

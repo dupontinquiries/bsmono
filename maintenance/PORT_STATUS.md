@@ -297,7 +297,10 @@ so the app behaves as though it had none. That inverts the usual default and is
 the right way round — a screensaver that dimmed when unsure would black out a
 phone with no proximity sensor at all.
 
-**`ambient-learner` has NOT been ported at all.** It is a whole app —
+**`ambient-learner` was partly ported after all** — see the correction below.
+The original note read:
+
+> **`ambient-learner` has NOT been ported at all.** It is a whole app —
 `iio_proxy.rs`, `environment.rs`, `world_state.rs`, an animated background
 driven by real sensor readings — and it has no egui frontend and no row in the
 parity table. It is the largest genuinely unported thing found so far, and it is
@@ -420,3 +423,37 @@ Undefined, since Undefined would re-arm the ratchet.
 
 Still not wired: nothing polls this yet. It is a reader with no caller, which is
 the same honest gap as the temperature seam.
+
+## Correction: ambient-learner was partly ported
+
+An earlier section here said ambient-learner "has NOT been ported at all". That
+was wrong, and grepping before writing caught it: `src/ui/egui/mod.rs` already
+holds a 214-line port of the **Live page**, with eased temperature, an animated
+confidence tint and a weather-share row. What is missing is the rest —
+`HistoryPage`, `LocationsPage`, `MapPage`, `ModelPage`, `SyncPage`, and the
+small pieces.
+
+It is still invisible to the parity audit, which only walks apps with an
+`egui-frontend` directory. ambient-learner puts its port at `src/ui/egui`
+instead, so the tool has never seen it. That is a tooling gap rather than a
+porting one, and it is the reason the app looked untouched.
+
+**`PressureGauge` is now ported** into that module and drawn on the Live page.
+The interesting rule is that an unknown trend is not a steady one:
+`environment::pressure_trend_hpa` returns `None` until it has four samples over
+five minutes, because a barometer wobbles and a short window extrapolates
+nonsense. Rendering that as "steady" would claim settled weather right before a
+storm, so `Trend::Unknown` is its own state and reads "collecting readings".
+
+The needle saturates outside 980–1040 hPa rather than rescaling the dial — an
+extreme value means "weather event" whatever the number, and a dial that
+stretched to fit one outlier would flatten every ordinary day into the middle.
+Saturation shows in the needle's colour, because a needle pinned at the edge
+otherwise looks like a stuck one. `LiveSnapshot::pressure` is an `Option`, and
+`None` draws nothing: a dial at its minimum is indistinguishable from a real
+low-pressure reading, which is the worst possible way to say "no barometer".
+
+**Building it needs `--no-default-features --features egui`.** The default
+feature is `gtk`, which pulls pango and libadwaita and does not build in this
+container. Same shape as logscope's lean build: the flag exists, and nothing was
+exercising it.
