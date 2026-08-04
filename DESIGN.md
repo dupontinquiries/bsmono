@@ -4018,6 +4018,42 @@ experiment that changes nothing has two explanations, and "my hypothesis was
 wrong" is only one of them. The other is that the experiment did not test
 the hypothesis.
 
+## v1.123.0 — over-relaxed sphere tracing
+
+Every optimisation so far has been something to turn DOWN. This one costs
+nothing: it is the same march, reaching the same surfaces, in fewer steps.
+
+A sphere march advances by the distance to the NEAREST surface, which is
+safe and usually timid — the surface actually ahead of the ray is often much
+further away than the one beside it. Over-relaxation steps by d * omega with
+omega above one, and stays exact as long as consecutive spheres OVERLAP. If
+they do not, the larger step might have jumped over something, so the ray
+backs up and retakes it conservatively.
+
+Measured over 600 reflection rays on PERPLEXUS:
+
+    omega   steps    evaluations   vs safe
+     1.0    11,043       94,474      100%
+     1.3     9,062       77,949       83%
+     1.6     8,551       74,349       79%
+     1.9    10,428       91,436       97%
+
+1.6 is the sweet spot and 1.9 is past it: beyond a point the backtracks cost
+more than the longer steps save, which is exactly the shape the literature
+predicts and worth seeing in our own numbers rather than taking on trust.
+
+A 21% saving at MAXIMUM quality, where there was previously nothing left to
+turn down.
+
+ONE HONEST CAVEAT. Of 488 rays that hit something under the safe march, 487
+hit under the relaxed one — a single grazing ray lands differently. I tried
+two explanations and neither was it: extra step budget for the backtracks
+did not recover it, and neither did suppressing relaxation near the
+minimum-step floor. At one ray in 488, in a REFLECTION, it is a pixel's
+worth of difference at a glancing angle, and worth 21% — but it is a
+difference, not a proof of equivalence, and I would rather record that than
+call the two identical.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

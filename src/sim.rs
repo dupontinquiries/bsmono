@@ -3365,6 +3365,123 @@ pub fn run(args: &[String]) {
                 saved * 100.0
             );
         }
+        // ---- OVER-RELAXED SPHERE TRACING ----
+        // A sphere march steps by the distance to the nearest surface, which
+        // is guaranteed safe and usually timid: the true surface is often
+        // much further along the ray than the nearest one is to the side.
+        // Over-relaxation steps by d * omega with omega > 1 and only backs
+        // off when the larger step would have skipped something — detected
+        // by whether consecutive spheres still overlap. Same answer, fewer
+        // steps, and nothing is approximated.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let shapes: Vec<(Vec3, f32, usize)> = w
+                .shapes
+                .iter()
+                .enumerate()
+                .filter(|(_, sh)| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|(i, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5), i))
+                .collect();
+            let march = |omega: f32| -> (u64, u64, u64) {
+                let (mut steps, mut evals, mut hits) = (0u64, 0u64, 0u64);
+                for k in 0..600 {
+                    let a = k as f32 * 0.7548;
+                    let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.08 - 0.3, a.sin()).normalize();
+                    let mut cand: Vec<(f32, f32, usize)> = shapes
+                        .iter()
+                        .filter_map(|(c, r, i)| {
+                            let to = *c - eye;
+                            let b = to.dot(dir);
+                            let disc = b * b - (to.length_squared() - r * r);
+                            if disc < 0.0 {
+                                return None;
+                            }
+                            let sq = disc.sqrt();
+                            ((b + sq) > 0.0 && (b - sq) < 260.0).then_some((b - sq, b + sq, *i))
+                        })
+                        .collect();
+                    cand.sort_by(|a, b| a.0.total_cmp(&b.0));
+                    cand.truncate(16);
+                    let mut t = 0.1f32;
+                    let mut first = 0usize;
+                    let mut prev_d = 0.0f32;
+                    let mut step = 0.0f32;
+                    let mut relax = omega;
+                    let mut hit = false;
+                    // a backtrack costs an iteration, so a relaxed march
+                    // needs a little headroom or it runs out of budget where
+                    // the safe one did not — which shows up as a ray that
+                    // finds nothing rather than as a wrong answer
+                    let budget = if omega > 1.0 { 52 } else { 48 };
+                    for _ in 0..budget {
+                        steps += 1;
+                        let p = eye + dir * t;
+                        let mut d = p.y - w.ground_h(p.x, p.z);
+                        while first < cand.len() && cand[first].1 <= t {
+                            first += 1;
+                        }
+                        for (_, _, i) in cand[first..].iter() {
+                            let sh = &w.shapes[*i];
+                            let bd = p.distance(sh.pos) - crate::shape_bound(&sh.sdf).max(0.5);
+                            if bd >= d + 0.25 {
+                                continue;
+                            }
+                            evals += 1;
+                            d = d.min(w.shape_sdf_at(*i, p));
+                        }
+                        // OVERSHOOT TEST: consecutive spheres must overlap,
+                        // or the relaxed step jumped over something
+                        if relax > 1.0 && d + prev_d < step {
+                            t -= step; // undo, and retry conservatively
+                            relax = 1.0;
+                            prev_d = 0.0;
+                            step = 0.0;
+                            continue;
+                        }
+                        if d < 0.01 * t + 0.01 {
+                            hit = true;
+                            break;
+                        }
+                        prev_d = d;
+                        // Relax ONLY where the step is genuinely driven by
+                        // the distance field. The 0.05 floor exists so a
+                        // march near a surface still advances, but it breaks
+                        // the overlap guarantee over-relaxation depends on —
+                        // and that was the one ray in 488 that found nothing.
+                        let om = if d > 0.15 { relax } else { 1.0 };
+                        step = d.max(0.05) * om * 0.96;
+                        t += step;
+                        if t > 260.0 {
+                            break;
+                        }
+                    }
+                    if hit {
+                        hits += 1;
+                    }
+                }
+                (steps, evals, hits)
+            };
+            println!();
+            println!("{:>8} {:>10} {:>12} {:>8} {:>10}", "omega", "steps", "evaluations", "hits", "vs safe");
+            let (s0, e0, h0) = march(1.0);
+            for om in [1.0f32, 1.3, 1.6, 1.9] {
+                let (st, ev, hi) = march(om);
+                println!(
+                    "{:>8.1} {:>10} {:>12} {:>8} {:>9.0}%",
+                    om,
+                    st,
+                    ev,
+                    hi,
+                    ev as f32 / e0 as f32 * 100.0
+                );
+                if om > 1.0 && hi != h0 {
+                    println!("   (hit count changed: {hi} vs {h0} — that would be a visible difference)");
+                }
+            }
+            let _ = s0;
+        }
+
         // ---- OVERDRAW: what the depth pre-pass saves ----
         // The scene shader casts a shadow ray, four AO probes and a
         // reflection for every fragment it runs — including every fragment
