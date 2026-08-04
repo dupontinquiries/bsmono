@@ -375,3 +375,48 @@ The host wiring: nothing yet reads `aux_temp_c` into `glove.ambient_c`, polls a
 tilt vector, or feeds transcripts in. snapclone holds the cursor and applies its
 actions, but the three seams are unconnected — this is a working engine behind
 an unconnected socket, and saying so is the point of this section.
+
+## Reading the accelerometer in Rust: not kernel work
+
+Answered by reading iio-sensor-proxy's own source rather than guessing.
+
+**It is userspace.** `drv-iio-poll-accel.c` does exactly three things: read
+`in_accel_{x,y,z}_raw` from a sysfs directory and multiply by a scale. Plain
+file I/O against an interface the kernel's IIO core already exports — no module,
+no ioctl, no privilege. `iio_accel.rs` is that, in Rust.
+
+**Sharing depends on which driver the daemon is using, and that is knowable.**
+
+* `drv-iio-poll-accel` — sysfs on a timer, nothing claimed. A second reader
+  coexists; both processes read the same files.
+* `drv-iio-buffer-accel` — opens `/dev/iio:deviceN` and ENABLES THE RING BUFFER.
+  While that is enabled the IIO core refuses `*_raw` sysfs reads with `EBUSY`.
+
+So `EBUSY` is not a transient to retry through — it is the daemon saying it owns
+the device in buffered mode. `Reading::Contended` names that case so a caller
+falls back to the D-Bus strings instead of spinning.
+
+**Passing data INTO iio-sensor-proxy is not possible**, and it is better to say
+so than leave it open. The daemon is a reader of kernel devices that exports
+over D-Bus: no ingest path, no socket, no shared buffer, drivers compiled in and
+discovered through udev. Handing it a vector would mean writing a new driver
+into the daemon (C, upstream) or presenting a fake IIO device to the kernel —
+which IS the kernel-adjacent work the question was trying to avoid.
+
+The direction that works is the opposite one, and it is what this takes: read
+the same sysfs the daemon reads, and **classify identically**. `orientation.c`'s
+thresholds — 35° portrait, 35° landscape, 70° face-down, 20° tilt, and the
+`SAME_AXIS_LIMIT` hysteresis — are copied rather than invented, because a Rust
+reader with its own numbers would make the glove ratchet fire at different
+angles depending on which backend happened to be available. That is the worst
+kind of bug: it works on the developer's phone.
+
+The hysteresis is the part that matters most for gestures. Two branches return
+the previous orientation unchanged — corner-up, and flat — and dropping them
+would let the reading flap at a border, which the ratchet would see as spurious
+flicks from a hand that is merely holding the phone at an angle. A contended or
+absent read also keeps the last classification rather than resetting to
+Undefined, since Undefined would re-arm the ratchet.
+
+Still not wired: nothing polls this yet. It is a reader with no caller, which is
+the same honest gap as the temperature seam.
