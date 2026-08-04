@@ -533,3 +533,102 @@ mod tally_tests {
         assert!(t.report(6.33, 21.0).is_none());
     }
 }
+
+/// Can this layer take the GPU-routed path even though the model streams?
+///
+/// # The condition is not what the guard assumes
+///
+/// `moe_ffn_gpu_routed` is gated on `m.stream.is_none()`, and the reason is real: the routed path
+/// selects experts on the device, so the CPU never learns which ones — and a streaming model needs
+/// the CPU to know, in order to fetch them.
+///
+/// **But that is a property of the LAYER, not the MODEL.** If every expert for this layer is already
+/// pinned, any selection the device makes is a cache hit, so there is nothing to fetch and nothing
+/// for the CPU to learn. The layer can route on-device while the model as a whole still streams.
+///
+/// # Why this matters more than it looks
+///
+/// Scout's decode is 99.9% CPU-wait from one blocking readback per layer. Every layer that qualifies
+/// removes one readback. The condition is per-layer, so the benefit is proportional rather than
+/// all-or-nothing — a model with half its layers fully pinned loses half its stalls.
+///
+/// # And it is what makes IQ1_S experts worth having
+///
+/// Scout pins 6 of 16 experts at q4, so no layer qualifies today. At IQ1_S the expert bytes are 2.88x
+/// smaller, so the same budget holds ~17 of 16 — every layer qualifies. **That is the chain: narrower
+/// experts, more pinned, whole layers resident, on-device routing, no readback.** The memory saving
+/// is not the point; it is the means.
+pub fn layer_can_route(pinned: &[u32], n_experts: u32) -> bool {
+    // Every expert, not merely enough of them. A selection the device makes is unknown to the CPU, so
+    // a single unpinned expert means a possible miss the CPU cannot service — and a miss it cannot
+    // service is worse than the stall this avoids.
+    n_experts > 0 && (0..n_experts).all(|e| pinned.contains(&e))
+}
+
+/// How many of a model's layers could route, given a per-layer pin set.
+pub fn routable_layers(per_layer_pinned: &[Vec<u32>], n_experts: u32) -> usize {
+    per_layer_pinned.iter().filter(|p| layer_can_route(p, n_experts)).count()
+}
+
+/// The share of per-layer readbacks this removes, 0..1 — which is the share of the stall removed,
+/// since the stalls are one per layer and equal in cost.
+pub fn stall_reduction(per_layer_pinned: &[Vec<u32>], n_experts: u32) -> f32 {
+    if per_layer_pinned.is_empty() { return 0.0 }
+    routable_layers(per_layer_pinned, n_experts) as f32 / per_layer_pinned.len() as f32
+}
+
+#[cfg(test)]
+mod route_condition_tests {
+    use super::*;
+
+    #[test]
+    fn a_FULLY_PINNED_layer_can_route_while_the_model_streams() {
+        // The insight: stream.is_none() is a property of the MODEL and the real constraint is a
+        // property of the LAYER. If nothing can miss, the CPU has nothing to fetch.
+        assert!(layer_can_route(&(0..16).collect::<Vec<_>>(), 16));
+    }
+
+    #[test]
+    fn ONE_unpinned_expert_disqualifies_the_layer() {
+        // Not "enough of them". A selection the device makes is unknown to the CPU, so a single
+        // unpinned expert means a possible miss the CPU cannot service — worse than the stall this
+        // avoids.
+        let mut p: Vec<u32> = (0..16).collect();
+        p.retain(|e| *e != 7);
+        assert!(!layer_can_route(&p, 16));
+    }
+
+    #[test]
+    fn SCOUT_TODAY_qualifies_for_nothing() {
+        // 6 of 16 pinned at q4. This is the honest baseline: the condition changes nothing until the
+        // experts get narrower.
+        let layers: Vec<Vec<u32>> = (0..48).map(|_| (0..6).collect()).collect();
+        assert_eq!(routable_layers(&layers, 16), 0);
+        assert_eq!(stall_reduction(&layers, 16), 0.0);
+    }
+
+    #[test]
+    fn IQ1_S_EXPERTS_would_qualify_every_layer() {
+        // 2.88x smaller experts in the same budget: 6 of 16 becomes all 16. That is the chain —
+        // narrower experts, more pinned, whole layers resident, on-device routing, no readback. The
+        // memory saving is the means, not the point.
+        let layers: Vec<Vec<u32>> = (0..48).map(|_| (0..16).collect()).collect();
+        assert_eq!(stall_reduction(&layers, 16), 1.0);
+    }
+
+    #[test]
+    fn the_benefit_is_PROPORTIONAL_not_all_or_nothing() {
+        // Half the layers fully pinned removes half the stalls, which makes a partial pin budget
+        // worth having rather than a failure.
+        let layers: Vec<Vec<u32>> = (0..48).map(|i| {
+            if i % 2 == 0 { (0..16).collect() } else { (0..6).collect() }
+        }).collect();
+        assert!((stall_reduction(&layers, 16) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_model_with_NO_experts_does_not_claim_to_route() {
+        // A dense model has no MoE path to take, and returning true would be a division by an idea.
+        assert!(!layer_can_route(&[], 0));
+    }
+}
