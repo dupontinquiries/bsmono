@@ -504,7 +504,12 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         // a memory plan needs and a forward pass must not have.
         10 => if n % 256 == 0 { Some(n / 256 * 84) } else { None },   // Q2_K
         11 => if n % 256 == 0 { Some(n / 256 * 110) } else { None },  // Q3_K
-        19 => if n % 256 == 0 { Some(n / 256 * 50) } else { None },  // IQ1_S: 50 B per 256 → 1.5625 bits/wt
+        19 => if n % 256 == 0 { Some(n / 256 * 50) } else { None },  // IQ1_S
+        // IQ1_M: 56 bytes per 256 weights, 1.75 bpw. THE SIZE IS ALL THAT IS SUPPORTED — see
+        // dequantize, which refuses it. Knowing the size lets the loader report an honest "this
+        // format needs a dequantizer" instead of "unknown tensor type", which is the difference
+        // between a five-minute answer and an afternoon.
+        29 => if n % 256 == 0 { Some(n / 256 * 56) } else { None },  // IQ1_M
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block
         20 => if n % 32 == 0 { Some(n / 32 * 18) } else { None }, // IQ4_NL: f16 d + 16B 4-bit codebook idx
@@ -684,6 +689,15 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             });
             Ok(out)
         }
+        // IQ1_M IS NOT IQ1_S WITH A DIFFERENT BLOCK SIZE. Both are ~1.6-1.75 bpw codebook
+        // formats and they lay their scales out differently: IQ1_S carries per-32 sub-scales in
+        // the block header, IQ1_M packs per-8 scales alongside the codebook indices. A
+        // dequantizer for one produces GARBAGE from the other — silently, because every length
+        // check passes and the output is plausible floats.
+        //
+        // Refused by name, so a run says which format it needs rather than failing as "unknown
+        // tensor type" or, worse, decoding it wrong. dot_iq1_s and MATVEC_IQ1_S are IQ1_S only.
+        29 => return Err("IQ1_M (type 29) has no dequantizer here — its per-8 scale layout differs from IQ1_S, so the IQ1_S path would decode it to garbage without failing. Use an IQ1_S build, or implement the IQ1_M decode first".into()),
         19 => {
             // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
             // 8 u16 `qh`. Each group of 8 weights takes an 11-BIT codebook index: 8 bits from qs plus 3
@@ -1094,5 +1108,33 @@ mod arch_tests {
     #[test]
     fn arch_defaults_to_llama_when_nothing_is_declared() {
         assert_eq!(g(vec![]).arch(), "llama");
+    }
+}
+
+#[cfg(test)]
+mod iq1m_tests {
+    use super::*;
+
+    #[test]
+    fn IQ1_M_has_a_known_SIZE_so_the_loader_can_report_honestly() {
+        // Knowing the size lets a run say "this format needs a dequantizer" instead of "unknown
+        // tensor type" — the difference between a five-minute answer and an afternoon.
+        assert_eq!(type_nbytes(29, 256), Some(56));
+        assert_eq!(type_nbytes(29, 512), Some(112));
+        assert_eq!(type_nbytes(19, 256), Some(50), "IQ1_S is 50, IQ1_M is 56 — different formats");
+    }
+
+    #[test]
+    fn IQ1_M_is_REFUSED_rather_than_decoded_by_the_IQ1_S_path() {
+        // The dangerous failure: every length check passes and the output is plausible floats. A
+        // model would load and generate confident nonsense.
+        let e = dequantize(29, &vec![0u8; 56], 256).unwrap_err();
+        assert!(e.contains("decode it to garbage without failing"), "{e}");
+        assert!(e.contains("Use an IQ1_S build"), "and say what to do instead");
+    }
+
+    #[test]
+    fn a_non_block_aligned_IQ1_M_tensor_has_no_size() {
+        assert_eq!(type_nbytes(29, 300), None);
     }
 }
