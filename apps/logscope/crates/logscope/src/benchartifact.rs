@@ -183,3 +183,105 @@ mod tests {
         assert!(REQUIRED_ARTIFACTS.contains(&"manifest.json"));
     }
 }
+
+/// What a driver's arithmetic actually does, measured rather than read from a spec.
+///
+/// **Every one of these was assumed correctly-behaved and was not**, and each cost a run:
+///
+/// * division lowered to an approximate reciprocal — broke Q4_K scales
+/// * `round()` implementing ties-away where the WGSL spec says ties-to-even
+/// * multiply-add contracted in one shader and not another, from identical source
+/// * a shift by a lane-varying amount returning zero for three lanes in four
+///
+/// A benchmark that compares two machines without recording these is comparing arithmetic, not
+/// performance. **The spec is not a substitute for the measurement** — reading it is what produced
+/// the ties-to-even change that made a gate 8.8x worse.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DriverProfile {
+    /// Does `a / b` match a correctly-rounded division?
+    pub exact_division: bool,
+    /// Does `round()` break ties away from zero (Metal) or to even (the WGSL spec)?
+    pub ties_away_from_zero: bool,
+    /// Does `a * b + c` contract into an FMA?
+    pub contracts_fma: bool,
+    /// Does a shift by a lane-varying amount work?
+    pub lane_varying_shift: bool,
+}
+
+impl DriverProfile {
+    /// The profile a spec-reader would predict. **Honeykrisp matches it on none of the four.**
+    pub fn by_the_spec() -> Self {
+        DriverProfile { exact_division: true, ties_away_from_zero: false,
+                        contracts_fma: false, lane_varying_shift: true }
+    }
+
+    /// Measured on an M2 Ultra under Asahi/Honeykrisp Vulkan.
+    pub fn honeykrisp_measured() -> Self {
+        DriverProfile { exact_division: false, ties_away_from_zero: true,
+                        contracts_fma: true, lane_varying_shift: false }
+    }
+
+    /// Behaviours where this driver departs from what a spec-reader would expect.
+    ///
+    /// **This is the list a porter needs**, and it is the one nobody writes down because each entry
+    /// only becomes visible after it has cost a day.
+    pub fn surprises(&self) -> Vec<&'static str> {
+        let spec = Self::by_the_spec();
+        let mut v = Vec::new();
+        if self.exact_division != spec.exact_division {
+            v.push("division is an approximate reciprocal — a quotient on a .5 boundary may land \
+either side, and no CPU expression reproduces it");
+        }
+        if self.ties_away_from_zero != spec.ties_away_from_zero {
+            v.push("round() breaks ties AWAY from zero, not to even as the WGSL spec states — \
+matching the spec here made a gate 8.8x worse");
+        }
+        if self.contracts_fma != spec.contracts_fma {
+            v.push("multiply-add contracts into an FMA, and does so per compilation unit, so \
+identical source in two shaders can round differently");
+        }
+        if self.lane_varying_shift != spec.lane_varying_shift {
+            v.push("a shift by a lane-varying amount returns zero for lanes whose shift is non-zero \
+— use extractBits, and audit every unpack");
+        }
+        v
+    }
+
+    /// Can a quantization result from this driver be compared bit-for-bit against a CPU reference?
+    pub fn allows_bit_exact_quant(&self) -> bool { self.exact_division }
+}
+
+#[cfg(test)]
+mod driver_tests {
+    use super::*;
+
+    #[test]
+    fn HONEYKRISP_departs_from_the_spec_on_all_four() {
+        // Every one was assumed and every one cost a run. A porter arriving at this driver with the
+        // spec in hand gets four wrong answers.
+        let p = DriverProfile::honeykrisp_measured();
+        assert_eq!(p.surprises().len(), 4, "{:?}", p.surprises());
+    }
+
+    #[test]
+    fn a_SPEC_CONFORMING_driver_surprises_nobody() {
+        assert!(DriverProfile::by_the_spec().surprises().is_empty());
+    }
+
+    #[test]
+    fn INEXACT_DIVISION_forbids_a_bit_exact_quant_comparison() {
+        // The conclusion that took four fixes to reach: a gate demanding bit-equality on this driver
+        // is demanding the CPU emulate rcp, which cannot be written.
+        assert!(!DriverProfile::honeykrisp_measured().allows_bit_exact_quant());
+        assert!(DriverProfile::by_the_spec().allows_bit_exact_quant());
+    }
+
+    #[test]
+    fn each_surprise_says_what_to_DO_about_it() {
+        // "Division is inexact" is a fact; "use extractBits and audit every unpack" is an action, and
+        // a porter needs the second.
+        let s = DriverProfile::honeykrisp_measured().surprises();
+        assert!(s.iter().any(|x| x.contains("use extractBits")));
+        assert!(s.iter().any(|x| x.contains("no CPU expression reproduces it")));
+    }
+}
