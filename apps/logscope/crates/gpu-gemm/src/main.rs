@@ -4193,6 +4193,28 @@ not the dequant");
                 println!("      last differing word: {:?} of {}", bad.last(), got.len());
                 let per_block: std::collections::BTreeSet<usize> = bad.iter().map(|i| i % 32).collect();
                 println!("      positions within a 32-word block: {:?}", per_block);
+                // ISOLATED TO SUB-BLOCK 7, and the period is the DATA: this test fills with
+                // (i * 31) % 253, so 253 super-blocks is one cycle of the pattern and every
+                // occurrence is the same byte values meeting the same edge.
+                //
+                // Word 31 is weights 248..255 — the last of eight sub-blocks. Sub-blocks 4..7 take
+                // their scale from the PACKED 6-bit form, and j=7 reads base+11: the last of the
+                // twelve scale bytes. Printing the extraction rather than asserting anything about
+                // it, because eight wrong theories have come from reasoning about this code.
+                if let Some(&w0) = bad.first() {
+                    let sb = w0 / 32;
+                    let base = sb * 144;
+                    if base + 16 <= raw.len() {
+                        let b = |o: usize| raw[base + 4 + o] as u32;
+                        let sc: Vec<u32> = (0..8usize).map(|j| if j < 4 { b(j) & 63 }
+                            else { (b(j + 4) & 0x0F) | ((b(j - 4) >> 6) << 4) }).collect();
+                        let mn: Vec<u32> = (0..8usize).map(|j| if j < 4 { b(j + 4) & 63 }
+                            else { (b(j + 4) >> 4) | ((b(j) >> 6) << 4) }).collect();
+                        println!("      super-block {sb} scale idx {sc:?}");
+                        println!("      super-block {sb} min   idx {mn:?}");
+                        println!("      12 scale bytes: {:?}", &raw[base + 4..base + 16]);
+                    }
+                }
             }
             ck(&format!("large tensor converts exactly across the whole grid ({diff} words differ)"), diff == 0);
         }
