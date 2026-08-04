@@ -1,0 +1,642 @@
+{
+ "_doc": [
+  "Cluster -> part class. Fill in `label` for each; the shape and the",
+  "commonest member names are there to decide from.",
+  "",
+  "Suggested vocabulary: exhaust, thruster, barrel, muzzle, plate,",
+  "armour, wheel, tread, hoverpad, strut, frame, cabin, glass, fin,",
+  "greeble, hull."
+ ],
+ "clusters": [
+  {
+   "id": 0,
+   "n": 356,
+   "label": "",
+   "shape": {
+    "elong": 2.138,
+    "flat": 0.582,
+    "round": 0.77,
+    "hollow": 0.385,
+    "vol_frac": 0.005,
+    "fore": 0.106,
+    "up": 0.417,
+    "lateral": 0.196,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.517,
+    "axis_up": 0.003
+   },
+   "members": [
+    [
+     "bone",
+     58
+    ],
+    [
+     "pelvis",
+     57
+    ],
+    [
+     "spine",
+     35
+    ],
+    [
+     "clavr",
+     26
+    ],
+    [
+     "clavl",
+     23
+    ],
+    [
+     "thighr",
+     19
+    ]
+   ]
+  },
+  {
+   "id": 1,
+   "n": 568,
+   "label": "",
+   "shape": {
+    "elong": 1.272,
+    "flat": 0.57,
+    "round": 0.802,
+    "hollow": 0.476,
+    "vol_frac": 0.005,
+    "fore": 0.046,
+    "up": -0.126,
+    "lateral": 0.51,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.0,
+    "axis_up": 1.0
+   },
+   "members": [
+    [
+     "link",
+     161
+    ],
+    [
+     "coil",
+     42
+    ],
+    [
+     "thighr",
+     30
+    ],
+    [
+     "thighl",
+     29
+    ],
+    [
+     "clavr",
+     26
+    ],
+    [
+     "pelvis",
+     26
+    ]
+   ]
+  },
+  {
+   "id": 2,
+   "n": 298,
+   "label": "",
+   "shape": {
+    "elong": 1.928,
+    "flat": 0.98,
+    "round": 0.003,
+    "hollow": 0.994,
+    "vol_frac": 0.0,
+    "fore": 0.248,
+    "up": 0.088,
+    "lateral": 0.45,
+    "mirrored": 0.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.913,
+    "axis_up": 0.0
+   },
+   "members": [
+    [
+     "guts",
+     222
+    ],
+    [
+     "greeble",
+     43
+    ],
+    [
+     "clad",
+     15
+    ],
+    [
+     "finger",
+     5
+    ],
+    [
+     "bone",
+     3
+    ],
+    [
+     "link",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 3,
+   "n": 87,
+   "label": "",
+   "shape": {
+    "elong": 1.333,
+    "flat": 0.823,
+    "round": 0.283,
+    "hollow": 0.688,
+    "vol_frac": 0.003,
+    "fore": -0.065,
+    "up": 0.079,
+    "lateral": 0.423,
+    "mirrored": 0.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.0,
+    "axis_up": 1.0
+   },
+   "members": [
+    [
+     "greeble",
+     39
+    ],
+    [
+     "thighr",
+     7
+    ],
+    [
+     "pelvis",
+     6
+    ],
+    [
+     "link",
+     6
+    ],
+    [
+     "clad",
+     5
+    ],
+    [
+     "vertebra",
+     4
+    ]
+   ]
+  },
+  {
+   "id": 4,
+   "n": 49,
+   "label": "",
+   "shape": {
+    "elong": 22.17,
+    "flat": 0.864,
+    "round": 0.26,
+    "hollow": 0.784,
+    "vol_frac": 0.0,
+    "fore": -0.07,
+    "up": -0.103,
+    "lateral": 0.168,
+    "mirrored": 0.878,
+    "enclosure": 0.0,
+    "axis_fore": 0.245,
+    "axis_up": 0.02
+   },
+   "members": [
+    [
+     "rib",
+     30
+    ],
+    [
+     "pelvis",
+     6
+    ],
+    [
+     "larmr",
+     3
+    ],
+    [
+     "clavl",
+     3
+    ],
+    [
+     "clavr",
+     3
+    ],
+    [
+     "thighr",
+     2
+    ]
+   ]
+  },
+  {
+   "id": 5,
+   "n": 392,
+   "label": "",
+   "shape": {
+    "elong": 1.818,
+    "flat": 0.608,
+    "round": 0.807,
+    "hollow": 0.533,
+    "vol_frac": 0.005,
+    "fore": -0.619,
+    "up": -0.178,
+    "lateral": 0.584,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.765,
+    "axis_up": 0.0
+   },
+   "members": [
+    [
+     "muscle",
+     117
+    ],
+    [
+     "coil",
+     46
+    ],
+    [
+     "bone",
+     34
+    ],
+    [
+     "piston",
+     34
+    ],
+    [
+     "larmr",
+     33
+    ],
+    [
+     "larml",
+     32
+    ]
+   ]
+  },
+  {
+   "id": 6,
+   "n": 456,
+   "label": "",
+   "shape": {
+    "elong": 1.907,
+    "flat": 0.871,
+    "round": 0.007,
+    "hollow": 0.938,
+    "vol_frac": 0.001,
+    "fore": 0.04,
+    "up": -0.049,
+    "lateral": 0.394,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.0,
+    "axis_up": 1.0
+   },
+   "members": [
+    [
+     "greeble",
+     117
+    ],
+    [
+     "clad",
+     106
+    ],
+    [
+     "link",
+     98
+    ],
+    [
+     "vertebra",
+     36
+    ],
+    [
+     "gyro",
+     29
+    ],
+    [
+     "foot",
+     26
+    ]
+   ]
+  },
+  {
+   "id": 7,
+   "n": 95,
+   "label": "",
+   "shape": {
+    "elong": 1.423,
+    "flat": 0.802,
+    "round": 0.829,
+    "hollow": 0.223,
+    "vol_frac": 0.063,
+    "fore": -0.007,
+    "up": 0.045,
+    "lateral": 0.189,
+    "mirrored": 0.916,
+    "enclosure": 0.0,
+    "axis_fore": 0.642,
+    "axis_up": 0.053
+   },
+   "members": [
+    [
+     "pelvis",
+     20
+    ],
+    [
+     "spine",
+     15
+    ],
+    [
+     "clavr",
+     14
+    ],
+    [
+     "clavl",
+     14
+    ],
+    [
+     "neck",
+     12
+    ],
+    [
+     "chest",
+     6
+    ]
+   ]
+  },
+  {
+   "id": 8,
+   "n": 836,
+   "label": "",
+   "shape": {
+    "elong": 2.112,
+    "flat": 0.991,
+    "round": 0.003,
+    "hollow": 0.994,
+    "vol_frac": 0.0,
+    "fore": 0.385,
+    "up": 0.357,
+    "lateral": 0.287,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.962,
+    "axis_up": 0.0
+   },
+   "members": [
+    [
+     "guts",
+     747
+    ],
+    [
+     "greeble",
+     43
+    ],
+    [
+     "clad",
+     21
+    ],
+    [
+     "gyro",
+     10
+    ],
+    [
+     "thighl",
+     3
+    ],
+    [
+     "clavl",
+     3
+    ]
+   ]
+  },
+  {
+   "id": 9,
+   "n": 806,
+   "label": "",
+   "shape": {
+    "elong": 2.303,
+    "flat": 0.991,
+    "round": 0.004,
+    "hollow": 0.997,
+    "vol_frac": 0.0,
+    "fore": 0.377,
+    "up": -0.23,
+    "lateral": 0.32,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.922,
+    "axis_up": 0.0
+   },
+   "members": [
+    [
+     "guts",
+     646
+    ],
+    [
+     "clad",
+     75
+    ],
+    [
+     "greeble",
+     40
+    ],
+    [
+     "link",
+     14
+    ],
+    [
+     "foot",
+     12
+    ],
+    [
+     "bone",
+     8
+    ]
+   ]
+  },
+  {
+   "id": 10,
+   "n": 396,
+   "label": "",
+   "shape": {
+    "elong": 1.876,
+    "flat": 0.416,
+    "round": 0.083,
+    "hollow": 0.701,
+    "vol_frac": 0.001,
+    "fore": -0.051,
+    "up": -0.163,
+    "lateral": 0.277,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.093,
+    "axis_up": 0.013
+   },
+   "members": [
+    [
+     "rib",
+     148
+    ],
+    [
+     "link",
+     72
+    ],
+    [
+     "face",
+     57
+    ],
+    [
+     "gyro",
+     26
+    ],
+    [
+     "cable",
+     20
+    ],
+    [
+     "bone",
+     14
+    ]
+   ]
+  },
+  {
+   "id": 11,
+   "n": 122,
+   "label": "",
+   "shape": {
+    "elong": 1.935,
+    "flat": 0.541,
+    "round": 0.624,
+    "hollow": 0.394,
+    "vol_frac": 0.005,
+    "fore": -0.053,
+    "up": 0.054,
+    "lateral": 0.379,
+    "mirrored": 0.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.475,
+    "axis_up": 0.0
+   },
+   "members": [
+    [
+     "clavr",
+     18
+    ],
+    [
+     "pelvis",
+     17
+    ],
+    [
+     "rib",
+     12
+    ],
+    [
+     "bone",
+     10
+    ],
+    [
+     "shinr",
+     9
+    ],
+    [
+     "clavl",
+     8
+    ]
+   ]
+  },
+  {
+   "id": 12,
+   "n": 530,
+   "label": "",
+   "shape": {
+    "elong": 1.656,
+    "flat": 0.506,
+    "round": 0.778,
+    "hollow": 0.494,
+    "vol_frac": 0.004,
+    "fore": 0.467,
+    "up": -0.356,
+    "lateral": 0.376,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.758,
+    "axis_up": 0.0
+   },
+   "members": [
+    [
+     "muscle",
+     106
+    ],
+    [
+     "piston",
+     71
+    ],
+    [
+     "shinr",
+     41
+    ],
+    [
+     "thighl",
+     38
+    ],
+    [
+     "bone",
+     36
+    ],
+    [
+     "shinl",
+     36
+    ]
+   ]
+  },
+  {
+   "id": 13,
+   "n": 449,
+   "label": "",
+   "shape": {
+    "elong": 2.468,
+    "flat": 0.942,
+    "round": 0.002,
+    "hollow": 0.988,
+    "vol_frac": 0.001,
+    "fore": -0.516,
+    "up": -0.113,
+    "lateral": 0.387,
+    "mirrored": 1.0,
+    "enclosure": 0.0,
+    "axis_fore": 0.731,
+    "axis_up": 0.0
+   },
+   "members": [
+    [
+     "guts",
+     118
+    ],
+    [
+     "face",
+     67
+    ],
+    [
+     "finger",
+     55
+    ],
+    [
+     "clad",
+     51
+    ],
+    [
+     "greeble",
+     50
+    ],
+    [
+     "link",
+     28
+    ]
+   ]
+  }
+ ]
+}
