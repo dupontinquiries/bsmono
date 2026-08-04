@@ -132,6 +132,9 @@ impl Lift {
     pub fn classify(name: &str, span_ratio: f32) -> Lift {
         let n = name.to_ascii_lowercase();
         // rotors and ducted fans announce themselves
+        // "heli" and "moto" are new import prefixes; the roster had NO rotor
+        // chassis at all until the helicopters arrived, so that branch was
+        // theory until now.
         const ROTOR: &[&str] = &[
             "heli", "copter", "rotor", "vtol", "hover", "harrier", "osprey", "drone", "quad",
         ];
@@ -248,6 +251,21 @@ mod tests {
         assert_eq!(Lift::classify("imported_spaceship_afterburn_aka_large_orbital_lander", 0.4), Lift::Thrust);
         assert_eq!(Lift::classify("flyer_c_130j_super_hercules", 1.4), Lift::Wing);
         assert_eq!(Lift::classify("jet_dawnshade", 0.65), Lift::Wing);
+    }
+
+    #[test]
+    fn the_new_imports_classify_the_way_their_names_say() {
+        // helicopters are the first ROTOR chassis in the roster
+        assert_eq!(Lift::classify("heli_eclipse_aka_z_10ag_attack_helicopter", 0.9), Lift::Rotor);
+        assert_eq!(Lift::classify("heli_hornet_aka_z_29_sea_hornet_drone_copter", 0.8), Lift::Rotor);
+        // and a raid boss that hovers is a hoverer, not a wing
+        assert_eq!(
+            Lift::classify("raid_boss_russian_doll_style_mothership_tank_hat_390_hover", 0.7),
+            Lift::Rotor
+        );
+        // motorcycles do not fly at all, so the classifier must not be asked
+        // — but if it is, a narrow body reads as thrust rather than a wing
+        assert_eq!(Lift::classify("moto_darkwolf_aka_shelled_cyberpunk_motorcycle", 0.3), Lift::Thrust);
     }
 
     #[test]

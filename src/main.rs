@@ -2155,6 +2155,8 @@ impl Game {
             chord::Class::Flyer
         } else if self.car.hover.is_some() || n.contains("hover") {
             chord::Class::Hoverer
+        } else if n.starts_with("moto") || n.contains("motorcycle") || n.contains("bike") {
+            chord::Class::Moto
         } else if n.contains("tank") || n.contains("patton") || n.contains("lynx") {
             chord::Class::Tank
         } else {

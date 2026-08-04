@@ -38,6 +38,8 @@ pub enum Class {
     Racer,
     /// treads, same hybrid as a racer with a turret on the end of it
     Tank,
+    /// two wheels: jumps, and leans rather than steers
+    Moto,
     /// no wheels to jump on; several things worth targeting
     Hoverer,
     /// no jump at all; the thumb belongs to target selection
@@ -100,8 +102,14 @@ pub fn resolve(form: Form, class: Class, press: Press) -> Intent {
         (Form::Vehicle, p) => match (class, p) {
             // a racer jumps — that is half of what a racer is — so the tap
             // is never taken away from it, and the hold does the extra
-            (Class::Racer, Press::Tap) | (Class::Tank, Press::Tap) => Intent::Jump,
-            (Class::Racer, Press::Hold) | (Class::Tank, Press::Hold) => Intent::Weapons,
+            // a bike jumps like a racer; it has less to shoot with, so the
+            // hold reaches the weapons layer the same way
+            (Class::Racer, Press::Tap) | (Class::Tank, Press::Tap) | (Class::Moto, Press::Tap) => {
+                Intent::Jump
+            }
+            (Class::Racer, Press::Hold) | (Class::Tank, Press::Hold) | (Class::Moto, Press::Hold) => {
+                Intent::Weapons
+            }
 
             // a jet has no legs out. The thumb belongs to target selection,
             // which is what a pilot actually needs it for.
@@ -245,8 +253,8 @@ impl Sight {
 mod tests {
     use super::*;
 
-    const ALL_CLASS: [Class; 5] =
-        [Class::Racer, Class::Tank, Class::Hoverer, Class::Flyer, Class::Other];
+    const ALL_CLASS: [Class; 6] =
+        [Class::Racer, Class::Tank, Class::Moto, Class::Hoverer, Class::Flyer, Class::Other];
 
     #[test]
     fn a_bot_on_its_feet_always_jumps() {
@@ -272,7 +280,7 @@ mod tests {
     fn a_racer_never_loses_its_tap() {
         // half of what a racer does is jump; taking that away to make room
         // for a menu would be the worse trade
-        for c in [Class::Racer, Class::Tank] {
+        for c in [Class::Racer, Class::Tank, Class::Moto] {
             assert_eq!(resolve(Form::Vehicle, c, Press::Tap), Intent::Jump, "{c:?}");
             assert_eq!(resolve(Form::Vehicle, c, Press::Hold), Intent::Weapons, "{c:?}");
         }
