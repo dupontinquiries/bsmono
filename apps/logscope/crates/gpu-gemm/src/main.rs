@@ -4213,6 +4213,25 @@ not the dequant");
                         println!("      super-block {sb} scale idx {sc:?}");
                         println!("      super-block {sb} min   idx {mn:?}");
                         println!("      12 scale bytes: {:?}", &raw[base + 4..base + 16]);
+                        // THE DECISIVE ONE: a bad READ or a bad PACK.
+                        //
+                        // Word 31 is weights 248..255, whose nibbles are the last four bytes of the
+                        // 144-byte block. The scale is exonerated — words 28..31 share it and only 31
+                        // differs — so what is left is how those eight weights are read or packed.
+                        //
+                        // If the two sides DEQUANTIZE the eight identically but PACK different nibbles,
+                        // it is the pack. If the dequantized values already differ, it is the read.
+                        let qs = base + 16;
+                        if qs + 128 <= raw.len() {
+                            println!("      qs bytes for weights 248..255: {:?}", &raw[qs + 124..qs + 128]);
+                            println!("      gpu word 31 = 0x{:08X}   cpu word 31 = 0x{:08X}",
+                                got[w0], cpu_words[w0]);
+                            let nib = |x: u32| (0..8).map(|i| (x >> (i * 4)) & 0xF).collect::<Vec<_>>();
+                            println!("      gpu nibbles {:?}", nib(got[w0]));
+                            println!("      cpu nibbles {:?}", nib(cpu_words[w0]));
+                            let dq = &f32ref[sb * 256 + 248..sb * 256 + 256];
+                            println!("      cpu dequantized 248..255: {:?}", dq);
+                        }
                     }
                 }
             }
