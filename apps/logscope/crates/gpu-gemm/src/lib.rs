@@ -22,6 +22,7 @@ pub mod specverify;
 pub mod batchplan;
 pub mod q2demote;
 pub mod quantref;
+pub mod shaderdev;
 pub mod sensitivity;
 pub mod lookupdraft;
 pub mod specloop;
@@ -1447,6 +1448,10 @@ impl Gpu {
     /// bit patterns (quantized nibbles) rather than numbers, where a round-trip through f32 could alter
     /// NaN payloads.
     fn run_u32(&self, shader: &str, inputs: &[&[u8]], out_len: usize, dims: &[u8], wg: (u32, u32, u32)) -> Vec<u32> {
+        // Hot-reloadable. Ten gate cycles on one Q4_K bug each paid a full release build to change
+        // a WGSL literal while the Rust never changed. LOGSCOPE_SHADER_DIR skips that, and announces
+        // every override so a stale file cannot silently describe a tree it does not match.
+        let shader = &*crate::shaderdev::resolve(shader_name_of(shader), shader);
         let bytes = self.run(shader, inputs, (out_len * 4) as u64, dims, wg);
         bytemuck::cast_slice(&bytes).to_vec()
     }
@@ -13418,6 +13423,22 @@ fn gemma_norm(w: &[f32], acfg: &crate::archcfg::ArchConfig) -> Vec<f32> {
 /// overflows that on any real weight matrix — a 26M-weight tensor needs 102400 — and wgpu reports it as a
 /// validation error the loader logs and continues past, leaving the output buffer UNWRITTEN. Silent
 /// garbage weights, in other words, which is why this is a hard cap rather than a tuning knob.
+/// Best-effort identity for a shader source, for the override lookup.
+///
+/// Matches on the first `fn` or a distinctive marker rather than requiring every call site to pass a
+/// name — a name parameter threaded through forty dispatch sites is forty chances to pass the wrong
+/// one, and this only has to be right for shaders someone is actively editing.
+fn shader_name_of(src: &str) -> &'static str {
+    for (needle, name) in [
+        ("dst[dims.qs_off + bi]", "Q4K_TO_Q4"),
+        ("fn wbyte", "MATVEC_IQ1_S"),
+        ("insertBits(packed", "QUANT_PACK"),
+    ] {
+        if src.contains(needle) { return name }
+    }
+    "UNNAMED"
+}
+
 pub fn wrapped_grid(units: usize) -> (u32, u32) {
     const W: usize = 32768; // comfortably under 65535, power of two
     if units <= W { return (units as u32, 1); }
