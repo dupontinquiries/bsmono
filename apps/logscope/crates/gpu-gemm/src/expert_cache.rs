@@ -725,3 +725,145 @@ mod dense_moe_tests {
         assert!(dense_moe_worthwhile(0.99, 0, 0).is_err());
     }
 }
+
+/// Choosing between routed and dense MoE at runtime, with hysteresis.
+///
+/// # Why this cannot be a constant
+///
+/// The crossover for Scout is 93.75% stall, and a real conversation measured **74%, 91%, then 112%**
+/// across three turns. So the right answer changes WITHIN a session: dense loses at turn one and wins
+/// by 60x at turn three, because the stall compounds with context length.
+///
+/// A fixed choice is wrong for two thirds of that conversation.
+///
+/// # Why it needs a dwell
+///
+/// A measurement near the crossover flips the decision, and each flip costs a mode change. Two
+/// options within noise of each other alternating is the flapping `dwell` was written for — and here
+/// the switch is not free, because dense mode requires every expert resident and routed mode does
+/// not, so a flip can force a residency change.
+///
+/// # top_k is ONE for Scout, and it matters
+///
+/// vLLM's Llama-4 post states one expert activated per token. A search summary claimed two; the
+/// difference moves the crossover from 93.75% to 87.5%, which is the gap between "wins at turn
+/// three only" and "wins at turn two as well". Primary source over summary.
+pub struct MoeModeChoice {
+    dense: bool,
+    dwell: std::time::Instant,
+    min_dwell: std::time::Duration,
+    switches: u32,
+}
+
+impl MoeModeChoice {
+    pub fn new() -> Self {
+        MoeModeChoice {
+            dense: false,
+            dwell: std::time::Instant::now(),
+            // Longer than dwell's default: a mode change here may force experts to become resident,
+            // which is far more expensive than a kernel swap.
+            min_dwell: std::time::Duration::from_secs(120),
+            switches: 0,
+        }
+    }
+
+    pub fn dense(&self) -> bool { self.dense }
+    pub fn switches(&self) -> u32 { self.switches }
+
+    /// Consider switching, given the measured stall and whether every expert is resident.
+    ///
+    /// Returns the reason when it declines, because "it stayed routed" is not informative and "it
+    /// stayed routed because only 6 of 16 experts are resident" is.
+    pub fn consider(&mut self, sync_share: f32, all_resident: bool, n_experts: u32, top_k: u32)
+        -> Result<bool, String>
+    {
+        // The hard precondition, checked before anything else: dense mode computes every expert, and
+        // computing one that is not resident means streaming it — which is the readback's cost paid
+        // n_experts times, the opposite of the intent.
+        if !all_resident {
+            if self.dense { self.dense = false; }   // residency was lost; fall back immediately
+            return Err(format!("dense MoE needs every expert resident and they are not. This is the \
+same precondition as layer_can_route, and it is what narrower experts buy"));
+        }
+        let want = dense_moe_worthwhile(sync_share, n_experts, top_k).is_ok();
+        if want == self.dense { return Ok(self.dense) }
+        let waited = self.dwell.elapsed();
+        if waited < self.min_dwell {
+            return Err(format!("{} is {:.0}% better right now, but the last change was {}s ago — a \
+measurement near the {:.0}% crossover flips this, and each flip may force a residency change",
+                if want { "dense" } else { "routed" },
+                (sync_share * 100.0), waited.as_secs(),
+                dense_moe_crossover(n_experts, top_k) * 100.0));
+        }
+        self.dense = want;
+        self.dwell = std::time::Instant::now();
+        self.switches += 1;
+        Ok(self.dense)
+    }
+}
+
+impl Default for MoeModeChoice { fn default() -> Self { Self::new() } }
+
+#[cfg(test)]
+mod mode_choice_tests {
+    use super::*;
+
+    fn ready() -> MoeModeChoice {
+        let mut m = MoeModeChoice::new();
+        m.dwell = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        m
+    }
+
+    #[test]
+    fn a_REAL_CONVERSATION_flips_the_right_answer_mid_session() {
+        // 74%, 91%, 112% across three turns. Dense loses at turn one and wins at turn three, so a
+        // fixed choice is wrong for two thirds of it.
+        assert!(dense_moe_worthwhile(0.74, 16, 1).is_err(), "turn one: routed");
+        assert!(dense_moe_worthwhile(0.91, 16, 1).is_err(), "turn two: still routed");
+        assert!(dense_moe_worthwhile(0.999, 16, 1).is_ok(), "turn three: dense, by 60x");
+    }
+
+    #[test]
+    fn NON_RESIDENT_experts_refuse_dense_mode_outright() {
+        // Computing an expert that is not resident means streaming it — the readback's cost paid
+        // sixteen times, which is the opposite of the intent.
+        let e = ready().consider(0.999, false, 16, 1).unwrap_err();
+        assert!(e.contains("needs every expert resident"));
+        assert!(e.contains("what narrower experts buy"));
+    }
+
+    #[test]
+    fn losing_residency_falls_back_IMMEDIATELY_without_waiting_for_the_dwell() {
+        // The dwell protects against flapping on a marginal measurement. Losing residency is not a
+        // marginal measurement, and holding dense mode without the experts would be catastrophic.
+        let mut m = ready();
+        assert!(m.consider(0.999, true, 16, 1).unwrap(), "dense");
+        let _ = m.consider(0.999, false, 16, 1);
+        assert!(!m.dense(), "fell back at once");
+    }
+
+    #[test]
+    fn a_measurement_near_the_CROSSOVER_does_not_flap() {
+        // 93.75% for Scout, and readings either side of it arrive turn to turn.
+        let mut m = MoeModeChoice::new();
+        let e = m.consider(0.999, true, 16, 1).unwrap_err();
+        assert!(e.contains("crossover"));
+        assert!(!m.dense(), "held by the dwell");
+    }
+
+    #[test]
+    fn TOP_K_moves_the_crossover_and_the_source_matters() {
+        // vLLM's Llama-4 post says ONE expert per token; a search summary said two. The difference is
+        // 93.75% against 87.5% — the gap between winning at turn three only and winning at turn two
+        // as well.
+        assert!((dense_moe_crossover(16, 1) - 0.9375).abs() < 1e-4);
+        assert!((dense_moe_crossover(16, 2) - 0.875).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_DECLINE_says_why_rather_than_just_staying_put() {
+        // "It stayed routed" is not informative. "It stayed routed because only 6 of 16 experts are
+        // resident" is.
+        assert!(MoeModeChoice::new().consider(0.999, false, 16, 1).is_err());
+    }
+}
