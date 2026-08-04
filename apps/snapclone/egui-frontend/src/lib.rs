@@ -199,6 +199,8 @@ pub struct Snapclone {
     /// The field the cursor armed for voice entry. NOT a keyboard request:
     /// rusty-board's cue is that no key event is ever synthesised.
     pub voice_field: Option<String>,
+    /// (field, text) pairs spoken into armed fields, for the host to apply.
+    pub dictated: Vec<(String, String)>,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -272,6 +274,7 @@ impl Snapclone {
             last_voice_at: None,
             glove: Default::default(),
             voice_field: None,
+            dictated: Vec::new(),
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -573,6 +576,13 @@ impl Snapclone {
             G::ArmField(id) => self.voice_field = Some(id),
             G::Dismiss => { self.voice_field = None; self.menu.close(); }
             G::Activate(id) => { if self.menu.is_open() { self.menu.choose(&id); } }
+            // Dictated text goes to the armed field; the shell holds it until
+            // the host writes it through. Escape clears the arm, which is the
+            // whole point of the out-of-band gesture.
+            G::Dictated(text) => {
+                if let Some(f) = self.voice_field.clone() { self.dictated.push((f, text)); }
+            }
+            G::Escaped => self.voice_field = None,
             G::Toggle(_) | G::Nudge { .. } | G::Step(_) => {}
         }
     }
