@@ -2877,6 +2877,11 @@ impl Gpu {
         //
         // Only reopened if one was open on entry: a caller that downloads without a frame does not want
         // one opened behind its back.
+        // INSTRUMENTED. On a Scout run 67% of submits had no frame open while decode_step_stream
+        // opens one on its first line — so the frame is dropped and not restored, and this is the
+        // only place that drops it deliberately. If had_frame is false here, decode's frame was
+        // already gone when we arrived, which makes download the symptom rather than the cause.
+        if !had_frame { crate::framediag::REOPEN_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         if had_frame {
             self.begin_frame();
             // PACING. Reopening restores batching, but it also removes the pacing that
