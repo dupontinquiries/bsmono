@@ -3595,10 +3595,15 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             let base = r * k + b * 32;
                             let mut amax = 0f32;
                             for j in 0..32 { amax = amax.max(w[base + j].abs()); }
-                            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+                            let scale = if amax > 0.0 { amax * (1.0f32 / 127.0) } else { 1.0 };
+                            let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
                             qs_c[lr * kb + b] = scale;
                             for j in 0..32 {
-                                qb_c[lr * k + b * 32 + j] = (w[base + j] / scale).round().clamp(-127.0, 127.0) as i32 as i8;
+                                // SAME PAIR AS Q4_K, in the int8 path. QUANT_PACK computes round(x * inv): a
+                            // multiply by the reciprocal, and WGSL's round is half-to-EVEN. Dividing
+                            // and rounding away from zero here disagrees on both counts, and at 127
+                            // levels ties are commoner than at 7.
+                            qb_c[lr * k + b * 32 + j] = (w[base + j] * inv_scale).round_ties_even().clamp(-127.0, 127.0) as i32 as i8;
                             }
                         }
                     }
@@ -4078,7 +4083,10 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
                                 qs_c[rr * kb + b] = scale;
                                 for j in 0..32 {
-                                    let qv = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
+                                    // The second q4 quantizer, which I patched the first of and missed this one — the
+                    // same reciprocal-and-tie pair, and no gate exercises it at a scale that would
+                    // have shown either.
+                    let qv = (w[base + j] * inv_scale).round_ties_even().clamp(-7.0, 7.0) as i32;
                                     nib_c[rr * k + b * 32 + j] = (qv + 8) as u8;
                                 }
                             }
