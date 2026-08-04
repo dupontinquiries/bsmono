@@ -406,3 +406,103 @@ mod universal_core_tests {
         assert!(UNIVERSAL_CORE.len() < 600, "got {} chars", UNIVERSAL_CORE.len());
     }
 }
+
+/// What the workspace itself says, which outranks what the request says.
+///
+/// `classify` reads the request text. That was the only signal available and it is the weaker one:
+/// **an empty repository is ground truth.** A request phrased as maintenance cannot be maintenance if
+/// there is nothing to maintain, and no amount of careful wording detection beats counting the files.
+///
+/// A real transcript: a 1B model in an EMPTY repo, asked to "write a rust tui game", produced a plan
+/// to "fix SQL injection vulnerabilities" and "optimize database queries". `_546` fixed the
+/// prompt-side classifier so bare build verbs count. This is the signal that would have caught it
+/// without any wording rule at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RepoState {
+    /// No source files. Nothing can be maintained.
+    Empty,
+    /// A handful of files — a project just started.
+    Sparse { files: usize },
+    /// An established codebase.
+    Established { files: usize },
+}
+
+impl RepoState {
+    pub fn from_counts(source_files: usize) -> Self {
+        match source_files {
+            0 => RepoState::Empty,
+            // Below this a "maintenance" framing still misleads: there is not enough there for
+            // architecture-preservation advice to be about anything.
+            n if n < 5 => RepoState::Sparse { files: n },
+            n => RepoState::Established { files: n },
+        }
+    }
+
+    /// Does the workspace contradict a maintenance framing?
+    pub fn forbids_maintenance_posture(self) -> bool {
+        matches!(self, RepoState::Empty | RepoState::Sparse { .. })
+    }
+
+    pub fn explain(self) -> &'static str {
+        match self {
+            RepoState::Empty =>
+                "the repository is EMPTY — there is nothing to maintain, so a maintenance posture \
+describes work that cannot exist, whatever the request said",
+            RepoState::Sparse { .. } =>
+                "the repository has only a few files — architecture-preservation advice would be \
+about almost nothing, and a build posture serves better",
+            RepoState::Established { .. } =>
+                "an established codebase; the request text decides the posture",
+        }
+    }
+}
+
+/// The posture, with the workspace allowed to overrule the text.
+pub fn posture_for(class: TaskClass, repo: RepoState) -> String {
+    // The override runs FIRST. A wording rule that says "maintenance" and a directory that says
+    // "empty" are not two opinions to weigh — one of them is a fact.
+    if repo.forbids_maintenance_posture() {
+        return format!("{GREENFIELD_BUILD_POSTURE}{UNIVERSAL_CORE}");
+    }
+    posture_full(class)
+}
+
+#[cfg(test)]
+mod repo_state_tests {
+    use super::*;
+
+    #[test]
+    fn an_EMPTY_repo_forbids_the_maintenance_posture_whatever_the_request_says() {
+        // The transcript: a 1B model in an empty repo, asked to write a TUI game, produced a plan to
+        // fix SQL injection vulnerabilities. No wording rule was needed to catch that — counting the
+        // files was enough.
+        let p = posture_for(classify("fix the bug in the parser"), RepoState::Empty);
+        assert!(p.contains("NEW BUILD"), "an empty repo cannot be maintained");
+    }
+
+    #[test]
+    fn a_SPARSE_repo_also_prefers_building() {
+        // Architecture-preservation advice about three files is advice about almost nothing.
+        assert!(RepoState::from_counts(3).forbids_maintenance_posture());
+        assert!(!RepoState::from_counts(40).forbids_maintenance_posture());
+    }
+
+    #[test]
+    fn an_ESTABLISHED_repo_lets_the_REQUEST_decide() {
+        // The override is for when the workspace contradicts the text, not a blanket rule.
+        let p = posture_for(classify("fix the off-by-one in arena_place"), RepoState::from_counts(40));
+        assert!(!p.contains("NEW BUILD"));
+    }
+
+    #[test]
+    fn the_UNIVERSAL_CORE_survives_the_override() {
+        // The override replaces the class posture and must not drop the floor with it.
+        let p = posture_for(classify("fix the parser"), RepoState::Empty);
+        assert!(p.contains("An outline is not a step"));
+    }
+
+    #[test]
+    fn the_explanation_says_it_is_a_FACT_not_a_preference() {
+        assert!(RepoState::Empty.explain().contains("whatever the request said"));
+    }
+}
