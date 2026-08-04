@@ -18,6 +18,66 @@ pub mod row_render;
 pub mod detect;
 pub mod explore;
 pub mod manpage_view;
+
+/// Double-flick commands, bound to tab management.
+///
+/// Bottom-up twice opens a tab. The binding is voiceterm's; the recognition and
+/// the settings gate are the kit's, so snapclone's camera swap and this cannot
+/// disagree about what a double flick is.
+pub fn shake_bindings() -> uikit_egui::glove::ShakeCommands {
+    use uikit_egui::glove::{Orient, ShakeBinding, ShakeCommands};
+    ShakeCommands::with(vec![
+        ShakeBinding { dir: Orient::BottomUp, action: "new_tab".into(),
+                       label: "New tab".into() },
+        // Left-up closes, deliberately NOT bound to anything destructive
+        // without a confirmation: see Confirm in the kit.
+        ShakeBinding { dir: Orient::LeftUp, action: "prev_tab".into(),
+                       label: "Previous tab".into() },
+        ShakeBinding { dir: Orient::RightUp, action: "next_tab".into(),
+                       label: "Next tab".into() },
+    ])
+}
+
+#[cfg(test)]
+mod shake_binding_tests {
+    use uikit_egui::glove::Orient;
+
+    #[test]
+    fn a_double_flick_opens_a_tab_and_a_single_one_does_not() {
+        let mut c = super::shake_bindings();
+        c.enabled = true;
+        assert_eq!(c.feed(Some(Orient::BottomUp), 16.0), None);
+        assert_eq!(c.feed(Some(Orient::BottomUp), 150.0).as_deref(), Some("new_tab"));
+    }
+
+    #[test]
+    fn tab_navigation_is_bound_both_ways() {
+        let mut c = super::shake_bindings();
+        c.enabled = true;
+        c.feed(Some(Orient::RightUp), 16.0);
+        assert_eq!(c.feed(Some(Orient::RightUp), 150.0).as_deref(), Some("next_tab"));
+        c.feed(Some(Orient::LeftUp), 16.0);
+        assert_eq!(c.feed(Some(Orient::LeftUp), 150.0).as_deref(), Some("prev_tab"));
+    }
+
+    #[test]
+    fn nothing_destructive_is_bound_to_a_shake() {
+        // A gesture you can make by accident must not close a tab with unsaved
+        // work in it. Closing stays a deliberate action behind a confirmation.
+        let c = super::shake_bindings();
+        for dir in [Orient::BottomUp, Orient::LeftUp, Orient::RightUp] {
+            let label = c.describe(dir).unwrap_or("");
+            assert!(!label.to_lowercase().contains("close"), "{dir:?} -> {label}");
+        }
+    }
+
+    #[test]
+    fn the_gesture_is_off_until_switched_on() {
+        let mut c = super::shake_bindings();
+        c.feed(Some(Orient::BottomUp), 16.0);
+        assert_eq!(c.feed(Some(Orient::BottomUp), 150.0), None);
+    }
+}
 pub mod mail_view;
 pub mod archived_view;
 pub mod cards_view;

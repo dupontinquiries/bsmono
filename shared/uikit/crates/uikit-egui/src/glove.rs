@@ -200,9 +200,14 @@ impl Ratchet {
         self.at == Orient::FaceDown && self.dwell_ms >= ESCAPE_HOLD_MS
     }
 
-    /// Feed a descriptor reading. Returns a direction on the frame a flick
-    /// completes.
-    pub fn feed(&mut self, o: Orient, dt_ms: f32) -> Option<(f32, f32)> {
+    /// Feed a descriptor reading. Returns the ORIENTATION that was flicked, on
+    /// the frame the flick completes.
+    ///
+    /// Returns the orientation rather than a vector so both consumers can use
+    /// one event: the cursor turns it into a step, the command layer matches it
+    /// against a binding. Two detectors watching the same descriptor stream
+    /// independently would be a second source of truth about what a flick is.
+    pub fn feed(&mut self, o: Orient, dt_ms: f32) -> Option<Orient> {
         if o == self.at {
             self.dwell_ms += dt_ms;
             // Resting long enough re-arms; being AWAY long enough turns the
@@ -225,11 +230,10 @@ impl Ratchet {
         self.at = o;
         self.dwell_ms = 0.0;
 
-        if let Some(dir) = o.direction() {
+        if o.direction().is_some() {
             // Leaving rest. Only records the intent — the step fires on the way
             // back, when we know how long it took.
             if was.is_rest() && self.armed { self.away_in = Some(o); }
-            let _ = dir;
             return None;
         }
 
@@ -238,9 +242,109 @@ impl Ratchet {
         if o.is_rest() {
             let fired = self.away_in.take().filter(|_| was_dwell <= FLICK_MAX_MS);
             self.armed = false;   // must rest REARM_MIN_MS before the next one
-            return fired.and_then(|d| d.direction());
+            return fired;
         }
         None
+    }
+}
+
+/// Longest gap between the two halves of a double flick.
+///
+/// A double flick is a deliberate command, so the window can be generous — but
+/// not so generous that two ordinary cursor steps in the same direction become
+/// one. 550ms is comfortably longer than a shake-and-return and comfortably
+/// shorter than two considered moves.
+pub const DOUBLE_FLICK_MS: f32 = 550.0;
+
+/// Recognises two flicks in the same direction as one command.
+///
+/// Sits ON TOP of the ratchet rather than beside it, so there is one source of
+/// truth about what a flick is. Single flicks still move the cursor; the double
+/// is what carries app commands, which is the split that keeps them from
+/// fighting: "new tab" cannot be produced by someone walking a cursor across
+/// the screen, because that is single flicks with rests between.
+///
+/// The cost is honest and worth stating: the FIRST flick of a double has
+/// already moved the cursor by the time the second arrives. A caller that binds
+/// both must undo the step, or bind doubles only in contexts where the cursor
+/// is not in play — which is what the app bindings here do.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DoubleFlick {
+    last: Option<(Orient, f32)>,
+    since_ms: f32,
+}
+
+impl DoubleFlick {
+    /// Feed the ratchet's output. Returns the direction on the second flick.
+    pub fn feed(&mut self, flick: Option<Orient>, dt_ms: f32) -> Option<Orient> {
+        self.since_ms += dt_ms;
+        if let Some((_, _)) = self.last {
+            if self.since_ms > DOUBLE_FLICK_MS { self.last = None; }
+        }
+        let Some(dir) = flick else { return None };
+        match self.last.take() {
+            // Same direction, inside the window: that is the command.
+            Some((prev, _)) if prev == dir => {
+                // Cleared rather than kept, so a THIRD flick starts a fresh
+                // pair instead of firing again immediately.
+                self.since_ms = 0.0;
+                Some(dir)
+            }
+            // A different direction restarts the pair rather than being
+            // ignored: someone who flicks left then right has changed their
+            // mind, not made a command.
+            _ => {
+                self.last = Some((dir, 0.0));
+                self.since_ms = 0.0;
+                None
+            }
+        }
+    }
+}
+
+/// An app command bound to a double flick.
+///
+/// The binding lives with the app, not here: "new tab" means nothing to
+/// snapclone and "swap camera" means nothing to a terminal. What is shared is
+/// the recognition and the settings gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShakeBinding {
+    pub dir: Orient,
+    /// The app's own action id.
+    pub action: String,
+    /// Shown in settings, so a user can find out what the gesture does without
+    /// performing it.
+    pub label: String,
+}
+
+/// The app-command layer: a double-flick recogniser plus a binding table.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShakeCommands {
+    /// Independent of glove mode. Someone may want shake-for-new-tab without
+    /// wanting a cursor, and someone in gloves may want the cursor without
+    /// having their tabs multiply.
+    pub enabled: bool,
+    detector: DoubleFlick,
+    bindings: Vec<ShakeBinding>,
+}
+
+impl ShakeCommands {
+    pub fn with(bindings: Vec<ShakeBinding>) -> Self {
+        ShakeCommands { enabled: false, detector: DoubleFlick::default(), bindings }
+    }
+
+    pub fn bindings(&self) -> &[ShakeBinding] { &self.bindings }
+
+    /// Feed the ratchet's flick output. Returns an action id on a double.
+    pub fn feed(&mut self, flick: Option<Orient>, dt_ms: f32) -> Option<String> {
+        if !self.enabled { return None; }
+        let dir = self.detector.feed(flick, dt_ms)?;
+        self.bindings.iter().find(|b| b.dir == dir).map(|b| b.action.clone())
+    }
+
+    /// What a direction is bound to, for the settings list.
+    pub fn describe(&self, dir: Orient) -> Option<&str> {
+        self.bindings.iter().find(|b| b.dir == dir).map(|b| b.label.as_str())
     }
 }
 
@@ -424,18 +528,74 @@ impl Vocab {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Tick {
     pub snapped: Option<String>,
+    /// The direction flicked this frame, for a command layer to consume. Passed
+    /// out rather than handled here so the cursor does not have to know what an
+    /// app command is.
+    pub flicked: Option<Orient>,
     /// The phone was held screen-down long enough to leave a listening field.
     pub escaped: bool,
+}
+
+/// How glove mode decides whether to be on.
+///
+/// Three states rather than a bool plus a threshold, because "manual on" and
+/// "auto, currently cold" are different intents and a bool cannot tell them
+/// apart. Someone who has switched it on deliberately — indoors, with an injury,
+/// wearing gloves for a reason the thermometer knows nothing about — must not
+/// have it turned off by a warm reading.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ColdMode {
+    /// Never.
+    Off,
+    /// Always, whatever the weather. The thermometer is not consulted.
+    On,
+    /// On when the ambient reading is at or below the threshold.
+    Auto { threshold_c: f32 },
+}
+
+impl Default for ColdMode {
+    fn default() -> Self { ColdMode::Auto { threshold_c: COLD_C } }
+}
+
+impl ColdMode {
+    /// Should the mode be active, given what the thermometer says?
+    ///
+    /// `ambient_c` of `None` means no reading. In `Auto` that is NOT cold — a
+    /// phone with no ambient sensor would otherwise show a cursor indoors in
+    /// July — but in `On` it is irrelevant, which is the point of having the
+    /// state at all.
+    pub fn active(self, ambient_c: Option<f32>) -> bool {
+        match self {
+            ColdMode::Off => false,
+            ColdMode::On => true,
+            ColdMode::Auto { threshold_c } =>
+                ambient_c.map(|c| c <= threshold_c).unwrap_or(false),
+        }
+    }
+
+    /// What the settings row should say, so the state is legible without
+    /// opening it.
+    pub fn summary(self, ambient_c: Option<f32>) -> String {
+        match self {
+            ColdMode::Off => "Off".into(),
+            ColdMode::On => "On".into(),
+            ColdMode::Auto { threshold_c } => match ambient_c {
+                // Naming the reading matters: "Auto (off)" with no number
+                // leaves the user unable to tell a warm day from a dead sensor.
+                Some(c) => format!("Auto — {c:.0}°C, on below {threshold_c:.0}°C"),
+                None => format!("Auto — no reading, on below {threshold_c:.0}°C"),
+            },
+        }
+    }
 }
 
 /// The ratcheting cursor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GloveCursor {
-    pub enabled: bool,
+    /// Off / On / Auto with a threshold — see `ColdMode`.
+    pub mode_setting: ColdMode,
     /// Last ambient temperature the host reported.
     pub ambient_c: Option<f32>,
-    /// Threshold, from settings.
-    pub cold_c: f32,
     pos: (f32, f32),
     /// The flick ratchet. No velocity: the cursor does not coast.
     ratchet: Ratchet,
@@ -447,7 +607,7 @@ pub struct GloveCursor {
 impl Default for GloveCursor {
     fn default() -> Self {
         GloveCursor {
-            enabled: false, ambient_c: None, cold_c: COLD_C,
+            mode_setting: ColdMode::Off, ambient_c: None,
             pos: (0.0, 0.0), ratchet: Ratchet::default(), mode: Mode::Navigating,
             snapped: None, bounds: (0.0, 0.0),
         }
@@ -455,17 +615,14 @@ impl Default for GloveCursor {
 }
 
 impl GloveCursor {
-    /// Is it cold enough to offer this?
-    ///
-    /// Unknown temperature is NOT cold. A phone with no ambient sensor would
-    /// otherwise show a rolling ball indoors in July, and an accessibility mode
-    /// that appears uninvited is one people switch off permanently.
-    pub fn is_cold(&self) -> bool {
-        self.ambient_c.map(|c| c <= self.cold_c).unwrap_or(false)
-    }
+    /// Is the mode on right now?
+    pub fn active(&self) -> bool { self.mode_setting.active(self.ambient_c) }
 
-    /// Both conditions: the user asked for it AND the world agrees.
-    pub fn active(&self) -> bool { self.enabled && self.is_cold() }
+    /// Is the thermometer the reason? Used by the settings summary and by
+    /// anything that wants to explain itself.
+    pub fn is_cold(&self) -> bool {
+        matches!(self.mode_setting, ColdMode::Auto { .. }) && self.active()
+    }
 
     pub fn set_bounds(&mut self, w: f32, h: f32) {
         self.bounds = (w, h);
@@ -503,7 +660,8 @@ impl GloveCursor {
 
         // The escape is checked FIRST and works in either mode. It has to be
         // reachable from dictation, which is the state it exists to leave.
-        let stepped = self.ratchet.feed(o, dt_ms);
+        let flicked = self.ratchet.feed(o, dt_ms);
+        out.flicked = flicked;
         if self.ratchet.escaping() {
             out.escaped = self.escape();
         }
@@ -516,7 +674,7 @@ impl GloveCursor {
             return out;
         }
 
-        if let Some((dx, dy)) = stepped {
+        if let Some((dx, dy)) = flicked.and_then(|f| f.direction()) {
             // A fixed step, clamped to the screen. No momentum: the cursor
             // arrives where it was sent and stays there, which is what makes it
             // aimable with a shaking hand.
@@ -612,7 +770,7 @@ mod tests {
     }
 
     fn cold_cursor() -> GloveCursor {
-        let mut g = GloveCursor { enabled: true, ambient_c: Some(2.0), ..Default::default() };
+        let mut g = GloveCursor { mode_setting: ColdMode::Auto { threshold_c: COLD_C }, ambient_c: Some(2.0), ..Default::default() };
         g.set_bounds(400.0, 800.0);
         g
     }
@@ -622,7 +780,7 @@ mod tests {
         // A phone with no ambient sensor would otherwise roll a ball across the
         // screen indoors in July, and a mode that appears uninvited is one
         // people switch off permanently.
-        let mut g = GloveCursor { enabled: true, ..Default::default() };
+        let mut g = GloveCursor { mode_setting: ColdMode::Auto { threshold_c: COLD_C }, ..Default::default() };
         assert!(!g.is_cold());
         assert!(!g.active());
         g.ambient_c = Some(20.0);
@@ -630,19 +788,61 @@ mod tests {
     }
 
     #[test]
-    fn both_the_user_and_the_world_have_to_agree() {
-        let mut g = GloveCursor { enabled: false, ambient_c: Some(-5.0), ..Default::default() };
-        assert!(g.is_cold());
-        assert!(!g.active(), "cold alone does not switch it on");
-        g.enabled = true;
-        assert!(g.active());
+    fn manual_on_ignores_the_thermometer_entirely() {
+        // The reason this is three states and not a bool plus a threshold.
+        // Someone who switched it on deliberately — indoors, with an injury,
+        // wearing gloves for a reason the thermometer knows nothing about —
+        // must not have it turned off by a warm reading.
+        let warm = GloveCursor { mode_setting: ColdMode::On, ambient_c: Some(28.0),
+                                 ..Default::default() };
+        assert!(warm.active());
+        assert!(!warm.is_cold(), "on, but not BECAUSE it is cold");
+
+        let no_sensor = GloveCursor { mode_setting: ColdMode::On, ambient_c: None,
+                                      ..Default::default() };
+        assert!(no_sensor.active(), "and a missing sensor is irrelevant here");
     }
 
-    /// Complete a flick: leave rest in `dir`, come back after `away_ms`.
+    #[test]
+    fn off_means_off_however_cold_it_is() {
+        let g = GloveCursor { mode_setting: ColdMode::Off, ambient_c: Some(-20.0),
+                              ..Default::default() };
+        assert!(!g.active());
+    }
+
+    #[test]
+    fn auto_uses_the_threshold_the_user_chose() {
+        // A custom threshold is the point: people differ about what is cold,
+        // and 8 is a default rather than a truth.
+        let chilly = ColdMode::Auto { threshold_c: 15.0 };
+        assert!(chilly.active(Some(12.0)), "12 is cold if you said 15");
+        assert!(!chilly.active(Some(18.0)));
+        let hardy = ColdMode::Auto { threshold_c: 0.0 };
+        assert!(!hardy.active(Some(5.0)), "5 is not cold if you said 0");
+    }
+
+    #[test]
+    fn auto_with_no_reading_is_not_cold() {
+        // A phone with no ambient sensor would otherwise show a cursor indoors
+        // in July, and a mode that appears uninvited is switched off for good.
+        assert!(!ColdMode::Auto { threshold_c: COLD_C }.active(None));
+    }
+
+    #[test]
+    fn the_settings_summary_names_the_reading_not_just_the_state() {
+        // "Auto (off)" with no number leaves the user unable to tell a warm day
+        // from a dead sensor.
+        let m = ColdMode::Auto { threshold_c: 8.0 };
+        assert!(m.summary(Some(14.0)).contains("14"));
+        assert!(m.summary(None).contains("no reading"));
+        assert_eq!(ColdMode::Off.summary(Some(1.0)), "Off");
+    }
+
+    /// Complete a flick: rest, dwell, leave in `dir`, return.
+    ///
+    /// Two rest readings because arriving at rest clears the arm and the dwell
+    /// restores it — which is what a real poller emits.
     fn flick(g: &mut GloveCursor, dir: Orient, away_ms: f32, ts: &[Target]) {
-        // Two rest readings: the first is the TRANSITION to rest (which clears
-        // the arm), the second is dwell at rest (which restores it). A real
-        // poller emits repeated readings, so this is what the daemon looks like.
         g.feed(Orient::Rest, 0.0, ts);
         g.feed(Orient::Rest, REARM_MIN_MS, ts);
         g.feed(dir, 0.0, ts);
@@ -652,7 +852,7 @@ mod tests {
 
     #[test]
     fn an_inactive_cursor_does_not_move() {
-        let mut g = GloveCursor { enabled: false, ambient_c: Some(0.0), ..Default::default() };
+        let mut g = GloveCursor { mode_setting: ColdMode::Off, ambient_c: Some(0.0), ..Default::default() };
         g.set_bounds(400.0, 800.0);
         let before = g.pos();
         flick(&mut g, Orient::LeftUp, 200.0, &[]);
@@ -977,7 +1177,7 @@ mod escape_and_confirm_tests {
     }
 
     fn cursor() -> GloveCursor {
-        let mut g = GloveCursor { enabled: true, ambient_c: Some(1.0), ..Default::default() };
+        let mut g = GloveCursor { mode_setting: ColdMode::Auto { threshold_c: COLD_C }, ambient_c: Some(1.0), ..Default::default() };
         g.set_bounds(400.0, 800.0);
         g
     }
@@ -1120,5 +1320,96 @@ mod escape_and_confirm_tests {
         let r = c.readout();
         assert!(r.contains("delete"));
         assert!(r.contains("cancel"));
+    }
+}
+
+#[cfg(test)]
+mod shake_command_tests {
+    use super::*;
+
+    fn cmds() -> ShakeCommands {
+        let mut c = ShakeCommands::with(vec![
+            ShakeBinding { dir: Orient::BottomUp, action: "new_tab".into(),
+                           label: "New tab".into() },
+            ShakeBinding { dir: Orient::RightUp, action: "swap_camera".into(),
+                           label: "Swap camera".into() },
+        ]);
+        c.enabled = true;
+        c
+    }
+
+    #[test]
+    fn a_single_flick_is_not_a_command() {
+        // Single flicks move a cursor. If one also opened a tab, walking the
+        // cursor across the screen would open a row of them.
+        let mut c = cmds();
+        assert_eq!(c.feed(Some(Orient::BottomUp), 16.0), None);
+    }
+
+    #[test]
+    fn two_flicks_the_same_way_are_a_command() {
+        let mut c = cmds();
+        c.feed(Some(Orient::BottomUp), 16.0);
+        assert_eq!(c.feed(Some(Orient::BottomUp), 200.0).as_deref(), Some("new_tab"));
+    }
+
+    #[test]
+    fn the_second_flick_must_arrive_inside_the_window() {
+        // Two considered moves minutes apart are not one gesture.
+        let mut c = cmds();
+        c.feed(Some(Orient::BottomUp), 16.0);
+        c.feed(None, DOUBLE_FLICK_MS + 100.0);
+        assert_eq!(c.feed(Some(Orient::BottomUp), 16.0), None, "the pair timed out");
+    }
+
+    #[test]
+    fn changing_direction_restarts_the_pair_rather_than_firing() {
+        // Someone who flicks left then right has changed their mind, not made a
+        // command.
+        let mut c = cmds();
+        c.feed(Some(Orient::BottomUp), 16.0);
+        assert_eq!(c.feed(Some(Orient::RightUp), 100.0), None);
+        // And that right flick is now the first of a NEW pair.
+        assert_eq!(c.feed(Some(Orient::RightUp), 100.0).as_deref(), Some("swap_camera"));
+    }
+
+    #[test]
+    fn a_third_flick_does_not_fire_again_immediately() {
+        // Otherwise a vigorous shake ratchets a command per flick after the
+        // first pair.
+        let mut c = cmds();
+        c.feed(Some(Orient::BottomUp), 16.0);
+        assert!(c.feed(Some(Orient::BottomUp), 100.0).is_some());
+        assert_eq!(c.feed(Some(Orient::BottomUp), 100.0), None, "starts a fresh pair");
+    }
+
+    #[test]
+    fn an_unbound_direction_does_nothing() {
+        let mut c = cmds();
+        c.feed(Some(Orient::LeftUp), 16.0);
+        assert_eq!(c.feed(Some(Orient::LeftUp), 100.0), None);
+    }
+
+    #[test]
+    fn the_toggle_is_independent_of_glove_mode() {
+        // Someone may want shake-for-new-tab without a cursor, and someone in
+        // gloves may want the cursor without their tabs multiplying.
+        let mut c = cmds();
+        c.enabled = false;
+        c.feed(Some(Orient::BottomUp), 16.0);
+        assert_eq!(c.feed(Some(Orient::BottomUp), 100.0), None);
+    }
+
+    #[test]
+    fn settings_can_name_what_a_gesture_does_without_performing_it() {
+        let c = cmds();
+        assert_eq!(c.describe(Orient::BottomUp), Some("New tab"));
+        assert_eq!(c.describe(Orient::LeftUp), None);
+    }
+
+    #[test]
+    fn the_window_is_wider_than_a_shake_and_narrower_than_two_moves() {
+        assert!(DOUBLE_FLICK_MS > FLICK_MAX_MS - 200.0);
+        assert!(DOUBLE_FLICK_MS < 1_000.0);
     }
 }

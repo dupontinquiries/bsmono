@@ -201,6 +201,10 @@ pub struct Snapclone {
     pub voice_field: Option<String>,
     /// (field, text) pairs spoken into armed fields, for the host to apply.
     pub dictated: Vec<(String, String)>,
+    /// Double-flick commands. Bound to camera swap here; independent of glove
+    /// mode, because wanting the gesture and wanting a cursor are different
+    /// wants.
+    pub shake: uikit_egui::glove::ShakeCommands,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -275,6 +279,11 @@ impl Snapclone {
             glove: Default::default(),
             voice_field: None,
             dictated: Vec::new(),
+            shake: uikit_egui::glove::ShakeCommands::with(vec![
+                uikit_egui::glove::ShakeBinding {
+                    dir: uikit_egui::glove::Orient::RightUp,
+                    action: "swap_camera".into(), label: "Swap camera".into() },
+            ]),
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -563,6 +572,12 @@ impl Snapclone {
             Answer::Declined => {}
         }
         self.incoming_call = None;
+    }
+
+    /// Feed a flick to the command layer and carry out whatever it binds.
+    pub fn apply_shake(&mut self, flicked: Option<uikit_egui::glove::Orient>, dt_ms: f32) {
+        let Some(action) = self.shake.feed(flicked, dt_ms) else { return };
+        if action == "swap_camera" { self.viewfinder.flip(); }
     }
 
     /// Carry out what glove mode asked for.
@@ -1092,16 +1107,42 @@ mod tests {
     }
 
     #[test]
+    fn a_double_flick_swaps_the_camera_and_a_single_one_does_not() {
+        use uikit_egui::glove::Orient;
+        let mut s = app();
+        s.shake.enabled = true;
+        let before = s.viewfinder.facing;
+        s.apply_shake(Some(Orient::RightUp), 16.0);
+        assert_eq!(s.viewfinder.facing, before, "one flick is a cursor move, not a command");
+        s.apply_shake(Some(Orient::RightUp), 150.0);
+        assert_ne!(s.viewfinder.facing, before);
+    }
+
+    #[test]
+    fn shake_commands_are_off_until_switched_on() {
+        use uikit_egui::glove::Orient;
+        let mut s = app();
+        let before = s.viewfinder.facing;
+        s.apply_shake(Some(Orient::RightUp), 16.0);
+        s.apply_shake(Some(Orient::RightUp), 150.0);
+        assert_eq!(s.viewfinder.facing, before);
+    }
+
+    #[test]
     fn glove_mode_needs_the_user_and_the_weather_to_agree() {
         let mut s = app();
-        s.glove.enabled = true;
+        use uikit_egui::glove::ColdMode;
+        s.glove.mode_setting = ColdMode::Auto { threshold_c: 8.0 };
         assert!(!s.glove.active(), "no temperature reading is not cold");
         s.glove.ambient_c = Some(18.0);
         assert!(!s.glove.active(), "and a mild day is not cold");
         s.glove.ambient_c = Some(1.0);
         assert!(s.glove.active());
-        s.glove.enabled = false;
-        assert!(!s.glove.active(), "cold alone does not switch it on");
+        s.glove.mode_setting = ColdMode::Off;
+        assert!(!s.glove.active(), "Off means off, however cold it is");
+        s.glove.mode_setting = ColdMode::On;
+        s.glove.ambient_c = Some(30.0);
+        assert!(s.glove.active(), "and manual On ignores the thermometer");
     }
 
     #[test]
