@@ -626,6 +626,144 @@ def body_symmetry(parts, tol=0.06):
     return orbits
 
 
+def _rot(axis, ang):
+    """Rodrigues rotation matrix."""
+    a = np.asarray(axis, float)
+    a = a / max(np.linalg.norm(a), 1e-9)
+    K = np.array([[0, -a[2], a[1]], [a[2], 0, -a[0]], [-a[1], a[0], 0]])
+    return np.eye(3) + math.sin(ang) * K + (1 - math.cos(ang)) * (K @ K)
+
+
+def grow_orbit(parts, seed_idx, axis, centre, order, scale, tol=0.05):
+    """MULTISTEP: use a seed orbit to find the rest of the assembly.
+
+    The seed is a clean N-fold group of identical parts — that is all
+    body_symmetry can find, because it demands matching shape hashes. But a
+    real rotor is a hub, a spinner, blades, and often blade TIPS modelled
+    separately, none of which hash alike.
+
+    So: take the seed's axis, centre and order, build the rotation by
+    2*pi/N, and APPLY IT to every other part. Anything whose centroid lands
+    on another part's centroid under that rotation belongs to the same
+    assembly, whatever its shape. Repeat until nothing new joins.
+
+    This is a much weaker claim per part and a much stronger one overall:
+    one part matching by chance is likely, a dozen parts all mapping onto
+    each other under the same rotation is not.
+    """
+    R = _rot(axis, 2 * math.pi / order)
+    cents = np.array([p.mean(0) for _, p, _ in parts])
+    radii = np.array([np.linalg.norm(p - p.mean(0), axis=1).max() for _, p, _ in parts])
+    member = set(seed_idx)
+    eps = scale * tol
+    grew = True
+    while grew:
+        grew = False
+        for i in range(len(parts)):
+            if i in member:
+                continue
+            img = centre + R @ (cents[i] - centre)
+            d = np.linalg.norm(cents - img, axis=1)
+            j = int(np.argmin(d))
+            # it must land on ANOTHER part, of similar reach — a blade maps
+            # onto a blade, not onto the hub it orbits
+            if d[j] < eps and j != i and abs(radii[j] - radii[i]) < radii[i] * 0.5 + eps:
+                member.add(i)
+                if j not in member:
+                    member.add(j)
+                grew = True
+    return sorted(member)
+
+
+def voxel_symmetry(pts, axis, grid=24, orders=(2, 3, 4, 5, 6, 8)):
+    """N-fold symmetry by ROTATING A CUBE GRID and measuring overlap.
+
+    Centroid matching was the wrong tool and it failed loudly: growing from a
+    seed called 195 of a helicopter's 293 parts one rotor, because a centroid
+    landing near another centroid is a weak claim and weak claims compound.
+    Voxels make it a strong one — rotate the occupied set by 2*pi/n and ask
+    how much of it lands back on itself. A propeller matches; a car body,
+    rotated by 120 degrees, does not.
+    
+    IoU rather than a hit count, so a dense region cannot score by volume
+    alone. Returns {n: iou}.
+    """
+    c = pts.mean(0)
+    q = pts - c
+    ext = float(np.abs(q).max())
+    if ext < 1e-9:
+        return {}
+    def vox(P):
+        i = np.clip(((P / ext * 0.5 + 0.5) * grid).astype(int), 0, grid - 1)
+        return set(map(tuple, i))
+    base = vox(q)
+    out = {}
+    for n in orders:
+        R = _rot(axis, 2 * math.pi / n)
+        rot = vox((R @ q.T).T)
+        inter = len(base & rot)
+        union = len(base | rot)
+        out[n] = inter / max(union, 1)
+    return out
+
+
+def principal_axes(pts):
+    """The three principal axes, best rotation candidates for a rigid body."""
+    q = pts - pts.mean(0)
+    _, _, vt = np.linalg.svd(q, full_matrices=False)
+    return [vt[0], vt[1], vt[2]]
+
+
+def is_rotor(pts, min_iou=0.62, min_n=3):
+    """Rotor if some axis gives high overlap at n >= 3 but NOT at every n.
+
+    The second half is what excludes a disc or a cylinder: those match at
+    every order because they are surfaces of revolution, and a wheel is not
+    a propeller. A real rotor matches at its blade count and fails between.
+    """
+    best = (1, 0.0, None)
+    for ax in principal_axes(pts):
+        sym = voxel_symmetry(pts, ax)
+        if not sym:
+            continue
+        # a surface of revolution scores high everywhere, including at the
+        # orders that are not its blade count
+        allhigh = min(sym.values()) > min_iou * 0.85
+        for n, iou in sym.items():
+            if n >= min_n and iou > best[1] and not allhigh:
+                best = (n, iou, ax)
+    return (best[1] >= min_iou), best[0], round(best[1], 3), best[2]
+
+
+def find_rotors(parts, min_order=3):
+    """Seed, grow, then classify. Returns (indices, axis, centre, order)."""
+    orbits = body_symmetry(parts)
+    allp = np.vstack([p for _, p, _ in parts])
+    scale = float((allp.max(0) - allp.min(0)).max())
+    cents = np.array([p.mean(0) for _, p, _ in parts])
+    out = []
+    claimed = set()
+    for kind, idxs, order, axis in orbits:
+        if kind != "rotational" or order < min_order:
+            continue
+        if set(idxs) & claimed:
+            continue
+        centre = cents[idxs].mean(0)
+        grown = grow_orbit(parts, idxs, axis, centre, order, scale)
+        # VERIFY: the grown assembly must still be N-fold as a whole. Growing
+        # can wander, and an assembly that is not symmetric after growth was
+        # never a rotor — it was a seed plus its neighbours.
+        R = _rot(axis, 2 * math.pi / order)
+        C = cents[grown]
+        img = centre + (R @ (C - centre).T).T
+        d = np.linalg.norm(img[:, None, :] - C[None], axis=2).min(1)
+        if float(d.mean()) > scale * 0.06:
+            continue
+        claimed |= set(grown)
+        out.append((grown, axis, centre, order))
+    return out
+
+
 def rotational_symmetry(pts, axis, bins=72):
     """N-fold symmetry about `axis`, and whether the shape is uniform.
 
@@ -758,8 +896,9 @@ def aero(pts, flow=(0.0, 0.0, -1.0)):
     # this reports 0 and the caller can see there is no propeller data,
     # instead of trusting a number that is noise.
     _ = (occupied, radial_even, disc_like)
-    is_prop, prop_n, prop_s, prop_u = propeller(q, f)
-    bladed = is_prop
+    # the voxel test, which is the one that works in both directions
+    bladed, prop_n, prop_s, _ax = is_rotor(q)
+    prop_u = 0.0
 
     # drag area: frontal silhouette scaled by how bluff it is. A round nose
     # sheds; a flat face does not.
