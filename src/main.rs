@@ -5212,52 +5212,7 @@ impl Game {
             _ => None,
         };
         if let Some(show) = stage_car {
-            let aspect = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
-            // camera basis, so the stand follows wherever you are looking
-            let fwd = (self.cam.look - self.cam.pos).normalize_or(Vec3::NEG_Z);
-            let right = fwd.cross(self.cam.up).normalize_or(Vec3::X);
-            let up = right.cross(fwd).normalize_or(Vec3::Y);
-            // WIDE SCREENS PUT IT BESIDE THE PANEL, TALL ONES ABOVE IT.
-            // On a wide window there is room to the right and none above; on
-            // a tall or square one the reverse. The panel narrows to match
-            // (see `garage_menu`), so the two never overlap.
-            let wide = aspect > 1.25;
-            let dist = 4.2;
-            let off = if wide {
-                right * (dist * 0.40) + up * (dist * 0.02)
-            } else {
-                up * (dist * 0.30)
-            };
-            let at = self.cam.pos + fwd * dist + off;
-            // a slow turntable, so you see the whole car without touching it
-            let spin = Quat::from_rotation_y(self.time * 0.5);
-            // A BOSS PREVIEWS AT BOSS SIZE. Scaling it up alone would put it
-            // through the camera, so the stand backs off by the same factor —
-            // the model reads as huge because the frame is the same and the
-            // thing in it is not.
-            let cscale = self.chassis_scale(show);
-            let at = if cscale > 1.0 { self.cam.pos + (at - self.cam.pos) * cscale } else { at };
-
-            // NO 3D MARKER YET. It wants an ObjDraw with the renderer's raw
-            // object format and a mesh to point at, and guessing at that
-            // blind is how you get a marker in the wrong space that reads as
-            // a joint in the wrong place — the exact failure this tool
-            // exists to catch. The readout names the joint and its parts;
-            // the marker is the next piece, and it belongs beside a display.
-            self.push_car(
-                &mut objs,
-                show,
-                at,
-                spin,
-                false,
-                self.time * 2.2,
-                0.0,
-                0.0,
-                self.cfg.car.size * 1.35,
-                None,
-                true,
-                self.skin_params(),
-            );
+            self.push_stage(&mut objs, show);
         }
 
         // remote cars + their boost flames
@@ -5331,6 +5286,130 @@ impl Game {
         // z doubles as the MOMENTUM input: how hot the current combo is
         let combo = (self.combo as f32 / 8.0).clamp(0.0, 1.0);
         [self.look.skin as f32, (self.save.car as f32) * 1.7, combo.max(0.35), sp]
+    }
+
+    /// THE CATALOGUE STAND. Extracted because it was the only place four
+    /// near-identical `push_car` calls could be told apart, and editing it
+    /// by string match into a five-thousand-line render function put the
+    /// same block into the peer-rendering loop twice.
+    ///
+    /// One place to change, and the things it needs — camera basis, the
+    /// stand's position, the model's scale — are locals here rather than
+    /// buried in the middle of another function.
+    fn push_stage(&self, objs: &mut Vec<ObjDraw>, show: usize) {
+                let aspect = self.gpu.config.width.max(1) as f32 / self.gpu.config.height.max(1) as f32;
+                // camera basis, so the stand follows wherever you are looking
+                let fwd = (self.cam.look - self.cam.pos).normalize_or(Vec3::NEG_Z);
+                let right = fwd.cross(self.cam.up).normalize_or(Vec3::X);
+                let up = right.cross(fwd).normalize_or(Vec3::Y);
+                // WIDE SCREENS PUT IT BESIDE THE PANEL, TALL ONES ABOVE IT.
+                // On a wide window there is room to the right and none above; on
+                // a tall or square one the reverse. The panel narrows to match
+                // (see `garage_menu`), so the two never overlap.
+                let wide = aspect > 1.25;
+                let dist = 4.2;
+                let off = if wide {
+                    right * (dist * 0.40) + up * (dist * 0.02)
+                } else {
+                    up * (dist * 0.30)
+                };
+                let at = self.cam.pos + fwd * dist + off;
+                // a slow turntable, so you see the whole car without touching it
+                let spin = Quat::from_rotation_y(self.time * 0.5);
+                // A BOSS PREVIEWS AT BOSS SIZE. Scaling it up alone would put it
+                // through the camera, so the stand backs off by the same factor —
+                // the model reads as huge because the frame is the same and the
+                // thing in it is not.
+                let cscale = self.chassis_scale(show);
+                let at = if cscale > 1.0 { self.cam.pos + (at - self.cam.pos) * cscale } else { at };
+
+                // IDLE, from the chassis's own size rather than a per-model
+                // curve. A pendulum's period goes as the square root of its
+                // length, so a boss breathes slowly for the same reason its
+                // fold is slow — one relationship, two uses.
+                let idl = idle::pose(
+                    &idle::Chassis {
+                        kind: idle::Kind::from_class(self.cars.class_of(show)),
+                        scale: cscale,
+                        reach_m: self.cfg.car.size.max(0.3) * 4.0,
+                    },
+                    self.time,
+                );
+                let at = at + up * idl.bob + right * idl.sway;
+                let spin = spin
+                    * Quat::from_rotation_y(idl.yaw)
+                    * Quat::from_rotation_z(idl.roll)
+                    * Quat::from_rotation_x(idl.pitch);
+
+                // MINIONS FOR SCALE. A boss previewed alone is a model that
+                // fills the frame — you cannot tell 2.6x from a closer
+                // camera. Three ordinary chassis beside it give the eye
+                // something to measure against, which is the only way a size
+                // reads at all.
+                if cscale > 1.0 {
+                    let n = self.cars.models.len().max(1);
+                    for m in 0..3usize {
+                        let mut pick = (show + 1 + m * 7) % n;
+                        for _ in 0..n.min(24) {
+                            if !self.is_boss(pick) {
+                                break;
+                            }
+                            pick = (pick + 1) % n;
+                        }
+                        if self.is_boss(pick) {
+                            continue;
+                        }
+                        let ang = std::f32::consts::TAU * (m as f32 / 3.0) + 0.6;
+                        let moff =
+                            right * ang.cos() * cscale * 0.9 + fwd * ang.sin() * cscale * 0.45;
+                        // each on its own phase, or three bots breathe in
+                        // unison and read as one object
+                        let mi = idle::pose(
+                            &idle::Chassis {
+                                kind: idle::Kind::from_class(self.cars.class_of(pick)),
+                                scale: 1.0,
+                                reach_m: self.cfg.car.size.max(0.3) * 4.0,
+                            },
+                            self.time + m as f32 * 1.7,
+                        );
+                        self.push_car(
+                            objs,
+                            pick,
+                            at + moff + up * (mi.bob - 0.12 * cscale),
+                            Quat::from_rotation_y(self.time * 0.5 + ang)
+                                * Quat::from_rotation_z(mi.roll),
+                            false,
+                            0.0,
+                            0.0,
+                            0.0,
+                            self.cfg.car.size,
+                            None,
+                            true,
+                            self.skin_params(),
+                        );
+                    }
+                }
+
+                // NO 3D MARKER YET. It wants an ObjDraw with the renderer's raw
+                // object format and a mesh to point at, and guessing at that
+                // blind is how you get a marker in the wrong space that reads as
+                // a joint in the wrong place — the exact failure this tool
+                // exists to catch. The readout names the joint and its parts;
+                // the marker is the next piece, and it belongs beside a display.
+                self.push_car(
+                    objs,
+                    show,
+                    at,
+                    spin,
+                    false,
+                    self.time * 2.2,
+                    0.0,
+                    0.0,
+                    self.cfg.car.size * 1.35,
+                    None,
+                    true,
+                    self.skin_params(),
+                );
     }
 
     fn push_car(
