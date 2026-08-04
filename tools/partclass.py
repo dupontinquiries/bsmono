@@ -97,7 +97,20 @@ def describe(pts, model_lo, model_ext, others_c, others_r):
     perp = q - np.outer(q @ long_ax, long_ax)
     r = np.linalg.norm(perp, axis=1)
     rmax = max(r.max(), 1e-9)
-    round_ = 1.0 - float(np.std(r[r > rmax * 0.25]) / rmax) if (r > rmax * 0.25).sum() > 8 else 0.0
+    # ROUNDNESS WAS BROKEN, and it was 87% of the reason 62% of real parts
+    # matched nothing. std/rmax is not a shape measure: for a shell-sampled
+    # BOX the radii spread from face-centre to corner, so std is large and
+    # roundness collapses to ~0.007 — while every synthetic exemplar, being
+    # sampled from analytic surfaces with far more regular radii, sat at
+    # 0.85. The two populations could not meet, and no amount of new
+    # archetypes would have fixed it because the axis itself was wrong.
+    #
+    # Measure it properly: how close is the cross-section to a circle, as the
+    # ratio of its mean radius to its max. A circle gives 1, a square about
+    # 0.9, a flat plate about 0.5. Bounded, stable under sampling density,
+    # and it means the same thing for both populations.
+    sel = r > rmax * 0.15
+    round_ = float(r[sel].mean() / rmax) if sel.sum() > 8 else 0.0
     hollow = float((r > rmax * 0.55).mean())
 
     vol = a * b * cc
@@ -322,6 +335,20 @@ ARCHETYPES = {
     "antenna":   lambda g: _tube(0, g, g.uniform(0.8, 2.0), g.uniform(0.01, 0.03)),
     "greeble":   lambda g: _box(g, g.uniform(0.05, 0.2), g.uniform(0.05, 0.2), g.uniform(0.05, 0.2)),
     "hullbox":   lambda g: _box(g, g.uniform(0.6, 1.6), g.uniform(0.4, 1.0), g.uniform(0.8, 2.4)),
+    # ---- guts: the boxy interior families. THIS IS THE MISSING SET.
+    # Ten ordinary road cars put 55% of their parts in "intake" because
+    # nothing box-shaped-and-buried existed to match — a Boxster does not
+    # have 372 intakes, it has floor pan sections, sill boxes and frame
+    # rails. Roundness settled it: the exemplars sit at 0.79, the real
+    # matches at 0.13.
+    "guts_rail":     lambda g: _box(g, g.uniform(0.06, 0.14), g.uniform(0.08, 0.18), g.uniform(1.2, 3.0)),
+    "guts_cross":    lambda g: _box(g, g.uniform(1.0, 2.2), g.uniform(0.06, 0.14), g.uniform(0.06, 0.16)),
+    "guts_pan":      lambda g: _box(g, g.uniform(0.7, 1.5), g.uniform(0.03, 0.09), g.uniform(0.8, 1.8)),
+    "guts_bulkhead": lambda g: _box(g, g.uniform(0.7, 1.4), g.uniform(0.4, 0.9), g.uniform(0.04, 0.10)),
+    "guts_tank":     lambda g: _box(g, g.uniform(0.3, 0.7), g.uniform(0.2, 0.45), g.uniform(0.35, 0.8)),
+    "guts_duct":     lambda g: _tube(0, g, g.uniform(0.6, 1.8), g.uniform(0.04, 0.09)),
+    "guts_bracket":  lambda g: _box(g, g.uniform(0.08, 0.22), g.uniform(0.08, 0.22), g.uniform(0.10, 0.28)),
+    "guts_mount":    lambda g: _box(g, g.uniform(0.12, 0.3), g.uniform(0.12, 0.3), g.uniform(0.12, 0.3)),
     # ---- skeleton ----
     "bone":      lambda g: _taper(g, g.uniform(1.0, 2.4), g.uniform(0.06, 0.12), g.uniform(0.09, 0.18)),
     "ball":      lambda g: _disc(g, g.uniform(0.12, 0.25), g.uniform(0.2, 0.4)),
@@ -348,7 +375,13 @@ PLACEMENT = {
     "coil": (-0.2, -0.2, 0.5, 1), "piston": (0.1, -0.4, 0.6, 1),
     "canopy": (0.45, 0.6, 0.1, 0), "intake": (0.3, 0.1, 0.6, 1),
     "antenna": (-0.3, 0.8, 0.3, 0), "greeble": (0.0, 0.2, 0.5, 0),
-    "hullbox": (0.0, 0.0, 0.2, 0), "bone": (0.0, 0.0, 0.5, 1),
+    "hullbox": (0.0, 0.0, 0.2, 0),
+    # buried, low, and mostly paired — a frame rail has a twin, a pan does not
+    "guts_rail": (0.0, -0.45, 0.55, 1), "guts_cross": (0.1, -0.45, 0.05, 0),
+    "guts_pan": (0.0, -0.6, 0.15, 0), "guts_bulkhead": (-0.35, -0.1, 0.1, 0),
+    "guts_tank": (-0.45, -0.3, 0.35, 0), "guts_duct": (0.2, -0.2, 0.45, 1),
+    "guts_bracket": (0.0, -0.2, 0.5, 1), "guts_mount": (0.1, -0.35, 0.5, 1),
+    "bone": (0.0, 0.0, 0.5, 1),
     "ball": (0.0, 0.1, 0.4, 1), "rib": (0.0, 0.2, 0.4, 1),
     "vertebra": (-0.1, 0.3, 0.05, 0), "pelvis": (0.0, -0.1, 0.05, 0),
     "skull": (0.2, 0.9, 0.05, 0), "h_torso": (0.0, 0.3, 0.05, 0),
@@ -446,6 +479,31 @@ def label(path):
         print(f"  {c:10s} {n:6d}  {100*n/tot:5.1f}%   {top}")
 
 
+def abstain_cut(A, ye, mult=3.0):
+    """How far is too far — measured from the EXEMPLARS, not the query set.
+
+    The first version used the 55th percentile of the query distances, which
+    reports 45% unknown by construction however good the library gets.
+    Adding eight guts archetypes changed the number by 0.0%, which is what a
+    self-fulfilling threshold looks like from the outside.
+
+    The honest cut comes from the reference frame: how far apart are members
+    of the SAME class? A real part further than a few of those from anything
+    is genuinely unlike everything we have described, and that is a fact
+    about the library rather than about the sample.
+    """
+    spreads = []
+    for c in set(map(str, ye)):
+        m = np.array([str(v) == c for v in ye])
+        if m.sum() < 2:
+            continue
+        Z = A[m]
+        D = ((Z[:, None, :] - Z[None]) ** 2).sum(-1)
+        np.fill_diagonal(D, np.nan)
+        spreads.append(np.sqrt(np.nanmedian(D)))
+    return float(np.median(spreads) * mult) if spreads else 6.0
+
+
 def report_match(ex, real):
     """Label real parts by nearest synthetic exemplar.
 
@@ -464,7 +522,7 @@ def report_match(ex, real):
     conf = 1.0 / (1.0 + np.sqrt(d[np.arange(len(B)), near]))
     counts, examples = {}, {}
     far_all = np.sqrt(d[np.arange(len(B)), near])
-    cut_all = float(np.percentile(far_all, 55))
+    cut_all = abstain_cut(A, ye)
     for i, k in enumerate(near):
         c = "unknown" if far_all[i] > cut_all else str(ye[k])
         counts[c] = counts.get(c, 0) + 1
@@ -478,7 +536,7 @@ def report_match(ex, real):
     # "intake". Anything past this distance is UNKNOWN, which is a fact worth
     # having: it names the archetypes still missing from the library.
     far = np.sqrt(d[np.arange(len(B)), near])
-    cut = float(np.percentile(far, 55))
+    cut = abstain_cut(A, ye)
     unknown = int((far > cut).sum())
     print(f"abstaining past distance {cut:.1f}: {unknown} unknown "
           f"({100*unknown/tot:.0f}%)\n")
