@@ -74,6 +74,7 @@ pub mod blastradius;
 pub mod confinement;
 pub mod externalwatch;
 pub mod buildsignal;
+pub mod quantcompare;
 pub mod filewindow;
 pub mod symbolfind;
 pub mod patchcheck;
