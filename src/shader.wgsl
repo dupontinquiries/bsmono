@@ -805,7 +805,14 @@ fn grid_shade(p: vec2<f32>, step: f32, width: f32) -> f32 {
 /// transform and a depth write. Its whole job is to establish what is
 /// actually visible before anything expensive runs.
 @fragment
-fn fs_depth(in: VsOut) {
+fn fs_depth(in: VsOut) -> @location(0) vec4<f32> {
+    // The pipeline declares a colour target (it must, to be compatible with
+    // the pass) and masks every channel off, so this value is discarded by
+    // the blend hardware. It exists because an entry point has to match the
+    // targets its pipeline declares — returning nothing while a target is
+    // declared is the second half of the same validation rule that rejected
+    // an empty target list.
+    return vec4<f32>(0.0);
 }
 
 @fragment

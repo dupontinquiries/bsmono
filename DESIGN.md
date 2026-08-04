@@ -3933,6 +3933,37 @@ half. It is the right order of magnitude, and it is the largest structural
 saving left in the renderer: every previous round made rays cheaper, and
 this one removes them.
 
+## v1.120.0 — the depth pre-pass, actually working
+
+The pre-pass shipped broken and crashed on startup. Three things were wrong,
+and only the first announced itself.
+
+INCOMPATIBLE ATTACHMENTS, which is what the validation error reported. The
+obvious way to write "depth only" is an empty colour target list, and wgpu
+rejects it: a pipeline's attachments must match the pass it runs in, and
+that pass has an Rgba16Float colour attachment. The fix is a target of the
+same format with every channel MASKED OFF — the hardware then does exactly
+what was wanted, depth written and colour untouched, and the pipeline is
+compatible.
+
+THE ENTRY POINT HAD TO MATCH TOO. The same rule applies at the shader end:
+declaring a target and returning nothing from the fragment shader is the
+other half of the mismatch. `fs_depth` returns a value now, and the write
+mask throws it away.
+
+AND THE ONE THAT WOULD HAVE BEEN WORSE. The pre-pass writes each opaque
+fragment's depth with `Less`. The shaded pass then draws the SAME geometry
+at the SAME depth — and `Less` rejects equal, so every opaque surface would
+have failed its own depth test and the scene would have rendered EMPTY. That
+is not a crash; it is a black screen with the UI still on it, which is a far
+harder thing to diagnose from a bug report. `LessEqual` on the second pass is
+what makes a depth pre-pass work at all: the first establishes the depth,
+the second is allowed to match it.
+
+The shader test validates the module but not entry-point-to-pipeline
+compatibility, which is why the first error reached a real GPU rather than
+the harness. Worth remembering about what that test does and does not cover.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

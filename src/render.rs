@@ -472,6 +472,21 @@ impl Gpu {
             stencil: Default::default(),
             bias: Default::default(),
         };
+        // THE PASS AFTER A PRE-PASS MUST ACCEPT EQUALITY.
+        //
+        // The pre-pass writes each opaque fragment's depth with `Less`. The
+        // shaded pass then draws the SAME geometry at the SAME depth — and
+        // `Less` rejects equal, so every opaque surface would fail its own
+        // depth test and the scene would render empty. `LessEqual` is what
+        // makes a depth pre-pass work at all: the first pass establishes the
+        // depth, the second is allowed to match it.
+        let depth_equal = wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::LessEqual,
+            stencil: Default::default(),
+            bias: Default::default(),
+        };
         let depth_skip = wgpu::DepthStencilState {
             format: wgpu::TextureFormat::Depth32Float,
             depth_write_enabled: false,
@@ -548,7 +563,7 @@ impl Gpu {
                 front_face: wgpu::FrontFace::Ccw,
                 ..Default::default()
             },
-            depth_stencil: Some(depth_write.clone()),
+            depth_stencil: Some(depth_equal),
             multisample: wgpu::MultisampleState { count: SAMPLES, ..Default::default() },
             multiview: None,
             cache: None,
@@ -584,7 +599,20 @@ impl Gpu {
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
                 entry_point: "fs_depth",
-                targets: &[],
+                // A COLOUR TARGET THAT WRITES NOTHING.
+                //
+                // The obvious way to say "depth only" is an empty target
+                // list, and wgpu rejects it: a pipeline's attachments must
+                // match the pass it runs in, and this pass has an Rgba16Float
+                // colour attachment. So declare the same format and mask off
+                // every channel — the blend and depth hardware then does
+                // exactly what was wanted (depth written, colour untouched)
+                // and the pipeline is compatible with the pass.
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: HDR_FMT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::empty(),
+                })],
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState {
