@@ -3604,7 +3604,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             // multiply by the reciprocal, and WGSL's round is half-to-EVEN. Dividing
                             // and rounding away from zero here disagrees on both counts, and at 127
                             // levels ties are commoner than at 7.
-                            qb_c[lr * k + b * 32 + j] = (w[base + j] * inv_scale).round_ties_even().clamp(-127.0, 127.0) as i32 as i8;
+                            qb_c[lr * k + b * 32 + j] = (w[base + j] * inv_scale).round().clamp(-127.0, 127.0) as i32 as i8;
                             }
                         }
                     }
@@ -3678,21 +3678,22 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                                 // Reciprocal, matching the shader: this driver turns `/` into a multiply by an
                                 // f32 reciprocal, and here an ULP crosses a .5 boundary where the two
                                 // round() rules then differ by a whole quantization level.
-                                // ROUND-TIES-EVEN, matching WGSL. This is the last difference and the only one that
-                                // was never arithmetic:
+                                // ROUND HALF AWAY FROM ZERO — and this was measured, not assumed.
                                 //
-                                //   WGSL round()      half to EVEN       round(2.5)=2
-                                //   Rust f32::round() half AWAY from 0   round(2.5)=3
+                                // The WGSL spec says round() is ties-to-even, so I switched the CPU
+                                // to round_ties_even() to match. The gate went from 1104 differing
+                                // words to 9680, and the pattern spread from three positions within a
+                                // block to ten. A clean refutation: the change moved the CPU AWAY
+                                // from the GPU.
                                 //
-                                // They differ only at exact .5 and only where the even neighbour is
-                                // lower — 0.5, 2.5, 4.5, 6.5. A 4-bit quantizer has levels -7..7, so
-                                // ties are rare per block and inevitable across many: 112 blocks hit
-                                // none, 70000 hit 1104.
+                                // Metal's round() is ties-AWAY-from-zero, and naga lowers WGSL's
+                                // round() straight onto it. The spec describes one rule and this
+                                // driver implements the other, so Rust's plain .round() was right all
+                                // along.
                                 //
-                                // That is why every small-tensor check passed exactly while the large
-                                // one failed identically through four arithmetic fixes. Arithmetic
-                                // would have moved both.
-                                let q = (w[base + j] * inv_scale).round_ties_even().clamp(-7.0, 7.0) as i32;
+                                // Reading the spec is what made this wrong. The gate is what made it
+                                // right.
+                                let q = (w[base + j] * inv_scale).round().clamp(-7.0, 7.0) as i32;
                                 nb_c[lr * k + b * 32 + j] = (q + 8) as u8; // 1..=15, symmetric around 8
                             }
                         }
@@ -4087,7 +4088,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                                     // The second q4 quantizer, which I patched the first of and missed this one — the
                     // same reciprocal-and-tie pair, and no gate exercises it at a scale that would
                     // have shown either.
-                    let qv = (w[base + j] * inv_scale).round_ties_even().clamp(-7.0, 7.0) as i32;
+                    let qv = (w[base + j] * inv_scale).round().clamp(-7.0, 7.0) as i32;
                                     nib_c[rr * k + b * 32 + j] = (qv + 8) as u8;
                                 }
                             }
