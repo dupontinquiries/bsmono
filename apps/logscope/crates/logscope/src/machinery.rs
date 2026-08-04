@@ -1821,3 +1821,130 @@ mod beacon_skin_tests {
         assert!(beacon_skin("Folding@home").aging.contains("bleach"));
     }
 }
+
+/// Teaching the machine's vocabulary, once.
+///
+/// The landmark is designed to read without a legend — a stopped pendulum looks stopped. But that
+/// only works **after** someone knows the pendulum tracks the engine. The first encounter teaches
+/// nothing, and a visual language nobody learned is decoration.
+///
+/// ## Why it appears once and not on hover
+///
+/// A tooltip that fires every time trains the reader to dismiss it, and dismissing becomes the
+/// habit — so the one time it matters, it is already invisible. Showing it on first encounter and
+/// never again means the reader either learned it or can ask.
+///
+/// ## Why it is tied to the STATE and not to the machine
+///
+/// Explaining "this is a clocktower, its pendulum shows GPU activity" while the pendulum swings
+/// normally teaches an abstraction. Explaining it the first time the pendulum **stops** teaches a
+/// fact the reader can immediately check against the thing in front of them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Lesson {
+    /// The state this teaches.
+    pub motion: Motion,
+    /// One sentence, in the scene's own vocabulary.
+    pub text: String,
+}
+
+/// What to say the first time a reader sees this motion in this scene.
+///
+/// Returns None for states that need no teaching: a machine working normally is self-explanatory,
+/// and interrupting to say so spends the reader's attention on the least useful case.
+pub fn lesson_for(scene: &str, motion: Motion) -> Option<Lesson> {
+    let m = machine_for(scene);
+    let text = match motion {
+        // The one that must be taught, because "stopped" is ambiguous until you know it is
+        // deliberate. Without this a reader's first thought is that the RENDERER broke.
+        Motion::Stalled => format!(
+            "{} — that is not a rendering fault. The engine is waiting on the GPU, and the mechanism \
+stops when it does.", m.stall),
+        // Worth teaching because it is the state a reader will misread as a problem: lots of motion
+        // looks like strain.
+        Motion::Fetching => format!(
+            "{} — experts are being streamed in. Movement here is work, not trouble.", m.fetch),
+        // Self-explanatory. Saying "it is working" while it visibly works is the interruption that
+        // teaches people to ignore the next one.
+        Motion::Thriving | Motion::Deciding => return None,
+    };
+    Some(Lesson { motion, text })
+}
+
+/// Tracks which lessons a reader has already seen.
+#[derive(Clone, Debug, Default)]
+pub struct Taught(std::collections::BTreeSet<u8>);
+
+impl Taught {
+    fn key(scene: &str, m: Motion) -> u8 {
+        // Scene-scoped: the vocabulary differs per world, so learning it in the Library does not
+        // teach it in Atlantis. Hashed to a byte because this only needs to distinguish a handful.
+        let s = scene.bytes().fold(0u8, |a, b| a.wrapping_mul(31).wrapping_add(b));
+        s.wrapping_mul(4).wrapping_add(m as u8)
+    }
+
+    /// Should this lesson be shown now?
+    pub fn take(&mut self, scene: &str, motion: Motion) -> Option<Lesson> {
+        let k = Self::key(scene, motion);
+        if self.0.contains(&k) { return None }
+        let l = lesson_for(scene, motion)?;
+        self.0.insert(k);
+        Some(l)
+    }
+
+    pub fn seen(&self) -> usize { self.0.len() }
+}
+
+#[cfg(test)]
+mod lesson_tests {
+    use super::*;
+
+    #[test]
+    fn a_STALL_is_taught_because_stopped_is_ambiguous() {
+        // Without this, a reader's first thought on seeing a frozen mechanism is that the RENDERER
+        // broke — which is the opposite of the message.
+        let l = lesson_for("Old Library", Motion::Stalled).unwrap();
+        assert!(l.text.contains("not a rendering fault"));
+        assert!(l.text.contains("does not fall"), "in the scene's own vocabulary");
+    }
+
+    #[test]
+    fn a_WORKING_machine_is_not_explained() {
+        // Saying "it is working" while it visibly works is the interruption that teaches people to
+        // ignore the next one.
+        assert!(lesson_for("Old Library", Motion::Thriving).is_none());
+        assert!(lesson_for("Old Library", Motion::Deciding).is_none());
+    }
+
+    #[test]
+    fn FETCHING_is_taught_because_motion_reads_as_strain() {
+        // The state a reader will misread as a problem: lots of movement looks like trouble.
+        let l = lesson_for("Treehouse", Motion::Fetching).unwrap();
+        assert!(l.text.contains("work, not trouble"));
+    }
+
+    #[test]
+    fn each_lesson_fires_ONCE() {
+        // A tooltip that repeats trains the reader to dismiss it, and dismissing becomes the habit —
+        // so the one time it matters it is already invisible.
+        let mut t = Taught::default();
+        assert!(t.take("Canopy", Motion::Stalled).is_some());
+        assert!(t.take("Canopy", Motion::Stalled).is_none());
+    }
+
+    #[test]
+    fn the_vocabulary_is_SCENE_SCOPED() {
+        // Learning that a pendulum means the engine does not teach that coral-crusted vanes do.
+        let mut t = Taught::default();
+        assert!(t.take("Old Library", Motion::Stalled).is_some());
+        assert!(t.take("Atlantis", Motion::Stalled).is_some(), "a new world is a new vocabulary");
+    }
+
+    #[test]
+    fn states_are_taught_INDEPENDENTLY() {
+        // Seeing a stall does not explain a fetch.
+        let mut t = Taught::default();
+        t.take("Canopy", Motion::Stalled);
+        assert!(t.take("Canopy", Motion::Fetching).is_some());
+        assert_eq!(t.seen(), 2);
+    }
+}
