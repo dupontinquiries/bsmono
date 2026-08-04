@@ -3860,6 +3860,34 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--frame-diag") {
+        // ONE RUN, SEVERAL ANSWERS. The operator's cost is the round trip — download, unpack, run,
+        // read — so a batch of independent probes is cheaper for them than one careful print per
+        // turn, and the ones that fail do not stop the ones that do not.
+        //
+        // Open question: 39% of submits on a dense resident model ran with no frame open, though
+        // decode_step_q8 calls begin_frame() first thing. This says where.
+        gpu_kernels::framediag::arm();
+        println!("frame-diag: armed. Run a generation, then this prints on exit.");
+        println!("  LOGSCOPE_FRAME_DIAG=1 arms it inside the app instead.");
+        let gpu = Gpu::new();
+        println!("frame-diag: adapter = {}", gpu.adapter_name);
+        // A synthetic decode-shaped burst: many small dispatches, the pattern decode produces.
+        let a = gpu.upload(&vec![0.1f32; 4096], 1, 4096);
+        for _ in 0..64 { let _ = gpu.rmsnorm_t(&a, &a, 1, 4096, 1e-5); }
+        println!("--- with no frame open ---\n{}", gpu_kernels::framediag::report());
+        gpu_kernels::framediag::reset();
+        gpu_kernels::framediag::arm();
+        gpu.begin_frame();
+        for _ in 0..64 { let _ = gpu.rmsnorm_t(&a, &a, 1, 4096, 1e-5); }
+        gpu.end_frame();
+        // THE CONTROL. If the framed run also reports frameless dispatches, the frame is not being
+        // honoured at all and the decode-path question is moot — a much bigger finding than a
+        // mis-placed end_frame, and one this comparison gets for free.
+        println!("--- with a frame held ---\n{}", gpu_kernels::framediag::report());
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-quantref") {
         // THE CONTRACT, checked before any kernel implements it. q1/q2/q3 do not exist yet; this
         // fixes what they must do so the next one inherits what q4_K cost seven wrong theories.
