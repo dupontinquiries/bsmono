@@ -104,6 +104,11 @@ pub const STEP_PX: f32 = 88.0;
 /// Above this it is a lean, and a lean on a bus is exactly what must not fire.
 pub const FLICK_MAX_MS: f32 = 700.0;
 
+/// How long the phone must be held screen-down to escape a listening field.
+///
+/// A HOLD rather than a flick, and that is the point — see `Tick::escaped`.
+pub const ESCAPE_HOLD_MS: f32 = 600.0;
+
 /// Shortest a phone must rest before another flick can fire.
 ///
 /// Descriptor chatter at a boundary — the reading flapping between "normal" and
@@ -117,8 +122,11 @@ pub const REARM_MIN_MS: f32 = 120.0;
 /// and all a ratchet needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Orient {
-    /// Upright, or flat on its back or face. All of these are REST.
+    /// Upright, or flat on its back. REST: re-arms the ratchet.
     Rest,
+    /// Screen down. Rest for ratchet purposes — a brief flip re-arms like any
+    /// other — but HELD it is the escape, which is why it is its own variant.
+    FaceDown,
     LeftUp,
     RightUp,
     BottomUp,
@@ -135,8 +143,8 @@ impl Orient {
     /// the phone flat does nothing except make the next flick possible.
     pub fn parse(s: &str) -> Orient {
         match s.trim().to_lowercase().as_str() {
-            "normal" | "face-up" | "face_up" | "faceup"
-            | "face-down" | "face_down" | "facedown" | "flat" => Orient::Rest,
+            "normal" | "face-up" | "face_up" | "faceup" | "flat" => Orient::Rest,
+            "face-down" | "face_down" | "facedown" => Orient::FaceDown,
             "left-up" | "left_up" | "leftup" => Orient::LeftUp,
             "right-up" | "right_up" | "rightup" => Orient::RightUp,
             "bottom-up" | "bottom_up" | "bottomup" => Orient::BottomUp,
@@ -144,7 +152,7 @@ impl Orient {
         }
     }
 
-    pub fn is_rest(self) -> bool { matches!(self, Orient::Rest) }
+    pub fn is_rest(self) -> bool { matches!(self, Orient::Rest | Orient::FaceDown) }
 
     /// The step this flick would make, in (dx, dy) units.
     ///
@@ -156,7 +164,7 @@ impl Orient {
             Orient::LeftUp => Some((-1.0, 0.0)),
             Orient::RightUp => Some((1.0, 0.0)),
             Orient::BottomUp => Some((0.0, -1.0)),
-            Orient::Rest | Orient::Unknown => None,
+            Orient::Rest | Orient::FaceDown | Orient::Unknown => None,
         }
     }
 }
@@ -186,6 +194,11 @@ impl Ratchet {
     pub fn armed(&self) -> bool { self.armed }
     pub fn at(&self) -> Orient { self.at }
     pub fn away(&self) -> bool { self.away_in.is_some() }
+
+    /// True once the phone has been held screen-down long enough to escape.
+    pub fn escaping(&self) -> bool {
+        self.at == Orient::FaceDown && self.dwell_ms >= ESCAPE_HOLD_MS
+    }
 
     /// Feed a descriptor reading. Returns a direction on the frame a flick
     /// completes.
@@ -268,6 +281,85 @@ pub enum GloveAction {
     /// each row is slower than saying "next".
     Step(i32),
     Dismiss,
+    /// Text spoken into an armed field. NOT a command — see `Mode::Dictating`.
+    Dictated(String),
+    /// The user held the phone screen-down to leave a listening field.
+    Escaped,
+}
+
+/// What the cursor is doing with speech.
+///
+/// The distinction is not cosmetic. While a field is armed, EVERY SPOKEN WORD
+/// IS CONTENT: "next" is a word someone might dictate into a message, and
+/// resolving it as a command would jump the cursor and silently swallow the
+/// word. So the vocabulary is SUSPENDED while dictating, and the only way out
+/// is out-of-band.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Mode {
+    Navigating,
+    Dictating { field: String },
+}
+
+/// A confirmation the user must answer by NAMING the action.
+///
+/// Confirmations are where an accidental step is worst, and glove mode makes
+/// every accident more likely: the recogniser is hearing a person through a
+/// scarf, and the cursor is being aimed by shaking a phone. Two rules follow.
+///
+/// **"Yes" is not accepted.** It is one short syllable, it is what a
+/// half-heard "yes?" or a background conversation sounds like, and it carries
+/// no information about WHAT is being agreed to. The user must say the verb —
+/// "delete", "leave", "send" — which is longer, more distinctive to a
+/// recogniser, and impossible to say by accident in answer to the wrong prompt.
+///
+/// **The safe choice is where the cursor starts.** As with the context menu,
+/// nothing destructive is pre-selected, so a stray flick or a misheard "select"
+/// lands on Cancel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Confirm {
+    pub prompt: String,
+    /// The verb that confirms — "delete", not "yes".
+    pub verb: String,
+    /// True when going ahead cannot be undone.
+    pub destructive: bool,
+}
+
+/// What a spoken answer to a confirmation resolved to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Confirmed,
+    Cancelled,
+    /// Heard, but not an answer. The prompt stays up.
+    Unclear,
+}
+
+impl Confirm {
+    pub fn new(prompt: &str, verb: &str, destructive: bool) -> Self {
+        Confirm { prompt: prompt.into(), verb: verb.trim().to_lowercase(), destructive }
+    }
+
+    /// Resolve a spoken answer.
+    pub fn answer(&self, phrase: &str) -> Answer {
+        let p = phrase.trim().to_lowercase();
+        if p.is_empty() { return Answer::Unclear; }
+        // Cancelling is easy on purpose: several ways to say it, all accepted.
+        // Backing out of a destructive prompt should never require precision.
+        if matches!(p.as_str(),
+            "cancel" | "no" | "stop" | "never mind" | "nevermind" | "go back" | "back") {
+            return Answer::Cancelled;
+        }
+        // Confirming requires the verb. "yes" is refused even here.
+        if p == self.verb || p == format!("{} it", self.verb) {
+            return Answer::Confirmed;
+        }
+        Answer::Unclear
+    }
+
+    /// What the prompt should read out, so the verb is discoverable — a user
+    /// who does not know the word cannot say it.
+    pub fn readout(&self) -> String {
+        format!("{} — say \"{}\" to confirm, or \"cancel\"", self.prompt, self.verb)
+    }
 }
 
 /// Maps a transcript to an action against the current target.
@@ -328,7 +420,15 @@ impl Vocab {
     }
 }
 
-/// The rolling cursor.
+/// What one orientation reading produced.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tick {
+    pub snapped: Option<String>,
+    /// The phone was held screen-down long enough to leave a listening field.
+    pub escaped: bool,
+}
+
+/// The ratcheting cursor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GloveCursor {
     pub enabled: bool,
@@ -339,6 +439,7 @@ pub struct GloveCursor {
     pos: (f32, f32),
     /// The flick ratchet. No velocity: the cursor does not coast.
     ratchet: Ratchet,
+    mode: Mode,
     snapped: Option<String>,
     bounds: (f32, f32),
 }
@@ -347,7 +448,7 @@ impl Default for GloveCursor {
     fn default() -> Self {
         GloveCursor {
             enabled: false, ambient_c: None, cold_c: COLD_C,
-            pos: (0.0, 0.0), ratchet: Ratchet::default(),
+            pos: (0.0, 0.0), ratchet: Ratchet::default(), mode: Mode::Navigating,
             snapped: None, bounds: (0.0, 0.0),
         }
     }
@@ -377,13 +478,45 @@ impl GloveCursor {
     /// phone that will not respond needs to know it is waiting for rest.
     pub fn armed(&self) -> bool { self.ratchet.armed() }
 
+    pub fn mode(&self) -> &Mode { &self.mode }
+    pub fn dictating(&self) -> bool { matches!(self.mode, Mode::Dictating { .. }) }
+
+    /// Arm a field for voice entry. Suspends the vocabulary.
+    pub fn arm_field(&mut self, id: &str) {
+        self.mode = Mode::Dictating { field: id.to_string() };
+    }
+
+    /// Leave dictation. Returns true if it was actually listening.
+    pub fn escape(&mut self) -> bool {
+        let was = self.dictating();
+        self.mode = Mode::Navigating;
+        was
+    }
+
     /// Feed one orientation reading.
     ///
     /// `o` is `AccelerometerOrientation` parsed by `Orient::parse` — the daemon
-    /// string, nothing more. Returns the snapped id after any step.
-    pub fn feed(&mut self, o: Orient, dt_ms: f32, targets: &[Target]) -> Option<String> {
-        if !self.active() { return None; }
-        if let Some((dx, dy)) = self.ratchet.feed(o, dt_ms) {
+    /// string, nothing more.
+    pub fn feed(&mut self, o: Orient, dt_ms: f32, targets: &[Target]) -> Tick {
+        if !self.active() { return Tick::default(); }
+        let mut out = Tick::default();
+
+        // The escape is checked FIRST and works in either mode. It has to be
+        // reachable from dictation, which is the state it exists to leave.
+        let stepped = self.ratchet.feed(o, dt_ms);
+        if self.ratchet.escaping() {
+            out.escaped = self.escape();
+        }
+
+        // While dictating the cursor does not move. A phone held to the mouth
+        // sways, and a cursor that wandered off the field during dictation
+        // would deliver the text somewhere else.
+        if self.dictating() {
+            out.snapped = self.snapped.clone();
+            return out;
+        }
+
+        if let Some((dx, dy)) = stepped {
             // A fixed step, clamped to the screen. No momentum: the cursor
             // arrives where it was sent and stays there, which is what makes it
             // aimable with a shaking hand.
@@ -391,7 +524,8 @@ impl GloveCursor {
             self.pos.1 = (self.pos.1 + dy * STEP_PX).clamp(0.0, self.bounds.1);
         }
         self.snapped = self.nearest(targets).map(|t| t.id.clone());
-        self.snapped.clone()
+        out.snapped = self.snapped.clone();
+        out
     }
 
     /// The nearest target within the snap radius.
@@ -425,10 +559,19 @@ impl GloveCursor {
 
     /// Resolve a spoken phrase against whatever is snapped.
     pub fn speak(&mut self, phrase: &str, targets: &[Target]) -> Option<GloveAction> {
+        // Dictating: the vocabulary is suspended and the words are content.
+        // Resolving "next" here would jump the cursor and swallow the word.
+        if self.dictating() {
+            if phrase.trim().is_empty() { return None; }
+            return Some(GloveAction::Dictated(phrase.to_string()));
+        }
         let target = targets.iter().find(|t| Some(t.id.as_str()) == self.snapped())?;
         let action = Vocab::resolve(phrase, target)?;
         if let GloveAction::Step(d) = action {
             self.step(targets, d);
+        }
+        if let GloveAction::ArmField(id) = &action {
+            self.arm_field(id);
         }
         Some(action)
     }
@@ -673,7 +816,7 @@ mod tests {
     fn nothing_outside_the_radius_captures_the_ball() {
         let mut g = cold_cursor();
         let ts = vec![target("miles", TargetKind::Button, 20.0, 20.0)];
-        assert_eq!(g.feed(Orient::Rest, 16.0, &ts), None);
+        assert_eq!(g.feed(Orient::Rest, 16.0, &ts).snapped, None);
         assert_eq!(g.readout(&ts), "nothing selected");
     }
 
@@ -822,5 +965,160 @@ mod tests {
             g.feed(Orient::Rest, 16.0, &ts);
             assert_eq!(g.speak("cancel", &ts), Some(GloveAction::Dismiss), "{kind:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod escape_and_confirm_tests {
+    use super::*;
+
+    fn target(id: &str, kind: TargetKind, x: f32, y: f32) -> Target {
+        Target { id: id.into(), kind, at: (x, y), label: id.into() }
+    }
+
+    fn cursor() -> GloveCursor {
+        let mut g = GloveCursor { enabled: true, ambient_c: Some(1.0), ..Default::default() };
+        g.set_bounds(400.0, 800.0);
+        g
+    }
+
+    #[test]
+    fn while_dictating_the_vocabulary_is_suspended() {
+        // THE bug this fixes. "next" is a word someone dictates into a message;
+        // resolving it as a command jumps the cursor and swallows the word.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        assert!(g.dictating());
+        assert_eq!(g.speak("next", &ts), Some(GloveAction::Dictated("next".into())));
+        // Even "cancel" is content while listening, which is exactly why the
+        // escape has to be out of band.
+        assert_eq!(g.speak("cancel", &ts), Some(GloveAction::Dictated("cancel".into())));
+    }
+
+    #[test]
+    fn holding_the_phone_screen_down_escapes_dictation() {
+        // A HOLD, not a double flick: escape must be reliable and can afford
+        // latency, and a hold cannot be produced by a single ambient sway.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        assert!(g.dictating());
+
+        g.feed(Orient::FaceDown, 0.0, &ts);
+        let out = g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &ts);
+        assert!(out.escaped);
+        assert!(!g.dictating());
+    }
+
+    #[test]
+    fn a_brief_flip_face_down_does_not_escape_it_just_re_arms() {
+        // Otherwise the escape would fire every time the phone was turned over
+        // in passing, and face-down is a resting pose people use constantly.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        g.feed(Orient::FaceDown, 0.0, &ts);
+        let out = g.feed(Orient::FaceDown, ESCAPE_HOLD_MS - 50.0, &ts);
+        assert!(!out.escaped);
+        assert!(g.dictating(), "still listening");
+    }
+
+    #[test]
+    fn the_cursor_does_not_wander_while_dictating() {
+        // A phone held near the mouth sways. A cursor that drifted off the
+        // field during dictation would deliver the text somewhere else.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        let before = g.pos();
+        for _ in 0..5 {
+            g.feed(Orient::Rest, 200.0, &ts);
+            g.feed(Orient::LeftUp, 100.0, &ts);
+            g.feed(Orient::Rest, 0.0, &ts);
+        }
+        assert_eq!(g.pos(), before);
+    }
+
+    #[test]
+    fn escaping_when_not_listening_reports_nothing_happened() {
+        let mut g = cursor();
+        g.feed(Orient::FaceDown, 0.0, &[]);
+        let out = g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &[]);
+        assert!(!out.escaped, "there was nothing to escape from");
+    }
+
+    #[test]
+    fn after_escaping_the_vocabulary_works_again() {
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        g.feed(Orient::FaceDown, 0.0, &ts);
+        g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
+        assert_eq!(g.speak("select", &ts), Some(GloveAction::ArmField("body".into())));
+    }
+
+    // ── confirmations ───────────────────────────────────────────────────────
+
+    #[test]
+    fn yes_does_not_confirm_anything() {
+        // One short syllable, indistinguishable from a half-heard "yes?" or a
+        // background conversation, and carrying no information about what is
+        // being agreed to.
+        let c = Confirm::new("Delete this snap?", "delete", true);
+        assert_eq!(c.answer("yes"), Answer::Unclear);
+        assert_eq!(c.answer("yeah"), Answer::Unclear);
+        assert_eq!(c.answer("ok"), Answer::Unclear);
+    }
+
+    #[test]
+    fn naming_the_verb_confirms() {
+        let c = Confirm::new("Delete this snap?", "delete", true);
+        assert_eq!(c.answer("delete"), Answer::Confirmed);
+        assert_eq!(c.answer("  DELETE  "), Answer::Confirmed);
+        assert_eq!(c.answer("delete it"), Answer::Confirmed);
+    }
+
+    #[test]
+    fn the_verb_of_one_prompt_does_not_answer_another() {
+        // Saying "delete" at a "Leave the call?" prompt must not confirm it —
+        // which is the real reason to require the verb rather than "yes".
+        let leave = Confirm::new("Leave the call?", "leave", false);
+        assert_eq!(leave.answer("delete"), Answer::Unclear);
+        assert_eq!(leave.answer("leave"), Answer::Confirmed);
+    }
+
+    #[test]
+    fn cancelling_is_easy_and_has_several_words() {
+        // Backing out of a destructive prompt should never require precision.
+        let c = Confirm::new("Delete this snap?", "delete", true);
+        for phrase in ["cancel", "no", "stop", "never mind", "go back"] {
+            assert_eq!(c.answer(phrase), Answer::Cancelled, "{phrase}");
+        }
+    }
+
+    #[test]
+    fn an_unclear_answer_leaves_the_prompt_up() {
+        // Neither confirming nor cancelling on a mishearing: the prompt is the
+        // safe state, so staying there is the safe failure.
+        let c = Confirm::new("Delete this snap?", "delete", true);
+        assert_eq!(c.answer("banana"), Answer::Unclear);
+        assert_eq!(c.answer(""), Answer::Unclear);
+    }
+
+    #[test]
+    fn the_readout_teaches_the_word_it_requires() {
+        // A user who does not know the verb cannot say it, so the prompt has to
+        // say it.
+        let c = Confirm::new("Delete this snap?", "delete", true);
+        let r = c.readout();
+        assert!(r.contains("delete"));
+        assert!(r.contains("cancel"));
     }
 }
