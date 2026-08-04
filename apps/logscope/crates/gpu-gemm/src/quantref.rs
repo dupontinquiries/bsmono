@@ -10,9 +10,13 @@
 //! that does this disagree by an ULP — invisible until the value crosses a quantization boundary,
 //! then a whole level.
 //!
-//! **Round ties to even, never away from zero.** WGSL's `round()` is half-to-even; Rust's
-//! `f32::round()` is half-away-from-zero. They differ at exactly 0.5, 2.5, 4.5 — where the even
-//! neighbour is lower.
+//! **Round ties AWAY FROM ZERO — measured, not read from the spec.** The WGSL spec says `round()` is
+//! ties-to-even, so the obvious move is to match that on the CPU. Doing so took `gate-q4k` from 1104
+//! differing words to **9680**. Metal's `round()` is ties-away, naga lowers WGSL's onto it, and the
+//! spec describes a rule this driver does not implement.
+//!
+//! This is the single most important line in the module: **the specification was the wrong source and
+//! the gate was the right one.**
 //!
 //! ## Tie density scales with level count, which decides how big a test must be
 //!
@@ -44,7 +48,7 @@ pub fn quantize_block(w: &[f32], bits: u32) -> Option<(f32, Vec<i32>)> {
     let scale = if amax > 0.0 { amax * (1.0f32 / bound) } else { 1.0 };
     let inv = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
     let q = w.iter()
-        .map(|x| (x * inv).round_ties_even().clamp(-bound, bound) as i32)
+        .map(|x| (x * inv).round().clamp(-bound, bound) as i32)
         .collect();
     Some((scale, q))
 }
@@ -93,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn TIES_round_to_even_at_every_width() {
+    fn TIES_round_AWAY_FROM_ZERO_at_every_width() {
         // The rule WGSL uses and Rust does not. Constructed so the quotient is exactly 2.5: the even
         // neighbour is 2, and f32::round() would give 3.
         // THE REACHABLE TIES DEPEND ON THE WIDTH, which my first fixture got wrong. A quotient of
@@ -109,11 +113,12 @@ mod tests {
             if bound >= 3.0 { w.push(2.5); w.push(-2.5); }
             let (scale, q) = quantize_block(&w, bits).unwrap();
             assert_eq!(scale, 1.0, "bits {bits}: amax is the bound so the scale is unity");
-            assert_eq!(q[1], 0, "0.5 must round to 0 at {bits} bits, got {}", q[1]);
-            assert_eq!(q[2], 0, "-0.5 must round to 0");
+            // Away from zero, matching Metal — NOT the spec's ties-to-even, which measured worse.
+            assert_eq!(q[1], 1, "0.5 must round AWAY to 1 at {bits} bits, got {}", q[1]);
+            assert_eq!(q[2], -1, "-0.5 must round away to -1");
             if bound >= 3.0 {
-                assert_eq!(q[3], 2, "2.5 must round to 2 at {bits} bits, got {}", q[3]);
-                assert_eq!(q[4], -2, "-2.5 must round to -2");
+                assert_eq!(q[3], 3, "2.5 must round AWAY to 3 at {bits} bits, got {}", q[3]);
+                assert_eq!(q[4], -3, "-2.5 must round away to -3");
             }
         }
     }
