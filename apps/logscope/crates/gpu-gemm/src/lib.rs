@@ -8502,6 +8502,32 @@ last block and k's first would decode to garbage")),
             // (--gate-q4k proves the conversion is bit-identical to the CPU route it replaces), so the
             // dequantize-to-f32 and requantize steps disappear entirely. LOGSCOPE_NO_Q4K_GPU falls back to
             // the CPU path if this ever needs to be bisected against.
+            // IQ1_S NATIVE: the file's bytes ARE the resident form.
+            //
+            // Every other path here fetches f32 and requantizes. For IQ1_S that is not merely wasteful
+            // — at 1.5625 bpw the conversion to q4's 4.5 is a 2.88x inflation, so a 30.3 GiB
+            // checkpoint becomes 87 GiB and is refused. The whole point of the format is that it is
+            // already small enough, and converting it throws that away.
+            //
+            // Modelled on the q4 fast path immediately below, which established that a tensor can go
+            // from mmap to GPU without a dequantize pass. This is the same move for a format where it
+            // is the difference between loading and not.
+            if quantize && t.ggml_type == 19 && k % 256 == 0
+                && std::env::var("LOGSCOPE_NO_IQ1_NATIVE").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if count == n * k {
+                    if let (Some(nbytes), Some(sset)) = (gguf::type_nbytes(19, count), static_set.as_ref()) {
+                        if let Some(raw) = sset.slice(t.offset, nbytes) {
+                            // Uploaded as opaque words. MATVEC_IQ1_S reads the block layout itself, so
+                            // nothing here needs to understand it — which is why this is small.
+                            let words: Vec<u32> = raw.chunks_exact(4)
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            let blocks = self.upload_u32(&words);
+                            return Ok(Lin::iq1(Iq1Weight { blocks, n, k }));
+                        }
+                    }
+                }
+            }
             if quantize && q4_mode && t.ggml_type == 12 && k % 256 == 0
                 && std::env::var("LOGSCOPE_NO_Q4K_GPU").is_err() {
                 let count = t.dims.iter().product::<u64>() as usize;
