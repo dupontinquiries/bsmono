@@ -77,6 +77,7 @@ pub mod buildsignal;
 pub mod filewindow;
 pub mod symbolfind;
 pub mod patchcheck;
+pub mod anchor;
 pub mod contextwidth;
 pub mod modelfit;
 pub mod linearize;
