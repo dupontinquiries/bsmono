@@ -576,6 +576,20 @@ impl Gpu {
             attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
         };
 
+        // A LAYOUT WITH ONLY WHAT THE PRE-PASS USES.
+        //
+        // Borrowing the scene's layout looked harmless — same vertices, same
+        // transform — but a pipeline layout is a CONTRACT: it declares the
+        // bind groups the pipeline requires, and the scene's third group is
+        // the texture. The pre-pass never sets one (it reads no textures),
+        // so every draw failed validation for a group it did not need in the
+        // first place. Its own layout declares the two it actually uses.
+        let prepass_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("depth prepass"),
+            bind_group_layouts: &[&globals_layout, &obj_layout],
+            push_constant_ranges: &[],
+        });
+
         // ---- DEPTH PRE-PASS PIPELINE ----
         //
         // The scene shader casts a shadow ray, four AO probes and a
@@ -589,7 +603,7 @@ impl Gpu {
         // work and nothing else.
         let depth_prepass = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("depth prepass"),
-            layout: Some(&scene_layout),
+            layout: Some(&prepass_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: "vs_scene",

@@ -3964,6 +3964,25 @@ The shader test validates the module but not entry-point-to-pipeline
 compatibility, which is why the first error reached a real GPU rather than
 the harness. Worth remembering about what that test does and does not cover.
 
+## v1.121.0 — the pre-pass borrowed the wrong contract
+
+Second crash from the same feature, and the same root cause in a different
+guise: the pre-pass was borrowing the scene's PIPELINE LAYOUT.
+
+That looked harmless — same vertices, same transform, why build another? But
+a pipeline layout is a CONTRACT, not a convenience: it declares the bind
+groups a pipeline REQUIRES. The scene's third group is the texture, and the
+pre-pass never sets one because it reads no textures. Every draw therefore
+failed validation for a resource it did not need in the first place.
+
+It has its own layout now, declaring the two groups it actually binds:
+globals and the per-object uniform.
+
+Both failures in this feature came from reusing something that looked
+compatible — an empty target list where the pass has an attachment, and a
+layout that demands more than the pipeline uses. The pattern is worth
+naming: in wgpu, a pipeline must describe ITSELF, not the thing it resembles.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
