@@ -193,7 +193,10 @@ compiles or it does not, and it can be reverted in a second. Reasoning about wha
 is expensive: it consumes a turn and returns a guess. If a question could be settled by writing the \
 thing, or by adding a print and running it, do that instead of explaining what you expect. Prefer the \
 smallest version that RUNS over the most complete version that is described. Explanations are for \
-after the result comes back, not instead of it.";
+after the result comes back, not instead of it. AND WHEN YOU MUST RETURN FOR A DECISION, RETURN WITH \
+THE EVIDENCE ALREADY GATHERED \u{2014} if a question needs the user, run the cheap check on the way \
+and bring the result. Coming back with two options and no data asks them to decide something you \
+could have narrowed for the cost of a print.";
 
 pub const UNIVERSAL_CORE: &str = "\n\nALWAYS: An outline is not a step \u{2014} if you name a step, \
 take it in the same reply. State what you actually compiled or ran versus what you only wrote; \
@@ -575,5 +578,36 @@ mod build_bias_tests {
         // The specific corrective: nine hypotheses against five measurements, and the measurements
         // were four lines each. "Add a print and run it" is the cheap action the core never named.
         assert!(BUILD_BIAS.contains("adding a print and running it"));
+    }
+}
+
+#[cfg(test)]
+mod return_with_evidence_tests {
+    use super::*;
+
+    /// The sharper form of the build bias, and the one this session most needed.
+    ///
+    /// I said "the decisive print is X" and stopped, four separate times, when ADDING the print cost
+    /// less than describing it. Each of those turns ended with the user holding a question I could
+    /// have half-answered on the way.
+    #[test]
+    fn returning_for_a_decision_requires_bringing_EVIDENCE() {
+        assert!(BUILD_BIAS.contains("RETURN WITH THE EVIDENCE ALREADY GATHERED"));
+        assert!(BUILD_BIAS.contains("run the cheap check on the way"));
+    }
+
+    #[test]
+    fn it_names_the_failure_as_ASKING_rather_than_as_slowness() {
+        // Not "you were slow" — "you asked them to decide something you could have narrowed". The
+        // cost lands on the other person, which is what makes it worth a rule.
+        assert!(BUILD_BIAS.contains("asks them to decide something you could have narrowed"));
+    }
+
+    #[test]
+    fn the_bias_still_permits_returning_for_a_decision_at_all() {
+        // Some questions genuinely need the user — which model to download, whether a tradeoff is
+        // acceptable. The rule is about arriving with data, not about never arriving.
+        assert!(BUILD_BIAS.contains("WHEN YOU MUST RETURN FOR A DECISION"),
+            "the phrasing has to grant that returning is sometimes right");
     }
 }
