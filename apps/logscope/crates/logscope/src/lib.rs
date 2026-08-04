@@ -70,6 +70,7 @@ pub mod benchartifact;
 pub mod machinery;
 pub mod longrun;
 pub mod buildsignal;
+pub mod filewindow;
 pub mod verifyplan;
 pub mod panelvoice;
 pub mod injecttime;
