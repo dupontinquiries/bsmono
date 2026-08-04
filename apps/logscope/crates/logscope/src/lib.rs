@@ -74,6 +74,7 @@ pub mod filewindow;
 pub mod symbolfind;
 pub mod patchcheck;
 pub mod contextwidth;
+pub mod modelfit;
 pub mod verifyplan;
 pub mod panelvoice;
 pub mod injecttime;
