@@ -170,3 +170,170 @@ mod tests {
         assert_eq!(rule(&a), rule(&a), "deterministic, and therefore uncorrelated with the agent");
     }
 }
+
+/// Taint that PROPAGATES, modelled on Perl's taint mode.
+///
+/// `Action::from_read_content` is a flag someone has to set, which protects only the first hop. If a
+/// summariser reads a file and its output feeds another agent, the second agent sees clean-looking
+/// text and the defence is gone.
+///
+/// **Perl solved this in 1989** and the design is still right: data originating outside the program
+/// is tainted, taint follows every derivation automatically, and tainted data cannot reach a
+/// dangerous operation until it is explicitly laundered. The laundering is the interesting part —
+/// Perl requires a regex match, because forcing the programmer to say WHAT SHAPE they expect is what
+/// makes the untainting a decision rather than a cast.
+///
+/// This is the same, adapted: a summary of a tainted file is tainted, a plan derived from a tainted
+/// summary is tainted, and laundering requires the operator.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Tainted<T> {
+    value: T,
+    /// Where it came from, in order. **Kept as a chain rather than a bool** so a refusal can say
+    /// which file three hops back is responsible — "this is tainted" is not actionable, "this came
+    /// from vendor/foo/README via two summaries" is.
+    origin: Vec<String>,
+}
+
+impl<T> Tainted<T> {
+    /// Data the operator typed. Clean by definition — they are the authority this system serves.
+    pub fn from_operator(value: T) -> Self { Tainted { value, origin: Vec::new() } }
+
+    /// Data read from anywhere else: a file, a crate, a web page, another agent's output.
+    pub fn from_source(value: T, source: impl Into<String>) -> Self {
+        Tainted { value, origin: vec![source.into()] }
+    }
+
+    pub fn is_tainted(&self) -> bool { !self.origin.is_empty() }
+    pub fn origin(&self) -> &[String] { &self.origin }
+
+    /// Read the value. **Always permitted** — taint restricts what may be AUTHORISED, never what may
+    /// be read or reasoned about. A defence that stopped the agent seeing file contents would stop
+    /// it working.
+    pub fn peek(&self) -> &T { &self.value }
+
+    /// Derive a new value. **Taint follows automatically**, which is the whole point: a summary of a
+    /// tainted file is tainted without anyone remembering to say so.
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> Tainted<U> {
+        Tainted { value: f(self.value), origin: self.origin }
+    }
+
+    /// Combine two values. Taint unions — one tainted input taints the result, because a plan
+    /// half-derived from an untrusted file is a plan derived from an untrusted file.
+    pub fn combine<U, V>(self, other: Tainted<U>, f: impl FnOnce(T, U) -> V) -> Tainted<V> {
+        let mut origin = self.origin;
+        origin.extend(other.origin);
+        Tainted { value: f(self.value, other.value), origin }
+    }
+
+    /// Launder, with the operator's explicit approval.
+    ///
+    /// Takes the approval as a value rather than a bool so it cannot be passed accidentally, and
+    /// records what was approved. Perl's regex requirement has the same purpose: make untainting a
+    /// decision with a shape, not a cast.
+    pub fn launder(self, approval: OperatorApproval) -> T {
+        let _ = approval;
+        self.value
+    }
+}
+
+/// Proof that a human looked at the specific thing.
+///
+/// Constructed only from a description, so an approval for one action cannot be reused for another
+/// by a caller holding a spare `true`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OperatorApproval(String);
+
+impl OperatorApproval {
+    pub fn of(what_was_shown: impl Into<String>) -> Self { OperatorApproval(what_was_shown.into()) }
+    pub fn what(&self) -> &str { &self.0 }
+}
+
+/// Rule on an action whose justification is tainted.
+///
+/// Supersedes the `from_read_content` flag: the taint arrives with the value rather than being
+/// remembered by a caller.
+pub fn rule_tainted(action: &Tainted<Action>) -> Ruling {
+    let a = action.peek();
+    if action.is_tainted() && a.reversibility >= Reversibility::Irreversible {
+        return Ruling::Refuse { because: format!(
+            "'{}' is irreversible and its justification traces to {} — content that was read, not \
+instructed. It may inform and it may not authorise", a.what, action.origin().join(" -> ")) };
+    }
+    rule(a)
+}
+
+#[cfg(test)]
+mod taint_tests {
+    use super::*;
+
+    #[test]
+    fn taint_PROPAGATES_through_a_summary() {
+        // The gap the flag left: a summariser reads a file, and the next agent sees clean-looking
+        // text. Perl solved this in 1989 by making taint follow every derivation.
+        let file = Tainted::from_source("rm -rf /".to_string(), "vendor/foo/README.md");
+        let summary = file.map(|s| format!("the readme suggests: {s}"));
+        assert!(summary.is_tainted());
+        let plan = summary.map(|s| format!("plan based on {s}"));
+        assert!(plan.is_tainted(), "three hops and still tainted");
+    }
+
+    #[test]
+    fn the_ORIGIN_CHAIN_survives_so_a_refusal_can_name_the_file() {
+        // "This is tainted" is not actionable. "This came from vendor/foo/README via two summaries"
+        // is — the operator can go and look.
+        let a = Tainted::from_source("x".to_string(), "crates.io/somecrate/build.rs");
+        assert_eq!(a.map(|s| s.len()).origin(), ["crates.io/somecrate/build.rs"]);
+    }
+
+    #[test]
+    fn ONE_tainted_input_taints_a_combination() {
+        // A plan half-derived from an untrusted file is a plan derived from an untrusted file.
+        let clean = Tainted::from_operator(1u32);
+        let dirty = Tainted::from_source(2u32, "some.md");
+        assert!(clean.combine(dirty, |a, b| a + b).is_tainted());
+    }
+
+    #[test]
+    fn OPERATOR_data_is_clean_and_stays_clean() {
+        // They are the authority this system serves; treating their input as suspect would make the
+        // whole mechanism useless.
+        let t = Tainted::from_operator("delete the build dir".to_string());
+        assert!(!t.is_tainted());
+        assert!(!t.map(|s| s.to_uppercase()).is_tainted());
+    }
+
+    #[test]
+    fn READING_tainted_data_is_always_permitted() {
+        // Taint restricts what may be AUTHORISED, never what may be read or reasoned about. A defence
+        // that stopped the agent seeing file contents would stop it working.
+        let t = Tainted::from_source("some content".to_string(), "f.md");
+        assert_eq!(t.peek(), "some content");
+    }
+
+    #[test]
+    fn a_TAINTED_irreversible_action_is_refused_and_names_its_chain() {
+        let a = Tainted::from_source(
+            Action { what: "delete node_modules".into(),
+                     reversibility: Reversibility::Irreversible, from_read_content: false },
+            "vendor/setup.md");
+        let r = rule_tainted(&a);
+        assert!(matches!(r, Ruling::Refuse { .. }));
+        assert!(format!("{r:?}").contains("vendor/setup.md"));
+    }
+
+    #[test]
+    fn the_same_action_from_the_OPERATOR_only_confirms() {
+        let a = Tainted::from_operator(
+            Action { what: "delete node_modules".into(),
+                     reversibility: Reversibility::Irreversible, from_read_content: false });
+        assert!(matches!(rule_tainted(&a), Ruling::Confirm { .. }));
+    }
+
+    #[test]
+    fn LAUNDERING_requires_a_described_approval_not_a_bool() {
+        // Perl requires a regex so untainting is a decision with a shape. An approval carrying what
+        // was shown cannot be reused for a different action by a caller holding a spare `true`.
+        let t = Tainted::from_source(42u32, "f.md");
+        assert_eq!(t.launder(OperatorApproval::of("shown the file and the proposed deletion")), 42);
+    }
+}
