@@ -153,3 +153,49 @@ The pattern names the class without another guess:
 * **regular gaps** — a boundary or stride error
 * **all past a fixed index** — a dispatch or grid-limit error
 * **scattered, one position per block** — a rounding straggler after all
+
+---
+
+# The last 276: not the scale, and not arithmetic
+
+```
+gaps: 8096 exactly, 276 times
+positions within a 32-word block: {31}
+super-block 245 scale idx [21, 52, 19, 50, 16, 31, 46, 45]
+12 scale bytes: [85, 116, 147, 178, 209, 240, 18, 49, 80, 111, 142, 173]
+```
+
+**The extraction is correct.** Hand-computing the ggml rule against those twelve bytes reproduces the
+printed indices exactly, `j=7` included — `sc = (q[11] & 0xF) | ((q[3] >> 6) << 4) = 45`,
+`mn = (q[11] >> 4) | ((q[7] >> 6) << 4) = 10`. Both sides implement it the same way.
+
+**And it cannot be the scale anyway.** Words 28, 29, 30 and 31 all belong to sub-block 7 and share one
+scale. A wrong scale corrupts all four. **Only word 31 differs**, in every one of the 276 occurrences.
+
+## What that leaves
+
+Word 31 is weights 248..255 — the final eight of the super-block. Their nibbles live in the **last four
+bytes of the 144-byte block**, which is also the last four bytes before the next block begins.
+
+So the remaining candidates are about the **end of the block**, not its contents:
+
+1. A read that straddles the block boundary — `byte_at` fetches a `u32` word, and the final bytes of
+   one block share a word with the first bytes of the next when the 144-byte stride is not
+   word-aligned. **144 is divisible by 4**, so this should not happen — which is exactly the kind of
+   "should" that has been wrong eight times here.
+2. The nibble-packing loop's last iteration, where `w == 3` and `b == 7` reach the final byte.
+3. The period is the DATA — `(i * 31) % 253` — so whatever it is, it is triggered by specific byte
+   values arriving at that position, not by the position alone.
+
+The decisive print is the raw `qs` bytes for weights 248..255 alongside both sides' nibbles for word
+31. That distinguishes a bad READ from a bad PACK, and it is one line.
+
+## Trajectory
+
+```
+297430  ->  1104  ->  9680  ->  276
+        scale ULP   my revert   quantizer reciprocal
+                    (ties-even)
+```
+
+Nine theories, five measurements. Every measurement narrowed it; four of the theories widened it.
