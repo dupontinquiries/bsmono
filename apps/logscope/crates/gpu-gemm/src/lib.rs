@@ -13794,6 +13794,97 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
 ///
 /// The weights are ternary, so the product is a select-and-add and there is nothing for an integer
 /// path to accelerate. That is the opposite of the Q8_0 case where the integer dot was worth 2×.
+/// IQ1_S matvec across selected experts, in one dispatch.
+///
+/// **The kernel the stacked MoE path could not have.** Every other expert kind binds a (quant, scale)
+/// PAIR of buffers; IQ1_S interleaves indices and scales in one 50-byte block and additionally needs
+/// the 2048-entry codebook grid, so it takes six bindings where the pair kinds take five. That shape
+/// mismatch is why `LinKind::Iq1` was unreachable from the MoE arm.
+///
+/// One structural change from the dense kernel: the row base is offset by the selected expert, read
+/// from `selw`'s first half — the same buffer `MOE_TOPK` fills and `MOE_MATVEC_GLU_Q4` reads. The
+/// block decode is untouched, so `--gate-iq1s-kernel`'s validation of the arithmetic still applies.
+///
+/// `xper` matches the GLU kernel's flag of the same name: per-slot activations when the caller
+/// pre-scaled them for a weight_before architecture, shared row 0 otherwise.
+pub const MOE_MATVEC_IQ1_S: &str = r#"
+// slots: how many experts are selected. xper: activations are per-slot (pre-scaled) rather than
+// shared, matching MOE_MATVEC_GLU_Q4's flag of the same name.
+struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, slots:u32, xper:u32, pad:u32 };
+@group(0) @binding(0) var<storage, read> a: array<f32>;      // activations [k]
+@group(0) @binding(1) var<storage, read> w: array<u32>;      // IQ1_S blocks, 50 B per 256
+@group(0) @binding(2) var<storage, read> grid: array<u32>;   // 2048 entries, 2 u32 each
+@group(0) @binding(3) var<storage, read> selw: array<u32>;   // [slots idx | slots weight]
+@group(0) @binding(4) var<storage, read_write> c: array<f32>;
+@group(0) @binding(5) var<uniform> d: D;
+
+// Byte at absolute offset `i` of the weight blob. IQ1_S rows are 50-byte multiples, which is NOT a
+// multiple of 4, so a row does not start on a word boundary and every read must go through here.
+fn wbyte(i: u32) -> u32 { return extractBits(w[i >> 2u], (i & 3u) * 8u, 8u); }
+fn whalf(i: u32) -> u32 { return wbyte(i) | (wbyte(i + 1u) << 8u); }
+
+// f16 -> f32. The scale is the only float in the block and it is half-precision.
+fn f16(h: u32) -> f32 {
+    let sgn = f32(1 - i32((h >> 15u) & 1u) * 2);
+    let exp = (h >> 10u) & 0x1Fu;
+    let man = h & 0x3FFu;
+    if (exp == 0u) { return sgn * f32(man) * 5.9604645e-8; }
+    if (exp == 31u) { return sgn * 65504.0; }
+    return sgn * exp2(f32(i32(exp) - 15)) * (1.0 + f32(man) / 1024.0);
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let row  = g.x + g.y * d.gx;
+    let slot = g.z;
+    if (row >= d.n || slot >= d.slots) { return; }
+    let nblk = d.k / 256u;
+    // THE EXPERT OFFSET IS THE ONLY STRUCTURAL DIFFERENCE from the dense kernel. Experts are stacked
+    // contiguously, so expert e begins at e * n * nblk * 50 bytes — and the index comes from selw's
+    // FIRST half, the same buffer MOE_TOPK fills and MOE_MATVEC_GLU_Q4 reads.
+    let expert = selw[slot];
+    let rowbase = (expert * d.n + row) * nblk * 50u;
+    // Two accumulator chains: every FMA otherwise waits on the previous one, which serialises the
+    // loop to iterations x latency regardless of available bandwidth. Colibri's int8 matvec does the
+    // same on NEON, and here k is thousands rather than tens.
+    // Per-slot activations when the caller pre-scaled them for a weight_before architecture,
+    // otherwise every slot shares row 0 — the same contract as MOE_MATVEC_GLU_Q4's xper.
+    var abase = 0u;
+    if (d.xper == 1u) { abase = slot * d.k; }
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    for (var b = 0u; b < nblk; b = b + 1u) {
+        let blk = rowbase + b * 50u;
+        let dsc = f16(whalf(blk));
+        for (var ib = 0u; ib < 8u; ib = ib + 1u) {
+            let h = whalf(blk + 34u + 2u * ib);
+            let dl = dsc * f32(2u * ((h >> 12u) & 7u) + 1u);
+            var delta = 0.125;
+            if ((h & 0x8000u) != 0u) { delta = -0.125; }
+            for (var l = 0u; l < 4u; l = l + 1u) {
+                // 11-bit index: 8 bits from qs, 3 from qh at this group's offset.
+                // extractBits throughout: `h >> (3u * l)` is a shift by a lane-varying amount, which
+                // returns zero on Honeykrisp for every lane whose shift is non-zero.
+                let idx = wbyte(blk + 2u + ib * 4u + l) | (extractBits(h, 3u * l, 3u) << 8u);
+                let lo = grid[idx * 2u];
+                let hi = grid[idx * 2u + 1u];
+                let base = b * 256u + ib * 32u + l * 8u;
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    // Same rule for the byte selects. The trailing `<< 24u >> 24u` is a sign
+                    // extension by CONSTANT amounts and is unaffected — it is the varying shift that
+                    // fails, not shifting as such.
+                    let tl = f32(i32(extractBits(lo, 8u * j, 8u)) << 24u >> 24u);
+                    let th = f32(i32(extractBits(hi, 8u * j, 8u)) << 24u >> 24u);
+                    acc0 = acc0 + a[abase + base + j] * (tl + delta) * dl;
+                    acc1 = acc1 + a[abase + base + 4u + j] * (th + delta) * dl;
+                }
+            }
+        }
+    }
+    c[slot * d.n + row] = acc0 + acc1;
+}
+"#;
+
 pub const MATVEC_IQ1_S: &str = r#"
 struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, pad0:u32, pad1:u32, pad2:u32 };
 @group(0) @binding(0) var<storage, read> a: array<f32>;      // activations [k]
