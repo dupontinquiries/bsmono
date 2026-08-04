@@ -78,19 +78,67 @@ def clusters(xz, cell):
     return blobs
 
 
+def hull(pts):
+    """Convex hull in the ground plane — the support polygon."""
+    P = sorted(map(tuple, pts))
+    if len(P) < 3:
+        return P
+    def half(ps):
+        h = []
+        for p in ps:
+            while len(h) >= 2 and (h[-1][0]-h[-2][0])*(p[1]-h[-2][1]) - (h[-1][1]-h[-2][1])*(p[0]-h[-2][0]) <= 0:
+                h.pop()
+            h.append(p)
+        return h[:-1]
+    return half(P) + half(P[::-1])
+
+
+def com_margin(com_xz, poly):
+    """Signed distance from the CoM to the support polygon edge, in metres.
+
+    POSITIVE MEANS IT STANDS. This is the classic static-stability margin and
+    it is what separates a leg from a wing without ever mentioning either: a
+    support that carries load is one the centre of mass is standing ON. A
+    wing is above the CoM and outside the polygon it would need to be inside,
+    so a body balanced on its wingtips reads as unstable no matter how
+    beautifully symmetric its wings are.
+    """
+    if len(poly) < 3:
+        # fewer than three contacts cannot bound anything, so nothing stands
+        # on them. Returning a sentinel here leaked -546082511 into the
+        # printout once divided by body width; -1 body-width is the honest
+        # magnitude and reads as what it is.
+        return -1.0
+    best = 1e9
+    inside = True
+    n = len(poly)
+    for i in range(n):
+        a, b = np.array(poly[i]), np.array(poly[(i + 1) % n])
+        e = b - a
+        L = np.linalg.norm(e)
+        if L < 1e-9:
+            continue
+        nrm = np.array([-e[1], e[0]]) / L
+        d = float(np.dot(np.array(com_xz) - a, nrm))
+        if d < 0:
+            inside = False
+        best = min(best, abs(d))
+    return best if inside else -best
+
+
 def score(P):
     ext = P.max(0) - P.min(0)
     lo = P.min(0)
     band = P[P[:, 1] < lo[1] + ext[1] * 0.14]
     if len(band) < 20:
-        return 0.0, 0, 0.0
+        return 0.0, 0, 0.0, -1.0
     cell = max(ext[0], ext[2]) * 0.06
     if cell <= 0:
-        return 0.0, 0, 0.0
+        return 0.0, 0, 0.0, -1.0
     bl = clusters(band[:, [0, 2]], cell)
     n = len(bl)
     if n == 0:
-        return 0.0, 0, 0.0
+        return 0.0, 0, 0.0, -1.0
     mid_x = (P[:, 0].max() + P[:, 0].min()) * 0.5
     # SYMMETRY: does each contact have a partner mirrored in x
     tol = max(ext[0], ext[2]) * 0.16
@@ -108,6 +156,19 @@ def score(P):
         spread = 0.0
     # HEADROOM: mass above the contacts, not below
     head = float((P[:, 1] > lo[1] + ext[1] * 0.5).mean())
+
+    # STATIC STABILITY, which is the term that knows a leg from a wing.
+    # Symmetry alone cannot: a flyer's wings are as symmetric as any pair of
+    # legs. The difference is that legs are what the centre of mass is
+    # standing ON, so project the CoM into the ground plane and ask whether
+    # it falls inside the polygon the contacts make, and by how much.
+    #
+    # Normalised by body width, so a wide-stance mech and a narrow biped are
+    # comparable — a spider is not more stable merely for being large.
+    com = P.mean(0)
+    poly = hull([tuple(b) for b in bl])
+    marg = com_margin((com[0], com[2]), poly) / max(ext[0], ext[2], 1e-9)
+    stable = float(np.clip(0.5 + marg * 2.0, 0.0, 1.0))
     # SLENDERNESS: legs are thin things reaching DOWN. A body lying on its
     # side has contacts too — its flank — and they are wide and continuous
     # rather than a few narrow points. So measure how much of the bottom band
@@ -116,9 +177,9 @@ def score(P):
     fp_area = max(np.ptp(band[:, 0]), 1e-9) * max(np.ptp(band[:, 2]), 1e-9)
     covered = len(clusters(band[:, [0, 2]], cell)) * (cell * cell)
     slender = 1.0 - min(covered / max(fp_area, 1e-9), 1.0)
-    s = (min(n, 6) / 6.0) * 0.28 + sym * 0.24 + min(spread, 1.0) * 0.14 \
-        + head * 0.24 + slender * 0.10
-    return s, n, sym
+    s = (min(n, 6) / 6.0) * 0.20 + sym * 0.16 + min(spread, 1.0) * 0.10 \
+        + head * 0.18 + slender * 0.06 + stable * 0.30
+    return s, n, sym, marg
 
 
 def verdict(rows, margin=0.12):
@@ -143,8 +204,8 @@ def best(iqm):
     rows = []
     for name, R in ORIENTS.items():
         Q = P @ R.T
-        s, n, sym = score(Q)
-        rows.append((s, name, n, sym))
+        s, n, sym, marg = score(Q)
+        rows.append((s, name, n, sym, marg))
     rows.sort(reverse=True)
     return rows
 
@@ -158,7 +219,8 @@ if __name__ == "__main__":
         except Exception as e:
             print(f"{iqm[:44]:44s} ERR {e}"); continue
         print(f"\n{iqm.replace('imported_','')[:52]}")
-        for s, name, n, sym in rows:
-            print(f"   {s:.3f}  {name:12s} contacts {n:2d} symmetry {sym:.2f}")
+        for s, name, n, sym, marg in rows:
+            st = "stands" if marg > 0 else "topples"
+            print(f"   {s:.3f}  {name:12s} contacts {n:2d} sym {sym:.2f} margin {marg:+.3f} {st}")
         call, marg = verdict(rows)
         print(f"   -> {('APPLY ' + call) if call else 'leave as exported'}  (margin {marg:+.3f})")
