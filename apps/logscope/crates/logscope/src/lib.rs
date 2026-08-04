@@ -65,6 +65,7 @@ pub mod docroute;
 pub mod manifest;
 pub mod interleave;
 pub mod dwell;
+pub mod benchscenario;
 pub mod machinery;
 pub mod panelvoice;
 pub mod injecttime;
