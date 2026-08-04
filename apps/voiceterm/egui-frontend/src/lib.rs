@@ -19,6 +19,7 @@ pub mod detect;
 pub mod explore;
 pub mod manpage_view;
 pub mod voice_routing;
+pub mod iio_accel;
 
 /// Double-flick commands, bound to tab management.
 ///
