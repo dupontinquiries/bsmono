@@ -14,15 +14,54 @@
 //!
 //! * **Temperature** — `ambient-learner`'s `EnvSnapshot::aux_temp_c`, a real
 //!   ambient reading from a BME280-style sensor rather than a CPU thermal zone.
-//! * **Tilt** — and this one needs saying plainly: `iio-sensor-proxy` exposes
-//!   orientation only as STRINGS ("normal", "left-up", "bottom-up"), not as a
-//!   vector. A ball cannot be rolled with four labels. The raw counts live in
-//!   sysfs, which is the path snapclone's `IioSensorProxySource` already polls
-//!   for its motion bit, so the vector is reachable — but it is not what the
-//!   D-Bus daemon hands you, and anything built on the proxy alone would move
-//!   in four directions at one speed.
+//! * **Orientation** — `iio-sensor-proxy`'s `AccelerometerOrientation`, the
+//!   plain descriptor strings. Nothing else. See the ratchet below for why that
+//!   is enough, and why an earlier version of this module was wrong to say it
+//!   was not.
 //! * **Speech** — the recogniser. `Vocab` maps a transcript to an action; it
 //!   does not listen.
+//!
+//! ## The ratchet, which is the whole motion model
+//!
+//! The cursor does NOT roll under continuous acceleration. It ratchets: each
+//! shake moves it one fixed step, and it will not move again until the phone
+//! comes back to rest. Shake, return, shake, return — you traverse by
+//! repeating, the way you walk a ball through a tilt maze.
+//!
+//! This matters for three reasons, and the first is the one that changed the
+//! design:
+//!
+//! 1. **The four descriptor strings are enough.** A continuous model needs an
+//!    acceleration vector, which `iio-sensor-proxy` does not expose — an
+//!    earlier version of this module concluded from that it could not be built
+//!    on the daemon and needed a sysfs reader. That was wrong. A ratchet needs
+//!    only to know WHICH WAY the phone was turned and WHEN it came back, and
+//!    "left-up" / "normal" carries both.
+//! 2. **A gloved hand cannot aim a rolling ball.** Fixed steps land on a grid;
+//!    momentum lands wherever the shaking hand left off.
+//! 3. **Returning to rest is free.** Face-up and face-down do nothing except
+//!    re-arm, so the return stroke costs the user nothing and cannot overshoot.
+//!
+//! ## Flick timing, which is what makes it work on a bus
+//!
+//! The step fires on the RETURN to rest, not on the way out, and only if the
+//! phone was away for less than `FLICK_MAX_MS`. That is the whole defence
+//! against a moving environment: on a train or while walking, the orientation
+//! descriptor drifts through the same values a flick passes through, but it
+//! drifts SLOWLY and it stays there. A lean is not a flick, and a lean that is
+//! held is not a flick that was slow.
+//!
+//! Firing on the return costs one return-stroke of latency, and that is a trade
+//! made on purpose. A step that fires on the way out cannot be un-fired when
+//! the phone turns out to have been leaning rather than flicking, and an
+//! accidental step is far worse than a late one for someone wearing gloves who
+//! cannot easily correct it.
+//!
+//! `REARM_MIN_MS` is the other half: the phone must rest before it can fire
+//! again. Descriptor chatter at a boundary — the reading flapping between
+//! "normal" and "left-up" as the hand shakes — would otherwise ratchet several
+//! steps from one motion. Holding a tilt never repeats either: one flick, one
+//! step, however long the pose is held.
 //!
 //! ## Why the cursor snaps rather than clicking where it is
 //!
@@ -54,20 +93,143 @@ pub const COLD_C: f32 = 8.0;
 /// worst.
 pub const SNAP_RADIUS_PX: f32 = 72.0;
 
-/// Tilt below this is the phone resting, not steering. Without it the ball
-/// creeps across the screen whenever the device is not perfectly level, which
-/// it never is.
-pub const TILT_DEADZONE: f32 = 0.06;
+/// How far one flick moves the cursor, in pixels.
+///
+/// A grid step rather than a distance: fixed steps land somewhere predictable,
+/// which is the point of ratcheting instead of rolling.
+pub const STEP_PX: f32 = 88.0;
 
-/// Acceleration per unit of tilt, px/s².
-pub const TILT_GAIN: f32 = 2_400.0;
+/// Longest a phone may be away from rest and still count as a flick.
+///
+/// Above this it is a lean, and a lean on a bus is exactly what must not fire.
+pub const FLICK_MAX_MS: f32 = 700.0;
 
-/// Velocity retained per second — rolling friction. Without it the ball
-/// oscillates around a target forever and never settles enough to snap.
-pub const FRICTION_PER_SEC: f32 = 0.12;
+/// Shortest a phone must rest before another flick can fire.
+///
+/// Descriptor chatter at a boundary — the reading flapping between "normal" and
+/// "left-up" as a shaking hand crosses it — would otherwise ratchet several
+/// steps from one motion.
+pub const REARM_MIN_MS: f32 = 120.0;
 
-/// Speed below which the ball is considered parked, px/s.
-pub const PARK_SPEED: f32 = 8.0;
+/// The descriptor as `iio-sensor-proxy` reports it.
+///
+/// Parsed from the string rather than a vector, which is all the daemon gives —
+/// and all a ratchet needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orient {
+    /// Upright, or flat on its back or face. All of these are REST.
+    Rest,
+    LeftUp,
+    RightUp,
+    BottomUp,
+    /// The daemon could not tell. Neither fires nor re-arms — an unknown
+    /// reading is not evidence of anything, and treating it as rest would let
+    /// a phone tumbling in a pocket re-arm between flaps.
+    Unknown,
+}
+
+impl Orient {
+    /// Parse `AccelerometerOrientation` / `AccelerometerTilt`.
+    ///
+    /// Face-up and face-down are REST, per the maze game this follows: turning
+    /// the phone flat does nothing except make the next flick possible.
+    pub fn parse(s: &str) -> Orient {
+        match s.trim().to_lowercase().as_str() {
+            "normal" | "face-up" | "face_up" | "faceup"
+            | "face-down" | "face_down" | "facedown" | "flat" => Orient::Rest,
+            "left-up" | "left_up" | "leftup" => Orient::LeftUp,
+            "right-up" | "right_up" | "rightup" => Orient::RightUp,
+            "bottom-up" | "bottom_up" | "bottomup" => Orient::BottomUp,
+            _ => Orient::Unknown,
+        }
+    }
+
+    pub fn is_rest(self) -> bool { matches!(self, Orient::Rest) }
+
+    /// The step this flick would make, in (dx, dy) units.
+    ///
+    /// Left-up means the left edge lifted — the phone rotated anticlockwise —
+    /// and the ball runs downhill, to the left. Bottom-up lifts the bottom
+    /// edge, so the ball runs up the screen.
+    pub fn direction(self) -> Option<(f32, f32)> {
+        match self {
+            Orient::LeftUp => Some((-1.0, 0.0)),
+            Orient::RightUp => Some((1.0, 0.0)),
+            Orient::BottomUp => Some((0.0, -1.0)),
+            Orient::Rest | Orient::Unknown => None,
+        }
+    }
+}
+
+/// The flick ratchet: one step per out-and-back, gated on timing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ratchet {
+    /// Where the phone is now.
+    at: Orient,
+    /// How long it has been there.
+    dwell_ms: f32,
+    /// The direction it left rest in, if it is away.
+    away_in: Option<Orient>,
+    /// True once it has rested long enough to fire again.
+    armed: bool,
+}
+
+impl Default for Ratchet {
+    fn default() -> Self {
+        // Starts UNARMED: the first reading after switching the mode on should
+        // not fire a step just because the phone happens to be tilted.
+        Ratchet { at: Orient::Unknown, dwell_ms: 0.0, away_in: None, armed: false }
+    }
+}
+
+impl Ratchet {
+    pub fn armed(&self) -> bool { self.armed }
+    pub fn at(&self) -> Orient { self.at }
+    pub fn away(&self) -> bool { self.away_in.is_some() }
+
+    /// Feed a descriptor reading. Returns a direction on the frame a flick
+    /// completes.
+    pub fn feed(&mut self, o: Orient, dt_ms: f32) -> Option<(f32, f32)> {
+        if o == self.at {
+            self.dwell_ms += dt_ms;
+            // Resting long enough re-arms; being AWAY long enough turns the
+            // flick into a lean, which will never fire.
+            if self.at.is_rest() && self.dwell_ms >= REARM_MIN_MS { self.armed = true; }
+            if self.away_in.is_some() && self.dwell_ms > FLICK_MAX_MS { self.away_in = None; }
+            return None;
+        }
+
+        // An unknown reading changes nothing: it is not evidence of rest or of
+        // a direction, and letting it re-arm would let a tumbling phone ratchet.
+        if o == Orient::Unknown {
+            self.at = o;
+            self.dwell_ms = 0.0;
+            return None;
+        }
+
+        let was = self.at;
+        let was_dwell = self.dwell_ms;
+        self.at = o;
+        self.dwell_ms = 0.0;
+
+        if let Some(dir) = o.direction() {
+            // Leaving rest. Only records the intent — the step fires on the way
+            // back, when we know how long it took.
+            if was.is_rest() && self.armed { self.away_in = Some(o); }
+            let _ = dir;
+            return None;
+        }
+
+        // Arrived at rest. If we left rest in a direction and got back inside
+        // the flick window, that was a flick.
+        if o.is_rest() {
+            let fired = self.away_in.take().filter(|_| was_dwell <= FLICK_MAX_MS);
+            self.armed = false;   // must rest REARM_MIN_MS before the next one
+            return fired.and_then(|d| d.direction());
+        }
+        None
+    }
+}
 
 /// What kind of thing the cursor can land on. The action vocabulary differs per
 /// kind, because "louder" means nothing to a checkbox.
@@ -175,7 +337,8 @@ pub struct GloveCursor {
     /// Threshold, from settings.
     pub cold_c: f32,
     pos: (f32, f32),
-    vel: (f32, f32),
+    /// The flick ratchet. No velocity: the cursor does not coast.
+    ratchet: Ratchet,
     snapped: Option<String>,
     bounds: (f32, f32),
 }
@@ -184,7 +347,8 @@ impl Default for GloveCursor {
     fn default() -> Self {
         GloveCursor {
             enabled: false, ambient_c: None, cold_c: COLD_C,
-            pos: (0.0, 0.0), vel: (0.0, 0.0), snapped: None, bounds: (0.0, 0.0),
+            pos: (0.0, 0.0), ratchet: Ratchet::default(),
+            snapped: None, bounds: (0.0, 0.0),
         }
     }
 }
@@ -208,44 +372,24 @@ impl GloveCursor {
     }
 
     pub fn pos(&self) -> (f32, f32) { self.pos }
-    pub fn velocity(&self) -> (f32, f32) { self.vel }
     pub fn snapped(&self) -> Option<&str> { self.snapped.as_deref() }
-    pub fn parked(&self) -> bool { self.vel.0.hypot(self.vel.1) < PARK_SPEED }
+    /// Is the ratchet ready to fire? Shown in the UI, because a user shaking a
+    /// phone that will not respond needs to know it is waiting for rest.
+    pub fn armed(&self) -> bool { self.ratchet.armed() }
 
-    /// Roll the ball. `tilt` is a unit-ish gravity vector from the host's
-    /// accelerometer — see the module docs on why the D-Bus proxy cannot supply
-    /// this.
+    /// Feed one orientation reading.
     ///
-    /// Returns the id the cursor is snapped to after moving, if any.
-    pub fn tick(&mut self, tilt: (f32, f32), dt_s: f32, targets: &[Target]) -> Option<String> {
+    /// `o` is `AccelerometerOrientation` parsed by `Orient::parse` — the daemon
+    /// string, nothing more. Returns the snapped id after any step.
+    pub fn feed(&mut self, o: Orient, dt_ms: f32, targets: &[Target]) -> Option<String> {
         if !self.active() { return None; }
-
-        // Deadzone, or the ball creeps whenever the phone is not perfectly
-        // level — which it never is, least of all in a gloved hand.
-        let (tx, ty) = tilt;
-        let mag = tx.hypot(ty);
-        let (ax, ay) = if mag < TILT_DEADZONE { (0.0, 0.0) }
-                       else { (tx * TILT_GAIN, ty * TILT_GAIN) };
-
-        self.vel.0 += ax * dt_s;
-        self.vel.1 += ay * dt_s;
-        // Exponential friction, framerate-independent: a fixed per-frame
-        // multiplier would make the ball heavier on a slow device, which is the
-        // opposite of helpful.
-        let keep = FRICTION_PER_SEC.powf(dt_s);
-        self.vel.0 *= keep;
-        self.vel.1 *= keep;
-
-        self.pos.0 += self.vel.0 * dt_s;
-        self.pos.1 += self.vel.1 * dt_s;
-
-        // Walls absorb rather than bounce. A ball that bounces off the edge
-        // travels back across the screen and you have to chase it.
-        if self.pos.0 < 0.0 { self.pos.0 = 0.0; self.vel.0 = 0.0; }
-        if self.pos.1 < 0.0 { self.pos.1 = 0.0; self.vel.1 = 0.0; }
-        if self.pos.0 > self.bounds.0 { self.pos.0 = self.bounds.0; self.vel.0 = 0.0; }
-        if self.pos.1 > self.bounds.1 { self.pos.1 = self.bounds.1; self.vel.1 = 0.0; }
-
+        if let Some((dx, dy)) = self.ratchet.feed(o, dt_ms) {
+            // A fixed step, clamped to the screen. No momentum: the cursor
+            // arrives where it was sent and stays there, which is what makes it
+            // aimable with a shaking hand.
+            self.pos.0 = (self.pos.0 + dx * STEP_PX).clamp(0.0, self.bounds.0);
+            self.pos.1 = (self.pos.1 + dy * STEP_PX).clamp(0.0, self.bounds.1);
+        }
         self.snapped = self.nearest(targets).map(|t| t.id.clone());
         self.snapped.clone()
     }
@@ -275,7 +419,6 @@ impl GloveCursor {
         // Stepping moves the BALL too, so the cursor stays where the attention
         // is rather than leaving a latched highlight somewhere off-ball.
         self.pos = targets[next].at;
-        self.vel = (0.0, 0.0);
         self.snapped = Some(targets[next].id.clone());
         self.snapped.clone()
     }
@@ -352,67 +495,169 @@ mod tests {
         assert!(g.active());
     }
 
+    /// Complete a flick: leave rest in `dir`, come back after `away_ms`.
+    fn flick(g: &mut GloveCursor, dir: Orient, away_ms: f32, ts: &[Target]) {
+        // Two rest readings: the first is the TRANSITION to rest (which clears
+        // the arm), the second is dwell at rest (which restores it). A real
+        // poller emits repeated readings, so this is what the daemon looks like.
+        g.feed(Orient::Rest, 0.0, ts);
+        g.feed(Orient::Rest, REARM_MIN_MS, ts);
+        g.feed(dir, 0.0, ts);
+        g.feed(dir, away_ms, ts);
+        g.feed(Orient::Rest, 0.0, ts);
+    }
+
     #[test]
     fn an_inactive_cursor_does_not_move() {
         let mut g = GloveCursor { enabled: false, ambient_c: Some(0.0), ..Default::default() };
         g.set_bounds(400.0, 800.0);
         let before = g.pos();
-        g.tick((1.0, 1.0), 0.5, &[]);
+        flick(&mut g, Orient::LeftUp, 200.0, &[]);
         assert_eq!(g.pos(), before);
     }
 
     #[test]
-    fn tilt_rolls_the_ball_in_the_direction_of_the_tilt() {
-        let mut g = cold_cursor();
-        let before = g.pos();
-        g.tick((0.5, 0.0), 0.1, &[]);
-        assert!(g.pos().0 > before.0, "rolled right");
-        assert!((g.pos().1 - before.1).abs() < 0.01, "and not vertically");
+    fn the_descriptor_strings_are_all_this_needs() {
+        // An earlier version of this module concluded the daemon could not
+        // drive it because it exposes no vector. A ratchet needs only which way
+        // and when, and these strings carry both.
+        assert_eq!(Orient::parse("left-up"), Orient::LeftUp);
+        assert_eq!(Orient::parse("RIGHT_UP"), Orient::RightUp);
+        assert_eq!(Orient::parse("bottom-up"), Orient::BottomUp);
+        assert_eq!(Orient::parse("normal"), Orient::Rest);
+        assert_eq!(Orient::parse("nonsense"), Orient::Unknown);
     }
 
     #[test]
-    fn a_resting_phone_does_not_creep() {
-        // The deadzone. A phone is never perfectly level, least of all in a
-        // gloved hand, and a ball that drifts is a ball you fight.
+    fn face_up_and_face_down_are_rest_and_do_nothing_but_re_arm() {
+        // Per the maze game: turning the phone flat does not move the ball, it
+        // makes the next flick possible.
+        for flat in ["face-up", "face-down", "flat", "normal"] {
+            assert!(Orient::parse(flat).is_rest(), "{flat}");
+            assert_eq!(Orient::parse(flat).direction(), None);
+        }
+    }
+
+    #[test]
+    fn one_flick_moves_exactly_one_step() {
         let mut g = cold_cursor();
         let before = g.pos();
-        for _ in 0..100 { g.tick((TILT_DEADZONE * 0.5, TILT_DEADZONE * 0.5), 0.016, &[]); }
+        flick(&mut g, Orient::LeftUp, 200.0, &[]);
+        assert_eq!(g.pos().0, before.0 - STEP_PX);
+        assert_eq!(g.pos().1, before.1, "and not vertically");
+    }
+
+    #[test]
+    fn shaking_repeatedly_traverses() {
+        // The whole point: you walk the cursor across the screen by repeating.
+        // Two steps, deliberately: a third would hit the right edge of the
+        // 400px test screen and be clamped, which the wall test covers
+        // separately.
+        let mut g = cold_cursor();
+        let before = g.pos();
+        for _ in 0..2 { flick(&mut g, Orient::RightUp, 150.0, &[]); }
+        assert_eq!(g.pos().0, before.0 + 2.0 * STEP_PX);
+    }
+
+    #[test]
+    fn holding_a_tilt_never_repeats() {
+        // A held pose turning into a runaway scroll is unrecoverable for
+        // someone who cannot easily tap.
+        let mut g = cold_cursor();
+        let before = g.pos();
+        g.feed(Orient::Rest, 0.0, &[]);
+        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
+        g.feed(Orient::LeftUp, 0.0, &[]);
+        for _ in 0..100 { g.feed(Orient::LeftUp, 16.0, &[]); }
+        assert_eq!(g.pos(), before, "no step while held");
+    }
+
+    #[test]
+    fn a_slow_lean_is_not_a_flick() {
+        // THE reason to gate on timing. On a bus the descriptor drifts through
+        // the same values a flick passes through — slowly, and it stays there.
+        let mut g = cold_cursor();
+        let before = g.pos();
+        flick(&mut g, Orient::LeftUp, FLICK_MAX_MS + 100.0, &[]);
+        assert_eq!(g.pos(), before, "held too long to be a flick");
+    }
+
+    #[test]
+    fn a_flick_just_inside_the_window_still_counts() {
+        let mut g = cold_cursor();
+        let before = g.pos();
+        flick(&mut g, Orient::LeftUp, FLICK_MAX_MS - 1.0, &[]);
+        assert_eq!(g.pos().0, before.0 - STEP_PX);
+    }
+
+    #[test]
+    fn the_step_fires_on_the_return_not_on_the_way_out() {
+        // It cannot be un-fired, so it waits until the timing is known. An
+        // accidental step is worse than a late one for someone in gloves.
+        let mut g = cold_cursor();
+        let before = g.pos();
+        g.feed(Orient::Rest, 0.0, &[]);
+        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
+        g.feed(Orient::LeftUp, 0.0, &[]);
+        g.feed(Orient::LeftUp, 100.0, &[]);
+        assert_eq!(g.pos(), before, "still out");
+        g.feed(Orient::Rest, 0.0, &[]);
+        assert_eq!(g.pos().0, before.0 - STEP_PX, "fired on the return");
+    }
+
+    #[test]
+    fn chatter_at_the_boundary_does_not_ratchet_several_steps() {
+        // The reading flapping between normal and left-up as a shaking hand
+        // crosses the boundary is one motion, not four.
+        let mut g = cold_cursor();
+        let before = g.pos();
+        g.feed(Orient::Rest, 0.0, &[]);
+        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
+        for _ in 0..4 {
+            g.feed(Orient::LeftUp, 10.0, &[]);
+            g.feed(Orient::Rest, 10.0, &[]);   // far shorter than REARM_MIN_MS
+        }
+        assert_eq!(g.pos().0, before.0 - STEP_PX, "one step, not four");
+    }
+
+    #[test]
+    fn an_unknown_reading_neither_fires_nor_re_arms() {
+        // A phone tumbling in a pocket must not ratchet between flaps.
+        let mut g = cold_cursor();
+        let before = g.pos();
+        g.feed(Orient::Rest, 0.0, &[]);
+        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
+        g.feed(Orient::Unknown, 500.0, &[]);
+        g.feed(Orient::LeftUp, 0.0, &[]);
+        g.feed(Orient::Rest, 0.0, &[]);
+        assert_eq!(g.pos(), before, "the flick did not start from a known rest");
+    }
+
+    #[test]
+    fn it_starts_unarmed_so_switching_the_mode_on_while_tilted_does_nothing() {
+        let mut g = cold_cursor();
+        let before = g.pos();
+        g.feed(Orient::LeftUp, 0.0, &[]);
+        g.feed(Orient::Rest, 0.0, &[]);
         assert_eq!(g.pos(), before);
     }
 
     #[test]
-    fn friction_brings_the_ball_to_rest() {
-        // Without it the ball oscillates around a target forever and never
-        // settles enough to snap.
+    fn the_cursor_stops_at_the_screen_edge_and_stays_there() {
+        // No momentum to carry it off, and no bounce to chase.
         let mut g = cold_cursor();
-        g.tick((1.0, 0.0), 0.1, &[]);
-        assert!(!g.parked());
-        for _ in 0..200 { g.tick((0.0, 0.0), 0.016, &[]); }
-        assert!(g.parked(), "still moving at {:?}", g.velocity());
+        for _ in 0..20 { flick(&mut g, Orient::LeftUp, 100.0, &[]); }
+        assert_eq!(g.pos().0, 0.0);
+        flick(&mut g, Orient::RightUp, 100.0, &[]);
+        assert_eq!(g.pos().0, STEP_PX, "and comes straight back");
     }
 
     #[test]
-    fn friction_is_framerate_independent() {
-        // A fixed per-frame multiplier would make the ball heavier on a slow
-        // device, which is the opposite of helpful.
-        let mut fast = cold_cursor();
-        let mut slow = cold_cursor();
-        fast.tick((1.0, 0.0), 0.1, &[]);
-        slow.tick((1.0, 0.0), 0.1, &[]);
-        for _ in 0..60 { fast.tick((0.0, 0.0), 1.0 / 60.0, &[]); }
-        for _ in 0..15 { slow.tick((0.0, 0.0), 1.0 / 15.0, &[]); }
-        let (fv, sv) = (fast.velocity().0, slow.velocity().0);
-        assert!((fv - sv).abs() < fv.abs().max(1.0) * 0.2, "{fv} vs {sv}");
-    }
-
-    #[test]
-    fn walls_absorb_rather_than_bounce() {
-        // A ball that bounces off the edge travels back across the screen and
-        // you have to chase it.
+    fn bottom_up_runs_the_cursor_up_the_screen() {
         let mut g = cold_cursor();
-        for _ in 0..200 { g.tick((1.0, 0.0), 0.016, &[]); }
-        assert_eq!(g.pos().0, 400.0);
-        assert_eq!(g.velocity().0, 0.0, "the wall took the energy");
+        let before = g.pos();
+        flick(&mut g, Orient::BottomUp, 150.0, &[]);
+        assert_eq!(g.pos().1, before.1 - STEP_PX);
     }
 
     #[test]
@@ -420,7 +665,7 @@ mod tests {
         let mut g = cold_cursor();
         let ts = vec![target("far", TargetKind::Button, 200.0, 500.0),
                       target("near", TargetKind::Button, 200.0, 410.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.snapped(), Some("near"));
     }
 
@@ -428,7 +673,7 @@ mod tests {
     fn nothing_outside_the_radius_captures_the_ball() {
         let mut g = cold_cursor();
         let ts = vec![target("miles", TargetKind::Button, 20.0, 20.0)];
-        assert_eq!(g.tick((0.0, 0.0), 0.016, &ts), None);
+        assert_eq!(g.feed(Orient::Rest, 16.0, &ts), None);
         assert_eq!(g.readout(&ts), "nothing selected");
     }
 
@@ -445,7 +690,7 @@ mod tests {
         // cannot be pressed by the hand that needed this mode.
         let mut g = cold_cursor();
         let ts = vec![target("name", TargetKind::Field, 200.0, 400.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.speak("select", &ts), Some(GloveAction::ArmField("name".into())));
         // Nothing in the action vocabulary can ask for a keyboard.
         let dbg = format!("{:?}", g.speak("press", &ts));
@@ -456,7 +701,7 @@ mod tests {
     fn selecting_a_button_activates_it() {
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.speak("go", &ts), Some(GloveAction::Activate("send".into())));
     }
 
@@ -464,7 +709,7 @@ mod tests {
     fn a_toggle_flips_on_select_and_on_its_own_words() {
         let mut g = cold_cursor();
         let ts = vec![target("wifi", TargetKind::Toggle, 200.0, 400.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.speak("select", &ts), Some(GloveAction::Toggle("wifi".into())));
         assert_eq!(g.speak("turn off", &ts), Some(GloveAction::Toggle("wifi".into())));
     }
@@ -475,7 +720,7 @@ mod tests {
         // not.
         let mut g = cold_cursor();
         let ts = vec![target("vol", TargetKind::Slider, 200.0, 400.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.speak("louder", &ts),
                    Some(GloveAction::Nudge { id: "vol".into(), delta: 0.10 }));
         assert_eq!(g.speak("a bit less", &ts),
@@ -490,7 +735,7 @@ mod tests {
         // something arbitrary.
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.speak("louder", &ts), None);
     }
 
@@ -500,7 +745,7 @@ mod tests {
         let ts = vec![target("a", TargetKind::ListItem, 200.0, 400.0),
                       target("b", TargetKind::ListItem, 200.0, 460.0),
                       target("c", TargetKind::ListItem, 200.0, 520.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.snapped(), Some("a"));
         g.speak("next", &ts);
         assert_eq!(g.snapped(), Some("b"));
@@ -515,10 +760,10 @@ mod tests {
         let mut g = cold_cursor();
         let ts = vec![target("a", TargetKind::ListItem, 200.0, 400.0),
                       target("b", TargetKind::ListItem, 200.0, 460.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         g.speak("next", &ts);
         assert_eq!(g.pos(), (200.0, 460.0));
-        assert_eq!(g.velocity(), (0.0, 0.0), "and it arrives stopped");
+        
     }
 
     #[test]
@@ -544,7 +789,7 @@ mod tests {
         // wearing gloves and cannot easily undo.
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.speak("banana", &ts), None);
     }
 
@@ -553,7 +798,7 @@ mod tests {
         // Someone is speaking through a scarf; the transcript will be messy.
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert!(g.speak("  SELECT ", &ts).is_some());
     }
 
@@ -564,7 +809,7 @@ mod tests {
         let mut t = target("vol", TargetKind::Slider, 200.0, 400.0);
         t.label = "Volume".into();
         let ts = vec![t];
-        g.tick((0.0, 0.0), 0.016, &ts);
+        g.feed(Orient::Rest, 16.0, &ts);
         assert_eq!(g.readout(&ts), "Volume");
     }
 
@@ -574,7 +819,7 @@ mod tests {
         for kind in [TargetKind::Button, TargetKind::Field, TargetKind::Slider,
                      TargetKind::Toggle, TargetKind::ListItem] {
             let ts = vec![target("x", kind, 200.0, 400.0)];
-            g.tick((0.0, 0.0), 0.016, &ts);
+            g.feed(Orient::Rest, 16.0, &ts);
             assert_eq!(g.speak("cancel", &ts), Some(GloveAction::Dismiss), "{kind:?}");
         }
     }
