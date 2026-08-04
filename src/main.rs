@@ -518,6 +518,12 @@ struct Game {
 
     /// how the current chassis stays up, when it flies at all
     lift: Option<lift::Lift>,
+    /// KEY REPEAT FOR MENUS. Held arrows step once and then stop, which
+    /// makes a forty-row list a forty-press list. `repeat_key` is what is
+    /// held, `repeat_t` counts down to the next fire — long for the first
+    /// (so a single tap is never two) and short after.
+    repeat_key: Option<Key>,
+    repeat_t: f32,
     /// which joint the catalogue is pointing at
     joint_sel: usize,
     /// step only through the misparented ones — 306 joints is scrolling,
@@ -1299,6 +1305,8 @@ fn main() {
         wep: weapons::Weapons::new(),
         autotarget: false,
         lift: None,
+        repeat_key: None,
+        repeat_t: 0.0,
         joint_sel: 0,
         joint_only_bad: true,
         space: chord::Chord::new(),
@@ -1577,6 +1585,7 @@ fn main() {
                     }
                 },
                 WindowEvent::RedrawRequested => {
+                    game.tick_key_repeat(1.0 / 60.0, elwt, &win);
                     let now = Instant::now();
                     // 0.25 cap: the old 0.05 clamp DROPPED wall time below
                     // 20 fps, so lag literally slowed the game down
@@ -2485,18 +2494,64 @@ impl Game {
     }
 
     /// Row height of whatever menu is open (touch maths shares this).
+    /// Delay before a held key starts repeating, then the interval between.
+    /// 0.38 is long enough that a deliberate single press never doubles.
+    const REPEAT_DELAY: f32 = 0.38;
+    const REPEAT_RATE: f32 = 0.055;
+
+    /// Fire held navigation keys again on a timer. Menus only: a held key in
+    /// play is already handled as an axis, and repeating it would fight that.
+    fn tick_key_repeat(&mut self, dt: f32, elwt: &winit::event_loop::EventLoopWindowTarget<()>, win: &winit::window::Window) {
+        if self.mode == Mode::Play {
+            self.repeat_key = None;
+            return;
+        }
+        let Some(k) = self.repeat_key.clone() else { return };
+        if !self.held.contains(&k) {
+            self.repeat_key = None;
+            return;
+        }
+        self.repeat_t -= dt;
+        if self.repeat_t <= 0.0 {
+            self.repeat_t = Self::REPEAT_RATE;
+            self.key_down(k, elwt, win);
+        }
+    }
+
     /// Keep the selected row inside the viewport after a keyboard move.
     fn follow_selection(&mut self) {
         let (sel, n) = match self.mode {
             Mode::Tweaks { menu, sel } => (sel, tweak_rows(menu).len()),
             Mode::Binds { sel, .. } => (sel, hud::BIND_ROWS),
             Mode::Maps { sel } => (sel, world::STYLE_COUNT),
+            // THE CATALOGUE WAS MISSING, which is why the model list never
+            // scrolled to what you had selected: arrowing past the bottom
+            // moved the highlight off screen and left the view where it was.
+            // Its rows are the DISPLAY list — family headers included — so
+            // the index that scrolls is the row's position in that, not the
+            // model id.
+            Mode::Catalog { sel } => {
+                let rows = self.catalog_rows();
+                let at = rows
+                    .iter()
+                    .position(|(is_head, i)| !is_head && *i == sel)
+                    .unwrap_or(0);
+                (at, rows.len())
+            }
             _ => return,
         };
         let rh = self.menu_row_h();
+        let tall = self.gpu.aspect() < 1.25;
         let top = match self.mode {
             Mode::Maps { .. } => hud::MAPS_TOP,
             Mode::Binds { .. } => hud::BIND_TOP,
+            Mode::Catalog { .. } => {
+                if tall {
+                    hud::CAT_TOP_TALL
+                } else {
+                    hud::CAT_TOP
+                }
+            }
             _ => hud::TW_TOP,
         };
         let vis = hud::vis_rows(rh, top, hud::TW_BOTTOM);
@@ -2513,6 +2568,13 @@ impl Game {
         match self.mode {
             Mode::Maps { .. } => hud::maps_row_h(),
             Mode::Binds { .. } => hud::BIND_ROW_H,
+            Mode::Catalog { .. } => {
+                if self.gpu.aspect() < 1.25 {
+                    hud::CAT_ROW_H_TALL
+                } else {
+                    hud::CAT_ROW_H
+                }
+            }
             _ => hud::TW_ROW_H,
         }
     }
@@ -2520,9 +2582,17 @@ impl Game {
     /// How far this menu can scroll, in rows.
     fn menu_max_scroll(&self) -> f32 {
         let rh = self.menu_row_h();
+        let tall = self.gpu.aspect() < 1.25;
         let top = match self.mode {
             Mode::Maps { .. } => hud::MAPS_TOP,
             Mode::Binds { .. } => hud::BIND_TOP,
+            Mode::Catalog { .. } => {
+                if tall {
+                    hud::CAT_TOP_TALL
+                } else {
+                    hud::CAT_TOP
+                }
+            }
             _ => hud::TW_TOP,
         };
         let vis = hud::vis_rows(rh, top, hud::TW_BOTTOM);
@@ -2959,6 +3029,26 @@ impl Game {
             Key::Character(s) => s.as_str(),
             _ => "",
         };
+        // arm the repeat for navigation keys, in menus only. Done here rather
+        // than in the winit handler so it follows every path that reaches
+        // key_down, including the repeat's own re-entry — which resets the
+        // timer to the fast rate rather than the initial delay.
+        if self.mode != Mode::Play
+            && matches!(
+                key,
+                Key::Named(
+                    NamedKey::ArrowUp
+                        | NamedKey::ArrowDown
+                        | NamedKey::ArrowLeft
+                        | NamedKey::ArrowRight
+                )
+            )
+        {
+            if self.repeat_key.as_ref() != Some(&key) {
+                self.repeat_key = Some(key.clone());
+                self.repeat_t = Self::REPEAT_DELAY;
+            }
+        }
         match self.mode {
             Mode::Catalog { sel } => {
                 // LEFT/RIGHT WALK THE RIG. Up and down already move between
