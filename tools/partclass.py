@@ -236,6 +236,158 @@ def classify(f):
 LABELS_PATH = os.path.join(HERE, "part-labels.json")
 
 
+# =====================================================================
+# SYNTHETIC EXEMPLARS — the way out of the bootstrap.
+#
+# There is no labelled corpus of "hover pad vs tread link", so make one.
+# Every archetype below is a parametric surface sampler with a KNOWN label,
+# and every one is measured by the same describe() the real parts go
+# through — that identity is the whole correctness requirement. If the
+# synthetic features were computed differently the nearest-neighbour lookup
+# would be comparing two different things and quietly returning nonsense.
+#
+# Surface samples, not solids, because the real meshes are surfaces too. A
+# solid-sampled cylinder and a shell-sampled cylinder have completely
+# different `hollow` and `round`, which is the trap the plate signature fell
+# into earlier.
+# =====================================================================
+
+def _rng(seed):
+    return np.random.default_rng(seed)
+
+
+def _tube(r, g, length, radius, wall=0.0, n=900):
+    """Open cylinder shell. wall > 0 makes it an annulus — a nozzle."""
+    th = g.uniform(0, 2 * math.pi, n)
+    z = g.uniform(-length / 2, length / 2, n)
+    rad = radius * np.ones(n) if wall <= 0 else g.choice([radius, radius * (1 - wall)], n)
+    return np.stack([rad * np.cos(th), rad * np.sin(th), z], 1)
+
+
+def _box(g, sx, sy, sz, n=900):
+    """Box SHELL: pick a face, then a point on it."""
+    f = g.integers(0, 6, n)
+    u, v = g.uniform(-0.5, 0.5, n), g.uniform(-0.5, 0.5, n)
+    p = np.zeros((n, 3))
+    for i in range(6):
+        m = f == i
+        ax, sgn = i // 2, (i % 2) * 2 - 1
+        a, b = [k for k in range(3) if k != ax]
+        p[m, ax] = 0.5 * sgn
+        p[m, a] = u[m]
+        p[m, b] = v[m]
+    return p * np.array([sx, sy, sz])
+
+
+def _disc(g, radius, thick, n=900):
+    """Wheel: an annular rim plus two faces."""
+    th = g.uniform(0, 2 * math.pi, n)
+    rr = radius * np.sqrt(g.uniform(0.25, 1.0, n))
+    z = g.choice([-thick / 2, thick / 2], n)
+    rim = g.random(n) < 0.35
+    rr[rim] = radius
+    z[rim] = g.uniform(-thick / 2, thick / 2, rim.sum())
+    return np.stack([rr * np.cos(th), rr * np.sin(th), z], 1)
+
+
+def _plate(g, w, h, t, n=900):
+    return _box(g, w, t, h, n)
+
+
+def _taper(g, length, r0, r1, n=900):
+    th = g.uniform(0, 2 * math.pi, n)
+    u = g.uniform(0, 1, n)
+    rad = r0 + (r1 - r0) * u
+    return np.stack([rad * np.cos(th), rad * np.sin(th), (u - 0.5) * length], 1)
+
+
+# archetype -> (builder, class label). Position and orientation are applied
+# by the caller, because fore/up/lateral are features and a barrel at the
+# tail is an exhaust.
+ARCHETYPES = {
+    "barrel":    lambda g: _tube(0, g, g.uniform(1.4, 4.0), g.uniform(0.05, 0.16)),
+    "muzzle":    lambda g: _taper(g, g.uniform(0.4, 0.9), g.uniform(0.08, 0.2), g.uniform(0.12, 0.3)),
+    "exhaust":   lambda g: _tube(0, g, g.uniform(0.5, 1.6), g.uniform(0.07, 0.2), wall=g.uniform(0.2, 0.5)),
+    "thruster":  lambda g: _taper(g, g.uniform(0.6, 1.5), g.uniform(0.10, 0.22), g.uniform(0.22, 0.5)),
+    "wheel":     lambda g: _disc(g, g.uniform(0.3, 0.7), g.uniform(0.12, 0.35)),
+    "tread":     lambda g: _box(g, g.uniform(0.15, 0.3), g.uniform(0.08, 0.15), g.uniform(1.6, 3.2)),
+    "hoverpad":  lambda g: _plate(g, g.uniform(0.5, 1.0), g.uniform(0.6, 1.4), g.uniform(0.04, 0.10)),
+    "plate":     lambda g: _plate(g, g.uniform(0.6, 1.6), g.uniform(0.5, 1.5), g.uniform(0.03, 0.09)),
+    "fin":       lambda g: _plate(g, g.uniform(0.1, 0.25), g.uniform(0.7, 1.6), g.uniform(0.02, 0.06)),
+    "strut":     lambda g: _tube(0, g, g.uniform(1.2, 3.5), g.uniform(0.02, 0.06)),
+    "coil":      lambda g: _tube(0, g, g.uniform(0.3, 0.7), g.uniform(0.12, 0.25)),
+    "piston":    lambda g: _tube(0, g, g.uniform(0.5, 1.2), g.uniform(0.06, 0.12)),
+    "canopy":    lambda g: _taper(g, g.uniform(0.8, 1.6), g.uniform(0.25, 0.5), g.uniform(0.05, 0.15)),
+    "intake":    lambda g: _tube(0, g, g.uniform(0.3, 0.7), g.uniform(0.15, 0.35), wall=g.uniform(0.3, 0.6)),
+    "antenna":   lambda g: _tube(0, g, g.uniform(0.8, 2.0), g.uniform(0.01, 0.03)),
+    "greeble":   lambda g: _box(g, g.uniform(0.05, 0.2), g.uniform(0.05, 0.2), g.uniform(0.05, 0.2)),
+    "hullbox":   lambda g: _box(g, g.uniform(0.6, 1.6), g.uniform(0.4, 1.0), g.uniform(0.8, 2.4)),
+    # ---- skeleton ----
+    "bone":      lambda g: _taper(g, g.uniform(1.0, 2.4), g.uniform(0.06, 0.12), g.uniform(0.09, 0.18)),
+    "ball":      lambda g: _disc(g, g.uniform(0.12, 0.25), g.uniform(0.2, 0.4)),
+    "rib":       lambda g: _tube(0, g, g.uniform(0.8, 1.8), g.uniform(0.02, 0.05)),
+    "vertebra":  lambda g: _box(g, g.uniform(0.15, 0.3), g.uniform(0.1, 0.2), g.uniform(0.1, 0.2)),
+    "pelvis":    lambda g: _box(g, g.uniform(0.5, 0.9), g.uniform(0.3, 0.5), g.uniform(0.3, 0.6)),
+    "skull":     lambda g: _disc(g, g.uniform(0.2, 0.35), g.uniform(0.3, 0.5)),
+    # ---- human ----
+    "h_torso":   lambda g: _box(g, g.uniform(0.35, 0.5), g.uniform(0.55, 0.75), g.uniform(0.2, 0.3)),
+    "h_head":    lambda g: _disc(g, g.uniform(0.1, 0.14), g.uniform(0.2, 0.26)),
+    "h_limb":    lambda g: _taper(g, g.uniform(0.6, 0.95), g.uniform(0.05, 0.08), g.uniform(0.04, 0.06)),
+    "h_hand":    lambda g: _box(g, g.uniform(0.08, 0.12), g.uniform(0.16, 0.22), g.uniform(0.04, 0.06)),
+    "h_foot":    lambda g: _box(g, g.uniform(0.09, 0.13), g.uniform(0.06, 0.09), g.uniform(0.22, 0.3)),
+}
+
+# where each class typically SITS, as (fore, up, lateral, mirrored) priors.
+# fore +1 nose, -1 tail. These are part of the exemplar, not a filter.
+PLACEMENT = {
+    "barrel": (0.55, 0.25, 0.2, 0), "muzzle": (0.85, 0.2, 0.2, 0),
+    "exhaust": (-0.75, -0.15, 0.35, 1), "thruster": (-0.8, 0.0, 0.4, 1),
+    "wheel": (0.4, -0.75, 0.85, 1), "tread": (0.0, -0.7, 0.8, 1),
+    "hoverpad": (0.0, -0.85, 0.5, 1), "plate": (0.1, 0.2, 0.5, 1),
+    "fin": (-0.5, 0.5, 0.6, 1), "strut": (0.0, -0.3, 0.4, 1),
+    "coil": (-0.2, -0.2, 0.5, 1), "piston": (0.1, -0.4, 0.6, 1),
+    "canopy": (0.45, 0.6, 0.1, 0), "intake": (0.3, 0.1, 0.6, 1),
+    "antenna": (-0.3, 0.8, 0.3, 0), "greeble": (0.0, 0.2, 0.5, 0),
+    "hullbox": (0.0, 0.0, 0.2, 0), "bone": (0.0, 0.0, 0.5, 1),
+    "ball": (0.0, 0.1, 0.4, 1), "rib": (0.0, 0.2, 0.4, 1),
+    "vertebra": (-0.1, 0.3, 0.05, 0), "pelvis": (0.0, -0.1, 0.05, 0),
+    "skull": (0.2, 0.9, 0.05, 0), "h_torso": (0.0, 0.3, 0.05, 0),
+    "h_head": (0.0, 0.85, 0.05, 0), "h_limb": (0.0, -0.2, 0.4, 1),
+    "h_hand": (0.1, -0.1, 0.5, 1), "h_foot": (0.15, -0.9, 0.3, 1),
+}
+
+
+def synth(n_each=18, seed=7):
+    """Build the exemplar table: features + label, measured by describe()."""
+    g = _rng(seed)
+    X, y = [], []
+    # a fake model box so fore/up/lateral are meaningful
+    model_lo = np.array([-2.0, -1.0, -3.0])
+    model_ext = np.array([4.0, 2.0, 6.0])
+    for cls, build in ARCHETYPES.items():
+        fore, up, lat, mirr = PLACEMENT[cls]
+        for _ in range(n_each):
+            pts = build(g)
+            # random orientation about the part's own long axis, plus the
+            # occasional 90-degree lay-down: a barrel is a barrel whichever
+            # way the modeller pointed it
+            if g.random() < 0.35:
+                pts = pts[:, [2, 1, 0]]
+            if g.random() < 0.25:
+                pts = pts[:, [0, 2, 1]]
+            c = np.array([
+                (lat * g.uniform(0.6, 1.0)) * model_ext[0] * 0.5,
+                up * g.uniform(0.6, 1.0) * model_ext[1] * 0.5,
+                -fore * g.uniform(0.6, 1.0) * model_ext[2] * 0.5,
+            ])
+            pts = pts + c
+            others_c = np.array([c, [-c[0], c[1], c[2]]]) if mirr else np.array([c, c + 9.0])
+            f = describe(pts, model_lo, model_ext, others_c, np.array([0.2, 0.2]))
+            X.append(f)
+            y.append(cls)
+    return np.array(X, np.float32), np.array(y)
+
+
 def label_clusters(path, k):
     """Cluster, then write a stub label file for a human to fill in.
 
@@ -294,6 +446,51 @@ def label(path):
         print(f"  {c:10s} {n:6d}  {100*n/tot:5.1f}%   {top}")
 
 
+def report_match(ex, real):
+    """Label real parts by nearest synthetic exemplar.
+
+    Both sides are z-normalised with the EXEMPLARS' statistics, not the real
+    parts': the exemplar table is the reference frame, so normalising the
+    query set by its own mean would slide it against the reference and the
+    nearest neighbour would depend on which parts you happened to load.
+    """
+    Xe, ye = ex["X"], ex["y"]
+    Xr, meta = real["X"], real["meta"]
+    mu, sd = Xe.mean(0), Xe.std(0)
+    sd[sd < 1e-6] = 1.0
+    A, B = (Xe - mu) / sd, (Xr - mu) / sd
+    d = ((B[:, None, :] - A[None]) ** 2).sum(-1)
+    near = np.argmin(d, 1)
+    conf = 1.0 / (1.0 + np.sqrt(d[np.arange(len(B)), near]))
+    counts, examples = {}, {}
+    far_all = np.sqrt(d[np.arange(len(B)), near])
+    cut_all = float(np.percentile(far_all, 55))
+    for i, k in enumerate(near):
+        c = "unknown" if far_all[i] > cut_all else str(ye[k])
+        counts[c] = counts.get(c, 0) + 1
+        examples.setdefault(c, []).append(str(meta[i][1]))
+    tot = len(B)
+    print(f"{tot} real parts labelled by nearest of {len(Xe)} exemplars")
+    print(f"mean confidence {conf.mean():.2f}")
+    # AN HONEST ABSTAIN. The exemplars separate cleanly from each other —
+    # 94.8% leave-one-out — but a real part can sit nowhere near any of them,
+    # and forcing it to the least-distant one is how 51% of a car became
+    # "intake". Anything past this distance is UNKNOWN, which is a fact worth
+    # having: it names the archetypes still missing from the library.
+    far = np.sqrt(d[np.arange(len(B)), near])
+    cut = float(np.percentile(far, 55))
+    unknown = int((far > cut).sum())
+    print(f"abstaining past distance {cut:.1f}: {unknown} unknown "
+          f"({100*unknown/tot:.0f}%)\n")
+    for c, n in sorted(counts.items(), key=lambda x: -x[1]):
+        stems = {}
+        for nm in examples[c][:600]:
+            st = "".join(ch for ch in nm if ch.isalpha())
+            stems[st] = stems.get(st, 0) + 1
+        top = sorted(stems.items(), key=lambda x: -x[1])[:4]
+        print(f"  {c:10s} {n:6d} {100*n/tot:5.1f}%   {top}")
+
+
 def main():
     if len(sys.argv) < 3:
         print(__doc__)
@@ -314,6 +511,14 @@ def main():
         cluster(path, k)
     elif cmd == "label":
         label(path)
+    elif cmd == "synth":
+        X, y = synth()
+        np.savez_compressed(path, X=X, y=y, names=np.array(FEATURES))
+        print(f"{len(X)} exemplars across {len(set(y))} classes -> {path}")
+    elif cmd == "match":
+        ex = np.load(path, allow_pickle=True)
+        real = np.load(sys.argv[3], allow_pickle=True)
+        report_match(ex, real)
     elif cmd == "stub":
         k = int(sys.argv[sys.argv.index("-k") + 1]) if "-k" in sys.argv else 24
         label_clusters(path, k)
