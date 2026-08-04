@@ -632,3 +632,96 @@ mod route_condition_tests {
         assert!(!layer_can_route(&[], 0));
     }
 }
+
+/// Is it faster to compute EVERY expert than to ask which one?
+///
+/// # The trade
+///
+/// `moe_ffn_v1` downloads router logits so the CPU can fetch the chosen experts. That readback is a
+/// DEPENDENCY — nothing can proceed without knowing which expert — so it cannot be batched away.
+///
+/// **But it can be removed.** Compute all `n_experts` and mask by the routing weight: the router's
+/// output never leaves the GPU, so there is nothing to wait for. The cost is `n_experts / top_k`
+/// times the expert compute.
+///
+/// # Why that is worth considering here and nowhere else
+///
+/// Normally 16x the compute is absurd. When 99.9% of the step is spent WAITING, the compute being
+/// multiplied is 0.1% of the time:
+///
+/// ```text
+/// stalled 99.9%   compute 0.1% -> 1.6%    62x faster
+/// stalled 99.0%   compute 1.0% -> 16%      6x faster
+/// stalled 91.0%   compute 9.0% -> 144%   0.7x — a LOSS
+/// ```
+///
+/// The crossover is where `compute * multiplier` reaches 1. Above roughly 94% stall it wins; below,
+/// it loses badly. **That is a measurement, not a preference**, which makes it exactly the kind of
+/// decision the autotuner already makes for kernels.
+///
+/// # The precondition
+///
+/// Every expert must be RESIDENT. You cannot compute what you would have to stream, and streaming
+/// them all is the readback's cost paid sixteen times. So this needs the same thing
+/// `layer_can_route` needs, and for the same reason: narrow enough experts that a whole layer fits.
+pub fn dense_moe_worthwhile(sync_share: f32, n_experts: u32, top_k: u32) -> Result<f32, String> {
+    if top_k == 0 || n_experts == 0 { return Err("a model with no experts has nothing to densify".into()) }
+    let mult = n_experts as f32 / top_k as f32;
+    let compute = (1.0 - sync_share).max(1e-6);
+    let after = compute * mult;
+    if after < 1.0 {
+        Ok(1.0 / after)
+    } else {
+        Err(format!(
+            "computing all {n_experts} experts costs {mult:.0}x the compute, and compute is already \
+{:.0}% of the step — it would become {:.0}%. Only worth it when the stall dominates, which is a \
+measurement rather than a preference", compute * 100.0, after * 100.0))
+    }
+}
+
+/// The stall share above which computing everything wins.
+pub fn dense_moe_crossover(n_experts: u32, top_k: u32) -> f32 {
+    if n_experts == 0 || top_k == 0 { return 1.0 }
+    1.0 - (top_k as f32 / n_experts as f32)
+}
+
+#[cfg(test)]
+mod dense_moe_tests {
+    use super::*;
+
+    #[test]
+    fn at_SCOUTS_measured_stall_computing_everything_is_dramatically_faster() {
+        // 99.9% waiting means the 16x multiplier lands on 0.1% of the step.
+        let s = dense_moe_worthwhile(0.999, 16, 1).unwrap();
+        assert!(s > 50.0, "got {s}x");
+    }
+
+    #[test]
+    fn at_a_MODERATE_stall_it_is_a_LOSS_and_says_so() {
+        // 91% was turn two of a real conversation. The same change that wins 62x at turn three loses
+        // at turn two, which is why this must be measured per-run rather than decided once.
+        let e = dense_moe_worthwhile(0.91, 16, 1).unwrap_err();
+        assert!(e.contains("Only worth it when the stall dominates"));
+    }
+
+    #[test]
+    fn the_CROSSOVER_is_where_the_multiplier_eats_the_saving() {
+        // 16 experts at top-1: compute must be under 1/16, so the stall must exceed 15/16.
+        let c = dense_moe_crossover(16, 1);
+        assert!((c - 0.9375).abs() < 1e-4, "got {c}");
+        assert!(dense_moe_worthwhile(c + 0.01, 16, 1).is_ok());
+        assert!(dense_moe_worthwhile(c - 0.01, 16, 1).is_err());
+    }
+
+    #[test]
+    fn a_WIDER_top_k_makes_it_cheaper_and_the_crossover_lower() {
+        // Top-2 of 16 is an 8x multiplier, so it wins at a lower stall — the trade improves as the
+        // router already touches more experts.
+        assert!(dense_moe_crossover(16, 2) < dense_moe_crossover(16, 1));
+    }
+
+    #[test]
+    fn a_DENSE_model_is_refused_rather_than_given_a_ratio() {
+        assert!(dense_moe_worthwhile(0.99, 0, 0).is_err());
+    }
+}
