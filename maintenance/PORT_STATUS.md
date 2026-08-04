@@ -484,3 +484,31 @@ Its GTK dependencies also do not build in this container (`pango-sys` fails), so
 everything here is `--no-default-features --features egui`. That is the same
 lean-build shape as logscope and worth remembering before believing a build
 error from this app.
+
+## ambient-learner now has a row, and it says something uncomfortable
+
+The audit reports it at **18 surfaces, 44% named, 11% code — and `no` for
+binary, `no` for app-definition, `NO` for manifest.** Those three columns are
+the real finding. Every other port in the table produces a runnable binary and
+is registered; this one is a library module that nothing launches.
+
+That is a different kind of incomplete from a missing page. `HistoryPage` and
+`PressureGauge` being ported does not mean anyone can run the egui
+ambient-learner, because there is no egui binary target and no manifest entry.
+Worth fixing before porting more pages: three more surfaces behind an
+unrunnable front end is less useful than one behind a runnable one.
+
+**`HistoryPage` is ported.** The rules worth naming:
+
+* **A flat series must not render as a storm.** Indoors with the heating on,
+  every reading can be identical to a tenth of a degree, and a chart that scaled
+  to its own range would fill itself with sensor quantisation. A minimum span of
+  0.5°C is enforced and a genuinely flat series draws through the middle.
+* **Fewer than two points is not a chart** — the QML refuses to draw rather than
+  plotting a dot, because one mark invites the eye to read a trend that is not
+  there. The empty states say which case it is, so a user can tell waiting from
+  broken.
+* **The point count is shown beside the statistics.** "Min 18.2, Max 24.6" reads
+  as a fact about the week; over four samples it is a fact about four moments.
+* Normalised `y` is 0 at the BOTTOM and the caller flips once. Every call site
+  remembering to invert is how half a chart ends up upside down.
