@@ -42,6 +42,7 @@ mod procars;
 mod render;
 mod style;
 mod sun;
+mod survival;
 mod save;
 mod ship;
 mod sim;
