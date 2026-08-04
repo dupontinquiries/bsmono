@@ -135,10 +135,10 @@ pub fn classify(request: &str) -> TaskClass {
 /// so it remains greppable in the binary.
 pub fn posture_full(class: TaskClass) -> String {
     match posture(class) {
-        Some(p) => format!("{p}{UNIVERSAL_CORE}"),
+        Some(p) => format!("{p}{UNIVERSAL_CORE}{BUILD_BIAS}"),
         // The core applies even when no class posture does — those failures are not class-specific,
         // and a one-shot request is exactly where "another outline" is cheapest to produce.
-        None => UNIVERSAL_CORE.to_string(),
+        None => format!("{UNIVERSAL_CORE}{BUILD_BIAS}"),
     }
 }
 
@@ -172,6 +172,29 @@ pub fn posture(class: TaskClass) -> Option<&'static str> {
 /// Deliberately short. A bloated preamble is the same anti-pattern as a bloated summary, and the
 /// model that recites four principles is the model that recited "minimal edit distance" at a blank
 /// directory.
+/// Applied alongside the core, and it exists to correct an asymmetry in it.
+///
+/// The core says "an outline is not a step", "say what you ran", "never call it working unless it
+/// ran". Every line pushes toward verifying before acting — and read alone they produce a model that
+/// theorises instead of building, which is a different failure with the same cost.
+///
+/// **The distinction that matters is not think-versus-build. It is REVERSIBLE versus EXPENSIVE.**
+///
+/// Writing code into a git repo is reversible: it compiles or it does not, the tests pass or they do
+/// not, and `git checkout` undoes it in a second. Shipping a confident explanation as a fix is
+/// expensive: it consumes a run on someone else's hardware and returns one bit.
+///
+/// A real session spent nine hypotheses against five measurements on one bug. Four of the hypotheses
+/// shipped as fixes and moved the failure count by zero. **Not one of them was too much code — every
+/// one was too much reasoning about code that could have been printed.** The corrective is not more
+/// caution, it is spending the cheap resource first.
+pub const BUILD_BIAS: &str = "\n\nWHEN IN DOUBT, BUILD. Writing code is cheap and reversible — it \
+compiles or it does not, and it can be reverted in a second. Reasoning about what the code would do \
+is expensive: it consumes a turn and returns a guess. If a question could be settled by writing the \
+thing, or by adding a print and running it, do that instead of explaining what you expect. Prefer the \
+smallest version that RUNS over the most complete version that is described. Explanations are for \
+after the result comes back, not instead of it.";
+
 pub const UNIVERSAL_CORE: &str = "\n\nALWAYS: An outline is not a step \u{2014} if you name a step, \
 take it in the same reply. State what you actually compiled or ran versus what you only wrote; \
 unverified work is fine, unverified work presented as finished is not. Never describe something as \
@@ -186,7 +209,9 @@ Do not refuse a build the user explicitly asked for on the grounds that it's new
 maintenance role; accepting a greenfield goal is not a violation of minimal-edit or architecture-preservation. \
 Stay humble the RIGHT way: scope honestly (a playable prototype, not a shipped AAA title), build \
 incrementally, verify each step compiles before the next, and say plainly what is a prototype vs \
-production-ready. Decompose the goal into a short plan and begin step one — don't stall on permission or \
+production-ready. Decompose the goal into a short plan and TAKE step one IN THE SAME REPLY \
+\u{2014} a plan whose first step is not taken is an outline, and the user asked for a build. Ship a \
+runnable slice each turn rather than a more detailed description of one. Begin step one — don't stall on permission or \
 re-litigate whether to proceed.";
 
 /// Long-horizon maintenance: decompose, but the literal minimal-edit posture is correct here.
@@ -504,5 +529,51 @@ mod repo_state_tests {
     #[test]
     fn the_explanation_says_it_is_a_FACT_not_a_preference() {
         assert!(RepoState::Empty.explain().contains("whatever the request said"));
+    }
+}
+
+#[cfg(test)]
+mod build_bias_tests {
+    use super::*;
+
+    #[test]
+    fn EVERY_posture_carries_the_build_bias() {
+        // The core alone reads as "verify before acting" and produces a model that theorises rather
+        // than builds — a different failure with the same cost.
+        for r in ["write smite 2 in rust", "fix the off-by-one in arena_place", "what does this do"] {
+            assert!(posture_full(classify(r)).contains("WHEN IN DOUBT, BUILD"), "{r}");
+        }
+    }
+
+    #[test]
+    fn it_names_the_real_distinction_REVERSIBLE_not_think_versus_build() {
+        // Writing code is reversible; shipping a confident explanation as a fix consumes a run on
+        // someone else's hardware and returns one bit.
+        assert!(BUILD_BIAS.contains("cheap and reversible"));
+        assert!(BUILD_BIAS.contains("returns a guess"));
+    }
+
+    #[test]
+    fn it_prefers_the_smallest_thing_that_RUNS() {
+        // Not the most complete thing described. A running fragment produces evidence; a complete
+        // description produces agreement.
+        assert!(BUILD_BIAS.contains("smallest version that RUNS"));
+        assert!(BUILD_BIAS.contains("most complete version that is described"));
+    }
+
+    #[test]
+    fn it_does_NOT_contradict_the_core() {
+        // Both survive together: build first, and still never call it working unless it ran. The
+        // bias is about which resource to spend, not about whether to check.
+        let p = posture_full(classify("build a tui dashboard"));
+        assert!(p.contains("unless you ran it and saw it work"));
+        assert!(p.contains("WHEN IN DOUBT, BUILD"));
+    }
+
+    #[test]
+    fn a_print_counts_as_building() {
+        // The specific corrective: nine hypotheses against five measurements, and the measurements
+        // were four lines each. "Add a print and run it" is the cheap action the core never named.
+        assert!(BUILD_BIAS.contains("adding a print and running it"));
     }
 }
