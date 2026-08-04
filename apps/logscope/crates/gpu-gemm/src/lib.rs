@@ -2231,6 +2231,11 @@ fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
         Tensor { buf: t.buf.clone(), rows, cols, pool: None, view: Some((base + byte_off, byte_len)) }
     }
     match &l.kind {
+        // Not sliceable yet: IQ1_S packs 256 weights into 50 bytes, so a row slice lands on a
+        // block boundary only when the row length is a multiple of 256. That is the same
+        // alignment rule qkvsplit enforces for Q4_K and it needs the same explicit check rather
+        // than a silent mid-block cut. Nothing slices an IQ1_S tensor today.
+        LinKind::Iq1(_) => None,
         LinKind::Q8(w) => {
             let kb = w.k / 32;
             Some(Lin { kind: LinKind::Q8(QWeight {
@@ -2616,10 +2621,34 @@ impl<'a> Rd<'a> {
 /// (Qwen2 has one on Q/K/V; llama does not). Both precisions answer the same `apply`, and the bias is
 /// folded in there, so every forward path is agnostic to both precision and architecture.
 pub struct Lin { kind: LinKind, bias: Option<Tensor> }
-enum LinKind { F32(Tensor), Q8(QWeight), Q4(Q4Weight) }
+/// A weight held as IQ1_S, in the file's own bytes.
+///
+/// **The point is that nothing is converted.** Every other resident kind is produced by requantizing
+/// to q4 or int8; this one keeps the source blocks, because at 1.5625 bpw the conversion to 4.5 is a
+/// 2.88x inflation that puts a 30.3 GiB checkpoint at 87 GiB.
+///
+/// `dot_iq1_s` is the bit-exact CPU reference and `MATVEC_IQ1_S` the GPU kernel; both predate this
+/// and both are gated. What was missing was somewhere to PUT the bytes.
+pub struct Iq1Weight {
+    /// The file's IQ1_S blocks, uploaded unmodified.
+    pub blocks: Tensor,
+    /// Rows and columns of the logical matrix.
+    pub n: usize,
+    pub k: usize,
+}
+
+impl Iq1Weight {
+    /// Bytes per 256-weight block: 50 for IQ1_S.
+    pub const BLOCK_BYTES: usize = 50;
+    pub fn bytes(&self) -> usize { (self.n * self.k / 256) * Self::BLOCK_BYTES }
+}
+
+enum LinKind { F32(Tensor), Q8(QWeight), Q4(Q4Weight), Iq1(Iq1Weight) }
 impl Lin {
     pub fn f32(t: Tensor) -> Self { Lin { kind: LinKind::F32(t), bias: None } }
     pub fn q8(q: QWeight) -> Self { Lin { kind: LinKind::Q8(q), bias: None } }
+    /// Hold a weight as IQ1_S without converting it.
+    pub fn iq1(q: Iq1Weight) -> Self { Lin { kind: LinKind::Iq1(q), bias: None } }
     pub fn q4(q: Q4Weight) -> Self { Lin { kind: LinKind::Q4(q), bias: None } }
     pub fn with_bias(mut self, b: Option<Tensor>) -> Self { self.bias = b; self }
     /// Is this weight held as resident q4? Used to key tuning verdicts by precision.
@@ -2629,6 +2658,9 @@ impl Lin {
         let out = match &self.kind {
             LinKind::F32(t) => { let (n, k) = (t.rows, t.cols); gpu.linear_t(a, t, m, n, k) }
             LinKind::Q8(q) => gpu.linear_q8_0_t(a, q, m),
+            // Native: the source blocks go straight to MATVEC_IQ1_S with no dequantize pass, which
+            // is the whole reason this variant exists.
+            LinKind::Iq1(q) => gpu.linear_iq1_s_t(a, q, m),
             LinKind::Q4(q) => gpu.linear_q4_0_t(a, q, m),
         };
         match &self.bias { Some(b) => gpu.add_bias_t(&out, b), None => out }
@@ -2639,6 +2671,10 @@ impl Lin {
         if m == 1 && self.bias.is_none() {
             match &self.kind {
                 LinKind::Q8(q) => return gpu.linear_q8_0_add(a, q, resid),
+            // No fused residual-add kernel for IQ1_S. Falling through to matvec-then-add is correct
+            // and one extra dispatch — worth far less than the memory this variant saves, and
+            // inventing a fused kernel to avoid it would be optimising the wrong thing.
+            LinKind::Iq1(_) => {}
                 LinKind::Q4(q) => return gpu.linear_q4_0_add(a, q, resid),
                 LinKind::F32(_) => {}
             }
@@ -4944,11 +4980,35 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let (gu_qw, gu_qs, gu_k, sh) = match &m.stacked_gu.kind {
             LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
             LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            // IQ1_S DOES NOT FIT THIS SHAPE, and saying so is better than faking it.
+            //
+            // Every other kind splits into a (quant, scale) PAIR of buffers. IQ1_S interleaves its
+            // codebook indices and scales in one block, so there is no second buffer to hand over —
+            // and passing the same tensor twice would produce plausible wrong numbers, which is the
+            // failure mode this codebase has spent a week on.
+            //
+            // The MoE stacks are therefore never built as Iq1 today; the loader converts them. A
+            // native MoE path needs MOE_MATVEC_IQ1_S with a one-buffer binding, which does not exist.
+            LinKind::Iq1(_) => unreachable!(
+                "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
+binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
             LinKind::F32(_) => return None,
         };
         let (dn_qw, dn_qs, dn_k, sh_dn) = match &m.stacked_down.kind {
             LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
             LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            // IQ1_S DOES NOT FIT THIS SHAPE, and saying so is better than faking it.
+            //
+            // Every other kind splits into a (quant, scale) PAIR of buffers. IQ1_S interleaves its
+            // codebook indices and scales in one block, so there is no second buffer to hand over —
+            // and passing the same tensor twice would produce plausible wrong numbers, which is the
+            // failure mode this codebase has spent a week on.
+            //
+            // The MoE stacks are therefore never built as Iq1 today; the loader converts them. A
+            // native MoE path needs MOE_MATVEC_IQ1_S with a one-buffer binding, which does not exist.
+            LinKind::Iq1(_) => unreachable!(
+                "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
+binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
             LinKind::F32(_) => return None,
         };
         let slots = m.cfg.n_used.clamp(1, 16) as usize;
@@ -9191,6 +9251,10 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
     fn dump_lin(&self, o: &mut Vec<u8>, l: &Lin) {
         match &l.kind { // biases are never cached (biased models skip the cache write, see save_int8_cache)
             LinKind::F32(t) => { o.push(0); self.dump_tensor(o, t); }
+            // Tag 3. NOT cached: the cache exists to skip requantization, and IQ1_S is never
+            // requantized — the file's bytes ARE the resident form, so a cache copy would duplicate
+            // the checkpoint for no gain.
+            LinKind::Iq1(_) => { return; }
             LinKind::Q8(q) => { o.push(1); o.extend_from_slice(&(q.n as u32).to_le_bytes()); o.extend_from_slice(&(q.k as u32).to_le_bytes());
                 self.dump_tensor(o, &q.qw); self.dump_tensor(o, &q.qs); }
             LinKind::Q4(q) => { o.push(2); o.extend_from_slice(&(q.n as u32).to_le_bytes()); o.extend_from_slice(&(q.k as u32).to_le_bytes());
@@ -10816,6 +10880,22 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Confirms or refutes the 16-byte-stride diagnosis in one run: if this reads correctly where the
     /// scalar probe does not, `array<u32>` is being laid out with std140 padding.
     /// `dst[i] = f32(i)` — tests the invocation index alone.
+    /// Matvec against IQ1_S weights held in the file's own bytes.
+    ///
+    /// The kernel and its bindings already existed for `--gate-iq1s-kernel`. This is the entry point
+    /// that lets a RESIDENT weight reach them, which is the piece that was missing.
+    pub fn linear_iq1_s_t(&self, a: &Tensor, w: &Iq1Weight, m: usize) -> Tensor {
+        // Decode only. This variant exists so a 30.3 GiB checkpoint can stay resident, and residency
+        // matters at m == 1; claiming batch support it does not have would be the same kind of lie as
+        // a gate testing a path nothing calls.
+        assert_eq!(m, 1, "IQ1_S matvec is decode-only; batched prefill converts instead");
+        let out = self.alloc(1, w.n);
+        let dims = [w.n as u32, w.k as u32, (w.k / 256) as u32, 0u32];
+        let gx = (w.n as u32).div_ceil(64).max(1);
+        self.dispatch(MATVEC_IQ1_S, &[a, &w.blocks], &out, bytemuck::cast_slice(&dims), (gx, 1, 1));
+        out
+    }
+
     pub fn id_probe(&self, n: usize) -> Vec<f32> {
         self.byte_probe_with(&vec![0u8; n], ID_PROBE)
     }

@@ -1275,7 +1275,13 @@ mod measurement_factor_tests {
 /// proceeds to a more precise refusal, while a false *no* refuses a model that would have run.
 pub fn file_views_plausible(gate_type: Option<u32>, up_type: Option<u32>, down_type: Option<u32>,
                             q6k_views_enabled: bool) -> bool {
-    let allowed: &[u32] = if q6k_views_enabled { &[12, 14] } else { &[12] };
+    // IQ1_S (type 19) IS A FILE-VIEW TYPE. It was excluded only because nothing could consume it —
+    // and a Scout UD-IQ1_S checkpoint is 30.3 GiB against a 31 GiB ceiling, so excluding it sends the
+    // one format that fits down the host-copy path where it inflates to 87 GiB and is refused.
+    //
+    // On its own this saves nothing: the streaming path still converts each expert to q4. It is the
+    // precondition for the native path, and it makes the refusal message honest in the meantime.
+    let allowed: &[u32] = if q6k_views_enabled { &[12, 14, 19] } else { &[12, 19] };
     let (g, u, d) = match (gate_type, up_type, down_type) {
         (Some(g), Some(u), Some(d)) => (g, u, d),
         // A tensor the table does not have is not a type problem — it is a different layout, and the
@@ -1432,5 +1438,36 @@ is why a 56.6 GiB resident model died at 30");
         for gib in [4.6, 17.1, 20.5] {
             assert!(gib < ASAHI_MAPPED_CEILING_GIB, "{gib} GiB stays fully mapped");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod iq1s_view_tests {
+    use super::*;
+
+    #[test]
+    fn IQ1_S_is_a_file_view_type() {
+        // Scout UD-IQ1_S is 30.3 GiB against a 31 GiB ceiling — the one format that fits. Excluding
+        // it sent it down the host-copy path, where it inflates to 87 GiB and is refused before it
+        // starts.
+        assert!(file_views_plausible(Some(19), Some(19), Some(19), false));
+    }
+
+    #[test]
+    fn a_MIXED_checkpoint_still_needs_gate_and_up_to_agree() {
+        // UD quants vary width per tensor, but gate and up are PACKED TOGETHER and must share a type.
+        // down may differ, which is why RawExpertSrc carries gu_type and dn_type apart.
+        assert!(!file_views_plausible(Some(19), Some(12), Some(19), false));
+        assert!(file_views_plausible(Some(19), Some(19), Some(12), false), "down may differ");
+    }
+
+    #[test]
+    fn Q6_K_still_needs_its_flag_and_IQ1_S_does_not() {
+        // Q6_K views stay behind LOGSCOPE_Q6K_VIEWS because its fill shader went green on lavapipe
+        // and RED on an M2. IQ1_S has a bit-exact CPU reference and two passing gates, so it does not
+        // carry the same doubt.
+        assert!(!file_views_plausible(Some(14), Some(14), Some(14), false));
+        assert!(file_views_plausible(Some(19), Some(19), Some(19), false));
     }
 }
