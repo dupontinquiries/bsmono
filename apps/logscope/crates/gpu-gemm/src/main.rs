@@ -3860,6 +3860,41 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-quantref") {
+        // THE CONTRACT, checked before any kernel implements it. q1/q2/q3 do not exist yet; this
+        // fixes what they must do so the next one inherits what q4_K cost seven wrong theories.
+        println!("gate-quantref: the reference contract every width must meet");
+        let mut ok = true;
+        let mut ck = |name: &str, pass: bool| {
+            println!("  [{}] {name}", if pass { "✓" } else { "✗ FAIL" });
+            ok &= pass;
+        };
+        use gpu_kernels::quantref::*;
+        ck("q1 is refused — one bit cannot hold a signed level set, real 1-bit formats use a codebook",
+           level_bound(1).is_none());
+        for bits in [2u32, 3, 4, 8] {
+            let bound = level_bound(bits).unwrap();
+            let (scale, q) = quantize_block(&[bound, 0.5, -0.5], bits).unwrap();
+            ck(&format!("q{bits}: ties round to EVEN (0.5 -> 0), not away from zero"),
+               scale == 1.0 && q[1] == 0 && q[2] == 0);
+            let recip = 2.2067833f32 * (1.0f32 / bound);
+            let (s2, _) = quantize_block(&[2.2067833f32, 0.0], bits).unwrap();
+            ck(&format!("q{bits}: the scale is a RECIPROCAL product, not a quotient"),
+               s2.to_bits() == recip.to_bits());
+        }
+        // Tie density decides how large a gate must be — the trap that hid q4_K's bug behind a
+        // green 112-block test for weeks.
+        let mut r = 7u32;
+        let w: Vec<f32> = (0..8192).map(|_| { r = r.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((r >> 8) as f32 / 8_388_608.0) - 1.0 }).collect();
+        for bits in [2u32, 3, 4, 8] {
+            let f = tie_fraction(&w, bits, 0.02) * level_bound(bits).unwrap();
+            println!("      q{bits}: ties per unit range {f:.3} — a gate must be large enough to contain one");
+        }
+        println!("gate-quantref: {}", if ok { "contract holds ✓" } else { "FAIL ✗" });
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-q4k") {
         // GPU Q4_K dequant vs the CPU implementation that every loading Q4_K model already depends on.
         // This is the enabling step for the Colibri approach — never convert on load, let the GPU read the

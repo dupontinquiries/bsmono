@@ -21,6 +21,7 @@ pub mod ragged;
 pub mod specverify;
 pub mod batchplan;
 pub mod q2demote;
+pub mod quantref;
 pub mod sensitivity;
 pub mod lookupdraft;
 pub mod specloop;
