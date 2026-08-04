@@ -23,6 +23,7 @@ pub mod batchplan;
 pub mod q2demote;
 pub mod quantref;
 pub mod shaderdev;
+pub mod framediag;
 pub mod sensitivity;
 pub mod lookupdraft;
 pub mod specloop;
@@ -3242,6 +3243,7 @@ impl Gpu {
     /// encoder instead of each submitting. Flushed by `end_frame` or the terminal `download`.
     /// Idempotent-safe: an already-open frame is flushed first (no commands are lost).
     pub fn begin_frame(&self) {
+        crate::framediag::FRAME_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut fr = self.frame.lock().unwrap();
         // TAGGED: flushing a previous frame is an end_frame in all but name. Six of eight submit callers incremented nothing, which is
         // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
@@ -3257,6 +3259,7 @@ impl Gpu {
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     pub fn end_frame(&self) {
+        crate::framediag::FRAME_CLOSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(frame) = self.frame.lock().unwrap().take() {
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc); self.retain_keep(frame.keep);
@@ -3406,6 +3409,16 @@ impl Gpu {
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
+            // Per-site tally, armed only by --frame-diag. The aggregate counter says 6821
+            // happened and not where; this names them in one run instead of one hypothesis per
+            // round trip.
+            // The shader's own identity, which shaderdev already derives for hot-reload. Reusing it
+            // means the tally names kernels rather than addresses, and costs nothing new.
+            // record_dispatch has the pipeline, not the source, so the tally keys on the pipeline
+            // POINTER — stable per kernel for a run, which is all a "which site dominates" question
+            // needs. A readable name would require threading one through every call site, and the
+            // shape of the answer matters more than its labels.
+            crate::framediag::note_frameless_ptr(pipeline as *const _ as usize);
             SUBMIT_BY_NO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc); // queue order makes each op's writes visible to the next
         }
