@@ -58,10 +58,13 @@ concluded from this excerpt is a claim about those windows rather than about the
 
 /// Lines of context to keep either side of a match.
 ///
-/// **Five, matching `rg -C 5`** — calibrated by someone who does this daily rather than picked. I had
-/// 12; the smaller window fits more distinct sites in a budget, and distinct sites are what answer
-/// "how many places does this touch", which is the question that mattered every time here.
-pub const CONTEXT: usize = 5;
+/// **Twelve.** I briefly set this to 5 on the belief that `rg -C 5` was a calibration; it was an
+/// upload-size limit for a different tool, and taking an arbitrary constraint for a considered choice
+/// is its own lesson.
+///
+/// The default is a starting point, not a rule — see `contextwidth`, which picks a width from what
+/// the read is FOR and adapts it from whether the reads are working.
+pub const CONTEXT: usize = 12;
 
 /// Plan a read.
 ///
@@ -151,8 +154,8 @@ mod tests {
         // evidence is — which matters when the question is "how many sites does this bug touch".
         let p = plan(1000, &[100, 105, 110], 500);
         assert_eq!(p.windows.len(), 1, "{:?}", p.windows);
-        assert_eq!(p.windows[0].start, 95);
-        assert_eq!(p.windows[0].end, 115);
+        assert_eq!(p.windows[0].start, 88);
+        assert_eq!(p.windows[0].end, 122);
     }
 
     #[test]
@@ -166,10 +169,10 @@ mod tests {
     fn a_window_is_kept_WHOLE_or_dropped() {
         // Truncating mid-item is worse than dropping: a half-read function invites a conclusion about
         // the half, which is how "I checked that path" becomes wrong.
-        // Budget 25 fits two 11-line windows and not a third — kept whole, not trimmed to fit.
-        let p = plan(10000, &[100, 5000, 9000], 25);
+        // Budget 55 fits two 25-line windows and not a third — kept whole, not trimmed to fit.
+        let p = plan(10000, &[100, 5000, 9000], 55);
         assert_eq!(p.windows.len(), 2, "whole windows, not three truncated ones");
-        assert!(p.windows.iter().all(|w| w.lines() == 11), "none was trimmed");
+        assert!(p.windows.iter().all(|w| w.lines() == 25), "none was trimmed");
     }
 
     #[test]
