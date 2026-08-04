@@ -192,6 +192,13 @@ pub struct Snapclone {
     pub posture: crate::posture::PostureEngine,
     /// When voice last arrived, for the five-minute arming window.
     pub last_voice_at: Option<i64>,
+    /// Cold-weather glove mode. The temperature comes from ambient-learner's
+    /// EnvSnapshot::aux_temp_c and the tilt vector from the host's raw IIO
+    /// poll — see uikit_egui::glove for why the D-Bus proxy cannot supply it.
+    pub glove: uikit_egui::glove::GloveCursor,
+    /// The field the cursor armed for voice entry. NOT a keyboard request:
+    /// rusty-board's cue is that no key event is ever synthesised.
+    pub voice_field: Option<String>,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -263,6 +270,8 @@ impl Snapclone {
             snaps_saved: Vec::new(),
             posture: Default::default(),
             last_voice_at: None,
+            glove: Default::default(),
+            voice_field: None,
             peel: crate::nav_chrome::PeelHint::new(PAGES.len()),
             ribbon: {
                 // The tab labels are the nav's own, so the ribbon and the
@@ -551,6 +560,21 @@ impl Snapclone {
             Answer::Declined => {}
         }
         self.incoming_call = None;
+    }
+
+    /// Carry out what glove mode asked for.
+    ///
+    /// `ArmField` is the interesting one: it records the field and stops. No
+    /// keyboard is raised, because the hand that needs this mode cannot press
+    /// keys — that is the whole reason the mode exists.
+    pub fn apply_glove(&mut self, a: uikit_egui::glove::GloveAction) {
+        use uikit_egui::glove::GloveAction as G;
+        match a {
+            G::ArmField(id) => self.voice_field = Some(id),
+            G::Dismiss => { self.voice_field = None; self.menu.close(); }
+            G::Activate(id) => { if self.menu.is_open() { self.menu.choose(&id); } }
+            G::Toggle(_) | G::Nudge { .. } | G::Step(_) => {}
+        }
     }
 
     /// Re-derive whether posture should be acting.
@@ -1055,6 +1079,38 @@ mod tests {
     fn entry(id: &str) -> crate::snaps::FeedEntry {
         crate::snaps::FeedEntry { id: id.into(), sender_name: "Ada".into(), sent_at: 0,
             media: crate::snaps::Media::Image, thumb_path: String::new() }
+    }
+
+    #[test]
+    fn glove_mode_needs_the_user_and_the_weather_to_agree() {
+        let mut s = app();
+        s.glove.enabled = true;
+        assert!(!s.glove.active(), "no temperature reading is not cold");
+        s.glove.ambient_c = Some(18.0);
+        assert!(!s.glove.active(), "and a mild day is not cold");
+        s.glove.ambient_c = Some(1.0);
+        assert!(s.glove.active());
+        s.glove.enabled = false;
+        assert!(!s.glove.active(), "cold alone does not switch it on");
+    }
+
+    #[test]
+    fn arming_a_field_asks_for_voice_and_never_a_keyboard() {
+        // The hand that needs glove mode cannot press keys. rusty-board's cue
+        // is that no key event is ever synthesised.
+        let mut s = app();
+        s.apply_glove(uikit_egui::glove::GloveAction::ArmField("peer_host".into()));
+        assert_eq!(s.voice_field.as_deref(), Some("peer_host"));
+    }
+
+    #[test]
+    fn dismissing_clears_the_armed_field_and_any_menu() {
+        let mut s = app();
+        s.apply_glove(uikit_egui::glove::GloveAction::ArmField("peer_host".into()));
+        s.open_snap_menu("s1", (0.0, 0.0));
+        s.apply_glove(uikit_egui::glove::GloveAction::Dismiss);
+        assert!(s.voice_field.is_none());
+        assert!(!s.menu.is_open());
     }
 
     #[test]

@@ -311,3 +311,53 @@ positions rather than from a compass, and the dial reads touch, not tilt. A real
 gyroscope integration would be a new feature rather than a port — worth saying
 plainly, because "integrate the gyroscope" sounds like wiring up something that
 is already half there, and it is not.
+
+## Glove mode: built, and the three things it needs from outside
+
+`uikit_egui::glove` is a tilt-rolled cursor for cold weather, when gloves make
+capacitive glass useless and the real alternative is not using the phone at all.
+The physics, snapping, vocabulary and gate are here and pure. Three inputs are
+seams, each because a daemon already owns it:
+
+1. **Temperature** — `ambient-learner`'s `EnvSnapshot::aux_temp_c`, a genuine
+   ambient reading rather than a CPU thermal zone. Unknown temperature is NOT
+   cold, deliberately: a phone with no ambient sensor would otherwise roll a
+   ball across the screen indoors in July.
+2. **Tilt** — and this is the one that needs saying. **`iio-sensor-proxy`
+   exposes orientation only as strings** — "normal", "left-up", "right-up",
+   "bottom-up" — not as a vector. You cannot roll a ball with four labels;
+   anything built on the D-Bus daemon alone would move in four directions at one
+   speed. The raw counts are in sysfs, which is the path snapclone's
+   `IioSensorProxySource` already polls for its motion bit, so the vector is
+   reachable — but it is a different reader, and it is not built.
+3. **Speech** — the recogniser. `Vocab` maps a transcript to an action; it does
+   not listen.
+
+**`ballgame.py` is not in this repository.** I searched: the only Python is in
+`shared/webhost-kit` and `tools/`. The physics is written from the description —
+tilt as gravity, rolling friction, absorbing walls — and if the original has
+behaviour worth matching, this is not yet matching it.
+
+### What was built
+
+* Snapping is generous (72px) and the ball latches to the nearest target rather
+  than requiring containment. A tilt-driven cursor is least precise exactly when
+  it is needed, because a cold hand shakes.
+* **Selecting a field arms VOICE, never the keyboard.** rusty-board raising
+  itself would cover the screen with keys the gloved hand cannot press — the
+  problem restated. `ArmField` is the whole signal, and its cue to rusty-board
+  is negative: no key event is ever synthesised.
+* A vocabulary that is small and literal, because the user is speaking through a
+  scarf. Sliders take coarse and fine nudges ("louder", "a bit less", "mute")
+  because that is how people talk about volume. Words that mean nothing to a
+  kind are REFUSED rather than guessed — acting on a misheard word is worse than
+  doing nothing when you cannot easily undo.
+* "next" and "back" step the snap through a list, and move the ball with it, so
+  the highlight is never somewhere the ball is not.
+
+### Not built
+
+The host wiring: nothing yet reads `aux_temp_c` into `glove.ambient_c`, polls a
+tilt vector, or feeds transcripts in. snapclone holds the cursor and applies its
+actions, but the three seams are unconnected — this is a working engine behind
+an unconnected socket, and saying so is the point of this section.

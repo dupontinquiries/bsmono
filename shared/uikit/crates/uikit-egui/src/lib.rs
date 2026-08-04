@@ -34,6 +34,7 @@ pub mod nav;
 pub mod scroll;
 pub mod fuzzy;
 pub mod fmt;
+pub mod glove;
 pub mod menu;
 pub mod motion;
 pub mod confirm_dialog;
