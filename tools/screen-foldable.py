@@ -83,14 +83,34 @@ def main():
             # upright, and fifteen of twenty were thrown out purely for not
             # growing enough. A fold that adds a quarter to a body's height
             # and leaves it taller than it is long HAS stood up.
+            # THE UPRIGHT GATE WAS A BIPED ASSUMPTION, and it made a whole
+            # category invisible. The library's own metadata lists spider 7,
+            # beast 2, avian 2, dragon 1 — body plans that fold into
+            # something LOW AND LONG rather than tall. Requiring the robot to
+            # be taller than it is wide rejects every one of them, which is
+            # why measuring ground contacts never found a quadruped: they
+            # were filtered out before any measurement ran.
+            #
+            # A fold is a fold if the body CHANGED SHAPE. Growing upward is
+            # one way; a spider unfolding legs outward is another, and it
+            # shows as a large change in the extent ratios rather than in
+            # height alone.
             grew = r[1] > v[1] * 1.25
             upright = r[1] >= max(r[0], r[2]) * 0.90
-            if grew and upright:
+            # how much the proportions moved, regardless of direction
+            def shape(e):
+                m = max(e[0], e[1], e[2]) or 1.0
+                return (e[0] / m, e[1] / m, e[2] / m)
+            sv, sr = shape(v), shape(r)
+            reshaped = sum(abs(a - b) for a, b in zip(sv, sr)) > 0.35
+            # sprawling: wider or longer than it was, and it opened up
+            sprawled = (max(r[0], r[2]) > max(v[0], v[2]) * 1.25) and reshaped
+            if (grew and upright) or sprawled:
                 good.append(iqm)
                 verdict = "folds"
             else:
                 bad.append(iqm)
-                verdict = f"no ({'flat' if not grew else 'not upright'})"
+                verdict = f"no ({'flat' if not grew else 'not upright'}, no sprawl)"
         if i % 20 == 0 or verdict.startswith("folds"):
             print(f"  [{i:3d}/{len(cands)}] {name[:44]:44s} {verdict}")
     dt = time.time() - t0
