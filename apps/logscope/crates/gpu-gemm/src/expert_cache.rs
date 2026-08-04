@@ -435,3 +435,101 @@ mod tests {
             "predictor prefetch lifts hit rate: cold {:.2} → warm {:.2}", cold.hit_rate(), warm.hit_rate());
     }
 }
+
+/// Running tally of what the expert cache actually delivered.
+///
+/// Scout streams 6.33 GiB of expert weights per token and runs at 0.92 tok/s against a 3.3 tok/s
+/// upload-bound ceiling — a 3.6× gap that is prefetch, overlap and slot scheduling rather than kernel
+/// throughput. **And none of it is visible.** No log line reports whether an expert was already
+/// resident when it was needed, so the one number that would say whether the gap is schedulable is
+/// the one nobody has.
+///
+/// The bind-group cache reports 26% hits on Scout against ~100% on a resident model, which says the
+/// streaming path churns its bindings — but that is a proxy for the thing, not the thing.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct AccessTally {
+    pub pinned: u64,
+    /// Present in a ring slot when asked for — the prefetcher won.
+    pub resident: u64,
+    /// Not present: a stall while the expert uploads.
+    pub missed: u64,
+}
+
+impl AccessTally {
+    pub fn record(&mut self, a: Access) {
+        match a {
+            Access::Pinned => self.pinned += 1,
+            Access::Hit(_) => self.resident += 1,
+            _ => self.missed += 1,
+        }
+    }
+
+    pub fn total(&self) -> u64 { self.pinned + self.resident + self.missed }
+
+    /// Fraction of accesses that did NOT stall, 0..1.
+    ///
+    /// Pinned and resident both count: from the token's point of view the difference is where the
+    /// bytes came from, not whether it waited.
+    pub fn hit_rate(&self) -> f64 {
+        if self.total() == 0 { return 0.0; }
+        (self.pinned + self.resident) as f64 / self.total() as f64
+    }
+
+    /// A line worth printing, or None when nothing streamed.
+    ///
+    /// Silent on a fully resident model, because a hit rate of 1.0 that is structurally guaranteed is
+    /// not information — it is a line that trains people to skip the region it prints in.
+    pub fn report(&self, gib_per_token: f64, upload_gib_s: f64) -> Option<String> {
+        if self.missed == 0 { return None; }
+        let stall_gib = gib_per_token * (self.missed as f64 / self.total().max(1) as f64);
+        Some(format!(
+            "expert cache — {} pinned, {} resident, {} MISSED ({:.0}% hit). At {:.1} GiB/token and \
+{upload_gib_s:.0} GiB/s the misses alone cost ~{:.0} ms/token; a perfect prefetcher would remove all \
+of it and nothing else here can",
+            self.pinned, self.resident, self.missed, self.hit_rate() * 100.0,
+            gib_per_token, stall_gib / upload_gib_s * 1000.0))
+    }
+}
+
+#[cfg(test)]
+mod tally_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_and_resident_both_count_as_HITS() {
+        // From the token's point of view the difference is where the bytes came from, not whether it
+        // waited — and waiting is what costs the 3.6x.
+        let mut t = AccessTally::default();
+        t.record(Access::Pinned);
+        t.record(Access::Hit(0));
+        assert_eq!(t.hit_rate(), 1.0);
+    }
+
+    #[test]
+    fn a_fully_resident_model_reports_NOTHING() {
+        // A hit rate of 1.0 that is structurally guaranteed is not information. Printing it every run
+        // trains people to skip the region it appears in, which is where the interesting line will be.
+        let mut t = AccessTally::default();
+        for _ in 0..48 { t.record(Access::Pinned); }
+        assert!(t.report(6.33, 21.0).is_none());
+    }
+
+    #[test]
+    fn the_report_names_the_COST_of_the_misses_not_just_the_rate() {
+        // "19% hit" is a number. "the misses cost ~250 ms/token" is a decision — it says whether
+        // prefetch work is worth doing before anyone does it.
+        let mut t = AccessTally::default();
+        t.record(Access::Pinned);
+        for _ in 0..15 { t.record(Access::Miss(0)); }
+        let r = t.report(6.33, 21.0).expect("something missed");
+        assert!(r.contains("MISSED"));
+        assert!(r.contains("ms/token"), "the cost, not just the rate: {r}");
+    }
+
+    #[test]
+    fn an_empty_tally_does_not_divide_by_zero() {
+        let t = AccessTally::default();
+        assert_eq!(t.hit_rate(), 0.0);
+        assert!(t.report(6.33, 21.0).is_none());
+    }
+}

@@ -83,7 +83,24 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 /// Per-system autotune cache: maps (adapter, k×n shape) → the winning decode tile, so the one-time
 /// benchmark on first model load is skipped on every load thereafter. A tiny TSV in the cache dir
 /// (adapter \t k \t n \t tile per line). Best-effort: any IO/parse failure just means "re-benchmark".
-fn autotune_file() -> PathBuf { cache_root().join("autotune-v3.tsv") } // v2: value is a packed (kernel,tile)
+/// The autotune cache, and the filename IS the epoch.
+///
+/// v2: the value became a packed (kernel, tile).
+///
+/// **v4: the probes that produce these verdicts were fed corrupt weights.** `QUANT_PACK` and
+/// `Q4K_TO_Q4` packed their bytes with a shift by a lane-varying amount, which returns zero on
+/// Honeykrisp for every lane whose shift is non-zero. Three probes depended on it — `self_check_sg`,
+/// `probe_valid_gemm_tiles`, `probe_expert_compute` — so every tile choice cached on that driver was
+/// made from a candidate set pruned by a broken fixture, and the subgroup kernel was excluded
+/// entirely.
+///
+/// A cached verdict outlives the code that produced it. I wrote that "one load re-answers all of
+/// them", which was wrong: the next load reads `autotune-v3.tsv` and never re-probes. Bumping the
+/// filename is what makes the fix reach a machine that has already run.
+///
+/// The rule this encodes: **changing a kernel invalidates every measurement taken against it.** The
+/// epoch is in the name so that is one edit rather than a cache-clearing instruction nobody follows.
+fn autotune_file() -> PathBuf { cache_root().join("autotune-v4.tsv") }
 pub fn autotune_get(adapter: &str, k: usize, n: usize) -> Option<u32> {
     let txt = std::fs::read_to_string(autotune_file()).ok()?;
     for line in txt.lines() {
@@ -134,7 +151,13 @@ pub fn flush_put(adapter: &str, flush: u32) {
     let _ = std::fs::write(flush_file(), out);
 }
 
-fn fast_ab_file() -> std::path::PathBuf { cache_root().join("fast_ab.tsv") }
+/// The fast-decode A/B verdict, cached per adapter — and versioned for the same reason as the
+/// autotune file.
+///
+/// The lever verdicts were measured against kernels whose byte unpacking returned zero for three
+/// lanes in four on Honeykrisp. "Levers OFF, cached" is a conclusion about a build that no longer
+/// exists, and a cached verdict outlives the code that produced it.
+fn fast_ab_file() -> std::path::PathBuf { cache_root().join("fast_ab-v2.tsv") }
 /// The persisted dispatch-lever A/B verdict for this adapter: Some(true)=ON, Some(false)=OFF, None=never
 /// measured (probe on next load). Keyed by adapter so each GPU keeps its own answer.
 pub fn fast_ab_get(adapter: &str) -> Option<bool> {
@@ -647,5 +670,74 @@ mod bandwidth_tests {
         bandwidth_put("test-adapter-B-11", 200.0);
         assert_eq!(bandwidth_get("test-adapter-A-11"), Some(100.0));
         assert_eq!(bandwidth_get("test-adapter-B-11"), Some(200.0));
+    }
+}
+
+/// The GPU budget a device was MEASURED to honour, keyed by adapter.
+///
+/// The compiled-in ceiling for Asahi/Honeykrisp is 48 GiB, and `--gate-vram` measured the same M2
+/// Ultra honouring 63. Llama-4 Scout needs 54.8 — **between the two**. So the model is refused by a
+/// constant on a device that would run it, and the refusal message already says so, leaving the
+/// operator to set LOGSCOPE_MAX_GPU_GB by hand every time.
+///
+/// A measurement is worth more than a constant and should not have to be re-typed. Same shape as
+/// `bandwidth_put`: a TSV keyed by adapter name, so a machine that has run the probe remembers.
+fn vram_file() -> PathBuf { cache_root().join("measured-vram.tsv") }
+
+pub fn vram_put(adapter: &str, gib: f32) {
+    let mut out = String::new();
+    if let Ok(txt) = std::fs::read_to_string(vram_file()) {
+        for line in txt.lines() {
+            if line.split('\t').next() != Some(adapter) {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out.push_str(&format!("{adapter}\t{gib:.2}\n"));
+    let _ = std::fs::create_dir_all(cache_root());
+    let _ = std::fs::write(vram_file(), out);
+}
+
+/// What this adapter was measured to honour, if it has ever been probed.
+///
+/// Returns None rather than a default, so a caller can tell "never measured" from "measured and
+/// small" — the whole point is to stop treating an unmeasured constant as a finding.
+pub fn vram_get(adapter: &str) -> Option<f32> {
+    let txt = std::fs::read_to_string(vram_file()).ok()?;
+    for line in txt.lines() {
+        let mut f = line.split('\t');
+        if f.next() == Some(adapter) {
+            return f.next().and_then(|v| v.parse().ok());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod vram_store_tests {
+    use super::*;
+
+    #[test]
+    fn a_measured_ceiling_round_trips_per_adapter() {
+        let a = format!("test-adapter-{}", std::process::id());
+        assert!(vram_get(&a).is_none(), "never measured means None, not a default");
+        vram_put(&a, 63.0);
+        assert_eq!(vram_get(&a), Some(63.0));
+        // A second measurement replaces rather than appends — a device's honoured ceiling is one
+        // value, and two lines for one adapter would make the answer depend on read order.
+        vram_put(&a, 61.5);
+        assert_eq!(vram_get(&a), Some(61.5));
+    }
+
+    #[test]
+    fn one_adapters_measurement_does_not_disturb_anothers() {
+        // A laptop and a desktop sharing a home directory over NFS is not exotic, and a probe on one
+        // must not silently raise the ceiling on the other.
+        let (a, b) = (format!("gpu-a-{}", std::process::id()), format!("gpu-b-{}", std::process::id()));
+        vram_put(&a, 63.0);
+        vram_put(&b, 12.0);
+        assert_eq!(vram_get(&a), Some(63.0));
+        assert_eq!(vram_get(&b), Some(12.0));
     }
 }

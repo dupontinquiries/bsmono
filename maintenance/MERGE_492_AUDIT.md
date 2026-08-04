@@ -110,3 +110,59 @@ target-specific information` — a message that has nothing to do with the real
 cause. If cargo starts reporting impossible toolchain errors, check `df` before
 anything else, and build with `CARGO_TARGET_DIR` outside the repo so the trees
 can be reclaimed one at a time.
+
+---
+
+# Merge 605 (c4-541)
+
+Second upstream merge. Same base as the first — `370eedee`, so this line has not
+moved since — with **122 incoming commits, every one under `apps/logscope`**,
+against 262 of ours.
+
+## It merged clean, and this time clean meant clean
+
+Five files were touched by both sides (`backend.rs`, `lib.rs`, `scene3d.rs`,
+`tabs/chat.rs`, `logscope-fan/src/lib.rs`) and git auto-merged all five with no
+conflicts. Last merge that was not the end of the story — `theme.rs` auto-merged
+and then failed to compile with `E0428`, because both lines had added
+`md_strong()` in different positions. So the merge is not accepted until it
+builds:
+
+| build | result |
+|---|---|
+| `--features gui` | **745 passed** (was 703 — 42 new upstream tests) |
+| `--no-default-features` (lean) | **498 passed** (was 483) |
+| `logscope-fan` | **247 passed**, 1 ignored |
+
+All three of our earlier logscope changes survived: the `dev-views` gate, the
+un-gated `workspace`/`merge`/`hud_pack` modules that make the lean build
+compile, and `ensure_contrast_all`.
+
+## Concerns
+
+**1. Upstream added `apps/logscope/.cargo/config.toml` with
+`-C link-arg=-fuse-ld=gold -C prefer-dynamic`.** Both work here — `ld.gold` is
+present — but this is a new hard requirement on the build host that did not
+exist before, and it is per-app rather than workspace-wide. A machine without
+the gold linker now fails to build logscope and only logscope, which is a
+confusing way to find out. `prefer-dynamic` also changes what a release binary
+depends on at runtime; worth confirming that is intended for shipped builds
+rather than a local iteration speed-up that escaped.
+
+**2. A misleading error I previously mis-diagnosed.** `failed to run rustc to
+learn about target-specific information` appeared during this merge check. The
+audit above records that message as meaning *disk exhaustion*. That was
+incomplete: here it was caused by redirecting `</dev/null` into cargo, which
+feeds the rustc probe an empty stdin. Two different causes, one message, and
+neither mentions the real problem. Check disk AND stdin before believing the
+toolchain is broken.
+
+**3. Two reverts came in, one of which is a correction of a bad measurement.**
+`revert(arena): pull the slab unmap — and I compared two different code paths to
+justify it` and `revert(q4k): ties-to-even made it 8.8x WORSE — Metal rounds
+ties AWAY, whatever the spec says`. Both are healthy, but the first is worth
+reading before building on that area: it says a previous optimisation was
+justified by comparing two different code paths, which is the same class of
+measurement error this port's own audit keeps finding.
+
+**4. No new dependencies**, which is the good news in a 122-commit merge.

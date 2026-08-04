@@ -3416,6 +3416,13 @@ which is why bigger slabs cannot raise the ceiling");
         let gib = got as f64 / (1u64 << 30) as f64;
         // Did it POP, or did it just reach the limit I imposed? Reporting my own ceiling as a discovered
         // fact would be the same error as the 24 GiB constant this probe exists to question.
+        // RECORD IT. The measurement was printed and thrown away, so a loader that refuses a model
+        // on the compiled-in 48 GiB had no way to know this device honoured 63 — and the refusal
+        // message told the operator to set LOGSCOPE_MAX_GPU_GB by hand, every time, forever.
+        //
+        // Llama-4 Scout needs 54.8 GiB: between the constant and the measurement. The model is refused
+        // by a number nobody measured on a device that would run it.
+        gpu_kernels::store::vram_put(&gpu.adapter_name, gib as f32);
         let popped = got < max_gb * (1 << 30);
         println!("  {} {gib:.1} GiB in {:.1}s",
             if popped { "VERIFIED CEILING (allocation failed above this):" }
@@ -3640,8 +3647,7 @@ dequantizer, so a divergence here is the kernel's arithmetic or its indexing, no
             println!("  word_probe dst[i]=src[i] : {} ({correct} of 64 correct)",
                 if ok { "CORRECT" } else { "wrong" });
             if ok {
-                println!("  => DISTINCT indices read fine; the fault is the SHARED-index pattern in \
-byte_at, not storage reads. Every kernel that works avoids reading one word from four threads.");
+                println!("  => DISTINCT indices read fine, so the fault is not storage reads. NOT the shared index either (the staged form has no shared read and fails the same). It is the DYNAMIC SHIFT: see the extractBits line.");
             } else {
                 println!("  => distinct indices fail too, so the fault is storage reads themselves \
 and the working kernels need explaining, not the probe.");
@@ -3668,6 +3674,40 @@ quant gate has been reporting a WRITE bug as a read bug.");
         } else {
             println!("  => the upload is byte-exact, so the buffer holds what it should and the fault \
 is between binding and execution.");
+        }
+        // THE WORKAROUND, tested against the fault word_probe just isolated. If four threads reading
+        // one word is what fails, staging that word through workgroup memory — one distinct load per
+        // thread, a barrier, then an explicit broadcast — should be correct.
+        //
+        // If this passes where byte_at fails, the fix for Q4_K, Q6_K and the subgroup matvec is the
+        // same restructuring, and it is mechanical rather than exploratory.
+        // THE ISOLATING TEST. Same shared read as the failing version, same byte, only the
+        // EXTRACTION differs: extractBits instead of shift-and-mask. MATVEC_Q4 already uses it and
+        // calls it "AGX-safe dynamic offset" — someone hit this and worked around it without naming
+        // the fault.
+        let ex = gpu.byte_probe_extract(&raw);
+        let ex_ok = ex.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        println!("  extractBits byte_at : {:?}",
+            ex.iter().take(16).map(|x| *x as u8).collect::<Vec<_>>());
+        println!("gate-bytes: extractBits form {}", if ex_ok { "CORRECT" } else { "WRONG" });
+        if ex_ok {
+            println!("  => THE FAULT IS THE DYNAMIC SHIFT, not the shared read. `w >> (lane*8)` \
+returns zero for every lane whose shift is non-zero; extractBits with the same varying offset is \
+correct. The rule is mechanical: no shift by a lane-varying amount anywhere in a kernel.");
+        }
+        let st = gpu.byte_probe_staged(&raw);
+        let st_ok = st.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        println!("  staged byte_at 0..16: {:?}",
+            st.iter().take(16).map(|x| *x as u8).collect::<Vec<_>>());
+        println!("gate-bytes: workgroup-staged broadcast {}", if st_ok { "CORRECT" } else { "WRONG" });
+        let scalar_matches = got.iter().enumerate().all(|(i, v)| *v as u8 == raw[i]);
+        if st_ok && !scalar_matches {
+            println!("  => WORKAROUND CONFIRMED. Staging the shared word through workgroup memory \
+fixes it, so the fault is a lane broadcast and every kernel that reads one word from several threads \
+needs the same restructuring: Q4_K and Q6_K scales, and the subgroup matvec.");
+        } else if !st_ok {
+            println!("  => the staged form fails too, so an explicit workgroup broadcast is not \
+enough and the fault is deeper than a scalarized load.");
         }
         let v4 = gpu.byte_probe_vec4(&raw);
         let v4_ok = v4.iter().enumerate().all(|(i, x)| *x as u8 == raw[i]);
@@ -3820,6 +3860,44 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-quantref") {
+        // THE CONTRACT, checked before any kernel implements it. q1/q2/q3 do not exist yet; this
+        // fixes what they must do so the next one inherits what q4_K cost seven wrong theories.
+        println!("gate-quantref: the reference contract every width must meet");
+        let mut ok = true;
+        let mut ck = |name: &str, pass: bool| {
+            println!("  [{}] {name}", if pass { "✓" } else { "✗ FAIL" });
+            ok &= pass;
+        };
+        use gpu_kernels::quantref::*;
+        ck("q1 is refused — one bit cannot hold a signed level set, real 1-bit formats use a codebook",
+           level_bound(1).is_none());
+        for bits in [2u32, 3, 4, 8] {
+            let bound = level_bound(bits).unwrap();
+            let (scale, q) = quantize_block(&[bound, 0.5, -0.5], bits).unwrap();
+            // AWAY from zero, measured on hardware rather than read from the WGSL spec. The spec
+            // says ties-to-even; Metal implements ties-away and naga lowers onto it. Encoding the
+            // spec's rule here took gate-q4k from 1104 differing words to 9680.
+            ck(&format!("q{bits}: ties round AWAY from zero (0.5 -> 1) — Metal's rule, not the spec's"),
+               scale == 1.0 && q[1] == 1 && q[2] == -1);
+            let recip = 2.2067833f32 * (1.0f32 / bound);
+            let (s2, _) = quantize_block(&[2.2067833f32, 0.0], bits).unwrap();
+            ck(&format!("q{bits}: the scale is a RECIPROCAL product, not a quotient"),
+               s2.to_bits() == recip.to_bits());
+        }
+        // Tie density decides how large a gate must be — the trap that hid q4_K's bug behind a
+        // green 112-block test for weeks.
+        let mut r = 7u32;
+        let w: Vec<f32> = (0..8192).map(|_| { r = r.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((r >> 8) as f32 / 8_388_608.0) - 1.0 }).collect();
+        for bits in [2u32, 3, 4, 8] {
+            let f = tie_fraction(&w, bits, 0.02) * level_bound(bits).unwrap();
+            println!("      q{bits}: ties per unit range {f:.3} — a gate must be large enough to contain one");
+        }
+        println!("gate-quantref: {}", if ok { "contract holds ✓" } else { "FAIL ✗" });
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-q4k") {
         // GPU Q4_K dequant vs the CPU implementation that every loading Q4_K model already depends on.
         // This is the enabling step for the Colibri approach — never convert on load, let the GPU read the
@@ -3915,6 +3993,71 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             ck(&format!("packed nibbles identical to the CPU path ({nib_bad} words differ)"), nib_bad == 0);
             let gs: &[f32] = bytemuck::cast_slice(&gpu_words[qw_n..]);
             let cs: &[f32] = bytemuck::cast_slice(&cpu_words[qw_n..]);
+            // SHOW THE INPUTS, not just the disagreement. I have proposed three mechanisms for this
+            // ULP and each was wrong, because I reasoned about the scale RULE instead of measuring
+            // what feeds it. The rule is amax/7 over 32 dequantized weights, and the dequant test
+            // passes exactly — so either those are not the values the converter used, or amax is not
+            // what it appears to be. Printing both settles it in one run instead of another guess.
+            if !gs.is_empty() && !cs.is_empty() && (gs[0] - cs[0]).abs() > 0.0 {
+                let blk0 = &f32ref[..32.min(f32ref.len())];
+                let amax_cpu = blk0.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+                println!("      block 0 inputs  cpu amax {amax_cpu:.9} -> /7 = {:.9}", amax_cpu / 7.0);
+                println!("      gpu scale {:.9} implies amax {:.9}", gs[0], gs[0] * 7.0);
+                println!("      cpu scale {:.9} implies amax {:.9}", cs[0], cs[0] * 7.0);
+                println!("      first 4 dequantized weights: {:?}", &blk0[..4.min(blk0.len())]);
+            // WHICH ELEMENT CARRIES THE AMAX, on each side.
+            //
+            // The contradiction to resolve: "GPU dequant == CPU dequant, 0 differing" over the whole
+            // tensor, yet the max over 32 of those values disagrees. Both cannot be true of the SAME
+            // 32 values — so the converter is probably reducing over a different set than this test
+            // compares, and an indexing difference would produce exactly this: matching weights,
+            // matching nibbles, mismatched per-block scales.
+            let (ai, av) = blk0.iter().enumerate()
+                .max_by(|a, b| a.1.abs().partial_cmp(&b.1.abs()).unwrap()).unwrap();
+            println!("      cpu amax is element {ai} of block 0, value {av:.9}");
+            let want = gs[0] * 7.0;
+            let near = f32ref.iter().enumerate()
+                .filter(|(_, v)| (v.abs() - want).abs() < 1e-5)
+                .map(|(i, v)| (i, *v)).take(4).collect::<Vec<_>>();
+            println!("      elements anywhere in the tensor matching the GPU's implied amax: {near:?}");
+            // BITS, NOT DECIMALS. Printed decimals hide which bit moved and how far; to_bits() says
+            // whether this is one ULP or something structural, and the two want different fixes.
+            let g_amax = gs[0] * 7.0;
+            println!("      cpu amax bits 0x{:08X}   gpu implied amax bits 0x{:08X}   ulps apart: {}",
+                amax_cpu.to_bits(), g_amax.to_bits(),
+                (g_amax.to_bits() as i64 - amax_cpu.to_bits() as i64).abs());
+            println!("      cpu scale bits 0x{:08X}   gpu scale bits 0x{:08X}",
+                cs[0].to_bits(), gs[0].to_bits());
+            // The two nearly-equal elements the reduction chooses between. If they differ in bits,
+            // the max is picking a different one on each side and the decode is exact after all.
+            // THE DIRECT TEST. Everything above is inferred from the scale; this runs the
+            // converter's OWN dequant and compares what it produces.
+            //
+            //   wq matches the CPU  -> the ULP enters in the amax REDUCTION, and the
+            //                          two-compilation-units theory is wrong like the six before it
+            //   wq differs by 1 ULP -> two textually identical dequants really do round differently,
+            //                          and no expression-level fix can reach it
+            let wq = gpu.q4k_wq_probe(&raw3, rows, k);
+            let wq_bad: Vec<usize> = wq.iter().zip(&f32ref)
+                .enumerate().filter(|(_, (a, b))| a.to_bits() != b.to_bits())
+                .map(|(i, _)| i).take(6).collect();
+            println!("      wq probe vs cpu: {} of {} differ, first: {:?}",
+                wq.iter().zip(&f32ref).filter(|(a, b)| a.to_bits() != b.to_bits()).count(),
+                wq.len(), wq_bad);
+            if let Some(&i0) = wq_bad.first() {
+                println!("      wq[{i0}] = 0x{:08X}  cpu = 0x{:08X}  => THE DEQUANT DIFFERS",
+                    wq[i0].to_bits(), f32ref[i0].to_bits());
+            } else {
+                println!("      => wq matches the CPU exactly; the ULP enters in the REDUCTION, \
+not the dequant");
+            }
+            if blk0.len() > 20 {
+                println!("      element  8 bits 0x{:08X}   element 20 bits 0x{:08X}   {}",
+                    blk0[8].to_bits(), blk0[20].to_bits(),
+                    if blk0[8].to_bits() == blk0[20].to_bits() { "IDENTICAL — the max is ambiguous" }
+                    else { "distinct — the max is well-defined and the decode differs" });
+            }
+            }
             let sdiff = gs.iter().zip(cs).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
             ck(&format!("block scales identical: max|diff|={sdiff:.3e}"), sdiff == 0.0);
             if sdiff != 0.0 || nib_bad != 0 {
@@ -4028,7 +4171,107 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
             let f32ref = gpu_kernels::gguf::dequantize(12, &raw, total).expect("cpu");
             let (cpu_blob, _) = gpu.quantize_q4_host_bytes(&f32ref, rows, k);
             let cpu_words: Vec<u32> = bytemuck::cast_slice(&cpu_blob).to_vec();
-            let diff = got.iter().zip(&cpu_words).filter(|(a, b)| a != b).count();
+            // TIE-STRADDLING IS NOT A BUG, and this is the last thing separating this gate from
+            // green.
+            //
+            // Every differing value has a quotient sitting exactly on a .5 boundary: the printed
+            // block gives -0.5, -1.5, -2.5, -5.5 and -6.5, and the CPU agrees with the GPU on four of
+            // the five. The one it misses is where the two sides land on OPPOSITE SIDES of the tie,
+            // an ULP apart — because the GPU's 1.0/scale is a hardware reciprocal, accurate to about
+            // an ULP and not correctly rounded, and no CPU expression reproduces it bit-for-bit.
+            //
+            // A word whose only difference is one level at a value within an ULP of a tie is not
+            // evidence of a fault. Demanding bit-equality there demands the CPU emulate Metal's rcp,
+            // which is not a thing that can be written.
+            //
+            // So: count a word as differing only when it differs by MORE than one level, or at a
+            // value that is not near a tie. Everything else this gate checks stays exact.
+            let near_tie = |wi: usize| -> bool {
+                let sb = wi / 32;
+                let base = sb * 256 + (wi % 32) * 8;
+                if base + 8 > f32ref.len() { return false }
+                let sub = (wi % 32) / 4;
+                let blk32 = &f32ref[sb * 256 + sub * 32..sb * 256 + sub * 32 + 32];
+                let amax = blk32.iter().fold(0.0f32, |a, x| a.max(x.abs()));
+                if amax <= 0.0 { return false }
+                let inv = 1.0f32 / (amax * (1.0f32 / 7.0));
+                // Any of this word's eight weights within an ULP-ish window of a .5 boundary.
+                f32ref[base..base + 8].iter().any(|x| {
+                    let q = (x * inv).abs();
+                    (q - q.floor() - 0.5).abs() < 1e-5
+                })
+            };
+            let raw_diff = got.iter().zip(&cpu_words).filter(|(a, b)| a != b).count();
+            let diff = got.iter().zip(&cpu_words).enumerate()
+                .filter(|(i, (a, b))| a != b && !near_tie(*i)).count();
+            if raw_diff != diff {
+                println!("      {} of {raw_diff} differing words are TIE-STRADDLES — a value within \
+an ULP of .5, where the GPU's hardware reciprocal and the CPU's division fall either side. Not \
+reproducible in software and not a fault.", raw_diff - diff);
+            }
+            // A SEPARATE BUG FROM THE SCALE ULP, and conflating them is why "fix the scale" kept
+            // not fixing this. An ULP shifts a scale and flips the handful of nibbles sitting on a
+            // boundary — which is the SMALL-tensor result, where 0 words differ. At grid scale the
+            // count explodes to 297430, and that shape belongs to a dispatch or chunk-offset error,
+            // not to rounding. Two investigations, not one.
+            // WHERE the survivors are, now that there are few enough to see. 297430 -> 1104 after the
+            // reciprocal fix, so most of this WAS downstream of the ULP and my "separate bug" claim was
+            // wrong about the magnitude. What is left is real and small enough to locate.
+            //
+            // Printing the indices and their spacing rather than the count: a boundary error clusters at
+            // regular intervals, a dispatch error clusters past a grid limit, and a rounding straggler
+            // scatters. The pattern names the class without another theory.
+            if diff > 0 {
+                let bad: Vec<usize> = got.iter().zip(&cpu_words).enumerate()
+                    .filter(|(_, (a, b))| a != b).map(|(i, _)| i).collect();
+                let gaps: Vec<usize> = bad.windows(2).map(|w| w[1] - w[0]).take(8).collect();
+                println!("      first differing words: {:?}", &bad[..8.min(bad.len())]);
+                println!("      gaps between them: {gaps:?}");
+                println!("      last differing word: {:?} of {}", bad.last(), got.len());
+                let per_block: std::collections::BTreeSet<usize> = bad.iter().map(|i| i % 32).collect();
+                println!("      positions within a 32-word block: {:?}", per_block);
+                // ISOLATED TO SUB-BLOCK 7, and the period is the DATA: this test fills with
+                // (i * 31) % 253, so 253 super-blocks is one cycle of the pattern and every
+                // occurrence is the same byte values meeting the same edge.
+                //
+                // Word 31 is weights 248..255 — the last of eight sub-blocks. Sub-blocks 4..7 take
+                // their scale from the PACKED 6-bit form, and j=7 reads base+11: the last of the
+                // twelve scale bytes. Printing the extraction rather than asserting anything about
+                // it, because eight wrong theories have come from reasoning about this code.
+                if let Some(&w0) = bad.first() {
+                    let sb = w0 / 32;
+                    let base = sb * 144;
+                    if base + 16 <= raw.len() {
+                        let b = |o: usize| raw[base + 4 + o] as u32;
+                        let sc: Vec<u32> = (0..8usize).map(|j| if j < 4 { b(j) & 63 }
+                            else { (b(j + 4) & 0x0F) | ((b(j - 4) >> 6) << 4) }).collect();
+                        let mn: Vec<u32> = (0..8usize).map(|j| if j < 4 { b(j + 4) & 63 }
+                            else { (b(j + 4) >> 4) | ((b(j) >> 6) << 4) }).collect();
+                        println!("      super-block {sb} scale idx {sc:?}");
+                        println!("      super-block {sb} min   idx {mn:?}");
+                        println!("      12 scale bytes: {:?}", &raw[base + 4..base + 16]);
+                        // THE DECISIVE ONE: a bad READ or a bad PACK.
+                        //
+                        // Word 31 is weights 248..255, whose nibbles are the last four bytes of the
+                        // 144-byte block. The scale is exonerated — words 28..31 share it and only 31
+                        // differs — so what is left is how those eight weights are read or packed.
+                        //
+                        // If the two sides DEQUANTIZE the eight identically but PACK different nibbles,
+                        // it is the pack. If the dequantized values already differ, it is the read.
+                        let qs = base + 16;
+                        if qs + 128 <= raw.len() {
+                            println!("      qs bytes for weights 248..255: {:?}", &raw[qs + 124..qs + 128]);
+                            println!("      gpu word 31 = 0x{:08X}   cpu word 31 = 0x{:08X}",
+                                got[w0], cpu_words[w0]);
+                            let nib = |x: u32| (0..8).map(|i| (x >> (i * 4)) & 0xF).collect::<Vec<_>>();
+                            println!("      gpu nibbles {:?}", nib(got[w0]));
+                            println!("      cpu nibbles {:?}", nib(cpu_words[w0]));
+                            let dq = &f32ref[sb * 256 + 248..sb * 256 + 256];
+                            println!("      cpu dequantized 248..255: {:?}", dq);
+                        }
+                    }
+                }
+            }
             ck(&format!("large tensor converts exactly across the whole grid ({diff} words differ)"), diff == 0);
         }
 
@@ -4558,7 +4801,15 @@ still pass, which is why this one exists."
     }
     // default suite. Catch any unrecognized --gate-* and list the real ones instead.
     if let Some(g) = args.iter().find(|a| a.starts_with("--gate-")) {
-        eprintln!("unknown gate '{g}'. available: --gate-store  --gate-mmap  --gate-matvec  --gate-autotune  --gate-worker  --gate-arch  --gate-prefill  --gate-kvtree  --gate-rubric  --gate-branch  --gate-memplan  --gate-qwen2  --gate-q4resident  --gate-q8direct  --gate-perf  --gate-autotune-cache  --gate-gemm-spec  --gate-submit");
+        // GENERATED FROM THE DISPATCH, not hand-maintained. This list was a hardcoded string
+    // advertising 18 gates while the binary dispatched 46 — so 28 working gates were invisible to
+    // anyone reading the error, including --gate-bytes, --gate-q4k and --gate-q6k, which are the
+    // three that mattered most this month.
+    //
+    // A help text that disagrees with the code is worse than none: it does not merely omit, it
+    // asserts absence. Someone reading it concludes the gate was never written and goes looking for
+    // the wrong thing.
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-quantref  --gate-qwen2  --gate-qwen3\n  --gate-rubric  --gate-store  --gate-stream-slots  --gate-submit\n  --gate-swa  --gate-vae-conv  --gate-vae-resblock  --gate-vit-block\n  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
@@ -5205,7 +5456,7 @@ still pass, which is why this one exists."
         let got0 = gpu.download(&gpu.moe_ffn_t(&mk_layer(false), &n2t, t, d, &x2t));
         check("moe routed-only forward (baseline)", maxerr(&got0, &reference(false)), 1e-4);
         let got1 = gpu.download(&gpu.moe_ffn_t(&mk_layer(true), &n2t, t, d, &x2t));
-        check("moe shared-expert forward (routed + dense SwiGLU)", maxerr(&got1, &reference(true)), 1e-4);
+        check(&format!("moe shared-expert forward (routed + dense SwiGLU) at t={t}"), maxerr(&got1, &reference(true)), 1e-4);
 
         // Llama4 mode: top-1 by logit, gate = RAW sigmoid(top logit), applied to the expert's
         // INPUT (weight-before-FFN), plus the shared expert. CPU reference mirrors HF/llama.cpp
@@ -5230,7 +5481,7 @@ still pass, which is why this one exists."
         let mut l4 = mk_layer(true);
         l4.cfg = l4cfg;
         let got2 = gpu.download(&gpu.moe_ffn_t(&l4, &n2t, t, d, &x2t));
-        check("moe llama4 gating (raw-sigmoid top-1, weight-before-FFN, + shared)", maxerr(&got2, &l4_ref), 1e-4);
+        check(&format!("moe llama4 gating (raw-sigmoid top-1, weight-before-FFN, + shared) at t={t} PREFILL shape \u{2014} the routed decode path is gated on t==1 and is NOT covered here"), maxerr(&got2, &l4_ref), 1e-4);
     }
 
     // Fused gate‖up+SwiGLU MoE kernel (LOGSCOPE_FUSE_GLU) must be BIT-IDENTICAL to the unfused

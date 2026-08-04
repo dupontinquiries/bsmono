@@ -273,6 +273,25 @@ is not real. Look at kernel throughput (--gate-perf) and at bytes moved per toke
                 self.sync_share * 100.0, self.submits_per_token, self.ceiling);
         }
         if self.sync_share > self.cpu_share * 4.0 {
+            // OVER 100% IS POSSIBLE AND IT MEANS SOMETHING DIFFERENT. sync_ns is a global atomic
+            // summed across every thread that waits, so with concurrent sessions the total CPU-time
+            // spent waiting exceeds the wall clock. A real run reported 112%, which read as an
+            // arithmetic bug and is in fact the metric being aggregate rather than fractional.
+            //
+            // Reporting it as "% of the step" is only true single-threaded. Above 100 it has to say
+            // what it actually is, or the number looks broken and gets discounted — which is worse
+            // than saying nothing, because the underlying finding is real.
+            if self.sync_share > 1.0 {
+                return format!("sync-bound: {:.1}x the wall clock spent WAITING across all threads \
+at {} submits/token — over 100% because several sessions each stall on their own readback, so the \
+CPU-time lost is larger than the elapsed time. The win is removing readbacks, not caching. Ceiling {}",
+                    self.sync_share, self.submits_per_token,
+                    // "Ceiling infx" is what an unbounded ratio printed, which reads as a glitch.
+                    // An unbounded ceiling means the measured compute was ~0, and saying that is more
+                    // useful than a symbol nobody can act on.
+                    if self.ceiling.is_finite() { format!("{:.1}x", self.ceiling) }
+                    else { "unbounded — the measured compute was ~0, so the ratio has no meaning".into() });
+            }
             format!("sync-bound: {:.0}% of the step is the CPU WAITING at {} submits/token — the frame is being drained constantly and the GPU starved. The win is removing readbacks, not caching — a bind-group cache does not shorten a stall. Ceiling {:.2}x.",
                 self.sync_share * 100.0, self.submits_per_token, self.ceiling)
         } else {
@@ -462,5 +481,53 @@ mod tests {
         assert!(t.dominant().is_none());
         assert_eq!(t.summary(), vec!["no spans recorded".to_string()]);
         assert!(t.hot_layers(Phase::Upload, 4, 2.0).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod aggregate_wait_tests {
+    use super::*;
+
+    /// The three generations from one real Scout conversation, in order.
+    ///
+    /// **Submits per token roughly DOUBLE each turn** — 511, 972, 1915 — and sync tracks them: 74%,
+    /// 91%, 112%. That is not routing, which is constant per layer. It is the context growing: a
+    /// longer conversation means more attention work per token, more dispatches, and one blocking
+    /// readback per layer multiplied by all of it.
+    ///
+    /// So the stall does not merely dominate — **it compounds with conversation length**, which is
+    /// why a first message runs and a third crawls.
+    fn verdict(sync_ns: u64, wall_ns: u64, spt: u32, ceiling: f32) -> String {
+        Headroom { sync_share: sync_ns as f32 / wall_ns as f32, cpu_share: 0.01,
+                   submits_per_token: spt as u64, ceiling }.verdict()
+    }
+
+    #[test]
+    fn over_100_percent_is_reported_as_AGGREGATE_not_as_a_share() {
+        // A real run printed "112% of the step", which reads as an arithmetic bug. It is not: sync_ns
+        // is summed across every waiting thread, so concurrent sessions lose more CPU-time than the
+        // elapsed time. Saying "% of the step" is only true single-threaded, and a number that looks
+        // broken gets discounted — worse than silence, because the finding underneath is real.
+        let t = verdict(267_122_500_000, 238_000_000_000, 1915, f32::INFINITY);
+        assert!(t.contains("the wall clock spent WAITING across all threads"), "{t}");
+        assert!(!t.contains("112% of the step"));
+    }
+
+    #[test]
+    fn an_UNBOUNDED_ceiling_says_why_rather_than_printing_inf() {
+        // "Ceiling infx" is what an unbounded ratio printed. It means the measured compute was ~0,
+        // and saying that is actionable where a symbol is not.
+        let t = verdict(267_122_500_000, 238_000_000_000, 1915, f32::INFINITY);
+        assert!(t.contains("the measured compute was ~0"), "{t}");
+        assert!(!t.contains("infx"));
+    }
+
+    #[test]
+    fn under_100_percent_still_reads_as_a_SHARE() {
+        // The single-threaded case is the common one and must not get the aggregate phrasing, which
+        // would be confusing where the simple reading is correct.
+        let t = verdict(177_774_800_000, 239_000_000_000, 511, 3.90);
+        assert!(t.contains("% of the step"), "{t}");
+        assert!(!t.contains("across all threads"));
     }
 }

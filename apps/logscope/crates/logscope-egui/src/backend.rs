@@ -240,7 +240,16 @@ pub(crate) mod engine {
                 if asahi {
                     // Honeykrisp/Asahi: the fragile path we've hardened against (subgroup hangs, unreliable
                     // completion callbacks → bounded submits, watchdog-sensitive dispatches).
-                    notes.push("Asahi/Honeykrisp Vulkan detected → subgroup matvec OFF, decode window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan budget".into());
+                    // REPORT THE ACTUAL STATE, not the default. This was a static string keyed on
+                    // conservative_vma and said "subgroup matvec OFF" whether or not it was — so a run
+                    // with LOGSCOPE_MATVEC_SG=1 printed the same line as one without, and there was no
+                    // way to tell from the log whether the override took.
+                    //
+                    // A preflight summary that reports intent rather than outcome is worse than none:
+                    // it is read as confirmation.
+                    notes.push(format!("Asahi/Honeykrisp Vulkan detected → subgroup matvec {}, decode \
+window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan budget",
+                        if gpu.subgroup_kernel_ok() { "ON (LOGSCOPE_MATVEC_SG override)" } else { "OFF" }));
                 }
                 // Report env overrides and whether each PARSED (the PREFILL_CHUNK-vs-LOGSCOPE_PREFILL_CHUNK
                 // class of silent-ignore cost real test cycles; make it visible).
@@ -475,7 +484,20 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
             if std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_none() {
                 let shapes = gpu.model_decode_shapes(&model);
                 let safe: String = gpu.adapter_name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
-                let cache = gpu_kernels::store::cache_root().join(format!("autotune-shapes-{safe}.bin"));
+                // VERSIONED IN THE NAME, like the other two caches. This is the per-shape file — a
+                // SEPARATE store from autotune-v4.tsv, which is why bumping that one did nothing and a
+                // run after the kernel fixes still reported "loaded 41 decode + 14 GEMM tiles from
+                // cache".
+                //
+                // Those verdicts were measured against kernels whose byte unpacking returned zero for
+                // three lanes in four, and against a candidate set that probe_valid_gemm_tiles pruned
+                // using the same corrupt weights. Every tile in that file is a conclusion about a
+                // build that no longer exists — and it is why LOGSCOPE_MATVEC_V3 could not take
+                // effect: a cached choice never re-enters the search.
+                //
+                // v2: kernels fixed (lane-varying shifts replaced with extractBits/insertBits).
+                let cache = gpu_kernels::store::cache_root()
+                    .join(format!("autotune-shapes-v2-{safe}.bin"));
                 let (dl, gl) = gpu.load_autotune(&cache).unwrap_or((0, 0));
                 if dl > 0 || gl > 0 { eprintln!("wgpu-engine: per-shape autotune — loaded {dl} decode + {gl} GEMM tiles from cache"); }
                 // Time-box the whole probe so a slow/large model can never stall the load (capped-width
@@ -719,7 +741,28 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                 &self.gpu.adapter_name, self.model.decode_class(),
                 self.model.residency_class());
             if prof.record(&tkey, v.clone()) {
-                gpu_kernels::store::fast_ab_put(&key, decision);
+                // MARGIN BEFORE PERSISTING. The A/B measures two timings and picks the faster, and
+                // "faster" over a short sample includes noise — a verdict written from a 2% win gets
+                // cached and applied to every later run on this GPU and decode class.
+                //
+                // dwell::Verdict answers whether the win pays for taking it. There is no dwell here
+                // because this decides once per model load rather than continuously; the margin is
+                // the half that applies, and it is the half that stops a coin-flip becoming a
+                // persisted policy.
+                //
+                // Scores are inverted from times: the levers "win" by being FASTER, so the challenger
+                // score is off_ms and the incumbent is on_ms when decision is true.
+                let (incumbent_ms, challenger_ms) = if decision { (off * 1000.0, on * 1000.0) }
+                                                    else { (on * 1000.0, off * 1000.0) };
+                let mut d = logscope::dwell::Dwelling::new(
+                    std::time::Duration::from_secs(0), logscope::dwell::DEFAULT_MARGIN);
+                let verdict = d.consider(1.0 / incumbent_ms.max(1e-6),
+                                         1.0 / challenger_ms.max(1e-6), false);
+                if verdict.switches() {
+                    gpu_kernels::store::fast_ab_put(&key, decision);
+                } else {
+                    eprintln!("wgpu-engine: A/B verdict NOT persisted — {}", verdict.explain());
+                }
                 if let Err(e) = prof.save(&prof_path) { eprintln!("wgpu-engine: tuning profile not saved: {e}"); }
                 eprintln!("wgpu-engine: fast-decode A/B — {} by {:+.0}% ({:.1} vs {:.1} ms/tok), cached for [{}]",
                     if decision { "ON" } else { "off" }, v.margin() * 100.0,
@@ -1099,6 +1142,26 @@ was evicted)", prompt_ids.len())
             // submits rather than the process lifetime's.
             let attr = format!("wgpu-engine: [{}] {}", self.name,
                 gpu_kernels::submit_attribution_since(cause0, ds as u64));
+            // EXPERT RESIDENCY. These counters have been tracked and reported nowhere, so there has
+            // been no way to tell whether pinning more experts would help or whether the cache is
+            // already saturated and the cost is in the kernels. For a streaming MoE that is the whole
+            // question, and it decides whether the next move is budget or a kernel.
+            {
+                let (hits, fills, bytes, repins, _) = gpu_kernels::moe_stream_stats();
+                if hits + fills > 0 {
+                    let r = gpu_kernels::perfverdict::ExpertResidency {
+                        hits, fills, bytes, repins,
+                        pinned: gpu_kernels::moe_pin_counts().0, total: gpu_kernels::moe_pin_counts().1,
+                    };
+                    eprintln!("wgpu-engine: [{}] {}", self.name, r.report(per as u64));
+                    // Prediction is a DIFFERENT lever from the pin set: the pin set decides what is
+                    // always here, prediction decides what will be wanted next and is the only one
+                    // that can hide a fetch behind compute.
+                    let (issued, phits) = gpu_kernels::moe_prefetch_stats();
+                    eprintln!("wgpu-engine: [{}] {}", self.name,
+                        gpu_kernels::perfverdict::PrefetchAccuracy { issued, hits: phits }.verdict());
+                }
+            }
             // THE PROFILE CHECKED AGAINST ITSELF. A line that contradicts itself is worse than no
             // line: every number in it gets used to reason about where time goes, and one that cannot
             // be true poisons the conclusions drawn from the rest.
@@ -1173,6 +1236,14 @@ was evicted)", prompt_ids.len())
                 eprintln!("wgpu-engine: [{}] SHORT REPLY ({produced} tok) — stop: {why}; stop_set={:?}; next-token argmax={:?}",
                     self.name, self.stop_ids, next_argmax);
                 eprintln!("wgpu-engine: [{}]   generated text = {:?}", self.name, decoded);
+                // CODE CHECK, behind LOGSCOPE_DEBUG_FORMAT. Reports rather than rewrites: a formatter that
+                // silently repairs a model's output makes broken code LOOK correct, and the reader loses the
+                // one signal that something went wrong.
+                if logscope::codefmt::enabled() {
+                    if let Some(s) = logscope::codefmt::summary(&logscope::codefmt::check(&decoded)) {
+                        eprintln!("wgpu-engine: [{}] {s}", self.name);
+                    }
+                }
                 eprintln!("wgpu-engine: [{}]   generated ids (≤16) = {:?}", self.name, tail);
             }
             // This turn (prompt + what we generated) joins the pool as a branch tip; `prefill_len` is how
