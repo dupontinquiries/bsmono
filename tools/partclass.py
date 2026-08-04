@@ -48,6 +48,8 @@ FV = os.path.join(BS, "rust", "foldview", "target", "release", "foldview")
 
 # names foldview gives parts; kept as a WEAK prior, never as the answer
 FEATURES = [
+    "thickness",    # real slab thickness / longest extent — plates are tiny
+    "solidity",     # enclosed volume / bbox — a block is high, a shell low
     "elong",        # longest / middle extent
     "flat",         # shortest / middle    (a plate is small here)
     "round",        # how circular the cross-section is, 0..1
@@ -63,6 +65,63 @@ FEATURES = [
 ]
 
 
+def mesh_mass(pts, idx):
+    """PERCEIVED MASS from the mesh itself, not its bounding box.
+
+    Earlier work used bbox volume as a mass proxy, which is wrong in the
+    direction that matters most here: a hollow shell and a solid block with
+    the same silhouette weigh completely differently, and the whole roster is
+    shells.
+
+    Two numbers do it, both from the triangles:
+
+      VOLUME by the divergence theorem — sum the signed tetrahedra from the
+      origin to each face. For a closed surface this is the enclosed volume;
+      for an open one it is still a usable proxy because the open faces
+      contribute little.
+
+      AREA is just the triangle sum.
+
+    Then THICKNESS = 2V/A, which for a slab really is its thickness, and
+    SOLIDITY = V / bbox, which separates a plate from a block regardless of
+    how the modeller sampled it.
+
+    This also recovers what gltfx's thickening destroyed. Slabbing degenerate
+    sheets was right — some really were paper-thin and shaded wrong — but it
+    added a KNOWN amount, longest * 0.012, so the original thinness is
+    subtractable rather than lost.
+    """
+    idx = np.asarray(idx).ravel()
+    if idx.size < 3 or len(pts) < 3:
+        return 0.0, 0.0, 0.0, 0.0
+    idx = idx[idx < len(pts)]
+    if idx.size < 3:
+        return 0.0, 0.0, 0.0, 0.0
+    tri = idx[: (idx.size // 3) * 3].reshape(-1, 3)
+    # ORIGIN AT THE CENTROID. The divergence sum is exact for a closed mesh
+    # wherever you put the origin, and badly wrong for an OPEN one if the
+    # origin is far away — the missing faces' contribution grows with the
+    # distance. Every part here is an open shell, and with the origin left
+    # at the model origin some shins reported solidity 1.8, which is a
+    # volume larger than the box containing it.
+    ctr = pts.mean(0)
+    q = pts - ctr
+    a, b, c = q[tri[:, 0]], q[tri[:, 1]], q[tri[:, 2]]
+    cross = np.cross(b - a, c - a)
+    area = float(np.linalg.norm(cross, axis=1).sum() * 0.5)
+    vol = float(abs((a * np.cross(b, c)).sum()) / 6.0)
+    e = pts.max(0) - pts.min(0)
+    bbox = float(np.prod(np.maximum(e, 1e-9)))
+    longest = float(e.max())
+    thick = 2.0 * vol / max(area, 1e-9)
+    # undo the export's slabbing so a panel reads as a panel again
+    thick_raw = max(thick - longest * 0.012, 0.0)
+    # a shell cannot enclose more than its own box; clamp rather than let a
+    # numerical artefact leak into a feature
+    solidity = min(vol / bbox, 1.0)
+    return vol, area, thick_raw / max(longest, 1e-9), solidity
+
+
 def parts_of(iqm, t=0.0):
     """Named part clouds from a foldview export."""
     out_dir = "/tmp/_pc"
@@ -74,15 +133,21 @@ def parts_of(iqm, t=0.0):
     buf = open(f"{out_dir}/scene.bin", "rb").read()
     out = []
     for n in g["nodes"]:
-        a = g["accessors"][g["meshes"][n["mesh"]]["primitives"][0]["attributes"]["POSITION"]]
+        prim = g["meshes"][n["mesh"]]["primitives"][0]
+        a = g["accessors"][prim["attributes"]["POSITION"]]
         bv = g["bufferViews"][a["bufferView"]]
         off = bv.get("byteOffset", 0) + a.get("byteOffset", 0)
         p = np.frombuffer(buf, "<f4", count=a["count"] * 3, offset=off).reshape(-1, 3)
-        out.append((n.get("name", ""), np.asarray(p, float)))
+        ia = g["accessors"][prim["indices"]]
+        ibv = g["bufferViews"][ia["bufferView"]]
+        ioff = ibv.get("byteOffset", 0) + ia.get("byteOffset", 0)
+        dt = {5121: "<u1", 5123: "<u2", 5125: "<u4"}[ia["componentType"]]
+        ix = np.frombuffer(buf, dt, count=ia["count"], offset=ioff).astype(np.int64)
+        out.append((n.get("name", ""), np.asarray(p, float), ix))
     return out
 
 
-def describe(pts, model_lo, model_ext, others_c, others_r):
+def describe(pts, model_lo, model_ext, others_c, others_r, idx=None):
     """The twelve numbers. All scale-free, so a lander and a carrier compare."""
     c = pts.mean(0)
     q = pts - c
@@ -131,8 +196,14 @@ def describe(pts, model_lo, model_ext, others_c, others_r):
     # long-axis orientation
     axis_fore = abs(float(long_ax[2]))
     axis_up = abs(float(long_ax[1]))
-    return [elong, flat, round_, hollow, vol_frac, fore, up, lateral,
-            mirrored, 0.0, axis_fore, axis_up]
+    if idx is None:
+        # synthetic clouds have no faces; approximate from the point spread
+        thickness = float(cc / max(a, 1e-9))
+        solidity = float(min(1.0, (b * cc) / max(a * a, 1e-9)))
+    else:
+        _, _, thickness, solidity = mesh_mass(pts, idx)
+    return [thickness, solidity, elong, flat, round_, hollow, vol_frac, fore,
+            up, lateral, mirrored, 0.0, axis_fore, axis_up]
 
 
 def extract(models, out_path, limit_parts=100000):
@@ -141,16 +212,18 @@ def extract(models, out_path, limit_parts=100000):
         try:
             ps = parts_of(iqm)
         except Exception as ex:
-            print(f"  skip {iqm}: {ex}")
+            import traceback
+            print(f"  skip {iqm}: {type(ex).__name__}: {ex}")
+            traceback.print_exc(limit=2)
             continue
-        allp = np.vstack([p for _, p in ps])
+        allp = np.vstack([p for _, p, _ in ps])
         lo, ext = allp.min(0), allp.max(0) - allp.min(0)
-        cents = np.array([p.mean(0) for _, p in ps])
-        radii = np.array([np.linalg.norm(p - p.mean(0), axis=1).max() for _, p in ps])
-        for k, (name, p) in enumerate(ps):
+        cents = np.array([p.mean(0) for _, p, _ in ps])
+        radii = np.array([np.linalg.norm(p - p.mean(0), axis=1).max() for _, p, _ in ps])
+        for k, (name, p, ix) in enumerate(ps):
             if len(p) < 4:
                 continue
-            f = describe(p, lo, ext, cents, radii)
+            f = describe(p, lo, ext, cents, radii, ix)
             rows.append(f)
             meta.append((os.path.basename(iqm), name, k))
         print(f"  [{mi+1}/{len(models)}] {os.path.basename(iqm)[:40]:40s} {len(ps)} parts")
