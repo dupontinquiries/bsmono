@@ -485,7 +485,7 @@ happening somewhere GPU_SYNC_NS is not wrapped around"),
 }
 
 /// Check a profile against itself. Empty means the numbers can coexist.
-pub fn profile_doubts(polls: u64, downloads: u64, sync_ms: f64, wall_ms: f64) -> Vec<ProfileDoubt> {
+pub fn profile_doubts(_polls: u64, downloads: u64, sync_ms: f64, wall_ms: f64) -> Vec<ProfileDoubt> {
     let mut v = Vec::new();
     // THE POLL/DOWNLOAD DOUBT IS WITHDRAWN, one commit after I wrote it. SUBMIT_BY_DOWNLOAD is tagged
     // in THREE places — `run`, `sample_at` and `download` — and only the last one maps a buffer and
@@ -549,5 +549,315 @@ mod doubt_tests {
         // Not every workload maps a buffer, and demanding a poll from one that never downloads would
         // fire the warning on every profile that is fine.
         assert!(profile_doubts(0, 0, 500.0, 5000.0).is_empty());
+    }
+}
+
+/// What the expert cache actually achieved, in the terms that decide what to do next.
+///
+/// The streaming counters — hits, fills, bytes, repins — are tracked and were reported nowhere, so
+/// there has been no way to tell whether pinning more experts would help or whether the cache is
+/// already saturated and the remaining cost is elsewhere.
+///
+/// That distinction is the whole question for a streaming MoE. Scout pins 6 of 16 and routes to 1 per
+/// layer per token: if the hit rate is near 40% the pin set is the lever and more budget buys tokens
+/// directly; if it is near 95% the cache has already done its work and more pinning buys almost
+/// nothing, which points at the kernels instead.
+///
+/// Uniform routing would give 6/16 = 37.5%. **Anything well above that is the LFRU policy earning its
+/// place**, and anything at or below it means the policy is not tracking the routing — a different
+/// and much worse problem than a small pin set.
+/// How well the routing PREDICTION did, which is a different lever from the pin set.
+///
+/// The pin set answers "which experts are always here"; prediction answers "which will be wanted
+/// next", and it is the one that can overlap a fetch with compute instead of stalling on it. Both
+/// counters exist (`prefetched`, `prefetch_hits`) behind `LOGSCOPE_MOE_PREFETCH`, and neither was
+/// reported — so the flag has never been judgeable.
+///
+/// **A mispredict is not free.** It spends a fill's bandwidth on an expert nobody wanted, and on a
+/// model streaming 10 of 16 that bandwidth is the scarce thing. So the useful threshold is not "is it
+/// above zero" but "does it beat the cost of being wrong".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PrefetchAccuracy {
+    pub issued: u64,
+    pub hits: u64,
+}
+
+impl PrefetchAccuracy {
+    pub fn rate(&self) -> f64 {
+        if self.issued == 0 { return 0.0; }
+        self.hits as f64 / self.issued as f64
+    }
+
+    /// A prefetch pays when a hit saves a stalled fetch and a miss costs a wasted one, so it is worth
+    /// having above 50% and actively harmful below — it is then spending bandwidth to slow the model
+    /// down.
+    pub fn verdict(&self) -> String {
+        if self.issued == 0 {
+            return "routing prefetch not enabled (LOGSCOPE_MOE_PREFETCH=1) — untested on this model"
+                .to_string();
+        }
+        let r = self.rate();
+        format!("routing prefetch — {:.0}% of {} speculative fills were wanted: {}",
+            r * 100.0, self.issued,
+            if r >= 0.7 {
+                "the coupling table is predicting well, and overlapping the fetch with compute is where the remaining decode time goes"
+            } else if r >= 0.5 {
+                "marginally worth its bandwidth — a hit saves a stalled fetch and a miss wastes one, so this is near the break-even"
+            } else {
+                "BELOW BREAK-EVEN — more fills are wasted than saved, so prefetch is spending scarce bandwidth to make decode slower and should be off until the table learns"
+            })
+    }
+}
+
+pub struct ExpertResidency {
+    pub hits: u64,
+    pub fills: u64,
+    pub bytes: u64,
+    pub repins: u64,
+    pub pinned: usize,
+    pub total: usize,
+}
+
+impl ExpertResidency {
+    pub fn hit_rate(&self) -> f64 {
+        let n = self.hits + self.fills;
+        if n == 0 { return 0.0; }
+        self.hits as f64 / n as f64
+    }
+
+    /// What uniform routing would give with this pin set — the floor a policy must beat to be worth
+    /// having.
+    pub fn uniform_baseline(&self) -> f64 {
+        if self.total == 0 { return 0.0; }
+        self.pinned as f64 / self.total as f64
+    }
+
+    pub fn report(&self, tokens: u64) -> String {
+        let hr = self.hit_rate();
+        let base = self.uniform_baseline();
+        let verdict = if self.hits + self.fills == 0 {
+            "no expert traffic recorded — this model is not streaming".to_string()
+        // THE BASELINE IS NOT "CHANCE" — it is close to the ceiling, and treating it as a failure
+        // threshold sends people to fix a policy that is working.
+        //
+        // MoE training uses a load-balancing loss that PENALISES concentration: the router is trained
+        // to spread tokens evenly so no expert is wasted. A perfectly balanced router gives exactly
+        // pinned/total, and any excess is skew the training was actively suppressing.
+        //
+        // Scout measured 46.0% against a 37.5% floor — 8.5 points of real skew captured on a router
+        // built to have none. That is a policy working near its limit, not one failing to learn.
+        //
+        // Which makes the pin count the only linear lever: each expert pinned adds 1/total directly,
+        // and no policy can beat a router that was trained flat.
+        } else if hr <= base + 0.02 {
+            format!("at or below the {:.0}% balanced-router floor — the policy is capturing no skew at all, \
+which is unusual: even a load-balanced router leaves some, so check the heat map is being updated \
+before raising the budget",
+                base * 100.0)
+        } else if hr > 0.90 {
+            format!("well above the {:.0}% uniform baseline and near saturation — more pinning buys \
+little, so the remaining decode cost is in the kernels rather than in expert traffic", base * 100.0)
+        } else {
+            format!("above the {:.0}% balanced-router floor, which is where a well-trained MoE puts \
+the ceiling — the excess is real skew the policy found, and PINNING is the linear lever from here \
+since each expert added moves the floor by 1/{}", base * 100.0, self.total)
+        };
+        format!("expert residency — {:.1}% hit ({} hits / {} fills), {:.1} GiB moved, {} repins, \
+{}/{} pinned, {:.0} MiB per token | {verdict}",
+            hr * 100.0, self.hits, self.fills,
+            self.bytes as f64 / (1u64 << 30) as f64, self.repins, self.pinned, self.total,
+            if tokens == 0 { 0.0 } else { self.bytes as f64 / tokens as f64 / (1u64 << 20) as f64 })
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    #[test]
+    fn below_half_is_named_as_ACTIVELY_HARMFUL() {
+        // A hit saves a stalled fetch and a miss wastes one, so under 50% it is spending the scarce
+        // resource to slow the model down. "Low accuracy" would read as merely unhelpful.
+        let v = PrefetchAccuracy { issued: 100, hits: 30 }.verdict();
+        assert!(v.contains("BELOW BREAK-EVEN"));
+        assert!(v.contains("slower"));
+    }
+
+    #[test]
+    fn a_good_rate_points_at_OVERLAP_as_the_next_lever() {
+        // If the table predicts well, the remaining cost is the fetch not being hidden behind
+        // compute — a structural change rather than a policy one.
+        assert!(PrefetchAccuracy { issued: 100, hits: 85 }.verdict().contains("overlapping the fetch"));
+    }
+
+    #[test]
+    fn a_disabled_prefetch_says_UNTESTED_rather_than_zero_percent() {
+        // 0% would read as a broken predictor on a model that never ran one.
+        let v = PrefetchAccuracy { issued: 0, hits: 0 }.verdict();
+        assert!(v.contains("not enabled"));
+        assert!(!v.contains("0%"));
+    }
+
+    #[test]
+    fn the_break_even_band_is_called_MARGINAL_not_good() {
+        // 55% is not a success; it is barely paying for itself, and reporting it as working would
+        // retire a question that is still open.
+        assert!(PrefetchAccuracy { issued: 100, hits: 55 }.verdict().contains("break-even"));
+    }
+}
+
+#[cfg(test)]
+mod residency_tests {
+    use super::*;
+
+    fn r(hits: u64, fills: u64) -> ExpertResidency {
+        ExpertResidency { hits, fills, bytes: 123 << 30, repins: 40, pinned: 6, total: 16 }
+    }
+
+    #[test]
+    fn a_saturated_cache_points_at_the_KERNELS_not_the_budget() {
+        // The case where raising the GPU budget is wasted effort, and saying so is the point of
+        // reporting this at all.
+        let s = r(950, 50).report(661);
+        assert!(s.contains("near saturation"));
+        assert!(s.contains("in the kernels"));
+    }
+
+    #[test]
+    fn a_hit_rate_at_the_FLOOR_means_no_skew_was_captured_at_all() {
+        // 6 pinned of 16 is 37.5% for a perfectly balanced router. I first called that "chance" and
+        // treated hitting it as a policy failure — wrong, and the correction matters: MoE training
+        // uses a load-balancing loss that PENALISES concentration, so a balanced router is the
+        // trained-for outcome and the floor is close to the ceiling.
+        //
+        // Landing exactly on it is still unusual, because even a balanced router leaves some skew, so
+        // the report points at the heat map rather than at the budget.
+        let s = r(375, 625).report(100);
+        assert!(s.contains("balanced-router floor"), "{s}");
+        assert!(s.contains("heat map is being updated"));
+    }
+
+    #[test]
+    fn above_the_floor_names_PINNING_as_the_linear_lever() {
+        // No policy can beat a router trained flat, so the excess over the floor is all the skew
+        // there is and the only remaining lever is moving the floor itself — each expert pinned adds
+        // 1/total directly.
+        let s = r(700, 300).report(100);
+        assert!(s.contains("balanced-router floor"), "{s}");
+        assert!(s.contains("PINNING is the linear lever"));
+        assert!(s.contains("1/16"), "and says by how much: {s}");
+    }
+
+    #[test]
+    fn bytes_per_token_is_reported_because_it_is_the_number_that_moves() {
+        // 123 GiB over 661 tokens is ~190 MiB/token — which sounds enormous and is in fact one and a
+        // third expert fetches across 48 layers, i.e. the cache eliminating ~97% of the traffic.
+        let s = r(900, 100).report(661);
+        assert!(s.contains("MiB per token"));
+    }
+
+    #[test]
+    fn a_dense_model_reports_no_traffic_rather_than_a_zero_rate() {
+        // 0% hit rate would read as a broken cache on a model that has no experts at all.
+        assert!(r(0, 0).report(100).contains("not streaming"));
+    }
+}
+
+#[cfg(test)]
+mod gate_list_tests {
+    /// The advertised gate list must match the gates the binary dispatches.
+    ///
+    /// It was a hand-maintained string listing 18 while the binary had 46 — **28 working gates
+    /// invisible**, including `--gate-bytes`, `--gate-q4k` and `--gate-q6k`, which are the three that
+    /// mattered most this month. `--gate-bytes` is what found the lane-varying shift.
+    ///
+    /// A help text that disagrees with the code is worse than none. It does not merely omit, it
+    /// **asserts absence**: someone reading it concludes the gate was never written and goes looking
+    /// for the wrong thing.
+    ///
+    /// Checked by reading main.rs rather than by calling the binary, so the test fails at build time
+    /// when someone adds a gate and forgets the list — which is exactly how it drifted by 28.
+    #[test]
+    fn every_dispatched_gate_is_advertised() {
+        let src = include_str!("main.rs");
+        let dispatched: std::collections::BTreeSet<&str> = src
+            .match_indices("\"--gate-").map(|(i, _)| {
+                let rest = &src[i + 1..];
+                &rest[..rest.find('"').unwrap_or(0)]
+            }).collect();
+        // The advertised block is the one printed for an unknown gate.
+        let start = src.find("unknown gate ").expect("the message exists");
+        let end = src[start..].find(");").map(|e| start + e).unwrap_or(src.len());
+        let advertised = &src[start..end];
+        let missing: Vec<&&str> = dispatched.iter()
+            .filter(|g| !advertised.contains(**g)).collect();
+        assert!(missing.is_empty(),
+            "{} gate(s) are dispatched and not advertised: {:?}", missing.len(), missing);
+        assert!(dispatched.len() > 40, "sanity: found only {} gates", dispatched.len());
+    }
+}
+
+#[cfg(test)]
+mod logit_cmp_tests {
+    use crate::compare_logits;
+
+    #[test]
+    fn different_LENGTHS_are_not_a_zero_difference() {
+        // The int8-cache gate printed "argmax_match=false max|d|=0.00e0" — a contradiction on its
+        // face. `zip` truncated to the shorter vector so the difference was measured over a prefix,
+        // while the argmax scanned both in full.
+        let a = vec![1.0f32, 2.0, 9.0];
+        let b = vec![1.0f32, 2.0];
+        let c = compare_logits(&a, &b);
+        assert!(!c.argmax_match);
+        assert!(c.max_abs.is_infinite(), "a shape disagreement is the most severe kind, got {}", c.max_abs);
+    }
+
+    #[test]
+    fn identical_vectors_agree_on_BOTH_measures() {
+        // The property the gate was asserting and could not actually check.
+        let v = vec![0.5f32, -1.0, 3.25, 3.25];
+        let c = compare_logits(&v, &v);
+        assert!(c.argmax_match);
+        assert_eq!(c.max_abs, 0.0);
+    }
+
+    #[test]
+    fn a_TIE_resolves_to_the_same_index_on_both_sides() {
+        // Strict `>` means first-max wins, so equal values cannot make two identical vectors
+        // disagree — worth pinning, because "it was a tie" was the other candidate explanation and
+        // it was wrong.
+        let v = vec![1.0f32, 5.0, 5.0, 2.0];
+        assert!(compare_logits(&v, &v.clone()).argmax_match);
+    }
+}
+
+#[cfg(test)]
+mod gate_scope_tests {
+    /// A gate name is a claim about SCOPE and nothing checks it.
+    ///
+    /// Four times this week a green check turned out to be green about something adjacent:
+    ///
+    /// * `--gate-vram` measured the largest allocation the device ACCEPTS and was read as how much it
+    ///   will HOLD — two resources, one name, and a 56.6 GiB plan on a device that dies at 31.
+    /// * `--gate-q6k` was red for weeks because its fixture used random bytes as f16 scales.
+    /// * the fast-decode A/B reported "inconclusive" when the levers were unreachable.
+    /// * `moe llama4 gating (weight-before)` passed at **t=3**, the prefill shape, while the decode
+    ///   path it appears to cover is gated on `t == 1` and was never entered.
+    ///
+    /// The common shape: **the name describes the inputs and the coverage depends on a parameter
+    /// buried in the setup.** A reader cannot see the gap, and a passing line retires the question.
+    ///
+    /// The fix that scales is not more gates — it is names that carry the parameter that decides
+    /// which path runs. This test pins the two MoE gates that were misleading; it cannot pin all of
+    /// them, and saying so is more honest than a check that implies it did.
+    #[test]
+    fn the_moe_gates_state_the_token_count_that_selects_their_path() {
+        let src = include_str!("main.rs");
+        assert!(src.contains("at t={t} PREFILL shape"),
+            "the llama4 gating gate must say which shape it covers");
+        assert!(src.contains("routed decode path is gated on t==1 and is NOT covered"),
+            "and say plainly what it does NOT cover — an omission a reader cannot see is the whole \
+failure mode");
     }
 }

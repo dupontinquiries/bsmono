@@ -662,8 +662,22 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
                     let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
                     let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
                     for l in 0..32 {
-                        y[yoff + l] = d1 * (qs[qoff + l] & 0xF) as f32 - mm1;
-                        y[yoff + 32 + l] = d2 * (qs[qoff + l] >> 4) as f32 - mm2;
+                        // MUL_ADD, to match what the GPU cannot be stopped from doing.
+                        //
+                        // The shader binds `dsc` and `dm` to named values, and it does NOT help: WGSL
+                        // `let` names a value, it is not a rounding barrier, and the compiler still
+                        // contracts `dsc * nib - dm` into an FMA. There is no no_fma pragma to reach
+                        // for, so the GPU rounds once here whatever the source looks like.
+                        //
+                        // gate-q4k measured the consequence: 0.31525478 against 0.31525475, one ULP,
+                        // on 57 of 112 block scales — and because this value feeds `round(v / scale)`
+                        // in the re-quantizer, an ULP crosses quantization boundaries and became
+                        // 297430 differing words on the large tensor.
+                        //
+                        // So the reference matches the hardware rather than the other way round. This
+                        // is MORE accurate, not less: one rounding instead of two.
+                        y[yoff + l] = d1.mul_add((qs[qoff + l] & 0xF) as f32, -mm1);
+                        y[yoff + 32 + l] = d2.mul_add((qs[qoff + l] >> 4) as f32, -mm2);
                     }
                     qoff += 32; yoff += 64; is += 2;
                 }

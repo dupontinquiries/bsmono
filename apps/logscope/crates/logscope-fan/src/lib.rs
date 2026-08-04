@@ -19,6 +19,7 @@
 
 #[allow(dead_code)] pub mod bestregion;
 #[allow(dead_code)] pub mod bridge;
+#[allow(dead_code)] pub mod pairing;
 #[allow(dead_code)] pub mod cmdpalette;
 #[allow(dead_code)] pub mod consensus;
 #[allow(dead_code)] pub mod coordinator;

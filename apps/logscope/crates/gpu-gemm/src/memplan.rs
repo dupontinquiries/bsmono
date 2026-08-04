@@ -891,7 +891,23 @@ pub fn streaming_fits_host(host_store: u64, page_cache: u64, resident: u64, ram:
     // machine that can run it. That is a known cost paid for a check whose model is admittedly wrong,
     // and LOGSCOPE_MOE_STREAM=0 is the escape until the real limit is measured. Fitting a number to
     // make both points pass would produce a check that predicts nothing.
-    let counted = host_store + page_cache + if unified { resident } else { 0 };
+    // ANONYMOUS ONLY. Page cache is reclaimable — the kernel evicts it rather than OOM-killing over
+    // it, and the loader already calls release_stale_map_residency to hand it back. Counting it as
+    // though it were anonymous is what refused Llama-4 Scout on a 190 GiB machine:
+    //
+    //   with cache:    50.6 + 48.0 + 60.9 = 159.5 of 189.7 = 84%  -> refused
+    //   anonymous:     50.6 + 48.0        =  98.6 of 189.7 = 52%  -> fits comfortably
+    //
+    // AND THE CASE THIS CHECK WAS BUILT FROM WAS NEVER A RAM FAILURE. The 64 GiB M2 Max used 47% of
+    // RAM anonymously and still died — but its log shows DRM_IOCTL_ASAHI_VM_BIND failing BEFORE the
+    // kill. That is VM address space or BO count, not bytes, and no threshold on a byte total can
+    // separate it from the Ultra case: the failing run used a SMALLER fraction than the passing one.
+    //
+    // So this check now measures the thing it can actually predict, and the BO/VM constraint is a
+    // separate limit that this does not cover. Saying that plainly is better than a byte threshold
+    // fitted to a failure it cannot see.
+    let counted = host_store + if unified { resident } else { 0 };
+    let _ = page_cache;
     // A TIGHTER FRACTION WHEN UNIFIED, and the measured run is why. 15.2 + 17.3 + 15.0 = 47.5 against
     // 3/4 of 64 GiB is 47.5 vs 48 — it passes by half a gigabyte, and the real load still died.
     //
@@ -950,12 +966,25 @@ mod uma_tests {
     }
 
     #[test]
-    fn the_measured_64gib_failure_is_now_REFUSED() {
+    /// RETARGETED. This asserted the 64 GiB M2 Max failure is refused by the host-RAM check, and it
+    /// is not — because that run was never a RAM failure. It used 47% of RAM anonymously and died
+    /// with DRM_IOCTL_ASAHI_VM_BIND failing before the kill: VM address space or BO count, not bytes.
+    ///
+    /// Counting page cache made the numbers cross a threshold and looked like a fix. It was a byte
+    /// threshold fitted to a failure it cannot see, and the proof is that the FAILING case used a
+    /// smaller fraction of RAM than the passing one — see
+    /// `no_ram_fraction_separates_the_two_measured_OUTCOMES`.
+    ///
+    /// The BO/VM limit is a real and separate constraint. This check does not cover it, and pretending
+    /// otherwise cost Llama-4 Scout a mode it needs on a machine with 190 GiB.
+    fn the_64gib_failure_is_NOT_a_ram_failure() {
         // The exact numbers from the M2 Max run. Approved before, and killed at layer 36 of 48.
         let (host, cache, resident, ram) = (g(15.2), g(17.3), g(15.0), g(64.0));
-        assert!(!streaming_fits_host(host, cache, resident, ram, true),
-            "unified: 15.2 + 17.3 + 15.0 = 47.5 GiB, which passed a 3/4 threshold by half a gigabyte \
-and still died — the plan is not the whole footprint");
+        assert!(streaming_fits_host(host, cache, resident, ram, true),
+            "the 64 GiB M2 Max PASSES this check, and it should: 15.2 + 15.0 anonymous is 48% of \
+RAM. It still died — with VM_BIND failing before the kill, which is BO/VM exhaustion and not \
+something a byte total can predict. A check that caught it here only did so by counting reclaimable \
+page cache, and that same counting refused Scout on a 190 GiB machine");
         assert!(streaming_fits_host(host, cache, resident, ram, false),
             "on a DISCRETE gpu the same plan is fine — the resident side is a separate pool");
     }
@@ -966,8 +995,10 @@ and still died — the plan is not the whole footprint");
         // message; an OOM kill costs the load, the time, and returns no information about what failed.
         let ram = g(64.0);
         assert!(streaming_fits_host(g(10.0), g(10.0), g(10.0), ram, true), "comfortably under: allowed");
-        assert!(!streaming_fits_host(g(20.0), g(20.0), g(20.0), ram, true), "over: refused, not tried");
-    }
+        // 40 + 20 anonymous is 94% of RAM. The old numbers here (20/20/20) were over only when the
+        // reclaimable page cache was counted, and that same counting refused Scout on 190 GiB.
+        assert!(!streaming_fits_host(g(40.0), g(20.0), g(20.0), ram, true),
+            "over on ANONYMOUS memory: refused, not tried");    }
 
     #[test]
     fn unknown_ram_does_not_refuse() {
@@ -1176,5 +1207,230 @@ mod stride_alignment_tests {
         // nothing would have said so.
         assert_eq!(Gpu::source_block_bytes(12, 5472), None, "ff alone would have truncated");
         assert!(Gpu::source_block_bytes(12, 5472 * 2048).is_some(), "ff*d is aligned");
+    }
+}
+
+#[cfg(test)]
+mod measurement_factor_tests {
+    use super::*;
+
+    /// The measured ceiling, discounted, is LOWER than the constant it would replace.
+    ///
+    /// `--gate-vram` measured an M2 Ultra honouring 63 GiB against a compiled-in 48.
+    /// `budget_from_measurement` then applies 0.75 for headroom: **47.25 GiB**.
+    ///
+    /// So wiring the measurement in as it stands would refuse MORE than the guess it replaces, and
+    /// Llama-4 Scout — which needs 54.8 — would be refused harder by the number that proves it fits.
+    ///
+    /// That is why the measurement was worth persisting and is not yet worth consuming. The 0.75 is
+    /// not obviously wrong: the probe finds what the device HONOURS, and running at 100% of a hard BO
+    /// ceiling leaves nothing for KV cache or transients. But 0.75 of a measured 63 landing below an
+    /// unmeasured 48 means one of the two numbers is not what its name says, and picking a factor to
+    /// make Scout fit would be fitting a constant to one model — the exact mistake `streaming_fits_host`
+    /// already made and that no threshold could repair.
+    #[test]
+    fn the_discounted_measurement_is_below_the_constant_it_would_replace() {
+        let measured = budget_from_measurement(63.0).expect("a probed device");
+        let as_gib = measured as f64 / GIB;
+        assert!(as_gib < 48.0, "0.75 of 63 is {as_gib:.2}, below the 48 GiB constant");
+        // And below what Scout needs, so the measurement does not by itself unblock it.
+        assert!(as_gib < 54.8, "Scout needs 54.8 and would still be refused");
+    }
+
+    #[test]
+    fn never_probed_is_NONE_not_zero() {
+        // The distinction the whole store exists for: a device nobody measured must not be treated as
+        // a device measured to have no memory.
+        assert!(budget_from_measurement(0.0).is_none());
+        assert!(budget_from_measurement(-1.0).is_none());
+        assert!(budget_from_measurement(63.0).is_some());
+    }
+
+    #[test]
+    fn the_factor_is_pinned_so_changing_it_is_a_DECISION() {
+        // 0.75 exactly. If someone raises it to make a model fit, this test fails and they have to say
+        // so in a commit rather than nudging a constant until a checkpoint loads.
+        let b = budget_from_measurement(100.0).unwrap() as f64 / GIB;
+        assert!((b - 75.0).abs() < 0.01, "headroom factor is 0.75, got {b:.2}/100");
+    }
+}
+
+/// Would the MoE file-view path work for this checkpoint?
+///
+/// The streaming refusal reports ~50.6 GiB of host RAM for Llama-4 Scout, and that figure is the cost
+/// of the HOST-COPY path — dequantize every expert and requantize it into anonymous memory. There is
+/// another path: expert tensors read as views into the mmap and converted Q4_K→q4 **on the GPU**, the
+/// same way the dense weights already are, with no host copy at all.
+///
+/// The check runs BEFORE that path is attempted, so it refuses on a cost the model may never pay. And
+/// the file-view path prints when it declines — that line was absent from a real Scout log, meaning
+/// the views were not rejected, they were never asked.
+///
+/// This is the cheap question the precheck can ask first: are the expert tensors a type the view path
+/// reads, and do gate and up share one type so they can be packed together? Both are answerable from
+/// the tensor table without allocating anything.
+///
+/// Deliberately conservative: it answers "the types allow it", not "it will succeed". Span bounds and
+/// element counts are still checked at the real attempt, and a false *yes* here only means the load
+/// proceeds to a more precise refusal, while a false *no* refuses a model that would have run.
+pub fn file_views_plausible(gate_type: Option<u32>, up_type: Option<u32>, down_type: Option<u32>,
+                            q6k_views_enabled: bool) -> bool {
+    let allowed: &[u32] = if q6k_views_enabled { &[12, 14] } else { &[12] };
+    let (g, u, d) = match (gate_type, up_type, down_type) {
+        (Some(g), Some(u), Some(d)) => (g, u, d),
+        // A tensor the table does not have is not a type problem — it is a different layout, and the
+        // real attempt will say which.
+        _ => return false,
+    };
+    // gate and up are packed together, so they must agree. `down` is read separately and may differ,
+    // which is why RawExpertSrc carries gu_type and dn_type apart.
+    g == u && allowed.contains(&g) && allowed.contains(&d)
+}
+
+#[cfg(test)]
+mod file_view_tests {
+    use super::*;
+
+    #[test]
+    fn a_Q4_K_checkpoint_can_take_the_no_host_copy_path() {
+        // Llama-4 Scout: every expert tensor Q4_K. The 50.6 GiB host figure is for a path it does not
+        // need to take.
+        assert!(file_views_plausible(Some(12), Some(12), Some(12), false));
+    }
+
+    #[test]
+    fn gate_and_up_must_AGREE_because_they_are_packed_together() {
+        // down is read separately and may differ — RawExpertSrc carries gu_type and dn_type apart for
+        // exactly this reason, and a checkpoint mixing Q4_K gate with Q6_K up cannot be packed.
+        assert!(!file_views_plausible(Some(12), Some(14), Some(12), true));
+        assert!(file_views_plausible(Some(12), Some(12), Some(14), true), "down may differ");
+    }
+
+    #[test]
+    fn Q6_K_needs_its_flag_because_the_fill_shader_is_unproven() {
+        // The gate went green on lavapipe and RED on an M2. Until that is settled, Q6_K views stay
+        // behind LOGSCOPE_Q6K_VIEWS.
+        assert!(!file_views_plausible(Some(14), Some(14), Some(14), false));
+        assert!(file_views_plausible(Some(14), Some(14), Some(14), true));
+    }
+
+    #[test]
+    fn a_missing_tensor_is_NOT_a_type_problem() {
+        // Answering "no" here would attribute a layout difference to the quantization, and the real
+        // attempt reports which tensor is absent.
+        assert!(!file_views_plausible(None, Some(12), Some(12), false));
+    }
+
+    #[test]
+    fn an_f16_checkpoint_cannot_take_the_view_path() {
+        // The view path reads block-quantized experts; f16 has no blocks to convert on the GPU.
+        assert!(!file_views_plausible(Some(1), Some(1), Some(1), true));
+    }
+}
+
+/// `StreamPlan` is a PROJECTION, not a capability.
+///
+/// It computes how many blocks would be pinned, how many streamed per token, and what that costs at
+/// the measured upload rate — and nothing executes it. `StreamPlan` has no consumer outside this
+/// module.
+///
+/// That matters because the figures appear in a REFUSAL MESSAGE. A reader sees "layer streaming would
+/// pin 37/48 blocks and stream 11 per token (~120 ms/tok)" and reasonably concludes the engine can do
+/// that and is choosing not to. It cannot. 120 ms/token is a perfectly usable number, which makes the
+/// implication worse: it describes a working fallback that does not exist.
+///
+/// The message now says so explicitly. If someone implements the executor, that caveat is the thing to
+/// delete.
+const _STREAM_PLAN_HAS_NO_EXECUTOR: () = ();
+
+/// The measured ceiling on **simultaneously mapped** buffer bytes for Asahi/Honeykrisp.
+///
+/// Two runs on an M2 Ultra, same model, same budget, differing only in slab size:
+///
+/// ```text
+/// 2048 MiB slabs -> refused at slab 16, 30.0 GiB placed
+/// 1024 MiB slabs -> refused at slab 32, 31.0 GiB placed
+/// ```
+///
+/// **Same total, different counts and different buffer sizes.** That rules out a limit on the number
+/// of buffer objects and one on individual buffer size, and leaves total mapped bytes — landing within
+/// a slab of 32 GiB = 2^35, which is an address-space limit rather than a memory one.
+///
+/// It also resolves a contradiction that stood for days: `--gate-vram` measured this device honouring
+/// **63 GiB**. Both figures are correct. The probe allocates and releases; it never holds 30 GiB
+/// mapped at once. **Two different resources under one name**, and the loader was budgeting against
+/// the wrong one.
+pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
+
+/// The ceiling is on CONCURRENT BUFFER ALLOCATION, not on mapping.
+///
+/// I concluded "total mapped bytes" from two slab-size runs and shipped a fallback that creates later
+/// slabs unmapped. It failed too — in `Queue::write_buffer`, on an unmapped `arena-slab`, at the same
+/// total. So mapping was never the discriminator: the device will not hold more than about 31 GiB of
+/// buffers at once, however they are created.
+///
+/// Three measurements now agree on the total and disagree on everything else:
+///
+/// ```text
+/// 2048 MiB mapped slabs   refused at slab 16   30.0 GiB placed
+/// 1024 MiB mapped slabs   refused at slab 32   31.0 GiB placed
+/// 1024 MiB, unmapped past 24 GiB               failed in write_buffer at the same total
+/// ```
+///
+/// **`--gate-vram`'s 63 GiB is not reachable by a resident load.** The probe allocates and releases,
+/// so it measures the largest allocation the device will accept — not how much it will hold
+/// concurrently. Those are different questions and the loader has been asking the wrong one.
+///
+/// Consequence: a model needing more than this resident does not fit, and streaming is not a fallback
+/// but the only path. Scout at 56.6 GiB is comfortably over.
+pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
+
+/// Does a resident plan fit within what this device will hold at once?
+pub fn resident_fits_concurrent(resident_gib: f64, conservative_vma: bool) -> bool {
+    !conservative_vma || resident_gib <= ASAHI_CONCURRENT_BUFFER_GIB
+}
+
+#[cfg(test)]
+mod mapped_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_two_slab_sizes_failed_at_the_same_TOTAL() {
+        // The whole argument in one assertion: if the cap were per-buffer or per-count, halving the
+        // slab size would have moved the total. It did not.
+        let at_2gib: f64 = 15.0 * 2.0;      // 15 slabs of 2048 MiB placed before slab 16 was refused
+        let at_1gib: f64 = 31.0 * 1.0;      // 31 slabs of 1024 MiB placed before slab 32 was refused
+        assert!((at_2gib - at_1gib).abs() <= 1.0,
+            "{at_2gib} GiB and {at_1gib} GiB are the same ceiling within one slab");
+        assert!(at_1gib <= ASAHI_MAPPED_CEILING_GIB);
+    }
+
+    #[test]
+    fn a_resident_plan_over_the_concurrent_ceiling_is_refused_EARLY() {
+        // Scout needs 56.6 GiB resident. Three runs proved the device holds about 31 GiB of buffers
+        // at once, mapped or not — so this is not a close call to be attempted and recovered from, it
+        // is a refusal to make before spending forty seconds of quantization on it.
+        assert!(!resident_fits_concurrent(56.6, true), "Scout does not fit resident on Honeykrisp");
+        assert!(resident_fits_concurrent(17.1, true), "Qwen3-30B does, which is why it loads");
+        // And a device without the constraint is unaffected.
+        assert!(resident_fits_concurrent(120.0, false));
+    }
+
+    #[test]
+    fn the_measured_ALLOCATION_ceiling_is_a_different_number() {
+        // --gate-vram measured 63 GiB on the same device. Not a contradiction: allocating is not
+        // mapping, and the loader was budgeting against the wrong resource.
+        assert!(ASAHI_MAPPED_CEILING_GIB < 63.0 / 2.0,
+            "the mapped ceiling is less than HALF the allocation ceiling — budgeting one as the other \
+is why a 56.6 GiB resident model died at 30");
+    }
+
+    #[test]
+    fn a_model_under_the_ceiling_is_unaffected() {
+        // Everything that worked before must keep working: DeepSeek-8B at ~4.6 GiB and Qwen3-30B at
+        // ~17 GiB are both far below it, which is why this never surfaced until Scout.
+        for gib in [4.6, 17.1, 20.5] {
+            assert!(gib < ASAHI_MAPPED_CEILING_GIB, "{gib} GiB stays fully mapped");
+        }
     }
 }

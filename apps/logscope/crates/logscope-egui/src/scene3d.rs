@@ -7799,3 +7799,545 @@ mod tests {
         set_env_params(EnvParams::default()); // restore
     }
 }
+
+/// Add the diagnostic landmark to a scene.
+///
+/// This is the generic mechanism `machinery::Parts` was designed for: a **store** of slots with some
+/// filled, a **selector** pointing at one of them, and a **drive** turning at a rate. Every theme is
+/// this shape wearing different materials and proportions — writing it once and dressing it is why
+/// `Parts` carries numbers rather than each of fifteen scenes inventing its own geometry.
+///
+/// ## The stall has to read as stopped, not slow
+///
+/// Motion is expressed through `Float.amp` and `speed`, and a stalled drive gets **zero for both**.
+/// A mechanism creeping along reads as working hard; one that has visibly stopped reads as stopped,
+/// and that difference is the entire reason to draw this rather than print a percentage.
+///
+/// ## Filled and streaming slots must be distinguishable at a glance
+///
+/// A resident slot sits still and solid. A streaming one floats — it is in transit, and the reader
+/// should be able to count the difference across the room without reading a number.
+pub fn add_landmark(
+    s: &mut Scene,
+    parts: logscope::machinery::Parts,
+    place: logscope::machinery::Placement,
+    // THE THEME'S SILHOUETTE. Without it every scene drew the same box and fifteen carefully written
+    // themes existed only as prose the renderer never saw — a clocktower and an abacus-mill are not
+    // the same shape, and the silhouette is most of what reads at landmark distance.
+    shape: logscope::machinery::Shape,
+    // HOW BUILT AND HOW OVERGROWN. A disconnecting machine loses PARTS rather than fading — a
+    // half-transparent clocktower reads as a rendering bug and a half-collapsed one reads as a ruin.
+    weather: logscope::machinery::Weathering,
+    resident: Color32,
+    streaming: Color32,
+    frame: Color32,
+) {
+    let base = v(place.pos[0], place.pos[1], place.pos[2]);
+    let k = place.scale;
+
+    // The frame: a plinth and an upright the parts hang from. Still, always — it is the thing the
+    // moving parts are measured against, and a frame that drifted would make a stopped drive
+    // ambiguous.
+    s.add(box_slab(base, 1.6 * k, 0.12 * k, 0.9 * k, frame), Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+    let rise = 1.5 * k * shape.rise;
+    s.add(box_slab(v(base.x, base.y + rise, base.z), 0.1 * k, rise, 0.1 * k, frame),
+          Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+
+    // The store: one marker per slot, laid along the plinth. Resident markers are solid and still;
+    // streaming ones float, so the split is countable at a glance.
+    let n = parts.slots.max(1);
+    let span = 2.8 * k * shape.spread;
+    // Crumble from the far end inward, so a collapsing machine visibly shortens rather than
+    // developing holes — a gap-toothed store reads as a missing expert, which is a different and
+    // wrong message.
+    let slots_kept = weather.parts_shown(n);
+    for i in 0..slots_kept {
+        let t = if n == 1 { 0.5 } else { i as f32 / (n - 1) as f32 };
+        let x = base.x - span * 0.5 + span * t;
+        let home = i < parts.filled;
+        let c = if home { resident } else { streaming };
+        let m = box_slab(v(x, base.y + 0.28 * k, base.z), 0.055 * k, 0.16 * k, 0.16 * k, c);
+        // Streaming slots are in transit and say so; resident ones are still. The amplitude also
+        // scales with how much is MISSING, so a nearly-full store barely stirs and an empty one is
+        // visibly churning.
+        let f = if home || !parts.has_traffic() {
+            Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 }
+        } else {
+            let churn = 1.0 - parts.smoothness;
+            Float { amp: 0.06 * k * (0.4 + churn), speed: 1.1 + churn, phase: i as f32 * 0.7, drift: 0.0 }
+        };
+        s.add(m, f);
+    }
+
+    // The selector: an arm over the chosen slot. Absent entirely when nothing is selected, because a
+    // stalled machine is not mid-choice and an arm parked on a slot would read as deliberation.
+    // The selector goes early: a machine that is coming apart is not choosing anything.
+    if let Some(sel) = parts.selected.filter(|_| weather.built > 0.5) {
+        let t = if n == 1 { 0.5 } else { (sel.min(n - 1)) as f32 / (n - 1) as f32 };
+        let x = base.x - span * 0.5 + span * t;
+        s.add(box_slab(v(x, base.y + 0.62 * k, base.z), 0.04 * k, 0.2 * k, 0.04 * k, frame),
+              Float { amp: 0.03 * k, speed: 0.8, phase: 0.0, drift: 0.0 });
+    }
+
+    // The drive: a wheel on the upright whose motion IS the rate. Zero amplitude at a stall — not a
+    // slow wobble, which would read as "working hard" and is the one impression to avoid.
+    // Age slows the drive independently of the engine's rate: an overgrown mechanism labours.
+    let d = parts.drive * (1.0 - 0.6 * weather.age);
+    let dr = 0.5 * k * shape.drive;
+    s.add(box_slab(v(base.x, base.y + rise * 1.72, base.z), dr, dr, 0.06 * k, frame),
+          Float { amp: if d > 0.0 { 0.09 * k * d } else { 0.0 },
+                  speed: d * 1.6, phase: 0.0, drift: 0.0 });
+}
+
+#[cfg(test)]
+mod landmark_tests {
+    use super::*;
+    use logscope::machinery::{Motion, Parts, placement};
+
+    fn built(parts: Parts) -> Scene {
+        let mut s = Scene::new();
+        add_landmark(&mut s, parts, placement(20.0, 12.0),
+                     logscope::machinery::machine_for("Old Library").shape,
+                     logscope::machinery::Weathering::present(),
+                     Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
+                     Color32::from_rgb(70, 70, 80));
+        s
+    }
+
+    #[test]
+    fn a_stalled_machine_has_NOTHING_moving() {
+        // The property the whole feature rests on. A creeping mechanism reads as working hard; a
+        // stopped one reads as stopped.
+        let s = built(Parts::from_state(6, 16, Some(3), Motion::Stalled, 0.46));
+        assert!(s.floats.iter().all(|f| f.amp == 0.0 && f.speed == 0.0),
+            "a stalled landmark must be completely still");
+    }
+
+    #[test]
+    fn a_thriving_machine_HAS_motion() {
+        let s = built(Parts::from_state(16, 16, Some(1), Motion::Thriving, 0.98));
+        assert!(s.floats.iter().any(|f| f.amp > 0.0), "thriving must visibly move");
+    }
+
+    #[test]
+    fn one_mesh_per_SLOT_plus_the_frame_and_drive() {
+        // 16 slots + plinth + upright + drive + selector = 20.
+        let s = built(Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.46));
+        assert_eq!(s.meshes.len(), 20, "got {}", s.meshes.len());
+    }
+
+    #[test]
+    fn NO_SELECTOR_mesh_when_nothing_is_selected() {
+        // A stalled machine is not mid-choice, and an arm parked over a slot would say it was.
+        let with = built(Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5)).meshes.len();
+        let without = built(Parts::from_state(6, 16, None, Motion::Fetching, 0.5)).meshes.len();
+        assert_eq!(with, without + 1);
+    }
+
+    #[test]
+    fn a_CHURNING_store_stirs_harder_than_a_clean_one() {
+        // Smoothness drives amplitude separately from speed, so a machine missing constantly looks
+        // frantic rather than merely busy.
+        //
+        // Measured over the SLOT floats only. My first version took the max across every float and
+        // compared the drive wheel to itself — the drive's amplitude dominates the slots and does not
+        // depend on smoothness at all, so the test was asserting nothing. The frame is floats[0..2]
+        // and the slots follow.
+        let amp = |sm: f32| {
+            let s = built(Parts::from_state(2, 16, Some(0), Motion::Fetching, sm));
+            s.floats[2..2 + 16].iter().map(|f| f.amp).fold(0.0f32, f32::max)
+        };
+        assert!(amp(0.1) > amp(0.9), "churn {} vs clean {}", amp(0.1), amp(0.9));
+    }
+
+    #[test]
+    fn the_FRAME_never_moves() {
+        // It is what the moving parts are measured against; a drifting frame would make a stopped
+        // drive ambiguous.
+        let s = built(Parts::from_state(16, 16, Some(1), Motion::Thriving, 0.99));
+        assert_eq!(s.floats[0].amp, 0.0, "the plinth is still");
+        assert_eq!(s.floats[1].amp, 0.0, "and the upright");
+    }
+}
+
+#[cfg(test)]
+mod landmark_theme_tests {
+    use super::*;
+    use logscope::machinery::{Motion, Parts, machine_for, placement};
+
+    fn built_as(scene: &str) -> Scene {
+        let mut s = Scene::new();
+        add_landmark(&mut s, Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5),
+                     placement(20.0, 12.0), machine_for(scene).shape,
+                     logscope::machinery::Weathering::present(),
+                     Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
+                     Color32::from_rgb(70, 70, 80));
+        s
+    }
+
+    /// Height of the tallest vertex — the silhouette, which is all that reads at landmark distance.
+    fn top(s: &Scene) -> f32 {
+        s.meshes.iter().flat_map(|m| m.verts.iter()).map(|p| p.y).fold(f32::MIN, f32::max)
+    }
+    fn width(s: &Scene) -> f32 {
+        let (lo, hi) = s.meshes.iter().flat_map(|m| m.verts.iter())
+            .fold((f32::MAX, f32::MIN), |(l, h), p| (l.min(p.x), h.max(p.x)));
+        hi - lo
+    }
+
+    #[test]
+    fn a_CLOCKTOWER_is_taller_than_an_abacus_mill() {
+        // The distinction the shape table exists for. Before it, both drew the same box and the
+        // themes lived only in prose the renderer never saw.
+        assert!(top(&built_as("Old Library")) > top(&built_as("Treehouse")));
+    }
+
+    #[test]
+    fn an_ABACUS_MILL_is_wider_than_a_spire() {
+        assert!(width(&built_as("Treehouse")) > width(&built_as("Fractal Spires")));
+    }
+
+    #[test]
+    fn the_SPIRE_is_the_tallest_thing_in_the_table() {
+        let spire = top(&built_as("Fractal Spires"));
+        for other in ["Canopy", "Cloudscape", "Treehouse", "Mansion Garden", "Atlantis"] {
+            assert!(spire > top(&built_as(other)), "spire vs {other}");
+        }
+    }
+
+    #[test]
+    fn an_UNKNOWN_scene_still_builds_a_sane_machine() {
+        // Plain proportions rather than degenerate ones: a landmark of zero height would read as a
+        // rendering failure rather than as an unthemed scene.
+        let s = built_as("Somewhere New");
+        assert!(top(&s) > 0.0 && width(&s) > 0.0);
+        assert_eq!(s.meshes.len(), 20);
+    }
+
+    #[test]
+    fn the_theme_changes_the_SILHOUETTE_and_not_the_part_count() {
+        // Every theme is the same mechanism proportioned differently — so the reader learns one
+        // vocabulary of parts and applies it everywhere, and a stall looks like a stall in all
+        // fifteen worlds.
+        for scene in ["Old Library", "Canopy", "Treehouse", "Fractal Spires", "Mansion Garden"] {
+            assert_eq!(built_as(scene).meshes.len(), 20, "{scene}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod landmark_weather_tests {
+    use super::*;
+    use logscope::machinery::{Motion, Parts, Weathering, machine_for, placement};
+
+    fn built_with(w: Weathering) -> Scene {
+        let mut s = Scene::new();
+        add_landmark(&mut s, Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5),
+                     placement(20.0, 12.0), machine_for("Old Library").shape, w,
+                     Color32::from_rgb(200, 180, 120), Color32::from_rgb(90, 120, 160),
+                     Color32::from_rgb(70, 70, 80));
+        s
+    }
+
+    #[test]
+    fn a_crumbling_machine_has_FEWER_MESHES() {
+        // Not fainter ones. A half-transparent clocktower reads as a rendering bug; a half-collapsed
+        // one reads as a ruin, and only the second is the message.
+        let whole = built_with(Weathering::present()).meshes.len();
+        let mut half = Weathering::present();
+        half.tick(logscope::machinery::WEATHER_TRANSITION_S * 0.5, false, 0.0);
+        assert!(built_with(half).meshes.len() < whole);
+    }
+
+    #[test]
+    fn a_fully_gone_machine_keeps_only_its_FRAME() {
+        // The plinth and upright remain so the site is still legible: a landmark that disappears
+        // entirely reads as "there was never a machine here", and a ruin says the opposite.
+        let mut gone = Weathering::present();
+        gone.tick(logscope::machinery::WEATHER_TRANSITION_S * 2.0, false, 0.0);
+        let s = built_with(gone);
+        assert_eq!(s.meshes.len(), 3, "plinth, upright, drive — no slots, no selector");
+    }
+
+    #[test]
+    fn the_SELECTOR_goes_before_the_store_is_empty() {
+        // A machine coming apart is not choosing anything, and an arm still pointing while the rack
+        // collapses around it would be the wrong picture.
+        let mut mid = Weathering::present();
+        mid.tick(logscope::machinery::WEATHER_TRANSITION_S * 0.6, false, 0.0);
+        assert!(mid.built < 0.5 && mid.built > 0.0);
+        let s = built_with(mid);
+        // frame(2) + drive(1) + some slots, and no selector.
+        assert!(s.meshes.len() > 3, "some store survives");
+        assert!(s.meshes.len() < 3 + 16, "and the selector is gone");
+    }
+
+    #[test]
+    fn an_OVERGROWN_machine_labours() {
+        // Age slows the drive independently of what the engine reports: a mechanism swallowed by
+        // vines should look like it is working against them.
+        let clean = Weathering { built: 1.0, age: 0.0 };
+        let mossy = Weathering { built: 1.0, age: 1.0 };
+        let drive_speed = |w| built_with(w).floats.last().unwrap().speed;
+        assert!(drive_speed(mossy) < drive_speed(clean));
+        assert!(drive_speed(mossy) > 0.0, "labouring, not stopped — a stall is a different message");
+    }
+
+    #[test]
+    fn the_store_shortens_from_the_END_rather_than_developing_holes() {
+        // A gap-toothed rack reads as a missing expert, which is a different and wrong message.
+        let mut mid = Weathering::present();
+        mid.tick(logscope::machinery::WEATHER_TRANSITION_S * 0.4, false, 0.0);
+        let s = built_with(mid);
+        let xs: Vec<f32> = s.meshes[2..].iter()
+            .map(|m| m.verts.iter().map(|p| p.x).sum::<f32>() / m.verts.len() as f32).collect();
+        let mut sorted = xs.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // The surviving slots occupy a contiguous run from the low end.
+        assert!(sorted.windows(2).all(|w| w[1] - w[0] < 1.0), "contiguous, not scattered");
+    }
+}
+
+/// Add a viewer's beacon — a lighthouse, lantern or lamp depending on the world.
+///
+/// Distinct from `add_landmark` on purpose. A worker gets a mechanism because it does work; a viewer
+/// gets a **signal**, because what it contributes is presence. Drawing a phone as a small mechanism
+/// would depict inference that never happens.
+///
+/// Three channels, three visible properties:
+///
+/// * `Lighthouse::height` — the tower, from capability. Stable across a session.
+/// * `Lighthouse::lamp` and `sweep` — the light, from link recency.
+/// * `Lighthouse::vines` — accretion on the structure, from silence.
+///
+/// The lamp is a separate mesh from the tower so **the light can fail while the tower stands**, which
+/// is the whole reason a viewer got three channels: a dark lamp on a tall clean tower says "good
+/// device, bad link", and one mesh could not say it.
+pub fn add_beacon(
+    s: &mut Scene,
+    lh: logscope::machinery::Lighthouse,
+    place: logscope::machinery::Placement,
+    tower: Color32,
+    lamp_lit: Color32,
+    accretion: Color32,
+) {
+    let base = v(place.pos[0], place.pos[1], place.pos[2]);
+    let k = place.scale * 0.55;               // a beacon is slighter than a worker's mechanism
+    let h = 2.2 * k * lh.height;
+
+    // The tower. Always drawn at full solidity: a viewer that is merely unreachable has not fallen
+    // down, and crumbling it would say the device was gone rather than quiet.
+    s.add(box_slab(v(base.x, base.y + h * 0.5, base.z), 0.18 * k, h * 0.5, 0.18 * k, tower),
+          Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+
+    // The lamp: separate, so the light fails independently of the structure. Amplitude carries
+    // brightness and speed carries the sweep — and sweep falls faster, so a marginal link LOOKS
+    // marginal before it looks dark.
+    if lh.lamp > 0.02 {
+        s.add(box_slab(v(base.x, base.y + h + 0.22 * k, base.z), 0.3 * k, 0.22 * k, 0.3 * k, lamp_lit),
+              Float { amp: 0.12 * k * lh.lamp, speed: 2.4 * lh.sweep, phase: 0.0, drift: 0.0 });
+    }
+
+    // Accretion: coral, soot, rust, creeper — whatever the skin calls it. Bands up the tower, more of
+    // them the longer the silence, so age is COUNTABLE rather than a shade.
+    let bands = (lh.vines * 5.0).round() as u32;
+    for i in 0..bands {
+        let y = base.y + h * (0.12 + 0.16 * i as f32);
+        s.add(box_slab(v(base.x, y, base.z), 0.23 * k, 0.05 * k, 0.23 * k, accretion),
+              Float { amp: 0.0, speed: 0.0, phase: 0.0, drift: 0.0 });
+    }
+}
+
+#[cfg(test)]
+mod beacon_render_tests {
+    use super::*;
+    use logscope::machinery::{Lighthouse, placement};
+
+    fn built(lh: Lighthouse) -> Scene {
+        let mut s = Scene::new();
+        add_beacon(&mut s, lh, placement(20.0, 12.0),
+                   Color32::from_rgb(120, 120, 130), Color32::from_rgb(255, 230, 160),
+                   Color32::from_rgb(70, 110, 70));
+        s
+    }
+
+    #[test]
+    fn a_DARK_beacon_still_has_its_tower() {
+        // A viewer that is unreachable has not fallen down. Crumbling it would say the device was
+        // gone rather than quiet, and those are different facts.
+        let s = built(Lighthouse::of(10.0, 16.0, 60.0, 0.0));
+        assert_eq!(s.meshes.len(), 1, "tower only — no lamp, no accretion");
+    }
+
+    #[test]
+    fn the_LAMP_is_a_separate_mesh_from_the_tower() {
+        // So the light can fail while the tower stands — the whole reason a viewer got three
+        // channels. One mesh could not say "good device, bad link".
+        let lit = built(Lighthouse::of(10.0, 16.0, 0.0, 0.0)).meshes.len();
+        let dark = built(Lighthouse::of(10.0, 16.0, 60.0, 0.0)).meshes.len();
+        assert_eq!(lit, dark + 1);
+    }
+
+    #[test]
+    fn a_CAPABLE_device_builds_a_taller_tower_in_the_geometry() {
+        let top = |lh| built(lh).meshes.iter().flat_map(|m| m.verts.iter())
+            .map(|p| p.y).fold(f32::MIN, f32::max);
+        assert!(top(Lighthouse::of(20.0, 32.0, 0.0, 0.0)) > top(Lighthouse::of(2.0, 4.0, 0.0, 0.0)));
+    }
+
+    #[test]
+    fn AGE_is_countable_rather_than_a_shade() {
+        // Bands accumulate, so "how long" can be read at a glance without comparing colours across
+        // the scene — which is exactly what a shade would require.
+        let fresh = built(Lighthouse::of(10.0, 16.0, 0.0, 0.0)).meshes.len();
+        let old = built(Lighthouse::of(10.0, 16.0, 0.0, 1e6)).meshes.len();
+        assert!(old > fresh + 3, "{old} vs {fresh}");
+    }
+
+    #[test]
+    fn a_marginal_link_SWEEPS_slower_than_a_good_one() {
+        // Sweep falls faster than brightness, so marginal looks marginal before it looks dark.
+        let speed = |since| built(Lighthouse::of(10.0, 16.0, since, 0.0))
+            .floats.iter().map(|f| f.speed).fold(0.0f32, f32::max);
+        assert!(speed(15.0) < speed(0.0) * 0.5, "{} vs {}", speed(15.0), speed(0.0));
+    }
+
+    #[test]
+    fn a_beacon_is_SLIGHTER_than_a_worker_mechanism() {
+        // A viewer contributes presence, not labour, and a beacon the size of a clocktower would
+        // claim otherwise.
+        let b = built(Lighthouse::of(10.0, 16.0, 0.0, 0.0));
+        assert!(b.meshes.len() < 20, "far fewer parts than a mechanism's 20");
+    }
+}
+
+/// Colours for a scene's beacon: tower, lit lamp, and accretion.
+///
+/// `machinery::beacon_skin` names each scene's aging in prose — coral, soot, rust, verdigris,
+/// photobleaching. **This has to agree with it.** A skin that says coral and renders moss-green is
+/// two stories about one object, and the reader trusts whichever they saw first.
+///
+/// The accretion colour is the one that carries meaning, so it is chosen from the material rather
+/// than from the scene's general palette: rust is orange-brown wherever it appears, and tinting it to
+/// match an alley's grey would make it read as shadow.
+pub fn beacon_palette(scene: &str) -> (Color32, Color32, Color32) {
+    match scene {
+        "Canopy" | "Forest" | "Treehouse" => (
+            Color32::from_rgb(96, 74, 52),      // weathered trunk
+            Color32::from_rgb(255, 224, 150),   // warm lamp between the boughs
+            Color32::from_rgb(74, 128, 62),     // creeper
+        ),
+        "Atlantis" => (
+            Color32::from_rgb(104, 118, 124),   // wet stone
+            Color32::from_rgb(150, 255, 214),   // green shaft through water
+            Color32::from_rgb(224, 122, 132),   // coral, pink — not algae green
+        ),
+        "Cloudscape" | "Mistfall" => (
+            Color32::from_rgb(214, 198, 170),   // paper
+            Color32::from_rgb(255, 206, 128),   // flame through paper
+            Color32::from_rgb(58, 52, 50),      // soot, near-black
+        ),
+        "Alley" | "Slate" => (
+            Color32::from_rgb(72, 74, 80),      // cast iron
+            Color32::from_rgb(255, 214, 140),   // sodium
+            Color32::from_rgb(170, 92, 46),     // rust, orange-brown
+        ),
+        "Fractal Spires" | "Recursive Citadel" => (
+            Color32::from_rgb(148, 156, 176),   // hull
+            Color32::from_rgb(176, 214, 255),   // cold underside pulse
+            Color32::from_rgb(96, 100, 112),    // dulling — the hull losing its finish
+        ),
+        "Old Library" | "Archive" | "Reading Room" => (
+            Color32::from_rgb(158, 126, 62),    // brass
+            Color32::from_rgb(255, 232, 176),   // reading-lamp cone
+            Color32::from_rgb(154, 140, 116),   // dust, warm grey
+        ),
+        "Folding@home" => (
+            Color32::from_rgb(120, 140, 168),   // lattice
+            // Brighter than the bleached tag it sits on. Bleaching correctly goes toward TRANSPARENT,
+            // which made the accretion paler than the lamp and broke the rule that the light must be
+            // the findable thing — the two rules are each right and collided here. An emitting
+            // fluorophore out-shining a bleached one is also the correct physics, so the lamp moved.
+            Color32::from_rgb(190, 255, 236),   // fluorophore emission
+            Color32::from_rgb(196, 204, 212),   // bleaching — toward transparent, not toward dark
+        ),
+        "Mansion Garden" => (
+            Color32::from_rgb(168, 138, 74),    // brass tripod
+            Color32::from_rgb(255, 250, 224),   // heliograph flash, near-white
+            Color32::from_rgb(86, 156, 134),    // verdigris
+        ),
+        _ => (
+            Color32::from_rgb(120, 120, 130),
+            Color32::from_rgb(255, 230, 160),
+            Color32::from_rgb(110, 110, 110),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod beacon_palette_tests {
+    use super::*;
+    use logscope::machinery::beacon_skin;
+
+    fn hue_family(c: Color32) -> &'static str {
+        let (r, g, b) = (c.r() as i32, c.g() as i32, c.b() as i32);
+        if r > g + 30 && r > b + 30 { "warm" }
+        else if g > r + 20 && g > b + 10 { "green" }
+        else if b > r + 20 { "cool" }
+        else if r > 200 && g > 200 && b > 200 { "pale" }
+        else { "neutral" }
+    }
+
+    #[test]
+    fn the_palette_AGREES_with_the_prose() {
+        // A skin that says coral and renders moss-green is two stories about one object, and the
+        // reader trusts whichever they saw first.
+        let (_, _, coral) = beacon_palette("Atlantis");
+        assert!(beacon_skin("Atlantis").aging.contains("oral"));
+        assert_eq!(hue_family(coral), "warm", "coral is pink, not algae");
+
+        let (_, _, soot) = beacon_palette("Cloudscape");
+        assert!(beacon_skin("Cloudscape").aging.contains("oot"));
+        assert!(soot.r() < 80 && soot.g() < 80, "soot is near-black");
+
+        let (_, _, verdigris) = beacon_palette("Mansion Garden");
+        assert!(beacon_skin("Mansion Garden").aging.contains("erdigris"));
+        assert_eq!(hue_family(verdigris), "green");
+    }
+
+    #[test]
+    fn BLEACHING_goes_toward_transparent_rather_than_toward_dark() {
+        // The one accretion that lightens. Every other material darkens its object, and rendering a
+        // photobleached tag as sooty would invert what the process is.
+        let (_, _, bleach) = beacon_palette("Folding@home");
+        assert!(bleach.r() > 180 && bleach.g() > 180 && bleach.b() > 180, "pale, not dark");
+    }
+
+    #[test]
+    fn RUST_is_orange_brown_wherever_it_appears() {
+        // Chosen from the MATERIAL rather than the scene's palette. Tinting it to match an alley's
+        // grey would make it read as shadow, which says nothing about time.
+        let (_, _, rust) = beacon_palette("Alley");
+        assert_eq!(hue_family(rust), "warm");
+        assert!(rust.r() > rust.b() + 80, "orange-brown");
+    }
+
+    #[test]
+    fn the_LAMP_is_always_the_brightest_of_the_three() {
+        // It is the channel that has to be findable across the scene; a lamp dimmer than its own
+        // tower would defeat the reason a viewer gets a beacon at all.
+        for s in ["Canopy", "Atlantis", "Cloudscape", "Alley", "Fractal Spires",
+                  "Old Library", "Folding@home", "Mansion Garden", "Somewhere New"] {
+            let (t, l, a) = beacon_palette(s);
+            let lum = |c: Color32| c.r() as u32 + c.g() as u32 + c.b() as u32;
+            assert!(lum(l) > lum(t) && lum(l) > lum(a), "{s}: the lamp must be brightest");
+        }
+    }
+
+    #[test]
+    fn an_unthemed_scene_gets_a_usable_palette() {
+        let (t, l, a) = beacon_palette("Somewhere New");
+        assert_ne!(t, l);
+        assert_ne!(l, a);
+    }
+}
