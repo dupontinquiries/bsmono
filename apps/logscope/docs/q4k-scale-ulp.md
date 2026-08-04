@@ -199,3 +199,50 @@ The decisive print is the raw `qs` bytes for weights 248..255 alongside both sid
 ```
 
 Nine theories, five measurements. Every measurement narrowed it; four of the theories widened it.
+
+---
+
+# The 276: one nibble, one level, and a contradiction
+
+```
+qs bytes for weights 248..255: [0, 31, 62, 93]
+gpu word 31 = 0x56781234   cpu word 31 = 0x56782234
+gpu nibbles [4, 3, 2, 1, 8, 7, 6, 5]
+cpu nibbles [4, 3, 2, 2, 8, 7, 6, 5]
+cpu dequantized 248..255: [-8605444, -10756804, -11832484, -13983844, -3.8, -1075683.8, -3227043.8, -5378404]
+```
+
+**One nibble differs, by exactly one level, at the largest-magnitude value in the word.** Nibble 1 is
+q=-7 (the clamp); nibble 2 is q=-6.
+
+## What that rules out
+
+**Not reciprocal error.** At scale ≈ 2e6 the f32 reciprocal is ≈ 5.0058e-7 and one ULP of it moves the
+quotient by ~1e-6. The quotient is -6.9999995, which rounds to -7 on either side. Reciprocal precision
+cannot span a level here.
+
+**Not the tie rule.** -6.9999995 is not a tie.
+
+**Not the scale.** Words 28..31 share sub-block 7's scale and only word 31 differs.
+
+## The contradiction
+
+For the CPU to produce q=-6 where the GPU produces q=-7, its `amax` would need to be about **16%
+larger** — 1.63e7 against 1.40e7. That is not a rounding difference, it is a different set of values.
+
+**But the `wq` probe reported 0 of 3584 differing.** The two sides dequantize identically and then
+reduce to different maxima, which cannot both be true.
+
+Possible resolutions, none yet measured:
+
+1. The probe covered a small tensor and the large one diverges — the same size-dependence that hid the
+   tie rule. *The probe should be run at 70000 super-blocks.*
+2. The reduction reads a different 32-weight window at `j=7` specifically — an off-by-one in `t0` that
+   only shows at the last sub-block, where reading past would take values from the next block.
+3. The clamp is applied differently — if one side clamps before the max and the other after.
+
+**Resolution 2 is the one the position data favours**: `j=7` is the only sub-block whose 32-weight
+window ends at the block boundary, and the last word is the only part of it that would be affected by
+a read that runs over.
+
+The decisive print is `amax` from both sides for that sub-block, which the gate does not yet show.
