@@ -149,6 +149,10 @@ struct GpuMesh {
 }
 
 pub struct Gpu {
+    /// Depth-only pipeline: establishes what is visible before the ray
+    /// shader runs, so shadow rays, AO probes and reflections are not cast
+    /// for fragments something nearer later covers up.
+    depth_prepass: wgpu::RenderPipeline,
     /// Present accounting. The frame counter used to tick once per loop
     /// iteration whether or not anything reached the screen, which reads as
     /// hundreds of FPS while the display updates a few times a second.
@@ -544,6 +548,50 @@ impl Gpu {
                 front_face: wgpu::FrontFace::Ccw,
                 ..Default::default()
             },
+            depth_stencil: Some(depth_write.clone()),
+            multisample: wgpu::MultisampleState { count: SAMPLES, ..Default::default() },
+            multiview: None,
+            cache: None,
+        });
+
+        // the vertex layout again for the pre-pass (it is not Copy)
+        let vlayout2 = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
+        };
+
+        // ---- DEPTH PRE-PASS PIPELINE ----
+        //
+        // The scene shader casts a shadow ray, four AO probes and a
+        // reflection for EVERY fragment it runs — including every fragment
+        // that something nearer later covers up. In a scene with real
+        // overdraw that is most of the work thrown away.
+        //
+        // So: lay the depth down first with a pipeline that has no colour
+        // target and an empty fragment shader, then let the expensive pass
+        // run only where it wins the depth test. The pre-pass costs vertex
+        // work and nothing else.
+        let depth_prepass = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("depth prepass"),
+            layout: Some(&scene_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_scene",
+                buffers: &[vlayout2],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_depth",
+                targets: &[],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                front_face: wgpu::FrontFace::Ccw,
+                ..Default::default()
+            },
             depth_stencil: Some(depth_write),
             multisample: wgpu::MultisampleState { count: SAMPLES, ..Default::default() },
             multiview: None,
@@ -680,6 +728,7 @@ impl Gpu {
         let pp_comp = mk_pbuf();
 
         let mut gpu = Gpu {
+            depth_prepass,
             presented: 0,
             reconfigures: 0,
             dropped: 0,
@@ -1022,6 +1071,33 @@ impl Gpu {
             rp.set_pipeline(&self.sky_pipe);
             rp.set_bind_group(0, &self.globals_bg, &[]);
             rp.draw(0..3, 0..1);
+
+            // ---- DEPTH FIRST ----
+            // Lay the OPAQUE geometry into the depth buffer with a shader
+            // that does nothing but transform vertices. Everything after it
+            // then fails the depth test wherever it is hidden, so the
+            // expensive pass runs about once per visible pixel instead of
+            // once per drawn fragment. Translucent draws are excluded: they
+            // do not occlude, and writing their depth would hide what is
+            // behind them.
+            rp.set_pipeline(&self.depth_prepass);
+            rp.set_bind_group(0, &self.globals_bg, &[]);
+            {
+                let mut pm = usize::MAX;
+                for (i, o) in objs.iter().take(n).enumerate() {
+                    if o.raw.color[3] < 0.985 {
+                        continue;
+                    }
+                    let mesh = &self.meshes[o.mesh];
+                    rp.set_bind_group(1, &self.obj_bg, &[(i as u64 * OBJ_STRIDE) as u32]);
+                    if o.mesh != pm {
+                        rp.set_vertex_buffer(0, mesh.vbuf.slice(..));
+                        rp.set_index_buffer(mesh.ibuf.slice(..), wgpu::IndexFormat::Uint32);
+                        pm = o.mesh;
+                    }
+                    rp.draw_indexed(0..mesh.icount, 0, 0..1);
+                }
+            }
 
             rp.set_pipeline(&self.scene_pipe);
             rp.set_bind_group(0, &self.globals_bg, &[]);

@@ -3365,6 +3365,58 @@ pub fn run(args: &[String]) {
                 saved * 100.0
             );
         }
+        // ---- OVERDRAW: what the depth pre-pass saves ----
+        // The scene shader casts a shadow ray, four AO probes and a
+        // reflection for every fragment it runs — including every fragment
+        // something nearer later covers. Depth complexity is how many times
+        // an average pixel is written before the frame settles, and it is
+        // very nearly the multiplier on all of that wasted work.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 3.0, 40.0);
+            let fwd = -Vec3::Z;
+            // sample rays through the frame and count how many opaque shapes
+            // each one passes through: that is the depth complexity
+            let mut layers = 0u64;
+            let mut rays = 0u64;
+            for k in 0..2000 {
+                let a = (k % 50) as f32 / 50.0 - 0.5;
+                let b = (k / 50) as f32 / 40.0 - 0.5;
+                let dir = (fwd + Vec3::new(a * 1.2, b * 0.7, 0.0)).normalize();
+                let mut hits = 0u64;
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) || sh.color[3] < 0.985 {
+                        continue;
+                    }
+                    let r = crate::shape_bound(&sh.sdf).max(0.5);
+                    let to = sh.pos - eye;
+                    let along = to.dot(dir);
+                    if along < 0.0 || along > 260.0 {
+                        continue;
+                    }
+                    if (to - dir * along).length() < r {
+                        hits += 1;
+                    }
+                }
+                if hits > 0 {
+                    layers += hits;
+                    rays += 1;
+                }
+            }
+            let depth_complexity = layers as f32 / rays.max(1) as f32;
+            println!();
+            println!(
+                "overdraw: an average covered pixel is written {depth_complexity:.2} times"
+            );
+            println!(
+                "   the ray shader ran that many times per pixel; with a depth pre-pass it runs once,"
+            );
+            println!(
+                "   so roughly {:.0}% of shadow rays, AO probes and reflections were being thrown away",
+                (1.0 - 1.0 / depth_complexity.max(1.0)) * 100.0
+            );
+        }
+
         // ---- draw-call state churn: what ordering the frame is worth ----
         {
             use crate::render::{order_for_draw, ObjDraw, ObjectRaw};

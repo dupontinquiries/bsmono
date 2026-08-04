@@ -3904,6 +3904,35 @@ regression that this session's work merely made visible. The check is left
 failing rather than relaxed, because a threshold moved to match a regression
 is how a regression becomes permanent.
 
+## v1.119.0 — a depth pre-pass: stop shading what you cannot see
+
+80-120 fps with rays, wanting 240. Every optimisation so far made each ray
+cheaper; this one stops casting rays that were never going to be seen.
+
+The scene shader casts a shadow ray, four ambient-occlusion probes and a
+reflection for EVERY fragment it runs — including every fragment that
+something nearer later covers up. Measured on PERPLEXUS, an average covered
+pixel is written 1.96 times, so roughly HALF of all that work was being
+thrown away before it reached the screen.
+
+So the opaque geometry is now laid into the depth buffer first, by a
+pipeline with no colour target and an empty fragment shader: vertex work and
+a depth write, nothing else. Everything after it fails the depth test
+wherever it is hidden, and the expensive pass runs about once per visible
+pixel instead of once per drawn fragment.
+
+Translucent draws are excluded from the pre-pass deliberately — they do not
+occlude, and writing their depth would hide what is behind them, which is
+the whole reason they are sorted back to front in the first place.
+
+A caveat on the number: depth complexity here is measured by counting how
+many opaque BOUNDING SPHERES each sample ray passes through, which
+overestimates — a ray can clip a bound without hitting the shape. So 1.96 is
+an upper bound on the overdraw and the real saving is somewhat less than
+half. It is the right order of magnitude, and it is the largest structural
+saving left in the renderer: every previous round made rays cheaper, and
+this one removes them.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

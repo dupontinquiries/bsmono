@@ -801,6 +801,13 @@ fn grid_shade(p: vec2<f32>, step: f32, width: f32) -> f32 {
     return 1.0 - smoothstep(width, width * 2.2, d);
 }
 
+/// DEPTH PRE-PASS. No colour, no rays, no texture reads — just the vertex
+/// transform and a depth write. Its whole job is to establish what is
+/// actually visible before anything expensive runs.
+@fragment
+fn fs_depth(in: VsOut) {
+}
+
 @fragment
 fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
     var n = normalize(in.wnrm);
