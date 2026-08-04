@@ -125,10 +125,20 @@ def mesh_mass(pts, idx):
 def parts_of(iqm, t=0.0):
     """Named part clouds from a foldview export."""
     out_dir = "/tmp/_pc"
-    subprocess.run(
+    # CLEAR THE OUTPUT AND CHECK THE EXIT CODE. Reusing the directory without
+    # either meant a failed export left the PREVIOUS model's glTF in place
+    # and it was read as if it were this one — two different vehicles came
+    # back byte-identical, which is the only reason it was noticed. Silent
+    # stale data is the worst failure a tool like this can have, because
+    # every number downstream is plausible and wrong.
+    import shutil
+    shutil.rmtree(out_dir, ignore_errors=True)
+    r = subprocess.run(
         [FV, "--data", DATA, "--content", os.path.join(BS, "content"),
          "--veh", os.path.join(DATA, iqm), "--gltf", out_dir, "--t", str(t)],
         capture_output=True, timeout=240)
+    if r.returncode != 0 or not os.path.exists(os.path.join(out_dir, "scene.gltf")):
+        raise RuntimeError(f"foldview failed on {iqm}: {r.stderr.decode()[:160]}")
     g = json.load(open(f"{out_dir}/scene.gltf"))
     buf = open(f"{out_dir}/scene.bin", "rb").read()
     out = []
@@ -524,6 +534,157 @@ def frontal_area(pts, d, cells=28):
     return area, 1.0 - hole
 
 
+def body_symmetry(parts, tol=0.06):
+    """Find repeated-part ORBITS across the whole body.
+
+    You meant symmetry across the model, and that is the better test. A
+    propeller blade is ONE part; the propeller is N parts arranged around an
+    axis. Asking whether a single mesh is rotationally symmetric misses that
+    entirely — and it is why the per-part version called a 4-blade rotor
+    "2-fold": with four separate blades, each individual mesh is just a
+    paddle.
+
+    The arrangement carries the meaning, and it separates the cases the
+    per-part test could not:
+
+      propeller   3+ same-shape parts on a circle, evenly spaced in angle
+      wheels      4 same-shape parts at the corners — two mirror planes,
+                  not a rotation
+      tread       many same-shape parts evenly spaced along a LINE
+      bilateral   a pair mirrored in x, which is most of a vehicle
+
+    Parts are grouped by a coarse shape signature first, because only
+    identical shapes can be images of each other under a symmetry. That is
+    the same 8^3 occupancy descriptor the atlas work used — one structure,
+    another use.
+
+    Returns a list of orbits: (kind, indices, order, axis_or_dir).
+    """
+    import hashlib
+
+    def sig(pts, grid=6):
+        c = pts.mean(0)
+        q = pts - c
+        e = q.max(0) - q.min(0)
+        o = np.argsort(-e)
+        q = q[:, o]
+        e = e[o]
+        q = q / max(e[0], 1e-9)
+        lo = q.min(0)
+        span = np.maximum(q.max(0) - lo, 1e-9)
+        idx = np.clip(((q - lo) / span * grid).astype(int), 0, grid - 1)
+        occ = np.zeros((grid,) * 3, np.uint8)
+        occ[idx[:, 0], idx[:, 1], idx[:, 2]] = 1
+        # size bucket too: two boxes of very different size are not images
+        b = int(math.log2(max(e[0], 1e-6)) * 2)
+        return hashlib.blake2b(occ.tobytes() + bytes([b & 0xFF]), digest_size=8).hexdigest()
+
+    groups = {}
+    cents = []
+    for i, (_, pts, _) in enumerate(parts):
+        cents.append(pts.mean(0))
+        groups.setdefault(sig(pts), []).append(i)
+    cents = np.array(cents)
+    allp = np.vstack([p for _, p, _ in parts])
+    scale = float((allp.max(0) - allp.min(0)).max())
+
+    orbits = []
+    for _, idxs in groups.items():
+        if len(idxs) < 2:
+            continue
+        C = cents[idxs]
+        mid = C.mean(0)
+        # ROTATIONAL: co-planar, equidistant from a centre, evenly spaced
+        d = np.linalg.norm(C - mid, axis=1)
+        if len(idxs) >= 3 and d.std() / max(d.mean(), 1e-9) < tol * 3:
+            # plane normal from the spread
+            Q = C - mid
+            _, _, vt = np.linalg.svd(Q, full_matrices=False)
+            axis = vt[2]
+            u, v = vt[0], vt[1]
+            ang = np.sort(np.arctan2(Q @ v, Q @ u))
+            gaps = np.diff(np.concatenate([ang, [ang[0] + 2 * math.pi]]))
+            if gaps.std() / max(gaps.mean(), 1e-9) < tol * 4:
+                orbits.append(("rotational", idxs, len(idxs), axis))
+                continue
+        # TRANSLATIONAL: collinear and evenly spaced
+        if len(idxs) >= 4:
+            Q = C - mid
+            _, sv, vt = np.linalg.svd(Q, full_matrices=False)
+            if sv[1] < sv[0] * 0.18:
+                t = np.sort(Q @ vt[0])
+                gaps = np.diff(t)
+                if len(gaps) and gaps.std() / max(abs(gaps.mean()), 1e-9) < tol * 5:
+                    orbits.append(("translational", idxs, len(idxs), vt[0]))
+                    continue
+        # BILATERAL: pairs mirrored in x
+        if len(idxs) == 2:
+            a, b = C
+            if abs(a[0] + b[0] - 2 * cents[:, 0].mean()) < scale * tol and \
+               abs(a[1] - b[1]) < scale * tol and abs(a[2] - b[2]) < scale * tol:
+                orbits.append(("bilateral", idxs, 2, np.array([1.0, 0.0, 0.0])))
+    return orbits
+
+
+def rotational_symmetry(pts, axis, bins=72):
+    """N-fold symmetry about `axis`, and whether the shape is uniform.
+
+    THIS IS WHAT THE PROPELLER TEST SHOULD HAVE BEEN. Angular occupancy asks
+    "is there mass in a few sectors", which every rectangle answers yes to,
+    because four corners are four sectors. Symmetry asks a different and much
+    harder-to-fake question: DOES ROTATING IT BY 360/N LEAVE IT UNCHANGED.
+
+    That separates the three cases cleanly, which occupancy never could:
+
+      propeller   high symmetry at some N >= 3, and NOT uniform — the blades
+                  repeat, the gaps between them are real
+      disc/wheel  symmetric at every N, because it is uniform. High score,
+                  and the uniformity flag is what stops it being called a
+                  rotor.
+      plate       symmetric at N = 2 only. A rectangle maps onto itself at
+                  180 degrees and nothing else.
+
+    Returns (best_n, strength 0..1, uniformity 0..1).
+    """
+    axis = np.asarray(axis, float)
+    axis = axis / max(np.linalg.norm(axis), 1e-9)
+    a = np.array([0.0, 1.0, 0.0])
+    if abs(a @ axis) > 0.9:
+        a = np.array([1.0, 0.0, 0.0])
+    u = np.cross(a, axis); u /= max(np.linalg.norm(u), 1e-9)
+    v = np.cross(axis, u)
+    x, y = pts @ u, pts @ v
+    r = np.hypot(x, y)
+    if r.max() < 1e-9:
+        return 1, 0.0, 1.0
+    th = np.arctan2(y, x)
+    # weight by radius: blades live at the rim, hubs should not dominate
+    w, _ = np.histogram(th, bins=bins, range=(-math.pi, math.pi), weights=r)
+    if w.sum() <= 0:
+        return 1, 0.0, 1.0
+    w = w / w.mean()
+    uniformity = float(1.0 / (1.0 + w.std()))
+
+    best_n, best_s = 1, 0.0
+    for n in range(2, 13):
+        if bins % n:
+            continue
+        shift = bins // n
+        rolled = np.roll(w, shift)
+        num = float(((w - w.mean()) * (rolled - rolled.mean())).mean())
+        den = float(w.var()) + 1e-12
+        score = max(0.0, num / den)
+        if score > best_s:
+            best_s, best_n = score, n
+    return best_n, float(best_s), uniformity
+
+
+def propeller(pts, axis):
+    """Is this a rotor? N-fold repetition with real gaps between blades."""
+    n, strength, uni = rotational_symmetry(pts, axis)
+    return (n >= 3 and strength > 0.55 and uni < 0.62), n, strength, uni
+
+
 def aero(pts, flow=(0.0, 0.0, -1.0)):
     """What this part does to air moving along `flow` (default: nose-first).
 
@@ -597,7 +758,8 @@ def aero(pts, flow=(0.0, 0.0, -1.0)):
     # this reports 0 and the caller can see there is no propeller data,
     # instead of trusting a number that is noise.
     _ = (occupied, radial_even, disc_like)
-    bladed = False
+    is_prop, prop_n, prop_s, prop_u = propeller(q, f)
+    bladed = is_prop
 
     # drag area: frontal silhouette scaled by how bluff it is. A round nose
     # sheds; a flat face does not.
@@ -613,7 +775,10 @@ def aero(pts, flow=(0.0, 0.0, -1.0)):
         "through": through,
         "camber": camber,
         "aoa": aoa,
-        "blades": occupied if bladed else 0,
+        "blades": prop_n if bladed else 0,
+        "sym_n": prop_n,
+        "sym_strength": round(prop_s, 3),
+        "uniformity": round(prop_u, 3),
     }
 
 
