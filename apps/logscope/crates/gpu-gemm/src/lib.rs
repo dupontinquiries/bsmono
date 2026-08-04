@@ -7893,7 +7893,26 @@ failure when forcing it, not a surprise; coherent output is the evidence that wo
         //
         // Same shape as expert_weights_scale being "effectively hardcoded to 1": a value the file
         // carries, read from a constant instead.
-        let nope_step = if is_llama4 {
+        // SMOLLM3 ALSO USES NoPE, and it was getting rope on every layer.
+        //
+        // Its distinctive feature is exactly Llama-4's: every fourth layer skips positional encoding
+        // entirely. The mechanism was already here and gated on `is_llama4`, so a SmolLM3 checkpoint
+        // loaded, generated coherent text, and was WRONG on a quarter of its layers — the failure
+        // that looks like "the model is a bit weak" rather than like a bug.
+        //
+        // Four is the architecture constant, not a GGUF key: SmolLM3's config carries
+        // `no_rope_layer_interval: 4` and llama.cpp hardcodes it. Read the key if present so a future
+        // checkpoint that states it wins, and fall back to 4.
+        // Matched on the prefix because archcfg has no SmolLm3 variant — it loads via
+        // LOGSCOPE_TRY_UNSUPPORTED_ARCH. Adding the variant is the tidier fix and a larger one; this
+        // makes the model CORRECT today and the enum can catch up.
+        let is_smollm3 = acfg.prefix.starts_with("smollm3");
+        let nope_step = if is_smollm3 {
+            g.get_u32(&format!("{}.attention.no_rope_interval", acfg.prefix))
+                .or_else(|| g.get_u32(&format!("{}.no_rope_layer_interval", acfg.prefix)))
+                .map(|v| v as usize)
+                .unwrap_or(4)
+        } else if is_llama4 {
             g.get_u32(&format!("{}.attention.no_rope_interval", acfg.prefix))
                 .or_else(|| g.get_u32(&format!("{}.no_rope_interval", acfg.prefix)))
                 .map(|v| v as usize)
