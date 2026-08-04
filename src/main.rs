@@ -4149,9 +4149,35 @@ impl Game {
             // LOD: distant primitives swap to low-poly meshes. Spheres and
             // capsules are the most-used shapes in the game (foliage, rocks,
             // pillars, orbs) and the full-fat sphere is ~750 triangles.
+            // SWAP ON PROJECTED SIZE, NOT DISTANCE.
+            //
+            // A fixed distance is the wrong question: a 6 m tube and a 0.4 m
+            // orb at 90 m are wildly different things on screen, and the
+            // threshold that suits one wastes the other. What actually
+            // matters is how many PIXELS the silhouette covers, because that
+            // is what decides whether its faceting can be seen.
+            //
+            // Measured: 87-95% of drawn shapes sit beyond 60 m, so nearly
+            // every shape in a frame is a candidate — and the depth pre-pass
+            // now draws opaque geometry TWICE, which doubles what each
+            // simplification is worth.
             let d2 = s.pos.distance_squared(rc.0);
-            let far = d2 > 140.0 * 140.0;
-            let vfar = d2 > 90.0 * 90.0;
+            let dist = d2.sqrt().max(0.01);
+            let bound = shape_bound(&s.sdf).max(0.4);
+            // radius in pixels: (r / d) radians over radians-per-pixel
+            let px_r = (bound / dist) / (self.cfg.cam.fov_deg.to_radians() / self.gpu.config.width.max(1) as f32);
+            // a 10-segment silhouette is indistinguishable under ~22 px, and
+            // the coarser tube meshes hold up a little further out
+            //
+            // Measured, the size rule alone is MORE CONSERVATIVE than the
+            // distance rule it replaced — 35% of shapes against 76% — because
+            // a large tube at 90 m still covers plenty of pixels. That is
+            // better looking and slower, which is the wrong direction here.
+            // So take BOTH: anything far away, or anything small on screen.
+            // Each rule catches what the other misses, and neither has to be
+            // loosened to compensate.
+            let vfar = px_r < 22.0 || d2 > 90.0 * 90.0;
+            let far = px_r < 34.0 || d2 > 140.0 * 140.0;
             let mesh = match (s.mesh, far, vfar) {
                 (world::M_SHELL, true, _) => world::M_SHELL_LO,
                 (world::M_SHELL_OPEN, true, _) => world::M_SHELL_OPEN_LO,

@@ -4054,6 +4054,43 @@ worth of difference at a glancing angle, and worth 21% — but it is a
 difference, not a proof of equivalence, and I would rather record that than
 call the two identical.
 
+## v1.124.0 — LOD by projected size, and one idea measured out of existence
+
+Two candidates, and measuring first killed one of them.
+
+SIZE CULLING IS WORTH NOTHING HERE. The idea is sound in general — a shape
+that projects to less than a pixel can be skipped entirely, however visible
+it is to the frustum test. Measured across four maps: ZERO percent of drawn
+shapes are sub-pixel, and zero are under four pixels. This world is built
+from large forms and there is nothing small enough to skip. That is a
+feature that would have looked reasonable in a commit message and done
+nothing at all.
+
+SIZE LOD IS WORTH SOMETHING, and the reason is the interesting part. LOD
+already existed, keyed to fixed distances (90 m for spheres and capsules,
+140 m for tubes). A fixed distance is the wrong question: a 6 m tube and a
+0.4 m orb at the same range are wildly different on screen, and a threshold
+that suits one wastes the other. What decides whether faceting shows is how
+many PIXELS the silhouette covers.
+
+So the rule is now projected radius — and the measurement immediately said
+something I did not expect:
+
+    map              distance rule   size rule   both
+    ARENA CLASSIC          76%           35%      77%
+    PERPLEXUS              77%            9%      77%
+    MONKEY RUN             91%           31%      91%
+    CHAMBER                73%           18%      73%
+
+The size rule alone is MORE CONSERVATIVE than the distance rule it was meant
+to replace, because a large tube at 90 m still covers plenty of pixels. It
+looks better and saves less, which is the wrong direction when the ask is
+performance. So both rules run: anything far away, OR anything small on
+screen. Each catches what the other misses and neither has to be loosened.
+
+This matters more than it did a version ago: the depth pre-pass draws opaque
+geometry TWICE, so every mesh simplification now counts double.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

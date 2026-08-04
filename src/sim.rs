@@ -3365,6 +3365,188 @@ pub fn run(args: &[String]) {
                 saved * 100.0
             );
         }
+        // ---- WHAT IS LEFT TO CULL, AND WHAT IS LEFT TO SIMPLIFY ----
+        // Frustum culling answers "is it on screen". It does not answer "is
+        // it worth drawing" — a shape can be perfectly in view and project
+        // to less than a pixel. And the depth pre-pass doubled the vertex
+        // work of every opaque draw, so distance LOD is worth more now than
+        // it was a version ago.
+        {
+            println!();
+            println!("{:<14} {:>8} {:>9} {:>9} {:>9} {:>9}", "map", "drawn", "sub-px", "<4px", "far half", "tris");
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+                let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
+                let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
+                // a 1080p-ish frame at 86 degrees: radians per pixel
+                let px = (86.0f32.to_radians()) / 1920.0;
+                let (mut drawn, mut subpx, mut small, mut far) = (0u32, 0u32, 0u32, 0u32);
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                        continue;
+                    }
+                    let r = crate::shape_bound(&sh.sdf).max(0.5);
+                    let d = (sh.pos - eye).length().max(0.01);
+                    if d > 300.0 {
+                        continue;
+                    }
+                    drawn += 1;
+                    // angular radius in pixels
+                    let ang = (r / d).atan() / px;
+                    if ang < 1.0 {
+                        subpx += 1;
+                    }
+                    if ang < 4.0 {
+                        small += 1;
+                    }
+                    if d > 60.0 {
+                        far += 1;
+                    }
+                }
+                println!(
+                    "{:<14} {:>8} {:>8}{} {:>8}{} {:>8}{} {:>9}",
+                    name,
+                    drawn,
+                    subpx * 100 / drawn.max(1),
+                    "%",
+                    small * 100 / drawn.max(1),
+                    "%",
+                    far * 100 / drawn.max(1),
+                    "%",
+                    "-"
+                );
+            }
+            println!("   nothing is sub-pixel, so size CULLING would save nothing — but size LOD is another matter");
+            // what the projected-size rule catches that the old distance
+            // rule did not
+            println!();
+            println!("{:<14} {:>12} {:>12} {:>10}", "map", "distance", "size", "both");
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+                let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
+                let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
+                let px = (86.0f32.to_radians()) / 1920.0;
+                let (mut n, mut old, mut new, mut both) = (0u32, 0u32, 0u32, 0u32);
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                        continue;
+                    }
+                    let r = crate::shape_bound(&sh.sdf).max(0.4);
+                    let d = (sh.pos - eye).length().max(0.01);
+                    if d > 300.0 {
+                        continue;
+                    }
+                    n += 1;
+                    if d > 90.0 {
+                        old += 1;
+                    }
+                    if (r / d) / px < 22.0 {
+                        new += 1;
+                    }
+                    if (r / d) / px < 22.0 || d > 90.0 {
+                        both += 1;
+                    }
+                }
+                println!(
+                    "{:<14} {:>11}{} {:>11}{} {:>9}{}",
+                    name,
+                    old * 100 / n.max(1), "%",
+                    new * 100 / n.max(1), "%",
+                    both * 100 / n.max(1), "%"
+                );
+            }
+            println!("   ...and the depth pre-pass draws opaque geometry twice, so each swap counts double");
+        }
+
+        // ---- WHAT IS LEFT TO CULL, AND WHAT IS LEFT TO SIMPLIFY ----
+        // Frustum culling answers "is it on screen". It does not answer "is
+        // it worth drawing" — a shape can be perfectly in view and project
+        // to less than a pixel. And the depth pre-pass doubled the vertex
+        // work of every opaque draw, so distance LOD is worth more now than
+        // it was a version ago.
+        {
+            println!();
+            println!("{:<14} {:>8} {:>9} {:>9} {:>9} {:>9}", "map", "drawn", "sub-px", "<4px", "far half", "tris");
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+                let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
+                let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
+                // a 1080p-ish frame at 86 degrees: radians per pixel
+                let px = (86.0f32.to_radians()) / 1920.0;
+                let (mut drawn, mut subpx, mut small, mut far) = (0u32, 0u32, 0u32, 0u32);
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                        continue;
+                    }
+                    let r = crate::shape_bound(&sh.sdf).max(0.5);
+                    let d = (sh.pos - eye).length().max(0.01);
+                    if d > 300.0 {
+                        continue;
+                    }
+                    drawn += 1;
+                    // angular radius in pixels
+                    let ang = (r / d).atan() / px;
+                    if ang < 1.0 {
+                        subpx += 1;
+                    }
+                    if ang < 4.0 {
+                        small += 1;
+                    }
+                    if d > 60.0 {
+                        far += 1;
+                    }
+                }
+                println!(
+                    "{:<14} {:>8} {:>8}{} {:>8}{} {:>8}{} {:>9}",
+                    name,
+                    drawn,
+                    subpx * 100 / drawn.max(1),
+                    "%",
+                    small * 100 / drawn.max(1),
+                    "%",
+                    far * 100 / drawn.max(1),
+                    "%",
+                    "-"
+                );
+            }
+            println!("   nothing is sub-pixel, so size CULLING would save nothing — but size LOD is another matter");
+            // what the projected-size rule catches that the old distance
+            // rule did not
+            println!();
+            println!("{:<14} {:>12} {:>12} {:>10}", "map", "distance", "size", "both");
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+                let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
+                let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
+                let px = (86.0f32.to_radians()) / 1920.0;
+                let (mut n, mut old, mut new, mut both) = (0u32, 0u32, 0u32, 0u32);
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                        continue;
+                    }
+                    let r = crate::shape_bound(&sh.sdf).max(0.4);
+                    let d = (sh.pos - eye).length().max(0.01);
+                    if d > 300.0 {
+                        continue;
+                    }
+                    n += 1;
+                    if d > 90.0 {
+                        old += 1;
+                    }
+                    if (r / d) / px < 22.0 {
+                        new += 1;
+                    }
+                    if (r / d) / px < 22.0 || d > 90.0 {
+                        both += 1;
+                    }
+                }
+                println!(
+                    "{:<14} {:>11}{} {:>11}{} {:>9}{}",
+                    name,
+                    old * 100 / n.max(1), "%",
+                    new * 100 / n.max(1), "%",
+                    both * 100 / n.max(1), "%"
+                );
+            }
+            println!("   ...and the depth pre-pass draws opaque geometry twice, so each swap counts double");
+        }
+
         // ---- OVER-RELAXED SPHERE TRACING ----
         // A sphere march steps by the distance to the nearest surface, which
         // is guaranteed safe and usually timid: the true surface is often
