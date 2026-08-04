@@ -135,10 +135,10 @@ pub fn classify(request: &str) -> TaskClass {
 /// so it remains greppable in the binary.
 pub fn posture_full(class: TaskClass) -> String {
     match posture(class) {
-        Some(p) => format!("{p}{UNIVERSAL_CORE}{BUILD_BIAS}"),
+        Some(p) => format!("{p}{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}"),
         // The core applies even when no class posture does — those failures are not class-specific,
         // and a one-shot request is exactly where "another outline" is cheapest to produce.
-        None => format!("{UNIVERSAL_CORE}{BUILD_BIAS}"),
+        None => format!("{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}"),
     }
 }
 
@@ -188,6 +188,29 @@ pub fn posture(class: TaskClass) -> Option<&'static str> {
 /// shipped as fixes and moved the failure count by zero. **Not one of them was too much code — every
 /// one was too much reasoning about code that could have been printed.** The corrective is not more
 /// caution, it is spending the cheap resource first.
+/// The asymmetry nothing else here accounts for.
+///
+/// **A person types ten tokens in the time this model emits a thousand.** So a short prompt is not a
+/// precise one — it is a COMPRESSED one, written under a cost the model does not pay. "keep working"
+/// carries the intent of a paragraph the operator did not have time to write.
+///
+/// Two failures follow from reading brevity as specification:
+///
+/// * **Scoping effort to the prompt's length.** Ten words asked for do not mean ten words of work.
+/// * **Asking for elaboration.** A clarifying question costs the operator another round of typing to
+///   save the model a guess it could have made and stated. That trade is backwards: the model's guess
+///   is cheap and correctable, the operator's time is neither.
+///
+/// The corrective is not to invent requirements. It is to read the request as the fuller one it
+/// stands in for, SAY which reading was taken, and proceed — so a wrong expansion costs one visible
+/// sentence instead of a silent detour.
+pub const TERSENESS_BIAS: &str = "\n\nA SHORT REQUEST IS COMPRESSED, NOT PRECISE. The person types \
+far slower than you generate, so brevity reflects their cost and not the size of what they want \u{2014} \
+read a terse instruction as the fuller one they would have written with more time. Do not scope your \
+effort to the prompt's length, and do not ask a clarifying question you could answer yourself: a \
+question spends their turn to save you a guess, which is the wrong way round. State the reading you \
+took in one line and act on it, so a wrong reading costs a sentence rather than a detour.";
+
 pub const BUILD_BIAS: &str = "\n\nWHEN IN DOUBT, BUILD. Writing code is cheap and reversible — it \
 compiles or it does not, and it can be reverted in a second. Reasoning about what the code would do \
 is expensive: it consumes a turn and returns a guess. If a question could be settled by writing the \
@@ -609,5 +632,59 @@ mod return_with_evidence_tests {
         // acceptable. The rule is about arriving with data, not about never arriving.
         assert!(BUILD_BIAS.contains("WHEN YOU MUST RETURN FOR A DECISION"),
             "the phrasing has to grant that returning is sometimes right");
+    }
+}
+
+#[cfg(test)]
+mod terseness_tests {
+    use super::*;
+
+    #[test]
+    fn EVERY_posture_carries_it() {
+        for r in ["keep working", "write smite 2 in rust", "fix the parser"] {
+            assert!(posture_full(classify(r)).contains("COMPRESSED, NOT PRECISE"), "{r}");
+        }
+    }
+
+    #[test]
+    fn effort_is_NOT_scoped_to_the_prompt_length() {
+        // Ten words asked for do not mean ten words of work. "keep working" carries the intent of a
+        // paragraph the operator did not have time to write.
+        assert!(TERSENESS_BIAS.contains("do not scope your effort to the prompt's length")
+             || TERSENESS_BIAS.contains("Do not scope your effort to the prompt's length"));
+    }
+
+    #[test]
+    fn a_clarifying_question_is_named_as_SPENDING_THEIR_TURN() {
+        // The trade is backwards: the model's guess is cheap and correctable, the operator's typing
+        // time is neither. Naming who pays is what makes this actionable rather than polite advice.
+        assert!(TERSENESS_BIAS.contains("spends their turn to save you a guess"));
+        assert!(TERSENESS_BIAS.contains("wrong way round"));
+    }
+
+    #[test]
+    fn the_expansion_must_be_STATED_not_silent() {
+        // The safeguard that makes charitable reading safe: a wrong expansion costs one visible
+        // sentence instead of a silent detour, and the operator can correct it in four words.
+        assert!(TERSENESS_BIAS.contains("State the reading you took in one line"));
+    }
+
+    #[test]
+    fn it_does_not_license_INVENTING_requirements() {
+        // Read the request as the fuller one it stands in for — not as a different request. The
+        // wording says "they would have written", which is about recovering intent rather than
+        // adding to it.
+        assert!(TERSENESS_BIAS.contains("the fuller one they would have written"));
+    }
+
+    #[test]
+    fn all_four_layers_coexist() {
+        // core: verify. build bias: spend the cheap resource. evidence: do not return empty-handed.
+        // terseness: read generously. None cancels another.
+        let p = posture_full(classify("keep working"));
+        for marker in ["An outline is not a step", "WHEN IN DOUBT, BUILD",
+                       "RETURN WITH THE EVIDENCE", "COMPRESSED, NOT PRECISE"] {
+            assert!(p.contains(marker), "missing {marker}");
+        }
     }
 }
