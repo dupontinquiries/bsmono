@@ -18,6 +18,7 @@ pub mod row_render;
 pub mod detect;
 pub mod explore;
 pub mod manpage_view;
+pub mod voice_routing;
 
 /// Double-flick commands, bound to tab management.
 ///
@@ -36,6 +37,89 @@ pub fn shake_bindings() -> uikit_egui::glove::ShakeCommands {
         ShakeBinding { dir: Orient::RightUp, action: "next_tab".into(),
                        label: "Next tab".into() },
     ])
+}
+
+/// Drive the router from glove mode's state.
+///
+/// One place decides, so the terminal's command path and the cursor's dictation
+/// state cannot disagree about who owns the microphone. Arming a field
+/// SUSPENDS the command NLU rather than leaving it running and discarding its
+/// output — a filtered command is still a command that nearly fired.
+pub fn sync_voice_routing(router: &mut voice_routing::VoiceRouter,
+                          glove: &uikit_egui::glove::GloveCursor) {
+    match glove.mode() {
+        uikit_egui::glove::Mode::Dictating { field } => router.dictate_into(field),
+        // Leaving dictation returns the mic to the command vocabulary rather
+        // than to idle: voiceterm is a voice-driven app, and a terminal that
+        // stopped listening after one dictation would need a tap to wake — the
+        // gesture glove mode exists to avoid.
+        uikit_egui::glove::Mode::Navigating => router.listen_for_commands(),
+    }
+}
+
+#[cfg(test)]
+mod voice_glove_tests {
+    use super::voice_routing::{Consumer, VoiceRouter};
+    use uikit_egui::glove::{ColdMode, GloveCursor, Target, TargetKind, Orient};
+
+    fn cursor() -> GloveCursor {
+        let mut g = GloveCursor::with_mode(ColdMode::On);
+        g.set_bounds(400.0, 800.0);
+        g
+    }
+
+    #[test]
+    fn arming_a_field_suspends_the_terminals_command_path() {
+        // The collision this exists for: voiceterm is already listening for
+        // commands when glove mode starts dictating.
+        let ts = vec![Target { id: "body".into(), kind: TargetKind::Field,
+                               at: (200.0, 400.0), label: "Body".into() }];
+        let mut g = cursor();
+        let mut r = VoiceRouter::new();
+        r.listen_for_commands();
+        assert!(r.feeds(Consumer::CommandNlu));
+
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        super::sync_voice_routing(&mut r, &g);
+        assert!(!r.feeds(Consumer::CommandNlu), "suspended, not filtered");
+        assert!(r.feeds(Consumer::DictationSink));
+        assert!(r.feeds(Consumer::Fingerprint), "and training continues");
+    }
+
+    #[test]
+    fn escaping_returns_the_mic_to_commands_not_to_idle() {
+        // A terminal that stopped listening after one dictation would need a
+        // tap to wake — the gesture glove mode exists to avoid.
+        let ts = vec![Target { id: "body".into(), kind: TargetKind::Field,
+                               at: (200.0, 400.0), label: "Body".into() }];
+        let mut g = cursor();
+        let mut r = VoiceRouter::new();
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        super::sync_voice_routing(&mut r, &g);
+        assert!(r.dictating());
+
+        g.feed(Orient::FaceDown, 0.0, &ts);
+        g.feed(Orient::FaceDown, uikit_egui::glove::ESCAPE_HOLD_MS, &ts);
+        super::sync_voice_routing(&mut r, &g);
+        assert!(!r.dictating());
+        assert!(r.feeds(Consumer::CommandNlu), "back to listening for commands");
+    }
+
+    #[test]
+    fn the_wake_prefix_still_reaches_stop_while_a_field_is_armed() {
+        let ts = vec![Target { id: "body".into(), kind: TargetKind::Field,
+                               at: (200.0, 400.0), label: "Body".into() }];
+        let mut g = cursor();
+        let mut r = VoiceRouter::new();
+        g.feed(Orient::Rest, 16.0, &ts);
+        g.speak("select", &ts);
+        super::sync_voice_routing(&mut r, &g);
+        assert_eq!(r.route("terminal, stop"),
+                   super::voice_routing::Routed::Interrupt("stop".into()));
+        assert_eq!(r.route("stop"), super::voice_routing::Routed::Text("stop".into()));
+    }
 }
 
 #[cfg(test)]

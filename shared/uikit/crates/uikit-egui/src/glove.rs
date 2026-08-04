@@ -615,6 +615,14 @@ impl Default for GloveCursor {
 }
 
 impl GloveCursor {
+    /// Build with a setting. Needed because the internals are private, and a
+    /// caller in another crate cannot reach for struct-update syntax — which is
+    /// the right way round: the ratchet and the cursor position are not things
+    /// an app should set.
+    pub fn with_mode(mode_setting: ColdMode) -> Self {
+        GloveCursor { mode_setting, ..Default::default() }
+    }
+
     /// Is the mode on right now?
     pub fn active(&self) -> bool { self.mode_setting.active(self.ambient_c) }
 
