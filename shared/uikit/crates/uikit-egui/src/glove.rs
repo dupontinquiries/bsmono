@@ -348,6 +348,44 @@ impl ShakeCommands {
     }
 }
 
+/// The escape dot: a visible way out of a listening field.
+///
+/// The held-face-down escape works and cannot miss, but it is INVISIBLE — you
+/// have to have been told it exists. The dot is the discoverable half: it
+/// appears when a field starts listening, it is the only thing the cursor can
+/// reach while listening, and flicking onto it ends dictation. It then
+/// disappears, so its presence is also the "still listening" indicator.
+///
+/// **It sits ABOVE the field, and that is forced by the hardware.**
+/// `AccelerometerOrientation` yields three usable directions — left-up,
+/// right-up and bottom-up — and bottom-up moves the cursor UP. There is no
+/// downward flick, so a dot below the field could not be reached at all. This
+/// is a case where the sensor's vocabulary decides the layout.
+///
+/// Both escapes stay. A flick can miss; a hold cannot. Keeping the infallible
+/// one behind the discoverable one is the same shape as the context menu taking
+/// both right-click and long-press.
+pub const ESCAPE_DOT_ID: &str = "__glove_escape__";
+
+/// Where the dot goes, given the field it belongs to.
+///
+/// Exactly one step above, so it is reachable by a single flick — two would
+/// make the quick exit not quick, and a partial approach would leave the cursor
+/// stranded between the field and its way out.
+pub fn escape_dot_at(field_at: (f32, f32)) -> (f32, f32) {
+    (field_at.0, field_at.1 - STEP_PX)
+}
+
+/// The dot as a target, for the frames where it exists.
+pub fn escape_dot(field_at: (f32, f32)) -> Target {
+    Target {
+        id: ESCAPE_DOT_ID.into(),
+        kind: TargetKind::Button,
+        at: escape_dot_at(field_at),
+        label: "stop listening".into(),
+    }
+}
+
 /// What kind of thing the cursor can land on. The action vocabulary differs per
 /// kind, because "louder" means nothing to a checkbox.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -674,10 +712,34 @@ impl GloveCursor {
             out.escaped = self.escape();
         }
 
-        // While dictating the cursor does not move. A phone held to the mouth
-        // sways, and a cursor that wandered off the field during dictation
-        // would deliver the text somewhere else.
-        if self.dictating() {
+        // While dictating, the cursor MAY move — but the only thing it can
+        // reach is the escape dot.
+        //
+        // An earlier version froze it entirely, on the grounds that a swaying
+        // phone would deliver text somewhere else. That was over-cautious:
+        // dictated text is routed by the armed FIELD ID, not by where the
+        // cursor happens to be, so drift cannot misdeliver it. And the
+        // vocabulary is suspended while dictating, so a stray snap cannot be
+        // acted on either. Freezing bought nothing and cost the user their
+        // visible way out.
+        if let Mode::Dictating { field } = self.mode.clone() {
+            if let Some((dx, dy)) = flicked.and_then(|f| f.direction()) {
+                self.pos.0 = (self.pos.0 + dx * STEP_PX).clamp(0.0, self.bounds.0);
+                self.pos.1 = (self.pos.1 + dy * STEP_PX).clamp(0.0, self.bounds.1);
+            }
+            // The dot is the ONLY target. Nothing else can capture the cursor,
+            // so there is no way to wander into acting on another control.
+            let dot = targets.iter().find(|t| t.id == field)
+                .map(|f| escape_dot(f.at));
+            self.snapped = match &dot {
+                Some(d) if self.within_snap(d.at) => {
+                    // Reached it: dictation ends and the dot goes with it.
+                    out.escaped = self.escape();
+                    None
+                }
+                Some(d) => Some(d.id.clone()),
+                None => None,
+            };
             out.snapped = self.snapped.clone();
             return out;
         }
@@ -692,6 +754,11 @@ impl GloveCursor {
         self.snapped = self.nearest(targets).map(|t| t.id.clone());
         out.snapped = self.snapped.clone();
         out
+    }
+
+    /// Is a point inside the snap radius of the cursor?
+    fn within_snap(&self, at: (f32, f32)) -> bool {
+        (at.0 - self.pos.0).hypot(at.1 - self.pos.1) <= SNAP_RADIUS_PX
     }
 
     /// The nearest target within the snap radius.
@@ -757,6 +824,22 @@ pub fn glove_ui(ui: &mut egui::Ui, g: &GloveCursor, targets: &[Target],
                 c: &crate::PaletteColors) {
     if !g.active() { return; }
     let p = ui.painter();
+
+    // The escape dot, while listening. Drawn before the cursor so the ball
+    // passes over it rather than under, and pulsing so it reads as live rather
+    // than as a stray mark on the screen.
+    if let Mode::Dictating { field } = g.mode() {
+        if let Some(f) = targets.iter().find(|t| &t.id == field) {
+            let at = escape_dot_at(f.at);
+            let at = egui::pos2(at.0, at.1);
+            p.circle_filled(at, 9.0, c.danger);
+            p.circle_stroke(at, 13.0, egui::Stroke::new(1.0, c.danger));
+            // Labelled, because a bare dot is a mystery. One flick up is the
+            // whole instruction and it fits.
+            p.text(at + egui::vec2(0.0, -20.0), egui::Align2::CENTER_BOTTOM,
+                   "flick up to stop", egui::FontId::proportional(11.0), c.text_weak);
+        }
+    }
     // The snap ring is drawn on the TARGET, not the ball: the user needs to
     // know what will be acted on, and the ball is the thing they are already
     // watching.
@@ -1235,21 +1318,92 @@ mod escape_and_confirm_tests {
         assert!(g.dictating(), "still listening");
     }
 
+    /// Complete one flick against a target list.
+    fn flick_to(g: &mut GloveCursor, dir: Orient, ts: &[Target]) -> Tick {
+        g.feed(Orient::Rest, 0.0, ts);
+        g.feed(Orient::Rest, REARM_MIN_MS, ts);
+        g.feed(dir, 0.0, ts);
+        g.feed(dir, 120.0, ts);
+        g.feed(Orient::Rest, 0.0, ts)
+    }
+
     #[test]
-    fn the_cursor_does_not_wander_while_dictating() {
-        // A phone held near the mouth sways. A cursor that drifted off the
-        // field during dictation would deliver the text somewhere else.
+    fn the_escape_dot_sits_above_the_field_because_there_is_no_downward_flick() {
+        // The sensor's vocabulary decides the layout: left-up, right-up and
+        // bottom-up are the three usable directions, and bottom-up moves the
+        // cursor UP. A dot below the field could never be reached.
+        let f = (200.0, 400.0);
+        assert_eq!(escape_dot_at(f), (200.0, 400.0 - STEP_PX));
+        assert!(escape_dot_at(f).1 < f.1, "above, not below");
+        assert_eq!(Orient::BottomUp.direction(), Some((0.0, -1.0)));
+        // Nothing in the vocabulary moves the cursor down.
+        for o in [Orient::LeftUp, Orient::RightUp, Orient::BottomUp] {
+            assert!(o.direction().unwrap().1 <= 0.0, "{o:?} moves down");
+        }
+    }
+
+    #[test]
+    fn one_flick_up_reaches_the_dot_and_ends_dictation() {
+        // Exactly one step, so the quick exit is quick.
         let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
         let mut g = cursor();
-        g.feed(Orient::Rest, 16.0, &ts);
-        g.speak("select", &ts);
-        let before = g.pos();
-        for _ in 0..5 {
-            g.feed(Orient::Rest, 200.0, &ts);
-            g.feed(Orient::LeftUp, 100.0, &ts);
-            g.feed(Orient::Rest, 0.0, &ts);
-        }
-        assert_eq!(g.pos(), before);
+        g.pos = (200.0, 400.0);
+        g.arm_field("body");
+        let out = flick_to(&mut g, Orient::BottomUp, &ts);
+        assert!(out.escaped);
+        assert!(!g.dictating());
+    }
+
+    #[test]
+    fn the_dot_disappears_once_used() {
+        // Its presence is also the "still listening" indicator, so it must go
+        // when listening does.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.pos = (200.0, 400.0);
+        g.arm_field("body");
+        flick_to(&mut g, Orient::BottomUp, &ts);
+        assert_eq!(g.snapped(), None, "nothing left to snap to");
+    }
+
+    #[test]
+    fn the_dot_is_the_only_thing_reachable_while_listening() {
+        // Flicking sideways must not wander onto another control — and cannot
+        // act on one anyway, since the vocabulary is suspended.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0),
+                      target("send", TargetKind::Button, 288.0, 400.0)];
+        let mut g = cursor();
+        g.pos = (200.0, 400.0);
+        g.arm_field("body");
+        let out = flick_to(&mut g, Orient::RightUp, &ts);
+        assert!(!out.escaped);
+        assert!(g.dictating(), "still listening");
+        assert_ne!(g.snapped(), Some("send"), "the button is not reachable from here");
+    }
+
+    #[test]
+    fn the_cursor_may_move_while_dictating_because_text_is_routed_by_id() {
+        // An earlier version froze it, guarding against misdelivery that cannot
+        // happen: dictated text goes to the armed field id, not to wherever the
+        // cursor drifted. Freezing bought nothing and cost the visible exit.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.pos = (200.0, 400.0);
+        g.arm_field("body");
+        flick_to(&mut g, Orient::RightUp, &ts);
+        assert_ne!(g.pos().0, 200.0, "it moved");
+        assert!(g.dictating());
+    }
+
+    #[test]
+    fn the_held_escape_still_works_as_the_one_that_cannot_miss() {
+        // A flick can miss; a hold cannot. Keeping the infallible one behind
+        // the discoverable one is the context menu's shape again.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.arm_field("body");
+        g.feed(Orient::FaceDown, 0.0, &ts);
+        assert!(g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &ts).escaped);
     }
 
     #[test]
