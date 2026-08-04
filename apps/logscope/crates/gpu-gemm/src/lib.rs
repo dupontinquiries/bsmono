@@ -3666,9 +3666,13 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             // lowers `/` to a multiply by an f32-rounded reciprocal. Matching it is
                             // the only way the two agree, and the reference is what moves.
                             let scale = if amax > 0.0 { amax * (1.0f32 / 7.0) } else { 1.0 };
+                            let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
                             qs_c[lr * kb + b] = scale;
                             for j in 0..32 {
-                                let q = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
+                                // Reciprocal, matching the shader: this driver turns `/` into a multiply by an
+                                // f32 reciprocal, and here an ULP crosses a .5 boundary where the two
+                                // round() rules then differ by a whole quantization level.
+                                let q = (w[base + j] * inv_scale).round().clamp(-7.0, 7.0) as i32;
                                 nb_c[lr * k + b * 32 + j] = (q + 8) as u8; // 1..=15, symmetric around 8
                             }
                         }
@@ -4057,6 +4061,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             // lowers `/` to a multiply by an f32-rounded reciprocal. Matching it is
                             // the only way the two agree, and the reference is what moves.
                             let scale = if amax > 0.0 { amax * (1.0f32 / 7.0) } else { 1.0 };
+                            let inv_scale = if scale > 0.0 { 1.0f32 / scale } else { 0.0 };
                                 qs_c[rr * kb + b] = scale;
                                 for j in 0..32 {
                                     let qv = (w[base + j] / scale).round().clamp(-7.0, 7.0) as i32;
@@ -14160,6 +14165,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
   if (amax > 0.0) { scale = amax * 0.14285714285714285; }
     let bi = blk * 8u + j;               // global index of this 32-block
     dst[dims.qs_off + bi] = bitcast<u32>(scale);
+    // Bound once and shared by every weight in the block, so all 32 divide identically.
+    var inv_scale = 0.0;
+    if (scale > 0.0) { inv_scale = 1.0 / scale; }
     // pack 8 nibbles per word, 4 words per 32-block
     for (var w = 0u; w < 4u; w = w + 1u) {
         var acc = 0u;
@@ -14170,7 +14178,14 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
             //  * Rust's f32::round() is half-AWAY-from-zero; WGSL's round() is half-to-even.
             var qv = 0.0;
             if (v == v) {
-                let x = v / scale;
+                // RECIPROCAL AGAIN, one level down. The same fast-math lowering that broke amax/7 breaks this
+      // division too — and here an ULP crosses a .5 boundary, where WGSL's round() (half-to-even) and
+      // Rust's round() (half-away-from-zero) then disagree by a whole level.
+      //
+      // That is the 1104 survivors: not a dispatch or stride error, but the last of the same bug in
+      // the quantizer's own divide. Their period tracks the test pattern rather than the grid, which
+      // is what says "specific VALUES" rather than "specific positions".
+      let x = v * inv_scale;
                 let r = sign(x) * floor(abs(x) + 0.5);
                 qv = clamp(r, -7.0, 7.0);
             }
