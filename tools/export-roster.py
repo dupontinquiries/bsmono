@@ -96,8 +96,15 @@ def robot_yaw(d):
     return None
 
 
-def yaw_pose(d, deg):
-    """Rotate every position in a written pose about Y, in place."""
+def yaw_pose(d, deg, axis="y"):
+    """Rotate every position in a written pose, in place.
+
+    Three axes now, because "upside-down" cannot be said in yaw. A body
+    rotated 180 about Y is still the same way up; it takes a ROLL about the
+    forward axis to turn one over, and lynx_6x6, alphastar and hawkeye all
+    needed exactly that. Pitch is here for completeness — a nose-up import
+    is the same kind of fault about the third axis.
+    """
     if abs(deg) < 1e-6:
         return
     r = math.radians(deg)
@@ -115,9 +122,14 @@ def yaw_pose(d, deg):
         for i in range(a["count"]):
             o = off + i * 12
             x, y, z = struct.unpack_from("<3f", buf, o)
-            nx, nz = c * x + s * z, -s * x + c * z
-            struct.pack_into("<3f", buf, o, nx, y, nz)
-            for k, v in enumerate((nx, y, nz)):
+            if axis == "y":
+                nx, ny, nz = c * x + s * z, y, -s * x + c * z
+            elif axis == "z":
+                nx, ny, nz = c * x - s * y, s * x + c * y, z
+            else:  # "x" — pitch
+                nx, ny, nz = x, c * y - s * z, s * y + c * z
+            struct.pack_into("<3f", buf, o, nx, ny, nz)
+            for k, v in enumerate((nx, ny, nz)):
                 lo[k] = min(lo[k], v)
                 hi[k] = max(hi[k], v)
         a["min"], a["max"] = lo, hi
@@ -190,6 +202,8 @@ def main():
         ov = OVERRIDES.get(name, {})
         flat_yaw = float(ov.get("yaw", 0.0))
         turn = float(ov.get("turn", 0.0))
+        roll = float(ov.get("roll", 0.0))
+        pitch = float(ov.get("pitch", 0.0))
         if turn == 0.0 and flat_yaw == 0.0:
             subprocess.run(
             [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
@@ -231,14 +245,24 @@ def main():
                 break
             # flat_yaw turns the whole strip; turn spends the rotation
             # across the fold. They compose, so a chassis can do both.
+            pose_dir = os.path.join(d, f"f{k:02d}")
+            # roll and pitch apply flat across the strip: a body that is
+            # upside down is upside down in both modes, and spending that
+            # across the fold would mean it is only half wrong in the middle.
+            if roll:
+                yaw_pose(pose_dir, roll, "z")
+            if pitch:
+                yaw_pose(pose_dir, pitch, "x")
             deg = flat_yaw + turn * smoothstep(t)
             if deg:
-                yaw_pose(os.path.join(d, f"f{k:02d}"), deg)
+                yaw_pose(pose_dir, deg, "y")
         if good:
             ok += 1
         tag = ", ".join(
             [x for x in (f"yaw {flat_yaw:.0f}" if flat_yaw else "",
-                         f"turn {turn:.0f}" if turn else "") if x]
+                         f"turn {turn:.0f}" if turn else "",
+                         f"roll {roll:.0f}" if roll else "",
+                         f"pitch {pitch:.0f}" if pitch else "") if x]
         ) or "as exported"
         print(f"  [{i:2d}/{len(todo)}] {name:22s} {'ok' if good else 'FAILED'}  {tag}")
     print(f"\n{ok} exported, {len(fail)} failed, {time.time()-t0:.0f}s")

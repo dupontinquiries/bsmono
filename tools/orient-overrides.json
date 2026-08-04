@@ -6,14 +6,15 @@
   "the SPINE of the robot pose, which points forward whatever the model is",
   "called and however its parts are labelled.",
   "",
-  "The turn is the NEGATION of that reading. An earlier version applied a flat",
-  "180 to every chassis that read as 'backwards', which was wrong for any that",
-  "were not exactly backwards: a body measuring -91 became +89, which is a bot",
-  "facing left. Rounding a measurement to a convenient number throws the",
-  "measurement away.",
   "",
-  "`turn` spends the rotation across the fold, so the vehicle keeps the facing",
-  "it has and only the robot end moves."
+  "ROLL AND PITCH exist because 'upside-down' cannot be said in yaw. A body",
+  "turned 180 about Y is still the same way up; turning one over is a ROLL",
+  "about the forward axis. Roll and pitch apply FLAT across the strip, not",
+  "spent across the fold: a body that is upside down is upside down in both",
+  "modes, and easing it would leave it only half wrong in the middle.",
+  "",
+  "Entries marked `why: reported` came from someone looking at the model,",
+  "which beats every heuristic tried here."
  ],
  "overrides": {
   "blackstar": {
@@ -26,15 +27,16 @@
   },
   "hawkeye": {
    "turn": 170.2,
-   "why": "robot chest-spine measured -170deg"
+   "why": "reported upside-down",
+   "roll": 180.0
   },
   "chokepoint": {
    "turn": -142.4,
    "why": "robot chest-spine measured +142deg"
   },
   "ebr_105_mad_max_mod": {
-   "turn": 177.1,
-   "why": "robot chest-spine measured -177deg"
+   "turn": 87.1,
+   "why": "chest-spine measured -177.1 (base turn +177.1); reported 90 clockwise about the feet on top of that, so +177.1 - 90 = +87.1. YOUR REPORTS ARE RELATIVE TO WHAT SHIPS, so they add to the measured correction rather than replacing it \u2014 I clobbered this one first time round."
   },
   "jet_dawnshade": {
    "turn": -179.9,
@@ -78,11 +80,13 @@
   },
   "jet_alphastar": {
    "turn": -179.8,
-   "why": "robot chest-spine measured +180deg"
+   "why": "reported upside-down",
+   "roll": 180.0
   },
   "jet_bulwark": {
    "turn": -178.9,
-   "why": "robot chest-spine measured +179deg"
+   "why": "reported backwards",
+   "yaw": 180.0
   },
   "jet_darkguard": {
    "turn": 179.9,
@@ -106,7 +110,8 @@
   },
   "lynx_6x6": {
    "turn": -165.2,
-   "why": "robot chest-spine measured +165deg"
+   "why": "reported upside-down",
+   "roll": 180.0
   },
   "boartail": {
    "turn": 142.0,
