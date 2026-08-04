@@ -4091,6 +4091,41 @@ screen. Each catches what the other misses and neither has to be loosened.
 This matters more than it did a version ago: the depth pre-pass draws opaque
 geometry TWICE, so every mesh simplification now counts double.
 
+## v1.125.0 — bots can go up after a ball
+
+The striker could only get airborne by carrying a ball up ITSELF. A ball
+already flying — a clear, a pass, a rebound off a wall — sailed over its
+head, and it went unnoticed because the default scenario never presents one.
+That is the single biggest thing separating it from someone who can play.
+
+There is an AERIAL phase now, decided during the approach on the conditions
+a player weighs: the ball is genuinely up, it is not already dropping into
+reach, the flight is short enough, and there is boost to arrive. Any one
+missing and driving is the better play.
+
+SOLVE FOR THE MEETING POINT, DO NOT GUESS A LEAD. Aiming where the ball will
+be in a fixed time is only right at one distance — the first version took
+off every time and missed by two to ten metres. The question is "when can I
+GET there", and that depends on its own answer, so it iterates: predict,
+measure the flight, predict again. Three passes.
+
+    height  range   took off   closest
+      7 m    12 m      yes       6.9 m
+     10 m    18 m      yes      11.8 m
+     14 m    24 m      yes       2.1 m
+      9 m    30 m      yes       1.9 m
+
+WHAT IS DONE AND WHAT IS NOT. Taking off is solved — four of four, where
+before it was zero of four, because the capability did not exist. Arriving
+is not: the long approaches get within two metres and the short ones do not,
+which points at the climb rather than the aim. A bot that is already close
+has to gain height more than distance, and the same nose-at-the-target rule
+that works at range wastes the short one.
+
+`--sim aerial` is the harness, and it checks closest approach rather than a
+binary touch: with four samples "did it connect" is mostly noise, and the
+distance is what actually moved.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

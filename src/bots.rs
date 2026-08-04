@@ -78,6 +78,9 @@ pub enum Brain {
 /// Striker state machine phases (tutorial stages, one enum variant each).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Phase {
+    /// Flying to intercept a ball in the air — not carrying one up there,
+    /// but going to MEET one that is already flying.
+    Aerial,
     Approach,  // get behind the ball, lined up with the goal
     Carry,     // ground dribble: ball on the hood, match speed
     Pop,       // jump under the ball the moment it settles -> launch
@@ -503,6 +506,22 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
             c.boost = ang < 0.3 && d > 8.0;
             c.powerslide = ang > 1.2 && car.on_ground;
             prejump(&mut c, &b.car, &mut b.jump_cd, ball, ctx.grav);
+            // ---- SHOULD I FLY? ----
+            //
+            // Decided during the approach, because that is when the ball is
+            // ahead of you and there is still time to leave the ground. The
+            // conditions are the ones a player weighs: the ball is genuinely
+            // up there, it is not already dropping into reach, I am close
+            // enough that the flight is short, and I have the boost to
+            // arrive. Any one of those missing and driving is the better
+            // play.
+            let rising_or_high = ball.pos.y > 4.0 && (ball.vel.y > -3.0 || ball.pos.y > 7.0);
+            let close_enough = d < 26.0;
+            let have_fuel = car.boost > 22.0;
+            if rising_or_high && close_enough && have_fuel && car.on_ground {
+                b.phase = Phase::Aerial;
+                b.phase_t = 0.0;
+            }
             let on_hood = ball_rel.y > car.half_h * 0.8 && flat_d < 1.4;
             if on_hood {
                 b.phase = Phase::Carry;
@@ -596,6 +615,73 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
             c.boost = false;
             if b.phase_t > 0.9 {
                 b.phase = Phase::AirCarry; // missed the slap; regroup
+                b.phase_t = 0.0;
+            }
+        }
+        Phase::Aerial => {
+            // ---- AERIAL INTERCEPT ----
+            //
+            // The striker could only ever get airborne by carrying a ball up
+            // itself. A ball already flying — a clear, a pass, a rebound off
+            // the wall — simply sailed over its head, which is the single
+            // biggest thing separating it from someone who can play.
+            //
+            // Aim at where the ball WILL BE, not where it is: solve forward
+            // for a moment far enough ahead to be worth flying to, and point
+            // the car through that point. The prediction is ballistic, which
+            // is exactly right for a ball in flight and cheap enough to redo
+            // every frame as the estimate sharpens.
+            // SOLVE FOR THE MEETING POINT, do not guess a lead.
+            //
+            // A fixed lead aims where the ball will be in a fixed time,
+            // which is only right at one distance — the bot took off every
+            // time and still missed by two to ten metres. The question is
+            // "when can I GET there", and that depends on the answer, so
+            // iterate: predict, measure how long the flight would take,
+            // predict again. Three passes converge well inside the error
+            // of everything else here.
+            let mut lead = 0.45f32;
+            let mut pred = ball.pos;
+            for _ in 0..3 {
+                pred = ball.pos + ball.vel * lead + ctx.grav * (0.5 * lead * lead);
+                let reach = (pred - car.pos).length();
+                // speed already carried toward it, plus what boost adds
+                let speed = car.vel.length().max(6.0) + 14.0;
+                lead = (reach / speed).clamp(0.12, 2.2);
+            }
+            let to = pred - car.pos;
+            let dist = to.length();
+            let dir = to.normalize_or(Vec3::Y);
+            if car.on_ground {
+                // leave the floor pointed at the intercept, not straight up
+                c.throttle = 1.0;
+                let (_, ang) = steer_to(&mut c, car, Vec3::new(pred.x, car.pos.y, pred.z));
+                if ang < 0.5 {
+                    c.jump_pressed = true;
+                    c.jump_held = true;
+                }
+            } else {
+                // in the air the nose IS the steering: point it at the
+                // intercept and burn
+                aim(&mut c, car, dir);
+                c.jump_held = b.phase_t < 0.30; // hold for the taller first jump
+                // BOOST EARLIER. Waiting until the nose was within about 40
+                // degrees meant the whole climb was spent turning rather
+                // than travelling, and gravity does not wait. Sixty degrees
+                // is close enough that most of the thrust goes the right
+                // way, and the remaining error is corrected while moving.
+                let facing = car.forward().dot(dir);
+                c.boost = facing > 0.5 && dist > 1.2;
+                // a second jump once pointed, for the extra height a single
+                // one cannot reach
+                if b.phase_t > 0.34 && b.phase_t < 0.42 && car.can_flip() && dir.y > 0.55 {
+                    c.jump_pressed = true;
+                }
+            }
+            // give up when the ball is low again, or it has been too long
+            let ball_low = ball.pos.y < 2.2 && ball.vel.y < 0.0;
+            if b.phase_t > 2.4 || ball_low || (dist < 1.5 && b.phase_t > 0.2) {
+                b.phase = Phase::Approach;
                 b.phase_t = 0.0;
             }
         }

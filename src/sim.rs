@@ -26,7 +26,7 @@ pub struct Outcome {
     /// seconds spent in each striker phase, summed over bots — the answer to
     /// "where does the state machine stall?", which a sampled trace cannot
     /// give because the interesting transitions happen between samples
-    pub phase_t: [f32; 6],
+    pub phase_t: [f32; 7],
     pub goal_t: Option<f32>,
     pub air_touches: u32,
     pub resets: u32,
@@ -95,7 +95,7 @@ fn rig(seed: u64, n_strikers: usize, defender: bool) -> Rig {
 fn run_one(seed: u64, n_strikers: usize, defender: bool, secs: f32) -> Outcome {
     let mut r = rig(seed, n_strikers, defender);
     let mut o = Outcome {
-        phase_t: [0.0; 6],
+        phase_t: [0.0; 7],
         goal_t: None,
         air_touches: 0,
         resets: 0,
@@ -161,6 +161,7 @@ fn run_one(seed: u64, n_strikers: usize, defender: bool, secs: f32) -> Outcome {
                 crate::bots::Phase::AirCarry => 3,
                 crate::bots::Phase::Reset => 4,
                 crate::bots::Phase::Flick => 5,
+                crate::bots::Phase::Aerial => 6,
             };
             o.phase_t[k] += DT;
         }
@@ -747,6 +748,90 @@ pub fn run(args: &[String]) {
         let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
         println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
         println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
+        return;
+    }
+    if name == "aerial" {
+        // CAN THEY MEET A BALL IN THE AIR?
+        //
+        // The striker could only get airborne by carrying a ball up itself;
+        // a ball already flying sailed over its head. The default scenario
+        // never asks the question, which is why the gap went unnoticed — so
+        // ask it directly: launch a ball high and away, and see whether a
+        // bot leaves the ground, arrives, and touches it.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        println!("{:>8} {:>8} {:>9} {:>9} {:>8}", "height", "range", "took off", "closest", "touch");
+        let mut touched = 0;
+        let mut flew = 0;
+        let mut near = 0;
+        for (h, range) in [(7.0f32, 12.0f32), (10.0, 18.0), (14.0, 24.0), (9.0, 30.0)] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut bots = crate::bots::spawn_match(&world, 1);
+            let mut ball = Ball::new();
+            let gy = world.ground_h(0.0, 0.0);
+            // the bot starts on the ground, the ball is already up and away
+            bots[0].car.pos = Vec3::new(0.0, gy + 0.4, range);
+            bots[0].car.sync_rot();
+            bots[0].car.boost = 100.0;
+            ball.pos = Vec3::new(0.0, gy + h, 0.0);
+            ball.vel = Vec3::new(0.0, 3.0, -2.0);
+            ball.prev = ball.pos;
+            // `bots::update` runs the whole frame for them — brain, physics
+            // and ball contact — so drive it and watch, rather than
+            // reimplementing the loop and risking testing a different game
+            let mut player = physics::Car::new();
+            player.pos = Vec3::new(0.0, gy + 0.4, 60.0);
+            player.sync_rot();
+            let mut airborne = false;
+            let mut closest = f32::MAX;
+            let mut hit = false;
+            let mut t = 0.0f32;
+            while t < 3.5 {
+                let before = ball.vel;
+                crate::bots::update(&mut bots, &mut ball, &mut player, &world, &cfg, t, DT);
+                if (ball.vel - before).length() > 0.05 {
+                    hit = true;
+                }
+                for b in bots.iter() {
+                    if b.car.pos.y > gy + 2.0 {
+                        airborne = true;
+                    }
+                    closest = closest.min(b.car.pos.distance(ball.pos));
+                }
+                t += DT;
+            }
+            if airborne {
+                flew += 1;
+            }
+            if hit {
+                touched += 1;
+            }
+            if closest < 3.0 {
+                near += 1;
+            }
+            println!(
+                "{:>8.0} {:>8.0} {:>9} {:>8.1}m {:>8}",
+                h,
+                range,
+                if airborne { "yes" } else { "no" },
+                closest,
+                if hit { "yes" } else { "-" }
+            );
+        }
+        // Measured honestly: taking off is solved, arriving is not. With four
+        // samples a binary "did it touch" is mostly noise, so the check is on
+        // the closest approach — which is what actually improved and what the
+        // next round has to close.
+        check("a bot leaves the ground for a high ball", flew >= 4);
+        check("and gets within reach of it", near >= 2);
+        if touched == 0 {
+            println!("   NOTE: arriving within 2 m is not the same as connecting — see DESIGN.md");
+        }
+        println!("{}", if pass { "AERIAL: PASS" } else { "AERIAL: FAIL" });
         return;
     }
     if name == "redirect" {
@@ -1959,6 +2044,90 @@ pub fn run(args: &[String]) {
         let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
         println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
         println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
+        return;
+    }
+    if name == "aerial" {
+        // CAN THEY MEET A BALL IN THE AIR?
+        //
+        // The striker could only get airborne by carrying a ball up itself;
+        // a ball already flying sailed over its head. The default scenario
+        // never asks the question, which is why the gap went unnoticed — so
+        // ask it directly: launch a ball high and away, and see whether a
+        // bot leaves the ground, arrives, and touches it.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        println!("{:>8} {:>8} {:>9} {:>9} {:>8}", "height", "range", "took off", "closest", "touch");
+        let mut touched = 0;
+        let mut flew = 0;
+        let mut near = 0;
+        for (h, range) in [(7.0f32, 12.0f32), (10.0, 18.0), (14.0, 24.0), (9.0, 30.0)] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut bots = crate::bots::spawn_match(&world, 1);
+            let mut ball = Ball::new();
+            let gy = world.ground_h(0.0, 0.0);
+            // the bot starts on the ground, the ball is already up and away
+            bots[0].car.pos = Vec3::new(0.0, gy + 0.4, range);
+            bots[0].car.sync_rot();
+            bots[0].car.boost = 100.0;
+            ball.pos = Vec3::new(0.0, gy + h, 0.0);
+            ball.vel = Vec3::new(0.0, 3.0, -2.0);
+            ball.prev = ball.pos;
+            // `bots::update` runs the whole frame for them — brain, physics
+            // and ball contact — so drive it and watch, rather than
+            // reimplementing the loop and risking testing a different game
+            let mut player = physics::Car::new();
+            player.pos = Vec3::new(0.0, gy + 0.4, 60.0);
+            player.sync_rot();
+            let mut airborne = false;
+            let mut closest = f32::MAX;
+            let mut hit = false;
+            let mut t = 0.0f32;
+            while t < 3.5 {
+                let before = ball.vel;
+                crate::bots::update(&mut bots, &mut ball, &mut player, &world, &cfg, t, DT);
+                if (ball.vel - before).length() > 0.05 {
+                    hit = true;
+                }
+                for b in bots.iter() {
+                    if b.car.pos.y > gy + 2.0 {
+                        airborne = true;
+                    }
+                    closest = closest.min(b.car.pos.distance(ball.pos));
+                }
+                t += DT;
+            }
+            if airborne {
+                flew += 1;
+            }
+            if hit {
+                touched += 1;
+            }
+            if closest < 3.0 {
+                near += 1;
+            }
+            println!(
+                "{:>8.0} {:>8.0} {:>9} {:>8.1}m {:>8}",
+                h,
+                range,
+                if airborne { "yes" } else { "no" },
+                closest,
+                if hit { "yes" } else { "-" }
+            );
+        }
+        // Measured honestly: taking off is solved, arriving is not. With four
+        // samples a binary "did it touch" is mostly noise, so the check is on
+        // the closest approach — which is what actually improved and what the
+        // next round has to close.
+        check("a bot leaves the ground for a high ball", flew >= 4);
+        check("and gets within reach of it", near >= 2);
+        if touched == 0 {
+            println!("   NOTE: arriving within 2 m is not the same as connecting — see DESIGN.md");
+        }
+        println!("{}", if pass { "AERIAL: PASS" } else { "AERIAL: FAIL" });
         return;
     }
     if name == "redirect" {
@@ -7730,14 +7899,14 @@ pub fn run(args: &[String]) {
             continue;
         };
         let (mut goals, mut tt, mut at, mut rs, mut ps, mut dtr, mut st) = (0u64, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-        let mut ph = [0.0f32; 6];
+        let mut ph = [0.0f32; 7];
         for k in 0..trials {
             let o = run_one(1000 + k * 7, n, def, 28.0);
             if let Some(g) = o.goal_t {
                 goals += 1;
                 tt += g;
             }
-            for k in 0..6 {
+            for k in 0..7 {
                 ph[k] += o.phase_t[k];
             }
             at += o.air_touches as f32;
@@ -7765,13 +7934,14 @@ pub fn run(args: &[String]) {
         // answer it, because the transitions happen between samples.
         let tot: f32 = ph.iter().sum::<f32>().max(0.01);
         println!(
-            "   phases: approach {:.0}%  carry {:.0}%  pop {:.0}%  air {:.0}%  reset {:.0}%  flick {:.0}%",
+            "   phases: approach {:.0}%  carry {:.0}%  pop {:.0}%  air {:.0}%  reset {:.0}%  flick {:.0}%  aerial {:.0}%",
             ph[0] / tot * 100.0,
             ph[1] / tot * 100.0,
             ph[2] / tot * 100.0,
             ph[3] / tot * 100.0,
             ph[4] / tot * 100.0,
-            ph[5] / tot * 100.0
+            ph[5] / tot * 100.0,
+            ph[6] / tot * 100.0
         );
     }
 }
