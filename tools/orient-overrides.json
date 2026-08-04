@@ -32,7 +32,8 @@
   },
   "chokepoint": {
    "turn": -142.4,
-   "why": "robot chest-spine measured +142deg"
+   "why": "robot chest-spine measured +142deg",
+   "note": "reported floating components below the feet"
   },
   "ebr_105_mad_max_mod": {
    "turn": 87.1,
@@ -64,15 +65,20 @@
   },
   "cryofin": {
    "turn": 142.0,
-   "why": "robot chest-spine measured -142deg"
+   "why": "robot chest-spine measured -142deg",
+   "note": "reported floating components below the feet \u2014 geometry, not rotation; needs the tuck pass"
   },
   "beetlejuice": {
-   "turn": 180.0,
-   "why": "robot chest-spine measured -180deg"
+   "turn": 0.0,
+   "why": "reported vehicle backwards; yaw flips the strip and turn -180 keeps the robot end where the chest-spine measurement put it",
+   "yaw": 180.0,
+   "class": "hoverer"
   },
   "analog": {
-   "turn": -173.9,
-   "why": "robot chest-spine measured +174deg"
+   "turn": -353.9,
+   "why": "reported vehicle backwards; yaw flips the strip and turn -180 keeps the robot end where the chest-spine measurement put it",
+   "yaw": 180.0,
+   "note": "also reported hanging parts below the feet"
   },
   "jet_whistlewind": {
    "turn": 172.8,
@@ -84,8 +90,8 @@
    "roll": 180.0
   },
   "jet_bulwark": {
-   "turn": -178.9,
-   "why": "reported backwards",
+   "turn": -358.9,
+   "why": "reported vehicle backwards. First pass added yaw 180 alone, which flipped the ROBOT too \u2014 turn -180 takes it back out of the robot end.",
    "yaw": 180.0
   },
   "jet_darkguard": {
@@ -114,8 +120,9 @@
    "roll": 180.0
   },
   "boartail": {
-   "turn": 142.0,
-   "why": "robot chest-spine measured -142deg"
+   "turn": -38.0,
+   "why": "reported vehicle backwards; yaw flips the strip and turn -180 keeps the robot end where the chest-spine measurement put it",
+   "yaw": 180.0
   },
   "jet_ventride": {
    "turn": -175.2,
@@ -124,6 +131,11 @@
   "jet_vertigo": {
    "turn": 178.4,
    "why": "robot chest-spine measured -178deg"
+  },
+  "brutis": {
+   "yaw": 180.0,
+   "turn": -180.0,
+   "why": "reported vehicle backwards; yaw flips the strip and turn -180 keeps the robot end where the chest-spine measurement put it"
   }
  },
  "_roll_candidates": [

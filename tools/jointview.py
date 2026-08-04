@@ -154,6 +154,20 @@ class View:
         self.pose = "f04" if self.pose == "f00" else "f00"
         self.load()
 
+    def below_feet(self, margin=0.04):
+        """Points sitting under the foot plane — the floating-component report.
+
+        Returned rather than judged: my automatic tuck fires on nothing
+        because it demands a part be ENTIRELY below the plane, and the
+        numbers cannot tell a reported chassis from an unreported one
+        (cryofin 2.8%, analog 3.9%, blackstar 3.4% and blackstar was never
+        reported). So the viewer shows them and a human says which are wrong.
+        """
+        y = self.pts[:, 1]
+        h = float(y.max() - y.min())
+        plane = float(np.percentile(y, 5)) - h * margin
+        return self.pts[y < plane], plane
+
     def cur(self):
         return self.joints[self.sel] if self.joints else None
 
@@ -206,6 +220,11 @@ def draw(v, ax):
         ax.annotate(f"J{j['i']}", (mxy[0], mxy[1]), color=col, zorder=12,
                     xytext=(10, 8), textcoords="offset points",
                     fontsize=13, fontweight="bold")
+    # anything under the foot plane, drawn hot so it is findable
+    low, plane = v.below_feet()
+    if len(low):
+        lxy, _ = project(low - v.centre, v.yaw, v.pitch, v.zoom)
+        ax.scatter(lxy[:, 0], lxy[:, 1], s=3.0, c="#ff9a3c", zorder=6)
     lim = v.span * 0.62
     ax.set_xlim(-lim, lim)
     ax.set_ylim(-lim, lim)
@@ -214,7 +233,9 @@ def draw(v, ax):
     j = v.cur()
     scope = f"{len(v.bad)} bad" if v.only_bad else f"{len(v.joints)} joints"
     mode = "ROBOT (pivots are NOT in this frame)" if v.pose == "f04" else "VEHICLE — pivot frame"
+    nlow = len(v.below_feet()[0])
     clip = f"  clip:{v.clip}" if v.clip else ""
+    clip += f"  below-feet:{nlow}" if nlow else ""
     ax.set_title(f"{v.name}  [{mode}]  [{scope}]{clip}\n{describe(j) if j else 'no joint data'}",
                  color="#d8dee9", fontsize=11, loc="left", family="monospace")
 
