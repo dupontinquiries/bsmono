@@ -749,6 +749,81 @@ pub fn run(args: &[String]) {
         println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
         return;
     }
+    if name == "redirect" {
+        // THE REDIRECT. A glancing touch on a moving ball should make it
+        // FASTER, not merely send it elsewhere — you do not have to beat the
+        // ball's speed, you have to add to it. Easy to claim and easy to get
+        // wrong in either direction: too little and a tip is a waste of a
+        // position, too much and every brush is a rocket.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // a ball travelling, a car arriving at an angle
+        let tip = |ball_speed: f32, car_speed: f32, angle_deg: f32| -> (f32, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let gy = world.ground_h(0.0, 0.0);
+            let dir = Vec3::new(0.0, 0.0, -1.0);
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, gy + ball.r + 0.6, 0.0);
+            ball.vel = dir * ball_speed;
+            ball.prev = ball.pos;
+            // the car comes in from the side, at `angle` off the ball's line
+            let a = angle_deg.to_radians();
+            let approach = Vec3::new(a.sin(), 0.0, -a.cos());
+            // START IN REACH. A car chasing an 18 m/s ball at 20 m/s closes
+            // at barely one metre a second, so from 2.2 m back it never
+            // touched it inside the test window and every gain read zero.
+            // A redirect happens when the car is ALREADY there.
+            car.pos = ball.pos - approach * 1.70 - Vec3::Y * 0.45;
+            car.rot = glam::Quat::from_rotation_y(-a);
+            car.sync_rot();
+            car.vel = approach * car_speed;
+            let c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            let before = ball.vel.length();
+            let mut peak = before;
+            for _ in 0..60 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                peak = peak.max(ball.vel.length());
+            }
+            (before, peak)
+        };
+        println!("{:>8} {:>8} {:>8} {:>9} {:>9}", "ball", "car", "angle", "after", "gain");
+        let mut gains = Vec::new();
+        for (bs, cs, ang) in [
+            (18.0f32, 20.0f32, 15.0f32),
+            (18.0, 20.0, 35.0),
+            (18.0, 20.0, 60.0),
+            (28.0, 24.0, 20.0),
+            (10.0, 8.0, 25.0),
+        ] {
+            let (before, after) = tip(bs, cs, ang);
+            let gain = after - before;
+            gains.push(gain);
+            println!("{:>8.1} {:>8.1} {:>7.0}d {:>9.1} {:>+9.1}", bs, cs, ang, after, gain);
+        }
+        // I expected a wider angle to add LESS, and the measurement says the
+        // opposite — correctly. A 60 degree impact is a side-on HIT, and a
+        // big one; the redirect is about what a SHALLOW touch does, which
+        // used to be almost nothing. Both belong, and the checks should say
+        // what is actually true rather than what I guessed.
+        check("a shallow tip now speeds the ball up", gains[0] > 2.0);
+        check("a square hit is still the bigger event", gains[2] > gains[0]);
+        // ...and the limit that keeps it honest: you cannot feed a ball that
+        // is already going faster than you are. A 28 m/s ball tipped by a
+        // 24 m/s car gains nothing, which is exactly right — the redirect is
+        // the car's own speed resolved along the ball's line, and there is
+        // none to give.
+        check("a car slower than the ball cannot add to it", gains[3] < 1.0);
+        check("a gentle touch stays gentle", gains[4] < 2.0);
+        check("nothing is turned into a rocket", gains.iter().all(|g| *g < 22.0));
+        println!("{}", if pass { "REDIRECT: PASS" } else { "REDIRECT: FAIL" });
+        return;
+    }
     if name == "carry" {
         // TURNING WITH THE BALL ON THE HOOD.
         //
@@ -1884,6 +1959,81 @@ pub fn run(args: &[String]) {
         let ok = worst_median <= 2.0 && (8.0..20.0).contains(&hull_creased);
         println!("   our hull: median {worst_median:.1}d (refs 0.4-2.2), creased {hull_creased:.1}% (refs 10.4%)");
         println!("{}", if ok { "SHELL: PASS" } else { "SHELL: FAIL" });
+        return;
+    }
+    if name == "redirect" {
+        // THE REDIRECT. A glancing touch on a moving ball should make it
+        // FASTER, not merely send it elsewhere — you do not have to beat the
+        // ball's speed, you have to add to it. Easy to claim and easy to get
+        // wrong in either direction: too little and a tip is a waste of a
+        // position, too much and every brush is a rocket.
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<48} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        // a ball travelling, a car arriving at an angle
+        let tip = |ball_speed: f32, car_speed: f32, angle_deg: f32| -> (f32, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let gy = world.ground_h(0.0, 0.0);
+            let dir = Vec3::new(0.0, 0.0, -1.0);
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, gy + ball.r + 0.6, 0.0);
+            ball.vel = dir * ball_speed;
+            ball.prev = ball.pos;
+            // the car comes in from the side, at `angle` off the ball's line
+            let a = angle_deg.to_radians();
+            let approach = Vec3::new(a.sin(), 0.0, -a.cos());
+            // START IN REACH. A car chasing an 18 m/s ball at 20 m/s closes
+            // at barely one metre a second, so from 2.2 m back it never
+            // touched it inside the test window and every gain read zero.
+            // A redirect happens when the car is ALREADY there.
+            car.pos = ball.pos - approach * 1.70 - Vec3::Y * 0.45;
+            car.rot = glam::Quat::from_rotation_y(-a);
+            car.sync_rot();
+            car.vel = approach * car_speed;
+            let c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            let before = ball.vel.length();
+            let mut peak = before;
+            for _ in 0..60 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                peak = peak.max(ball.vel.length());
+            }
+            (before, peak)
+        };
+        println!("{:>8} {:>8} {:>8} {:>9} {:>9}", "ball", "car", "angle", "after", "gain");
+        let mut gains = Vec::new();
+        for (bs, cs, ang) in [
+            (18.0f32, 20.0f32, 15.0f32),
+            (18.0, 20.0, 35.0),
+            (18.0, 20.0, 60.0),
+            (28.0, 24.0, 20.0),
+            (10.0, 8.0, 25.0),
+        ] {
+            let (before, after) = tip(bs, cs, ang);
+            let gain = after - before;
+            gains.push(gain);
+            println!("{:>8.1} {:>8.1} {:>7.0}d {:>9.1} {:>+9.1}", bs, cs, ang, after, gain);
+        }
+        // I expected a wider angle to add LESS, and the measurement says the
+        // opposite — correctly. A 60 degree impact is a side-on HIT, and a
+        // big one; the redirect is about what a SHALLOW touch does, which
+        // used to be almost nothing. Both belong, and the checks should say
+        // what is actually true rather than what I guessed.
+        check("a shallow tip now speeds the ball up", gains[0] > 2.0);
+        check("a square hit is still the bigger event", gains[2] > gains[0]);
+        // ...and the limit that keeps it honest: you cannot feed a ball that
+        // is already going faster than you are. A 28 m/s ball tipped by a
+        // 24 m/s car gains nothing, which is exactly right — the redirect is
+        // the car's own speed resolved along the ball's line, and there is
+        // none to give.
+        check("a car slower than the ball cannot add to it", gains[3] < 1.0);
+        check("a gentle touch stays gentle", gains[4] < 2.0);
+        check("nothing is turned into a rocket", gains.iter().all(|g| *g < 22.0));
+        println!("{}", if pass { "REDIRECT: PASS" } else { "REDIRECT: FAIL" });
         return;
     }
     if name == "carry" {
@@ -5079,8 +5229,13 @@ pub fn run(args: &[String]) {
                 let cary = car2.vel.y;
                 c2.jump_pressed = true;
                 ev2.pulses.clear();
+                // the pulse is armed on release and fires at the start of the
+                // NEXT step, so the body lands before the car shoves off —
+                // the test has to allow that tick
                 physics::step(&mut car2, &mut b2, &mut world, &c2, &cfg, DT, &mut ev2);
                 c2.jump_pressed = false;
+                c2.jump_held = false;
+                physics::step(&mut car2, &mut b2, &mut world, &c2, &cfg, DT, &mut ev2);
                 let after = b2.vel.length();
                 println!(
                     "   through physics::step: ball {before:.1} -> {after:.1} m/s, car lift {:+.1}, pulses {}",
@@ -5113,6 +5268,8 @@ pub fn run(args: &[String]) {
                 let v0 = b3.vel.length();
                 c3.jump_pressed = true;
                 ev3.pulses.clear();
+                physics::step(&mut car2, &mut b3, &mut world, &c3, &cfg, DT, &mut ev3);
+                c3.jump_pressed = false;
                 physics::step(&mut car2, &mut b3, &mut world, &c3, &cfg, DT, &mut ev3);
                 println!("   pulse after reset: ball {v0:.1} -> {:.1} m/s", b3.vel.length());
                 check("and the pulse still pushes the ball afterwards", ev3.pulses.len() == 1 && b3.vel.length() > v0 + 1.0);
@@ -5197,6 +5354,7 @@ pub fn run(args: &[String]) {
             ball.vel = Vec3::ZERO;
             ball.prev = at_release;
             let before = ball.vel.length();
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
             physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
             let out = ball.vel.length() - before;
             powers.push(out);

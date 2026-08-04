@@ -3856,6 +3856,54 @@ the ray, and how much is the blur standing in for it. The slider now spans
 nearly SIX times in cost rather than four, and the bottom of it is a
 deliberate look — soft reflections — instead of a broken version of the top.
 
+## v1.118.0 — the redirect
+
+A glancing touch on a moving ball now makes it FASTER rather than only
+sending it elsewhere. That is the shot the game is built around — you do not
+have to beat the ball's speed, you have to add to it — and it is what makes
+a well-read tip worth more than a big hit from a bad position.
+
+The term is the car's own velocity resolved along the direction the ball is
+already travelling, so driving WITH the ball feeds it and driving across it
+gives the deflection alone. Measured, with an 18 m/s ball and a 20 m/s car:
+
+    approach 15 deg   +3.0 m/s     a tip, and it used to be nothing
+    approach 35 deg   +6.1
+    approach 60 deg  +14.1         (a side-on hit, which was always big)
+    28 m/s ball, 24 m/s car    +0.0
+
+That last row is the limit that keeps it honest: you cannot feed a ball
+already travelling faster than you are, because the redirect IS your speed
+along its line and there is none to give.
+
+HOVERCARS GET IT TOO, in both the field and the pulse — the field is how a
+hovercar touches the ball, so that is where its redirect lives. Without it a
+hovercar could only ever push a ball about, never sharpen it.
+
+TWO GATES WERE NEEDED, both found by regression rather than foresight:
+
+  * ONLY GLANCING TOUCHES. Weighted by contact strength alone it also fired
+    on flicks, and speed added along the ball's line is speed not spent
+    going up: every flick's launch angle fell from 23 degrees to 16. The
+    contact normal tells them apart — across the ball's travel on a tip,
+    with it on a flick.
+  * NOT WHILE ROTATING. A flick is a THROW, and `spin` only starts counting
+    at 3 rad/s, so an early-dodge contact still took two thirds of the
+    redirect. A rotating car is throwing, full stop.
+
+THE PULSE FIRES ONE TICK LATE, as asked, and the reasoning is worth keeping:
+releasing and blasting in the same step means the car is already moving away
+when the contact resolves, so the body never quite lands on the ball — the
+blast does everything and the geometry does nothing. Arming on release and
+firing at the start of the next step puts them in the right order.
+
+STILL OPEN: the backflip flick lofts at 33 degrees where the harness wants
+45, and it measured 52 earlier in the project. It is NOT the redirect —
+gating that off entirely leaves the number unchanged — so it is an older
+regression that this session's work merely made visible. The check is left
+failing rather than relaxed, because a threshold moved to match a regression
+is how a regression becomes permanent.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

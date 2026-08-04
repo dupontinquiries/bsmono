@@ -75,6 +75,8 @@ pub struct Car {
     pub pulse_fire: f32,
     /// 0..1 wind-up on a held jump (hovercars)
     pub pulse_charge: f32,
+    /// released, and firing at the start of the next step
+    pub pulse_armed: bool,
     pub wheel_spin: f32,
     pub steer_vis: f32,
     // jump / dodge state
@@ -206,6 +208,7 @@ impl Car {
             pulse_t: 0.0,
             pulse_fire: 0.0,
             pulse_charge: 0.0,
+            pulse_armed: false,
             half_w: 0.32,
             susp: 0.0,
             prev: Vec3::ZERO,
@@ -446,8 +449,24 @@ pub fn step(
     // strength, which is the old behaviour; a hold winds up and lets go when
     // you do. Firing on the press instead would make the charge unusable —
     // there would be nothing left to release.
-    if car.hover.is_some() && !c.jump_held && car.pulse_charge > 0.0 && hover_pulse(car, ball, ev) {
-        ev.jumped = true;
+    // ---- THE PULSE FIRES ONE TICK LATE, ON PURPOSE ----
+    //
+    // Releasing and blasting in the same step means the car is already
+    // moving away when the contact is resolved, so the body never quite
+    // lands on the ball — the blast does everything and the geometry does
+    // nothing. Arming on release and firing at the START of the next step
+    // puts them in the right order: the body hits, the contact impulse
+    // resolves, and only then does the car shove off. That single frame is
+    // the difference between a pulse that feels aimed and one that feels
+    // like an area effect.
+    if car.pulse_armed {
+        car.pulse_armed = false;
+        if hover_pulse(car, ball, ev) {
+            ev.jumped = true;
+        }
+    }
+    if car.hover.is_some() && !c.jump_held && car.pulse_charge > 0.0 {
+        car.pulse_armed = true;
     }
 
     // blast-off launchers: anything on the ring gets the arrow
@@ -1732,6 +1751,15 @@ pub fn hover_pulse(car: &mut Car, ball: &mut Ball, ev: &mut StepEvents) -> bool 
         let core = f * f * (0.45 + 0.55 * f); // peaks at the centre, tapers hard
         let push = h.pulse_k * core * power;
         ball.vel += (to / d) * push;
+        // and the pulse adds to a ball already moving, which is what makes it
+        // a redirect rather than a reset — catching a fast ball and pushing
+        // it faster is the whole point of reading the play early
+        let bs = ball.vel.length();
+        if bs > 2.0 {
+            let along = ball.vel / bs;
+            let with_it = car.vel.dot(along).max(0.0);
+            ball.vel += along * with_it * 0.35 * core * power;
+        }
         ev.touches.push((ball.pos - (to / d) * ball.r, push));
     }
     ev.pulses.push((car.pos, h.pulse_r, h.pulse_k * power));
@@ -1763,6 +1791,16 @@ pub fn hover_field(car: &mut Car, ball: &mut Ball, dt: f32, boost: bool, ev: &mu
         push *= 3.4; // the pulse: the hovercar's shot
     }
     ball.vel += dir * push * dt;
+    // A HOVERCAR REDIRECTS TOO. The field is how it touches the ball, so
+    // that is where its redirect lives: pressure applied along the ball's
+    // own travel adds to it, exactly as a wheeled car's contact does. Without
+    // this a hovercar could only ever push a ball around, never sharpen it.
+    let bs = ball.vel.length();
+    if bs > 2.0 {
+        let along = ball.vel / bs;
+        let with_it = car.vel.dot(along).max(0.0);
+        ball.vel += along * with_it * 0.30 * cone * reach * dt;
+    }
     // the ball presses back, so the field is not a free tractor beam
     car.vel -= dir * push * dt * 0.16;
     ball.ang += dir.cross(Vec3::Y) * push * dt * 0.05;
@@ -2007,6 +2045,43 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
         // touch and a committed 22 m/s strike got the same treatment. Scale
         // it with the hit — dribble touches stay gentle, real shots punch.
         ball.vel += dir * strength * (0.06 + 0.55 * soft);
+
+        // ---- THE REDIRECT ----
+        //
+        // A glancing touch on a moving ball should make it FASTER, not just
+        // send it elsewhere. That is the shot the whole game is built around
+        // — you do not have to beat the ball's speed, you have to add to it —
+        // and it is what makes a well-read tip more valuable than a big hit
+        // from a bad position.
+        //
+        // The term is the car's own velocity resolved along the direction
+        // the ball is already travelling: drive with the ball and you feed
+        // it, drive across it and you get the deflection alone. It scales
+        // with the contact rather than being free, so brushing past does
+        // little and a committed touch does a lot.
+        let ball_speed = ball.vel.length();
+        if ball_speed > 2.0 {
+            let along = ball.vel / ball_speed;
+            let with_it = car.vel.dot(along).max(0.0);
+            // A REDIRECT IS A GLANCING TOUCH. Weighting it only by contact
+            // strength meant it also fired on a FLICK, where the car is
+            // driving straight along the ball's line — and adding speed
+            // along that line flattened every flick's launch angle (23 deg
+            // down to 16). The tell is the contact normal: on a tip it is
+            // across the ball's travel, on a flick it is with it.
+            let glance = 1.0 - n.dot(along).abs();
+            let bite = (0.30 + 0.70 * soft) * (-vn).min(18.0) / 18.0;
+            // ...and none of it during a flick. A flick is a THROW — the car
+            // rotating out from under the ball — and the redirect is a
+            // TOUCH. Letting both fire on the same contact flattened the
+            // backflip flick from 52 degrees to 33, because speed added
+            // along the ball's travel is speed not spent going up.
+            //  only starts counting at 3 rad/s, so an early-dodge
+            // contact still took two thirds of the redirect and the backflip
+            // stayed flat. A rotating car is throwing, full stop.
+            let touching = if car.omega.length() > 2.5 { 0.0 } else { 1.0 };
+            ball.vel += along * with_it * 0.55 * bite * glance * touching;
+        }
         // ...and the hood's own motion carries the ball with it. Without
         // this a flick is only ever as strong as the collision, when in
         // truth the car is throwing the ball, not hitting it.
