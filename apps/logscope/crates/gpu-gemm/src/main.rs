@@ -3875,8 +3875,11 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         for bits in [2u32, 3, 4, 8] {
             let bound = level_bound(bits).unwrap();
             let (scale, q) = quantize_block(&[bound, 0.5, -0.5], bits).unwrap();
-            ck(&format!("q{bits}: ties round to EVEN (0.5 -> 0), not away from zero"),
-               scale == 1.0 && q[1] == 0 && q[2] == 0);
+            // AWAY from zero, measured on hardware rather than read from the WGSL spec. The spec
+            // says ties-to-even; Metal implements ties-away and naga lowers onto it. Encoding the
+            // spec's rule here took gate-q4k from 1104 differing words to 9680.
+            ck(&format!("q{bits}: ties round AWAY from zero (0.5 -> 1) — Metal's rule, not the spec's"),
+               scale == 1.0 && q[1] == 1 && q[2] == -1);
             let recip = 2.2067833f32 * (1.0f32 / bound);
             let (s2, _) = quantize_block(&[2.2067833f32, 0.0], bits).unwrap();
             ck(&format!("q{bits}: the scale is a RECIPROCAL product, not a quotient"),
