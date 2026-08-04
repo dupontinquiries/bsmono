@@ -457,3 +457,30 @@ low-pressure reading, which is the worst possible way to say "no barometer".
 feature is `gtk`, which pulls pango and libadwaita and does not build in this
 container. Same shape as logscope's lean build: the flag exists, and nothing was
 exercising it.
+
+## ambient-learner joins the table, and the table was the problem
+
+I reported this app as "not ported at all". That was wrong in one direction and
+right in another, and both halves matter.
+
+**Wrong:** it has an egui port. `src/ui/egui/` holds the pressure gauge and now
+the live page, behind an `egui` feature, and 34 tests pass.
+
+**Right:** the audit could not see it, so it had no row — and an app with no row
+reads as an app with nothing to do rather than an app nobody has measured. Two
+separate causes, both fixed:
+
+1. It was not in `PORTS` at all.
+2. `port_text` walked only `egui-frontend/`. This app's port is a FEATURE of the
+   existing crate rather than a separate one, so it lives inline. The discovery
+   now accepts either shape.
+
+With both fixed it lands at **39% named / 11% code across 18 surfaces**, and it
+is the only app in the table with **no egui binary and no app-def** — it cannot
+be launched as an egui app at all yet. That is a more useful thing to know than
+the "0%" I would have guessed.
+
+Its GTK dependencies also do not build in this container (`pango-sys` fails), so
+everything here is `--no-default-features --features egui`. That is the same
+lean-build shape as logscope and worth remembering before believing a build
+error from this app.
