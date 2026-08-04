@@ -288,9 +288,7 @@ Verified by, in order of strength:
 
 ### Elasticity debts
 
-- **Constant-strain triangles.** Poor in bending; the finest mesh tested reaches ~85% of the beam
-  solution. Quadratic (T6) elements or incompatible modes are the fix, and both need real
-  quadrature — which is where the closed-form element integral finally ends.
+- **Constant-strain triangles are stiff in bending — measured, not assumed.** See the study below.
 - **In-plane isotropy only.** `constitutive_of` uses a transversely isotropic material's in-plane
   constants, which is exact for in-plane loading and silently wrong for anything involving z. A
   full orthotropic `D` is needed before FR-4 warp or nacre stacking can be modelled.
@@ -336,3 +334,58 @@ this kind can reach it, because bounds assume perfectly bonded phases while nacr
 interfaces sliding, deflecting and bridging. **A homogenization that reproduces nacre's stiffness
 proves nothing about its toughness** — which is the clearest statement I can make of why the
 cohesive-interface model is the real work.
+
+
+## CST bending: what the measurement actually says
+
+The earlier note ("~85% of the beam solution") was a single data point from one mesh shape, and
+following it up changed two conclusions.
+
+**It converges correctly, at the expected rate.** Cantilever at L/h = 10, tip deflection as a
+fraction of the exact 2D answer:
+
+```
+   8x2      32 tris    29.8%      rate  —
+  16x4     128 tris    62.5%      rate 0.91
+  32x8     512 tris    86.7%      rate 1.50
+  64x16   2048 tris    96.2%      rate 1.78
+ 128x32   8192 tris    98.9%      rate 1.76
+```
+
+Approaching O(h²) as it should. The "85%" was just the 32×8 row.
+
+**The reference was wrong, and the test was passing for the wrong reason.** A plane-stress solve
+converges to the exact *two-dimensional elasticity* answer, which includes shear deflection and
+therefore sits **above** Euler–Bernoulli — by 0.78% here. The old test asserted the FEM "must not
+overshoot the beam solution" against the Euler value, which is false: a converged solve is supposed
+to exceed it. It passed only because CST is stiff enough never to get there, so **a better element
+would have failed a correct implementation.** The reference is now Timoshenko.
+
+**Element shape matters more than element count.** At a fixed budget of 1024 elements, trading
+length resolution for thickness resolution:
+
+```
+  256x2   63.5%      128x4   86.7%      64x8   93.7%      32x16   88.8%      16x32   68.5%
+```
+
+Thirty points of accuracy for the same cost, decided entirely by aspect ratio, with a clear optimum
+at near-square cells. `Mesh::worst_aspect` now reports this and a regression test guards it — it is
+a cheap pre-check that predicts accuracy loss before any solve runs.
+
+### What to do about it, by regime
+
+- **Thick sections, L/h ≲ 20:** CST is adequate. Use near-square elements and refine; 96% at 2k
+  elements is fine for most purposes. No code change needed, just meshing discipline.
+- **Thin structures — PCB warp, EUV mask distortion:** this is where CST fails and **more elements
+  will not save it.** Near-square cells at L/h = 1000 means ~8000 along the length for 8 through
+  the thickness, tens of thousands of elements for one cross-section. The right answer is not a
+  better 2D element but a **different formulation**: plate or shell elements, whose unknowns are
+  mid-surface displacement and rotations and which need one element through the thickness by
+  construction. 2D plane-stress continuum is the wrong model for a thin plate regardless of element
+  quality.
+- **Stress concentration and fracture:** neither helps. Crack-tip fields are singular and need
+  local refinement, quarter-point elements, or an enrichment — and the J-integral is evaluated on a
+  contour away from the tip precisely to avoid depending on how badly the tip is resolved.
+- **T6 quadratic triangles** would fix the first regime handsomely and the second not at all. Worth
+  doing when the element integral needs real quadrature anyway — nonlinear materials, curved
+  geometry, full orthotropy — rather than for bending alone.

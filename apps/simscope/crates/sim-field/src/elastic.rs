@@ -352,19 +352,31 @@ mod tests {
     }
 
     #[test]
-    fn cantilever_deflection_converges_toward_the_beam_solution_from_below() {
-        // Constant-strain triangles cannot represent bending curvature, so a coarse mesh is too
-        // stiff and the tip deflects too little. What must hold is that refinement moves it
-        // monotonically toward PL^3/3EI — the error is a known property of the element, not a bug,
-        // and asserting the trend is honest where asserting the value would not be.
+    fn cantilever_deflection_converges_toward_the_exact_2d_solution() {
+        // Two things this test gets right that an earlier version did not.
+        //
+        // First, the reference is TIMOSHENKO, not Euler-Bernoulli. A plane-stress solve converges
+        // to the exact two-dimensional elasticity answer, which includes shear deflection and
+        // therefore sits ABOVE the Euler value — here by 0.78% at L/h = 10. The earlier test
+        // asserted the FEM "must not overshoot the beam solution" against Euler, which is simply
+        // false: a converged solve is supposed to exceed it slightly. It passed only because CST
+        // is stiff enough never to get there, so a better element would have failed a correct
+        // implementation.
+        //
+        // Second, constant-strain triangles cannot represent bending curvature, so a coarse mesh
+        // is too stiff and refinement must soften it monotonically. That is a property of the
+        // element, not a defect, and the honest assertion is the trend plus a measured floor.
         let (l, h, t, p_load) = (10.0, 1.0, 1.0, 1000.0);
         let i_area = t * h * h * h / 12.0;
         let euler = p_load * l * l * l / (3.0 * E * i_area);
-        let d = constitutive(E, NU, Assumption::PlaneStress);
+        let g = E / (2.0 * (1.0 + NU));
+        let timoshenko = euler + p_load * l / ((5.0 / 6.0) * g * h * t);
+        assert!(timoshenko > euler, "shear always adds deflection");
 
+        let d = constitutive(E, NU, Assumption::PlaneStress);
         let mut tips = Vec::new();
-        for n in [8usize, 16, 32] {
-            let m = Mesh::rectangle(l, h, n, n / 4);
+        for (nx, ny) in [(16usize, 4usize), (32, 8), (64, 16)] {
+            let m = Mesh::rectangle(l, h, nx, ny);
             let k = assemble(&m, &d, t);
             let mut fixed = Vec::new();
             for (i, q) in m.xy.iter().enumerate() {
@@ -373,24 +385,63 @@ mod tests {
                     fixed.push(Constraint { dof: 2 * i + 1, value: 0.0 });
                 }
             }
-            // Distribute the tip load over the free-end nodes.
             let tip: Vec<usize> = (0..m.nodes()).filter(|&i| (m.xy[i][0] - l).abs() < 1e-12).collect();
             let mut f = vec![0.0; 2 * m.nodes()];
             for &i in &tip {
                 f[2 * i + 1] = -p_load / tip.len() as f64;
             }
             let u = solve(&k, &f, &fixed, 1e-12).unwrap();
-            let tip_v = tip.iter().map(|&i| u[2 * i + 1]).sum::<f64>() / tip.len() as f64;
-            tips.push(tip_v.abs());
+            tips.push((tip.iter().map(|&i| u[2 * i + 1]).sum::<f64>() / tip.len() as f64).abs());
         }
         for w in tips.windows(2) {
             assert!(w[1] > w[0], "refinement must soften the beam: {tips:?}");
         }
-        for tv in &tips {
-            assert!(*tv < euler * 1.05, "CST must not overshoot the beam solution: {tv:e} vs {euler:e}");
-        }
-        let closeness = tips[2] / euler;
-        assert!(closeness > 0.7, "finest mesh reached only {:.2} of the beam solution", closeness);
+        // Measured: 62.5%, 86.7%, 96.2% of Timoshenko at these three densities.
+        assert!(
+            tips[2] / timoshenko > 0.94,
+            "finest mesh reached {:.1}% of the exact solution",
+            tips[2] / timoshenko * 100.0
+        );
+        assert!(tips[2] < timoshenko, "CST is stiff, so it must still be under");
+    }
+
+    #[test]
+    fn element_shape_matters_more_than_element_count_in_bending() {
+        // The measured finding, guarded as a regression: at a FIXED element budget, a cantilever
+        // meshed with near-square elements reaches ~94% of the exact deflection while an elongated
+        // mesh of the same cost reaches ~64%. Anyone tempted to refine only along the length is
+        // spending elements for almost nothing.
+        let (l, h, t, p_load) = (10.0, 1.0, 1.0, 1000.0);
+        let d = constitutive(E, NU, Assumption::PlaneStress);
+        let run = |nx: usize, ny: usize| {
+            let m = Mesh::rectangle(l, h, nx, ny);
+            let k = assemble(&m, &d, t);
+            let mut fixed = Vec::new();
+            for (i, q) in m.xy.iter().enumerate() {
+                if q[0].abs() < 1e-12 {
+                    fixed.push(Constraint { dof: 2 * i, value: 0.0 });
+                    fixed.push(Constraint { dof: 2 * i + 1, value: 0.0 });
+                }
+            }
+            let tip: Vec<usize> = (0..m.nodes()).filter(|&i| (m.xy[i][0] - l).abs() < 1e-12).collect();
+            let mut f = vec![0.0; 2 * m.nodes()];
+            for &i in &tip {
+                f[2 * i + 1] = -p_load / tip.len() as f64;
+            }
+            let u = solve(&k, &f, &fixed, 1e-12).unwrap();
+            let v = (tip.iter().map(|&i| u[2 * i + 1]).sum::<f64>() / tip.len() as f64).abs();
+            (v, m.worst_aspect())
+        };
+        let (elongated, aspect_bad) = run(256, 2); // 1024 elements, 128:1 cells
+        let (balanced, aspect_good) = run(64, 8); // 1024 elements, near-square cells
+        assert!(balanced > elongated * 1.3, "square cells should win decisively: {balanced:e} vs {elongated:e}");
+        // 64x8 cells are 1.25:1 and score ~1.8; 256x2 cells are 12.8:1 and score ~11. The metric
+        // flags the bad mesh six times over, which is the point — it is a cheap pre-check that
+        // predicts the accuracy loss before any solve is run.
+        assert!(
+            aspect_good < aspect_bad / 4.0,
+            "the quality metric should flag the elongated mesh: {aspect_good:.2} vs {aspect_bad:.2}"
+        );
     }
 
     #[test]
@@ -416,3 +467,4 @@ mod tests {
         assert!((von_mises([0.0, 0.0, 100e6]) - 3f64.sqrt() * 100e6).abs() < 1.0);
     }
 }
+

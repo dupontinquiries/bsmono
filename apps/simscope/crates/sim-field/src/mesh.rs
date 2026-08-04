@@ -29,6 +29,32 @@ impl Mesh {
         (q[0] - p[0]) * (r[1] - p[1]) - (r[0] - p[0]) * (q[1] - p[1])
     }
 
+    /// Element shape quality: the ratio of the longest edge to the shortest altitude, normalised
+    /// so an equilateral triangle scores 1.0. Larger is worse.
+    ///
+    /// This matters more than it looks for bending. A constant-strain triangle carries constant
+    /// strain, so representing curvature requires several elements through the thickness — and a
+    /// measured study (see PLAN.md) found that at a fixed element budget, a cantilever reached
+    /// 93.7% of the exact deflection with near-square elements and only 63.5% with elongated
+    /// ones. Same cost, thirty points of accuracy, decided entirely by element shape.
+    pub fn worst_aspect(&self) -> f64 {
+        let mut worst: f64 = 0.0;
+        for t in 0..self.tri.len() {
+            let [a, b, c] = self.tri[t];
+            let (p, q, r) = (self.xy[a], self.xy[b], self.xy[c]);
+            let e = |u: [f64; 2], v: [f64; 2]| (u[0] - v[0]).hypot(u[1] - v[1]);
+            let longest = e(p, q).max(e(q, r)).max(e(r, p));
+            let area = (self.double_area(t) / 2.0).abs();
+            if area <= 0.0 {
+                return f64::INFINITY;
+            }
+            // shortest altitude = 2*area / longest edge
+            let ratio = longest * longest / (2.0 * area);
+            worst = worst.max(ratio / (2.0 / 3f64.sqrt()));
+        }
+        worst
+    }
+
     /// Longest edge in the mesh — the `h` a convergence study is measured against.
     pub fn h_max(&self) -> f64 {
         let mut h: f64 = 0.0;
@@ -217,6 +243,21 @@ mod tests {
         for i in seg {
             assert!((m.xy[i][1] - 0.2).abs() < 1e-12);
         }
+    }
+
+    #[test]
+    fn aspect_ratio_scores_equilateral_as_one_and_slivers_as_worse() {
+        // A square cell split into two right triangles has legs 1,1 and hypotenuse sqrt(2), so its
+        // score is modest; a 10:1 rectangle split the same way is much worse.
+        let square = Mesh::rectangle(1.0, 1.0, 4, 4).worst_aspect();
+        let sliver = Mesh::rectangle(10.0, 1.0, 4, 4).worst_aspect();
+        assert!(square >= 1.0, "nothing beats equilateral, got {square}");
+        // A square split by its diagonal gives right isoceles triangles: legs 1, hypotenuse sqrt2,
+        // area 1/2, so the raw ratio is 2 and the normalised score is exactly sqrt(3) = 1.732.
+        // That is the best a structured tensor grid can do, and an earlier threshold of 1.5 was
+        // asserting something no quad-split mesh can achieve.
+        assert!((square - 3f64.sqrt()).abs() < 1e-9, "square cells score sqrt(3), got {square}");
+        assert!(sliver > 5.0 * square, "10:1 cells should score far worse: {sliver} vs {square}");
     }
 
     #[test]
