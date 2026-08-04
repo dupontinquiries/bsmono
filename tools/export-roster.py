@@ -170,7 +170,14 @@ def main():
     # stand up (robot height clearly above vehicle height, AND height as its
     # own longest axis, so a body on a diagonal does not pass). Its output
     # is used when present; the tuned list is the fallback.
-    screened = os.environ.get("ROSTER", "/tmp/foldable.json")
+    # tools/roster.json is the CURATED list: everything already shipping,
+    # plus the body plans the screener was never handed (spiders, hawks, a
+    # beast, a dragonflyer, mechs), plus the raid bosses. 259 screened
+    # chassis is more than a five-pose export can carry; this is the subset
+    # worth carrying.
+    screened = os.environ.get("ROSTER", os.path.join(HERE, "roster.json"))
+    if not os.path.isfile(screened):
+        screened = "/tmp/foldable.json"
     if os.path.isfile(screened):
         tuning = json.load(open(screened))
         print(f"roster from {screened}: {len(tuning)} screened chassis")
@@ -257,6 +264,14 @@ def main():
             if deg:
                 yaw_pose(pose_dir, deg, "y")
         if good:
+            # A RAID BOSS IS BIGGER THAN A BOT, and the scale ships BESIDE the
+            # poses rather than being hard-coded in the engine, so adding a
+            # boss later is a data change. 2.6x reads as a boss at the
+            # distance you first see one without pushing it past the terrain
+            # collision the world can actually support.
+            scale = 2.6 if iqm.startswith(("imported_raidboss", "imported_raid_")) else 1.0
+            with open(os.path.join(d, "chassis.json"), "w") as f:
+                json.dump({"scale": scale, "boss": scale > 1.0, "source": iqm}, f)
             ok += 1
         tag = ", ".join(
             [x for x in (f"yaw {flat_yaw:.0f}" if flat_yaw else "",

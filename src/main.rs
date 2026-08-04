@@ -464,6 +464,12 @@ struct Chassis {
     /// the fitted rig, for the catalogue's joint inspector. Empty when the
     /// chassis shipped without a joints.json.
     joints: Vec<joints::Joint>,
+    /// SIZE MULTIPLIER, shipped beside the poses. A raid boss is 2.6x a bot,
+    /// and it is data rather than a constant so adding one is an export
+    /// rather than a recompile.
+    scale: f32,
+    /// does this chassis fight as a boss
+    boss: bool,
     /// jets fly instead of driving: never grounded, lift and nose thrust
     flight: bool,
 }
@@ -1254,6 +1260,20 @@ fn main() {
                 strip,
                 dirs,
                 joints: joints::load(&bdir.join("joints.json")),
+                scale: {
+                    // a tiny hand parse, same reasoning as joints.rs: the
+                    // file is written by a tool in this repo and adding a
+                    // derive crate to read two fields costs more than it saves
+                    let txt = std::fs::read_to_string(bdir.join("chassis.json")).unwrap_or_default();
+                    txt.find("\"scale\":")
+                        .and_then(|i| txt[i + 8..].split(|c| c == ',' || c == '}').next())
+                        .and_then(|v| v.trim().parse::<f32>().ok())
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .unwrap_or(1.0)
+                },
+                boss: std::fs::read_to_string(bdir.join("chassis.json"))
+                    .map(|t| t.contains("\"boss\": true") || t.contains("\"boss\":true"))
+                    .unwrap_or(false),
                 flight,
             });
         }
@@ -2268,6 +2288,22 @@ impl Game {
                 self.cam.poi = None;
                 self.cam.combat = false;
             }
+        }
+    }
+
+    /// Size multiplier for a model, 1.0 unless it is a boss.
+    fn chassis_scale(&self, model: usize) -> f32 {
+        match self.cars.xform.get(&model) {
+            Some(&(cid, _)) => self.cars.chassis[cid].scale,
+            None => 1.0,
+        }
+    }
+
+    /// Is this model a raid boss?
+    fn is_boss(&self, model: usize) -> bool {
+        match self.cars.xform.get(&model) {
+            Some(&(cid, _)) => self.cars.chassis[cid].boss,
+            None => false,
         }
     }
 
@@ -5194,6 +5230,12 @@ impl Game {
             let at = self.cam.pos + fwd * dist + off;
             // a slow turntable, so you see the whole car without touching it
             let spin = Quat::from_rotation_y(self.time * 0.5);
+            // A BOSS PREVIEWS AT BOSS SIZE. Scaling it up alone would put it
+            // through the camera, so the stand backs off by the same factor —
+            // the model reads as huge because the frame is the same and the
+            // thing in it is not.
+            let cscale = self.chassis_scale(show);
+            let at = if cscale > 1.0 { self.cam.pos + (at - self.cam.pos) * cscale } else { at };
 
             // NO 3D MARKER YET. It wants an ObjDraw with the renderer's raw
             // object format and a mesh to point at, and guessing at that
