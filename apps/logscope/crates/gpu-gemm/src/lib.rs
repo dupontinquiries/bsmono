@@ -3672,7 +3672,21 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                                 // Reciprocal, matching the shader: this driver turns `/` into a multiply by an
                                 // f32 reciprocal, and here an ULP crosses a .5 boundary where the two
                                 // round() rules then differ by a whole quantization level.
-                                let q = (w[base + j] * inv_scale).round().clamp(-7.0, 7.0) as i32;
+                                // ROUND-TIES-EVEN, matching WGSL. This is the last difference and the only one that
+                                // was never arithmetic:
+                                //
+                                //   WGSL round()      half to EVEN       round(2.5)=2
+                                //   Rust f32::round() half AWAY from 0   round(2.5)=3
+                                //
+                                // They differ only at exact .5 and only where the even neighbour is
+                                // lower — 0.5, 2.5, 4.5, 6.5. A 4-bit quantizer has levels -7..7, so
+                                // ties are rare per block and inevitable across many: 112 blocks hit
+                                // none, 70000 hit 1104.
+                                //
+                                // That is why every small-tensor check passed exactly while the large
+                                // one failed identically through four arithmetic fixes. Arithmetic
+                                // would have moved both.
+                                let q = (w[base + j] * inv_scale).round_ties_even().clamp(-7.0, 7.0) as i32;
                                 nb_c[lr * k + b * 32 + j] = (q + 8) as u8; // 1..=15, symmetric around 8
                             }
                         }
