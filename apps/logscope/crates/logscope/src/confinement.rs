@@ -167,3 +167,75 @@ mod tests {
         assert_eq!(mixed.enforcement_level(), Level::SelfConfined);
     }
 }
+
+/// Detect what is in force, warning only.
+///
+/// **Deliberately minimal**: this observes, it does not apply Landlock. Applying it is irreversible
+/// per process and would need a decision about which paths, which is a bigger question than a first
+/// step should answer. Warning first is the honest order — the system says what it can and cannot
+/// promise, and enforcement follows once the paths are understood.
+pub fn detect() -> Confinement {
+    let mut mechanisms = Vec::new();
+
+    // SELinux: /sys/fs/selinux/enforce is "1" when enforcing, "0" when permissive. Absent means the
+    // LSM is not loaded at all, which is different from loaded-and-permissive and is why absence is
+    // not recorded as a disabled mechanism.
+    if let Ok(v) = std::fs::read_to_string("/sys/fs/selinux/enforce") {
+        mechanisms.push(Mechanism::Selinux { enforcing: v.trim() == "1" });
+    }
+
+    // AppArmor: /proc/self/attr/current is "unconfined" when not, or a profile name followed by a
+    // mode. "(complain)" is AppArmor's permissive mode and must not count as confinement, for the
+    // same reason SELinux permissive does not.
+    if let Ok(v) = std::fs::read_to_string("/proc/self/attr/current") {
+        let v = v.trim();
+        if !v.is_empty() {
+            let confined = v != "unconfined" && !v.contains("(complain)");
+            mechanisms.push(Mechanism::AppArmor { confined });
+        }
+    }
+
+    // bubblewrap and flatpak both leave /.flatpak-info or set container=, which is the only signal
+    // available from inside — a namespace does not announce itself.
+    if std::path::Path::new("/.flatpak-info").exists()
+        || std::env::var_os("container").is_some() {
+        mechanisms.push(Mechanism::Bubblewrap);
+    }
+
+    // Landlock: reported as NOT applied, because this function does not apply it. Recording the
+    // kernel's SUPPORT as though it were protection would be the precise false assurance this module
+    // exists to prevent — a capability nobody used protects nothing.
+    mechanisms.push(Mechanism::Landlock { paths_restricted: false });
+
+    Confinement { mechanisms }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+
+    #[test]
+    fn detection_never_claims_LANDLOCK_it_did_not_apply() {
+        // The whole risk of a detector: recording the kernel's support as though it were protection.
+        // A capability nobody used protects nothing.
+        let c = detect();
+        assert!(c.mechanisms.iter().any(|m| matches!(m, Mechanism::Landlock { paths_restricted: false })));
+        assert!(!c.mechanisms.iter().any(|m| m.self_applied() && m.effective()));
+    }
+
+    #[test]
+    fn an_unconfined_container_reports_ADVISORY_and_says_so() {
+        // The expected result on most desktops, and it must read as a warning rather than as silence.
+        let c = detect();
+        if c.enforcement_level() == Level::AdvisoryOnly {
+            assert!(c.report().contains("NO KERNEL CONFINEMENT"));
+        }
+    }
+
+    #[test]
+    fn detection_does_not_PANIC_when_the_lsm_files_are_absent() {
+        // Most systems have neither, and a detector that fails on a normal machine is worse than no
+        // detector.
+        let _ = detect();
+    }
+}

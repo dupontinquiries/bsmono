@@ -484,6 +484,67 @@ impl Gguf {
     }
 }
 
+/// Human name for a ggml type, so an error names the FORMAT rather than a number.
+///
+/// "type 18 unsupported" sends someone to a table. "IQ3_XXS unsupported" is the answer.
+pub fn type_name(t: u32) -> &'static str {
+    match t {
+        0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
+        8 => "Q8_0", 9 => "Q8_1", 10 => "Q2_K", 11 => "Q3_K", 12 => "Q4_K", 13 => "Q5_K",
+        14 => "Q6_K", 15 => "Q8_K", 16 => "IQ2_XXS", 17 => "IQ2_XS", 18 => "IQ3_XXS",
+        19 => "IQ1_S", 20 => "IQ4_NL", 21 => "IQ3_S", 22 => "IQ2_S", 23 => "IQ4_XS",
+        24 => "I8", 25 => "I16", 26 => "I32", 27 => "I64", 28 => "F64", 29 => "IQ1_M",
+        30 => "BF16", 34 => "TQ1_0", 35 => "TQ2_0",
+        _ => "unknown",
+    }
+}
+
+/// Every quant type in a checkpoint that this engine cannot read, with what it would cost to add.
+///
+/// **A UD ("unsloth dynamic") quant is a MIXTURE.** The file is called IQ1_S and its attention
+/// tensors are IQ3_XXS, because the sensitive layers are kept wider on purpose. So supporting the
+/// name on the box is never enough, and failing on the FIRST unsupported tensor costs a round trip
+/// per type — the operator downloads 30 GiB, runs, learns one type, and repeats.
+///
+/// This reports all of them at once: what, how many tensors, and how many bytes, so the decision
+/// about which to implement can be made from the sizes rather than from the order the loader
+/// happened to walk.
+pub struct MissingType { pub ggml_type: u32, pub tensors: usize, pub bytes: u64 }
+
+pub fn unsupported_types(
+    tensors: impl IntoIterator<Item = (u32, u64)>,
+    supported: &[u32],
+) -> Vec<MissingType> {
+    let mut m: std::collections::BTreeMap<u32, (usize, u64)> = Default::default();
+    for (t, bytes) in tensors {
+        if supported.contains(&t) { continue }
+        let e = m.entry(t).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += bytes;
+    }
+    // Largest first: the decision about what to implement follows the bytes, not the walk order.
+    let mut v: Vec<_> = m.into_iter()
+        .map(|(t, (n, b))| MissingType { ggml_type: t, tensors: n, bytes: b }).collect();
+    v.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    v
+}
+
+/// The message for an operator holding a 30 GiB file that will not load.
+pub fn unsupported_report(missing: &[MissingType], total_bytes: u64) -> String {
+    if missing.is_empty() { return "every tensor type in this file is supported".into() }
+    let mut out = vec!["this checkpoint uses quant types the engine cannot read:".to_string()];
+    for m in missing {
+        let share = if total_bytes > 0 { m.bytes as f64 * 100.0 / total_bytes as f64 } else { 0.0 };
+        out.push(format!("  {:<9} (type {:>2})  {:>4} tensors  {:>6.1} MiB  {:.0}% of the file",
+            type_name(m.ggml_type), m.ggml_type, m.tensors,
+            m.bytes as f64 / (1024.0 * 1024.0), share));
+    }
+    out.push("a 'UD' quant is a MIXTURE — the file is named for its smallest type and keeps sensitive tensors wider, so the name on the box does not say what is inside".into());
+    out.push("listed together rather than one per run, because finding them one at a time costs a download each".into());
+    out
+        .join("\n")
+}
+
 pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
     match ggml_type {
         0 => Some(n * 4),
@@ -1136,5 +1197,62 @@ mod iq1m_tests {
     #[test]
     fn a_non_block_aligned_IQ1_M_tensor_has_no_size() {
         assert_eq!(type_nbytes(29, 300), None);
+    }
+}
+
+#[cfg(test)]
+mod mixed_quant_tests {
+    use super::*;
+
+    /// The types the engine can actually read today.
+    const SUPPORTED: &[u32] = &[0, 1, 8, 12, 14, 19];
+
+    #[test]
+    fn the_UD_IQ1_S_failure_is_reported_as_a_FORMAT_not_a_number() {
+        // The real log said "type 18 unsupported for blk.0.attn_q.weight", which sends someone to a
+        // table. IQ3_XXS is the answer.
+        assert_eq!(type_name(18), "IQ3_XXS");
+        assert_eq!(type_name(19), "IQ1_S");
+        assert_eq!(type_name(29), "IQ1_M");
+    }
+
+    #[test]
+    fn EVERY_unsupported_type_is_reported_in_one_pass() {
+        // Failing on the first costs a round trip per type: download 30 GiB, run, learn one type,
+        // repeat. A UD quant has several.
+        let tensors = vec![(18, 1000), (18, 2000), (22, 500), (12, 9999), (19, 8888)];
+        let m = unsupported_types(tensors, SUPPORTED);
+        assert_eq!(m.len(), 2, "IQ3_XXS and IQ2_S, not just the first one hit");
+    }
+
+    #[test]
+    fn they_are_ordered_by_BYTES_not_by_walk_order() {
+        // The decision about what to implement follows the size, not the order the loader happened
+        // to reach them.
+        let m = unsupported_types(vec![(22, 10), (18, 5000)], SUPPORTED);
+        assert_eq!(m[0].ggml_type, 18);
+    }
+
+    #[test]
+    fn the_report_explains_that_a_UD_QUANT_IS_A_MIXTURE() {
+        // The thing that made this surprising: a file named IQ1_S whose attention tensors are
+        // IQ3_XXS, because the sensitive layers are kept wider on purpose.
+        let r = unsupported_report(&unsupported_types(vec![(18, 1024 * 1024)], SUPPORTED), 2 * 1024 * 1024);
+        assert!(r.contains("IQ3_XXS"));
+        assert!(r.contains("the name on the box does not say what is inside"));
+        assert!(r.contains("50% of the file"));
+    }
+
+    #[test]
+    fn a_fully_supported_file_says_so() {
+        assert!(unsupported_types(vec![(12, 1), (19, 2)], SUPPORTED).is_empty());
+        assert!(unsupported_report(&[], 100).contains("every tensor type"));
+    }
+
+    #[test]
+    fn the_report_says_WHY_it_lists_them_together() {
+        // So the next person does not "helpfully" restore fail-fast behaviour.
+        let r = unsupported_report(&unsupported_types(vec![(18, 1)], SUPPORTED), 1);
+        assert!(r.contains("costs a download each"));
     }
 }
