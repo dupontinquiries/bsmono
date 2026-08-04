@@ -4975,8 +4975,35 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             let gx = (ff as u32).min(32768);
             let gy = (ff as u32).div_ceil(gx);
             // d.n = ff (output width), rstride = 2ff (gate at col, up at col+ff)
-            let dims = [ff as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32, 0u32, 0u32];
-            self.dispatch(glu_sh, &[n2, gu_qw, gu_qs, &selw], &hmid, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
+            // PRE-SCALED ACTIVATIONS for weight_before architectures, behind a flag.
+            //
+            // Llama-4 applies the routing weight to the expert INPUT. The GLU shader reads `selw`
+            // only for the expert index and never for the weight, so the weight must arrive already
+            // multiplied in — and `xper == 1` is the existing switch that makes each slot read its
+            // own row.
+            //
+            // OFF BY DEFAULT because the failure mode is silently wrong text, not a crash. Enable
+            // with LOGSCOPE_MOE_PRESCALE=1 alongside LOGSCOPE_MOE_V2_CHECK=1, which computes v1 and
+            // the routed path on the same activations and compares them — that check is the reason
+            // this can be attempted at all.
+            //
+            // NOTE FOR SCOUT SPECIFICALLY: this lifts `weight_before`, and Scout also fails
+            // `m.stream.is_none()`. Necessary, not sufficient — it does nothing for Scout until
+            // streaming can drive expert selection from the device.
+            let prescale = m.cfg.weight_before
+                && std::env::var_os("LOGSCOPE_MOE_PRESCALE").is_some();
+            let n2s;
+            let act = if prescale {
+                let buf = self.alloc(1, slots * gu_k);
+                let pd = [gu_k as u32, slots as u32, 0u32, 0u32];
+                let wg = ((slots * gu_k).div_ceil(64) as u32).max(1);
+                self.dispatch(MOE_PRESCALE, &[n2, &selw], &buf, bytemuck::cast_slice(&pd), (wg, 1, 1));
+                n2s = buf;
+                &n2s
+            } else { n2 };
+            let dims = [ff as u32, gu_k as u32, (gu_k / 32) as u32, gx, 0u32, ff2 as u32,
+                        if prescale { 1u32 } else { 0u32 }, 0u32];
+            self.dispatch(glu_sh, &[act, gu_qw, gu_qs, &selw], &hmid, bytemuck::cast_slice(&dims), (gx, gy, slots as u32));
             hmid
         } else {
             let gu_out = self.alloc(slots, ff2);
@@ -14000,6 +14027,38 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) lid:
 /// Built by taking Q4K_TO_Q4's source and replacing only its output statement, so the surrounding
 /// code — and therefore the compiler's contraction decisions — stay as close as a separate shader can
 /// get.
+/// Scale the activation row per slot by that slot's routing weight.
+///
+/// **The piece Llama-4 needs and the routed path lacks.** Llama-4 applies the routing weight to the
+/// expert's INPUT, and SwiGLU is nonlinear, so `silu(w·g)·(w·u) ≠ w·silu(g)·u` — scaling the output
+/// cannot recover it. `MOE_MATVEC_GLU_Q4` reads `selw` only for the expert INDEX and never for the
+/// weight, so the weight has to arrive already multiplied into the activations.
+///
+/// The shader already supports this: `xper == 1` makes each slot read its own row at `slot * k`
+/// instead of sharing row 0. Nothing there needs changing — only the caller, which today passes one
+/// unscaled row.
+///
+/// Writes `slots * k` floats: slot s gets `x[j] * weight[s]`.
+pub const MOE_PRESCALE: &str = r#"
+struct D { k:u32, slots:u32, _a:u32, _b:u32 };
+@group(0)@binding(0) var<storage,read> x: array<f32>;
+@group(0)@binding(1) var<storage,read> selw: array<u32>;
+@group(0)@binding(2) var<storage,read_write> out: array<f32>;
+@group(0)@binding(3) var<uniform> d: D;
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) {
+  let i = g.x;
+  if (i >= d.k * d.slots) { return; }
+  let slot = i / d.k;
+  let j    = i % d.k;
+  // selw layout: [slots indices (u32) | slots weights (f32 bitcast)] — the same buffer MOE_TOPK
+  // fills, read for its SECOND half here rather than its first.
+  let w = bitcast<f32>(selw[d.slots + slot]);
+  out[i] = x[j] * w;
+}
+"#;
+
 pub const Q4K_WQ_PROBE: &str = r#"
 struct D { nblk:u32, qs_off:u32, qw_base:u32, grid_w:u32 };
 @group(0)@binding(0) var<storage,read> src: array<u32>;      // raw Q4_K bytes as words
