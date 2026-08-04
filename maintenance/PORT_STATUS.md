@@ -323,20 +323,34 @@ seams, each because a daemon already owns it:
    ambient reading rather than a CPU thermal zone. Unknown temperature is NOT
    cold, deliberately: a phone with no ambient sensor would otherwise roll a
    ball across the screen indoors in July.
-2. **Tilt** — and this is the one that needs saying. **`iio-sensor-proxy`
-   exposes orientation only as strings** — "normal", "left-up", "right-up",
-   "bottom-up" — not as a vector. You cannot roll a ball with four labels;
-   anything built on the D-Bus daemon alone would move in four directions at one
-   speed. The raw counts are in sysfs, which is the path snapclone's
-   `IioSensorProxySource` already polls for its motion bit, so the vector is
-   reachable — but it is a different reader, and it is not built.
+2. **Orientation** — `AccelerometerOrientation`, the descriptor strings, and
+   nothing else. **An earlier version of this section said the daemon could not
+   drive the cursor because it exposes no vector. That was wrong**, and it was
+   wrong because I had assumed the wrong motion model. A RATCHET needs only
+   which way the phone turned and when it came back, and "left-up" / "normal"
+   carries both. No sysfs reader is required after all.
 3. **Speech** — the recogniser. `Vocab` maps a transcript to an action; it does
    not listen.
 
-**`ballgame.py` is not in this repository.** I searched: the only Python is in
-`shared/webhost-kit` and `tools/`. The physics is written from the description —
-tilt as gravity, rolling friction, absorbing walls — and if the original has
-behaviour worth matching, this is not yet matching it.
+**`ballgame.py` is not in this repository** — the only Python is in
+`shared/webhost-kit` and `tools/` — so the mechanic comes from the description
+of it, and the description corrected my first attempt. That attempt rolled a
+ball under continuous acceleration. The real thing ratchets: each shake moves a
+fixed step, returning to face-up or face-down does nothing but re-arm, and you
+traverse by repeating.
+
+Ratcheting is better here for a reason worth writing down: **it can be gated on
+flick timing.** The step fires on the RETURN to rest and only if the phone was
+away for under 700ms. On a bus or while walking, the orientation descriptor
+drifts through exactly the values a flick passes through — but slowly, and it
+stays there. A lean is not a flick, and a lean that is held is not a flick that
+was slow. Continuous physics has no equivalent defence: ambient sway is
+indistinguishable from gentle steering.
+
+Firing on the return costs one return-stroke of latency, taken on purpose. A
+step that fires on the way out cannot be un-fired when the phone turns out to
+have been leaning, and an accidental step is far worse than a late one for
+someone in gloves who cannot easily correct it.
 
 ### What was built
 
