@@ -166,3 +166,58 @@ justified by comparing two different code paths, which is the same class of
 measurement error this port's own audit keeps finding.
 
 **4. No new dependencies**, which is the good news in a 122-commit merge.
+
+## Follow-up: was the quantization work adopted? Yes, and here is the proof
+
+Asked directly, because that work was buggy, is now less so, and had compiled
+upstream. Three checks, in increasing strength.
+
+**1. What we touched.** Since the last merge, our line changed exactly FIVE
+files under `apps/logscope`, in two commits:
+
+```
+check-features.sh
+render-scene.sh
+crates/logscope-egui/Cargo.toml     (dev-views feature)
+crates/logscope-egui/src/lib.rs     (module gating for the lean build)
+crates/logscope-egui/src/theme.rs   (ensure_contrast_all)
+```
+
+Nothing under `gpu-gemm`, nothing quantization-related, nothing a kernel or a
+quantizer lives in.
+
+**2. What differs from upstream.** The merged tree differs from upstream in 117
+files under `apps/logscope` — which sounds alarming and is not. Upstream changed
+16 files under `gpu-gemm`; our line changed 93 there, all pre-dating this merge.
+Of the files **upstream actually touched**, only five differ, and they are
+exactly the five both sides edited: `backend.rs`, `lib.rs`, `scene3d.rs`,
+`tabs/chat.rs`, `logscope-fan/src/lib.rs`. A merge is supposed to differ from
+both parents precisely there and nowhere else.
+
+Every quantization file upstream touched — `gpu-gemm/src/quantref.rs` (new, 268
+lines) and `docs/q4k-scale-ulp.md` — is **byte-identical to upstream** in the
+merged tree.
+
+**3. A gap in the original verification, now closed.** The merge commit reported
+745 + 498 + 247 tests passing. **None of them compiled a line of gpu-gemm.** It
+is `exclude`d from the workspace and only enters through the optional
+`wgpu-engine` feature, so all three configurations skipped the crate the
+quantization work lives in. Saying "it builds" on that evidence was too strong.
+
+Built separately, and it holds:
+
+| | |
+|---|---|
+| `cargo check --lib` in `gpu-gemm` | compiles, 7 warnings |
+| `cargo test --lib` | **543 passed** |
+| `cargo test --lib quantref` | **12 passed** |
+
+The twelve are the tolerance contract from `feat(quantref)` — the q1/q2/q3
+bounds and the corrected tie rule from `fix(gate-quantref): the gate asserted
+the spec's tie rule too — corrected to the measured one`.
+
+**Standing concern.** gpu-gemm being outside the workspace means a normal
+`cargo test` in `apps/logscope` will never build it, so a regression there is
+invisible to anyone who has not read this note. `check-features.sh` should grow
+a gpu-gemm arm — it already exists to stop exactly this class of "the flag
+nobody exercises" problem.

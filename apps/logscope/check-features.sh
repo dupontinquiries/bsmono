@@ -62,6 +62,21 @@ run() {
 run "lean (no default features)"  --no-default-features
 run "gui only (CPU scene path)"   --no-default-features --features gui
 run "default (gui + gpu-scene)"
+
+# gpu-gemm is EXCLUDED from the workspace and only enters through the optional
+# wgpu-engine feature, so none of the arms above compile a line of it — which is
+# where the quantizers and the WGSL kernels live. A regression there is
+# invisible to a normal `cargo test` in this directory, and the 605 merge was
+# verified with 1,490 passing tests none of which touched it.
+printf '%-34s ' "gpu-gemm (quantizers, kernels)"
+if out=$(cd crates/gpu-gemm && cargo "$MODE" --lib </dev/null 2>&1); then
+    echo "ok $(echo "$out" | grep -oE 'test result: ok\. [0-9]+ passed' | head -1)"
+else
+    echo "FAILED"
+    echo "$out" | grep -E '^error' -A 4 | head -12 | sed 's/^/    /'
+    FAIL=1
+fi
+
 reclaim
 
 exit $FAIL
