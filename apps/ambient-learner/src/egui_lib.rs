@@ -45,6 +45,11 @@ impl LiveState {
             series: vec![19.8, 20.2, 20.6, 21.0, 21.1, 21.3, 21.4],
             condition: "steady".into(),
             updated: 0,
+            // A falling barometer, so the demo shows the trend arrow doing
+            // something — a gauge sitting at steady teaches nothing about what
+            // the page is for.
+            pressure: Some(crate::ui::egui::pressure::Pressure {
+                hpa: 1008.0, trend_hpa_per_30m: Some(-1.8) }),
         })
     }
 
