@@ -41,6 +41,7 @@ mod posture;
 mod procars;
 mod render;
 mod style;
+mod sun;
 mod save;
 mod ship;
 mod sim;
