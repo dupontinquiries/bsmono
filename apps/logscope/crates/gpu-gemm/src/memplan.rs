@@ -1471,3 +1471,43 @@ mod iq1s_view_tests {
         assert!(file_views_plausible(Some(19), Some(19), Some(19), false));
     }
 }
+
+
+/// What will actually happen to an IQ1_S checkpoint, said at load time.
+///
+/// **The native path is not wired.** `LinKind::Iq1`, `MATVEC_IQ1_S` and `MOE_MATVEC_IQ1_S` exist;
+/// the loader still routes every tensor through `dequantize` to f32 and then requantizes, so an
+/// IQ1_S file becomes q4 and inflates 2.88x.
+///
+/// A 30.3 GiB checkpoint becomes 87 GiB. Saying so BEFORE the load beats discovering it after — the
+/// load is minutes, and the failure would otherwise arrive as a budget refusal that names no cause.
+pub fn iq1s_load_plan(file_gib: f32, ceiling_gib: f32, native_path_wired: bool) -> String {
+    if native_path_wired {
+        return format!("IQ1_S held natively: {file_gib:.1} GiB resident against a {ceiling_gib:.1} GiB ceiling. Experts stay at 1.5625 bpw, so more of them pin — which is what makes whole layers routable and removes the per-layer readback.");
+    }
+    let converted = file_gib * 4.5 / 1.5625;
+    format!("IQ1_S checkpoint, {file_gib:.1} GiB on disk. THE NATIVE PATH IS NOT WIRED: the loader converts every tensor to q4, so this needs {converted:.0} GiB resident against a {ceiling_gib:.1} GiB ceiling and will be refused or streamed. LinKind::Iq1 and the kernels exist; what is missing is the loader keeping the bytes instead of round-tripping them through f32.")
+}
+
+#[cfg(test)]
+mod iq1s_plan_tests {
+    use super::*;
+
+    #[test]
+    fn the_UNWIRED_plan_names_the_inflation_and_the_cause() {
+        // The load is minutes; the failure would otherwise arrive as a budget refusal naming no
+        // cause, which is how someone spends an evening on it.
+        let s = iq1s_load_plan(30.3, 31.0, false);
+        assert!(s.contains("87 GiB resident"), "{s}");
+        assert!(s.contains("keeping the bytes instead of round-tripping them through f32"));
+    }
+
+    #[test]
+    fn the_WIRED_plan_says_why_it_matters_beyond_memory() {
+        // The memory saving is the means. More experts pinned is what makes whole layers routable,
+        // which is what removes the 99.9% stall.
+        let s = iq1s_load_plan(30.3, 31.0, true);
+        assert!(s.contains("whole layers routable"));
+        assert!(s.contains("removes the per-layer readback"));
+    }
+}
