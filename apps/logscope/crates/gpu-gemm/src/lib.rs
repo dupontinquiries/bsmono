@@ -8438,7 +8438,21 @@ last block and k's first would decode to garbage")),
             }
             let t = g.tensor(name).ok_or(format!("missing tensor {name}"))?;
             let count = t.dims.iter().product::<u64>() as usize;
-            let nbytes = gguf::type_nbytes(t.ggml_type, count).ok_or(format!("type {} unsupported for {name}", t.ggml_type))?;
+            let nbytes = gguf::type_nbytes(t.ggml_type, count).ok_or_else(|| {
+                // SCAN THE WHOLE FILE RATHER THAN REPORTING THE TENSOR WE HAPPENED TO REACH.
+                //
+                // A UD quant is a mixture: the file is named for its smallest type and keeps
+                // sensitive tensors wider. "type 18 unsupported for blk.0.attn_q.weight" costs a
+                // 30 GiB download to learn ONE of them, and there are usually several.
+                let supported: Vec<u32> = vec![0, 1, 8, 12, 14, 19];
+                let all: Vec<(u32, u64)> = g.tensors.iter()
+                    .map(|x| (x.ggml_type, x.dims.iter().product::<u64>())).collect();
+                let total: u64 = all.iter().map(|(_, n)| *n).sum();
+                let missing = gguf::unsupported_types(all, &supported);
+                format!("{} (first hit: {} in {name})\n{}",
+                    gguf::type_name(t.ggml_type), t.ggml_type,
+                    gguf::unsupported_report(&missing, total))
+            })?;
             // A read that escapes the set means a shard is missing — report which tensor rather than
             // decoding a short buffer into plausible garbage.
             let raw = set.slice(t.offset, nbytes).ok_or(format!(
