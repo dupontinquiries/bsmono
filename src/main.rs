@@ -31,6 +31,7 @@ mod hud;
 mod input;
 mod joints;
 mod lift;
+mod loadout;
 mod interior;
 mod menu;
 mod meshgen;
