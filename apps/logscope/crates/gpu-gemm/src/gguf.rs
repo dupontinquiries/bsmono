@@ -571,6 +571,16 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         // format needs a dequantizer" instead of "unknown tensor type", which is the difference
         // between a five-minute answer and an afternoon.
         29 => if n % 256 == 0 { Some(n / 256 * 56) } else { None },  // IQ1_M
+        // Sizes for the rest of the IQ family. KNOWING A SIZE IS NOT SUPPORTING A TYPE — dequantize
+        // still refuses these. It is what lets the report state honest byte shares, and a share is
+        // what decides which one to implement first.
+        16 => if n % 256 == 0 { Some(n / 256 * 66) } else { None },  // IQ2_XXS, 2.06 bpw
+        17 => if n % 256 == 0 { Some(n / 256 * 74) } else { None },  // IQ2_XS,  2.31 bpw
+        18 => if n % 256 == 0 { Some(n / 256 * 98) } else { None },  // IQ3_XXS, 3.06 bpw
+        20 => if n % 32  == 0 { Some(n / 32  * 18) } else { None },  // IQ4_NL,  4.5 bpw
+        21 => if n % 256 == 0 { Some(n / 256 * 110) } else { None }, // IQ3_S,   3.44 bpw
+        22 => if n % 256 == 0 { Some(n / 256 * 82) } else { None },  // IQ2_S,   2.56 bpw
+        23 => if n % 256 == 0 { Some(n / 256 * 136) } else { None }, // IQ4_XS,  4.25 bpw
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block
         20 => if n % 32 == 0 { Some(n / 32 * 18) } else { None }, // IQ4_NL: f16 d + 16B 4-bit codebook idx
