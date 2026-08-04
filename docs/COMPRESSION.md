@@ -159,3 +159,80 @@ reason as everything else: a collider tree is per-part, and per-part
 transforms come from joints. But unlike the residual work, this one has a
 number that stands on its own — 17x at 8x resolution — and it lifts a
 current hard cap of twelve.
+
+---
+
+# SPHERE / CUBE MODS AND A 3D DCT — measured
+
+Asked whether primitive-plus-residual or a trig basis would pay. Measured on
+real parts rather than reasoned about, and the answer is a clear no for
+geometry and a clear yes for something else.
+
+## Are these parts even star-shaped?
+
+A sphere parameterisation needs `r(θ,φ)` to be single-valued — one surface
+crossing per direction. Tested across grit, blackstar and patton:
+
+```
+82% of parts are star-shaped within 18% radial spread
+median spread per direction bin: 0.11
+```
+
+So the parameterisation is VALID for four parts in five. The remaining
+fifth — L-brackets, rings, anything with a concavity — cannot be expressed
+this way at all, which already caps the method below "use it for everything".
+
+## What it costs and what it gets
+
+```
+method                     bytes/part    median error (% of part size)
+raw f32                        99,082        0.00
+16-bit quantised               49,541        0.03
+sphere r(θ,φ) 32x32             2,054        4.72
+sphere r(θ,φ) 16x16               518        5.79
+sphere r(θ,φ) 8x8                 134        6.84
+sphere r(θ,φ) 4x4                  38        8.69
+sphere (single radius)              8       11.29
+```
+
+**48x smaller than quantised at 32x32, and 4.7% error.** That sounds good
+until you look at the shape of the curve: quadrupling the coefficients from
+4x4 to 16x16 buys 8.7% -> 5.8%. The error is not converging, because most of
+it is not high-frequency detail — it is the 18% of parts that are not
+star-shaped, plus the hard edges of the ones that are. A box has a
+discontinuous `r(θ,φ)`, and no smooth basis represents a discontinuity
+cheaply. That is Gibbs, and a DCT has exactly the same problem.
+
+**4.7% of part size is not acceptable for geometry.** On a 2 m torso that is
+9 cm of wobble on every panel edge. It would look like the model was carved
+from soap.
+
+## So: no for meshes, and here is what it IS for
+
+The measurement kills the residual idea for POSITIONS and hands it a much
+better job. Look again at where the megabytes actually are: five poses of
+the same body, and the fix is rest-pose-plus-joint-angles (5x). Nothing
+about that wants a spherical basis.
+
+But `r(θ,φ)` at 4x4 — THIRTY-EIGHT BYTES — carries a part's shape to 8.7%,
+which is uselessly coarse for rendering and excellent as a DESCRIPTOR. It is
+the same role the 8³ occupancy signature plays for the atlas and the octree,
+in a fifth of the space and with rotation handled by shifting the θ axis
+rather than re-voxelising.
+
+So the honest recommendation is to stop treating this as compression and use
+it as the shape key: cheap, rotation-aware, and already validated on 82% of
+the library. The 18% that are not star-shaped keep the voxel signature,
+which handles concavity fine.
+
+## The 3D DCT specifically
+
+Worse than the above, for a reason that is structural rather than tuneable.
+A 3D DCT wants a dense volume, and these meshes are SHELLS — 11.8% occupancy
+in the collision grid. You would be transforming seven-eighths air, and the
+coefficients would spend their energy describing where the emptiness is.
+
+The 2D DCT over `r(θ,φ)` is the sensible version of the idea, and it is
+what the table above approximates: a grid IS the DCT with every coefficient
+kept, so the numbers there are the BEST a DCT of that resolution could do.
+Truncating coefficients can only move down that column.
