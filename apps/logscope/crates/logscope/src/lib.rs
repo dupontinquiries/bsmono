@@ -69,6 +69,7 @@ pub mod benchscenario;
 pub mod benchartifact;
 pub mod machinery;
 pub mod longrun;
+pub mod opsched;
 pub mod buildsignal;
 pub mod filewindow;
 pub mod symbolfind;
