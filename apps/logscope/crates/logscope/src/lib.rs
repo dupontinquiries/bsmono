@@ -72,6 +72,7 @@ pub mod longrun;
 pub mod opsched;
 pub mod blastradius;
 pub mod confinement;
+pub mod externalwatch;
 pub mod buildsignal;
 pub mod filewindow;
 pub mod symbolfind;
