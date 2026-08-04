@@ -36,8 +36,8 @@
    "note": "reported floating components below the feet"
   },
   "ebr_105_mad_max_mod": {
-   "turn": 87.1,
-   "why": "chest-spine measured -177.1 (base turn +177.1); reported 90 clockwise about the feet on top of that, so +177.1 - 90 = +87.1. YOUR REPORTS ARE RELATIVE TO WHAT SHIPS, so they add to the measured correction rather than replacing it \u2014 I clobbered this one first time round."
+   "turn": -2.9,
+   "why": "chest-spine +177.1 then your reported 90 clockwise twice: 177.1-90-90 = -2.9. The support test cannot find a yaw error, margin was only +0.031."
   },
   "jet_dawnshade": {
    "turn": -179.9,
@@ -136,6 +136,11 @@
    "yaw": 180.0,
    "turn": -180.0,
    "why": "reported vehicle backwards; yaw flips the strip and turn -180 keeps the robot end where the chest-spine measurement put it"
+  },
+  "drone_v6_cybertech": {
+   "roll": 180.0,
+   "turn": -90.0,
+   "why": "stance.py scored roll 180 at +0.192 over as-exported (6 symmetric contacts vs 3); the 90 clockwise is your report, which the support test cannot see (keyed by the EXPORT LABEL, drone_v6_cybertech, not the source filename \u2014 the first attempt used the latter and silently did nothing)"
   }
  },
  "_roll_candidates": [
@@ -147,5 +152,22 @@
   "  jet_darkguard   X 1.10  Y 1.58  Z 2.03",
   "  lynx_6x6        X 0.99  Y 1.03  Z 1.62",
   "  boartail        X 0.93  Y 0.98  Z 2.00"
- ]
+ ],
+ "_stance": {
+  "doc": [
+   "tools/stance.py scores the six axis-aligned orientations by how much",
+   "SYMMETRIC SUPPORT each puts underneath \u2014 your rule, made mechanical.",
+   "",
+   "It agrees with you on spider_drone_v6_cybertech: roll 180 wins by 0.192",
+   "with six contacts at perfect symmetry against three at 0.67. That is the",
+   "upside-down call, found without being told.",
+   "",
+   "It correctly leaves blackstar, grit and spider_tank alone.",
+   "",
+   "It does NOT find ebr_105's 90-degree turn, margin +0.031. That is the",
+   "honest limit: a turn about the vertical does not change what is",
+   "underneath, so a support test cannot see it. Yaw needs the front/back",
+   "reasoning \u2014 exhausts, intakes, wheel size, sleekness \u2014 not this."
+  ]
+ }
 }
