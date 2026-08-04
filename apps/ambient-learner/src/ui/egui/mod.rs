@@ -12,6 +12,9 @@
 pub mod live;
 pub mod pressure;
 
+/// Recorded readings over time — the chart and the four numbers under it.
+pub mod history;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
