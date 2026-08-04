@@ -4755,7 +4755,32 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // is encouraging — and I did not finish reading where the weight is multiplied in. Shipping
         // the relaxation on an unread shader would produce silently wrong output on every Llama-4
         // token, which is the exact failure this codebase has spent the session chasing.
-        if t == 1 && m.stream.is_none() && !m.cfg.weight_before
+        // STREAMING IS A PER-MODEL FACT AND THE CONSTRAINT IS PER-LAYER.
+        //
+        // The routed path selects on-device, so the CPU never learns which experts were chosen — and
+        // a streaming model needs the CPU to know, to fetch them. That is why the guard reads
+        // `stream.is_none()`.
+        //
+        // But if every expert for THIS layer is already pinned, any selection is a hit: nothing to
+        // fetch, nothing for the CPU to learn. `layer_can_route` is that check, and it lets a
+        // streaming model route the layers that happen to be fully resident. The benefit is
+        // proportional — stalls are one per layer and equal in cost.
+        //
+        // Behind LOGSCOPE_MOE_LAYER_ROUTE because it is unvalidated on hardware and the failure mode
+        // is a miss the CPU cannot service. Scout at 6-of-16 qualifies for nothing today, so the flag
+        // changes nothing until the experts are narrower — which is the whole argument for IQ1_S.
+        // The pin set lives on the stream, which is the thing that knows what is resident. Asking it
+        // rather than threading a parameter keeps the condition next to the fact it depends on.
+        let layer_resident = std::env::var_os("LOGSCOPE_MOE_LAYER_ROUTE").is_some()
+            && m.stream.as_ref().is_some_and(|st| {
+                // try_lock, not lock: this runs on the decode path and blocking here to answer
+                // "can we avoid blocking" would be self-defeating. A contended lock means the
+                // streamer is busy, which is itself an answer — not fully resident.
+                st.try_lock().is_ok_and(|s| {
+                    expert_cache::layer_can_route(s.policy.pinned_ids(), s.n_expert as u32)
+                })
+            });
+        if t == 1 && (m.stream.is_none() || layer_resident) && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
             if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
