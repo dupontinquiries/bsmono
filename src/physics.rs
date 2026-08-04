@@ -2079,7 +2079,37 @@ pub fn collide_car_ball(car: &mut Car, ball: &mut Ball, cfg: &Config, who: u8, e
             //  only starts counting at 3 rad/s, so an early-dodge
             // contact still took two thirds of the redirect and the backflip
             // stayed flat. A rotating car is throwing, full stop.
-            let touching = if car.omega.length() > 2.5 { 0.0 } else { 1.0 };
+            // ASK WHETHER A FLICK IS HAPPENING, not how fast the car is
+            // spinning yet.
+            //
+            // Gating on instantaneous rotation looked equivalent and is not:
+            // a dodge's rotation RAMPS, and the ball contact in a flick
+            // happens early while omega is still under the threshold. So the
+            // gate never fired, the redirect ran on every flick, and the
+            // backflip lofted at 33 degrees instead of 52 — speed added
+            // along the ball's line is speed not spent going up.
+            //
+            // I convinced myself the redirect was innocent by disabling the
+            // GATE and seeing no change, which tested the gate rather than
+            // the thing it guarded. Disabling the redirect itself restored
+            // 52 degrees immediately. The dodge timer knows a flick is in
+            // progress from its first frame, which is what the gate needed
+            // to be asking all along.
+            // ...and the ball has to be PASSING, not riding along.
+            //
+            // The flick gate still did not explain it: the redirect was not
+            // firing during the dodge, it was firing on the CARRY frames
+            // before it, feeding the ball horizontal speed so it was already
+            // flat by the time the flick launched. A redirect is a touch on
+            // a ball going past you; a carry is a ball travelling WITH you,
+            // and the relative velocity tells them apart cleanly where the
+            // rotation rate did not.
+            let passing = (ball.vel - car.vel).length() > 3.5;
+            let touching = if !passing || car.dodge_timer > 0.0 || car.omega.length() > 2.5 {
+                0.0
+            } else {
+                1.0
+            };
             ball.vel += along * with_it * 0.55 * bite * glance * touching;
         }
         // ...and the hood's own motion carries the ball with it. Without

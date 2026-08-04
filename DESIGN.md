@@ -3983,6 +3983,41 @@ compatible — an empty target list where the pass has an attachment, and a
 layout that demands more than the pipeline uses. The pattern is worth
 naming: in wgpu, a pipeline must describe ITSELF, not the thing it resembles.
 
+## v1.122.0 — the backflip regression was the redirect after all
+
+I reported last version that the flat backflip flick was an older regression
+and NOT the redirect, on the grounds that disabling the gate changed
+nothing. That was wrong, and the mistake is worth writing down: disabling
+the GATE tests the gate, not the thing it guards. Disabling the redirect
+itself restored 52 degrees immediately.
+
+    backflip flick, redirect on      33 deg
+    backflip flick, redirect off     52 deg
+
+Two gates were then needed, and the first was still wrong. Gating on
+instantaneous rotation looked equivalent to "is this a flick" and is not: a
+dodge's rotation RAMPS, so the ball contact happens while omega is still
+under the threshold. Gating on the dodge timer instead — which knows from
+the first frame — also failed to fix it, and that is what finally pointed at
+the real mechanism.
+
+THE REDIRECT WAS NOT FIRING DURING THE FLICK AT ALL. It was firing on the
+CARRY frames before it, feeding the ball horizontal speed so it was already
+flat by the time the flick launched. A redirect is a touch on a ball going
+PAST you; a carry is a ball travelling WITH you. Relative velocity tells
+them apart cleanly where rotation rate could not:
+
+    a redirect needs the ball passing at more than 3.5 m/s relative
+
+Everything now holds together: FLICK, REDIRECT, CARRY, HITS, BALL SPIN and
+HOVER all pass, the backflip lofts at 52 degrees again, and a shallow tip
+still adds 3 m/s to a moving ball.
+
+The wider lesson is the one this project keeps teaching from new angles: an
+experiment that changes nothing has two explanations, and "my hypothesis was
+wrong" is only one of them. The other is that the experiment did not test
+the hypothesis.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
