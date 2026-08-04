@@ -13,6 +13,7 @@ mod clinch;
 mod config;
 mod drop;
 mod font;
+mod foothold;
 mod fx;
 mod gamepad;
 mod gyro;
