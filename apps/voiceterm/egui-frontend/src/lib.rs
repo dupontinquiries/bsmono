@@ -61,7 +61,7 @@ pub fn sync_voice_routing(router: &mut voice_routing::VoiceRouter,
 #[cfg(test)]
 mod voice_glove_tests {
     use super::voice_routing::{Consumer, VoiceRouter};
-    use uikit_egui::glove::{ColdMode, GloveCursor, Target, TargetKind, Orient};
+    use uikit_egui::glove::{ColdMode, GloveCursor, Target, TargetKind, Orient, Tilt};
 
     fn cursor() -> GloveCursor {
         let mut g = GloveCursor::with_mode(ColdMode::On);
@@ -80,7 +80,7 @@ mod voice_glove_tests {
         r.listen_for_commands();
         assert!(r.feeds(Consumer::CommandNlu));
 
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("select", &ts);
         super::sync_voice_routing(&mut r, &g);
         assert!(!r.feeds(Consumer::CommandNlu), "suspended, not filtered");
@@ -96,13 +96,13 @@ mod voice_glove_tests {
                                at: (200.0, 400.0), label: "Body".into() }];
         let mut g = cursor();
         let mut r = VoiceRouter::new();
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("select", &ts);
         super::sync_voice_routing(&mut r, &g);
         assert!(r.dictating());
 
-        g.feed(Orient::FaceDown, 0.0, &ts);
-        g.feed(Orient::FaceDown, uikit_egui::glove::ESCAPE_HOLD_MS, &ts);
+        g.feed(Orient::Normal, Tilt::FaceDown, 0.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceDown, uikit_egui::glove::ESCAPE_HOLD_MS, &ts);
         super::sync_voice_routing(&mut r, &g);
         assert!(!r.dictating());
         assert!(r.feeds(Consumer::CommandNlu), "back to listening for commands");
@@ -114,7 +114,7 @@ mod voice_glove_tests {
                                at: (200.0, 400.0), label: "Body".into() }];
         let mut g = cursor();
         let mut r = VoiceRouter::new();
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("select", &ts);
         super::sync_voice_routing(&mut r, &g);
         assert_eq!(r.route("terminal, stop"),
@@ -125,7 +125,7 @@ mod voice_glove_tests {
 
 #[cfg(test)]
 mod shake_binding_tests {
-    use uikit_egui::glove::Orient;
+    use uikit_egui::glove::{Orient, Tilt};
 
     #[test]
     fn a_double_flick_opens_a_tab_and_a_single_one_does_not() {

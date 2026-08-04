@@ -122,29 +122,61 @@ pub const REARM_MIN_MS: f32 = 120.0;
 /// and all a ratchet needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Orient {
-    /// Upright, or flat on its back. REST: re-arms the ratchet.
-    Rest,
-    /// Screen down. Rest for ratchet purposes — a brief flip re-arms like any
-    /// other — but HELD it is the escape, which is why it is its own variant.
-    FaceDown,
+    /// Upright — standing on its charging port, top edge up.
+    ///
+    /// This is a DIRECTION, not rest. An earlier version treated it as rest and
+    /// thereby threw away a quarter of the vocabulary, leaving no way to move
+    /// the cursor down. Rest belongs to the TILT descriptor, which is a
+    /// separate property; orientation is four rotations about the screen normal
+    /// and all four of them mean something.
+    Normal,
+    /// Upside down — bottom edge up.
+    BottomUp,
     LeftUp,
     RightUp,
-    BottomUp,
     /// The daemon could not tell. Neither fires nor re-arms — an unknown
     /// reading is not evidence of anything, and treating it as rest would let
     /// a phone tumbling in a pocket re-arm between flaps.
     Unknown,
 }
 
+/// `AccelerometerTilt` — how the phone is lying, as distinct from how it is
+/// turned.
+///
+/// This is what rest actually is: flat on a table, screen up or screen down.
+/// It is a separate D-Bus property and, per iio-sensor-proxy's own docs, a
+/// NEWER-VERSIONS-ONLY one — so `Tilt::Unsupported` is a real case and the
+/// degradation is spelled out at `Ratchet::feed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tilt {
+    /// Flat, screen up. Rest.
+    FaceUp,
+    /// Flat, screen down. Rest, and HELD it is the escape.
+    FaceDown,
+    /// Being held at an angle — not resting.
+    Raised,
+    /// The daemon does not publish this property.
+    Unsupported,
+}
+
+impl Tilt {
+    pub fn parse(s: &str) -> Tilt {
+        match s.trim().to_lowercase().as_str() {
+            "face-up" | "face_up" | "faceup" | "flat" => Tilt::FaceUp,
+            "face-down" | "face_down" | "facedown" => Tilt::FaceDown,
+            "raised" | "tilted" | "vertical" | "normal" => Tilt::Raised,
+            _ => Tilt::Unsupported,
+        }
+    }
+
+    pub fn is_rest(self) -> bool { matches!(self, Tilt::FaceUp | Tilt::FaceDown) }
+}
+
 impl Orient {
-    /// Parse `AccelerometerOrientation` / `AccelerometerTilt`.
-    ///
-    /// Face-up and face-down are REST, per the maze game this follows: turning
-    /// the phone flat does nothing except make the next flick possible.
+    /// Parse `AccelerometerOrientation`.
     pub fn parse(s: &str) -> Orient {
         match s.trim().to_lowercase().as_str() {
-            "normal" | "face-up" | "face_up" | "faceup" | "flat" => Orient::Rest,
-            "face-down" | "face_down" | "facedown" => Orient::FaceDown,
+            "normal" => Orient::Normal,
             "left-up" | "left_up" | "leftup" => Orient::LeftUp,
             "right-up" | "right_up" | "rightup" => Orient::RightUp,
             "bottom-up" | "bottom_up" | "bottomup" => Orient::BottomUp,
@@ -152,19 +184,21 @@ impl Orient {
         }
     }
 
-    pub fn is_rest(self) -> bool { matches!(self, Orient::Rest | Orient::FaceDown) }
-
     /// The step this flick would make, in (dx, dy) units.
     ///
-    /// Left-up means the left edge lifted — the phone rotated anticlockwise —
-    /// and the ball runs downhill, to the left. Bottom-up lifts the bottom
-    /// edge, so the ball runs up the screen.
+    /// All four rotations, and the ball runs downhill in each.
+    ///
+    /// Left-up lifts the left edge, so the ball runs left. Bottom-up lifts the
+    /// bottom edge, so it runs up the screen. And NORMAL — the phone stood on
+    /// its charging port, top edge up — runs it DOWN, which is the direction an
+    /// earlier version of this had no way to express at all.
     pub fn direction(self) -> Option<(f32, f32)> {
         match self {
             Orient::LeftUp => Some((-1.0, 0.0)),
             Orient::RightUp => Some((1.0, 0.0)),
             Orient::BottomUp => Some((0.0, -1.0)),
-            Orient::Rest | Orient::FaceDown | Orient::Unknown => None,
+            Orient::Normal => Some((0.0, 1.0)),
+            Orient::Unknown => None,
         }
     }
 }
@@ -174,6 +208,8 @@ impl Orient {
 pub struct Ratchet {
     /// Where the phone is now.
     at: Orient,
+    /// How it is lying. Rest comes from here, not from the orientation.
+    tilt: Tilt,
     /// How long it has been there.
     dwell_ms: f32,
     /// The direction it left rest in, if it is away.
@@ -186,7 +222,8 @@ impl Default for Ratchet {
     fn default() -> Self {
         // Starts UNARMED: the first reading after switching the mode on should
         // not fire a step just because the phone happens to be tilted.
-        Ratchet { at: Orient::Unknown, dwell_ms: 0.0, away_in: None, armed: false }
+        Ratchet { at: Orient::Unknown, tilt: Tilt::Unsupported,
+                  dwell_ms: 0.0, away_in: None, armed: false }
     }
 }
 
@@ -197,7 +234,27 @@ impl Ratchet {
 
     /// True once the phone has been held screen-down long enough to escape.
     pub fn escaping(&self) -> bool {
-        self.at == Orient::FaceDown && self.dwell_ms >= ESCAPE_HOLD_MS
+        self.tilt == Tilt::FaceDown && self.dwell_ms >= ESCAPE_HOLD_MS
+    }
+
+    /// Is the phone at rest?
+    ///
+    /// From the TILT descriptor when it is published. When it is not — it is a
+    /// newer-versions-only property — we fall back to treating `Normal` as
+    /// rest, which is what this module did before tilt was used at all. That
+    /// costs the downward flick on older daemons, and costing a direction is
+    /// better than a ratchet that can never re-arm.
+    fn at_rest(&self) -> bool {
+        match self.tilt {
+            Tilt::Unsupported => self.at == Orient::Normal,
+            t => t.is_rest(),
+        }
+    }
+
+    /// Does this orientation carry a step, given what tilt is available?
+    fn steerable(&self, o: Orient) -> Option<(f32, f32)> {
+        if self.tilt == Tilt::Unsupported && o == Orient::Normal { return None; }
+        o.direction()
     }
 
     /// Feed a descriptor reading. Returns the ORIENTATION that was flicked, on
@@ -207,12 +264,19 @@ impl Ratchet {
     /// one event: the cursor turns it into a step, the command layer matches it
     /// against a binding. Two detectors watching the same descriptor stream
     /// independently would be a second source of truth about what a flick is.
-    pub fn feed(&mut self, o: Orient, dt_ms: f32) -> Option<Orient> {
-        if o == self.at {
+    pub fn feed(&mut self, o: Orient, tilt: Tilt, dt_ms: f32) -> Option<Orient> {
+        // Rest is evaluated against the PREVIOUS tilt before the new reading is
+        // stored. Overwriting first makes the transition test "was I resting?"
+        // against the state being moved INTO, which is never true when leaving
+        // rest — so no flick would ever start.
+        let was_rest = self.at_rest();
+        let tilt_changed = tilt != self.tilt;
+        self.tilt = tilt;
+        if o == self.at && !tilt_changed {
             self.dwell_ms += dt_ms;
             // Resting long enough re-arms; being AWAY long enough turns the
             // flick into a lean, which will never fire.
-            if self.at.is_rest() && self.dwell_ms >= REARM_MIN_MS { self.armed = true; }
+            if self.at_rest() && self.dwell_ms >= REARM_MIN_MS { self.armed = true; }
             if self.away_in.is_some() && self.dwell_ms > FLICK_MAX_MS { self.away_in = None; }
             return None;
         }
@@ -225,21 +289,21 @@ impl Ratchet {
             return None;
         }
 
-        let was = self.at;
         let was_dwell = self.dwell_ms;
         self.at = o;
         self.dwell_ms = 0.0;
+        let now_rest = self.at_rest();
 
-        if o.direction().is_some() {
+        if !now_rest && self.steerable(o).is_some() {
             // Leaving rest. Only records the intent — the step fires on the way
             // back, when we know how long it took.
-            if was.is_rest() && self.armed { self.away_in = Some(o); }
+            if was_rest && self.armed { self.away_in = Some(o); }
             return None;
         }
 
         // Arrived at rest. If we left rest in a direction and got back inside
         // the flick window, that was a flick.
-        if o.is_rest() {
+        if now_rest {
             let fired = self.away_in.take().filter(|_| was_dwell <= FLICK_MAX_MS);
             self.armed = false;   // must rest REARM_MIN_MS before the next one
             return fired;
@@ -356,11 +420,14 @@ impl ShakeCommands {
 /// reach while listening, and flicking onto it ends dictation. It then
 /// disappears, so its presence is also the "still listening" indicator.
 ///
-/// **It sits ABOVE the field, and that is forced by the hardware.**
-/// `AccelerometerOrientation` yields three usable directions — left-up,
-/// right-up and bottom-up — and bottom-up moves the cursor UP. There is no
-/// downward flick, so a dot below the field could not be reached at all. This
-/// is a case where the sensor's vocabulary decides the layout.
+/// **It sits BELOW the field.** An earlier version put it above and justified
+/// that with a hardware constraint that turned out to be self-inflicted: I had
+/// treated `normal` as rest, which left no orientation meaning "down". Once
+/// rest comes from the TILT descriptor instead, all four rotations are
+/// directions and down is one of them — you stand the phone on its charging
+/// port. Below is the better place: it is where a thumb-held phone tips
+/// naturally, and it keeps the dot clear of the text the user is watching
+/// appear.
 ///
 /// Both escapes stay. A flick can miss; a hold cannot. Keeping the infallible
 /// one behind the discoverable one is the same shape as the context menu taking
@@ -369,11 +436,11 @@ pub const ESCAPE_DOT_ID: &str = "__glove_escape__";
 
 /// Where the dot goes, given the field it belongs to.
 ///
-/// Exactly one step above, so it is reachable by a single flick — two would
+/// Exactly one step below, so it is reachable by a single flick — two would
 /// make the quick exit not quick, and a partial approach would leave the cursor
 /// stranded between the field and its way out.
 pub fn escape_dot_at(field_at: (f32, f32)) -> (f32, f32) {
-    (field_at.0, field_at.1 - STEP_PX)
+    (field_at.0, field_at.1 + STEP_PX)
 }
 
 /// The dot as a target, for the frames where it exists.
@@ -700,13 +767,13 @@ impl GloveCursor {
     ///
     /// `o` is `AccelerometerOrientation` parsed by `Orient::parse` — the daemon
     /// string, nothing more.
-    pub fn feed(&mut self, o: Orient, dt_ms: f32, targets: &[Target]) -> Tick {
+    pub fn feed(&mut self, o: Orient, tilt: Tilt, dt_ms: f32, targets: &[Target]) -> Tick {
         if !self.active() { return Tick::default(); }
         let mut out = Tick::default();
 
         // The escape is checked FIRST and works in either mode. It has to be
         // reachable from dictation, which is the state it exists to leave.
-        let flicked = self.ratchet.feed(o, dt_ms);
+        let flicked = self.ratchet.feed(o, tilt, dt_ms);
         out.flicked = flicked;
         if self.ratchet.escaping() {
             out.escaped = self.escape();
@@ -836,8 +903,9 @@ pub fn glove_ui(ui: &mut egui::Ui, g: &GloveCursor, targets: &[Target],
             p.circle_stroke(at, 13.0, egui::Stroke::new(1.0, c.danger));
             // Labelled, because a bare dot is a mystery. One flick up is the
             // whole instruction and it fits.
-            p.text(at + egui::vec2(0.0, -20.0), egui::Align2::CENTER_BOTTOM,
-                   "flick up to stop", egui::FontId::proportional(11.0), c.text_weak);
+            p.text(at + egui::vec2(0.0, 20.0), egui::Align2::CENTER_TOP,
+                   "stand it upright to stop", egui::FontId::proportional(11.0),
+                   c.text_weak);
         }
     }
     // The snap ring is drawn on the TARGET, not the ball: the user needs to
@@ -934,11 +1002,11 @@ mod tests {
     /// Two rest readings because arriving at rest clears the arm and the dwell
     /// restores it — which is what a real poller emits.
     fn flick(g: &mut GloveCursor, dir: Orient, away_ms: f32, ts: &[Target]) {
-        g.feed(Orient::Rest, 0.0, ts);
-        g.feed(Orient::Rest, REARM_MIN_MS, ts);
-        g.feed(dir, 0.0, ts);
-        g.feed(dir, away_ms, ts);
-        g.feed(Orient::Rest, 0.0, ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, ts);
+        g.feed(dir, Tilt::Raised, 0.0, ts);
+        g.feed(dir, Tilt::Raised, away_ms, ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, ts);
     }
 
     #[test]
@@ -958,18 +1026,66 @@ mod tests {
         assert_eq!(Orient::parse("left-up"), Orient::LeftUp);
         assert_eq!(Orient::parse("RIGHT_UP"), Orient::RightUp);
         assert_eq!(Orient::parse("bottom-up"), Orient::BottomUp);
-        assert_eq!(Orient::parse("normal"), Orient::Rest);
+        assert_eq!(Orient::parse("normal"), Orient::Normal);
         assert_eq!(Orient::parse("nonsense"), Orient::Unknown);
     }
 
     #[test]
-    fn face_up_and_face_down_are_rest_and_do_nothing_but_re_arm() {
-        // Per the maze game: turning the phone flat does not move the ball, it
-        // makes the next flick possible.
-        for flat in ["face-up", "face-down", "flat", "normal"] {
-            assert!(Orient::parse(flat).is_rest(), "{flat}");
-            assert_eq!(Orient::parse(flat).direction(), None);
+    fn rest_comes_from_tilt_not_from_orientation() {
+        // The correction. Treating "normal" as rest threw away a quarter of the
+        // vocabulary and left no way to move the cursor down.
+        for flat in ["face-up", "face-down", "flat"] {
+            assert!(Tilt::parse(flat).is_rest(), "{flat}");
         }
+        assert!(!Tilt::parse("raised").is_rest());
+        // And every orientation is now a direction.
+        for o in ["normal", "left-up", "right-up", "bottom-up"] {
+            assert!(Orient::parse(o).direction().is_some(), "{o} should steer");
+        }
+    }
+
+    #[test]
+    fn standing_the_phone_on_its_port_moves_the_cursor_down() {
+        // The direction that did not exist before. "normal" is the phone
+        // upright on its charging port, and the ball runs downhill.
+        assert_eq!(Orient::Normal.direction(), Some((0.0, 1.0)));
+        let mut g = cold_cursor();
+        let before = g.pos();
+        flick(&mut g, Orient::Normal, 120.0, &[]);
+        assert_eq!(g.pos().1, before.1 + STEP_PX, "downward, at last");
+    }
+
+    #[test]
+    fn the_escape_dot_is_now_below_the_field() {
+        // It moved once down became reachable. Below is where a thumb-held
+        // phone tips naturally, and it keeps the dot clear of the text the user
+        // is watching appear.
+        assert_eq!(escape_dot_at((200.0, 400.0)), (200.0, 400.0 + STEP_PX));
+    }
+
+    #[test]
+    fn an_older_daemon_without_tilt_still_works_with_three_directions() {
+        // AccelerometerTilt is newer-versions-only. Without it, "normal" falls
+        // back to meaning rest — costing the downward flick, which is better
+        // than a ratchet that can never re-arm.
+        let mut r = Ratchet::default();
+        r.feed(Orient::Normal, Tilt::Unsupported, 0.0);
+        r.feed(Orient::Normal, Tilt::Unsupported, REARM_MIN_MS);
+        assert!(r.armed(), "normal is rest when tilt is unavailable");
+        r.feed(Orient::LeftUp, Tilt::Unsupported, 0.0);
+        r.feed(Orient::LeftUp, Tilt::Unsupported, 100.0);
+        assert_eq!(r.feed(Orient::Normal, Tilt::Unsupported, 0.0), Some(Orient::LeftUp),
+                   "sideways flicks still work");
+    }
+
+    #[test]
+    fn an_older_daemon_cannot_flick_downward_and_that_is_the_documented_cost() {
+        let mut r = Ratchet::default();
+        r.feed(Orient::BottomUp, Tilt::Unsupported, 0.0);
+        r.feed(Orient::Normal, Tilt::Unsupported, 0.0);
+        r.feed(Orient::Normal, Tilt::Unsupported, REARM_MIN_MS);
+        // "normal" is rest here, so it can never be the away-direction.
+        assert_eq!(r.feed(Orient::Normal, Tilt::Unsupported, 0.0), None);
     }
 
     #[test]
@@ -999,10 +1115,10 @@ mod tests {
         // someone who cannot easily tap.
         let mut g = cold_cursor();
         let before = g.pos();
-        g.feed(Orient::Rest, 0.0, &[]);
-        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
-        g.feed(Orient::LeftUp, 0.0, &[]);
-        for _ in 0..100 { g.feed(Orient::LeftUp, 16.0, &[]); }
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, &[]);
+        g.feed(Orient::LeftUp, Tilt::Raised, 0.0, &[]);
+        for _ in 0..100 { g.feed(Orient::LeftUp, Tilt::Raised, 16.0, &[]); }
         assert_eq!(g.pos(), before, "no step while held");
     }
 
@@ -1030,12 +1146,12 @@ mod tests {
         // accidental step is worse than a late one for someone in gloves.
         let mut g = cold_cursor();
         let before = g.pos();
-        g.feed(Orient::Rest, 0.0, &[]);
-        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
-        g.feed(Orient::LeftUp, 0.0, &[]);
-        g.feed(Orient::LeftUp, 100.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, &[]);
+        g.feed(Orient::LeftUp, Tilt::Raised, 0.0, &[]);
+        g.feed(Orient::LeftUp, Tilt::Raised, 100.0, &[]);
         assert_eq!(g.pos(), before, "still out");
-        g.feed(Orient::Rest, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
         assert_eq!(g.pos().0, before.0 - STEP_PX, "fired on the return");
     }
 
@@ -1045,11 +1161,11 @@ mod tests {
         // crosses the boundary is one motion, not four.
         let mut g = cold_cursor();
         let before = g.pos();
-        g.feed(Orient::Rest, 0.0, &[]);
-        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, &[]);
         for _ in 0..4 {
-            g.feed(Orient::LeftUp, 10.0, &[]);
-            g.feed(Orient::Rest, 10.0, &[]);   // far shorter than REARM_MIN_MS
+            g.feed(Orient::LeftUp, Tilt::Raised, 10.0, &[]);
+            g.feed(Orient::Normal, Tilt::FaceUp, 10.0, &[]);   // far shorter than REARM_MIN_MS
         }
         assert_eq!(g.pos().0, before.0 - STEP_PX, "one step, not four");
     }
@@ -1059,11 +1175,11 @@ mod tests {
         // A phone tumbling in a pocket must not ratchet between flaps.
         let mut g = cold_cursor();
         let before = g.pos();
-        g.feed(Orient::Rest, 0.0, &[]);
-        g.feed(Orient::Rest, REARM_MIN_MS, &[]);
-        g.feed(Orient::Unknown, 500.0, &[]);
-        g.feed(Orient::LeftUp, 0.0, &[]);
-        g.feed(Orient::Rest, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, &[]);
+        g.feed(Orient::Unknown, Tilt::Raised, 500.0, &[]);
+        g.feed(Orient::LeftUp, Tilt::Raised, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
         assert_eq!(g.pos(), before, "the flick did not start from a known rest");
     }
 
@@ -1071,8 +1187,8 @@ mod tests {
     fn it_starts_unarmed_so_switching_the_mode_on_while_tilted_does_nothing() {
         let mut g = cold_cursor();
         let before = g.pos();
-        g.feed(Orient::LeftUp, 0.0, &[]);
-        g.feed(Orient::Rest, 0.0, &[]);
+        g.feed(Orient::LeftUp, Tilt::Raised, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
         assert_eq!(g.pos(), before);
     }
 
@@ -1099,7 +1215,7 @@ mod tests {
         let mut g = cold_cursor();
         let ts = vec![target("far", TargetKind::Button, 200.0, 500.0),
                       target("near", TargetKind::Button, 200.0, 410.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.snapped(), Some("near"));
     }
 
@@ -1107,7 +1223,7 @@ mod tests {
     fn nothing_outside_the_radius_captures_the_ball() {
         let mut g = cold_cursor();
         let ts = vec![target("miles", TargetKind::Button, 20.0, 20.0)];
-        assert_eq!(g.feed(Orient::Rest, 16.0, &ts).snapped, None);
+        assert_eq!(g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts).snapped, None);
         assert_eq!(g.readout(&ts), "nothing selected");
     }
 
@@ -1124,7 +1240,7 @@ mod tests {
         // cannot be pressed by the hand that needed this mode.
         let mut g = cold_cursor();
         let ts = vec![target("name", TargetKind::Field, 200.0, 400.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.speak("select", &ts), Some(GloveAction::ArmField("name".into())));
         // Nothing in the action vocabulary can ask for a keyboard.
         let dbg = format!("{:?}", g.speak("press", &ts));
@@ -1135,7 +1251,7 @@ mod tests {
     fn selecting_a_button_activates_it() {
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.speak("go", &ts), Some(GloveAction::Activate("send".into())));
     }
 
@@ -1143,7 +1259,7 @@ mod tests {
     fn a_toggle_flips_on_select_and_on_its_own_words() {
         let mut g = cold_cursor();
         let ts = vec![target("wifi", TargetKind::Toggle, 200.0, 400.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.speak("select", &ts), Some(GloveAction::Toggle("wifi".into())));
         assert_eq!(g.speak("turn off", &ts), Some(GloveAction::Toggle("wifi".into())));
     }
@@ -1154,7 +1270,7 @@ mod tests {
         // not.
         let mut g = cold_cursor();
         let ts = vec![target("vol", TargetKind::Slider, 200.0, 400.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.speak("louder", &ts),
                    Some(GloveAction::Nudge { id: "vol".into(), delta: 0.10 }));
         assert_eq!(g.speak("a bit less", &ts),
@@ -1169,7 +1285,7 @@ mod tests {
         // something arbitrary.
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.speak("louder", &ts), None);
     }
 
@@ -1179,7 +1295,7 @@ mod tests {
         let ts = vec![target("a", TargetKind::ListItem, 200.0, 400.0),
                       target("b", TargetKind::ListItem, 200.0, 460.0),
                       target("c", TargetKind::ListItem, 200.0, 520.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.snapped(), Some("a"));
         g.speak("next", &ts);
         assert_eq!(g.snapped(), Some("b"));
@@ -1194,7 +1310,7 @@ mod tests {
         let mut g = cold_cursor();
         let ts = vec![target("a", TargetKind::ListItem, 200.0, 400.0),
                       target("b", TargetKind::ListItem, 200.0, 460.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("next", &ts);
         assert_eq!(g.pos(), (200.0, 460.0));
         
@@ -1223,7 +1339,7 @@ mod tests {
         // wearing gloves and cannot easily undo.
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.speak("banana", &ts), None);
     }
 
@@ -1232,7 +1348,7 @@ mod tests {
         // Someone is speaking through a scarf; the transcript will be messy.
         let mut g = cold_cursor();
         let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert!(g.speak("  SELECT ", &ts).is_some());
     }
 
@@ -1243,7 +1359,7 @@ mod tests {
         let mut t = target("vol", TargetKind::Slider, 200.0, 400.0);
         t.label = "Volume".into();
         let ts = vec![t];
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.readout(&ts), "Volume");
     }
 
@@ -1253,7 +1369,7 @@ mod tests {
         for kind in [TargetKind::Button, TargetKind::Field, TargetKind::Slider,
                      TargetKind::Toggle, TargetKind::ListItem] {
             let ts = vec![target("x", kind, 200.0, 400.0)];
-            g.feed(Orient::Rest, 16.0, &ts);
+            g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
             assert_eq!(g.speak("cancel", &ts), Some(GloveAction::Dismiss), "{kind:?}");
         }
     }
@@ -1279,7 +1395,7 @@ mod escape_and_confirm_tests {
         // resolving it as a command jumps the cursor and swallows the word.
         let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
         let mut g = cursor();
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("select", &ts);
         assert!(g.dictating());
         assert_eq!(g.speak("next", &ts), Some(GloveAction::Dictated("next".into())));
@@ -1294,12 +1410,12 @@ mod escape_and_confirm_tests {
         // latency, and a hold cannot be produced by a single ambient sway.
         let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
         let mut g = cursor();
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("select", &ts);
         assert!(g.dictating());
 
-        g.feed(Orient::FaceDown, 0.0, &ts);
-        let out = g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &ts);
+        g.feed(Orient::Normal, Tilt::FaceDown, 0.0, &ts);
+        let out = g.feed(Orient::Normal, Tilt::FaceDown, ESCAPE_HOLD_MS, &ts);
         assert!(out.escaped);
         assert!(!g.dictating());
     }
@@ -1310,46 +1426,50 @@ mod escape_and_confirm_tests {
         // in passing, and face-down is a resting pose people use constantly.
         let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
         let mut g = cursor();
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("select", &ts);
-        g.feed(Orient::FaceDown, 0.0, &ts);
-        let out = g.feed(Orient::FaceDown, ESCAPE_HOLD_MS - 50.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceDown, 0.0, &ts);
+        let out = g.feed(Orient::Normal, Tilt::FaceDown, ESCAPE_HOLD_MS - 50.0, &ts);
         assert!(!out.escaped);
         assert!(g.dictating(), "still listening");
     }
 
     /// Complete one flick against a target list.
     fn flick_to(g: &mut GloveCursor, dir: Orient, ts: &[Target]) -> Tick {
-        g.feed(Orient::Rest, 0.0, ts);
-        g.feed(Orient::Rest, REARM_MIN_MS, ts);
-        g.feed(dir, 0.0, ts);
-        g.feed(dir, 120.0, ts);
-        g.feed(Orient::Rest, 0.0, ts)
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, ts);
+        g.feed(dir, Tilt::Raised, 0.0, ts);
+        g.feed(dir, Tilt::Raised, 120.0, ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, ts)
     }
 
     #[test]
-    fn the_escape_dot_sits_above_the_field_because_there_is_no_downward_flick() {
-        // The sensor's vocabulary decides the layout: left-up, right-up and
-        // bottom-up are the three usable directions, and bottom-up moves the
-        // cursor UP. A dot below the field could never be reached.
+    fn the_escape_dot_sits_below_the_field_now_that_down_is_reachable() {
+        // It was above, justified by a constraint that turned out to be
+        // self-inflicted: treating "normal" as rest left no downward
+        // orientation. All four rotations steer, so the dot goes where a
+        // thumb-held phone tips naturally.
         let f = (200.0, 400.0);
-        assert_eq!(escape_dot_at(f), (200.0, 400.0 - STEP_PX));
-        assert!(escape_dot_at(f).1 < f.1, "above, not below");
-        assert_eq!(Orient::BottomUp.direction(), Some((0.0, -1.0)));
-        // Nothing in the vocabulary moves the cursor down.
-        for o in [Orient::LeftUp, Orient::RightUp, Orient::BottomUp] {
-            assert!(o.direction().unwrap().1 <= 0.0, "{o:?} moves down");
-        }
+        assert_eq!(escape_dot_at(f), (200.0, 400.0 + STEP_PX));
+        assert!(escape_dot_at(f).1 > f.1, "below, not above");
+        assert_eq!(Orient::Normal.direction(), Some((0.0, 1.0)));
+        // All four rotations carry a step, in four different directions.
+        let dirs: Vec<_> = [Orient::LeftUp, Orient::RightUp,
+                            Orient::BottomUp, Orient::Normal]
+            .iter().map(|o| o.direction().unwrap()).collect();
+        assert_eq!(dirs.len(), 4);
+        for i in 0..4 { for j in (i + 1)..4 { assert_ne!(dirs[i], dirs[j]); } }
     }
 
     #[test]
-    fn one_flick_up_reaches_the_dot_and_ends_dictation() {
-        // Exactly one step, so the quick exit is quick.
+    fn one_flick_down_reaches_the_dot_and_ends_dictation() {
+        // Exactly one step, so the quick exit is quick. DOWN, now that standing
+        // the phone upright is a direction rather than a rest.
         let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
         let mut g = cursor();
         g.pos = (200.0, 400.0);
         g.arm_field("body");
-        let out = flick_to(&mut g, Orient::BottomUp, &ts);
+        let out = flick_to(&mut g, Orient::Normal, &ts);
         assert!(out.escaped);
         assert!(!g.dictating());
     }
@@ -1362,7 +1482,7 @@ mod escape_and_confirm_tests {
         let mut g = cursor();
         g.pos = (200.0, 400.0);
         g.arm_field("body");
-        flick_to(&mut g, Orient::BottomUp, &ts);
+        flick_to(&mut g, Orient::Normal, &ts);
         assert_eq!(g.snapped(), None, "nothing left to snap to");
     }
 
@@ -1402,15 +1522,15 @@ mod escape_and_confirm_tests {
         let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
         let mut g = cursor();
         g.arm_field("body");
-        g.feed(Orient::FaceDown, 0.0, &ts);
-        assert!(g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &ts).escaped);
+        g.feed(Orient::Normal, Tilt::FaceDown, 0.0, &ts);
+        assert!(g.feed(Orient::Normal, Tilt::FaceDown, ESCAPE_HOLD_MS, &ts).escaped);
     }
 
     #[test]
     fn escaping_when_not_listening_reports_nothing_happened() {
         let mut g = cursor();
-        g.feed(Orient::FaceDown, 0.0, &[]);
-        let out = g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &[]);
+        g.feed(Orient::Normal, Tilt::FaceDown, 0.0, &[]);
+        let out = g.feed(Orient::Normal, Tilt::FaceDown, ESCAPE_HOLD_MS, &[]);
         assert!(!out.escaped, "there was nothing to escape from");
     }
 
@@ -1418,11 +1538,11 @@ mod escape_and_confirm_tests {
     fn after_escaping_the_vocabulary_works_again() {
         let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
         let mut g = cursor();
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         g.speak("select", &ts);
-        g.feed(Orient::FaceDown, 0.0, &ts);
-        g.feed(Orient::FaceDown, ESCAPE_HOLD_MS, &ts);
-        g.feed(Orient::Rest, 16.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceDown, 0.0, &ts);
+        g.feed(Orient::Normal, Tilt::FaceDown, ESCAPE_HOLD_MS, &ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
         assert_eq!(g.speak("select", &ts), Some(GloveAction::ArmField("body".into())));
     }
 
