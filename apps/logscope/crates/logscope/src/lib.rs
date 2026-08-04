@@ -72,6 +72,7 @@ pub mod longrun;
 pub mod buildsignal;
 pub mod filewindow;
 pub mod symbolfind;
+pub mod patchcheck;
 pub mod verifyplan;
 pub mod panelvoice;
 pub mod injecttime;
