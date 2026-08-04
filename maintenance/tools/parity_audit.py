@@ -30,6 +30,10 @@ PORTS = [
     ("snapclone",   "apps/snapclone"),
     ("voiceterm",   "apps/voiceterm"),
     ("krapper",     "apps/krapper"),
+    # Its port is inline (src/ui/egui) rather than in egui-frontend/, which is
+    # why it was missing from this list AND from the discovery below. An app
+    # with no row looks like an app with nothing to do.
+    ("ambient-learner", "apps/ambient-learner"),
 ]
 
 def surfaces(app_dir):
@@ -55,7 +59,7 @@ def surfaces(app_dir):
     found = set()
     inherits = {}          # base class -> {subclasses}
     for root, dirs, files in os.walk(app_dir):
-        dirs[:] = [d for d in dirs if d not in ('target', 'build', '.git', 'egui-frontend')]
+        dirs[:] = [d for d in dirs if d not in ('target', 'build', '.git', 'egui-frontend', 'egui')]
         for f in files:
             p = os.path.join(root, f)
             # Test trees are not UI. voiceterm keeps golden OUTPUTS named
@@ -127,10 +131,25 @@ def surfaces(app_dir):
             frontier.append(sub)
     return found
 
+def port_dirs(app_dir):
+    """Where an egui port might live.
+
+    `egui-frontend/` is the convention, but it is not the only shape: an app
+    whose port is a FEATURE of the existing crate keeps it inline, and
+    ambient-learner does exactly that at `src/ui/egui/`. The audit used to walk
+    only the convention, so that app was invisible — it had no row at all, and
+    an app with no row looks like an app with nothing to do rather than an app
+    nobody has measured.
+
+    Returns every directory that exists, so a hybrid is counted once."""
+    candidates = [os.path.join(app_dir, 'egui-frontend'),
+                  os.path.join(app_dir, 'src', 'ui', 'egui')]
+    return [c for c in candidates if os.path.isdir(c)]
+
 def port_text(app_dir):
     out = []
-    src = os.path.join(app_dir, 'egui-frontend')
-    for root, dirs, files in os.walk(src):
+    for src in port_dirs(app_dir):
+      for root, dirs, files in os.walk(src):
         dirs[:] = [d for d in dirs if d != 'target']
         for f in files:
             if f.endswith(('.rs', '.md', '.toml')):
@@ -206,7 +225,7 @@ def main():
     rows = []
     for name, rel in PORTS:
         d = os.path.join(ROOT, rel)
-        if not os.path.isdir(os.path.join(d, 'egui-frontend')): continue
+        if not port_dirs(d): continue
         surf = surfaces(d)
         text = port_text(d)
         hit = {s for s in surf if covered(s, text)}

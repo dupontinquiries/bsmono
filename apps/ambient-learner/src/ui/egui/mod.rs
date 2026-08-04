@@ -9,6 +9,7 @@
 
 /// The barometric gauge — absolute reading plus the trend that actually
 /// predicts weather.
+pub mod live;
 pub mod pressure;
 
 use uikit_egui::motion;
