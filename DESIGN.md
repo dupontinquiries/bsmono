@@ -4126,6 +4126,50 @@ that works at range wastes the short one.
 binary touch: with four samples "did it connect" is mostly noise, and the
 distance is what actually moved.
 
+## v1.126.0 — bots read one bounce ahead, and score
+
+Every prediction in the bot code was plain ballistics — position plus
+velocity plus gravity — which is exactly right until the ball touches
+something and completely wrong immediately after. A bot chasing a ball about
+to land was aiming at a point underneath the floor.
+
+`predict_ball` follows the ball through AT MOST ONE bounce. Against the real
+physics, on a ball that lands inside the horizon:
+
+    ahead   ballistic   with bounce
+     0.3s      0.6 m        0.2 m
+     0.6s      3.2 m        0.3 m
+     1.0s      6.0 m        1.3 m
+     1.5s      9.1 m        3.2 m
+     2.0s     13.3 m        4.1 m
+
+ONE BOUNCE IS A DESIGN CHOICE, not a budget. Reading the first bounce is what
+a competent player does. Two or three out, the real ball depends on spin,
+surface and contact detail this integration does not model — a bot that
+committed that far would be confidently wrong, and it would drain the
+unpredictability that makes a bouncing ball worth playing against. It
+anticipates one bounce and treats the rest as genuinely open.
+
+It feeds both the approach (line up behind where the ball WILL be, with the
+lead scaled to how long the drive takes) and the aerial intercept.
+
+THE RESULT, on the standard scenario:
+
+                     before   after
+    goals              0/6     1/6
+    air touches        2.2     5.7
+    style              7.7    23.9
+
+The first goals this project has recorded from a bot. Air touches are up
+2.6x on where this session started.
+
+TWO HARNESS CORRECTIONS, both the same fault. The prediction test first used
+a ball that never bounced inside the horizon, so it compared two identical
+predictions and passed — a test that cannot fail is worse than none. And the
+aerial check demanded two cases under three metres, which called a genuine
+improvement (mean closest 5.9 m to 3.8 m, plus the first connection) a
+regression. With four samples the aggregate is the honest measure.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

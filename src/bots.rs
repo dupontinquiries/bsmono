@@ -26,6 +26,9 @@ pub struct Ctx<'a> {
     pub mates: &'a [Mate],
     pub attacker: bool,
     pub grav: f32,
+    /// the world, so a brain can predict a BOUNCE rather than only a
+    /// parabola — the surface is what the ball bounces off
+    pub world: &'a World,
 }
 
 /// Anticipatory jump: leave the ground ~a third of a second BEFORE a
@@ -229,6 +232,58 @@ pub fn spawn_sparta_300(world: &World) -> Vec<Bot> {
     v
 }
 
+/// Where the ball will be in `t` seconds, followed through AT MOST ONE
+/// bounce.
+///
+/// Every prediction in here used to be plain ballistics — position plus
+/// velocity plus gravity — which is exactly right until the ball touches
+/// something, and completely wrong immediately afterwards. A bot chasing a
+/// ball that is about to bounce was aiming at a point underneath the floor.
+///
+/// One bounce is the deliberate limit, and it is a design choice rather than
+/// a budget one. Reading the first bounce is what a competent player does:
+/// you see the ball coming off the ground and move to where it will be. Two
+/// or three bounces out, the real ball's behaviour depends on spin, surface
+/// and contact detail that this integration does not model — so a bot that
+/// committed that far would be confidently wrong, and would also drain the
+/// unpredictability that makes a bouncing ball interesting to play against.
+/// It anticipates one bounce and treats the rest as genuinely open.
+pub fn predict_ball(ball: &Ball, world: &World, grav: f32, t: f32) -> (Vec3, u32) {
+    let mut p = ball.pos;
+    let mut v = ball.vel;
+    let mut left = t;
+    let mut bounces = 0u32;
+    // 30 Hz is plenty for an aim point: the error from coarse stepping is
+    // far below the error in knowing the ball's future at all
+    let dt: f32 = 1.0 / 30.0;
+    while left > 1e-4 {
+        let step = dt.min(left);
+        v.y -= grav * step;
+        let np = p + v * step;
+        let d = world.sdf(np);
+        if d < ball.r {
+            if bounces >= 1 {
+                // past the one bounce we are willing to predict: stop here
+                // rather than pretend to know
+                return (p, bounces);
+            }
+            let n = world.normal(np);
+            let into = v.dot(n);
+            if into < 0.0 {
+                // reflect, and lose what a real bounce loses
+                v = (v - n * (2.0 * into)) * 0.62;
+                bounces += 1;
+                p = np + n * (ball.r - d).max(0.0);
+                left -= step;
+                continue;
+            }
+        }
+        p = np;
+        left -= step;
+    }
+    (p, bounces)
+}
+
 /// One frame of every bot: brain -> physics -> ball touch -> crowd shoving.
 pub fn update(
     bots: &mut [Bot],
@@ -296,6 +351,7 @@ pub fn update(
             mates: &mates,
             attacker: nearest.get(&b.team).map(|e| e.1) == Some(bi),
             grav,
+            world,
         };
         let c = match b.brain {
             Brain::Ballchase => ballchase(b, ball, time, &ctx),
@@ -501,7 +557,22 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
     match b.phase {
         Phase::Approach => {
             // line up BEHIND the ball on the goal axis ("setup is 80%")
-            let behind = ball.pos - to_goal * (2.6 + ball.vel.length() * 0.12);
+            // ---- LINE UP ON THE FUTURE BALL ----
+            //
+            // "Setup is 80%" is only true if you set up on the right spot.
+            // Aiming behind the ball's CURRENT position sends the bot to
+            // where the ball has already left, and against a bouncing ball
+            // it chases the whole way. Predicting the arrival — through one
+            // bounce — turns the same manoeuvre into an interception.
+            //
+            // The lead is how long the drive will take, so it scales with
+            // distance rather than being a constant.
+            let drive_t = ((ball.pos - car.pos).length() / car.vel.length().max(9.0)).clamp(0.10, 1.40);
+            let (future, bounces) = predict_ball(ball, ctx.world, ctx.grav, drive_t);
+            // a ball that will bounce arrives slower than it looks, so sit a
+            // little tighter to it
+            let stand_off = if bounces > 0 { 2.1 } else { 2.6 + ball.vel.length() * 0.12 };
+            let behind = future - to_goal * stand_off;
             let (d, ang) = steer_to(&mut c, car, behind);
             c.boost = ang < 0.3 && d > 8.0;
             c.powerslide = ang > 1.2 && car.on_ground;
@@ -643,7 +714,9 @@ fn striker(b: &mut Bot, ball: &Ball, world: &World, ctx: &Ctx, dt: f32) -> Contr
             let mut lead = 0.45f32;
             let mut pred = ball.pos;
             for _ in 0..3 {
-                pred = ball.pos + ball.vel * lead + ctx.grav * (0.5 * lead * lead);
+                // bounce-aware: plain ballistics aims under the floor the
+                // moment the ball is about to land
+                pred = predict_ball(ball, ctx.world, ctx.grav, lead).0;
                 let reach = (pred - car.pos).length();
                 // speed already carried toward it, plus what boost adds
                 let speed = car.vel.length().max(6.0) + 14.0;
