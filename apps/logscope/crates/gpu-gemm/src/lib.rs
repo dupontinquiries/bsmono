@@ -8450,8 +8450,20 @@ last block and k's first would decode to garbage")),
                 // sensitive tensors wider. "type 18 unsupported for blk.0.attn_q.weight" costs a
                 // 30 GiB download to learn ONE of them, and there are usually several.
                 let supported: Vec<u32> = vec![0, 1, 8, 12, 14, 19];
+                // BYTES, NOT ELEMENTS. My first version passed dims.product(), which is the
+                // element count — so a report on a 30966 MiB file summed to 63135 MiB and its
+                // percentages exceeded 100. The shares are the whole point of the report, since they
+                // decide which type to implement first, and a wrong share ranks them wrongly.
                 let all: Vec<(u32, u64)> = g.tensors.iter()
-                    .map(|x| (x.ggml_type, x.dims.iter().product::<u64>())).collect();
+                    .filter_map(|x| {
+                        let n = x.dims.iter().product::<u64>() as usize;
+                        gguf::type_nbytes(x.ggml_type, n)
+                            .map(|b| (x.ggml_type, b as u64))
+                            // A type whose SIZE is unknown still has to appear, or the report omits
+                            // exactly the types it exists to name. Fall back to the element count and
+                            // let the share be approximate rather than absent.
+                            .or(Some((x.ggml_type, n as u64)))
+                    }).collect();
                 let total: u64 = all.iter().map(|(_, n)| *n).sum();
                 let missing = gguf::unsupported_types(all, &supported);
                 format!("{} (first hit: {} in {name})\n{}",
