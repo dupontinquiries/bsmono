@@ -24,6 +24,10 @@ app = ["dep:eframe"]
 # submodule. The #[path] trick is for modules living inside an app crate; this
 # is not one.
 snapclone-composer = { path = "../rust/snapclone-composer" }
+# The connection-request approval lifecycle. A dependency for the same reason
+# the composer is: it ships an rlib, and its modules use crate:: paths that
+# resolve to the wrong crate under a #[path] include.
+snapclone-mailbox = { path = "../rust/snapclone-mailbox" }
 # The camera bridge device-kit was written for — its description names
 # snapclone explicitly, and no port had ever depended on it.
 # One authenticated session per peer, streams on demand. The roster was a
