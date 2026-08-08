@@ -462,3 +462,84 @@ runtime = "none"
 targets = ["desktop", "phone"]
 primary = true
 notes = "the egui port of ambient-learner. A SEPARATE CRATE rather than a feature of the parent: iced 0.12 caps web-sys below what eframe 0.34 needs, and cargo resolves optional dependencies whether or not their feature is on, so an eframe binary in the parent fails to RESOLVE even with iced disabled. The view code is not copied — one #[path] include pulls in src/egui_lib.rs and its page tree. Live and History pages are ported; Locations, Map, Model and Sync are not."
+
+# ── daemons ──────────────────────────────────────────────────────────────────
+#
+# These four existed in apps/ with working Cargo manifests and NO entry here, so
+# gitmind — which builds from this file — could not build them. All four compile
+# clean; the only thing missing was the registration. `role = "daemon"` and
+# `daemon = true` so a build that wants services picks them up without having to
+# know their names.
+
+[apps.sharemd]
+path = "apps/sharemd"
+kind = "cargo"
+role = "daemon"
+daemon = true
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+notes = "the cross-app data-share daemon. Binds the `share` socket and serves datashare-core's Hub: namespaced key/value with pub-sub, so shared state (contacts, sessions, now-playing, handoff) lives once. Apps reach it through ipc-kit and fall back to private state when it is not running, which is why nothing breaks when it is missing — and why its absence from this manifest went unnoticed."
+
+[apps.settingsd]
+path = "apps/settingsd"
+kind = "cargo"
+role = "daemon"
+daemon = true
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+notes = "the persistent settings daemon. Serves the cross-app `settings` namespace and, unlike sharemd, PERSISTS every change to ~/.config/gitmind/settings.conf through config-kit, so preferences survive a restart. Seeds defaults from settings-kit on first run. settings-app publishes here; every egui-kit app subscribes."
+
+[apps.voiced]
+path = "apps/voiced"
+kind = "cargo"
+role = "daemon"
+daemon = true
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+notes = "the unified voice daemon. Binds the `voiced` socket and owns intent routing via voiced-core's Registry: apps register intent types at Always/Active scope, the compositor reports focus, and utterances are routed to whoever is entitled to them. This is the arbitration voiceterm's own mic work stops short of — that is about hardware and pipelines, this is about which APP gets the intent."
+
+[apps.coordd]
+path = "apps/coordd"
+kind = "cargo"
+role = "daemon"
+daemon = true
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+notes = "the coordination daemon. Binds the `coord` socket and serves coord-core's Arbiter: apps claim and release shared resources with a priority and a mode, and announce activity that is relayed to interested apps. The obvious consumer is the microphone — snapclone in a call and voiceterm listening for commands are exactly the contention this exists to settle."
+
+# ── apps that were also missing ───────────────────────────────────────────────
+
+[apps.settings-app]
+path = "apps/settings-app"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+primary = true            # the egui SettingsEditor is the only front end there is
+notes = "the central settings app for the egui-kit apps: a shared SettingsEditor on uikit-egui, plus two front ends onto settingsd — the `bsettings` GUI and the `bsettings-cli` command line. Both read current Prefs from the daemon and publish changes to the `settings` namespace so every app updates live. Uses settings-kit for schema/diff and bigsilicon-client for the daemon link."
+
+[apps.beatspace]
+path = "apps/beatspace"
+kind = "cargo"
+role = "tool"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "a Rust port of the kBM3 mel-spectrogram GAN. A tool rather than a shipped app. NOTE: needs libasound2-dev — `cargo check` fails in alsa-sys's build script without it, which is a host requirement rather than a code fault. Registered anyway so the dependency is discoverable from here instead of on first build."
+
+[apps.av1tuner-m1]
+path = "apps/av1tuner-m1"
+kind = "cargo"
+role = "tool"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "the M1 variant of av1tuner. Registered alongside av1tuner, which was already listed — the pair had drifted, with only one of them known to the build."
