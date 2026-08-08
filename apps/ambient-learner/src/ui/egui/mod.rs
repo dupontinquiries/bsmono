@@ -18,6 +18,9 @@ pub mod history;
 /// The saved places a reading can be attributed to.
 pub mod locations;
 
+/// What the local database holds, and the transfer that is not wired yet.
+pub mod sync;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
