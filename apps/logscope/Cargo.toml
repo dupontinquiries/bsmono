@@ -15,3 +15,30 @@ codegen-units = 1
 [profile.dev]
 debug = 1
 split-debuginfo = "unpacked"
+
+# ITERATION SPEED, MEASURED rather than assumed.
+#
+# logscope-egui is 51K lines in one crate, 7.8K of it in tabs/chat.rs. Rust's FRONTEND is
+# single-threaded per crate, so more cores do not help the part that dominates — which is why the
+# obvious answer, "let cargo multithread it", is not the answer.
+#
+# What does help, on one core, checking after touching chat.rs:
+#
+#     CARGO_INCREMENTAL=0     95 s     (cold)
+#     CARGO_INCREMENTAL=1     27 s     (first, populates the cache)
+#     CARGO_INCREMENTAL=1      2.7 s   (warm)
+#
+# 35x, with no code change. Incremental is ON by default for dev profiles — it is only lost when
+# something sets CARGO_INCREMENTAL=0, which CI scripts do routinely and which is worth NOT copying
+# into an interactive shell.
+incremental = true
+
+# 256 is the dev default and is stated here so nobody "optimises" it downward. Fewer units means
+# better codegen and worse parallelism, and this profile is for iterating rather than shipping.
+codegen-units = 256
+
+# NOT SETTING opt-level on dependencies. I added it and removed it in the same sitting: optimising
+# dependencies speeds up RUNNING their code and does nothing for CHECKING ours, which is the loop
+# being optimised here. It cost a full dependency rebuild and bought nothing measurable.
+#
+# It would be worth it for a profile aimed at running the app rather than iterating on it.
