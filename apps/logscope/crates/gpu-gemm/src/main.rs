@@ -3860,6 +3860,26 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-quanttables") {
+        // Five decoders were added in one sitting and every test for them constructs a block from
+        // the same understanding of the layout the decoder uses — which is circular. This does not
+        // fix that; it checks the three places the same facts are written down against each other.
+        //
+        // It found a real gap the run it was written: source_bpw had no Q5_K entry, so the planner
+        // could not size any file containing it.
+        let a = gpu_kernels::quantref::table_consistency();
+        let b = gpu_kernels::quantref::decoder_length_agreement();
+        for p in a.iter().chain(b.iter()) { println!("  {p}"); }
+        if a.is_empty() && b.is_empty() {
+            println!("gate-quanttables: type_nbytes, source_bpw and the decoders agree on every \
+supported type. THIS DOES NOT PROVE THE LAYOUTS ARE RIGHT — only a real checkpoint does that — but \
+a disagreement here would have proved one wrong.");
+        } else {
+            println!("gate-quanttables: {} FAIL", a.len() + b.len());
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-residency") {
         // MEASURE what ASAHI_CONCURRENT_BUFFER_GIB assumes. That constant is one M2 Ultra's figure
         // applied to every Asahi device, and a wrong value is a wrong REFUSAL — invisible, because
@@ -4917,7 +4937,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-quantref  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-store  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-quantref  --gate-quanttables  --gate-qwen2\n  --gate-qwen3  --gate-residency  --gate-rubric  --gate-store\n  --gate-stream-slots  --gate-submit  --gate-swa  --gate-vae-conv\n  --gate-vae-resblock  --gate-vit-block  --gate-vram  --gate-worker\n  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
