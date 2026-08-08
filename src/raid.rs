@@ -94,6 +94,28 @@ pub fn window_s(orbit: &Orbit, w: Weather) -> f32 {
     }
 }
 
+/// WHAT THE SHIP TOOK WHILE YOU WERE INSIDE.
+///
+/// foothold says an LZ approach PINS THE SHIP — it lands and stays, and a
+/// large stationary thing on a hostile world is a target. That was a stated
+/// cost with no mechanism; this is the mechanism.
+///
+/// A fortress run leaves the ship in orbit and it takes nothing. An LZ run
+/// leaves it on the deck for the whole raid, so the longer you are down
+/// there the more it wears. The cost lands on the NEXT voyage, which is the
+/// kind of consequence worth having.
+pub fn ship_exposure(r: &Run, raid: &Raid) -> f32 {
+    match r.approach {
+        Some(Approach::ClearLz) => {
+            // proportional to how long the raid ran, which the encounter
+            // times already describe
+            let secs: f32 = raid.encounters.iter().sum::<f32>().max(60.0);
+            (secs / 240.0).clamp(0.2, 4.0)
+        }
+        _ => 0.0,
+    }
+}
+
 /// Run it, having flown there first.
 ///
 /// THE VOYAGE IS PART OF THE RAID. Supplies burn the whole way, so a team
@@ -394,6 +416,30 @@ mod tests {
         let b = run(&r, Body::Cybertronian, 14.0, 77, &[Body::Cybertronian]);
         assert_eq!(a.phase, b.phase);
         assert_eq!(a.drop.map(|d| d.grade), b.drop.map(|d| d.grade));
+    }
+
+    #[test]
+    fn an_lz_run_wears_the_ship_and_a_fortress_run_does_not() {
+        use crate::damage::{hit, Condition};
+        use crate::loadout::{Module, Ship};
+        let r = raid(Weather::DustStorm, quiet());
+        let mut lz = r.clone();
+        lz.sites = vec![site(Approach::ClearLz, 200.0, 60.0)];
+        let mut fort = r.clone();
+        fort.sites = vec![site(Approach::SeizeFortress, 300.0, 120.0)];
+        let a = run(&lz, Body::Cybertronian, 14.0, 4, &[Body::Cybertronian]);
+        let b = run(&fort, Body::Cybertronian, 14.0, 4, &[Body::Cybertronian]);
+        assert!(ship_exposure(&a, &lz) > 0.0, "a pinned ship should be exposed");
+        assert_eq!(ship_exposure(&b, &fort), 0.0, "a ship in orbit takes nothing");
+
+        // and the wear is real: it shows up as delta-v next time
+        let s = Ship { hull: 10, modules: vec![Module::Armour, Module::Reactor, Module::Hold] };
+        let mut c = Condition::intact(&s);
+        let before = c.dv_kms(40.0);
+        for i in 0..6 {
+            hit(&mut c, ship_exposure(&a, &lz), i);
+        }
+        assert!(c.dv_kms(40.0) < before, "the trip home should be shorter than the trip out");
     }
 
     #[test]

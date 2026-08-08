@@ -12,6 +12,7 @@ mod chord;
 mod clinch;
 mod combine;
 mod config;
+mod damage;
 mod drop;
 mod font;
 mod foothold;
