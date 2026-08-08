@@ -24,6 +24,8 @@ pub mod q2demote;
 pub mod quantref;
 pub mod iq4;
 pub mod iq1m;
+pub mod iqgrids;
+pub mod iq2xxs;
 pub mod kquant;
 pub mod shaderdev;
 pub mod framediag;
@@ -8533,7 +8535,7 @@ last block and k's first would decode to garbage")),
                 // 20 and 23 joined the list when iq4.rs landed. The report is only honest if this
                 // matches what dequantize actually accepts — a stale list here reports supported
                 // types as missing, which sends someone to implement what already works.
-                let supported: Vec<u32> = vec![0, 1, 8, 10, 11, 12, 13, 14, 19, 20, 23, 29];
+                let supported: Vec<u32> = vec![0, 1, 8, 10, 11, 12, 13, 14, 16, 19, 20, 23, 29];
                 // BYTES, NOT ELEMENTS. My first version passed dims.product(), which is the
                 // element count — so a report on a 30966 MiB file summed to 63135 MiB and its
                 // percentages exceeded 100. The shares are the whole point of the report, since they

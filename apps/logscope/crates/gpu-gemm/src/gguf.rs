@@ -941,6 +941,9 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         // IQ1_M now READS. It was refused by name because its per-8 scale layout differs from
         // IQ1_S's and the IQ1_S path would have decoded it to garbage silently — the refusal was
         // right, and iq1m.rs is what replaces it rather than relaxing it.
+        // IQ2_XXS: the first CODEBOOK format here, decoded against a grid fetched from
+        // ggml-common.h rather than recalled. 18% of a UD-IQ1_S Scout.
+        16 => return crate::iq2xxs::dequant_iq2_xxs(data, n),
         29 => return crate::iq1m::dequant_iq1_m(data, n),
         19 => {
             // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
@@ -1558,7 +1561,9 @@ mod iq4_wiring_tests {
         // 29 (IQ1_M) left the list when iq1m.rs landed. The remaining five are the CODEBOOK
         // formats that each need a 2048-entry grid transcribed — IQ1_M was tractable precisely
         // because it reuses the grid IQ1_S already carries.
-        for t in [16, 17, 18, 21, 22] {
+        // 16 (IQ2_XXS) left when the grids were fetched. The four remaining need iq2xs_grid,
+        // iq3xxs_grid and iq3s_grid wired to their decoders — the tables are already here.
+        for t in [17, 18, 21, 22] {
             assert!(dequantize(t, &vec![0u8; 512], 256).is_err(), "type {t} must stay refused");
         }
     }
