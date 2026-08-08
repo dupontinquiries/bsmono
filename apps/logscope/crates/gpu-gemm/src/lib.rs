@@ -3173,6 +3173,36 @@ impl Gpu {
     }
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
     fn flush_and_wait(&self) {
+        // REOPENS THE FRAME IT TOOK. This is where decode's 67% no-frame came from.
+        //
+        // `take()` removes the frame and nothing put one back, so every dispatch after the first
+        // expert stream in a decode step ran frameless — and stream_expert_lins runs PER LAYER, which
+        // is why Scout (67%) is worse than the dense model (39%, from downloads alone).
+        //
+        // Symmetric with `download`, which drops and restores `if had_frame`, and for the same
+        // reason: a caller that had a frame expects to still have one afterwards. A caller that did
+        // not must not acquire one behind its back, so the reopen is conditional on there having been
+        // something to take.
+        let had_frame;
+        {
+            let mut g = self.frame.lock().unwrap();
+            had_frame = g.is_some();
+            drop(g.take().map(|frame| {
+                SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                frame
+            }).map(|frame| { self.submit(frame.enc); self.retain_keep(frame.keep); }));
+        }
+        let t_poll = std::time::Instant::now();
+        crate::counted_poll(&self.device);
+        check_stall(t_poll, 0);
+        self.clear_retained();
+        if had_frame && std::env::var_os("LOGSCOPE_NO_FRAME_REOPEN").is_none() {
+            self.begin_frame();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn flush_and_wait_legacy(&self) {
         if let Some(frame) = self.frame.lock().unwrap().take() {
             // TAGGED: the explicit end_frame path. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
