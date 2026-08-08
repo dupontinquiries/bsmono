@@ -499,6 +499,10 @@ const DIMS_CACHE_CAP: usize = 4096;
 /// (pipeline, buffers, dims) combos across the recycled activation set; once full it falls back to
 /// create-without-cache, so it's never worse than the old always-create path.
 const BG_CACHE_CAP: usize = 8192;
+
+/// Lookups whose key contains a moving view and therefore CANNOT hit, reported beside the hit rate
+/// so a blended figure can be split into "the cache is missing" and "this workload rebinds".
+pub static BG_VIEW_VARYING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bind-group cache key: pipeline identity + the ordered buffer handles (inputs, then output) + the dims
 /// buffer handle. wgpu::Buffer is Eq/Hash on its inner handle, so equal keys ⇒ identical bindings.
 /// (pipeline, [(input buffer, view offset, view size)…], output buffer, dims buffer).
@@ -3399,6 +3403,12 @@ impl Gpu {
             let bufs: Vec<(wgpu::Buffer, u64, u64)> = inputs.iter()
                 .map(|t| { let (o, l) = t.view.unwrap_or((0, 0)); (t.buf.clone(), o, l) }).collect();
             let ov = out.view.unwrap_or((0, out.buf.size()));
+            // A non-zero input view means a KV slice rather than a whole weight, so this key can
+            // never repeat. Counted here, where the views are already in hand — blending these into
+            // the hit rate makes a working cache read as 13% and invites optimising what is not broken.
+            if bufs.iter().any(|(_, off, _)| *off != 0) {
+                BG_VIEW_VARYING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             Some((pipe_ptr, bufs, (out.buf.clone(), ov.0, ov.1), (*dbuf).clone()))
         } else { None };
         if let Some(key) = &cache_key {
