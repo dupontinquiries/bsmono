@@ -30,12 +30,23 @@ pub enum Stage {
     Locating,
     /// Found a record; trying to reach it.
     Connecting,
-    Connected { device: String },
+    /// Connected, and what the link can actually carry.
+    ///
+    /// **`Connected` was binary and that hides the case a phone hits most.** `reachability` models
+    /// three working paths and only one of them carries inference: a relayed link connects fine and
+    /// then every token crosses someone else's bandwidth, and a hole-punched one dies when either NAT
+    /// rebinds. Both report success and then fail at the thing the user connected in order to do.
+    ///
+    /// Saying so at connect time is the difference between "it broke" and "this link is for control,
+    /// not generation" — and the second is something a person can act on while they are still
+    /// standing there.
+    Connected { device: String, carries: Carries },
     Failed(Failure),
 }
 
 /// Why it did not connect, kept separate because each wants a different action.
 #[derive(Clone, PartialEq, Debug)]
+
 pub enum Failure {
     /// The checksum caught it. **Cheapest to fix and the only one the phone can settle alone.**
     BadCode { position: Option<usize> },
@@ -105,7 +116,11 @@ impl Stage {
             Stage::CodeAccepted => "code looks right — checking whether that machine is online".into(),
             Stage::Locating => "looking it up".into(),
             Stage::Connecting => "found it, opening a path".into(),
-            Stage::Connected { device } => format!("connected to {device}"),
+            // The caption now says what the link is GOOD FOR, not merely that it exists. A phone
+            // user connected in order to do something, and "connected" alone lets them start a
+            // generation over a relay and discover the problem three minutes in.
+            Stage::Connected { device, carries } =>
+                format!("{device} — {}", carries.caption()),
             Stage::Failed(f) => f.what_to_do(),
         }
     }
@@ -193,5 +208,81 @@ mod tests {
         // It is a checksum, not a lookup, and "code accepted" reading as "connected" is how someone
         // waits for a machine that was never on.
         assert!(Stage::CodeAccepted.caption().contains("checking whether that machine is online"));
+    }
+}
+
+/// What a working connection is good for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Carries {
+    /// Direct: everything, including generation.
+    Everything,
+    /// Works, and every byte costs a relay. Fine for control and browsing, wrong for tokens.
+    ControlOnly,
+    /// Works until either NAT rebinds. Fine for a short exchange, and a long generation may lose it
+    /// partway and report a failure that is about the network.
+    Fragile,
+}
+
+impl Carries {
+    /// One line under the "connected" indicator, in the user's terms rather than the network's.
+    pub fn caption(self) -> &'static str {
+        match self {
+            Carries::Everything => "connected",
+            // Not "relayed" — the user did not choose a relay and the word explains nothing they can
+            // act on. What they need to know is which features will work.
+            Carries::ControlOnly => "connected via relay — browse and control, but run generation on the desktop rather than through the phone",
+            Carries::Fragile => "connected through NAT — fine for short exchanges, and a long generation may drop partway",
+        }
+    }
+
+    /// May a generation be started over this link?
+    ///
+    /// Advisory rather than a block: the user may want to try anyway, and refusing outright would be
+    /// deciding for them about their own bandwidth.
+    pub fn good_for_generation(self) -> bool { matches!(self, Carries::Everything) }
+}
+
+#[cfg(test)]
+mod carries_tests {
+    use super::*;
+
+    #[test]
+    fn CONNECTED_says_what_the_link_is_good_for() {
+        // It was binary, and that hides the case a phone hits most: a relayed link connects fine and
+        // then every token crosses someone else's bandwidth.
+        let s = Stage::Connected { device: "workstation".into(), carries: Carries::ControlOnly };
+        assert!(s.caption().contains("browse and control"));
+        assert!(s.caption().contains("run generation on the desktop"));
+    }
+
+    #[test]
+    fn the_caption_avoids_the_word_RELAYED() {
+        // The user did not choose a relay and the word explains nothing they can act on. What they
+        // need is which features will work.
+        assert!(!Carries::ControlOnly.caption().contains("relayed"));
+        assert!(Carries::ControlOnly.caption().contains("relay"), "naming it once is fine as context");
+    }
+
+    #[test]
+    fn a_FRAGILE_link_warns_BEFORE_the_long_job_rather_than_after() {
+        // It dies when either NAT rebinds, and a failure then is about the network. Told afterwards
+        // it reads as the model breaking.
+        assert!(Carries::Fragile.caption().contains("may drop partway"));
+        assert!(!Carries::Fragile.good_for_generation());
+    }
+
+    #[test]
+    fn a_DIRECT_link_says_nothing_extra() {
+        // Everything works, so a caveat would be noise — and a caveat that fires when nothing is
+        // wrong is how the useful ones get ignored.
+        assert_eq!(Carries::Everything.caption(), "connected");
+        assert!(Carries::Everything.good_for_generation());
+    }
+
+    #[test]
+    fn good_for_generation_is_ADVISORY_not_a_block() {
+        // The user may want to try anyway, and refusing outright would be deciding for them about
+        // their own bandwidth. Nothing here returns a Result.
+        let _: bool = Carries::ControlOnly.good_for_generation();
     }
 }
