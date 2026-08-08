@@ -194,6 +194,40 @@ impl Cohesive {
         [scale * open + t_n_compression, scale * beta * beta * s.tangent]
     }
 
+    /// Consistent 2×2 tangent `dT_i/dδ_j` for mixed-mode separation.
+    ///
+    /// Derived rather than approximated, because a secant tangent converges linearly and the whole
+    /// reason for using Newton here is the quadratic rate. Writing `e` for the effective
+    /// separation, `s = T(e)/e` for the secant and `T'` for the one-dimensional tangent:
+    ///
+    /// ```text
+    ///   dT_n/dd_n = s + (T' - s) <d_n>^2 / e^2
+    ///   dT_n/dd_t = dT_t/dd_n = (T' - s) <d_n> beta^2 d_t / e^2
+    ///   dT_t/dd_t = s beta^2 + (T' - s) beta^4 d_t^2 / e^2
+    /// ```
+    ///
+    /// It comes out symmetric, which is not a coincidence — the law derives from a potential — and
+    /// is worth asserting, since an asymmetric tangent would quietly destroy the symmetry of the
+    /// global stiffness matrix and with it any hope of using a symmetric solver later.
+    pub fn tangent_matrix(&self, sep: Separation, beta: f64) -> [[f64; 2]; 2] {
+        let open = sep.normal.max(0.0);
+        let e = self.effective(sep, beta);
+        let penalty = if sep.normal < 0.0 { self.k0 } else { 0.0 };
+        if e <= 0.0 {
+            // Closed and unslipped: penalty normally, and the intact shear stiffness.
+            return [[self.k0.max(penalty), 0.0], [0.0, self.k0 * beta * beta]];
+        }
+        let t_eff = self.traction(e);
+        let s = t_eff / e;
+        let tp = self.tangent(e);
+        let f = (tp - s) / (e * e);
+        let bt = beta * beta * sep.tangent;
+        [
+            [s + f * open * open + penalty, f * open * bt],
+            [f * bt * open, s * beta * beta + f * bt * bt],
+        ]
+    }
+
     /// Commit damage from a mixed-mode state.
     pub fn commit_mixed(&mut self, s: Separation, beta: f64) {
         let eff = self.effective(s, beta);
@@ -575,6 +609,52 @@ mod tests {
         let t = dragged.tractions(sep, beta);
         assert!(t[1] > 0.0, "and it must resist that sliding");
         assert!(t[0] < 0.0, "while still carrying the contact pressure");
+    }
+
+    #[test]
+    fn the_mixed_mode_tangent_matches_finite_differences_and_is_symmetric() {
+        // Same discipline as the power flow Jacobian and the one-dimensional tangent before it: a
+        // wrong tangent still converges, just linearly, so only differentiating the traction
+        // numerically actually checks it.
+        let l = law();
+        let beta = 1.4;
+        for (dn, dt) in [
+            (0.4, 0.3),
+            (1.2, 0.5),
+            (0.2, 2.0),
+            (-0.5, 1.1), // compressed and sliding
+        ] {
+            let sep = Separation { normal: dn * l.delta_f, tangent: dt * l.delta_f };
+            let mut probe = l;
+            probe.commit_mixed(sep, beta);
+            let analytic = probe.tangent_matrix(sep, beta);
+            let h = l.delta_f * 1e-7;
+            for j in 0..2 {
+                let bump = |x: f64| {
+                    let mut s2 = sep;
+                    if j == 0 { s2.normal += x } else { s2.tangent += x }
+                    let mut c = l;
+                    c.commit_mixed(s2, beta);
+                    c.tractions(s2, beta)
+                };
+                let up = bump(h);
+                let dn_ = bump(-h);
+                for i in 0..2 {
+                    let numeric = (up[i] - dn_[i]) / (2.0 * h);
+                    let scale = analytic[i][j].abs().max(l.k0 * 1e-3);
+                    assert!(
+                        (numeric - analytic[i][j]).abs() < scale * 0.05,
+                        "d({dn},{dt}) dT{i}/dd{j}: analytic {:e} vs numeric {numeric:e}",
+                        analytic[i][j]
+                    );
+                }
+            }
+            assert!(
+                (analytic[0][1] - analytic[1][0]).abs()
+                    <= analytic[0][1].abs().max(l.k0 * 1e-6) * 1e-9,
+                "the tangent must be symmetric: {analytic:?}"
+            );
+        }
     }
 
     #[test]

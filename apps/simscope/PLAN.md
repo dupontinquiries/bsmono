@@ -671,8 +671,41 @@ rather than the shear-lag estimate in `pullout_energy`.
 
 ### Still open before a full nacre RVE
 
-- **The meshed `interface` module assembles opening only.** The law is mixed-mode; the element is
-  not. That is the next piece and it is mechanical work.
+- ~~The meshed `interface` module assembles opening only.~~ Done — the element now carries both
+  components with a consistent rotated tangent.
 - **Arc-length control**, **sparse indefinite solve**, and a process zone (`E G_c / σ_max²`) that
   fits inside the model — unchanged from the previous entry, and all three are needed together
   before an RVE is affordable and mesh-independent.
+
+
+## Mixed mode in the mesh
+
+The element now carries both separation components, with the 2×2 material tangent rotated into
+global coordinates. That tangent is derived rather than approximated — a secant would converge
+linearly and the point of Newton here is the quadratic rate — and it is verified against finite
+differences at four separation states including one that is *compressed and sliding*. It comes out
+symmetric, which is not a coincidence (the law derives from a potential) and is asserted, because an
+asymmetric tangent would quietly destroy the symmetry of the global stiffness.
+
+**Shear and opening dissipate identically**, to 1e-6. An interface is not tougher in one direction
+than the other, only harder to separate.
+
+Getting that test to run taught two things, both physics rather than tuning:
+
+**The interface must be the compliant path.** Opening a block is only possible by opening its
+interface — but a block shears perfectly well by deforming its own bulk, so with a stiff penalty the
+halves simply shear and the interface never slides enough to damage. At the opening test's
+parameters the interface was 37× stiffer than the bulk in shear and dissipated essentially nothing.
+
+**And the snap-back condition bites again, from the other side.** At those same parameters the
+softening slope and the bulk shear stiffness were within 20% of each other — right at the
+instability `cohesive` already names. A gentler peak traction puts the slope an order of magnitude
+below the bulk and restores stability. The test now *asserts* that margin before running, so it
+fails with a legible message rather than as a convergence mystery.
+
+### Remaining for a nacre RVE
+
+Unchanged and now genuinely the last three: **arc-length control**, a **sparse indefinite solve**,
+and an RVE large enough that the process zone `E G_c / σ_max²` fits inside it. All three are needed
+together — the first to trace propagation, the second to afford the mesh, the third for the answer
+to be mesh-independent rather than merely converged.

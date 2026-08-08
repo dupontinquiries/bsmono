@@ -21,7 +21,7 @@
 
 use sim_num::{newton, Lu, NewtonOpts, System};
 
-use crate::cohesive::Cohesive;
+use crate::cohesive::{Cohesive, Separation};
 use crate::elastic::{element_stiffness, Assumption, constitutive};
 use crate::mesh::Mesh;
 use crate::p1::Element;
@@ -37,6 +37,8 @@ pub struct Interface {
     pub laws: Vec<Cohesive>,
     /// Interface normal, pointing from the negative side to the positive.
     pub normal: [f64; 2],
+    /// Shear/opening weight for the mixed-mode law.
+    pub beta: f64,
 }
 
 impl Interface {
@@ -59,34 +61,57 @@ impl Interface {
             .sum()
     }
 
-    fn separation(&self, i: usize, u: &[f64]) -> f64 {
+    /// In-plane tangent direction, the normal rotated a quarter turn.
+    fn tangent_dir(&self) -> [f64; 2] {
+        [-self.normal[1], self.normal[0]]
+    }
+
+    fn separation(&self, i: usize, u: &[f64]) -> Separation {
         let (p, m) = self.pairs[i];
         let du = [u[2 * p] - u[2 * m], u[2 * p + 1] - u[2 * m + 1]];
-        du[0] * self.normal[0] + du[1] * self.normal[1]
+        let t = self.tangent_dir();
+        Separation {
+            normal: du[0] * self.normal[0] + du[1] * self.normal[1],
+            tangent: du[0] * t[0] + du[1] * t[1],
+        }
     }
 
     /// Internal forces from the interface, added into `f`.
     fn add_forces(&self, u: &[f64], f: &mut [f64]) {
+        let td = self.tangent_dir();
         for i in 0..self.pairs.len() {
-            let d = self.separation(i, u);
-            let t = self.laws[i].traction(d) * self.tributary[i];
+            let sep = self.separation(i, u);
+            let tr = self.laws[i].tractions(sep, self.beta);
+            let a = self.tributary[i];
             let (p, m) = self.pairs[i];
             for k in 0..2 {
-                f[2 * p + k] += t * self.normal[k];
-                f[2 * m + k] -= t * self.normal[k];
+                let force = (tr[0] * self.normal[k] + tr[1] * td[k]) * a;
+                f[2 * p + k] += force;
+                f[2 * m + k] -= force;
             }
         }
     }
 
     /// Tangent contributions as triplets.
     fn add_tangent(&self, u: &[f64], trip: &mut Vec<(usize, usize, f64)>) {
+        let td = self.tangent_dir();
         for i in 0..self.pairs.len() {
-            let d = self.separation(i, u);
-            let kt = self.laws[i].tangent(d) * self.tributary[i];
+            let sep = self.separation(i, u);
+            let d2 = self.laws[i].tangent_matrix(sep, self.beta);
+            let area = self.tributary[i];
+            // Rotate the 2x2 material tangent into global coordinates: K = A * R^T D R, with the
+            // rows of R being the normal and tangent directions.
+            let dirs = [self.normal, td];
             let (p, m) = self.pairs[i];
             for a in 0..2 {
                 for b in 0..2 {
-                    let v = kt * self.normal[a] * self.normal[b];
+                    let mut v = 0.0;
+                    for r in 0..2 {
+                        for c in 0..2 {
+                            v += d2[r][c] * dirs[r][a] * dirs[c][b];
+                        }
+                    }
+                    let v = v * area;
                     trip.push((2 * p + a, 2 * p + b, v));
                     trip.push((2 * m + a, 2 * m + b, v));
                     trip.push((2 * p + a, 2 * m + b, -v));
@@ -99,8 +124,8 @@ impl Interface {
     /// Commit damage for the converged state.
     fn commit(&mut self, u: &[f64]) {
         for i in 0..self.pairs.len() {
-            let d = self.separation(i, u);
-            self.laws[i].commit(d);
+            let sep = self.separation(i, u);
+            self.laws[i].commit_mixed(sep, self.beta);
         }
     }
 }
@@ -219,12 +244,34 @@ pub fn split_horizontal(mesh: &Mesh, y_split: f64, tol: f64) -> (Mesh, Interface
         pairs.push((i, dup[&i])); // original stays with the upper half
         tributary.push(left + right);
     }
-    let interface = Interface { pairs, tributary, laws: Vec::new(), normal: [0.0, 1.0] };
+    let interface = Interface { pairs, tributary, laws: Vec::new(), normal: [0.0, 1.0], beta: 1.0 };
     (Mesh { xy, tri }, interface)
+}
+
+/// Which way the top face is driven.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Drive {
+    /// Straight up: mode I opening.
+    Opening,
+    /// Sideways: mode II sliding, which is the platelet pull-out configuration.
+    Sliding,
 }
 
 /// Pull a split block apart under displacement control, tracking dissipation.
 pub fn pull_apart(
+    mesh: &Mesh,
+    interface: Interface,
+    law: Cohesive,
+    e: f64,
+    nu: f64,
+    y_split: f64,
+    openings: &[f64],
+) -> Result<Vec<Step>, String> {
+    drive_apart(mesh, interface, law, e, nu, y_split, openings, Drive::Opening)
+}
+
+/// Drive a split block in a chosen direction under displacement control.
+pub fn drive_apart(
     mesh: &Mesh,
     mut interface: Interface,
     law: Cohesive,
@@ -232,6 +279,7 @@ pub fn pull_apart(
     nu: f64,
     y_split: f64,
     openings: &[f64],
+    drive: Drive,
 ) -> Result<Vec<Step>, String> {
     interface.laws = vec![law; interface.pairs.len()];
     let n_dof = 2 * mesh.nodes();
@@ -281,7 +329,10 @@ pub fn pull_apart(
     for &open in openings {
         let mut prescribed = vec![0.0; n_dof];
         for &i in &top {
-            prescribed[2 * i + 1] = open;
+            match drive {
+                Drive::Opening => prescribed[2 * i + 1] = open,
+                Drive::Sliding => prescribed[2 * i] = open,
+            }
         }
         let mut body = Body { k_bulk: k_bulk.clone(), n_dof, free: &free, prescribed, interface: interface.clone() };
         let scale = law.sigma_max * mesh.xy.len() as f64;
@@ -300,7 +351,10 @@ pub fn pull_apart(
             let b = Body { k_bulk: k_bulk.clone(), n_dof, free: &free, prescribed: u.clone(), interface: interface.clone() };
             b.full_forces(&u)
         };
-        let reaction: f64 = top.iter().map(|&i| full[2 * i + 1]).sum();
+        let reaction: f64 = match drive {
+            Drive::Opening => top.iter().map(|&i| full[2 * i + 1]).sum(),
+            Drive::Sliding => top.iter().map(|&i| full[2 * i]).sum(),
+        };
         out.push(Step {
             opening: open,
             reaction,
@@ -365,6 +419,61 @@ mod tests {
     }
 
     #[test]
+    fn shearing_a_block_dissipates_the_same_energy_as_opening_it() {
+        // The pull-out configuration, and the reason the element had to become mixed-mode: nacre's
+        // platelets fail in SHEAR. The energy balance must be identical to mode I — an interface is
+        // not tougher in one direction than the other, only harder to separate.
+        //
+        // Two things had to change from the opening test, and both are physics rather than tuning.
+        //
+        // First, the interface must be the COMPLIANT path. Opening a block is only possible by
+        // opening its interface, but a block can shear perfectly well by deforming its own bulk —
+        // so with a stiff penalty the halves simply shear and the interface never slides enough to
+        // damage. The penalty is lowered until the interface, not the bulk, takes the motion.
+        //
+        // Second, the softening slope must stay below the bulk shear stiffness or the system snaps
+        // back. At the opening test's parameters those two are within 20% of each other, which is
+        // exactly the instability `cohesive` already names; a gentler peak traction pushes the
+        // slope an order of magnitude below the bulk and restores stability.
+        let (w, h) = (4e-3, 2e-3);
+        let base = Mesh::rectangle(w, h, 6, 4);
+        let (mesh, interface) = split_horizontal(&base, h / 2.0, h * 1e-9);
+        let law = Cohesive::from_energy(20.0, 10e6, 1e13);
+        let bulk_shear = 70e9 / (2.0 * 1.3) / (h / 2.0);
+        let softening = law.sigma_max / (law.delta_f - law.delta_0());
+        assert!(
+            bulk_shear > softening * 4.0,
+            "the test is only meaningful when the structure is stiffer than the softening slope: \
+             bulk {bulk_shear:.2e} vs slope {softening:.2e}"
+        );
+
+        let steps: Vec<f64> = (1..=200).map(|i| law.delta_f * 6.0 * i as f64 / 200.0).collect();
+        let sheared =
+            drive_apart(&mesh, interface.clone(), law, 70e9, 0.3, h / 2.0, &steps, Drive::Sliding)
+                .unwrap();
+        let opened =
+            drive_apart(&mesh, interface, law, 70e9, 0.3, h / 2.0, &steps, Drive::Opening).unwrap();
+
+        let s_last = sheared.last().unwrap();
+        let o_last = opened.last().unwrap();
+        assert!(s_last.separated > w * 0.9, "shear must fully separate it too");
+        assert!(
+            (s_last.dissipated / (law.fracture_energy() * s_last.separated) - 1.0).abs() < 1e-9,
+            "shear dissipation {:.4} vs G_c x area {:.4}",
+            s_last.dissipated,
+            law.fracture_energy() * s_last.separated
+        );
+        assert!(
+            (s_last.dissipated / o_last.dissipated - 1.0).abs() < 1e-6,
+            "shear and opening must cost the same: {:.4} vs {:.4}",
+            s_last.dissipated,
+            o_last.dissipated
+        );
+        let peak = sheared.iter().fold(0.0f64, |m, st| m.max(st.reaction.abs()));
+        assert!(peak > law.sigma_max * w * 0.3, "peak shear reaction {peak:.3e} is too small");
+    }
+
+    #[test]
     fn an_intact_interface_behaves_like_the_bulk() {
         // With a penalty stiffness far above the bulk and openings below the damage threshold, the
         // split block must behave as though it were never split — which checks the assembly, the
@@ -386,3 +495,4 @@ mod tests {
         );
     }
 }
+
