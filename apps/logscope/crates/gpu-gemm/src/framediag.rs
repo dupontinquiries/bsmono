@@ -202,3 +202,41 @@ mod tests {
         assert!(report().contains("held for the whole run"));
     }
 }
+
+#[cfg(test)]
+mod flush_reopen_tests {
+    /// The frame leak that produced decode's 67% no-frame, pinned so it cannot silently return.
+    ///
+    /// `flush_and_wait` did `self.frame.lock().unwrap().take()` and nothing put a frame back. It is
+    /// called from `stream_expert_lins`, which runs PER LAYER — so every dispatch after the first
+    /// expert stream in a decode step ran outside a frame, and each became its own submit.
+    ///
+    /// The measurements either side of the diagnosis:
+    ///
+    /// * Scout (streams experts): **67%** no-frame
+    /// * dense Qwen3-4B (does not): **39%**, from downloads alone
+    /// * a frame held deliberately, on hardware: **0**
+    ///
+    /// The third is what ruled out `begin_frame` being broken and left "something takes it and does
+    /// not give it back" as the only remaining shape.
+    #[test]
+    fn flush_and_wait_REOPENS_the_frame_it_took() {
+        let src = include_str!("lib.rs");
+        let i = src.find("fn flush_and_wait(&self)").expect("flush_and_wait moved");
+        let body = &src[i..(i + 1800).min(src.len())];
+        assert!(body.contains("self.begin_frame();"),
+            "flush_and_wait must restore the frame it took, or every dispatch after an expert \
+stream runs frameless");
+        assert!(body.contains("had_frame"),
+            "and only when there WAS one — a caller that did not have a frame must not acquire one \
+behind its back, which is the same rule download follows");
+    }
+
+    #[test]
+    fn the_reopen_can_be_DISABLED_to_measure_the_difference() {
+        // The fix is a behaviour change on the hottest path, and being able to turn it off is how
+        // its effect gets measured rather than asserted.
+        let src = include_str!("lib.rs");
+        assert!(src.contains("LOGSCOPE_NO_FRAME_REOPEN"));
+    }
+}
