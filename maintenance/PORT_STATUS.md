@@ -558,10 +558,15 @@ needs a running binary on a device, not a test.
 
 * **Daemons cannot be built in gitmind.** Untouched.
 * **The app list is incomplete and does not mark egui ports as primary.**
-  `manifest/projects.toml` does have `primary = true` on some egui entries
-  (voiceterm-egui, rusty-board-egui) but not on all of them, and
-  ambient-learner has no entry at all — its audit row still reads
-  `no / no / NO` for binary, app-definition and manifest.
+  FIXED. Only 2 of 10 egui entries carried `primary = true` (voiceterm-egui,
+  rusty-board-egui); all 11 do now, including `gitmind-egui`, whose own notes
+  already described it as "the egui-primary port" while the flag was simply
+  missing. `ambient-learner-egui` is registered, and its row now reads
+  `yes / yes / yes / yes`.
+
+  One flag carries a caveat rather than a claim: `snapclone-egui` is marked
+  primary with the note that camera and call wiring are still absent. Marking it
+  primary is what was asked for; pretending it is complete would not be.
 * **voiceterm has no text input to the terminal.** Partly diagnosed already:
   control keys are encoded into `App::pending_bytes` and **nothing drains
   them** — `take_pending_bytes()` has no caller. That is a wire, not a rewrite.
@@ -571,3 +576,27 @@ needs a running binary on a device, not a test.
   are ported — viewfinder, ring, voice bar — but nothing is connected to a
   capture device or a call session. This is the same class as the glove-mode
   seams: engines and views exist, the host wiring does not.
+
+## ambient-learner is runnable, and why it needed a separate crate
+
+The parity row now reads `yes / yes / yes / yes`. Getting there was not just
+adding a `[[bin]]`.
+
+The first attempt put an eframe binary in the parent crate and it **would not
+resolve**: iced 0.12 caps `web-sys` at 0.3.67 and eframe 0.34 needs >= 0.3.77.
+Cargo resolves optional dependencies whether or not their feature is enabled, so
+`--features egui-app` failed with iced *switched off*. The parent's own comment
+says the two "cannot be enabled together" — the truth is stronger: they cannot
+coexist in one manifest at all.
+
+So the frontend is its own crate at `egui-frontend/`, matching every other port
+in the fleet and giving the audit the directory it looks for. **The view code is
+not copied**: one `#[path]` include pulls in `src/egui_lib.rs`, and because a
+path-included module resolves ITS nested modules relative to its own directory,
+the `pub mod ui { pub mod egui; }` inside finds the page tree without further
+help. One include, one copy of the pages.
+
+The binary sits behind a default-on `app` feature so `--no-default-features`
+builds a headless library. That matters more here than elsewhere: eframe pulls
+glutin and winit, and this container cannot even LINK them, so without the split
+the pages would be untestable in CI.

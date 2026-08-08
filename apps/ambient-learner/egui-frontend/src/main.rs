@@ -1,0 +1,65 @@
+//! The window. Deliberately thin: everything visible is a ported page.
+//!
+//! This exists because the parity audit reported ambient-learner as `no` binary,
+//! `no` app-definition, `NO` manifest while having ported pages — a port nobody
+//! could run. Ported surfaces behind an unrunnable front end are worth less
+//! than one surface behind a runnable one.
+
+use ambient_learner_egui::{ui::egui::history, LiveState};
+
+// This eframe requires `ui` as well as `update`; the window host draws from
+// `update` and leaves `ui` empty, matching voiceterm's binary rather than
+// inventing a second convention.
+
+#[derive(PartialEq)]
+enum Page { Live, History }
+
+struct App {
+    live: LiveState,
+    colors: uikit_egui::PaletteColors,
+    page: Page,
+    history: history::History,
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, _ui: &mut egui::Ui, _frame: &mut eframe::Frame) {}
+
+    fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                // Two tabs because two pages are ported. A bar listing pages
+                // that do not exist would be the same overstatement the audit
+                // caught in the first place.
+                ui.selectable_value(&mut self.page, Page::Live, "Live");
+                ui.selectable_value(&mut self.page, Page::History, "History");
+            });
+            ui.separator();
+            match self.page {
+                Page::Live => self.live.ui(ui),
+                Page::History => history::history_ui(ui, &self.history, &self.colors),
+            }
+        });
+        // The live view eases toward its target, so it needs frames even when
+        // nothing is being touched.
+        ctx.request_repaint_after(std::time::Duration::from_millis(33));
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([420.0, 720.0])
+            .with_title("Ambient Learner"),
+        ..Default::default()
+    };
+    eframe::run_native("ambient-learner-egui", opts, Box::new(|_cc| {
+        Ok(Box::new(App {
+            live: LiveState::demo(),
+            colors: uikit_egui::palette_colors("cloudscape"),
+            page: Page::Live,
+            // Empty rather than fabricated: the history page says "no readings
+            // recorded yet", which is true, instead of drawing invented data.
+            history: history::History::default(),
+        }))
+    }))
+}
