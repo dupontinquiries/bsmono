@@ -43,6 +43,7 @@ pub mod swipe_physics;
 pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
+pub mod voice_playout;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -212,6 +213,9 @@ pub struct Snapclone {
     pub camera_policy: crate::camera_policy::CameraPolicy,
     /// Which cameras are known to work. Consulted before opening one.
     pub camera_health: crate::camera_policy::CameraHealth,
+    /// The receive half's scheduling. Decode and the audio sink stay with the
+    /// host; this decides play / conceal / silence per sender per interval.
+    pub playout: crate::voice_playout::VoicePlayout,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -288,6 +292,7 @@ impl Snapclone {
             dictated: Vec::new(),
             camera_policy: Default::default(),
             camera_health: Default::default(),
+            playout: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -581,6 +586,21 @@ impl Snapclone {
             Answer::Declined => {}
         }
         self.incoming_call = None;
+    }
+
+    /// Join or leave the group call, keeping play-out in step.
+    ///
+    /// One place does both, because a call whose floor state and whose audio
+    /// scheduler disagree is a call where someone is talking and nobody hears
+    /// it — or worse, where the previous call's frames play into the new one.
+    pub fn set_in_call(&mut self, joined: bool) {
+        if joined {
+            self.group_voice.join();
+            self.playout.start();
+        } else {
+            self.group_voice.leave();
+            self.playout.stop();
+        }
     }
 
     /// Which camera to open, given what is known about the fleet's health.
@@ -1192,6 +1212,23 @@ mod tests {
         }
         assert_eq!(landed.as_deref(), Some("abc"),
                    "a field reached by Tab must keep every character, not the first");
+    }
+
+    #[test]
+    fn joining_a_call_starts_playout_and_leaving_flushes_it() {
+        // A call whose floor state and audio scheduler disagree is a call where
+        // someone talks and nobody hears — or where the last call's frames play
+        // into the next one.
+        let mut s = app();
+        s.set_in_call(true);
+        assert!(s.group_voice.joined);
+        assert!(s.playout.is_playing());
+
+        s.playout.on_frame("ada", crate::voice_playout::Frame { seq: 1, payload_len: 40 });
+        s.set_in_call(false);
+        assert!(!s.group_voice.joined);
+        assert!(!s.playout.is_playing());
+        assert_eq!(s.playout.senders(), 0, "and the old call's audio is gone");
     }
 
     #[test]
