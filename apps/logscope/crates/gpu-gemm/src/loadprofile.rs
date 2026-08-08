@@ -180,3 +180,126 @@ mod tests {
         }
     }
 }
+
+/// Is per-TENSOR hand-tuning worth it?
+///
+/// **Mostly no, and the reason is worth stating precisely.** A model has hundreds of tensors and the
+/// load path treats them identically: read, convert, stage, upload. Tuning tensor 47 differently from
+/// tensor 48 optimises variance that does not exist, and the bookkeeping costs more than it saves.
+///
+/// **But two properties DO change the path**, and they partition the tensors into a handful of groups
+/// rather than hundreds of cases:
+///
+/// * **Quant type.** A UD checkpoint carries seven, and they convert at different costs — IQ3_S is
+///   codebook lookups, Q4_K is shifts and a scale. A convert-side optimisation lands on some and not
+///   others.
+/// * **Destination.** Resident, pinned expert, or streamed-on-demand. A streamed expert is uploaded
+///   again every time it is needed, so its cost is multiplied by how often the router picks it,
+///   while a resident tensor is uploaded once.
+///
+/// So: **cluster, do not enumerate.** Four hundred tensors become five or six groups, and a group is
+/// large enough that measuring it is meaningful and small enough that tuning it is one decision.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
+pub enum Destination {
+    /// Uploaded once, stays. Cost is paid at load.
+    Resident,
+    /// Uploaded once and kept for the session, but competing for the pin budget.
+    PinnedExpert,
+    /// **Uploaded every time the router picks it.** Its load cost is multiplied by selection
+    /// frequency, which is the one place a per-group optimisation compounds.
+    Streamed,
+}
+
+/// A group of tensors that share a load path.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LoadGroup {
+    pub ggml_type: u32,
+    pub destination: Destination,
+    pub tensors: usize,
+    pub bytes: u64,
+}
+
+impl LoadGroup {
+    /// How many times these bytes cross the bus in a session, roughly.
+    ///
+    /// **This is why grouping beats enumerating.** A streamed group's bytes move once per selection,
+    /// so a 2 GiB group picked every third token moves more total than a 20 GiB resident group that
+    /// moves once — and no per-tensor view surfaces that.
+    pub fn bus_bytes(&self, tokens: u64, selection_rate: f64) -> u64 {
+        match self.destination {
+            Destination::Resident | Destination::PinnedExpert => self.bytes,
+            Destination::Streamed =>
+                self.bytes + (self.bytes as f64 * selection_rate * tokens as f64) as u64,
+        }
+    }
+
+    pub fn worth_tuning(&self, total_bytes: u64) -> bool {
+        // Below a twentieth of the load, a group cannot repay the work of treating it specially.
+        total_bytes > 0 && (self.bytes as f64 / total_bytes as f64) > 0.05
+    }
+}
+
+/// Cluster tensors into load groups.
+pub fn group(tensors: impl IntoIterator<Item = (u32, Destination, u64)>) -> Vec<LoadGroup> {
+    let mut m: std::collections::BTreeMap<(u32, Destination), (usize, u64)> = Default::default();
+    for (t, d, b) in tensors {
+        let e = m.entry((t, d)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += b;
+    }
+    let mut v: Vec<_> = m.into_iter()
+        .map(|((ggml_type, destination), (tensors, bytes))|
+            LoadGroup { ggml_type, destination, tensors, bytes })
+        .collect();
+    v.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    v
+}
+
+#[cfg(test)]
+mod group_tests {
+    use super::*;
+
+    #[test]
+    fn HUNDREDS_of_tensors_become_a_handful_of_groups() {
+        // Cluster, do not enumerate. A group is large enough to measure and small enough to tune as
+        // one decision.
+        let t: Vec<_> = (0..400u64)
+            .map(|i| (if i % 3 == 0 { 12u32 } else { 21 },
+                      if i % 5 == 0 { Destination::Streamed } else { Destination::Resident },
+                      1_000_000))
+            .collect();
+        assert!(group(t).len() <= 6);
+    }
+
+    #[test]
+    fn a_STREAMED_group_can_outweigh_a_much_larger_RESIDENT_one() {
+        // The thing no per-tensor view surfaces: streamed bytes move once per selection.
+        let streamed = LoadGroup { ggml_type: 12, destination: Destination::Streamed,
+                                   tensors: 10, bytes: 2 << 30 };
+        let resident = LoadGroup { ggml_type: 12, destination: Destination::Resident,
+                                   tensors: 100, bytes: 20 << 30 };
+        assert!(streamed.bus_bytes(1000, 0.33) > resident.bus_bytes(1000, 0.33));
+    }
+
+    #[test]
+    fn a_RESIDENT_group_costs_its_bytes_ONCE_however_many_tokens_run() {
+        let g = LoadGroup { ggml_type: 12, destination: Destination::Resident,
+                            tensors: 1, bytes: 1 << 30 };
+        assert_eq!(g.bus_bytes(1, 1.0), g.bus_bytes(100_000, 1.0));
+    }
+
+    #[test]
+    fn a_SMALL_group_is_not_worth_tuning_separately() {
+        // Below a twentieth of the load it cannot repay the bookkeeping, which is the whole argument
+        // against per-tensor tuning applied one level up.
+        let small = LoadGroup { ggml_type: 13, destination: Destination::Resident,
+                                tensors: 27, bytes: 100 };
+        assert!(!small.worth_tuning(10_000));
+    }
+
+    #[test]
+    fn groups_are_ordered_by_BYTES_so_the_first_one_is_the_one_to_tune() {
+        let g = group(vec![(13, Destination::Resident, 10), (21, Destination::Resident, 5000)]);
+        assert_eq!(g[0].ggml_type, 21);
+    }
+}
