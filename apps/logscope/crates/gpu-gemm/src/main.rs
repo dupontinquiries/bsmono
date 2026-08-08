@@ -4051,6 +4051,12 @@ pushing until it fails hard");
         // honoured at all and the decode-path question is moot — a much bigger finding than a
         // mis-placed end_frame, and one this comparison gets for free.
         println!("--- with a frame held ---\n{}", gpu_kernels::framediag::report());
+        // DOWNLOADS BY CALLER. `download` is 20-29% of submits on real runs and nobody knows which
+        // calls they are: sampling is one per token, and a dense model showed ~137. Counting them
+        // where they happen is the same move that found the frame leak.
+        let _ = gpu.download(&a);
+        let _ = gpu.download(&a);
+        println!("--- downloads by call site ---\n{}", gpu_kernels::framediag::download_report(2));
         return;
     }
 
