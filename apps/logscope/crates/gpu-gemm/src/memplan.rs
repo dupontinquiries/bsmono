@@ -1122,18 +1122,22 @@ mod sub4_tests {
     use super::*;
 
     #[test]
-    fn Q2_and_Q3_can_be_SIZED_without_being_readable() {
+    fn Q3_can_be_SIZED_without_being_readable() {
+        // UPDATED: Q2_K gained a dequantizer (kquant.rs), so it is no longer an example of this.
+        // The PRINCIPLE is unchanged and Q3_K still demonstrates it — a size lets the planner say
+        // what the file costs, and only a dequantizer lets the model load. Narrowing the test to the
+        // type that still has one and not the other keeps it honest rather than deleting it.
         // The honest half of sub-4 support. type_nbytes returning Some means a memory plan can say
         // what the file costs; dequantize returning None means the forward pass refuses to invent
         // values. Knowing the size without being able to read it is exactly what a planner needs and
         // a kernel must not have.
-        assert_eq!(source_bpw(10), Some(2.625), "Q2_K");
         assert_eq!(source_bpw(11), Some(3.4375), "Q3_K");
         assert_eq!(crate::gguf::type_nbytes(10, 256), Some(84));
         assert_eq!(crate::gguf::type_nbytes(11, 256), Some(110));
         // And they still refuse to decode, so nothing can accidentally run on them.
-        assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_err(),
-            "a size is not a dequantizer, and a model must not load on the strength of one");
+        // Q2_K NOW READS. It gained a dequantizer, and asserting the positive here means this
+        // test fails again if that regresses rather than silently passing on a stale premise.
+        assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_ok(), "Q2_K reads now");
         assert!(crate::gguf::dequantize(11, &[0u8; 110], 256).is_err());
     }
 
