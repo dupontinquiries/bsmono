@@ -24,6 +24,9 @@ pub mod sync;
 /// Model statistics, device state, and who calibrated it.
 pub mod model;
 
+/// The scatter map: places and pins, projected into a box that fits them.
+pub mod map;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
