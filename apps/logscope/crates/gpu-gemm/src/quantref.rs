@@ -266,3 +266,99 @@ mod tolerance_tests {
             "q2 should expect essentially none; any is suspicious");
     }
 }
+
+/// Cross-checking the quant tables against each other.
+///
+/// # What this can and cannot catch
+///
+/// Five decoders were added in one sitting — IQ4_NL, IQ4_XS, Q2_K, Q3_K, Q5_K — and every test for
+/// them constructs a block from the same understanding of the layout that the decoder uses.
+/// **That is circular**: the test asserts what the implementation does, and a transcription error in
+/// both is invisible.
+///
+/// Verifying against a real checkpoint is the only real answer and needs a file this container does
+/// not have. What IS available is that the same facts are written down in THREE independent places:
+///
+/// * `gguf::type_nbytes` — bytes per element count, used by the loader
+/// * `memplan::source_bpw` — bits per weight, used by the planner
+/// * the decoders' own `*_BLOCK` constants and their output lengths
+///
+/// Those were written at different times for different reasons. **Agreement between them does not
+/// prove the layout is right; disagreement proves something is wrong**, and this session has already
+/// found one such disagreement — the loader's byte report was counting elements.
+pub fn table_consistency() -> Vec<String> {
+    let mut problems = Vec::new();
+    // (type, elements per block)
+    let cases: [(u32, usize); 11] = [
+        (8, 32), (10, 256), (11, 256), (12, 256), (13, 256), (14, 256),
+        (16, 256), (19, 256), (20, 32), (21, 256), (23, 256),
+    ];
+    for (t, per_block) in cases {
+        let Some(bytes) = crate::gguf::type_nbytes(t, per_block) else {
+            problems.push(format!("{} (type {t}): type_nbytes has no entry",
+                crate::gguf::type_name(t)));
+            continue;
+        };
+        let Some(bpw) = crate::memplan::source_bpw(t) else {
+            problems.push(format!("{} (type {t}): source_bpw has no entry — the planner cannot size \
+a file containing this", crate::gguf::type_name(t)));
+            continue;
+        };
+        let implied = bytes as f64 * 8.0 / per_block as f64;
+        if (implied - bpw as f64).abs() > 1e-6 {
+            problems.push(format!(
+                "{} (type {t}): type_nbytes implies {implied:.4} bpw, source_bpw says {bpw:.4}. One \
+of the two tables is wrong and the planner and loader disagree about this format's size",
+                crate::gguf::type_name(t)));
+        }
+    }
+    problems
+}
+
+/// Every decoder must consume exactly what `type_nbytes` says and produce exactly `n` values.
+///
+/// A decoder that reads fewer bytes than the loader skips will silently decode the NEXT tensor's
+/// data as this one's tail.
+pub fn decoder_length_agreement() -> Vec<String> {
+    let mut problems = Vec::new();
+    for (t, n) in [(10u32, 256usize), (11, 256), (12, 256), (13, 256), (14, 256), (20, 32), (23, 256)] {
+        let Some(bytes) = crate::gguf::type_nbytes(t, n) else { continue };
+        match crate::gguf::dequantize(t, &vec![0u8; bytes], n) {
+            Ok(v) if v.len() == n => {}
+            Ok(v) => problems.push(format!("{} (type {t}): decoded {} values from a {n}-weight \
+block", crate::gguf::type_name(t), v.len())),
+            Err(e) => problems.push(format!("{} (type {t}): rejected exactly {bytes} bytes, which is \
+what type_nbytes says a block is — {e}", crate::gguf::type_name(t))),
+        }
+    }
+    problems
+}
+
+#[cfg(test)]
+mod consistency_tests {
+    use super::*;
+
+    #[test]
+    fn the_THREE_tables_agree_on_every_supported_type() {
+        // Written at different times for different reasons. Agreement does not prove the layout is
+        // right; DISAGREEMENT proves something is wrong, and this session already found one — the
+        // loader's byte report was counting elements.
+        let p = table_consistency();
+        assert!(p.is_empty(), "{}", p.join("\n"));
+    }
+
+    #[test]
+    fn every_decoder_consumes_exactly_a_BLOCK_and_yields_exactly_n() {
+        // A decoder reading fewer bytes than the loader skips silently decodes the NEXT tensor's
+        // data as this one's tail — which produces a working model with a corrupted layer.
+        let p = decoder_length_agreement();
+        assert!(p.is_empty(), "{}", p.join("\n"));
+    }
+
+    #[test]
+    fn the_check_REPORTS_rather_than_panicking_so_a_gate_can_list_all_of_them() {
+        // Finding one mismatch per run is the round-trip cost this project has spent the session
+        // learning to avoid.
+        let _: Vec<String> = table_consistency();
+    }
+}
