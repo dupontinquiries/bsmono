@@ -8576,6 +8576,65 @@ pub fn run(args: &[String]) {
         println!("{}", if pass { "GYRO: PASS" } else { "GYRO: FAIL" });
         return;
     }
+    if name == "jumpflip" {
+        // ONE PRESS SHOULD BE ONE JUMP.
+        // Reported: the flip fires immediately on jump. A dodge is meant to
+        // need a SECOND press while airborne, so if a single press produces
+        // both, the edge is being seen twice or the dodge gate is open when
+        // it should not be.
+        let cfg = Config::default();
+        let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+        let mut car = physics::Car::new();
+        car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+        car.sync_rot();
+        let mut ball = Ball::new();
+        ball.pos = Vec3::new(0.0, 40.0, 60.0);
+        ball.prev = ball.pos;
+        let mut c = physics::Controls::default();
+        c.throttle = 1.0;
+        for _ in 0..60 {
+            physics::step_car_only(&mut car, &ball, &world, &c, &cfg, DT);
+        }
+        println!("{:>7} {:>9} {:>9} {:>10} {:>9}", "t", "on_ground", "jumped", "dodged", "vel.y");
+        let mut ev = StepEvents::default();
+        let mut jumps = 0;
+        let mut dodges = 0;
+        // ONE press, then nothing
+        // A TAP, which is what a player does: pressed for one step, then
+        // RELEASED. My first version held the button down for the whole run
+        // and saw no dodge — but holding is not what was reported.
+        c.jump_pressed = true;
+        c.jump_held = true;
+        for k in 0..40 {
+            ev.jumped = false;
+            ev.dodged = false;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false; // the edge is consumed after one step
+            c.jump_held = false;    // ...and the button comes back up
+            if ev.jumped {
+                jumps += 1;
+            }
+            if ev.dodged {
+                dodges += 1;
+            }
+            if k < 8 || ev.dodged {
+                println!(
+                    "{:>6.3} {:>9} {:>9} {:>10} {:>9.2}",
+                    k as f32 * DT,
+                    car.on_ground as u8,
+                    ev.jumped as u8,
+                    ev.dodged as u8,
+                    car.vel.y
+                );
+            }
+        }
+        println!("   one press produced {jumps} jump(s) and {dodges} dodge(s)");
+        println!(
+            "{}",
+            if dodges == 0 { "JUMPFLIP: PASS" } else { "JUMPFLIP: FAIL" }
+        );
+        return;
+    }
     if name == "flip" {
         // RL-style flip audit: every cardinal combo, from ground and air.
         // A flip must complete ONE full turn about ONE axis and finish at

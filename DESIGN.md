@@ -4557,6 +4557,39 @@ like a finding and was a bug in the instrument. A car that had just been
 built to spec reporting -100% on every axis is not a plausible measurement,
 and that implausibility is what caught it.
 
+## 1.139.0 - could not reproduce the instant flip
+
+Reported: the flip fires right away on jump. A dodge is supposed to need a
+SECOND press while airborne, so either the edge is being seen twice or the
+dodge gate is open when it should not be.
+
+`--sim jumpflip` drives a grounded car and gives it exactly one press:
+
+    one press produced 1 jump and 0 dodges
+
+Both as a HOLD and as a TAP (pressed one step, released the next, which is
+what a player actually does). The physics is not the fault: a single edge
+produces a single jump and the dodge never fires.
+
+WHAT IS RULED OUT so nobody repeats it:
+
+  * The dodge branch is inside the AIRBORNE arm, and the grounded jump sets
+    on_ground=false only after that arm was already skipped - so one STEP
+    cannot do both.
+  * The fixed-step loop consumes the edge once: jump_pressed is set from the
+    edge inside the loop, cleared after the step, and the edge is cleared
+    with it. Multiple substeps in a frame cannot each see the press.
+  * Keyboard auto-repeat is guarded - key_down runs only when !event.repeat,
+    except in online text fields.
+  * The pad path is edge-triggered (ps.edge), as is the mouse path; all
+    three funnel through one_shot.
+
+WHAT WOULD FIND IT. The harness proves the model, not the machine. What is
+missing is the actual sequence of Controls the running game produced - so
+the next step is logging jump_pressed, jump_held, on_ground and dodge_window
+per substep from a real session and looking at the frames around a jump.
+Anything I changed now would be a guess dressed up as a fix.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
