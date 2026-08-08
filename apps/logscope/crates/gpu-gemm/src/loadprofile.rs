@@ -76,6 +76,12 @@ the curve shows where it stops helping",
         },
         Requirement {
             stage: Stage::Read,
+            fact: "the kernel's PAGE SIZE",
+            how: "getconf PAGESIZE, or read it out of uname — an Asahi kernel tagged +16k runs 16 KiB pages",
+            unlocks: "whether a zero-copy mmap path is possible at all. A GGUF tensor offset that is 4K-aligned is NOT page-aligned on a 16K kernel, so a mapping written assuming 4K either falls back to a copy silently or is wrong. It also means small-tensor allocations waste four times the slack, and it may mean the concurrent-buffer ceiling is page-COUNT bound rather than byte bound — in which case 31 GiB is specific to this page size",
+        },
+        Requirement {
+            stage: Stage::Read,
             fact: "is the file in page cache, and does mmap beat read() here",
             how: "load twice and compare; the second load is the cached number",
             unlocks: "whether read time is worth optimising at all. A 30 GiB file on a machine with \
@@ -158,6 +164,16 @@ mod tests {
     }
 
     #[test]
+    fn the_PAGE_SIZE_is_a_required_fact() {
+        // From a real uname: 7.1.6-400.asahi.fc43.aarch64+16k runs 16 KiB pages, so a GGUF offset
+        // that is 4K-aligned is NOT page-aligned and a zero-copy mmap written assuming 4K is wrong.
+        let ps = requirements().into_iter().find(|r| r.fact.contains("PAGE SIZE")).unwrap();
+        assert!(ps.unlocks.contains("zero-copy mmap path is possible at all"));
+        assert!(ps.unlocks.contains("page-COUNT bound"),
+            "and it may mean 31 GiB is specific to this page size");
+    }
+
+    #[test]
     fn OVERLAP_is_listed_as_a_requirement_and_not_only_a_speed() {
         // Whether two stages are serialised is a structural fact, and it is the largest single win
         // available if the answer is yes.
@@ -168,7 +184,9 @@ mod tests {
     fn the_READ_requirement_distinguishes_FIRST_load_from_SUBSEQUENT() {
         // A 30 GiB file on a 128 GB machine is cached after the first load, so tuning against the
         // wrong one optimises a case that happens once.
-        let read = requirements().into_iter().find(|r| r.stage == Stage::Read).unwrap();
+        let read = requirements().into_iter()
+            .find(|r| r.stage == Stage::Read && r.fact.contains("page cache"))
+            .expect("the page-cache requirement");
         assert!(read.unlocks.contains("happens once"));
     }
 
