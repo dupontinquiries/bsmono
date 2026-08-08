@@ -28,6 +28,9 @@ pub mod palette;
 /// The compressor curve and its gain-reduction meter.
 pub mod dynamics;
 
+/// What media each peer has, and what is still coming.
+pub mod sync;
+
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use studio_collab::Doc;
 use studio_core::{ClipId, Project, Ticks, TrackId, TrackKind, TICKS_PER_SECOND};
