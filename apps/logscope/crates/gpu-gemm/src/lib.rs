@@ -960,6 +960,13 @@ pub fn ab_is_decided() -> bool {
 fn fast_decode_enabled() -> bool {
     dispatch_levers_active()
 }
+/// Enabled by LOGSCOPE_PASS_FUSE=1. Off by default until measured on a real generation — the gate
+/// proves the driver honours the barriers, not that fusing makes this engine faster.
+fn pass_fuse_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("LOGSCOPE_PASS_FUSE").as_deref() == Ok("1"))
+}
+
 fn bind_group_cache_enabled() -> bool {
     fast_decode_enabled() || std::env::var("LOGSCOPE_BG_CACHE").as_deref() == Ok("1")
 }
@@ -1042,7 +1049,15 @@ fn env_gemm_tile() -> Option<u32> {
     *T.get_or_init(|| std::env::var("LOGSCOPE_GEMM_TILE").ok().and_then(|s| s.parse::<u32>().ok()).map(|t| t.clamp(4, 32)))
 }
 
-struct Frame { enc: wgpu::CommandEncoder, keep: Vec<Box<dyn std::any::Any + Send>>, passes: u32 }
+/// A dispatch recorded but not yet encoded.
+///
+/// **Deferring is what makes pass fusion possible without a self-referential Frame.** A
+/// `ComputePass` borrows the encoder, so it cannot be held across `record_dispatch` calls; queueing
+/// the three things a dispatch needs and encoding them all at flush time gets the same result and is
+/// how llama.cpp builds a graph before submitting it.
+type Pending = (wgpu::ComputePipeline, std::sync::Arc<wgpu::BindGroup>, (u32, u32, u32));
+
+struct Frame { enc: wgpu::CommandEncoder, pending: Vec<Pending>, keep: Vec<Box<dyn std::any::Any + Send>>, passes: u32 }
 /// Default passes-per-submit. Frame batching collapsed a token to a single ~129ms submit, which on a
 /// shared GPU (display + compute) starves the compositor and shows as screen artifacts. Flushing every N
 /// passes bounds each submit's duration so the display is serviced between chunks, while still batching
@@ -1962,6 +1977,11 @@ impl Gpu {
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
+            // DRAIN BEFORE SUBMIT. A queued dispatch that is never encoded is silently dropped —
+            // the model would produce output from a partially-executed layer, which is the exact
+            // class of failure this codebase has spent a session learning to distrust.
+            let mut frame = frame;
+            Self::drain_pending(&mut frame);
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             // TAGGED: a readback, flushing the open frame first. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
@@ -2900,6 +2920,11 @@ impl Gpu {
         // everything that follows. See the reopen at the end of this function.
         let had_frame = self.frame.lock().unwrap().is_some();
         if let Some(mut frame) = self.frame.lock().unwrap().take() {
+            // DRAIN BEFORE SUBMIT. A queued dispatch that is never encoded is silently dropped —
+            // the model would produce output from a partially-executed layer, which is the exact
+            // class of failure this codebase has spent a session learning to distrust.
+            let mut frame = frame;
+            Self::drain_pending(&mut frame);
             SUBMIT_BY_DOWNLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             frame.enc.copy_buffer_to_buffer(&t.buf, 0, &staging, 0, bytes);
             self.submit(frame.enc);
@@ -3220,6 +3245,21 @@ impl Gpu {
         (POOL_MISSES.load(std::sync::atomic::Ordering::Relaxed) as usize).saturating_sub(free)
     }
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
+    /// Encode every queued dispatch into ONE compute pass.
+    ///
+    /// Order is preserved by the Vec, and WebGPU inserts memory barriers between dispatches inside a
+    /// pass — which `--gate-passfuse` confirmed this driver honours rather than assuming from spec.
+    fn drain_pending(frame: &mut Frame) {
+        if frame.pending.is_empty() { return }
+        let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("fused"), timestamp_writes: None });
+        for (pipe, bg, wg) in frame.pending.drain(..) {
+            pass.set_pipeline(&pipe);
+            pass.set_bind_group(0, bg.as_ref(), &[]);
+            pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+        }
+    }
+
     fn flush_and_wait(&self) {
         // REOPENS THE FRAME IT TOOK. This is where decode's 67% no-frame came from.
         //
@@ -3235,7 +3275,11 @@ impl Gpu {
         {
             let mut g = self.frame.lock().unwrap();
             had_frame = g.is_some();
-            drop(g.take().map(|frame| {
+            // This site takes the frame through a `map` rather than an `if let`, so the blanket
+            // drain did not reach it — and it is flush_and_wait, the path Scout uses PER LAYER.
+            // Missing it would have dropped queued dispatches on the hottest route in the engine.
+            drop(g.take().map(|mut frame| {
+                Self::drain_pending(&mut frame);
                 SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 frame
             }).map(|frame| { self.submit(frame.enc); self.retain_keep(frame.keep); }));
@@ -3252,6 +3296,11 @@ impl Gpu {
     #[allow(dead_code)]
     fn flush_and_wait_legacy(&self) {
         if let Some(frame) = self.frame.lock().unwrap().take() {
+            // DRAIN BEFORE SUBMIT. A queued dispatch that is never encoded is silently dropped —
+            // the model would produce output from a partially-executed layer, which is the exact
+            // class of failure this codebase has spent a session learning to distrust.
+            let mut frame = frame;
+            Self::drain_pending(&mut frame);
             // TAGGED: the explicit end_frame path. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3345,12 +3394,17 @@ impl Gpu {
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(prev.enc);
         }
-        *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
+        *fr = Some(Frame { enc: self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0 });
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     pub fn end_frame(&self) {
         crate::framediag::FRAME_CLOSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(frame) = self.frame.lock().unwrap().take() {
+            // DRAIN BEFORE SUBMIT. A queued dispatch that is never encoded is silently dropped —
+            // the model would produce output from a partially-executed layer, which is the exact
+            // class of failure this codebase has spent a session learning to distrust.
+            let mut frame = frame;
+            Self::drain_pending(&mut frame);
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc); self.retain_keep(frame.keep);
         }
@@ -3487,9 +3541,19 @@ impl Gpu {
                 // rather than a crash.
                 //
                 // `--gate-passfuse` compares fused against unfused output before this is trusted.
+                // FUSED: queue the dispatch instead of opening a pass for it. Drained into ONE
+                // pass at flush, which is what --gate-passfuse authorised on real Honeykrisp
+                // hardware (unfused 8191, fused 8191 on an M2 Max).
+                //
+                // Deferring rather than holding a pass open is what avoids a self-referential Frame:
+                // a ComputePass borrows the encoder and cannot live across calls.
+                if pass_fuse_enabled() {
+                    frame.pending.push((pipeline.clone(), bg.clone(), wg));
+                } else {
                 let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
+                }
             }
             frame.keep.push(Box::new(bg.clone())); // Arc<BindGroup> kept until flush (cached or fresh)
             if let Some(d) = dbuf { frame.keep.push(Box::new(d.clone())); } // AND its dims uniform Arc
@@ -3502,7 +3566,7 @@ impl Gpu {
                 let old = fr.take().unwrap();
                 self.submit(old.enc);
                 self.retain_keep(old.keep);
-                *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), keep: Vec::new(), passes: 0 });
+                *fr = Some(Frame { enc: dev.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") }), pending: Vec::new(), keep: Vec::new(), passes: 0 });
                 drop(fr);
                 if over_retain && self.pending_keep.lock().unwrap().len() >= DIMS_RETAIN_CAP {
                     crate::counted_poll(&self.device);
