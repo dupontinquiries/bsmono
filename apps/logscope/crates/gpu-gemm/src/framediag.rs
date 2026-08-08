@@ -240,3 +240,42 @@ behind its back, which is the same rule download follows");
         assert!(src.contains("LOGSCOPE_NO_FRAME_REOPEN"));
     }
 }
+
+
+#[cfg(test)]
+mod second_leak_tests {
+    /// The dense fix did not fix Scout, and the measurement said so in one run.
+    ///
+    /// ```text
+    /// dense 1B    39% -> 0%    flush_and_wait fixed it
+    /// Scout       67% -> 71%   unchanged
+    /// ```
+    ///
+    /// Scout's per-layer path is `moe_ffn_v1` downloading router logits as u32, and
+    /// `download_u32` took the frame without restoring it while `download` grew a reopen. Two
+    /// siblings, one fixed — the fifth time this codebase has produced that shape.
+    #[test]
+    fn download_u32_REOPENS_the_frame_like_its_sibling() {
+        let src = include_str!("lib.rs");
+        let i = src.find("pub fn download_u32").expect("moved");
+        // To the NEXT fn, not a fixed window: download_u32 is longer than 4000 chars and my first
+        // version searched past its start and stopped before its end, which reported a reopen that
+        // is there as absent.
+        let body = &src[i..i + src[i + 10..].find("\n    pub fn ").map(|n| n + 10).unwrap_or(4000)];
+        assert!(body.contains("had_frame_u32"), "download_u32 must record whether a frame existed");
+        assert!(body.contains("self.begin_frame();"),
+            "and restore it — Scout's 71% no-frame came from this function alone");
+    }
+
+    #[test]
+    fn BOTH_download_paths_are_symmetric() {
+        // The failure mode is one path growing a fix the other does not. Asserting both have it is
+        // cheaper than remembering to check.
+        let src = include_str!("lib.rs");
+        for f in ["pub fn download_u32", "fn flush_and_wait(&self)"] {
+            let i = src.find(f).unwrap_or_else(|| panic!("{f} moved"));
+            let end = i + src[i + 10..].find("\n    pub fn ").map(|n| n + 10).unwrap_or(4000);
+            assert!(src[i..end.min(src.len())].contains("begin_frame"), "{f} does not reopen");
+        }
+    }
+}
