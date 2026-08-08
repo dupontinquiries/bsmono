@@ -1309,6 +1309,15 @@ pub fn file_views_plausible(gate_type: Option<u32>, up_type: Option<u32>, down_t
     //
     // On its own this saves nothing: the streaming path still converts each expert to q4. It is the
     // precondition for the native path, and it makes the refusal message honest in the meantime.
+    // A FILE VIEW NEEDS A GPU-SIDE DECODER, WHICH IS NOT THE SAME AS A CPU DEQUANTIZER.
+    //
+    // Seven IQ types gained CPU dequantizers, and none of them can be added here: a view means the
+    // shader reads the mmap'd bytes and decodes them on the GPU. Q4_K (12), Q6_K (14) and IQ1_S (19)
+    // have that; the rest load through the CPU path and become q4 resident, which is the 2.88x
+    // inflation views exist to avoid.
+    //
+    // This is the same loading-versus-fitting split as everywhere else: a CPU dequantizer gets a
+    // checkpoint to LOAD, and only a GPU decoder gets it to FIT.
     let allowed: &[u32] = if q6k_views_enabled { &[12, 14, 19] } else { &[12, 19] };
     let (g, u, d) = match (gate_type, up_type, down_type) {
         (Some(g), Some(u), Some(d)) => (g, u, d),
@@ -1319,6 +1328,27 @@ pub fn file_views_plausible(gate_type: Option<u32>, up_type: Option<u32>, down_t
     // gate and up are packed together, so they must agree. `down` is read separately and may differ,
     // which is why RawExpertSrc carries gu_type and dn_type apart.
     g == u && allowed.contains(&g) && allowed.contains(&d)
+}
+
+/// Why file views were refused, named so the operator knows what is missing.
+///
+/// `file_views_plausible` returning false sends the loader down the host-copy path, and the plan
+/// then reports tens of GiB of host RAM with no indication why. **Naming the type turns "streaming
+/// will hold ~50.6 GiB" into a sentence someone can act on.**
+pub fn file_view_refusal(gate_type: Option<u32>, up_type: Option<u32>, down_type: Option<u32>)
+    -> Option<String>
+{
+    let (g, u, d) = (gate_type?, up_type?, down_type?);
+    if g != u {
+        return Some(format!("gate is type {g} and up is type {u} — they are packed together and must agree, so this is a layout difference rather than an unsupported format"));
+    }
+    let named = |t: u32| crate::gguf::type_name(t);
+    if !matches!(g, 12 | 14 | 19) || !matches!(d, 12 | 14 | 19) {
+        return Some(format!(
+            "experts are {} (gate/up) and {} (down). A file view needs a GPU-SIDE decoder and only Q4_K, Q6_K and IQ1_S have one — a CPU dequantizer gets the checkpoint to LOAD but the weights then become q4 resident, which is the inflation views exist to avoid",
+            named(g), named(d)));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1848,5 +1878,53 @@ mod probe_meaningful_tests {
         // Declining on an unrecognised name would silently skip the measurement on exactly the
         // hardware nobody has characterised yet, which is where it is most wanted.
         assert!(probe_is_meaningful("Some Vendor Unreleased Part"));
+    }
+}
+
+#[cfg(test)]
+mod file_view_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn an_IQ2_expert_set_is_refused_and_the_TYPE_is_named() {
+        // Without the name, the plan reports tens of GiB of host RAM and nothing says why — which is
+        // how "streaming will hold ~50.6 GiB" reads as a fact about the model rather than the
+        // consequence of one missing decoder.
+        let why = file_view_refusal(Some(16), Some(16), Some(16)).unwrap();
+        assert!(why.contains("IQ2_XXS"));
+        assert!(why.contains("GPU-SIDE decoder"));
+    }
+
+    #[test]
+    fn the_refusal_states_the_LOADING_versus_FITTING_split() {
+        // Seven IQ types gained CPU dequantizers and none of them can be a file view. A reader who
+        // knows the dequantizer landed will otherwise assume this should now work.
+        let why = file_view_refusal(Some(22), Some(22), Some(12)).unwrap();
+        assert!(why.contains("CPU dequantizer gets the checkpoint to LOAD"));
+        assert!(why.contains("inflation views exist to avoid"));
+    }
+
+    #[test]
+    fn MISMATCHED_gate_and_up_is_a_LAYOUT_problem_not_a_format_one() {
+        // They are packed together, so disagreeing types mean something structurally different — and
+        // reporting it as an unsupported format would send someone to write a decoder they do not
+        // need.
+        let why = file_view_refusal(Some(12), Some(14), Some(12)).unwrap();
+        assert!(why.contains("layout difference rather than an unsupported format"));
+    }
+
+    #[test]
+    fn a_SUPPORTED_set_produces_no_refusal() {
+        // The function must stay silent on the good path, or the loader prints a warning about
+        // something that worked.
+        assert!(file_view_refusal(Some(12), Some(12), Some(12)).is_none());
+        assert!(file_view_refusal(Some(19), Some(19), Some(19)).is_none());
+    }
+
+    #[test]
+    fn a_MISSING_tensor_yields_no_refusal_rather_than_a_wrong_one() {
+        // A tensor the table does not have is a different layout, and the real load attempt reports
+        // it better than a guess here would.
+        assert!(file_view_refusal(None, Some(12), Some(12)).is_none());
     }
 }
