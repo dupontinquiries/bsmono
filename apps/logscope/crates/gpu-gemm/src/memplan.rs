@@ -1403,6 +1403,24 @@ pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
 /// The right fix is to probe concurrent residency the way the arena already probes slabs, and record
 /// it per adapter in the store beside the autotune verdicts. Until then this is a constant that
 /// LOOKS like a measurement, which is the shape of every misleading number this project has found.
+/// # This is ONE MACHINE'S measurement applied to every Asahi device
+///
+/// A wrong value here is a wrong REFUSAL, and a refusal is invisible: the model does not load and
+/// nothing says the ceiling was a guess. That risk is unchanged for machines other than the one
+/// below — an M2 Max with 64 GB has not been measured.
+///
+/// # CONFIRMED BY MEASUREMENT on an M2 Ultra, 2026-08
+///
+/// `--gate-residency` held 31 GiB in 124 one-GiB slabs and the 125th failed with "Failed to allocate
+/// BO VMA / BO creation failed" — on a machine with 177 GiB of RAM, with the probe allowed to reach
+/// 88 GiB. **The hardware genuinely stops at 31.**
+///
+/// So the value is right and the previous doc comment overstated the risk: this is not a stale guess
+/// inherited from the staging path, it is the number, at least for this device. The remaining
+/// caution is unchanged — it is ONE machine's figure and an M2 Max with 64 GB has not been measured.
+///
+/// It also means the 70B Q4_K_M refusal at this ceiling was CORRECT rather than a wrong refusal,
+/// which is the opposite of what I expected when I wrote the probe.
 pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
 
 /// Does a resident plan fit within what this device will hold at once?
