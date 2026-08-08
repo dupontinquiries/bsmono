@@ -299,3 +299,15 @@ The tell is that another crate builds fine at the same moment with a different
 target dir. If disk is healthy and stdin is a terminal, delete the target
 directory before believing anything about the toolchain — the message names
 rustc and means nothing of the sort in any of its three causes.
+
+### The corrupted-target-dir failure is frequent, not a curiosity
+
+Recorded once as a third cause. It has now happened three times in three
+sessions, always the same way: a workspace that tested clean minutes earlier
+fails with `exit status: 101` and no diagnostic, or with a rustc probe error,
+and a fresh CARGO_TARGET_DIR builds it with no source change.
+
+It correlates with the disk filling — this container runs at 90%+ and a target
+directory written during an out-of-space moment stays broken afterwards. So the
+first response to an inexplicable build failure here is `rm -rf` the target dir
+and retry BEFORE reading the error, not after.
