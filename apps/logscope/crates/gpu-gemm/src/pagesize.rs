@@ -92,6 +92,46 @@ pub fn portable_align_overhead(n: usize) -> usize {
     align_up(n, PORTABLE_ALIGN) - align_up(n, running_page_size())
 }
 
+/// How many of a checkpoint's tensors could be mapped without a copy.
+///
+/// **The arena is not the place this matters, and I said it was.** Its 256-byte alignment is a
+/// GPU-access constraint on offsets WITHIN an already-created buffer — no page mapping is involved.
+///
+/// Where page size actually decides something is the file-view path: aliasing a GGUF tensor's bytes
+/// straight into a GPU buffer needs the tensor's file offset page-aligned. GGUF aligns tensor data
+/// to 32 bytes by default, so on a 4 KiB kernel most offsets miss and on a 16 KiB kernel almost all
+/// do — which means a "zero-copy" view is usually a copy, and nothing currently reports that.
+pub struct MapAudit {
+    pub total: usize,
+    pub page_aligned: usize,
+    pub page: usize,
+}
+
+impl MapAudit {
+    pub fn of(offsets: impl IntoIterator<Item = u64>, page: usize) -> Self {
+        let mut total = 0;
+        let mut ok = 0;
+        for o in offsets {
+            total += 1;
+            if can_map_directly(o, page) { ok += 1 }
+        }
+        MapAudit { total, page_aligned: ok, page }
+    }
+
+    pub fn report(&self) -> String {
+        if self.total == 0 { return "no tensors to audit".into() }
+        let pct = 100.0 * self.page_aligned as f64 / self.total as f64;
+        format!("{}/{} tensor offsets are aligned to this kernel's {} KiB pages ({pct:.0}%). {}", self.page_aligned, self.total, self.page / 1024,
+            if pct < 5.0 {
+                "A file view therefore copies for nearly every tensor — the zero-copy path exists and almost never takes effect, which is worth knowing before optimising around it"
+            } else if pct > 95.0 {
+                "The file was written with this page size in mind, so views alias rather than copy"
+            } else {
+                "Mixed, so a view path's benefit depends on WHICH tensors happen to land right — which is not a property anyone chose"
+            })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +184,34 @@ mod tests {
         // would corrupt a mapping rather than fail it.
         assert_eq!(align_up(100, 3), 100);
         assert!(!can_map_directly(0, 0));
+    }
+
+    #[test]
+    fn a_GGUF_style_offset_set_is_MOSTLY_UNALIGNED_at_16K() {
+        // GGUF aligns tensor data to 32 bytes, so on a 16 KiB kernel almost nothing lands on a page
+        // boundary — the "zero-copy" view is usually a copy, and that is the fact worth reporting.
+        let offsets: Vec<u64> = (0..100).map(|i| 4096 + i * 32).collect();
+        let a = MapAudit::of(offsets, PAGE_16K);
+        assert!(a.page_aligned * 20 < a.total, "expected under 5% aligned, got {}", a.page_aligned);
+        assert!(a.report().contains("almost never takes effect"));
+    }
+
+    #[test]
+    fn a_deliberately_aligned_file_reports_that_views_ALIAS() {
+        let offsets: Vec<u64> = (0..10).map(|i| i * PAGE_64K as u64).collect();
+        assert!(MapAudit::of(offsets, PAGE_16K).report().contains("alias rather than copy"));
+    }
+
+    #[test]
+    fn a_MIXED_result_says_the_benefit_is_not_something_anyone_chose() {
+        let mut offsets: Vec<u64> = (0..5).map(|i| i * PAGE_16K as u64).collect();
+        offsets.extend((0..5).map(|i| 32 + i * 32));
+        assert!(MapAudit::of(offsets, PAGE_16K).report().contains("not a property anyone chose"));
+    }
+
+    #[test]
+    fn an_EMPTY_audit_does_not_divide_by_zero() {
+        assert!(MapAudit::of(Vec::<u64>::new(), PAGE_16K).report().contains("no tensors"));
     }
 
     #[test]
