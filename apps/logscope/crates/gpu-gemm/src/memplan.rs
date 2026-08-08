@@ -1559,3 +1559,248 @@ to treat it as arbitrary and raise it");
         assert!(doc.contains("a refusal is invisible"));
     }
 }
+
+/// Measuring concurrent residency instead of assuming it.
+///
+/// `ASAHI_CONCURRENT_BUFFER_GIB` is one machine's measurement applied to every Asahi device, and a
+/// wrong value is a wrong REFUSAL — invisible, because the model simply does not load.
+///
+/// ## The tradeoff, and why caching resolves it
+///
+/// Probing costs a slow start: allocate slabs until one fails, then release them. Doing that every
+/// launch is unacceptable. Doing it **once per adapter and storing the result** beside the autotune
+/// verdicts costs one slow start ever, which is the same bargain autotuning already makes and for
+/// the same reason.
+///
+/// ## A probe that wedges the GPU is worse than a wrong constant
+///
+/// This is the constraint that shapes everything below. A failed allocation must be recoverable, the
+/// probe must stop well before the system is under pressure, and a probe that does not COMPLETE must
+/// leave no cached value — because a partial result recorded as fact is worse than no result.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ResidencyProbe {
+    /// GiB successfully held at once.
+    pub held_gib: f64,
+    /// Slab size used, since the answer depends on it — a device may hold 31 GiB in 1 GiB slabs and
+    /// less in 4 GiB ones.
+    pub slab_gib: f64,
+    /// Did the probe run to a natural stop, or was it cut short?
+    pub complete: bool,
+}
+
+/// Stop here regardless of success. Beyond this the probe is competing with the operator's desktop
+/// for memory, and a benchmark that makes the machine unusable is not one anybody runs twice.
+pub const PROBE_CEILING_GIB: f64 = 96.0;
+
+/// The ceiling the fixed one does not cover.
+///
+/// **This was found by the probe being OOM-killed on the machine that wrote it.** A constant ceiling
+/// assumes the device has that much; on a software rasterizer, or any machine smaller than the
+/// constant, the allocations come from system RAM and the kernel kills the process before any device
+/// error is reported.
+///
+/// So the real bound is a share of what the SYSTEM has, and the fixed ceiling is only the upper
+/// limit of that. Two thirds leaves the desktop working — a probe that makes the machine unusable is
+/// not one anybody runs twice, and a probe nobody runs is a constant with extra steps.
+/// Half of AVAILABLE, not two thirds of total. Two thirds of total was killed on a 4 GiB machine.
+pub const PROBE_SYSTEM_SHARE: f64 = 0.5;
+
+/// Should a residency probe run on this adapter at all?
+///
+/// **On a software rasterizer it measures nothing.** lavapipe's "device memory" is host RAM, so the
+/// probe measures how much the process can malloc — a number that says nothing about any GPU and
+/// that gets the process OOM-killed on the way to finding it. That happened three times while
+/// writing this, at 96, 2.6 and 1.8 GiB.
+///
+/// Worse, an upload there is an allocation AND a copy, so the probe costs roughly double what it
+/// counts, which is why each bound I chose was still too generous.
+///
+/// A probe that cannot answer the question should decline rather than approximate it.
+pub fn probe_is_meaningful(adapter: &str) -> bool {
+    let a = adapter.to_ascii_lowercase();
+    !(a.contains("llvmpipe") || a.contains("lavapipe") || a.contains("softpipe")
+      || a.contains("swiftshader"))
+}
+
+/// How far the probe may go on this machine./// How far the probe may go on this machine.
+pub fn probe_limit_gib(system_ram_gib: f64) -> f64 {
+    if system_ram_gib <= 0.0 {
+        // Unknown RAM: use the smallest thing that still answers the question. Guessing high here is
+        // how the probe got killed, and a low probe reports "at least N" which is still usable.
+        return ASAHI_CONCURRENT_BUFFER_GIB;
+    }
+    (system_ram_gib * PROBE_SYSTEM_SHARE).min(PROBE_CEILING_GIB)
+}
+
+/// Total system memory in GiB, or 0 if it cannot be determined.
+pub fn system_ram_gib() -> f64 {
+    // MEM_AVAILABLE, and I argued the opposite and was wrong twice in one sitting.
+    //
+    // The reasoning for MemTotal was that page cache is droppable so available understates what is
+    // reachable. True, and irrelevant: the probe was OOM-KILLED at 66% of MemTotal on a 4 GiB
+    // machine, because the compiler's resident memory and the probe's own 1 GiB source buffer are
+    // not page cache and will not be dropped.
+    //
+    // Available is what the kernel says can be had without reclaim pressure, which is the question
+    // actually being asked. Being wrong low costs a smaller probe; being wrong high costs the
+    // process.
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0.0 };
+    s.lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse::<f64>().ok())
+        .map(|kb| kb / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
+}
+
+impl ResidencyProbe {
+    /// Is this result safe to cache and act on?
+    ///
+    /// **An incomplete probe is discarded, not rounded down.** A probe cut short at 20 GiB tells you
+    /// the device holds at least 20; recording that as the ceiling would refuse models between 20 and
+    /// the truth, which is the same invisible failure the constant already causes.
+    pub fn usable(&self) -> bool { self.complete && self.held_gib > 0.0 }
+
+    /// What to plan with, given a probe that may not be usable.
+    pub fn budget_gib(&self, fallback: f64) -> f64 {
+        if self.usable() { self.held_gib } else { fallback }
+    }
+
+    pub fn explain(&self, fallback: f64) -> String {
+        if self.usable() {
+            format!("concurrent residency measured on THIS device: {:.1} GiB in {:.0} GiB slabs",
+                self.held_gib, self.slab_gib)
+        } else {
+            format!("the residency probe did not complete — falling back to the compiled-in {fallback:.1} \
+GiB. An incomplete probe is discarded rather than rounded down, because 'it held at least 20' \
+recorded as 'it holds 20' refuses models between 20 and the truth")
+        }
+    }
+}
+
+/// The key a cached probe is stored under.
+///
+/// **Adapter string plus slab size.** The adapter covers the hardware and driver; the slab size is
+/// part of the question rather than of the machine, so a probe at 1 GiB cannot answer for 4 GiB.
+pub fn probe_key(adapter: &str, slab_gib: f64) -> String {
+    format!("{adapter}|slab={slab_gib:.1}")
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn an_INCOMPLETE_probe_is_discarded_rather_than_rounded_down() {
+        // "It held at least 20" recorded as "it holds 20" refuses models between 20 and the truth —
+        // the same invisible failure the constant already causes, arrived at by a different route.
+        let p = ResidencyProbe { held_gib: 20.0, slab_gib: 1.0, complete: false };
+        assert!(!p.usable());
+        assert_eq!(p.budget_gib(31.0), 31.0, "falls back rather than believing itself");
+        assert!(p.explain(31.0).contains("discarded rather than rounded down"));
+    }
+
+    #[test]
+    fn a_COMPLETE_probe_replaces_the_constant() {
+        let p = ResidencyProbe { held_gib: 44.0, slab_gib: 1.0, complete: true };
+        assert_eq!(p.budget_gib(31.0), 44.0);
+        assert!(p.explain(31.0).contains("on THIS device"));
+    }
+
+    #[test]
+    fn the_key_includes_the_SLAB_SIZE_because_it_changes_the_answer() {
+        // A device may hold 31 GiB in 1 GiB slabs and less in 4 GiB ones. The slab is part of the
+        // question, not of the machine.
+        assert_ne!(probe_key("M2 Ultra", 1.0), probe_key("M2 Ultra", 4.0));
+        assert_eq!(probe_key("M2 Ultra", 1.0), probe_key("M2 Ultra", 1.0));
+    }
+
+    #[test]
+    fn the_probe_has_a_CEILING_so_it_cannot_fight_the_desktop_for_memory() {
+        // A benchmark that makes the machine unusable is not one anybody runs twice, and a probe
+        // nobody runs is a constant with extra steps.
+        assert!(PROBE_CEILING_GIB <= 128.0);
+        assert!(PROBE_CEILING_GIB > ASAHI_CONCURRENT_BUFFER_GIB);
+    }
+
+    #[test]
+    fn a_ZERO_result_is_not_usable_even_when_marked_complete() {
+        // A probe that completed by failing its first allocation measured nothing, and a zero budget
+        // would refuse every model with a message implying it had measured one.
+        let p = ResidencyProbe { held_gib: 0.0, slab_gib: 1.0, complete: true };
+        assert!(!p.usable());
+        assert_eq!(p.budget_gib(31.0), 31.0);
+    }
+}
+
+
+#[cfg(test)]
+mod probe_limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_probe_is_bounded_by_SYSTEM_RAM_not_only_by_a_constant() {
+        // Found by the probe being OOM-killed on the machine that wrote it: a constant ceiling
+        // assumes the device HAS that much, and on a smaller machine the kernel kills the process
+        // before any device error is reported.
+        assert!(probe_limit_gib(16.0) < PROBE_CEILING_GIB);
+        assert!((probe_limit_gib(16.0) - 16.0 * PROBE_SYSTEM_SHARE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_LARGE_machine_is_still_capped_by_the_constant() {
+        // 66% of 512 GB is not a reasonable probe, and the fixed ceiling remains the upper limit.
+        assert_eq!(probe_limit_gib(512.0), PROBE_CEILING_GIB);
+    }
+
+    #[test]
+    fn UNKNOWN_ram_probes_conservatively_rather_than_optimistically() {
+        // Guessing high is how the probe got killed. A low probe reports "at least N", which is still
+        // usable; a killed probe reports nothing and leaves the constant in place anyway.
+        assert_eq!(probe_limit_gib(0.0), ASAHI_CONCURRENT_BUFFER_GIB);
+    }
+
+    #[test]
+    fn system_ram_is_read_without_panicking_wherever_it_runs() {
+        // /proc/meminfo is absent on macOS, and a probe that panics there is worse than one that
+        // declines to run.
+        let r = system_ram_gib();
+        assert!(r >= 0.0);
+    }
+
+    #[test]
+    fn two_thirds_leaves_the_desktop_working() {
+        // A probe that makes the machine unusable is not one anybody runs twice, and a probe nobody
+        // runs is a constant with extra steps.
+        // Two thirds of MemTotal was killed; half of MemAvailable is the corrected figure, and the
+        // difference between those two denominators is most of the fix.
+        assert!(PROBE_SYSTEM_SHARE <= 0.5);
+        assert!(PROBE_SYSTEM_SHARE >= 0.25, "low enough to be pointless is no better");
+    }
+}
+
+
+#[cfg(test)]
+mod probe_meaningful_tests {
+    use super::*;
+
+    #[test]
+    fn a_SOFTWARE_rasterizer_declines_the_probe() {
+        // Its "device memory" is host RAM, so the probe measures malloc and says nothing about any
+        // GPU — after getting the process OOM-killed three times on the way to finding out.
+        assert!(!probe_is_meaningful("llvmpipe (LLVM 20.1.2, 256 bits) [Gl]"));
+        assert!(!probe_is_meaningful("SwiftShader Device"));
+    }
+
+    #[test]
+    fn REAL_hardware_runs_it() {
+        assert!(probe_is_meaningful("Apple M2 Ultra (G14D B1) [Vulkan]"));
+        assert!(probe_is_meaningful("AMD Radeon RX 7900 XTX"));
+    }
+
+    #[test]
+    fn an_unknown_adapter_is_assumed_REAL() {
+        // Declining on an unrecognised name would silently skip the measurement on exactly the
+        // hardware nobody has characterised yet, which is where it is most wanted.
+        assert!(probe_is_meaningful("Some Vendor Unreleased Part"));
+    }
+}
