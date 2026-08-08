@@ -43,6 +43,7 @@ pub mod swipe_physics;
 pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
+pub mod reticle;
 pub mod shutter;
 pub mod tile_strip;
 pub mod voice_playout;

@@ -52,6 +52,14 @@ pub struct Viewfinder {
     pub sensor_aspect: f32,
     /// Focus point in NORMALISED sensor coordinates, so it survives a resize.
     pub focus: Option<[f32; 2]>,
+    /// The reticle proper: three states and a linger, from `FocusReticle`.
+    ///
+    /// The fields above fade on a fixed timer, which is the SHAPE of a reticle
+    /// and not its job — a reticle that disappears on schedule regardless of
+    /// outcome never tells the user whether the camera focused. Kept alongside
+    /// during the changeover so existing callers still compile; new drawing
+    /// should use this.
+    pub reticle: crate::reticle::Reticle,
     /// Seconds since the tap, for the reticle fade.
     pub focus_age: f32,
     pub recipient: Option<String>,
@@ -61,7 +69,8 @@ impl Default for Viewfinder {
     fn default() -> Self {
         Viewfinder {
             facing: Facing::Back, full_bleed: true, scan_mode: false,
-            sensor_aspect: 4.0 / 3.0, focus: None, focus_age: 0.0, recipient: None,
+            sensor_aspect: 4.0 / 3.0, focus: None, focus_age: 0.0,
+            reticle: Default::default(), recipient: None,
         }
     }
 }
@@ -124,7 +133,12 @@ impl Viewfinder {
 
     pub fn tap(&mut self, p: Pos2, into: Rect) -> bool {
         match self.to_sensor(p, into) {
-            Some(s) => { self.focus = Some(s); self.focus_age = 0.0; true }
+            Some(s) => {
+                self.focus = Some(s);
+                self.focus_age = 0.0;
+                self.reticle.trigger_at(s[0], s[1]);
+                true
+            }
             // A tap outside the image must NOT move focus — on a letterboxed
             // preview the bars are not part of the picture.
             None => false,
@@ -133,6 +147,7 @@ impl Viewfinder {
 
     pub fn tick(&mut self, dt: f32) {
         if self.focus.is_some() {
+            self.reticle.tick(dt * 1000.0);
             self.focus_age += dt;
             if self.focus_age > RETICLE_SECONDS { self.focus = None; }
         }
@@ -312,5 +327,45 @@ mod tests {
         assert!(vf.frame_interval() > normal * 2.0,
                 "scanning must be slower: {} vs {}", vf.frame_interval(), normal);
         assert!((vf.frame_interval() - 1.0 / SCAN_FPS).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod reticle_wiring_tests {
+    use super::*;
+    use crate::reticle::FocusState;
+
+    #[test]
+    fn a_viewfinder_tap_starts_a_real_sweep_not_just_a_timer() {
+        // The old path set a point and counted down. A reticle that fades on
+        // schedule regardless of outcome never says whether focus succeeded.
+        let mut v = Viewfinder::default();
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        v.tap(egui::pos2(200.0, 150.0), view);
+        assert_eq!(v.reticle.state(), FocusState::Searching);
+        assert!(v.reticle.visible());
+    }
+
+    #[test]
+    fn the_reticle_waits_for_the_camera_rather_than_the_clock() {
+        // Ten seconds of ticking with no result: still searching, because the
+        // camera decides when a sweep ends.
+        let mut v = Viewfinder::default();
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        v.tap(egui::pos2(200.0, 150.0), view);
+        for _ in 0..100 { v.tick(0.1); }
+        assert_eq!(v.reticle.state(), FocusState::Searching);
+        assert!(v.reticle.visible());
+    }
+
+    #[test]
+    fn a_focus_failure_is_shown_before_it_fades() {
+        let mut v = Viewfinder::default();
+        let view = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(400.0, 300.0));
+        v.tap(egui::pos2(200.0, 150.0), view);
+        assert!(v.reticle.set_state(FocusState::Failed));
+        v.tick(0.5);
+        assert_eq!(v.reticle.state(), FocusState::Failed);
+        assert_eq!(v.reticle.alpha(), 1.0, "lingering, not fading yet");
     }
 }
