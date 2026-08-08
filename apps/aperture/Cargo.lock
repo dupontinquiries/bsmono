@@ -80,6 +80,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aperture-scene"
+version = "0.1.0"
+dependencies = [
+ "aperture-core",
+ "aperture-egui",
+ "eframe",
+ "egui",
+ "scene-kit",
+]
+
+[[package]]
 name = "arboard"
 version = "3.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -703,6 +714,12 @@ checksum = "5b38ad915f6dadd993ced50848a8291a543bd41ca62bc10740d5e64e2ab4cfd7"
 dependencies = [
  "bytemuck",
 ]
+
+[[package]]
+name = "font8x8"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "875488b8711a968268c7cf5d139578713097ca4635a76044e8fe8eedf831d07e"
 
 [[package]]
 name = "foreign-types"
@@ -1332,6 +1349,10 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
+name = "noise-kit"
+version = "0.1.0"
 
 [[package]]
 name = "num-traits"
@@ -1990,6 +2011,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "scene-kit"
+version = "0.1.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "font8x8",
+ "noise-kit",
 ]
 
 [[package]]

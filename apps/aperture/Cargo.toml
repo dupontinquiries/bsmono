@@ -17,6 +17,7 @@ members = [
     "crates/aperture-core",
     "crates/aperture-complete",
     "crates/aperture-egui",
+    "crates/aperture-scene",
 ]
 resolver = "2"
 
