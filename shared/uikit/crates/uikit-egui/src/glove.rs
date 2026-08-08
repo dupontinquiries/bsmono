@@ -232,6 +232,18 @@ impl Ratchet {
     pub fn at(&self) -> Orient { self.at }
     pub fn away(&self) -> bool { self.away_in.is_some() }
 
+    /// Discard any flick currently in flight, leaving arming and dwell intact.
+    ///
+    /// Gating only at the moment a flick COMPLETES is not enough: the return
+    /// stroke is what fires, so a motion that began while the user was looking
+    /// elsewhere would land the instant they looked back. A test caught exactly
+    /// that. Cancelling the in-flight intent means a flick must begin AND end
+    /// under attention to count.
+    ///
+    /// Arming is deliberately untouched — the phone is still resting or not,
+    /// and lying about that would put the ratchet out of step with the world.
+    pub fn cancel_flick(&mut self) { self.away_in = None; }
+
     /// True once the phone has been held screen-down long enough to escape.
     pub fn escaping(&self) -> bool {
         self.tilt == Tilt::FaceDown && self.dwell_ms >= ESCAPE_HOLD_MS
@@ -694,6 +706,34 @@ impl ColdMode {
     }
 }
 
+/// Whether the gaze layer sees someone looking at the screen.
+///
+/// Three states, and `Unknown` is the one that matters. A phone with no
+/// tracker, or one whose tracker is looking at a scarf and a hat — which in
+/// cold weather is most of them — must behave EXACTLY as it did before gaze
+/// existed. Requiring a look would break glove mode on precisely the devices
+/// and the days it was built for.
+///
+/// So this gates on `Away` only: known-not-looking blocks, unknown does not.
+/// That asymmetry is the whole design, and it is the mirror of the posture
+/// veto — there, attention could only keep a screen awake; here, it can only
+/// block an action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Watching {
+    /// No tracker, or no confident reading. Behaves as though gaze did not
+    /// exist.
+    #[default]
+    Unknown,
+    Looking,
+    /// The tracker is working and the user is demonstrably not looking.
+    Away,
+}
+
+impl Watching {
+    /// Should an action be blocked?
+    pub fn blocks(self) -> bool { self == Watching::Away }
+}
+
 /// The ratcheting cursor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct GloveCursor {
@@ -705,6 +745,7 @@ pub struct GloveCursor {
     /// The flick ratchet. No velocity: the cursor does not coast.
     ratchet: Ratchet,
     mode: Mode,
+    watching: Watching,
     snapped: Option<String>,
     bounds: (f32, f32),
 }
@@ -714,6 +755,7 @@ impl Default for GloveCursor {
         GloveCursor {
             mode_setting: ColdMode::Off, ambient_c: None,
             pos: (0.0, 0.0), ratchet: Ratchet::default(), mode: Mode::Navigating,
+            watching: Watching::Unknown,
             snapped: None, bounds: (0.0, 0.0),
         }
     }
@@ -748,6 +790,10 @@ impl GloveCursor {
     /// phone that will not respond needs to know it is waiting for rest.
     pub fn armed(&self) -> bool { self.ratchet.armed() }
 
+    /// Report what the gaze layer sees.
+    pub fn set_watching(&mut self, w: Watching) { self.watching = w; }
+    pub fn watching(&self) -> Watching { self.watching }
+
     pub fn mode(&self) -> &Mode { &self.mode }
     pub fn dictating(&self) -> bool { matches!(self.mode, Mode::Dictating { .. }) }
 
@@ -772,12 +818,32 @@ impl GloveCursor {
         let mut out = Tick::default();
 
         // The escape is checked FIRST and works in either mode. It has to be
-        // reachable from dictation, which is the state it exists to leave.
+        // reachable from dictation, which is the state it exists to leave —
+        // and it is NOT gated on attention, deliberately. If getting out
+        // required looking at the phone, a device that ended up in a pocket
+        // while listening could not be stopped.
         let flicked = self.ratchet.feed(o, tilt, dt_ms);
-        out.flicked = flicked;
         if self.ratchet.escaping() {
             out.escaped = self.escape();
         }
+
+        // ATTENTION GATE. A flick only counts while the user is not
+        // demonstrably looking elsewhere. This is what the flick-timing window
+        // cannot do: a phone jostling at your side as you walk can produce a
+        // perfectly clean out-and-back, and timing has no way to tell that from
+        // a deliberate one. Where the eyes are does.
+        //
+        // The ratchet is still FED, so its arming and dwell stay in step with
+        // reality — dropping the reading instead would leave it armed from
+        // whenever attention was last present, and the first look back would
+        // fire a step from a motion made minutes earlier.
+        let flicked = if self.watching.blocks() {
+            // Not just "ignore the result": cancel the intent, so a motion that
+            // STARTED unwatched cannot land the moment the user looks back.
+            self.ratchet.cancel_flick();
+            None
+        } else { flicked };
+        out.flicked = flicked;
 
         // While dictating, the cursor MAY move — but the only thing it can
         // reach is the escape dot.
@@ -859,12 +925,18 @@ impl GloveCursor {
 
     /// Resolve a spoken phrase against whatever is snapped.
     pub fn speak(&mut self, phrase: &str, targets: &[Target]) -> Option<GloveAction> {
-        // Dictating: the vocabulary is suspended and the words are content.
-        // Resolving "next" here would jump the cursor and swallow the word.
+        // Dictating is NOT gated on attention. People look away while talking —
+        // at the road, at the person they are describing, at nothing — and a
+        // dictation that stopped accepting words whenever the eyes left the
+        // screen would be unusable in exactly the situations it is for.
         if self.dictating() {
             if phrase.trim().is_empty() { return None; }
             return Some(GloveAction::Dictated(phrase.to_string()));
         }
+        // Commands ARE gated. Acting on a misheard word while the phone is at
+        // your side is the failure this pairing exists to prevent, and unlike
+        // dictation there is no reason to issue one without looking.
+        if self.watching.blocks() { return None; }
         let target = targets.iter().find(|t| Some(t.id.as_str()) == self.snapped())?;
         let action = Vocab::resolve(phrase, target)?;
         if let GloveAction::Step(d) = action {
@@ -1693,5 +1765,138 @@ mod shake_command_tests {
     fn the_window_is_wider_than_a_shake_and_narrower_than_two_moves() {
         assert!(DOUBLE_FLICK_MS > FLICK_MAX_MS - 200.0);
         assert!(DOUBLE_FLICK_MS < 1_000.0);
+    }
+}
+
+#[cfg(test)]
+mod attention_gate_tests {
+    use super::*;
+
+    fn target(id: &str, kind: TargetKind, x: f32, y: f32) -> Target {
+        Target { id: id.into(), kind, at: (x, y), label: id.into() }
+    }
+
+    fn cursor() -> GloveCursor {
+        let mut g = GloveCursor::with_mode(ColdMode::On);
+        g.set_bounds(400.0, 800.0);
+        g
+    }
+
+    /// Rest is a TILT (face-up), not an orientation — orientation is four
+    /// directions and all four mean something.
+    fn flick(g: &mut GloveCursor, dir: Orient, ts: &[Target]) {
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, ts);
+        g.feed(dir, Tilt::Raised, 0.0, ts);
+        g.feed(dir, Tilt::Raised, 150.0, ts);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, ts);
+    }
+
+    #[test]
+    fn a_phone_with_no_tracker_behaves_exactly_as_before() {
+        // THE constraint. In cold weather the camera is looking at a scarf and
+        // a hat as often as a face, so requiring a look would break glove mode
+        // on precisely the days it exists for.
+        let mut g = cursor();
+        assert_eq!(g.watching(), Watching::Unknown);
+        let before = g.pos();
+        flick(&mut g, Orient::LeftUp, &[]);
+        assert_ne!(g.pos(), before, "unknown attention must not block anything");
+    }
+
+    #[test]
+    fn a_flick_made_while_not_looking_does_not_move_the_cursor() {
+        // What flick timing cannot do: a phone jostling at your side as you
+        // walk produces a perfectly clean out-and-back, and timing has no way
+        // to tell that from a deliberate one.
+        let mut g = cursor();
+        g.set_watching(Watching::Away);
+        let before = g.pos();
+        flick(&mut g, Orient::LeftUp, &[]);
+        assert_eq!(g.pos(), before);
+    }
+
+    #[test]
+    fn looking_back_does_not_replay_a_motion_made_while_away() {
+        // The ratchet keeps being FED while blocked, so its arming stays in
+        // step with reality. Dropping the readings instead would leave it armed
+        // from whenever attention was last present, and the first look back
+        // would fire a step from a motion made minutes ago.
+        let mut g = cursor();
+        g.set_watching(Watching::Away);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
+        g.feed(Orient::Normal, Tilt::FaceUp, REARM_MIN_MS, &[]);
+        g.feed(Orient::LeftUp, Tilt::Raised, 0.0, &[]);
+        g.feed(Orient::LeftUp, Tilt::Raised, 150.0, &[]);
+        let before = g.pos();
+        // The user looks back mid-gesture; the return stroke completes.
+        g.set_watching(Watching::Looking);
+        g.feed(Orient::Normal, Tilt::FaceUp, 0.0, &[]);
+        assert_eq!(g.pos(), before,
+                   "the flick that began unwatched must not land on looking back");
+    }
+
+    #[test]
+    fn a_command_is_refused_while_not_looking() {
+        // Acting on a misheard word while the phone is at your side is exactly
+        // what this pairing prevents, and there is no reason to issue a command
+        // without looking.
+        let ts = vec![target("send", TargetKind::Button, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
+        g.set_watching(Watching::Away);
+        assert_eq!(g.speak("select", &ts), None);
+        g.set_watching(Watching::Looking);
+        assert_eq!(g.speak("select", &ts), Some(GloveAction::Activate("send".into())));
+    }
+
+    #[test]
+    fn dictation_is_not_gated_because_people_look_away_while_talking() {
+        // At the road, at the person they are describing, at nothing. A
+        // dictation that stopped accepting words whenever the eyes left the
+        // screen would be unusable in the situations it is for.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
+        g.speak("select", &ts);
+        assert!(g.dictating());
+        g.set_watching(Watching::Away);
+        assert_eq!(g.speak("the roof is leaking", &ts),
+                   Some(GloveAction::Dictated("the roof is leaking".into())));
+    }
+
+    #[test]
+    fn the_escape_works_while_not_looking() {
+        // If getting out required looking at the phone, a device that ended up
+        // in a pocket while listening could not be stopped.
+        let ts = vec![target("body", TargetKind::Field, 200.0, 400.0)];
+        let mut g = cursor();
+        g.feed(Orient::Normal, Tilt::FaceUp, 16.0, &ts);
+        g.speak("select", &ts);
+        g.set_watching(Watching::Away);
+        g.feed(Orient::Normal, Tilt::FaceDown, 0.0, &ts);
+        let out = g.feed(Orient::Normal, Tilt::FaceDown, ESCAPE_HOLD_MS, &ts);
+        assert!(out.escaped);
+        assert!(!g.dictating());
+    }
+
+    #[test]
+    fn looking_restores_normal_behaviour_immediately() {
+        // No dwell, no re-arming delay: the gate is a gate, not a state machine
+        // of its own.
+        let mut g = cursor();
+        g.set_watching(Watching::Away);
+        flick(&mut g, Orient::LeftUp, &[]);
+        let blocked = g.pos();
+        g.set_watching(Watching::Looking);
+        flick(&mut g, Orient::LeftUp, &[]);
+        assert_ne!(g.pos(), blocked);
+    }
+
+    #[test]
+    fn the_gate_blocks_only_on_away_never_on_unknown() {
+        assert!(Watching::Away.blocks());
+        assert!(!Watching::Unknown.blocks());
+        assert!(!Watching::Looking.blocks());
     }
 }

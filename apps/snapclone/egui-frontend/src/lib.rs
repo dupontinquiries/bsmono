@@ -187,6 +187,8 @@ pub struct Snapclone {
     /// The action menu, opened by right-click on a desktop and press-and-hold
     /// on a phone. Before this the fleet had neither, anywhere.
     pub menu: uikit_egui::menu::ContextMenu,
+    /// "Someone is looking at this screen", from the gaze layer.
+    pub attention: crate::gaze::Attention,
     /// The snap the menu was opened on.
     pub menu_target: Option<String>,
     /// Snaps the user asked to keep, for the host to write out.
@@ -285,6 +287,7 @@ impl Snapclone {
             shutter_pressed: false,
             video: None,
             menu: Default::default(),
+            attention: Default::default(),
             menu_target: None,
             snaps_saved: Vec::new(),
             posture: Default::default(),
@@ -656,6 +659,41 @@ impl Snapclone {
             G::Escaped => self.voice_field = None,
             G::Toggle(_) | G::Nudge { .. } | G::Step(_) => {}
         }
+    }
+
+    /// Feed one gaze sample and route it to everything that wants attention.
+    ///
+    /// One place, because the posture veto and the glove gate must not disagree
+    /// about whether the user is present — a screen that stays awake while
+    /// gestures are refused would look broken in both directions at once.
+    ///
+    /// Note the two consumers use it in OPPOSITE directions, which is correct:
+    /// posture only ever keeps the screen awake, and the glove gate only ever
+    /// blocks an action. Neither can cause the harm the other guards against.
+    pub fn feed_gaze(&mut self, s: crate::gaze::GazeSample, dt_ms: f32) {
+        self.attention.feed(s, dt_ms);
+        self.apply_attention();
+    }
+
+    /// The tracker stopped or the camera went away.
+    pub fn gaze_lost(&mut self) {
+        self.attention.lost();
+        // NOT reported as Away. A missing tracker is Unknown, and Unknown must
+        // leave glove mode exactly as it was — in cold weather the camera is
+        // looking at a scarf as often as a face, so treating "no reading" as
+        // "not looking" would disable gestures on the days they are for.
+        self.glove.set_watching(uikit_egui::glove::Watching::Unknown);
+        self.posture.set_watched(false);
+    }
+
+    fn apply_attention(&mut self) {
+        let present = self.attention.present();
+        self.posture.set_watched(present);
+        self.glove.set_watching(if present {
+            uikit_egui::glove::Watching::Looking
+        } else {
+            uikit_egui::glove::Watching::Away
+        });
     }
 
     /// Re-derive whether posture should be acting.
@@ -1214,6 +1252,45 @@ mod tests {
         }
         assert_eq!(landed.as_deref(), Some("abc"),
                    "a field reached by Tab must keep every character, not the first");
+    }
+
+    #[test]
+    fn one_gaze_sample_reaches_both_consumers() {
+        // The posture veto and the glove gate must not disagree about whether
+        // the user is present: a screen that stays awake while gestures are
+        // refused looks broken in both directions at once.
+        use uikit_egui::glove::Watching;
+        let mut s = app();
+        s.feed_gaze(crate::gaze::GazeSample {
+            gaze: [0.0, 0.0, 0.95], confidence: 0.8, t_ms: 0.0 }, 300.0);
+        assert!(s.posture.watched());
+        assert_eq!(s.glove.watching(), Watching::Looking);
+    }
+
+    #[test]
+    fn a_lost_tracker_is_unknown_to_the_glove_gate_not_away() {
+        // In cold weather the camera is looking at a scarf as often as a face.
+        // Treating "no reading" as "not looking" would disable gestures on
+        // exactly the days glove mode exists for.
+        use uikit_egui::glove::Watching;
+        let mut s = app();
+        s.feed_gaze(crate::gaze::GazeSample {
+            gaze: [0.0, 0.0, 0.95], confidence: 0.8, t_ms: 0.0 }, 300.0);
+        s.gaze_lost();
+        assert_eq!(s.glove.watching(), Watching::Unknown);
+        assert!(!s.posture.watched(), "but the screen may dim again");
+    }
+
+    #[test]
+    fn looking_away_blocks_gestures_while_leaving_the_screen_alone() {
+        // The two consumers pull in opposite directions on purpose: posture can
+        // only keep a screen awake, the gate can only block an action.
+        use uikit_egui::glove::Watching;
+        let mut s = app();
+        s.feed_gaze(crate::gaze::GazeSample {
+            gaze: [0.9, 0.0, 0.1], confidence: 0.8, t_ms: 0.0 }, 300.0);
+        assert_eq!(s.glove.watching(), Watching::Away);
+        assert!(!s.posture.watched());
     }
 
     #[test]
