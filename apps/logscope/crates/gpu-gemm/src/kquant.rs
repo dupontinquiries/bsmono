@@ -215,3 +215,140 @@ mod tests {
         assert!(dequant_q5_k(&[0u8; Q5_K_BLOCK], 300).is_err());
     }
 }
+
+pub const Q3_K_BLOCK: usize = 110;
+
+/// Q3_K's sixteen 6-bit scales, which are packed DIFFERENTLY from Q4_K's.
+///
+/// Q4_K splits bytes pairwise. Q3_K treats the twelve scale bytes as three u32s and shuffles: the
+/// low four bits of each scale live in the first eight bytes, and the high two bits are gathered in
+/// the last four, two bits per scale. **Assuming the Q4_K arrangement here produces sixteen
+/// plausible scales that are all wrong**, which is the failure mode this whole family shares.
+///
+/// Transcribed from llama.cpp's `dequantize_row_q3_K`. The masks are `0x03030303` for the high pairs
+/// and `0x0f0f0f0f` for the low nibbles, applied across all four lanes of each u32 at once.
+///
+/// Scales are SIGNED after unpacking: biased by 32, so a raw 0 means -32.
+pub fn scales_q3_k(raw: &[u8]) -> [i8; 16] {
+    let mut aux = [0u32; 4];
+    for i in 0..3 {
+        aux[i] = u32::from_le_bytes([raw[i * 4], raw[i * 4 + 1], raw[i * 4 + 2], raw[i * 4 + 3]]);
+    }
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | (((tmp) & KMASK1) << 4);
+    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+    let mut out = [0i8; 16];
+    for i in 0..4 {
+        for b in 0..4 {
+            // Biased by 32. A raw 0 is -32, not 0, and forgetting the bias flips the sign of every
+            // weight in the sub-block rather than merely scaling it.
+            out[i * 4 + b] = (((aux[i] >> (8 * b)) & 0xFF) as i32 - 32) as i8;
+        }
+    }
+    out
+}
+
+/// Q3_K: 256 weights in 110 bytes — 32 hmask, 64 qs, 12 scales, f16 d.
+///
+/// **The high bit is INVERTED.** `hmask` set means "do not subtract 4", so a weight's value is
+/// `(q & 3) - 4` when the bit is CLEAR. Reading it the natural way round gives every weight the
+/// wrong sign in half the block, which looks like a badly-trained model rather than a decode bug.
+pub fn dequant_q3_k(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
+    if n % 256 != 0 { return Err(format!("Q3_K needs a multiple of 256 weights, got {n}")) }
+    let blocks = n / 256;
+    if raw.len() < blocks * Q3_K_BLOCK {
+        return Err(format!("Q3_K: {} bytes for {blocks} blocks, need {}", raw.len(), blocks * Q3_K_BLOCK));
+    }
+    let mut out = vec![0.0f32; n];
+    for b in 0..blocks {
+        let p = b * Q3_K_BLOCK;
+        let hmask = &raw[p..p + 32];
+        let qs = &raw[p + 32..p + 96];
+        let scales = scales_q3_k(&raw[p + 96..p + 108]);
+        let d = f16(raw[p + 108], raw[p + 109]);
+        let mut m: u8 = 1;
+        let mut is = 0usize;
+        let mut o = b * 256;
+        for g in 0..2 {
+            for shift in [0u32, 2, 4, 6] {
+                for half in 0..2 {
+                    let dl = d * scales[is] as f32;
+                    for l in 0..16 {
+                        let idx = g * 32 + half * 16 + l;
+                        let q = ((qs[idx] >> shift) & 3) as i32;
+                        // Inverted: the bit being SET means no subtraction.
+                        let adj = if hmask[idx % 32] & m != 0 { 0 } else { 4 };
+                        out[o + half * 16 + l] = dl * (q - adj) as f32;
+                    }
+                    is += 1;
+                }
+                o += 32;
+                m <<= 1;
+                if m == 0 { m = 1; }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod q3k_tests {
+    use super::*;
+
+    #[test]
+    fn Q3_K_scales_are_packed_DIFFERENTLY_from_Q4_K() {
+        // Assuming the Q4_K arrangement produces sixteen plausible scales that are all wrong, which
+        // is the failure this family shares and the reason the two functions are separate.
+        let raw = [0u8; 12];
+        let s = scales_q3_k(&raw);
+        assert_eq!(s.len(), 16, "Q3_K has SIXTEEN sub-blocks; Q4_K has eight");
+        assert!(s.iter().all(|x| *x == -32), "raw 0 means -32 after the bias");
+    }
+
+    #[test]
+    fn the_BIAS_of_32_is_applied_and_a_raw_zero_is_NEGATIVE() {
+        // Forgetting it flips the sign of every weight in the sub-block rather than merely scaling
+        // it — a much louder failure than a wrong magnitude, and still not an error.
+        let mut raw = [0u8; 12];
+        raw[0] = 32;                    // low nibble 0, and the value should come out at 32-32 = 0
+        assert_eq!(scales_q3_k(&raw)[0], (32 & 0x0F) - 32);
+    }
+
+    #[test]
+    fn the_HIGH_BIT_is_INVERTED() {
+        // hmask SET means do not subtract 4. Read the natural way round, half the block gets the
+        // wrong sign — which looks like a badly-trained model rather than a decode bug.
+        let mut raw = vec![0u8; Q3_K_BLOCK];
+        raw[108] = 0x00; raw[109] = 0x3C;      // d = 1.0
+        // Scale 0's SIX bits are not one byte: four low bits here and two high bits from the last
+        // four scale bytes. My first version set 33 expecting scale 1 and got -31, because the high
+        // pair lives elsewhere — the exact confusion this function exists to encapsulate, and worth
+        // leaving in the test rather than tidying into a magic number.
+        raw[96 + 0] = 1;                        // low nibble 1
+        raw[96 + 8] = 0b10;                     // scale 0's high pair = 2 -> (2 << 4) | 1 = 33 - 32 = 1
+        raw[32] = 0x01;                         // weight 0 quant = 1
+        // hmask bit 0 CLEAR for weight 0 -> subtract 4 -> 1 - 4 = -3
+        let v = dequant_q3_k(&raw, 256).unwrap();
+        assert_eq!(v[0], -3.0, "a clear mask bit must subtract 4");
+        raw[0] = 0x01;                          // now SET hmask bit 0
+        let v = dequant_q3_k(&raw, 256).unwrap();
+        assert_eq!(v[0], 1.0, "a set bit must NOT subtract");
+    }
+
+    #[test]
+    fn Q3_K_has_SIXTEEN_sub_blocks_of_sixteen() {
+        // Q4_K and Q5_K have eight of thirty-two. A loop written for those overruns or underfills.
+        let raw = vec![0u8; Q3_K_BLOCK];
+        assert_eq!(dequant_q3_k(&raw, 256).unwrap().len(), 256);
+    }
+
+    #[test]
+    fn WRONG_lengths_are_refused() {
+        assert!(dequant_q3_k(&[0u8; 4], 256).is_err());
+        assert!(dequant_q3_k(&[0u8; Q3_K_BLOCK], 300).is_err());
+    }
+}

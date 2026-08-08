@@ -1027,6 +1027,18 @@ pub fn source_bpw(ggml_type: u32) -> Option<f32> {
         10 => 2.625,         // Q2_K: 84 bytes per 256
         11 => 3.4375,        // Q3_K: 110 bytes per 256
         12 => 4.5,           // Q4_K: 144 bytes per 256
+        // The IQ family, added when the loader started reporting per-type byte shares. A planner
+        // that does not know a type's width cannot size a file that contains it, and a UD checkpoint
+        // contains seven — so "unknown" here meant the plan was wrong about most of the file.
+        16 => 2.0625,        // IQ2_XXS: 66 bytes per 256
+        17 => 2.3125,        // IQ2_XS:  74
+        18 => 3.0625,        // IQ3_XXS: 98
+        19 => 1.5625,        // IQ1_S:   50
+        20 => 4.5,           // IQ4_NL:  18 per 32
+        21 => 3.4375,        // IQ3_S:  110
+        22 => 2.5625,        // IQ2_S:   82
+        23 => 4.25,          // IQ4_XS: 136
+        29 => 1.75,          // IQ1_M:   56
         14 => 6.5625,        // Q6_K: 210 bytes per 256
         19 => 1.5625,        // IQ1_S: 50 bytes per 256
         _ => return None,
@@ -1122,7 +1134,11 @@ mod sub4_tests {
     use super::*;
 
     #[test]
-    fn Q3_can_be_SIZED_without_being_readable() {
+    fn a_type_can_be_SIZED_without_being_readable() {
+        // Retargeted TWICE now, as Q2_K and then Q3_K gained decoders. The principle is the point and
+        // the example is incidental: a size lets the planner say what a file costs, and only a
+        // dequantizer lets the model load. IQ2_XXS carries it now — a codebook format, which is the
+        // category that will still be unreadable when the scalar ones are all done.
         // UPDATED: Q2_K gained a dequantizer (kquant.rs), so it is no longer an example of this.
         // The PRINCIPLE is unchanged and Q3_K still demonstrates it — a size lets the planner say
         // what the file costs, and only a dequantizer lets the model load. Narrowing the test to the
@@ -1131,14 +1147,16 @@ mod sub4_tests {
         // what the file costs; dequantize returning None means the forward pass refuses to invent
         // values. Knowing the size without being able to read it is exactly what a planner needs and
         // a kernel must not have.
-        assert_eq!(source_bpw(11), Some(3.4375), "Q3_K");
+        assert_eq!(source_bpw(16), Some(2.0625), "IQ2_XXS");
         assert_eq!(crate::gguf::type_nbytes(10, 256), Some(84));
-        assert_eq!(crate::gguf::type_nbytes(11, 256), Some(110));
+        assert_eq!(crate::gguf::type_nbytes(16, 256), Some(66));
         // And they still refuse to decode, so nothing can accidentally run on them.
         // Q2_K NOW READS. It gained a dequantizer, and asserting the positive here means this
         // test fails again if that regresses rather than silently passing on a stale premise.
         assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_ok(), "Q2_K reads now");
-        assert!(crate::gguf::dequantize(11, &[0u8; 110], 256).is_err());
+        assert!(crate::gguf::dequantize(16, &[0u8; 66], 256).is_err(),
+            "IQ2_XXS is a CODEBOOK format — a 2048-entry grid, not a table of sixteen — which is why \
+it is still unreadable while every scalar K-quant now works");
     }
 
     #[test]
