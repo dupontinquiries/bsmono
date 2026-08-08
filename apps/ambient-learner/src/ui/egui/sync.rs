@@ -107,7 +107,7 @@ impl SyncPage {
 
 /// Draw the page.
 pub fn sync_ui(ui: &mut egui::Ui, p: &SyncPage, c: &uikit_egui::PaletteColors) {
-    ui.label(egui::RichText::new("📍 Local database").strong());
+    crate::ui::egui::chrome::card_heading(ui, "📍 Local database");
     ui.add_space(6.0);
     egui::Grid::new("sync_db").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
         for (label, value) in p.db.rows() {
@@ -127,7 +127,7 @@ pub fn sync_ui(ui: &mut egui::Ui, p: &SyncPage, c: &uikit_egui::PaletteColors) {
 
     if !can {
         ui.add_space(10.0);
-        ui.label(egui::RichText::new("ℹ️  Note").strong());
+        crate::ui::egui::chrome::card_heading(ui, "ℹ️  Note");
         ui.colored_label(c.text_weak, SYNC_NOTE);
     }
 }

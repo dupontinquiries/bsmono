@@ -180,7 +180,7 @@ impl ModelPage {
 
 /// Draw the page.
 pub fn model_ui(ui: &mut egui::Ui, p: &ModelPage, c: &uikit_egui::PaletteColors) {
-    ui.label(egui::RichText::new("📊 Model statistics").strong());
+    crate::ui::egui::chrome::card_heading(ui, "📊 Model statistics");
     egui::Grid::new("model_stats").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
         ui.colored_label(c.text_weak, "Active model:");
         ui.colored_label(c.text, p.stats.model_text());
@@ -200,7 +200,7 @@ pub fn model_ui(ui: &mut egui::Ui, p: &ModelPage, c: &uikit_egui::PaletteColors)
     });
 
     ui.add_space(10.0);
-    ui.label(egui::RichText::new("⚙️  Device state").strong());
+    crate::ui::egui::chrome::card_heading(ui, "⚙️  Device state");
     egui::Grid::new("model_device").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
         ui.colored_label(c.text_weak, "CPU load:");
         ui.colored_label(c.text, p.device.cpu_text());
@@ -212,7 +212,7 @@ pub fn model_ui(ui: &mut egui::Ui, p: &ModelPage, c: &uikit_egui::PaletteColors)
 
     ui.add_space(10.0);
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new("🧾  Recent calibrations").strong());
+        crate::ui::egui::chrome::card_heading(ui, "🧾  Recent calibrations");
         ui.colored_label(c.text_weak, p.log_count_text());
     });
     if p.log().is_empty() {

@@ -708,3 +708,17 @@ half-turned face — so it is the only variant that can run continuously. Any
 design that needs the pointing pipeline running all day is not deployable, which
 is the real argument for treating the two halves as separate features rather
 than one feature with a quality setting.
+
+## ambient-learner is done bar an artifact
+
+94% named, 56% code, and the one remaining "surface" is `AmbientLearnerApp` —
+the audit's CamelCase of the app itself, not a thing that can be ported. Every
+real page is across: Live, History, Places, Map, Model, Sync, the debug
+screen-temperature viewer, the ambient layer and the section chrome.
+
+It arrived at this from an odd starting point. Three sessions ago it was
+recorded here as "NOT ported at all", which was wrong — a Live page already
+existed. Then it had no binary, no manifest entry and no audit row, so the pages
+that did exist could not be run or counted. Both of those were fixed before any
+more porting, and the order mattered: the run column is what turned "some
+modules compile" into "an app you can open".
