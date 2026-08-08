@@ -946,6 +946,8 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         21 => return crate::iq23::dequant_iq3_s(data, n),
         18 => return crate::iq23::dequant_iq3_xxs(data, n),
         22 => return crate::iq23::dequant_iq2_s(data, n),
+        18 => return crate::iq3::dequant_iq3_xxs(data, n),
+        22 => return crate::iq3::dequant_iq2_s(data, n),
         16 => return crate::iq2xxs::dequant_iq2_xxs(data, n),
         29 => return crate::iq1m::dequant_iq1_m(data, n),
         19 => {
