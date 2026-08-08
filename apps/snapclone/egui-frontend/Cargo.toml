@@ -18,6 +18,12 @@ default = ["app"]
 app = ["dep:eframe"]
 
 [dependencies]
+# The composer tile-strip decision model. A real dependency rather than a
+# #[path] include: it is a standalone crate with an rlib target, and its `ffi`
+# module uses `crate::` paths that break when a lib.rs is pulled in as a
+# submodule. The #[path] trick is for modules living inside an app crate; this
+# is not one.
+snapclone-composer = { path = "../rust/snapclone-composer" }
 # The camera bridge device-kit was written for — its description names
 # snapclone explicitly, and no port had ever depended on it.
 # One authenticated session per peer, streams on demand. The roster was a
