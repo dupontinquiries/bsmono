@@ -688,6 +688,62 @@ pub fn run(args: &[String]) {
             println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
         }
         println!();
+        // ---- PROPORTIONS AGAINST THE CHARACTER REFERENCES ----
+        // Surface was the last two rounds; this is the other half of looking
+        // like an Octane. Measured off the reference models themselves:
+        //
+        //            W/L     H/L    wheel dia / height   wheel / L   cabin / L
+        //   OCTANE   0.538   0.392        0.62             0.242       0.32
+        //   DOMINUS  0.479   0.259        0.83             0.216       0.31
+        //
+        // The cue that jumps out is the WHEELS: a fifth of the car's whole
+        // length, and most of its height. A car with small wheels reads as a
+        // toy or a spaceship however good its bodywork is.
+        {
+            let src = include_str!("procars.rs");
+            println!("{:<12} {:>7} {:>7} {:>9} {:>9} {:>8}", "car", "W/L", "H/L", "wheel/H", "wheel/L", "verdict");
+            let mut off = Vec::new();
+            for line in src.lines() {
+                let t = line.trim();
+                if !t.contains("half_len:") || !t.contains("wheel_r:") {
+                    continue;
+                }
+                let num = |key: &str| -> Option<f32> {
+                    let i = t.find(key)? + key.len();
+                    let rest = &t[i..];
+                    let end = rest.find(|c: char| c != '.' && !c.is_ascii_digit() && c != ' ')?;
+                    rest[..end].trim().parse::<f32>().ok()
+                };
+                let (Some(l), Some(h), Some(w), Some(r)) =
+                    (num("half_len:"), num("half_h:"), num("half_w:"), num("wheel_r:"))
+                else {
+                    continue;
+                };
+                if l <= 0.0 || h <= 0.0 {
+                    continue;
+                }
+                let wl = w / l;
+                let hl = h / l;
+                let wheel_h = (r * 2.0) / (h * 2.0);
+                let wheel_l = (r * 2.0) / (l * 2.0);
+                // the reference band, with room either side
+                let ok = (0.42..0.62).contains(&wl) && (0.50..0.95).contains(&wheel_h) && (0.17..0.29).contains(&wheel_l);
+                if !ok {
+                    off.push(format!("{wl:.2}/{wheel_h:.2}"));
+                }
+                println!(
+                    "{:<12} {:>7.3} {:>7.3} {:>9.2} {:>9.3} {:>8}",
+                    format!("car{}", off.len()),
+                    wl,
+                    hl,
+                    wheel_h,
+                    wheel_l,
+                    if ok { "in band" } else { "OFF" }
+                );
+            }
+            println!("   references: W/L 0.48-0.54, wheel/height 0.62-0.83, wheel/length 0.22-0.24");
+        }
+
         // ---- CATALOGUE AUDIT ----
         // A house style is only a style if the whole catalogue is built to
         // it. This reads the source and reports which cars are made from the
@@ -2071,6 +2127,62 @@ pub fn run(args: &[String]) {
             println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
         }
         println!();
+        // ---- PROPORTIONS AGAINST THE CHARACTER REFERENCES ----
+        // Surface was the last two rounds; this is the other half of looking
+        // like an Octane. Measured off the reference models themselves:
+        //
+        //            W/L     H/L    wheel dia / height   wheel / L   cabin / L
+        //   OCTANE   0.538   0.392        0.62             0.242       0.32
+        //   DOMINUS  0.479   0.259        0.83             0.216       0.31
+        //
+        // The cue that jumps out is the WHEELS: a fifth of the car's whole
+        // length, and most of its height. A car with small wheels reads as a
+        // toy or a spaceship however good its bodywork is.
+        {
+            let src = include_str!("procars.rs");
+            println!("{:<12} {:>7} {:>7} {:>9} {:>9} {:>8}", "car", "W/L", "H/L", "wheel/H", "wheel/L", "verdict");
+            let mut off = Vec::new();
+            for line in src.lines() {
+                let t = line.trim();
+                if !t.contains("half_len:") || !t.contains("wheel_r:") {
+                    continue;
+                }
+                let num = |key: &str| -> Option<f32> {
+                    let i = t.find(key)? + key.len();
+                    let rest = &t[i..];
+                    let end = rest.find(|c: char| c != '.' && !c.is_ascii_digit() && c != ' ')?;
+                    rest[..end].trim().parse::<f32>().ok()
+                };
+                let (Some(l), Some(h), Some(w), Some(r)) =
+                    (num("half_len:"), num("half_h:"), num("half_w:"), num("wheel_r:"))
+                else {
+                    continue;
+                };
+                if l <= 0.0 || h <= 0.0 {
+                    continue;
+                }
+                let wl = w / l;
+                let hl = h / l;
+                let wheel_h = (r * 2.0) / (h * 2.0);
+                let wheel_l = (r * 2.0) / (l * 2.0);
+                // the reference band, with room either side
+                let ok = (0.42..0.62).contains(&wl) && (0.50..0.95).contains(&wheel_h) && (0.17..0.29).contains(&wheel_l);
+                if !ok {
+                    off.push(format!("{wl:.2}/{wheel_h:.2}"));
+                }
+                println!(
+                    "{:<12} {:>7.3} {:>7.3} {:>9.2} {:>9.3} {:>8}",
+                    format!("car{}", off.len()),
+                    wl,
+                    hl,
+                    wheel_h,
+                    wheel_l,
+                    if ok { "in band" } else { "OFF" }
+                );
+            }
+            println!("   references: W/L 0.48-0.54, wheel/height 0.62-0.83, wheel/length 0.22-0.24");
+        }
+
         // ---- CATALOGUE AUDIT ----
         // A house style is only a style if the whole catalogue is built to
         // it. This reads the source and reports which cars are made from the

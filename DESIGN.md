@@ -4197,6 +4197,36 @@ so one change covers procedural, lofted, imported and assembled cars alike.
 The tag tiers alone were worth 16% of car prims across a typical spread. The
 per-part rule is what reaches the detail the measurement actually found.
 
+## v1.128.0 — the references' proportions, measured off the references
+
+Two rounds went into the SURFACE — smoothness, character lines. This is the
+other half of looking like an Octane, and it starts by measuring the models
+themselves rather than trusting an eye:
+
+                W/L     H/L    wheel dia/height   wheel/length   cabin/length
+    OCTANE     0.538   0.392        0.62              0.242          0.32
+    DOMINUS    0.479   0.259        0.83              0.216          0.31
+
+THE WHEELS ARE THE CUE. A fifth of the car's whole length, and most of its
+height. Ours measured 0.37-0.54 of body height and as little as 0.09 of
+length — less than half the reference. A car with small wheels reads as a
+toy or a spaceship however good its bodywork is, and that single ratio
+explains more of the gap than anything in the shell work did.
+
+Six cars re-shod to wheel/length 0.22, which is the middle of the band.
+
+AND THEN THE FLAT ONES BROKE. Fixing the wheels immediately exposed the
+deeper fault: with correct wheels, LONGBOY's tyres stood 1.9 times its body
+height, WEDGE's 1.4. Those cars were not merely low, they were flatter than
+any reference — H/L of 0.115 against 0.26-0.39 — and the wheels had been
+shrunk to hide it. So the bodies came up rather than the wheels going back
+down: three cars raised to a wheel/height of 0.80, which lands them at H/L
+0.275, inside the reference band for the first time.
+
+That is the useful shape of this kind of work: a proportion that is wrong
+usually has a second proportion propping it up, and correcting one without
+the other just moves the error.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
