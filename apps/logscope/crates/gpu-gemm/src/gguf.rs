@@ -694,6 +694,8 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         // Sizes for the rest of the IQ family. KNOWING A SIZE IS NOT SUPPORTING A TYPE — dequantize
         // still refuses these. It is what lets the report state honest byte shares, and a share is
         // what decides which one to implement first.
+        10 => if n % 256 == 0 { Some(n / 256 * 84) } else { None },  // Q2_K
+        13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K
         16 => if n % 256 == 0 { Some(n / 256 * 66) } else { None },  // IQ2_XXS, 2.06 bpw
         17 => if n % 256 == 0 { Some(n / 256 * 74) } else { None },  // IQ2_XS,  2.31 bpw
         18 => if n % 256 == 0 { Some(n / 256 * 98) } else { None },  // IQ3_XXS, 3.06 bpw
@@ -925,6 +927,10 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             }
             return Ok(out);
         }
+        // The K-quants that were missing. Scalar formats like Q4_K and Q6_K, which is why they are
+        // here and the codebook IQ types are not. Q2_K unlocks the 39.6 GB Q2_K Scout checkpoint.
+        10 => return crate::kquant::dequant_q2_k(data, n),
+        13 => return crate::kquant::dequant_q5_k(data, n),
         // IQ4_NL and IQ4_XS: the two IQ formats that are NOT codebook formats. Sixteen
         // non-linear values indexed by a nibble, so the whole "codebook" is one small table — which
         // is why these two are supported and IQ2_XXS is not.
