@@ -30,6 +30,28 @@ pub fn list_row(ui: &mut Ui, label: &str, selected: bool, height: f32, c: &Palet
 
 /// A stack of full-width bordered action buttons (e.g. "+ New" / "○ Graph" / "⚙ Settings"),
 /// meant to sit at the bottom of a side list. Returns the index of a clicked button, if any.
+/// A stack of action buttons, returning the ACTION rather than an index.
+///
+/// Prefer this over [`action_stack`]. The index form forces the caller to keep
+/// two parallel lists in step:
+///
+/// ```ignore
+/// if let Some(i) = action_stack(ui, &["+ New", "○ Graph", "⚙ Settings"], 30.0, c) {
+///     action = Some([Action::New, Action::Graph, Action::Settings][i]);
+/// }
+/// ```
+///
+/// Nothing checks that those two literals are the same length. Add a fourth
+/// label and the click panics — which is exactly the bug that made gitmind's
+/// Ctrl+A crash the program: an eleven-entry tab list indexed into a nine-entry
+/// key array. Pairing the label with its action makes the mismatch
+/// unrepresentable rather than merely absent.
+pub fn action_items<T: Clone>(ui: &mut Ui, items: &[(&str, T)], height: f32,
+                              c: &PaletteColors) -> Option<T> {
+    let labels: Vec<&str> = items.iter().map(|(l, _)| *l).collect();
+    action_stack(ui, &labels, height, c).map(|i| items[i].1.clone())
+}
+
 pub fn action_stack(ui: &mut Ui, labels: &[&str], height: f32, c: &PaletteColors) -> Option<usize> {
     let mut clicked = None;
     for (i, label) in labels.iter().enumerate() {
@@ -149,5 +171,35 @@ mod tests {
         assert_eq!(c.width_chars, 3);
         let c2 = Chip::new("Esc");
         assert_eq!(c2.width_chars, 3);
+    }
+}
+
+#[cfg(test)]
+mod action_items_tests {
+    /// The pairing is a TYPE-level guarantee, so the test that matters is that
+    /// the mismatch cannot be written rather than that it is caught at runtime.
+    ///
+    /// `action_items(&[(label, action)])` has no second list to fall out of
+    /// step with. The old shape — `[A, B, C][i]` where `i` came from a
+    /// separately-written label array — is what crashed gitmind on every Ctrl
+    /// chord, and no amount of testing the panicking version prevents someone
+    /// adding a tenth entry to one side.
+    ///
+    /// What is testable is that pairing preserves order, since a zip that
+    /// mismatched would be a subtler version of the same bug.
+    #[test]
+    fn pairing_preserves_the_order_of_labels_and_actions() {
+        #[derive(Clone, PartialEq, Debug)]
+        enum A { New, Graph, Settings }
+        let items = [("+ New", A::New), ("○ Graph", A::Graph), ("⚙ Settings", A::Settings)];
+        let labels: Vec<&str> = items.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, vec!["+ New", "○ Graph", "⚙ Settings"]);
+        assert_eq!(items[2].1, A::Settings, "the third label carries the third action");
+    }
+
+    #[test]
+    fn an_empty_item_list_is_harmless() {
+        let items: [(&str, u8); 0] = [];
+        assert!(items.is_empty());
     }
 }

@@ -61,9 +61,13 @@ impl Sidebar {
         // spacer pushes the action buttons to the bottom of the sidebar
         ui.add_space(ui.available_height() - 3.0 * 34.0 - 8.0);
         ui.separator();
-        if let Some(i) = dock::action_stack(ui, &["+ New", "○ Graph", "⚙ Settings"], 30.0, c) {
-            action = Some([SidebarAction::New, SidebarAction::Graph, SidebarAction::Settings][i]);
-        }
+        // Paired, so a fourth button cannot be added to one list and forgotten
+        // in the other — the mismatch that crashed gitmind on every Ctrl chord.
+        action = dock::action_items(ui, &[
+            ("+ New", SidebarAction::New),
+            ("○ Graph", SidebarAction::Graph),
+            ("⚙ Settings", SidebarAction::Settings),
+        ], 30.0, c).or(action);
         action
     }
 }
