@@ -42,6 +42,7 @@ pub mod glass;
 pub mod swipe_physics;
 pub mod video_viewer;
 pub mod posture;
+pub mod camera_policy;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -205,6 +206,12 @@ pub struct Snapclone {
     /// mode, because wanting the gesture and wanting a cursor are different
     /// wants.
     pub shake: uikit_egui::glove::ShakeCommands,
+    /// Capture timeouts and limits. The backend reads a SNAPSHOT at start:
+    /// editing this mid-capture does not retune a running pipeline, matching
+    /// the Qt policy's own threading rule.
+    pub camera_policy: crate::camera_policy::CameraPolicy,
+    /// Which cameras are known to work. Consulted before opening one.
+    pub camera_health: crate::camera_policy::CameraHealth,
     /// The swipe affordance. Retires itself after four swipes.
     pub peel: crate::nav_chrome::PeelHint,
     /// The Inbox's bottom ribbon: All / Unread / Sent plus the actions each of
@@ -279,6 +286,8 @@ impl Snapclone {
             glove: Default::default(),
             voice_field: None,
             dictated: Vec::new(),
+            camera_policy: Default::default(),
+            camera_health: Default::default(),
             shake: uikit_egui::glove::ShakeCommands::with(vec![
                 uikit_egui::glove::ShakeBinding {
                     dir: uikit_egui::glove::Orient::RightUp,
@@ -572,6 +581,31 @@ impl Snapclone {
             Answer::Declined => {}
         }
         self.incoming_call = None;
+    }
+
+    /// Which camera to open, given what is known about the fleet's health.
+    ///
+    /// Falls back to plain enumeration when nothing has been probed — asking an
+    /// empty health cache would answer "nothing works" and leave the user with
+    /// no viewfinder on a phone whose cameras are fine.
+    pub fn camera_to_open(&self, known: &[String]) -> Option<String> {
+        use crate::camera_policy::Facing;
+        let want = if self.viewfinder.facing == crate::camera::Facing::Front {
+            Facing::Front } else { Facing::Rear };
+        if self.camera_health.has_any_result() {
+            if let Some(id) = self.camera_health.best_working(want) {
+                return Some(id.to_string());
+            }
+        }
+        known.first().cloned()
+    }
+
+    /// Record that a capture actually delivered frames.
+    pub fn note_camera_worked(&mut self, id: &str, now_ms: i64) {
+        use crate::camera_policy::Facing;
+        let facing = if self.viewfinder.facing == crate::camera::Facing::Front {
+            Facing::Front } else { Facing::Rear };
+        self.camera_health.record_capture_success(id, facing, now_ms);
     }
 
     /// Feed a flick to the command layer and carry out whatever it binds.
@@ -1158,6 +1192,34 @@ mod tests {
         }
         assert_eq!(landed.as_deref(), Some("abc"),
                    "a field reached by Tab must keep every character, not the first");
+    }
+
+    #[test]
+    fn an_unprobed_phone_still_gets_a_viewfinder() {
+        // Asking an empty health cache would answer "nothing works" and leave
+        // the user staring at nothing on a phone whose cameras are fine.
+        let s = app();
+        let known = vec!["cam0".to_string(), "cam1".to_string()];
+        assert_eq!(s.camera_to_open(&known).as_deref(), Some("cam0"));
+    }
+
+    #[test]
+    fn a_known_working_camera_is_preferred_over_the_first_one_listed() {
+        let mut s = app();
+        s.camera_health.record_capture_success("cam1", 
+            crate::camera_policy::Facing::Rear, 0);
+        let known = vec!["cam0".to_string(), "cam1".to_string()];
+        assert_eq!(s.camera_to_open(&known).as_deref(), Some("cam1"));
+    }
+
+    #[test]
+    fn a_successful_capture_is_remembered_against_the_facing_in_use() {
+        let mut s = app();
+        s.viewfinder.facing = crate::camera::Facing::Front;
+        s.note_camera_worked("front0", 500);
+        assert_eq!(s.camera_health.get("front0").unwrap().facing,
+                   crate::camera_policy::Facing::Front);
+        assert_eq!(s.camera_to_open(&["x".into()]).as_deref(), Some("front0"));
     }
 
     #[test]
