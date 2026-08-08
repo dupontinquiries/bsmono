@@ -18,6 +18,7 @@ on every surface yet. Nothing here deletes a working front-end.
 | app             | egui (primary)                    | Qt/QML (→ qt-ui-kit)        | GTK (→ gtk-ui-kit)      |
 |-----------------|-----------------------------------|-----------------------------|-------------------------|
 | gitmind         | crates/gui-egui                   | crates/gui (15 qml)         | —                       |
+| aperture        | crates/aperture-egui (only UI)    | —                           | —                       |
 | voiceterm       | egui-frontend                     | qml (18 qml)                | —                       |
 | bo-suite        | egui-frontend                     | bo-controller/qml (46 qml)  | —                       |
 | ambient-learner | src/ui/egui (feature `egui`)      | 14 qml                      | gtk4 + libadwaita       |

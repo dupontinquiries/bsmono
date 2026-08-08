@@ -1,0 +1,12 @@
+[package]
+name = "aperture-complete"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "aperture's AI-completion engine, egui-free and std-only: the Provider trait, a worker that coalesces stale requests behind a generation gate, a pure Debounce, and three providers — ollama (FIM over /api/generate, adapted from logscope-fan's dependency-free client), any subprocess (point it at a script — the escape hatch to every other model), and a static table for tests. The internal loop is inspectable by design: every request/latency/outcome is reported back as a value."
+
+# ZERO dependencies, the logscope-fan rule: the whole engine recompiles in
+# under a second, cross-compiles to aarch64/musl untouched, and there is no
+# TLS/runtime stack to audit. Cloud HTTPS providers belong behind a feature
+# with ureq when someone actually needs one — see DESIGN.md §completion.
+[dependencies]

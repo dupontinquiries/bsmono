@@ -1,0 +1,30 @@
+# apps/aperture — the code editor. Three crates, layered the way studio is:
+#   * aperture-core     — buffer (rope), invertible ops + undo, cursor/selection,
+#                         line-lexer syntax seam. Headless, egui-free.
+#   * aperture-complete — the AI-completion engine: debounce/coalesce/generations,
+#                         provider trait, ollama + subprocess + static providers.
+#                         Headless, egui-free, std-only (+ nothing).
+#   * aperture-egui     — the egui shell on uikit-egui: virtualized editor view,
+#                         smooth camera, ghost text, palette, the loop pane.
+#
+# Own workspace on purpose (the monorepo is an orchestrator over nested
+# workspaces — see LAYOUT.md). egui is pinned to a 0.34.x that builds on
+# rustc 1.91 (0.34.3 raised rust-version to 1.92; the authoring sandbox tops
+# out at the Ubuntu 1.91 toolchain — see apps/aperture/DESIGN.md §toolchain).
+
+[workspace]
+members = [
+    "crates/aperture-core",
+    "crates/aperture-complete",
+    "crates/aperture-egui",
+    "crates/aperture-scene",
+]
+resolver = "2"
+
+[workspace.dependencies]
+egui = "0.34"
+aperture-core = { path = "crates/aperture-core" }
+aperture-complete = { path = "crates/aperture-complete" }
+
+[profile.dev]
+opt-level = 1

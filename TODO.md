@@ -127,3 +127,57 @@ BLOCKED in the headless sandbox by unendlich's version-4 Cargo.lock (needs a
 newer cargo than 1.75); wire it on a GPU host with a current toolchain — the
 buffer layout already matches the engine's mesh upload, so it's a consume,
 not a rewrite.
+
+## aperture (apps/aperture) — follow-ups
+
+Session scope was: rope core + invertible-Op history, line-lexer syntax,
+ghost-text completion loop (ollama FIM / subprocess / demo), smooth-camera
+egui shell, loop pane, palette. Deliberately deferred, in rough order of pull:
+
+- **tree-sitter** behind the existing `LineLexer` seam (`aperture-core/syntax.rs`).
+  The seam is `(line, entry_state) -> (spans, exit_state)` so an incremental
+  parser slots in without touching the renderer. Deferred because grammar
+  crates churn their `Language`/`LANGUAGE` symbol and version-pair with the
+  runtime crate; pin both when adding.
+- **Streaming ghosts**: ollama `stream:true` + a channel of deltas so long
+  completions paint progressively. Engine already coalesces newest-wins;
+  streaming needs a cancel path (drop the TcpStream) added to `Provider`.
+- **infer-kit extraction**: `aperture-complete/providers.rs` ollama client is
+  adapted from `logscope-fan/src/ollama.rs` (adds FIM suffix + de-chunking).
+  Two call sites now exist — next co-change, lift `shared/infer-kit`.
+- **Cloud provider** behind a `ureq` feature (TLS). Until then
+  `APERTURE_CMD` subprocess is the escape hatch (curl in a script).
+- **File-fuzzy palette**: Ctrl+O currently takes a typed path; walk the
+  workspace root and reuse `uikit_egui::fuzzy` for ranking.
+- **Multi-cursor**: `Selection` is already value-based; becomes
+  `Vec<Selection>` + edit fan-out with offset fixup.
+- **CJK/double-width**: caret x assumes monospace `col * char_w`; wide glyphs
+  need galley-measured x (egui does no full shaping — known engine limit).
+- **IME preedit** (`egui::Event::Ime`), **LSP** (own crate behind the same
+  worker pattern as the completion Engine), **egui_kittest** snapshots for the
+  view layer (state layer is already headless-tested), **minimap** on the
+  scrollbar rail.
+
+## scene-kit (shared/scene-kit) — logscope migration
+
+`shared/scene-kit` is logscope-egui's physical-UI core (spatial, mesh3d,
+gpuscene, glow_scene, texgen, textsurface) lifted at its second call site
+(aperture-view), **plus** the two fixes `apps/logscope/docs/physical-ui-findings.md`
+called the enabling changes: per-vertex UVs (12→14 floats, `MAT_INSCRIPTION`
+sampling `u_page` in page space) and a *wired* `u_touch` (emissive proximity
+response, age by frame delta). logscope still runs its own copy; migrate at
+the next scene co-change:
+
+- Replace the six module files with `pub use scene_kit::<mod>::*;` shims
+  (paths stay valid for all 123 modules).
+- Sweep `Mesh3 {` literals in scene3d.rs to add `uvs: None,` (mechanical;
+  the compiler's E0063 list is the site inventory — 22 sites in mesh3d took
+  minutes this way).
+- `theme::{power_mode, detail}` → `scene_kit::perf` (env names change to
+  `SCENE_KIT_*`; logscope's shell can keep its LOGSCOPE_* dials by setting
+  the kit env or calling its own values through).
+- `local_hour()` in the kit is UTC + `SCENE_KIT_HOUR`/`LOGSCOPE_HOUR`
+  override (chrono severed); logscope's shell should set the override from
+  its chrono local time to keep true local solar time.
+- Then delete the copies and let scene3d's inscriptions use real UVs — the
+  street signs and runestones textsurface.rs already designed for.
