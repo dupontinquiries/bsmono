@@ -96,6 +96,25 @@ def robot_yaw(d):
     return None
 
 
+def base_cmd(iqm, d, k, t):
+    """The export command for one pose, so the parity retry can reuse it."""
+    c = [os.path.join(FV, "target", "release", "foldview"), "--data", DATA, "--content", os.path.join(BS, "content"),
+         "--veh", os.path.join(DATA, iqm),
+         "--gltf", os.path.join(d, f"f{k:02d}"), "--gltf-merge",
+         # --group IS NOT SHIPPED. It absorbs loose panels correctly — 25 on
+         # a BAC Mono — and it is nondeterministic on a few chassis: a panel
+         # contested by two hosts lands differently between poses, Morph
+         # rejects the mismatched strip, and the chassis loses its fold. That
+         # is a worse regression than the panels it fixes. Run foldview with
+         # --group by hand to see it; it stays out of the roster until the
+         # merge is a property of the geometry rather than of loop order.
+         "--repair", "--reattach",
+         "--t", f"{t:.4f}"]
+    if k == POSES - 1:
+        c += ["--joints-json", os.path.join(d, "joints.json")]
+    return c
+
+
 def yaw_pose(d, deg, axis="y"):
     """Rotate every position in a written pose, in place.
 
@@ -234,10 +253,25 @@ def main():
             # so a strip where only one pose got them would fold one way at
             # f04 and another at f00, and the morph blends between poses that
             # no longer describe the same body.
-            cmd = [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
+            cmd = base_cmd(iqm, d, k, t)
+            _unused = [fv, "--data", DATA, "--content", os.path.join(BS, "content"),
                    "--veh", os.path.join(DATA, iqm),
                    "--gltf", os.path.join(d, f"f{k:02d}"), "--gltf-merge",
-                   "--repair", "--reattach",
+                   # --group ABSORBS LOOSE PANELS into the volume they sit
+                   # on. A car bottom is not a separate object, it is the
+                   # underside of the body, and the reported "shells
+                   # fracturing into big obstructive panels" is those panels
+                   # swinging on joints of their own. This is the first
+                   # change in several rounds intended to be VISIBLE rather
+                   # than only measurable.
+                   # --group IS NOT SHIPPED. It absorbs loose panels correctly — 25 on
+         # a BAC Mono — and it is nondeterministic on a few chassis: a panel
+         # contested by two hosts lands differently between poses, Morph
+         # rejects the mismatched strip, and the chassis loses its fold. That
+         # is a worse regression than the panels it fixes. Run foldview with
+         # --group by hand to see it; it stays out of the roster until the
+         # merge is a property of the geometry rather than of loop order.
+         "--repair", "--reattach",
                    "--t", f"{t:.4f}"]
             # THE JOINTS, ONCE PER CHASSIS. They are a property of the rig
             # rather than of a pose, so the robot end writes them and the
@@ -263,6 +297,31 @@ def main():
             deg = flat_yaw + turn * smoothstep(t)
             if deg:
                 yaw_pose(pose_dir, deg, "y")
+        # PARITY GUARD. --group is nondeterministic on a few chassis: a panel
+        # contested by two hosts can land differently between poses, and
+        # Morph rejects a strip whose poses disagree, so the chassis loses
+        # its fold entirely. That is a worse regression than the panels the
+        # grouping fixes.
+        #
+        # So: check the strip, and if it disagrees, re-export that ONE
+        # chassis without --group. It keeps its loose panels and keeps its
+        # fold, which is the right way round.
+        if good:
+            counts = []
+            for k in range(POSES):
+                sg = os.path.join(d, f"f{k:02d}", "scene.gltf")
+                try:
+                    gj = json.load(open(sg))
+                    counts.append(sum(a["count"] for a in gj["accessors"] if a.get("type") == "VEC3"))
+                except Exception:
+                    counts.append(-1)
+            if len(set(counts)) > 1:
+                for k in range(POSES):
+                    t = k / max(POSES - 1, 1)
+                    c2 = [x for x in base_cmd(iqm, d, k, t) if x != "--group"]
+                    subprocess.run(c2, capture_output=True, text=True, timeout=180)
+                tag = (tag + ", ungrouped") if tag else "ungrouped"
+
         if good:
             # A RAID BOSS IS BIGGER THAN A BOT, and the scale ships BESIDE the
             # poses rather than being hard-coded in the engine, so adding a
