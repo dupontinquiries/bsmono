@@ -602,10 +602,45 @@ is precisely what the LEFM model could not express, and why this module had to e
 
 ### Cohesive debts
 
-- **No meshed cohesive elements.** The law and a one-dimensional solve are verified; inserting
-  interfaces between bulk elements in a 2D RVE is the remaining work, and is what would let a
-  brick-and-mortar model produce toughness rather than only stiffness.
+- ~~No meshed cohesive elements.~~ Built; see below. A brick-and-mortar RVE with interfaces on
+  every platelet boundary is the remaining step.
 - **No arc-length control**, so snap-back is detected and refused rather than traced.
 - **Mode I only.** Mixed-mode needs an effective separation and a mode-mixity criterion.
 - **Rate independent**, whereas nacre's organic matrix is viscoelastic and its dissipation is
   rate-dependent — part of why hydration matters so much.
+
+
+## Meshed cohesive interfaces
+
+The law is now in a mesh, which is what lets a *structure* dissipate rather than a point. Node pairs
+share a location, one per side, each carrying its own damage history — so a crack runs along the
+interface **progressively** rather than the whole surface failing at once. That progressiveness is
+the point: it makes dissipated energy scale with crack *area* instead of with load.
+
+**The verification is an energy balance and it is exact to 1e-9.** However the crack advances, the
+energy dissipated must equal `G_c` times the length actually separated. No reference data, no
+handbook — conservation, the same class of test as the J-integral's path independence. Alongside it:
+the peak reaction lands at the cohesive capacity `σ_max · w`, a fully separated interface carries
+nothing, dissipation never runs backwards, and an intact interface reproduces bulk stiffness — which
+checks the node duplication, the assembly and the force signs at once.
+
+Nodes are duplicated here rather than treating the crack as an unrestrained symmetry boundary the
+way `fracture` does, because these two faces must *interact* through a traction rather than simply
+be free.
+
+### The solver constraint that shapes this
+
+The tangent is assembled dense and factorised by **LU, not CG**, because once any pair enters
+softening the tangent is **indefinite** and CG's assumptions fail outright. That is not a tuning
+choice — it is the same reason `sim-power` uses LU while `sim-field`'s Laplace problems use CG, and
+it caps the mesh size here. A sparse indefinite factorisation is the fix and is recorded as a debt.
+
+### Remaining before nacre's toughness is computable
+
+- **A brick-and-mortar RVE with interfaces on every platelet boundary**, which is now assembly work
+  rather than new physics.
+- **Arc-length control**, since a propagating crack in a compliant structure snaps back.
+- **Sparse indefinite solve**, to afford an RVE large enough to contain a process zone — and the
+  process zone length `E G_c / σ_max²` must fit inside the model or the answer is mesh-dependent.
+- **Mixed-mode**, because platelet pull-out is dominated by *shear* on the interface while this
+  models opening.
