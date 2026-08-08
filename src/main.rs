@@ -4520,9 +4520,56 @@ impl Game {
         let base = Mat4::from_translation(pos) * Mat4::from_quat(rot) * flip_m
             * Mat4::from_scale(Vec3::splat(scale));
         let active = &self.cars.models[model_i];
+
+        // ---- CAR LOD ----
+        //
+        // Map geometry is large, so a distance rule catches it. Cars invert
+        // that: they are small, so they drop under a pixel threshold at
+        // ranges no sensible distance cut would reach — and until now every
+        // car pushed every prim, in modes that put three hundred of them on
+        // the pitch, twice each since the depth pre-pass.
+        //
+        // Measured: a car is about 11 px across at 80 m, and roughly 70% of
+        // its prims are detail — rims, sills, greebles, thruster nozzles.
+        // Two tiers, because the parts stop being legible at different
+        // sizes: the rims go first (they are detail ON a wheel), then the
+        // wheels themselves, leaving the silhouette that is all anyone can
+        // see at that range.
+        let car_px = {
+            let d = (pos - self.cam.pos).length().max(0.01);
+            let rad = active.half_len.max(active.half_w) * scale;
+            (rad / d) / (self.cfg.cam.fov_deg.to_radians() / self.gpu.config.width.max(1) as f32)
+        };
+        // Thresholds set by what the part IS, not by a round number. A rim
+        // is detail on a wheel: once the whole car is ~35 px it cannot
+        // resolve spokes. A wheel is part of the silhouette and survives
+        // longer, but by ~20 px a car is a lozenge and its wheels are two
+        // pixels of darker edge.
+        let drop_rims = car_px < 35.0;
+        let drop_wheels = car_px < 20.0;
+
         for prim in active.prims.iter() {
             if !wheels && !matches!(prim.tag, model::Tag::Body) {
                 continue;
+            }
+            if drop_wheels && !matches!(prim.tag, model::Tag::Body) {
+                continue;
+            }
+            if drop_rims && prim.mesh_id >= world::M_RIM_0 && prim.mesh_id < world::M_RIM_0 + 7 {
+                continue;
+            }
+            // ...and every other small part, by its own size rather than by
+            // what it is called. Tags name wheels and rims — eight prims of
+            // twenty-six — while sills, greebles and nozzles are just small
+            // body prims. A part that covers less than about a pixel and a
+            // half cannot be seen, whatever it is.
+            if car_px < 60.0 {
+                let pr = self.gpu.mesh_radius(prim.mesh_id) * scale;
+                let part_px = (pr / (pos - self.cam.pos).length().max(0.01))
+                    / (self.cfg.cam.fov_deg.to_radians() / self.gpu.config.width.max(1) as f32);
+                if part_px < 1.5 {
+                    continue;
+                }
             }
             let mut color = prim.color;
             if matches!(prim.tag, model::Tag::Body) && self.look.paint > 0 {

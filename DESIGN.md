@@ -4170,6 +4170,33 @@ aerial check demanded two cases under three metres, which called a genuine
 improvement (mean closest 5.9 m to 3.8 m, plus the first connection) a
 regression. With four samples the aggregate is the honest measure.
 
+## v1.127.0 — LOD for cars, which invert the map's rule
+
+Map geometry is large, so a distance rule catches it and a size rule is the
+conservative one. Cars invert that exactly: they are small, so they fall
+under a pixel threshold at ranges no sensible distance cut would reach — and
+until now every car pushed every prim, in modes that put three hundred of
+them on the pitch, twice each since the depth pre-pass.
+
+Measured: a car is about 11 px across at 80 m, and roughly 70% of its prims
+are detail — rims, sills, greebles, thruster nozzles.
+
+THREE TIERS, each set by what the part IS rather than by a round number:
+
+    rims      below ~35 px of car    spokes cannot resolve
+    wheels    below ~20 px           the car is a lozenge by then
+    any part  below 1.5 px of ITSELF whatever it is, it is invisible
+
+That third tier is the one that needed real work. A tag names wheels and
+rims — eight prims of twenty-six — while the sills, greebles and nozzles
+that make up the rest of the detail are just small BODY prims and invisible
+to it. So every mesh now records its bounding radius as it is uploaded:
+`add_mesh` is the single place every mesh passes through, whatever built it,
+so one change covers procedural, lofted, imported and assembled cars alike.
+
+The tag tiers alone were worth 16% of car prims across a typical spread. The
+per-part rule is what reaches the detail the measurement actually found.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

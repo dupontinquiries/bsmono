@@ -3630,6 +3630,74 @@ pub fn run(args: &[String]) {
                 saved * 100.0
             );
         }
+        // ---- CARS AND PARTICLES: THE LOD NOBODY APPLIED ----
+        // Map geometry is large, so the distance rule catches it and the
+        // size rule is the conservative one. Cars invert that: they are
+        // small, so they fall under a pixel threshold at ranges no sensible
+        // distance cut would reach — and every car is drawn prim by prim
+        // with no LOD at all, in a mode that can put three hundred of them
+        // on the pitch.
+        {
+            println!();
+            println!("{:<16} {:>7} {:>9} {:>10} {:>12}", "car", "prims", "at 30 m", "at 80 m", "detail prims");
+            let px = (86.0f32.to_radians()) / 1920.0;
+            for (nm, i) in [("first model", 0usize)] {
+                let _ = (nm, i);
+            }
+            // a representative car: how much of it is small detail?
+            for (nm, half_len, prims, detail) in [
+                ("Octane-like", 0.72f32, 26usize, 18usize),
+                ("assembled", 0.70, 34, 26),
+                ("hovercar", 0.68, 30, 22),
+            ] {
+                let r30 = (half_len / 30.0) / px;
+                let r80 = (half_len / 80.0) / px;
+                println!(
+                    "{:<16} {:>7} {:>8.0}px {:>9.0}px {:>11}%",
+                    nm,
+                    prims,
+                    r30,
+                    r80,
+                    detail * 100 / prims
+                );
+            }
+            println!("   a car at 80 m is ~11 px across; its wheel rims and greebles are sub-pixel");
+            // what the two tiers remove across a crowd spread over the pitch
+            println!();
+            println!("{:>10} {:>9} {:>10} {:>10} {:>9}", "range", "px", "rims", "wheels", "prims left");
+            let (mut total, mut kept) = (0u32, 0u32);
+            for range in [10.0f32, 25.0, 45.0, 70.0, 110.0] {
+                let px_r = (0.72f32 / range) / px;
+                let drop_rims = px_r < 35.0;
+                let drop_wheels = px_r < 20.0;
+                // a representative car: 8 body, 4 wheels, 4 rims, 10 detail
+                let prims = 26u32;
+                let mut left = prims;
+                if drop_rims {
+                    left -= 4;
+                }
+                if drop_wheels {
+                    left -= 4;
+                }
+                total += prims;
+                kept += left;
+                println!(
+                    "{:>9.0}m {:>9.0} {:>10} {:>10} {:>9}",
+                    range,
+                    px_r,
+                    if drop_rims { "dropped" } else { "kept" },
+                    if drop_wheels { "dropped" } else { "kept" },
+                    left
+                );
+            }
+            println!(
+                "   across that spread: {}% of car prims still drawn",
+                kept * 100 / total.max(1)
+            );
+            println!("   and 300-bot modes push every one of those prims every frame, twice with");
+            println!("   the depth pre-pass");
+        }
+
         // ---- WHAT IS LEFT TO CULL, AND WHAT IS LEFT TO SIMPLIFY ----
         // Frustum culling answers "is it on screen". It does not answer "is
         // it worth drawing" — a shape can be perfectly in view and project
@@ -3719,6 +3787,74 @@ pub fn run(args: &[String]) {
                 );
             }
             println!("   ...and the depth pre-pass draws opaque geometry twice, so each swap counts double");
+        }
+
+        // ---- CARS AND PARTICLES: THE LOD NOBODY APPLIED ----
+        // Map geometry is large, so the distance rule catches it and the
+        // size rule is the conservative one. Cars invert that: they are
+        // small, so they fall under a pixel threshold at ranges no sensible
+        // distance cut would reach — and every car is drawn prim by prim
+        // with no LOD at all, in a mode that can put three hundred of them
+        // on the pitch.
+        {
+            println!();
+            println!("{:<16} {:>7} {:>9} {:>10} {:>12}", "car", "prims", "at 30 m", "at 80 m", "detail prims");
+            let px = (86.0f32.to_radians()) / 1920.0;
+            for (nm, i) in [("first model", 0usize)] {
+                let _ = (nm, i);
+            }
+            // a representative car: how much of it is small detail?
+            for (nm, half_len, prims, detail) in [
+                ("Octane-like", 0.72f32, 26usize, 18usize),
+                ("assembled", 0.70, 34, 26),
+                ("hovercar", 0.68, 30, 22),
+            ] {
+                let r30 = (half_len / 30.0) / px;
+                let r80 = (half_len / 80.0) / px;
+                println!(
+                    "{:<16} {:>7} {:>8.0}px {:>9.0}px {:>11}%",
+                    nm,
+                    prims,
+                    r30,
+                    r80,
+                    detail * 100 / prims
+                );
+            }
+            println!("   a car at 80 m is ~11 px across; its wheel rims and greebles are sub-pixel");
+            // what the two tiers remove across a crowd spread over the pitch
+            println!();
+            println!("{:>10} {:>9} {:>10} {:>10} {:>9}", "range", "px", "rims", "wheels", "prims left");
+            let (mut total, mut kept) = (0u32, 0u32);
+            for range in [10.0f32, 25.0, 45.0, 70.0, 110.0] {
+                let px_r = (0.72f32 / range) / px;
+                let drop_rims = px_r < 35.0;
+                let drop_wheels = px_r < 20.0;
+                // a representative car: 8 body, 4 wheels, 4 rims, 10 detail
+                let prims = 26u32;
+                let mut left = prims;
+                if drop_rims {
+                    left -= 4;
+                }
+                if drop_wheels {
+                    left -= 4;
+                }
+                total += prims;
+                kept += left;
+                println!(
+                    "{:>9.0}m {:>9.0} {:>10} {:>10} {:>9}",
+                    range,
+                    px_r,
+                    if drop_rims { "dropped" } else { "kept" },
+                    if drop_wheels { "dropped" } else { "kept" },
+                    left
+                );
+            }
+            println!(
+                "   across that spread: {}% of car prims still drawn",
+                kept * 100 / total.max(1)
+            );
+            println!("   and 300-bot modes push every one of those prims every frame, twice with");
+            println!("   the depth pre-pass");
         }
 
         // ---- WHAT IS LEFT TO CULL, AND WHAT IS LEFT TO SIMPLIFY ----

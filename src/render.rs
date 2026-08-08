@@ -149,6 +149,8 @@ struct GpuMesh {
 }
 
 pub struct Gpu {
+    /// Bounding radius per uploaded mesh, for size-based LOD.
+    mesh_radii: Vec<f32>,
     /// Depth-only pipeline: establishes what is visible before the ray
     /// shader runs, so shadow rays, AO probes and reflections are not cast
     /// for fragments something nearer later covers up.
@@ -770,6 +772,7 @@ impl Gpu {
         let pp_comp = mk_pbuf();
 
         let mut gpu = Gpu {
+            mesh_radii: Vec::new(),
             depth_prepass,
             presented: 0,
             reconfigures: 0,
@@ -933,7 +936,23 @@ impl Gpu {
         self.config.width as f32 / self.config.height.max(1) as f32
     }
 
+    /// Bounding radius of every uploaded mesh, in model units.
+    ///
+    /// Captured here because `add_mesh` is the one place every mesh passes
+    /// through, whatever built it. Per-prim size is what a car LOD actually
+    /// needs: a tag identifies wheels and rims, which is eight prims of
+    /// twenty-six, while the sills, greebles and nozzles that make up the
+    /// rest of the detail are invisible to it.
+    pub fn mesh_radius(&self, i: usize) -> f32 {
+        self.mesh_radii.get(i).copied().unwrap_or(1.0)
+    }
+
     pub fn add_mesh(&mut self, data: &MeshData) -> usize {
+        let mut r2 = 0.0f32;
+        for v in data.verts.iter() {
+            r2 = r2.max(v.pos[0] * v.pos[0] + v.pos[1] * v.pos[1] + v.pos[2] * v.pos[2]);
+        }
+        self.mesh_radii.push(r2.sqrt());
         let vbuf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("mesh-v"),
             contents: bytemuck::cast_slice(&data.verts),
