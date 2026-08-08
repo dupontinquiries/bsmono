@@ -19,6 +19,7 @@ use crate::{deviceplan, reachability};
 /// A machine, with both halves of what is known about it.
 ///
 /// The join `reachability` and `deviceplan` each assumed someone else would make.
+#[derive(Clone, PartialEq, Debug)]
 pub struct FleetMember {
     pub peer: reachability::Peer,
     pub device: deviceplan::Device,
@@ -85,6 +86,44 @@ pub fn candidates<'a>(members: &'a [FleetMember], t: deviceplan::Task)
     (ok, refused)
 }
 
+/// Pick one member for a task, given how much work the session can commit to.
+///
+/// `candidates` returns everyone eligible; something has to choose. The choice is not "fastest
+/// machine" — **it is the cheapest machine that clears the bar**, because spending the direct-path
+/// 24 GiB peer on a build check leaves nothing for inference when it is asked for next.
+///
+/// Ties break toward the LOWER capability for the same reason: a fleet that always picks its best
+/// machine has one machine.
+pub fn choose<'a>(
+    members: &'a [FleetMember],
+    t: deviceplan::Task,
+) -> Result<(&'a FleetMember, reachability::Path), Vec<String>> {
+    let (mut ok, refused) = candidates(members, t);
+    if ok.is_empty() { return Err(refused) }
+    // Cheapest-that-clears: sort by capability ASCENDING and take the first. For a bandwidth-bound
+    // task the eligible set is already restricted to direct paths, so this does not undercut it.
+    ok.sort_by(|a, b| a.0.device.gpu_gib.partial_cmp(&b.0.device.gpu_gib)
+        .unwrap_or(std::cmp::Ordering::Equal));
+    Ok(ok.remove(0))
+}
+
+/// Everything the fleet can do right now, as one line per task kind.
+///
+/// **Reports the empty cases too.** "No machine can verify aarch64 natively" is the fact an operator
+/// needs before they wonder why a build never gets checked, and a summary that lists only successes
+/// hides exactly that.
+pub fn capability_summary(members: &[FleetMember]) -> Vec<String> {
+    use deviceplan::Task::*;
+    [Inference, Draft, Delegate, BuildCheck, NativeRun].iter().map(|t| {
+        let (ok, _) = candidates(members, *t);
+        if ok.is_empty() {
+            format!("{t:?}: NO machine available — work of this kind stays local")
+        } else {
+            format!("{t:?}: {} machine(s)", ok.len())
+        }
+    }).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,6 +140,37 @@ mod tests {
                 gpu_gib: gpu, rtt_s: 0.02, link_mib_s: link, can_execute: true,
             },
         }
+    }
+
+    #[test]
+    fn choose_takes_the_CHEAPEST_that_clears_the_bar_not_the_fastest() {
+        // Spending the 24 GiB peer on a build check leaves nothing for inference when it is asked
+        // for next, and a fleet that always picks its best machine has one machine.
+        let ms = vec![
+            member("big", 24.0, 1000.0, Some(Path::Direct)),
+            member("small", 4.0, 1000.0, Some(Path::Direct)),
+        ];
+        let (picked, _) = choose(&ms, Task::Delegate).unwrap();
+        assert_eq!(picked.device.name, "small");
+    }
+
+    #[test]
+    fn choose_returns_the_REFUSALS_when_nothing_qualifies() {
+        // An empty Err would say "no" without saying why, and the operator cannot fix that.
+        let ms = vec![member("nogpu", 0.0, 1000.0, Some(Path::Direct))];
+        let e = choose(&ms, Task::Inference).unwrap_err();
+        assert_eq!(e.len(), 1);
+        assert!(e[0].contains("nogpu"));
+    }
+
+    #[test]
+    fn the_summary_reports_the_EMPTY_capabilities_too() {
+        // "No machine can verify aarch64 natively" is the fact an operator needs BEFORE wondering
+        // why a build never gets checked.
+        let ms = vec![member("nogpu", 0.0, 1000.0, Some(Path::Direct))];
+        let lines = capability_summary(&ms);
+        assert!(lines.iter().any(|l| l.contains("Inference: NO machine")));
+        assert!(lines.iter().any(|l| l.contains("BuildCheck: 1 machine")));
     }
 
     #[test]
