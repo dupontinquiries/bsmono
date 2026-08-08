@@ -4621,6 +4621,37 @@ TWO NEAR-MISSES IN MY OWN READING, both the same shape:
     physics bug that does not exist; velocity is what tells a leak from a
     ledge.
 
+## 1.141.0 - the sweep widened, and still nothing strange
+
+Four more invariants, chosen where the first six did not look.
+
+    air control mirrors on every axis     exact, to 0.0000
+    no state ever goes non-finite         0 in 60 s of hard random driving
+    a car dropped in any attitude settles  6 of 6, all upright
+    a hovercar mirrors, and holds height   0.740 to 0.740 m over 8 s
+
+THE ATTITUDE DROPS were the most likely to find something and did not.
+Upside down, on its nose, on its tail, on one side and corner-first all
+settle quietly, end upright, and never launch or bury themselves. Wedging a
+rigid body against a resolver it dislikes is the standard way to get a car
+that jitters or fires into the sky.
+
+THE HOVER CHASSIS was the other candidate: weeks old against years of
+scrutiny on the wheeled car, with its own ground solve, its own steering and
+its own ball contact, and never held to any of this. It mirrors exactly and
+holds a resting height to the millimetre.
+
+AND ONE MORE INSTRUMENT BUG, the third in two versions. The yaw row read
+0.000 in both directions, which looks exactly like a car that cannot turn in
+the air. The game has a separate `yaw` input; I had driven the test with
+`steer`, which is the GROUND control and correctly does nothing up there.
+Reading it as a finding would have meant "fixing" a control that was working.
+
+The pattern is worth naming since it keeps recurring: every anomaly this
+sweep has surfaced so far has been in the measurement, not the game. That is
+weak evidence the physics is sound and strong evidence that a new probe
+deserves as much suspicion as the thing it is probing.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

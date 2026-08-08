@@ -8871,6 +8871,213 @@ pub fn run(args: &[String]) {
             println!("   after 7.5 s flat out: deepest penetration {worst_inside:.3} m");
             check("a boosting car never ends up inside geometry", worst_inside < 0.6);
         }
+        // ---- AIR CONTROL SYMMETRY ----
+        // The ground checks mirror left and right. The AIR is a different
+        // code path — pitch, yaw and roll are separate axes with separate
+        // signs, and a wrong one there only shows when the car is upside
+        // down or turning the unusual way.
+        println!();
+        println!("{:<14} {:>12} {:>12} {:>10}", "axis", "positive", "negative", "mirror err");
+        let air = |pitch: f32, yaw: f32, roll: f32| -> Vec3 {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 30.0, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, 60.0, 200.0);
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            // AIR YAW IS ITS OWN INPUT. I first drove this with `steer`,
+            // which is the ground control and correctly does nothing up
+            // there — so the yaw row read 0.000 in both directions and looked
+            // like a car that cannot turn in the air. The game has a
+            // separate `yaw`; the test was addressing the wrong field.
+            c.pitch = pitch;
+            c.yaw = yaw;
+            c.roll = roll;
+            for _ in 0..60 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            // report the attitude reached, in the world frame
+            // capture all three axes: nose height (pitch), roll of the up
+            // vector, and heading (yaw)
+            let f = car.forward();
+            let u = car.up();
+            Vec3::new(f.y, u.x, f.x)
+        };
+        let mut worst_air = 0.0f32;
+        for (nm, p_, y_, r_) in [
+            ("pitch", 1.0f32, 0.0f32, 0.0f32),
+            ("yaw", 0.0, 1.0, 0.0),
+            ("roll", 0.0, 0.0, 1.0),
+        ] {
+            let a = air(p_, y_, r_);
+            let b = air(-p_, -y_, -r_);
+            // mirroring the input should mirror the attitude
+            let e = (a + b).length();
+            worst_air = worst_air.max(e);
+            println!("{:<14} {:>12.3} {:>12.3} {:>10.4}", nm, a.length(), b.length(), e);
+        }
+        check("air control mirrors on every axis", worst_air < 0.02);
+
+        // ---- NOTHING GOES NON-FINITE ----
+        // A NaN anywhere in a physics state poisons everything downstream and
+        // usually arrives from a normalise of a zero vector — which this
+        // project has already produced twice, in the flick throw and the tube
+        // gravity field. Drive hard for a long time and check.
+        {
+            let mut world = World::generate(31, crate::world::style(21), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 2.0, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            ball.prev = ball.pos;
+            let mut ev = StepEvents::default();
+            let mut bad = 0;
+            for k in 0..7200 {
+                let mut c = physics::Controls::default();
+                // a deliberately awkward input pattern
+                let t = k as f32 * DT;
+                c.throttle = (t * 3.1).sin();
+                c.steer = (t * 2.3).cos();
+                c.pitch = (t * 1.7).sin();
+                c.roll = (t * 0.9).cos();
+                c.boost = (k / 40) % 3 == 0;
+                c.jump_pressed = k % 47 == 0;
+                c.jump_held = k % 47 < 6;
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                let vals = [
+                    car.pos.x, car.pos.y, car.pos.z, car.vel.x, car.vel.y, car.vel.z,
+                    car.omega.x, car.omega.y, car.omega.z, car.rot.x, car.rot.y, car.rot.z, car.rot.w,
+                    ball.pos.x, ball.pos.y, ball.pos.z, ball.vel.x, ball.vel.y, ball.vel.z,
+                ];
+                if vals.iter().any(|v| !v.is_finite()) {
+                    bad += 1;
+                    if bad == 1 {
+                        println!("   NON-FINITE at step {k} (t={t:.2}s)");
+                    }
+                }
+            }
+            println!();
+            println!("   60 s of hard random driving on PERPLEXUS: {bad} non-finite states");
+            check("no state ever goes non-finite", bad == 0);
+        }
+        // ---- LANDING IN EVERY ATTITUDE ----
+        // Dropping a car upside down, on its nose, on a corner. Any of these
+        // can wedge a rigid body: the resolver pushes it out along a normal
+        // it does not like and the car ends up jittering, launched, or stuck
+        // half inside the floor.
+        println!();
+        println!("{:<16} {:>9} {:>10} {:>10} {:>9}", "dropped", "settled", "upright", "launched", "buried");
+        let mut trouble = Vec::new();
+        for (nm, rot) in [
+            ("flat", glam::Quat::IDENTITY),
+            ("upside down", glam::Quat::from_rotation_z(std::f32::consts::PI)),
+            ("on its nose", glam::Quat::from_rotation_x(-1.4)),
+            ("on its tail", glam::Quat::from_rotation_x(1.4)),
+            ("on one side", glam::Quat::from_rotation_z(1.5)),
+            ("corner first", glam::Quat::from_euler(glam::EulerRot::XYZ, 0.9, 0.7, 1.1)),
+        ] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let gy = world.ground_h(0.0, 0.0);
+            car.pos = Vec3::new(0.0, gy + 6.0, 0.0);
+            car.rot = rot;
+            car.sync_rot();
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, 60.0, 200.0);
+            ball.prev = ball.pos;
+            let c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            let mut peak_up = 0.0f32;
+            let mut deepest = 0.0f32;
+            for _ in 0..600 {
+                let before = car.pos.y;
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                // a launch is upward motion long after the drop
+                peak_up = peak_up.max(car.vel.y);
+                let d = world.sdf(car.pos) - car.half_h;
+                if d < 0.0 {
+                    deepest = deepest.max(-d);
+                }
+                let _ = before;
+            }
+            let settled = car.vel.length() < 1.0;
+            let upright = car.up().dot(Vec3::Y) > 0.5;
+            let launched = peak_up > 6.0;
+            let buried = deepest > 0.25;
+            if !settled || launched || buried {
+                trouble.push(nm);
+            }
+            println!(
+                "{:<16} {:>9} {:>10} {:>10} {:>9}",
+                nm,
+                if settled { "yes" } else { "NO" },
+                if upright { "yes" } else { "no" },
+                if launched { "LAUNCHED" } else { "-" },
+                if buried { format!("{deepest:.2}m") } else { "-".to_string() }
+            );
+        }
+        check("a car dropped in any attitude settles quietly", trouble.is_empty());
+
+        // ---- THE SAME INVARIANTS, ON A HOVERCAR ----
+        // The wheeled physics has years of scrutiny behind it. The hover
+        // chassis is weeks old, has its own ground solve, its own steering
+        // and its own ball contact, and has never been held to any of this.
+        {
+            let hrun = |steer: f32, boost: bool| -> (Vec3, Vec3) {
+                let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+                let mut car = physics::Car::new();
+                car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.8, 0.0);
+                car.sync_rot();
+                car.hover = Some(physics::Hover::default());
+                car.charge = 100.0;
+                let mut ball = Ball::new();
+                ball.pos = Vec3::new(0.0, 60.0, 200.0);
+                ball.prev = ball.pos;
+                let mut c = physics::Controls::default();
+                let mut ev = StepEvents::default();
+                c.throttle = 1.0;
+                c.boost = boost;
+                for _ in 0..90 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                c.steer = steer;
+                for _ in 0..90 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                (car.pos, car.vel)
+            };
+            let (lp, lv) = hrun(-1.0, true);
+            let (rp, rv) = hrun(1.0, true);
+            let e = (Vec3::new(-lp.x, lp.y, lp.z) - rp).length().max((Vec3::new(-lv.x, lv.y, lv.z) - rv).length());
+            println!();
+            println!("   hovercar turn mirrors to {e:.4}");
+            check("a hovercar mirrors left and right", e < 0.02);
+            // and it must not gain height for free: hold still and watch
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            let gy = world.ground_h(0.0, 0.0);
+            car.pos = Vec3::new(0.0, gy + 0.8, 0.0);
+            car.sync_rot();
+            car.hover = Some(physics::Hover::default());
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, 60.0, 200.0);
+            ball.prev = ball.pos;
+            let c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            let (mut hi, mut lo) = (f32::MIN, f32::MAX);
+            for k in 0..1200 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if k > 240 {
+                    hi = hi.max(car.pos.y - gy);
+                    lo = lo.min(car.pos.y - gy);
+                }
+            }
+            println!("   hovering at rest: height between {lo:.3} and {hi:.3} m over 8 s");
+            check("a resting hovercar holds a steady height", (hi - lo) < 0.06);
+        }
         println!("{}", if pass { "SANITY: PASS" } else { "SANITY: FAIL" });
         return;
     }
