@@ -147,7 +147,7 @@ pub fn history_ui(ui: &mut egui::Ui, h: &History, colors: &uikit_egui::PaletteCo
     }
 
     ui.add_space(6.0);
-    ui.label(egui::RichText::new("📈 Recent statistics").strong());
+    crate::ui::egui::chrome::card_heading(ui, "📈 Recent statistics");
     let stats = h.stats();
     ui.horizontal(|ui| {
         for (label, value) in ["Min", "Max", "Curr", "Pts"].iter().zip(stats.iter()) {

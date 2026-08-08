@@ -6,7 +6,7 @@
 //! than one surface behind a runnable one.
 
 use ambient_learner_egui::{
-    ui::egui::{ambience, history, locations, map, model, screen_temps, sync},
+    ui::egui::{ambience, chrome, history, locations, map, model, screen_temps, sync},
     LiveState,
 };
 
@@ -30,6 +30,21 @@ struct App {
     sparkles: ambience::Sparkles,
     started: std::time::Instant,
     temps: screen_temps::ScreenTempsPage,
+}
+
+impl App {
+    /// Which section the current page belongs to.
+    fn section(&self) -> chrome::Section {
+        match self.page {
+            Page::Live => chrome::Section::Live,
+            Page::History => chrome::Section::History,
+            Page::Places => chrome::Section::Places,
+            Page::Map => chrome::Section::Map,
+            Page::Model => chrome::Section::Model,
+            Page::Sync => chrome::Section::Sync,
+            Page::Temps => chrome::Section::Debug,
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -58,6 +73,10 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.page, Page::Temps, "Temps");
             });
             ui.separator();
+            // The floating section title, which the port had been missing
+            // entirely: every page had its card headings and none had a page
+            // title, so the tab bar was the only thing saying where you were.
+            chrome::section_header(ui, self.section(), self.colors.accent);
             match self.page {
                 Page::Live => self.live.ui(ui),
                 Page::History => history::history_ui(ui, &self.history, &self.colors),

@@ -33,6 +33,9 @@ pub mod ambience;
 /// The published screen-surface temperature field, and its debug viewer.
 pub mod screen_temps;
 
+/// Section titles and card headings — the chrome the pages share.
+pub mod chrome;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
@@ -167,7 +170,7 @@ impl LiveView {
         ui.add_space(12.0);
         ui.separator();
         // Share-with-contact row — the weather-share integration.
-        ui.label(egui::RichText::new("Share this reading").strong());
+        crate::ui::egui::chrome::card_heading(ui, "Share this reading");
         if contacts.is_empty() {
             ui.label(egui::RichText::new("no contacts yet").weak().small());
         }
