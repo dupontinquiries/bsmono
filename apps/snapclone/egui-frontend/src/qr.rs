@@ -429,3 +429,57 @@ mod tests {
         assert_eq!(SCAN_FPS, 8);
     }
 }
+
+#[cfg(test)]
+mod input_reality_check {
+    use super::*;
+    use egui::{Context, Event, RawInput};
+
+    /// Drive the REAL page for several frames, typing one character per frame.
+    ///
+    /// The primitive works in isolation; this asks whether the page as written
+    /// does. A field that takes one character and then stops is a field whose
+    /// widget id moved, or whose focus was taken, between frames — and neither
+    /// shows up in a unit test of the state machine.
+    #[test]
+    fn the_manual_field_accepts_more_than_one_character() {
+        let ctx = Context::default();
+        let colors = uikit_egui::palette_colors("midnight");
+        let mut s = QrScan::manual_only();
+
+        // Frame one: draw, so the widgets exist to be focused.
+        let _ = ctx.run(RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                qr_ui(ui, &mut s, &colors);
+            });
+        });
+
+        // Tab to the field rather than guessing its id. next_auto_id() before
+        // the call is NOT the field — several widgets precede it — and a probe
+        // that focuses the wrong widget reports a bug that is its own.
+        let tab = |ctx: &Context, s: &mut QrScan| {
+            let input = RawInput {
+                events: vec![Event::Key { key: egui::Key::Tab, physical_key: None,
+                                          pressed: true, repeat: false,
+                                          modifiers: Default::default() }],
+                ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { qr_ui(ui, s, &colors); });
+            });
+        };
+        // The manual field is the first focusable widget on the manual-only
+        // sheet, so one Tab reaches it.
+        tab(&ctx, &mut s);
+
+        for ch in "sc-ab".chars() {
+            let input = RawInput { events: vec![Event::Text(ch.to_string())],
+                                   ..Default::default() };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    qr_ui(ui, &mut s, &colors);
+                });
+            });
+        }
+        assert_eq!(s.manual, "sc-ab", "the field kept only {:?}", s.manual);
+    }
+}
