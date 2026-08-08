@@ -65,6 +65,23 @@ pub enum Playout {
 pub struct Frame {
     pub seq: u64,
     pub payload_len: usize,
+    /// First frame of a talk spurt.
+    ///
+    /// The sender restarts sequence numbers at 0 every spurt, so without this
+    /// flag a second spurt looks exactly like a flood of very late frames and
+    /// the drop-late rule eats all of it. This scheduler was written without
+    /// the flag and had precisely that bug; `talkspurt_gap` pins it.
+    pub talkspurt_start: bool,
+}
+
+impl Frame {
+    pub fn new(seq: u64, payload_len: usize) -> Frame {
+        Frame { seq, payload_len, talkspurt_start: false }
+    }
+    /// The first frame of a spurt: resets the receiver's sequencing.
+    pub fn spurt_start(seq: u64, payload_len: usize) -> Frame {
+        Frame { seq, payload_len, talkspurt_start: true }
+    }
 }
 
 /// A single sender's buffer.
@@ -91,6 +108,18 @@ impl PeerStream {
     /// of order: it arrived after its moment passed, and inserting it behind the
     /// current position would play the past.
     pub fn push(&mut self, f: Frame) -> bool {
+        // A new talk spurt resets sequencing. Anything still queued belongs to
+        // the previous spurt and is DISCARDED rather than played after it: the
+        // speaker already stopped, and those frames are older than the silence
+        // the listener just heard.
+        if f.talkspurt_start {
+            self.queue.clear();
+            self.next_seq = None;
+            self.concealed_run = 0;
+            self.started = false;
+            self.queue.push(f);
+            return true;
+        }
         if let Some(next) = self.next_seq {
             if f.seq < next { return false; }
         }
@@ -228,7 +257,7 @@ impl VoicePlayout {
 mod tests {
     use super::*;
 
-    fn f(seq: u64) -> Frame { Frame { seq, payload_len: 40 } }
+    fn f(seq: u64) -> Frame { Frame::new(seq, 40) }
 
     fn started_stream() -> PeerStream {
         let mut s = PeerStream::default();
@@ -356,8 +385,8 @@ mod tests {
     fn preroll_plays_before_live_audio_and_in_order() {
         // The head of an accepted message would otherwise be lost.
         let mut s = PeerStream::default();
-        s.push_preroll(Frame { seq: 100, payload_len: 10 });
-        s.push_preroll(Frame { seq: 101, payload_len: 10 });
+        s.push_preroll(Frame::new(100, 10));
+        s.push_preroll(Frame::new(101, 10));
         s.push(f(1));
         s.push(f(2));
         assert!(matches!(s.tick(), Playout::Play { seq: 100, .. }));
@@ -371,7 +400,7 @@ mod tests {
         // Those are the same speaker seconds apart — summing them is an echo,
         // not a recovery.
         let mut s = PeerStream::default();
-        s.push_preroll(Frame { seq: 100, payload_len: 10 });
+        s.push_preroll(Frame::new(100, 10));
         s.push(f(1));
         assert_eq!(s.depth(), 1);
         assert_eq!(s.preroll_len(), 1);
@@ -404,5 +433,30 @@ mod tests {
         let mut v = VoicePlayout::default();
         assert!(v.note_decoder_unavailable());
         assert!(!v.note_decoder_unavailable());
+    }
+}
+
+#[cfg(test)]
+mod talkspurt_gap {
+    use super::*;
+
+    /// A second talk spurt restarts sequence numbers at 0.
+    ///
+    /// The sender's contract says so explicitly: "sequence numbers restart at 0
+    /// each talk-spurt and the first frame is flagged TALKSPURT_START so the
+    /// receiver resets its jitter buffer cleanly." This scheduler was written
+    /// without that flag, so the drop-late-frames rule silently eats the whole
+    /// second spurt.
+    #[test]
+    fn a_second_talk_spurt_is_not_swallowed_as_late_frames() {
+        let mut s = PeerStream::default();
+        s.push(Frame::spurt_start(0, 40));
+        s.push(Frame::new(1, 40));
+        s.tick();
+        s.tick();                      // played 0 and 1, next_seq = 2
+
+        // Speaker stops, then starts again: sequence restarts at 0.
+        let accepted = s.push(Frame::spurt_start(0, 40));
+        assert!(accepted, "the new spurt's first frame was dropped as 'late'");
     }
 }
