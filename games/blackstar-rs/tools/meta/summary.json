@@ -1,0 +1,91 @@
+{
+ "_doc": [
+  "Library metadata, supplied rather than inferred. 451 entries covering the",
+  "supercomp archive.",
+  "",
+  "WHY THIS MATTERS MORE THAN ITS SIZE:",
+  "",
+  "  SUBTYPE names body plans the fitter cannot see. spider 7, beast 2,",
+  "  avian 2, dragon 1 \u2014 the non-humanoid shapes veh.rs forces into two arms",
+  "  and two legs. Measuring ground contacts never found them because the",
+  "  SCREENER rejects anything that does not stand up tall, so the whole",
+  "  category was invisible to every test run so far.",
+  "",
+  "  MODES lists 19 models with BOTH robot and alt forms. Those are real",
+  "  transform references \u2014 a fold someone authored, against which foldview's",
+  "  fitted one can be compared. Grimlock, Shockwave, Soundwave, Megatron,",
+  "  Ratchet, Jetfire, Ironhide and the Insecticons among them.",
+  "",
+  "  FLAGS name six models carrying ANIMATION: `transform_anim` on Fall of",
+  "  Cybertron Megatron, `idle_anim` on Soundwave, `animated` on four more.",
+  "  Gait strips have been the blocker for walking and running through this",
+  "  entire port, and this is the first evidence that authored motion exists",
+  "  in the library at all."
+ ],
+ "counts": {
+  "categories": {
+   "vehicle": 194,
+   "bot": 84,
+   "unknown": 46,
+   "reference": 40,
+   "weapon": 28,
+   "terrain": 27,
+   "raid_boss": 19,
+   "structure": 13
+  },
+  "body_plans": {
+   "flyer": 59,
+   "raid_boss": 13,
+   "spider": 7,
+   "beast": 2,
+   "avian": 2,
+   "dragon": 1
+  },
+  "both_modes": 19,
+  "animated": 7
+ },
+ "both_modes": [
+  "3 Insecticons",
+  "AirRaid",
+  "BULLDOG",
+  "Demolishor",
+  "Grimlock",
+  "Ironhide",
+  "Jetfire",
+  "MIXMASTER",
+  "Megatron",
+  "Ratchet",
+  "Scattershot",
+  "Shockwave",
+  "Slipstream",
+  "Slug",
+  "Soundwave",
+  "Swoop",
+  "Transformers Fall Of Cybertron Combaticons",
+  "Transformers_ Fall of Cybertron Megatron",
+  "Warpath"
+ ],
+ "animated": [
+  "Mech Constructor  Heavy Spider (Animated) [animated]",
+  "Megatron [animated]",
+  "Realistic Old Russian Guy [animated]",
+  "Soundwave [idle_anim]",
+  "Transformers_ Fall of Cybertron Megatron [both_modes,transform_anim]",
+  "fall of optimus prime animated [animated]",
+  "spearhead [animated]"
+ ],
+ "non_humanoid": [
+  "Spider Bot [spider]",
+  "Spider Drone V6 Cybertech [spider]",
+  "Spider Tank [spider]",
+  "asonia [avian]",
+  "dimstreak [beast]",
+  "falcontip [avian]",
+  "ironforge [dragon]",
+  "nullbite [spider]",
+  "radiachnor [spider]",
+  "rollout [spider]",
+  "runningwind [beast]",
+  "widowback [spider]"
+ ]
+}

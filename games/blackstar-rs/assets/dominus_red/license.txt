@@ -1,0 +1,11 @@
+Model Information:
+* title:	Dominus in rocket league
+* source:	https://sketchfab.com/3d-models/dominus-in-rocket-league-2cdfef6e0cc844bba2d4818143b5318b
+* author:	97Mason (https://sketchfab.com/97Mason)
+
+Model License:
+* license type:	CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)
+* requirements:	Author must be credited. Commercial use is allowed.
+
+If you use this 3D model in your project be sure to copy paste this credit wherever you share it:
+This work is based on "Dominus in rocket league" (https://sketchfab.com/3d-models/dominus-in-rocket-league-2cdfef6e0cc844bba2d4818143b5318b) by 97Mason (https://sketchfab.com/97Mason) licensed under CC-BY-4.0 (http://creativecommons.org/licenses/by/4.0/)

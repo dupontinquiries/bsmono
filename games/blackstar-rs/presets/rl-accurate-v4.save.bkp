@@ -1,0 +1,95 @@
+tuned_profile 0
+total_rings 0
+total_car_rings 2
+total_goals 0
+best_combo 0
+best_air 3.25
+top_speed 24.21
+volume 0.80
+music 1
+minimap 0
+ball_cam 0
+fullscreen 1
+car 2
+map 18
+seed 20260726
+bind forward k:.
+bind reverse k:e
+bind steer_l k:o
+bind steer_r k:u
+bind roll_l k:
+bind roll_r k:p
+bind jump k:z,p:0
+bind boost k:v,p:1
+bind slide k:a,p:2
+bind ball_cam n:space,p:3
+bind toss k:t
+bind ball_front n:shift
+bind reset_car k:r,p:8
+bind minimap k:m
+bind music k:n
+bind vol_down k:[
+bind vol_up k:]
+bind flip_vis k:f
+bind car1 k:1
+bind car2 k:2
+bind car3 k:3
+cfg cam_fov 84.592
+cfg cam_dist 4.788
+cfg cam_height 1.592
+cfg cam_angle 22.273
+cfg cam_shake 0.094
+cfg cam_grav 0.343
+cfg cam_stiff 2.193
+cfg gravity 0.900
+cfg arena_bounce 1.150
+cfg arena_friction 0.600
+cfg arena_scale 1.200
+cfg ball_size 1.050
+cfg ball_bounce 1.100
+cfg ball_friction 2.425
+cfg ball_weight 0.800
+cfg car_size 1.051
+cfg car_grip 0.999
+cfg car_top 1.000
+cfg car_accel 1.000
+cfg car_boost 1.000
+cfg car_boost_regen 0.000
+cfg car_boost_max 1.000
+cfg car_boost_unl 1.000
+cfg car_jump 1.000
+cfg car_analog 1.000
+cfg car_analog_soft 0.450
+cfg flip_strength 1.200
+cfg flip_resets 1.000
+cfg flip_strict 1.000
+cfg flip_unlimited 0.000
+cfg flip_cancel 1.000
+cfg land_assist 0.000
+cfg flip_spin 0.850
+cfg gyro_on 0.000
+cfg gyro_sens 1.000
+cfg gyro_dz 0.060
+cfg gyro_smooth 0.050
+cfg gyro_ix 0.000
+cfg gyro_iy 0.000
+cfg gyro_air 0.000
+cfg gyro_gate 0.000
+cfg steer_rate 0.900
+cfg input_ease 1.100
+cfg air_roll_default 0.000
+cfg rays 1.000
+cfg gfx_tier 3.000
+cfg ray_quality 1.000
+cfg filmic 1.000
+cfg exposure 1.000
+cfg vignette 0.320
+cfg grain 0.120
+cfg letterbox 0.000
+cfg bloom 0.700
+cfg vsync 1.000
+cfg screen_door 0.000
+cfg render_scale 1.000
+cfg touch_enabled 0.000
+cfg touch_scale 1.000
+cfg preset 0.000
