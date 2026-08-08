@@ -108,7 +108,10 @@ def base_cmd(iqm, d, k, t):
          # is a worse regression than the panels it fixes. Run foldview with
          # --group by hand to see it; it stays out of the roster until the
          # merge is a property of the geometry rather than of loop order.
-         "--repair", "--reattach",
+         # --ribs -1 asks the body what it is: fineness ratio decides whether
+         # a rib is an armoured arch or an aerodynamic spar. Vertex-count
+         # preserving, so strip parity survives it — unlike --group.
+         "--repair", "--reattach", "--ribs", "-1",
          "--t", f"{t:.4f}"]
     if k == POSES - 1:
         c += ["--joints-json", os.path.join(d, "joints.json")]
@@ -271,7 +274,10 @@ def main():
          # is a worse regression than the panels it fixes. Run foldview with
          # --group by hand to see it; it stays out of the roster until the
          # merge is a property of the geometry rather than of loop order.
-         "--repair", "--reattach",
+         # --ribs -1 asks the body what it is: fineness ratio decides whether
+         # a rib is an armoured arch or an aerodynamic spar. Vertex-count
+         # preserving, so strip parity survives it — unlike --group.
+         "--repair", "--reattach", "--ribs", "-1",
                    "--t", f"{t:.4f}"]
             # THE JOINTS, ONCE PER CHASSIS. They are a property of the rig
             # rather than of a pose, so the robot end writes them and the
