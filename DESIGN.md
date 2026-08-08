@@ -4524,6 +4524,39 @@ I have not acted on it. Giving a map genuine structural identity is content
 work I cannot verify by measurement alone, and half of it would be worse
 than none. The survey is the instrument for doing it properly.
 
+## 1.138.0 — VIPERA gets its drawings
+
+VIPERA was built from a written description. It now has a dimensioned
+reference sheet, so it is built to that instead:
+
+    length 4.60   width 2.15   height 1.05   wheelbase 3.15
+    track 1.70    wheel diameter 0.78   overhangs 0.65 / 0.80
+
+    ratio        sheet    built
+    W/L          0.467    0.468
+    H/L          0.228    0.229
+    wheel/L      0.170    0.170
+    wheel/H      0.743    0.744
+
+THE INTERESTING PART IS HOW FAR THAT SITS FROM THE OTHER REFERENCES. The
+catalogue is held to Octane and Dominus: wheel/length 0.216 to 0.242. This
+car is 0.170 - its wheels are proportionally much SMALLER. Not because they
+are small, but because a real hypercar is far longer relative to everything
+else: 4.6 m with a 3.15 m wheelbase and only 1.05 m of height.
+
+That is a different design language, not a car that is wrong, and it means
+the proportion audit had to learn that one car answers to its own sheet.
+Holding VIPERA to the Rocket League band would have been holding it to the
+wrong reference - and it would have "corrected" a car that now matches its
+drawings to within 0.3%.
+
+A CHECK THAT FAILED FOR THE WRONG REASON. The first version of the sheet
+comparison read every ratio as zero and reported OFF ITS SHEET: the source
+parser split on the wrong literal and never reached the fields. It looked
+like a finding and was a bug in the instrument. A car that had just been
+built to spec reporting -100% on every axis is not a plausible measurement,
+and that implausibility is what caught it.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
