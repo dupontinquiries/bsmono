@@ -5797,6 +5797,40 @@ pub fn run(args: &[String]) {
             //  * Already ruled out: spawn height, entry speed, bore
             //    clearance, wall thickness, junction width, node density,
             //    gravity-field overlap and gravity-field shape.
+            // ---- IS THERE GRAVITY ON THE CENTRELINE? ----
+            //
+            // Everything above rules out the geometry and the route shape,
+            // and records that the car never lands on the bore wall. One
+            // cause would explain all of it at once: if the tube's gravity
+            // field CANCELS at the centre of the bore, a car on the
+            // centreline has nothing pulling it to a wall — and the route
+            // waypoints ARE the centreline. It would fly straight until a
+            // bend, exactly as observed, and be insensitive to every
+            // geometric change tried.
+            if label.starts_with("MONKEY") {
+                println!("   gravity across the bore (0 = centreline, 1 = wall):");
+                // sample outward from a waypoint, across the bore
+                if let Some(r0) = world.routes.first() {
+                    let pts = &r0.0;
+                    if pts.len() > 2 {
+                        let p = pts[pts.len() / 2];
+                        let along = (pts[pts.len() / 2 + 1] - pts[pts.len() / 2 - 1]).normalize_or(Vec3::Z);
+                        let side = along.cross(Vec3::Y).normalize_or(Vec3::X);
+                        for f in [0.0f32, 0.15, 0.35, 0.55, 0.75, 0.9] {
+                            let q = p + side * (f * 7.0);
+                            let g = world.gravity_dir(q);
+                            println!(
+                                "     {:>4.0}%  |g| {:>5.2}  dir ({:+.2},{:+.2},{:+.2})",
+                                f * 100.0,
+                                g.length(),
+                                g.x,
+                                g.y,
+                                g.z
+                            );
+                        }
+                    }
+                }
+            }
             let checked = n_routes;
             println!(
                 "{label:<12} traversed {done}/{checked} routes   fell out of {escaped}   worst: {}",

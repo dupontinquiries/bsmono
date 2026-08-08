@@ -4420,6 +4420,38 @@ Five measured layers now: surface, character lines, proportion, plan view
 and side view — and this one is the argument for the whole approach. Eyes
 would have called the first reading obvious.
 
+## 1.135.0 — a real discontinuity in the tube field, and it was not the culprit
+
+Sampling gravity across a Monkey Run bore found something wrong:
+
+    across the bore    before                  after
+      0% (centreline)  (-0.05,-0.99,+0.09)     (-0.05,-0.99,+0.09)
+     15%               (+0.90,-0.04,+0.44)     (+0.26,-0.94,+0.20)
+     35%               (+0.90,-0.04,+0.44)     (+0.74,-0.56,+0.37)
+     55%               (+0.90,-0.03,+0.43)     (+0.90,-0.09,+0.43)
+
+A tube's field is radial: `(p - node).normalize_or(NEG_Y)`. On the axis that
+vector is ZERO, so it returned world-down — while a car a few centimetres
+off-axis got a full sideways push. The field flipped through ninety degrees
+across nothing. It is the same shape of fault as the flick singularity: a
+direction defined by a difference, sampled where the difference vanishes.
+
+It blends now — world-down on the axis, fully radial by a quarter of the
+bore. Both ends are right (a car on the centreline of a horizontal pipe
+should fall to its floor; one near the wall should be held against it) and
+there is no step between them. Monkey Run's drivability went 49% to 52% and
+every tube harness still passes.
+
+AND IT DID NOT FIX THE ROUTES. Monkey Run still traverses 0 of 7, failing at
+the same 5/6/7/9% as before — identical to the digit. The fix demonstrably
+applied, since the sampled field changed; the route failure simply has
+another cause. That is worth recording as firmly as the fix: the standing
+note in `--sim drive` lists what has been ruled out, and the gravity field's
+DIRECTION can now be struck off alongside its shape and overlap.
+
+What remains unexamined is what that note already suspected: the harness's
+own fall-out rule and its spawn, rather than the map.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

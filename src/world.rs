@@ -4568,7 +4568,30 @@ impl World {
             if n.inward {
                 (n.pos - p).normalize_or(Vec3::NEG_Y) // planets PULL
             } else if n.tube {
-                (p - n.pos).normalize_or(Vec3::NEG_Y) // bore walls push out
+                // A DISCONTINUITY AT THE AXIS.
+                //
+                // On the bore's centreline the radial vector is zero, so
+                // this returned world-down — while a car a few centimetres
+                // off-axis got a full sideways push toward the wall. The
+                // field flipped through ninety degrees across nothing.
+                //
+                // That is why MONKEY RUN traversed none of its routes: the
+                // waypoints ARE the centreline, so a car following one sits
+                // exactly where the field is undefined, flies straight with
+                // no wall to settle onto, and is thrown sideways the moment
+                // it drifts. Every geometric explanation had been ruled out
+                // because the geometry was never the problem.
+                //
+                // Blend instead: world-down on the axis, fully radial by a
+                // quarter of the bore. Both ends are right — a car on the
+                // centreline of a horizontal pipe should fall to its floor,
+                // and one near the wall should be held against it — and
+                // there is no longer a step between them.
+                let radial = p - n.pos;
+                let len = radial.length();
+                let soft = (len / (n.r * 0.25).max(0.01)).clamp(0.0, 1.0);
+                (Vec3::NEG_Y * (1.0 - soft) + radial.normalize_or(Vec3::NEG_Y) * soft)
+                    .normalize_or(Vec3::NEG_Y)
             } else {
                 n.down
             }
