@@ -473,6 +473,10 @@ struct Chassis {
     /// means different target lengths), so the morph has to reload with the
     /// SAME numbers or the blend would rescale as it goes.
     dirs: Vec<(PathBuf, f32)>,
+    /// WALK PHASES at the robot end, empty when the chassis shipped without
+    /// them. Separate from `strip` on purpose: a fold is indexed by t and a
+    /// walk by phase, and one list cannot say which is which.
+    walk: Vec<usize>,
     /// the fitted rig, for the catalogue's joint inspector. Empty when the
     /// chassis shipped without a joints.json.
     joints: Vec<joints::Joint>,
@@ -1272,9 +1276,34 @@ fn main() {
                 cars.names.push(Box::leak(nm.into_boxed_str()));
                 cars.xform.insert(idx, (cid, k));
             }
-            println!("bots: {label} — {} poses{}", strip.len(), if flight { ", flight" } else { "" });
+            // THE WALK STRIP, four phases at the robot end. Loaded at the
+            // SAME target scale the robot pose got, because a walk that
+            // resized between phases would breathe exactly the way the fold
+            // used to before one scale was measured for the whole strip.
+            let robot_target = dirs.last().map(|(_, t)| *t).unwrap_or(1.32);
+            let mut walk: Vec<usize> = Vec::new();
+            for k in 0..4usize {
+                let wp = bdir.join(format!("w{k:02}")).join("scene.gltf");
+                if !wp.exists() {
+                    break;
+                }
+                let m = model::load(&wp, &mut gpu, robot_target);
+                let idx = cars.models.len();
+                walk.push(idx);
+                cars.models.push(m);
+                cars.names.push(Box::leak(
+                    format!("{} WALK {k}", label.to_uppercase()).into_boxed_str(),
+                ));
+            }
+            println!(
+                "bots: {label} — {} poses{}{}",
+                strip.len(),
+                if walk.is_empty() { String::new() } else { format!(", {} walk", walk.len()) },
+                if flight { ", flight" } else { "" }
+            );
             cars.chassis.push(Chassis {
                 strip,
+                walk,
                 dirs,
                 joints: joints::load(&bdir.join("joints.json")),
                 scale: {
@@ -2307,6 +2336,27 @@ impl Game {
                 self.cam.combat = false;
             }
         }
+    }
+
+    /// WHICH MODEL TO DRAW while walking.
+    ///
+    /// anim::Locomotion already runs every frame and produces a phase; until
+    /// now the engine read two fields off its Pose and threw the four limb
+    /// angles away. The strip is those angles, baked. So the phase picks a
+    /// frame and the walk finally reaches the screen.
+    ///
+    /// Returns None when the chassis has no walk strip or the bot is not on
+    /// its feet, in which case the caller draws the fold pose as before.
+    fn walk_frame(&self, model: usize) -> Option<usize> {
+        let (cid, k) = *self.cars.xform.get(&model)?;
+        let ch = &self.cars.chassis[cid];
+        // only at the robot end: a walking car is not a thing
+        if ch.walk.is_empty() || k + 1 != ch.strip.len() {
+            return None;
+        }
+        let ph = self.loco_pose.phase.rem_euclid(1.0);
+        let n = ch.walk.len();
+        Some(ch.walk[((ph * n as f32) as usize).min(n - 1)])
     }
 
     /// Size multiplier for a model, 1.0 unless it is a boss.
