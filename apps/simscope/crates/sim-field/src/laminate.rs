@@ -118,23 +118,59 @@ impl Laminate {
         (a, b, d)
     }
 
-    /// Thermal force and moment resultants for a uniform temperature change.
-    pub fn thermal_resultants(&self, delta_t: f64) -> ([f64; 3], [f64; 3]) {
+    /// Thermal resultants for a temperature field varying linearly through the thickness:
+    /// `T(z) = t_mid + slope·z`, with `z` measured from the mid-plane.
+    ///
+    /// The gradient term is what makes this worth generalising. A symmetric laminate heated
+    /// *uniformly* has no thermal moment and stays flat — that is the whole reason for balanced
+    /// stackups. Put a gradient through it and the moment reappears, because the hot face wants to
+    /// expand more than the cold one, and symmetry offers no protection at all.
+    ///
+    /// That is precisely the EUV mask problem: absorbed power is deposited at the multilayer
+    /// surface and conducted away through the blank, so the distortion is driven by a gradient
+    /// rather than by a bulk temperature rise.
+    pub fn thermal_resultants_linear(&self, t_mid: f64, slope: f64) -> ([f64; 3], [f64; 3]) {
         let z = self.z();
         let mut n = [0.0f64; 3];
         let mut m = [0.0f64; 3];
         for (k, ply) in self.plies.iter().enumerate() {
             let q = ply.q();
-            // Free thermal strain is dilatational: no shear component.
-            let e0 = [ply.alpha * delta_t, ply.alpha * delta_t, 0.0];
-            let s: Vec<f64> = (0..3).map(|i| (0..3).map(|j| q[i][j] * e0[j]).sum()).collect();
+            // Unit free thermal strain, dilatational so no shear component.
+            let unit = [ply.alpha, ply.alpha, 0.0];
+            let s: Vec<f64> = (0..3).map(|i| (0..3).map(|j| q[i][j] * unit[j]).sum()).collect();
             let (z0, z1) = (z[k], z[k + 1]);
+            // INTEGRAL T dz and INTEGRAL T z dz over the ply, for T = t_mid + slope*z.
+            let i0 = t_mid * (z1 - z0) + slope * (z1 * z1 - z0 * z0) / 2.0;
+            let i1 = t_mid * (z1 * z1 - z0 * z0) / 2.0 + slope * (z1 * z1 * z1 - z0 * z0 * z0) / 3.0;
             for i in 0..3 {
-                n[i] += s[i] * (z1 - z0);
-                m[i] += s[i] * (z1 * z1 - z0 * z0) / 2.0;
+                n[i] += s[i] * i0;
+                m[i] += s[i] * i1;
             }
         }
         (n, m)
+    }
+
+    /// Thermal force and moment resultants for a uniform temperature change.
+    pub fn thermal_resultants(&self, delta_t: f64) -> ([f64; 3], [f64; 3]) {
+        self.thermal_resultants_linear(delta_t, 0.0)
+    }
+
+    /// Response to a linear through-thickness temperature profile, free of external load.
+    pub fn thermal_response_linear(&self, t_mid: f64, slope: f64) -> Result<Response, String> {
+        let (n, m) = self.thermal_resultants_linear(t_mid, slope);
+        self.solve(n, m)
+    }
+
+    /// Steady temperature difference across the stack when `flux` (W/m²) is absorbed at one face
+    /// and removed at the other: the series thermal resistance of the plies.
+    ///
+    /// Returns `None` if any ply has no conductivity, rather than assuming one.
+    pub fn steady_delta_t(&self, flux: f64, k: &[f64]) -> Option<f64> {
+        if k.len() != self.plies.len() || k.iter().any(|v| *v <= 0.0) {
+            return None;
+        }
+        let r: f64 = self.plies.iter().zip(k).map(|(p, kk)| p.thickness / kk).sum();
+        Some(flux * r)
     }
 
     /// Solve the 6x6 system for mid-plane strain and curvature under given resultants.
@@ -313,6 +349,101 @@ mod tests {
         ]);
         assert!(balanced.is_symmetric());
         assert!(balanced.thermal_response(200.0).unwrap().bow(0.1) < bow * 1e-6);
+    }
+
+    #[test]
+    fn a_through_thickness_gradient_bends_even_a_uniform_plate() {
+        // Exact closed form: an unconstrained homogeneous plate with a linear temperature profile
+        // curves at kappa = alpha * (T_top - T_bot) / h, independent of modulus. That the modulus
+        // drops out is the check worth making — it means the curvature is pure kinematics, and a
+        // result that depended on E would mean the thermal moment and the bending stiffness were
+        // not consistently derived.
+        let (alpha, h) = (23.6e-6, 2.0e-3);
+        let dt_across = 40.0;
+        for e in [70e9, 200e9, 400e9] {
+            let lam = Laminate::new(vec![iso(h, e, 0.3, alpha)]);
+            let r = lam.thermal_response_linear(0.0, dt_across / h).unwrap();
+            let want = alpha * dt_across / h;
+            assert!(
+                (r.curvature[0] - want).abs() / want < 1e-12,
+                "E={e:e}: kappa {} vs {want}",
+                r.curvature[0]
+            );
+            // A pure gradient with zero mean produces curvature but no net stretch.
+            assert!(r.strain[0].abs() < want * h * 1e-9, "mean strain should vanish: {:?}", r.strain);
+        }
+    }
+
+    #[test]
+    fn symmetry_protects_against_uniform_heating_but_not_against_a_gradient() {
+        // The distinction that matters for design. A balanced stackup cannot warp from a bulk
+        // temperature rise — B is identically zero — but it warps freely under a gradient, because
+        // the hot face expands more than the cold one and no amount of symmetry prevents that.
+        let lam = Laminate::new(vec![
+            iso(35e-6, 117e9, 0.34, 16.5e-6),
+            iso(1.5e-3, 22e9, 0.15, 14e-6),
+            iso(35e-6, 117e9, 0.34, 16.5e-6),
+        ]);
+        assert!(lam.is_symmetric());
+        let uniform = lam.thermal_response(100.0).unwrap();
+        assert!(uniform.curvature[0].abs() < 1e-9, "symmetric stack must not warp when heated");
+
+        let h = lam.thickness();
+        let gradient = lam.thermal_response_linear(0.0, 20.0 / h).unwrap();
+        assert!(
+            gradient.curvature[0].abs() > 1e-4,
+            "a 20 K gradient must warp it: {:?}",
+            gradient.curvature
+        );
+    }
+
+    #[test]
+    fn an_euv_mask_distorts_measurably_from_a_few_watts() {
+        // The loop closing back to L3. An EUV mask blank is a 6025 plate of ultra-low-expansion
+        // glass; the multilayer reflects ~70% and the rest is absorbed at the surface, so the
+        // distortion is driven by a through-thickness GRADIENT rather than a bulk rise.
+        //
+        // ULE's CTE is nominally zero, but the specification is a band around zero — and this is
+        // what that band costs. Using the edge of tolerance rather than the nominal value is the
+        // whole point: at exactly zero there is no problem, and the material is never exactly zero.
+        let ule = sim_mat::library::ule_glass();
+        let alpha_worst = ule.thermal.unwrap().alpha.range.unwrap().1; // +3e-8/K
+        let k = ule.thermal.unwrap().k.value;
+        let (side, h) = (0.152, 6.35e-3); // a 6025 blank
+        let absorbed = 2.0; // watts
+        let flux = absorbed / (side * side);
+
+        let lam = Laminate::new(vec![Ply {
+            thickness: h,
+            e: ule.elastic.e_inplane(),
+            nu: ule.elastic.nu_inplane(),
+            alpha: alpha_worst,
+        }]);
+        let dt = lam.steady_delta_t(flux, &[k]).unwrap();
+        assert!(dt > 0.1 && dt < 5.0, "through-thickness gradient of {dt:.3} K");
+
+        let r = lam.thermal_response_linear(0.0, dt / h).unwrap();
+        let bow = r.bow(side);
+        // Out-of-plane bow at the mask becomes overlay error through the 6 degree chief ray:
+        // roughly 2*bow*tan(6deg).
+        let overlay = 2.0 * bow * (6.0f64).to_radians().tan();
+        assert!(bow > 1e-10, "bow {:.2} nm", bow * 1e9);
+        assert!(
+            overlay > 0.1e-9,
+            "overlay contribution {:.2} nm should be significant against a sub-nm budget",
+            overlay * 1e9
+        );
+        // And with a genuinely zero CTE the problem disappears, which is why ULE exists.
+        let perfect = Laminate::new(vec![Ply { alpha: 0.0, ..lam.plies[0] }]);
+        assert!(perfect.thermal_response_linear(0.0, dt / h).unwrap().bow(side) < 1e-18);
+    }
+
+    #[test]
+    fn steady_gradient_is_refused_without_conductivity() {
+        let lam = Laminate::new(vec![iso(1e-3, 70e9, 0.3, 1e-5)]);
+        assert!(lam.steady_delta_t(1000.0, &[]).is_none(), "mismatched length");
+        assert!(lam.steady_delta_t(1000.0, &[0.0]).is_none(), "zero conductivity is not a default");
+        assert!(lam.steady_delta_t(1000.0, &[1.3]).is_some());
     }
 
     #[test]

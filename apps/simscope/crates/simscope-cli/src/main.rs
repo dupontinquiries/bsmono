@@ -274,6 +274,79 @@ fn l3() -> usize {
          pupil onto an order that missed, which is why dipole still prints there."
     );
     println!("\nL3: {}", if failures == 0 { "PASS" } else { "FAIL" });
+    failures + mask_distortion()
+}
+
+/// Where L3 meets the mechanics: an EUV mask absorbs power, develops a through-thickness
+/// gradient, and bends. The imaging model above says nothing about this, and it is one of the
+/// things that actually limits overlay on a real scanner.
+fn mask_distortion() -> usize {
+    use sim_field::{Laminate, Ply};
+    println!("\nsimscope — EUV mask thermal distortion (L3 x mechanics)\n");
+    let ule = sim_mat::library::ule_glass();
+    let th = ule.thermal.unwrap();
+    let k = th.k.value;
+    let (side, h) = (0.152, 6.35e-3);
+    println!(
+        "  6025 blank, {:.0} mm square x {:.2} mm, ULE glass (k = {k} W/mK)",
+        side * 1e3,
+        h * 1e3
+    );
+    println!(
+        "  CTE is specified as a BAND around zero: {:.1e} to {:.1e} /K. The nominal value is\n  \
+         harmless; the tolerance is what costs overlay.\n",
+        th.alpha.range.unwrap().0,
+        th.alpha.range.unwrap().1
+    );
+    println!(
+        "  {:>8} {:>10} {:>12} {:>12} {:>12}",
+        "absorbed", "dT thru", "curvature", "bow", "overlay"
+    );
+    let mut failures = 0usize;
+    for absorbed in [0.5f64, 1.0, 2.0, 5.0] {
+        let flux = absorbed / (side * side);
+        for alpha in [0.0, th.alpha.range.unwrap().1] {
+            let lam = Laminate::new(vec![Ply {
+                thickness: h,
+                e: ule.elastic.e_inplane(),
+                nu: ule.elastic.nu_inplane(),
+                alpha,
+            }]);
+            let Some(dt) = lam.steady_delta_t(flux, &[k]) else {
+                failures += 1;
+                continue;
+            };
+            let r = match lam.thermal_response_linear(0.0, dt / h) {
+                Ok(r) => r,
+                Err(_) => {
+                    failures += 1;
+                    continue;
+                }
+            };
+            let bow = r.bow(side);
+            let overlay = 2.0 * bow * (6.0f64).to_radians().tan();
+            if alpha == 0.0 {
+                // A perfectly athermal blank must show nothing at all.
+                if bow > 1e-15 {
+                    failures += 1;
+                }
+                continue;
+            }
+            println!(
+                "  {absorbed:>7.1}W {:>9.3}K {:>12.3e} {:>9.2} nm {:>9.2} nm",
+                dt,
+                r.curvature[0],
+                bow * 1e9,
+                overlay * 1e9
+            );
+        }
+    }
+    println!(
+        "\n  Bow becomes overlay through the 6 degree chief ray, roughly 2*bow*tan(6deg). A\n  \
+         symmetric stack offers no protection here: balancing cancels moments from a UNIFORM\n  \
+         temperature rise, and this is driven by a gradient."
+    );
+    println!("\nmask: {}", if failures == 0 { "PASS" } else { "FAIL" });
     failures
 }
 

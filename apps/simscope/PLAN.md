@@ -422,8 +422,36 @@ ratio of 0.001.
 - **In-plane isotropic laminae only.** Correct for FR-4 and for a transversely isotropic stack —
   such a material is by definition isotropic in-plane — but ply angles and genuinely orthotropic
   laminae are not modelled, so a fibre-oriented composite cannot be described.
-- **Uniform temperature only.** A through-thickness gradient produces its own curvature and is not
-  handled; that is the EUV mask case, where absorbed power is deposited at the surface.
+- ~~Uniform temperature only.~~ Closed: `thermal_response_linear` handles `T(z) = T_mid + slope·z`,
+  which is the EUV mask case.
 - **No moisture, no cure shrinkage**, both of which warp real boards comparably to CTE mismatch.
 - **Linear elastic.** Copper yields during reflow, so a plastic laminate model is needed before the
   cyclic via-fatigue question can be answered rather than bounded.
+
+
+## EUV mask distortion — L3 meeting the mechanics
+
+The imaging model in L3 says nothing about the mask moving, and on a real scanner that is one of
+the things limiting overlay. A 6025 blank absorbs what the multilayer does not reflect, at the
+*surface*, so the distortion is driven by a **through-thickness gradient** — and symmetry offers no
+protection, because balancing a stackup cancels moments from a uniform rise, not from a gradient.
+
+```
+  absorbed    dT thru    curvature          bow      overlay
+      0.5W     0.105K     4.956e-7      1.43 nm      0.30 nm
+      2.0W     0.420K     1.982e-6      5.73 nm      1.20 nm
+      5.0W     1.049K     4.956e-6     14.31 nm      3.01 nm
+```
+
+Bow becomes overlay through the 6° chief ray, roughly `2·bow·tan(6°)`.
+
+The point the table makes is about **tolerance rather than nominal value**. ULE's CTE is specified
+as a band, −3e-8 to +3e-8 /K, and at exactly zero the distortion vanishes identically — the test
+asserts that. Nothing is ever exactly zero, and the edge of the band turns 0.42 K into 1.2 nm of
+overlay. The material specification is doing the engineering, not the material.
+
+Two structural checks came with it. A homogeneous plate under a linear gradient curves at exactly
+`κ = α ΔT / h`, **independent of modulus** — that E drops out is the real check, since a result that
+depended on stiffness would mean the thermal moment and the bending stiffness were not consistently
+derived. And a symmetric laminate warps freely under a gradient while staying flat under uniform
+heating, which is the design distinction stated as a test.
