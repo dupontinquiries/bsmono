@@ -1,0 +1,15 @@
+[package]
+name = "echelon-runner"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Headless match runner: scripted race AIs, replays, determinism verification"
+
+[dependencies]
+echelon-data = { path = "../echelon-data" }
+echelon-sim = { path = "../echelon-sim" }
+ron.workspace = true
+serde.workspace = true
+echelon-net = { path = "../echelon-net" }
+echelon-bots = { path = "../echelon-bots" }

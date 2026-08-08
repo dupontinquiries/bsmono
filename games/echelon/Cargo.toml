@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/echelon-data", "crates/echelon-sim", "crates/echelon-net", "crates/echelon-bots", "crates/echelon-runner", "crates/echelon-arena", "crates/echelon-deck"]
+exclude = ["client"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Pinned so the workspace builds on distro rustc 1.75 (monorepo convention;
+# see apps/bot-arena for the same pattern). Bump freely on newer toolchains.
+serde = { version = "=1.0.203", features = ["derive"] }
+ron = "=0.8.1"

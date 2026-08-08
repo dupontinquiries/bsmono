@@ -1,0 +1,19 @@
+// Volcanic basalt & cinder. Ember key light over deep slate ambience,
+// wet-basalt sheen (broad specular), heaviest use for Cauldron.
+(
+    name: "ashfall",
+    low: Rgb(42, 38, 36),      low_var: Rgb(58, 55, 51),
+    high: Rgb(55, 48, 42),     high_var: Rgb(66, 57, 49),
+    ramp: Rgb(69, 55, 44),
+    bridge: Rgb(62, 50, 44),
+    cliff: Rgb(23, 21, 26),
+    rock: Rgb(16, 16, 20),
+    grit: 68,
+    sun_dir: (-520, -360, 780),
+    sun: Rgb(255, 150, 84),
+    ambient: Rgb(36, 44, 58),
+    rim: Rgb(120, 44, 30),
+    spec_pow: 12, spec: 26,
+    alloy_glow: Rgb(60, 255, 214),
+    flux_glow: Rgb(176, 108, 255),
+)

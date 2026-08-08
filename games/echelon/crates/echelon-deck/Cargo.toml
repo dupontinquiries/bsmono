@@ -1,0 +1,17 @@
+[package]
+name = "echelon-deck"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+echelon-data = { path = "../echelon-data" }
+echelon-sim = { path = "../echelon-sim" }
+echelon-bots = { path = "../echelon-bots" }
+ron = { workspace = true }
+minifb = { version = "0.25", optional = true }
+
+[features]
+# interactive window on machines with a display; headless tape mode is
+# the default and what CI exercises
+window = ["dep:minifb"]

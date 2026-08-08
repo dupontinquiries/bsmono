@@ -1,0 +1,11 @@
+[package]
+name = "echelon-sim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Deterministic fixed-point lockstep simulation core (no engine deps)"
+
+[dependencies]
+echelon-data = { path = "../echelon-data" }
+serde.workspace = true

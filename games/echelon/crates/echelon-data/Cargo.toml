@@ -1,0 +1,11 @@
+[package]
+name = "echelon-data"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Balance/content definitions + RON loading for the Echelon RTS"
+
+[dependencies]
+serde.workspace = true
+ron.workspace = true

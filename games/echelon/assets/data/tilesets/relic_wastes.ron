@@ -1,0 +1,19 @@
+// Bleached hardpan over buried machinery. Harsh gold key against dusk
+// indigo shadow, driest/most gritty, least specular.
+(
+    name: "relic_wastes",
+    low: Rgb(61, 54, 44),      low_var: Rgb(70, 64, 47),
+    high: Rgb(74, 68, 56),     high_var: Rgb(85, 78, 62),
+    ramp: Rgb(79, 68, 51),
+    bridge: Rgb(70, 60, 46),
+    cliff: Rgb(36, 31, 25),
+    rock: Rgb(26, 23, 18),
+    grit: 74,
+    sun_dir: (-560, -260, 790),
+    sun: Rgb(255, 226, 178),
+    ambient: Rgb(30, 32, 52),
+    rim: Rgb(96, 80, 140),
+    spec_pow: 10, spec: 18,
+    alloy_glow: Rgb(60, 255, 214),
+    flux_glow: Rgb(176, 108, 255),
+)
