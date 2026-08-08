@@ -111,7 +111,10 @@ def base_cmd(iqm, d, k, t):
          # --ribs -1 asks the body what it is: fineness ratio decides whether
          # a rib is an armoured arch or an aerodynamic spar. Vertex-count
          # preserving, so strip parity survives it — unlike --group.
-         "--repair", "--reattach", "--ribs", "-1",
+         # --tuck lifts anything poking below the foot plane. The reported
+         # "legs too short" was never the legs — it was wheels standing 3% of
+         # body height below the feet, so the bot sat on its tyres.
+         "--repair", "--reattach", "--tuck", "--ribs", "-1",
          "--t", f"{t:.4f}"]
     if k == POSES - 1:
         c += ["--joints-json", os.path.join(d, "joints.json")]
@@ -277,7 +280,10 @@ def main():
          # --ribs -1 asks the body what it is: fineness ratio decides whether
          # a rib is an armoured arch or an aerodynamic spar. Vertex-count
          # preserving, so strip parity survives it — unlike --group.
-         "--repair", "--reattach", "--ribs", "-1",
+         # --tuck lifts anything poking below the foot plane. The reported
+         # "legs too short" was never the legs — it was wheels standing 3% of
+         # body height below the feet, so the bot sat on its tyres.
+         "--repair", "--reattach", "--tuck", "--ribs", "-1",
                    "--t", f"{t:.4f}"]
             # THE JOINTS, ONCE PER CHASSIS. They are a property of the rig
             # rather than of a pose, so the robot end writes them and the
