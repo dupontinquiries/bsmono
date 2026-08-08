@@ -605,7 +605,7 @@ is precisely what the LEFM model could not express, and why this module had to e
 - ~~No meshed cohesive elements.~~ Built; see below. A brick-and-mortar RVE with interfaces on
   every platelet boundary is the remaining step.
 - **No arc-length control**, so snap-back is detected and refused rather than traced.
-- **Mode I only.** Mixed-mode needs an effective separation and a mode-mixity criterion.
+- ~~Mode I only.~~ Mixed-mode implemented; see below.
 - **Rate independent**, whereas nacre's organic matrix is viscoelastic and its dissipation is
   rate-dependent — part of why hydration matters so much.
 
@@ -642,5 +642,37 @@ it caps the mesh size here. A sparse indefinite factorisation is the fix and is 
 - **Arc-length control**, since a propagating crack in a compliant structure snaps back.
 - **Sparse indefinite solve**, to afford an RVE large enough to contain a process zone — and the
   process zone length `E G_c / σ_max²` must fit inside the model or the answer is mesh-dependent.
-- **Mixed-mode**, because platelet pull-out is dominated by *shear* on the interface while this
-  models opening.
+- ~~Mixed-mode.~~ Done — the law now takes a normal/tangential separation pair. The meshed
+  `interface` module still assembles opening only.
+
+
+## Mixed mode, and pull-out solved rather than estimated
+
+The effective separation is `sqrt(<δ_n>² + β²δ_t²)`. The Macaulay bracket on the normal term is the
+physics: closing an interface must not damage it, or a compressed crack would heal by being
+squeezed — while sliding damages it either way, which is exactly the case a platelet being dragged
+from its socket lives in.
+
+**The test that makes it trustworthy: every proportional path dissipates exactly `G_c`.** Pure
+opening, pure sliding, and everything between, at three values of β. A law that quietly became
+tougher in shear would flatter any model whose failure is shear-driven — which is precisely nacre's,
+so this is the one place a subtle error would be most rewarded and least noticed.
+
+`β` turns out to separate two concerns cleanly, which is what makes it a usable parameter: it sets
+how much *sliding* it takes to fail an interface without changing how much *energy* that costs. And
+a refactor guard asserts mode I behaviour is bit-identical to before the generalisation.
+
+**Pull-out is now solved rather than estimated.** A platelet bonded along one face, dragged under
+displacement control, with the interface as segments each carrying its own damage — so debonding
+starts at the loaded end and travels. Two things hold: the work equals `G_c` times the bonded
+length, independent of how the debond travelled, and it scales *linearly* with that length. The
+second is why a long thin platelet is worth more than a short fat one, and it is now a solved result
+rather than the shear-lag estimate in `pullout_energy`.
+
+### Still open before a full nacre RVE
+
+- **The meshed `interface` module assembles opening only.** The law is mixed-mode; the element is
+  not. That is the next piece and it is mechanical work.
+- **Arc-length control**, **sparse indefinite solve**, and a process zone (`E G_c / σ_max²`) that
+  fits inside the model — unchanged from the previous entry, and all three are needed together
+  before an RVE is affordable and mesh-independent.

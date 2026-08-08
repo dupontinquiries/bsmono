@@ -147,6 +147,60 @@ impl Cohesive {
     }
 }
 
+/// Separation of an interface, resolved into components.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Separation {
+    /// Opening, positive when the faces move apart.
+    pub normal: f64,
+    /// Sliding along the interface.
+    pub tangent: f64,
+}
+
+impl Cohesive {
+    /// Effective separation for mixed-mode loading:
+    ///
+    /// ```text
+    ///   delta_eff = sqrt( <delta_n>^2 + beta^2 delta_t^2 )
+    /// ```
+    ///
+    /// The Macaulay bracket on the normal term is the physics: closing an interface must not damage
+    /// it, or a compressed crack would heal by being squeezed. Sliding damages it either way, which
+    /// is exactly the case that matters for a platelet being dragged out of its socket.
+    ///
+    /// `beta` weights shear against opening. It is a material parameter of the *interface*, not of
+    /// either bulk phase, and it is one of the numbers a nacre model has to be told rather than
+    /// look up.
+    pub fn effective(&self, s: Separation, beta: f64) -> f64 {
+        let open = s.normal.max(0.0);
+        (open * open + beta * beta * s.tangent * s.tangent).sqrt()
+    }
+
+    /// Normal and tangential tractions under mixed-mode separation.
+    ///
+    /// The traction magnitude comes from the same one-dimensional law evaluated at the effective
+    /// separation, then distributed between the components in proportion to how each contributed.
+    /// A consequence worth checking, and checked below: **every proportional path dissipates
+    /// exactly `G_c`**, whatever the mode mix — the law does not quietly become tougher in shear.
+    pub fn tractions(&self, s: Separation, beta: f64) -> [f64; 2] {
+        let eff = self.effective(s, beta);
+        // Compression is carried by the penalty with no damage, independent of any sliding.
+        let t_n_compression = if s.normal < 0.0 { self.k0 * s.normal } else { 0.0 };
+        if eff <= 0.0 {
+            return [t_n_compression, 0.0];
+        }
+        let t_eff = self.traction(eff);
+        let scale = t_eff / eff;
+        let open = s.normal.max(0.0);
+        [scale * open + t_n_compression, scale * beta * beta * s.tangent]
+    }
+
+    /// Commit damage from a mixed-mode state.
+    pub fn commit_mixed(&mut self, s: Separation, beta: f64) {
+        let eff = self.effective(s, beta);
+        self.commit(eff);
+    }
+}
+
 /// A bar of stiffness `k_bar` in series with a cohesive interface, pulled to a prescribed total
 /// displacement. One unknown — the interface separation — and a nonlinear equation for it.
 struct SeriesInterface {
@@ -199,6 +253,54 @@ pub fn pull(law: Cohesive, k_bar: f64, steps: &[f64]) -> Result<Vec<(f64, f64)>,
         sep = x[0];
         law.commit(sep);
         out.push((sep, law.traction(sep)));
+    }
+    Ok(out)
+}
+
+/// Shear-lag pull-out of a single platelet, solved rather than estimated.
+///
+/// A platelet of length `l` bonded along one face by a cohesive interface, dragged out under
+/// displacement control. The platelet is treated as an elastic bar of stiffness `k_platelet` and
+/// the interface as a row of `n` cohesive segments in parallel, each with its own damage state — so
+/// debonding starts at the loaded end and travels, which is the shear-lag behaviour that makes
+/// aspect ratio matter.
+///
+/// Returns `(pull distance, force)` per step. The area under that curve is the work of pull-out,
+/// and it is the quantity nacre's toughness is made of.
+pub fn pull_out(
+    law: Cohesive,
+    beta: f64,
+    l: f64,
+    n: usize,
+    k_platelet: f64,
+    steps: &[f64],
+) -> Result<Vec<(f64, f64)>, String> {
+    let seg = l / n as f64;
+    let mut laws = vec![law; n];
+    let mut out = Vec::with_capacity(steps.len());
+    for &pull in steps {
+        // Shear lag: segment i has slipped by the pull less the elastic stretch of the platelet
+        // ahead of it. A stiffer platelet transfers load further, which is the whole mechanism.
+        let mut force = 0.0;
+        let mut slips = vec![0.0; n];
+        // Two passes: estimate the force, then redistribute. One fixed-point sweep is enough at
+        // these stiffnesses and keeps the model transparent.
+        for _ in 0..40 {
+            let mut f_acc = 0.0;
+            for i in 0..n {
+                let carried = f_acc; // load already transferred beyond this segment
+                let stretch = carried * (i as f64 * seg) / (k_platelet * l).max(1e-30);
+                let slip = (pull - stretch).max(0.0);
+                slips[i] = slip;
+                let sep = Separation { normal: 0.0, tangent: slip };
+                f_acc += laws[i].tractions(sep, beta)[1] * seg;
+            }
+            force = f_acc;
+        }
+        for i in 0..n {
+            laws[i].commit_mixed(Separation { normal: 0.0, tangent: slips[i] }, beta);
+        }
+        out.push((pull, force));
     }
     Ok(out)
 }
@@ -399,6 +501,131 @@ mod tests {
             pull(l, compliant, &long).is_err(),
             "a compliant structure must be reported as unstable, not silently smoothed"
         );
+    }
+
+    #[test]
+    fn every_proportional_path_dissipates_exactly_the_fracture_energy() {
+        // The property that makes a mixed-mode law trustworthy: pure opening, pure sliding, and
+        // anything between must all dissipate G_c. A law that quietly became tougher in shear
+        // would flatter any model whose failure is shear-driven — which is precisely nacre's.
+        let l = law();
+        for beta in [0.5f64, 1.0, 2.0] {
+            for (a, b) in [(1.0, 0.0), (0.0, 1.0), (1.0, 1.0), (0.3, 0.95)] {
+                let n = 100_000;
+                // March along a straight path in separation space, far enough to fully separate.
+                let s_max = l.delta_f * 3.0 / (a * a + beta * beta * b * b).sqrt().max(1e-9);
+                let mut probe = l;
+                let mut work = 0.0;
+                let mut prev = (0.0f64, 0.0f64, [0.0f64; 2]);
+                for i in 1..=n {
+                    let t = s_max * i as f64 / n as f64;
+                    let sep = Separation { normal: a * t, tangent: b * t };
+                    probe.commit_mixed(sep, beta);
+                    let tr = probe.tractions(sep, beta);
+                    // Trapezoid on T . d(delta).
+                    work += 0.5 * (tr[0] + prev.2[0]) * (sep.normal - prev.0)
+                        + 0.5 * (tr[1] + prev.2[1]) * (sep.tangent - prev.1);
+                    prev = (sep.normal, sep.tangent, tr);
+                }
+                assert!(
+                    (work / l.fracture_energy() - 1.0).abs() < 2e-3,
+                    "beta={beta} path=({a},{b}): dissipated {work:.4} vs G_c {:.4}",
+                    l.fracture_energy()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pure_shear_reaches_the_same_energy_at_a_different_separation() {
+        // beta rescales how much sliding it takes to fail, without changing how much energy that
+        // costs. That separation of concerns is what makes beta a usable knob: it sets the
+        // interface's shear ductility, not its toughness.
+        let l = law();
+        for beta in [0.5f64, 1.0, 2.0] {
+            let mut probe = l;
+            // Slide until the effective separation passes delta_f.
+            let slide = l.delta_f / beta;
+            probe.commit_mixed(Separation { normal: 0.0, tangent: slide * 1.001 }, beta);
+            assert!((probe.dissipated() - l.fracture_energy()).abs() < 1e-9);
+            // A smaller beta means more sliding is needed to fail.
+            let mut half = l;
+            half.commit_mixed(Separation { normal: 0.0, tangent: slide * 0.5 }, beta);
+            assert!(half.damage() < 1.0, "half the sliding must not fully fail it");
+        }
+    }
+
+    #[test]
+    fn compression_does_not_damage_but_sliding_under_compression_does() {
+        // The case a nacre platelet actually lives in: pressed against its neighbours and dragged.
+        // Closing must not damage the interface, or a compressed crack would heal by being
+        // squeezed; sliding must, or pull-out would dissipate nothing.
+        let l = law();
+        let beta = 1.0;
+        let mut pressed = l;
+        pressed.commit_mixed(Separation { normal: -l.delta_f, tangent: 0.0 }, beta);
+        assert_eq!(pressed.damage(), 0.0, "compression alone must not damage");
+        let t = pressed.tractions(Separation { normal: -l.delta_f, tangent: 0.0 }, beta);
+        assert!(t[0] < 0.0, "but interpenetration must still be resisted");
+
+        let mut dragged = l;
+        let sep = Separation { normal: -l.delta_f * 0.1, tangent: l.delta_f * 0.6 };
+        dragged.commit_mixed(sep, beta);
+        assert!(dragged.damage() > 0.0, "sliding under compression must damage");
+        let t = dragged.tractions(sep, beta);
+        assert!(t[1] > 0.0, "and it must resist that sliding");
+        assert!(t[0] < 0.0, "while still carrying the contact pressure");
+    }
+
+    #[test]
+    fn mode_i_is_unchanged_by_the_mixed_mode_generalisation() {
+        // A refactor guard: the one-dimensional behaviour verified earlier must survive exactly.
+        let l = law();
+        for frac in [0.2f64, 0.8, 1.5, 4.0] {
+            let d = l.delta_0() * frac;
+            let mut a = l;
+            a.commit(d);
+            let mut b = l;
+            b.commit_mixed(Separation { normal: d, tangent: 0.0 }, 1.7);
+            assert_eq!(a.damage(), b.damage());
+            let t = b.tractions(Separation { normal: d, tangent: 0.0 }, 1.7);
+            assert!((t[0] - a.traction(d)).abs() < a.sigma_max * 1e-12, "mode I traction changed");
+            assert_eq!(t[1], 0.0, "no shear from pure opening");
+        }
+    }
+
+    #[test]
+    fn a_solved_pull_out_dissipates_its_interfaces_energy_and_scales_with_length() {
+        // The estimate in `pullout_energy` said toughness goes as tau * (l/t) * slip. Here the same
+        // thing is solved with real damage states instead: debonding starts at the loaded end and
+        // travels, and the work done is the area under the force-displacement curve.
+        //
+        // Two things must hold. The work must equal G_c times the bonded LENGTH — conservation,
+        // independent of how the debond travelled. And it must scale linearly with that length,
+        // which is what makes a long thin platelet worth more than a short fat one.
+        let l = Cohesive::from_energy(20.0, 20e6, 1e15);
+        let beta = 1.0;
+        let work_for = |bond: f64| {
+            let steps: Vec<f64> = (1..=400).map(|i| l.delta_f * 6.0 * i as f64 / 400.0).collect();
+            let h = pull_out(l, beta, bond, 40, 1e12, &steps).unwrap();
+            let mut w = 0.0;
+            let mut prev = (0.0, 0.0);
+            for &(d, f) in &h {
+                w += 0.5 * (f + prev.1) * (d - prev.0);
+                prev = (d, f);
+            }
+            (w, h.iter().fold(0.0f64, |m, (_, f)| m.max(*f)))
+        };
+        let (w1, peak1) = work_for(10e-6);
+        let (w2, peak2) = work_for(20e-6);
+
+        assert!(
+            (w1 / (l.fracture_energy() * 10e-6) - 1.0).abs() < 0.05,
+            "work {w1:.3e} vs G_c x length {:.3e}",
+            l.fracture_energy() * 10e-6
+        );
+        assert!((w2 / w1 - 2.0).abs() < 0.1, "work should double with bonded length: {w2:.3e} vs {w1:.3e}");
+        assert!((peak2 / peak1 - 2.0).abs() < 0.15, "so should the peak force");
     }
 
     #[test]
