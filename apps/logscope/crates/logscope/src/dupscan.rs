@@ -168,6 +168,26 @@ mod tests {
 ///
 /// Wired so the scan RUNS rather than merely existing — this module was itself in the unwired list
 /// the day after it was written, which is the joke that makes the point.
+/// Every source file in every sibling crate of this workspace.
+///
+/// **Scoped to the workspace rather than the crate**, because a duplicate detector that only sees
+/// its own crate reports clean while the duplicates sit next door — which is exactly what happened
+/// here for six of them.
+pub fn workspace_items() -> Vec<Item> {
+    let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    // ../ is crates/, whose children are the sibling crates.
+    let Some(crates_dir) = here.parent() else { return Vec::new() };
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(crates_dir) else { return Vec::new() };
+    for e in entries.flatten() {
+        let src = e.path().join("src");
+        if src.is_dir() {
+            if let Ok(items) = scan_dir(&src) { out.extend(items) }
+        }
+    }
+    out
+}
+
 pub fn scan_dir(dir: &std::path::Path) -> std::io::Result<Vec<Item>> {
     let mut out = Vec::new();
     for e in std::fs::read_dir(dir)? {
@@ -195,12 +215,46 @@ mod live_tests {
     /// `Block`, `Budget` in unrelated domains — and demanding zero would mean either a mass rename
     /// nobody wants or a test everyone deletes. A ceiling catches the NEXT one without arguing about
     /// the existing ones.
+    /// The scan must see the crate where the duplicates actually were.
+    ///
+    /// Six duplicate implementations were found BY HAND this session and every one was in gpu-gemm,
+    /// which the scan did not cover — it reported clean the whole time, which is worse than not
+    /// existing because it said the tree was fine.
+    ///
+    /// This asserts the widened scan reaches that crate at all. Without it, someone re-scoping the
+    /// scan to one crate would see every other test still pass.
+    #[test]
+    fn the_scan_reaches_SIBLING_crates_and_not_only_this_one() {
+        let items = workspace_items();
+        if items.is_empty() { return }   // not a source checkout
+        assert!(items.iter().any(|i| i.module.contains("gguf") || i.module.contains("expert_cache")),
+            "the scan is not reaching gpu-gemm, which is where every duplicate found by hand was");
+    }
+
     #[test]
     fn duplicate_names_do_not_grow() {
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let Ok(items) = scan_dir(&dir) else { return };  // not a source checkout; nothing to check
+        // EVERY CRATE IN THE WORKSPACE, not just this one.
+        //
+        // The scan passed all session while six duplicate implementations were found by hand — and
+        // every one of them was in gpu-gemm, which this test never looked at. A duplicate detector
+        // scoped to the crate it lives in cannot see the crate where the duplicates are, and its
+        // passing was worse than its absence: it said the tree was clean.
+        let items = crate::dupscan::workspace_items();
+        if items.is_empty() { return }  // not a source checkout
         let d = duplicates(&items);
-        const CEILING: usize = 92;
+        // 277 is the WORKSPACE figure. The old 92 was this crate alone, and the gap is not 185
+        // new duplicates — it is 185 that were always there and outside the scan's reach.
+        //
+        // A RATCHET, NOT A TARGET. Most of these are generic names that are legitimately distinct
+        // (`Enum Action` in vimmode, toolpipe and chatgesture is three unrelated ideas), so driving
+        // this to zero is neither possible nor desirable. What it must do is not GROW: a new
+        // collision is either two ideas sharing a name, which is a readability cost, or two
+        // implementations of one idea, which is the failure this exists to catch.
+        //
+        // Lowering it means auditing the list, and the ones worth auditing first are same-KIND
+        // collisions in related modules — `Enum Access` in expert_cache and memplan is a candidate;
+        // `Const ALL` in four unrelated modules is not.
+        const CEILING: usize = 277;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
@@ -213,8 +267,8 @@ is what happened seven times this session.\n{}",
         // A ceiling test passes trivially if the scan returns nothing. This is the guard on the
         // guard, and it is the failure mode `--gate-quantref` had when six of eight submit callers
         // incremented no counter and the profile looked clean.
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let Ok(items) = scan_dir(&dir) else { return };
+        let items = crate::dupscan::workspace_items();
+        if items.is_empty() { return }
         assert!(items.len() > 500, "only {} public items found — the scanner is broken, not the tree \
 clean", items.len());
     }
