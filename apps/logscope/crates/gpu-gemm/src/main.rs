@@ -3934,6 +3934,18 @@ a disagreement here would have proved one wrong.");
         println!();
 
         // NOT MEASURABLE HERE, and said so rather than guessed.
+        // MEASURED HERE TOO: what the running kernel's page size means for the view path. Synthetic
+        // offsets at GGUF's 32-byte alignment, because the real answer needs a checkpoint and the
+        // SHAPE of the answer does not.
+        {
+            use gpu_kernels::pagesize::*;
+            let p = running_page_size();
+            let synthetic: Vec<u64> = (0..1000u64).map(|i| 4096 + i * 32).collect();
+            println!("page size: {} KiB", p / 1024);
+            println!("  {}", MapAudit::of(synthetic, p).report());
+            println!();
+        }
+
         println!("still needed from the machine, in the order they constrain each other:");
         for (n, r) in requirements().iter().enumerate() {
             println!("  {}. [{:?}] {}", n + 1, r.stage, r.fact);

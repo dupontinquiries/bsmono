@@ -8555,6 +8555,16 @@ format would save ~{:.1} GiB and is what would make this fit.",
                         eprintln!("loader: MoE experts are a file-view type — reading them as views \
 into the mmap and converting on the GPU, so the host-copy cost below does not apply");
                     }
+                    // Say WHY when views were refused. Without this the plan reports tens of GiB of
+                    // host RAM and nothing indicates the cause, which is how "streaming will hold
+                    // ~50.6 GiB" reads as a fact about the model rather than the consequence of one
+                    // missing GPU decoder.
+                    if !views_ok {
+                        if let Some(why) = crate::memplan::file_view_refusal(
+                            ty("ffn_gate_exps"), ty("ffn_up_exps"), ty("ffn_down_exps")) {
+                            eprintln!("loader: MoE experts CANNOT be file views \u{2014} {why}");
+                        }
+                    }
                     let host_store = if views_ok { 0 } else {
                         (n_expert as u64) * per_expert_all_layers
                     };
