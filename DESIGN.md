@@ -4388,6 +4388,38 @@ references, so the profile is checked rather than assumed.
 That is four measured layers of reference work now: surface, character
 lines, proportion, and plan view.
 
+## 1.134.0 — the roofline, and an axis I nearly got backwards
+
+Side view, measured like the plan view before it: roof height at nine
+stations, normalised to the tallest.
+
+    OCTANE   1.00 0.94 0.66 0.79 0.80 0.74 0.67 0.48 0.39
+    DOMINUS  0.89 0.97 1.00 1.00 0.99 0.72 0.72 0.69 0.62
+
+My first reading was that the references peak at the front while ours peaks
+at the rear — an inversion, and a big change to make. Before making it I
+checked WHICH END IS THE NOSE, because the sampling runs along whichever
+axis is longest and says nothing about direction.
+
+The reference wheel nodes are named FR/FL/BR/BL, and their transforms put
+the FRONT pair at +X. So station 1 is the REAR and station 9 the nose. Read
+correctly, both references are tallest at the rear and lowest at the nose —
+and so are ours. There was no inversion. I nearly corrected a profile that
+was already right, on a table I had oriented by assumption.
+
+WITH THE AXIS RESOLVED, a real gap showed up instead. The references keep
+39% (Octane) and 62% (Dominus) of their tallest height at the nose. Ours
+fell to -12%: the roofline dropped BELOW the body origin, a far sharper
+wedge than either. A nose that tapers to nothing reads as a dart; a car
+keeps some section right to the bumper.
+
+    ours before  0.84 0.99 1.00 0.90 0.71 0.50 0.26 0.05 -0.12
+    ours after   0.84 0.99 1.00 0.90 0.71 0.48 0.21 0.20  0.42
+
+Five measured layers now: surface, character lines, proportion, plan view
+and side view — and this one is the argument for the whole approach. Eyes
+would have called the first reading obvious.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

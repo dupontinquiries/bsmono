@@ -754,6 +754,23 @@ pub fn shell_car(
                 } else {
                     1.0
                 };
+                // AND HOLD THE NOSE UP.
+                //
+                // With the axis resolved, the references keep 39% (Octane)
+                // and 62% (Dominus) of their tallest roof height at the
+                // nose. Ours fell to -12% — the roofline dropped BELOW the
+                // body origin, a far sharper wedge than either. A nose that
+                // tapers to nothing reads as a dart; a car keeps some
+                // section right to the bumper.
+                let roof_max = sections.iter().fold(f32::MIN, |m, s| m.max(s.3));
+                let floor = roof_max * 0.42;
+                let y1 = if y1 < floor {
+                    // lift toward the floor, hardest at the very tip
+                    let end = ((z - z0) / span * 2.0 - 1.0).abs();
+                    y1 + (floor - y1) * (end * end)
+                } else {
+                    y1
+                };
                 (z, hw * arch, y0, y1, r)
             })
             .collect()

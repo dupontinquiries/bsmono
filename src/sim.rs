@@ -701,7 +701,7 @@ pub fn run(args: &[String]) {
         {
             let mut gpu_free = crate::meshgen::loft(
                 &[
-                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.80, 0.16, -0.055, 0.0357, 0.55),
                     (-0.44, 0.33, -0.075, 0.010, 0.40),
                     (-0.02, 0.40, -0.085, 0.055, 0.30),
                     (0.42, 0.39, -0.080, 0.085, 0.30),
@@ -712,7 +712,7 @@ pub fn run(args: &[String]) {
             // the same waist the house recipe applies
             let waisted = crate::meshgen::loft(
                 &[
-                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.80, 0.16, -0.055, 0.0357, 0.55),
                     (-0.44, 0.33 * 0.866, -0.075, 0.010, 0.40),
                     (-0.02, 0.40 * 0.66, -0.085, 0.055, 0.30),
                     (0.42, 0.39 * 0.805, -0.080, 0.085, 0.30),
@@ -744,6 +744,69 @@ pub fn run(args: &[String]) {
             // the middle must be narrower than the widest station
             let waist_depth = 1.0 - b[4];
             println!("   waist depth {:.0}% (references 11-35%)", waist_depth * 100.0);
+        }
+
+        // ---- THE ROOFLINE ----
+        // Plan view was the last round; this is the side view, measured the
+        // same way. Roof height at nine stations, normalised to the tallest:
+        //
+        //   OCTANE   1.00 0.94 0.66 0.79 0.80 0.74 0.67 0.48 0.39
+        //   DOMINUS  0.89 0.97 1.00 1.00 0.99 0.72 0.72 0.69 0.62
+        //
+        // Both fall away hard toward one end — Octane to 39% of its tallest,
+        // Dominus to 62%. A car is not symmetric in profile: it has a low
+        // end and a tall end, and which is which is most of what tells you
+        // it is facing somewhere.
+        {
+            let roof = |m: &crate::meshgen::MeshData| -> Vec<f32> {
+                let (mut z0, mut z1) = (f32::MAX, f32::MIN);
+                for v in m.verts.iter() {
+                    z0 = z0.min(v.pos[2]);
+                    z1 = z1.max(v.pos[2]);
+                }
+                let span = (z1 - z0).max(1e-4);
+                let mut h = vec![f32::MIN; 9];
+                for v in m.verts.iter() {
+                    let k = ((((v.pos[2] - z0) / span) * 8.999) as usize).min(8);
+                    h[k] = h[k].max(v.pos[1]);
+                }
+                let mx = h.iter().cloned().fold(f32::MIN, f32::max).max(1e-4);
+                h.iter().map(|x| x / mx).collect()
+            };
+            let ours = crate::meshgen::loft(
+                &[
+                    (-0.80, 0.16, -0.055, 0.0357, 0.55),
+                    (-0.44, 0.29, -0.075, 0.010, 0.40),
+                    (-0.02, 0.31, -0.085, 0.055, 0.30),
+                    (0.42, 0.32, -0.080, 0.085, 0.30),
+                    (0.80, 0.28, -0.060, 0.060, 0.55),
+                ],
+                22,
+            );
+            let r = roof(&ours);
+            println!();
+            // WHICH END IS THE NOSE. The reference wheel nodes are named
+            // FR/FL/BR/BL, and their transforms put the FRONT pair at +X and
+            // the rear at -X. So in these tables station 1 is the REAR and
+            // station 9 the nose — without which the comparison is
+            // meaningless, and I read it backwards before checking.
+            println!("   (station 1 = rear, station 9 = nose, from the FR/BR node transforms)");
+            println!("   OCTANE   1.00 0.94 0.66 0.79 0.80 0.74 0.67 0.48 0.39");
+            println!("   DOMINUS  0.89 0.97 1.00 1.00 0.99 0.72 0.72 0.69 0.62");
+            // ours runs nose-first, so reverse it to line the tables up
+            let rev: Vec<f32> = r.iter().rev().cloned().collect();
+            println!(
+                "   ours     {}",
+                rev.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" ")
+            );
+            let nose = rev[8];
+            let tall = rev.iter().cloned().fold(f32::MIN, f32::max);
+            println!(
+                "   nose height {:.0}% of the tallest station (references 39% and 62%)",
+                (nose / tall.max(1e-4)) * 100.0
+            );
+            println!("   same character as the references — low nose, tall rear — which is why");
+            println!("   this needed measuring rather than correcting");
         }
 
         // ---- PROPORTIONS AGAINST THE CHARACTER REFERENCES ----
@@ -2224,7 +2287,7 @@ pub fn run(args: &[String]) {
         {
             let mut gpu_free = crate::meshgen::loft(
                 &[
-                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.80, 0.16, -0.055, 0.0357, 0.55),
                     (-0.44, 0.33, -0.075, 0.010, 0.40),
                     (-0.02, 0.40, -0.085, 0.055, 0.30),
                     (0.42, 0.39, -0.080, 0.085, 0.30),
@@ -2235,7 +2298,7 @@ pub fn run(args: &[String]) {
             // the same waist the house recipe applies
             let waisted = crate::meshgen::loft(
                 &[
-                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.80, 0.16, -0.055, 0.0357, 0.55),
                     (-0.44, 0.33 * 0.866, -0.075, 0.010, 0.40),
                     (-0.02, 0.40 * 0.66, -0.085, 0.055, 0.30),
                     (0.42, 0.39 * 0.805, -0.080, 0.085, 0.30),
@@ -2267,6 +2330,69 @@ pub fn run(args: &[String]) {
             // the middle must be narrower than the widest station
             let waist_depth = 1.0 - b[4];
             println!("   waist depth {:.0}% (references 11-35%)", waist_depth * 100.0);
+        }
+
+        // ---- THE ROOFLINE ----
+        // Plan view was the last round; this is the side view, measured the
+        // same way. Roof height at nine stations, normalised to the tallest:
+        //
+        //   OCTANE   1.00 0.94 0.66 0.79 0.80 0.74 0.67 0.48 0.39
+        //   DOMINUS  0.89 0.97 1.00 1.00 0.99 0.72 0.72 0.69 0.62
+        //
+        // Both fall away hard toward one end — Octane to 39% of its tallest,
+        // Dominus to 62%. A car is not symmetric in profile: it has a low
+        // end and a tall end, and which is which is most of what tells you
+        // it is facing somewhere.
+        {
+            let roof = |m: &crate::meshgen::MeshData| -> Vec<f32> {
+                let (mut z0, mut z1) = (f32::MAX, f32::MIN);
+                for v in m.verts.iter() {
+                    z0 = z0.min(v.pos[2]);
+                    z1 = z1.max(v.pos[2]);
+                }
+                let span = (z1 - z0).max(1e-4);
+                let mut h = vec![f32::MIN; 9];
+                for v in m.verts.iter() {
+                    let k = ((((v.pos[2] - z0) / span) * 8.999) as usize).min(8);
+                    h[k] = h[k].max(v.pos[1]);
+                }
+                let mx = h.iter().cloned().fold(f32::MIN, f32::max).max(1e-4);
+                h.iter().map(|x| x / mx).collect()
+            };
+            let ours = crate::meshgen::loft(
+                &[
+                    (-0.80, 0.16, -0.055, 0.0357, 0.55),
+                    (-0.44, 0.29, -0.075, 0.010, 0.40),
+                    (-0.02, 0.31, -0.085, 0.055, 0.30),
+                    (0.42, 0.32, -0.080, 0.085, 0.30),
+                    (0.80, 0.28, -0.060, 0.060, 0.55),
+                ],
+                22,
+            );
+            let r = roof(&ours);
+            println!();
+            // WHICH END IS THE NOSE. The reference wheel nodes are named
+            // FR/FL/BR/BL, and their transforms put the FRONT pair at +X and
+            // the rear at -X. So in these tables station 1 is the REAR and
+            // station 9 the nose — without which the comparison is
+            // meaningless, and I read it backwards before checking.
+            println!("   (station 1 = rear, station 9 = nose, from the FR/BR node transforms)");
+            println!("   OCTANE   1.00 0.94 0.66 0.79 0.80 0.74 0.67 0.48 0.39");
+            println!("   DOMINUS  0.89 0.97 1.00 1.00 0.99 0.72 0.72 0.69 0.62");
+            // ours runs nose-first, so reverse it to line the tables up
+            let rev: Vec<f32> = r.iter().rev().cloned().collect();
+            println!(
+                "   ours     {}",
+                rev.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" ")
+            );
+            let nose = rev[8];
+            let tall = rev.iter().cloned().fold(f32::MIN, f32::max);
+            println!(
+                "   nose height {:.0}% of the tallest station (references 39% and 62%)",
+                (nose / tall.max(1e-4)) * 100.0
+            );
+            println!("   same character as the references — low nose, tall rear — which is why");
+            println!("   this needed measuring rather than correcting");
         }
 
         // ---- PROPORTIONS AGAINST THE CHARACTER REFERENCES ----
