@@ -49,3 +49,30 @@ connect:   bsgames "▶ join" ── resolve session ──▶ game's UDP/enet T
    the fleet DHT instead of a bespoke tracker. unendlich's `UdpTransport` stays the data plane.
 3. **Retire the last bespoke bits.** Anything doing its own peer list (game lobbies) points at the
    snapcore routing table + profiles instead.
+
+## Tournaments — the layer above a match
+
+netcode had `host`, `join`, presence and profiles: everything to get two people
+into ONE match, and nothing about what happens across many. The echelon drop
+describes a "cross-game tournament host" and bsgames runs the centre, so
+`netcode::tournament` is the shared structure rather than any one game's.
+
+Deliberately game-agnostic: it knows entrants, pairings and results, and nothing
+about scores or what winning means. A goal in skydribble, a raid cleared in
+blackstar and a lockstep match in echelon are all different, and a bracket that
+understood any of them would need rewriting for the next.
+
+Three distinctions carry the design:
+
+* **A bye is not a win.** With an odd entrant count somebody advances without
+  playing; counting that as a victory corrupts every statistic downstream and
+  lets a tiebreak on matches-won reward whoever drew the short bracket.
+* **Pending is not a draw.** A tournament that auto-resolved unreported matches
+  would decide outcomes during a network partition — exactly when it should
+  wait, since the match may have been played and the report simply not arrived.
+* **A void is not a draw.** A draw is a result; a void is the absence of one, and
+  counting them together rewards whoever disconnects when losing.
+
+Draws and voids advance NOBODY, and the caller decides what follows — replay,
+coin toss, tiebreak — because that rule differs per game and inventing one here
+would impose it on all of them.
