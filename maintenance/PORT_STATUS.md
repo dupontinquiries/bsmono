@@ -512,3 +512,53 @@ unrunnable front end is less useful than one behind a runnable one.
   as a fact about the week; over four samples it is a fact about four moments.
 * Normalised `y` is 0 at the BOTTOM and the caller flips once. Every call site
   remembering to invert is how half a chart ends up upside down.
+
+## Reported defects, and what I could confirm
+
+A list arrived of things wrong with the ports. Recording what is verified, what
+is reproduced, and what I have not touched — so none of it depends on my memory.
+
+### 1. Input fields accept one character — REPRODUCED, narrowed, NOT fixed
+
+Three probes, in order:
+
+| level | result |
+|---|---|
+| bare `TextEdit`, synthetic keystrokes | accepts every character |
+| `qr::qr_ui`, a real ported page, focused by Tab | accepts every character |
+| `Snapclone::ui`, the whole shell, up to 80 Tab presses | **not one character lands** |
+
+So the widgets are fine and the pages are fine; the fault is in the SHELL, and
+it is worse than reported — not one character rather than exactly one. The
+reproduction lives in `snapclone/egui-frontend/src/lib.rs` as an `#[ignore]`d
+test with the evidence in its doc comment; run it with
+`cargo test -- --ignored typing_into_a_field`.
+
+Prime suspect: `GestureLayer::update` runs across the full surface before the
+pages draw. A layer that interacts with the whole rect every frame is the right
+shape to take focus back between keystrokes. Confirming it means bisecting the
+shell with the gesture layer disabled — the next step, and not something to
+guess at in a commit message.
+
+Worth noting the probe design cost me a wrong answer first: focusing
+`ui.next_auto_id()` from before the page call targets the wrong widget, and
+reported zero characters for a page that actually works. Tab navigation is the
+honest way to focus something you did not build.
+
+### 2. Not yet addressed, and named rather than implied
+
+* **Daemons cannot be built in gitmind.** Untouched.
+* **The app list is incomplete and does not mark egui ports as primary.**
+  `manifest/projects.toml` does have `primary = true` on some egui entries
+  (voiceterm-egui, rusty-board-egui) but not on all of them, and
+  ambient-learner has no entry at all — its audit row still reads
+  `no / no / NO` for binary, app-definition and manifest.
+* **voiceterm has no text input to the terminal.** Partly diagnosed already:
+  control keys are encoded into `App::pending_bytes` and **nothing drains
+  them** — `take_pending_bytes()` has no caller. That is a wire, not a rewrite.
+* **The Qt functionality is missing from the egui voiceterm.** Broad; the parity
+  table's `code` column (55%) is the honest measure of it.
+* **snapclone egui needs camera and voice calls to actually work.** The views
+  are ported — viewfinder, ring, voice bar — but nothing is connected to a
+  capture device or a call session. This is the same class as the glove-mode
+  seams: engines and views exist, the host wiring does not.

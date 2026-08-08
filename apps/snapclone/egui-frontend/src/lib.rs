@@ -1106,6 +1106,61 @@ mod tests {
             media: crate::snaps::Media::Image, thumb_path: String::new() }
     }
 
+    /// REPRODUCTION of the reported "input fields only accept one character".
+    ///
+    /// Ignored so the suite stays green, NOT because it is unimportant — run it
+    /// with `cargo test -- --ignored typing_into_a_field`. It fails, and what it
+    /// proves narrows the bug considerably:
+    ///
+    /// * `TextEdit` in isolation accepts every character (probe in uikit-egui).
+    /// * `qr::qr_ui` — a real ported page — accepts every character once the
+    ///   field is focused by Tab (`qr::input_reality_check`).
+    /// * Through `Snapclone::ui`, with up to 80 Tab presses, **not one
+    ///   character lands**.
+    ///
+    /// So the fault is in the SHELL, not in the widgets or the pages, and it is
+    /// worse than "one character" — it is none. The prime suspect is the
+    /// full-surface `GestureLayer::update` running before the pages: a layer
+    /// that interacts across the whole rect every frame is exactly the shape of
+    /// thing that takes focus back between keystrokes. Confirming that means
+    /// bisecting the shell by disabling the gesture layer, which is the next
+    /// step and not a guess to ship.
+    #[test]
+    #[ignore = "reproduces a real shell-level input bug; see the doc comment"]
+    fn typing_into_a_field_through_the_whole_shell_keeps_every_character() {
+        // The page passes in isolation; this drives the SHELL, which is where a
+        // gesture layer, a modal or an overlay could take focus back between
+        // keystrokes. A field that keeps one character is a field whose focus
+        // was stolen after the first — invisible to any state-machine test.
+        use egui::{Context, Event, RawInput};
+        let ctx = Context::default();
+        let mut app = app();
+        app.nav.go_page(2);                    // Friends: the add-peer form
+        let adaptive = Adaptive::default();
+
+        let mut frame = |ctx: &Context, app: &mut Snapclone, events: Vec<Event>| {
+            let _ = ctx.run(RawInput { events, ..Default::default() }, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| { app.ui(ui, &adaptive); });
+            });
+        };
+        frame(&ctx, &mut app, vec![]);
+
+        // Tab until the host field has focus, then type.
+        let tab = Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true,
+                               repeat: false, modifiers: Default::default() };
+        let mut typed = false;
+        for _ in 0..80 {
+            frame(&ctx, &mut app, vec![tab.clone()]);
+            let before = app.add_form.host.clone();
+            for ch in "abc".chars() {
+                frame(&ctx, &mut app, vec![Event::Text(ch.to_string())]);
+            }
+            if app.add_form.host.len() >= before.len() + 3 { typed = true; break; }
+
+        }
+        assert!(typed, "the shell kept {:?} of three characters", app.add_form.host);
+    }
+
     #[test]
     fn a_double_flick_swaps_the_camera_and_a_single_one_does_not() {
         use uikit_egui::glove::Orient;
