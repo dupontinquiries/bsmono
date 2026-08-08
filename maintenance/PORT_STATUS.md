@@ -653,3 +653,58 @@ themselves.
 The bridge from `gaze-core` to this layer. gaze-core needs OpenCV, so it is a
 host-side poller feeding `GazeSample`s in — the same seam shape as the tilt and
 temperature readers, and honest for the same reason.
+
+## Where gaze would actually get used
+
+The dwell pointer is the RARE use. Dwell-to-click is slower than touch, tiring
+to sustain, and wrong often enough that people abandon it after the demo. It
+earns its place for hands-free operation and nothing else.
+
+The distinction that decides everything is **pointing versus attention**:
+
+| | pointing | attention |
+|---|---|---|
+| calibration | per session | **none** |
+| accuracy needed | ~1° | "a face oriented at the screen" |
+| frame rate | 30–60fps | 2–3fps |
+| cost of being wrong | activates the wrong thing | a few seconds of backlight |
+
+Attention is cheap in every dimension pointing is expensive, and that is what
+makes it deployable on a phone rather than a demo.
+
+### Ranked by how often it would actually fire
+
+1. **Screen dimming (BUILT).** `PostureEngine` dims and blanks from proximity
+   and stillness, which cannot tell reading from absence — sitting still with a
+   long message open looks exactly like an unused phone, so the screensaver
+   fires while you are reading it. Every phone has this bug and everyone works
+   around it by jabbing the screen. Attention is a VETO here, never a trigger:
+   the errors are not symmetric, and a false "not looking" blanks the screen in
+   someone's face.
+
+2. **Which app is being addressed.** `voiced` routes intents by focus scope and
+   takes focus from the compositor. With several windows visible, gaze answers
+   "which one did you just talk to" better than which window was last clicked —
+   and being wrong is cheap, because the compositor's answer is still there as a
+   fallback.
+
+3. **Which pane a voice command means.** voiceterm has split panes and a spoken
+   vocabulary. "Clear" is ambiguous across four panes; the pane being looked at
+   is the referent. No dwell, no calibration precision needed — pane-sized
+   targets are enormous — and the user sees the highlight before speaking.
+
+4. **Notification placement.** Put the banner where the user is not looking. No
+   interaction at all, and a wrong guess costs nothing.
+
+5. **"Seen" that means seen.** A snap marked viewed when it was actually looked
+   at rather than when it rendered. Correct, but privacy-loaded enough that it
+   should be opt-in and is not worth leading with.
+
+### The constraint that shapes all of it
+
+A selfie camera at 30fps to keep a screen awake would cost more battery than the
+screen. Attention needs 2–3fps, no calibration, and tolerates a blurry
+half-turned face — so it is the only variant that can run continuously. Any
+design that needs the pointing pipeline running all day is not deployable, which
+is the real argument for treating the two halves as separate features rather
+than one feature with a quality setting.

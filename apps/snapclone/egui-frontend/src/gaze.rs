@@ -572,3 +572,184 @@ mod tests {
         assert!(uikit_egui::glove::SNAP_RADIUS_PX > 0.0);
     }
 }
+
+// ── attention ───────────────────────────────────────────────────────────────
+
+/// "Is the user looking at this screen?" — the cheap half of gaze.
+///
+/// Everything above this line is POINTING: calibrated, per-session, accurate to
+/// about a degree, and — honestly — a rare interaction. Dwell-to-click is slower
+/// than touch and tiring to sustain, so it earns its place for hands-free
+/// operation and nothing else.
+///
+/// This is the half that gets used every day, and it is cheap in every
+/// dimension pointing is expensive:
+///
+/// * **No calibration.** It asks whether a face is oriented at the screen, not
+///   where on the screen. There is nothing to fit and nothing to drift.
+/// * **No accuracy budget.** A degree of error is irrelevant to a yes/no.
+/// * **Low rate.** Two or three samples a second is plenty, which matters
+///   because the alternative is a selfie camera at 30fps eating the battery of
+///   the phone it is trying to keep awake.
+/// * **Cheap to be wrong.** The worst outcome is a screen that stays on a few
+///   seconds longer.
+///
+/// ## What it is actually for
+///
+/// `PostureEngine` dims and then blanks the screen from proximity and
+/// stillness. Sitting still, reading a long message, is indistinguishable from
+/// not using the phone — so the screensaver fires while you are reading. Every
+/// phone has this bug and everyone works around it by jabbing the screen.
+/// Attention is the missing signal, and it is a VETO rather than a trigger: it
+/// can keep a screen awake, and it can never dim one.
+///
+/// That asymmetry is deliberate. A false "looking" costs a few seconds of
+/// backlight. A false "not looking" blanks the screen in someone's face, and
+/// that is the failure people actually notice.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Attention {
+    /// Seconds of grace after the last confident look.
+    ///
+    /// Generous, because glancing away — at a keyboard, at someone talking to
+    /// you — is not leaving. Shorter than the dim timeout so it never fights it.
+    pub grace_ms: f32,
+    since_seen_ms: f32,
+    /// True once a look has been seen at all.
+    ever: bool,
+}
+
+impl Default for Attention {
+    fn default() -> Self {
+        Attention { grace_ms: 4_000.0, since_seen_ms: f32::INFINITY, ever: false }
+    }
+}
+
+/// Confidence floor for "a face is oriented at the screen".
+///
+/// Lower than `MIN_CONFIDENCE` for pointing on purpose: a blurry, half-turned,
+/// badly-lit face is poor evidence of WHERE someone is looking and perfectly
+/// good evidence THAT they are.
+pub const ATTENTION_CONFIDENCE: f64 = 0.15;
+
+/// How far off-axis the gaze may be and still count as at-screen.
+///
+/// The z component of the unit gaze points toward the camera. 0.5 is roughly
+/// sixty degrees off-axis — deliberately loose, because someone reading the
+/// bottom of a tall phone screen is genuinely looking well off the camera's
+/// axis and must not be treated as having left.
+pub const AT_SCREEN_Z: f64 = 0.5;
+
+impl Attention {
+    /// Feed a sample. Cheap enough to call at 2-3Hz.
+    pub fn feed(&mut self, s: GazeSample, dt_ms: f32) {
+        self.since_seen_ms = self.since_seen_ms.saturating_add_f32(dt_ms);
+        if s.confidence >= ATTENTION_CONFIDENCE && s.gaze[2] >= AT_SCREEN_Z {
+            self.since_seen_ms = 0.0;
+            self.ever = true;
+        }
+    }
+
+    /// No camera, or the tracker stopped. Attention becomes UNKNOWN, and
+    /// unknown must not hold a screen awake forever.
+    pub fn lost(&mut self) { self.since_seen_ms = f32::INFINITY; }
+
+    /// Is the user looking, within the grace window?
+    pub fn present(&self) -> bool { self.ever && self.since_seen_ms <= self.grace_ms }
+
+    /// Time since the last confident look, for a UI that wants to explain
+    /// itself rather than just behaving differently.
+    pub fn since_seen_ms(&self) -> f32 { self.since_seen_ms }
+}
+
+trait SatAdd { fn saturating_add_f32(self, d: f32) -> f32; }
+impl SatAdd for f32 {
+    /// Infinity plus anything is infinity, and that is the wanted behaviour —
+    /// but so is not overflowing a long session into NaN.
+    fn saturating_add_f32(self, d: f32) -> f32 {
+        if self.is_infinite() { self } else { (self + d).min(1.0e9) }
+    }
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+
+    fn looking(t: f64) -> GazeSample {
+        GazeSample { gaze: [0.1, -0.1, 0.95], confidence: 0.8, t_ms: t }
+    }
+    fn away(t: f64) -> GazeSample {
+        GazeSample { gaze: [0.9, 0.1, 0.2], confidence: 0.8, t_ms: t }
+    }
+
+    #[test]
+    fn attention_needs_no_calibration_to_answer() {
+        // The whole reason this half is deployable: there is nothing to fit and
+        // nothing to drift, so it works the first time on any face.
+        let mut a = Attention::default();
+        a.feed(looking(0.0), 300.0);
+        assert!(a.present());
+    }
+
+    #[test]
+    fn a_glance_away_is_not_leaving() {
+        // Looking at a keyboard, or at someone talking to you, must not blank
+        // the screen you are working on.
+        let mut a = Attention::default();
+        a.feed(looking(0.0), 300.0);
+        a.feed(away(300.0), 1_500.0);
+        assert!(a.present(), "still within grace");
+    }
+
+    #[test]
+    fn actually_leaving_ends_attention() {
+        let mut a = Attention::default();
+        a.feed(looking(0.0), 300.0);
+        a.feed(away(300.0), a.grace_ms + 100.0);
+        assert!(!a.present());
+    }
+
+    #[test]
+    fn a_dim_face_still_counts_as_present() {
+        // Poor evidence of WHERE someone is looking is perfectly good evidence
+        // THAT they are — which is why this threshold is below the pointing one.
+        let mut a = Attention::default();
+        a.feed(GazeSample { gaze: [0.0, 0.0, 0.9], confidence: 0.2, t_ms: 0.0 }, 300.0);
+        assert!(a.present());
+        assert!(ATTENTION_CONFIDENCE < MIN_CONFIDENCE);
+    }
+
+    #[test]
+    fn reading_the_bottom_of_a_tall_screen_still_counts() {
+        // Someone reading the bottom of a phone is genuinely well off the
+        // camera's axis. A tight cone would call that "left the room".
+        let mut a = Attention::default();
+        a.feed(GazeSample { gaze: [0.0, -0.75, 0.66], confidence: 0.7, t_ms: 0.0 }, 300.0);
+        assert!(a.present());
+    }
+
+    #[test]
+    fn a_phone_that_never_saw_anyone_is_not_present() {
+        // Otherwise a device with no camera would hold its screen on forever.
+        let a = Attention::default();
+        assert!(!a.present());
+    }
+
+    #[test]
+    fn losing_the_tracker_ends_attention_rather_than_freezing_it() {
+        // Unknown must not hold a screen awake indefinitely.
+        let mut a = Attention::default();
+        a.feed(looking(0.0), 300.0);
+        assert!(a.present());
+        a.lost();
+        assert!(!a.present());
+    }
+
+    #[test]
+    fn a_long_session_does_not_overflow_into_nonsense() {
+        let mut a = Attention::default();
+        a.feed(looking(0.0), 300.0);
+        for _ in 0..100_000 { a.feed(away(0.0), 1_000.0); }
+        assert!(a.since_seen_ms().is_finite());
+        assert!(!a.present());
+    }
+}
