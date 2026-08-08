@@ -112,7 +112,18 @@ def walk_cmd(iqm, d, k):
             "--content", os.path.join(BS, "content"),
             "--veh", os.path.join(DATA, iqm),
             "--gltf", os.path.join(d, f"w{k:02d}"), "--gltf-merge",
-            "--repair", "--reattach", "--tuck", "--seams", "0.03", "--ribs", "-1",
+            # --tuck IS OUT. It measures a part's overhang in the ROBOT pose and
+         # applies the lift in REST space, which is the vehicle frame — so a
+         # part correct in one mode is displaced in the other. Measured: it
+         # shifts blackstar's vehicle extent by 0.0225 while fixing its robot
+         # pose. That is a part detaching from a car to make a bot stand
+         # right, which is the "more detached parts from vehicles" report.
+         #
+         # Tried to fix it by lifting along the rest axis the fold maps onto
+         # world up, and the drift did not move. Out of the export until the
+         # frame conversion is right; the wheels-below-feet problem comes back
+         # and it is the smaller of the two.
+         "--repair", "--reattach", "--seams", "0.03", "--ribs", "-1",
             "--gait", f"{phase:.4f}", "--t", "1.0"]
 
 
@@ -138,7 +149,18 @@ def base_cmd(iqm, d, k, t):
          # It does not touch the reported elbow and shoulder gaps, because
          # those are between parts whose joints are not linked at all — a
          # topology fault wearing a seam's clothes.
-         "--repair", "--reattach", "--tuck", "--seams", "0.03", "--ribs", "-1",
+         # --tuck IS OUT. It measures a part's overhang in the ROBOT pose and
+         # applies the lift in REST space, which is the vehicle frame — so a
+         # part correct in one mode is displaced in the other. Measured: it
+         # shifts blackstar's vehicle extent by 0.0225 while fixing its robot
+         # pose. That is a part detaching from a car to make a bot stand
+         # right, which is the "more detached parts from vehicles" report.
+         #
+         # Tried to fix it by lifting along the rest axis the fold maps onto
+         # world up, and the drift did not move. Out of the export until the
+         # frame conversion is right; the wheels-below-feet problem comes back
+         # and it is the smaller of the two.
+         "--repair", "--reattach", "--seams", "0.03", "--ribs", "-1",
          "--t", f"{t:.4f}"]
     if k == POSES - 1:
         c += ["--joints-json", os.path.join(d, "joints.json")]
@@ -311,7 +333,18 @@ def main():
          # It does not touch the reported elbow and shoulder gaps, because
          # those are between parts whose joints are not linked at all — a
          # topology fault wearing a seam's clothes.
-         "--repair", "--reattach", "--tuck", "--seams", "0.03", "--ribs", "-1",
+         # --tuck IS OUT. It measures a part's overhang in the ROBOT pose and
+         # applies the lift in REST space, which is the vehicle frame — so a
+         # part correct in one mode is displaced in the other. Measured: it
+         # shifts blackstar's vehicle extent by 0.0225 while fixing its robot
+         # pose. That is a part detaching from a car to make a bot stand
+         # right, which is the "more detached parts from vehicles" report.
+         #
+         # Tried to fix it by lifting along the rest axis the fold maps onto
+         # world up, and the drift did not move. Out of the export until the
+         # frame conversion is right; the wheels-below-feet problem comes back
+         # and it is the smaller of the two.
+         "--repair", "--reattach", "--seams", "0.03", "--ribs", "-1",
                    "--t", f"{t:.4f}"]
             # THE JOINTS, ONCE PER CHASSIS. They are a property of the rig
             # rather than of a pose, so the robot end writes them and the
