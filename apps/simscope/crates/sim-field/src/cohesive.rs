@@ -26,6 +26,7 @@
 //! returns along a secant to the origin. Getting that wrong makes a model that heals itself under
 //! cyclic load, which is both unphysical and flattering.
 
+use sim_num::arclength::{trace, ArcOpts, ArcSystem};
 use sim_num::{newton, NewtonOpts, System};
 
 /// A bilinear traction-separation law with damage.
@@ -289,6 +290,68 @@ pub fn pull(law: Cohesive, k_bar: f64, steps: &[f64]) -> Result<Vec<(f64, f64)>,
         out.push((sep, law.traction(sep)));
     }
     Ok(out)
+}
+
+/// The same bar-and-interface, posed for arc-length tracing.
+///
+/// The unknown is the interface separation and the load factor scales a unit force. Because the
+/// path is followed in `(separation, load)` space rather than by prescribing either, the snap-back
+/// that displacement control has to refuse is simply traversed.
+struct ArcInterface {
+    law: Cohesive,
+}
+
+impl ArcSystem for ArcInterface {
+    fn dim(&self) -> usize {
+        1
+    }
+    fn internal(&mut self, u: &[f64], f: &mut [f64]) {
+        // The bar and the interface are in series, so at equilibrium both carry the applied force;
+        // the internal force expressed in terms of the separation alone is the interface traction.
+        f[0] = self.law.traction(u[0]);
+    }
+    fn external(&self) -> Vec<f64> {
+        // The reference load is the cohesive strength, not unity, so the load factor is
+        // dimensionless AND the tracer's tolerance — which it scales by the reference load — lands
+        // at a reachable fraction of a traction measured in pascals.
+        //
+        // This is the third time in this workspace that an absolute tolerance on a dimensional
+        // residual has produced a false non-convergence: the Newton pull, the meshed interface, and
+        // now this. The pattern is worth naming — a tolerance is only meaningful relative to the
+        // scale of the quantity it bounds, and every solver interface should make that scale
+        // explicit rather than leaving the caller to remember.
+        vec![self.law.sigma_max]
+    }
+    fn solve_tangent(&mut self, u: &[f64], rhs: &[f64]) -> Option<Vec<f64>> {
+        let kt = self.law.tangent(u[0]);
+        if kt.abs() < 1e-300 {
+            return None;
+        }
+        Some(vec![rhs[0] / kt])
+    }
+    fn commit(&mut self, u: &[f64]) {
+        self.law.commit(u[0]);
+    }
+}
+
+/// Trace the full response of a cohesive interface, including the softening branch, and return
+/// `(separation, total displacement, force)` at each point.
+///
+/// Total displacement is the separation plus the bar's stretch, which is what an experiment would
+/// measure — and it is that combination that turns back on itself when the bar is compliant.
+pub fn trace_response(law: Cohesive, k_bar: f64, step: f64, max_steps: usize) -> Vec<(f64, f64, f64)> {
+    let mut sys = ArcInterface { law };
+    let path = trace(
+        &mut sys,
+        &[0.0],
+        ArcOpts { step, max_steps, max_iter: 60, tol: 1e-12 },
+    );
+    path.iter()
+        .map(|p| {
+            let force = p.lambda * law.sigma_max;
+            (p.u[0], p.u[0] + force / k_bar, force)
+        })
+        .collect()
 }
 
 /// Shear-lag pull-out of a single platelet, solved rather than estimated.
@@ -672,6 +735,61 @@ mod tests {
             assert!((t[0] - a.traction(d)).abs() < a.sigma_max * 1e-12, "mode I traction changed");
             assert_eq!(t[1], 0.0, "no shear from pure opening");
         }
+    }
+
+    #[test]
+    fn arc_length_traces_the_snap_back_that_displacement_control_must_refuse() {
+        // The gap closed. `pull` refuses a compliant structure because there is no stable
+        // equilibrium at some prescribed displacements — and that refusal was correct. Arc-length
+        // does not prescribe displacement, so it walks straight through.
+        let l = law();
+        let softening = l.sigma_max / (l.delta_f - l.delta_0());
+        let compliant = softening * 0.2; // well inside the snap-back regime
+
+        // Displacement control cannot do it.
+        let reach = l.sigma_max / compliant + l.delta_f * 2.0;
+        let steps: Vec<f64> = (0..300).map(|i| reach * (i + 1) as f64 / 300.0).collect();
+        assert!(pull(l, compliant, &steps).is_err(), "this is a snap-back by construction");
+
+        // Arc-length traces it.
+        let path = trace_response(l, compliant, l.delta_f / 200.0, 900);
+        assert!(path.len() > 100, "path is too short to have gone anywhere: {}", path.len());
+
+        // The separation grows throughout — it is the load and the TOTAL displacement that turn.
+        for w in path.windows(2) {
+            assert!(w[1].0 >= w[0].0 - 1e-18, "separation must advance monotonically");
+        }
+        // The force rises to the cohesive strength and falls away.
+        let peak = path.iter().fold(0.0f64, |m, p| m.max(p.2));
+        assert!((peak / l.sigma_max - 1.0).abs() < 0.05, "peak {peak:e} vs sigma_max {:e}", l.sigma_max);
+        assert!(path.last().unwrap().2 < peak * 0.05, "force must fall away");
+
+        // And the definitive signature: total displacement doubles back. In a snap-back the
+        // structure releases faster than it is pulled, so a testing machine under displacement
+        // control would jump across this stretch rather than follow it.
+        let turned = path.windows(2).any(|w| w[1].1 < w[0].1 - 1e-15);
+        assert!(turned, "a snap-back must show total displacement decreasing somewhere");
+    }
+
+    #[test]
+    fn the_traced_snap_back_still_dissipates_exactly_the_fracture_energy() {
+        // Tracing an unstable path must not change what it costs.
+        let l = law();
+        let compliant = l.sigma_max / (l.delta_f - l.delta_0()) * 0.2;
+        let path = trace_response(l, compliant, l.delta_f / 400.0, 2000);
+        // Work done on the interface, integrated over separation rather than total displacement —
+        // the bar's stretch is recoverable and is not dissipation.
+        let mut work = 0.0;
+        let mut prev = (0.0, 0.0);
+        for &(sep, _, f) in &path {
+            work += 0.5 * (f + prev.1) * (sep - prev.0);
+            prev = (sep, f);
+        }
+        assert!(
+            (work / l.fracture_energy() - 1.0).abs() < 0.05,
+            "traced work {work:.3} vs G_c {:.3}",
+            l.fracture_energy()
+        );
     }
 
     #[test]

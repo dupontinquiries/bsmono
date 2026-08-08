@@ -604,7 +604,7 @@ is precisely what the LEFM model could not express, and why this module had to e
 
 - ~~No meshed cohesive elements.~~ Built; see below. A brick-and-mortar RVE with interfaces on
   every platelet boundary is the remaining step.
-- **No arc-length control**, so snap-back is detected and refused rather than traced.
+- ~~No arc-length control.~~ Implemented; snap-back is now traced.
 - ~~Mode I only.~~ Mixed-mode implemented; see below.
 - **Rate independent**, whereas nacre's organic matrix is viscoelastic and its dissipation is
   rate-dependent — part of why hydration matters so much.
@@ -709,3 +709,42 @@ Unchanged and now genuinely the last three: **arc-length control**, a **sparse i
 and an RVE large enough that the process zone `E G_c / σ_max²` fits inside it. All three are needed
 together — the first to trace propagation, the second to afford the mesh, the third for the answer
 to be mesh-independent rather than merely converged.
+
+
+## Arc-length control
+
+Newton under prescribed load fails at a limit point — past the peak no load produces equilibrium.
+Newton under prescribed displacement fails at a **snap-back**, where the structure releases faster
+than it is pulled and the response turns back in displacement too. Both are real behaviours of
+softening structures, and the cohesive module was correct to refuse them.
+
+Arc-length makes neither load nor displacement the independent variable: it advances a fixed
+distance along the equilibrium path in `(u, λ)` space, so the path can turn however it likes. Rather
+than factorise the bordered system, the tangent is solved twice — against the residual and against
+the reference load — which reduces the constraint to a **quadratic in one scalar**. Choosing between
+its two roots is the entire difficulty: take the wrong one and the solver retraces the path it just
+walked, which *looks like convergence*.
+
+Verified four ways: it traces past a limit point where the load factor must come back down; it does
+**not** invent a snap-back where none exists; every traced point satisfies equilibrium rather than
+merely being where the algorithm stopped; and steps advance by the requested arc length.
+
+Applied to the cohesive interface, the previously-refused case is now traversed, with the definitive
+signature asserted — **total displacement decreases somewhere along the path**, which is what a
+displacement-controlled testing machine would jump across rather than follow. And tracing an
+unstable path does not change what it costs: the traced work still equals `G_c`.
+
+### A pattern worth naming
+
+This was the **third** false non-convergence in the workspace caused by an absolute tolerance on a
+dimensional residual — the 1D cohesive pull, the meshed interface, and now the tracer, whose
+reference load was unity while its residual was a traction in pascals. Each time it presented as a
+solver failure rather than a units error, which is why it kept recurring. **A tolerance is only
+meaningful relative to the scale of the quantity it bounds**, and a solver interface should carry
+that scale explicitly rather than leaving the caller to remember it.
+
+### Remaining for a nacre RVE
+
+Two: a **sparse indefinite solve** to afford the mesh, and an RVE large enough that the process zone
+`E G_c / σ_max²` fits inside it — the latter so the answer is mesh-*independent* rather than merely
+converged.

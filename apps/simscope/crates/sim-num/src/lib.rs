@@ -1,3 +1,4 @@
+pub mod arclength;
 pub mod complex;
 pub mod fft;
 pub mod kernel;
@@ -6,6 +7,7 @@ pub mod newton;
 pub mod sparse;
 pub mod sum;
 
+pub use arclength::{trace, ArcOpts, ArcPoint, ArcSystem};
 pub use complex::{c64, C64};
 pub use fft::{fft, fft2, fftshift, freq, Dir};
 pub use lu::{Lu, LuError};
