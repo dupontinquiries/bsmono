@@ -211,8 +211,18 @@ mod tests {
 ///
 /// **A summary that loses the line numbers is useless**, because the follow-up read is the whole
 /// point of summarising.
+/// **Named `ReadFanPlan`, not `FanPlan`, and that is not a style choice.**
+///
+/// `fanplan.rs` already has a `FanPlan` — with `kind`, `width`, `gib` and a reason line — and I built
+/// this one without noticing. Rust permitted both because they live in different modules, which is
+/// why the collision survived until `dupscan` was written and immediately found it.
+///
+/// They are genuinely different: that one plans INFERENCE lanes and their memory, this one splits
+/// file windows across seats. Two different things wanting one name is the better half of the
+/// duplicate problem — the worse half is two implementations of one thing, and telling them apart is
+/// the point of looking.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct FanPlan {
+pub struct ReadFanPlan {
     /// How many windows each seat summarises.
     pub per_seat: usize,
     /// Seats used. May be fewer than available — starting a seat costs more than it saves for one
@@ -226,17 +236,17 @@ pub struct FanPlan {
 pub const MIN_WINDOWS_TO_FAN: usize = 6;
 
 /// Split windows across fan seats.
-pub fn fan_plan(windows: usize, seats_available: usize) -> FanPlan {
+pub fn fan_plan(windows: usize, seats_available: usize) -> ReadFanPlan {
     if windows < MIN_WINDOWS_TO_FAN || seats_available == 0 {
         // Dispatch, prompt and collect cost more than reading six windows directly. A plan that fans
         // everything looks parallel and is slower.
-        return FanPlan { per_seat: 0, seats: 0, inline: windows };
+        return ReadFanPlan { per_seat: 0, seats: 0, inline: windows };
     }
     let seats = seats_available.min(windows);
-    FanPlan { per_seat: windows.div_ceil(seats), seats, inline: 0 }
+    ReadFanPlan { per_seat: windows.div_ceil(seats), seats, inline: 0 }
 }
 
-impl FanPlan {
+impl ReadFanPlan {
     /// Is the work actually spread, or is this one seat wearing a plan?
     pub fn is_parallel(&self) -> bool { self.seats > 1 }
 
