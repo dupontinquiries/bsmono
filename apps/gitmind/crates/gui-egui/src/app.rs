@@ -154,19 +154,40 @@ impl App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             let surface = ui.max_rect();
-            match self.tab {
-                Tab::Network => pages::network::ui(self, ui),
-            Tab::Share => pages::share::ui(self, ui),
-                Tab::Apps => pages::apps::ui(self, ui),
-                Tab::Import => pages::import::ui(self, ui),
-                Tab::Branches => pages::branches::ui(self, ui),
-                Tab::Files => pages::files::ui(self, ui),
-            Tab::Artifacts => pages::artifacts::ui(self, ui),
-                Tab::Timeline => pages::timeline::ui(self, ui),
-                Tab::Fleet => pages::fleet::ui(self, ui),
-                Tab::Push => pages::push::ui(self, ui),
-                Tab::Settings => pages::settings::ui(self, ui),
-            }
+            // EVERY page scrolls, and it is done HERE rather than in each page.
+            //
+            // Ten of the thirteen pages had no ScrollArea at all, so any list
+            // longer than the viewport was simply unreachable — no scrollbar,
+            // no wheel, no way down. Adding one per page would have meant
+            // thirteen chances to forget, and the fourteenth page would forget
+            // again.
+            //
+            // The scroll id is keyed to the TAB so each page keeps its own
+            // position: switching to Files and back should not scroll Timeline
+            // to the top, which is what a single shared id would do.
+            //
+            // `auto_shrink([false, false])` because a page shorter than the
+            // viewport must still fill it — without this, short pages collapse
+            // to their content height and any bottom-anchored layout inside
+            // them jumps up the screen.
+            egui::ScrollArea::vertical()
+                .id_salt(("gitmind_page", self.tab.label()))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    match self.tab {
+                        Tab::Network => pages::network::ui(self, ui),
+                        Tab::Share => pages::share::ui(self, ui),
+                        Tab::Apps => pages::apps::ui(self, ui),
+                        Tab::Import => pages::import::ui(self, ui),
+                        Tab::Branches => pages::branches::ui(self, ui),
+                        Tab::Files => pages::files::ui(self, ui),
+                        Tab::Artifacts => pages::artifacts::ui(self, ui),
+                        Tab::Timeline => pages::timeline::ui(self, ui),
+                        Tab::Fleet => pages::fleet::ui(self, ui),
+                        Tab::Push => pages::push::ui(self, ui),
+                        Tab::Settings => pages::settings::ui(self, ui),
+                    }
+                });
             // Swipe left/right between tabs on the phone, with the shared detent feel. Enabled only in
             // the compact (bottom-bar) layout; on desktop the sidebar is the nav.
             let frame = self.nav_gesture.update(ui, surface, compact);
