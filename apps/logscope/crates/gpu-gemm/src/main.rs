@@ -2898,7 +2898,7 @@ fn main() {
         let gus: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(100 + l as u32 * 50 + e as u32, 2 * ff * d)).collect()).collect();
         let dns: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(900 + l as u32 * 50 + e as u32, d * ff)).collect()).collect();
         // 4 distinct inputs, cycled 3× = 12 "tokens"
-        let inputs: Vec<Vec<f32>> = (0..4).map(|i| mk(7000 + i as u32, d)).collect();
+        let _inputs: Vec<Vec<f32>> = (0..4).map(|i| mk(7000 + i as u32, d)).collect();
 
         // Routing must actually VARY for prefetch to matter. With random weights every input routes to the
         // same experts (nothing evicts, nothing to prefetch), so drive routing explicitly: an input built as

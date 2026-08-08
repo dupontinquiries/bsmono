@@ -1977,7 +1977,7 @@ impl Gpu {
         let bytes = (t.len() * 4) as u64;
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor { label: Some("dl_u32"), size: bytes,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-        let _keep = if let Some(mut frame) = self.frame.lock().unwrap().take() {
+        let _keep = if let Some(frame) = self.frame.lock().unwrap().take() {
             // DRAIN BEFORE SUBMIT. A queued dispatch that is never encoded is silently dropped —
             // the model would produce output from a partially-executed layer, which is the exact
             // class of failure this codebase has spent a session learning to distrust.
@@ -2920,7 +2920,7 @@ impl Gpu {
         // Remember whether a frame was OPEN, because taking it here is what silently ends batching for
         // everything that follows. See the reopen at the end of this function.
         let had_frame = self.frame.lock().unwrap().is_some();
-        if let Some(mut frame) = self.frame.lock().unwrap().take() {
+        if let Some(frame) = self.frame.lock().unwrap().take() {
             // DRAIN BEFORE SUBMIT. A queued dispatch that is never encoded is silently dropped —
             // the model would produce output from a partially-executed layer, which is the exact
             // class of failure this codebase has spent a session learning to distrust.
@@ -4219,7 +4219,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
 
     /// As `build_moe_stream_raw`, with the gate/up and down source types given.
     pub fn build_moe_stream_raw_typed(&self, gate: &'static [u8], up: &'static [u8], down: &'static [u8],
-        n_expert: usize, ff: usize, d: usize, n_used: usize, ring: usize,
+        n_expert: usize, ff: usize, d: usize, _n_used: usize, ring: usize,
         gu_ty: u32, dn_ty: u32) -> MoeStream {
         let gu_expert_bytes = Self::source_block_bytes(gu_ty, ff * d)
             .expect("a source type this helper can size");
@@ -8907,7 +8907,7 @@ The file is not corrupt; this loader does not recognise its attention layout",
                 // necessary, not sufficient, so this is accepted only when the split form is absent and
                 // the total is exactly right.
                 let want_rows = (attn_dim + 2 * kv) as u64;
-                let mut qkv = if g.tensor(&format!("blk.{i}.attn_q.weight")).is_none() {
+                let qkv = if g.tensor(&format!("blk.{i}.attn_q.weight")).is_none() {
                     let name = format!("blk.{i}.attn_qkv.weight");
                     let t = g.tensor(&name).ok_or_else(|| format!("blk.{i}: neither attn_q nor attn_qkv"))?;
                     let rows = t.dims.last().copied().unwrap_or(0).max(t.dims.first().copied().unwrap_or(0));
