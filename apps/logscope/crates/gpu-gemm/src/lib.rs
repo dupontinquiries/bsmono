@@ -5034,6 +5034,27 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                     expert_cache::layer_can_route(s.policy.pinned_ids(), s.n_expert as u32)
                 })
             });
+        // WHY A LAYER FELL BACK TO v1, said once per model rather than guessed from submit counts.
+        //
+        // v1 pays a blocking readback per layer — 99.9% of the step on Scout — and v2 avoids it
+        // entirely. Which one runs is decided by three facts, and a run that takes v1 currently says
+        // nothing about WHICH of them was false. That is the difference between "Scout is slow" and
+        // "Scout has weight_before, so set LOGSCOPE_MOE_PRESCALE=1 and try again".
+        if t == 1 && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed() {
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !(m.stream.is_none() || layer_resident) || m.cfg.weight_before {
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    let mut why = Vec::new();
+                    if !(m.stream.is_none() || layer_resident) {
+                        why.push("experts are streamed and no layer is fully resident (narrower experts, or a bigger pin budget, would change this)");
+                    }
+                    if m.cfg.weight_before {
+                        why.push("this model scales by the routing weight BEFORE the expert, which the v2 kernel does not implement (LOGSCOPE_MOE_PRESCALE=1 is the untested lever)");
+                    }
+                    eprintln!("wgpu-engine: MoE decode is taking the v1 READBACK path — {}. v1 blocks on a per-layer readback; v2 routes on the GPU with none.", why.join("; and "));
+                }
+            }
+        }
         if t == 1 && (m.stream.is_none() || layer_resident) && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
