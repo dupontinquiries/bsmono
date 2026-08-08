@@ -22,6 +22,9 @@ pub mod grid;
 /// Time-range selection — the audio editor's unit, distinct from clip picking.
 pub mod range;
 
+/// One box for transcript search, commands and routines.
+pub mod palette;
+
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use studio_collab::Doc;
 use studio_core::{ClipId, Project, Ticks, TrackId, TrackKind, TICKS_PER_SECOND};

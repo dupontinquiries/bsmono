@@ -2217,6 +2217,7 @@ dependencies = [
  "studio-core",
  "studio-fx",
  "studio-live",
+ "studio-voice",
  "uikit-egui",
 ]
 
