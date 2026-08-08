@@ -5,20 +5,21 @@
 //! could run. Ported surfaces behind an unrunnable front end are worth less
 //! than one surface behind a runnable one.
 
-use ambient_learner_egui::{ui::egui::history, LiveState};
+use ambient_learner_egui::{ui::egui::{history, locations}, LiveState};
 
 // This eframe requires `ui` as well as `update`; the window host draws from
 // `update` and leaves `ui` empty, matching voiceterm's binary rather than
 // inventing a second convention.
 
 #[derive(PartialEq)]
-enum Page { Live, History }
+enum Page { Live, History, Places }
 
 struct App {
     live: LiveState,
     colors: uikit_egui::PaletteColors,
     page: Page,
     history: history::History,
+    places: locations::LocationsPage,
 }
 
 impl eframe::App for App {
@@ -32,11 +33,19 @@ impl eframe::App for App {
                 // caught in the first place.
                 ui.selectable_value(&mut self.page, Page::Live, "Live");
                 ui.selectable_value(&mut self.page, Page::History, "History");
+                ui.selectable_value(&mut self.page, Page::Places, "Places");
             });
             ui.separator();
             match self.page {
                 Page::Live => self.live.ui(ui),
                 Page::History => history::history_ui(ui, &self.history, &self.colors),
+                Page::Places => {
+                    // The action is dropped: this demo has no backend to
+                    // perform it against. Applying it locally would show a
+                    // place that was never saved, which is the failure the
+                    // page's own tests forbid.
+                    let _ = locations::locations_ui(ui, &mut self.places, &self.colors);
+                }
             }
         });
         // The live view eases toward its target, so it needs frames even when
@@ -60,6 +69,9 @@ fn main() -> eframe::Result<()> {
             // Empty rather than fabricated: the history page says "no readings
             // recorded yet", which is true, instead of drawing invented data.
             history: history::History::default(),
+            // Empty, like the history: the page says "no saved locations, tap +
+            // to add one", which is true, rather than inventing places.
+            places: locations::LocationsPage::default(),
         }))
     }))
 }
