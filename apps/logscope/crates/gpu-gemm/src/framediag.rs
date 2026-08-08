@@ -297,3 +297,46 @@ mod second_leak_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod leak_guard {
+    /// Every `flush_and_wait` on a hot path must reopen the frame it closed.
+    ///
+    /// Two leaks were found by reading, a week apart in effect: the dims-ring wrap, and expert
+    /// streaming at 480 calls per token. Both were `flush_and_wait()` with no reopen, both cost
+    /// two thirds of all submits, and both were invisible because **the frame was correctly opened
+    /// at the top of the decode step** — so every obvious check passed.
+    ///
+    /// A grep is a crude test and it is the right shape here: the failure is a call site MISSING a
+    /// neighbouring line, which no type or trait can express.
+    #[test]
+    fn every_flush_and_wait_is_followed_by_a_conditional_reopen() {
+        let src = include_str!("lib.rs");
+        let mut missing = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            if !line.trim().starts_with("self.flush_and_wait();") { continue }
+            // The reopen must be within a few lines after, and guarded by had_frame.
+            let after: String = src.lines().skip(n + 1).take(4).collect::<Vec<_>>().join("\n");
+            if !(after.contains("had_frame") && after.contains("begin_frame")) {
+                missing.push(n + 1);
+            }
+        }
+        assert!(missing.is_empty(),
+            "flush_and_wait at line(s) {missing:?} ends the frame without reopening it. Everything \
+dispatched after runs on its own encoder until the next decode step — which is how 67% of submits \
+came to have no frame open");
+    }
+
+    /// The reopen must be CONDITIONAL, not unconditional.
+    ///
+    /// A caller that was not in a frame must not acquire one behind its back — `download`'s comment
+    /// establishes that and both new sites follow it. An unconditional `begin_frame` would leave a
+    /// frame open across a caller that never wanted one, and the symptom would be work batched into
+    /// a frame nobody flushes.
+    #[test]
+    fn the_reopens_are_guarded_by_had_frame() {
+        let src = include_str!("lib.rs");
+        let guarded = src.matches("if had_frame && std::env::var_os(\"LOGSCOPE_NO_FRAME_REOPEN\")").count();
+        assert!(guarded >= 2, "expected both reopen sites to be guarded, found {guarded}");
+    }
+}

@@ -4156,7 +4156,18 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                             if std::env::var("LOGSCOPE_STAGE_FENCE").as_deref() == Ok("submit") {
                                 self.end_frame();
                             } else {
+                                // THE SECOND FRAME LEAK, and on Scout the larger one. flush_and_wait ends the frame
+                                // and nothing reopened it, exactly as at the dims-ring wrap — but this runs PER COLD
+                                // EXPERT PER LAYER, which for a 10-cold-expert 48-layer plan is 480 times a token
+                                // against the ring wrap's handful.
+                                //
+                                // Same reopen and the same condition: a caller that was not in a frame must not
+                                // acquire one behind its back.
+                                let had_frame = self.frame.lock().unwrap().is_some();
                                 self.flush_and_wait();
+                                if had_frame && std::env::var_os("LOGSCOPE_NO_FRAME_REOPEN").is_none() {
+                                    self.begin_frame();
+                                }
                             }
                         }
                         s
