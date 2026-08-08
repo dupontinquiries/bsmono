@@ -1,0 +1,9 @@
+[package]
+name = "snapcore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust Kademlia DHT node for the unified monorepo. Routing core; cluster overlay, scheduling, and transport layer on top."
+
+[lib]
+path = "src/lib.rs"

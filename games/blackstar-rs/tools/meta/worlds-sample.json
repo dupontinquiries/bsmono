@@ -1,0 +1,152 @@
+[
+ {
+  "world": {
+   "seed": 12,
+   "gravity_g": 0.308,
+   "air_atm": 0.6481,
+   "terrain": "procedural",
+   "wind_ms": 0.73,
+   "has_ground": true
+  },
+  "roster": [
+   {
+    "id": "flyer_influx_aka_mg_harrier_defender_121_116_00",
+    "name": "Influx",
+    "class": "flyer",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "spaceship_odyssey",
+    "name": "Odyssey",
+    "class": "spaceship",
+    "plausibility": 0.4,
+    "note": "an odd thing to find here"
+   },
+   {
+    "id": "car_hunter_manhattan_custom",
+    "name": "Hunter Manhattan Custom",
+    "class": "car",
+    "plausibility": 0.43,
+    "note": "an odd thing to find here"
+   },
+   {
+    "id": "flyer_skynok",
+    "name": "Skynok",
+    "class": "flyer",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "truck_utilitarian_vehicle",
+    "name": "Utilitarian Vehicle",
+    "class": "truck",
+    "plausibility": 0.43,
+    "note": "an odd thing to find here"
+   },
+   {
+    "id": "grimorph_part13",
+    "name": "Part13",
+    "class": "grimorph",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "flyer_interceptor",
+    "name": "Interceptor",
+    "class": "flyer",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "hoverer_hardwall_aka_dystopian_police_car",
+    "name": "Hardwall",
+    "class": "hoverer",
+    "plausibility": 0.8,
+    "note": "native"
+   },
+   {
+    "id": "flyer_spaceship_ufo_2",
+    "name": "Spaceship Ufo 2",
+    "class": "flyer",
+    "plausibility": 0.5,
+    "note": "native"
+   }
+  ]
+ },
+ {
+  "world": {
+   "seed": 7,
+   "gravity_g": 0.0,
+   "air_atm": 0.0,
+   "terrain": "deep_space",
+   "wind_ms": 0.0,
+   "has_ground": false
+  },
+  "roster": [
+   {
+    "id": "spaceship_albatar",
+    "name": "Albatar",
+    "class": "spaceship",
+    "plausibility": 0.8,
+    "note": "native"
+   },
+   {
+    "id": "spaceship_unitron",
+    "name": "Unitron",
+    "class": "spaceship",
+    "plausibility": 0.8,
+    "note": "native"
+   },
+   {
+    "id": "raidboss_strider_tank",
+    "name": "Strider Tank",
+    "class": "raidboss",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "animal_bot_dimstreak",
+    "name": "Bot Dimstreak",
+    "class": "animal",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "grimorph_part55",
+    "name": "Part55",
+    "class": "grimorph",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "spaceship_supervac",
+    "name": "Supervac",
+    "class": "spaceship",
+    "plausibility": 0.8,
+    "note": "native"
+   },
+   {
+    "id": "flyer_bulwark",
+    "name": "Bulwark",
+    "class": "flyer",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "flyer_interceptor",
+    "name": "Interceptor",
+    "class": "flyer",
+    "plausibility": 0.5,
+    "note": "native"
+   },
+   {
+    "id": "flyer_intervention",
+    "name": "Intervention",
+    "class": "flyer",
+    "plausibility": 0.5,
+    "note": "native"
+   }
+  ]
+ }
+]

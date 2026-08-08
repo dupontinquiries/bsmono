@@ -1,0 +1,5962 @@
+[
+ {
+  "raw": "plan.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "plan",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./plan.zip"
+ },
+ {
+  "raw": "plan2.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "plan2",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./plan2.zip"
+ },
+ {
+  "raw": "plan3.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "plan3",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./plan3.zip"
+ },
+ {
+  "raw": "plan4.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "plan4",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./plan4.zip"
+ },
+ {
+  "raw": "plan5.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "plan5",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./plan5.zip"
+ },
+ {
+  "raw": "omnitrix.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "omnitrix",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./ben-ten/omnitrix.zip"
+ },
+ {
+  "raw": "low_poly_classical_new_york_city_homes.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "low poly classical new york city homes",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/low_poly_classical_new_york_city_homes.zip"
+ },
+ {
+  "raw": "low_poly_construction_assets.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "low poly construction assets",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/low_poly_construction_assets.zip"
+ },
+ {
+  "raw": "nyc_the_high_bridge.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "nyc the high bridge",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/nyc_the_high_bridge.zip"
+ },
+ {
+  "raw": "detailed_old_nyc_building.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "detailed"
+  ],
+  "subtype": null,
+  "name": "detailed old nyc building",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/detailed_old_nyc_building.zip"
+ },
+ {
+  "raw": "low_poly_night_city_building_skyline.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "low poly night city building skyline",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/low_poly_night_city_building_skyline.zip"
+ },
+ {
+  "raw": "city_street.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "city street",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/city_street.zip"
+ },
+ {
+  "raw": "ruined_city_free.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ruined city free",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/ruined_city_free.zip"
+ },
+ {
+  "raw": "brutalist_building.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "brutalist building",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/brutalist_building.zip"
+ },
+ {
+  "raw": "sci-fi_mega_castle_by_jungle_jim.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "sci fi mega castle by jungle jim",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/sci-fi_mega_castle_by_jungle_jim.zip"
+ },
+ {
+  "raw": "brutalist_building-2.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "brutalist building 2",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/brutalist_building-2.zip"
+ },
+ {
+  "raw": "Two California Plaza -  Los Angeles.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Two California Plaza    Los Angeles",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/Two California Plaza -  Los Angeles.zip"
+ },
+ {
+  "raw": "Beverly Hills, California, 323 N Rodeo Drive.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Beverly Hills, California, 323 N Rodeo Drive",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/Beverly Hills, California, 323 N Rodeo Drive.zip"
+ },
+ {
+  "raw": "Mosaic B1 (CS-assets).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Mosaic B1 (CS assets)",
+  "note": null,
+  "category": "structure",
+  "dir": "cities",
+  "path": "./cities/Mosaic B1 (CS-assets).zip"
+ },
+ {
+  "raw": "le_epic_mech.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "le epic mech",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./mechs/le_epic_mech.zip"
+ },
+ {
+  "raw": "exo-armor_monsterup.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "exo armor monsterup",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./mechs/exo-armor_monsterup.zip"
+ },
+ {
+  "raw": "bot--T4B tank tread mech vehicle form.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "T4B tank tread mech vehicle form",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./mechs/bot--T4B tank tread mech vehicle form.zip"
+ },
+ {
+  "raw": "PAQ Quadruped Mech.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "PAQ Quadruped Mech",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./mechs/PAQ Quadruped Mech.zip"
+ },
+ {
+  "raw": "mech--void.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "void",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./mechs/as-is/mech--void.zip"
+ },
+ {
+  "raw": "Mech Constructor_ Heavy Spider (Animated).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "animated"
+  ],
+  "subtype": null,
+  "name": "Mech Constructor  Heavy Spider (Animated)",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./mechs/idk/Mech Constructor_ Heavy Spider (Animated).zip"
+ },
+ {
+  "raw": "call_of_duty_advanced_warfare_-_razorback_vtol.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "call of duty advanced warfare razorback vtol",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/call_of_duty_advanced_warfare_-_razorback_vtol.zip"
+ },
+ {
+  "raw": "call_of_duty_advanced_warfare_-_gaz_cleaner.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "call of duty advanced warfare gaz cleaner",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/call_of_duty_advanced_warfare_-_gaz_cleaner.zip"
+ },
+ {
+  "raw": "call_of_duty_advanced_warfare_-_ec-635.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "call of duty advanced warfare ec 635",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/call_of_duty_advanced_warfare_-_ec-635.zip"
+ },
+ {
+  "raw": "multi-vehicle--Spaceship Constructor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Spaceship Constructor",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/multi-vehicle--Spaceship Constructor.zip"
+ },
+ {
+  "raw": "tank-t-70.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tank t 70",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank-t-70.zip"
+ },
+ {
+  "raw": "tank-lynx_6x6.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tank lynx 6x6",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank-lynx_6x6.zip"
+ },
+ {
+  "raw": "tank-ebr_105_mad_max_mod.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tank ebr 105 mad max mod",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank-ebr_105_mad_max_mod.zip"
+ },
+ {
+  "raw": "tank-the_russian_bmd-4-based_rakushka.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tank the russian bmd 4 based rakushka",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank-the_russian_bmd-4-based_rakushka.zip"
+ },
+ {
+  "raw": "tank-ariete_c1.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tank ariete c1",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank-ariete_c1.zip"
+ },
+ {
+  "raw": "tank--Fiat2000 Italian heavy tank - parade version.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Fiat2000 Italian heavy tank",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--Fiat2000 Italian heavy tank - parade version.zip"
+ },
+ {
+  "raw": "tank--alpine doom.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "alpine doom",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--alpine doom.zip"
+ },
+ {
+  "raw": "tank--boartail.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "boartail",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--boartail.zip"
+ },
+ {
+  "raw": "tank--vanquish-aka T-666 Concept Tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "vanquish",
+  "note": "T-666 Concept Tank",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--vanquish-aka T-666 Concept Tank.zip"
+ },
+ {
+  "raw": "tank--patton- aka scifitank patton.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "patton",
+  "note": "scifitank patton",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--patton- aka scifitank patton.zip"
+ },
+ {
+  "raw": "tank--rollout-aka Sci-fi Tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "rollout",
+  "note": "Sci-fi Tank",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--rollout-aka Sci-fi Tank.zip"
+ },
+ {
+  "raw": "tank--blackshell-aka Cyber Tank (Futuristic_Cyberpunk).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "blackshell",
+  "note": "Cyber Tank (Futuristic_Cyberpunk)",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--blackshell-aka Cyber Tank (Futuristic_Cyberpunk).zip"
+ },
+ {
+  "raw": "SPz Puma.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "SPz Puma",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/SPz Puma.zip"
+ },
+ {
+  "raw": "tank--guzzle-aka  Military AAV.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "guzzle",
+  "note": "Military AAV",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--guzzle-aka  Military AAV.zip"
+ },
+ {
+  "raw": "tank--crusher-aka Grob traktor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "crusher",
+  "note": "Grob traktor",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--crusher-aka Grob traktor.zip"
+ },
+ {
+  "raw": "tank--pepperspray-aka panzerkampfwagen e-175 ausf B, _Fledermaus_.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "pepperspray",
+  "note": "panzerkampfwagen e-175 ausf B, _Fledermaus_",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--pepperspray-aka panzerkampfwagen e-175 ausf B, _Fledermaus_.zip"
+ },
+ {
+  "raw": "tank--riot-aka Anti-Riot Heavy Unit (Futuristic_Cyberpunk).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "riot",
+  "note": "Anti-Riot Heavy Unit (Futuristic_Cyberpunk)",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--riot-aka Anti-Riot Heavy Unit (Futuristic_Cyberpunk).zip"
+ },
+ {
+  "raw": "tank--chokepoint-aka StarCraft inspired Siege Tank Tribute.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "chokepoint",
+  "note": "StarCraft inspired Siege Tank Tribute",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--chokepoint-aka StarCraft inspired Siege Tank Tribute.zip"
+ },
+ {
+  "raw": "tank--hawkeye-aka modern T.I.K. - Battle Tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "hawkeye",
+  "note": "modern T.I.K. - Battle Tank",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--hawkeye-aka modern T.I.K. - Battle Tank.zip"
+ },
+ {
+  "raw": "tank--lockon.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "lockon",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--lockon.zip"
+ },
+ {
+  "raw": "tank--embermane-aka Tank 02 Sci-fi LP.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "embermane",
+  "note": "Tank 02 Sci-fi LP",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--embermane-aka Tank 02 Sci-fi LP.zip"
+ },
+ {
+  "raw": "tank--T-35.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "T",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--T-35.zip"
+ },
+ {
+  "raw": "tank--colossus-aka halo scorpion style tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "colossus",
+  "note": "halo scorpion style tank",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--colossus-aka halo scorpion style tank.zip"
+ },
+ {
+  "raw": "tank--ekmos-aka EK23 TANK + GUN3.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ekmos",
+  "note": "EK23 TANK + GUN3",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--ekmos-aka EK23 TANK + GUN3.zip"
+ },
+ {
+  "raw": "tank--nightprowl-aka the M98A3 Behomoth Concept.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "nightprowl",
+  "note": "the M98A3 Behomoth Concept",
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--nightprowl-aka the M98A3 Behomoth Concept.zip"
+ },
+ {
+  "raw": "tank--fivesix.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "fivesix",
+  "note": null,
+  "category": "vehicle",
+  "dir": "tanks",
+  "path": "./vehicles/tanks/tank--fivesix.zip"
+ },
+ {
+  "raw": "car-2019_porsche_718_boxster_t.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car 2019 porsche 718 boxster t",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-2019_porsche_718_boxster_t.zip"
+ },
+ {
+  "raw": "car-1970_dodge_charger_rt_fast__furious.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car 1970 dodge charger rt fast furious",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-1970_dodge_charger_rt_fast__furious.zip"
+ },
+ {
+  "raw": "car-1970_plymouth_barracuda_440-6.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car 1970 plymouth barracuda 440 6",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-1970_plymouth_barracuda_440-6.zip"
+ },
+ {
+  "raw": "car-1970_alfa_romeo_montreal.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car 1970 alfa romeo montreal",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-1970_alfa_romeo_montreal.zip"
+ },
+ {
+  "raw": "car-1968_alfa_romeo_33_stradale.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car 1968 alfa romeo 33 stradale",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-1968_alfa_romeo_33_stradale.zip"
+ },
+ {
+  "raw": "car-alfa_romeo_disco_volante_speziale_hardtop.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car alfa romeo disco volante speziale hardtop",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-alfa_romeo_disco_volante_speziale_hardtop.zip"
+ },
+ {
+  "raw": "car-alfa_romeo_disco_volante_speziale_coupe.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car alfa romeo disco volante speziale coupe",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-alfa_romeo_disco_volante_speziale_coupe.zip"
+ },
+ {
+  "raw": "car-2026_ferrari_849_testarossa.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car 2026 ferrari 849 testarossa",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-2026_ferrari_849_testarossa.zip"
+ },
+ {
+  "raw": "car-racing-2004_ferrari_f2004.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car racing 2004 ferrari f2004",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-racing-2004_ferrari_f2004.zip"
+ },
+ {
+  "raw": "car-ford_falcon_gt_1973.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car ford falcon gt 1973",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-ford_falcon_gt_1973.zip"
+ },
+ {
+  "raw": "car-widowmaker_-_death_race_2000.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car widowmaker death race 2000",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-widowmaker_-_death_race_2000.zip"
+ },
+ {
+  "raw": "car-madmax_sports_car.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car madmax sports car",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-madmax_sports_car.zip"
+ },
+ {
+  "raw": "car-mad_max_-_desert_rust.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car mad max desert rust",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-mad_max_-_desert_rust.zip"
+ },
+ {
+  "raw": "car-orion_skylark_gt.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car orion skylark gt",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-orion_skylark_gt.zip"
+ },
+ {
+  "raw": "car-2024_lbsilhouette_works_murcielago_gt_evo.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car 2024 lbsilhouette works murcielago gt evo",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-2024_lbsilhouette_works_murcielago_gt_evo.zip"
+ },
+ {
+  "raw": "car-hot_wheels_twin_mill.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car hot wheels twin mill",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-hot_wheels_twin_mill.zip"
+ },
+ {
+  "raw": "car-speed_racers_mach_6.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car speed racers mach 6",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-speed_racers_mach_6.zip"
+ },
+ {
+  "raw": "car-lynx_crabronix_dash_v.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car lynx crabronix dash v",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-lynx_crabronix_dash_v.zip"
+ },
+ {
+  "raw": "car-hunter_manhattan_custom.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car hunter manhattan custom",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car-hunter_manhattan_custom.zip"
+ },
+ {
+  "raw": "car--bruiser-aka-special ops racer.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "bruiser",
+  "note": "special ops racer",
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car--bruiser-aka-special ops racer.zip"
+ },
+ {
+  "raw": "car--prowler.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "prowler",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car--prowler.zip"
+ },
+ {
+  "raw": "racer--grit-aka-rocket car.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "grit",
+  "note": "rocket car",
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/racer--grit-aka-rocket car.zip"
+ },
+ {
+  "raw": "racer--cryofin-aka-slick mobile.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "cryofin",
+  "note": "slick mobile",
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/racer--cryofin-aka-slick mobile.zip"
+ },
+ {
+  "raw": "racer--quickfire.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "quickfire",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/racer--quickfire.zip"
+ },
+ {
+  "raw": "racer--nightvent.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "nightvent",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/racer--nightvent.zip"
+ },
+ {
+  "raw": "car--outback-aka jeep scifi _LAV-D3_.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "outback",
+  "note": "jeep scifi _LAV-D3_",
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car--outback-aka jeep scifi _LAV-D3_.zip"
+ },
+ {
+  "raw": "renault sport r.s. 01.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "renault sport r.s. 01",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/renault sport r.s. 01.zip"
+ },
+ {
+  "raw": "car--1977 Renault Alpine A442.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "1977 Renault Alpine A442",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car--1977 Renault Alpine A442.zip"
+ },
+ {
+  "raw": "racer--reverser-aka wasteland car with gatling gun out the back.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "reverser",
+  "note": "wasteland car with gatling gun out the back",
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/racer--reverser-aka wasteland car with gatling gun out the back.zip"
+ },
+ {
+  "raw": "car--rumbleshock-aka Futuristic Car Rigged.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "rumbleshock",
+  "note": "Futuristic Car Rigged",
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car--rumbleshock-aka Futuristic Car Rigged.zip"
+ },
+ {
+  "raw": "car--Bac mono.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Bac mono",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/car--Bac mono.zip"
+ },
+ {
+  "raw": "1967 Chevrolet Camaro RS 327 V-8.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "1967 Chevrolet Camaro RS 327 V 8",
+  "note": null,
+  "category": "vehicle",
+  "dir": "cars",
+  "path": "./vehicles/cars/1967 Chevrolet Camaro RS 327 V-8.zip"
+ },
+ {
+  "raw": "truck-lynx_nemoxus_twin_v8.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "truck lynx nemoxus twin v8",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck-lynx_nemoxus_twin_v8.zip"
+ },
+ {
+  "raw": "truck-lynx_dominante_av_445.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "truck lynx dominante av 445",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck-lynx_dominante_av_445.zip"
+ },
+ {
+  "raw": "truck-mad_car_8k_resolution.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "truck mad car 8k resolution",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck-mad_car_8k_resolution.zip"
+ },
+ {
+  "raw": "truck-maz-543.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "truck maz 543",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck-maz-543.zip"
+ },
+ {
+  "raw": "truck-2003_peugeot_hoggar_concept.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "truck 2003 peugeot hoggar concept",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck-2003_peugeot_hoggar_concept.zip"
+ },
+ {
+  "raw": "truck-utilitarian_vehicle.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "truck utilitarian vehicle",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck-utilitarian_vehicle.zip"
+ },
+ {
+  "raw": "truck-giant_elephant.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "truck giant elephant",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck-giant_elephant.zip"
+ },
+ {
+  "raw": "truck--dino-truck-tonton.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "dino",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck--dino-truck-tonton.zip"
+ },
+ {
+  "raw": "truck--barrage-aka-M270 Multiple Launch Rocket System.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "barrage",
+  "note": "M270 Multiple Launch Rocket System",
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck--barrage-aka-M270 Multiple Launch Rocket System.zip"
+ },
+ {
+  "raw": "truck--BTR-80.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "BTR",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/trucks/truck--BTR-80.zip"
+ },
+ {
+  "raw": "spaceship-unsc_vorpal_blade_palomino-class_halo_zeo.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "spaceship unsc vorpal blade palomino class halo zeo",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship-unsc_vorpal_blade_palomino-class_halo_zeo.zip"
+ },
+ {
+  "raw": "spaceship--rocket_ship.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "rocket_ship",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--rocket_ship.zip"
+ },
+ {
+  "raw": "spaceship--pax-wind.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "pax",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--pax-wind.zip"
+ },
+ {
+  "raw": "spaceship--cargo-01.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "cargo",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--cargo-01.zip"
+ },
+ {
+  "raw": "spaceship--Unitron.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Unitron",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--Unitron.zip"
+ },
+ {
+  "raw": "spaceship--Albatar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Albatar",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--Albatar.zip"
+ },
+ {
+  "raw": "spaceship--transformers fall of cybertron ark.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "transformers fall of cybertron ark",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--transformers fall of cybertron ark.zip"
+ },
+ {
+  "raw": "spaceship--darkwing.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "darkwing",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--darkwing.zip"
+ },
+ {
+  "raw": "spaceship--nemesis.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "nemesis",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--nemesis.zip"
+ },
+ {
+  "raw": "spaceship--supervac.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "supervac",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--supervac.zip"
+ },
+ {
+  "raw": "3 Decepticon Starships.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "3  Starships",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/3 Decepticon Starships.zip"
+ },
+ {
+  "raw": "spaceship--odyssey.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "odyssey",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--odyssey.zip"
+ },
+ {
+  "raw": "spaceship--pinnacle.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "pinnacle",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--pinnacle.zip"
+ },
+ {
+  "raw": "spaceship--ascendus.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ascendus",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--ascendus.zip"
+ },
+ {
+  "raw": "spaceship--briskfall.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "briskfall",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--briskfall.zip"
+ },
+ {
+  "raw": "spaceship--horizon.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "horizon",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--horizon.zip"
+ },
+ {
+  "raw": "spaceship--unionizer.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "unionizer",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--unionizer.zip"
+ },
+ {
+  "raw": "spaceship--marmot-aka ATT - Multi Troop Transport.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "marmot",
+  "note": "ATT - Multi Troop Transport",
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--marmot-aka ATT - Multi Troop Transport.zip"
+ },
+ {
+  "raw": "spaceship-small--hawkdrop-aka Spaceship (retopology and texturing).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "hawkdrop",
+  "note": "Spaceship (retopology and texturing)",
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship-small--hawkdrop-aka Spaceship (retopology and texturing).zip"
+ },
+ {
+  "raw": "spaceship--praetor-aka spaceship with partial interior.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "praetor",
+  "note": "spaceship with partial interior",
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--praetor-aka spaceship with partial interior.zip"
+ },
+ {
+  "raw": "spaceship--widesky-aka 3km space carrier.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "widesky",
+  "note": "3km space carrier",
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--widesky-aka 3km space carrier.zip"
+ },
+ {
+  "raw": "spaceship--patronus black.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "patronus black",
+  "note": null,
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--patronus black.zip"
+ },
+ {
+  "raw": "spaceship--afterburn-aka large orbital lander.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "afterburn",
+  "note": "large orbital lander",
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--afterburn-aka large orbital lander.zip"
+ },
+ {
+  "raw": "spaceship--warpzone-aka military troop ship.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "warpzone",
+  "note": "military troop ship",
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--warpzone-aka military troop ship.zip"
+ },
+ {
+  "raw": "spaceship--spearhead-aka Rocket Spaceship Concept - Animated.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "animated"
+  ],
+  "subtype": null,
+  "name": "spearhead",
+  "note": "Rocket Spaceship Concept - Animated",
+  "category": "vehicle",
+  "dir": "spaceships",
+  "path": "./vehicles/spaceships/spaceship--spearhead-aka Rocket Spaceship Concept - Animated.zip"
+ },
+ {
+  "raw": "flyer-longsword_precursors_legacy.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "longsword precursors legacy",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-longsword_precursors_legacy.zip"
+ },
+ {
+  "raw": "flyer-mikoyan_mig-25pd_ussr.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "mikoyan mig 25pd ussr",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-mikoyan_mig-25pd_ussr.zip"
+ },
+ {
+  "raw": "flyer-lim-6bis_poland.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "lim 6bis poland",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-lim-6bis_poland.zip"
+ },
+ {
+  "raw": "flyer-sparrowhawk.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "sparrowhawk",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-sparrowhawk.zip"
+ },
+ {
+  "raw": "flyer-pelican.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "pelican",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-pelican.zip"
+ },
+ {
+  "raw": "flyer-einzwht.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "einzwht",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-einzwht.zip"
+ },
+ {
+  "raw": "flyer-ps1low_poly_f-16_fighter_jet_w_animations.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "ps1low poly f 16 fighter jet w animations",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-ps1low_poly_f-16_fighter_jet_w_animations.zip"
+ },
+ {
+  "raw": "flyer--cool-futuristic-flyer.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "cool futuristic flyer",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--cool-futuristic-flyer.zip"
+ },
+ {
+  "raw": "flyer--SPACESHIP UFO 2.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "SPACESHIP UFO 2",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--SPACESHIP UFO 2.zip"
+ },
+ {
+  "raw": "flyer--white-tiger.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "white tiger",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--white-tiger.zip"
+ },
+ {
+  "raw": "flyer--intervention.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "intervention",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--intervention.zip"
+ },
+ {
+  "raw": "flyer--F-14B Tomcat with AIM-54 Phoenix.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "F 14B Tomcat with AIM 54 Phoenix",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--F-14B Tomcat with AIM-54 Phoenix.zip"
+ },
+ {
+  "raw": "flyerF-117 Nighthawk.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "F 117 Nighthawk",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyerF-117 Nighthawk.zip"
+ },
+ {
+  "raw": "flyer--Sea Harrier FA2 with AIM-9L & AIM-120B.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "Sea Harrier FA2 with AIM 9L & AIM 120B",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--Sea Harrier FA2 with AIM-9L & AIM-120B.zip"
+ },
+ {
+  "raw": "flyer-decepticon potential SpaceShip 4.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "potential SpaceShip 4",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-decepticon potential SpaceShip 4.zip"
+ },
+ {
+  "raw": "flyer-valkyrie.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "valkyrie",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-valkyrie.zip"
+ },
+ {
+  "raw": "flyer--speedrunner.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "speedrunner",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--speedrunner.zip"
+ },
+ {
+  "raw": "flyer--splitwing.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "splitwing",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--splitwing.zip"
+ },
+ {
+  "raw": "flyer-pursuer.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "pursuer",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-pursuer.zip"
+ },
+ {
+  "raw": "flyer-hull.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "hull",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-hull.zip"
+ },
+ {
+  "raw": "flyer--2 modes - viper.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "2 modes   viper",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--2 modes - viper.zip"
+ },
+ {
+  "raw": "flyer--wayside.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "wayside",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--wayside.zip"
+ },
+ {
+  "raw": "flyer--planetside.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "planetside",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--planetside.zip"
+ },
+ {
+  "raw": "flyer--bulwark.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "bulwark",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--bulwark.zip"
+ },
+ {
+  "raw": "flyer--splinter.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "splinter",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--splinter.zip"
+ },
+ {
+  "raw": "flyer--freighter.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "freighter",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--freighter.zip"
+ },
+ {
+  "raw": "flyer--perception.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "perception",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--perception.zip"
+ },
+ {
+  "raw": "flyer--nimbus.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "nimbus",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--nimbus.zip"
+ },
+ {
+  "raw": "flyer--red-dot.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "red dot",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--red-dot.zip"
+ },
+ {
+  "raw": "flyer--verisimilitude.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "verisimilitude",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--verisimilitude.zip"
+ },
+ {
+  "raw": "flyer--skyraid.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "skyraid",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--skyraid.zip"
+ },
+ {
+  "raw": "flyer--folley.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "folley",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--folley.zip"
+ },
+ {
+  "raw": "flyer--skytower.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "skytower",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--skytower.zip"
+ },
+ {
+  "raw": "flyer--interceptor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "interceptor",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--interceptor.zip"
+ },
+ {
+  "raw": "flyer--prowler.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "prowler",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--prowler.zip"
+ },
+ {
+  "raw": "flyer--deathstroke.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "deathstroke",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--deathstroke.zip"
+ },
+ {
+  "raw": "flyer--resonator.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "resonator",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--resonator.zip"
+ },
+ {
+  "raw": "flyer--dawnshade.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "dawnshade",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--dawnshade.zip"
+ },
+ {
+  "raw": "flyer--alphastar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "alphastar",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--alphastar.zip"
+ },
+ {
+  "raw": "flyer--darkguard.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "darkguard",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--darkguard.zip"
+ },
+ {
+  "raw": "flyer--doomlift.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "doomlift",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--doomlift.zip"
+ },
+ {
+  "raw": "flyer--skynok.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "skynok",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--skynok.zip"
+ },
+ {
+  "raw": "flyer--shadowscream.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "shadowscream",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--shadowscream.zip"
+ },
+ {
+  "raw": "flyer--kfir c10.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "kfir c10",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--kfir c10.zip"
+ },
+ {
+  "raw": "flyer--C-130J Super Hercules.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "C 130J Super Hercules",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--C-130J Super Hercules.zip"
+ },
+ {
+  "raw": "flyer-vertigo.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "vertigo",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer-vertigo.zip"
+ },
+ {
+  "raw": "flyer--whisperwind-aka F-117 Nighthawk (USA).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "whisperwind",
+  "note": "F-117 Nighthawk (USA)",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--whisperwind-aka F-117 Nighthawk (USA).zip"
+ },
+ {
+  "raw": "flyer--needlenose-aka Chinese Chengdu J-20.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "needlenose",
+  "note": "Chinese Chengdu J-20",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--needlenose-aka Chinese Chengdu J-20.zip"
+ },
+ {
+  "raw": "flyer--batwing-aka Axis Fighter Plane - Wolf. New Order.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "batwing",
+  "note": "Axis Fighter Plane - Wolf. New Order",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--batwing-aka Axis Fighter Plane - Wolf. New Order.zip"
+ },
+ {
+  "raw": "flyer--updraft.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "updraft",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--updraft.zip"
+ },
+ {
+  "raw": "flyer--tercel.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "tercel",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--tercel.zip"
+ },
+ {
+  "raw": "flyer--lonestar-aka bronze space age Combat Jet Animation.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "lonestar",
+  "note": "bronze space age Combat Jet Animation",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--lonestar-aka bronze space age Combat Jet Animation.zip"
+ },
+ {
+  "raw": "flyer--influx-aka MG Harrier Defender 121-116-00.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "influx",
+  "note": "MG Harrier Defender 121-116-00",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--influx-aka MG Harrier Defender 121-116-00.zip"
+ },
+ {
+  "raw": "flyer--forlorn-aka AV-8B (NA) _PROTOTYPE_.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "forlorn",
+  "note": "AV-8B (NA) _PROTOTYPE_",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--forlorn-aka AV-8B (NA) _PROTOTYPE_.zip"
+ },
+ {
+  "raw": "flyer--argentglide-aka S-ER.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "argentglide",
+  "note": "S-ER",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--argentglide-aka S-ER.zip"
+ },
+ {
+  "raw": "flyer--downdraft-aka stealth fighter.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "downdraft",
+  "note": "stealth fighter",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--downdraft-aka stealth fighter.zip"
+ },
+ {
+  "raw": "flyer--hexaust.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "hexaust",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/flyer--hexaust.zip"
+ },
+ {
+  "raw": "[War Thunder] F-16C (Block 50) Fighting Falcon.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "[War Thunder] F 16C (Block 50) Fighting Falcon",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/[War Thunder] F-16C (Block 50) Fighting Falcon.zip"
+ },
+ {
+  "raw": "helicopter--apparition-aka Boeing-Sikorsky RAH-66 Comanche.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "apparition",
+  "note": "Boeing-Sikorsky RAH-66 Comanche",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/helicopters/helicopter--apparition-aka Boeing-Sikorsky RAH-66 Comanche.zip"
+ },
+ {
+  "raw": "heli--eclipse-aka Z-10AG Attack Helicopter.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "eclipse",
+  "note": "Z-10AG Attack Helicopter",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/helicopters/heli--eclipse-aka Z-10AG Attack Helicopter.zip"
+ },
+ {
+  "raw": "flyer--ventride.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "ventride",
+  "note": null,
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/helicopters/flyer--ventride.zip"
+ },
+ {
+  "raw": "heli--stiletto-aka Future Drone 1.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "stiletto",
+  "note": "Future Drone 1",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/helicopters/heli--stiletto-aka Future Drone 1.zip"
+ },
+ {
+  "raw": "slowflyer--skywalker-aka iron ufo.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "skywalker",
+  "note": "iron ufo",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/slow-flyers/slowflyer--skywalker-aka iron ufo.zip"
+ },
+ {
+  "raw": "slowflyer--hellfire-aka Zeppelin from war game.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "hellfire",
+  "note": "Zeppelin from war game",
+  "category": "vehicle",
+  "dir": "flyers",
+  "path": "./vehicles/flyers/slow-flyers/slowflyer--hellfire-aka Zeppelin from war game.zip"
+ },
+ {
+  "raw": "hoverer-a8_glider_hovercar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "hoverer a8 glider hovercar",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer-a8_glider_hovercar.zip"
+ },
+ {
+  "raw": "hoverer--bullhorn.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "bullhorn",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--bullhorn.zip"
+ },
+ {
+  "raw": "hoverer--elegance.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "elegance",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--elegance.zip"
+ },
+ {
+  "raw": "hoverer--blackstar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "blackstar",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--blackstar.zip"
+ },
+ {
+  "raw": "hoverer--beetlejuice.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "beetlejuice",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--beetlejuice.zip"
+ },
+ {
+  "raw": "hoverer--lowride.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "lowride",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--lowride.zip"
+ },
+ {
+  "raw": "hoverer--steelius.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "steelius",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--steelius.zip"
+ },
+ {
+  "raw": "hoverer--trifang.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "trifang",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--trifang.zip"
+ },
+ {
+  "raw": "hoverer--Vulcanus.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Vulcanus",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--Vulcanus.zip"
+ },
+ {
+  "raw": "hoverer--rubble-aka-hover tank scifi.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "rubble",
+  "note": "hover tank scifi",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--rubble-aka-hover tank scifi.zip"
+ },
+ {
+  "raw": "hoverer--matris-aka-elegant hovercar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "matris",
+  "note": "elegant hovercar",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--matris-aka-elegant hovercar.zip"
+ },
+ {
+  "raw": "hoverer--vectorzoid-aka-futuristic shielded hovercar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "vectorzoid",
+  "note": "futuristic shielded hovercar",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--vectorzoid-aka-futuristic shielded hovercar.zip"
+ },
+ {
+  "raw": "hoverer--brutis-aka-hover tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "brutis",
+  "note": "hover tank",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--brutis-aka-hover tank.zip"
+ },
+ {
+  "raw": "hoverer--analog-aka-weaponless scout.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "has_weapon"
+  ],
+  "subtype": null,
+  "name": "analog",
+  "note": "weaponless scout",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--analog-aka-weaponless scout.zip"
+ },
+ {
+  "raw": "hoverer--pinprick-aka-missile barrage hovercar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "pinprick",
+  "note": "missile barrage hovercar",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--pinprick-aka-missile barrage hovercar.zip"
+ },
+ {
+  "raw": "hoverer--folly-aka-land surfer sharp.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "folly",
+  "note": "land surfer sharp",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--folly-aka-land surfer sharp.zip"
+ },
+ {
+  "raw": "hovertank--tempest.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tempest",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hovertank--tempest.zip"
+ },
+ {
+  "raw": "hoverers--shellstike.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "shellstike",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverers--shellstike.zip"
+ },
+ {
+  "raw": "hovertank--whistlewind-aka Hover IFV (PBR).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "pbr"
+  ],
+  "subtype": null,
+  "name": "whistlewind",
+  "note": "Hover IFV (PBR)",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hovertank--whistlewind-aka Hover IFV (PBR).zip"
+ },
+ {
+  "raw": "hoverer--lineback-aka Modular Hover Racers Example.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "lineback",
+  "note": "Modular Hover Racers Example",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--lineback-aka Modular Hover Racers Example.zip"
+ },
+ {
+  "raw": "hoverer--unitus-aka FREE Sci-Fi Vehicle 001 - public domain (CC0).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "unitus",
+  "note": "FREE Sci-Fi Vehicle 001 - public domain (CC0)",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--unitus-aka FREE Sci-Fi Vehicle 001 - public domain (CC0).zip"
+ },
+ {
+  "raw": "hoverer--hardwall-aka Dystopian police car.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "hardwall",
+  "note": "Dystopian police car",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--hardwall-aka Dystopian police car.zip"
+ },
+ {
+  "raw": "hoverer--akimbo-aka Sleek Cyberpunk Car.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "akimbo",
+  "note": "Sleek Cyberpunk Car",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--akimbo-aka Sleek Cyberpunk Car.zip"
+ },
+ {
+  "raw": "hoverer--echotron-aka hover citizen car.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "echotron",
+  "note": "hover citizen car",
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/hoverer--echotron-aka hover citizen car.zip"
+ },
+ {
+  "raw": "hoverer--Contingency.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Contingency",
+  "note": null,
+  "category": "vehicle",
+  "dir": "hoverers",
+  "path": "./vehicles/hoverers/motorcycle-size/hoverer--Contingency.zip"
+ },
+ {
+  "raw": "swimmer--mecha_shark_rig.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "mecha_shark_rig",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/swimmers/swimmer--mecha_shark_rig.zip"
+ },
+ {
+  "raw": "swimmer--Sub Oceanic Hauler.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sub Oceanic Hauler",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/swimmers/swimmer--Sub Oceanic Hauler.zip"
+ },
+ {
+  "raw": "mech--tl-4.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tl",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/mechs/mech--tl-4.zip"
+ },
+ {
+  "raw": "Mech Constructor_ The Defender.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Mech Constructor  The Defender",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/mechs/Mech Constructor_ The Defender.zip"
+ },
+ {
+  "raw": "boat--Super Portaviones.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Super Portaviones",
+  "note": null,
+  "category": "vehicle",
+  "dir": "boats",
+  "path": "./vehicles/boats/boat--Super Portaviones.zip"
+ },
+ {
+  "raw": "Sentoku I-400.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sentoku I 400",
+  "note": null,
+  "category": "vehicle",
+  "dir": "boats",
+  "path": "./vehicles/boats/Sentoku I-400.zip"
+ },
+ {
+  "raw": "boat--MISTRAL CLASS LHD.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "MISTRAL CLASS LHD",
+  "note": null,
+  "category": "vehicle",
+  "dir": "boats",
+  "path": "./vehicles/boats/boat--MISTRAL CLASS LHD.zip"
+ },
+ {
+  "raw": "motorcycle--Kurogane Type 95.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Kurogane Type 95",
+  "note": null,
+  "category": "vehicle",
+  "dir": "vehicles",
+  "path": "./vehicles/motorcycles/motorcycle--Kurogane Type 95.zip"
+ },
+ {
+  "raw": "call_of_duty_mw2019_-_venerated_mil-sim.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "call of duty mw2019 venerated mil sim",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./humanoids/call_of_duty_mw2019_-_venerated_mil-sim.zip"
+ },
+ {
+  "raw": "exo-armor_plunger_cameraman_monsterup.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "exo armor plunger cameraman monsterup",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./humanoids/exo-armor_plunger_cameraman_monsterup.zip"
+ },
+ {
+  "raw": "halo_04.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "halo 04",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./humanoids/halo_04.zip"
+ },
+ {
+  "raw": "humanoid--Realistic Old Russian Guy (animated).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "animated"
+  ],
+  "subtype": null,
+  "name": "Realistic Old Russian Guy",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./humanoids/humanoid--Realistic Old Russian Guy (animated).zip"
+ },
+ {
+  "raw": "astro_armor_titan_speakerman.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "astro armor titan speakerman",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/astro_armor_titan_speakerman.zip"
+ },
+ {
+  "raw": "seperated_titan_cameraman_3.0_armor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "seperated titan cameraman 3.0 armor",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/seperated_titan_cameraman_3.0_armor.zip"
+ },
+ {
+  "raw": "titan_cameraman_3.0_what_if....zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "titan cameraman 3.0 what if...",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/titan_cameraman_3.0_what_if....zip"
+ },
+ {
+  "raw": "plasmas_mechagodzilla_anime_trilogy.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "plasmas mechagodzilla anime trilogy",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/plasmas_mechagodzilla_anime_trilogy.zip"
+ },
+ {
+  "raw": "devastator-good-for-raid-jhiaxus.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "devastator good for raid jhiaxus",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/devastator-good-for-raid-jhiaxus.zip"
+ },
+ {
+  "raw": "raidboss-hussar_tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "hussar tank",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss-hussar_tank.zip"
+ },
+ {
+  "raw": "raid-boss--cherno_alpha.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "cherno alpha",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raid-boss--cherno_alpha.zip"
+ },
+ {
+  "raw": "raid-boss--wuthering_waves_sigillum.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "wuthering waves sigillum",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raid-boss--wuthering_waves_sigillum.zip"
+ },
+ {
+  "raw": "raidboss-hardboil.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "hardboil",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss-hardboil.zip"
+ },
+ {
+  "raw": "raidboss--Strider-Tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "Strider Tank",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--Strider-Tank.zip"
+ },
+ {
+  "raw": "raidboss--trenchmaster.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "trenchmaster",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--trenchmaster.zip"
+ },
+ {
+  "raw": "raidboss--gigadrill.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "gigadrill",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--gigadrill.zip"
+ },
+ {
+  "raw": "raidboss--pyrachnid.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "pyrachnid",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--pyrachnid.zip"
+ },
+ {
+  "raw": "raidboss--tremor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "tremor",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--tremor.zip"
+ },
+ {
+  "raw": "raidboss--primitive-mantis-mech.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "primitive mantis mech",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--primitive-mantis-mech.zip"
+ },
+ {
+  "raw": "raidboss-starlord-aka-human sized transformer with two hammers that are sentry guns.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "starlord",
+  "note": "human sized transformer with two hammers that are sentry guns",
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss-starlord-aka-human sized transformer with two hammers that are sentry guns.zip"
+ },
+ {
+  "raw": "raidboss--scorpion commander transformer reference remove the hat find a scorpion body.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "scorpion commander  reference remove the hat find a scorpion body",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--scorpion commander transformer reference remove the hat find a scorpion body.zip"
+ },
+ {
+  "raw": "raidboss--judgementor-aka large walker tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "raid_boss",
+  "name": "judgementor",
+  "note": "large walker tank",
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/raidboss--judgementor-aka large walker tank.zip"
+ },
+ {
+  "raw": "Sphere Robot.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sphere Robot",
+  "note": null,
+  "category": "raid_boss",
+  "dir": "raid-bosses",
+  "path": "./raid-bosses/Sphere Robot.zip"
+ },
+ {
+  "raw": "the_landscape_is_a_forest_in_the_mountains.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "the landscape is a forest in the mountains",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/the_landscape_is_a_forest_in_the_mountains.zip"
+ },
+ {
+  "raw": "reference--noise-Half Dome, Yosemite.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "noise",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference--noise-Half Dome, Yosemite.zip"
+ },
+ {
+  "raw": "reference--large scale-San Francisco Bay, California.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference--large scale-San Francisco Bay, California.zip"
+ },
+ {
+  "raw": "reference--Environment Asset_ Grassland Hill LowPoly.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Environment Asset_ Grassland Hill LowPoly",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference--Environment Asset_ Grassland Hill LowPoly.zip"
+ },
+ {
+  "raw": "reference--tactical-fortress-placement-aka-Masada Fortress - ISRAEL.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "tactical",
+  "note": "Masada Fortress - ISRAEL",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference--tactical-fortress-placement-aka-Masada Fortress - ISRAEL.zip"
+ },
+ {
+  "raw": "large scale mountains and Glacial Lake.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale mountains and Glacial Lake",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/large scale mountains and Glacial Lake.zip"
+ },
+ {
+  "raw": "reference-terrain--Death Valley - Terrain.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Death Valley",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--Death Valley - Terrain.zip"
+ },
+ {
+  "raw": "reference-terrain--exoplanet desert aka Star Wars_ Binary sunset over Tatooine desert.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "exoplanet desert",
+  "note": "Star Wars_ Binary sunset over Tatooine desert",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--exoplanet desert aka Star Wars_ Binary sunset over Tatooine desert.zip"
+ },
+ {
+  "raw": "reference-terrain-- large scale small section of Mars Landscape.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale small section of Mars Landscape",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain-- large scale small section of Mars Landscape.zip"
+ },
+ {
+  "raw": "reference-terrain-- noise reference aka Serra Do Segredo - Fazenda Pedra Furada.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "noise reference",
+  "note": "Serra Do Segredo - Fazenda Pedra Furada",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain-- noise reference aka Serra Do Segredo - Fazenda Pedra Furada.zip"
+ },
+ {
+  "raw": "reference-terrain-- large scale noise aka Lama lagunar.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale noise",
+  "note": "Lama lagunar",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain-- large scale noise aka Lama lagunar.zip"
+ },
+ {
+  "raw": "reference-terrain--large scale mountain central with even water erosion noise reference aka Mountain Terrain _ Landscape.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale mountain central with even water erosion noise reference",
+  "note": "Mountain Terrain _ Landscape",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--large scale mountain central with even water erosion noise reference aka Mountain Terrain _ Landscape.zip"
+ },
+ {
+  "raw": "reference-terrain--large scale aka Half Dome Terrain _ Landscape.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale",
+  "note": "Half Dome Terrain _ Landscape",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--large scale aka Half Dome Terrain _ Landscape.zip"
+ },
+ {
+  "raw": "reference-terrain--small scale water cave noise aka Forno da Orca.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "small scale water cave noise",
+  "note": "Forno da Orca",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--small scale water cave noise aka Forno da Orca.zip"
+ },
+ {
+  "raw": "reference-terrain-- medium scale - Mossy rock at rocky beach scan (II).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "medium scale",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain-- medium scale - Mossy rock at rocky beach scan (II).zip"
+ },
+ {
+  "raw": "reference-terrain--large scale river bend noise aka Horseshoe Bend,colorado,Grand Canyon,scan,map.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale river bend noise",
+  "note": "Horseshoe Bend,colorado,Grand Canyon,scan,map",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--large scale river bend noise aka Horseshoe Bend,colorado,Grand Canyon,scan,map.zip"
+ },
+ {
+  "raw": "reference-terrain--rock cluster large scale - Falkenstein Table Mountain.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "rock cluster large scale",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--rock cluster large scale - Falkenstein Table Mountain.zip"
+ },
+ {
+  "raw": "Cinematic Canyon Landscape - Canyonized.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Cinematic Canyon Landscape   Canyonized",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/Cinematic Canyon Landscape - Canyonized.zip"
+ },
+ {
+  "raw": "Meteor Crater.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Meteor Crater",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/Meteor Crater.zip"
+ },
+ {
+  "raw": "reference-terrain--cliff face noise aka Torre Sul.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "cliff face noise",
+  "note": "Torre Sul",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--cliff face noise aka Torre Sul.zip"
+ },
+ {
+  "raw": "reference-terrain--nock arch door aka Rocks Set 3.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "nock arch door",
+  "note": "Rocks Set 3",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--nock arch door aka Rocks Set 3.zip"
+ },
+ {
+  "raw": "reference-terrain--rock enclosure aka Rocks set2.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "rock enclosure",
+  "note": "Rocks set2",
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/reference-terrain--rock enclosure aka Rocks set2.zip"
+ },
+ {
+  "raw": "large scale - Sandstone Towers.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "large scale   Sandstone Towers",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/large scale - Sandstone Towers.zip"
+ },
+ {
+  "raw": "water erosion and landscape noise - Iceland Landscape.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "water erosion and landscape noise   Iceland Landscape",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/water erosion and landscape noise - Iceland Landscape.zip"
+ },
+ {
+  "raw": "noise reference -- Red Canyon Landscape.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Red Canyon Landscape",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/noise reference -- Red Canyon Landscape.zip"
+ },
+ {
+  "raw": "stone and water texture mapping example -- Leavitt Creek, Sonora Pass California.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Leavitt Creek",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/stone and water texture mapping example -- Leavitt Creek, Sonora Pass California.zip"
+ },
+ {
+  "raw": "noise reference--Bathymetry Hunga Tonga-Hunga Ha\u2019apai.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Bathymetry Hunga Tonga",
+  "note": null,
+  "category": "terrain",
+  "dir": "terrains",
+  "path": "./terrains/noise reference--Bathymetry Hunga Tonga-Hunga Ha\u2019apai.zip"
+ },
+ {
+  "raw": "benelli_m3_tactical.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "benelli m3 tactical",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/benelli_m3_tactical.zip"
+ },
+ {
+  "raw": "bumblebee_weapon_pack.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "has_weapon"
+  ],
+  "subtype": null,
+  "name": "bumblebee weapon pack",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/bumblebee_weapon_pack.zip"
+ },
+ {
+  "raw": "Ultra Magnus Hammer from Transformers.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Ultra Magnus Hammer from",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/Ultra Magnus Hammer from Transformers.zip"
+ },
+ {
+  "raw": "blaster weapon part or jet turbine transform.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "has_weapon"
+  ],
+  "subtype": null,
+  "name": "blaster weapon part or jet turbine transform",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster weapon part or jet turbine transform.zip"
+ },
+ {
+  "raw": "missile--energy_crystal_aether_rod.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "energy_crystal_aether_rod",
+  "note": null,
+  "category": "weapon",
+  "dir": "missiles",
+  "path": "./weapons/missiles/missile--energy_crystal_aether_rod.zip"
+ },
+ {
+  "raw": "flyer missile human.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "flyer",
+  "name": "missile human",
+  "note": null,
+  "category": "weapon",
+  "dir": "missiles",
+  "path": "./weapons/missiles/flyer missile human.zip"
+ },
+ {
+  "raw": "missile--Sci-fi Rocket missile 07 (Heavy).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sci",
+  "note": null,
+  "category": "weapon",
+  "dir": "missiles",
+  "path": "./weapons/missiles/missile--Sci-fi Rocket missile 07 (Heavy).zip"
+ },
+ {
+  "raw": "missile--thunderpod.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "thunderpod",
+  "note": null,
+  "category": "weapon",
+  "dir": "missiles",
+  "path": "./weapons/missiles/missile--thunderpod.zip"
+ },
+ {
+  "raw": "missile--seeker.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "seeker",
+  "note": null,
+  "category": "weapon",
+  "dir": "missiles",
+  "path": "./weapons/missiles/missile--seeker.zip"
+ },
+ {
+  "raw": "missile--piercer.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "piercer",
+  "note": null,
+  "category": "weapon",
+  "dir": "missiles",
+  "path": "./weapons/missiles/missile--piercer.zip"
+ },
+ {
+  "raw": "Zweihander.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Zweihander",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/swords/Zweihander.zip"
+ },
+ {
+  "raw": "Ancient Bronze Sword Liptov.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Ancient Bronze Sword Liptov",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/swords/Ancient Bronze Sword Liptov.zip"
+ },
+ {
+  "raw": "Titanium Great Sword.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Titanium Great Sword",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/swords/Titanium Great Sword.zip"
+ },
+ {
+  "raw": "Caliburn_Excalibur.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Caliburn Excalibur",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/swords/Caliburn_Excalibur.zip"
+ },
+ {
+  "raw": "Caiman Rail-Slasher - 3D Model Stylized Weapon.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "has_weapon"
+  ],
+  "subtype": null,
+  "name": "Caiman Rail Slasher   3D Model Stylized Weapon",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/swords/Caiman Rail-Slasher - 3D Model Stylized Weapon.zip"
+ },
+ {
+  "raw": "low-poly PDR-C.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "low_poly"
+  ],
+  "subtype": null,
+  "name": "low poly PDR C",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/low-poly PDR-C.zip"
+ },
+ {
+  "raw": "low-poly AKDAS SA-9.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "low_poly"
+  ],
+  "subtype": null,
+  "name": "low poly AKDAS SA 9",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/low-poly AKDAS SA-9.zip"
+ },
+ {
+  "raw": "Blaster concept.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Blaster concept",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/Blaster concept.zip"
+ },
+ {
+  "raw": "Anime scifi blaster 1.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Anime scifi blaster 1",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/Anime scifi blaster 1.zip"
+ },
+ {
+  "raw": "MI-214 Plasma Blaster.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "MI 214 Plasma Blaster",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/MI-214 Plasma Blaster.zip"
+ },
+ {
+  "raw": "Dc-17m Blaster.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Dc 17m Blaster",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/Dc-17m Blaster.zip"
+ },
+ {
+  "raw": "Scifi Assault Rifle.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Scifi Assault Rifle",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/Scifi Assault Rifle.zip"
+ },
+ {
+  "raw": "BRT-BLASTER v1 \u2014 Optimized Game-Ready Weapon.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "has_weapon"
+  ],
+  "subtype": null,
+  "name": "BRT BLASTER v1 \u2014 Optimized Game Ready Weapon",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/BRT-BLASTER v1 \u2014 Optimized Game-Ready Weapon.zip"
+ },
+ {
+  "raw": "Scifi Battle gun.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Scifi Battle gun",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/Scifi Battle gun.zip"
+ },
+ {
+  "raw": "Retro Sci-Fi Blaster.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Retro Sci Fi Blaster",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/Retro Sci-Fi Blaster.zip"
+ },
+ {
+  "raw": "Futuristic Handheld Blaster _ Blaster Pistol.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Futuristic Handheld Blaster   Blaster Pistol",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/blaster-references/Futuristic Handheld Blaster _ Blaster Pistol.zip"
+ },
+ {
+  "raw": "AX - Solitude Ember - 3D Model Stylized.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "AX   Solitude Ember   3D Model Stylized",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/hammers/AX - Solitude Ember - 3D Model Stylized.zip"
+ },
+ {
+  "raw": "Halo Gravity Hammer.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Halo Gravity Hammer",
+  "note": null,
+  "category": "weapon",
+  "dir": "weapons",
+  "path": "./weapons/hammers/Halo Gravity Hammer.zip"
+ },
+ {
+  "raw": "transformers_fall_of_cybertron_optimus_prime-animated.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "animated"
+  ],
+  "subtype": null,
+  "name": "fall of optimus prime animated",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/transformers_fall_of_cybertron_optimus_prime-animated.zip"
+ },
+ {
+  "raw": "transformers_fall_of_cybertron_soldiers.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "fall of soldiers",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/transformers_fall_of_cybertron_soldiers.zip"
+ },
+ {
+  "raw": "transformers_fall_of_cybertron_megatron-3forms.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "fall of megatron 3forms",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/transformers_fall_of_cybertron_megatron-3forms.zip"
+ },
+ {
+  "raw": "transformers_fall_of_cybertron_starscream-2-forms.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "fall of starscream 2 forms",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/transformers_fall_of_cybertron_starscream-2-forms.zip"
+ },
+ {
+  "raw": "detailed-shockwave_decepticon_transformers.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "detailed"
+  ],
+  "subtype": null,
+  "name": "shockwave",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/detailed-shockwave_decepticon_transformers.zip"
+ },
+ {
+  "raw": "hq Shockwave Transformers Human Alliance.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "hq Shockwave  Human Alliance",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/hq Shockwave Transformers Human Alliance.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Menasor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Menasor",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron Menasor.zip"
+ },
+ {
+  "raw": "Transformers fall of cybertron Motormaster.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Motormaster",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers fall of cybertron Motormaster.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron Swoop.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Swoop",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron Swoop.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron Grimlock.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Grimlock",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron Grimlock.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron Slug.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Slug",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron Slug.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Snarl.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Snarl",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron Snarl.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Sludge.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sludge",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron Sludge.zip"
+ },
+ {
+  "raw": "Transformers Fall of Cybertron Hound.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Hound",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall of Cybertron Hound.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Ultra Magnus.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Ultra Magnus",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron Ultra Magnus.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Breakdown.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Breakdown",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron Breakdown.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Deadend.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Deadend",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron Deadend.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Dragstrip.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Dragstrip",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron Dragstrip.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron Warpath.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Warpath",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron Warpath.zip"
+ },
+ {
+  "raw": "both-transformers fall of cybertron Demolishor.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Demolishor",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-transformers fall of cybertron Demolishor.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron 3 Insecticons.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "3 Insecticons",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron 3 Insecticons.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron Shockwave.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Shockwave",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron Shockwave.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron Soundwave.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Soundwave",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron Soundwave.zip"
+ },
+ {
+  "raw": "both-Transformers Fall Of Cybertron Scattershot.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Scattershot",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall Of Cybertron Scattershot.zip"
+ },
+ {
+  "raw": "pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "pack   soldiers s   Soldiers",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/pack- decepticon soldiers s Transformers War For Cybertron Soldiers.zip"
+ },
+ {
+  "raw": "transformers fall of cybertron Perceptor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Perceptor",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/transformers fall of cybertron Perceptor.zip"
+ },
+ {
+  "raw": "both-TRANSFORMERS MIXMASTER.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "MIXMASTER",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-TRANSFORMERS MIXMASTER.zip"
+ },
+ {
+  "raw": "TRANSFORMERS JOLT VOL.2.0.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "JOLT VOL.2.0",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/TRANSFORMERS JOLT VOL.2.0.zip"
+ },
+ {
+  "raw": "Sideswipe (Transformers).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sideswipe ()",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Sideswipe (Transformers).zip"
+ },
+ {
+  "raw": "Elita One.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Elita One",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Elita One.zip"
+ },
+ {
+  "raw": "Jetfire ROTF Game.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Jetfire ROTF Game",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Jetfire ROTF Game.zip"
+ },
+ {
+  "raw": "Transformers Revenge Of The Fallen Game Ratchet.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Revenge Of The Fallen Game Ratchet",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Revenge Of The Fallen Game Ratchet.zip"
+ },
+ {
+  "raw": "both-Transformers Fall of Cybertron Ratchet.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Ratchet",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers Fall of Cybertron Ratchet.zip"
+ },
+ {
+  "raw": "TRANSFORMER JETFIRE.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "JETFIRE",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/TRANSFORMER JETFIRE.zip"
+ },
+ {
+  "raw": "both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes",
+   "transform_anim"
+  ],
+  "subtype": null,
+  "name": "Transformers_ Fall of Cybertron Megatron",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both--with-transform-animation--Transformers_ Fall of Cybertron Megatron.zip"
+ },
+ {
+  "raw": "Trypticon.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Trypticon",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Trypticon.zip"
+ },
+ {
+  "raw": "both-transformers fall of cybertron AirRaid.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "AirRaid",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-transformers fall of cybertron AirRaid.zip"
+ },
+ {
+  "raw": "War for cybertron omega.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "omega",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/War for cybertron omega.zip"
+ },
+ {
+  "raw": "both-Slipstream_War of Cybertron.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Slipstream",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Slipstream_War of Cybertron.zip"
+ },
+ {
+  "raw": "animated idle Transformers_ Fall of Cybertron Soundwave.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "idle_anim"
+  ],
+  "subtype": null,
+  "name": "Soundwave",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/animated idle Transformers_ Fall of Cybertron Soundwave.zip"
+ },
+ {
+  "raw": "Transformers_ War For Cybertron Bumblebee.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Bumblebee",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers_ War For Cybertron Bumblebee.zip"
+ },
+ {
+  "raw": "animated - Transformers War For Cybertron Megatron.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "animated"
+  ],
+  "subtype": null,
+  "name": "Megatron",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/animated - Transformers War For Cybertron Megatron.zip"
+ },
+ {
+  "raw": "both-Transformers_ Fall of Cybertron Ironhide.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Ironhide",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-Transformers_ Fall of Cybertron Ironhide.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron flying soldier.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "flying soldier",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/Transformers Fall Of Cybertron flying soldier.zip"
+ },
+ {
+  "raw": "transformers fall of cybertron soldier.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "soldier",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/transformers fall of cybertron soldier.zip"
+ },
+ {
+  "raw": "both+weapon-Transformers Fall Of Cybertron Megatron.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes",
+   "has_weapon"
+  ],
+  "subtype": null,
+  "name": "Megatron",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both+weapon-Transformers Fall Of Cybertron Megatron.zip"
+ },
+ {
+  "raw": "both--set of 5--Transformers Fall Of Cybertron Combaticons.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes",
+   "set"
+  ],
+  "subtype": null,
+  "name": "Transformers Fall Of Cybertron Combaticons",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both--set of 5--Transformers Fall Of Cybertron Combaticons.zip"
+ },
+ {
+  "raw": "both-transformers fall of cybertron Jetfire.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "Jetfire",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-transformers fall of cybertron Jetfire.zip"
+ },
+ {
+  "raw": "ROTF Breakaway.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ROTF Breakaway",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/ROTF Breakaway.zip"
+ },
+ {
+  "raw": "reference--dragon bot body-aka Sci-fi Dragon Armor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "dragon bot body",
+  "note": "Sci-fi Dragon Armor",
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/reference--dragon bot body-aka Sci-fi Dragon Armor.zip"
+ },
+ {
+  "raw": "both-TRANSFORMER BULLDOG.zip",
+  "modes": [
+   "robot",
+   "alt"
+  ],
+  "flags": [
+   "both_modes"
+  ],
+  "subtype": null,
+  "name": "BULLDOG",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/both-TRANSFORMER BULLDOG.zip"
+ },
+ {
+  "raw": "transformers_fall_of_cybertron_nemesis.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "fall of nemesis",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/transformers_fall_of_cybertron_nemesis.zip"
+ },
+ {
+  "raw": "Brawl Tank Transformers Human Alliance.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Brawl Tank  Human Alliance",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Brawl Tank Transformers Human Alliance.zip"
+ },
+ {
+  "raw": "transformes fall of cybertron Motormaster VH.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "transformes  Motormaster VH",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/transformes fall of cybertron Motormaster VH.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Barricade.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Barricade",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Transformers Fall Of Cybertron Barricade.zip"
+ },
+ {
+  "raw": "Transformers Fall Of Cybertron Cliffjumper.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Cliffjumper",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Transformers Fall Of Cybertron Cliffjumper.zip"
+ },
+ {
+  "raw": "transformers fall of cybertron Perceptor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Perceptor",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/transformers fall of cybertron Perceptor.zip"
+ },
+ {
+  "raw": "Megatron Tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Megatron Tank",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Megatron Tank.zip"
+ },
+ {
+  "raw": "Fall of CyberTron_ Bumble Bee Vehicle.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Bumble Bee Vehicle",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Fall of CyberTron_ Bumble Bee Vehicle.zip"
+ },
+ {
+  "raw": "War For CyberTron_ Bumble Bee Vehicle.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Bumble Bee Vehicle",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/War For CyberTron_ Bumble Bee Vehicle.zip"
+ },
+ {
+  "raw": "Fall of CyberTron_ Optimus Prime CyberTruck.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Optimus Prime CyberTruck",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Fall of CyberTron_ Optimus Prime CyberTruck.zip"
+ },
+ {
+  "raw": "Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "DLC G1 Optimus Prime Alt Mode",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Fall of CyberTron_ DLC G1 Optimus Prime Alt Mode.zip"
+ },
+ {
+  "raw": "Trasformers Fall Of Cybertron Sideswipe.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Trasformers  Sideswipe",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/Trasformers Fall Of Cybertron Sideswipe.zip"
+ },
+ {
+  "raw": "PlayStation 3 ROTF Megatron.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "PlayStation 3 ROTF Megatron",
+  "note": null,
+  "category": "bot",
+  "dir": "vehicles",
+  "path": "./bots/vehicles/PlayStation 3 ROTF Megatron.zip"
+ },
+ {
+  "raw": "bot--dragonstrike.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "dragonstrike",
+  "note": null,
+  "category": "bot",
+  "dir": "patrol-bots",
+  "path": "./bots/patrol-bots/bot--dragonstrike.zip"
+ },
+ {
+  "raw": "bot--yukon-brawler.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "yukon",
+  "note": null,
+  "category": "bot",
+  "dir": "patrol-bots",
+  "path": "./bots/patrol-bots/bot--yukon-brawler.zip"
+ },
+ {
+  "raw": "bot--lucifer.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "lucifer",
+  "note": null,
+  "category": "bot",
+  "dir": "patrol-bots",
+  "path": "./bots/patrol-bots/bot--lucifer.zip"
+ },
+ {
+  "raw": "bot--sazabi.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "sazabi",
+  "note": null,
+  "category": "bot",
+  "dir": "patrol-bots",
+  "path": "./bots/patrol-bots/bot--sazabi.zip"
+ },
+ {
+  "raw": "bot--uplink.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "uplink",
+  "note": null,
+  "category": "bot",
+  "dir": "patrol-bots",
+  "path": "./bots/patrol-bots/bot--uplink.zip"
+ },
+ {
+  "raw": "animal-bot--dimstreak.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "beast",
+  "name": "dimstreak",
+  "note": null,
+  "category": "bot",
+  "dir": "animals",
+  "path": "./bots/animals/animal-bot--dimstreak.zip"
+ },
+ {
+  "raw": "animal-bot--runningwind.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "beast",
+  "name": "runningwind",
+  "note": null,
+  "category": "bot",
+  "dir": "animals",
+  "path": "./bots/animals/animal-bot--runningwind.zip"
+ },
+ {
+  "raw": "Quadruped Mech walker.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Quadruped Mech walker",
+  "note": null,
+  "category": "bot",
+  "dir": "animals",
+  "path": "./bots/animals/extra/Quadruped Mech walker.zip"
+ },
+ {
+  "raw": "Spider Drone V6 Cybertech.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "spider",
+  "name": "Spider Drone V6 Cybertech",
+  "note": null,
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/Spider Drone V6 Cybertech.zip"
+ },
+ {
+  "raw": "bot--slingshot.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "slingshot",
+  "note": null,
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/bot--slingshot.zip"
+ },
+ {
+  "raw": "bot--drillsling.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "drillsling",
+  "note": null,
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/bot--drillsling.zip"
+ },
+ {
+  "raw": "spiderbot--rollout-aka-good detailing for realism.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "spider",
+  "name": "rollout",
+  "note": "good detailing for realism",
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/spiderbot--rollout-aka-good detailing for realism.zip"
+ },
+ {
+  "raw": "spiderbot--nullbite.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "spider",
+  "name": "nullbite",
+  "note": null,
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/spiderbot--nullbite.zip"
+ },
+ {
+  "raw": "spiderbot--radiachnor.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "spider",
+  "name": "radiachnor",
+  "note": null,
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/spiderbot--radiachnor.zip"
+ },
+ {
+  "raw": "Spider Tank.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "spider",
+  "name": "Spider Tank",
+  "note": null,
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/Spider Tank.zip"
+ },
+ {
+  "raw": "spiderbot--widowback-aka Sci-Fi Spider metal PBR low-poly game ready 3D m.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "low_poly",
+   "pbr"
+  ],
+  "subtype": "spider",
+  "name": "widowback",
+  "note": "Sci-Fi Spider metal PBR low-poly game ready 3D m",
+  "category": "bot",
+  "dir": "spiders",
+  "path": "./bots/animals/spiders/spiderbot--widowback-aka Sci-Fi Spider metal PBR low-poly game ready 3D m.zip"
+ },
+ {
+  "raw": "hawk-flyer--falcontip-aka hawk-mech Osprey X-80.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "avian",
+  "name": "falcontip",
+  "note": "hawk-mech Osprey X-80",
+  "category": "bot",
+  "dir": "falcons",
+  "path": "./bots/animals/falcons/hawk-flyer--falcontip-aka hawk-mech Osprey X-80.zip"
+ },
+ {
+  "raw": "hawk-flyer--asonia.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "avian",
+  "name": "asonia",
+  "note": null,
+  "category": "bot",
+  "dir": "falcons",
+  "path": "./bots/animals/falcons/hawk-flyer--asonia.zip"
+ },
+ {
+  "raw": "dragonflyer--ironforge-aka Cyber Dragon Warrior bot with hand and chest beam blaster.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "dragon",
+  "name": "ironforge",
+  "note": "Cyber Dragon Warrior bot with hand and chest beam blaster",
+  "category": "bot",
+  "dir": "dragons",
+  "path": "./bots/animals/dragons/dragonflyer--ironforge-aka Cyber Dragon Warrior bot with hand and chest beam blaster.zip"
+ },
+ {
+  "raw": "dinobot--prowler.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "prowler",
+  "note": null,
+  "category": "bot",
+  "dir": "bots",
+  "path": "./bots/dinos/dinobot--prowler.zip"
+ },
+ {
+  "raw": "blackstar-mystery-scythe-reference--harvester_of_sorrows.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "harvester_of_sorrows",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/blackstar-mystery-scythe-reference--harvester_of_sorrows.zip"
+ },
+ {
+  "raw": "animation-reference--male_skeleton.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "male_skeleton",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/animation-reference--male_skeleton.zip"
+ },
+ {
+  "raw": "blackstar-figure-humanoid-inspiration--doom_2099_-_marvel_rivals.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "doom_2099_",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/blackstar-figure-humanoid-inspiration--doom_2099_-_marvel_rivals.zip"
+ },
+ {
+  "raw": "humanoid-roboskeleton-reference--terminator_rev_9.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "terminator_rev_9",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/humanoid-roboskeleton-reference--terminator_rev_9.zip"
+ },
+ {
+  "raw": "humanoid--witwicky-suit-reference-T60pa.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "witwicky",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/humanoid--witwicky-suit-reference-T60pa.zip"
+ },
+ {
+  "raw": "reference--bot-watch-engineer-vine-clone-transformer-hybrid.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "bot",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--bot-watch-engineer-vine-clone-transformer-hybrid.zip"
+ },
+ {
+  "raw": "humanoid--outer-rim-military.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "outer",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/humanoid--outer-rim-military.zip"
+ },
+ {
+  "raw": "reference--bot-blindside.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "bot",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--bot-blindside.zip"
+ },
+ {
+  "raw": "reference--human-to-bot-convert-wingclip-bot.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "human",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--human-to-bot-convert-wingclip-bot.zip"
+ },
+ {
+  "raw": "reference--military-big-suit-outer-rim-02.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "military",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--military-big-suit-outer-rim-02.zip"
+ },
+ {
+  "raw": "reference--Devastator.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Devastator",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--Devastator.zip"
+ },
+ {
+  "raw": "Ice Material.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Ice Material",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/Ice Material.zip"
+ },
+ {
+  "raw": "ice particle.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ice particle",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/ice particle.zip"
+ },
+ {
+  "raw": "Ice Block.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Ice Block",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/Ice Block.zip"
+ },
+ {
+  "raw": "female human face reference.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "female human face reference",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/female human face reference.zip"
+ },
+ {
+  "raw": "reference--military-suit-outer-rim-03.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "military",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--military-suit-outer-rim-03.zip"
+ },
+ {
+  "raw": "reference--terrain mountain noise example earth-aka-Mount Fuji Volcano Crater with Snow - Japan.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "terrain mountain noise example earth",
+  "note": "Mount Fuji Volcano Crater with Snow - Japan",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--terrain mountain noise example earth-aka-Mount Fuji Volcano Crater with Snow - Japan.zip"
+ },
+ {
+  "raw": "reference--blackstar throne aka Throne.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "blackstar throne",
+  "note": "Throne",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--blackstar throne aka Throne.zip"
+ },
+ {
+  "raw": "reference--good mech legs for IMAX level detail-aka ZBrush 4R4 how to draw mech using insert mesh.1.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "good mech legs for IMAX level detail",
+  "note": "ZBrush 4R4 how to draw mech using insert mesh.1",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--good mech legs for IMAX level detail-aka ZBrush 4R4 how to draw mech using insert mesh.1.zip"
+ },
+ {
+  "raw": "reference--blackstar body shape for robot style transfer 03-aka Moon Knight - Blood Moon Knight.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "blackstar body shape for robot style transfer 03",
+  "note": "Moon Knight - Blood Moon Knight",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--blackstar body shape for robot style transfer 03-aka Moon Knight - Blood Moon Knight.zip"
+ },
+ {
+  "raw": "reference--good model detail-aka 4-legged gunner sphere droid rolling mech.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "good model detail",
+  "note": "4-legged gunner sphere droid rolling mech",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--good model detail-aka 4-legged gunner sphere droid rolling mech.zip"
+ },
+ {
+  "raw": "reference-- player camera spectator indicator-aka non-military consumer UAV drone.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "player camera spectator indicator",
+  "note": "non-military consumer UAV drone",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference-- player camera spectator indicator-aka non-military consumer UAV drone.zip"
+ },
+ {
+  "raw": "reference--ship parts for transformation-aka Star Sparrow Modular Spaceship.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ship parts for transformation",
+  "note": "Star Sparrow Modular Spaceship",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--ship parts for transformation-aka Star Sparrow Modular Spaceship.zip"
+ },
+ {
+  "raw": "reference--smoother design of elegance-aka Laser Turret.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "smoother design of elegance",
+  "note": "Laser Turret",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--smoother design of elegance-aka Laser Turret.zip"
+ },
+ {
+  "raw": "references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "potential Jhiaxus reference not sure yet",
+  "note": "MIND ALPHA",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/references--potential Jhiaxus reference not sure yet-aka MIND ALPHA.zip"
+ },
+ {
+  "raw": "reference--good body model details-aka Bi-Pedal Heavy Weapons Platform Concept.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [
+   "has_weapon"
+  ],
+  "subtype": null,
+  "name": "good body model details",
+  "note": "Bi-Pedal Heavy Weapons Platform Concept",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--good body model details-aka Bi-Pedal Heavy Weapons Platform Concept.zip"
+ },
+ {
+  "raw": "reference--three-headed-dragon-transformer-dragon-form.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "three",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/reference--three-headed-dragon-transformer-dragon-form.zip"
+ },
+ {
+  "raw": "part--Basic Rocket Engine.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Basic Rocket Engine",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/part--Basic Rocket Engine.zip"
+ },
+ {
+  "raw": "part--Rocket_BM21-122mm.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Rocket_BM21",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/part--Rocket_BM21-122mm.zip"
+ },
+ {
+  "raw": "Iron Hand - Prosthetic Arm.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Iron Hand   Prosthetic Arm",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/body/Iron Hand - Prosthetic Arm.zip"
+ },
+ {
+  "raw": "Rail turret.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Rail turret",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/turrets/Rail turret.zip"
+ },
+ {
+  "raw": "Heavy Gatling Turret.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Heavy Gatling Turret",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/turrets/Heavy Gatling Turret.zip"
+ },
+ {
+  "raw": "Turret_01a.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Turret 01a",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/turrets/Turret_01a.zip"
+ },
+ {
+  "raw": "missile pod vehicle or ground.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "missile pod vehicle or ground",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/turrets/missile pod vehicle or ground.zip"
+ },
+ {
+  "raw": "Doctor Octopus Arms Model Concept.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Doctor Octopus Arms Model Concept",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/parts/robotparts/Doctor Octopus Arms Model Concept.zip"
+ },
+ {
+  "raw": "ice clone skin reference.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ice clone skin reference",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/ice clone/ice clone skin reference.zip"
+ },
+ {
+  "raw": "ice clone body reference.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "ice clone body reference",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/ice clone/ice clone body reference.zip"
+ },
+ {
+  "raw": "watch-bearer body reference.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "watch bearer body reference",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/watch-bearer/watch-bearer body reference.zip"
+ },
+ {
+  "raw": "reference-good insecticon model.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "reference good insecticon model",
+  "note": null,
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/insecticons/reference-good insecticon model.zip"
+ },
+ {
+  "raw": "reference--terrain ref-aka- korea jeju BUM island.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "terrain ref",
+  "note": "korea jeju BUM island",
+  "category": "reference",
+  "dir": "references",
+  "path": "./references/terrain/reference--terrain ref-aka- korea jeju BUM island.zip"
+ },
+ {
+  "raw": "insecticon-vehicle-mode.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "insecticon vehicle mode",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./insecticons/insecticon-vehicle-mode.zip"
+ },
+ {
+  "raw": "pipe_box_metal_-_7mb.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "pipe box metal 7mb",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/pipe_box_metal_-_7mb.zip"
+ },
+ {
+  "raw": "metal_toolbox.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "metal toolbox",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/metal_toolbox.zip"
+ },
+ {
+  "raw": "car_box.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "car box",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/car_box.zip"
+ },
+ {
+  "raw": "old_wooden_watchtower_house_3.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "old wooden watchtower house 3",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/old_wooden_watchtower_house_3.zip"
+ },
+ {
+  "raw": "old_wooden_barn_house_4.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "old wooden barn house 4",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/old_wooden_barn_house_4.zip"
+ },
+ {
+  "raw": "door_metal_door_window.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "door metal door window",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/door_metal_door_window.zip"
+ },
+ {
+  "raw": "fence_protective_metal_17mb.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "fence protective metal 17mb",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/fence_protective_metal_17mb.zip"
+ },
+ {
+  "raw": "metal_grate.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "metal grate",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/metal_grate.zip"
+ },
+ {
+  "raw": "metal_desk.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "metal desk",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/metal_desk.zip"
+ },
+ {
+  "raw": "metal_shelf_-_14mb.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "metal shelf 14mb",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./doodads/metal_shelf_-_14mb.zip"
+ },
+ {
+  "raw": "rpc--Namek Spaceship.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Namek Spaceship",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./robot-passive-creatures/rpc--Namek Spaceship.zip"
+ },
+ {
+  "raw": "Old Spider Droid.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Old Spider Droid",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./robot-passive-creatures/Old Spider Droid.zip"
+ },
+ {
+  "raw": "Spider Bot.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": "spider",
+  "name": "Spider Bot",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./robot-passive-creatures/Spider Bot.zip"
+ },
+ {
+  "raw": "Sci-Fi Robot Spider.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sci Fi Robot Spider",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./robot-passive-creatures/Sci-Fi Robot Spider.zip"
+ },
+ {
+  "raw": "Moon.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Moon",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./planets/Moon.zip"
+ },
+ {
+  "raw": "Mars.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Mars",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./planets/Mars.zip"
+ },
+ {
+  "raw": "War Robot ATV SH-183.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "War Robot ATV SH 183",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-goons/War Robot ATV SH-183.zip"
+ },
+ {
+  "raw": "Qu4drup3d T4nk.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Qu4drup3d T4nk",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-goons/Qu4drup3d T4nk.zip"
+ },
+ {
+  "raw": "FK02-01.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "FK02 01",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-goons/FK02-01.zip"
+ },
+ {
+  "raw": "Enemy Drone.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Enemy Drone",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-goons/Enemy Drone.zip"
+ },
+ {
+  "raw": "Antitank Robot Walker V1.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Antitank Robot Walker V1",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-goons/Antitank Robot Walker V1.zip"
+ },
+ {
+  "raw": "RL-TRR0095213 HP.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "RL TRR0095213 HP",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./turrets/RL-TRR0095213 HP.zip"
+ },
+ {
+  "raw": "Turret.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Turret",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./turrets/Turret.zip"
+ },
+ {
+  "raw": "Sci-Fi Turret.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sci Fi Turret",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./turrets/Sci-Fi Turret.zip"
+ },
+ {
+  "raw": "planetary Railgun Turret.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "planetary Railgun Turret",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./turrets/planetary Railgun Turret.zip"
+ },
+ {
+  "raw": "Sci-fi turret.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Sci fi turret",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./turrets/Sci-fi turret.zip"
+ },
+ {
+  "raw": "Krazoa Palace.zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Krazoa Palace",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-areas/not sure general ideas/Krazoa Palace.zip"
+ },
+ {
+  "raw": "Krazoa Shrine (Test of Observation).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "Krazoa Shrine (Test of Observation)",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-areas/not sure general ideas/Krazoa Shrine (Test of Observation).zip"
+ },
+ {
+  "raw": "SciFi-Corridor (Sky Palace).zip",
+  "modes": [
+   "robot"
+  ],
+  "flags": [],
+  "subtype": null,
+  "name": "SciFi Corridor (Sky Palace)",
+  "note": null,
+  "category": "unknown",
+  "dir": null,
+  "path": "./raid-areas/not sure general ideas/SciFi-Corridor (Sky Palace).zip"
+ }
+]
