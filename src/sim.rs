@@ -994,6 +994,56 @@ pub fn run(args: &[String]) {
                 );
             }
             println!("   references: W/L 0.48-0.54, wheel/height 0.62-0.83, wheel/length 0.22-0.24");
+            // ---- VIPERA ANSWERS TO A DIFFERENT SHEET ----
+            //
+            // It has measured drawings of its own — a green hypercar, 4.60 x
+            // 2.15 x 1.05 m, wheelbase 3.15, track 1.70, wheel diameter 0.78
+            // — and they sit a long way from the Rocket League references
+            // the rest of the catalogue follows. A real hypercar is LONGER
+            // relative to everything else, so its wheels are proportionally
+            // smaller: 0.170 of length against Octane's 0.242. Holding it to
+            // the other band would be holding it to the wrong car.
+            {
+                let src = include_str!("procars.rs");
+                // take the whole function body: the Model literal names the
+                // fields but `split("Model {")` landed on an earlier one, so
+                // every reading came back zero — a check that fails for the
+                // wrong reason is worse than no check
+                let v = src.split("pub fn vipera").nth(1).unwrap_or("");
+                let v = &v[..v.find("\npub fn ").unwrap_or(v.len())];
+                let num = |k: &str| -> f32 {
+                    v.find(k)
+                        .and_then(|i| {
+                            let r = &v[i + k.len()..];
+                            let e = r.find(|c: char| c != '.' && !c.is_ascii_digit() && c != ' ')?;
+                            r[..e].trim().parse::<f32>().ok()
+                        })
+                        .unwrap_or(0.0)
+                };
+                let (l, h, w, r) = (num("half_len:"), num("half_h:"), num("half_w:"), num("wheel_r:"));
+                println!();
+                println!("   VIPERA against its own drawings (4.60 x 2.15 x 1.05 m):");
+                let rows = [
+                    ("W/L", w / l.max(1e-4), 0.467),
+                    ("H/L", h / l.max(1e-4), 0.228),
+                    ("wheel/L", r / l.max(1e-4), 0.170),
+                    ("wheel/H", r / h.max(1e-4), 0.743),
+                ];
+                let mut worst = 0.0f32;
+                for (nm, got, want) in rows {
+                    let err = (got - want).abs() / want;
+                    worst = worst.max(err);
+                    println!("     {nm:<9} {got:.3}  sheet {want:.3}  ({:+.1}%)", (got / want - 1.0) * 100.0);
+                }
+                println!(
+                    "   {}",
+                    if worst < 0.03 {
+                        "built to its sheet"
+                    } else {
+                        "OFF ITS SHEET"
+                    }
+                );
+            }
             if off.is_empty() {
                 println!("   every car that should look like a car does");
             } else {
@@ -2690,6 +2740,56 @@ pub fn run(args: &[String]) {
                 );
             }
             println!("   references: W/L 0.48-0.54, wheel/height 0.62-0.83, wheel/length 0.22-0.24");
+            // ---- VIPERA ANSWERS TO A DIFFERENT SHEET ----
+            //
+            // It has measured drawings of its own — a green hypercar, 4.60 x
+            // 2.15 x 1.05 m, wheelbase 3.15, track 1.70, wheel diameter 0.78
+            // — and they sit a long way from the Rocket League references
+            // the rest of the catalogue follows. A real hypercar is LONGER
+            // relative to everything else, so its wheels are proportionally
+            // smaller: 0.170 of length against Octane's 0.242. Holding it to
+            // the other band would be holding it to the wrong car.
+            {
+                let src = include_str!("procars.rs");
+                // take the whole function body: the Model literal names the
+                // fields but `split("Model {")` landed on an earlier one, so
+                // every reading came back zero — a check that fails for the
+                // wrong reason is worse than no check
+                let v = src.split("pub fn vipera").nth(1).unwrap_or("");
+                let v = &v[..v.find("\npub fn ").unwrap_or(v.len())];
+                let num = |k: &str| -> f32 {
+                    v.find(k)
+                        .and_then(|i| {
+                            let r = &v[i + k.len()..];
+                            let e = r.find(|c: char| c != '.' && !c.is_ascii_digit() && c != ' ')?;
+                            r[..e].trim().parse::<f32>().ok()
+                        })
+                        .unwrap_or(0.0)
+                };
+                let (l, h, w, r) = (num("half_len:"), num("half_h:"), num("half_w:"), num("wheel_r:"));
+                println!();
+                println!("   VIPERA against its own drawings (4.60 x 2.15 x 1.05 m):");
+                let rows = [
+                    ("W/L", w / l.max(1e-4), 0.467),
+                    ("H/L", h / l.max(1e-4), 0.228),
+                    ("wheel/L", r / l.max(1e-4), 0.170),
+                    ("wheel/H", r / h.max(1e-4), 0.743),
+                ];
+                let mut worst = 0.0f32;
+                for (nm, got, want) in rows {
+                    let err = (got - want).abs() / want;
+                    worst = worst.max(err);
+                    println!("     {nm:<9} {got:.3}  sheet {want:.3}  ({:+.1}%)", (got / want - 1.0) * 100.0);
+                }
+                println!(
+                    "   {}",
+                    if worst < 0.03 {
+                        "built to its sheet"
+                    } else {
+                        "OFF ITS SHEET"
+                    }
+                );
+            }
             if off.is_empty() {
                 println!("   every car that should look like a car does");
             } else {

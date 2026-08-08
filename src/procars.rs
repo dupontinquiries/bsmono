@@ -510,10 +510,29 @@ pub fn vipera(gpu: &mut Gpu) -> Model {
     let mut prims = Vec::new();
     let paint = [0.06, 0.34, 0.16, 1.0];
     let trim = [0.78, 0.80, 0.76, 1.0];
-    let (half_len, half_w, wheel_r) = (0.77f32, 0.36f32, 0.130f32);
+    // ---- BUILT TO A DIMENSIONED SHEET ----
+    //
+    // This car was originally made from a written description. It now has
+    // measured drawings, so it is built to them:
+    //
+    //   length 4.60   width 2.15   height 1.05   wheelbase 3.15
+    //   track 1.70    wheel dia 0.78   overhangs 0.65 front / 0.80 rear
+    //
+    // As ratios of length: W 0.467, H 0.228, wheel 0.170, wheelbase 0.685,
+    // track 0.791 of width. Note how far that sits from the Rocket League
+    // references the rest of the catalogue is held to (wheel/length 0.216 to
+    // 0.242): a real hypercar is LONGER relative to everything else, so its
+    // wheels are proportionally smaller. That is a different design
+    // language, not a car that is wrong — which is why the proportion audit
+    // has to know this one answers to its own sheet.
+    let half_len = 0.77f32;
+    let half_w = half_len * 0.467; // 0.360
+    let wheel_r = half_len * 0.170; // 0.131
+    // wheelbase is 0.685 of length, so the axles sit at +/- 0.3425 of it
+    let axle_z = half_len * 0.685;
 
     // 1-4: hardpoints and wheels first, then everything else answers to them
-    let hp = hardpoints(1.05, 0.60, wheel_r, -0.055);
+    let hp = hardpoints(axle_z / half_len * 1.36, 0.791, wheel_r, -0.055);
 
     // 5: chassis slab between the hardpoints (battery floor, mostly hidden)
     prims.push(body_prim(
@@ -592,7 +611,7 @@ pub fn vipera(gpu: &mut Gpu) -> Model {
     prims.push(body_prim(gpu, part(meshgen::cbox(0.14), Vec3::new(0.28, 0.012, 0.20), Quat::from_rotation_x(-0.12), Vec3::new(0.0, -0.075, 0.50)), [0.05, 0.05, 0.06, 1.0]));
 
     mount_wheels(gpu, &mut prims, &hp, [0.16, 0.17, 0.19, 1.0], 6);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len, half_h: 0.175, half_w, wheel_r }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.77, half_h: 0.176, half_w: 0.36, wheel_r: 0.131 }
 }
 
 /// AEGIS — the silver armoured wedge.
