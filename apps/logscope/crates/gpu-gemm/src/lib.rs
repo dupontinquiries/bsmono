@@ -22,6 +22,7 @@ pub mod specverify;
 pub mod batchplan;
 pub mod q2demote;
 pub mod quantref;
+pub mod iq4;
 pub mod shaderdev;
 pub mod framediag;
 pub mod sensitivity;
@@ -8505,7 +8506,10 @@ last block and k's first would decode to garbage")),
                 // A UD quant is a mixture: the file is named for its smallest type and keeps
                 // sensitive tensors wider. "type 18 unsupported for blk.0.attn_q.weight" costs a
                 // 30 GiB download to learn ONE of them, and there are usually several.
-                let supported: Vec<u32> = vec![0, 1, 8, 12, 14, 19];
+                // 20 and 23 joined the list when iq4.rs landed. The report is only honest if this
+                // matches what dequantize actually accepts — a stale list here reports supported
+                // types as missing, which sends someone to implement what already works.
+                let supported: Vec<u32> = vec![0, 1, 8, 12, 14, 19, 20, 23];
                 // BYTES, NOT ELEMENTS. My first version passed dims.product(), which is the
                 // element count — so a report on a 30966 MiB file summed to 63135 MiB and its
                 // percentages exceeded 100. The shares are the whole point of the report, since they

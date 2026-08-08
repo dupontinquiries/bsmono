@@ -836,6 +836,11 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             }
             return Ok(out);
         }
+        // IQ4_NL and IQ4_XS: the two IQ formats that are NOT codebook formats. Sixteen
+        // non-linear values indexed by a nibble, so the whole "codebook" is one small table — which
+        // is why these two are supported and IQ2_XXS is not.
+        20 => return crate::iq4::dequant_iq4_nl(data, n),
+        23 => return crate::iq4::dequant_iq4_xs(data, n),
         29 => return Err("IQ1_M (type 29) has no dequantizer here — its per-8 scale layout differs from IQ1_S, so the IQ1_S path would decode it to garbage without failing. Use an IQ1_S build, or implement the IQ1_M decode first".into()),
         19 => {
             // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
@@ -1423,5 +1428,37 @@ mod iq4xs_tests {
         assert_eq!(v.len(), 256);
         // And a misaligned length is refused rather than truncated.
         assert!(dequantize(23, &data, 300).is_err());
+    }
+}
+
+#[cfg(test)]
+mod iq4_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn dequantize_ACCEPTS_iq4_nl_and_iq4_xs() {
+        // The decoders are useless if dequantize still refuses them, and a module that compiles but
+        // is never reached is the shape of MOE_MATVEC_IQ1_S sitting undispatched.
+        let nl = vec![0u8; 18];
+        let xs = vec![0u8; 136];
+        assert!(dequantize(20, &nl, 32).is_ok(), "IQ4_NL");
+        assert!(dequantize(23, &xs, 256).is_ok(), "IQ4_XS");
+    }
+
+    #[test]
+    fn the_still_UNSUPPORTED_iq_types_are_still_refused() {
+        // Adding two must not accidentally open the others: a codebook format read through a
+        // non-linear decoder produces plausible floats and a model that generates confident nonsense.
+        for t in [16, 17, 18, 21, 22, 29] {
+            assert!(dequantize(t, &vec![0u8; 512], 256).is_err(), "type {t} must stay refused");
+        }
+    }
+
+    #[test]
+    fn the_sizes_agree_with_the_decoders() {
+        // type_nbytes was added before the decoders so the loader could report honestly. If they
+        // disagree the report was wrong about the bytes it counted.
+        assert_eq!(type_nbytes(20, 32), Some(crate::iq4::IQ4_NL_BLOCK));
+        assert_eq!(type_nbytes(23, 256), Some(crate::iq4::IQ4_XS_BLOCK));
     }
 }
