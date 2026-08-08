@@ -114,7 +114,11 @@ def base_cmd(iqm, d, k, t):
          # --tuck lifts anything poking below the foot plane. The reported
          # "legs too short" was never the legs — it was wheels standing 3% of
          # body height below the feet, so the bot sat on its tyres.
-         "--repair", "--reattach", "--tuck", "--ribs", "-1",
+         # --seams closes hinge gaps between parts whose joints ARE linked.
+         # It does not touch the reported elbow and shoulder gaps, because
+         # those are between parts whose joints are not linked at all — a
+         # topology fault wearing a seam's clothes.
+         "--repair", "--reattach", "--tuck", "--seams", "0.03", "--ribs", "-1",
          "--t", f"{t:.4f}"]
     if k == POSES - 1:
         c += ["--joints-json", os.path.join(d, "joints.json")]
@@ -283,7 +287,11 @@ def main():
          # --tuck lifts anything poking below the foot plane. The reported
          # "legs too short" was never the legs — it was wheels standing 3% of
          # body height below the feet, so the bot sat on its tyres.
-         "--repair", "--reattach", "--tuck", "--ribs", "-1",
+         # --seams closes hinge gaps between parts whose joints ARE linked.
+         # It does not touch the reported elbow and shoulder gaps, because
+         # those are between parts whose joints are not linked at all — a
+         # topology fault wearing a seam's clothes.
+         "--repair", "--reattach", "--tuck", "--seams", "0.03", "--ribs", "-1",
                    "--t", f"{t:.4f}"]
             # THE JOINTS, ONCE PER CHASSIS. They are a property of the rig
             # rather than of a pose, so the robot end writes them and the
