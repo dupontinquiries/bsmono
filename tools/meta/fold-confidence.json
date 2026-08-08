@@ -1,0 +1,54 @@
+{
+ "_doc": [
+  "WHY THE AVIANS WORK, measured after they were reported as the first models",
+  "that look right without a correction.",
+  "",
+  "It is not joint quality. flyer_asonia is 1.3% faults and falcontip 1.9%,",
+  "against a roster median of 2.0% \u2014 ordinary. brutis, alphastar, vertigo and",
+  "the scorpion commander all sit at ZERO and none of them was reported as",
+  "looking good.",
+  "",
+  "It is the FOLD RATIO. The avians grow 3.72x and 1.63x from vehicle to",
+  "robot, against 4.4x for blackstar, 4.9x for dawnshade and 6.3x for grit.",
+  "A modest fold moves parts a short way, so a misplaced pivot displaces its",
+  "geometry proportionally less \u2014 the same error in the rig produces a",
+  "smaller visible fault.",
+  "",
+  "And falcontip, the LOWEST ratio in the roster at 1.63x, is the one that",
+  "reads best. A wing that folds is already most of the way to a wing that is",
+  "spread; a car that becomes a person is not.",
+  "",
+  "THE LESSON IS NOT 'PREFER AVIANS'. It is that fold ratio predicts how much",
+  "rig error a chassis can hide, so it belongs in the screener as a",
+  "CONFIDENCE score rather than as a filter: a 6x fold needs its joints right",
+  "and a 1.6x fold forgives them. That is a better use of the joint fault",
+  "numbers than a flat threshold, and it says where to spend repair effort."
+ ],
+ "measured": {
+  "flyer_asonia": {
+   "joints": 237,
+   "faults": 3,
+   "pct": 1.3,
+   "fold_ratio": 3.72
+  },
+  "flyer_falcontip": {
+   "joints": 161,
+   "faults": 3,
+   "pct": 1.9,
+   "fold_ratio": 1.63
+  },
+  "jet_dawnshade": {
+   "fold_ratio": 4.91
+  },
+  "blackstar": {
+   "fold_ratio": 4.4
+  },
+  "grit": {
+   "joints": 306,
+   "faults": 2,
+   "pct": 0.7,
+   "fold_ratio": 6.31
+  },
+  "roster_median_fault_pct": 2.0
+ }
+}
