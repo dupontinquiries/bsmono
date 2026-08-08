@@ -389,3 +389,41 @@ a cheap pre-check that predicts accuracy loss before any solve runs.
 - **T6 quadratic triangles** would fix the first regime handsomely and the second not at all. Worth
   doing when the element integral needs real quadrature anyway — nonlinear materials, curved
   geometry, full orthotropy — rather than for bending alone.
+
+
+## Laminates — the answer the bending study pointed to
+
+For thin layered structures the fix is not a better element but a different formulation: stop
+meshing through the thickness and integrate through it analytically. Classical laminate theory
+gives A, B and D matrices relating in-plane strain and curvature to force and moment resultants,
+and it solves PCB warp and mask distortion at the level those problems actually live at.
+
+**`B` vanishing for a symmetric stack is the sharp test** — exactly, not approximately. It is why a
+symmetric PCB stackup lies flat through reflow and an asymmetric one potato-chips, and it is the
+design rule the theory exists to justify. A 1.5 mm FR-4 board with copper on one face bows 0.1 mm
+over 100 mm at reflow; balanced copper on both faces removes it entirely.
+
+Two predictions of mine were wrong and the measurements corrected them:
+
+**CLT matches Timoshenko's 1925 bimetal formula to twelve figures**, with no biaxial correction. I
+expected a factor of `1/(1−ν)`, since Timoshenko's strip is free to contract laterally and a plate
+is not. There is none, because his curvature depends on the moduli *only through their ratio* — the
+plate constraint replaces every `E` with `E/(1−ν)` and leaves that ratio unchanged. Confirmed by
+giving the two layers different Poisson ratios, which breaks the coincidence as the explanation
+requires.
+
+**Stoney's 1/t² is asymptotic, not exact.** Measured across 0.5–2 mm with a 20 µm film the exponent
+is 1.70, and asserting 2 there demands a limit hold outside its limit. The test now checks that the
+exponent *moves toward* 2 as the thickness ratio improves, reaching 2.00 at a film-to-substrate
+ratio of 0.001.
+
+### Laminate debts
+
+- **In-plane isotropic laminae only.** Correct for FR-4 and for a transversely isotropic stack —
+  such a material is by definition isotropic in-plane — but ply angles and genuinely orthotropic
+  laminae are not modelled, so a fibre-oriented composite cannot be described.
+- **Uniform temperature only.** A through-thickness gradient produces its own curvature and is not
+  handled; that is the EUV mask case, where absorbed power is deposited at the surface.
+- **No moisture, no cure shrinkage**, both of which warp real boards comparably to CTE mismatch.
+- **Linear elastic.** Copper yields during reflow, so a plastic laminate model is needed before the
+  cyclic via-fatigue question can be answered rather than bounded.
