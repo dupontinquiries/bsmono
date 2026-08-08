@@ -2907,7 +2907,11 @@ impl Gpu {
         };
         Tensor { buf, rows, cols, pool: Some(self.pool.clone()), view: None }
     }
+    /// `#[track_caller]` so the diagnostic attributes each readback to the code that ASKED for it.
+    /// Without it the tally names this line 53 times and answers nothing.
+    #[track_caller]
     pub fn download(&self, t: &Tensor) -> Vec<f32> {
+        crate::framediag::note_download();
         // Post-OOM safety (see download_u32): mapping a buffer that failed to allocate is a fatal wgpu
         // error, so bail early with an empty result once the device has signalled OOM this step.
         if self.oom_backoff() { return Vec::new(); }

@@ -37,6 +37,7 @@ pub fn arm() {
     ARMED.store(true, Relaxed);
     *FRAMELESS_BY_SITE.lock().unwrap() = Some(Default::default());
     *BY_PTR.lock().unwrap() = Some(Default::default());
+    *DOWNLOADS_BY_SITE.lock().unwrap() = Some(Default::default());
 }
 
 /// Record a frameless dispatch by pipeline pointer.
@@ -133,11 +134,66 @@ all, rather than dropped at one place", v.len())
     lines.join("\n")
 }
 
+/// Downloads by call site.
+///
+/// `download` is 20-29% of submits and nobody knows which calls they are. Sampling is one readback
+/// per token, so a dense model showing ~137 per token has ~136 coming from somewhere unaccounted —
+/// and the honest way to find out is the same one that found the frame leak: **count them where they
+/// happen rather than reason about where they might be.**
+///
+/// Keyed on `std::panic::Location`, so no call site needs editing to be counted.
+pub static DOWNLOADS_BY_SITE: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>>
+    = std::sync::Mutex::new(None);
+
+/// Record a readback. `#[track_caller]` puts the CALLER's location in the map, which is the question
+/// being asked — `download` itself is one line and says nothing.
+#[track_caller]
+pub fn note_download() {
+    if !ARMED.load(Relaxed) { return }
+    let loc = std::panic::Location::caller();
+    let key = format!("{}:{}", loc.file().rsplit('/').next().unwrap_or(loc.file()), loc.line());
+    if let Ok(mut g) = DOWNLOADS_BY_SITE.lock() {
+        if let Some(m) = g.as_mut() { *m.entry(key).or_insert(0) += 1; }
+    }
+}
+
+/// The download report, ordered by count.
+pub fn download_report(tokens: u64) -> String {
+    let Ok(g) = DOWNLOADS_BY_SITE.lock() else { return "download tally unavailable".into() };
+    let Some(m) = g.as_ref() else { return "not armed; pass --frame-diag or set LOGSCOPE_FRAME_DIAG=1".into() };
+    if m.is_empty() { return "no downloads recorded".into() }
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let total: u64 = v.iter().map(|(_, n)| **n).sum();
+    let mut out = vec![format!("{total} downloads across {} sites", v.len())];
+    if tokens > 0 {
+        // Per token is the number that matters: one is sampling and unavoidable, and everything
+        // above one is the question.
+        out.push(format!("  {:.1} per token — sampling accounts for 1.0, the rest is the question",
+            total as f64 / tokens as f64));
+    }
+    for (site, n) in v.iter().take(10) {
+        out.push(format!("  {n:>8}  {site}{}", if tokens > 0 {
+            format!("  ({:.1}/tok)", **n as f64 / tokens as f64) } else { String::new() }));
+    }
+    out.join("\n")
+}
+
+/// Serialises every test that touches the process-global tallies.
+///
+/// **One lock at module scope, not one per test module.** Two locks would not serialise against each
+/// other, which is exactly the race the first one was added to fix — and the download tests share
+/// the same statics as the frame tests.
+#[cfg(test)]
+pub(crate) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn reset() {
     for c in [&FRAME_OPENED, &FRAME_CLOSED, &FRAME_CLOSED_WHILE_CLOSED, &REOPEN_DECLINED] {
         c.store(0, Relaxed);
     }
     if let Ok(mut g) = FRAMELESS_BY_SITE.lock() { if let Some(m) = g.as_mut() { m.clear(); } }
+    if let Ok(mut g) = BY_PTR.lock() { if let Some(m) = g.as_mut() { m.clear(); } }
+    if let Ok(mut g) = DOWNLOADS_BY_SITE.lock() { if let Some(m) = g.as_mut() { m.clear(); } }
 }
 
 #[cfg(test)]
@@ -151,12 +207,11 @@ mod tests {
     /// assertions. That produced exactly one failure in ten full-suite runs while writing this,
     /// which is the worst frequency for a flake: often enough to be real, rare enough to be
     /// dismissed as noise the next time it appears.
-    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn fresh() -> std::sync::MutexGuard<'static, ()> {
         // Poisoning is ignored: a panicking test already failed, and refusing to run the others
         // because of it turns one failure into eight.
-        let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let g = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         arm();
         g
@@ -204,7 +259,7 @@ mod tests {
     fn UNARMED_says_how_to_arm_rather_than_reporting_zero() {
         // Reporting "0 frameless dispatches" when the tally was never enabled is the false-green
         // shape this project keeps hitting.
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         *FRAMELESS_BY_SITE.lock().unwrap() = None;
         *BY_PTR.lock().unwrap() = None;
@@ -338,5 +393,42 @@ came to have no frame open");
         let src = include_str!("lib.rs");
         let guarded = src.matches("if had_frame && std::env::var_os(\"LOGSCOPE_NO_FRAME_REOPEN\")").count();
         assert!(guarded >= 2, "expected both reopen sites to be guarded, found {guarded}");
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn downloads_are_attributed_to_the_CALLER_not_to_download_itself() {
+        // Without #[track_caller] the tally names lib.rs's one download line 53 times and answers
+        // nothing. Two calls from adjacent lines must appear as two sites.
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset(); arm();
+        note_download();
+        note_download();
+        let r = download_report(2);
+        assert!(r.contains("2 downloads across 2 sites"), "{r}");
+    }
+
+    #[test]
+    fn the_per_token_line_names_the_ONE_readback_that_is_unavoidable() {
+        // Sampling is one per token. Everything above one is the question, and saying so stops a
+        // reader treating the whole figure as waste.
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset(); arm();
+        note_download();
+        assert!(download_report(1).contains("sampling accounts for 1.0"));
+    }
+
+    #[test]
+    fn an_UNARMED_tally_says_how_to_arm_rather_than_reporting_zero() {
+        // The false-green shape again: "0 downloads" when nothing was counted.
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        *DOWNLOADS_BY_SITE.lock().unwrap() = None;
+        ARMED.store(false, Relaxed);
+        assert!(download_report(0).contains("not armed"));
     }
 }
