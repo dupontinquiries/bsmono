@@ -4112,6 +4112,92 @@ pub fn run(args: &[String]) {
             println!("   ...and the depth pre-pass draws opaque geometry twice, so each swap counts double");
         }
 
+        // ---- THE GATHER IS THE OTHER HALF OF THE COST ----
+        // Before a ray takes a single step it walks EVERY shape in the map
+        // to decide which ones it could hit. On PERPLEXUS that is 465
+        // bounding-sphere tests per ray, per system, per fragment — and the
+        // march that follows is capped at 48 steps. The scan is not the part
+        // anyone optimises and it may well be the larger number.
+        //
+        // A two-level test would fix it: group shapes into clusters, test
+        // cluster bounds first, and only walk the shapes inside the few
+        // clusters a ray actually crosses. This measures whether the map's
+        // shapes cluster tightly enough for that to pay.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let shapes: Vec<(Vec3, f32)> = w
+                .shapes
+                .iter()
+                .filter(|sh| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .map(|sh| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5)))
+                .collect();
+            // Sweep the cell size: too fine and the cluster test IS the
+            // scan (174 clusters for 361 shapes helps nobody), too coarse
+            // and every cluster is hit so nothing is skipped. The optimum is
+            // a property of how the map is laid out, not a number to guess.
+            println!();
+            println!("{:>8} {:>10} {:>9} {:>12} {:>9}", "cell", "clusters", "per cell", "tests/ray", "vs flat");
+            for cell in [30.0f32, 55.0, 80.0, 120.0, 170.0] {
+            let mut cells: std::collections::HashMap<(i32, i32, i32), (Vec3, f32, u32)> =
+                std::collections::HashMap::new();
+            cells.clear();
+            // CONSERVATIVE INSERTION. Binning a shape by its CENTRE is
+            // wrong and would quietly drop geometry: a tube spanning three
+            // cells must be found from all three, or rays through the outer
+            // two miss it. Every cell the bounding sphere touches gets a
+            // reference, which is what makes the structure exact rather than
+            // an approximation that mostly works.
+            for (p, r) in shapes.iter() {
+                let lo = ((*p - Vec3::splat(*r)) / cell).floor();
+                let hi = ((*p + Vec3::splat(*r)) / cell).floor();
+                for gx in (lo.x as i32)..=(hi.x as i32) {
+                    for gy in (lo.y as i32)..=(hi.y as i32) {
+                        for gz in (lo.z as i32)..=(hi.z as i32) {
+                            let e = cells.entry((gx, gy, gz)).or_insert((*p, 0.0, 0));
+                            e.1 = e.1.max(e.0.distance(*p) + r);
+                            e.2 += 1;
+                        }
+                    }
+                }
+            }
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
+            let (mut scanned_flat, mut scanned_two, mut rays) = (0u64, 0u64, 0u64);
+            for k in 0..600 {
+                let a = k as f32 * 0.7548;
+                let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.08 - 0.3, a.sin()).normalize();
+                rays += 1;
+                scanned_flat += shapes.len() as u64;
+                // MARCH the grid, do not scan it. Testing every cluster
+                // bound makes the acceleration structure its own bottleneck
+                // — 174 cluster tests to avoid 361 shape tests is barely a
+                // saving. Walking only the cells the ray actually passes
+                // through is the whole point of having a grid.
+                let mut t = 0.0f32;
+                let mut seen: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
+                while t < 260.0 {
+                    let p = eye + dir * t;
+                    let k = ((p.x / cell) as i32, (p.y / cell) as i32, (p.z / cell) as i32);
+                    if seen.insert(k) {
+                        scanned_two += 1; // the cell lookup
+                        if let Some((_, _, n)) = cells.get(&k) {
+                            scanned_two += *n as u64;
+                        }
+                    }
+                    t += cell * 0.5;
+                }
+            }
+            println!(
+                "{:>8.0} {:>10} {:>9.1} {:>12.0} {:>8.0}%",
+                cell,
+                cells.len(),
+                shapes.len() as f32 / cells.len().max(1) as f32,
+                scanned_two as f32 / rays as f32,
+                scanned_two as f32 / scanned_flat as f32 * 100.0
+            );
+            }
+            println!("   ({} shapes scanned flat, every ray, every system)", shapes.len());
+        }
+
         // ---- OVER-RELAXED SPHERE TRACING ----
         // A sphere march steps by the distance to the nearest surface, which
         // is guaranteed safe and usually timid: the true surface is often

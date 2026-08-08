@@ -4253,6 +4253,46 @@ having it report by name rather than by count.
 
     every car that should look like a car does
 
+## 1.130.0 — two dead ends and one real target
+
+Three ideas for high quality. Two died on contact with a measurement, which
+is the cheapest way for an idea to die.
+
+FOG CANNOT CAP THE RAYS. If fog saturates before a ray's range runs out, the
+tail of the march is invisible and can be cut for free. Our fog densities are
+0.0008 to 0.0014, which saturates at about 2,300 m against a 260 m march.
+The idea is sound and this world is far too clear for it.
+
+BACK-FACING SHADOWS WERE ALREADY SKIPPED. Surfaces pointing away from the sun
+skip the shadow march entirely — that win was taken some versions ago.
+
+THE GATHER IS THE REAL TARGET, and it is the part nobody had looked at.
+Before a ray takes a single step it walks EVERY shape in the map to decide
+what it could hit: 361 bounding-sphere tests on PERPLEXUS, per ray, per
+system, per fragment — against a march capped at 48 steps. The scan is
+plausibly the larger number and it had no acceleration at all.
+
+A uniform grid, MARCHED rather than scanned, is the fix:
+
+    cell   clusters   tests/ray   vs flat
+     30 m     8881       151        42%
+     55 m     1742       135        38%
+     80 m      601       140        39%
+    120 m      236       143        40%
+
+AND A CORRECTION WORTH RECORDING. My first version of this measurement binned
+each shape by its CENTRE and reported 8% — a twelve-fold win. That is wrong
+and would have dropped geometry: a tube spanning three cells must be
+reachable from all three, or rays through the outer two miss it entirely.
+With conservative insertion — every cell the bounding sphere touches — the
+real figure is 38%. Still a 2.6x reduction in gather work, but I nearly
+banked a number that was five times too good because the cheap version of
+the structure is also the broken one.
+
+Implementing it means uploading the grid and marching it in WGSL, which is a
+larger change than the budget left here allows. The measurement and the cell
+size are recorded so it can be built against rather than guessed at.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
