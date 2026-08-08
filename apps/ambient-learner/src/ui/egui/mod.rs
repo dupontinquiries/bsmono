@@ -21,6 +21,9 @@ pub mod locations;
 /// What the local database holds, and the transfer that is not wired yet.
 pub mod sync;
 
+/// Model statistics, device state, and who calibrated it.
+pub mod model;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
