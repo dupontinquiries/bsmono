@@ -5,6 +5,10 @@ edition = "2021"
 description = "Studio's timeline UI on uikit-egui: tracks, clips, ruler, and the peer-presence overlay that makes collaborative editing legible."
 
 [dependencies]
+# The live rack model. A dependency rather than a copy: the grid is a VIEW of
+# the pattern, and a second definition of what a step is would drift from the
+# one the audio thread reads.
+studio-live = { path = "../studio-live" }
 studio-core = { path = "../studio-core" }
 studio-collab = { path = "../studio-collab" }
 studio-audio = { path = "../studio-audio" }
