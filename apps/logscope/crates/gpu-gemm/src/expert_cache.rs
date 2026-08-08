@@ -651,6 +651,31 @@ mod route_condition_tests {
 /// if a case ever appears where the readback survives full residency, this is the calculation. What
 /// is deleted is the belief that Scout is that case.
 ///
+/// # SUPERSEDED — read this before implementing dense-MoE
+///
+/// **The v2 decode path already routes on the GPU with zero readbacks**, and it was built before
+/// this analysis. `moe_ffn_routed` chooses it when:
+///
+/// ```text
+/// t == 1  &&  (m.stream.is_none() || layer_resident)  &&  !m.cfg.weight_before
+/// ```
+///
+/// So the readback that dense-MoE removes by computing all sixteen experts is ALREADY removed, at
+/// 1x the compute instead of 16x, by a top-k kernel plus expert-indexed matvecs over the stacked
+/// weights. Computing everything is strictly worse than routing correctly on the GPU.
+///
+/// **What actually blocks Scout is the two other conditions**, not the readback itself:
+///
+/// * `m.stream.is_none() || layer_resident` — Scout streams, and pins 6 of 16 experts, so no layer
+///   qualifies. IQ1_S residency is what changes this.
+/// * `!m.cfg.weight_before` — Scout has weight_before, which `MOE_PRESCALE` addresses and which is
+///   still unvalidated.
+///
+/// The arithmetic below is kept because the CROSSOVER reasoning is sound and reusable — a 16x
+/// compute multiplier landing on 0.1% of a step really is favourable. It is simply not the cheapest
+/// way to reach that outcome here, and I proposed it without checking what the routed path already
+/// did.
+///
 /// Is it faster to compute EVERY expert than to ask which one?
 ///
 /// # The trade
@@ -746,6 +771,16 @@ mod dense_moe_tests {
         // Top-2 of 16 is an 8x multiplier, so it wins at a lower stall — the trade improves as the
         // router already touches more experts.
         assert!(dense_moe_crossover(16, 2) < dense_moe_crossover(16, 1));
+    }
+
+    #[test]
+    fn the_module_says_v2_ALREADY_removes_this_readback() {
+        // Guards against someone implementing dense-MoE from the arithmetic without reading why it
+        // is not the cheapest route. The v2 path removes the same readback at 1x compute.
+        let src = include_str!("expert_cache.rs");
+        assert!(src.contains("SUPERSEDED"));
+        assert!(src.contains("already removed, at\n/// 1x the compute instead of 16x")
+             || src.contains("1x the compute instead of 16x"));
     }
 
     #[test]
