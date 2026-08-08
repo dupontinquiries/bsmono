@@ -24,6 +24,7 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
 targets = ["desktop"]
+primary = true            # the egui port is the intended build; camera and call wiring still absent
 notes = "the founding egui app for the uikit-egui patterns (live backgrounds, page/subpage nav originated here) — not a Qt/GTK port, so it uses the shared default palette rather than a bespoke one. `cargo build --release` produces the deployable `snapclone-egui` bin directly (the `app` feature is default-on). The C++ camera/peer engine (src/, cmake/) is the separate on-device native app; this is the egui reference/demo surface."
 
 [apps.bot-arena-egui]
@@ -34,6 +35,7 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11) — no GTK runtime, same convention as rusty-board-egui
 targets = ["desktop"]
+primary = true            # the egui port is the intended build
 notes = "the egui-primary port of bot-arena (GTK4/libadwaita dashboard) — see UI_STRATEGY.md. Defaults to the Arena palette, matching main.rs's real .bot-* CSS status colours (idle/running/pass/fail/spawn), not fsm.rs's separate SVG-diagram colour scheme. `cargo build --release` produces the deployable `bot-arena-egui` bin directly (the `app` feature is default-on); the GTK4 original stays the parity reference."
 
 [apps.bo-suite-egui]
@@ -44,6 +46,7 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11) — no Qt runtime, same convention as rusty-board-egui
 targets = ["desktop"]
+primary = true            # the egui port is the intended build
 notes = "the egui-primary port of bo-controller (Qt/QML B&O ambient audio panel) — see UI_STRATEGY.md. Defaults to the Amber palette (warm gold) matching the Qt surface. `cargo build --release` produces the deployable `bo-suite-egui` bin directly (the `app` feature is default-on); the Qt/QML original stays the parity reference. Compact-width layout uses the vertical-tabs sidebar (not a whole-surface swipe) since the Devices view's volume sliders would otherwise race a page-swipe gesture for the same drag."
 
 [apps.voiceterm-egui]
@@ -139,6 +142,7 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
 targets = ["desktop"]
+primary = true            # the egui port is the intended build
 notes = "the egui/eframe LLM chat app over the vendored headless logscope core — the egui-primary frontend (GTK stays behind the core's optional `gui` feature and isn't built). `cargo build --release -p logscope-egui` from apps/logscope produces the deployable bin (`gui` + `gpu-scene` are default-on). Local llama.cpp inference: `--features llamacpp` (Vulkan) or `llamacpp-cpu`; the pure-Rust wgpu engine: `--features wgpu-engine` (pulls crates/gpu-gemm, excluded otherwise). GLM-4.7-Flash (arch deepseek2, MLA+MoE) is supported on both paths — see apps/logscope/GLM47_FLASH_SUPPORT.md."
 
 [apps.fao-codec-egui]
@@ -149,6 +153,7 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
 targets = ["desktop"]
+primary = true            # the egui port is the intended build
 notes = "the egui-primary port of fao_app (GTK4/libadwaita video-codec workbench) — begun per UI_STRATEGY.md with the shell + the Encode Lab page driving the REAL fao-codec-lib encoder (encode_iframe_recon on a deterministic torture pattern; size/bpp/PSNR report, headless-tested). `cargo build --release -p fao-codec-egui` produces the deployable bin (app feature default-on); `--no-default-features` is the CI lib. The GTK original (fao_app, ~13K lines) stays the parity reference; sequence encode, block-match viz and v1/v2 comparison are the next pages. FIRST crate in the tree verified with the offline Rust 1.96 toolchain (rustup drop 2026-07-26) — the cargo-1.75/edition-2024 wall no longer applies in-sandbox."
 
 [apps.gitmind-egui]
@@ -159,6 +164,7 @@ daemon = false
 flatpak = false
 runtime = "none"          # pure egui/glow (wayland/x11), same convention as the other -egui apps
 targets = ["desktop"]
+primary = true            # its own notes already call it "the egui-primary port"; the flag was simply missing
 notes = "the egui-primary port of gitmind's Qt/QML touch GUI (Fleet/Push/Network/Apps/Import/Branches/Files/Timeline/Settings + dupes roll-up — see apps/gitmind/GITMIND_EGUI_PORT.md). Calls cockpit directly (both Rust; no JSON bridge). `cargo build --release -p gitmind-egui` produces the deployable bin (the `app` feature is default-on); headless lib for CI: `--no-default-features`. The Qt `gui` crate stays the untouched fallback and still needs Qt6."
 
 [apps.tomescope]
@@ -432,6 +438,7 @@ daemon = false
 flatpak = false
 runtime = "none"
 targets = ["desktop"]
+primary = true            # the egui port is the intended build
 notes = "the egui settings editor, embedded by other frontends rather than run on its own — which is why it has no [[bin]] and no `app` feature, unlike every other egui port. It was missing from this manifest entirely, so it could never appear in gitmind's catalogue; role=\"lib\" is the honest description rather than giving it a binary it does not need."
 
 [apps.krapper-egui]
@@ -442,4 +449,16 @@ daemon = false
 flatpak = false
 runtime = "none"
 targets = ["desktop"]
+primary = true            # the egui port is the intended build
 notes = "the egui port of krapper (an iced app). krapper had NO egui build at all and the parity audit never noticed, because it looks for an egui-frontend/ directory and krapper has one src/ with main.rs calling iced::application. vibe.rs, scale.rs, vocab.rs and dict.rs are iced-free, so the port mounts the model by #[path] and carries only the surface: the stress ruler, the hot-mic meter, and blurb suggestions filtered to what still fits the bar."
+
+[apps.ambient-learner-egui]
+path = "apps/ambient-learner/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop", "phone"]
+primary = true
+notes = "the egui port of ambient-learner. A SEPARATE CRATE rather than a feature of the parent: iced 0.12 caps web-sys below what eframe 0.34 needs, and cargo resolves optional dependencies whether or not their feature is on, so an eframe binary in the parent fails to RESOLVE even with iced disabled. The view code is not copied — one #[path] include pulls in src/egui_lib.rs and its page tree. Live and History pages are ported; Locations, Map, Model and Sync are not."

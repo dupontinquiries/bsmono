@@ -1,0 +1,36 @@
+# A SEPARATE CRATE, deliberately.
+#
+# The first attempt put an eframe binary in the parent crate and it would not
+# resolve: iced 0.12 caps web-sys at 0.3.67 and eframe 0.34 needs >= 0.3.77.
+# Cargo resolves optional dependencies whether or not their feature is enabled,
+# so `--features egui-app` failed to RESOLVE rather than failing to compile —
+# with iced switched off. The two cannot coexist in one manifest at all, which
+# is stronger than the parent's comment claimed.
+#
+# Splitting the frontend out sidesteps that entirely and matches what every
+# other port in this fleet does: egui-frontend/ with its own manifest. It also
+# gives the parity audit the directory it looks for.
+[package]
+name = "ambient-learner-egui"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# The fleet convention: the binary is behind a default-ON `app` feature, so
+# `--no-default-features` builds a headless library the pages can be tested
+# against without a window system. That matters here more than elsewhere —
+# eframe pulls glutin and winit, and this container cannot even LINK them, so
+# without this split the pages would be untestable in CI.
+default = ["app"]
+app = ["dep:eframe"]
+
+[dependencies]
+egui = "0.34"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+weather-share = { path = "../../../shared/weather-share" }
+
+[[bin]]
+name = "ambient-learner-egui"
+path = "src/main.rs"
+required-features = ["app"]
