@@ -131,11 +131,29 @@ pub fn autotune_put(adapter: &str, k: usize, n: usize, tile: u32) {
 
 fn flush_file() -> PathBuf { cache_root().join("submit-flush.tsv") }
 /// Cached passes-per-submit for this adapter (the SubmitTuner's settled value), if any.
+/// A cached autotune verdict is only valid for the ENGINE that measured it.
+///
+/// The submit tuner sweeps passes-per-submit and settles on whichever value gave the best per-token
+/// time. That measurement is only meaningful if batching could help — and until the dims-ring frame
+/// leak was fixed, the frame died at the first readback and every dispatch submitted on its own
+/// encoder regardless of flush_every. **A verdict measured then says nothing about now**, and it is
+/// keyed only by adapter, so it would be reused forever.
+///
+/// Bumped whenever a change alters what the tuner is measuring. This is cheaper than being clever:
+/// the cost of an unnecessary bump is one re-sweep, and the cost of a missed one is a permanently
+/// stale setting nobody thinks to question.
+pub const SUBMIT_TUNE_EPOCH: u32 = 2;
+
 pub fn flush_get(adapter: &str) -> Option<u32> {
     let txt = std::fs::read_to_string(flush_file()).ok()?;
     for line in txt.lines() {
         let mut f = line.split('\t');
-        if f.next() == Some(adapter) { return f.next().and_then(|v| v.parse::<u32>().ok()); }
+        if f.next() != Some(adapter) { continue }
+        let v = f.next().and_then(|v| v.parse::<u32>().ok())?;
+        // A row without an epoch predates this check and is discarded rather than assumed current.
+        let epoch = f.next().and_then(|e| e.parse::<u32>().ok()).unwrap_or(0);
+        if epoch != SUBMIT_TUNE_EPOCH { return None }
+        return Some(v)
     }
     None
 }
@@ -147,7 +165,10 @@ pub fn flush_put(adapter: &str, flush: u32) {
     for line in prev.lines() {
         if line.split('\t').next() != Some(adapter) && !line.trim().is_empty() { out.push_str(line); out.push('\n'); }
     }
-    out.push_str(&format!("{adapter}\t{flush}\n"));
+    // The epoch goes in the row, so a verdict measured by a different engine is discarded on read
+    // rather than silently reused. Appending a field keeps old rows parseable — they read as epoch 0
+    // and are rejected, which is the intended outcome for anything measured before this check.
+    out.push_str(&format!("{adapter}\t{flush}\t{SUBMIT_TUNE_EPOCH}\n"));
     let _ = std::fs::write(flush_file(), out);
 }
 
@@ -739,5 +760,43 @@ mod vram_store_tests {
         vram_put(&b, 12.0);
         assert_eq!(vram_get(&a), Some(63.0));
         assert_eq!(vram_get(&b), Some(12.0));
+    }
+}
+
+
+#[cfg(test)]
+mod epoch_tests {
+    use super::*;
+
+    #[test]
+    fn a_row_WITHOUT_an_epoch_is_rejected_rather_than_assumed_current() {
+        // Every verdict on every machine today predates this check, and every one of them was
+        // measured while the dims-ring frame leak made batching impossible. Reusing them would keep
+        // the frame fix invisible.
+        let dir = std::env::temp_dir().join(format!("ls-epoch-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("LOGSCOPE_CACHE_DIR", &dir);
+        let _ = std::fs::write(flush_file(), "SomeAdapter\t32\n");
+        assert_eq!(flush_get("SomeAdapter"), None, "a row with no epoch must not be trusted");
+    }
+
+    #[test]
+    fn a_row_at_the_CURRENT_epoch_is_used() {
+        let dir = std::env::temp_dir().join(format!("ls-epoch2-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("LOGSCOPE_CACHE_DIR", &dir);
+        let _ = std::fs::write(flush_file(), format!("A\t128\t{SUBMIT_TUNE_EPOCH}\n"));
+        assert_eq!(flush_get("A"), Some(128));
+    }
+
+    #[test]
+    fn a_row_from_a_FUTURE_epoch_is_also_rejected() {
+        // Downgrading the engine must not adopt a verdict measured by a newer one, for the same
+        // reason upgrading must not keep an older one.
+        let dir = std::env::temp_dir().join(format!("ls-epoch3-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::env::set_var("LOGSCOPE_CACHE_DIR", &dir);
+        let _ = std::fs::write(flush_file(), format!("A\t128\t{}\n", SUBMIT_TUNE_EPOCH + 5));
+        assert_eq!(flush_get("A"), None);
     }
 }
