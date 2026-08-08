@@ -60,7 +60,15 @@ pub const CSDF_W: u32 = 36;
 pub const CSDF_H: u32 = 24;
 pub const CSDF_SLAB: u32 = 44;
 pub const CSDF_MAXM: u32 = 12;
-pub const RC_K: usize = 28;
+/// Shapes per cell. Measured: the mean occupancy is 0.7 and the whole
+/// structure is nearly free to walk — but PERPLEXUS had fourteen cells needing more than 28, and I raised it twice more before
+/// thinking to ask what the densest cell ACTUALLY holds: 71. Two rounds of
+/// climbing toward a number the probe could have told me at once., and a cell over its cap silently drops the surplus, so
+/// a ray through one cannot see what was dropped. That is a correctness
+/// fault wearing a performance costume, and the fix costs 500 KB: the grid is
+/// 40x40 and a wider cell changes nothing about how fast it is walked, since
+/// the loop reads the actual count and not the cap.
+pub const RC_K: usize = 80;
 pub const RC_STRIDE: usize = 32;
 pub const HMAP_SIZE: u32 = 1024;
 /// Scene renders into HDR; bloom + tonemap live in the composite pass.

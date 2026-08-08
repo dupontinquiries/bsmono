@@ -4293,6 +4293,37 @@ Implementing it means uploading the grid and marching it in WGSL, which is a
 larger change than the budget left here allows. The measurement and the cell
 size are recorded so it can be built against rather than guessed at.
 
+## 1.131.0 — the gather was never the problem, and the cap was
+
+A CORRECTION TO MY OWN LAST VERSION. I measured a proposed grid against "a
+flat scan of every shape" and reported a 2.6x win. The gather has never
+scanned every shape: it already looks up a baked 40x40 cell and walks what is
+in it. The baseline was a strawman and the saving was imaginary. Measured
+properly, the mean occupancy is 0.7 shapes per cell — the structure is
+almost free to walk and there was nothing there to win.
+
+What the measurement did find is a fault of a different kind. A cell holds
+RC_K shapes and a busier one SILENTLY DROPS THE SURPLUS, so a ray through it
+cannot see what was dropped. PERPLEXUS had fourteen such cells.
+
+    map              shapes   mean/cell   max/cell   truncated
+    ARENA CLASSIC       278       0.3        14        0
+    PERPLEXUS           333       0.8        71        0   (was 14)
+    MONKEY RUN          182       0.2        10        0
+    DROPSHOT            262       0.3        15        0
+    CHAMBER              62       0.1         8        0
+
+AND I RAISED THE CAP THREE TIMES BEFORE THINKING TO ASK WHAT IT NEEDED. 28 to
+40 left six cells over; 40 to 64 left two; only then did I make the probe
+report the UNCAPPED maximum, which is 71. Two rounds of climbing toward a
+number the measurement could have given me at once — the same mistake as
+tuning against a threshold instead of asking what the data says.
+
+The cap is 80 now, no map truncates, and it costs 500 KB. Walking a cell is
+unchanged in speed because the loop reads the actual count, not the cap: this
+buys correctness at no performance cost, which is the opposite of every other
+trade in this file.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

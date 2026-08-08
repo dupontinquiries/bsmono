@@ -4112,90 +4112,72 @@ pub fn run(args: &[String]) {
             println!("   ...and the depth pre-pass draws opaque geometry twice, so each swap counts double");
         }
 
-        // ---- THE GATHER IS THE OTHER HALF OF THE COST ----
-        // Before a ray takes a single step it walks EVERY shape in the map
-        // to decide which ones it could hit. On PERPLEXUS that is 465
-        // bounding-sphere tests per ray, per system, per fragment — and the
-        // march that follows is capped at 48 steps. The scan is not the part
-        // anyone optimises and it may well be the larger number.
+        // ---- WHAT THE BAKED CELL GRID ACTUALLY COSTS ----
         //
-        // A two-level test would fix it: group shapes into clusters, test
-        // cluster bounds first, and only walk the shapes inside the few
-        // clusters a ray actually crosses. This measures whether the map's
-        // shapes cluster tightly enough for that to pay.
+        // A correction to my own last measurement. I compared a proposed
+        // grid against a "flat scan of every shape" and reported a 2.6x win
+        // — but the gather has NEVER scanned every shape. It already looks
+        // up a baked 40x40 cell and walks at most RC_K entries. The baseline
+        // was a strawman and the win was imaginary.
+        //
+        // What matters about this structure is not its speed but its CAP: a
+        // cell holds RC_K shapes and a busier one silently drops the rest,
+        // which is a correctness question wearing a performance costume.
         {
-            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
-            let shapes: Vec<(Vec3, f32)> = w
-                .shapes
-                .iter()
-                .filter(|sh| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
-                .map(|sh| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5)))
-                .collect();
-            // Sweep the cell size: too fine and the cluster test IS the
-            // scan (174 clusters for 361 shapes helps nobody), too coarse
-            // and every cluster is hit so nothing is skipped. The optimum is
-            // a property of how the map is laid out, not a number to guess.
+            use crate::render::{RC_DIM, RC_K};
             println!();
-            println!("{:>8} {:>10} {:>9} {:>12} {:>9}", "cell", "clusters", "per cell", "tests/ray", "vs flat");
-            for cell in [30.0f32, 55.0, 80.0, 120.0, 170.0] {
-            let mut cells: std::collections::HashMap<(i32, i32, i32), (Vec3, f32, u32)> =
-                std::collections::HashMap::new();
-            cells.clear();
-            // CONSERVATIVE INSERTION. Binning a shape by its CENTRE is
-            // wrong and would quietly drop geometry: a tube spanning three
-            // cells must be found from all three, or rays through the outer
-            // two miss it. Every cell the bounding sphere touches gets a
-            // reference, which is what makes the structure exact rather than
-            // an approximation that mostly works.
-            for (p, r) in shapes.iter() {
-                let lo = ((*p - Vec3::splat(*r)) / cell).floor();
-                let hi = ((*p + Vec3::splat(*r)) / cell).floor();
-                for gx in (lo.x as i32)..=(hi.x as i32) {
-                    for gy in (lo.y as i32)..=(hi.y as i32) {
-                        for gz in (lo.z as i32)..=(hi.z as i32) {
-                            let e = cells.entry((gx, gy, gz)).or_insert((*p, 0.0, 0));
-                            e.1 = e.1.max(e.0.distance(*p) + r);
-                            e.2 += 1;
+            println!("{:<14} {:>8} {:>9} {:>9} {:>10}", "map", "shapes", "mean/cell", "max/cell", "truncated");
+            for (name, style_id) in [
+                ("ARENA CLASSIC", 0usize),
+                ("PERPLEXUS", 21),
+                ("MONKEY RUN", 8),
+                ("DROPSHOT", 3),
+                ("CHAMBER", 30),
+            ] {
+                let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
+                let span = crate::world::TG_HALF * 2.0;
+                let cell = span / RC_DIM as f32;
+                let half_diag = cell * 0.7071;
+                let mut counts: Vec<usize> = Vec::new();
+                let mut truncated = 0usize;
+                let live: Vec<(Vec3, f32)> = w
+                    .shapes
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, sh)| !sh.cut && !w.is_mover(*i) && !matches!(sh.sdf, crate::world::Sdf::None))
+                    .map(|(_, sh)| (sh.pos, crate::shape_bound(&sh.sdf).max(0.5)))
+                    .collect();
+                for cz in 0..RC_DIM {
+                    for cx in 0..RC_DIM {
+                        let cc = glam::Vec2::new(
+                            -crate::world::TG_HALF + (cx as f32 + 0.5) * cell,
+                            -crate::world::TG_HALF + (cz as f32 + 0.5) * cell,
+                        );
+                        let mut n = 0usize;
+                        for (p, r) in live.iter() {
+                            let d = (glam::Vec2::new(p.x, p.z) - cc).length() - r - half_diag;
+                            if d < 0.0 {
+                                n += 1;
+                            }
                         }
+                        if n > RC_K {
+                            truncated += 1;
+                        }
+                        counts.push(n); // UNCAPPED: what the cell actually needs
                     }
                 }
+                let mean = counts.iter().sum::<usize>() as f32 / counts.len() as f32;
+                println!(
+                    "{:<14} {:>8} {:>9.1} {:>9} {:>9} cells",
+                    name,
+                    live.len(),
+                    mean,
+                    counts.iter().max().copied().unwrap_or(0),
+                    truncated
+                );
             }
-            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 4.0, 30.0);
-            let (mut scanned_flat, mut scanned_two, mut rays) = (0u64, 0u64, 0u64);
-            for k in 0..600 {
-                let a = k as f32 * 0.7548;
-                let dir = Vec3::new(a.cos(), (k % 9) as f32 * 0.08 - 0.3, a.sin()).normalize();
-                rays += 1;
-                scanned_flat += shapes.len() as u64;
-                // MARCH the grid, do not scan it. Testing every cluster
-                // bound makes the acceleration structure its own bottleneck
-                // — 174 cluster tests to avoid 361 shape tests is barely a
-                // saving. Walking only the cells the ray actually passes
-                // through is the whole point of having a grid.
-                let mut t = 0.0f32;
-                let mut seen: std::collections::HashSet<(i32, i32, i32)> = std::collections::HashSet::new();
-                while t < 260.0 {
-                    let p = eye + dir * t;
-                    let k = ((p.x / cell) as i32, (p.y / cell) as i32, (p.z / cell) as i32);
-                    if seen.insert(k) {
-                        scanned_two += 1; // the cell lookup
-                        if let Some((_, _, n)) = cells.get(&k) {
-                            scanned_two += *n as u64;
-                        }
-                    }
-                    t += cell * 0.5;
-                }
-            }
-            println!(
-                "{:>8.0} {:>10} {:>9.1} {:>12.0} {:>8.0}%",
-                cell,
-                cells.len(),
-                shapes.len() as f32 / cells.len().max(1) as f32,
-                scanned_two as f32 / rays as f32,
-                scanned_two as f32 / scanned_flat as f32 * 100.0
-            );
-            }
-            println!("   ({} shapes scanned flat, every ray, every system)", shapes.len());
+            println!("   cap is RC_K = {RC_K}: a cell needing more drops the surplus, and a ray");
+            println!("   through it cannot see what was dropped");
         }
 
         // ---- OVER-RELAXED SPHERE TRACING ----
