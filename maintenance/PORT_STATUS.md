@@ -518,32 +518,41 @@ unrunnable front end is less useful than one behind a runnable one.
 A list arrived of things wrong with the ports. Recording what is verified, what
 is reproduced, and what I have not touched — so none of it depends on my memory.
 
-### 1. Input fields accept one character — REPRODUCED, narrowed, NOT fixed
+### 1. Input fields accept one character — DID NOT REPRODUCE (corrected)
 
 Three probes, in order:
+
+**An earlier version of this section said the bug was reproduced and lived in
+the shell. That was wrong — twice over — and the corrections are the useful
+part.**
 
 | level | result |
 |---|---|
 | bare `TextEdit`, synthetic keystrokes | accepts every character |
 | `qr::qr_ui`, a real ported page, focused by Tab | accepts every character |
-| `Snapclone::ui`, the whole shell, up to 80 Tab presses | **not one character lands** |
+| `Snapclone::ui`, the whole shell, Tab-navigated | **accepts every character** |
 
-So the widgets are fine and the pages are fine; the fault is in the SHELL, and
-it is worse than reported — not one character rather than exactly one. The
-reproduction lives in `snapclone/egui-frontend/src/lib.rs` as an `#[ignore]`d
-test with the evidence in its doc comment; run it with
-`cargo test -- --ignored typing_into_a_field`.
+Two of my own probes invented the bug before the third measured it:
 
-Prime suspect: `GestureLayer::update` runs across the full surface before the
-pages draw. A layer that interacts with the whole rect every frame is the right
-shape to take focus back between keystrokes. Confirming it means bisecting the
-shell with the gesture layer disabled — the next step, and not something to
-guess at in a commit message.
+1. Focusing `ui.next_auto_id()` captured *before* the page call targets the
+   wrong widget — several widgets precede the field — and reported ZERO
+   characters for a page that works perfectly.
+2. Watching only `add_form.host` reported zero again, because that field is not
+   focusable in the default state. The text had been landing in `picker.query`
+   the whole time. The fifth Tab reaches it and all three characters arrive.
 
-Worth noting the probe design cost me a wrong answer first: focusing
-`ui.next_auto_id()` from before the page call targets the wrong widget, and
-reported zero characters for a page that actually works. Tab navigation is the
-honest way to focus something you did not build.
+I also named `GestureLayer::update` as the prime suspect. It only READS input —
+`ui.input(...)` — and never allocates a widget or interacts, so it cannot take
+focus. That was a guess stated with more confidence than it had earned.
+
+`typing_through_the_shell_keeps_every_character` is now a PASSING regression
+test rather than an ignored reproduction.
+
+**This does not mean the report is wrong.** It means the fault is not reachable
+from a synthetic-event harness. What this cannot see is the windowing layer:
+real keystrokes arrive through winit and may come as `Event::Ime` composition
+rather than `Event::Text`, and an on-screen keyboard adds a third path. That
+needs a running binary on a device, not a test.
 
 ### 2. Not yet addressed, and named rather than implied
 

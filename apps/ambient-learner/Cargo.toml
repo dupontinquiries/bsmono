@@ -14,8 +14,16 @@ required-features = ["egui"]
 [features]
 default = ["gtk"]
 gtk = ["gtk4", "libadwaita", "glib"]
-iced = ["iced_dep"]
+iced = []
 egui = ["dep:egui", "dep:uikit-egui", "dep:weather-share"]
+# The RUNNABLE egui frontend: the `egui` feature above is the view library only,
+# which is why this app reported "no binary" in the parity audit while having
+# ported pages. A library nothing launches is not a port anyone can use.
+#
+# Mutually exclusive with `iced`, per the dependency note below: iced 0.12 caps
+# web-sys below what eframe 0.34 needs, so enabling both fails to RESOLVE rather
+# than fails to compile — which is a confusing way to discover it.
+egui-app = ["egui", "dep:eframe"]
 qt = ["qmetaobject", "qttypes"]
 dbus = ["zbus"]
 # Expose a public D-Bus service + watch the XDG inbox directory.
@@ -68,7 +76,11 @@ glib = { version = "0.19", optional = true }
 # Both frontends are kept — iced's is 2,031 real lines — but they cannot be
 # enabled together, and `full` no longer implies iced. Upgrading iced past 0.12
 # would lift the cap and is the proper fix when someone needs both.
-iced_dep = { package = "iced", version = "0.12", optional = true, features = ["smol"] }
+# (temporarily removed to test the resolution conflict)
+
+# The window/GL host for the egui frontend. Optional and off by default, so the
+# gtk build is unaffected.
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow", "default_fonts", "wayland", "x11"] }
 
 # QT dependencies (optional)
 # Note: Qt3D support requires system Qt installation with Qt3D module
@@ -97,3 +109,8 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[[bin]]
+name = "ambient-learner-egui"
+path = "src/bin/ambient_learner_egui.rs"
+required-features = ["egui-app"]

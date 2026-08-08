@@ -42,6 +42,11 @@ impl CentralView {
 
 struct VoicetermApp {
     app: App,
+    /// Bytes destined for a PTY: the encoded control keys plus any submitted
+    /// line. The demo has no PTY, so they accumulate here rather than being
+    /// dropped — which is what was happening before, and why Ctrl-C did
+    /// nothing while ordinary typing worked.
+    pty_out: Vec<u8>,
     sidebar: Sidebar,
     compass: ActionCompass,
     colors: PaletteColors,
@@ -368,7 +373,30 @@ impl eframe::App for VoicetermApp {
                 }
                 return;
             }
-            self.app.handle_input(ui);
+            // Submitted line (Enter) and the raw BYTES are two different
+            // outputs and both matter. handle_input returns the line; the
+            // control keys — arrows, Ctrl-C, Tab — are encoded into
+            // pending_bytes, and until now NOTHING DRAINED THEM. They were
+            // computed correctly every frame and discarded, which is exactly
+            // why typing worked and Ctrl-C appeared dead.
+            let submitted = self.app.handle_input(ui);
+            let key_bytes = self.app.take_pending_bytes();
+            self.pty_out.extend_from_slice(&key_bytes);
+            if let Some(line) = submitted {
+                // A submitted line goes to the same place, newline included: a
+                // PTY does not distinguish "the user typed a command" from "the
+                // user typed bytes", and having two paths is how they drift.
+                self.pty_out.extend_from_slice(line.as_bytes());
+                self.pty_out.push(b'\r');
+            }
+            // The demo has no PTY to write to. Rather than dropping the bytes
+            // again, they are kept on the app where a host can drain them, and
+            // capped so a long session cannot grow without bound.
+            const PTY_OUT_CAP: usize = 64 * 1024;
+            if self.pty_out.len() > PTY_OUT_CAP {
+                let drop = self.pty_out.len() - PTY_OUT_CAP;
+                self.pty_out.drain(..drop);
+            }
             let area = ui.available_rect_before_wrap();
             let colors = self.colors; // PaletteColors is Copy — keeps the borrows below simple
 
@@ -611,6 +639,7 @@ fn main() -> eframe::Result<()> {
     },
         Box::new(move |_cc| {
             Ok(Box::new(VoicetermApp {
+                pty_out: Vec::new(),
                 app,
                 sidebar,
                 compass: ActionCompass::default(),
