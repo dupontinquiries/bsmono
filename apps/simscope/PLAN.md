@@ -501,3 +501,48 @@ insufficient refinement.
   is not accessible here.
 - **No thermal or conductivity homogenization**, though both are the same machinery with the
   Laplace operator instead of elasticity.
+
+
+## Fracture
+
+The crack-tip field is singular — it goes as `1/√r` — so no finite element resolves it, and a
+method that reads stress *at* the tip is measuring its own mesh. The J-integral sidesteps that
+entirely: it is conserved, so evaluating it on a contour away from the tip gives the same answer as
+one hugging it, and the far field is what the mesh does resolve.
+
+**Path independence is the primary test and needs no reference data.** Compute `J` over several
+annuli and they must agree; measured spread is under 5%. If they disagree, the result is not a
+J-integral whatever else it happens to match.
+
+Then, against the handbook: `K_I` matches the standard edge-crack solution within 12% at three
+crack lengths, and the `√a` scaling holds independently of any handbook constant. An uncracked
+ligament releases essentially no energy, which catches a domain integral picking up the general
+stress field rather than the singular one — an error that would still produce plausible numbers on
+a cracked mesh.
+
+The equivalent domain form is used rather than a line integral, because a contour drawn through a
+mesh cuts elements at arbitrary places and samples a piecewise-constant stress field at its worst.
+And the crack is modelled as an *unrestrained portion of a symmetry boundary* rather than by
+splitting nodes — simpler, and it removes a whole class of connectivity errors.
+
+### What this says about nacre
+
+At nacre's own working strength, aragonite's critical flaw is **0.81 µm** — larger than a platelet
+is thick (~0.5 µm). No crack big enough to matter fits inside a single platelet, which is the
+nanoscale flaw-tolerance argument: below a critical dimension a brittle solid becomes insensitive
+to flaws because theoretical strength is reached before a crack can run.
+
+That is a **size effect, not a material property**, which is exactly why it cannot live in
+`sim-mat`'s library and has to be computed. It is also only part of the story — flaw tolerance
+explains why the platelets do not break, not why cracks between them are arrested. That second half
+is still the cohesive-interface question.
+
+### Fracture debts
+
+- **LEFM only.** No plasticity, so no crack-tip yielding and no J-R curve; for copper or steel this
+  bounds rather than predicts.
+- **Mode I only.** No mixed-mode decomposition, which needs an interaction integral.
+- **No crack growth.** `J` is evaluated on a fixed geometry; propagation needs remeshing or an
+  enrichment.
+- **No cohesive zone.** The mechanism nacre actually needs, and now the only major piece left
+  before its toughness becomes approachable.
