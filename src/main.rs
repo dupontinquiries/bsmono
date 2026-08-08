@@ -47,6 +47,7 @@ mod posture;
 mod procars;
 mod procgen;
 mod raid;
+mod relay;
 mod render;
 mod style;
 mod subsea;
