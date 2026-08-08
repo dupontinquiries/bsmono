@@ -211,3 +211,124 @@ mod iq2s_tests {
         assert!(dequant_iq2_s(&vec![0u8; IQ2_S_BLOCK], 300).is_err());
     }
 }
+
+/// IQ3_S — the last unsupported type in a UD-IQ1_S Scout, at 24% of its bytes.
+///
+/// ## Its scale is unlike every other IQ format here
+///
+/// `1 + 2*nibble`, with **no half-offset and no 0.25 or 0.5 multiplier**. Every other format in this
+/// file is `(0.5 + nibble) * k`. Carrying the familiar form over gives a scale that is wrong by a
+/// factor between 2 and 4 depending on the nibble — non-uniform, so it distorts the weight
+/// distribution rather than merely shrinking it, which is worse than IQ3_XXS's uniform halving.
+///
+/// ## The ninth index bit
+///
+/// The grid has 512 entries, so an index is nine bits: eight from `qs`, one from `qh`. That bit is
+/// extracted by a SHIFT THAT VARIES WITH POSITION — `(qh[b] << (8 - 2*l)) & 256` for the even index
+/// and `(7 - 2*l)` for the odd — which packs eight index bits into one byte at alternating offsets.
+///
+/// A fixed shift reads the same bit for every `l`, so a quarter of the entries index into the wrong
+/// half of the grid. In range, and wrong.
+pub const IQ3_S_BLOCK: usize = 110;
+
+pub fn dequant_iq3_s(raw: &[u8], n: usize) -> Result<Vec<f32>, String> {
+    if n % 256 != 0 { return Err(format!("IQ3_S needs a multiple of 256 weights, got {n}")) }
+    let blocks = n / 256;
+    if raw.len() < blocks * IQ3_S_BLOCK {
+        return Err(format!("IQ3_S: {} bytes for {blocks} blocks, need {}",
+            raw.len(), blocks * IQ3_S_BLOCK));
+    }
+    let grid = &crate::iqgrids::IQ3S_GRID;
+    let mut out = vec![0.0f32; n];
+    for b in 0..blocks {
+        let p = b * IQ3_S_BLOCK;
+        let d = f16(raw[p], raw[p + 1]);
+        let qs = &raw[p + 2..p + 66];        // 64 index bytes
+        let qh = &raw[p + 66..p + 74];       // 8 bytes, one ninth-bit each per 32-weight group
+        let signs = &raw[p + 74..p + 106];   // 32 explicit sign bytes
+        let scales = &raw[p + 106..p + 110]; // 4 bytes, two nibbles each
+        let mut o = b * 256;
+        for pair in 0..4 {
+            // 1 + 2*nibble. NOT (0.5 + nibble) * k — the form every other IQ format here uses.
+            let db = [d * (1.0 + 2.0 * (scales[pair] & 0xF) as f32),
+                      d * (1.0 + 2.0 * (scales[pair] >> 4) as f32)];
+            for half in 0..2 {
+                let qo = pair * 16 + half * 8;
+                let so = pair * 8 + half * 4;
+                let hb = qh[pair * 2 + half] as usize;
+                for l in 0..4 {
+                    // Position-varying shift: the ninth bit for index 2l comes from a different
+                    // offset than for 2l+1. A fixed shift reads one bit for every l and sends a
+                    // quarter of the entries into the wrong half of a 512-entry grid.
+                    let i1 = qs[qo + 2 * l] as usize | ((hb << (8 - 2 * l)) & 256);
+                    let i2 = qs[qo + 2 * l + 1] as usize | ((hb << (7 - 2 * l)) & 256);
+                    let (g1, g2) = (grid[i1].to_le_bytes(), grid[i2].to_le_bytes());
+                    let sb = signs[so + l];
+                    for j in 0..4 {
+                        let s1 = if sb & KMASK_IQ2XS[j] != 0 { -1.0 } else { 1.0 };
+                        let s2 = if sb & KMASK_IQ2XS[j + 4] != 0 { -1.0 } else { 1.0 };
+                        out[o + j] = db[half] * g1[j] as f32 * s1;
+                        out[o + 4 + j] = db[half] * g2[j] as f32 * s2;
+                    }
+                    o += 8;
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod iq3s_tests {
+    use super::*;
+
+    #[test]
+    fn the_SCALE_form_is_1_PLUS_2N_unlike_every_other_IQ_format_here() {
+        // Others are (0.5 + nibble) * k. Carrying that form over gives a scale wrong by a factor
+        // between 2 and 4 depending on the nibble — NON-UNIFORM, so it distorts the weight
+        // distribution rather than merely shrinking it.
+        let mut raw = vec![0u8; IQ3_S_BLOCK];
+        raw[0] = 0x00; raw[1] = 0x3C;              // d = 1.0
+        raw[106] = 0x00;                            // nibble 0 -> db = 1 + 0 = 1.0
+        let v = dequant_iq3_s(&raw, 256).unwrap();
+        let g = crate::iqgrids::IQ3S_GRID[0].to_le_bytes();
+        assert_eq!(v[0], 1.0 * g[0] as f32, "a zero nibble scales by 1, not by 0.5*k");
+        raw[106] = 0x03;                            // nibble 3 -> 1 + 6 = 7.0
+        let v = dequant_iq3_s(&raw, 256).unwrap();
+        assert_eq!(v[0], 7.0 * g[0] as f32);
+    }
+
+    #[test]
+    fn the_NINTH_index_bit_uses_a_POSITION_VARYING_shift() {
+        // A fixed shift reads the same bit for every l, sending a quarter of the entries into the
+        // wrong half of a 512-entry grid — in range, and wrong.
+        assert_eq!(crate::iqgrids::IQ3S_GRID.len(), 512);
+        // l=0 takes bit 0 via <<8, l=1 takes bit 2 via <<6, and so on for the even indices.
+        for l in 0..4usize {
+            let only_bit = 1usize << (2 * l);
+            assert_eq!((only_bit << (8 - 2 * l)) & 256, 256, "bit {} must reach the 9th place", 2 * l);
+        }
+    }
+
+    #[test]
+    fn the_ODD_index_takes_a_DIFFERENT_bit_from_the_even_one() {
+        // (8 - 2l) against (7 - 2l). Using one shift for both halves duplicates the ninth bit and
+        // pairs of weights index the same half of the grid.
+        for l in 0..4usize {
+            let odd_bit = 1usize << (2 * l + 1);
+            assert_eq!((odd_bit << (7 - 2 * l)) & 256, 256);
+            assert_eq!((odd_bit << (8 - 2 * l)) & 256, 0, "the even shift must NOT catch it");
+        }
+    }
+
+    #[test]
+    fn a_zero_block_yields_n_values() {
+        assert_eq!(dequant_iq3_s(&vec![0u8; IQ3_S_BLOCK], 256).unwrap().len(), 256);
+    }
+
+    #[test]
+    fn WRONG_lengths_are_refused() {
+        assert!(dequant_iq3_s(&[0u8; 4], 256).is_err());
+        assert!(dequant_iq3_s(&vec![0u8; IQ3_S_BLOCK], 300).is_err());
+    }
+}
