@@ -1,0 +1,25 @@
+[package]
+name = "touchkit"
+version = "0.1.0"
+edition = "2021"
+description = "Backend-agnostic touch/trackpad gesture recognition (swipe, fling+momentum, pinch, tap, long-press) extracted from snapclone's input layer. egui-friendly, std-only core."
+license = "MIT OR Apache-2.0"
+
+# The core is dependency-free (std only) so it cross-compiles trivially to
+# aarch64 / musl / x86_64 / riscv64 — the whole point of lifting it into shared/.
+[dependencies]
+# Optional, and only pulled in by the `egui` feature. Pin this to the SAME egui
+# version your workspace uses (cargo-hakari / a workspace dep keeps it unified);
+# the conversions below only touch egui's Vec2/Pos2 { x, y } shape, which has been
+# stable across many releases, so the exact minor rarely matters.
+egui = { version = "0.34", optional = true }
+
+[features]
+default = []
+# Enables From/Into conversions between touchkit::Vec2 and egui's Vec2/Pos2.
+# The egui *input adapter* (events -> Touch set) intentionally lives in
+# `sketches/egui_input.rs`, NOT behind this feature, so enabling `egui` here adds
+# only the type glue and never drags a UI/event dependency into a headless build.
+egui = ["dep:egui"]
+
+[dev-dependencies]
