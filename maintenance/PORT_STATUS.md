@@ -600,3 +600,56 @@ The binary sits behind a default-on `app` feature so `--no-default-features`
 builds a headless library. That matters more here than elsewhere: eframe pulls
 glutin and winit, and this container cannot even LINK them, so without the split
 the pages would be untestable in CI.
+
+## Gaze: where it fits, and what it should NOT be
+
+`gaze-core` is a layered headless engine — geometry / pipeline / roi / tracker /
+engine / sink / synth — that emits a **unit gaze vector and a confidence** per
+frame, owning no camera and no thread. It deliberately does not emit a screen
+coordinate, because that depends on where the screen is relative to the eye,
+which is a per-session calibration rather than a property of the tracker.
+
+**It must not become a second cursor.** Glove mode already has targets, a snap
+radius, a spoken vocabulary and a confirmation type that refuses "yes". A
+parallel gaze cursor would duplicate all of it and the two would drift — the
+exact failure this programme keeps finding in the Qt code. So gaze produces a
+POINT and `glove`'s target machinery does the rest, using the same
+`SNAP_RADIUS_PX` so the two pointing methods cannot disagree about what "on a
+button" means.
+
+### The three things between a gaze vector and a usable pointer
+
+1. **Saccades.** The eye jumps several times a second and never truly stops
+   between jumps. This is structure to recognise, not jitter to smooth —
+   smoothing a saccade gives a cursor that lags then overshoots. Dispersion
+   detection (I-DT) reports a point only while the samples stay inside a box.
+2. **Blinks and glare.** A blink is the ABSENCE of a measurement, reported as
+   low confidence. Passing it through as a position throws the cursor across the
+   screen every few seconds, so low confidence FREEZES the pointer and stops the
+   dwell — you cannot dwell with your eyes shut.
+3. **The Midas touch.** If looking activates, you cannot look. There is no
+   clever fix, only an explicit one: dwell activation is ARMED separately, and
+   while disarmed the pointer still tracks and highlights so the user can see
+   where the system thinks they are looking without pressing anything.
+
+### The rule that decides whether it works
+
+**Dwell belongs to the TARGET, not the pixel.** Human fixation drifts by about a
+degree even when "still", so a timer keyed to a screen position restarts
+constantly and never completes. Keyed to the snapped target, the drift is
+irrelevant — the timer runs as long as the eye stays on the same button.
+
+Calibration is an affine fit rather than anything cleverer: with five to nine
+points a projective model overfits the noise and behaves worse away from them.
+It **reports its residual** and refuses to point above half a snap radius, and
+it returns `None` for collinear points rather than a near-singular solve, whose
+enormous coefficients look like a working calibration until the eye moves. An
+uncalibrated pointer is deliberately useless rather than plausible: one that
+lands plausibly-but-wrongly makes the user try to compensate and blame
+themselves.
+
+### Not built
+
+The bridge from `gaze-core` to this layer. gaze-core needs OpenCV, so it is a
+host-side poller feeding `GazeSample`s in — the same seam shape as the tilt and
+temperature readers, and honest for the same reason.
