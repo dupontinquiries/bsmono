@@ -325,6 +325,9 @@ pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// Dispatches that ran with NO frame open, each becoming its own command buffer. This is the expensive
 /// one and it was the only path left untagged — a run showed 4256 submits against 729 attributed, and
 /// the missing 3500 had to be here.
+/// Non-fatal device errors seen this process. Read by the residency probe to know when to stop.
+pub static DEVICE_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Nanoseconds inside `queue.submit` — encoder finish plus the driver handoff.
 ///
@@ -1150,6 +1153,10 @@ impl Gpu {
             // Same shape as the governor's pressure latch: a guard watching one failure mode on a
             // device that produces another.
             de.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Counted as well as logged. The residency probe needs to STOP on the first sign the
+            // device is unhappy — a probe that wedges the GPU is worse than the wrong constant it
+            // was measuring — and a log line it cannot read is no use for that.
+            DEVICE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!("wgpu-engine: device error (non-fatal, logged): {msg}");
                 }
             }));

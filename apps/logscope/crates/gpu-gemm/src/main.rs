@@ -3860,6 +3860,67 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-residency") {
+        // MEASURE what ASAHI_CONCURRENT_BUFFER_GIB assumes. That constant is one M2 Ultra's figure
+        // applied to every Asahi device, and a wrong value is a wrong REFUSAL — invisible, because
+        // the model simply does not load.
+        //
+        // A gate rather than a load-time probe: this costs a slow run and the answer is stable per
+        // adapter, so paying it once and recording the number beats paying it every launch.
+        use gpu_kernels::memplan::*;
+        let gpu = Gpu::new();
+        println!("gate-residency: adapter = {}", gpu.adapter_name);
+        println!("  the compiled-in assumption is {ASAHI_CONCURRENT_BUFFER_GIB:.1} GiB");
+        if !probe_is_meaningful(&gpu.adapter_name) {
+            println!("  DECLINING: this is a software rasterizer. Its 'device memory' is host RAM, \
+so the probe would measure malloc and say nothing about any GPU — after OOM-killing the process on \
+the way to finding out. A probe that cannot answer the question should decline rather than \
+approximate it.");
+            return;
+        }
+        // Smaller slabs: the source buffer is held for the whole probe, so a 1 GiB slab costs 1 GiB
+        // before a single upload happens. On a small machine that alone was a quarter of the budget.
+        let slab_gib = 0.25f64;
+        let slab_bytes = (slab_gib * (1u64 << 30) as f64) as usize / 4;
+        let mut held: Vec<gpu_kernels::Tensor> = Vec::new();
+        let mut complete = true;
+        let zero = vec![0u32; slab_bytes];
+        // Bounded by THIS machine's RAM, not only by the constant. The first version used the
+        // constant alone and was OOM-killed on a 16 GB container — the exact "a probe that wedges
+        // the machine is worse than a wrong constant" failure it was written to avoid.
+        let limit = probe_limit_gib(system_ram_gib());
+        println!("  probing to {limit:.1} GiB (system has {:.0} GiB)", system_ram_gib());
+        while (held.len() as f64) * slab_gib < limit {
+            // Held in a Vec so nothing is released until the probe ends — releasing as we go would
+            // measure the largest SINGLE allocation, which --gate-vram already answers and which is
+            // the question that produced the misleading 63 GiB.
+            let t = gpu.upload_u32(&zero);
+            held.push(t);
+            let n = held.len() as f64 * slab_gib;
+            if held.len() % 4 == 0 { println!("  held {n:.0} GiB in {} slabs", held.len()); }
+            // A probe that wedges the GPU is worse than a wrong constant, so stop on the first sign
+            // the device is unhappy rather than pushing until it fails hard.
+            if gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                complete = false;
+                println!("  device reported an error at {n:.0} GiB — stopping here rather than \
+pushing until it fails hard");
+                break;
+            }
+        }
+        let p = ResidencyProbe {
+            held_gib: held.len() as f64 * slab_gib,
+            slab_gib,
+            // Reaching the ceiling without failing is a COMPLETE probe with a floor rather than a
+            // ceiling: the device holds at least this much, and the number is still usable.
+            complete,
+        };
+        drop(held);
+        println!("{}", p.explain(ASAHI_CONCURRENT_BUFFER_GIB));
+        println!("gate-residency: plan with {:.1} GiB (LOGSCOPE_MAX_GPU_GB overrides)",
+            p.budget_gib(ASAHI_CONCURRENT_BUFFER_GIB));
+        return;
+    }
+
     if args.iter().any(|a| a == "--frame-diag") {
         // ONE RUN, SEVERAL ANSWERS. The operator's cost is the round trip — download, unpack, run,
         // read — so a batch of independent probes is cheaper for them than one careful print per
