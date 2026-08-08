@@ -487,6 +487,60 @@ impl Gguf {
 /// Human name for a ggml type, so an error names the FORMAT rather than a number.
 ///
 /// "type 18 unsupported" sends someone to a table. "IQ3_XXS unsupported" is the answer.
+/// IQ4_NL's 16-value lookup, shared with IQ4_XS.
+///
+/// **Sixteen entries, not a 2048-entry grid.** That is why IQ4_XS is tractable where IQ2_XXS and
+/// IQ3_S are not: those need the codebook tables from ggml-quants.c, and this needs one line.
+///
+/// The values are non-linear — spaced to match the distribution of neural weights rather than
+/// evenly — which is the whole point of the format and the reason a linear 4-bit quantizer scores
+/// worse at the same bit width.
+pub const KVALUES_IQ4NL: [i8; 16] =
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
+
+/// Dequantize one IQ4_XS super-block: 256 weights in 136 bytes, 4.25 bpw.
+///
+/// Layout, which is the part worth stating because getting it wrong produces plausible floats:
+///
+/// ```text
+///   0..2    d          f16 super-block scale
+///   2..4    scales_h   u16, the HIGH 2 bits of each of 8 sub-scales
+///   4..8    scales_l   u8[4], the LOW 4 bits, two sub-scales per byte
+///   8..136  qs         u8[128], two 4-bit indices per byte
+/// ```
+///
+/// Each 32-weight sub-block has a 6-bit scale assembled from those two halves, biased by 32. The
+/// split-across-two-fields layout is why a naive reader gets the first sub-block right and the rest
+/// wrong — the low nibbles are contiguous and the high bits are not.
+pub fn dequantize_iq4_xs_block(raw: &[u8], out: &mut [f32]) -> Result<(), String> {
+    if raw.len() < 136 { return Err(format!("IQ4_XS block is 136 bytes, got {}", raw.len())) }
+    if out.len() < 256 { return Err(format!("IQ4_XS block yields 256 weights, got {}", out.len())) }
+
+    let d = f16_to_f32(u16::from_le_bytes([raw[0], raw[1]]));
+    let scales_h = u16::from_le_bytes([raw[2], raw[3]]);
+    let qs = &raw[8..136];
+
+    for sub in 0..8usize {
+        // Low 4 bits: two sub-scales per byte, low nibble first.
+        let lo = if sub % 2 == 0 { raw[4 + sub / 2] & 0x0F } else { raw[4 + sub / 2] >> 4 };
+        // High 2 bits: packed two-per-sub-block across the u16, LSB first.
+        let hi = ((scales_h >> (2 * sub)) & 3) as u8;
+        // Biased by 32 — the scale is signed in an unsigned field.
+        let ls = ((hi << 4) | lo) as i32 - 32;
+        let dl = d * ls as f32;
+
+        for j in 0..32usize {
+            let idx = sub * 32 + j;
+            // Two 4-bit indices per byte: the first 16 weights of a sub-block take low nibbles, the
+            // next 16 take high nibbles of the SAME bytes.
+            let byte = qs[sub * 16 + (j % 16)];
+            let nib = if j < 16 { byte & 0x0F } else { byte >> 4 };
+            out[idx] = dl * KVALUES_IQ4NL[nib as usize] as f32;
+        }
+    }
+    Ok(())
+}
+
 pub fn type_name(t: u32) -> &'static str {
     match t {
         0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
@@ -768,6 +822,20 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         //
         // Refused by name, so a run says which format it needs rather than failing as "unknown
         // tensor type" or, worse, decoding it wrong. dot_iq1_s and MATVEC_IQ1_S are IQ1_S only.
+        // IQ4_XS: 21% of a UD-IQ1_S checkpoint by bytes, and the only one of its seven types that
+        // needs no codebook grid — sixteen values against IQ2/IQ3's 2048.
+        23 => {
+            if n % 256 != 0 { return Err(format!("IQ4_XS needs a multiple of 256 weights, got {n}")) }
+            let mut out = vec![0.0f32; n];
+            for (b, chunk) in (0..n / 256).zip(out.chunks_mut(256)) {
+                let off = b * 136;
+                if off + 136 > data.len() {
+                    return Err(format!("IQ4_XS block {b} runs past the tensor data"));
+                }
+                dequantize_iq4_xs_block(&data[off..off + 136], chunk)?;
+            }
+            return Ok(out);
+        }
         29 => return Err("IQ1_M (type 29) has no dequantizer here — its per-8 scale layout differs from IQ1_S, so the IQ1_S path would decode it to garbage without failing. Use an IQ1_S build, or implement the IQ1_M decode first".into()),
         19 => {
             // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
@@ -1264,5 +1332,96 @@ mod mixed_quant_tests {
         // So the next person does not "helpfully" restore fail-fast behaviour.
         let r = unsupported_report(&unsupported_types(vec![(18, 1)], SUPPORTED), 1);
         assert!(r.contains("costs a download each"));
+    }
+}
+
+#[cfg(test)]
+mod iq4xs_tests {
+    use super::*;
+
+    /// A block with a known scale and every nibble zero.
+    fn block(d: f32, sub_scales: [u8; 8], nibbles: u8) -> Vec<u8> {
+        let mut b = vec![0u8; 136];
+        // d as f16
+        // f16 by hand rather than pulling a crate in for a test fixture: 1.0 is 0x3C00 and the
+        // exponent arithmetic is only needed for the values these tests use.
+        let bits: u16 = if d == 1.0 { 0x3C00 } else if d == 2.0 { 0x4000 } else { 0x3C00 };
+        b[0..2].copy_from_slice(&bits.to_le_bytes());
+        let mut hi = 0u16;
+        for (i, s) in sub_scales.iter().enumerate() {
+            let biased = (*s as i32 + 32) as u8;      // undo the -32 the decoder applies
+            if i % 2 == 0 { b[4 + i / 2] |= biased & 0x0F } else { b[4 + i / 2] |= (biased & 0x0F) << 4 }
+            hi |= (((biased >> 4) & 3) as u16) << (2 * i);
+        }
+        b[2..4].copy_from_slice(&hi.to_le_bytes());
+        for x in b[8..136].iter_mut() { *x = nibbles | (nibbles << 4); }
+        b
+    }
+
+    #[test]
+    fn the_LOOKUP_is_sixteen_values_not_a_grid() {
+        // Why IQ4_XS is tractable where IQ2_XXS and IQ3_S are not: those need the 2048-entry
+        // codebooks from ggml-quants.c and this needs one line.
+        assert_eq!(KVALUES_IQ4NL.len(), 16);
+        // Non-linear on purpose — spaced to match weight distribution, which is why it beats a
+        // linear 4-bit quantizer at the same width.
+        let gaps: Vec<i32> = KVALUES_IQ4NL.windows(2).map(|w| (w[1] - w[0]) as i32).collect();
+        assert!(gaps.iter().min() != gaps.iter().max(), "a linear table would defeat the format");
+    }
+
+    #[test]
+    fn a_block_of_ZERO_INDICES_gives_the_table_s_first_value_scaled() {
+        // Index 0 is -127, not zero — a format where the low index means zero would waste a level,
+        // and assuming it does is the commonest way to misread this table.
+        let mut out = vec![0.0f32; 256];
+        dequantize_iq4_xs_block(&block(1.0, [1; 8], 0), &mut out).unwrap();
+        assert_eq!(out[0], -127.0, "index 0 maps to -127");
+        assert!(out.iter().all(|v| *v == -127.0));
+    }
+
+    #[test]
+    fn each_SUB_BLOCK_takes_its_own_scale() {
+        // The split-across-two-fields layout is why a naive reader gets the first sub-block right
+        // and the rest wrong: low nibbles are contiguous, high bits are not.
+        let mut out = vec![0.0f32; 256];
+        dequantize_iq4_xs_block(&block(1.0, [1, 2, 3, 4, 5, 6, 7, 8], 0), &mut out).unwrap();
+        for sub in 0..8 {
+            let expect = (sub as f32 + 1.0) * -127.0;
+            assert_eq!(out[sub * 32], expect, "sub-block {sub}");
+        }
+    }
+
+    #[test]
+    fn a_HIGH_scale_exercises_the_two_bits_in_scales_h() {
+        // Scales above 15 need the high field, which is where a decoder that reads only the low
+        // nibble silently produces a quarter of the right magnitude.
+        let mut out = vec![0.0f32; 256];
+        dequantize_iq4_xs_block(&block(1.0, [31; 8], 0), &mut out).unwrap();
+        assert_eq!(out[0], 31.0 * -127.0);
+    }
+
+    #[test]
+    fn the_LOW_and_HIGH_nibbles_split_the_sub_block_in_half() {
+        // First 16 weights take low nibbles, next 16 take high nibbles of the SAME bytes.
+        let mut b = block(1.0, [1; 8], 0);
+        for x in b[8..136].iter_mut() { *x = 0x0F; }   // low nibble 15, high nibble 0
+        let mut out = vec![0.0f32; 256];
+        dequantize_iq4_xs_block(&b, &mut out).unwrap();
+        assert_eq!(out[0], 113.0, "low nibble 15 -> last table value");
+        assert_eq!(out[16], -127.0, "high nibble 0 -> first");
+    }
+
+    #[test]
+    fn a_SHORT_block_is_refused_rather_than_read_past() {
+        assert!(dequantize_iq4_xs_block(&vec![0u8; 100], &mut vec![0.0; 256]).is_err());
+    }
+
+    #[test]
+    fn dequantize_ROUTES_type_23_now() {
+        let data = block(1.0, [1; 8], 0);
+        let v = dequantize(23, &data, 256).expect("IQ4_XS should dequantize");
+        assert_eq!(v.len(), 256);
+        // And a misaligned length is refused rather than truncated.
+        assert!(dequantize(23, &data, 300).is_err());
     }
 }
