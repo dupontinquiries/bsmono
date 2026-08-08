@@ -18,6 +18,7 @@ pub mod row_render;
 pub mod detect;
 pub mod explore;
 pub mod manpage_view;
+pub mod chrome_mode;
 pub mod voice_routing;
 pub mod iio_accel;
 
