@@ -22,7 +22,10 @@ pub mod specverify;
 pub mod batchplan;
 pub mod q2demote;
 pub mod quantref;
+pub mod iq4;
+pub mod kquant;
 pub mod shaderdev;
+pub mod framediag;
 pub mod sensitivity;
 pub mod lookupdraft;
 pub mod specloop;
@@ -324,6 +327,9 @@ pub static SUBMIT_BY_END_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// Dispatches that ran with NO frame open, each becoming its own command buffer. This is the expensive
 /// one and it was the only path left untagged — a run showed 4256 submits against 729 attributed, and
 /// the missing 3500 had to be here.
+/// Non-fatal device errors seen this process. Read by the residency probe to know when to stop.
+pub static DEVICE_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub static SUBMIT_BY_NO_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Nanoseconds inside `queue.submit` — encoder finish plus the driver handoff.
 ///
@@ -394,6 +400,28 @@ impl SubmitCauseSnapshot {
 }
 
 /// Attribution since `since`, so the causes share the profile's clock.
+/// The closing VERDICT for a run, to go after the attribution line.
+///
+/// The attribution line is 200+ characters and every diagnosis this session began by grepping the
+/// same three numbers out of it. This says which of them dominates and what to do — a verdict rather
+/// than a fourth line of figures.
+///
+/// Returns the headline and, only when something is anomalous, a caveat. **Silence is the normal
+/// case**: a run that always prints two extra lines teaches the reader to skip both, which is how
+/// five GPU resets sat unread in journalctl.
+pub fn run_verdict(tokens: u64, wall_s: f64, sync_s: f64) -> (String, Option<String>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let shape = crate::perfverdict::RunShape {
+        submits: SUBMIT_BY_NO_FRAME.load(Relaxed) + SUBMIT_BY_DOWNLOAD.load(Relaxed)
+               + SUBMIT_BY_PASSES.load(Relaxed),
+        no_frame: SUBMIT_BY_NO_FRAME.load(Relaxed),
+        download: SUBMIT_BY_DOWNLOAD.load(Relaxed),
+        passes: SUBMIT_BY_PASSES.load(Relaxed),
+        tokens, wall_s, sync_s,
+    };
+    (shape.headline(), shape.caveat())
+}
+
 pub fn submit_attribution_since(since: SubmitCauseSnapshot, actual: u64) -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let now = SubmitCauseSnapshot::now();
@@ -1149,6 +1177,10 @@ impl Gpu {
             // Same shape as the governor's pressure latch: a guard watching one failure mode on a
             // device that produces another.
             de.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Counted as well as logged. The residency probe needs to STOP on the first sign the
+            // device is unhappy — a probe that wedges the GPU is worse than the wrong constant it
+            // was measuring — and a log line it cannot read is no use for that.
+            DEVICE_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             eprintln!("wgpu-engine: device error (non-fatal, logged): {msg}");
                 }
             }));
@@ -1902,6 +1934,15 @@ impl Gpu {
     }
     /// Read back a u32 tensor (e.g. the argmax id). Mirrors `download` but reinterprets bytes as u32.
     pub fn download_u32(&self, t: &Tensor) -> Vec<u32> {
+        // THE SECOND FRAME LEAK, and the one that matters for Scout.
+        //
+        // Fixing flush_and_wait took the dense 1B from 39% no-frame to ZERO. Scout did not move —
+        // 67% to 71% — because its per-layer path goes through HERE: moe_ffn_v1 downloads router
+        // logits as u32, and this sibling of `download` takes the frame without restoring it.
+        //
+        // `download` grew a had_frame reopen and download_u32 did not, which is the
+        // two-paths-one-fixed shape this codebase has now produced five times.
+        let had_frame_u32 = self.frame.lock().unwrap().is_some();
         // If the device already signalled OOM this step, the staging buffer below may fail to allocate and
         // mapping an INVALID buffer is a FATAL wgpu error (get_mapped_range panics past the uncaptured-error
         // handler — seen on the q4-30B long second prompt). Bail early with an empty result; the caller
@@ -1975,6 +2016,11 @@ waiting longer will not help because the work is gone");
         let v = bytemuck::cast_slice::<u8, u32>(&data).to_vec();
         drop(data); staging.unmap();
         self.clear_retained();
+        // Symmetric with `download` and `flush_and_wait`: a caller that HAD a frame expects to
+        // still have one, and one that did not must not acquire one behind its back.
+        if had_frame_u32 && std::env::var_os("LOGSCOPE_NO_FRAME_REOPEN").is_none() {
+            self.begin_frame();
+        }
         v
     }
 }
@@ -2231,6 +2277,11 @@ fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
         Tensor { buf: t.buf.clone(), rows, cols, pool: None, view: Some((base + byte_off, byte_len)) }
     }
     match &l.kind {
+        // Not sliceable yet: IQ1_S packs 256 weights into 50 bytes, so a row slice lands on a
+        // block boundary only when the row length is a multiple of 256. That is the same
+        // alignment rule qkvsplit enforces for Q4_K and it needs the same explicit check rather
+        // than a silent mid-block cut. Nothing slices an IQ1_S tensor today.
+        LinKind::Iq1(_) => None,
         LinKind::Q8(w) => {
             let kb = w.k / 32;
             Some(Lin { kind: LinKind::Q8(QWeight {
@@ -2616,10 +2667,34 @@ impl<'a> Rd<'a> {
 /// (Qwen2 has one on Q/K/V; llama does not). Both precisions answer the same `apply`, and the bias is
 /// folded in there, so every forward path is agnostic to both precision and architecture.
 pub struct Lin { kind: LinKind, bias: Option<Tensor> }
-enum LinKind { F32(Tensor), Q8(QWeight), Q4(Q4Weight) }
+/// A weight held as IQ1_S, in the file's own bytes.
+///
+/// **The point is that nothing is converted.** Every other resident kind is produced by requantizing
+/// to q4 or int8; this one keeps the source blocks, because at 1.5625 bpw the conversion to 4.5 is a
+/// 2.88x inflation that puts a 30.3 GiB checkpoint at 87 GiB.
+///
+/// `dot_iq1_s` is the bit-exact CPU reference and `MATVEC_IQ1_S` the GPU kernel; both predate this
+/// and both are gated. What was missing was somewhere to PUT the bytes.
+pub struct Iq1Weight {
+    /// The file's IQ1_S blocks, uploaded unmodified.
+    pub blocks: Tensor,
+    /// Rows and columns of the logical matrix.
+    pub n: usize,
+    pub k: usize,
+}
+
+impl Iq1Weight {
+    /// Bytes per 256-weight block: 50 for IQ1_S.
+    pub const BLOCK_BYTES: usize = 50;
+    pub fn bytes(&self) -> usize { (self.n * self.k / 256) * Self::BLOCK_BYTES }
+}
+
+enum LinKind { F32(Tensor), Q8(QWeight), Q4(Q4Weight), Iq1(Iq1Weight) }
 impl Lin {
     pub fn f32(t: Tensor) -> Self { Lin { kind: LinKind::F32(t), bias: None } }
     pub fn q8(q: QWeight) -> Self { Lin { kind: LinKind::Q8(q), bias: None } }
+    /// Hold a weight as IQ1_S without converting it.
+    pub fn iq1(q: Iq1Weight) -> Self { Lin { kind: LinKind::Iq1(q), bias: None } }
     pub fn q4(q: Q4Weight) -> Self { Lin { kind: LinKind::Q4(q), bias: None } }
     pub fn with_bias(mut self, b: Option<Tensor>) -> Self { self.bias = b; self }
     /// Is this weight held as resident q4? Used to key tuning verdicts by precision.
@@ -2629,6 +2704,9 @@ impl Lin {
         let out = match &self.kind {
             LinKind::F32(t) => { let (n, k) = (t.rows, t.cols); gpu.linear_t(a, t, m, n, k) }
             LinKind::Q8(q) => gpu.linear_q8_0_t(a, q, m),
+            // Native: the source blocks go straight to MATVEC_IQ1_S with no dequantize pass, which
+            // is the whole reason this variant exists.
+            LinKind::Iq1(q) => gpu.linear_iq1_s_t(a, q, m),
             LinKind::Q4(q) => gpu.linear_q4_0_t(a, q, m),
         };
         match &self.bias { Some(b) => gpu.add_bias_t(&out, b), None => out }
@@ -2639,6 +2717,10 @@ impl Lin {
         if m == 1 && self.bias.is_none() {
             match &self.kind {
                 LinKind::Q8(q) => return gpu.linear_q8_0_add(a, q, resid),
+            // No fused residual-add kernel for IQ1_S. Falling through to matvec-then-add is correct
+            // and one extra dispatch — worth far less than the memory this variant saves, and
+            // inventing a fused kernel to avoid it would be optimising the wrong thing.
+            LinKind::Iq1(_) => {}
                 LinKind::Q4(q) => return gpu.linear_q4_0_add(a, q, resid),
                 LinKind::F32(_) => {}
             }
@@ -2840,6 +2922,11 @@ impl Gpu {
         //
         // Only reopened if one was open on entry: a caller that downloads without a frame does not want
         // one opened behind its back.
+        // INSTRUMENTED. On a Scout run 67% of submits had no frame open while decode_step_stream
+        // opens one on its first line — so the frame is dropped and not restored, and this is the
+        // only place that drops it deliberately. If had_frame is false here, decode's frame was
+        // already gone when we arrived, which makes download the symptom rather than the cause.
+        if !had_frame { crate::framediag::REOPEN_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
         if had_frame {
             self.begin_frame();
             // PACING. Reopening restores batching, but it also removes the pacing that
@@ -3124,6 +3211,36 @@ impl Gpu {
     }
     /// Flush any open frame and block until the GPU has drained it — used to fence ring reuse.
     fn flush_and_wait(&self) {
+        // REOPENS THE FRAME IT TOOK. This is where decode's 67% no-frame came from.
+        //
+        // `take()` removes the frame and nothing put one back, so every dispatch after the first
+        // expert stream in a decode step ran frameless — and stream_expert_lins runs PER LAYER, which
+        // is why Scout (67%) is worse than the dense model (39%, from downloads alone).
+        //
+        // Symmetric with `download`, which drops and restores `if had_frame`, and for the same
+        // reason: a caller that had a frame expects to still have one afterwards. A caller that did
+        // not must not acquire one behind its back, so the reopen is conditional on there having been
+        // something to take.
+        let had_frame;
+        {
+            let mut g = self.frame.lock().unwrap();
+            had_frame = g.is_some();
+            drop(g.take().map(|frame| {
+                SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                frame
+            }).map(|frame| { self.submit(frame.enc); self.retain_keep(frame.keep); }));
+        }
+        let t_poll = std::time::Instant::now();
+        crate::counted_poll(&self.device);
+        check_stall(t_poll, 0);
+        self.clear_retained();
+        if had_frame && std::env::var_os("LOGSCOPE_NO_FRAME_REOPEN").is_none() {
+            self.begin_frame();
+        }
+    }
+
+    #[allow(dead_code)]
+    fn flush_and_wait_legacy(&self) {
         if let Some(frame) = self.frame.lock().unwrap().take() {
             // TAGGED: the explicit end_frame path. Six of eight submit callers incremented nothing, which is
             // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
@@ -3206,6 +3323,7 @@ impl Gpu {
     /// encoder instead of each submitting. Flushed by `end_frame` or the terminal `download`.
     /// Idempotent-safe: an already-open frame is flushed first (no commands are lost).
     pub fn begin_frame(&self) {
+        crate::framediag::FRAME_OPENED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut fr = self.frame.lock().unwrap();
         // TAGGED: flushing a previous frame is an end_frame in all but name. Six of eight submit callers incremented nothing, which is
         // where the profile's "N UNATTRIBUTED, a submit path is still untagged" came from.
@@ -3221,6 +3339,7 @@ impl Gpu {
     }
     /// Flush the open frame (one submit for all its recorded ops). No-op if none is open.
     pub fn end_frame(&self) {
+        crate::framediag::FRAME_CLOSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(frame) = self.frame.lock().unwrap().take() {
             SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(frame.enc); self.retain_keep(frame.keep);
@@ -3370,6 +3489,16 @@ impl Gpu {
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);
             }
+            // Per-site tally, armed only by --frame-diag. The aggregate counter says 6821
+            // happened and not where; this names them in one run instead of one hypothesis per
+            // round trip.
+            // The shader's own identity, which shaderdev already derives for hot-reload. Reusing it
+            // means the tally names kernels rather than addresses, and costs nothing new.
+            // record_dispatch has the pipeline, not the source, so the tally keys on the pipeline
+            // POINTER — stable per kernel for a run, which is all a "which site dominates" question
+            // needs. A readable name would require threading one through every call site, and the
+            // shape of the answer matters more than its labels.
+            crate::framediag::note_frameless_ptr(pipeline as *const _ as usize);
             SUBMIT_BY_NO_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.submit(enc); // queue order makes each op's writes visible to the next
         }
@@ -4719,7 +4848,32 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         // is encouraging — and I did not finish reading where the weight is multiplied in. Shipping
         // the relaxation on an unread shader would produce silently wrong output on every Llama-4
         // token, which is the exact failure this codebase has spent the session chasing.
-        if t == 1 && m.stream.is_none() && !m.cfg.weight_before
+        // STREAMING IS A PER-MODEL FACT AND THE CONSTRAINT IS PER-LAYER.
+        //
+        // The routed path selects on-device, so the CPU never learns which experts were chosen — and
+        // a streaming model needs the CPU to know, to fetch them. That is why the guard reads
+        // `stream.is_none()`.
+        //
+        // But if every expert for THIS layer is already pinned, any selection is a hit: nothing to
+        // fetch, nothing for the CPU to learn. `layer_can_route` is that check, and it lets a
+        // streaming model route the layers that happen to be fully resident. The benefit is
+        // proportional — stalls are one per layer and equal in cost.
+        //
+        // Behind LOGSCOPE_MOE_LAYER_ROUTE because it is unvalidated on hardware and the failure mode
+        // is a miss the CPU cannot service. Scout at 6-of-16 qualifies for nothing today, so the flag
+        // changes nothing until the experts are narrower — which is the whole argument for IQ1_S.
+        // The pin set lives on the stream, which is the thing that knows what is resident. Asking it
+        // rather than threading a parameter keeps the condition next to the fact it depends on.
+        let layer_resident = std::env::var_os("LOGSCOPE_MOE_LAYER_ROUTE").is_some()
+            && m.stream.as_ref().is_some_and(|st| {
+                // try_lock, not lock: this runs on the decode path and blocking here to answer
+                // "can we avoid blocking" would be self-defeating. A contended lock means the
+                // streamer is busy, which is itself an answer — not fully resident.
+                st.try_lock().is_ok_and(|s| {
+                    expert_cache::layer_can_route(s.policy.pinned_ids(), s.n_expert as u32)
+                })
+            });
+        if t == 1 && (m.stream.is_none() || layer_resident) && !m.cfg.weight_before
             && std::env::var("LOGSCOPE_MOE_V1").is_err() && !route_trace_armed()
         {
             if std::env::var("LOGSCOPE_MOE_V2_CHECK").is_ok() {
@@ -4944,11 +5098,35 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let (gu_qw, gu_qs, gu_k, sh) = match &m.stacked_gu.kind {
             LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
             LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            // IQ1_S DOES NOT FIT THIS SHAPE, and saying so is better than faking it.
+            //
+            // Every other kind splits into a (quant, scale) PAIR of buffers. IQ1_S interleaves its
+            // codebook indices and scales in one block, so there is no second buffer to hand over —
+            // and passing the same tensor twice would produce plausible wrong numbers, which is the
+            // failure mode this codebase has spent a week on.
+            //
+            // The MoE stacks are therefore never built as Iq1 today; the loader converts them. A
+            // native MoE path needs MOE_MATVEC_IQ1_S with a one-buffer binding, which does not exist.
+            LinKind::Iq1(_) => unreachable!(
+                "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
+binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
             LinKind::F32(_) => return None,
         };
         let (dn_qw, dn_qs, dn_k, sh_dn) = match &m.stacked_down.kind {
             LinKind::Q8(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q8),
             LinKind::Q4(w) => (&w.qw, &w.qs, w.k, MOE_MATVEC_Q4),
+            // IQ1_S DOES NOT FIT THIS SHAPE, and saying so is better than faking it.
+            //
+            // Every other kind splits into a (quant, scale) PAIR of buffers. IQ1_S interleaves its
+            // codebook indices and scales in one block, so there is no second buffer to hand over —
+            // and passing the same tensor twice would produce plausible wrong numbers, which is the
+            // failure mode this codebase has spent a week on.
+            //
+            // The MoE stacks are therefore never built as Iq1 today; the loader converts them. A
+            // native MoE path needs MOE_MATVEC_IQ1_S with a one-buffer binding, which does not exist.
+            LinKind::Iq1(_) => unreachable!(
+                "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
+binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
             LinKind::F32(_) => return None,
         };
         let slots = m.cfg.n_used.clamp(1, 16) as usize;
@@ -7808,7 +7986,26 @@ failure when forcing it, not a surprise; coherent output is the evidence that wo
         //
         // Same shape as expert_weights_scale being "effectively hardcoded to 1": a value the file
         // carries, read from a constant instead.
-        let nope_step = if is_llama4 {
+        // SMOLLM3 ALSO USES NoPE, and it was getting rope on every layer.
+        //
+        // Its distinctive feature is exactly Llama-4's: every fourth layer skips positional encoding
+        // entirely. The mechanism was already here and gated on `is_llama4`, so a SmolLM3 checkpoint
+        // loaded, generated coherent text, and was WRONG on a quarter of its layers — the failure
+        // that looks like "the model is a bit weak" rather than like a bug.
+        //
+        // Four is the architecture constant, not a GGUF key: SmolLM3's config carries
+        // `no_rope_layer_interval: 4` and llama.cpp hardcodes it. Read the key if present so a future
+        // checkpoint that states it wins, and fall back to 4.
+        // Matched on the prefix because archcfg has no SmolLm3 variant — it loads via
+        // LOGSCOPE_TRY_UNSUPPORTED_ARCH. Adding the variant is the tidier fix and a larger one; this
+        // makes the model CORRECT today and the enum can catch up.
+        let is_smollm3 = acfg.prefix.starts_with("smollm3");
+        let nope_step = if is_smollm3 {
+            g.get_u32(&format!("{}.attention.no_rope_interval", acfg.prefix))
+                .or_else(|| g.get_u32(&format!("{}.no_rope_layer_interval", acfg.prefix)))
+                .map(|v| v as usize)
+                .unwrap_or(4)
+        } else if is_llama4 {
             g.get_u32(&format!("{}.attention.no_rope_interval", acfg.prefix))
                 .or_else(|| g.get_u32(&format!("{}.no_rope_interval", acfg.prefix)))
                 .map(|v| v as usize)
@@ -8052,8 +8249,13 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                 let cap = (crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB * (1u64 << 30) as f64) as u64;
                 if gpu_budget > cap {
                     eprintln!("loader: GPU budget {:.1} GiB clamped to {:.1} GiB — this driver \
-accepts a large single allocation but will not hold more than that in buffers at once (measured at \
-1 and 2 GiB slabs, mapped and unmapped). A plan above it fails mid-load rather than at planning time.",
+accepts a large single allocation but will not hold more than that in buffers at once. A plan above \
+it fails mid-load rather than at planning time. \
+THIS FIGURE IS A COMPILED-IN CONSTANT, not a measurement of this device: it was measured once on an \
+M2 Ultra at 1 and 2 GiB slabs, mapped and unmapped, and every Asahi machine now receives that \
+number. On different hardware it may be wrong in either direction \u{2014} `kernel-validate \
+--gate-vram` measures the single-allocation ceiling on THIS device, and a load that fails part-way \
+through is the evidence that the concurrent one is lower than this.",
                         gpu_budget as f64 / (1u64 << 30) as f64,
                         crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB);
                     gpu_budget = cap;
@@ -8321,7 +8523,36 @@ last block and k's first would decode to garbage")),
             }
             let t = g.tensor(name).ok_or(format!("missing tensor {name}"))?;
             let count = t.dims.iter().product::<u64>() as usize;
-            let nbytes = gguf::type_nbytes(t.ggml_type, count).ok_or(format!("type {} unsupported for {name}", t.ggml_type))?;
+            let nbytes = gguf::type_nbytes(t.ggml_type, count).ok_or_else(|| {
+                // SCAN THE WHOLE FILE RATHER THAN REPORTING THE TENSOR WE HAPPENED TO REACH.
+                //
+                // A UD quant is a mixture: the file is named for its smallest type and keeps
+                // sensitive tensors wider. "type 18 unsupported for blk.0.attn_q.weight" costs a
+                // 30 GiB download to learn ONE of them, and there are usually several.
+                // 20 and 23 joined the list when iq4.rs landed. The report is only honest if this
+                // matches what dequantize actually accepts — a stale list here reports supported
+                // types as missing, which sends someone to implement what already works.
+                let supported: Vec<u32> = vec![0, 1, 8, 10, 11, 12, 13, 14, 19, 20, 23];
+                // BYTES, NOT ELEMENTS. My first version passed dims.product(), which is the
+                // element count — so a report on a 30966 MiB file summed to 63135 MiB and its
+                // percentages exceeded 100. The shares are the whole point of the report, since they
+                // decide which type to implement first, and a wrong share ranks them wrongly.
+                let all: Vec<(u32, u64)> = g.tensors.iter()
+                    .filter_map(|x| {
+                        let n = x.dims.iter().product::<u64>() as usize;
+                        gguf::type_nbytes(x.ggml_type, n)
+                            .map(|b| (x.ggml_type, b as u64))
+                            // A type whose SIZE is unknown still has to appear, or the report omits
+                            // exactly the types it exists to name. Fall back to the element count and
+                            // let the share be approximate rather than absent.
+                            .or(Some((x.ggml_type, n as u64)))
+                    }).collect();
+                let total: u64 = all.iter().map(|(_, n)| *n).sum();
+                let missing = gguf::unsupported_types(all, &supported);
+                format!("{} (first hit: {} in {name})\n{}",
+                    gguf::type_name(t.ggml_type), t.ggml_type,
+                    gguf::unsupported_report(&missing, total))
+            })?;
             // A read that escapes the set means a shard is missing — report which tensor rather than
             // decoding a short buffer into plausible garbage.
             let raw = set.slice(t.offset, nbytes).ok_or(format!(
@@ -8398,6 +8629,32 @@ last block and k's first would decode to garbage")),
             // (--gate-q4k proves the conversion is bit-identical to the CPU route it replaces), so the
             // dequantize-to-f32 and requantize steps disappear entirely. LOGSCOPE_NO_Q4K_GPU falls back to
             // the CPU path if this ever needs to be bisected against.
+            // IQ1_S NATIVE: the file's bytes ARE the resident form.
+            //
+            // Every other path here fetches f32 and requantizes. For IQ1_S that is not merely wasteful
+            // — at 1.5625 bpw the conversion to q4's 4.5 is a 2.88x inflation, so a 30.3 GiB
+            // checkpoint becomes 87 GiB and is refused. The whole point of the format is that it is
+            // already small enough, and converting it throws that away.
+            //
+            // Modelled on the q4 fast path immediately below, which established that a tensor can go
+            // from mmap to GPU without a dequantize pass. This is the same move for a format where it
+            // is the difference between loading and not.
+            if quantize && t.ggml_type == 19 && k % 256 == 0
+                && std::env::var("LOGSCOPE_NO_IQ1_NATIVE").is_err() {
+                let count = t.dims.iter().product::<u64>() as usize;
+                if count == n * k {
+                    if let (Some(nbytes), Some(sset)) = (gguf::type_nbytes(19, count), static_set.as_ref()) {
+                        if let Some(raw) = sset.slice(t.offset, nbytes) {
+                            // Uploaded as opaque words. MATVEC_IQ1_S reads the block layout itself, so
+                            // nothing here needs to understand it — which is why this is small.
+                            let words: Vec<u32> = raw.chunks_exact(4)
+                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+                            let blocks = self.upload_u32(&words);
+                            return Ok(Lin::iq1(Iq1Weight { blocks, n, k }));
+                        }
+                    }
+                }
+            }
             if quantize && q4_mode && t.ggml_type == 12 && k % 256 == 0
                 && std::env::var("LOGSCOPE_NO_Q4K_GPU").is_err() {
                 let count = t.dims.iter().product::<u64>() as usize;
@@ -9191,6 +9448,10 @@ file-backed pages, not anonymous memory)", crate::memplan::gib(mapped));
     fn dump_lin(&self, o: &mut Vec<u8>, l: &Lin) {
         match &l.kind { // biases are never cached (biased models skip the cache write, see save_int8_cache)
             LinKind::F32(t) => { o.push(0); self.dump_tensor(o, t); }
+            // Tag 3. NOT cached: the cache exists to skip requantization, and IQ1_S is never
+            // requantized — the file's bytes ARE the resident form, so a cache copy would duplicate
+            // the checkpoint for no gain.
+            LinKind::Iq1(_) => { return; }
             LinKind::Q8(q) => { o.push(1); o.extend_from_slice(&(q.n as u32).to_le_bytes()); o.extend_from_slice(&(q.k as u32).to_le_bytes());
                 self.dump_tensor(o, &q.qw); self.dump_tensor(o, &q.qs); }
             LinKind::Q4(q) => { o.push(2); o.extend_from_slice(&(q.n as u32).to_le_bytes()); o.extend_from_slice(&(q.k as u32).to_le_bytes());
@@ -10816,6 +11077,22 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     /// Confirms or refutes the 16-byte-stride diagnosis in one run: if this reads correctly where the
     /// scalar probe does not, `array<u32>` is being laid out with std140 padding.
     /// `dst[i] = f32(i)` — tests the invocation index alone.
+    /// Matvec against IQ1_S weights held in the file's own bytes.
+    ///
+    /// The kernel and its bindings already existed for `--gate-iq1s-kernel`. This is the entry point
+    /// that lets a RESIDENT weight reach them, which is the piece that was missing.
+    pub fn linear_iq1_s_t(&self, a: &Tensor, w: &Iq1Weight, m: usize) -> Tensor {
+        // Decode only. This variant exists so a 30.3 GiB checkpoint can stay resident, and residency
+        // matters at m == 1; claiming batch support it does not have would be the same kind of lie as
+        // a gate testing a path nothing calls.
+        assert_eq!(m, 1, "IQ1_S matvec is decode-only; batched prefill converts instead");
+        let out = self.alloc(1, w.n);
+        let dims = [w.n as u32, w.k as u32, (w.k / 256) as u32, 0u32];
+        let gx = (w.n as u32).div_ceil(64).max(1);
+        self.dispatch(MATVEC_IQ1_S, &[a, &w.blocks], &out, bytemuck::cast_slice(&dims), (gx, 1, 1));
+        out
+    }
+
     pub fn id_probe(&self, n: usize) -> Vec<f32> {
         self.byte_probe_with(&vec![0u8; n], ID_PROBE)
     }
@@ -13714,6 +13991,97 @@ fn main(@builtin(global_invocation_id) g:vec3<u32>) {
 ///
 /// The weights are ternary, so the product is a select-and-add and there is nothing for an integer
 /// path to accelerate. That is the opposite of the Q8_0 case where the integer dot was worth 2×.
+/// IQ1_S matvec across selected experts, in one dispatch.
+///
+/// **The kernel the stacked MoE path could not have.** Every other expert kind binds a (quant, scale)
+/// PAIR of buffers; IQ1_S interleaves indices and scales in one 50-byte block and additionally needs
+/// the 2048-entry codebook grid, so it takes six bindings where the pair kinds take five. That shape
+/// mismatch is why `LinKind::Iq1` was unreachable from the MoE arm.
+///
+/// One structural change from the dense kernel: the row base is offset by the selected expert, read
+/// from `selw`'s first half — the same buffer `MOE_TOPK` fills and `MOE_MATVEC_GLU_Q4` reads. The
+/// block decode is untouched, so `--gate-iq1s-kernel`'s validation of the arithmetic still applies.
+///
+/// `xper` matches the GLU kernel's flag of the same name: per-slot activations when the caller
+/// pre-scaled them for a weight_before architecture, shared row 0 otherwise.
+pub const MOE_MATVEC_IQ1_S: &str = r#"
+// slots: how many experts are selected. xper: activations are per-slot (pre-scaled) rather than
+// shared, matching MOE_MATVEC_GLU_Q4's flag of the same name.
+struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, slots:u32, xper:u32, pad:u32 };
+@group(0) @binding(0) var<storage, read> a: array<f32>;      // activations [k]
+@group(0) @binding(1) var<storage, read> w: array<u32>;      // IQ1_S blocks, 50 B per 256
+@group(0) @binding(2) var<storage, read> grid: array<u32>;   // 2048 entries, 2 u32 each
+@group(0) @binding(3) var<storage, read> selw: array<u32>;   // [slots idx | slots weight]
+@group(0) @binding(4) var<storage, read_write> c: array<f32>;
+@group(0) @binding(5) var<uniform> d: D;
+
+// Byte at absolute offset `i` of the weight blob. IQ1_S rows are 50-byte multiples, which is NOT a
+// multiple of 4, so a row does not start on a word boundary and every read must go through here.
+fn wbyte(i: u32) -> u32 { return extractBits(w[i >> 2u], (i & 3u) * 8u, 8u); }
+fn whalf(i: u32) -> u32 { return wbyte(i) | (wbyte(i + 1u) << 8u); }
+
+// f16 -> f32. The scale is the only float in the block and it is half-precision.
+fn f16(h: u32) -> f32 {
+    let sgn = f32(1 - i32((h >> 15u) & 1u) * 2);
+    let exp = (h >> 10u) & 0x1Fu;
+    let man = h & 0x3FFu;
+    if (exp == 0u) { return sgn * f32(man) * 5.9604645e-8; }
+    if (exp == 31u) { return sgn * 65504.0; }
+    return sgn * exp2(f32(i32(exp) - 15)) * (1.0 + f32(man) / 1024.0);
+}
+
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+    let row  = g.x + g.y * d.gx;
+    let slot = g.z;
+    if (row >= d.n || slot >= d.slots) { return; }
+    let nblk = d.k / 256u;
+    // THE EXPERT OFFSET IS THE ONLY STRUCTURAL DIFFERENCE from the dense kernel. Experts are stacked
+    // contiguously, so expert e begins at e * n * nblk * 50 bytes — and the index comes from selw's
+    // FIRST half, the same buffer MOE_TOPK fills and MOE_MATVEC_GLU_Q4 reads.
+    let expert = selw[slot];
+    let rowbase = (expert * d.n + row) * nblk * 50u;
+    // Two accumulator chains: every FMA otherwise waits on the previous one, which serialises the
+    // loop to iterations x latency regardless of available bandwidth. Colibri's int8 matvec does the
+    // same on NEON, and here k is thousands rather than tens.
+    // Per-slot activations when the caller pre-scaled them for a weight_before architecture,
+    // otherwise every slot shares row 0 — the same contract as MOE_MATVEC_GLU_Q4's xper.
+    var abase = 0u;
+    if (d.xper == 1u) { abase = slot * d.k; }
+    var acc0 = 0.0;
+    var acc1 = 0.0;
+    for (var b = 0u; b < nblk; b = b + 1u) {
+        let blk = rowbase + b * 50u;
+        let dsc = f16(whalf(blk));
+        for (var ib = 0u; ib < 8u; ib = ib + 1u) {
+            let h = whalf(blk + 34u + 2u * ib);
+            let dl = dsc * f32(2u * ((h >> 12u) & 7u) + 1u);
+            var delta = 0.125;
+            if ((h & 0x8000u) != 0u) { delta = -0.125; }
+            for (var l = 0u; l < 4u; l = l + 1u) {
+                // 11-bit index: 8 bits from qs, 3 from qh at this group's offset.
+                // extractBits throughout: `h >> (3u * l)` is a shift by a lane-varying amount, which
+                // returns zero on Honeykrisp for every lane whose shift is non-zero.
+                let idx = wbyte(blk + 2u + ib * 4u + l) | (extractBits(h, 3u * l, 3u) << 8u);
+                let lo = grid[idx * 2u];
+                let hi = grid[idx * 2u + 1u];
+                let base = b * 256u + ib * 32u + l * 8u;
+                for (var j = 0u; j < 4u; j = j + 1u) {
+                    // Same rule for the byte selects. The trailing `<< 24u >> 24u` is a sign
+                    // extension by CONSTANT amounts and is unaffected — it is the varying shift that
+                    // fails, not shifting as such.
+                    let tl = f32(i32(extractBits(lo, 8u * j, 8u)) << 24u >> 24u);
+                    let th = f32(i32(extractBits(hi, 8u * j, 8u)) << 24u >> 24u);
+                    acc0 = acc0 + a[abase + base + j] * (tl + delta) * dl;
+                    acc1 = acc1 + a[abase + base + 4u + j] * (th + delta) * dl;
+                }
+            }
+        }
+    }
+    c[slot * d.n + row] = acc0 + acc1;
+}
+"#;
+
 pub const MATVEC_IQ1_S: &str = r#"
 struct D { m:u32, n:u32, k:u32, kb:u32, gx:u32, pad0:u32, pad1:u32, pad2:u32 };
 @group(0) @binding(0) var<storage, read> a: array<f32>;      // activations [k]

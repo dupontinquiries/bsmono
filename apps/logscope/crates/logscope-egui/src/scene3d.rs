@@ -8341,3 +8341,98 @@ mod beacon_palette_tests {
         assert_ne!(l, a);
     }
 }
+
+/// Render a scene with its live diagnostic landmark appended.
+///
+/// **The landmark cannot live in the cached `Scene`.** `with_env` rebuilds only when the palette,
+/// theme variant or env params change — the whole point of that cache — while the landmark changes
+/// every frame as experts stream, the drive stalls, and peers build or crumble.
+///
+/// So it is built fresh per call into a scratch scene and concatenated. That is ~20 boxes against a
+/// scene of hundreds, and it keeps the expensive part cached where it belongs.
+///
+/// Passing `None` for `parts` draws the world unchanged, so a caller with no engine — the GUI-only
+/// build, or a session before a model loads — costs nothing and shows nothing rather than showing a
+/// mechanism that is not measuring anything.
+pub fn with_env_and_landmark(
+    palette_name: &str,
+    t: f32,
+    parts: Option<(logscope::machinery::Parts, logscope::machinery::Shape,
+                   logscope::machinery::Weathering)>,
+    f: impl FnOnce(&[Mesh3]),
+) {
+    let Some((p, shape, weather)) = parts else { return with_env(palette_name, t, f) };
+    with_env(palette_name, t, |base| {
+        let mut lm = Scene::new();
+        // The scene's own extent decides where the landmark stands and how big — a cathedral wants
+        // its clocktower further out than a treehouse wants its abacus-mill.
+        let radius = base.iter().flat_map(|m| m.verts.iter())
+            .fold(0.0f32, |a, v| a.max((v.x * v.x + v.z * v.z).sqrt()));
+        let height = base.iter().flat_map(|m| m.verts.iter()).fold(0.0f32, |a, v| a.max(v.y));
+        let place = logscope::machinery::placement(radius, height);
+        let (tower, lamp, accretion) = beacon_palette(palette_name);
+        add_landmark(&mut lm, p, place, shape, weather, tower, lamp, accretion);
+        let all: Vec<Mesh3> = base.iter().cloned().chain(lm.meshes.into_iter()).collect();
+        f(&all);
+    });
+}
+
+#[cfg(test)]
+mod landmark_overlay_tests {
+    use super::*;
+    use logscope::machinery::{Motion, Parts, Weathering, machine_for};
+
+    fn parts() -> (Parts, logscope::machinery::Shape, Weathering) {
+        (Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.5),
+         machine_for("Old Library").shape, Weathering::present())
+    }
+
+    #[test]
+    fn the_landmark_is_APPENDED_not_baked_into_the_cache() {
+        // If it were baked in, the cached scene would freeze whatever the engine was doing at build
+        // time and never move again — a stalled clocktower that stays stalled after the stall clears.
+        let mut with = 0usize;
+        let mut without = 0usize;
+        with_env_and_landmark("Old Library", 0.0, None, |m| without = m.len());
+        with_env_and_landmark("Old Library", 0.0, Some(parts()), |m| with = m.len());
+        assert!(with > without, "{with} vs {without}");
+        assert_eq!(with - without, 20, "one mechanism: frame, store, selector, drive");
+    }
+
+    #[test]
+    fn NO_PARTS_draws_the_world_unchanged() {
+        // The GUI-only build and any session before a model loads. Showing a mechanism that is not
+        // measuring anything would be worse than showing none.
+        let mut a = 0usize;
+        let mut b = 0usize;
+        with_env("Old Library", 0.0, |m| a = m.len());
+        with_env_and_landmark("Old Library", 0.0, None, |m| b = m.len());
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_landmark_is_placed_from_the_SCENE_extent() {
+        // Scaled to its surroundings rather than fixed: the same apparatus reads as a toy in a
+        // cathedral and a monolith in a treehouse.
+        let mut far = 0.0f32;
+        with_env_and_landmark("Old Library", 0.0, Some(parts()), |m| {
+            far = m.iter().rev().take(20).flat_map(|x| x.verts.iter())
+                .fold(0.0f32, |a, v| a.max((v.x * v.x + v.z * v.z).sqrt()));
+        });
+        assert!(far > 2.0, "the landmark stands away from the reading surface, got {far}");
+    }
+
+    #[test]
+    fn a_CRUMBLING_landmark_appends_fewer_meshes() {
+        // The overlay carries weathering through, so a peer coming apart visibly loses parts rather
+        // than fading — and the count is the evidence.
+        let mut gone = Weathering::present();
+        gone.tick(logscope::machinery::WEATHER_TRANSITION_S * 2.0, false, 0.0);
+        let (p, s, _) = parts();
+        let mut whole = 0usize;
+        let mut ruin = 0usize;
+        with_env_and_landmark("Old Library", 0.0, Some(parts()), |m| whole = m.len());
+        with_env_and_landmark("Old Library", 0.0, Some((p, s, gone)), |m| ruin = m.len());
+        assert!(ruin < whole, "{ruin} vs {whole}");
+    }
+}

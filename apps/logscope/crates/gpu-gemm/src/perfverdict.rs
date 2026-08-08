@@ -861,3 +861,148 @@ mod gate_scope_tests {
 failure mode");
     }
 }
+
+/// One line at the end of a run that says what to fix first.
+///
+/// # Why this rather than more numbers
+///
+/// A generation currently prints a submit-cause line of 200+ characters, a bind-group cache line, a
+/// phase-balance line and a token-rate line. All four are true and the reader has to hold them
+/// together to learn anything. In practice every diagnosis this session started by grepping the same
+/// three figures out of them.
+///
+/// **The headline picks the dominant cost and names the lever.** Not a summary of everything — a
+/// verdict, which is what a closing line is for.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct RunShape {
+    pub submits: u64,
+    pub no_frame: u64,
+    pub download: u64,
+    pub passes: u64,
+    pub tokens: u64,
+    pub wall_s: f64,
+    /// Aggregate CPU wait across threads. May exceed wall time; that is not an error.
+    pub sync_s: f64,
+}
+
+impl RunShape {
+    pub fn tok_s(&self) -> f64 {
+        if self.wall_s > 0.0 { self.tokens as f64 / self.wall_s } else { 0.0 }
+    }
+    pub fn submits_per_token(&self) -> f64 {
+        if self.tokens > 0 { self.submits as f64 / self.tokens as f64 } else { 0.0 }
+    }
+    /// Share of wall time spent waiting. **Can exceed 1.0** when several sessions each stall on
+    /// their own readback, which is an aggregate across threads rather than an arithmetic error —
+    /// and reporting it as a percentage without saying so has confused a reader before.
+    pub fn sync_share(&self) -> f64 {
+        if self.wall_s > 0.0 { self.sync_s / self.wall_s } else { 0.0 }
+    }
+
+    /// The single most expensive thing, and what to do about it.
+    pub fn headline(&self) -> String {
+        let (nf, dl, ps) = (self.no_frame as f64, self.download as f64, self.passes as f64);
+        let total = (self.submits as f64).max(1.0);
+        let rate = self.tok_s();
+        // Ordered by share, and each arm names a LEVER rather than restating the number. A reader who
+        // wanted the number already has it on the line above.
+        let (share, what) = if nf >= dl && nf >= ps {
+            (nf / total, "dispatches ran with NO FRAME OPEN, so each became its own submit. Something \
+takes the frame and does not restore it — `--frame-diag` names which pipeline")
+        } else if dl >= ps {
+            (dl / total, "submits were READBACKS. On a MoE model these are per-layer router logits \
+going to the CPU to choose experts; computing every expert instead removes them entirely when the \
+stall dominates")
+        } else {
+            (ps / total, "submits were forced by PASS BOUNDARIES, which is what happens when work \
+cannot accumulate into one encoder")
+        };
+        format!("{rate:.2} tok/s at {:.0} submits/tok — {:.0}% of {what}",
+            self.submits_per_token(), share * 100.0)
+    }
+
+    /// A second line only when something is anomalous. **Silence is the normal case**, and a run
+    /// that always prints two lines teaches the reader to skip both.
+    pub fn caveat(&self) -> Option<String> {
+        if self.sync_share() > 1.0 {
+            return Some(format!("sync is {:.0}% of wall — over 100% because it is an aggregate \
+across threads, not an arithmetic error", self.sync_share() * 100.0));
+        }
+        if self.tokens == 0 {
+            return Some("no tokens were produced, so every rate above is a division by a run that \
+generated nothing".into());
+        }
+        if self.submits_per_token() > 5000.0 {
+            return Some(format!("{:.0} submits per token is extreme — for comparison a dense model \
+on this engine runs a few hundred", self.submits_per_token()));
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod headline_tests {
+    use super::*;
+
+    fn shape(nf: u64, dl: u64, ps: u64, tokens: u64, wall: f64, sync: f64) -> RunShape {
+        RunShape { submits: nf + dl + ps, no_frame: nf, download: dl, passes: ps,
+                   tokens, wall_s: wall, sync_s: sync }
+    }
+
+    #[test]
+    fn a_NO_FRAME_dominated_run_names_the_frame_lever() {
+        // Scout's real numbers: 388759 no-frame, 153664 download, 6223 passes.
+        let s = shape(388759, 153664, 6223, 601, 456.9, 400.0);
+        let h = s.headline();
+        assert!(h.contains("NO FRAME OPEN"));
+        assert!(h.contains("--frame-diag"), "a verdict must name what to run next");
+        assert!(h.contains("71%"), "got {h}");
+    }
+
+    #[test]
+    fn a_READBACK_dominated_run_names_the_dense_MoE_lever() {
+        let h = shape(100, 900, 50, 100, 10.0, 5.0).headline();
+        assert!(h.contains("READBACKS"));
+        assert!(h.contains("computing every expert"));
+    }
+
+    #[test]
+    fn the_headline_names_a_LEVER_rather_than_restating_the_number() {
+        // The reader already has the number on the line above. A closing line that repeats it adds a
+        // line and no information.
+        for h in [shape(900, 50, 50, 10, 1.0, 0.5).headline(),
+                  shape(50, 900, 50, 10, 1.0, 0.5).headline()] {
+            assert!(h.contains("tok/s"), "the rate is the one number worth carrying");
+        }
+    }
+
+    #[test]
+    fn SYNC_OVER_100_PERCENT_is_explained_rather_than_left_to_alarm() {
+        // It is an aggregate across threads. Reported as a bare percentage it has confused a reader
+        // before, and the explanation costs one clause.
+        let c = shape(10, 10, 10, 10, 10.0, 58.1).caveat().unwrap();
+        assert!(c.contains("aggregate across threads"));
+        assert!(c.contains("not an arithmetic error"));
+    }
+
+    #[test]
+    fn a_HEALTHY_run_prints_NO_caveat() {
+        // Silence is the normal case. A run that always prints two lines teaches the reader to skip
+        // both, which is how the GPU-reset line got missed in journalctl.
+        assert!(shape(10, 300, 40, 200, 20.0, 8.0).caveat().is_none());
+    }
+
+    #[test]
+    fn ZERO_TOKENS_is_caught_before_the_rates_are_believed() {
+        // Every rate is then a division by a run that generated nothing, and 0.00 tok/s reads as slow
+        // rather than as absent.
+        assert!(shape(10, 10, 10, 0, 5.0, 1.0).caveat().unwrap().contains("generated nothing"));
+    }
+
+    #[test]
+    fn an_EXTREME_submit_rate_is_given_a_comparison() {
+        // "13321 submits/token" means nothing without knowing that a few hundred is normal.
+        let c = shape(1_000_000, 100, 100, 100, 10.0, 5.0).caveat().unwrap();
+        assert!(c.contains("a few hundred"));
+    }
+}

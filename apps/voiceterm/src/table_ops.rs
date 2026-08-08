@@ -1124,3 +1124,38 @@ Alice | 30 | 60000
         assert_eq!(t.rows[0][1], "x|y");
     }
 }
+
+#[cfg(test)]
+mod qwen_malformed_tests {
+    use super::*;
+
+    /// A real Qwen transcript from LogScope: the rows lost their leading pipe. LogScope was about to
+    /// grow its own lenient parser before finding this one — which already handles it, because
+    /// `split_md_row` STRIPS a leading pipe rather than requiring one.
+    #[test]
+    fn rows_MISSING_their_leading_pipe_are_recovered() {
+        let src = "| Feature | Status |\n|-------|--------|\n\
+✅ Two players control turtles via arrow keys | ✔️ |\n\
+✅ Turtles move toward center | ✔️ |";
+        let t = parse_markdown_table(src).expect("a table, not three lines of prose");
+        assert_eq!(t.headers, vec!["Feature", "Status"]);
+        assert_eq!(t.rows.len(), 2);
+        assert_eq!(t.rows[0][1], "✔️");
+        assert!(t.rows[0][0].contains("Two players"));
+    }
+
+    #[test]
+    fn a_MISMATCHED_separator_dash_count_is_tolerated() {
+        // Models get the dash count wrong constantly and it carries no information a reader can use.
+        let t = parse_markdown_table("| a | b | c |\n|---|---|\n| 1 | 2 | 3 |").unwrap();
+        assert_eq!(t.headers.len(), 3);
+        assert_eq!(t.rows[0], vec!["1", "2", "3"]);
+    }
+
+    #[test]
+    fn PROSE_containing_a_pipe_is_not_turned_into_a_table() {
+        // The guard that makes leniency safe: a parser that mangles fine text is worse than a strict
+        // one.
+        assert!(parse_markdown_table("use a | b\nthen c\nand d").is_none());
+    }
+}

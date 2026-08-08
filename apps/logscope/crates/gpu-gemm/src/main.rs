@@ -3860,6 +3860,134 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-quanttables") {
+        // Five decoders were added in one sitting and every test for them constructs a block from
+        // the same understanding of the layout the decoder uses — which is circular. This does not
+        // fix that; it checks the three places the same facts are written down against each other.
+        //
+        // It found a real gap the run it was written: source_bpw had no Q5_K entry, so the planner
+        // could not size any file containing it.
+        let a = gpu_kernels::quantref::table_consistency();
+        let b = gpu_kernels::quantref::decoder_length_agreement();
+        for p in a.iter().chain(b.iter()) { println!("  {p}"); }
+        if a.is_empty() && b.is_empty() {
+            println!("gate-quanttables: type_nbytes, source_bpw and the decoders agree on every \
+supported type. THIS DOES NOT PROVE THE LAYOUTS ARE RIGHT — only a real checkpoint does that — but \
+a disagreement here would have proved one wrong.");
+        } else {
+            println!("gate-quanttables: {} FAIL", a.len() + b.len());
+        }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--gate-residency") {
+        // MEASURE what ASAHI_CONCURRENT_BUFFER_GIB assumes. That constant is one M2 Ultra's figure
+        // applied to every Asahi device, and a wrong value is a wrong REFUSAL — invisible, because
+        // the model simply does not load.
+        //
+        // A gate rather than a load-time probe: this costs a slow run and the answer is stable per
+        // adapter, so paying it once and recording the number beats paying it every launch.
+        use gpu_kernels::memplan::*;
+        let gpu = Gpu::new();
+        println!("gate-residency: adapter = {}", gpu.adapter_name);
+        println!("  the compiled-in assumption is {ASAHI_CONCURRENT_BUFFER_GIB:.1} GiB");
+        if !probe_is_meaningful(&gpu.adapter_name) {
+            println!("  DECLINING: this is a software rasterizer. Its 'device memory' is host RAM, \
+so the probe would measure malloc and say nothing about any GPU — after OOM-killing the process on \
+the way to finding out. A probe that cannot answer the question should decline rather than \
+approximate it.");
+            return;
+        }
+        // Smaller slabs: the source buffer is held for the whole probe, so a 1 GiB slab costs 1 GiB
+        // before a single upload happens. On a small machine that alone was a quarter of the budget.
+        let slab_gib = 0.25f64;
+        let slab_bytes = (slab_gib * (1u64 << 30) as f64) as usize / 4;
+        let mut held: Vec<gpu_kernels::Tensor> = Vec::new();
+        let mut complete = true;
+        let zero = vec![0u32; slab_bytes];
+        // Bounded by THIS machine's RAM, not only by the constant. The first version used the
+        // constant alone and was OOM-killed on a 16 GB container — the exact "a probe that wedges
+        // the machine is worse than a wrong constant" failure it was written to avoid.
+        let limit = probe_limit_gib(system_ram_gib());
+        println!("  probing to {limit:.1} GiB (system has {:.0} GiB)", system_ram_gib());
+        while (held.len() as f64) * slab_gib < limit {
+            // Held in a Vec so nothing is released until the probe ends — releasing as we go would
+            // measure the largest SINGLE allocation, which --gate-vram already answers and which is
+            // the question that produced the misleading 63 GiB.
+            // CATCH THE ALLOCATION FAILURE. On an M2 Ultra the probe held 31 GiB and then wgpu
+            // panicked inside upload — the engine's own OOM handler logged "degrading + backing off"
+            // and the panic came from the layer below it. Checking DEVICE_ERRORS after the call is
+            // too late when the call does not return.
+            //
+            // The failing allocation IS the answer, so surviving it is the difference between a
+            // measurement and a crash report.
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gpu.upload_u32(&zero)
+            }));
+            match attempt {
+                Ok(t) => held.push(t),
+                Err(_) => {
+                    let n = held.len() as f64 * slab_gib;
+                    println!("  allocation FAILED at {n:.1} GiB — that is the ceiling, and the \
+failure is the measurement rather than an error");
+                    break;
+                }
+            }
+            let n = held.len() as f64 * slab_gib;
+            if held.len() % 4 == 0 { println!("  held {n:.0} GiB in {} slabs", held.len()); }
+            // A probe that wedges the GPU is worse than a wrong constant, so stop on the first sign
+            // the device is unhappy rather than pushing until it fails hard.
+            if gpu_kernels::DEVICE_ERRORS.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                complete = false;
+                println!("  device reported an error at {n:.0} GiB — stopping here rather than \
+pushing until it fails hard");
+                break;
+            }
+        }
+        let p = ResidencyProbe {
+            held_gib: held.len() as f64 * slab_gib,
+            slab_gib,
+            // Hitting the wall IS completing: the probe exists to find where allocation fails, and
+            // finding it is success. `complete` is false only when something ELSE stopped the run —
+            // a device error unrelated to exhaustion, or the outer limit being reached without a
+            // failure, which reports a floor rather than a ceiling.
+            complete,
+        };
+        drop(held);
+        println!("{}", p.explain(ASAHI_CONCURRENT_BUFFER_GIB));
+        println!("gate-residency: plan with {:.1} GiB (LOGSCOPE_MAX_GPU_GB overrides)",
+            p.budget_gib(ASAHI_CONCURRENT_BUFFER_GIB));
+        return;
+    }
+
+    if args.iter().any(|a| a == "--frame-diag") {
+        // ONE RUN, SEVERAL ANSWERS. The operator's cost is the round trip — download, unpack, run,
+        // read — so a batch of independent probes is cheaper for them than one careful print per
+        // turn, and the ones that fail do not stop the ones that do not.
+        //
+        // Open question: 39% of submits on a dense resident model ran with no frame open, though
+        // decode_step_q8 calls begin_frame() first thing. This says where.
+        gpu_kernels::framediag::arm();
+        println!("frame-diag: armed. Run a generation, then this prints on exit.");
+        println!("  LOGSCOPE_FRAME_DIAG=1 arms it inside the app instead.");
+        let gpu = Gpu::new();
+        println!("frame-diag: adapter = {}", gpu.adapter_name);
+        // A synthetic decode-shaped burst: many small dispatches, the pattern decode produces.
+        let a = gpu.upload(&vec![0.1f32; 4096], 1, 4096);
+        for _ in 0..64 { let _ = gpu.rmsnorm_t(&a, &a, 1, 4096, 1e-5); }
+        println!("--- with no frame open ---\n{}", gpu_kernels::framediag::report());
+        gpu_kernels::framediag::reset();
+        gpu_kernels::framediag::arm();
+        gpu.begin_frame();
+        for _ in 0..64 { let _ = gpu.rmsnorm_t(&a, &a, 1, 4096, 1e-5); }
+        gpu.end_frame();
+        // THE CONTROL. If the framed run also reports frameless dispatches, the frame is not being
+        // honoured at all and the decode-path question is moot — a much bigger finding than a
+        // mis-placed end_frame, and one this comparison gets for free.
+        println!("--- with a frame held ---\n{}", gpu_kernels::framediag::report());
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-quantref") {
         // THE CONTRACT, checked before any kernel implements it. q1/q2/q3 do not exist yet; this
         // fixes what they must do so the next one inherits what q4_K cost seven wrong theories.
@@ -4809,7 +4937,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-quantref  --gate-qwen2  --gate-qwen3\n  --gate-rubric  --gate-store  --gate-stream-slots  --gate-submit\n  --gate-swa  --gate-vae-conv  --gate-vae-resblock  --gate-vit-block\n  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-quantref  --gate-quanttables  --gate-qwen2\n  --gate-qwen3  --gate-residency  --gate-rubric  --gate-store\n  --gate-stream-slots  --gate-submit  --gate-swa  --gate-vae-conv\n  --gate-vae-resblock  --gate-vit-block  --gate-vram  --gate-worker\n  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
