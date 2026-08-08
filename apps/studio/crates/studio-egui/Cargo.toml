@@ -9,6 +9,10 @@ description = "Studio's timeline UI on uikit-egui: tracks, clips, ruler, and the
 # the pattern, and a second definition of what a step is would drift from the
 # one the audio thread reads.
 studio-live = { path = "../studio-live" }
+# The transcript index and routine repertoire. A dependency rather than a copy:
+# the palette is a VIEW of the repertoire, and a second notion of what a routine
+# is would drift from the one that actually runs.
+studio-voice = { path = "../studio-voice" }
 studio-core = { path = "../studio-core" }
 studio-collab = { path = "../studio-collab" }
 studio-audio = { path = "../studio-audio" }
