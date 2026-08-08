@@ -722,3 +722,43 @@ existed. Then it had no binary, no manifest entry and no audit row, so the pages
 that did exist could not be run or counted. Both of those were fixed before any
 more porting, and the order mattered: the run column is what turned "some
 modules compile" into "an app you can open".
+
+## I have been misreading the `code` column
+
+Worth recording, because it changed what I thought the remaining work was.
+
+Chasing bo-suite's low `code` percentage, I went to port `SafetyToast` — and
+found `safety.rs` already there, 229 lines covering the bands, the eight-second
+toast, the clamp, and unlock-with-reapply. Writing it again would have been the
+"two lists of the same thing" failure this programme keeps finding in the Qt
+code, committed by me, for the fourth time. **Grepping before writing is what
+stopped it.**
+
+The same check on the rest of bo-suite's "named but not in code" list found
+`BandSlider` in `device.rs`, `BoRebound` in `scrollfeel.rs`,
+`AddToPlaylistDialog` and `ScanPickerDialog` in `dialogs.rs` — all ported, all
+under Rust names.
+
+**The tool is not wrong; its docstring says exactly this.** `covered_in_code`
+records that code-only matching drops bo-suite from 51% to 11% "because the
+house style names the Qt class in the MODULE DOC and then uses idiomatic Rust
+names in the code", which is why both metrics are shown. I have been quoting the
+lower number as though it were a coverage figure. It is a *naming-convention*
+figure, and a port that renames correctly scores badly on it by design.
+
+A third reading, counting surfaces whose snake_case stem appears in port code:
+
+| app | surfaces | named | code | named-only | of those, present under a Rust name |
+|---|---:|---:|---:|---:|---:|
+| bo-suite | 47 | 44 | 17 | 27 | 14 |
+| snapclone | 51 | 44 | 12 | 32 | 6 |
+| voiceterm | 22 | 20 | 16 | 4 | 1 |
+
+So bo-suite's real coverage is around 31 of 47 rather than 17, and the honest
+summary is that `named` overstates and `code` understates, with the truth
+between them and closer to `named` for the apps whose house style puts the Qt
+name in a module doc.
+
+That does not make `code` useless — it caught WayfinderPage and GroupVoiceBar,
+which is why it exists. It makes it a *lower bound* rather than a score, and the
+gap between the columns is a work queue to check, not a work queue to build.
