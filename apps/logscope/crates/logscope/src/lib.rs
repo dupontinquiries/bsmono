@@ -70,6 +70,7 @@ pub mod benchartifact;
 pub mod machinery;
 pub mod longrun;
 pub mod opsched;
+pub mod deviceplan;
 pub mod blastradius;
 pub mod confinement;
 pub mod externalwatch;
