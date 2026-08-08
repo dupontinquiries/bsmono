@@ -938,7 +938,10 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         // is why these two are supported and IQ2_XXS is not.
         20 => return crate::iq4::dequant_iq4_nl(data, n),
         23 => return crate::iq4::dequant_iq4_xs(data, n),
-        29 => return Err("IQ1_M (type 29) has no dequantizer here — its per-8 scale layout differs from IQ1_S, so the IQ1_S path would decode it to garbage without failing. Use an IQ1_S build, or implement the IQ1_M decode first".into()),
+        // IQ1_M now READS. It was refused by name because its per-8 scale layout differs from
+        // IQ1_S's and the IQ1_S path would have decoded it to garbage silently — the refusal was
+        // right, and iq1m.rs is what replaces it rather than relaxing it.
+        29 => return crate::iq1m::dequant_iq1_m(data, n),
         19 => {
             // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
             // 8 u16 `qh`. Each group of 8 weights takes an 11-BIT codebook index: 8 bits from qs plus 3
@@ -1366,12 +1369,18 @@ mod iq1m_tests {
     }
 
     #[test]
-    fn IQ1_M_is_REFUSED_rather_than_decoded_by_the_IQ1_S_path() {
-        // The dangerous failure: every length check passes and the output is plausible floats. A
-        // model would load and generate confident nonsense.
-        let e = dequantize(29, &vec![0u8; 56], 256).unwrap_err();
-        assert!(e.contains("decode it to garbage without failing"), "{e}");
-        assert!(e.contains("Use an IQ1_S build"), "and say what to do instead");
+    fn IQ1_M_is_decoded_by_its_OWN_path_and_not_IQ1_S_s() {
+        // This asserted a REFUSAL when written, and the refusal was right: IQ1_M's scale layout
+        // differs from IQ1_S's, so the IQ1_S path would have decoded it to plausible garbage.
+        //
+        // iq1m.rs REPLACES the refusal rather than relaxing it, and the assertion flips to the
+        // positive so a regression fails here rather than passing on a premise that has changed.
+        let v = dequantize(29, &vec![0u8; 56], 256).expect("IQ1_M reads now");
+        assert_eq!(v.len(), 256);
+        // The two formats must not share a decoder: their block sizes differ and feeding one to the
+        // other is the silent corruption the original refusal existed to prevent.
+        assert_ne!(type_nbytes(29, 256), type_nbytes(19, 256));
+        assert!(dequantize(19, &vec![0u8; 56], 256).is_ok(), "IQ1_S still reads its own 50-byte form");
     }
 
     #[test]
@@ -1546,7 +1555,10 @@ mod iq4_wiring_tests {
     fn the_still_UNSUPPORTED_iq_types_are_still_refused() {
         // Adding two must not accidentally open the others: a codebook format read through a
         // non-linear decoder produces plausible floats and a model that generates confident nonsense.
-        for t in [16, 17, 18, 21, 22, 29] {
+        // 29 (IQ1_M) left the list when iq1m.rs landed. The remaining five are the CODEBOOK
+        // formats that each need a 2048-entry grid transcribed — IQ1_M was tractable precisely
+        // because it reuses the grid IQ1_S already carries.
+        for t in [16, 17, 18, 21, 22] {
             assert!(dequantize(t, &vec![0u8; 512], 256).is_err(), "type {t} must stay refused");
         }
     }
