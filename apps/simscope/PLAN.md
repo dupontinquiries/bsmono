@@ -544,5 +544,68 @@ is still the cohesive-interface question.
 - **Mode I only.** No mixed-mode decomposition, which needs an interaction integral.
 - **No crack growth.** `J` is evaluated on a fixed geometry; propagation needs remeshing or an
   enrichment.
-- **No cohesive zone.** The mechanism nacre actually needs, and now the only major piece left
-  before its toughness becomes approachable.
+- ~~No cohesive zone.~~ Built; see below. Meshed cohesive *elements* remain the gap.
+
+
+## Cohesive interfaces — where toughness comes from
+
+LEFM answers "will this crack run" given a toughness measured elsewhere. A cohesive zone answers
+the prior question: **where does the toughness come from at all?** The crack is a process zone whose
+faces still pull on each other, and the area under the traction–separation curve *is* the fracture
+energy. That identity is the central test, checked by integrating the traction the law actually
+returns rather than trusting the closed form it was built from.
+
+This is the first genuinely nonlinear problem in the workspace, and it runs on the Newton solver
+written at the very start for power flow — which is the shared-core bet paying off on something
+that looks nothing like a power network.
+
+Three properties are asserted rather than assumed: the tangent matches a finite difference of the
+traction (the same discipline as the power-flow Jacobian, and for the same reason — a wrong tangent
+still converges, just slowly); softening makes the tangent **negative**, which is why load control
+is useless past the peak; and damage is **irreversible**, so unloading follows a secant to the
+origin rather than retracing the envelope. A model that retraced would heal itself under cyclic
+load, which is unphysical and flattering.
+
+### Three bugs, and what each looked like
+
+**Damage was driven by the committed history rather than the trial state.** A Newton iteration
+probes separations beyond the last committed maximum, and there the law extrapolated the *secant*
+instead of following the softening envelope — making the interface far too strong past the peak and
+costing the series solve its equilibrium entirely.
+
+**Snap-back is real and is now named.** When the surrounding structure is more compliant than the
+interface's softening slope (`σ_max²/2G_c`), there is no stable equilibrium: the interface releases
+faster than the structure can absorb, and the true response doubles back in *both* load and
+displacement. Following it needs arc-length control, not implemented. The test requires the solver
+to **fail loudly** there, because one that quietly returned the nearest converged point would draw
+a smooth curve through a discontinuity.
+
+**The Newton tolerance was absolute on a residual measured in pascals.** 1e-12 against ~1e7 is below
+machine precision, so a perfectly converged solve reported `MaxIterations` — the residual was
+already zero to every available bit. Exactly the same mistake as comparing strain and stress against
+one absolute number, and just as invisible.
+
+### What it says about nacre
+
+Aragonite releases 0.6 J/m²; nacre needs over a hundred times that. Pull-out can supply it:
+
+```
+   G_pullout  ~  tau · (l/t) · slip
+```
+
+At 20 MPa interfacial shear, aspect ratio 10 and a micron of slip, that is ~200 J/m² — the right
+order. **The aspect ratio is the amplifier**, linearly, which is why platelets are long and thin.
+
+And the cost is stated: a micron of slip exceeds a platelet thickness, so this is *sliding*, not
+stretching. **Nacre is tough because it is allowed to be damaged, not because it is strong** — which
+is precisely what the LEFM model could not express, and why this module had to exist.
+
+### Cohesive debts
+
+- **No meshed cohesive elements.** The law and a one-dimensional solve are verified; inserting
+  interfaces between bulk elements in a 2D RVE is the remaining work, and is what would let a
+  brick-and-mortar model produce toughness rather than only stiffness.
+- **No arc-length control**, so snap-back is detected and refused rather than traced.
+- **Mode I only.** Mixed-mode needs an effective separation and a mode-mixity criterion.
+- **Rate independent**, whereas nacre's organic matrix is viscoelastic and its dissipation is
+  rate-dependent — part of why hydration matters so much.

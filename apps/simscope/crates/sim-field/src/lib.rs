@@ -1,3 +1,4 @@
+pub mod cohesive;
 pub mod elastic;
 pub mod fracture;
 pub mod homogenize;
@@ -8,6 +9,7 @@ pub mod rlgc;
 pub mod thermal;
 
 pub use mesh::Mesh;
+pub use cohesive::{energy_from_k, pull, pullout_energy, Cohesive};
 pub use fracture::{edge_crack_k, j_integral, k_from_j, Domain};
 pub use homogenize::{effective_stiffness, e_from_stiffness, Rve};
 pub use laminate::{timoshenko_bimetal, Laminate, Ply, Response};
