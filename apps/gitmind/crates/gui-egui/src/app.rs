@@ -201,9 +201,22 @@ impl App {
         // swipe. Checked AFTER page ui so a focused TextEdit's own key handling wins first.
         ctx.input(|i| {
             if i.modifiers.ctrl {
-                for (n, t) in Tab::ALL.iter().enumerate() {
-                    let key = [egui::Key::Num1, egui::Key::Num2, egui::Key::Num3, egui::Key::Num4, egui::Key::Num5,
-                               egui::Key::Num6, egui::Key::Num7, egui::Key::Num8, egui::Key::Num9][n];
+                // ZIP, not index. This was `[..nine keys..][n]` over
+                // `Tab::ALL.iter().enumerate()` — and Tab::ALL has ELEVEN
+                // entries, so the tenth iteration indexed past the end of the
+                // key array and panicked. Every Ctrl chord ran this loop, so
+                // Ctrl+A took the whole program down without ever being a
+                // shortcut anyone had defined.
+                //
+                // Zipping makes the mismatch impossible rather than merely
+                // fixed: adding a twelfth tab now silently gets no shortcut,
+                // which is the correct behaviour when there are only nine
+                // number keys.
+                const NUM_KEYS: [egui::Key; 9] = [
+                    egui::Key::Num1, egui::Key::Num2, egui::Key::Num3,
+                    egui::Key::Num4, egui::Key::Num5, egui::Key::Num6,
+                    egui::Key::Num7, egui::Key::Num8, egui::Key::Num9];
+                for (t, key) in Tab::ALL.iter().zip(NUM_KEYS) {
                     if i.key_pressed(key) {
                         self.tab = *t;
                     }

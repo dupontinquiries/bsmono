@@ -6347,8 +6347,19 @@ fn build_ui(app: &adw::Application) {
 
             // Smart SVG caching - only regenerate when model actually changed
             // Uses hash to detect changes, smooth animation via pulse
-            static mut LAST_SVG_HASH: u64 = 0;
-            static mut CACHED_SVG: Option<String> = None;
+            // A thread_local RefCell rather than `static mut`.
+            //
+            // `&CACHED_SVG` below — and the autoref in `.is_none()` — are
+            // exactly what the `static_mut_refs` lint rejects, and that lint is
+            // a HARD ERROR in edition 2024 rather than the warning it is today.
+            // This is a GTK callback and therefore always on the main thread,
+            // so a thread_local is the closest safe equivalent: same lifetime,
+            // same single-threaded assumption, no unsafe and no lint to
+            // suppress.
+            thread_local! {
+                static SVG_CACHE: std::cell::RefCell<(u64, Option<String>)> =
+                    const { std::cell::RefCell::new((0, None)) };
+            }
             
             // Compute lightweight hash of model state
             let model_hash = {
@@ -6361,14 +6372,15 @@ fn build_ui(app: &adw::Application) {
                 hasher.finish()
             };
             
-            unsafe {
+            SVG_CACHE.with(|cache| {
+                let mut cache = cache.borrow_mut();
                 // Only regenerate SVG if model changed
-                if model_hash != LAST_SVG_HASH || CACHED_SVG.is_none() {
+                if model_hash != cache.0 || cache.1.is_none() {
                     let svg = generate_network_svg(&m_clone, 0.0);
-                    CACHED_SVG = Some(svg);
-                    LAST_SVG_HASH = model_hash;
-                    
-                    if let Some(svg) = &CACHED_SVG {
+                    cache.0 = model_hash;
+                    cache.1 = Some(svg);
+
+                    if let Some(svg) = &cache.1 {
                         let loader = PixbufLoader::new();
                         let _ = loader.write(svg.as_bytes());
                         let _ = loader.close();
@@ -6377,7 +6389,7 @@ fn build_ui(app: &adw::Application) {
                         }
                     }
                 }
-            }
+            });
 
             glib::ControlFlow::Continue
         });
