@@ -68,6 +68,7 @@ pub mod dwell;
 pub mod benchscenario;
 pub mod convbench;
 pub mod continuation;
+pub mod codesmell;
 pub mod benchartifact;
 pub mod machinery;
 pub mod longrun;
