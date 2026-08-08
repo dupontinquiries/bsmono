@@ -28,6 +28,10 @@ snapclone-composer = { path = "../rust/snapclone-composer" }
 # the composer is: it ships an rlib, and its modules use crate:: paths that
 # resolve to the wrong crate under a #[path] include.
 snapclone-mailbox = { path = "../rust/snapclone-mailbox" }
+# Location freshness. Its opacity/presentation/last_seen_label are view
+# functions with no view; the wayfinder was drawing arrows without asking
+# whether the position behind them was worth pointing at.
+snapclone-location = { path = "../rust/snapclone-location", default-features = false }
 # The camera bridge device-kit was written for — its description names
 # snapclone explicitly, and no port had ever depended on it.
 # One authenticated session per peer, streams on demand. The roster was a

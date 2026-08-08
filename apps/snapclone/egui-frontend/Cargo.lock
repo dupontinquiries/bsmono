@@ -2618,11 +2618,22 @@ dependencies = [
  "settings-kit",
  "share-kit",
  "snapclone-composer",
+ "snapclone-location",
  "snapclone-mailbox",
  "snapclone-theme",
  "touchkit",
  "uikit-egui",
  "uikit-gesture",
+]
+
+[[package]]
+name = "snapclone-location"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "tracing",
 ]
 
 [[package]]
