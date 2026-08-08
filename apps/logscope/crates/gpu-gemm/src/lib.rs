@@ -8793,9 +8793,19 @@ last block and k's first would decode to garbage")),
                         if let Some(raw) = sset.slice(t.offset, nbytes) {
                             // Uploaded as opaque words. MATVEC_IQ1_S reads the block layout itself, so
                             // nothing here needs to understand it — which is why this is small.
-                            let words: Vec<u32> = raw.chunks_exact(4)
-                                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
-                            let blocks = self.upload_u32(&words);
+                            // NO INTERMEDIATE Vec. The previous version built a Vec<u32> from these bytes and
+                            // handed it to upload_u32, which immediately casts it BACK to &[u8] — so a full copy
+                            // of every tensor bought a type change and nothing else. On a 30 GiB checkpoint that
+                            // is 30 GiB allocated and memcpyd for no reason, during the load this path exists to
+                            // make cheap.
+                            //
+                            // upload_bytes takes the mmap slice directly. No alignment requirement is introduced
+                            // because nothing reinterprets the bytes here — MATVEC_IQ1_S reads the block layout
+                            // on the GPU, which is why this path could be small in the first place.
+                            let blocks = Tensor {
+                                buf: self.upload_bytes(raw, "iq1"),
+                                rows: 1, cols: raw.len() / 4, pool: None, view: None,
+                            };
                             return Ok(Lin::iq1(Iq1Weight { blocks, n, k }));
                         }
                     }
