@@ -426,7 +426,16 @@ impl Orbit {
     /// Venus is 232 K equilibrium and 737 K in fact, so the term has to be
     /// able to nearly triple it.
     pub fn surface_k(&self) -> f32 {
-        self.equilibrium_k() * (1.0 + 2.2 * self.air.clamp(0.0, 1.0).powf(1.5))
+        // THE GREENHOUSE WAS CALIBRATED ON VENUS AND APPLIED TO EARTH. The
+        // old term multiplied by up to 3.2, which put a one-atmosphere world
+        // at 813 K — every ocean world boiled, and the Earth test only
+        // passed because I happened to write air: 0.30.
+        //
+        // Earth is the anchor: 254 K equilibrium, 288 K measured, so one
+        // atmosphere is worth about 13%. Venus needs ninety-two of them, so
+        // `air` is no longer clamped at 1 — a thick world is expressed by
+        // having more of it, not by a steeper curve.
+        self.equilibrium_k() * (1.0 + 0.135 * self.air.max(0.0).powf(0.45))
     }
 
     pub fn surface(&self) -> Surface {
@@ -525,7 +534,11 @@ mod star_tests {
         // 1400. The physics was right and the expectation was lazy; real
         // lava worlds (K2-141b, 55 Cnc e) orbit inside 0.02 AU.
         let hot = Orbit { star: g, au: 0.02, albedo: 0.1, air: 0.0 };
-        let venus = Orbit { star: g, au: 0.72, albedo: 0.77, air: 1.0 };
+        // VENUS HAS NINETY-TWO ATMOSPHERES, and now that `air` is not
+        // clamped at 1 it can say so. At air: 1.0 it comes out at 258 K —
+        // which is what a Venus with Earth's air pressure would actually be,
+        // and not Venus.
+        let venus = Orbit { star: g, au: 0.72, albedo: 0.77, air: 92.0 };
         let mars = Orbit { star: g, au: 1.52, albedo: 0.25, air: 0.01 };
         let pluto = Orbit { star: g, au: 39.5, albedo: 0.5, air: 0.0 };
         assert_eq!(hot.surface(), Surface::Molten, "{} K", hot.surface_k());
@@ -574,16 +587,16 @@ mod star_tests {
         // a hot world WITH air does
         let hot_air = Orbit { air: 0.8, ..mercury };
         assert!(hot_air.shimmer() > 0.3);
-        // and a cold one does not — but "cold" has to mean cold AFTER the
-        // greenhouse. At 6 AU with a full atmosphere the surface lands at
-        // 323 K, which shimmers faintly and correctly; the thick air is
-        // doing exactly what thick air does. Out at 15 AU it cannot.
-        let cold = Orbit { star: g, au: 15.0, albedo: 0.3, air: 1.0 };
+        // a cold one does not, and with the greenhouse recalibrated on Earth
+        // a 6 AU world at one atmosphere is 118 K rather than 323 — the old
+        // "faint shimmer at 6 AU" result was the miscalibration talking. It
+        // takes a Venus-like column to warm an outer world, not an
+        // Earth-like one.
+        let cold = Orbit { star: g, au: 6.0, albedo: 0.3, air: 1.0 };
         assert_eq!(cold.shimmer(), 0.0, "{} K", cold.surface_k());
-        // and the 6 AU greenhouse case is a real result worth keeping
-        let warm_far = Orbit { star: g, au: 6.0, albedo: 0.3, air: 1.0 };
-        assert!(warm_far.shimmer() > 0.0 && warm_far.shimmer() < 0.1,
-            "a thick-atmosphere outer world should shimmer faintly: {}", warm_far.shimmer());
+        let smothered = Orbit { air: 200.0, ..cold };
+        assert!(smothered.surface_k() > cold.surface_k() * 1.5,
+            "a huge column should still warm it: {} K", smothered.surface_k());
     }
 
     #[test]

@@ -28,6 +28,7 @@ mod replay;
 mod academy;
 mod stream;
 mod hud;
+mod hydro;
 mod idle;
 mod input;
 mod joints;

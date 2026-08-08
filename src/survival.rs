@@ -329,30 +329,39 @@ mod tests {
         // returned 0 and was right to. A terminator band only exists where
         // the mean is inside the band and the two faces are not, which is a
         // narrower set of worlds than I assumed.
-        let locked = Orbit { star: StarClass::M, au: 0.15, albedo: 0.25, air: 0.10 };
+        // 0.09 AU with the greenhouse recalibrated: at 0.15 the surface is
+        // 230 K and a suit fails everywhere for cold instead of heat, which
+        // is the same "no band" answer for the opposite reason
+        // 0.12 AU with the greenhouse recalibrated. The band needs the MEAN
+        // inside the envelope and the two faces outside it: 257 K mean, 347
+        // day, 90 night. At 0.09 the night face is 104 and the mean 297 —
+        // also a band, but the day face at 401 clips the ceiling and the
+        // answer becomes zero for the opposite reason.
+        let locked = Orbit { star: StarClass::M, au: 0.12, albedo: 0.25, air: 0.10 };
         assert!(locked.tidally_locked());
         let f = habitable_fraction(Body::HumanSuited, &locked);
         assert!(f > 0.0 && f < 0.25, "terminator band was {f} at {} K", locked.surface_k());
         // and the too-close case is genuinely uninhabitable, not a band
-        let scorched = Orbit { au: 0.04, ..locked };
+        let scorched = Orbit { au: 0.03, ..locked };
         assert_eq!(habitable_fraction(Body::HumanSuited, &scorched), 0.0,
             "a 454 K locked world offered a habitable band");
-        // MORE AIR IS NOT SIMPLY BETTER, which is the trade the model found
-        // and I did not expect. Atmosphere spreads heat around a locked
-        // world AND greenhouses it, so past a point the band it widens is a
-        // band it has already cooked. At this orbit 0.9 atm takes the
-        // surface from 234 K to 630 and the answer becomes zero.
+        // MORE AIR WIDENS THE BAND, which is what an atmosphere is for —
+        // and this test asserted the OPPOSITE for several rounds because the
+        // greenhouse term was calibrated on Venus's ninety-two atmospheres
+        // and applied to one. Under that term 0.9 atm took this world from
+        // 234 K to 630 and "cooked it", and I wrote that up as a trade the
+        // model had found. It was an artefact. With the greenhouse anchored
+        // on Earth instead, 0.9 atm reaches 277 K and does the thing air
+        // actually does.
         let thicker = Orbit { air: 0.9, ..locked };
-        assert_eq!(habitable_fraction(Body::HumanSuited, &thicker), 0.0,
-            "0.9 atm here should cook it: {} K", thicker.surface_k());
-        // out where the greenhouse cannot dominate, more air DOES widen it
-        let cold = Orbit { star: StarClass::M, au: 0.18, albedo: 0.3, air: 0.05 };
-        let colder_thick = Orbit { air: 0.25, ..cold };
-        if habitable_fraction(Body::HumanSuited, &cold) > 0.0 {
-            assert!(habitable_fraction(Body::HumanSuited, &colder_thick)
-                    >= habitable_fraction(Body::HumanSuited, &cold),
-                "air did not widen the band where it could");
-        }
+        assert!(habitable_fraction(Body::HumanSuited, &thicker) >= f,
+            "air should widen the band: {} at {} K", habitable_fraction(Body::HumanSuited, &thicker), thicker.surface_k());
+        // and a Venus-like column really does cook it, which is the same
+        // physics saying the trade exists — just two orders of magnitude
+        // further along than I had it
+        let smothered = Orbit { air: 92.0, ..locked };
+        assert_eq!(habitable_fraction(Body::HumanSuited, &smothered), 0.0,
+            "ninety-two atmospheres should cook it: {} K", smothered.surface_k());
     }
 
     #[test]

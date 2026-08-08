@@ -168,6 +168,79 @@ pub fn run(raid: &Raid, body: Body, speed_ms: f32, seed: u32, team: &[Body]) -> 
     }
 }
 
+// ==================================================== TIDEMAW ============
+//
+// A named raid, built from the pieces rather than scripted on top of them.
+//
+// ENTRY IS A DIVE. `drop.rs` already models a jump from a hangar with
+// inherited velocity and a terminal speed that differs between robot and
+// vehicle form; a water world just changes what you hit. Coming in from
+// orbit and going straight under is the same manoeuvre with the deceleration
+// happening in a fluid 830 times denser than the one it started in.
+//
+// THE CITY IS IN THE SHALLOWS because that is where the tide reaches at 0.75
+// and there is still cover — deep enough to be lost, shallow enough that the
+// water is trying to take you off the street.
+//
+// THE OPEN CROSSINGS ARE THE MECHANIC. hydro::Tide is periodic and it
+// telegraphs: slack, reverse, build. A heavy chassis crosses whenever it
+// likes; a flyer waits for slack and runs. That is a timing problem with a
+// visible signal, which is the only kind worth having.
+
+/// The water world, and the thing at the bottom of it.
+pub const TIDEMAW_ORBIT: Orbit = Orbit {
+    star: crate::sun::StarClass::K,
+    // 0.45 AU, not 0.62: a K dwarf is dimmer than the sun, and an ocean
+    // needs to sit where water is liquid rather than where the number looked
+    // plausible
+    au: 0.45,
+    albedo: 0.28,
+    air: 0.85,
+};
+
+/// Its tide: a long period, because a big ocean has long swings, and a peak
+/// that a bot can walk in and a flyer cannot.
+pub const TIDEMAW_TIDE: crate::hydro::Tide = crate::hydro::Tide { period_s: 150.0, peak_ms: 5.2 };
+
+/// Build the raid. Encounter times are seconds of fighting, and the two long
+/// ones are the open crossings — those are not fights, they are the water.
+pub fn tidemaw() -> Raid {
+    use crate::survival::Bunker;
+    Raid {
+        name: "TIDEMAW",
+        orbit: TIDEMAW_ORBIT,
+        // the surge is the world's own weather, not an event
+        weather: Weather::GiantWave,
+        sites: vec![
+            // a shelf above the waterline: quick to take, and the ship has to
+            // sit there in the surf
+            Site {
+                approach: Approach::ClearLz,
+                at: Bunker { distance_m: 220.0, shielded: false },
+                garrison: 0.4,
+                take_s: 70.0,
+            },
+            // the city's own seawall, held. Dug in, dry inside, and the
+            // reason to want it is that a bunker drowns and a SEAWALL does
+            // not — it is the structure the city built for exactly this.
+            Site {
+                approach: Approach::SeizeFortress,
+                at: Bunker { distance_m: 640.0, shielded: true },
+                garrison: 1.0,
+                take_s: 210.0,
+            },
+        ],
+        encounters: vec![
+            110.0, // the shallows, working inward
+            160.0, // FIRST OPEN CROSSING — no cover, tide running
+            140.0, // the drowned plaza
+            200.0, // SECOND CROSSING, deeper and longer
+        ],
+        boss_tier: 3,
+        extract_m: 1_400.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +357,38 @@ mod tests {
         let b = run(&r, Body::Cybertronian, 14.0, 77, &[Body::Cybertronian]);
         assert_eq!(a.phase, b.phase);
         assert_eq!(a.drop.map(|d| d.grade), b.drop.map(|d| d.grade));
+    }
+
+    #[test]
+    fn tidemaw_is_a_water_world_and_pays_like_one() {
+        let r = tidemaw();
+        assert_eq!(r.weather, Weather::GiantWave);
+        // temperate and wet: it is not trying to freeze or cook you, the
+        // water is the whole hazard
+        assert_eq!(r.orbit.surface(), crate::sun::Surface::Temperate);
+        assert!(r.orbit.flare_severity() < 0.4, "a K dwarf at 0.62 AU should be quiet");
+    }
+
+    #[test]
+    fn the_seawall_beats_the_shelf_because_a_surge_is_what_it_was_built_for() {
+        // and this is the bunker-drowns rule paying off rather than biting:
+        // foothold refuses a HOLE against water, and a seawall is not a hole
+        let r = tidemaw();
+        let out = run(&r, Body::Cybertronian, 13.0, 11, &[Body::Cybertronian]);
+        assert!(out.phase >= Phase::Contested, "{:?} {}", out.phase, out.note);
+    }
+
+    #[test]
+    fn a_heavy_chassis_crosses_open_water_a_light_one_must_time() {
+        use crate::hydro::{Swimmer, Zone};
+        let bot = Swimmer { mass: 900.0, volume: 0.55, frontal_m2: 1.6, cd: 0.9, through: 0.1 };
+        let flyer = Swimmer { mass: 260.0, volume: 0.22, frontal_m2: 3.4, cd: 0.7, through: 0.05 };
+        let t = TIDEMAW_TIDE;
+        let wb = t.window_s(bot.hold_ms(9.81, 0.7), Zone::OpenWater);
+        let wf = t.window_s(flyer.hold_ms(9.81, 0.7), Zone::OpenWater);
+        assert!(wb > wf, "bot window {wb:.0}s, flyer {wf:.0}s");
+        // the second crossing is 200 s of exposure — check who that rules out
+        assert!(wf < 200.0, "a flyer should NOT be able to stroll it: {wf:.0}s");
     }
 
     #[test]
