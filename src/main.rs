@@ -62,6 +62,7 @@ mod touch;
 mod ui;
 mod weapons;
 mod xform;
+mod voyage;
 mod world;
 
 use std::collections::{HashMap, HashSet};

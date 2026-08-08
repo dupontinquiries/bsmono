@@ -94,6 +94,43 @@ pub fn window_s(orbit: &Orbit, w: Weather) -> f32 {
     }
 }
 
+/// Run it, having flown there first.
+///
+/// THE VOYAGE IS PART OF THE RAID. Supplies burn the whole way, so a team
+/// that crossed the system arrives with less clock than one that hopped next
+/// door — and on a world with weather, clock IS the raid. Arriving at Pluto
+/// with two hours of air left is a different encounter from arriving at Mars
+/// with twenty.
+pub fn run_after_voyage(
+    raid: &Raid,
+    leg: &crate::voyage::Leg,
+    body: Body,
+    speed_ms: f32,
+    seed: u32,
+    team: &[Body],
+) -> Run {
+    if !leg.reachable {
+        return Run {
+            phase: Phase::Repulsed,
+            approach: None,
+            margin_s: leg.supply_left_s,
+            encounters_cleared: 0,
+            drop: None,
+            note: "the ship never arrived",
+        };
+    }
+    let mut r = run(raid, body, speed_ms, seed, team);
+    // what the voyage left is a ceiling on what the raid can spend
+    if r.margin_s > leg.supply_left_s {
+        r.margin_s = leg.supply_left_s;
+        if leg.supply_left_s <= 0.0 {
+            r.phase = Phase::Cleared.min(r.phase);
+            r.note = "cleared it and ran out of air before extraction";
+        }
+    }
+    r
+}
+
 /// Run it.
 pub fn run(raid: &Raid, body: Body, speed_ms: f32, seed: u32, team: &[Body]) -> Run {
     let window = window_s(&raid.orbit, raid.weather);
@@ -357,6 +394,32 @@ mod tests {
         let b = run(&r, Body::Cybertronian, 14.0, 77, &[Body::Cybertronian]);
         assert_eq!(a.phase, b.phase);
         assert_eq!(a.drop.map(|d| d.grade), b.drop.map(|d| d.grade));
+    }
+
+    #[test]
+    fn a_long_voyage_costs_the_raid_its_margin() {
+        use crate::voyage::{plan, Drive};
+        let r = raid(Weather::DustStorm, quiet());
+        let d = Drive { dv_kms: 200.0, supply_s: 6.0 * 3600.0, ..Drive::default() };
+        let near = plan(1.0, 1.524, &d, 4);
+        let far = plan(1.0, 9.537, &d, 4);
+        let a = run_after_voyage(&r, &near, Body::Cybertronian, 14.0, 3, &[Body::Cybertronian]);
+        let b = run_after_voyage(&r, &far, Body::Cybertronian, 14.0, 3, &[Body::Cybertronian]);
+        assert!(a.margin_s >= b.margin_s, "the long haul should not arrive richer");
+        assert_eq!(a.phase, Phase::Extracted);
+    }
+
+    #[test]
+    fn a_ship_that_cannot_get_there_is_not_a_failed_raid() {
+        use crate::voyage::{plan, Drive};
+        let r = raid(Weather::Clear, quiet());
+        let d = Drive { dv_kms: 4.0, ..Drive::default() };
+        let leg = plan(1.0, 39.48, &d, 4);
+        assert!(!leg.reachable);
+        let out = run_after_voyage(&r, &leg, Body::Cybertronian, 14.0, 1, &[Body::Cybertronian]);
+        assert_eq!(out.phase, Phase::Repulsed);
+        assert!(out.note.contains("never arrived"), "{}", out.note);
+        assert!(out.drop.is_none());
     }
 
     #[test]
