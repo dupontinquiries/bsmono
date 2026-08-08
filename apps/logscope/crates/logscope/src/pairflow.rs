@@ -286,3 +286,141 @@ mod carries_tests {
         let _: bool = Carries::ControlOnly.good_for_generation();
     }
 }
+
+/// Losing the connection, which on a phone is the normal case rather than the exception.
+///
+/// `Stage` covers establishing a link. Nothing covered losing one, and the two want opposite
+/// treatment:
+///
+/// * **A desktop disconnect is an error.** The cable came out or the peer died; something is wrong.
+/// * **A phone disconnect is expected.** You walked into a lift, the wifi handed off to cellular,
+///   the screen locked and the radio slept. Presenting that as a failure trains the user to dismiss
+///   an alert they will see ten times a day, and then the real one is invisible.
+///
+/// So the question is not "did it drop" but **"is this the kind of drop that fixes itself"**.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Interruption {
+    /// The radio slept, the app backgrounded, or the screen locked. **Resumes on its own** and the
+    /// user did nothing wrong.
+    Suspended,
+    /// The network changed underneath — wifi to cellular, or one wifi to another. The old path is
+    /// dead and a new one is likely available.
+    NetworkChanged { now_metered: bool },
+    /// Out of range or the peer went to sleep. Nothing to do from here.
+    PeerGone { last_seen_s: f32 },
+    /// The path itself failed — a NAT rebind on a punched connection, which `Carries::Fragile`
+    /// warned about before the job started.
+    PathCollapsed,
+}
+
+impl Interruption {
+    /// Will waiting fix this?
+    ///
+    /// **The question the UI actually needs**, because it decides between a quiet indicator and an
+    /// interruption. Everything that resolves itself should resolve itself silently.
+    pub fn resolves_itself(&self) -> bool {
+        matches!(self, Interruption::Suspended | Interruption::NetworkChanged { .. }
+                     | Interruption::PathCollapsed)
+    }
+
+    /// How long to wait before saying anything at all.
+    ///
+    /// A phone reconnects in under a second constantly. Showing a banner for every one is how a user
+    /// learns to ignore banners.
+    pub fn quiet_for_s(&self) -> f32 {
+        match self {
+            Interruption::Suspended => 5.0,
+            // A network change needs a new path found, which takes longer than a wake.
+            Interruption::NetworkChanged { .. } => 8.0,
+            Interruption::PathCollapsed => 8.0,
+            // Nothing is coming. Say so promptly rather than spinning.
+            Interruption::PeerGone { .. } => 2.0,
+        }
+    }
+
+    /// What to show once the quiet period passes.
+    pub fn message(&self) -> String {
+        match self {
+            Interruption::Suspended =>
+                "reconnecting — the phone slept and the link is being re-established".into(),
+            Interruption::NetworkChanged { now_metered: true } =>
+                "the network changed and you are now on cellular. Reconnecting, and generation will \
+be slower or unavailable over this link".into(),
+            Interruption::NetworkChanged { now_metered: false } =>
+                "the network changed. Reconnecting on the new one".into(),
+            Interruption::PathCollapsed =>
+                "the connection dropped — this was the fragile NAT path, which is what the warning \
+before the job was about. Retrying, and a direct link would not do this".into(),
+            Interruption::PeerGone { last_seen_s } => format!(
+                "the machine has not answered for {last_seen_s:.0}s. It may be asleep or off, and \
+there is nothing to do from the phone — this is not something you can fix by retrying"),
+        }
+    }
+
+    /// Was work in progress lost, or can it continue?
+    ///
+    /// **A generation survives a suspend and not a peer going away**, and telling the user which
+    /// decides whether they wait or start over. Getting this wrong in either direction wastes their
+    /// time: waiting for work that is gone, or redoing work that was fine.
+    pub fn work_survives(&self) -> bool {
+        !matches!(self, Interruption::PeerGone { .. })
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::*;
+
+    #[test]
+    fn a_SUSPEND_is_silent_for_several_seconds() {
+        // A phone reconnects in under a second constantly, and a banner for every one is how a user
+        // learns to ignore banners.
+        assert!(Interruption::Suspended.resolves_itself());
+        assert!(Interruption::Suspended.quiet_for_s() >= 5.0);
+    }
+
+    #[test]
+    fn a_PEER_GONE_speaks_up_SOONEST_because_nothing_is_coming() {
+        // The others are worth waiting through. This one is worth saying promptly rather than
+        // spinning at someone who could go and wake the machine.
+        let gone = Interruption::PeerGone { last_seen_s: 30.0 };
+        assert!(gone.quiet_for_s() < Interruption::Suspended.quiet_for_s());
+        assert!(!gone.resolves_itself());
+        assert!(gone.message().contains("nothing to do from the phone"));
+    }
+
+    #[test]
+    fn a_NETWORK_CHANGE_to_cellular_says_what_it_costs() {
+        // Reconnecting is the mechanical fact; "generation will be slower or unavailable" is the one
+        // the user can act on before starting something expensive.
+        let m = Interruption::NetworkChanged { now_metered: true }.message();
+        assert!(m.contains("cellular"));
+        assert!(m.contains("generation will be"));
+    }
+
+    #[test]
+    fn a_COLLAPSED_path_refers_back_to_the_warning_it_was_given() {
+        // Carries::Fragile said this could happen before the job started. Connecting the two makes
+        // the earlier caption worth having rather than noise the user scrolled past.
+        assert!(Interruption::PathCollapsed.message().contains("what the warning before the job was about"));
+    }
+
+    #[test]
+    fn WORK_SURVIVES_a_suspend_and_not_a_peer_going_away() {
+        // Getting this wrong wastes the user's time in either direction: waiting for work that is
+        // gone, or redoing work that was fine.
+        assert!(Interruption::Suspended.work_survives());
+        assert!(Interruption::NetworkChanged { now_metered: false }.work_survives());
+        assert!(!Interruption::PeerGone { last_seen_s: 60.0 }.work_survives());
+    }
+
+    #[test]
+    fn everything_that_RESOLVES_ITSELF_is_quiet_longer_than_what_does_not() {
+        // The rule behind the numbers, asserted so a future edit cannot invert it by adjusting one.
+        for i in [Interruption::Suspended, Interruption::NetworkChanged { now_metered: false },
+                  Interruption::PathCollapsed] {
+            assert!(i.quiet_for_s() > Interruption::PeerGone { last_seen_s: 0.0 }.quiet_for_s(),
+                "{i:?} should wait longer than a peer that is gone");
+        }
+    }
+}
