@@ -13,6 +13,7 @@ mod clinch;
 mod combine;
 mod config;
 mod damage;
+mod dispatch;
 mod drop;
 mod font;
 mod foothold;
