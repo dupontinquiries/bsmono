@@ -32,6 +32,7 @@ pub mod iq23;
 pub mod kquant;
 pub mod shaderdev;
 pub mod framediag;
+pub mod loadprofile;
 pub mod sensitivity;
 pub mod lookupdraft;
 pub mod specloop;

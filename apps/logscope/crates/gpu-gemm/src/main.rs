@@ -3904,6 +3904,48 @@ a disagreement here would have proved one wrong.");
         return;
     }
 
+    if args.iter().any(|a| a == "--gate-loadpath") {
+        // What to measure before hand-tuning file -> CPU -> GPU. Answers what it can here and prints
+        // the rest as a checklist, because a fact that needs a real model file cannot be faked and
+        // pretending otherwise would produce a number nobody should trust.
+        use gpu_kernels::loadprofile::*;
+        let gpu = Gpu::new();
+        println!("gate-loadpath: adapter = {}", gpu.adapter_name);
+        println!();
+
+        // MEASURED HERE: upload bandwidth against transfer size. This is the one that decides the
+        // arena's slab size, and 1024 MiB is currently a guess.
+        println!("upload bandwidth by transfer size:");
+        let mut prev_gib_s = 0.0f64;
+        for mib in [16usize, 64, 256] {
+            let words = mib * 1024 * 1024 / 4;
+            let src = vec![0u32; words];
+            let _warm = gpu.upload_u32(&src);      // first transfer pays allocation, not bandwidth
+            let t = std::time::Instant::now();
+            let _b = gpu.upload_u32(&src);
+            let s = t.elapsed().as_secs_f64();
+            let gib_s = (mib as f64 / 1024.0) / s.max(1e-9);
+            let trend = if prev_gib_s > 0.0 && gib_s < prev_gib_s * 0.9 { "  DEGRADING — smaller slabs may be faster" }
+                        else if prev_gib_s > 0.0 && gib_s > prev_gib_s * 1.1 { "  still climbing — larger slabs may be faster" }
+                        else { "" };
+            println!("  {mib:>5} MiB  {s:>7.3}s  {gib_s:>6.2} GiB/s{trend}");
+            prev_gib_s = gib_s;
+        }
+        println!();
+
+        // NOT MEASURABLE HERE, and said so rather than guessed.
+        println!("still needed from the machine, in the order they constrain each other:");
+        for (n, r) in requirements().iter().enumerate() {
+            println!("  {}. [{:?}] {}", n + 1, r.stage, r.fact);
+            println!("       how:     {}", r.how);
+            println!("       unlocks: {}", r.unlocks);
+        }
+        println!();
+        println!("and the two Scout quants need SEPARATE profiles:");
+        for q in ["Q4_K_M", "IQ1_S"] { println!("  {q}: {}", per_quant_note(q)); }
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-residency") {
         // MEASURE what ASAHI_CONCURRENT_BUFFER_GIB assumes. That constant is one M2 Ultra's figure
         // applied to every Asahi device, and a wrong value is a wrong REFUSAL — invisible, because
@@ -4961,7 +5003,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-passfuse  --gate-perf  --gate-prefill\n  --gate-q4k  --gate-q4resident  --gate-q6k  --gate-q8direct\n  --gate-qkv  --gate-quant-survey  --gate-quantref  --gate-quanttables\n  --gate-qwen2  --gate-qwen3  --gate-residency  --gate-rubric\n  --gate-store  --gate-stream-slots  --gate-submit  --gate-swa\n  --gate-vae-conv  --gate-vae-resblock  --gate-vit-block  --gate-vram\n  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-q4k  --gate-q4resident  --gate-q6k\n  --gate-q8direct  --gate-qkv  --gate-quant-survey  --gate-quantref\n  --gate-quanttables  --gate-qwen2  --gate-qwen3  --gate-residency\n  --gate-rubric  --gate-store  --gate-stream-slots  --gate-submit\n  --gate-swa  --gate-vae-conv  --gate-vae-resblock  --gate-vit-block\n  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
