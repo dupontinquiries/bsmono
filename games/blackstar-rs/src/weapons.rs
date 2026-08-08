@@ -64,6 +64,23 @@ pub enum Verb {
     Grapple,
 }
 
+impl Verb {
+    /// WHAT PHYSICS THIS VERB OBEYS, so a weapon's behaviour follows the
+    /// medium rather than a per-world table. Mapped from what the verb
+    /// actually does rather than from its name: Flak and Pierce throw mass,
+    /// Beam is light, Pool and Vortex are a pressure event, Thrust and
+    /// Grapple only reach as far as contact.
+    pub fn delivery(self) -> crate::ballistics::Delivery {
+        use crate::ballistics::Delivery as D;
+        match self {
+            Verb::Flak | Verb::Pierce | Verb::Bank | Verb::Chain => D::Kinetic,
+            Verb::Beam | Verb::Blink => D::Beam,
+            Verb::Pool | Verb::Vortex | Verb::Cone | Verb::Shove | Verb::Push => D::Blast,
+            Verb::Thrust | Verb::Grapple => D::Melee,
+        }
+    }
+}
+
 pub struct Form {
     pub name: &'static str,
     pub verb: Verb,

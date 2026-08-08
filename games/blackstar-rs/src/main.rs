@@ -5,6 +5,7 @@ mod anim;
 mod actuator;
 mod airlock;
 mod analog;
+mod ballistics;
 mod bigbody;
 mod bots;
 mod camera;
@@ -13,6 +14,7 @@ mod clinch;
 mod combine;
 mod config;
 mod damage;
+mod dispatch;
 mod drop;
 mod font;
 mod foothold;
@@ -471,6 +473,10 @@ struct Chassis {
     /// means different target lengths), so the morph has to reload with the
     /// SAME numbers or the blend would rescale as it goes.
     dirs: Vec<(PathBuf, f32)>,
+    /// WALK PHASES at the robot end, empty when the chassis shipped without
+    /// them. Separate from `strip` on purpose: a fold is indexed by t and a
+    /// walk by phase, and one list cannot say which is which.
+    walk: Vec<usize>,
     /// the fitted rig, for the catalogue's joint inspector. Empty when the
     /// chassis shipped without a joints.json.
     joints: Vec<joints::Joint>,
@@ -1270,9 +1276,34 @@ fn main() {
                 cars.names.push(Box::leak(nm.into_boxed_str()));
                 cars.xform.insert(idx, (cid, k));
             }
-            println!("bots: {label} — {} poses{}", strip.len(), if flight { ", flight" } else { "" });
+            // THE WALK STRIP, four phases at the robot end. Loaded at the
+            // SAME target scale the robot pose got, because a walk that
+            // resized between phases would breathe exactly the way the fold
+            // used to before one scale was measured for the whole strip.
+            let robot_target = dirs.last().map(|(_, t)| *t).unwrap_or(1.32);
+            let mut walk: Vec<usize> = Vec::new();
+            for k in 0..4usize {
+                let wp = bdir.join(format!("w{k:02}")).join("scene.gltf");
+                if !wp.exists() {
+                    break;
+                }
+                let m = model::load(&wp, &mut gpu, robot_target);
+                let idx = cars.models.len();
+                walk.push(idx);
+                cars.models.push(m);
+                cars.names.push(Box::leak(
+                    format!("{} WALK {k}", label.to_uppercase()).into_boxed_str(),
+                ));
+            }
+            println!(
+                "bots: {label} — {} poses{}{}",
+                strip.len(),
+                if walk.is_empty() { String::new() } else { format!(", {} walk", walk.len()) },
+                if flight { ", flight" } else { "" }
+            );
             cars.chassis.push(Chassis {
                 strip,
+                walk,
                 dirs,
                 joints: joints::load(&bdir.join("joints.json")),
                 scale: {
@@ -2305,6 +2336,37 @@ impl Game {
                 self.cam.combat = false;
             }
         }
+    }
+
+    /// WHICH MODEL TO DRAW while walking.
+    ///
+    /// anim::Locomotion already runs every frame and produces a phase; until
+    /// now the engine read two fields off its Pose and threw the four limb
+    /// angles away. The strip is those angles, baked. So the phase picks a
+    /// frame and the walk finally reaches the screen.
+    ///
+    /// Returns None when the chassis has no walk strip or the bot is not on
+    /// its feet, in which case the caller draws the fold pose as before.
+    fn walk_frame_at(&self, model: usize, offset: f32) -> Option<usize> {
+        let (cid, k) = *self.cars.xform.get(&model)?;
+        let ch = &self.cars.chassis[cid];
+        // only at the robot end: a walking car is not a thing
+        if ch.walk.is_empty() || k + 1 != ch.strip.len() {
+            return None;
+        }
+        // EACH BODY ON ITS OWN PHASE. A single locomotion phase drives the
+        // player correctly and would put every bot in the field on the same
+        // footfall — the lockstep that made three idling minions read as one
+        // object. The offset comes from the caller so it can be stable per
+        // bot rather than random per frame.
+        let ph = (self.loco_pose.phase + offset).rem_euclid(1.0);
+        let n = ch.walk.len();
+        Some(ch.walk[((ph * n as f32) as usize).min(n - 1)])
+    }
+
+    /// The player's own frame: no offset, because the phase IS theirs.
+    fn walk_frame(&self, model: usize) -> Option<usize> {
+        self.walk_frame_at(model, 0.0)
     }
 
     /// Size multiplier for a model, 1.0 unless it is a boss.
@@ -5239,10 +5301,15 @@ impl Game {
             push(&mut objs, prim.mesh_id, prim.tex_id, ball_m, prim.color, [0.0, 0.03, 0.45, ball_slot]);
         }
 
-        // the local car
+        // THE LOCAL CAR, or the local BOT MID-STRIDE. walk_frame swaps the
+        // static robot pose for the phase anim::Locomotion is already
+        // computing — it returns None for a vehicle, for a chassis with no
+        // walk strip, and for anything not standing at the robot end, so the
+        // fold pose stays the default and the walk is the exception.
+        let local_model = self.walk_frame(self.cars.active).unwrap_or(self.cars.active);
         self.push_car(
             &mut objs,
-            self.cars.active,
+            local_model,
             rc.0,
             rc.1,
             self.flip_vis,
@@ -5285,14 +5352,20 @@ impl Game {
 
         // the swarm: distance-LOD bot rendering (wheels only up close)
         let cam = self.cam.pos;
-        for b in &self.bots {
+        for (bi, b) in self.bots.iter().enumerate() {
             let d2 = b.car.pos.distance_squared(cam);
             if d2 > 150.0 * 150.0 {
                 continue;
             }
+            // the same for the others: you spend far more of a raid watching
+            // somebody else walk than watching yourself
             self.push_car(
                 &mut objs,
-                b.model,
+                // golden-ratio offset per bot: any stride count spreads
+                // evenly, where dividing by the bot count would re-synchronise
+                // whenever two of them happened to share a phase
+                self.walk_frame_at(b.model, (bi as f32) * 0.618_034)
+                    .unwrap_or(b.model),
                 b.car.pos,
                 b.car.rot,
                 false,
