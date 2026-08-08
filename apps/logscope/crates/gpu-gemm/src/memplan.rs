@@ -1152,16 +1152,18 @@ mod sub4_tests {
         // what the file costs; dequantize returning None means the forward pass refuses to invent
         // values. Knowing the size without being able to read it is exactly what a planner needs and
         // a kernel must not have.
-        assert_eq!(source_bpw(16), Some(2.0625), "IQ2_XXS");
+        assert_eq!(source_bpw(17), Some(2.3125), "IQ2_XS");
         assert_eq!(crate::gguf::type_nbytes(10, 256), Some(84));
-        assert_eq!(crate::gguf::type_nbytes(16, 256), Some(66));
+        assert_eq!(crate::gguf::type_nbytes(17, 256), Some(74));
         // And they still refuse to decode, so nothing can accidentally run on them.
         // Q2_K NOW READS. It gained a dequantizer, and asserting the positive here means this
         // test fails again if that regresses rather than silently passing on a stale premise.
         assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_ok(), "Q2_K reads now");
-        assert!(crate::gguf::dequantize(16, &[0u8; 66], 256).is_err(),
-            "IQ2_XXS is a CODEBOOK format — a 2048-entry grid, not a table of sixteen — which is why \
-it is still unreadable while every scalar K-quant now works");
+assert!(crate::gguf::dequantize(17, &[0u8; 74], 256).is_err(),
+            "IQ2_XS still lacks a decoder. RETARGETED A THIRD TIME — Q2_K, then Q3_K, then IQ2_XXS \
+each gained one. The old message here claimed IQ2_XXS needed a 2048-entry grid; fetching \
+ggml-common.h showed it is 256, which is the kind of thing a guess gets wrong and a download does \
+            not");
     }
 
     #[test]
