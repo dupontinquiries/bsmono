@@ -67,6 +67,7 @@ pub mod interleave;
 pub mod dwell;
 pub mod benchscenario;
 pub mod convbench;
+pub mod continuation;
 pub mod benchartifact;
 pub mod machinery;
 pub mod longrun;
