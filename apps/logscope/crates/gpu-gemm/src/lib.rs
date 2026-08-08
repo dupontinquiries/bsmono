@@ -400,6 +400,28 @@ impl SubmitCauseSnapshot {
 }
 
 /// Attribution since `since`, so the causes share the profile's clock.
+/// The closing VERDICT for a run, to go after the attribution line.
+///
+/// The attribution line is 200+ characters and every diagnosis this session began by grepping the
+/// same three numbers out of it. This says which of them dominates and what to do — a verdict rather
+/// than a fourth line of figures.
+///
+/// Returns the headline and, only when something is anomalous, a caveat. **Silence is the normal
+/// case**: a run that always prints two extra lines teaches the reader to skip both, which is how
+/// five GPU resets sat unread in journalctl.
+pub fn run_verdict(tokens: u64, wall_s: f64, sync_s: f64) -> (String, Option<String>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let shape = crate::perfverdict::RunShape {
+        submits: SUBMIT_BY_NO_FRAME.load(Relaxed) + SUBMIT_BY_DOWNLOAD.load(Relaxed)
+               + SUBMIT_BY_PASSES.load(Relaxed),
+        no_frame: SUBMIT_BY_NO_FRAME.load(Relaxed),
+        download: SUBMIT_BY_DOWNLOAD.load(Relaxed),
+        passes: SUBMIT_BY_PASSES.load(Relaxed),
+        tokens, wall_s, sync_s,
+    };
+    (shape.headline(), shape.caveat())
+}
+
 pub fn submit_attribution_since(since: SubmitCauseSnapshot, actual: u64) -> String {
     use std::sync::atomic::Ordering::Relaxed;
     let now = SubmitCauseSnapshot::now();

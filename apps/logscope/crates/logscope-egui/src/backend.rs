@@ -1111,6 +1111,16 @@ was evicted)", prompt_ids.len())
             // submits rather than the process lifetime's.
             let attr = format!("wgpu-engine: [{}] {}", self.name,
                 gpu_kernels::submit_attribution_since(cause0, ds as u64));
+            // THE VERDICT, immediately after the numbers it is about. The attribution line is 200+
+            // characters and every diagnosis this session began by grepping the same three figures
+            // out of it; this says which dominates and what to run next.
+            //
+            // The caveat prints only when something is anomalous. A run that always adds two lines
+            // teaches the reader to skip both, which is how five GPU resets sat unread in journalctl.
+            let (headline, caveat) = gpu_kernels::run_verdict(
+                per as u64, secs as f64, sync_ms / 1000.0);
+            eprintln!("wgpu-engine: [{}] {headline}", self.name);
+            if let Some(c) = caveat { eprintln!("wgpu-engine: [{}] {c}", self.name); }
             // EXPERT RESIDENCY. These counters have been tracked and reported nowhere, so there has
             // been no way to tell whether pinning more experts would help or whether the cache is
             // already saturated and the cost is in the kernels. For a streaming MoE that is the whole
