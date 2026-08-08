@@ -96,6 +96,37 @@ def robot_yaw(d):
     return None
 
 
+WALK_PHASES = 4
+
+
+def walk_cmd(iqm, d, k):
+    """One phase of a walk cycle, at the ROBOT end of the fold.
+
+    A gait is composed with the fold at the joint rather than applied after
+    it — see motion::pose_folded_with — so this is the same export with an
+    extra rotation per limb joint. Same passes as the fold strip, so the
+    vertex counts match and the two strips are interchangeable.
+    """
+    phase = k / WALK_PHASES
+    return [os.path.join(FV, "target", "release", "foldview"), "--data", DATA,
+            "--content", os.path.join(BS, "content"),
+            "--veh", os.path.join(DATA, iqm),
+            "--gltf", os.path.join(d, f"w{k:02d}"), "--gltf-merge",
+            # --tuck IS OUT. It measures a part's overhang in the ROBOT pose and
+         # applies the lift in REST space, which is the vehicle frame — so a
+         # part correct in one mode is displaced in the other. Measured: it
+         # shifts blackstar's vehicle extent by 0.0225 while fixing its robot
+         # pose. That is a part detaching from a car to make a bot stand
+         # right, which is the "more detached parts from vehicles" report.
+         #
+         # Tried to fix it by lifting along the rest axis the fold maps onto
+         # world up, and the drift did not move. Out of the export until the
+         # frame conversion is right; the wheels-below-feet problem comes back
+         # and it is the smaller of the two.
+         "--repair", "--reattach", "--seams", "0.03", "--ribs", "-1",
+            "--gait", f"{phase:.4f}", "--t", "1.0"]
+
+
 def base_cmd(iqm, d, k, t):
     """The export command for one pose, so the parity retry can reuse it."""
     c = [os.path.join(FV, "target", "release", "foldview"), "--data", DATA, "--content", os.path.join(BS, "content"),
@@ -118,7 +149,18 @@ def base_cmd(iqm, d, k, t):
          # It does not touch the reported elbow and shoulder gaps, because
          # those are between parts whose joints are not linked at all — a
          # topology fault wearing a seam's clothes.
-         "--repair", "--reattach", "--tuck", "--seams", "0.03", "--ribs", "-1",
+         # --tuck IS OUT. It measures a part's overhang in the ROBOT pose and
+         # applies the lift in REST space, which is the vehicle frame — so a
+         # part correct in one mode is displaced in the other. Measured: it
+         # shifts blackstar's vehicle extent by 0.0225 while fixing its robot
+         # pose. That is a part detaching from a car to make a bot stand
+         # right, which is the "more detached parts from vehicles" report.
+         #
+         # Tried to fix it by lifting along the rest axis the fold maps onto
+         # world up, and the drift did not move. Out of the export until the
+         # frame conversion is right; the wheels-below-feet problem comes back
+         # and it is the smaller of the two.
+         "--repair", "--reattach", "--seams", "0.03", "--ribs", "-1",
          "--t", f"{t:.4f}"]
     if k == POSES - 1:
         c += ["--joints-json", os.path.join(d, "joints.json")]
@@ -291,7 +333,18 @@ def main():
          # It does not touch the reported elbow and shoulder gaps, because
          # those are between parts whose joints are not linked at all — a
          # topology fault wearing a seam's clothes.
-         "--repair", "--reattach", "--tuck", "--seams", "0.03", "--ribs", "-1",
+         # --tuck IS OUT. It measures a part's overhang in the ROBOT pose and
+         # applies the lift in REST space, which is the vehicle frame — so a
+         # part correct in one mode is displaced in the other. Measured: it
+         # shifts blackstar's vehicle extent by 0.0225 while fixing its robot
+         # pose. That is a part detaching from a car to make a bot stand
+         # right, which is the "more detached parts from vehicles" report.
+         #
+         # Tried to fix it by lifting along the rest axis the fold maps onto
+         # world up, and the drift did not move. Out of the export until the
+         # frame conversion is right; the wheels-below-feet problem comes back
+         # and it is the smaller of the two.
+         "--repair", "--reattach", "--seams", "0.03", "--ribs", "-1",
                    "--t", f"{t:.4f}"]
             # THE JOINTS, ONCE PER CHASSIS. They are a property of the rig
             # rather than of a pose, so the robot end writes them and the
@@ -341,6 +394,27 @@ def main():
                     c2 = [x for x in base_cmd(iqm, d, k, t) if x != "--group"]
                     subprocess.run(c2, capture_output=True, text=True, timeout=180)
                 tag = (tag + ", ungrouped") if tag else "ungrouped"
+
+        # THE WALK CYCLE, four phases at the robot end. Written beside the
+        # fold strip rather than inside it: a fold is indexed by t and a walk
+        # by phase, and collapsing two axes into one list is what would make
+        # the engine unable to tell them apart.
+        if good:
+            for k in range(WALK_PHASES):
+                subprocess.run(walk_cmd(iqm, d, k), capture_output=True, text=True, timeout=180)
+            # the same flat corrections the fold strip gets, or the walk
+            # would face a different way from the model it belongs to
+            for k in range(WALK_PHASES):
+                wd = os.path.join(d, f"w{k:02d}")
+                if not os.path.isdir(wd):
+                    continue
+                if roll:
+                    yaw_pose(wd, roll, "z")
+                if pitch:
+                    yaw_pose(wd, pitch, "x")
+                deg = flat_yaw + turn      # a walk happens at t = 1
+                if deg:
+                    yaw_pose(wd, deg, "y")
 
         if good:
             # A RAID BOSS IS BIGGER THAN A BOT, and the scale ships BESIDE the
