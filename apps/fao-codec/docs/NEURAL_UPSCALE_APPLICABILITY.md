@@ -43,11 +43,53 @@ it. A game jitters its projection matrix; an encoder jitters its downsample.
 Nothing in the format prevents it, and the phase costs a couple of bits a frame
 to signal.
 
-The third has no equivalent. There is no depth buffer, and block motion vectors
-are wrong at occlusion boundaries in exactly the way per-pixel ones are not.
-That is where the artifacts would be, and it is a real limit rather than a
-detail: game upscalers use depth precisely because motion vectors alone fail
-there.
+~~The third has no equivalent. There is no depth buffer~~ — **WRONG, and
+corrected below.**
+
+## Correction: FAO has all three, and that was the design all along
+
+I wrote the above after reading `fao_codec_core` and stopping. v8's own header
+states the opposite:
+
+> Per-frame depth map (each pixel gets a Z value) … Triangle mesh of major
+> surfaces … **CompressionPass — use mesh+texture to encode each frame as
+> "render this mesh from this camera pose". Frame becomes a 12-byte camera
+> matrix instead of pixel data.**
+
+`CameraPose` carries position, a rotation quaternion, focal lengths and a
+principal point. Depth, rotation and zoom are first-class bitstream content.
+This is not a codec missing the third ingredient of a game upscaler; it is a
+codec whose entire thesis is to have all three, and surpassing AV1 that way was
+the point.
+
+**It is better placed than a game engine, not worse.** A renderer derives motion
+vectors from geometry as a side effect; here the geometry IS the bitstream. And
+unlike a renderer, a v8 decoder knows the PREVIOUS frame's depth too — which is
+what makes disocclusion detectable rather than guessable.
+
+`egui-frontend/src/reproject.rs` implements the piece that was missing:
+per-pixel motion from depth and pose, and a three-way visibility test
+(consistent / occluded / disoccluded) against the current depth map. 16 tests,
+including parallax — nearer geometry moving more under the same camera motion,
+which is precisely the information one block vector cannot carry because one
+block can contain both depths.
+
+## And it changes what "residual" should mean
+
+The stated goal is to store less residual. Reprojection is the mechanism: if the
+decoder can predict frame N from N-1's pixels plus this frame's depth and pose,
+the encoder sends only what reprojection gets WRONG — disocclusions, speculars,
+moving objects. Those are small and spatially clustered, which is the shape
+entropy coding likes. `residual_fraction` is that number.
+
+**PSNR is the wrong yardstick for judging it.** A reprojected frame that is
+geometrically right but shifted half a pixel scores terribly on whole-frame PSNR
+while looking correct; a blurred frame that is slightly wrong everywhere scores
+well and looks soft. Optimising a reprojecting codec against PSNR steers it
+toward blur — the one artefact this design must not have. `masked_error`
+measures only where the encoder was responsible, which separates "the prediction
+was good" from "the residual coding was good": two things a rate-distortion
+decision must weigh separately and which one PSNR number fuses.
 
 ## What this would be, concretely
 
