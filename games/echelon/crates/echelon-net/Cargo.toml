@@ -1,0 +1,11 @@
+[package]
+name = "echelon-net"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Transport-agnostic lockstep session: command turns, input delay, hash exchange, desync detection"
+
+[dependencies]
+echelon-sim = { path = "../echelon-sim" }
+serde.workspace = true

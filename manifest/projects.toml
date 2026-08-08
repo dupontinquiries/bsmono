@@ -543,3 +543,13 @@ flatpak = false
 runtime = "none"
 targets = ["desktop"]
 notes = "the M1 variant of av1tuner. Registered alongside av1tuner, which was already listed — the pair had drifted, with only one of them known to the build."
+
+[apps.echelon]
+path = "games/echelon"
+kind = "cargo"
+role = "game"
+daemon = false
+flatpak = false
+runtime = "none"
+targets = ["desktop"]
+notes = "deterministic 1v1 RTS in Rust: the M0 simulation core, a headless match runner with scripted macro bots for all three races, and the transport-agnostic lockstep session layer (M2), proven by running two clients in-process with zero desyncs. NO ENGINE DEPENDENCIES — serde + ron only — and pinned to rustc 1.75 so it builds on distro toolchains, the same convention as bot-arena. `client/` is workspace-EXCLUDED because it pulls Bevy; the sim workspace builds without it. Imported as a source snapshot: the tarball carried no .git, and the incremental bundle for the same drop could not be applied (see maintenance/ECHELON_M0_02_BLOCKED.md)."

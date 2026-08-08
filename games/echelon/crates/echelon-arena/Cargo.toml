@@ -1,0 +1,11 @@
+[package]
+name = "echelon-arena"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[dependencies]
+echelon-data = { path = "../echelon-data" }
+echelon-sim = { path = "../echelon-sim" }
+echelon-bots = { path = "../echelon-bots" }
+ron = { workspace = true }

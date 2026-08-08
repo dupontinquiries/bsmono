@@ -1,0 +1,11 @@
+[package]
+name = "echelon-bots"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Scripted macro AIs for each race — shared by the headless runner and the client's opponent"
+
+[dependencies]
+echelon-data = { path = "../echelon-data" }
+echelon-sim = { path = "../echelon-sim" }

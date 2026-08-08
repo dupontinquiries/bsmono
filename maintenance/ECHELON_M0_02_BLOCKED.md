@@ -71,3 +71,31 @@ history and has no prerequisites), or the earlier `echelon-m0-01` that contains
 Worth noting for future exports: `--all` on a repo this size costs more bytes
 and removes an entire class of "cannot apply" — this port's own bundles are
 built that way for exactly this reason, and verified on the copy every time.
+
+---
+
+# RESOLVED — the same drop arrived as a tarball
+
+`echelon-m0-02_tar.gz` carries the working tree the bundle could only describe.
+Imported at `games/echelon` and registered in the manifest.
+
+**It is a SNAPSHOT, not a merge.** The tarball has no `.git`, so there is no
+history to preserve and no ancestry linking it to the eleven commits the bundle
+listed. That matters for what comes next: a future `echelon-m0-03` bundle will
+have the same prerequisite problem, because this import shares no objects with
+that line. The fix on the export side is unchanged — `git bundle create --all`.
+
+**Verified before importing**, which is the point of doing it in that order:
+
+| | |
+|---|---|
+| `cargo test --workspace` | **9 passed, 0 failed, 0 errors** |
+| toolchain | pinned to rustc 1.75 — builds on distro toolchains |
+| dependencies | serde + ron only; no engine in the sim workspace |
+
+`client/` is workspace-`exclude`d because it pulls Bevy, so the simulation core
+builds and tests without a graphics stack — which is why it worked here at all,
+and the same reason bot-arena builds in this container when the GTK apps do not.
+
+Only `echelon` itself came in the tarball. The bundle's commit messages also
+named `cadscope`, `editor-kit` and `physui`, and those are still absent.

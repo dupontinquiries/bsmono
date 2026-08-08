@@ -1,0 +1,24 @@
+[package]
+name = "echelon-client"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Echelon M1 client: Bevy front-end over the deterministic sim (play vs the scripted bot)"
+
+# Detached from the parent workspace on purpose: the sim/net/data/runner
+# crates build on distro rustc 1.75, while Bevy needs a current stable
+# toolchain (rustup). `exclude = ["client"]` in ../Cargo.toml keeps the
+# 1.75 story intact.
+[workspace]
+
+[dependencies]
+bevy = { version = "0.16", default-features = true }
+echelon-data = { path = "../crates/echelon-data" }
+echelon-sim = { path = "../crates/echelon-sim" }
+echelon-bots = { path = "../crates/echelon-bots" }
+
+# Bevy-recommended dev profile: fast iteration, optimized deps
+[profile.dev]
+opt-level = 1
+[profile.dev.package."*"]
+opt-level = 3
