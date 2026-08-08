@@ -1389,6 +1389,20 @@ pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
 ///
 /// Consequence: a model needing more than this resident does not fit, and streaming is not a fallback
 /// but the only path. Scout at 56.6 GiB is comfortably over.
+/// # This is ONE MACHINE'S measurement applied to every Asahi device
+///
+/// 31.0 was measured on an M2 Ultra with 128 GB. It is now the ceiling for every machine that takes
+/// the conservative_vma path, including an M2 Max with 64 GB where the true figure is certainly
+/// lower and a hypothetical 192 GB machine where it is certainly higher.
+///
+/// **A wrong value here is a wrong REFUSAL**, and a refusal is invisible: the model does not load and
+/// nothing says the ceiling was a guess. The loader's own refusal message is honest about this
+/// ("a CONSTANT for Asahi/Honeykrisp, not a measurement") and the clamp message used to claim it was
+/// measured — the two described one number and disagreed about where it came from.
+///
+/// The right fix is to probe concurrent residency the way the arena already probes slabs, and record
+/// it per adapter in the store beside the autotune verdicts. Until then this is a constant that
+/// LOOKS like a measurement, which is the shape of every misleading number this project has found.
 pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
 
 /// Does a resident plan fit within what this device will hold at once?
@@ -1509,5 +1523,39 @@ mod iq1s_plan_tests {
         let s = iq1s_load_plan(30.3, 31.0, true);
         assert!(s.contains("whole layers routable"));
         assert!(s.contains("removes the per-layer readback"));
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    /// Two messages described the same 31 GiB and disagreed about where it came from: the refusal
+    /// called it "a CONSTANT ... not a measurement" and the clamp said "(measured at 1 and 2 GiB
+    /// slabs)". Both cannot be true, and the honest one was right.
+    ///
+    /// This pins the wording so the claim cannot creep back. A grep is a crude test and it is the
+    /// right one here — the failure being prevented is a STRING that overstates, and nothing about
+    /// the value itself changes.
+    #[test]
+    fn the_clamp_message_does_not_claim_to_have_MEASURED_this_device() {
+        let src = include_str!("lib.rs");
+        let i = src.find("GPU budget {:.1} GiB clamped to").expect("clamp message moved");
+        let window = &src[i..(i + 1400).min(src.len())];
+        assert!(window.contains("COMPILED-IN CONSTANT"),
+            "the clamp must say the figure is a constant, or it reads as a measurement of the \
+machine in front of the operator");
+        assert!(window.contains("measured once on an"),
+            "and it must say WHERE the number came from, since 'a constant' alone invites someone \
+to treat it as arbitrary and raise it");
+    }
+
+    #[test]
+    fn the_constant_documents_that_a_wrong_value_is_a_wrong_REFUSAL() {
+        // The consequence is what makes this worth fixing rather than tidying: a refusal is
+        // invisible. The model does not load and nothing says the ceiling was a guess.
+        let src = include_str!("memplan.rs");
+        let i = src.find("pub const ASAHI_CONCURRENT_BUFFER_GIB").unwrap();
+        let doc = &src[i.saturating_sub(1200)..i];
+        assert!(doc.contains("wrong REFUSAL"));
+        assert!(doc.contains("a refusal is invisible"));
     }
 }
