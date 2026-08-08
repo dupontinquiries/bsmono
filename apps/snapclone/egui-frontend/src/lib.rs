@@ -44,6 +44,7 @@ pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
 pub mod voice_playout;
+pub mod voice_send;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
@@ -1224,7 +1225,7 @@ mod tests {
         assert!(s.group_voice.joined);
         assert!(s.playout.is_playing());
 
-        s.playout.on_frame("ada", crate::voice_playout::Frame { seq: 1, payload_len: 40 });
+        s.playout.on_frame("ada", crate::voice_playout::Frame::new(1, 40));
         s.set_in_call(false);
         assert!(!s.group_voice.joined);
         assert!(!s.playout.is_playing());
