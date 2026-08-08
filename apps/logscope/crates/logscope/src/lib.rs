@@ -75,6 +75,7 @@ pub mod longrun;
 pub mod opsched;
 pub mod deviceplan;
 pub mod reachability;
+pub mod microdht;
 pub mod pairflow;
 pub mod phonesession;
 pub mod mobilelayout;
