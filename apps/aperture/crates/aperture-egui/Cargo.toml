@@ -1,0 +1,30 @@
+[package]
+name = "aperture-egui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "aperture's egui shell on uikit-egui: a virtualized editor view with a critically-smoothed camera (scroll, caret, and font size all animate through one Smooth primitive), ghost-text AI completion with Tab / word-accept, the fuzzy command palette, and the loop pane — the completion engine's requests, latencies and outcomes rendered live with the host/model steerable in place. Palettes via snapclone-theme, easing via uikit-egui motion."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "aperture"
+path = "src/bin/aperture.rs"
+required-features = ["app"]
+
+[features]
+# Default-on so `cargo build --release` (what the build orchestrator runs — see
+# manifest/projects.toml) produces the deploy binary directly, same convention
+# as bo-suite-egui / rusty-board-egui.
+default = ["app"]
+app = ["dep:eframe"]
+
+[dependencies]
+aperture-core = { workspace = true }
+aperture-complete = { workspace = true }
+egui = { workspace = true }
+uikit-egui = { path = "../../../../shared/uikit/crates/uikit-egui" }
+snapclone-theme = { path = "../../../../shared/uikit/crates/snapclone-theme" }
+settings-kit = { path = "../../../../shared/settings-kit" }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
