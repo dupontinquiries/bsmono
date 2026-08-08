@@ -1045,7 +1045,6 @@ pub fn source_bpw(ggml_type: u32) -> Option<f32> {
         23 => 4.25,          // IQ4_XS: 136
         29 => 1.75,          // IQ1_M:   56
         14 => 6.5625,        // Q6_K: 210 bytes per 256
-        19 => 1.5625,        // IQ1_S: 50 bytes per 256
         _ => return None,
     })
 }

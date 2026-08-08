@@ -928,12 +928,9 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         // here and the codebook IQ types are not. Q2_K unlocks the 39.6 GB Q2_K Scout checkpoint.
         10 => return crate::kquant::dequant_q2_k(data, n),
         11 => return crate::kquant::dequant_q3_k(data, n),
-        13 => return crate::kquant::dequant_q5_k(data, n),
         // IQ4_NL and IQ4_XS: the two IQ formats that are NOT codebook formats. Sixteen
         // non-linear values indexed by a nibble, so the whole "codebook" is one small table — which
         // is why these two are supported and IQ2_XXS is not.
-        20 => return crate::iq4::dequant_iq4_nl(data, n),
-        23 => return crate::iq4::dequant_iq4_xs(data, n),
         // IQ1_M now READS. It was refused by name because its per-8 scale layout differs from
         // IQ1_S's and the IQ1_S path would have decoded it to garbage silently — the refusal was
         // right, and iq1m.rs is what replaces it rather than relaxing it.
