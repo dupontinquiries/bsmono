@@ -19,6 +19,7 @@ pub mod detect;
 pub mod explore;
 pub mod manpage_view;
 pub mod chrome_mode;
+pub mod mail;
 pub mod voice_routing;
 pub mod iio_accel;
 
