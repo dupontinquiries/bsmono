@@ -87,6 +87,7 @@ pub mod quantcompare;
 pub mod filewindow;
 pub mod symbolfind;
 pub mod dupscan;
+pub mod unwired;
 pub mod patchcheck;
 pub mod anchor;
 pub mod contextwidth;
