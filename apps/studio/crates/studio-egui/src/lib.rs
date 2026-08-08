@@ -16,6 +16,9 @@ pub mod touch;
 pub mod keys;
 pub mod spectrum;
 
+/// The step-sequencer surface for studio-live.
+pub mod grid;
+
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Ui, Vec2};
 use studio_collab::Doc;
 use studio_core::{ClipId, Project, Ticks, TrackId, TrackKind, TICKS_PER_SECOND};

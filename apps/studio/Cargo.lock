@@ -2216,6 +2216,7 @@ dependencies = [
  "studio-collab",
  "studio-core",
  "studio-fx",
+ "studio-live",
  "uikit-egui",
 ]
 
