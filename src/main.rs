@@ -48,6 +48,7 @@ mod procgen;
 mod raid;
 mod render;
 mod style;
+mod subsea;
 mod sun;
 mod survival;
 mod save;
@@ -539,6 +540,11 @@ struct Game {
     /// (so a single tap is never two) and short after.
     repeat_key: Option<Key>,
     repeat_t: f32,
+    /// SEA LEVEL for a water world, in metres. None means dry land, which
+    /// is every map that is not TIDEMAW — kept as an Option rather than a
+    /// bool so the depth is available to the lighting rather than just the
+    /// fact of being wet.
+    sea_level: Option<f32>,
     /// which joint the catalogue is pointing at
     joint_sel: usize,
     /// step only through the misparented ones — 306 joints is scrolling,
@@ -1336,6 +1342,7 @@ fn main() {
         lift: None,
         repeat_key: None,
         repeat_t: 0.0,
+        sea_level: None,
         joint_sel: 0,
         joint_only_bad: true,
         space: chord::Chord::new(),
@@ -4259,17 +4266,58 @@ impl Game {
 
         // the single RAYS slider, normalised once and reused below
         let q01 = ((self.cfg.video.quality - 0.4) / 1.4).clamp(0.0, 1.0);
+
+        // SUBSEA LIGHTING, when the camera is under the water. Depth is a
+        // palette rather than a filter: water eats red in about five metres
+        // and blue in two hundred, so the hue IS the depth readout and the
+        // player never needs a number for it.
+        //
+        // Fog distance collapses with depth for the same reason — the same
+        // absorption that takes the red also takes the far wall, which is
+        // why an underwater scene closes in rather than merely dimming.
+        let sub = if self.sea_level.is_some_and(|s| self.cam.pos.y < s) {
+            let depth = self.sea_level.unwrap_or(0.0) - self.cam.pos.y;
+            let z = if depth > 60.0 {
+                hydro::Zone::Trench
+            } else if depth > 22.0 {
+                hydro::Zone::OpenWater
+            } else if depth > 4.0 {
+                hydro::Zone::Shallows
+            } else {
+                hydro::Zone::Surf
+            };
+            let sunst = sun::SunState {
+                dir: [st.sun[0], st.sun[1], st.sun[2]],
+                strength: 1.0,
+                color: [1.0; 3],
+                day: 1.0,
+                elev: st.sun[1],
+                flaring: false,
+            };
+            Some(subsea::light(z, &sunst, &raid::TIDEMAW_TIDE, self.time))
+        } else {
+            None
+        };
         let globals = Globals {
             view_proj: vp.to_cols_array(),
             inv_view_proj: ivp.to_cols_array(),
             cam: [self.cam.pos.x, self.cam.pos.y, self.cam.pos.z, self.time],
             sun: [st.sun[0], st.sun[1], st.sun[2], 0.0],
-            fog: [
-                st.fog[0].max(wx_flash * 0.92),
-                st.fog[1].max(wx_flash * 0.92),
-                st.fog[2].max(wx_flash * 0.96),
-                st.fog_d * wx_fogd,
-            ],
+            fog: match &sub {
+                // the water's own colour, and it closes in
+                Some(w) => [
+                    (st.fog[0] * w.tint[0]).max(wx_flash * 0.35),
+                    (st.fog[1] * w.tint[1]).max(wx_flash * 0.55),
+                    (st.fog[2] * w.tint[2]).max(wx_flash * 0.75),
+                    st.fog_d * wx_fogd * (0.10 + 0.30 * w.level),
+                ],
+                None => [
+                    st.fog[0].max(wx_flash * 0.92),
+                    st.fog[1].max(wx_flash * 0.92),
+                    st.fog[2].max(wx_flash * 0.96),
+                    st.fog_d * wx_fogd,
+                ],
+            },
             misc: [st.zenith[0], st.zenith[1], st.zenith[2], 0.0],
             rt: [if self.cfg.video.rays { 1.0 } else { 0.0 }, self.cfg.video.quality, rt_ids.static_n as f32, st.wet.max(wx_wet)],
             // AO probe count follows quality: four is the full set, two is
