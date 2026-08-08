@@ -8510,7 +8510,7 @@ last block and k's first would decode to garbage")),
                 // 20 and 23 joined the list when iq4.rs landed. The report is only honest if this
                 // matches what dequantize actually accepts — a stale list here reports supported
                 // types as missing, which sends someone to implement what already works.
-                let supported: Vec<u32> = vec![0, 1, 8, 10, 12, 13, 14, 19, 20, 23];
+                let supported: Vec<u32> = vec![0, 1, 8, 10, 11, 12, 13, 14, 19, 20, 23];
                 // BYTES, NOT ELEMENTS. My first version passed dims.product(), which is the
                 // element count — so a report on a 30966 MiB file summed to 63135 MiB and its
                 // percentages exceeded 100. The shares are the whole point of the report, since they
