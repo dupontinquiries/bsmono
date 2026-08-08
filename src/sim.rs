@@ -4180,6 +4180,52 @@ pub fn run(args: &[String]) {
             println!("   through it cannot see what was dropped");
         }
 
+        // ---- ORDERING THE DEPTH PRE-PASS ----
+        // The shaded pass is sorted by (mesh, texture) because state changes
+        // cost more than overdraw does there. The PRE-PASS has no material
+        // state at all — it binds no textures and one pipeline — so it is
+        // free to sort purely FRONT TO BACK, which is what early-z wants:
+        // the nearest surfaces land first and everything behind them is
+        // rejected before it writes.
+        {
+            let w = World::generate(9, crate::world::style(21), 0.31, 1.0);
+            let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
+            let mut opaque: Vec<f32> = w
+                .shapes
+                .iter()
+                .filter(|sh| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None) && sh.color[3] >= 0.985)
+                .map(|sh| (sh.pos - eye).length())
+                .collect();
+            // how much of the pre-pass is written twice in the order we use
+            // now, versus sorted near-first
+            let sample = |order: &[f32]| -> f32 {
+                // a crude depth-complexity proxy: a draw is "wasted" if
+                // something nearer is drawn after it
+                let mut nearest = f32::MAX;
+                let mut wasted = 0;
+                for d in order {
+                    if *d < nearest {
+                        nearest = *d;
+                    } else {
+                        wasted += 1;
+                    }
+                }
+                wasted as f32 / order.len().max(1) as f32 * 100.0
+            };
+            let unsorted = sample(&opaque);
+            opaque.sort_by(f32::total_cmp);
+            let sorted = sample(&opaque);
+            println!();
+            println!("depth pre-pass ordering: {} opaque draws", opaque.len());
+            // This counts draws that arrive AFTER something nearer — which is
+            // the early-z opportunity, so higher is better. I first read it
+            // as waste and nearly recorded the result backwards.
+            println!("   current order: {unsorted:.0}% arrive behind something already laid down");
+            println!("   front-to-back: {sorted:.0}%  (the ceiling)");
+            println!("   so the existing order is already near-optimal for early-z, and");
+            println!("   sorting the pre-pass separately is not worth the code");
+        }
+
         // ---- OVER-RELAXED SPHERE TRACING ----
         // A sphere march steps by the distance to the nearest surface, which
         // is guaranteed safe and usually timid: the true surface is often

@@ -4324,6 +4324,38 @@ unchanged in speed because the loop reads the actual count, not the cap: this
 buys correctness at no performance cost, which is the opposite of every other
 trade in this file.
 
+## 1.132.0 — cabins to the reference, and a fourth idea measured away
+
+THE CABIN was the last reference cue measured but unused. Both references
+put the glasshouse at 0.31-0.32 of body length; ours ran 0.34 to 0.41. A long
+cabin is the difference between a sports car silhouette and a people
+carrier, and every car had one.
+
+    breadbox 0.41    roller 0.40    longboy 0.37    shark 0.36    wedge 0.34
+                              all now 0.31-0.32
+
+Scaled about each car's OWN centre offset, because where the cabin sits
+fore-and-aft is character — Octane's is +0.12 of body length, Dominus's
+-0.07 — while how LONG it is turned out to be a shared rule.
+
+That completes the reference work in three measured layers: surface (median
+dihedral 1.3 degrees against 0.4-2.2), character lines (15% creased against
+10.4%), and proportion (wheels at 0.22 of length, bodies inside 0.26-0.39
+H/L, cabins at 0.315).
+
+ON PERFORMANCE, A FOURTH IDEA DIED. The shaded pass is sorted by (mesh,
+texture) because state changes cost more there than overdraw does. The
+pre-pass has no material state — no textures, one pipeline — so it is free
+to sort front to back, which is what early-z wants. Measured: the existing
+order already has 97% of draws arriving behind something nearer, against a
+ceiling of 100%. Three percent is not worth a second sort.
+
+I first read that metric BACKWARDS, as 97% waste rather than 97% of the
+available benefit, and nearly recorded a large win where there was none. The
+tell was that sorting front-to-back scored 100% on a metric I had labelled
+"wasted" — a perfect score on a badness measure should never have looked
+like success.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
