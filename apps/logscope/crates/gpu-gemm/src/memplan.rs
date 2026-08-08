@@ -1027,6 +1027,11 @@ pub fn source_bpw(ggml_type: u32) -> Option<f32> {
         10 => 2.625,         // Q2_K: 84 bytes per 256
         11 => 3.4375,        // Q3_K: 110 bytes per 256
         12 => 4.5,           // Q4_K: 144 bytes per 256
+        // Q5_K and Q6_K were missing, found by quantref::table_consistency the run it was written.
+        // Q5_K is 2% of a UD checkpoint and Q6_K is common in Q4_K_M files as the output tensor, so
+        // a planner returning None for either was mis-sizing most real models by a few percent —
+        // small enough to look like measurement noise against a 31 GiB ceiling.
+        13 => 5.5,           // Q5_K: 176 bytes per 256
         // The IQ family, added when the loader started reporting per-type byte shares. A planner
         // that does not know a type's width cannot size a file that contains it, and a UD checkpoint
         // contains seven — so "unknown" here meant the plan was wrong about most of the file.
