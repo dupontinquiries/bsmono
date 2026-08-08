@@ -27,6 +27,9 @@ pub mod model;
 /// The scatter map: places and pins, projected into a box that fits them.
 pub mod map;
 
+/// The mood background and the humidity droplets over it.
+pub mod ambience;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 
