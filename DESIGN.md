@@ -4486,6 +4486,44 @@ conclusion drawn about Monkey Run's shape count, overdraw and LOD headroom
 over the last several versions was drawn from a different map, and those are
 worth revisiting now they point at the right one.
 
+## 1.137.0 — surveying all 36 maps, and what the survey says
+
+I keep examining the same two maps because they are the ones with harnesses.
+`--sim maps` now measures all of them: shapes, routes, gravity nodes,
+movers, spread and vertical extent, plus how alike any two are.
+
+THE CATALOGUE IS UNIFORM to a degree the car catalogue never was:
+
+    159 to 290 shapes    about 510 m across    120 to 145 m tall
+
+and thirty-three of the thirty-six have NO routes and NO gravity nodes at
+all. Only PERPLEXUS (53 routes, 519 nodes) and MONKEY RUN (7 routes, 520)
+are structurally different things; BREAKWATER has 25 nodes and the rest have
+none.
+
+TWENTY-ONE OF THIRTY-SIX HAVE A NEAR-TWIN by composition — the mix of SDF
+primitives they are built from — with the closest pairs inside 0.03:
+
+    TEMPLE ~ SCRIPTORIUM   DOJO ~ COLISEUM   VAULT ~ COLISEUM
+
+And the reason is worth stating precisely, because the obvious diagnosis is
+wrong. Their style knobs DO differ, and substantially: rings 22 against 24,
+platforms 28 against 16, ramps 14 against 24. The maps are not copies. But
+every one of those knobs is a COUNT drawn from the same feature vocabulary —
+rings, halos, balloons, domes, ramps, platforms, trees, pads, nets — so
+different quantities of the same kinds of thing produce nearly the same
+composition. The maps differ in QUANTITY, not in KIND.
+
+That is a design finding rather than a bug, and it names the lever: what
+makes PERPLEXUS and MONKEY RUN feel like other places is not that they have
+more of anything, it is that they have a STRUCTURE the others lack — bores,
+routes, a gravity field that is not down. Thirty-three maps share one
+generator and are distinguished by palette and proportion.
+
+I have not acted on it. Giving a map genuine structural identity is content
+work I cannot verify by measurement alone, and half of it would be worse
+than none. The survey is the instrument for doing it properly.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

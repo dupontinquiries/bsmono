@@ -506,6 +506,116 @@ pub fn run(args: &[String]) {
         println!("{}", if long_enough && flat_enough && tight { "CAR SDF: PASS" } else { "CAR SDF: FAIL" });
         return;
     }
+    if name == "maps" {
+        // A SURVEY OF ALL 36, because I keep examining the same two.
+        //
+        // The measurements that matter for map design are not the same as
+        // for rendering: how much STRUCTURE a map has, how much of it is
+        // reachable, and whether the play space is filled or empty. An
+        // outlier in any of those is either a deliberate style or a map
+        // nobody has looked at since it was generated.
+        println!("{:<16} {:>7} {:>7} {:>8} {:>8} {:>9} {:>8}", "map", "shapes", "routes", "grav", "movers", "spread", "vert");
+        let mut rows: Vec<(String, usize, usize, f32, f32)> = Vec::new();
+        for si in 0..crate::world::STYLE_COUNT {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let live: Vec<&crate::world::Shape> = w
+                .shapes
+                .iter()
+                .filter(|sh| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .collect();
+            let n = live.len();
+            // how far the structure spreads, and how much of it is vertical
+            let (mut rmax, mut ymax, mut ymin) = (0.0f32, f32::MIN, f32::MAX);
+            for sh in live.iter() {
+                rmax = rmax.max(glam::Vec2::new(sh.pos.x, sh.pos.z).length());
+                ymax = ymax.max(sh.pos.y);
+                ymin = ymin.min(sh.pos.y);
+            }
+            let movers = (0..w.shapes.len()).filter(|i| w.is_mover(*i)).count();
+            let name = crate::world::style(si).name;
+            println!(
+                "{:<16} {:>7} {:>7} {:>8} {:>8} {:>8.0}m {:>7.0}m",
+                name,
+                n,
+                w.routes.len(),
+                w.grav.len(),
+                movers,
+                rmax,
+                (ymax - ymin).max(0.0)
+            );
+            rows.push((name.to_string(), n, w.routes.len(), rmax, (ymax - ymin).max(0.0)));
+        }
+        // ---- ARE THEY DIFFERENT MAPS, OR ONE MAP IN 36 PALETTES? ----
+        //
+        // The catalogue reads uniform: 159-290 shapes, ~510 m across,
+        // 120-145 m tall, almost all with no routes and no gravity nodes.
+        // The same question the car catalogue got: does thirty-six mean
+        // thirty-six PLACES, or one layout wearing thirty-six colour
+        // schemes? Composition is the tell — which SDF primitives a map is
+        // built from, and in what mix.
+        {
+            let mut sigs: Vec<(String, Vec<f32>)> = Vec::new();
+            for si in 0..crate::world::STYLE_COUNT {
+                let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+                let mut kind = [0.0f32; 8];
+                let mut n = 0.0f32;
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                        continue;
+                    }
+                    let k = match sh.sdf {
+                        crate::world::Sdf::Sphere { .. } => 0,
+                        crate::world::Sdf::RBox { .. } => 1,
+                        crate::world::Sdf::Torus { .. } => 2,
+                        crate::world::Sdf::Capsule { .. } => 3,
+                        crate::world::Sdf::TubeTorus { .. } => 4,
+                        crate::world::Sdf::Hex { .. } => 5,
+                        crate::world::Sdf::RingDeck { .. } => 6,
+                        _ => 7,
+                    };
+                    kind[k] += 1.0;
+                    n += 1.0;
+                }
+                let n = n.max(1.0);
+                sigs.push((crate::world::style(si).name.to_string(), kind.iter().map(|c| c / n).collect()));
+            }
+            // nearest neighbour for each: how close is the most similar map?
+            let mut pairs: Vec<(f32, String, String)> = Vec::new();
+            for i in 0..sigs.len() {
+                let mut best = (f32::MAX, String::new());
+                for j in 0..sigs.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let d: f32 = sigs[i].1.iter().zip(sigs[j].1.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                    if d < best.0 {
+                        best = (d, sigs[j].0.clone());
+                    }
+                }
+                pairs.push((best.0, sigs[i].0.clone(), best.1));
+            }
+            pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            println!();
+            println!("   closest pairs by composition (0 = built from the same mix):");
+            for (d, a, b) in pairs.iter().take(6) {
+                println!("     {d:.3}  {a} ~ {b}");
+            }
+            let twins = pairs.iter().filter(|p| p.0 < 0.05).count();
+            println!("   {twins} of {} maps have a near-twin (under 0.05)", sigs.len());
+        }
+
+        // outliers, which is the point of a survey
+        let mean = rows.iter().map(|r| r.1).sum::<usize>() as f32 / rows.len() as f32;
+        let mut thin: Vec<&str> = rows.iter().filter(|r| (r.1 as f32) < mean * 0.35).map(|r| r.0.as_str()).collect();
+        let mut flat: Vec<&str> = rows.iter().filter(|r| r.4 < 12.0).map(|r| r.0.as_str()).collect();
+        thin.sort();
+        flat.sort();
+        println!();
+        println!("   mean {mean:.0} shapes");
+        println!("   sparse (under a third of mean): {thin:?}");
+        println!("   flat (under 12 m of vertical structure): {flat:?}");
+        return;
+    }
     if name == "shell" {
         // WHAT MAKES A BODY LOOK LIKE A CAR BODY.
         //
@@ -2090,6 +2200,116 @@ pub fn run(args: &[String]) {
                 grounded_frames as f32 / steps as f32 * 100.0
             );
         }
+        return;
+    }
+    if name == "maps" {
+        // A SURVEY OF ALL 36, because I keep examining the same two.
+        //
+        // The measurements that matter for map design are not the same as
+        // for rendering: how much STRUCTURE a map has, how much of it is
+        // reachable, and whether the play space is filled or empty. An
+        // outlier in any of those is either a deliberate style or a map
+        // nobody has looked at since it was generated.
+        println!("{:<16} {:>7} {:>7} {:>8} {:>8} {:>9} {:>8}", "map", "shapes", "routes", "grav", "movers", "spread", "vert");
+        let mut rows: Vec<(String, usize, usize, f32, f32)> = Vec::new();
+        for si in 0..crate::world::STYLE_COUNT {
+            let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+            let live: Vec<&crate::world::Shape> = w
+                .shapes
+                .iter()
+                .filter(|sh| !sh.cut && !matches!(sh.sdf, crate::world::Sdf::None))
+                .collect();
+            let n = live.len();
+            // how far the structure spreads, and how much of it is vertical
+            let (mut rmax, mut ymax, mut ymin) = (0.0f32, f32::MIN, f32::MAX);
+            for sh in live.iter() {
+                rmax = rmax.max(glam::Vec2::new(sh.pos.x, sh.pos.z).length());
+                ymax = ymax.max(sh.pos.y);
+                ymin = ymin.min(sh.pos.y);
+            }
+            let movers = (0..w.shapes.len()).filter(|i| w.is_mover(*i)).count();
+            let name = crate::world::style(si).name;
+            println!(
+                "{:<16} {:>7} {:>7} {:>8} {:>8} {:>8.0}m {:>7.0}m",
+                name,
+                n,
+                w.routes.len(),
+                w.grav.len(),
+                movers,
+                rmax,
+                (ymax - ymin).max(0.0)
+            );
+            rows.push((name.to_string(), n, w.routes.len(), rmax, (ymax - ymin).max(0.0)));
+        }
+        // ---- ARE THEY DIFFERENT MAPS, OR ONE MAP IN 36 PALETTES? ----
+        //
+        // The catalogue reads uniform: 159-290 shapes, ~510 m across,
+        // 120-145 m tall, almost all with no routes and no gravity nodes.
+        // The same question the car catalogue got: does thirty-six mean
+        // thirty-six PLACES, or one layout wearing thirty-six colour
+        // schemes? Composition is the tell — which SDF primitives a map is
+        // built from, and in what mix.
+        {
+            let mut sigs: Vec<(String, Vec<f32>)> = Vec::new();
+            for si in 0..crate::world::STYLE_COUNT {
+                let w = World::generate(9, crate::world::style(si), 0.31, 1.0);
+                let mut kind = [0.0f32; 8];
+                let mut n = 0.0f32;
+                for sh in w.shapes.iter() {
+                    if sh.cut || matches!(sh.sdf, crate::world::Sdf::None) {
+                        continue;
+                    }
+                    let k = match sh.sdf {
+                        crate::world::Sdf::Sphere { .. } => 0,
+                        crate::world::Sdf::RBox { .. } => 1,
+                        crate::world::Sdf::Torus { .. } => 2,
+                        crate::world::Sdf::Capsule { .. } => 3,
+                        crate::world::Sdf::TubeTorus { .. } => 4,
+                        crate::world::Sdf::Hex { .. } => 5,
+                        crate::world::Sdf::RingDeck { .. } => 6,
+                        _ => 7,
+                    };
+                    kind[k] += 1.0;
+                    n += 1.0;
+                }
+                let n = n.max(1.0);
+                sigs.push((crate::world::style(si).name.to_string(), kind.iter().map(|c| c / n).collect()));
+            }
+            // nearest neighbour for each: how close is the most similar map?
+            let mut pairs: Vec<(f32, String, String)> = Vec::new();
+            for i in 0..sigs.len() {
+                let mut best = (f32::MAX, String::new());
+                for j in 0..sigs.len() {
+                    if i == j {
+                        continue;
+                    }
+                    let d: f32 = sigs[i].1.iter().zip(sigs[j].1.iter()).map(|(a, b)| (a - b) * (a - b)).sum::<f32>().sqrt();
+                    if d < best.0 {
+                        best = (d, sigs[j].0.clone());
+                    }
+                }
+                pairs.push((best.0, sigs[i].0.clone(), best.1));
+            }
+            pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            println!();
+            println!("   closest pairs by composition (0 = built from the same mix):");
+            for (d, a, b) in pairs.iter().take(6) {
+                println!("     {d:.3}  {a} ~ {b}");
+            }
+            let twins = pairs.iter().filter(|p| p.0 < 0.05).count();
+            println!("   {twins} of {} maps have a near-twin (under 0.05)", sigs.len());
+        }
+
+        // outliers, which is the point of a survey
+        let mean = rows.iter().map(|r| r.1).sum::<usize>() as f32 / rows.len() as f32;
+        let mut thin: Vec<&str> = rows.iter().filter(|r| (r.1 as f32) < mean * 0.35).map(|r| r.0.as_str()).collect();
+        let mut flat: Vec<&str> = rows.iter().filter(|r| r.4 < 12.0).map(|r| r.0.as_str()).collect();
+        thin.sort();
+        flat.sort();
+        println!();
+        println!("   mean {mean:.0} shapes");
+        println!("   sparse (under a third of mean): {thin:?}");
+        println!("   flat (under 12 m of vertical structure): {flat:?}");
         return;
     }
     if name == "shell" {
