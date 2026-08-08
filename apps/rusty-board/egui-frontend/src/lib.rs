@@ -10,6 +10,7 @@
 use egui::{Align2, FontId, Rect, CornerRadius, Sense, Stroke, Ui, Vec2};
 use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 
+pub mod keyboard_service;
 pub mod real_layout;
 pub mod dictation;
 pub mod mic_source;
