@@ -1910,6 +1910,15 @@ impl Gpu {
     }
     /// Read back a u32 tensor (e.g. the argmax id). Mirrors `download` but reinterprets bytes as u32.
     pub fn download_u32(&self, t: &Tensor) -> Vec<u32> {
+        // THE SECOND FRAME LEAK, and the one that matters for Scout.
+        //
+        // Fixing flush_and_wait took the dense 1B from 39% no-frame to ZERO. Scout did not move —
+        // 67% to 71% — because its per-layer path goes through HERE: moe_ffn_v1 downloads router
+        // logits as u32, and this sibling of `download` takes the frame without restoring it.
+        //
+        // `download` grew a had_frame reopen and download_u32 did not, which is the
+        // two-paths-one-fixed shape this codebase has now produced five times.
+        let had_frame_u32 = self.frame.lock().unwrap().is_some();
         // If the device already signalled OOM this step, the staging buffer below may fail to allocate and
         // mapping an INVALID buffer is a FATAL wgpu error (get_mapped_range panics past the uncaptured-error
         // handler — seen on the q4-30B long second prompt). Bail early with an empty result; the caller
@@ -1983,6 +1992,11 @@ waiting longer will not help because the work is gone");
         let v = bytemuck::cast_slice::<u8, u32>(&data).to_vec();
         drop(data); staging.unmap();
         self.clear_retained();
+        // Symmetric with `download` and `flush_and_wait`: a caller that HAD a frame expects to
+        // still have one, and one that did not must not acquire one behind its back.
+        if had_frame_u32 && std::env::var_os("LOGSCOPE_NO_FRAME_REOPEN").is_none() {
+            self.begin_frame();
+        }
         v
     }
 }
