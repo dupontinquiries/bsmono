@@ -116,3 +116,63 @@ than in the player is that the encoder's cooperation is what makes it work.
 Not built. The shared policy is (`uikit_egui::upscale`, 9 tests). The temporal
 part is a codec change with an encoder half, and it should be measured against
 FAO's existing rate-distortion numbers before anyone writes the magnifier.
+
+---
+
+# The part grammar: modelling the things in the video
+
+blackstar's `partdata` turns out to be directly relevant, and not for the reason
+a model library would be. Its own header:
+
+> The library ships no geometry: it is a catalogue of 5,873 part signatures and,
+> for 178 vehicles, WHERE each part sits. **That is a compositional grammar
+> rather than a mesh.**
+
+Eight classes — block, panel, strut, disc, wheel, barrel, greeble, tread — with
+a position and a size. That is a **prior over structure**, which is exactly what
+a reconstruction codec lacks. v8 densifies depth into points and then has to
+code the geometry; if a cluster can be described as *"wheel, here, this big"*,
+the bitstream carries nine bytes instead of a mesh patch.
+
+**And it carries meaning, which is worth more than the bytes.** `PartClass::spins`
+marks wheel, disc and tread. A wheel's motion between frames is a rotation about
+a known axis — so the decoder can PREDICT it rather than the encoder measuring
+it. No block motion vector can express "this rotated"; that is the gap the
+reprojection work above opens and the part grammar fills.
+
+## The failure mode is guarded before the win is claimed
+
+A part fitter that is confident and wrong does not produce noise. It produces
+**plausible structure that was never filmed** — the same trap as optimising
+against PSNR, wearing different clothes: a hallucinated wheel looks like content
+and scores well on any whole-frame metric.
+
+So every fit carries a residual, `accept` refuses one that does not explain its
+own points, and the fallback is ordinary residual coding rather than a worse
+fit. **Refusing is the expected case**: most video is not vehicles, and a grammar
+mined from 178 vehicles has no business describing a face or a tree.
+
+`worth_coding` adds the second condition, which is easy to forget: a fit must be
+accepted AND cheaper than the geometry it replaces. A perfect fit for four
+points costs more than the four points.
+
+## Two bugs the tests caught, both worth recording
+
+**Flatness must be tested before aspect.** A flat square — 3 × 3 × 0.2 — has an
+aspect of 15, so an aspect-first classifier calls a disc a strut. "Long and
+thin" has to mean thin in BOTH minor axes, and only the flatness test
+distinguishes thin-one-way from thin-two-ways.
+
+**A bounding box cannot see an outlier.** Measuring residual against the
+cluster's own min-to-max box means a stray point simply becomes the box, and a
+cloud with a point fifty units away fits perfectly. The extents are now the 90th
+percentile of per-axis deviation, so the bulk of the cluster defines the shape
+and a stray point lands outside it. That is the whole job of a residual, and the
+first version did not do it.
+
+## Status
+
+`part_fit.rs`, 13 tests. Not wired into the codec: this takes points something
+else has already grouped, and v8's clustering is where it would attach. The
+honest sequence is reprojection first (it needs no grammar and helps all
+content), then part fitting for the content where the grammar applies.

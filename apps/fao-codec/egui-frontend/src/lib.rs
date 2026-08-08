@@ -9,6 +9,7 @@
 //! the other -egui ports are. Remaining fao_app surfaces (sequence encode, block-match
 //! viz, v1/v2 comparison) are the follow-up pages — the pattern is set here.
 
+pub mod part_fit;
 pub mod reproject;
 pub mod seq_lab;
 pub mod lab;
