@@ -34,7 +34,7 @@ for no reason.
 
 | machine | OS | adapter | RAM | single alloc | concurrent | notes |
 |---|---|---|---|---|---|---|
-| M2 Ultra | Asahi | `Apple M2 Ultra (G14D B1) [Vulkan]` | 128 GB | 63 GiB (`--gate-vram`) | **31 GiB** (arena, measured) | the two disagree because they measure different resources |
+| M2 Ultra | Asahi | `Apple M2 Ultra (G14D B1) [Vulkan]` | 177 GiB | 63 GiB (`--gate-vram`) | **31 GiB — MEASURED, `--gate-residency` 2026-08** | held 31 GiB in 124 slabs; the 125th failed with "Failed to allocate BO VMA". The constant was right. |
 | M2 Max | Asahi | — | 64 GB | not measured | not measured | laptop; used for the Delegate role |
 
 **The gap between 63 and 31 is not an error.** `--gate-vram` allocates and releases; the arena must
@@ -68,6 +68,19 @@ kernel-validate --frame-diag       # submit structure
 
 Then load any model and record the `arena ON` and `GPU budget` lines, which are the concurrent
 figure.
+
+## RESOLVED: the constant was a measurement after all
+
+`--gate-residency` on the M2 Ultra held **31 GiB in 124 one-GiB slabs**, and the 125th failed with
+`Failed to allocate BO VMA`. The machine has 177 GiB and the probe was allowed to reach 88.
+
+**So the refusal's 31 GiB was correct**, and the 70B Q4_K_M refused at that ceiling was refused
+rightly. I wrote the probe expecting to find a stale constant costing you models, and found the
+opposite — which is the more useful outcome, because it means the planner can be trusted rather than
+worked around.
+
+What remains true: it is ONE machine's figure. An M2 Max with 64 GB has not been measured and its
+ceiling is certainly lower.
 
 ## Note on the constant that is not a measurement
 
