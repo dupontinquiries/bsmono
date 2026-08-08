@@ -43,6 +43,7 @@ pub mod swipe_physics;
 pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
+pub mod requests;
 pub mod reticle;
 pub mod roster;
 pub mod send_summary;
