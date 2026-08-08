@@ -43,6 +43,7 @@ mod physics;
 mod platform;
 mod posture;
 mod procars;
+mod procgen;
 mod raid;
 mod render;
 mod style;
