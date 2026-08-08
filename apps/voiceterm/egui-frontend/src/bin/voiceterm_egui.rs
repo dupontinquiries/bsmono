@@ -48,6 +48,11 @@ struct VoicetermApp {
     /// nothing while ordinary typing worked.
     pty_out: Vec<u8>,
     sidebar: Sidebar,
+    /// Touch chrome or voice chrome. On a phone the tab sidebar and the button
+    /// rows spend scarce width and height on affordances a voice user has
+    /// stopped touching, and a terminal converts that space directly into rows
+    /// of output.
+    chrome: voiceterm_egui::chrome_mode::Chrome,
     compass: ActionCompass,
     colors: PaletteColors,
     /// The toolbar gesture menus (QML `_pipePopup` / `_bracePopup`): press-drag-release on the
@@ -112,6 +117,14 @@ impl eframe::App for VoicetermApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         uikit_egui::apply_palette(ctx, snapclone_theme::palette_for(self.theme));
 
+        // The escape chord, checked before anything draws: if the recogniser
+        // has stopped working, voice mode must not be a room with no door.
+        if ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift
+                         && i.key_pressed(egui::Key::M)) {
+            if !self.chrome.escape() { self.chrome.toggle(); }
+        }
+        let show_chrome = self.chrome.mode().shows_tab_strip();
+        if show_chrome {
         egui::SidePanel::left("sidebar").resizable(true).default_width(160.0).width_range(120.0..=320.0).show(ctx, |ui| {
             if let Some(action) = self.sidebar.ui(ui, &self.colors) {
                 match action {
@@ -122,6 +135,7 @@ impl eframe::App for VoicetermApp {
                 }
             }
         });
+        }
 
         // toast above the bottom chrome (keycap bar ~76px + margin, the QML bind-to-chrome idea)
         self.toasts.ui(ctx, 84.0);
@@ -639,6 +653,7 @@ fn main() -> eframe::Result<()> {
     },
         Box::new(move |_cc| {
             Ok(Box::new(VoicetermApp {
+                chrome: Default::default(),
                 pty_out: Vec::new(),
                 app,
                 sidebar,
