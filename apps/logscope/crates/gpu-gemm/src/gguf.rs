@@ -943,6 +943,9 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         // right, and iq1m.rs is what replaces it rather than relaxing it.
         // IQ2_XXS: the first CODEBOOK format here, decoded against a grid fetched from
         // ggml-common.h rather than recalled. 18% of a UD-IQ1_S Scout.
+        21 => return crate::iq23::dequant_iq3_s(data, n),
+        18 => return crate::iq23::dequant_iq3_xxs(data, n),
+        22 => return crate::iq23::dequant_iq2_s(data, n),
         16 => return crate::iq2xxs::dequant_iq2_xxs(data, n),
         29 => return crate::iq1m::dequant_iq1_m(data, n),
         19 => {
@@ -1563,7 +1566,12 @@ mod iq4_wiring_tests {
         // because it reuses the grid IQ1_S already carries.
         // 16 (IQ2_XXS) left when the grids were fetched. The four remaining need iq2xs_grid,
         // iq3xxs_grid and iq3s_grid wired to their decoders — the tables are already here.
-        for t in [17, 18, 21, 22] {
+        // Only IQ2_XS (17) and IQ3_S (21) remain. Both grids are already in iqgrids.rs, so what
+        // is missing is decoder logic rather than data — which is a much better position than the
+        // one this list started in.
+        // ONLY IQ2_XS (17) REMAINS, and it is not in a UD-IQ1_S Scout at all. Every type in that
+        // checkpoint now reads.
+        for t in [17] {
             assert!(dequantize(t, &vec![0u8; 512], 256).is_err(), "type {t} must stay refused");
         }
     }
