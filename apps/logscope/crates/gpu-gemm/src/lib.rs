@@ -13,6 +13,7 @@ pub mod cpupool;
 pub mod cpuattn;
 pub mod cpudecode;
 pub mod perfverdict;
+pub mod passfuse;
 pub mod qkvsplit;
 pub mod prefetch;
 pub mod mladims;
@@ -3527,6 +3528,43 @@ impl Gpu {
         self.dispatch(LINEAR, &[a, w], &out, bytemuck::cast_slice(&dims), ((n as u32).div_ceil(TILE), (m as u32).div_ceil(TILE), 1)); out
     }
     /// Upload raw u32 words as a resident storage buffer (used for packed int8 weights). Zero-copy on UMA.
+    /// Run a dependent dispatch chain twice: as separate passes, then fused into one.
+    ///
+    /// Deliberately does NOT go through `record_dispatch` — the question is what the DRIVER does,
+    /// and routing through the engine's frame machinery would test that instead.
+    pub fn passfuse_probe(&self, wgsl: &str, steps: u32) -> (u32, u32) {
+        let m = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: None, source: wgpu::ShaderSource::Wgsl(wgsl.into()) });
+        let pipe = self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None, layout: None, module: &m, entry_point: Some("main"),
+            compilation_options: Default::default(), cache: None });
+        let run = |fuse: bool| -> u32 {
+            let t = self.upload_u32(&vec![1u32; 256]);
+            let bgl = pipe.get_bind_group_layout(0);
+            let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None, layout: &bgl,
+                entries: &[wgpu::BindGroupEntry { binding: 0, resource: t.buf.as_entire_binding() }] });
+            let mut enc = self.device.create_command_encoder(&Default::default());
+            if fuse {
+                // ONE pass, every dispatch inside it. Each must see the previous one's writes.
+                let mut p = enc.begin_compute_pass(&Default::default());
+                p.set_pipeline(&pipe); p.set_bind_group(0, &bg, &[]);
+                for _ in 0..steps { p.dispatch_workgroups(4, 1, 1); }
+            } else {
+                // A pass per dispatch: the control, and what the engine does today.
+                for _ in 0..steps {
+                    let mut p = enc.begin_compute_pass(&Default::default());
+                    p.set_pipeline(&pipe); p.set_bind_group(0, &bg, &[]);
+                    p.dispatch_workgroups(4, 1, 1);
+                }
+            }
+            self.queue.submit(Some(enc.finish()));
+            crate::counted_poll(&self.device);
+            self.download_u32(&t)[0]
+        };
+        (run(false), run(true))
+    }
+
     pub fn upload_u32(&self, data: &[u32]) -> Tensor {
         let bytes: &[u8] = bytemuck::cast_slice(data);
         Tensor { buf: self.upload_bytes(bytes, "qw"), rows: 1, cols: data.len(), pool: None, view: None }

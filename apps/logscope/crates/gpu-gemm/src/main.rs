@@ -3860,6 +3860,30 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-passfuse") {
+        // Does THIS driver honour barriers between dispatches inside one compute pass?
+        //
+        // Pass boundaries are 97% of submits on a dense model after the frame leaks were fixed, and
+        // collapsing them is a substantial restructure. This is the one cheap experiment that says
+        // whether it is possible at all — run before the work, not after.
+        use gpu_kernels::passfuse::*;
+        let gpu = Gpu::new();
+        println!("gate-passfuse: adapter = {}", gpu.adapter_name);
+        println!("  {STEPS} dependent steps of x = 2x + 1 from x = 1; correct answer {}",
+            expected(STEPS));
+        let src = r#"
+@group(0) @binding(0) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  if (g.x < arrayLength(&b)) { b[g.x] = b[g.x] * 2u + 1u; }
+}"#;
+        let (unfused, fused) = gpu.passfuse_probe(src, STEPS);
+        let v = judge(unfused, fused);
+        println!("  unfused {unfused}, fused {fused}");
+        println!("{}", v.explain());
+        if !v.safe_to_fuse() { println!("gate-passfuse: FAIL"); }
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-quanttables") {
         // Five decoders were added in one sitting and every test for them constructs a block from
         // the same understanding of the layout the decoder uses — which is circular. This does not
@@ -4937,7 +4961,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-quantref  --gate-quanttables  --gate-qwen2\n  --gate-qwen3  --gate-residency  --gate-rubric  --gate-store\n  --gate-stream-slots  --gate-submit  --gate-swa  --gate-vae-conv\n  --gate-vae-resblock  --gate-vit-block  --gate-vram  --gate-worker\n  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-passfuse  --gate-perf  --gate-prefill\n  --gate-q4k  --gate-q4resident  --gate-q6k  --gate-q8direct\n  --gate-qkv  --gate-quant-survey  --gate-quantref  --gate-quanttables\n  --gate-qwen2  --gate-qwen3  --gate-residency  --gate-rubric\n  --gate-store  --gate-stream-slots  --gate-submit  --gate-swa\n  --gate-vae-conv  --gate-vae-resblock  --gate-vit-block  --gate-vram\n  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
