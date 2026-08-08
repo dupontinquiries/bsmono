@@ -3894,8 +3894,25 @@ approximate it.");
             // Held in a Vec so nothing is released until the probe ends — releasing as we go would
             // measure the largest SINGLE allocation, which --gate-vram already answers and which is
             // the question that produced the misleading 63 GiB.
-            let t = gpu.upload_u32(&zero);
-            held.push(t);
+            // CATCH THE ALLOCATION FAILURE. On an M2 Ultra the probe held 31 GiB and then wgpu
+            // panicked inside upload — the engine's own OOM handler logged "degrading + backing off"
+            // and the panic came from the layer below it. Checking DEVICE_ERRORS after the call is
+            // too late when the call does not return.
+            //
+            // The failing allocation IS the answer, so surviving it is the difference between a
+            // measurement and a crash report.
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                gpu.upload_u32(&zero)
+            }));
+            match attempt {
+                Ok(t) => held.push(t),
+                Err(_) => {
+                    let n = held.len() as f64 * slab_gib;
+                    println!("  allocation FAILED at {n:.1} GiB — that is the ceiling, and the \
+failure is the measurement rather than an error");
+                    break;
+                }
+            }
             let n = held.len() as f64 * slab_gib;
             if held.len() % 4 == 0 { println!("  held {n:.0} GiB in {} slabs", held.len()); }
             // A probe that wedges the GPU is worse than a wrong constant, so stop on the first sign
@@ -3910,8 +3927,10 @@ pushing until it fails hard");
         let p = ResidencyProbe {
             held_gib: held.len() as f64 * slab_gib,
             slab_gib,
-            // Reaching the ceiling without failing is a COMPLETE probe with a floor rather than a
-            // ceiling: the device holds at least this much, and the number is still usable.
+            // Hitting the wall IS completing: the probe exists to find where allocation fails, and
+            // finding it is success. `complete` is false only when something ELSE stopped the run —
+            // a device error unrelated to exhaustion, or the outer limit being reached without a
+            // failure, which reports a floor rather than a ceiling.
             complete,
         };
         drop(held);
