@@ -211,6 +211,29 @@ effort to the prompt's length, and do not ask a clarifying question you could an
 question spends their turn to save you a guess, which is the wrong way round. State the reading you \
 took in one line and act on it, so a wrong reading costs a sentence rather than a detour.";
 
+/// Overrides the standing priority list when the task IS new functionality.
+///
+/// # The conflict this resolves
+///
+/// The system prompt opens with ten absolute priorities, "never reorder, never trade a higher for a
+/// lower", and **new functionality is number ten of ten**. Below readability. Below performance.
+///
+/// For maintenance that ordering is right and hard-won. For a greenfield request it is a direct
+/// instruction to do nine other things first — and no posture appended two thousand tokens later
+/// overcomes a numbered absolute at the top. That is why the classifier fixes kept not working: they
+/// were arguing with a rule the model had been told never to reorder.
+///
+/// # Not a reordering — a scope statement
+///
+/// The priorities are about how to CHANGE an existing system. When there is no existing system, one
+/// through five have nothing to preserve, understand or minimally edit. Saying so is not weakening
+/// them; it is naming what they were always about.
+pub const GREENFIELD_PRIORITY_OVERRIDE: &str = "\n\nPRIORITY SCOPE: the standing priority list \
+orders how to CHANGE an existing system, and 'new functionality' sits last there because a \
+maintenance task should not grow the system before it understands it. THIS TASK IS THE EXCEPTION \
+THE LIST DOES NOT COVER \u{2014} there is nothing here to preserve, understand or minimally edit, so \
+priorities one through five have no subject. Correctness still leads. Build the thing.";
+
 pub const BUILD_BIAS: &str = "\n\nWHEN IN DOUBT, BUILD. Writing code is cheap and reversible — it \
 compiles or it does not, and it can be reverted in a second. Reasoning about what the code would do \
 is expensive: it consumes a turn and returns a guess. If a question could be settled by writing the \
@@ -513,7 +536,10 @@ pub fn posture_for(class: TaskClass, repo: RepoState) -> String {
     // The override runs FIRST. A wording rule that says "maintenance" and a directory that says
     // "empty" are not two opinions to weigh — one of them is a fact.
     if repo.forbids_maintenance_posture() {
-        return format!("{GREENFIELD_BUILD_POSTURE}{UNIVERSAL_CORE}");
+        // The override goes FIRST, before the posture, because it is answering a rule that came
+        // before both — and a contradiction resolved late reads as a hedge rather than a scope.
+        return format!("{GREENFIELD_PRIORITY_OVERRIDE}{GREENFIELD_BUILD_POSTURE}{UNIVERSAL_CORE}\
+{BUILD_BIAS}{TERSENESS_BIAS}");
     }
     posture_full(class)
 }
@@ -685,6 +711,59 @@ mod terseness_tests {
         for marker in ["An outline is not a step", "WHEN IN DOUBT, BUILD",
                        "RETURN WITH THE EVIDENCE", "COMPRESSED, NOT PRECISE"] {
             assert!(p.contains(marker), "missing {marker}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod priority_conflict_tests {
+    use super::*;
+
+    /// The prompt opens with ten absolute priorities and **new functionality is tenth**. For
+    /// maintenance that is right. For a build request it instructs the model to do nine other things
+    /// first — and every classifier fix in this file was arguing with a rule the model was told never
+    /// to reorder.
+    #[test]
+    fn a_GREENFIELD_task_gets_the_priority_scope_statement() {
+        let p = posture_for(classify("write a rust tui game"), RepoState::Empty);
+        assert!(p.contains("PRIORITY SCOPE"));
+        assert!(p.contains("Build the thing"));
+    }
+
+    #[test]
+    fn it_is_a_SCOPE_statement_not_a_reordering() {
+        // Reordering an "absolute, never reorder" list invites the model to decide which other rules
+        // are negotiable. Saying the list has no subject here does not.
+        assert!(GREENFIELD_PRIORITY_OVERRIDE.contains("no subject"));
+        assert!(GREENFIELD_PRIORITY_OVERRIDE.contains("Correctness still leads"),
+            "the one priority that survives must be named, or 'the list does not apply' reads as \
+'nothing applies'");
+    }
+
+    #[test]
+    fn MAINTENANCE_does_not_get_it() {
+        // The ordering is right and hard-won for changing an existing system, and weakening it there
+        // would trade a real protection for a case it does not cover.
+        let p = posture_for(classify("fix the off-by-one in arena_place"), RepoState::from_counts(40));
+        assert!(!p.contains("PRIORITY SCOPE"));
+    }
+
+    #[test]
+    fn the_override_comes_BEFORE_the_posture_it_qualifies() {
+        // It answers a rule stated earlier than both, and a contradiction resolved late reads as a
+        // hedge rather than as a scope.
+        let p = posture_for(classify("build a game"), RepoState::Empty);
+        let scope = p.find("PRIORITY SCOPE").unwrap();
+        let posture = p.find("NEW BUILD").unwrap();
+        assert!(scope < posture);
+    }
+
+    #[test]
+    fn a_greenfield_posture_still_carries_the_other_three_layers() {
+        // The override replaces nothing — it adds the missing one.
+        let p = posture_for(classify("build a game"), RepoState::Empty);
+        for m in ["An outline is not a step", "WHEN IN DOUBT, BUILD", "COMPRESSED, NOT PRECISE"] {
+            assert!(p.contains(m), "lost {m}");
         }
     }
 }
