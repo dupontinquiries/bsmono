@@ -5,6 +5,7 @@ mod anim;
 mod actuator;
 mod airlock;
 mod analog;
+mod ballistics;
 mod bigbody;
 mod bots;
 mod camera;
