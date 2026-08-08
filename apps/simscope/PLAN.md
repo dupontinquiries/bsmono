@@ -252,9 +252,7 @@ they are never confused with measured ones. Not implemented.
 
 ### Materials debts
 
-- **No homogenization.** The RVE driver, periodic boundary conditions and the Voigt/Reuss bracket
-  test are the next piece, and the bracket is unusually strong: any effective modulus falling
-  outside those bounds is provably wrong with no reference data needed.
+- ~~No homogenization.~~ Built; see below. Periodic boundary conditions remain the gap.
 - **No elasticity solver yet**, so stiffness data is stored and unused. 2D plane stress/strain on
   triangles is the load-bearing dependency for fracture, impact and homogenization alike.
 - **No temperature dependence beyond resistivity.** `k`, `E` and `α` all vary and are stored as
@@ -455,3 +453,51 @@ Two structural checks came with it. A homogeneous plate under a linear gradient 
 depended on stiffness would mean the thermal moment and the bending stiffness were not consistently
 derived. And a symmetric laminate warps freely under a gradient while staying flat under uniform
 heating, which is the design distinction stated as a test.
+
+
+## Homogenization
+
+Three solves: apply each unit macroscopic strain in turn and the volume-averaged stress is the
+corresponding column of the effective stiffness. Structurally the same operation as capacitance
+extraction — impose a unit load, integrate the response, divide.
+
+`sim-mat::mixture` was written first on purpose, and it did its job: the bracket caught two wrong
+expectations of mine before either could become a believed result.
+
+**Kinematic boundary conditions are an upper bound, and the RVE-size convergence is measured**
+rather than claimed. Prescribing `u = ε·x` on the whole boundary suppresses the local fluctuation a
+real microstructure shows; the result relaxes downward as the RVE contains more repeat units.
+Periodic BCs give the right answer at any size and need multi-point constraints — not implemented.
+
+Two findings worth keeping:
+
+**Voigt is not attained by layers along the load, and I expected it to be.** Measured 165 GPa
+against 170.7. Kinematic BCs fix displacement only on the *boundary*, so while every layer carries
+the same `εxx`, the transverse `εyy` is suppressed at the boundary and free inside — and since
+`σxx = Q11 εxx + Q12 εyy`, that interior Poisson contraction pulls the average a few percent below
+the uniform-strain value. Voigt is attained only when *both* strain components are uniform.
+
+**The bracket must be applied to stiffness, not to Young's modulus.** The scalar Voigt/Reuss
+average of `E` is equivalent to the tensor bound only when the phases share a Poisson ratio. With
+aragonite at 0.30 and the organic matrix at 0.40, the extracted `E_eff` came out marginally *above*
+the scalar Voigt value while remaining perfectly admissible — because `E` is obtained by
+**inverting** `C`, and the inequality does not survive the inversion. The rigorous statement is on
+`Q11`.
+
+### Nacre: what this reaches and what it cannot
+
+A brick-and-mortar RVE — offset mineral platelets in a thin compliant matrix — homogenizes to a
+stiffness in the measured 60–80 GPa region. That is the most that can honestly be claimed, and the
+test asserts the other half explicitly: **every interface in this model is perfectly bonded**, so no
+platelet can slide, no crack can be deflected, and nothing can pull out. Those three mechanisms are
+what nacre's toughness *is*. The factor of 24 remains unreachable from here by construction, not by
+insufficient refinement.
+
+### Homogenization debts
+
+- **No periodic boundary conditions**, hence an upper bound rather than the answer.
+- **No cohesive interfaces**, hence stiffness only. This is the piece nacre actually needs.
+- **2D plane stress only.** A platelet stack is a 3D arrangement and its through-thickness response
+  is not accessible here.
+- **No thermal or conductivity homogenization**, though both are the same machinery with the
+  Laplace operator instead of elasticity.
