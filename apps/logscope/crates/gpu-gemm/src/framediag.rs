@@ -144,13 +144,29 @@ pub fn reset() {
 mod tests {
     use super::*;
 
-    fn fresh() { reset(); arm(); }
+    /// Serialises the tests in this module.
+    ///
+    /// **They share process-global state** — the counters and both tallies are statics — and cargo
+    /// runs tests in parallel by default, so one test's `reset()` can land inside another's
+    /// assertions. That produced exactly one failure in ten full-suite runs while writing this,
+    /// which is the worst frequency for a flake: often enough to be real, rare enough to be
+    /// dismissed as noise the next time it appears.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn fresh() -> std::sync::MutexGuard<'static, ()> {
+        // Poisoning is ignored: a panicking test already failed, and refusing to run the others
+        // because of it turns one failure into eight.
+        let g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        arm();
+        g
+    }
 
     #[test]
     fn a_DOMINANT_site_is_called_out() {
         // The shape of the answer decides the fix, and the report says which shape it is rather than
         // leaving a reader to eyeball a list.
-        fresh();
+        let _serial = fresh();
         for _ in 0..100 { note_frameless("moe_ffn_v1 readback"); }
         note_frameless("sample_at");
         assert!(report().contains("ONE SITE DOMINATES"));
@@ -160,7 +176,7 @@ mod tests {
     fn a_SPREAD_reads_as_the_frame_never_being_held() {
         // A different diagnosis from one bad site: if every site contributes, the frame is not being
         // held at all and fixing any one of them changes nothing.
-        fresh();
+        let _serial = fresh();
         for s in ["a", "b", "c", "d"] { for _ in 0..10 { note_frameless(s); } }
         let r = report();
         assert!(r.contains("not being held at all"), "{r}");
@@ -170,7 +186,7 @@ mod tests {
     fn CLOSED_WHILE_CLOSED_is_explained_rather_than_just_counted() {
         // The counter most likely to name the bug: a speculative end_frame makes everything after it
         // frameless, which is a different fault from a frame never opened.
-        fresh();
+        let _serial = fresh();
         FRAME_CLOSED_WHILE_CLOSED.store(3, Relaxed);
         assert!(report().contains("calls end_frame speculatively"));
     }
@@ -179,7 +195,7 @@ mod tests {
     fn a_DECLINED_REOPEN_points_at_download_as_the_SYMPTOM() {
         // If decode's frame was already closed by something earlier, download's `had_frame` guard
         // correctly refuses to reopen — which would make download look guilty and not be.
-        fresh();
+        let _serial = fresh();
         REOPEN_DECLINED.store(7, Relaxed);
         assert!(report().contains("SYMPTOM rather than the cause"));
     }
@@ -188,8 +204,10 @@ mod tests {
     fn UNARMED_says_how_to_arm_rather_than_reporting_zero() {
         // Reporting "0 frameless dispatches" when the tally was never enabled is the false-green
         // shape this project keeps hitting.
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         *FRAMELESS_BY_SITE.lock().unwrap() = None;
+        *BY_PTR.lock().unwrap() = None;
         ARMED.store(false, Relaxed);
         assert!(report().contains("not armed"));
     }
@@ -198,7 +216,7 @@ mod tests {
     fn armed_with_NO_hits_is_distinct_from_unarmed() {
         // "The frame held for the whole run" is a real result and must not be confused with "nobody
         // measured".
-        fresh();
+        let _serial = fresh();
         assert!(report().contains("held for the whole run"));
     }
 }
