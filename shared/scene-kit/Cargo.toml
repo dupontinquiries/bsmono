@@ -1,0 +1,19 @@
+[package]
+name = "scene-kit"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "The physical-UI scene renderer, lifted from logscope-egui: mesh3d scene assembly, gpuscene camera/pack/GLSL (triplanar materials, shadow map, post pass), the glow/egui PaintCallback embedding, textsurface (which shapes can carry words), and — new at extraction — per-vertex UVs (12→14 floats), an inscription material (MAT_INSCRIPTION samples a page texture by UV, so words sit ON a face instead of floating), a wired u_touch proximity response, and a font8x8 page rasterizer. See docs/physical-ui-findings.md in logscope for the brief this implements."
+
+[features]
+default = ["glow"]
+# The egui/eframe glow embedding (glow_scene). Off = pure-data core for headless tests.
+glow = ["dep:eframe"]
+
+[dependencies]
+egui = "0.34"
+noise-kit = { path = "../noise-kit" }
+font8x8 = "0.3"
+eframe = { version = "0.34", optional = true, default-features = false, features = ["glow"] }
+
+[workspace]

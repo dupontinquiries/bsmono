@@ -150,6 +150,61 @@ loop working with no server). Swapping is live via `Engine::swap_provider`.
 - `snapclone-theme::PaletteId::all()` has 14 entries; anything that hardcodes
   9 (older docs) is stale.
 
+## aperture-view: the physical viewer (second shell, same core)
+
+The second deliverable of the session: *view files with logscope's physical
+UI and scenes.* It exists to prove the layering — `aperture-core` didn't
+change by one line to gain a 3D shell.
+
+**The extraction decision.** logscope's physical UI (spatial → mesh3d →
+gpuscene → glow_scene, + texgen and the textsurface decision layer, ~3.9k
+lines, self-contained) became `shared/scene-kit`, because aperture is its
+second consumer and the repo lifts kits at two call sites. logscope keeps
+its copy untouched this session and migrates at the next scene co-change
+(TODO.md §scene-kit) — the same adapt-then-merge route the ollama client
+took. The rejected alternative was depending on `logscope-egui` wholesale:
+123 modules of an LLM app compiled into an editor, for four files.
+
+**What the kit gained at extraction** — the two gaps logscope's own
+`docs/physical-ui-findings.md` names as blocking the whole direction:
+
+1. **Per-vertex UVs** (12 → 14 floats, `location=5 in vec2 a_uv`).
+   `Mesh3.uvs: Option<Vec<[f32;2]>>` — `None` on every existing builder
+   packs (0,0) and changes nothing. `MAT_INSCRIPTION` (= 5.0, past the last
+   texgen layer) samples a new `u_page` texture *in page space* — so words
+   sit ON a face instead of floating. Relief for inscription faces falls
+   back to paper (layer 0): parchment tooth under the ink, not the clamped
+   moss layer. This was the findings doc's "enabling change", verbatim.
+2. **`u_touch` is live.** The proximity helper existed, was uploaded every
+   frame, and was never once set — dead code with a silent fallback. The
+   kit's fragment shader now drives emissive from it (every surface warms
+   faintly, inscribed ink more), and aperture-view sets it: click the page,
+   the page answers, age advanced by frame delta so the fade paces the same
+   at 60 and 120 Hz — the findings' own prescription.
+
+**The scroll trick.** Rasterizing 42 rows for a 40-row window and sliding
+the quad's UV window (`set_page_window` rewrites four UV pairs) means the
+`Smooth`-animated scroll costs *zero* rasterization — the page re-inks only
+when the integer window moves (`ensure_page`, version-gated; the GL side
+re-uploads on version bump alone). Same motion primitive as the editor.
+
+**The scene.** A stone floor, a wooden lectern carrying the inscribed
+parchment (overlay-biased so props can never occlude the reading face —
+mesh3d's physical-UI depth pull, used as intended), and four plinths behind:
+paper, wood, stone, moss — RUN_ON_DEVICE's context-panel materials,
+standing where the reader can see what the world is made of.
+
+**Viewer verification ledger.** Headless-tested: viewer brain (7 — raster
+window versioning, clamps, touch aging, UV offset), scene packing (2 —
+14-float stride, UV ride-along, window slide), inscribe (3 — glyphs, span
+colors, scale), plus the kit's 50 inherited tests updated to the new vertex
+(53 total). Compiled + boot-smoked only: the GL path (shader edits, page
+upload, callback) — no display in the sandbox, so the scene has *never been
+seen*. The shader changes follow the existing material-branch patterns and
+the attribute/stride math is mechanical, but visual verification is the
+first thing to do on a real machine: `cargo run --bin aperture-view -- 
+some_file.rs` (add `--ignore-rust-version` on rustc <1.92).
+
 ## Milestones next (each lands independently, seams already cut)
 
 1. tree-sitter behind `LineLexer` (syntax.rs untouched elsewhere).
@@ -157,3 +212,6 @@ loop working with no server). Swapping is live via `Engine::swap_provider`.
 3. File-fuzzy Ctrl+O over a workspace walk + `uikit_egui::fuzzy`.
 4. Multi-cursor (`Selection` → `Vec<Selection>`, edits fan out).
 5. LSP crate on the same worker/inbox pattern as the completion Engine.
+6. Physical viewer: logscope migrates to scene-kit (re-export shims +
+   `uvs: None` literal sweep); editing on the lectern (the ghost machine is
+   shell-agnostic already); a Runestone theme via `textsurface::for_scene`.
