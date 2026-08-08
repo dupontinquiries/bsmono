@@ -8,6 +8,7 @@
 
 pub mod transport;
 pub mod spaces;
+pub mod all_tracks;
 pub mod library;
 pub mod browse;
 pub mod queue;
