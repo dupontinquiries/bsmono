@@ -26,6 +26,7 @@ pub mod iq4;
 pub mod iq1m;
 pub mod iqgrids;
 pub mod iq2xxs;
+pub mod iq3;
 pub mod iq23;
 pub mod kquant;
 pub mod shaderdev;
