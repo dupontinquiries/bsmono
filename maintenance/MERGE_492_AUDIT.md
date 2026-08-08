@@ -286,3 +286,16 @@ the workspace.
 `voiceterm/src/table_ops.rs`. Those are engine crates the egui ports depend on
 or include, so future merges need the port test suites run as part of accepting
 them, not just logscope's. Done here; worth keeping.
+
+## A third cause for "failed to run rustc to learn about target-specific information"
+
+Already recorded twice: disk exhaustion, and redirecting `</dev/null` into cargo.
+There is a third, and it cost a chunk of a session before I found it — **a
+corrupted CARGO_TARGET_DIR**. The same crate that failed this way from
+`/tmp/uk` built and tested clean from a fresh `/tmp/uk2` with no source change
+between the two.
+
+The tell is that another crate builds fine at the same moment with a different
+target dir. If disk is healthy and stdin is a terminal, delete the target
+directory before believing anything about the toolchain — the message names
+rustc and means nothing of the sort in any of its three causes.
