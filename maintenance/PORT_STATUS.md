@@ -43,7 +43,7 @@ not see.
 | bot-arena | 2 | 100% named / 50% code | yes | yes | — |
 | fao-codec | 3 | 33% | yes | yes | — |
 | rusty-board | 8 | 50% | yes | yes | **yes** |
-| snapclone | 51 | 84% named / 22% code | yes | yes | **yes** |
+| snapclone | 51 | 86% named / 24% code | yes | yes | **yes** |
 | voiceterm | 22 | 91% named / 73% code | yes | yes | **yes** |
 | krapper | 1 | 100% | yes | yes | — |
 | settings | — | lib | no | **now yes** | n/a |

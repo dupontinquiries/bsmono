@@ -2525,6 +2525,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "snapclone-composer"
+version = "0.1.0"
+
+[[package]]
 name = "snapclone-egui"
 version = "0.1.0"
 dependencies = [
@@ -2535,6 +2539,7 @@ dependencies = [
  "peermux-core",
  "settings-kit",
  "share-kit",
+ "snapclone-composer",
  "snapclone-theme",
  "touchkit",
  "uikit-egui",
