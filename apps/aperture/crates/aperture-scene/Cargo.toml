@@ -1,0 +1,25 @@
+[package]
+name = "aperture-scene"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "aperture-view: the physical-UI file viewer. aperture-core's buffer + lexer, inscribed onto a lectern page inside a scene-kit world — words ON a surface (per-vertex UVs + MAT_INSCRIPTION), a wired touch response, material plinths (paper/wood/stone/moss) as the context row, and one Smooth camera for scroll and orbit."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "aperture-view"
+path = "src/bin/aperture-view.rs"
+required-features = ["app"]
+
+[features]
+default = ["app"]
+app = ["dep:eframe", "scene-kit/glow"]
+
+[dependencies]
+aperture-core = { workspace = true }
+aperture-egui = { path = "../aperture-egui", default-features = false }
+scene-kit = { path = "../../../../shared/scene-kit", default-features = false }
+egui = { workspace = true }
+eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
