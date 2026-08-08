@@ -633,6 +633,24 @@ mod route_condition_tests {
     }
 }
 
+/// # CORRECTION: this is redundant with `layer_can_route`, and the arithmetic below is still right
+///
+/// The 62x figure holds and the conclusion drawn from it did not. Dense MoE removes the readback by
+/// computing every expert — **and it requires every expert resident, because you cannot compute what
+/// you would have to stream.**
+///
+/// That is the same precondition `layer_can_route` needs. And when it holds, `layer_can_route`
+/// already removes the readback for FREE: the readback exists so the CPU can FETCH a cold expert,
+/// and `MOE_MATVEC_GLU_Q4` reads the expert index from `selw` on the GPU. With everything pinned
+/// there is nothing to fetch, so nothing to read back — at 1x the compute rather than 16x.
+///
+/// **Dense MoE pays 16x compute to buy something already available at 1x.** The two are not
+/// alternatives to weigh; one strictly dominates.
+///
+/// Kept rather than deleted because the model is correct and the crossover arithmetic is reusable —
+/// if a case ever appears where the readback survives full residency, this is the calculation. What
+/// is deleted is the belief that Scout is that case.
+///
 /// Is it faster to compute EVERY expert than to ask which one?
 ///
 /// # The trade
@@ -688,6 +706,16 @@ pub fn dense_moe_crossover(n_experts: u32, top_k: u32) -> f32 {
 #[cfg(test)]
 mod dense_moe_tests {
     use super::*;
+
+    #[test]
+    fn dense_moe_is_DOMINATED_by_layer_can_route_wherever_it_applies() {
+        // Both need every expert resident. When that holds, layer_can_route removes the same
+        // readback at 1x compute instead of 16x — so the favourable arithmetic below describes a
+        // trade nobody should take.
+        let all_pinned: Vec<u32> = (0..16).collect();
+        assert!(layer_can_route(&all_pinned, 16), "the cheaper path already applies");
+        assert!(dense_moe_worthwhile(0.999, 16, 1).is_ok(), "and the expensive one also would");
+    }
 
     #[test]
     fn at_SCOUTS_measured_stall_computing_everything_is_dramatically_faster() {
