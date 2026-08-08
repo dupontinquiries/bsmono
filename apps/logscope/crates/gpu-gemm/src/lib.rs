@@ -8174,8 +8174,13 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                 let cap = (crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB * (1u64 << 30) as f64) as u64;
                 if gpu_budget > cap {
                     eprintln!("loader: GPU budget {:.1} GiB clamped to {:.1} GiB — this driver \
-accepts a large single allocation but will not hold more than that in buffers at once (measured at \
-1 and 2 GiB slabs, mapped and unmapped). A plan above it fails mid-load rather than at planning time.",
+accepts a large single allocation but will not hold more than that in buffers at once. A plan above \
+it fails mid-load rather than at planning time. \
+THIS FIGURE IS A COMPILED-IN CONSTANT, not a measurement of this device: it was measured once on an \
+M2 Ultra at 1 and 2 GiB slabs, mapped and unmapped, and every Asahi machine now receives that \
+number. On different hardware it may be wrong in either direction \u{2014} `kernel-validate \
+--gate-vram` measures the single-allocation ceiling on THIS device, and a load that fails part-way \
+through is the evidence that the concurrent one is lower than this.",
                         gpu_budget as f64 / (1u64 << 30) as f64,
                         crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB);
                     gpu_budget = cap;
