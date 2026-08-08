@@ -201,3 +201,166 @@ mod tests {
         assert!(r.needs_human().contains("compiles and is no fun"));
     }
 }
+
+/// The human half, made fast to fill and hard to inflate.
+///
+/// ## Why not a 1-10 scale
+///
+/// Everything gets a 7. A scale invites a reviewer to average their impression, and an averaged
+/// impression of ten turns is one number that says less than any of the ten. **Binary questions
+/// about observable behaviour** cannot be averaged, take a second each, and disagree between
+/// reviewers in ways you can argue about — which is the property that makes a rubric useful rather
+/// than decorative.
+///
+/// ## Ordered so the cheap checks come first
+///
+/// If it does not run there is nothing to say about the fighting, and a reviewer who plays a game
+/// before checking whether the controls are documented will have learned them by trial and answer
+/// the later question wrong.
+///
+/// ## The first question is about the REVIEWER
+///
+/// "Did you run it" comes first because a review of code nobody ran is a different artefact from a
+/// review of a game somebody played, and the two must not be recorded as the same thing. This
+/// project has spent a session on results that looked like results.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Rubric {
+    /// **Answer honestly.** Everything below is conditional on this.
+    pub actually_ran_it: bool,
+    /// Did `cargo run` work without editing anything?
+    pub runs_unmodified: bool,
+    /// Could you tell which keys do what WITHOUT reading the source?
+    pub controls_discoverable: bool,
+    /// Do two players actually act independently, or does one input move both?
+    pub two_players_independent: bool,
+    /// Does a round end — someone wins, or it stops?
+    pub reaches_an_ending: bool,
+    /// Does the ASCII read as two figures facing each other, at a glance?
+    pub art_reads_as_fighters: bool,
+    /// Did it survive a minute of deliberate abuse — held keys, terminal resize, both players at
+    /// once?
+    pub survives_abuse: bool,
+    /// Would you extend this file rather than rewrite it?
+    pub worth_extending: bool,
+}
+
+impl Rubric {
+    /// Questions that can be answered without running anything.
+    ///
+    /// Separated because a reviewer who cannot run it can still answer these, and half a review
+    /// recorded as half a review is worth more than a blank or a guess.
+    pub const STATIC_ONLY: usize = 1;
+
+    /// Score, with the honest caveat attached.
+    ///
+    /// **Returns None when nobody ran it.** A total computed from a review of unrun code would be a
+    /// number about reading, presented as a number about a game.
+    pub fn score(&self) -> Option<u32> {
+        if !self.actually_ran_it { return None }
+        Some([self.runs_unmodified, self.controls_discoverable, self.two_players_independent,
+              self.reaches_an_ending, self.art_reads_as_fighters, self.survives_abuse,
+              self.worth_extending].iter().filter(|b| **b).count() as u32)
+    }
+
+    /// The one question whose answer changes what the rest mean.
+    ///
+    /// If it does not run unmodified, every later yes is about the version the reviewer fixed, and
+    /// that is a different program.
+    pub fn caveat(&self) -> Option<&'static str> {
+        if !self.actually_ran_it {
+            return Some("nobody ran it — the automated checks stand and everything below is a \
+reading, which is a different claim and must not be scored as if it were a session with the game");
+        }
+        if !self.runs_unmodified {
+            return Some("it did not run unmodified, so every answer below is about the version the \
+reviewer repaired — a different program from the one the model produced");
+        }
+        None
+    }
+
+    /// The questions in the order they should be asked.
+    pub fn order() -> [&'static str; 8] {
+        [
+            "Did you actually run it? (everything else is conditional on this)",
+            "Did `cargo run` work with no edits?",
+            "Could you tell which keys do what WITHOUT reading the source?",
+            "Do the two players act independently, or does one input move both?",
+            "Does a round end — someone wins, or it stops?",
+            "Does the art read as two figures facing each other, at a glance?",
+            "Did it survive a minute of abuse — held keys, resize, both players at once?",
+            "Would you extend this file, or rewrite it?",
+        ]
+    }
+}
+
+#[cfg(test)]
+mod rubric_tests {
+    use super::*;
+
+    fn all(v: bool) -> Rubric {
+        Rubric { actually_ran_it: v, runs_unmodified: v, controls_discoverable: v,
+                 two_players_independent: v, reaches_an_ending: v, art_reads_as_fighters: v,
+                 survives_abuse: v, worth_extending: v }
+    }
+
+    #[test]
+    fn a_review_of_UNRUN_code_has_no_score() {
+        // A total computed from reading, presented as a number about a game, is exactly the class of
+        // result this project has spent a session learning to distrust.
+        let mut r = all(true);
+        r.actually_ran_it = false;
+        assert_eq!(r.score(), None);
+        assert!(r.caveat().unwrap().contains("a different claim"));
+    }
+
+    #[test]
+    fn NOT_RUNNING_UNMODIFIED_caveats_everything_below_it() {
+        // Every later yes is about the version the reviewer repaired, which is a different program
+        // from the one the model produced.
+        let mut r = all(true);
+        r.runs_unmodified = false;
+        assert!(r.score().is_some(), "still scored — the answers are real about SOMETHING");
+        assert!(r.caveat().unwrap().contains("the version the reviewer repaired"));
+    }
+
+    #[test]
+    fn every_question_is_BINARY_and_about_something_observable() {
+        // A 1-10 scale gets a 7 for everything, because it invites averaging an impression — and an
+        // averaged impression of ten turns says less than any one of them.
+        for q in Rubric::order() {
+            // Contains, not ends_with: my first version required a trailing '?' and the first
+            // question ends with a parenthetical. The check was stricter than the property it was
+            // testing, which is a test bug rather than a rubric one.
+            assert!(q.contains('?') || q.contains("or rewrite it"), "not a question: {q}");
+        }
+        // "Is it intuitive" would be a quality; "could you tell which keys do what" is a thing that
+        // happened or did not.
+        assert!(Rubric::order()[2].contains("WITHOUT reading the source"));
+    }
+
+    #[test]
+    fn the_FIRST_question_is_about_the_reviewer_not_the_code() {
+        // A review of code nobody ran is a different artefact from a review of a game somebody
+        // played, and the two must not be recorded as the same thing.
+        assert!(Rubric::order()[0].contains("Did you actually run it"));
+    }
+
+    #[test]
+    fn CHEAP_checks_come_before_expensive_ones() {
+        // If it does not run there is nothing to say about the fighting — and a reviewer who plays
+        // before checking discoverability will have learned the controls by trial and answer that
+        // question wrong.
+        let o = Rubric::order();
+        let runs = o.iter().position(|q| q.contains("cargo run")).unwrap();
+        let abuse = o.iter().position(|q| q.contains("abuse")).unwrap();
+        let controls = o.iter().position(|q| q.contains("which keys")).unwrap();
+        assert!(runs < controls, "cannot judge controls on something that does not start");
+        assert!(controls < abuse, "playing first teaches the controls and spoils the question");
+    }
+
+    #[test]
+    fn a_PERFECT_run_scores_every_point_and_carries_no_caveat() {
+        assert_eq!(all(true).score(), Some(7));
+        assert_eq!(all(true).caveat(), None);
+    }
+}
