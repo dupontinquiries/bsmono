@@ -4227,6 +4227,32 @@ That is the useful shape of this kind of work: a proportion that is wrong
 usually has a second proportion propping it up, and correcting one without
 the other just moves the error.
 
+## v1.129.0 — the audit learns intent, and finds three real faults
+
+The proportion check flagged nearly every car, which makes it useless: a
+check that flags the CUBE for being a cube teaches you to ignore it. The
+oddities exist to be awkward and are held to "built the house way", not to
+"shaped like an Octane". Marking them as deliberate left exactly three cars
+genuinely off the reference — and all three were EVs, which are supposed to
+look like cars:
+
+    volt    H/L 0.464   too tall; the small wheel/height reading was a
+                        SYMPTOM of that, not a cause
+    pulse   W/L 0.635   too wide, and over-wheeled once narrowed
+    tram    H/L 0.548   a shuttle, but that is a van
+
+Each fix targeted the ratio actually out of band rather than the wheel by
+reflex. VOLT read as under-wheeled and was really over-tall: shrinking a
+body brought its wheel ratio into line without touching a wheel.
+
+AND PULSE CAUGHT ME OUT. I corrected its width and its wheels and left its
+HEIGHT — the one ratio that was still wrong — so it came back as drift in a
+new way. Correcting one dimension of three is how a car ends up differently
+broken. The audit is what caught it immediately, which is the argument for
+having it report by name rather than by count.
+
+    every car that should look like a car does
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

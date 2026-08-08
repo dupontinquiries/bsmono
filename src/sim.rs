@@ -702,12 +702,27 @@ pub fn run(args: &[String]) {
         {
             let src = include_str!("procars.rs");
             println!("{:<12} {:>7} {:>7} {:>9} {:>9} {:>8}", "car", "W/L", "H/L", "wheel/H", "wheel/L", "verdict");
+            // THE ODDITIES ARE ALLOWED TO BE ODD.
+            //
+            // The band is the character reference, and a check that flags
+            // every deviation flags the CUBE for being a cube — which
+            // teaches you to ignore it. These cars exist to be awkward: they
+            // are held to "built the house way", not to "shaped like an
+            // Octane". Everything else is drift and should be caught.
+            const DELIBERATE: [&str; 6] = ["breadbox", "roller", "cube", "shark", "longboy", "wedge"];
             let mut off = Vec::new();
+            let mut current = String::new();
             for line in src.lines() {
                 let t = line.trim();
+                if let Some(rest) = t.strip_prefix("pub fn ") {
+                    if let Some(n) = rest.split('(').next() {
+                        current = n.to_string();
+                    }
+                }
                 if !t.contains("half_len:") || !t.contains("wheel_r:") {
                     continue;
                 }
+                let exempt = DELIBERATE.contains(&current.as_str());
                 let num = |key: &str| -> Option<f32> {
                     let i = t.find(key)? + key.len();
                     let rest = &t[i..];
@@ -728,20 +743,31 @@ pub fn run(args: &[String]) {
                 let wheel_l = (r * 2.0) / (l * 2.0);
                 // the reference band, with room either side
                 let ok = (0.42..0.62).contains(&wl) && (0.50..0.95).contains(&wheel_h) && (0.17..0.29).contains(&wheel_l);
-                if !ok {
-                    off.push(format!("{wl:.2}/{wheel_h:.2}"));
+                if !ok && !exempt {
+                    off.push(current.clone());
                 }
                 println!(
                     "{:<12} {:>7.3} {:>7.3} {:>9.2} {:>9.3} {:>8}",
-                    format!("car{}", off.len()),
+                    current,
                     wl,
                     hl,
                     wheel_h,
                     wheel_l,
-                    if ok { "in band" } else { "OFF" }
+                    if ok {
+                        "in band"
+                    } else if exempt {
+                        "by design"
+                    } else {
+                        "DRIFT"
+                    }
                 );
             }
             println!("   references: W/L 0.48-0.54, wheel/height 0.62-0.83, wheel/length 0.22-0.24");
+            if off.is_empty() {
+                println!("   every car that should look like a car does");
+            } else {
+                println!("   off the reference and not meant to be: {off:?}");
+            }
         }
 
         // ---- CATALOGUE AUDIT ----
@@ -2141,12 +2167,27 @@ pub fn run(args: &[String]) {
         {
             let src = include_str!("procars.rs");
             println!("{:<12} {:>7} {:>7} {:>9} {:>9} {:>8}", "car", "W/L", "H/L", "wheel/H", "wheel/L", "verdict");
+            // THE ODDITIES ARE ALLOWED TO BE ODD.
+            //
+            // The band is the character reference, and a check that flags
+            // every deviation flags the CUBE for being a cube — which
+            // teaches you to ignore it. These cars exist to be awkward: they
+            // are held to "built the house way", not to "shaped like an
+            // Octane". Everything else is drift and should be caught.
+            const DELIBERATE: [&str; 6] = ["breadbox", "roller", "cube", "shark", "longboy", "wedge"];
             let mut off = Vec::new();
+            let mut current = String::new();
             for line in src.lines() {
                 let t = line.trim();
+                if let Some(rest) = t.strip_prefix("pub fn ") {
+                    if let Some(n) = rest.split('(').next() {
+                        current = n.to_string();
+                    }
+                }
                 if !t.contains("half_len:") || !t.contains("wheel_r:") {
                     continue;
                 }
+                let exempt = DELIBERATE.contains(&current.as_str());
                 let num = |key: &str| -> Option<f32> {
                     let i = t.find(key)? + key.len();
                     let rest = &t[i..];
@@ -2167,20 +2208,31 @@ pub fn run(args: &[String]) {
                 let wheel_l = (r * 2.0) / (l * 2.0);
                 // the reference band, with room either side
                 let ok = (0.42..0.62).contains(&wl) && (0.50..0.95).contains(&wheel_h) && (0.17..0.29).contains(&wheel_l);
-                if !ok {
-                    off.push(format!("{wl:.2}/{wheel_h:.2}"));
+                if !ok && !exempt {
+                    off.push(current.clone());
                 }
                 println!(
                     "{:<12} {:>7.3} {:>7.3} {:>9.2} {:>9.3} {:>8}",
-                    format!("car{}", off.len()),
+                    current,
                     wl,
                     hl,
                     wheel_h,
                     wheel_l,
-                    if ok { "in band" } else { "OFF" }
+                    if ok {
+                        "in band"
+                    } else if exempt {
+                        "by design"
+                    } else {
+                        "DRIFT"
+                    }
                 );
             }
             println!("   references: W/L 0.48-0.54, wheel/height 0.62-0.83, wheel/length 0.22-0.24");
+            if off.is_empty() {
+                println!("   every car that should look like a car does");
+            } else {
+                println!("   off the reference and not meant to be: {off:?}");
+            }
         }
 
         // ---- CATALOGUE AUDIT ----

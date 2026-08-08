@@ -160,7 +160,7 @@ pub fn volt(gpu: &mut Gpu) -> Model {
     );
     arches(gpu, &mut prims, 0.125, 0.30, -0.36, 0.36, -0.07, [0.13, 0.14, 0.16, 1.0]);
     ev_wheels(gpu, &mut prims, 0.125, 0.28, -0.36, 0.36, -0.07, [0.72, 0.76, 0.80, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.26, half_w: 0.31, wheel_r: 0.125 }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.56, half_h: 0.202, half_w: 0.31, wheel_r: 0.125 }
 }
 
 /// AXION — a low electric hypercar. Long, flat, fast: the flick blade.
@@ -249,8 +249,8 @@ pub fn pulse(gpu: &mut Gpu) -> Model {
         prims.push(body_prim(gpu, part(meshgen::sphere(8, 12), Vec3::splat(0.030), Quat::IDENTITY, Vec3::new(x, 0.325, -0.185)), [1.0, 0.97, 0.85, 1.0]));
     }
     arches(gpu, &mut prims, 0.155, 0.32, -0.32, 0.34, -0.02, [0.15, 0.15, 0.17, 1.0]);
-    ev_wheels(gpu, &mut prims, 0.155, 0.30, -0.32, 0.34, -0.02, [0.85, 0.86, 0.88, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.52, half_h: 0.30, half_w: 0.33, wheel_r: 0.155 }
+    ev_wheels(gpu, &mut prims, 0.12, 0.30, -0.32, 0.34, -0.02, [0.85, 0.86, 0.88, 1.0]);
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.52, half_h: 0.177, half_w: 0.27, wheel_r: 0.12 }
 }
 
 /// TRAM — an electric shuttle: a long slab of glass and aluminium with a
@@ -279,7 +279,7 @@ pub fn tram(gpu: &mut Gpu) -> Model {
     }
     arches(gpu, &mut prims, 0.125, 0.31, -0.38, 0.40, -0.07, [0.22, 0.23, 0.26, 1.0]);
     ev_wheels(gpu, &mut prims, 0.136, 0.29, -0.38, 0.40, -0.07, [0.62, 0.65, 0.70, 1.0]);
-    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.34, half_w: 0.32, wheel_r: 0.136 }
+    Model { prims, drive: Drive::Electric, hover: None, cloud: Vec::new(), cloud_n: Vec::new(), sdf_half: Vec3::ZERO, half_len: 0.62, half_h: 0.242, half_w: 0.32, wheel_r: 0.136 }
 }
 
 // ======================= ELECTRIFICATION =================================
