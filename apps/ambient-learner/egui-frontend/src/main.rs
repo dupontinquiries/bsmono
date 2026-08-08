@@ -5,14 +5,14 @@
 //! could run. Ported surfaces behind an unrunnable front end are worth less
 //! than one surface behind a runnable one.
 
-use ambient_learner_egui::{ui::egui::{history, locations, model, sync}, LiveState};
+use ambient_learner_egui::{ui::egui::{history, locations, map, model, sync}, LiveState};
 
 // This eframe requires `ui` as well as `update`; the window host draws from
 // `update` and leaves `ui` empty, matching voiceterm's binary rather than
 // inventing a second convention.
 
 #[derive(PartialEq)]
-enum Page { Live, History, Places, Model, Sync }
+enum Page { Live, History, Places, Map, Model, Sync }
 
 struct App {
     live: LiveState,
@@ -22,6 +22,7 @@ struct App {
     places: locations::LocationsPage,
     sync: sync::SyncPage,
     model: model::ModelPage,
+    map: map::MapPage,
 }
 
 impl eframe::App for App {
@@ -36,6 +37,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.page, Page::Live, "Live");
                 ui.selectable_value(&mut self.page, Page::History, "History");
                 ui.selectable_value(&mut self.page, Page::Places, "Places");
+                ui.selectable_value(&mut self.page, Page::Map, "Map");
                 ui.selectable_value(&mut self.page, Page::Model, "Model");
                 ui.selectable_value(&mut self.page, Page::Sync, "Sync");
             });
@@ -43,6 +45,7 @@ impl eframe::App for App {
             match self.page {
                 Page::Live => self.live.ui(ui),
                 Page::History => history::history_ui(ui, &self.history, &self.colors),
+                Page::Map => map::map_ui(ui, &mut self.map, &self.colors),
                 Page::Model => model::model_ui(ui, &self.model, &self.colors),
                 Page::Sync => sync::sync_ui(ui, &self.sync, &self.colors),
                 Page::Places => {
@@ -86,6 +89,10 @@ fn main() -> eframe::Result<()> {
             // doing its job — "0  (need 5 for neural)" is the state a new
             // device is actually in, and the most useful thing the page says.
             model: model::ModelPage::default(),
+            // Empty: the page says "no mapped locations yet", which is true of
+            // a device that has not been anywhere, rather than plotting
+            // invented coordinates on a map that looks real.
+            map: map::MapPage::default(),
         }))
     }))
 }
