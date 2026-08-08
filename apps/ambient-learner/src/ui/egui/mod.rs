@@ -30,6 +30,9 @@ pub mod map;
 /// The mood background and the humidity droplets over it.
 pub mod ambience;
 
+/// The published screen-surface temperature field, and its debug viewer.
+pub mod screen_temps;
+
 use uikit_egui::motion;
 use weather_share::{WeatherRecord, WeatherShare};
 

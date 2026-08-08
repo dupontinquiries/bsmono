@@ -6,7 +6,7 @@
 //! than one surface behind a runnable one.
 
 use ambient_learner_egui::{
-    ui::egui::{ambience, history, locations, map, model, sync},
+    ui::egui::{ambience, history, locations, map, model, screen_temps, sync},
     LiveState,
 };
 
@@ -15,7 +15,7 @@ use ambient_learner_egui::{
 // inventing a second convention.
 
 #[derive(PartialEq)]
-enum Page { Live, History, Places, Map, Model, Sync }
+enum Page { Live, History, Places, Map, Model, Sync, Temps }
 
 struct App {
     live: LiveState,
@@ -29,6 +29,7 @@ struct App {
     ambience: ambience::Ambience,
     sparkles: ambience::Sparkles,
     started: std::time::Instant,
+    temps: screen_temps::ScreenTempsPage,
 }
 
 impl eframe::App for App {
@@ -54,6 +55,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.page, Page::Map, "Map");
                 ui.selectable_value(&mut self.page, Page::Model, "Model");
                 ui.selectable_value(&mut self.page, Page::Sync, "Sync");
+                ui.selectable_value(&mut self.page, Page::Temps, "Temps");
             });
             ui.separator();
             match self.page {
@@ -62,6 +64,12 @@ impl eframe::App for App {
                 Page::Map => map::map_ui(ui, &mut self.map, &self.colors),
                 Page::Model => model::model_ui(ui, &self.model, &self.colors),
                 Page::Sync => sync::sync_ui(ui, &self.sync, &self.colors),
+                Page::Temps => {
+                    // No publisher in the demo, so the page shows its
+                    // Missing state — which is the honest thing a device with
+                    // ambient-learner not running would show.
+                    screen_temps::screen_temps_ui(ui, &self.temps, 0, &self.colors);
+                }
                 Page::Places => {
                     // The action is dropped: this demo has no backend to
                     // perform it against. Applying it locally would show a
@@ -115,6 +123,7 @@ fn main() -> eframe::Result<()> {
             // doing something; a demo at 0% would look like it was not ported.
             sparkles: ambience::Sparkles { humidity_pct: 60.0 },
             started: std::time::Instant::now(),
+            temps: screen_temps::ScreenTempsPage::default(),
         }))
     }))
 }
