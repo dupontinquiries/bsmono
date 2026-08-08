@@ -5,14 +5,14 @@
 //! could run. Ported surfaces behind an unrunnable front end are worth less
 //! than one surface behind a runnable one.
 
-use ambient_learner_egui::{ui::egui::{history, locations, sync}, LiveState};
+use ambient_learner_egui::{ui::egui::{history, locations, model, sync}, LiveState};
 
 // This eframe requires `ui` as well as `update`; the window host draws from
 // `update` and leaves `ui` empty, matching voiceterm's binary rather than
 // inventing a second convention.
 
 #[derive(PartialEq)]
-enum Page { Live, History, Places, Sync }
+enum Page { Live, History, Places, Model, Sync }
 
 struct App {
     live: LiveState,
@@ -21,6 +21,7 @@ struct App {
     history: history::History,
     places: locations::LocationsPage,
     sync: sync::SyncPage,
+    model: model::ModelPage,
 }
 
 impl eframe::App for App {
@@ -35,12 +36,14 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.page, Page::Live, "Live");
                 ui.selectable_value(&mut self.page, Page::History, "History");
                 ui.selectable_value(&mut self.page, Page::Places, "Places");
+                ui.selectable_value(&mut self.page, Page::Model, "Model");
                 ui.selectable_value(&mut self.page, Page::Sync, "Sync");
             });
             ui.separator();
             match self.page {
                 Page::Live => self.live.ui(ui),
                 Page::History => history::history_ui(ui, &self.history, &self.colors),
+                Page::Model => model::model_ui(ui, &self.model, &self.colors),
                 Page::Sync => sync::sync_ui(ui, &self.sync, &self.colors),
                 Page::Places => {
                     // The action is dropped: this demo has no backend to
@@ -79,6 +82,10 @@ fn main() -> eframe::Result<()> {
             // device nobody has calibrated yet, and the page renders it as 0
             // rather than as a dash for exactly that reason.
             sync: sync::SyncPage::default(),
+            // Zero neural calibrations, so the demo shows the threshold hint
+            // doing its job — "0  (need 5 for neural)" is the state a new
+            // device is actually in, and the most useful thing the page says.
+            model: model::ModelPage::default(),
         }))
     }))
 }
