@@ -5,7 +5,10 @@
 //! could run. Ported surfaces behind an unrunnable front end are worth less
 //! than one surface behind a runnable one.
 
-use ambient_learner_egui::{ui::egui::{history, locations, map, model, sync}, LiveState};
+use ambient_learner_egui::{
+    ui::egui::{ambience, history, locations, map, model, sync},
+    LiveState,
+};
 
 // This eframe requires `ui` as well as `update`; the window host draws from
 // `update` and leaves `ui` empty, matching voiceterm's binary rather than
@@ -23,6 +26,9 @@ struct App {
     sync: sync::SyncPage,
     model: model::ModelPage,
     map: map::MapPage,
+    ambience: ambience::Ambience,
+    sparkles: ambience::Sparkles,
+    started: std::time::Instant,
 }
 
 impl eframe::App for App {
@@ -30,6 +36,14 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            // The mood background sits BEHIND everything, and only on Live.
+            // On the data pages it would compete with numbers people are
+            // reading, which is the opposite of what an ambient layer is for.
+            if self.page == Page::Live {
+                let t = self.started.elapsed().as_millis() as f32;
+                ambience::ambience_ui(ui, &self.ambience, &self.sparkles, t,
+                                      ui.max_rect(), &self.colors);
+            }
             ui.horizontal(|ui| {
                 // Two tabs because two pages are ported. A bar listing pages
                 // that do not exist would be the same overstatement the audit
@@ -93,6 +107,14 @@ fn main() -> eframe::Result<()> {
             // a device that has not been anywhere, rather than plotting
             // invented coordinates on a map that looks real.
             map: map::MapPage::default(),
+            // Winter evening, no tilt, no light reading: the defaults the QML
+            // itself declares, so an unwired demo shows the state the app
+            // actually starts in rather than an invented summer afternoon.
+            ambience: ambience::Ambience::default(),
+            // 60% humidity — about fifteen droplets. Enough to show the layer
+            // doing something; a demo at 0% would look like it was not ported.
+            sparkles: ambience::Sparkles { humidity_pct: 60.0 },
+            started: std::time::Instant::now(),
         }))
     }))
 }
