@@ -163,3 +163,59 @@ mod tests {
         assert_eq!(duplicates(&all).len(), 1);
     }
 }
+
+/// Scan a directory of `.rs` files.
+///
+/// Wired so the scan RUNS rather than merely existing — this module was itself in the unwired list
+/// the day after it was written, which is the joke that makes the point.
+pub fn scan_dir(dir: &std::path::Path) -> std::io::Result<Vec<Item>> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir)? {
+        let p = e?.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("rs") { continue }
+        let Some(stem) = p.file_stem().and_then(|x| x.to_str()) else { continue };
+        if stem == "lib" || stem == "main" { continue }
+        let Ok(src) = std::fs::read_to_string(&p) else { continue };
+        out.extend(items_in(stem, &src, false));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// Runs on the ACTUAL source tree, every `cargo test`.
+    ///
+    /// A scan behind a CLI flag runs when someone remembers. This runs when anything runs, which is
+    /// the difference between a guard and a tool — and the seven duplicates this session were all
+    /// found by mechanisms that fired without being invoked.
+    ///
+    /// **Asserts a CEILING rather than zero.** The tree has 88 legitimate collisions — `Entry`,
+    /// `Block`, `Budget` in unrelated domains — and demanding zero would mean either a mass rename
+    /// nobody wants or a test everyone deletes. A ceiling catches the NEXT one without arguing about
+    /// the existing ones.
+    #[test]
+    fn duplicate_names_do_not_grow() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let Ok(items) = scan_dir(&dir) else { return };  // not a source checkout; nothing to check
+        let d = duplicates(&items);
+        const CEILING: usize = 92;
+        assert!(d.len() <= CEILING,
+            "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
+name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
+is what happened seven times this session.\n{}",
+            d.len(), report(&d));
+    }
+
+    #[test]
+    fn the_scan_finds_SOMETHING_so_a_broken_scanner_cannot_pass_silently() {
+        // A ceiling test passes trivially if the scan returns nothing. This is the guard on the
+        // guard, and it is the failure mode `--gate-quantref` had when six of eight submit callers
+        // incremented no counter and the profile looked clean.
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let Ok(items) = scan_dir(&dir) else { return };
+        assert!(items.len() > 500, "only {} public items found — the scanner is broken, not the tree \
+clean", items.len());
+    }
+}
