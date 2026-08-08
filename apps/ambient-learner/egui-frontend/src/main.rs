@@ -5,14 +5,14 @@
 //! could run. Ported surfaces behind an unrunnable front end are worth less
 //! than one surface behind a runnable one.
 
-use ambient_learner_egui::{ui::egui::{history, locations}, LiveState};
+use ambient_learner_egui::{ui::egui::{history, locations, sync}, LiveState};
 
 // This eframe requires `ui` as well as `update`; the window host draws from
 // `update` and leaves `ui` empty, matching voiceterm's binary rather than
 // inventing a second convention.
 
 #[derive(PartialEq)]
-enum Page { Live, History, Places }
+enum Page { Live, History, Places, Sync }
 
 struct App {
     live: LiveState,
@@ -20,6 +20,7 @@ struct App {
     page: Page,
     history: history::History,
     places: locations::LocationsPage,
+    sync: sync::SyncPage,
 }
 
 impl eframe::App for App {
@@ -34,11 +35,13 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.page, Page::Live, "Live");
                 ui.selectable_value(&mut self.page, Page::History, "History");
                 ui.selectable_value(&mut self.page, Page::Places, "Places");
+                ui.selectable_value(&mut self.page, Page::Sync, "Sync");
             });
             ui.separator();
             match self.page {
                 Page::Live => self.live.ui(ui),
                 Page::History => history::history_ui(ui, &self.history, &self.colors),
+                Page::Sync => sync::sync_ui(ui, &self.sync, &self.colors),
                 Page::Places => {
                     // The action is dropped: this demo has no backend to
                     // perform it against. Applying it locally would show a
@@ -72,6 +75,10 @@ fn main() -> eframe::Result<()> {
             // Empty, like the history: the page says "no saved locations, tap +
             // to add one", which is true, rather than inventing places.
             places: locations::LocationsPage::default(),
+            // Zeroes, not invented counts: an empty database is a fact about a
+            // device nobody has calibrated yet, and the page renders it as 0
+            // rather than as a dash for exactly that reason.
+            sync: sync::SyncPage::default(),
         }))
     }))
 }
