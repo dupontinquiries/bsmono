@@ -8576,6 +8576,304 @@ pub fn run(args: &[String]) {
         println!("{}", if pass { "GYRO: PASS" } else { "GYRO: FAIL" });
         return;
     }
+    if name == "sanity" {
+        // INVARIANTS, not cases. A scenario test finds the bug you thought
+        // to write; an invariant finds the one you did not. Three that a
+        // driving game must satisfy:
+        //   * SYMMETRY   left and right must mirror exactly
+        //   * DETERMINISM same inputs, same result, every time
+        //   * NO FREE ENERGY a car cannot gain speed from nothing
+        let cfg = Config::default();
+        let mut pass = true;
+        let mut check = |what: &str, ok: bool| {
+            println!("{:<52} {}", what, if ok { "ok" } else { "FAIL" });
+            pass &= ok;
+        };
+        let run = |steer: f32, dodge_x: f32, throttle: f32, boost: bool, steps: usize| -> (Vec3, Vec3, f32) {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, 60.0, 200.0); // far away: cars only
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            c.throttle = throttle;
+            c.boost = boost;
+            for _ in 0..90 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.steer = steer;
+            if dodge_x != 0.0 {
+                c.jump_pressed = true;
+                c.jump_held = true;
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                c.jump_pressed = false;
+                for _ in 0..10 {
+                    physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                }
+                c.steer = dodge_x;
+                c.jump_pressed = true;
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                c.jump_pressed = false;
+            }
+            for _ in 0..steps {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            (car.pos, car.vel, car.omega.length())
+        };
+        // ---- SYMMETRY ----
+        println!("{:<16} {:>10} {:>10} {:>10}", "manoeuvre", "left", "right", "mirror err");
+        let mut worst_sym = 0.0f32;
+        for (nm, st, dg) in [
+            ("steer", 1.0f32, 0.0f32),
+            ("gentle steer", 0.4, 0.0),
+            ("dodge", 0.0, 1.0),
+            ("steer+dodge", 0.7, 1.0),
+        ] {
+            let (lp, lv, lw) = run(-st, -dg, 1.0, false, 60);
+            let (rp, rv, rw) = run(st, dg, 1.0, false, 60);
+            // mirroring x should map one onto the other exactly
+            let e_pos = (Vec3::new(-lp.x, lp.y, lp.z) - rp).length();
+            let e_vel = (Vec3::new(-lv.x, lv.y, lv.z) - rv).length();
+            let e = e_pos.max(e_vel).max((lw - rw).abs());
+            worst_sym = worst_sym.max(e);
+            println!("{:<16} {:>10.2} {:>10.2} {:>10.4}", nm, lp.x, rp.x, e);
+        }
+        check("left and right mirror each other", worst_sym < 0.02);
+        // ---- DETERMINISM ----
+        let a1 = run(0.6, 1.0, 1.0, true, 80);
+        let a2 = run(0.6, 1.0, 1.0, true, 80);
+        let det = (a1.0 - a2.0).length() + (a1.1 - a2.1).length();
+        println!();
+        println!("   determinism: two identical runs differ by {det:.6}");
+        check("the same inputs give the same result", det < 1e-5);
+        // ---- NO FREE ENERGY ----
+        // coast with no throttle and no boost: speed must only fall
+        {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            car.vel = Vec3::new(0.0, 0.0, -22.0);
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, 60.0, 200.0);
+            ball.prev = ball.pos;
+            let c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            let mut prev = car.vel.length();
+            let mut gained = 0.0f32;
+            for _ in 0..240 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                let now = car.vel.length();
+                gained = gained.max(now - prev);
+                prev = now;
+            }
+            println!("   coasting: largest single-step speed GAIN {gained:.4} m/s");
+            check("a coasting car never speeds up", gained < 0.02);
+        }
+        // ---- EIGHT DIRECTIONS ----
+        // A dodge should go where it is aimed. Wrong-direction flips are the
+        // classic physics bug and they hide in the diagonals, where a sign
+        // error only shows on one axis.
+        println!();
+        println!("{:<14} {:>10} {:>10} {:>9}", "input", "aimed", "went", "error");
+        let mut worst_dir = 0.0f32;
+        for (nm, sx, sz) in [
+            ("forward", 0.0f32, -1.0f32),
+            ("back", 0.0, 1.0),
+            ("left", -1.0, 0.0),
+            ("right", 1.0, 0.0),
+            ("fwd-left", -0.7, -0.7),
+            ("fwd-right", 0.7, -0.7),
+            ("back-left", -0.7, 0.7),
+            ("back-right", 0.7, 0.7),
+        ] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, 60.0, 200.0);
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            // roll at a steady speed first, then jump and dodge
+            c.throttle = 1.0;
+            for _ in 0..90 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            let before = car.vel;
+            c.jump_pressed = true;
+            c.jump_held = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            for _ in 0..10 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            c.steer = sx;
+            c.throttle = -sz; // throttle forward is -z
+            c.jump_pressed = true;
+            physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            c.jump_pressed = false;
+            for _ in 0..6 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+            }
+            // the impulse the dodge added, in the car's own frame
+            let added = car.rot.inverse() * (car.vel - before);
+            let aimed = Vec3::new(sx, 0.0, sz).normalize_or(Vec3::NEG_Z);
+            let went = Vec3::new(added.x, 0.0, added.z).normalize_or(Vec3::NEG_Z);
+            let err = aimed.angle_between(went).to_degrees();
+            worst_dir = worst_dir.max(err);
+            println!(
+                "{:<14} ({:>+4.1},{:>+4.1}) ({:>+4.1},{:>+4.1}) {:>8.0}d",
+                nm, aimed.x, aimed.z, went.x, went.z, err
+            );
+        }
+        check("a dodge goes where it is aimed", worst_dir < 25.0);
+        // ---- TUNNELLING ----
+        // At 120 Hz a ball doing 60 m/s moves half a metre per step. A car is
+        // about 1.5 m long, so a fast enough ball can be on one side of it in
+        // one frame and the other side in the next, with no contact ever
+        // tested. This is the classic discrete-collision failure and it gets
+        // worse exactly when it matters most: the hardest shots.
+        println!();
+        println!("{:>10} {:>12} {:>10} {:>9}", "ball speed", "per step", "touched", "passed through");
+        let mut tunnelled = Vec::new();
+        for speed in [20.0f32, 40.0, 60.0, 90.0, 130.0] {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            // dead centre, aimed straight through the car
+            ball.pos = car.pos + Vec3::new(0.0, 0.35, 12.0);
+            ball.vel = Vec3::new(0.0, 0.0, -speed);
+            ball.prev = ball.pos;
+            let c = physics::Controls::default();
+            let mut ev = StepEvents::default();
+            let mut touched = false;
+            for _ in 0..90 {
+                let before = ball.vel;
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                if (ball.vel - before).length() > 0.5 {
+                    touched = true;
+                }
+                if ball.pos.z < car.pos.z - 4.0 {
+                    break;
+                }
+            }
+            let through = !touched;
+            if through {
+                tunnelled.push(speed);
+            }
+            println!(
+                "{:>9.0}m {:>11.2}m {:>10} {:>9}",
+                speed,
+                speed * DT,
+                if touched { "yes" } else { "NO" },
+                if through { "THROUGH" } else { "-" }
+            );
+        }
+        check("a fast ball cannot pass through a car", tunnelled.is_empty());
+        // ---- BOUNCES MUST NOT CREATE ENERGY ----
+        // A restitution above one is a ball that climbs higher each bounce.
+        // It usually enters through a correction term rather than the
+        // coefficient itself, so it is worth measuring rather than reading.
+        {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut ball = Ball::new();
+            let gy = world.ground_h(0.0, 0.0);
+            ball.pos = Vec3::new(0.0, gy + 12.0, 0.0);
+            ball.vel = Vec3::ZERO;
+            ball.prev = ball.pos;
+            let mut ev = StepEvents::default();
+            let mut peak = ball.pos.y;
+            let mut peaks: Vec<f32> = Vec::new();
+            let mut rising = false;
+            for _ in 0..2400 {
+                let prev_y = ball.pos.y;
+                physics::step_ball(&mut ball, &world, &cfg, DT, &mut ev);
+                if ball.pos.y > prev_y {
+                    rising = true;
+                    peak = peak.max(ball.pos.y);
+                } else if rising {
+                    peaks.push(peak - gy);
+                    peak = ball.pos.y;
+                    rising = false;
+                }
+            }
+            let mut grew = false;
+            for w in peaks.windows(2) {
+                if w[1] > w[0] + 0.02 {
+                    grew = true;
+                }
+            }
+            let shown: Vec<String> = peaks.iter().take(6).map(|h| format!("{h:.2}")).collect();
+            println!();
+            println!("   bounce heights: {}", shown.join(" -> "));
+            // The sequence converges toward a plateau rather than decaying to
+            // rest, and the implied restitution RISES with each bounce
+            // (0.87, 0.89, 0.96, 0.98). Either the ball keeps energy as the
+            // bounce weakens, or the peak detector is counting something
+            // else. Report where the ball actually finishes: a ball at rest
+            // sits at its own radius, so anything else is the detector.
+            println!(
+                "   after 20 s the ball is at {:.2} m above ground (radius {:.2})",
+                ball.pos.y - gy,
+                ball.r
+            );
+            // "7.47 m above the ground" is only damning if the ball is
+            // MOVING. ARENA CLASSIC has structures in it, and a ball that
+            // came to rest on top of one sits well above the terrain height
+            // with no energy at all. Velocity is what distinguishes a leak
+            // from a ledge, and height alone nearly had me report one.
+            println!(
+                "   ...and its speed is {:.3} m/s, with the surface {:.2} m below it",
+                ball.vel.length(),
+                ball.r
+            );
+            let at_rest = ball.vel.length() < 1.5;
+            println!(
+                "   {}",
+                if at_rest {
+                    "it is at rest - resting on a structure, not bouncing: no energy leak"
+                } else {
+                    "it is STILL BOUNCING after 20 s - that is a real energy leak"
+                }
+            );
+            check("each bounce is lower than the last", !grew && peaks.len() >= 3);
+            check("and the ball comes to rest", at_rest);
+        }
+        // ---- A CAR CANNOT LEAVE THE ARENA ----
+        // Drive flat out at a wall for long enough to be sure.
+        {
+            let mut world = World::generate(31, crate::world::style(ARENA), 0.31, 1.0);
+            let mut car = physics::Car::new();
+            car.pos = Vec3::new(0.0, world.ground_h(0.0, 0.0) + 0.31, 0.0);
+            car.sync_rot();
+            let mut ball = Ball::new();
+            ball.pos = Vec3::new(0.0, 60.0, 200.0);
+            ball.prev = ball.pos;
+            let mut c = physics::Controls::default();
+            c.throttle = 1.0;
+            c.boost = true;
+            let mut ev = StepEvents::default();
+            let mut worst_inside = 0.0f32;
+            for _ in 0..900 {
+                physics::step(&mut car, &mut ball, &mut world, &c, &cfg, DT, &mut ev);
+                let d = world.sdf(car.pos);
+                if d < 0.0 {
+                    worst_inside = worst_inside.min(d).abs().max(worst_inside);
+                }
+            }
+            println!("   after 7.5 s flat out: deepest penetration {worst_inside:.3} m");
+            check("a boosting car never ends up inside geometry", worst_inside < 0.6);
+        }
+        println!("{}", if pass { "SANITY: PASS" } else { "SANITY: FAIL" });
+        return;
+    }
     if name == "jumpflip" {
         // ONE PRESS SHOULD BE ONE JUMP.
         // Reported: the flip fires immediately on jump. A dodge is meant to

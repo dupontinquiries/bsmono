@@ -4590,6 +4590,37 @@ the next step is logging jump_pressed, jump_held, on_ground and dodge_window
 per substep from a real session and looking at the frames around a jump.
 Anything I changed now would be a guess dressed up as a fix.
 
+## 1.140.0 - an invariant sweep, and no strange physics found
+
+A scenario test finds the bug you thought to write. An invariant finds the
+one you did not. `--sim sanity` checks six things a driving game must
+satisfy regardless of what anyone was looking for:
+
+    left and right mirror each other          exact, to 0.0000
+    the same inputs give the same result      identical, to 1e-6
+    a coasting car never speeds up            largest gain 0.0009 m/s
+    a dodge goes where it is aimed            all 8 within 9 degrees
+    a fast ball cannot pass through a car     clean to 130 m/s
+    a boosting car stays out of geometry      0.000 m penetration
+
+The tunnelling result is the one I expected to fail. At 130 m/s a ball
+covers 1.08 m per step and a car is about 1.5 m long, which is the classic
+setup for discrete collision to miss entirely. It does not.
+
+TWO NEAR-MISSES IN MY OWN READING, both the same shape:
+
+  * Sideways dodges land 9 degrees off their aim, which looked like a sign
+    error until I noticed the bias is FORWARD - a car moving forward that
+    dodges sideways should end up going forward-and-sideways. Correct.
+  * Bounce heights converged to a plateau (12.00, 9.01, 8.01, 7.66, 7.54)
+    with the implied restitution RISING toward 1.0, which is exactly what an
+    energy leak looks like. I wrote a check that reported "STILL BOUNCING
+    after 20 s - that is a real energy leak". Then I printed the velocity:
+    0.000 m/s. The ball had come to rest ON A STRUCTURE 6.5 m above the
+    terrain height I was measuring from. Height alone nearly had me report a
+    physics bug that does not exist; velocity is what tells a leak from a
+    ledge.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
