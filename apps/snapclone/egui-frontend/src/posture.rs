@@ -119,13 +119,26 @@ pub struct PostureEngine {
     dim: f32,
     /// How long we have been still in Dim.
     still_ms: f32,
+    /// "Someone is looking at this screen", from the gaze layer.
+    ///
+    /// A VETO, never a trigger. It can keep a screen awake and can never dim
+    /// one, because the two errors are not symmetric: a false "looking" costs a
+    /// few seconds of backlight, while a false "not looking" blanks the screen
+    /// in someone's face — and that is the failure people actually notice.
+    ///
+    /// Proximity and stillness cannot tell reading from absence. Sitting still
+    /// with a long message open looks exactly like a phone nobody is using, so
+    /// the screensaver fires WHILE YOU ARE READING IT. This is the missing
+    /// signal for that, and it is the reason to run a gaze tracker at all on a
+    /// device most people will never point their eyes at.
+    watched: bool,
 }
 
 impl Default for PostureEngine {
     fn default() -> Self {
         PostureEngine {
             cfg: Config::default(), state: State::Normal, armed: false, in_call: false,
-            near: false, moving: false, dim: 0.0, still_ms: 0.0,
+            near: false, moving: false, dim: 0.0, still_ms: 0.0, watched: false,
         }
     }
 }
@@ -144,6 +157,19 @@ impl PostureEngine {
     }
 
     pub fn set_in_call(&mut self, in_call: bool) { self.in_call = in_call; }
+
+    /// Report whether the gaze layer currently sees someone looking.
+    ///
+    /// Wakes on the RISING edge only. Looking back at a dimmed screen should
+    /// restore it — that is the whole point — but a steady "yes" must not keep
+    /// re-waking and cancelling a dim the proximity sensor is legitimately
+    /// asking for, such as the phone being at your ear while you read nothing.
+    pub fn set_watched(&mut self, watched: bool) {
+        if watched && !self.watched { self.wake(); }
+        self.watched = watched;
+    }
+
+    pub fn watched(&self) -> bool { self.watched }
 
     /// Feed a source. Unavailable hardware reads as far + still, so the app
     /// behaves exactly as it would with no sensors at all.
@@ -210,6 +236,16 @@ impl PostureEngine {
         if !self.cfg.enabled || !self.armed {
             self.state = State::Normal;
             self.dim = 0.0;
+            return self.output();
+        }
+
+        // The veto. Someone reading is using the phone, whatever the proximity
+        // sensor and the accelerometer think.
+        if self.watched {
+            self.state = State::Normal;
+            self.still_ms = 0.0;
+            let step = dt_ms / self.fade_ms().max(1.0);
+            self.dim = (self.dim - step).max(0.0);
             return self.output();
         }
 
@@ -463,5 +499,79 @@ mod tests {
             let out = e.tick(1_000.0);
             assert!((0.0..=1.0).contains(&out.dim), "dim escaped: {}", out.dim);
         }
+    }
+}
+
+#[cfg(test)]
+mod attention_veto_tests {
+    use super::*;
+
+    fn armed() -> PostureEngine {
+        let mut e = PostureEngine::default();
+        e.set_armed(true);
+        e
+    }
+
+    #[test]
+    fn reading_a_long_message_does_not_get_the_screen_blanked() {
+        // The bug this exists for. Sitting still with a message open is
+        // indistinguishable from an unused phone to a proximity sensor and an
+        // accelerometer, so the screensaver fires while you are reading.
+        let mut e = armed();
+        e.set_proximity_near(true);
+        e.set_watched(true);
+        let out = e.tick(e.cfg.stillness_ms * 3.0);
+        assert_eq!(e.state(), State::Normal);
+        assert_eq!(out.dim, 0.0);
+        assert!(!out.screensaver);
+    }
+
+    #[test]
+    fn attention_can_keep_a_screen_awake_but_never_dim_one() {
+        // The asymmetry is the whole design: a false "looking" costs seconds of
+        // backlight, a false "not looking" blanks the screen in someone's face.
+        let mut e = armed();
+        e.set_watched(false);
+        // Not looking, and nothing else asking for a dim: still normal.
+        let out = e.tick(e.cfg.stillness_ms * 2.0);
+        assert_eq!(e.state(), State::Normal);
+        assert_eq!(out.dim, 0.0);
+    }
+
+    #[test]
+    fn looking_back_at_a_dimmed_screen_restores_it() {
+        let mut e = armed();
+        e.set_proximity_near(true);
+        for _ in 0..20 { e.tick(1_000.0); }
+        assert!(e.dim() > 0.0);
+        e.set_watched(true);
+        for _ in 0..20 { e.tick(200.0); }
+        assert_eq!(e.dim(), 0.0);
+        assert_eq!(e.state(), State::Normal);
+    }
+
+    #[test]
+    fn a_steady_look_does_not_keep_re_waking() {
+        // Rising edge only. A continuous "yes" that re-woke every frame would
+        // cancel a dim the proximity sensor is legitimately asking for.
+        let mut e = armed();
+        e.set_watched(true);
+        e.set_watched(true);
+        assert!(e.watched());
+        e.set_watched(false);
+        e.set_proximity_near(true);
+        e.tick(1_000.0);
+        assert_eq!(e.state(), State::Dim, "the dim proceeds once nobody is looking");
+    }
+
+    #[test]
+    fn a_phone_with_no_gaze_tracker_behaves_exactly_as_before() {
+        // The degradation contract again: never watched means the veto never
+        // fires, and posture is unchanged from before this existed.
+        let mut e = armed();
+        e.set_proximity_near(true);
+        e.tick(1_000.0);
+        e.tick(e.cfg.stillness_ms);
+        assert_eq!(e.state(), State::Screensaver);
     }
 }
