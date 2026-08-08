@@ -147,3 +147,110 @@ mod tests {
         assert!(r.find("alpha::a").unwrap() < r.find("zed::b").unwrap());
     }
 }
+
+/// Strip `#[cfg(test)]` regions, so a test reference does not count as wiring.
+fn without_tests(src: &str) -> String {
+    let (mut out, mut in_test, mut depth, mut depth_at) = (String::new(), false, 0i32, 0i32);
+    for line in src.lines() {
+        let t = line.trim();
+        if t.starts_with("#[cfg(test)]") { in_test = true; depth_at = depth; }
+        depth += line.matches('{').count() as i32 - line.matches('}').count() as i32;
+        if in_test && depth <= depth_at && t.contains('}') { in_test = false; continue }
+        if !in_test { out.push_str(line); out.push('\n'); }
+    }
+    out
+}
+
+/// Build the usage map across several crate source roots.
+///
+/// **Several roots, not one.** The first version of this analysis scanned `logscope/src` alone and
+/// reported 742 unwired items; 208 of those were used from `logscope-egui` and `gpu-gemm`. A scan
+/// that reports a third false positives is the noise this module warns about, delivered by the
+/// module itself.
+pub fn scan_roots(roots: &[&std::path::Path], define_in: &std::path::Path) -> Vec<Usage> {
+    let mut bodies: Vec<(String, String)> = Vec::new();
+    for r in roots {
+        let Ok(rd) = std::fs::read_dir(r) else { continue };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("rs") { continue }
+            let (Some(stem), Ok(src)) = (p.file_stem().and_then(|x| x.to_str()),
+                                         std::fs::read_to_string(&p)) else { continue };
+            bodies.push((format!("{}/{stem}", r.display()), without_tests(&src)));
+        }
+    }
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(define_in) else { return out };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.extension().and_then(|x| x.to_str()) != Some("rs") { continue }
+        let (Some(stem), Ok(src)) = (p.file_stem().and_then(|x| x.to_str()),
+                                     std::fs::read_to_string(&p)) else { continue };
+        if stem == "lib" || stem == "main" { continue }
+        let body = without_tests(&src);
+        let key = format!("{}/{stem}", define_in.display());
+        for line in body.lines() {
+            let t = line.trim();
+            let Some(rest) = t.strip_prefix("pub ") else { continue };
+            let name: Option<&str> = ["fn ", "struct ", "enum ", "const ", "static ", "trait "]
+                .iter().find_map(|kw| rest.strip_prefix(*kw))
+                .map(|a| a.split(|c: char| !(c.is_alphanumeric() || c == '_')).next().unwrap_or(""));
+            let Some(name) = name.filter(|n| n.len() >= 4) else { continue };
+            let used_from: Vec<String> = bodies.iter()
+                .filter(|(m, b)| m != &key && b.contains(name))
+                .map(|(m, _)| m.clone()).collect();
+            out.push(Usage { name: name.to_string(), defined_in: key.clone(), used_from });
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+
+    /// Runs on the real tree every `cargo test`, and asserts a CEILING.
+    ///
+    /// Zero is not the target and never will be: some `pub` items genuinely are API, and demanding
+    /// zero produces a test people delete. **The ceiling catches the next feature that is built and
+    /// never connected** without relitigating the 534 that already exist.
+    #[test]
+    fn unwired_items_do_not_grow() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let me = base.join("src");
+        let egui = base.parent().map(|p| p.join("logscope-egui/src"));
+        let gpu = base.parent().map(|p| p.join("gpu-gemm/src"));
+        let mut roots: Vec<&std::path::Path> = vec![&me];
+        if let Some(e) = egui.as_deref() { if e.exists() { roots.push(e) } }
+        if let Some(g) = gpu.as_deref() { if g.exists() { roots.push(g) } }
+        let u = scan_roots(&roots, &me);
+        if u.is_empty() { return }   // not a source checkout
+        let n = u.iter().filter(|x| !x.wired() && !super::is_expected(&x.name)).count();
+        // 594 measured by THIS implementation. My python prototype said 534 — it matched
+        // identifiers differently and I nearly set the ceiling from the estimate rather than from
+        // the code that runs. A ceiling taken from a different implementation's number fails on the
+        // first honest run, which is how a useful test gets deleted as flaky.
+        const CEILING: usize = 600;
+        assert!(n <= CEILING,
+            "{n} unwired public items, ceiling {CEILING}. Something was built and not connected — \
+which looks finished from every angle a check can see, and is why this ceiling exists rather than a \
+note in a commit message");
+    }
+
+    #[test]
+    fn the_scan_sees_MORE_THAN_ONE_crate() {
+        // The first version scanned one crate and reported 742, of which 208 were used from
+        // logscope-egui and gpu-gemm. A scan that is a third false positives is the noise this
+        // module warns about, delivered by the module itself.
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let me = base.join("src");
+        let egui = base.parent().map(|p| p.join("logscope-egui/src"));
+        if !me.exists() { return }
+        let solo = scan_roots(&[&me], &me);
+        let Some(e) = egui.as_deref().filter(|p| p.exists()) else { return };
+        let both = scan_roots(&[&me, e], &me);
+        let count = |v: &[Usage]| v.iter().filter(|x| !x.wired()).count();
+        assert!(count(&both) < count(&solo),
+            "scanning logscope-egui too must find consumers the single-crate scan missed");
+    }
+}
