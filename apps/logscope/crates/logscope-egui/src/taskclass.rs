@@ -135,10 +135,10 @@ pub fn classify(request: &str) -> TaskClass {
 /// so it remains greppable in the binary.
 pub fn posture_full(class: TaskClass) -> String {
     match posture(class) {
-        Some(p) => format!("{p}{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}"),
+        Some(p) => format!("{p}{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}{STATE_EXIT_CONDITIONS}"),
         // The core applies even when no class posture does — those failures are not class-specific,
         // and a one-shot request is exactly where "another outline" is cheapest to produce.
-        None => format!("{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}"),
+        None => format!("{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}{STATE_EXIT_CONDITIONS}"),
     }
 }
 
@@ -228,6 +228,37 @@ took in one line and act on it, so a wrong reading costs a sentence rather than 
 /// The priorities are about how to CHANGE an existing system. When there is no existing system, one
 /// through five have nothing to preserve, understand or minimally edit. Saying so is not weakening
 /// them; it is naming what they were always about.
+/// What a cognitive state must PRODUCE, not what it should be called.
+///
+/// # The failure this addresses
+///
+/// The prompt names eight states — RECONSTRUCT, MODEL, EXPLORE, CRITIQUE, SYNTHESIZE, IMPLEMENT,
+/// VERIFY, REFLECT — and says to move through them. **IMPLEMENT is sixth of eight.**
+///
+/// A capable model treats that as a checklist of thinking. A small one treats it as a checklist of
+/// HEADINGS, and an external review of this project caught exactly that: a transcript reciting
+/// "CRITIQUE" without finding a problem, and "let's implement character classes" followed by listing
+/// them again. Eight named stages before building is eight chances to emit stage-shaped text.
+///
+/// # Exit conditions, not stage names
+///
+/// The corrective is not fewer states — the states are good — it is that **each one exits on an
+/// artefact rather than on having been mentioned.** CRITIQUE ends when a named assumption has been
+/// attacked, not when the word appears. A state whose product is a paragraph about the state has not
+/// run.
+///
+/// And a state whose work is already done is SKIPPED. "Never camp in one" reads as "visit all
+/// eight", which for a two-line fix means six stages of ceremony before a one-line edit.
+pub const STATE_EXIT_CONDITIONS: &str = "\n\nTHE COGNITIVE STATES EXIT ON PRODUCTS, NOT ON BEING \
+NAMED. RECONSTRUCT ends when you can name the files involved; MODEL when the goal fits one line; \
+EXPLORE when you have two approaches that differ in more than wording; CRITIQUE when you have \
+attacked a SPECIFIC assumption and can say which fails; SYNTHESIZE when one path is chosen and the \
+others are rejected for stated reasons; IMPLEMENT when code exists; VERIFY when something was run. \
+Writing the name of a state is not entering it, and a paragraph about critiquing is not a critique. \
+SKIP any state whose work is already done \u{2014} a two-line fix does not need six stages before \
+the edit, and moving through them all when they are not needed is the ceremony this list exists to \
+replace.";
+
 pub const GREENFIELD_PRIORITY_OVERRIDE: &str = "\n\nPRIORITY SCOPE: the standing priority list \
 orders how to CHANGE an existing system, and 'new functionality' sits last there because a \
 maintenance task should not grow the system before it understands it. THIS TASK IS THE EXCEPTION \
@@ -539,7 +570,7 @@ pub fn posture_for(class: TaskClass, repo: RepoState) -> String {
         // The override goes FIRST, before the posture, because it is answering a rule that came
         // before both — and a contradiction resolved late reads as a hedge rather than a scope.
         return format!("{GREENFIELD_PRIORITY_OVERRIDE}{GREENFIELD_BUILD_POSTURE}{UNIVERSAL_CORE}\
-{BUILD_BIAS}{TERSENESS_BIAS}");
+{BUILD_BIAS}{TERSENESS_BIAS}{STATE_EXIT_CONDITIONS}");
     }
     posture_full(class)
 }
@@ -763,6 +794,57 @@ mod priority_conflict_tests {
         // The override replaces nothing — it adds the missing one.
         let p = posture_for(classify("build a game"), RepoState::Empty);
         for m in ["An outline is not a step", "WHEN IN DOUBT, BUILD", "COMPRESSED, NOT PRECISE"] {
+            assert!(p.contains(m), "lost {m}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod state_exit_tests {
+    use super::*;
+
+    /// The prompt names eight states and IMPLEMENT is sixth. An external review of this project
+    /// caught a transcript reciting "CRITIQUE" without finding a problem — eight named stages before
+    /// building is eight chances to emit stage-shaped text instead of work.
+    #[test]
+    fn every_posture_carries_the_exit_conditions() {
+        for r in ["write a game", "fix the parser", "what does this do"] {
+            assert!(posture_full(classify(r)).contains("EXIT ON PRODUCTS"), "{r}");
+        }
+    }
+
+    #[test]
+    fn it_says_naming_a_state_is_not_ENTERING_it() {
+        // The specific failure: "let's implement character classes" followed by listing them again.
+        assert!(STATE_EXIT_CONDITIONS.contains("Writing the name of a state is not entering it"));
+        assert!(STATE_EXIT_CONDITIONS.contains("a paragraph about critiquing is not a critique"));
+    }
+
+    #[test]
+    fn each_state_gets_a_CHECKABLE_product() {
+        // "Ends when you can name the files" is verifiable. "Ends when you understand the
+        // architecture" is not, and an unverifiable exit condition is a stage name with extra words.
+        for phrase in ["name the files involved", "fits one line", "differ in more than wording",
+                       "attacked a SPECIFIC assumption", "code exists", "something was run"] {
+            assert!(STATE_EXIT_CONDITIONS.contains(phrase), "missing product: {phrase}");
+        }
+    }
+
+    #[test]
+    fn a_state_whose_work_is_DONE_may_be_skipped() {
+        // "Never camp in one" reads as "visit all eight", which for a two-line fix is six stages of
+        // ceremony before a one-line edit.
+        assert!(STATE_EXIT_CONDITIONS.contains("SKIP any state whose work is already done"));
+        assert!(STATE_EXIT_CONDITIONS.contains("a two-line fix does not need six stages"));
+    }
+
+    #[test]
+    fn all_five_layers_coexist_on_a_greenfield_task() {
+        // priorities, posture, core, build, terseness, states — six pieces pulling in different
+        // directions and none may cancel another.
+        let p = posture_for(classify("write a rust tui game"), RepoState::Empty);
+        for m in ["PRIORITY SCOPE", "NEW BUILD", "An outline is not a step",
+                  "WHEN IN DOUBT, BUILD", "COMPRESSED, NOT PRECISE", "EXIT ON PRODUCTS"] {
             assert!(p.contains(m), "lost {m}");
         }
     }
