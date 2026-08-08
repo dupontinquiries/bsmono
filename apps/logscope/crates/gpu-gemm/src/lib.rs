@@ -3463,6 +3463,19 @@ impl Gpu {
         let mut fr = self.frame.lock().unwrap();
         if let Some(frame) = fr.as_mut() {
             {
+                // ONE PASS PER DISPATCH is what makes `passes` 97% of submits on a dense model
+                // after the frame leaks were fixed. WebGPU inserts memory barriers between
+                // dispatches WITHIN a pass, so consecutive dispatches may legally share one — and
+                // llama.cpp's Vulkan backend does exactly that, recording a whole graph into one
+                // command buffer.
+                //
+                // Behind a flag and OFF by default, because this driver already departs from the
+                // WGSL spec in four measured ways (lane-varying shifts, division, round() ties, FMA
+                // contraction). Assuming its inter-dispatch barriers are correct on the strength of
+                // the spec would be the fifth assumption, and the failure mode is wrong weights
+                // rather than a crash.
+                //
+                // `--gate-passfuse` compares fused against unfused output before this is trusted.
                 let mut pass = frame.enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: None, timestamp_writes: None });
                 pass.set_pipeline(pipeline); pass.set_bind_group(0, bg.as_ref(), &[]);
                 pass.dispatch_workgroups(wg.0, wg.1, wg.2);

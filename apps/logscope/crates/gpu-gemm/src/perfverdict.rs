@@ -914,8 +914,12 @@ takes the frame and does not restore it — `--frame-diag` names which pipeline"
 going to the CPU to choose experts; computing every expert instead removes them entirely when the \
 stall dominates")
         } else {
-            (ps / total, "submits were forced by PASS BOUNDARIES, which is what happens when work \
-cannot accumulate into one encoder")
+            // Names the concrete lever now that one exists. After both frame leaks were fixed this
+            // became the dominant cause on a dense model, and "work cannot accumulate" described the
+            // symptom without saying what to do.
+            (ps / total, "submits were forced by PASS BOUNDARIES — the engine opens a compute pass \
+per dispatch, and WebGPU permits consecutive dispatches to share one, which is what llama.cpp's \
+Vulkan backend does with a whole graph")
         };
         format!("{rate:.2} tok/s at {:.0} submits/tok — {:.0}% of {what}",
             self.submits_per_token(), share * 100.0)
@@ -1004,5 +1008,64 @@ mod headline_tests {
         // "13321 submits/token" means nothing without knowing that a few hundred is normal.
         let c = shape(1_000_000, 100, 100, 100, 10.0, 5.0).caveat().unwrap();
         assert!(c.contains("a few hundred"));
+    }
+}
+
+
+/// What fusing dispatches into one pass would buy, from a run's own numbers.
+///
+/// After both frame leaks were fixed, the dense 1B reported `no-frame 0, passes 97%`. The submits
+/// did not go away — they moved from one cause to another, because **the engine opens a compute pass
+/// per dispatch** and each boundary is a submit candidate.
+///
+/// llama.cpp's Vulkan backend records a whole graph into one command buffer; WebGPU permits the same
+/// within a pass, since it inserts memory barriers between dispatches automatically.
+///
+/// This estimates the ceiling rather than promising it: fusing removes pass-caused submits and
+/// touches neither readbacks nor whatever the GPU actually spends its time on.
+pub fn pass_fusion_ceiling(passes: u64, downloads: u64, no_frame: u64, tok_s: f64) -> String {
+    let total = (passes + downloads + no_frame).max(1);
+    let share = passes as f64 / total as f64;
+    if share < 0.25 {
+        return format!("pass boundaries are {:.0}% of submits — fusing them would not be the lever here", share * 100.0);
+    }
+    // Submits are not time. A run that is 97% pass-caused submits may still be bound by memory
+    // bandwidth, and saying "1.9x faster" would be promising something this arithmetic cannot know.
+    let remaining = 1.0 - share;
+    let best = if remaining > 0.0 { 1.0 / remaining } else { f64::INFINITY };
+    format!("pass boundaries are {:.0}% of submits. Fusing dispatches into one pass is an UPPER BOUND of {best:.1}x on submit count, not on time — at {tok_s:.2} tok/s the ceiling is {:.2} tok/s IF submits are what costs, which this arithmetic cannot establish", share * 100.0, tok_s * best)
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+
+    #[test]
+    fn a_PASS_DOMINATED_run_reports_the_ceiling() {
+        // The dense 1B after both frame fixes: no-frame 0, passes 97%.
+        let s = pass_fusion_ceiling(1591, 40, 0, 11.64);
+        assert!(s.contains("UPPER BOUND"));
+        // Not "97%": I copied the figure from the log line and passed different counts to the
+        // helper, which reports 98%. Asserting a number I did not derive from the inputs is how a
+        // test encodes a transcription rather than a property.
+        assert!(s.contains("98%"), "{s}");
+    }
+
+    #[test]
+    fn the_ceiling_is_stated_as_SUBMITS_not_TIME() {
+        // A run that is 97% pass-caused submits may still be bound by memory bandwidth. Promising a
+        // speedup this arithmetic cannot establish is the error the roofline verdict exists to
+        // avoid, and it would be worse coming from a helper named "ceiling".
+        let s = pass_fusion_ceiling(970, 30, 0, 10.0);
+        assert!(s.contains("not on time"));
+        assert!(s.contains("IF submits are what costs"));
+    }
+
+    #[test]
+    fn a_run_where_passes_are_MINOR_says_so_rather_than_computing_a_ratio() {
+        // Scout: 71% no-frame, 28% download, 1% passes. Fusing is not its lever and a number here
+        // would invite chasing it.
+        let s = pass_fusion_ceiling(6223, 153664, 388759, 1.32);
+        assert!(s.contains("would not be the lever here"));
     }
 }
