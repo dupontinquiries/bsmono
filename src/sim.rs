@@ -4113,7 +4113,7 @@ pub fn run(args: &[String]) {
         {
             println!();
             println!("{:<14} {:>8} {:>9} {:>9} {:>9} {:>9}", "map", "drawn", "sub-px", "<4px", "far half", "tris");
-            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 24), ("CHAMBER", 30)] {
                 let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
                 let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
                 // a 1080p-ish frame at 86 degrees: radians per pixel
@@ -4159,7 +4159,7 @@ pub fn run(args: &[String]) {
             // rule did not
             println!();
             println!("{:<14} {:>12} {:>12} {:>10}", "map", "distance", "size", "both");
-            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 24), ("CHAMBER", 30)] {
                 let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
                 let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
                 let px = (86.0f32.to_radians()) / 1920.0;
@@ -4272,7 +4272,7 @@ pub fn run(args: &[String]) {
         {
             println!();
             println!("{:<14} {:>8} {:>9} {:>9} {:>9} {:>9}", "map", "drawn", "sub-px", "<4px", "far half", "tris");
-            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 24), ("CHAMBER", 30)] {
                 let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
                 let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
                 // a 1080p-ish frame at 86 degrees: radians per pixel
@@ -4318,7 +4318,7 @@ pub fn run(args: &[String]) {
             // rule did not
             println!();
             println!("{:<14} {:>12} {:>12} {:>10}", "map", "distance", "size", "both");
-            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 8), ("CHAMBER", 30)] {
+            for (name, style_id) in [("ARENA CLASSIC", 0usize), ("PERPLEXUS", 21), ("MONKEY RUN", 24), ("CHAMBER", 30)] {
                 let w = World::generate(9, crate::world::style(style_id), 0.31, 1.0);
                 let eye = Vec3::new(0.0, w.ground_h(0.0, 0.0) + 6.0, 46.0);
                 let px = (86.0f32.to_radians()) / 1920.0;
@@ -4372,7 +4372,7 @@ pub fn run(args: &[String]) {
             for (name, style_id) in [
                 ("ARENA CLASSIC", 0usize),
                 ("PERPLEXUS", 21),
-                ("MONKEY RUN", 8),
+                ("MONKEY RUN", 24),
                 ("DROPSHOT", 3),
                 ("CHAMBER", 30),
             ] {

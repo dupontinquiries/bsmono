@@ -4452,6 +4452,40 @@ DIRECTION can now be struck off alongside its shape and overlap.
 What remains unexamined is what that note already suspected: the harness's
 own fall-out rule and its spawn, rather than the map.
 
+## 1.136.0 — five probes were measuring the wrong map
+
+Chasing the Monkey Run route failure into the harness turned up something
+else: the drive test uses style 24 for MONKEY RUN, while five of my render
+probes used style 8. One of them was wrong.
+
+Style 8 is LIGHTHOUSE. Style 24 is MONKEY RUN. The drive harness was right
+all along; the probes I added over the last several versions — overdraw,
+car LOD, cell occupancy, LOD comparison, proportions — have been measuring
+LIGHTHOUSE and printing "MONKEY RUN" over the top of it.
+
+The numbers were real, just attributed to the wrong map, and the correction
+is not small. Monkey Run has 503 shapes where the mislabelled figure said
+182: it is the DENSEST map in the game, not one of the sparsest, and it is
+busier than PERPLEXUS.
+
+    map            shapes   mean/cell   max/cell   truncated
+    ARENA CLASSIC     278      0.3         14        0
+    PERPLEXUS         333      0.8         71        0
+    MONKEY RUN        503      1.0         36        0   (was reading 182)
+    DROPSHOT          262      0.3         15        0
+    CHAMBER            62      0.1          8        0
+
+I first read the style table backwards and nearly "fixed" the drive harness
+to match my probes, which would have broken the one measurement that was
+correct. The list itself settled it: four other tables in the same file
+already used 24.
+
+The Monkey Run route failure is still unexplained — the drive harness was
+never testing the wrong map, so this is not its cause either. But every
+conclusion drawn about Monkey Run's shape count, overdraw and LOD headroom
+over the last several versions was drawn from a different map, and those are
+worth revisiting now they point at the right one.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay
