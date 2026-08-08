@@ -39,6 +39,11 @@ pub struct SwipeState {
     pub raw: String,
     recognizer: GestureRecognizer,
     start_ms: f64,
+    /// Predictive magnetism for the NEXT key, from the previous tick's
+    /// candidates. See `crate::nudge` — the pull is deliberately computed from
+    /// the UNNUDGED decode so this tick's nudges cannot influence the
+    /// candidates that produced them.
+    pub nudges: crate::nudge::Nudges,
 }
 
 impl Default for SwipeState {
@@ -56,6 +61,7 @@ impl SwipeState {
             raw: String::new(),
             recognizer: GestureRecognizer::new(),
             start_ms: 0.0,
+            nudges: Default::default(),
         }
     }
 
@@ -554,5 +560,57 @@ mod trail_style_tests {
         let acc = Color32::from_rgb(10, 200, 120);
         assert_eq!(TrailStyle::Dotted.color(acc), acc);
         assert_eq!(TrailStyle::Striped.color(acc), acc);
+    }
+}
+
+impl SwipeState {
+    /// Refresh the predictive pull from the current candidate list.
+    ///
+    /// Called between ticks rather than inside the decode, which is what keeps
+    /// the feedback loop open: the candidates feeding this were produced by a
+    /// decode that had not yet seen these nudges.
+    pub fn refresh_nudges(&mut self, consumed: usize) {
+        let cands: Vec<(String, f64)> = self.candidates.iter()
+            .map(|c| (c.word.clone(), c.score as f64))
+            .collect();
+        self.nudges.update_from_candidates(&cands, consumed);
+    }
+
+    /// Reset the pull. Called when a swipe ends, so the previous word's
+    /// predictions cannot bias the next word's first key.
+    pub fn clear_nudges(&mut self) { self.nudges.clear(); }
+}
+
+#[cfg(test)]
+mod nudge_wiring_tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_swipe_state_has_no_pull() {
+        // Neutral until candidates exist: the first key of a swipe has nothing
+        // to predict from and must decode exactly as it would with the feature
+        // off.
+        let s = SwipeState::new();
+        assert!(s.nudges.is_empty());
+        assert_eq!(s.nudges.nudge_for("r"), 1.0);
+    }
+
+    #[test]
+    fn clearing_between_swipes_removes_the_previous_words_bias() {
+        let mut s = SwipeState::new();
+        s.candidates = vec![WordCandidate { word: "store".into(), score: 1.0 }];
+        s.refresh_nudges(3);
+        assert!(!s.nudges.is_empty());
+        s.clear_nudges();
+        assert!(s.nudges.is_empty());
+    }
+
+    #[test]
+    fn no_candidates_means_no_pull_rather_than_a_default_guess() {
+        // An empty candidate list is "we do not know", and inventing a pull
+        // from nothing would bias the decode toward whatever key sorted first.
+        let mut s = SwipeState::new();
+        s.refresh_nudges(0);
+        assert!(s.nudges.is_empty());
     }
 }
