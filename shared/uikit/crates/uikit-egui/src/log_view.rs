@@ -107,3 +107,167 @@ mod tests {
         assert_eq!(LogLevel::parse("chatter"), LogLevel::Info); // unknown → info
     }
 }
+
+/// Classify a line of build/tool output.
+///
+/// Exists because the obvious version is wrong in a way that shows up
+/// constantly and reads as a broken build:
+///
+/// ```text
+///     Compiling thiserror v2.0.12
+/// ```
+///
+/// `line.contains("error")` matches that, so a successful compile of a
+/// perfectly ordinary dependency renders in red. The same trap catches
+/// `anyhow`'s `Error` re-exports, any crate with `fail` in its name, and
+/// `--warnings` in a command echo.
+///
+/// The fix is to classify on the SHAPE of a diagnostic rather than the presence
+/// of a scary word. cargo and rustc emit diagnostics at the start of a line as
+/// `error:`, `error[E0308]:`, `warning:` — a prefix, with punctuation. Progress
+/// lines are indented and start with a verb: `Compiling`, `Finished`, `Running`.
+///
+/// Being wrong in the safe direction matters here too: a real error shown as
+/// Debug is missed, so anything that genuinely looks like a diagnostic prefix is
+/// taken at face value even in an unexpected position.
+pub fn classify_line(line: &str) -> LogLevel {
+    let t = line.trim_start();
+
+    // Progress lines first. cargo indents these and leads with a capitalised
+    // verb, and none of them is a diagnostic however the crate is named.
+    for verb in ["Compiling", "Checking", "Downloading", "Downloaded",
+                 "Installing", "Updating", "Fresh", "Building", "Running",
+                 "Documenting", "Packaging", "Uploading", "Blocking"] {
+        if t.starts_with(verb) { return LogLevel::Debug; }
+    }
+    if t.starts_with("Finished") { return LogLevel::Info; }
+
+    // A diagnostic is a prefix with punctuation: `error:`, `error[E0308]:`,
+    // `warning:`. The bracket form has to be handled explicitly or every
+    // rustc error code line falls through.
+    let lower = t.to_ascii_lowercase();
+    let diag = |kind: &str| {
+        lower.starts_with(&format!("{kind}:"))
+            || lower.starts_with(&format!("{kind}[")) && lower.contains("]:")
+    };
+    if diag("error") { return LogLevel::Error; }
+    if diag("warning") { return LogLevel::Warn; }
+
+    // Test harness and script conventions, anchored rather than searched.
+    if t.starts_with('✗') || lower.starts_with("failed") || lower.starts_with("fatal") {
+        return LogLevel::Error;
+    }
+    if lower.starts_with("test result: failed") { return LogLevel::Error; }
+    if t.starts_with('✓') || lower.starts_with("test result: ok")
+        || lower.starts_with("success") {
+        return LogLevel::Info;
+    }
+    LogLevel::Debug
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::*;
+
+    #[test]
+    fn compiling_thiserror_is_not_an_error() {
+        // THE reported bug. `contains("error")` matches this line, so a
+        // successful compile of an ordinary dependency rendered in red.
+        assert_eq!(classify_line("   Compiling thiserror v2.0.12"), LogLevel::Debug);
+        assert_eq!(classify_line("   Compiling anyhow v1.0.86"), LogLevel::Debug);
+    }
+
+    #[test]
+    fn crates_with_scary_names_are_still_progress_lines() {
+        // The same trap catches anything named for what it handles: error
+        // types, failure types, warning lints, debug helpers.
+        for line in ["   Compiling error-chain v0.12.4",
+                     "   Compiling failure v0.1.8",
+                     "   Compiling debug-ignore v1.0.5",
+                     "   Compiling warnings-are-errors v0.1.0",
+                     "   Checking thiserror-impl v2.0.12",
+                     "   Downloading fail v0.5.1"] {
+            assert_eq!(classify_line(line), LogLevel::Debug, "{line}");
+        }
+    }
+
+    #[test]
+    fn a_real_diagnostic_is_still_an_error() {
+        // Fixing the false positive must not create a false negative — a
+        // missed error is worse than a mislabelled progress line.
+        assert_eq!(classify_line("error: could not compile `foo`"), LogLevel::Error);
+        assert_eq!(classify_line("error[E0308]: mismatched types"), LogLevel::Error);
+        assert_eq!(classify_line("warning: unused variable: `x`"), LogLevel::Warn);
+    }
+
+    #[test]
+    fn the_rustc_error_code_form_is_handled_explicitly() {
+        // Without the bracket case every coded error falls through to Debug,
+        // which is precisely the errors that matter most.
+        assert_eq!(classify_line("error[E0433]: failed to resolve"), LogLevel::Error);
+        assert_eq!(classify_line("warning[unused_imports]: unused import"),
+                   LogLevel::Warn);
+    }
+
+    #[test]
+    fn indentation_does_not_hide_a_diagnostic() {
+        // cargo indents nested output, and an error inside a sub-build is still
+        // an error.
+        assert_eq!(classify_line("    error: linking with `cc` failed"),
+                   LogLevel::Error);
+    }
+
+    #[test]
+    fn finished_is_success_and_compiling_is_progress() {
+        // Distinguished because one is worth colouring and the other is noise
+        // — a log where every line is Info tells you nothing.
+        assert_eq!(classify_line("    Finished `dev` profile [unoptimized]"),
+                   LogLevel::Info);
+        assert_eq!(classify_line("   Compiling serde v1.0.203"), LogLevel::Debug);
+    }
+
+    #[test]
+    fn a_command_echo_mentioning_warnings_is_not_a_warning() {
+        // `cargo build -- -D warnings` in a log header would otherwise paint
+        // the whole run yellow before it started.
+        assert_eq!(classify_line("$ cargo build -- -D warnings"), LogLevel::Debug);
+        assert_eq!(classify_line("RUSTFLAGS='-D warnings' cargo test"), LogLevel::Debug);
+    }
+
+    #[test]
+    fn a_path_containing_error_is_not_an_error() {
+        // Paths are the other place these words appear constantly.
+        assert_eq!(classify_line("     Running `target/debug/error_demo`"),
+                   LogLevel::Debug);
+        assert_eq!(classify_line("   Compiling foo (/src/errors)"), LogLevel::Debug);
+    }
+
+    #[test]
+    fn test_results_are_classified_by_outcome() {
+        assert_eq!(classify_line("test result: ok. 42 passed; 0 failed"), LogLevel::Info);
+        assert_eq!(classify_line("test result: FAILED. 1 passed; 2 failed"),
+                   LogLevel::Error);
+    }
+
+    #[test]
+    fn a_passing_test_line_mentioning_failed_is_not_an_error() {
+        // "0 failed" appears in every successful run, and matching on the word
+        // alone turns every green suite red.
+        assert_eq!(classify_line("test result: ok. 676 passed; 0 failed; 0 ignored"),
+                   LogLevel::Info);
+    }
+
+    #[test]
+    fn tick_and_cross_conventions_are_anchored_to_the_start() {
+        // A cross INSIDE a message is content, not a verdict.
+        assert_eq!(classify_line("✗ push rejected"), LogLevel::Error);
+        assert_eq!(classify_line("✓ pushed 3 refs"), LogLevel::Info);
+        assert_eq!(classify_line("renamed a✗b to c"), LogLevel::Debug);
+    }
+
+    #[test]
+    fn an_empty_line_is_harmless() {
+        assert_eq!(classify_line(""), LogLevel::Debug);
+        assert_eq!(classify_line("    "), LogLevel::Debug);
+    }
+}
