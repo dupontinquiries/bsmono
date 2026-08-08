@@ -1172,10 +1172,19 @@ was evicted)", prompt_ids.len())
             }
             eprintln!("[{}] {attr}", gpu_kernels::stamp());
             crate::diag::note(&attr);
-            let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
+            let vv0 = 0u64; // baseline is per-process; the subtraction keeps the shape of the others
+                    let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
             if bgh + bgm > 0 {
-                eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} lookups ({:.0}% reused, {:.0}/tok saved) [LOGSCOPE_BG_CACHE]",
-                    self.name, bgh + bgm, 100.0 * bgh as f64 / (bgh + bgm).max(1) as f64, bgh as f64 / per);
+                // SPLIT OUT THE UNCACHEABLE LOOKUPS. A dispatch whose input carries a non-zero view is a
+                    // KV slice, and its key CAN NEVER REPEAT — counting those as misses makes a working
+                    // cache read as 13% and invites optimising what is not broken. lib.rs says so at the
+                    // increment site, and the counter it increments was never read by anything.
+                    let vv = gpu_kernels::BG_VIEW_VARYING.load(AOrd::Relaxed).saturating_sub(vv0);
+                    let cacheable = (bgh + bgm).saturating_sub(vv);
+                    eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} cacheable lookups \
+({:.0}% reused, {:.0}/tok saved); {vv} uncacheable (KV slices, keys that cannot repeat) [LOGSCOPE_BG_CACHE]",
+                        self.name, cacheable,
+                        100.0 * bgh as f64 / cacheable.max(1) as f64, bgh as f64 / per);
             }
             // Adapt passes-per-submit: feed this turn's per-token decode time to the tuner, which sweeps
             // SUBMIT_PROFILES across replies and settles on the fastest, then caches it. Bit-exact across
