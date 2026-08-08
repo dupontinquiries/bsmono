@@ -124,6 +124,17 @@ runtime = "tbd"
 targets = ["desktop"]
 notes = "git-graph tool (gin); peek dedup DONE — GUI consumes tools/peek lib; marked broken upstream"
 
+[apps.aperture]
+path = "apps/aperture"
+kind = "cargo"
+role = "app"
+daemon = false
+flatpak = false
+runtime = "none"          # pure egui/glow (wayland/x11), same as the other egui apps
+targets = ["desktop"]
+primary = true            # no non-egui sibling; this IS the editor
+notes = "code editor (aperture): rope core with invertible-Op undo (studio's edit-as-a-value pattern), line-lexer syntax behind a swappable seam (tree-sitter deferred), ghost-text AI completion via a worker Engine (newest-request-wins) with ollama FIM / subprocess / offline-demo providers, all steerable live from the loop pane (F2). Shell is uikit-egui: motion Smooth camera (scroll+caret+zoom one primitive), fuzzy Ctrl+P palette, all 14 snapclone palettes drive syntax colors through theme_bridge. `cargo build --release` in apps/aperture gives the bin; NOTE egui 0.34 declares MSRV rustc 1.92 — on older toolchains build with --ignore-rust-version (compiles clean on 1.91, the floor is policy not syntax; see apps/aperture/DESIGN.md)."
+
 [apps.logscope]
 path = "apps/logscope"
 kind = "cargo"

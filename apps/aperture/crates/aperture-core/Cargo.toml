@@ -1,0 +1,13 @@
+[package]
+name = "aperture-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "aperture's headless editor core: a rope buffer, every edit as a serializable invertible Op (studio's pattern applied to text — undo, macros and future collab are one mechanism), cursor/selection with sticky columns, and the LineLexer syntax seam with an incremental state cache. No egui, no I/O beyond load/save."
+
+# ONE external dependency, looked at hard (the fan rule): ropey. A rope is what
+# makes edits O(log n) in a 100 MB file instead of O(n) — the difference between
+# "lightning fast" being a claim and a property. Pure Rust, no transitive deps
+# beyond smallvec/str_indices, cross-compiles clean to aarch64/musl.
+[dependencies]
+ropey = "1.6"
