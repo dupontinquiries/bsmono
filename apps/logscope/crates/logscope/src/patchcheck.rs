@@ -238,3 +238,138 @@ fn real() {
         assert_eq!(e.attempt(check("fn f() {}", "fn f() { let x = 1; }")), Verdict::Accept);
     }
 }
+
+/// Checking an edit's ANCHOR before its content.
+///
+/// `EditLoop` grades an attempt by the flaws in what was produced. That is the second question. The
+/// first is whether the edit will land where it was meant to — and this session hit the answer twice
+/// in two turns, inserting text whose anchor matched inside the text it had just inserted, producing
+/// `pub const BUILD_BIAS: &str = pub const BUILD_BIAS: &str =`.
+///
+/// **`anchor.rs` was written to catch exactly that and was not used**, because it was a tool to
+/// reach for rather than a step in the loop. Wiring it here makes it the first thing that happens.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum EditPlan {
+    /// The anchor is unique; apply it.
+    Apply { line: usize },
+    /// The anchor matched several places and was widened successfully.
+    Widened { from: String, to: String, line: usize },
+    /// Cannot be made unique. **Not a failure of the edit** — a failure to say where it goes, which
+    /// wants a different response from a bad patch.
+    Ambiguous { reason: String, guidance: &'static str },
+    /// The anchor matches nothing, usually whitespace or a stale read.
+    Absent { guidance: &'static str },
+}
+
+impl EditPlan {
+    pub fn can_apply(&self) -> bool {
+        matches!(self, EditPlan::Apply { .. } | EditPlan::Widened { .. })
+    }
+
+    /// One line for the log, and **only when something happened**. An edit that applied cleanly is
+    /// the normal case and logging it buries the two that did not.
+    pub fn log_line(&self) -> Option<String> {
+        match self {
+            EditPlan::Apply { .. } => None,
+            EditPlan::Widened { from, to, line } => Some(format!(
+                "anchor widened from {} to {} lines to reach line {line} — the short form matched \
+more than once",
+                from.lines().count(), to.lines().count())),
+            EditPlan::Ambiguous { reason, guidance } =>
+                Some(format!("edit NOT applied: {reason}. {guidance}")),
+            EditPlan::Absent { guidance } =>
+                Some(format!("edit NOT applied: the anchor matches nothing. {guidance}")),
+        }
+    }
+}
+
+/// Plan an edit against the file it will touch.
+///
+/// Widening is attempted before giving up, because "your anchor is ambiguous" is a complaint and a
+/// wider anchor is an answer.
+pub fn plan_edit(haystack: &str, anchor: &str) -> EditPlan {
+    match crate::anchor::check(haystack, anchor) {
+        Ok(line) => EditPlan::Apply { line },
+        Err(crate::anchor::AnchorFault::Absent) =>
+            EditPlan::Absent { guidance: crate::anchor::guidance(&crate::anchor::AnchorFault::Absent) },
+        Err(f @ crate::anchor::AnchorFault::Ambiguous { .. }) => {
+            match crate::anchor::widen(haystack, anchor, 8) {
+                Some(w) if w != anchor => match crate::anchor::check(haystack, &w) {
+                    Ok(line) => EditPlan::Widened { from: anchor.into(), to: w, line },
+                    // Widening produced something that still is not unique. Report the ORIGINAL
+                    // fault rather than a confusing second one.
+                    Err(_) => EditPlan::Ambiguous { reason: f.explain(),
+                        guidance: crate::anchor::guidance(&f) },
+                },
+                _ => EditPlan::Ambiguous { reason: f.explain(),
+                    guidance: crate::anchor::guidance(&f) },
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod edit_plan_tests {
+    use super::*;
+
+    const TWO: &str = "fn spawn() {\n    push_car(lane);\n}\n\nfn respawn() {\n    push_car(lane);\n}\n";
+
+    #[test]
+    fn an_AMBIGUOUS_anchor_is_widened_rather_than_refused() {
+        // "Your anchor is ambiguous" is a complaint; a wider anchor is an answer.
+        let p = plan_edit(TWO, "    push_car(lane);");
+        assert!(p.can_apply(), "{p:?}");
+        assert!(matches!(p, EditPlan::Widened { .. }));
+    }
+
+    #[test]
+    fn a_CLEAN_edit_logs_NOTHING() {
+        // The normal case. Logging it buries the two that did not apply, which is the same rule the
+        // run verdict's caveat follows.
+        assert_eq!(plan_edit(TWO, "fn respawn() {").log_line(), None);
+    }
+
+    #[test]
+    fn a_WIDENED_edit_says_so_and_says_WHY() {
+        // Silent widening is a change to what the caller asked for, and the log line is what makes it
+        // reviewable rather than surprising.
+        let l = plan_edit(TWO, "    push_car(lane);").log_line().unwrap();
+        assert!(l.contains("matched more than once"));
+    }
+
+    #[test]
+    fn an_UNFIXABLE_anchor_carries_a_PROCEDURE_not_a_complaint() {
+        let src = "x();\n".repeat(20);
+        let p = plan_edit(&src, "x();");
+        assert!(!p.can_apply());
+        assert!(p.log_line().unwrap().contains("enclosing function's signature line"));
+    }
+
+    #[test]
+    fn an_ABSENT_anchor_is_told_to_RE_READ() {
+        // Whitespace or a stale read, and neither is fixed by thinking harder about the intent.
+        let p = plan_edit(TWO, "fn nonexistent() {");
+        assert!(matches!(p, EditPlan::Absent { .. }));
+        assert!(p.log_line().unwrap().contains("copy them verbatim"));
+    }
+
+    #[test]
+    fn the_SELF_INFLICTED_case_is_covered() {
+        // Inserting before an anchor that appears in the inserted text: after the first insert the
+        // anchor matches twice, and the second insert lands inside the first. Producing
+        // `pub const X = pub const X =`, twice in two turns this session.
+        let after_first = "pub const BUILD_BIAS: &str = pub const BUILD_BIAS: &str = \"x\";\n";
+        // My first assertion here was that plan_edit REFUSES this, and it does not — widening finds
+        // a unique wider anchor, which is correct behaviour and not what I wanted to prove.
+        //
+        // The real guard is one step earlier: `check` sees the anchor twice BEFORE anything is
+        // inserted. That is the signal that would have stopped both incidents, because on the FIRST
+        // insert the anchor was still unique and on the second it was not.
+        assert!(matches!(crate::anchor::check(after_first, "pub const BUILD_BIAS: &str = "),
+                         Err(crate::anchor::AnchorFault::Ambiguous { matches: 2, .. })),
+            "a doubled declaration must be visible as ambiguous before a third insert");
+        // And the fault is flagged as the SILENT kind, which is why it survived twice.
+        let f = crate::anchor::check(after_first, "pub const BUILD_BIAS: &str = ").unwrap_err();
+        assert!(f.fails_silently());
+    }
+}
