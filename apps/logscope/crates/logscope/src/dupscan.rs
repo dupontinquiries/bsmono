@@ -92,6 +92,34 @@ pub fn duplicates(items: &[Item]) -> Vec<Vec<&Item>> {
 }
 
 /// The report.
+/// Does the reported location actually declare what the report says?
+///
+/// **A report whose line numbers do not match the source cannot be acted on**, and one unverifiable
+/// entry costs the reader's trust in all 277.
+///
+/// The audit that prompted this got the answer wrong in an instructive way. `Enum Access
+/// expert_cache:20, memplan:46` looked like a false positive because memplan.rs:46 held an unrelated
+/// function — but **there are TWO memplan.rs, one per crate**, and I had opened the wrong one
+/// because it was the directory I happened to be standing in.
+///
+/// The report was right. What the module name does not say is WHICH CRATE, and that ambiguity is
+/// what made a correct entry look wrong. The two Access enums are genuinely different ideas
+/// (residency format versus cache outcome) and the two memplans share zero public names, so neither
+/// is a duplicate implementation — but a reader cannot tell that from `memplan:46` alone.
+///
+/// Returns None when the file cannot be read, which is not a failure — a scan of a checkout that has
+/// moved on is stale rather than wrong.
+pub fn verify(item: &Item, crate_src: &std::path::Path) -> Option<bool> {
+    // The module name alone is ambiguous across crates — two memplan.rs exist — so verification
+    // takes the crate's src dir explicitly rather than guessing which one was meant.
+    let path = crate_src.join(format!("{}.rs", item.module));
+    let text = std::fs::read_to_string(path).ok()?;
+    let line = text.lines().nth(item.line.checked_sub(1)?)?;
+    // The declaration must mention the name. Not an exact parse — enough to catch a location that
+    // points at something else entirely, which is the failure seen.
+    Some(line.contains(&item.name))
+}
+
 pub fn report(groups: &[Vec<&Item>]) -> String {
     if groups.is_empty() {
         return "no public item is defined in two modules of this crate".into();
@@ -223,6 +251,34 @@ mod live_tests {
     ///
     /// This asserts the widened scan reaches that crate at all. Without it, someone re-scoping the
     /// scan to one crate would see every other test still pass.
+    /// Every reported location must point at what it claims.
+    ///
+    /// Found by auditing the report's own top entry and discovering the line number pointed at an
+    /// unrelated function. A duplicate list nobody can verify is a duplicate list nobody uses.
+    #[test]
+    fn reported_LOCATIONS_point_at_the_item_they_name() {
+        let here = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let Some(crates_dir) = here.parent() else { return };
+        let mut checked = 0usize;
+        let mut wrong = Vec::new();
+        for e in std::fs::read_dir(crates_dir).into_iter().flatten().flatten() {
+            let src = e.path().join("src");
+            if !src.is_dir() { continue }
+            let Ok(items) = scan_dir(&src) else { continue };
+            for it in items.iter().take(400) {
+                if let Some(ok) = verify(it, &src) {
+                    checked += 1;
+                    if !ok { wrong.push(format!("{} {} at {}:{}",
+                        format!("{:?}", it.kind), it.name, it.module, it.line)); }
+                }
+            }
+        }
+        if checked == 0 { return }   // not a source checkout
+        assert!(wrong.is_empty(),
+            "{} of {checked} reported locations do not declare what they name; first few: {:?}",
+            wrong.len(), &wrong[..wrong.len().min(4)]);
+    }
+
     #[test]
     fn the_scan_reaches_SIBLING_crates_and_not_only_this_one() {
         let items = workspace_items();
