@@ -1069,3 +1069,96 @@ mod fusion_tests {
         assert!(s.contains("would not be the lever here"));
     }
 }
+
+/// Why the bind-group cache reads 13%, and what would actually raise it.
+///
+/// A Scout run reported `80259 hits / 634903 lookups (13% reused)`. That looks like a broken cache
+/// and is not one.
+///
+/// **The key contains each input's `(buffer, offset, len)` view.** For weight tensors those never
+/// move and the entry is reusable forever. For the KV cache they move EVERY TOKEN, because attention
+/// reads a window that grows by one position each step — so those lookups can never hit, by
+/// construction, and they are a large share of the dispatches.
+///
+/// A 13% overall rate therefore mixes two populations: entries that can hit and entries that cannot.
+/// Optimising against the blended number means chasing misses that are not misses.
+///
+/// # What would raise it
+///
+/// **Bind the whole KV buffer and pass the offset as data rather than as part of the binding.**
+/// llama.cpp's Vulkan backend keeps descriptor sets stable and varies offsets through push
+/// constants; the same shape here is a dims-uniform field instead of a view. The bind group then
+/// stops depending on position and becomes cacheable like a weight.
+///
+/// That is a real change to how attention dispatches are built, and worth doing only if the split
+/// below shows the uncacheable population is what dominates.
+pub struct BgCacheSplit { pub hits: u64, pub lookups: u64, pub view_varying: u64 }
+
+impl BgCacheSplit {
+    /// Hit rate among lookups that COULD hit.
+    ///
+    /// The number to optimise against. If this is already high, the cache is working and the blended
+    /// figure is measuring the shape of the workload rather than a defect.
+    pub fn cacheable_rate(&self) -> Option<f64> {
+        let cacheable = self.lookups.checked_sub(self.view_varying)?;
+        if cacheable == 0 { return None }
+        Some(self.hits as f64 / cacheable as f64)
+    }
+
+    pub fn explain(&self) -> String {
+        let blended = if self.lookups > 0 { self.hits as f64 / self.lookups as f64 } else { 0.0 };
+        match self.cacheable_rate() {
+            None => format!("{:.0}% blended, and no lookup was cacheable — every dispatch bound a \
+view that moves, so the cache cannot help at all here", blended * 100.0),
+            Some(r) if r > 0.85 => format!(
+                "{:.0}% blended but {:.0}% among CACHEABLE lookups. The cache is working; the low \
+figure is the shape of the workload, since {} of {} lookups bound a KV view that moves every token \
+and can never repeat. Raising the blended number means changing what is BOUND — whole buffer plus \
+an offset in the uniform, as llama.cpp does with push constants — not fixing the cache",
+                blended * 100.0, r * 100.0, self.view_varying, self.lookups),
+            Some(r) => format!(
+                "{:.0}% blended and {:.0}% among cacheable lookups. The cache is genuinely missing on \
+entries that could hit, which is a different problem from the KV views and worth finding first",
+                blended * 100.0, r * 100.0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod bg_split_tests {
+    use super::*;
+
+    #[test]
+    fn a_LOW_BLENDED_rate_with_a_HIGH_cacheable_rate_says_the_cache_is_FINE() {
+        // Scout's shape: most lookups bind a KV view that moves every token and can never repeat.
+        // Optimising against the blended number chases misses that are not misses.
+        let s = BgCacheSplit { hits: 80259, lookups: 634903, view_varying: 545000 };
+        let e = s.explain();
+        assert!(e.contains("The cache is working"));
+        assert!(e.contains("changing what is BOUND"));
+    }
+
+    #[test]
+    fn a_LOW_rate_among_CACHEABLE_lookups_is_a_real_defect_and_says_so() {
+        // The case worth finding first, and the blended figure cannot distinguish it from the one
+        // above — which is the entire reason to split.
+        let s = BgCacheSplit { hits: 1000, lookups: 100000, view_varying: 50000 };
+        assert!(s.explain().contains("genuinely missing"));
+    }
+
+    #[test]
+    fn a_workload_where_NOTHING_is_cacheable_is_named_rather_than_divided_by_zero() {
+        let s = BgCacheSplit { hits: 0, lookups: 500, view_varying: 500 };
+        assert_eq!(s.cacheable_rate(), None);
+        assert!(s.explain().contains("cannot help at all"));
+    }
+
+    #[test]
+    fn the_FIX_is_named_as_changing_the_BINDING_not_the_cache() {
+        // Bind the whole KV buffer and pass the offset as data. llama.cpp keeps descriptor sets
+        // stable and varies offsets through push constants; the same shape here is a dims-uniform
+        // field instead of a view.
+        let s = BgCacheSplit { hits: 80259, lookups: 634903, view_varying: 545000 };
+        assert!(s.explain().contains("whole buffer plus an offset in the uniform"));
+    }
+}
