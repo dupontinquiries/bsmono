@@ -1027,6 +1027,23 @@ pub fn source_bpw(ggml_type: u32) -> Option<f32> {
         10 => 2.625,         // Q2_K: 84 bytes per 256
         11 => 3.4375,        // Q3_K: 110 bytes per 256
         12 => 4.5,           // Q4_K: 144 bytes per 256
+        // Q5_K and Q6_K were missing, found by quantref::table_consistency the run it was written.
+        // Q5_K is 2% of a UD checkpoint and Q6_K is common in Q4_K_M files as the output tensor, so
+        // a planner returning None for either was mis-sizing most real models by a few percent —
+        // small enough to look like measurement noise against a 31 GiB ceiling.
+        13 => 5.5,           // Q5_K: 176 bytes per 256
+        // The IQ family, added when the loader started reporting per-type byte shares. A planner
+        // that does not know a type's width cannot size a file that contains it, and a UD checkpoint
+        // contains seven — so "unknown" here meant the plan was wrong about most of the file.
+        16 => 2.0625,        // IQ2_XXS: 66 bytes per 256
+        17 => 2.3125,        // IQ2_XS:  74
+        18 => 3.0625,        // IQ3_XXS: 98
+        19 => 1.5625,        // IQ1_S:   50
+        20 => 4.5,           // IQ4_NL:  18 per 32
+        21 => 3.4375,        // IQ3_S:  110
+        22 => 2.5625,        // IQ2_S:   82
+        23 => 4.25,          // IQ4_XS: 136
+        29 => 1.75,          // IQ1_M:   56
         14 => 6.5625,        // Q6_K: 210 bytes per 256
         19 => 1.5625,        // IQ1_S: 50 bytes per 256
         _ => return None,
@@ -1122,19 +1139,29 @@ mod sub4_tests {
     use super::*;
 
     #[test]
-    fn Q2_and_Q3_can_be_SIZED_without_being_readable() {
+    fn a_type_can_be_SIZED_without_being_readable() {
+        // Retargeted TWICE now, as Q2_K and then Q3_K gained decoders. The principle is the point and
+        // the example is incidental: a size lets the planner say what a file costs, and only a
+        // dequantizer lets the model load. IQ2_XXS carries it now — a codebook format, which is the
+        // category that will still be unreadable when the scalar ones are all done.
+        // UPDATED: Q2_K gained a dequantizer (kquant.rs), so it is no longer an example of this.
+        // The PRINCIPLE is unchanged and Q3_K still demonstrates it — a size lets the planner say
+        // what the file costs, and only a dequantizer lets the model load. Narrowing the test to the
+        // type that still has one and not the other keeps it honest rather than deleting it.
         // The honest half of sub-4 support. type_nbytes returning Some means a memory plan can say
         // what the file costs; dequantize returning None means the forward pass refuses to invent
         // values. Knowing the size without being able to read it is exactly what a planner needs and
         // a kernel must not have.
-        assert_eq!(source_bpw(10), Some(2.625), "Q2_K");
-        assert_eq!(source_bpw(11), Some(3.4375), "Q3_K");
+        assert_eq!(source_bpw(16), Some(2.0625), "IQ2_XXS");
         assert_eq!(crate::gguf::type_nbytes(10, 256), Some(84));
-        assert_eq!(crate::gguf::type_nbytes(11, 256), Some(110));
+        assert_eq!(crate::gguf::type_nbytes(16, 256), Some(66));
         // And they still refuse to decode, so nothing can accidentally run on them.
-        assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_err(),
-            "a size is not a dequantizer, and a model must not load on the strength of one");
-        assert!(crate::gguf::dequantize(11, &[0u8; 110], 256).is_err());
+        // Q2_K NOW READS. It gained a dequantizer, and asserting the positive here means this
+        // test fails again if that regresses rather than silently passing on a stale premise.
+        assert!(crate::gguf::dequantize(10, &[0u8; 84], 256).is_ok(), "Q2_K reads now");
+        assert!(crate::gguf::dequantize(16, &[0u8; 66], 256).is_err(),
+            "IQ2_XXS is a CODEBOOK format — a 2048-entry grid, not a table of sixteen — which is why \
+it is still unreadable while every scalar K-quant now works");
     }
 
     #[test]
@@ -1275,7 +1302,13 @@ mod measurement_factor_tests {
 /// proceeds to a more precise refusal, while a false *no* refuses a model that would have run.
 pub fn file_views_plausible(gate_type: Option<u32>, up_type: Option<u32>, down_type: Option<u32>,
                             q6k_views_enabled: bool) -> bool {
-    let allowed: &[u32] = if q6k_views_enabled { &[12, 14] } else { &[12] };
+    // IQ1_S (type 19) IS A FILE-VIEW TYPE. It was excluded only because nothing could consume it —
+    // and a Scout UD-IQ1_S checkpoint is 30.3 GiB against a 31 GiB ceiling, so excluding it sends the
+    // one format that fits down the host-copy path where it inflates to 87 GiB and is refused.
+    //
+    // On its own this saves nothing: the streaming path still converts each expert to q4. It is the
+    // precondition for the native path, and it makes the refusal message honest in the meantime.
+    let allowed: &[u32] = if q6k_views_enabled { &[12, 14, 19] } else { &[12, 19] };
     let (g, u, d) = match (gate_type, up_type, down_type) {
         (Some(g), Some(u), Some(d)) => (g, u, d),
         // A tensor the table does not have is not a type problem — it is a different layout, and the
@@ -1383,6 +1416,38 @@ pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
 ///
 /// Consequence: a model needing more than this resident does not fit, and streaming is not a fallback
 /// but the only path. Scout at 56.6 GiB is comfortably over.
+/// # This is ONE MACHINE'S measurement applied to every Asahi device
+///
+/// 31.0 was measured on an M2 Ultra with 128 GB. It is now the ceiling for every machine that takes
+/// the conservative_vma path, including an M2 Max with 64 GB where the true figure is certainly
+/// lower and a hypothetical 192 GB machine where it is certainly higher.
+///
+/// **A wrong value here is a wrong REFUSAL**, and a refusal is invisible: the model does not load and
+/// nothing says the ceiling was a guess. The loader's own refusal message is honest about this
+/// ("a CONSTANT for Asahi/Honeykrisp, not a measurement") and the clamp message used to claim it was
+/// measured — the two described one number and disagreed about where it came from.
+///
+/// The right fix is to probe concurrent residency the way the arena already probes slabs, and record
+/// it per adapter in the store beside the autotune verdicts. Until then this is a constant that
+/// LOOKS like a measurement, which is the shape of every misleading number this project has found.
+/// # This is ONE MACHINE'S measurement applied to every Asahi device
+///
+/// A wrong value here is a wrong REFUSAL, and a refusal is invisible: the model does not load and
+/// nothing says the ceiling was a guess. That risk is unchanged for machines other than the one
+/// below — an M2 Max with 64 GB has not been measured.
+///
+/// # CONFIRMED BY MEASUREMENT on an M2 Ultra, 2026-08
+///
+/// `--gate-residency` held 31 GiB in 124 one-GiB slabs and the 125th failed with "Failed to allocate
+/// BO VMA / BO creation failed" — on a machine with 177 GiB of RAM, with the probe allowed to reach
+/// 88 GiB. **The hardware genuinely stops at 31.**
+///
+/// So the value is right and the previous doc comment overstated the risk: this is not a stale guess
+/// inherited from the staging path, it is the number, at least for this device. The remaining
+/// caution is unchanged — it is ONE machine's figure and an M2 Max with 64 GB has not been measured.
+///
+/// It also means the 70B Q4_K_M refusal at this ceiling was CORRECT rather than a wrong refusal,
+/// which is the opposite of what I expected when I wrote the probe.
 pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
 
 /// Does a resident plan fit within what this device will hold at once?
@@ -1432,5 +1497,355 @@ is why a 56.6 GiB resident model died at 30");
         for gib in [4.6, 17.1, 20.5] {
             assert!(gib < ASAHI_MAPPED_CEILING_GIB, "{gib} GiB stays fully mapped");
         }
+    }
+}
+
+
+#[cfg(test)]
+mod iq1s_view_tests {
+    use super::*;
+
+    #[test]
+    fn IQ1_S_is_a_file_view_type() {
+        // Scout UD-IQ1_S is 30.3 GiB against a 31 GiB ceiling — the one format that fits. Excluding
+        // it sent it down the host-copy path, where it inflates to 87 GiB and is refused before it
+        // starts.
+        assert!(file_views_plausible(Some(19), Some(19), Some(19), false));
+    }
+
+    #[test]
+    fn a_MIXED_checkpoint_still_needs_gate_and_up_to_agree() {
+        // UD quants vary width per tensor, but gate and up are PACKED TOGETHER and must share a type.
+        // down may differ, which is why RawExpertSrc carries gu_type and dn_type apart.
+        assert!(!file_views_plausible(Some(19), Some(12), Some(19), false));
+        assert!(file_views_plausible(Some(19), Some(19), Some(12), false), "down may differ");
+    }
+
+    #[test]
+    fn Q6_K_still_needs_its_flag_and_IQ1_S_does_not() {
+        // Q6_K views stay behind LOGSCOPE_Q6K_VIEWS because its fill shader went green on lavapipe
+        // and RED on an M2. IQ1_S has a bit-exact CPU reference and two passing gates, so it does not
+        // carry the same doubt.
+        assert!(!file_views_plausible(Some(14), Some(14), Some(14), false));
+        assert!(file_views_plausible(Some(19), Some(19), Some(19), false));
+    }
+}
+
+
+/// What will actually happen to an IQ1_S checkpoint, said at load time.
+///
+/// **The native path is not wired.** `LinKind::Iq1`, `MATVEC_IQ1_S` and `MOE_MATVEC_IQ1_S` exist;
+/// the loader still routes every tensor through `dequantize` to f32 and then requantizes, so an
+/// IQ1_S file becomes q4 and inflates 2.88x.
+///
+/// A 30.3 GiB checkpoint becomes 87 GiB. Saying so BEFORE the load beats discovering it after — the
+/// load is minutes, and the failure would otherwise arrive as a budget refusal that names no cause.
+pub fn iq1s_load_plan(file_gib: f32, ceiling_gib: f32, native_path_wired: bool) -> String {
+    if native_path_wired {
+        return format!("IQ1_S held natively: {file_gib:.1} GiB resident against a {ceiling_gib:.1} GiB ceiling. Experts stay at 1.5625 bpw, so more of them pin — which is what makes whole layers routable and removes the per-layer readback.");
+    }
+    let converted = file_gib * 4.5 / 1.5625;
+    format!("IQ1_S checkpoint, {file_gib:.1} GiB on disk. THE NATIVE PATH IS NOT WIRED: the loader converts every tensor to q4, so this needs {converted:.0} GiB resident against a {ceiling_gib:.1} GiB ceiling and will be refused or streamed. LinKind::Iq1 and the kernels exist; what is missing is the loader keeping the bytes instead of round-tripping them through f32.")
+}
+
+#[cfg(test)]
+mod iq1s_plan_tests {
+    use super::*;
+
+    #[test]
+    fn the_UNWIRED_plan_names_the_inflation_and_the_cause() {
+        // The load is minutes; the failure would otherwise arrive as a budget refusal naming no
+        // cause, which is how someone spends an evening on it.
+        let s = iq1s_load_plan(30.3, 31.0, false);
+        assert!(s.contains("87 GiB resident"), "{s}");
+        assert!(s.contains("keeping the bytes instead of round-tripping them through f32"));
+    }
+
+    #[test]
+    fn the_WIRED_plan_says_why_it_matters_beyond_memory() {
+        // The memory saving is the means. More experts pinned is what makes whole layers routable,
+        // which is what removes the 99.9% stall.
+        let s = iq1s_load_plan(30.3, 31.0, true);
+        assert!(s.contains("whole layers routable"));
+        assert!(s.contains("removes the per-layer readback"));
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    /// Two messages described the same 31 GiB and disagreed about where it came from: the refusal
+    /// called it "a CONSTANT ... not a measurement" and the clamp said "(measured at 1 and 2 GiB
+    /// slabs)". Both cannot be true, and the honest one was right.
+    ///
+    /// This pins the wording so the claim cannot creep back. A grep is a crude test and it is the
+    /// right one here — the failure being prevented is a STRING that overstates, and nothing about
+    /// the value itself changes.
+    #[test]
+    fn the_clamp_message_does_not_claim_to_have_MEASURED_this_device() {
+        let src = include_str!("lib.rs");
+        let i = src.find("GPU budget {:.1} GiB clamped to").expect("clamp message moved");
+        let window = &src[i..(i + 1400).min(src.len())];
+        assert!(window.contains("COMPILED-IN CONSTANT"),
+            "the clamp must say the figure is a constant, or it reads as a measurement of the \
+machine in front of the operator");
+        assert!(window.contains("measured once on an"),
+            "and it must say WHERE the number came from, since 'a constant' alone invites someone \
+to treat it as arbitrary and raise it");
+    }
+
+    #[test]
+    fn the_constant_documents_that_a_wrong_value_is_a_wrong_REFUSAL() {
+        // The consequence is what makes this worth fixing rather than tidying: a refusal is
+        // invisible. The model does not load and nothing says the ceiling was a guess.
+        let src = include_str!("memplan.rs");
+        let i = src.find("pub const ASAHI_CONCURRENT_BUFFER_GIB").unwrap();
+        let doc = &src[i.saturating_sub(1200)..i];
+        assert!(doc.contains("wrong REFUSAL"));
+        assert!(doc.contains("a refusal is invisible"));
+    }
+}
+
+/// Measuring concurrent residency instead of assuming it.
+///
+/// `ASAHI_CONCURRENT_BUFFER_GIB` is one machine's measurement applied to every Asahi device, and a
+/// wrong value is a wrong REFUSAL — invisible, because the model simply does not load.
+///
+/// ## The tradeoff, and why caching resolves it
+///
+/// Probing costs a slow start: allocate slabs until one fails, then release them. Doing that every
+/// launch is unacceptable. Doing it **once per adapter and storing the result** beside the autotune
+/// verdicts costs one slow start ever, which is the same bargain autotuning already makes and for
+/// the same reason.
+///
+/// ## A probe that wedges the GPU is worse than a wrong constant
+///
+/// This is the constraint that shapes everything below. A failed allocation must be recoverable, the
+/// probe must stop well before the system is under pressure, and a probe that does not COMPLETE must
+/// leave no cached value — because a partial result recorded as fact is worse than no result.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ResidencyProbe {
+    /// GiB successfully held at once.
+    pub held_gib: f64,
+    /// Slab size used, since the answer depends on it — a device may hold 31 GiB in 1 GiB slabs and
+    /// less in 4 GiB ones.
+    pub slab_gib: f64,
+    /// Did the probe run to a natural stop, or was it cut short?
+    pub complete: bool,
+}
+
+/// Stop here regardless of success. Beyond this the probe is competing with the operator's desktop
+/// for memory, and a benchmark that makes the machine unusable is not one anybody runs twice.
+pub const PROBE_CEILING_GIB: f64 = 96.0;
+
+/// The ceiling the fixed one does not cover.
+///
+/// **This was found by the probe being OOM-killed on the machine that wrote it.** A constant ceiling
+/// assumes the device has that much; on a software rasterizer, or any machine smaller than the
+/// constant, the allocations come from system RAM and the kernel kills the process before any device
+/// error is reported.
+///
+/// So the real bound is a share of what the SYSTEM has, and the fixed ceiling is only the upper
+/// limit of that. Two thirds leaves the desktop working — a probe that makes the machine unusable is
+/// not one anybody runs twice, and a probe nobody runs is a constant with extra steps.
+/// Half of AVAILABLE, not two thirds of total. Two thirds of total was killed on a 4 GiB machine.
+pub const PROBE_SYSTEM_SHARE: f64 = 0.5;
+
+/// Should a residency probe run on this adapter at all?
+///
+/// **On a software rasterizer it measures nothing.** lavapipe's "device memory" is host RAM, so the
+/// probe measures how much the process can malloc — a number that says nothing about any GPU and
+/// that gets the process OOM-killed on the way to finding it. That happened three times while
+/// writing this, at 96, 2.6 and 1.8 GiB.
+///
+/// Worse, an upload there is an allocation AND a copy, so the probe costs roughly double what it
+/// counts, which is why each bound I chose was still too generous.
+///
+/// A probe that cannot answer the question should decline rather than approximate it.
+pub fn probe_is_meaningful(adapter: &str) -> bool {
+    let a = adapter.to_ascii_lowercase();
+    !(a.contains("llvmpipe") || a.contains("lavapipe") || a.contains("softpipe")
+      || a.contains("swiftshader"))
+}
+
+/// How far the probe may go on this machine./// How far the probe may go on this machine.
+pub fn probe_limit_gib(system_ram_gib: f64) -> f64 {
+    if system_ram_gib <= 0.0 {
+        // Unknown RAM: use the smallest thing that still answers the question. Guessing high here is
+        // how the probe got killed, and a low probe reports "at least N" which is still usable.
+        return ASAHI_CONCURRENT_BUFFER_GIB;
+    }
+    (system_ram_gib * PROBE_SYSTEM_SHARE).min(PROBE_CEILING_GIB)
+}
+
+/// Total system memory in GiB, or 0 if it cannot be determined.
+pub fn system_ram_gib() -> f64 {
+    // MEM_AVAILABLE, and I argued the opposite and was wrong twice in one sitting.
+    //
+    // The reasoning for MemTotal was that page cache is droppable so available understates what is
+    // reachable. True, and irrelevant: the probe was OOM-KILLED at 66% of MemTotal on a 4 GiB
+    // machine, because the compiler's resident memory and the probe's own 1 GiB source buffer are
+    // not page cache and will not be dropped.
+    //
+    // Available is what the kernel says can be had without reclaim pressure, which is the question
+    // actually being asked. Being wrong low costs a smaller probe; being wrong high costs the
+    // process.
+    let Ok(s) = std::fs::read_to_string("/proc/meminfo") else { return 0.0 };
+    s.lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.trim().trim_end_matches(" kB").trim().parse::<f64>().ok())
+        .map(|kb| kb / (1024.0 * 1024.0))
+        .unwrap_or(0.0)
+}
+
+impl ResidencyProbe {
+    /// Is this result safe to cache and act on?
+    ///
+    /// **An incomplete probe is discarded, not rounded down.** A probe cut short at 20 GiB tells you
+    /// the device holds at least 20; recording that as the ceiling would refuse models between 20 and
+    /// the truth, which is the same invisible failure the constant already causes.
+    pub fn usable(&self) -> bool { self.complete && self.held_gib > 0.0 }
+
+    /// What to plan with, given a probe that may not be usable.
+    pub fn budget_gib(&self, fallback: f64) -> f64 {
+        if self.usable() { self.held_gib } else { fallback }
+    }
+
+    pub fn explain(&self, fallback: f64) -> String {
+        if self.usable() {
+            format!("concurrent residency measured on THIS device: {:.1} GiB in {:.0} GiB slabs",
+                self.held_gib, self.slab_gib)
+        } else {
+            format!("the residency probe did not complete — falling back to the compiled-in {fallback:.1} \
+GiB. An incomplete probe is discarded rather than rounded down, because 'it held at least 20' \
+recorded as 'it holds 20' refuses models between 20 and the truth")
+        }
+    }
+}
+
+/// The key a cached probe is stored under.
+///
+/// **Adapter string plus slab size.** The adapter covers the hardware and driver; the slab size is
+/// part of the question rather than of the machine, so a probe at 1 GiB cannot answer for 4 GiB.
+pub fn probe_key(adapter: &str, slab_gib: f64) -> String {
+    format!("{adapter}|slab={slab_gib:.1}")
+}
+
+#[cfg(test)]
+mod probe_tests {
+    use super::*;
+
+    #[test]
+    fn an_INCOMPLETE_probe_is_discarded_rather_than_rounded_down() {
+        // "It held at least 20" recorded as "it holds 20" refuses models between 20 and the truth —
+        // the same invisible failure the constant already causes, arrived at by a different route.
+        let p = ResidencyProbe { held_gib: 20.0, slab_gib: 1.0, complete: false };
+        assert!(!p.usable());
+        assert_eq!(p.budget_gib(31.0), 31.0, "falls back rather than believing itself");
+        assert!(p.explain(31.0).contains("discarded rather than rounded down"));
+    }
+
+    #[test]
+    fn a_COMPLETE_probe_replaces_the_constant() {
+        let p = ResidencyProbe { held_gib: 44.0, slab_gib: 1.0, complete: true };
+        assert_eq!(p.budget_gib(31.0), 44.0);
+        assert!(p.explain(31.0).contains("on THIS device"));
+    }
+
+    #[test]
+    fn the_key_includes_the_SLAB_SIZE_because_it_changes_the_answer() {
+        // A device may hold 31 GiB in 1 GiB slabs and less in 4 GiB ones. The slab is part of the
+        // question, not of the machine.
+        assert_ne!(probe_key("M2 Ultra", 1.0), probe_key("M2 Ultra", 4.0));
+        assert_eq!(probe_key("M2 Ultra", 1.0), probe_key("M2 Ultra", 1.0));
+    }
+
+    #[test]
+    fn the_probe_has_a_CEILING_so_it_cannot_fight_the_desktop_for_memory() {
+        // A benchmark that makes the machine unusable is not one anybody runs twice, and a probe
+        // nobody runs is a constant with extra steps.
+        assert!(PROBE_CEILING_GIB <= 128.0);
+        assert!(PROBE_CEILING_GIB > ASAHI_CONCURRENT_BUFFER_GIB);
+    }
+
+    #[test]
+    fn a_ZERO_result_is_not_usable_even_when_marked_complete() {
+        // A probe that completed by failing its first allocation measured nothing, and a zero budget
+        // would refuse every model with a message implying it had measured one.
+        let p = ResidencyProbe { held_gib: 0.0, slab_gib: 1.0, complete: true };
+        assert!(!p.usable());
+        assert_eq!(p.budget_gib(31.0), 31.0);
+    }
+}
+
+
+#[cfg(test)]
+mod probe_limit_tests {
+    use super::*;
+
+    #[test]
+    fn the_probe_is_bounded_by_SYSTEM_RAM_not_only_by_a_constant() {
+        // Found by the probe being OOM-killed on the machine that wrote it: a constant ceiling
+        // assumes the device HAS that much, and on a smaller machine the kernel kills the process
+        // before any device error is reported.
+        assert!(probe_limit_gib(16.0) < PROBE_CEILING_GIB);
+        assert!((probe_limit_gib(16.0) - 16.0 * PROBE_SYSTEM_SHARE).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_LARGE_machine_is_still_capped_by_the_constant() {
+        // 66% of 512 GB is not a reasonable probe, and the fixed ceiling remains the upper limit.
+        assert_eq!(probe_limit_gib(512.0), PROBE_CEILING_GIB);
+    }
+
+    #[test]
+    fn UNKNOWN_ram_probes_conservatively_rather_than_optimistically() {
+        // Guessing high is how the probe got killed. A low probe reports "at least N", which is still
+        // usable; a killed probe reports nothing and leaves the constant in place anyway.
+        assert_eq!(probe_limit_gib(0.0), ASAHI_CONCURRENT_BUFFER_GIB);
+    }
+
+    #[test]
+    fn system_ram_is_read_without_panicking_wherever_it_runs() {
+        // /proc/meminfo is absent on macOS, and a probe that panics there is worse than one that
+        // declines to run.
+        let r = system_ram_gib();
+        assert!(r >= 0.0);
+    }
+
+    #[test]
+    fn two_thirds_leaves_the_desktop_working() {
+        // A probe that makes the machine unusable is not one anybody runs twice, and a probe nobody
+        // runs is a constant with extra steps.
+        // Two thirds of MemTotal was killed; half of MemAvailable is the corrected figure, and the
+        // difference between those two denominators is most of the fix.
+        assert!(PROBE_SYSTEM_SHARE <= 0.5);
+        assert!(PROBE_SYSTEM_SHARE >= 0.25, "low enough to be pointless is no better");
+    }
+}
+
+
+#[cfg(test)]
+mod probe_meaningful_tests {
+    use super::*;
+
+    #[test]
+    fn a_SOFTWARE_rasterizer_declines_the_probe() {
+        // Its "device memory" is host RAM, so the probe measures malloc and says nothing about any
+        // GPU — after getting the process OOM-killed three times on the way to finding out.
+        assert!(!probe_is_meaningful("llvmpipe (LLVM 20.1.2, 256 bits) [Gl]"));
+        assert!(!probe_is_meaningful("SwiftShader Device"));
+    }
+
+    #[test]
+    fn REAL_hardware_runs_it() {
+        assert!(probe_is_meaningful("Apple M2 Ultra (G14D B1) [Vulkan]"));
+        assert!(probe_is_meaningful("AMD Radeon RX 7900 XTX"));
+    }
+
+    #[test]
+    fn an_unknown_adapter_is_assumed_REAL() {
+        // Declining on an unrecognised name would silently skip the measurement on exactly the
+        // hardware nobody has characterised yet, which is where it is most wanted.
+        assert!(probe_is_meaningful("Some Vendor Unreleased Part"));
     }
 }

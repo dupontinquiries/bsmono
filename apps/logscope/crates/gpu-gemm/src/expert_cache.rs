@@ -533,3 +533,337 @@ mod tally_tests {
         assert!(t.report(6.33, 21.0).is_none());
     }
 }
+
+/// Can this layer take the GPU-routed path even though the model streams?
+///
+/// # The condition is not what the guard assumes
+///
+/// `moe_ffn_gpu_routed` is gated on `m.stream.is_none()`, and the reason is real: the routed path
+/// selects experts on the device, so the CPU never learns which ones — and a streaming model needs
+/// the CPU to know, in order to fetch them.
+///
+/// **But that is a property of the LAYER, not the MODEL.** If every expert for this layer is already
+/// pinned, any selection the device makes is a cache hit, so there is nothing to fetch and nothing
+/// for the CPU to learn. The layer can route on-device while the model as a whole still streams.
+///
+/// # Why this matters more than it looks
+///
+/// Scout's decode is 99.9% CPU-wait from one blocking readback per layer. Every layer that qualifies
+/// removes one readback. The condition is per-layer, so the benefit is proportional rather than
+/// all-or-nothing — a model with half its layers fully pinned loses half its stalls.
+///
+/// # And it is what makes IQ1_S experts worth having
+///
+/// Scout pins 6 of 16 experts at q4, so no layer qualifies today. At IQ1_S the expert bytes are 2.88x
+/// smaller, so the same budget holds ~17 of 16 — every layer qualifies. **That is the chain: narrower
+/// experts, more pinned, whole layers resident, on-device routing, no readback.** The memory saving
+/// is not the point; it is the means.
+pub fn layer_can_route(pinned: &[u32], n_experts: u32) -> bool {
+    // Every expert, not merely enough of them. A selection the device makes is unknown to the CPU, so
+    // a single unpinned expert means a possible miss the CPU cannot service — and a miss it cannot
+    // service is worse than the stall this avoids.
+    n_experts > 0 && (0..n_experts).all(|e| pinned.contains(&e))
+}
+
+/// How many of a model's layers could route, given a per-layer pin set.
+pub fn routable_layers(per_layer_pinned: &[Vec<u32>], n_experts: u32) -> usize {
+    per_layer_pinned.iter().filter(|p| layer_can_route(p, n_experts)).count()
+}
+
+/// The share of per-layer readbacks this removes, 0..1 — which is the share of the stall removed,
+/// since the stalls are one per layer and equal in cost.
+pub fn stall_reduction(per_layer_pinned: &[Vec<u32>], n_experts: u32) -> f32 {
+    if per_layer_pinned.is_empty() { return 0.0 }
+    routable_layers(per_layer_pinned, n_experts) as f32 / per_layer_pinned.len() as f32
+}
+
+#[cfg(test)]
+mod route_condition_tests {
+    use super::*;
+
+    #[test]
+    fn a_FULLY_PINNED_layer_can_route_while_the_model_streams() {
+        // The insight: stream.is_none() is a property of the MODEL and the real constraint is a
+        // property of the LAYER. If nothing can miss, the CPU has nothing to fetch.
+        assert!(layer_can_route(&(0..16).collect::<Vec<_>>(), 16));
+    }
+
+    #[test]
+    fn ONE_unpinned_expert_disqualifies_the_layer() {
+        // Not "enough of them". A selection the device makes is unknown to the CPU, so a single
+        // unpinned expert means a possible miss the CPU cannot service — worse than the stall this
+        // avoids.
+        let mut p: Vec<u32> = (0..16).collect();
+        p.retain(|e| *e != 7);
+        assert!(!layer_can_route(&p, 16));
+    }
+
+    #[test]
+    fn SCOUT_TODAY_qualifies_for_nothing() {
+        // 6 of 16 pinned at q4. This is the honest baseline: the condition changes nothing until the
+        // experts get narrower.
+        let layers: Vec<Vec<u32>> = (0..48).map(|_| (0..6).collect()).collect();
+        assert_eq!(routable_layers(&layers, 16), 0);
+        assert_eq!(stall_reduction(&layers, 16), 0.0);
+    }
+
+    #[test]
+    fn IQ1_S_EXPERTS_would_qualify_every_layer() {
+        // 2.88x smaller experts in the same budget: 6 of 16 becomes all 16. That is the chain —
+        // narrower experts, more pinned, whole layers resident, on-device routing, no readback. The
+        // memory saving is the means, not the point.
+        let layers: Vec<Vec<u32>> = (0..48).map(|_| (0..16).collect()).collect();
+        assert_eq!(stall_reduction(&layers, 16), 1.0);
+    }
+
+    #[test]
+    fn the_benefit_is_PROPORTIONAL_not_all_or_nothing() {
+        // Half the layers fully pinned removes half the stalls, which makes a partial pin budget
+        // worth having rather than a failure.
+        let layers: Vec<Vec<u32>> = (0..48).map(|i| {
+            if i % 2 == 0 { (0..16).collect() } else { (0..6).collect() }
+        }).collect();
+        assert!((stall_reduction(&layers, 16) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_model_with_NO_experts_does_not_claim_to_route() {
+        // A dense model has no MoE path to take, and returning true would be a division by an idea.
+        assert!(!layer_can_route(&[], 0));
+    }
+}
+
+/// Is it faster to compute EVERY expert than to ask which one?
+///
+/// # The trade
+///
+/// `moe_ffn_v1` downloads router logits so the CPU can fetch the chosen experts. That readback is a
+/// DEPENDENCY — nothing can proceed without knowing which expert — so it cannot be batched away.
+///
+/// **But it can be removed.** Compute all `n_experts` and mask by the routing weight: the router's
+/// output never leaves the GPU, so there is nothing to wait for. The cost is `n_experts / top_k`
+/// times the expert compute.
+///
+/// # Why that is worth considering here and nowhere else
+///
+/// Normally 16x the compute is absurd. When 99.9% of the step is spent WAITING, the compute being
+/// multiplied is 0.1% of the time:
+///
+/// ```text
+/// stalled 99.9%   compute 0.1% -> 1.6%    62x faster
+/// stalled 99.0%   compute 1.0% -> 16%      6x faster
+/// stalled 91.0%   compute 9.0% -> 144%   0.7x — a LOSS
+/// ```
+///
+/// The crossover is where `compute * multiplier` reaches 1. Above roughly 94% stall it wins; below,
+/// it loses badly. **That is a measurement, not a preference**, which makes it exactly the kind of
+/// decision the autotuner already makes for kernels.
+///
+/// # The precondition
+///
+/// Every expert must be RESIDENT. You cannot compute what you would have to stream, and streaming
+/// them all is the readback's cost paid sixteen times. So this needs the same thing
+/// `layer_can_route` needs, and for the same reason: narrow enough experts that a whole layer fits.
+pub fn dense_moe_worthwhile(sync_share: f32, n_experts: u32, top_k: u32) -> Result<f32, String> {
+    if top_k == 0 || n_experts == 0 { return Err("a model with no experts has nothing to densify".into()) }
+    let mult = n_experts as f32 / top_k as f32;
+    let compute = (1.0 - sync_share).max(1e-6);
+    let after = compute * mult;
+    if after < 1.0 {
+        Ok(1.0 / after)
+    } else {
+        Err(format!(
+            "computing all {n_experts} experts costs {mult:.0}x the compute, and compute is already \
+{:.0}% of the step — it would become {:.0}%. Only worth it when the stall dominates, which is a \
+measurement rather than a preference", compute * 100.0, after * 100.0))
+    }
+}
+
+/// The stall share above which computing everything wins.
+pub fn dense_moe_crossover(n_experts: u32, top_k: u32) -> f32 {
+    if n_experts == 0 || top_k == 0 { return 1.0 }
+    1.0 - (top_k as f32 / n_experts as f32)
+}
+
+#[cfg(test)]
+mod dense_moe_tests {
+    use super::*;
+
+    #[test]
+    fn at_SCOUTS_measured_stall_computing_everything_is_dramatically_faster() {
+        // 99.9% waiting means the 16x multiplier lands on 0.1% of the step.
+        let s = dense_moe_worthwhile(0.999, 16, 1).unwrap();
+        assert!(s > 50.0, "got {s}x");
+    }
+
+    #[test]
+    fn at_a_MODERATE_stall_it_is_a_LOSS_and_says_so() {
+        // 91% was turn two of a real conversation. The same change that wins 62x at turn three loses
+        // at turn two, which is why this must be measured per-run rather than decided once.
+        let e = dense_moe_worthwhile(0.91, 16, 1).unwrap_err();
+        assert!(e.contains("Only worth it when the stall dominates"));
+    }
+
+    #[test]
+    fn the_CROSSOVER_is_where_the_multiplier_eats_the_saving() {
+        // 16 experts at top-1: compute must be under 1/16, so the stall must exceed 15/16.
+        let c = dense_moe_crossover(16, 1);
+        assert!((c - 0.9375).abs() < 1e-4, "got {c}");
+        assert!(dense_moe_worthwhile(c + 0.01, 16, 1).is_ok());
+        assert!(dense_moe_worthwhile(c - 0.01, 16, 1).is_err());
+    }
+
+    #[test]
+    fn a_WIDER_top_k_makes_it_cheaper_and_the_crossover_lower() {
+        // Top-2 of 16 is an 8x multiplier, so it wins at a lower stall — the trade improves as the
+        // router already touches more experts.
+        assert!(dense_moe_crossover(16, 2) < dense_moe_crossover(16, 1));
+    }
+
+    #[test]
+    fn a_DENSE_model_is_refused_rather_than_given_a_ratio() {
+        assert!(dense_moe_worthwhile(0.99, 0, 0).is_err());
+    }
+}
+
+/// Choosing between routed and dense MoE at runtime, with hysteresis.
+///
+/// # Why this cannot be a constant
+///
+/// The crossover for Scout is 93.75% stall, and a real conversation measured **74%, 91%, then 112%**
+/// across three turns. So the right answer changes WITHIN a session: dense loses at turn one and wins
+/// by 60x at turn three, because the stall compounds with context length.
+///
+/// A fixed choice is wrong for two thirds of that conversation.
+///
+/// # Why it needs a dwell
+///
+/// A measurement near the crossover flips the decision, and each flip costs a mode change. Two
+/// options within noise of each other alternating is the flapping `dwell` was written for — and here
+/// the switch is not free, because dense mode requires every expert resident and routed mode does
+/// not, so a flip can force a residency change.
+///
+/// # top_k is ONE for Scout, and it matters
+///
+/// vLLM's Llama-4 post states one expert activated per token. A search summary claimed two; the
+/// difference moves the crossover from 93.75% to 87.5%, which is the gap between "wins at turn
+/// three only" and "wins at turn two as well". Primary source over summary.
+pub struct MoeModeChoice {
+    dense: bool,
+    dwell: std::time::Instant,
+    min_dwell: std::time::Duration,
+    switches: u32,
+}
+
+impl MoeModeChoice {
+    pub fn new() -> Self {
+        MoeModeChoice {
+            dense: false,
+            dwell: std::time::Instant::now(),
+            // Longer than dwell's default: a mode change here may force experts to become resident,
+            // which is far more expensive than a kernel swap.
+            min_dwell: std::time::Duration::from_secs(120),
+            switches: 0,
+        }
+    }
+
+    pub fn dense(&self) -> bool { self.dense }
+    pub fn switches(&self) -> u32 { self.switches }
+
+    /// Consider switching, given the measured stall and whether every expert is resident.
+    ///
+    /// Returns the reason when it declines, because "it stayed routed" is not informative and "it
+    /// stayed routed because only 6 of 16 experts are resident" is.
+    pub fn consider(&mut self, sync_share: f32, all_resident: bool, n_experts: u32, top_k: u32)
+        -> Result<bool, String>
+    {
+        // The hard precondition, checked before anything else: dense mode computes every expert, and
+        // computing one that is not resident means streaming it — which is the readback's cost paid
+        // n_experts times, the opposite of the intent.
+        if !all_resident {
+            if self.dense { self.dense = false; }   // residency was lost; fall back immediately
+            return Err(format!("dense MoE needs every expert resident and they are not. This is the \
+same precondition as layer_can_route, and it is what narrower experts buy"));
+        }
+        let want = dense_moe_worthwhile(sync_share, n_experts, top_k).is_ok();
+        if want == self.dense { return Ok(self.dense) }
+        let waited = self.dwell.elapsed();
+        if waited < self.min_dwell {
+            return Err(format!("{} is {:.0}% better right now, but the last change was {}s ago — a \
+measurement near the {:.0}% crossover flips this, and each flip may force a residency change",
+                if want { "dense" } else { "routed" },
+                (sync_share * 100.0), waited.as_secs(),
+                dense_moe_crossover(n_experts, top_k) * 100.0));
+        }
+        self.dense = want;
+        self.dwell = std::time::Instant::now();
+        self.switches += 1;
+        Ok(self.dense)
+    }
+}
+
+impl Default for MoeModeChoice { fn default() -> Self { Self::new() } }
+
+#[cfg(test)]
+mod mode_choice_tests {
+    use super::*;
+
+    fn ready() -> MoeModeChoice {
+        let mut m = MoeModeChoice::new();
+        m.dwell = std::time::Instant::now() - std::time::Duration::from_secs(300);
+        m
+    }
+
+    #[test]
+    fn a_REAL_CONVERSATION_flips_the_right_answer_mid_session() {
+        // 74%, 91%, 112% across three turns. Dense loses at turn one and wins at turn three, so a
+        // fixed choice is wrong for two thirds of it.
+        assert!(dense_moe_worthwhile(0.74, 16, 1).is_err(), "turn one: routed");
+        assert!(dense_moe_worthwhile(0.91, 16, 1).is_err(), "turn two: still routed");
+        assert!(dense_moe_worthwhile(0.999, 16, 1).is_ok(), "turn three: dense, by 60x");
+    }
+
+    #[test]
+    fn NON_RESIDENT_experts_refuse_dense_mode_outright() {
+        // Computing an expert that is not resident means streaming it — the readback's cost paid
+        // sixteen times, which is the opposite of the intent.
+        let e = ready().consider(0.999, false, 16, 1).unwrap_err();
+        assert!(e.contains("needs every expert resident"));
+        assert!(e.contains("what narrower experts buy"));
+    }
+
+    #[test]
+    fn losing_residency_falls_back_IMMEDIATELY_without_waiting_for_the_dwell() {
+        // The dwell protects against flapping on a marginal measurement. Losing residency is not a
+        // marginal measurement, and holding dense mode without the experts would be catastrophic.
+        let mut m = ready();
+        assert!(m.consider(0.999, true, 16, 1).unwrap(), "dense");
+        let _ = m.consider(0.999, false, 16, 1);
+        assert!(!m.dense(), "fell back at once");
+    }
+
+    #[test]
+    fn a_measurement_near_the_CROSSOVER_does_not_flap() {
+        // 93.75% for Scout, and readings either side of it arrive turn to turn.
+        let mut m = MoeModeChoice::new();
+        let e = m.consider(0.999, true, 16, 1).unwrap_err();
+        assert!(e.contains("crossover"));
+        assert!(!m.dense(), "held by the dwell");
+    }
+
+    #[test]
+    fn TOP_K_moves_the_crossover_and_the_source_matters() {
+        // vLLM's Llama-4 post says ONE expert per token; a search summary said two. The difference is
+        // 93.75% against 87.5% — the gap between winning at turn three only and winning at turn two
+        // as well.
+        assert!((dense_moe_crossover(16, 1) - 0.9375).abs() < 1e-4);
+        assert!((dense_moe_crossover(16, 2) - 0.875).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_DECLINE_says_why_rather_than_just_staying_put() {
+        // "It stayed routed" is not informative. "It stayed routed because only 6 of 16 experts are
+        // resident" is.
+        assert!(MoeModeChoice::new().consider(0.999, false, 16, 1).is_err());
+    }
+}

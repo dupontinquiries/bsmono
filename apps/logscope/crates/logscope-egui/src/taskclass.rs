@@ -135,10 +135,10 @@ pub fn classify(request: &str) -> TaskClass {
 /// so it remains greppable in the binary.
 pub fn posture_full(class: TaskClass) -> String {
     match posture(class) {
-        Some(p) => format!("{p}{UNIVERSAL_CORE}"),
+        Some(p) => format!("{p}{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}{STATE_EXIT_CONDITIONS}"),
         // The core applies even when no class posture does — those failures are not class-specific,
         // and a one-shot request is exactly where "another outline" is cheapest to produce.
-        None => UNIVERSAL_CORE.to_string(),
+        None => format!("{UNIVERSAL_CORE}{BUILD_BIAS}{TERSENESS_BIAS}{STATE_EXIT_CONDITIONS}"),
     }
 }
 
@@ -172,6 +172,109 @@ pub fn posture(class: TaskClass) -> Option<&'static str> {
 /// Deliberately short. A bloated preamble is the same anti-pattern as a bloated summary, and the
 /// model that recites four principles is the model that recited "minimal edit distance" at a blank
 /// directory.
+/// Applied alongside the core, and it exists to correct an asymmetry in it.
+///
+/// The core says "an outline is not a step", "say what you ran", "never call it working unless it
+/// ran". Every line pushes toward verifying before acting — and read alone they produce a model that
+/// theorises instead of building, which is a different failure with the same cost.
+///
+/// **The distinction that matters is not think-versus-build. It is REVERSIBLE versus EXPENSIVE.**
+///
+/// Writing code into a git repo is reversible: it compiles or it does not, the tests pass or they do
+/// not, and `git checkout` undoes it in a second. Shipping a confident explanation as a fix is
+/// expensive: it consumes a run on someone else's hardware and returns one bit.
+///
+/// A real session spent nine hypotheses against five measurements on one bug. Four of the hypotheses
+/// shipped as fixes and moved the failure count by zero. **Not one of them was too much code — every
+/// one was too much reasoning about code that could have been printed.** The corrective is not more
+/// caution, it is spending the cheap resource first.
+/// The asymmetry nothing else here accounts for.
+///
+/// **A person types ten tokens in the time this model emits a thousand.** So a short prompt is not a
+/// precise one — it is a COMPRESSED one, written under a cost the model does not pay. "keep working"
+/// carries the intent of a paragraph the operator did not have time to write.
+///
+/// Two failures follow from reading brevity as specification:
+///
+/// * **Scoping effort to the prompt's length.** Ten words asked for do not mean ten words of work.
+/// * **Asking for elaboration.** A clarifying question costs the operator another round of typing to
+///   save the model a guess it could have made and stated. That trade is backwards: the model's guess
+///   is cheap and correctable, the operator's time is neither.
+///
+/// The corrective is not to invent requirements. It is to read the request as the fuller one it
+/// stands in for, SAY which reading was taken, and proceed — so a wrong expansion costs one visible
+/// sentence instead of a silent detour.
+pub const TERSENESS_BIAS: &str = "\n\nA SHORT REQUEST IS COMPRESSED, NOT PRECISE. The person types \
+far slower than you generate, so brevity reflects their cost and not the size of what they want \u{2014} \
+read a terse instruction as the fuller one they would have written with more time. Do not scope your \
+effort to the prompt's length, and do not ask a clarifying question you could answer yourself: a \
+question spends their turn to save you a guess, which is the wrong way round. State the reading you \
+took in one line and act on it, so a wrong reading costs a sentence rather than a detour.";
+
+/// Overrides the standing priority list when the task IS new functionality.
+///
+/// # The conflict this resolves
+///
+/// The system prompt opens with ten absolute priorities, "never reorder, never trade a higher for a
+/// lower", and **new functionality is number ten of ten**. Below readability. Below performance.
+///
+/// For maintenance that ordering is right and hard-won. For a greenfield request it is a direct
+/// instruction to do nine other things first — and no posture appended two thousand tokens later
+/// overcomes a numbered absolute at the top. That is why the classifier fixes kept not working: they
+/// were arguing with a rule the model had been told never to reorder.
+///
+/// # Not a reordering — a scope statement
+///
+/// The priorities are about how to CHANGE an existing system. When there is no existing system, one
+/// through five have nothing to preserve, understand or minimally edit. Saying so is not weakening
+/// them; it is naming what they were always about.
+/// What a cognitive state must PRODUCE, not what it should be called.
+///
+/// # The failure this addresses
+///
+/// The prompt names eight states — RECONSTRUCT, MODEL, EXPLORE, CRITIQUE, SYNTHESIZE, IMPLEMENT,
+/// VERIFY, REFLECT — and says to move through them. **IMPLEMENT is sixth of eight.**
+///
+/// A capable model treats that as a checklist of thinking. A small one treats it as a checklist of
+/// HEADINGS, and an external review of this project caught exactly that: a transcript reciting
+/// "CRITIQUE" without finding a problem, and "let's implement character classes" followed by listing
+/// them again. Eight named stages before building is eight chances to emit stage-shaped text.
+///
+/// # Exit conditions, not stage names
+///
+/// The corrective is not fewer states — the states are good — it is that **each one exits on an
+/// artefact rather than on having been mentioned.** CRITIQUE ends when a named assumption has been
+/// attacked, not when the word appears. A state whose product is a paragraph about the state has not
+/// run.
+///
+/// And a state whose work is already done is SKIPPED. "Never camp in one" reads as "visit all
+/// eight", which for a two-line fix means six stages of ceremony before a one-line edit.
+pub const STATE_EXIT_CONDITIONS: &str = "\n\nTHE COGNITIVE STATES EXIT ON PRODUCTS, NOT ON BEING \
+NAMED. RECONSTRUCT ends when you can name the files involved; MODEL when the goal fits one line; \
+EXPLORE when you have two approaches that differ in more than wording; CRITIQUE when you have \
+attacked a SPECIFIC assumption and can say which fails; SYNTHESIZE when one path is chosen and the \
+others are rejected for stated reasons; IMPLEMENT when code exists; VERIFY when something was run. \
+Writing the name of a state is not entering it, and a paragraph about critiquing is not a critique. \
+SKIP any state whose work is already done \u{2014} a two-line fix does not need six stages before \
+the edit, and moving through them all when they are not needed is the ceremony this list exists to \
+replace.";
+
+pub const GREENFIELD_PRIORITY_OVERRIDE: &str = "\n\nPRIORITY SCOPE: the standing priority list \
+orders how to CHANGE an existing system, and 'new functionality' sits last there because a \
+maintenance task should not grow the system before it understands it. THIS TASK IS THE EXCEPTION \
+THE LIST DOES NOT COVER \u{2014} there is nothing here to preserve, understand or minimally edit, so \
+priorities one through five have no subject. Correctness still leads. Build the thing.";
+
+pub const BUILD_BIAS: &str = "\n\nWHEN IN DOUBT, BUILD. Writing code is cheap and reversible — it \
+compiles or it does not, and it can be reverted in a second. Reasoning about what the code would do \
+is expensive: it consumes a turn and returns a guess. If a question could be settled by writing the \
+thing, or by adding a print and running it, do that instead of explaining what you expect. Prefer the \
+smallest version that RUNS over the most complete version that is described. Explanations are for \
+after the result comes back, not instead of it. AND WHEN YOU MUST RETURN FOR A DECISION, RETURN WITH \
+THE EVIDENCE ALREADY GATHERED \u{2014} if a question needs the user, run the cheap check on the way \
+and bring the result. Coming back with two options and no data asks them to decide something you \
+could have narrowed for the cost of a print.";
+
 pub const UNIVERSAL_CORE: &str = "\n\nALWAYS: An outline is not a step \u{2014} if you name a step, \
 take it in the same reply. State what you actually compiled or ran versus what you only wrote; \
 unverified work is fine, unverified work presented as finished is not. Never describe something as \
@@ -186,7 +289,9 @@ Do not refuse a build the user explicitly asked for on the grounds that it's new
 maintenance role; accepting a greenfield goal is not a violation of minimal-edit or architecture-preservation. \
 Stay humble the RIGHT way: scope honestly (a playable prototype, not a shipped AAA title), build \
 incrementally, verify each step compiles before the next, and say plainly what is a prototype vs \
-production-ready. Decompose the goal into a short plan and begin step one — don't stall on permission or \
+production-ready. Decompose the goal into a short plan and TAKE step one IN THE SAME REPLY \
+\u{2014} a plan whose first step is not taken is an outline, and the user asked for a build. Ship a \
+runnable slice each turn rather than a more detailed description of one. Begin step one — don't stall on permission or \
 re-litigate whether to proceed.";
 
 /// Long-horizon maintenance: decompose, but the literal minimal-edit posture is correct here.
@@ -404,5 +509,343 @@ mod universal_core_tests {
         // A bloated preamble is the same anti-pattern as a bloated summary, and a model reciting four
         // principles is the model that recited "minimal edit distance" at a blank directory.
         assert!(UNIVERSAL_CORE.len() < 600, "got {} chars", UNIVERSAL_CORE.len());
+    }
+}
+
+/// What the workspace itself says, which outranks what the request says.
+///
+/// `classify` reads the request text. That was the only signal available and it is the weaker one:
+/// **an empty repository is ground truth.** A request phrased as maintenance cannot be maintenance if
+/// there is nothing to maintain, and no amount of careful wording detection beats counting the files.
+///
+/// A real transcript: a 1B model in an EMPTY repo, asked to "write a rust tui game", produced a plan
+/// to "fix SQL injection vulnerabilities" and "optimize database queries". `_546` fixed the
+/// prompt-side classifier so bare build verbs count. This is the signal that would have caught it
+/// without any wording rule at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RepoState {
+    /// No source files. Nothing can be maintained.
+    Empty,
+    /// A handful of files — a project just started.
+    Sparse { files: usize },
+    /// An established codebase.
+    Established { files: usize },
+}
+
+impl RepoState {
+    pub fn from_counts(source_files: usize) -> Self {
+        match source_files {
+            0 => RepoState::Empty,
+            // Below this a "maintenance" framing still misleads: there is not enough there for
+            // architecture-preservation advice to be about anything.
+            n if n < 5 => RepoState::Sparse { files: n },
+            n => RepoState::Established { files: n },
+        }
+    }
+
+    /// Does the workspace contradict a maintenance framing?
+    pub fn forbids_maintenance_posture(self) -> bool {
+        matches!(self, RepoState::Empty | RepoState::Sparse { .. })
+    }
+
+    pub fn explain(self) -> &'static str {
+        match self {
+            RepoState::Empty =>
+                "the repository is EMPTY — there is nothing to maintain, so a maintenance posture \
+describes work that cannot exist, whatever the request said",
+            RepoState::Sparse { .. } =>
+                "the repository has only a few files — architecture-preservation advice would be \
+about almost nothing, and a build posture serves better",
+            RepoState::Established { .. } =>
+                "an established codebase; the request text decides the posture",
+        }
+    }
+}
+
+/// The posture, with the workspace allowed to overrule the text.
+pub fn posture_for(class: TaskClass, repo: RepoState) -> String {
+    // The override runs FIRST. A wording rule that says "maintenance" and a directory that says
+    // "empty" are not two opinions to weigh — one of them is a fact.
+    if repo.forbids_maintenance_posture() {
+        // The override goes FIRST, before the posture, because it is answering a rule that came
+        // before both — and a contradiction resolved late reads as a hedge rather than a scope.
+        return format!("{GREENFIELD_PRIORITY_OVERRIDE}{GREENFIELD_BUILD_POSTURE}{UNIVERSAL_CORE}\
+{BUILD_BIAS}{TERSENESS_BIAS}{STATE_EXIT_CONDITIONS}");
+    }
+    posture_full(class)
+}
+
+#[cfg(test)]
+mod repo_state_tests {
+    use super::*;
+
+    #[test]
+    fn an_EMPTY_repo_forbids_the_maintenance_posture_whatever_the_request_says() {
+        // The transcript: a 1B model in an empty repo, asked to write a TUI game, produced a plan to
+        // fix SQL injection vulnerabilities. No wording rule was needed to catch that — counting the
+        // files was enough.
+        let p = posture_for(classify("fix the bug in the parser"), RepoState::Empty);
+        assert!(p.contains("NEW BUILD"), "an empty repo cannot be maintained");
+    }
+
+    #[test]
+    fn a_SPARSE_repo_also_prefers_building() {
+        // Architecture-preservation advice about three files is advice about almost nothing.
+        assert!(RepoState::from_counts(3).forbids_maintenance_posture());
+        assert!(!RepoState::from_counts(40).forbids_maintenance_posture());
+    }
+
+    #[test]
+    fn an_ESTABLISHED_repo_lets_the_REQUEST_decide() {
+        // The override is for when the workspace contradicts the text, not a blanket rule.
+        let p = posture_for(classify("fix the off-by-one in arena_place"), RepoState::from_counts(40));
+        assert!(!p.contains("NEW BUILD"));
+    }
+
+    #[test]
+    fn the_UNIVERSAL_CORE_survives_the_override() {
+        // The override replaces the class posture and must not drop the floor with it.
+        let p = posture_for(classify("fix the parser"), RepoState::Empty);
+        assert!(p.contains("An outline is not a step"));
+    }
+
+    #[test]
+    fn the_explanation_says_it_is_a_FACT_not_a_preference() {
+        assert!(RepoState::Empty.explain().contains("whatever the request said"));
+    }
+}
+
+#[cfg(test)]
+mod build_bias_tests {
+    use super::*;
+
+    #[test]
+    fn EVERY_posture_carries_the_build_bias() {
+        // The core alone reads as "verify before acting" and produces a model that theorises rather
+        // than builds — a different failure with the same cost.
+        for r in ["write smite 2 in rust", "fix the off-by-one in arena_place", "what does this do"] {
+            assert!(posture_full(classify(r)).contains("WHEN IN DOUBT, BUILD"), "{r}");
+        }
+    }
+
+    #[test]
+    fn it_names_the_real_distinction_REVERSIBLE_not_think_versus_build() {
+        // Writing code is reversible; shipping a confident explanation as a fix consumes a run on
+        // someone else's hardware and returns one bit.
+        assert!(BUILD_BIAS.contains("cheap and reversible"));
+        assert!(BUILD_BIAS.contains("returns a guess"));
+    }
+
+    #[test]
+    fn it_prefers_the_smallest_thing_that_RUNS() {
+        // Not the most complete thing described. A running fragment produces evidence; a complete
+        // description produces agreement.
+        assert!(BUILD_BIAS.contains("smallest version that RUNS"));
+        assert!(BUILD_BIAS.contains("most complete version that is described"));
+    }
+
+    #[test]
+    fn it_does_NOT_contradict_the_core() {
+        // Both survive together: build first, and still never call it working unless it ran. The
+        // bias is about which resource to spend, not about whether to check.
+        let p = posture_full(classify("build a tui dashboard"));
+        assert!(p.contains("unless you ran it and saw it work"));
+        assert!(p.contains("WHEN IN DOUBT, BUILD"));
+    }
+
+    #[test]
+    fn a_print_counts_as_building() {
+        // The specific corrective: nine hypotheses against five measurements, and the measurements
+        // were four lines each. "Add a print and run it" is the cheap action the core never named.
+        assert!(BUILD_BIAS.contains("adding a print and running it"));
+    }
+}
+
+#[cfg(test)]
+mod return_with_evidence_tests {
+    use super::*;
+
+    /// The sharper form of the build bias, and the one this session most needed.
+    ///
+    /// I said "the decisive print is X" and stopped, four separate times, when ADDING the print cost
+    /// less than describing it. Each of those turns ended with the user holding a question I could
+    /// have half-answered on the way.
+    #[test]
+    fn returning_for_a_decision_requires_bringing_EVIDENCE() {
+        assert!(BUILD_BIAS.contains("RETURN WITH THE EVIDENCE ALREADY GATHERED"));
+        assert!(BUILD_BIAS.contains("run the cheap check on the way"));
+    }
+
+    #[test]
+    fn it_names_the_failure_as_ASKING_rather_than_as_slowness() {
+        // Not "you were slow" — "you asked them to decide something you could have narrowed". The
+        // cost lands on the other person, which is what makes it worth a rule.
+        assert!(BUILD_BIAS.contains("asks them to decide something you could have narrowed"));
+    }
+
+    #[test]
+    fn the_bias_still_permits_returning_for_a_decision_at_all() {
+        // Some questions genuinely need the user — which model to download, whether a tradeoff is
+        // acceptable. The rule is about arriving with data, not about never arriving.
+        assert!(BUILD_BIAS.contains("WHEN YOU MUST RETURN FOR A DECISION"),
+            "the phrasing has to grant that returning is sometimes right");
+    }
+}
+
+#[cfg(test)]
+mod terseness_tests {
+    use super::*;
+
+    #[test]
+    fn EVERY_posture_carries_it() {
+        for r in ["keep working", "write smite 2 in rust", "fix the parser"] {
+            assert!(posture_full(classify(r)).contains("COMPRESSED, NOT PRECISE"), "{r}");
+        }
+    }
+
+    #[test]
+    fn effort_is_NOT_scoped_to_the_prompt_length() {
+        // Ten words asked for do not mean ten words of work. "keep working" carries the intent of a
+        // paragraph the operator did not have time to write.
+        assert!(TERSENESS_BIAS.contains("do not scope your effort to the prompt's length")
+             || TERSENESS_BIAS.contains("Do not scope your effort to the prompt's length"));
+    }
+
+    #[test]
+    fn a_clarifying_question_is_named_as_SPENDING_THEIR_TURN() {
+        // The trade is backwards: the model's guess is cheap and correctable, the operator's typing
+        // time is neither. Naming who pays is what makes this actionable rather than polite advice.
+        assert!(TERSENESS_BIAS.contains("spends their turn to save you a guess"));
+        assert!(TERSENESS_BIAS.contains("wrong way round"));
+    }
+
+    #[test]
+    fn the_expansion_must_be_STATED_not_silent() {
+        // The safeguard that makes charitable reading safe: a wrong expansion costs one visible
+        // sentence instead of a silent detour, and the operator can correct it in four words.
+        assert!(TERSENESS_BIAS.contains("State the reading you took in one line"));
+    }
+
+    #[test]
+    fn it_does_not_license_INVENTING_requirements() {
+        // Read the request as the fuller one it stands in for — not as a different request. The
+        // wording says "they would have written", which is about recovering intent rather than
+        // adding to it.
+        assert!(TERSENESS_BIAS.contains("the fuller one they would have written"));
+    }
+
+    #[test]
+    fn all_four_layers_coexist() {
+        // core: verify. build bias: spend the cheap resource. evidence: do not return empty-handed.
+        // terseness: read generously. None cancels another.
+        let p = posture_full(classify("keep working"));
+        for marker in ["An outline is not a step", "WHEN IN DOUBT, BUILD",
+                       "RETURN WITH THE EVIDENCE", "COMPRESSED, NOT PRECISE"] {
+            assert!(p.contains(marker), "missing {marker}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod priority_conflict_tests {
+    use super::*;
+
+    /// The prompt opens with ten absolute priorities and **new functionality is tenth**. For
+    /// maintenance that is right. For a build request it instructs the model to do nine other things
+    /// first — and every classifier fix in this file was arguing with a rule the model was told never
+    /// to reorder.
+    #[test]
+    fn a_GREENFIELD_task_gets_the_priority_scope_statement() {
+        let p = posture_for(classify("write a rust tui game"), RepoState::Empty);
+        assert!(p.contains("PRIORITY SCOPE"));
+        assert!(p.contains("Build the thing"));
+    }
+
+    #[test]
+    fn it_is_a_SCOPE_statement_not_a_reordering() {
+        // Reordering an "absolute, never reorder" list invites the model to decide which other rules
+        // are negotiable. Saying the list has no subject here does not.
+        assert!(GREENFIELD_PRIORITY_OVERRIDE.contains("no subject"));
+        assert!(GREENFIELD_PRIORITY_OVERRIDE.contains("Correctness still leads"),
+            "the one priority that survives must be named, or 'the list does not apply' reads as \
+'nothing applies'");
+    }
+
+    #[test]
+    fn MAINTENANCE_does_not_get_it() {
+        // The ordering is right and hard-won for changing an existing system, and weakening it there
+        // would trade a real protection for a case it does not cover.
+        let p = posture_for(classify("fix the off-by-one in arena_place"), RepoState::from_counts(40));
+        assert!(!p.contains("PRIORITY SCOPE"));
+    }
+
+    #[test]
+    fn the_override_comes_BEFORE_the_posture_it_qualifies() {
+        // It answers a rule stated earlier than both, and a contradiction resolved late reads as a
+        // hedge rather than as a scope.
+        let p = posture_for(classify("build a game"), RepoState::Empty);
+        let scope = p.find("PRIORITY SCOPE").unwrap();
+        let posture = p.find("NEW BUILD").unwrap();
+        assert!(scope < posture);
+    }
+
+    #[test]
+    fn a_greenfield_posture_still_carries_the_other_three_layers() {
+        // The override replaces nothing — it adds the missing one.
+        let p = posture_for(classify("build a game"), RepoState::Empty);
+        for m in ["An outline is not a step", "WHEN IN DOUBT, BUILD", "COMPRESSED, NOT PRECISE"] {
+            assert!(p.contains(m), "lost {m}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod state_exit_tests {
+    use super::*;
+
+    /// The prompt names eight states and IMPLEMENT is sixth. An external review of this project
+    /// caught a transcript reciting "CRITIQUE" without finding a problem — eight named stages before
+    /// building is eight chances to emit stage-shaped text instead of work.
+    #[test]
+    fn every_posture_carries_the_exit_conditions() {
+        for r in ["write a game", "fix the parser", "what does this do"] {
+            assert!(posture_full(classify(r)).contains("EXIT ON PRODUCTS"), "{r}");
+        }
+    }
+
+    #[test]
+    fn it_says_naming_a_state_is_not_ENTERING_it() {
+        // The specific failure: "let's implement character classes" followed by listing them again.
+        assert!(STATE_EXIT_CONDITIONS.contains("Writing the name of a state is not entering it"));
+        assert!(STATE_EXIT_CONDITIONS.contains("a paragraph about critiquing is not a critique"));
+    }
+
+    #[test]
+    fn each_state_gets_a_CHECKABLE_product() {
+        // "Ends when you can name the files" is verifiable. "Ends when you understand the
+        // architecture" is not, and an unverifiable exit condition is a stage name with extra words.
+        for phrase in ["name the files involved", "fits one line", "differ in more than wording",
+                       "attacked a SPECIFIC assumption", "code exists", "something was run"] {
+            assert!(STATE_EXIT_CONDITIONS.contains(phrase), "missing product: {phrase}");
+        }
+    }
+
+    #[test]
+    fn a_state_whose_work_is_DONE_may_be_skipped() {
+        // "Never camp in one" reads as "visit all eight", which for a two-line fix is six stages of
+        // ceremony before a one-line edit.
+        assert!(STATE_EXIT_CONDITIONS.contains("SKIP any state whose work is already done"));
+        assert!(STATE_EXIT_CONDITIONS.contains("a two-line fix does not need six stages"));
+    }
+
+    #[test]
+    fn all_five_layers_coexist_on_a_greenfield_task() {
+        // priorities, posture, core, build, terseness, states — six pieces pulling in different
+        // directions and none may cancel another.
+        let p = posture_for(classify("write a rust tui game"), RepoState::Empty);
+        for m in ["PRIORITY SCOPE", "NEW BUILD", "An outline is not a step",
+                  "WHEN IN DOUBT, BUILD", "COMPRESSED, NOT PRECISE", "EXIT ON PRODUCTS"] {
+            assert!(p.contains(m), "lost {m}");
+        }
     }
 }

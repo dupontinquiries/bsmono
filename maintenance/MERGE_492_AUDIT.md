@@ -221,3 +221,68 @@ the spec's tie rule too — corrected to the measured one`.
 invisible to anyone who has not read this note. `check-features.sh` should grow
 a gpu-gemm arm — it already exists to stop exactly this class of "the flag
 nobody exercises" problem.
+
+---
+
+# Merge 670 (c4-573)
+
+73 upstream commits from `f498feb8` — the 605 tip — against 519 of ours.
+Auto-merged clean, no conflicts. Two files were touched by both sides
+(`backend.rs`, `scene3d.rs`) and git resolved both.
+
+| build | result |
+|---|---|
+| `--features gui` | **778 passed** (was 745) |
+| `--no-default-features` (lean) | **527 passed** (was 498) |
+| `logscope-fan` | **247 passed** |
+| voiceterm egui-frontend | **613 passed** |
+| `gpu-gemm` | **NOT RUN — see below** |
+
+voiceterm matters here because upstream changed `src/table_ops.rs`, which the
+egui port pulls in with `#[path]`. Upstream engine changes flow straight into
+the port, and its tests are what confirm they still hold.
+
+## The gpu-gemm arm cannot run in this container, and I had the cause wrong
+
+`check-features.sh` gained a gpu-gemm arm last merge precisely so the
+quantization work would not go unbuilt. It fails here, and the message is the
+same misleading one:
+
+```
+error: failed to run `rustc` to learn about target-specific information
+  ...
+  error: couldn't read from stdin, as it did not contain valid UTF-8
+```
+
+**The audit above blames this on redirecting `</dev/null`. That is wrong.**
+Tested directly: `< /dev/null` does not fix it, foreground does not fix it,
+`RUSTFLAGS=""` does not fix it, and naming `--target` explicitly does not fix
+it. `rustc - --print=cfg` works fine when run by hand with either empty or real
+input, so rustc and the toolchain are healthy.
+
+What is actually happening: gpu-gemm is `exclude`d from the workspace, so cargo
+runs a **host probe** for it — `rustc -` reading the source from stdin — and in
+this execution environment the inherited stdin is not valid UTF-8. The
+workspace crates never hit this path because their target info is already
+resolved.
+
+So the third cause is neither disk nor a redirect: it is *this container's
+stdin*, and the arm is unrunnable here rather than broken. It should still run
+on a normal host. **The quantization crate is therefore unverified in this
+merge**, and that is a gap, not a pass — the last merge did verify it (543
+tests) and this one could not.
+
+## Concerns
+
+**1. The prefer-dynamic config is still there** and now has a second
+consequence. `-C prefer-dynamic` and `-C link-arg=-fuse-ld=gold` appear in the
+failing probe command, which is how they came to my attention twice. They are
+not the cause here, but a per-app `.cargo/config.toml` that only affects one
+directory tree keeps producing confusing failures in the crate that sits outside
+the workspace.
+
+**2. Upstream now touches snapclone and voiceterm**, which it did not before —
+`snapclone-dht/src/identity.rs`, both NAT and DHT manifests, and
+`voiceterm/src/table_ops.rs`. Those are engine crates the egui ports depend on
+or include, so future merges need the port test suites run as part of accepting
+them, not just logscope's. Done here; worth keeping.

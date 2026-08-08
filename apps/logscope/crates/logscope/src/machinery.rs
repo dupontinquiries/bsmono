@@ -1821,3 +1821,270 @@ mod beacon_skin_tests {
         assert!(beacon_skin("Folding@home").aging.contains("bleach"));
     }
 }
+
+/// Teaching the machine's vocabulary, once.
+///
+/// The landmark is designed to read without a legend — a stopped pendulum looks stopped. But that
+/// only works **after** someone knows the pendulum tracks the engine. The first encounter teaches
+/// nothing, and a visual language nobody learned is decoration.
+///
+/// ## Why it appears once and not on hover
+///
+/// A tooltip that fires every time trains the reader to dismiss it, and dismissing becomes the
+/// habit — so the one time it matters, it is already invisible. Showing it on first encounter and
+/// never again means the reader either learned it or can ask.
+///
+/// ## Why it is tied to the STATE and not to the machine
+///
+/// Explaining "this is a clocktower, its pendulum shows GPU activity" while the pendulum swings
+/// normally teaches an abstraction. Explaining it the first time the pendulum **stops** teaches a
+/// fact the reader can immediately check against the thing in front of them.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Lesson {
+    /// The state this teaches.
+    pub motion: Motion,
+    /// One sentence, in the scene's own vocabulary.
+    pub text: String,
+}
+
+/// What to say the first time a reader sees this motion in this scene.
+///
+/// Returns None for states that need no teaching: a machine working normally is self-explanatory,
+/// and interrupting to say so spends the reader's attention on the least useful case.
+pub fn lesson_for(scene: &str, motion: Motion) -> Option<Lesson> {
+    let m = machine_for(scene);
+    let text = match motion {
+        // The one that must be taught, because "stopped" is ambiguous until you know it is
+        // deliberate. Without this a reader's first thought is that the RENDERER broke.
+        Motion::Stalled => format!(
+            "{} — that is not a rendering fault. The engine is waiting on the GPU, and the mechanism \
+stops when it does.", m.stall),
+        // Worth teaching because it is the state a reader will misread as a problem: lots of motion
+        // looks like strain.
+        Motion::Fetching => format!(
+            "{} — experts are being streamed in. Movement here is work, not trouble.", m.fetch),
+        // Self-explanatory. Saying "it is working" while it visibly works is the interruption that
+        // teaches people to ignore the next one.
+        Motion::Thriving | Motion::Deciding => return None,
+    };
+    Some(Lesson { motion, text })
+}
+
+/// Tracks which lessons a reader has already seen.
+#[derive(Clone, Debug, Default)]
+pub struct Taught(std::collections::BTreeSet<u8>);
+
+impl Taught {
+    fn key(scene: &str, m: Motion) -> u8 {
+        // Scene-scoped: the vocabulary differs per world, so learning it in the Library does not
+        // teach it in Atlantis. Hashed to a byte because this only needs to distinguish a handful.
+        let s = scene.bytes().fold(0u8, |a, b| a.wrapping_mul(31).wrapping_add(b));
+        s.wrapping_mul(4).wrapping_add(m as u8)
+    }
+
+    /// Should this lesson be shown now?
+    pub fn take(&mut self, scene: &str, motion: Motion) -> Option<Lesson> {
+        let k = Self::key(scene, motion);
+        if self.0.contains(&k) { return None }
+        let l = lesson_for(scene, motion)?;
+        self.0.insert(k);
+        Some(l)
+    }
+
+    pub fn seen(&self) -> usize { self.0.len() }
+}
+
+#[cfg(test)]
+mod lesson_tests {
+    use super::*;
+
+    #[test]
+    fn a_STALL_is_taught_because_stopped_is_ambiguous() {
+        // Without this, a reader's first thought on seeing a frozen mechanism is that the RENDERER
+        // broke — which is the opposite of the message.
+        let l = lesson_for("Old Library", Motion::Stalled).unwrap();
+        assert!(l.text.contains("not a rendering fault"));
+        assert!(l.text.contains("does not fall"), "in the scene's own vocabulary");
+    }
+
+    #[test]
+    fn a_WORKING_machine_is_not_explained() {
+        // Saying "it is working" while it visibly works is the interruption that teaches people to
+        // ignore the next one.
+        assert!(lesson_for("Old Library", Motion::Thriving).is_none());
+        assert!(lesson_for("Old Library", Motion::Deciding).is_none());
+    }
+
+    #[test]
+    fn FETCHING_is_taught_because_motion_reads_as_strain() {
+        // The state a reader will misread as a problem: lots of movement looks like trouble.
+        let l = lesson_for("Treehouse", Motion::Fetching).unwrap();
+        assert!(l.text.contains("work, not trouble"));
+    }
+
+    #[test]
+    fn each_lesson_fires_ONCE() {
+        // A tooltip that repeats trains the reader to dismiss it, and dismissing becomes the habit —
+        // so the one time it matters it is already invisible.
+        let mut t = Taught::default();
+        assert!(t.take("Canopy", Motion::Stalled).is_some());
+        assert!(t.take("Canopy", Motion::Stalled).is_none());
+    }
+
+    #[test]
+    fn the_vocabulary_is_SCENE_SCOPED() {
+        // Learning that a pendulum means the engine does not teach that coral-crusted vanes do.
+        let mut t = Taught::default();
+        assert!(t.take("Old Library", Motion::Stalled).is_some());
+        assert!(t.take("Atlantis", Motion::Stalled).is_some(), "a new world is a new vocabulary");
+    }
+
+    #[test]
+    fn states_are_taught_INDEPENDENTLY() {
+        // Seeing a stall does not explain a fetch.
+        let mut t = Taught::default();
+        t.take("Canopy", Motion::Stalled);
+        assert!(t.take("Canopy", Motion::Fetching).is_some());
+        assert_eq!(t.seen(), 2);
+    }
+}
+
+/// Which part of the mechanism the pointer is over.
+///
+/// Meshes are emitted in a fixed order by `add_landmark`, so an index maps back to a part without
+/// any separate hit-test geometry: plinth, upright, then one per slot, then the selector, then the
+/// drive.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Part { Frame, Slot(u32), Selector, Drive }
+
+/// Map a mesh index to the part it belongs to.
+///
+/// **Derived from the emission order rather than stored**, because a stored table drifts the moment
+/// someone adds a mesh — and the failure would be a tooltip describing the wrong part, which reads
+/// as a diagnosis rather than a bug.
+pub fn part_at(mesh_index: usize, slots: u32, has_selector: bool) -> Option<Part> {
+    let s = slots as usize;
+    match mesh_index {
+        0 | 1 => Some(Part::Frame),
+        i if i < 2 + s => Some(Part::Slot((i - 2) as u32)),
+        i if has_selector && i == 2 + s => Some(Part::Selector),
+        i if i == 2 + s + has_selector as usize => Some(Part::Drive),
+        _ => None,
+    }
+}
+
+/// What to say when the pointer rests on a part.
+///
+/// **Hover is asked for, so it carries the numbers.** The ambient view is deliberately qualitative —
+/// a mechanism that is moving or stopped — because a percentage on screen at all times is a
+/// percentage nobody reads. Someone who points at a part has asked a question and should get the
+/// figure, not another adjective.
+///
+/// This is the inverse of `lesson_for`, which interrupts and therefore says as little as possible.
+pub fn tooltip(part: Part, p: &Parts, m: &Machine, motion: Motion) -> String {
+    match part {
+        Part::Frame => format!(
+            "{}. The frame never moves — it is what the working parts are measured against.",
+            m.landmark),
+        Part::Slot(i) => {
+            let resident = i < p.filled;
+            if resident {
+                format!("Expert slot {i} of {} — RESIDENT. {} of {} are pinned; a pinned expert costs \
+nothing to use.", p.slots, p.filled, p.slots)
+            } else {
+                format!("Expert slot {i} of {} — STREAMED. {} of {} stream on demand, at {:.0}% \
+resident hit rate. Each miss is a fetch before the layer can proceed.",
+                    p.slots, p.streaming(), p.slots, p.smoothness * 100.0)
+            }
+        }
+        Part::Selector => match p.selected {
+            Some(s) => format!("The router has chosen expert {s}. {}", m.decide),
+            // Only reachable if the selector mesh exists while `selected` is None, which
+            // `Parts::from_state` prevents — but a tooltip that says nothing is worse than one that
+            // admits the inconsistency.
+            None => "The selector is drawn but no expert is chosen — that is a bug, not a state."
+                .to_string(),
+        },
+        Part::Drive => match motion {
+            Motion::Stalled => format!(
+                "STOPPED. {} The CPU is waiting on a readback, so the GPU has nothing queued — this \
+is the state worth acting on, and the only one where the mechanism is deliberately still.", m.stall),
+            Motion::Thriving => format!("{} Everything nominal at full rate.", m.thriving),
+            Motion::Fetching => format!("{} Running at {:.0}% of full rate while experts stream in.",
+                m.fetch, motion.rate() * 100.0),
+            Motion::Deciding => format!("{} Between tokens.", m.decide),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tooltip_tests {
+    use super::*;
+
+    fn parts() -> Parts { Parts::from_state(6, 16, Some(3), Motion::Fetching, 0.46) }
+
+    #[test]
+    fn the_mesh_index_maps_to_a_PART_without_a_stored_table() {
+        // A stored table drifts the moment someone adds a mesh, and the failure would be a tooltip
+        // describing the wrong part — which reads as a diagnosis rather than a bug.
+        assert_eq!(part_at(0, 16, true), Some(Part::Frame));
+        assert_eq!(part_at(1, 16, true), Some(Part::Frame));
+        assert_eq!(part_at(2, 16, true), Some(Part::Slot(0)));
+        assert_eq!(part_at(17, 16, true), Some(Part::Slot(15)));
+        assert_eq!(part_at(18, 16, true), Some(Part::Selector));
+        assert_eq!(part_at(19, 16, true), Some(Part::Drive));
+        assert_eq!(part_at(20, 16, true), None);
+    }
+
+    #[test]
+    fn with_NO_SELECTOR_the_drive_moves_up_one() {
+        // A stalled machine emits no selector mesh, so every index after the store shifts.
+        assert_eq!(part_at(18, 16, false), Some(Part::Drive));
+        assert_eq!(part_at(19, 16, false), None);
+    }
+
+    #[test]
+    fn hover_carries_the_NUMBERS_where_the_ambient_view_does_not() {
+        // The whole split: the landmark is qualitative because a percentage on screen at all times is
+        // a percentage nobody reads. Someone who points at a part has asked a question.
+        let t = tooltip(Part::Slot(9), &parts(), &machine_for("Old Library"), Motion::Fetching);
+        assert!(t.contains("46%"), "the hit rate belongs here: {t}");
+        assert!(t.contains("STREAMED"));
+    }
+
+    #[test]
+    fn a_RESIDENT_slot_reads_differently_from_a_streamed_one() {
+        let (p, m) = (parts(), machine_for("Old Library"));
+        assert!(tooltip(Part::Slot(0), &p, &m, Motion::Fetching).contains("RESIDENT"));
+        assert!(tooltip(Part::Slot(9), &p, &m, Motion::Fetching).contains("STREAMED"));
+    }
+
+    #[test]
+    fn the_DRIVE_tooltip_names_the_stall_as_the_actionable_state() {
+        // The one thing a reader should take away from this landmark.
+        let t = tooltip(Part::Drive, &parts(), &machine_for("Old Library"), Motion::Stalled);
+        assert!(t.contains("STOPPED"));
+        assert!(t.contains("waiting on a readback"));
+        assert!(t.contains("worth acting on"));
+    }
+
+    #[test]
+    fn every_tooltip_speaks_the_SCENE_vocabulary() {
+        // A tooltip in generic engine terms would undo the theming — the reader learned "pendulum",
+        // not "drive".
+        let (p, lib, tree) = (parts(), machine_for("Old Library"), machine_for("Treehouse"));
+        let a = tooltip(Part::Drive, &p, &lib, Motion::Stalled);
+        let b = tooltip(Part::Drive, &p, &tree, Motion::Stalled);
+        assert_ne!(a, b);
+        assert!(a.contains("pendulum") && b.contains("rope"));
+    }
+
+    #[test]
+    fn an_INCONSISTENT_selector_admits_it_rather_than_saying_nothing() {
+        // Parts::from_state prevents this, but a tooltip that goes blank is worse than one that says
+        // the state is impossible.
+        let p = Parts::from_state(6, 16, None, Motion::Fetching, 0.5);
+        let t = tooltip(Part::Selector, &p, &machine_for("Canopy"), Motion::Fetching);
+        assert!(t.contains("that is a bug, not a state"));
+    }
+}
