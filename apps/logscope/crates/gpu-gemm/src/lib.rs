@@ -3222,7 +3222,21 @@ impl Gpu {
         if idx == 0 {
             drop(ring); // release the ring lock before touching the frame/queue
             SUBMIT_BY_DIMS_WRAP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // THE FRAME LEAK. flush_and_wait calls end_frame and never reopens, and ring_dims runs
+            // on every dispatch that passes dims — so the FIRST wrap of the ring closed decode's
+            // frame permanently and every dispatch after it went out on its own encoder.
+            //
+            // That is why a Scout run showed 67% of submits with no frame open while
+            // decode_step_stream opens one on its first line: the frame survived until the first
+            // wrap and not one dispatch longer.
+            //
+            // Reopened on the same condition `download` uses and for the same reason — a caller
+            // that was NOT in a frame must not acquire one behind its back.
+            let had_frame = self.frame.lock().unwrap().is_some();
             self.flush_and_wait();
+            if had_frame && std::env::var_os("LOGSCOPE_NO_FRAME_REOPEN").is_none() {
+                self.begin_frame();
+            }
             ring = self.dims_ring.lock().unwrap();
         }
         let (buffers, next, _writes) = &mut *ring;
