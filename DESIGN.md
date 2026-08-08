@@ -4356,6 +4356,38 @@ tell was that sorting front-to-back scored 100% on a metric I had labelled
 "wasted" — a perfect score on a badness measure should never have looked
 like success.
 
+## 1.133.0 — haunches: the references are waisted and we were a lozenge
+
+Sampling body width at nine stations from nose to tail, normalised to the
+widest, says something neither the surface nor the proportion work caught:
+
+    OCTANE   0.89 0.96 1.00 0.78 0.65 0.64 0.83 0.88 0.88
+    DOMINUS  0.97 1.00 1.00 0.89 0.90 0.96 0.93 1.00 0.98
+    ours     0.56 0.76 0.88 0.96 0.99 1.00 0.99 0.93 0.80
+
+Both references are WAISTED — widest over the wheels, tucked in between,
+Octane by 35%. Ours peaked amidships, exactly where theirs are thinnest. That
+is why the bodies read as lozenges: a car is wide where its wheels are and
+narrows between them, and that single fact is most of what a wheel arch is.
+
+The house recipe now applies an arch curve, so the whole catalogue gets it at
+once. Two attempts were needed and the first failure was informative:
+
+  * SCALING THE MIDDLE DOWN by a flat 16% moved the waist by 4% and left the
+    body still widest amidships — because the sections themselves peak there,
+    a uniform pinch cannot change WHERE the maximum is.
+  * SHAPING THE CURVE AROUND THE WHEEL STATIONS — full width at 55% of the
+    way out, tucking toward the centre — moves the peak to where the wheels
+    are. At a depth of 0.34 the waist is 15%, inside the reference band.
+
+    ours now  0.68 0.87 0.92 0.90 0.85 0.94 1.00 1.00 0.94
+
+`--sim shell` measures our own loft output the same way it measured the
+references, so the profile is checked rather than assumed.
+
+That is four measured layers of reference work now: surface, character
+lines, proportion, and plan view.
+
 ## Stretch goals (still not in this cut)
 
 Shadow mapping, more shape families (arches, helices, half-pipes), ghost-replay

@@ -688,6 +688,64 @@ pub fn run(args: &[String]) {
             println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
         }
         println!();
+        // ---- THE WAIST ----
+        // Both references are widest over the wheels and tuck in between
+        // them. Sampled at nine stations, nose to tail, normalised to the
+        // widest:
+        //
+        //   OCTANE   0.89 0.96 1.00 0.78 0.65 0.64 0.83 0.88 0.88
+        //   DOMINUS  0.97 1.00 1.00 0.89 0.90 0.96 0.93 1.00 0.98
+        //
+        // A body that peaks in the MIDDLE is a lozenge, not a car. This
+        // measures the same way on our own loft output.
+        {
+            let mut gpu_free = crate::meshgen::loft(
+                &[
+                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.44, 0.33, -0.075, 0.010, 0.40),
+                    (-0.02, 0.40, -0.085, 0.055, 0.30),
+                    (0.42, 0.39, -0.080, 0.085, 0.30),
+                    (0.80, 0.28, -0.060, 0.060, 0.55),
+                ],
+                22,
+            );
+            // the same waist the house recipe applies
+            let waisted = crate::meshgen::loft(
+                &[
+                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.44, 0.33 * 0.866, -0.075, 0.010, 0.40),
+                    (-0.02, 0.40 * 0.66, -0.085, 0.055, 0.30),
+                    (0.42, 0.39 * 0.805, -0.080, 0.085, 0.30),
+                    (0.80, 0.28, -0.060, 0.060, 0.55),
+                ],
+                22,
+            );
+            let profile = |m: &crate::meshgen::MeshData| -> Vec<f32> {
+                let (mut z0, mut z1) = (f32::MAX, f32::MIN);
+                for v in m.verts.iter() {
+                    z0 = z0.min(v.pos[2]);
+                    z1 = z1.max(v.pos[2]);
+                }
+                let span = (z1 - z0).max(1e-4);
+                let mut w = vec![0.0f32; 9];
+                for v in m.verts.iter() {
+                    let k = (((v.pos[2] - z0) / span) * 8.999) as usize;
+                    w[k.min(8)] = w[k.min(8)].max(v.pos[0].abs());
+                }
+                let mx = w.iter().cloned().fold(0.0f32, f32::max).max(1e-4);
+                w.iter().map(|x| x / mx).collect()
+            };
+            let a = profile(&mut gpu_free);
+            let b = profile(&waisted);
+            let fmt = |v: &[f32]| v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" ");
+            println!("   OCTANE   0.89 0.96 1.00 0.78 0.65 0.64 0.83 0.88 0.88");
+            println!("   flat     {}", fmt(&a));
+            println!("   waisted  {}", fmt(&b));
+            // the middle must be narrower than the widest station
+            let waist_depth = 1.0 - b[4];
+            println!("   waist depth {:.0}% (references 11-35%)", waist_depth * 100.0);
+        }
+
         // ---- PROPORTIONS AGAINST THE CHARACTER REFERENCES ----
         // Surface was the last two rounds; this is the other half of looking
         // like an Octane. Measured off the reference models themselves:
@@ -2153,6 +2211,64 @@ pub fn run(args: &[String]) {
             println!("   {}", if ok_desc { "every family represented, every description distinct" } else { "CATALOGUE GAPS" });
         }
         println!();
+        // ---- THE WAIST ----
+        // Both references are widest over the wheels and tuck in between
+        // them. Sampled at nine stations, nose to tail, normalised to the
+        // widest:
+        //
+        //   OCTANE   0.89 0.96 1.00 0.78 0.65 0.64 0.83 0.88 0.88
+        //   DOMINUS  0.97 1.00 1.00 0.89 0.90 0.96 0.93 1.00 0.98
+        //
+        // A body that peaks in the MIDDLE is a lozenge, not a car. This
+        // measures the same way on our own loft output.
+        {
+            let mut gpu_free = crate::meshgen::loft(
+                &[
+                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.44, 0.33, -0.075, 0.010, 0.40),
+                    (-0.02, 0.40, -0.085, 0.055, 0.30),
+                    (0.42, 0.39, -0.080, 0.085, 0.30),
+                    (0.80, 0.28, -0.060, 0.060, 0.55),
+                ],
+                22,
+            );
+            // the same waist the house recipe applies
+            let waisted = crate::meshgen::loft(
+                &[
+                    (-0.80, 0.16, -0.055, -0.020, 0.55),
+                    (-0.44, 0.33 * 0.866, -0.075, 0.010, 0.40),
+                    (-0.02, 0.40 * 0.66, -0.085, 0.055, 0.30),
+                    (0.42, 0.39 * 0.805, -0.080, 0.085, 0.30),
+                    (0.80, 0.28, -0.060, 0.060, 0.55),
+                ],
+                22,
+            );
+            let profile = |m: &crate::meshgen::MeshData| -> Vec<f32> {
+                let (mut z0, mut z1) = (f32::MAX, f32::MIN);
+                for v in m.verts.iter() {
+                    z0 = z0.min(v.pos[2]);
+                    z1 = z1.max(v.pos[2]);
+                }
+                let span = (z1 - z0).max(1e-4);
+                let mut w = vec![0.0f32; 9];
+                for v in m.verts.iter() {
+                    let k = (((v.pos[2] - z0) / span) * 8.999) as usize;
+                    w[k.min(8)] = w[k.min(8)].max(v.pos[0].abs());
+                }
+                let mx = w.iter().cloned().fold(0.0f32, f32::max).max(1e-4);
+                w.iter().map(|x| x / mx).collect()
+            };
+            let a = profile(&mut gpu_free);
+            let b = profile(&waisted);
+            let fmt = |v: &[f32]| v.iter().map(|x| format!("{x:.2}")).collect::<Vec<_>>().join(" ");
+            println!("   OCTANE   0.89 0.96 1.00 0.78 0.65 0.64 0.83 0.88 0.88");
+            println!("   flat     {}", fmt(&a));
+            println!("   waisted  {}", fmt(&b));
+            // the middle must be narrower than the widest station
+            let waist_depth = 1.0 - b[4];
+            println!("   waist depth {:.0}% (references 11-35%)", waist_depth * 100.0);
+        }
+
         // ---- PROPORTIONS AGAINST THE CHARACTER REFERENCES ----
         // Surface was the last two rounds; this is the other half of looking
         // like an Octane. Measured off the reference models themselves:

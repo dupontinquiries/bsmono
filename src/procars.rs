@@ -706,6 +706,59 @@ pub fn shell_car(
     cabin: (f32, f32, f32, f32),
     ring: u32,
 ) {
+    // ---- THE WAIST ----
+    //
+    // Measured off the references, sampling body width at nine stations from
+    // nose to tail:
+    //
+    //   OCTANE   0.89 0.96 1.00 0.78 0.65 0.64 0.83 0.88 0.88
+    //   DOMINUS  0.97 1.00 1.00 0.89 0.90 0.96 0.93 1.00 0.98
+    //
+    // Both are WAISTED: widest over the wheels, narrower between them —
+    // Octane's middle is 35% narrower than its front arches. Ours peaked in
+    // the MIDDLE, exactly where theirs are thinnest, which is why the bodies
+    // read as lozenges rather than as cars with haunches. A car is wide
+    // where its wheels are and tucks in between; that single fact is most of
+    // what a wheel arch is.
+    //
+    // Applied here rather than per-car so the whole catalogue gets it, and
+    // scaled gently — the references disagree on depth (Octane 0.35,
+    // Dominus 0.11), so a middling 0.16 flatters both without turning
+    // anything into an hourglass.
+    let waisted: Vec<(f32, f32, f32, f32, f32)> = {
+        let zs: Vec<f32> = sections.iter().map(|s| s.0).collect();
+        let (z0, z1) = (
+            zs.iter().cloned().fold(f32::MAX, f32::min),
+            zs.iter().cloned().fold(f32::MIN, f32::max),
+        );
+        let span = (z1 - z0).max(1e-4);
+        sections
+            .iter()
+            .map(|&(z, hw, y0, y1, r)| {
+                // PEAK AT THE WHEELS, not at the centre.
+                //
+                // Scaling the middle down by a flat percentage moved the
+                // waist by 4% and left the body still widest amidships,
+                // because the sections themselves peak there. The references
+                // peak at the WHEEL STATIONS — roughly 55% of the way out —
+                // and tuck in between. So the curve has to be shaped around
+                // where the wheels are, not applied as a uniform pinch.
+                let t = ((z - z0) / span * 2.0 - 1.0).abs();
+                let arch = if t < 0.55 {
+                    // between the axles: tuck in, deepest at the centre
+                    let u = t / 0.55;
+// 0.22 reached only 7%: the sections are widest amidships to
+                    // begin with, so the tuck has to overcome that before it
+                    // starts showing. 0.34 lands inside the reference band.
+                    1.0 - 0.34 * (1.0 - u * u)
+                } else {
+                    1.0
+                };
+                (z, hw * arch, y0, y1, r)
+            })
+            .collect()
+    };
+    let sections = &waisted[..];
     prims.push(body_prim(gpu, part(meshgen::loft(sections, ring), Vec3::ONE, Quat::IDENTITY, Vec3::ZERO), paint));
     // the glasshouse: its own loft, sunk into the shell so the join is a
     // line rather than a lip
