@@ -45,6 +45,7 @@ pub mod posture;
 pub mod camera_policy;
 pub mod reticle;
 pub mod roster;
+pub mod send_summary;
 pub mod shutter;
 pub mod tile_strip;
 pub mod voice_playout;
@@ -197,6 +198,8 @@ pub struct Snapclone {
     pub menu_target: Option<String>,
     /// Snaps the user asked to keep, for the host to write out.
     pub snaps_saved: Vec<String>,
+    /// The send receipt, filled from the send path's own numbers.
+    pub send_summary: crate::send_summary::SendSummary,
     /// The proximity screensaver and talk-mode flip. Sensors are the host's;
     /// the arming rule is ours.
     pub posture: crate::posture::PostureEngine,
@@ -294,6 +297,7 @@ impl Snapclone {
             attention: Default::default(),
             menu_target: None,
             snaps_saved: Vec::new(),
+            send_summary: Default::default(),
             posture: Default::default(),
             last_voice_at: None,
             glove: Default::default(),
@@ -664,6 +668,23 @@ impl Snapclone {
             G::Toggle(_) | G::Nudge { .. } | G::Step(_) => {}
         }
     }
+
+    /// Fill the send receipt from what the send path computed.
+    ///
+    /// One call, because the three facts must describe the SAME send. Filling
+    /// them from three places is how a receipt ends up showing last send's
+    /// dedup beside this send's recipient count — and a receipt that is
+    /// partially stale is worse than none, since its whole value is being
+    /// checkable.
+    pub fn prepare_send(&mut self, format: i32, segments_removed: i32,
+                        upload_bytes: i64, total_bytes: i64, recipients: i32) {
+        self.send_summary.set_strip_result(format, segments_removed);
+        self.send_summary.set_dedup(upload_bytes, total_bytes);
+        self.send_summary.set_recipients(recipients);
+    }
+
+    /// May the send proceed?
+    pub fn can_send(&self) -> bool { !self.send_summary.blocks_send() }
 
     /// Feed one gaze sample and route it to everything that wants attention.
     ///
@@ -1256,6 +1277,29 @@ mod tests {
         }
         assert_eq!(landed.as_deref(), Some("abc"),
                    "a field reached by Tab must keep every character, not the first");
+    }
+
+    #[test]
+    fn the_receipt_describes_one_send_rather_than_three_moments() {
+        // Filling the facts from three places is how a receipt shows last
+        // send's dedup beside this send's recipient count, and a partially
+        // stale receipt is worse than none — its whole value is being
+        // checkable.
+        use crate::send_summary::Facet;
+        let mut s = app();
+        s.prepare_send(1, 2, 400_000, 1_000_000, 4);
+        assert_eq!(s.send_summary.detail_text(Facet::Privacy), "2 tags stripped");
+        assert_eq!(s.send_summary.saved_bytes(), 600_000);
+        assert_eq!(s.send_summary.primary_text(Facet::Encryption),
+                   "Encrypted to 4 people");
+        assert!(s.can_send());
+    }
+
+    #[test]
+    fn a_send_with_nobody_in_the_thread_is_blocked() {
+        let mut s = app();
+        s.prepare_send(1, 0, 0, 1_000, 0);
+        assert!(!s.can_send());
     }
 
     #[test]
