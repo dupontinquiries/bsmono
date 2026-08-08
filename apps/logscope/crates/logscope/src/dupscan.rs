@@ -310,7 +310,16 @@ mod live_tests {
         // Lowering it means auditing the list, and the ones worth auditing first are same-KIND
         // collisions in related modules — `Enum Access` in expert_cache and memplan is a candidate;
         // `Const ALL` in four unrelated modules is not.
-        const CEILING: usize = 277;
+        // 278 after microdht added `Request`, colliding with workspace_access.
+        //
+        // RAISED DELIBERATELY, and the decision is the point of the ratchet rather than a defeat of
+        // it. `microdht::Request` is idiomatic Rust — renaming it MicroDhtRequest would stutter at
+        // every use site — and workspace_access::Request is an unrelated idea. This is the
+        // "two ideas sharing a name" case, which costs readability and not correctness.
+        //
+        // Every raise should carry a line like this one. A ceiling bumped without a reason is a
+        // ceiling that will be bumped again without a reason, and then it is not a ratchet.
+        const CEILING: usize = 278;
         assert!(d.len() <= CEILING,
             "{} duplicate names, ceiling {CEILING}. A new one appeared — either two ideas sharing a \
 name, which is fine and wants the ceiling raised deliberately, or one idea implemented twice, which \
