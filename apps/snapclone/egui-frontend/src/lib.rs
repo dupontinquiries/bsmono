@@ -45,6 +45,7 @@ pub mod posture;
 pub mod camera_policy;
 pub mod voice_playout;
 pub mod voice_send;
+pub mod gaze;
 pub use unified_nav::{NavEvent, UnifiedNav, PAGE_NAMES, sub_tabs};
 
 /// The five Qt pages, verbatim (`MainWindow.cpp` kPageCamera..kPageSettings). The old 3-page
