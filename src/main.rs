@@ -10,6 +10,7 @@ mod bots;
 mod camera;
 mod chord;
 mod clinch;
+mod combine;
 mod config;
 mod drop;
 mod font;
