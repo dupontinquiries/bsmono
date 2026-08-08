@@ -20,13 +20,16 @@
 use crate::profile::{Presence, Profile};
 use crate::store::{ProfileBackend, ProfileService, Reach};
 
-const WIRE_V: u8 = 1;
+/// Wire version, shared with  — crate-visible rather than duplicated,
+/// because two copies of a wire format drift and the DHT is the last place you
+/// want to debug that.
+pub(crate) const WIRE_V: u8 = 1;
 
-fn put_str(b: &mut Vec<u8>, s: &str) {
+pub(crate) fn put_str(b: &mut Vec<u8>, s: &str) {
     b.extend_from_slice(&(s.len() as u32).to_le_bytes());
     b.extend_from_slice(s.as_bytes());
 }
-fn take_str(b: &mut &[u8]) -> Option<String> {
+pub(crate) fn take_str(b: &mut &[u8]) -> Option<String> {
     if b.len() < 4 {
         return None;
     }
