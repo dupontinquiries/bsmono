@@ -541,6 +541,72 @@ pub fn dequantize_iq4_xs_block(raw: &[u8], out: &mut [f32]) -> Result<(), String
     Ok(())
 }
 
+/// IQ4_NL: 32 weights in 18 bytes, 4.5 bpw. **The same table as IQ4_XS with none of the packing.**
+///
+/// One f16 scale per 32-weight block and no sub-scales, so there is no split-field arithmetic to get
+/// wrong — which makes it the cheapest quant in the IQ family to support once KVALUES_IQ4NL exists.
+pub fn dequantize_iq4_nl_block(raw: &[u8], out: &mut [f32]) -> Result<(), String> {
+    if raw.len() < 18 { return Err(format!("IQ4_NL block is 18 bytes, got {}", raw.len())) }
+    if out.len() < 32 { return Err(format!("IQ4_NL block yields 32 weights, got {}", out.len())) }
+    let d = f16_to_f32(u16::from_le_bytes([raw[0], raw[1]]));
+    for j in 0..32usize {
+        // Same halving as IQ4_XS: first 16 take low nibbles, next 16 take high nibbles of the SAME
+        // bytes. Consecutive-pairs would be the natural guess and is wrong.
+        let byte = raw[2 + (j % 16)];
+        let nib = if j < 16 { byte & 0x0F } else { byte >> 4 };
+        out[j] = d * KVALUES_IQ4NL[nib as usize] as f32;
+    }
+    Ok(())
+}
+
+/// Q5_K: 256 weights in 176 bytes, 5.5 bpw.
+///
+/// **A K-quant, not an I-quant** — no codebook at all. It is Q4_K with a fifth bit held in a separate
+/// plane, and it reuses the same 6-bit packed `scale_min` extraction, which this session already
+/// verified by hand against a real checkpoint.
+///
+/// ```text
+///   0..2      d        f16 super-block scale
+///   2..4      dmin     f16 super-block minimum
+///   4..16     scales   u8[12], 8 packed 6-bit (scale, min) pairs
+///   16..48    qh       u8[32], the FIFTH bit of each weight, one bit per weight
+///   48..176   qs       u8[128], the low 4 bits, two per byte
+/// ```
+///
+/// The fifth bit living in its own plane is the part a reader gets wrong: it is indexed by weight
+/// position across the whole super-block, not per sub-block, so `qh[j % 32] >> (j / 32)` and not
+/// anything local.
+pub fn dequantize_q5_k_block(raw: &[u8], out: &mut [f32]) -> Result<(), String> {
+    if raw.len() < 176 { return Err(format!("Q5_K block is 176 bytes, got {}", raw.len())) }
+    if out.len() < 256 { return Err(format!("Q5_K block yields 256 weights, got {}", out.len())) }
+    let d = f16_to_f32(u16::from_le_bytes([raw[0], raw[1]]));
+    let dmin = f16_to_f32(u16::from_le_bytes([raw[2], raw[3]]));
+    let sc = &raw[4..16];
+    let qh = &raw[16..48];
+    let qs = &raw[48..176];
+
+    for sub in 0..8usize {
+        // The ggml packing: sub-blocks 0..3 take their own byte, 4..7 assemble from two.
+        let (s, m) = if sub < 4 {
+            (sc[sub] & 63, sc[sub + 4] & 63)
+        } else {
+            ((sc[sub + 4] & 0x0F) | ((sc[sub - 4] >> 6) << 4),
+             (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4))
+        };
+        let dl = d * s as f32;
+        let ml = dmin * m as f32;
+        for j in 0..32usize {
+            let idx = sub * 32 + j;
+            let lo = if idx % 2 == 0 { qs[idx / 2] & 0x0F } else { qs[idx / 2] >> 4 };
+            // The fifth bit is indexed across the SUPER-BLOCK, not the sub-block.
+            let hi = (qh[idx % 32] >> (idx / 32)) & 1;
+            let q = (lo | (hi << 4)) as f32;
+            out[idx] = dl * q - ml;
+        }
+    }
+    Ok(())
+}
+
 pub fn type_name(t: u32) -> &'static str {
     match t {
         0 => "F32", 1 => "F16", 2 => "Q4_0", 3 => "Q4_1", 6 => "Q5_0", 7 => "Q5_1",
@@ -822,6 +888,29 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         //
         // Refused by name, so a run says which format it needs rather than failing as "unknown
         // tensor type" or, worse, decoding it wrong. dot_iq1_s and MATVEC_IQ1_S are IQ1_S only.
+        // IQ4_NL: the same table as IQ4_XS with none of the packing, so it costs a loop.
+        20 => {
+            if n % 32 != 0 { return Err(format!("IQ4_NL needs a multiple of 32 weights, got {n}")) }
+            let mut out = vec![0.0f32; n];
+            for (b, chunk) in (0..n / 32).zip(out.chunks_mut(32)) {
+                let off = b * 18;
+                if off + 18 > data.len() { return Err(format!("IQ4_NL block {b} runs past the data")) }
+                dequantize_iq4_nl_block(&data[off..off + 18], chunk)?;
+            }
+            return Ok(out);
+        }
+        // Q5_K: a K-quant, no codebook. Present in the Scout UD file AND in GLM-4.7-Flash's
+        // ffn_down, so it unblocks two checkpoints rather than one.
+        13 => {
+            if n % 256 != 0 { return Err(format!("Q5_K needs a multiple of 256 weights, got {n}")) }
+            let mut out = vec![0.0f32; n];
+            for (b, chunk) in (0..n / 256).zip(out.chunks_mut(256)) {
+                let off = b * 176;
+                if off + 176 > data.len() { return Err(format!("Q5_K block {b} runs past the data")) }
+                dequantize_q5_k_block(&data[off..off + 176], chunk)?;
+            }
+            return Ok(out);
+        }
         // IQ4_XS: 21% of a UD-IQ1_S checkpoint by bytes, and the only one of its seven types that
         // needs no codebook grid — sixteen values against IQ2/IQ3's 2048.
         23 => {
@@ -1460,5 +1549,99 @@ mod iq4_wiring_tests {
         // disagree the report was wrong about the bytes it counted.
         assert_eq!(type_nbytes(20, 32), Some(crate::iq4::IQ4_NL_BLOCK));
         assert_eq!(type_nbytes(23, 256), Some(crate::iq4::IQ4_XS_BLOCK));
+    }
+}
+
+#[cfg(test)]
+mod iq4nl_q5k_tests {
+    use super::*;
+
+    #[test]
+    fn IQ4_NL_splits_its_nibbles_the_same_way_IQ4_XS_does() {
+        // First 16 take low nibbles, next 16 take high nibbles of the SAME bytes. Consecutive pairs
+        // is the natural guess and is wrong, which is why it gets a test rather than a comment.
+        let mut b = vec![0u8; 18];
+        b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());   // d = 1.0
+        for x in b[2..18].iter_mut() { *x = 0x0F; }           // low nibble 15, high nibble 0
+        let mut out = vec![0.0f32; 32];
+        dequantize_iq4_nl_block(&b, &mut out).unwrap();
+        assert_eq!(out[0], 113.0, "low nibble 15 -> last table value");
+        assert_eq!(out[16], -127.0, "high nibble 0 -> first");
+    }
+
+    #[test]
+    fn IQ4_NL_shares_the_table_rather_than_copying_it() {
+        // One table, two formats. A second copy would drift, and drift in a lookup produces plausible
+        // weights rather than an error.
+        let mut b = vec![0u8; 18];
+        b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        let mut out = vec![0.0f32; 32];
+        dequantize_iq4_nl_block(&b, &mut out).unwrap();
+        assert_eq!(out[0], KVALUES_IQ4NL[0] as f32);
+    }
+
+    /// Q5_K with every scale byte set to one value.
+    ///
+    /// Deliberately NOT trying to encode a chosen scale and min separately. My first fixture did,
+    /// got the sub-block 4..7 packing backwards, and produced a test failure whose message accused
+    /// the DECODER — which is the exact hazard of a fixture more complicated than what it tests.
+    ///
+    /// Filling all twelve bytes gives every sub-block the same non-zero scale, which is all the
+    /// property below needs.
+    fn q5k_uniform(scale_byte: u8, high_bit: bool) -> Vec<u8> {
+        let mut b = vec![0u8; 176];
+        b[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());    // d = 1.0
+        b[2..4].copy_from_slice(&0x3C00u16.to_le_bytes());    // dmin = 1.0
+        for x in b[4..16].iter_mut() { *x = scale_byte; }
+        if high_bit { for x in b[16..48].iter_mut() { *x = 0xFF; } }
+        b
+    }
+
+    #[test]
+    fn EVERY_sub_block_decodes_including_the_last() {
+        // The fifth bit is indexed as qh[idx % 32] >> (idx / 32) — across the SUPER-BLOCK. A
+        // per-sub-block index gives the right answer for the first 32 weights and leaves the rest
+        // untouched, so the last weight is the one that catches it.
+        let mut out = vec![0.0f32; 256];
+        dequantize_q5_k_block(&q5k_uniform(0x11, true), &mut out).unwrap();
+        assert!(out.iter().all(|v| v.is_finite()), "every weight decoded");
+        assert_ne!(out[255], 0.0, "the last weight is where a local index would have left a hole");
+        assert_ne!(out[128], 0.0, "and the middle, past the sub-block-4 packing boundary");
+    }
+
+    #[test]
+    fn the_HIGH_BIT_changes_every_weight() {
+        // q = lo | (hi << 4), so setting the plane must move all 256 — not merely the first block.
+        let mut with = vec![0.0f32; 256];
+        let mut without = vec![0.0f32; 256];
+        dequantize_q5_k_block(&q5k_uniform(0x11, true), &mut with).unwrap();
+        dequantize_q5_k_block(&q5k_uniform(0x11, false), &mut without).unwrap();
+        assert!(with.iter().zip(&without).all(|(a, b)| a != b), "the fifth bit reached every weight");
+    }
+
+    #[test]
+    fn Q5_K_subtracts_a_MINIMUM() {
+        // dl*q - ml. A decoder that forgets the minimum produces weights offset by a constant —
+        // coherent text, subtly wrong, which is this family's specialty.
+        let mut out = vec![0.0f32; 256];
+        dequantize_q5_k_block(&q5k_uniform(0x11, false), &mut out).unwrap();
+        assert!(out[0] <= 0.0, "q=0 leaves -min, which cannot be positive: {}", out[0]);
+    }
+
+    #[test]
+    fn both_formats_REFUSE_a_short_block() {
+        assert!(dequantize_iq4_nl_block(&vec![0u8; 10], &mut vec![0.0; 32]).is_err());
+        assert!(dequantize_q5_k_block(&vec![0u8; 100], &mut vec![0.0; 256]).is_err());
+    }
+
+    #[test]
+    fn dequantize_routes_BOTH_new_types() {
+        let mut nl = vec![0u8; 18];
+        nl[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+        assert_eq!(dequantize(20, &nl, 32).unwrap().len(), 32);
+        assert_eq!(dequantize(13, &q5k_uniform(0x11, false), 256).unwrap().len(), 256);
+        // Misaligned lengths refused rather than truncated.
+        assert!(dequantize(20, &nl, 40).is_err());
+        assert!(dequantize(13, &q5k_uniform(0x11, false), 300).is_err());
     }
 }
