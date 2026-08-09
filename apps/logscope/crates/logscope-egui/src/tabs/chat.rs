@@ -5721,7 +5721,12 @@ them to", patches.len());
                 Mode::Command => {
                     let r = ui.add(egui::TextEdit::singleline(&mut self.cmdline).id(egui::Id::new("vim_cmdline"))
                         .desired_width(f32::INFINITY).font(egui::TextStyle::Small));
-                    r.request_focus();
+                    // Only when it does NOT already have focus. request_focus() on a
+                    // focused TextEdit re-initialises its cursor state every frame, so
+                    // the caret jumps back and each keystroke overwrites the last —
+                    // the "one character" bug. The composer at the top of this file
+                    // already guards it this way; these two did not.
+                    if !r.has_focus() { r.request_focus(); }
                     if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         let cmd = crate::vimmode::parse_command(&self.cmdline);
                         let keep = matches!(cmd, crate::vimmode::Command::Attach(_)); // :a drops into Insert
@@ -5756,7 +5761,9 @@ them to", patches.len());
                     ui.label(RichText::new(k).color(theme::DIM()).small());
                     let r = ui.add(egui::TextEdit::singleline(&mut self.search_q).id(egui::Id::new("vim_search"))
                         .desired_width(280.0).font(egui::TextStyle::Small));
-                    r.request_focus();
+                    // Same guard as the command line: unconditional request_focus()
+                    // resets the cursor every frame and eats all but one character.
+                    if !r.has_focus() { r.request_focus(); }
                     if !self.search_q.is_empty() {
                         let previews: Vec<(usize, String)> = self.msgs.iter().enumerate()
                             .map(|(i, m)| (i, m.text().chars().take(80).collect())).collect();
