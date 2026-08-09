@@ -71,7 +71,7 @@ reflowing text below.
 
 ## Reuse map (what the monorepo bought)
 
-- `shared/uikit/uikit-egui`: `theme_bridge::apply_palette` (all 14 snapclone
+- `shared/uikit/crates/uikit-egui`: `theme_bridge::apply_palette` (all 14 snapclone
   palettes; syntax colors derive from `PaletteColors`, so theming the editor
   = theming the suite), `fuzzy::score` for the Ctrl+P palette (same ranking
   feel as gitmind's pickers), `motion::ease` for the ghost fade,

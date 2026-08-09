@@ -89,7 +89,7 @@ imitation-by-initialization, the coach as permanent fixed exploiter,
 rotating evaluation seeds against memorization, deterministic
 entity-budget guards, warm-restart bursts for single-core boxes, and
 `bench` — the crush criterion (>=90% vs coach across all pairings, maps,
-colors, seeds). Tournaments run through `apps/bsgames` (the portfolio tournament host): `echelon-arena play-one` is the registered provider, and the Echelon Invitational — coach vs champion across all six race seats — is the inaugural event. See `docs/`/the phase-2 prompt for the league design.
+colors, seeds). Tournaments run through `games/bsgames` (the portfolio tournament host): `echelon-arena play-one` is the registered provider, and the Echelon Invitational — coach vs champion across all six race seats — is the inaugural event. See `docs/`/the phase-2 prompt for the league design.
 SC2Map prototypes convert via
 `tools/sc2map_extract.py`; `tools/mapedit.py` (built on
 `shared/editor-kit`) paints all four layers interactively, wearing
@@ -173,11 +173,11 @@ creep-like spread, high-ground vision.
 
 ## Monorepo integration
 
-Lives at `apps/echelon`. Suggested `manifest/projects.toml` entry:
+Lives at `games/echelon` in this monorepo (`apps/echelon` in the standalone repo this README came from). Registered in `manifest/projects.toml` as:
 
 ```toml
 [apps.echelon]
-path = "apps/echelon"
+path = "games/echelon"
 kind = "cargo"
 role = "app"
 daemon = false
