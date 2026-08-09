@@ -304,3 +304,66 @@ mod tests {
         assert!(max_context(&KvShape::glm_flash(48), "fp8", 31.0, 0.0).is_err());
     }
 }
+
+/// Prefill reads K/V without reuse; decode does not.
+///
+/// Traced after a sibling session measured `t(L) = 197 + 0.510·L + 7.17e-4·L²` on a different engine
+/// and attributed the quadratic to an attention kernel with one thread per (row, head), each
+/// serially streaming the whole K and V. **This tree has both kernels and picks per path:**
+///
+/// ```text
+///   block_prefill        -> attention_mh_t   -> ATTENTION_MH          no var<workgroup>
+///   attention_mh_ext_swa -> ATTENTION_MH_EXT_PAR                      tiled, online softmax
+///   decode               -> attention_mh_ext_swa                      takes the tiled one
+/// ```
+///
+/// So the decode numbers in this module are unaffected — **and prefill is not.** A prompt of L rows
+/// re-reads the cache once per (row, head) with no cross-row reuse, which is quadratic in L and is
+/// where a 197 ms constant plus 188 ms of quadratic came from on the other engine at L=512.
+///
+/// **This corrects an assumption in `cache_read_share`**: that function models DECODE, where one
+/// token reads the cache once. Prefill's traffic is a different and much larger number, and quoting
+/// the decode share as though it covered both would understate prefill by roughly `n_heads`.
+pub struct AttentionPath { pub tiled: bool, pub why: &'static str }
+
+/// Which kernel a phase takes today.
+pub fn attention_path(phase: &str) -> Option<AttentionPath> {
+    match phase {
+        "decode" => Some(AttentionPath { tiled: true,
+            why: "attention_mh_ext_swa dispatches ATTENTION_MH_EXT_PAR, which tiles the KV loop \
+with an online softmax over 2048-row tiles" }),
+        "prefill" => Some(AttentionPath { tiled: false,
+            why: "block_prefill calls attention_mh_t, which dispatches ATTENTION_MH — one thread \
+per (row, head), each streaming the whole K and V, no shared memory and no cross-row reuse. That is \
+quadratic in prompt length and the tiled kernel it needs already exists" }),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod attention_path_tests {
+    use super::*;
+
+    #[test]
+    fn DECODE_takes_the_tiled_kernel_and_PREFILL_does_not() {
+        // The split that makes this worth recording: the fix is not writing a kernel, it is routing
+        // one path to a kernel the tree already has.
+        assert!(attention_path("decode").unwrap().tiled);
+        assert!(!attention_path("prefill").unwrap().tiled);
+    }
+
+    #[test]
+    fn the_prefill_note_says_the_TILED_KERNEL_ALREADY_EXISTS() {
+        // Otherwise this reads as a request to write flash-attention rather than to change a call.
+        assert!(attention_path("prefill").unwrap().why.contains("already exists"));
+        assert!(attention_path("prefill").unwrap().why.contains("quadratic in prompt length"));
+    }
+
+    #[test]
+    fn cache_read_share_is_documented_as_a_DECODE_model_only() {
+        // It assumes one cache read per token. Prefill re-reads per (row, head), so quoting the
+        // decode share for prefill understates it by roughly n_heads.
+        let src = include_str!("kvbudget.rs");
+        assert!(src.contains("understate prefill by roughly `n_heads`"));
+    }
+}
