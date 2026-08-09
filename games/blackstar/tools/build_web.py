@@ -47,10 +47,28 @@ def load_obj(path):
     return verts, tris
 
 
-def quantise(verts):
-    """16-bit per axis in the part's own bbox. Returns (blob, lo, span)."""
+def quantise(verts, bits=16):
+    """Quantise per axis in the part's own bbox. Returns (blob, lo, span).
+
+    `bits` is measurable rather than assumed. Over 120 real parts, gzipped
+    vertex payload against p99.9 positional error as a fraction of the part's
+    own extent:
+
+        16-bit   64,666 bytes   0.0008%
+        12-bit   58,599 bytes   0.0122%
+        10-bit   52,017 bytes   0.0488%
+         8-bit   33,866 bytes   0.1955%
+
+    8-bit is 48% smaller than 16 and still a QUARTER of the 0.68% quantisation
+    the voxel probe accepted at its finest grid — and that probe found shape
+    agreement flat across resolutions, so this error is well inside the range
+    where nothing changes visibly. The default stays 16 so existing webs decode
+    unchanged; `--bits` selects.
+    """
     if not verts:
         return b"", (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+    maxq = (1 << bits) - 1
+    wide = bits > 8
     lo = tuple(min(v[i] for v in verts) for i in range(3))
     hi = tuple(max(v[i] for v in verts) for i in range(3))
     # A degenerate axis — a flat plate — would divide by zero, and clamping the
@@ -60,8 +78,9 @@ def quantise(verts):
     out = bytearray()
     for v in verts:
         for i in range(3):
-            q = int(round((v[i] - lo[i]) / span[i] * 65535.0))
-            out += struct.pack("<H", max(0, min(65535, q)))
+            q = int(round((v[i] - lo[i]) / span[i] * maxq))
+            q = max(0, min(maxq, q))
+            out += struct.pack("<H", q) if wide else struct.pack("<B", q)
     return bytes(out), lo, span
 
 
@@ -74,7 +93,7 @@ def pack_indices(tris, nverts):
     return b"".join(struct.pack("<3I", *t) for t in tris), 4
 
 
-def build(catalog_dirs, out_path):
+def build(catalog_dirs, out_path, bits=16):
     parts, blobs, seen = [], [], {}
     meta_by_mesh = {}
 
@@ -102,7 +121,7 @@ def build(catalog_dirs, out_path):
             verts, tris = load_obj(os.path.join(mdir, fn))
             if not verts or not tris:
                 continue
-            vblob, lo, span = quantise(verts)
+            vblob, lo, span = quantise(verts, bits)
             iblob, isize = pack_indices(tris, len(verts))
             key = hashlib.sha1(vblob + iblob).hexdigest()
             if key in seen:
@@ -131,7 +150,7 @@ def build(catalog_dirs, out_path):
     # Container: a JSON index, then the geometry blobs back to back. Index and
     # payload separate so a reader can load the annotations — which is what
     # most tools want — without touching megabytes of vertices.
-    index = {"version": 1, "parts": parts,
+    index = {"version": 1, "bits": bits, "parts": parts,
              "geom": [{"v": len(v), "i": len(i)} for v, i in blobs]}
     idx = json.dumps(index, separators=(",", ":")).encode()
     payload = b"".join(v + i for v, i in blobs)
@@ -147,8 +166,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("catalogs", nargs="+")
     ap.add_argument("--out", default="catalog/parts_web.bin.gz")
+    ap.add_argument("--bits", type=int, default=16, choices=[8, 10, 12, 16],
+                    help="vertex quantisation; 8 halves the payload at 0.2%% error")
     a = ap.parse_args()
-    parts, blobs, nidx, npay = build(a.catalogs, a.out)
+    parts, blobs, nidx, npay = build(a.catalogs, a.out, a.bits)
     named = sum(1 for p in parts if p.get("name"))
     size = os.path.getsize(a.out)
     print("parts        : %d" % len(parts))

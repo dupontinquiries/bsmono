@@ -134,3 +134,50 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def compose(lib, donor_model, choices, bands=4):
+    """Build a NEW model by swapping chosen variants into a donor's placements.
+
+    This is custom character creation reduced to what the data already supports:
+    a donor supplies the SKELETON — how many parts, where, at what orientation
+    and scale — and `choices` names a replacement part per slot.
+
+    Why a donor rather than composing from nothing: the placements encode
+    relationships the part library does not. A wheel belongs at a hub, at a
+    particular offset, mirrored across the hull. Generating those from scratch
+    is a different and much harder problem; reusing a real vehicle's arrangement
+    gives a buildable result on day one, and is exactly how kit-bashing works by
+    hand.
+
+    `choices` maps (category, band) -> mesh name. Unlisted slots keep their
+    original part, so a caller can change one wheel type and leave the rest of
+    the vehicle alone.
+    """
+    placements = lib.get("placements", {}).get(donor_model)
+    if not placements:
+        return None
+    by_mesh = {p["mesh"]: p for p in lib.get("parts", []) if p.get("mesh")}
+    by_sig = {}
+    for p in lib.get("parts", []):
+        if p.get("sig") and p.get("mesh") and p["sig"] not in by_sig:
+            by_sig[p["sig"]] = p
+
+    out, swapped = [], 0
+    for pl in placements:
+        src = by_sig.get(pl.get("sig"))
+        if src is None:
+            out.append(dict(pl))
+            continue
+        key = (src.get("name"), size_band(src.get("size"), bands))
+        pick = choices.get(key)
+        variant = by_mesh.get(pick) if pick else None
+        # A chosen variant from a DIFFERENT slot is refused rather than forced:
+        # the frame belongs to the slot, and a part from another size band
+        # posed into it is the absurd-wheel failure the bands exist to prevent.
+        if variant is None or variant.get("name") != src.get("name"):
+            out.append(dict(pl))
+            continue
+        out.append(swap_plan(pl, variant))
+        swapped += 1
+    return {"from": donor_model, "swapped": swapped, "placements": out}

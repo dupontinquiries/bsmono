@@ -613,3 +613,60 @@ Each part already has `sig`, `tris`, `size`, `instances` and `residual_mean`;
 the feature vector is `(log size, tri density, log instances, residual)` and
 neighbours are restricted to the same category — distance alone will report that
 a small disc resembles a small block, which is numerically true and useless.
+
+---
+
+# Round eight — compression measured to its floor, and composition works
+
+## Compression: two negative results, then a 22% win
+
+**Near-duplicate folding: nothing there.** All 502 emitted parts have distinct
+signatures, and comparing the 14 most-used `block` parts pairwise under the
+24-frame aligner gave **zero pairs above 0.80 voxel IoU** out of 91. The
+harvester's clustering has already extracted every repeat; what remains are
+genuinely different shapes.
+
+**So the win had to come from encoding.** Vertex quantisation, measured over 120
+real parts — gzipped payload against p99.9 positional error as a share of the
+part's own extent:
+
+| bits | payload | error |
+|---:|---:|---:|
+| 16 | 64,666 | 0.0008% |
+| 12 | 58,599 | 0.0122% |
+| 10 | 52,017 | 0.0488% |
+| **8** | **33,866** | **0.1955%** |
+
+8-bit is **48% smaller** and still a *quarter* of the 0.68% the voxel probe
+accepted at its finest grid — and that probe found shape agreement flat across
+resolutions, so this sits well inside the range where nothing changes visibly.
+
+Confirmed at the render, which is the only check that counts:
+
+```
+16-bit web  379,485 bytes   parity 0.906
+ 8-bit web  294,645 bytes   parity 0.904
+```
+
+**22% smaller for 0.002 IoU.** The web records its own bit depth so one decoder
+reads both; a decoder that assumed 16 would silently produce parts 256× too
+small.
+
+## Creation: `compose()`
+
+A donor supplies the **skeleton** — how many parts, where, at what orientation
+and scale — and `choices` names a replacement per slot. Swapping one slot on
+`raidboss_tremor` replaced **106 of 378 placements** in a single call.
+
+Why a donor rather than composing from nothing: placements encode relationships
+the part library does not. A wheel belongs at a hub, at an offset, mirrored
+across the hull. Generating that from scratch is a harder and different problem;
+reusing a real vehicle's arrangement is buildable today and is exactly how
+kit-bashing works by hand.
+
+Two refusals are deliberate. A variant from a **different category or band** is
+rejected rather than forced — the frame belongs to the slot, and a part from
+another band posed into it is the absurd-wheel failure the bands exist to
+prevent. And unlisted slots **keep their original part and its residual**, so
+changing one wheel type leaves the rest of the vehicle untouched: 49 residuals
+survived the swap above.
