@@ -555,3 +555,61 @@ projection did not depend on.
 * The 24-frame rotation search measured better than the 4-sign one (0.222 vs
   0.170) on the old component split and has never been re-measured on the
   correct one. It is the cheapest remaining improvement.
+
+---
+
+# Round seven — 0.906, and the web becomes buildable
+
+## Accuracy: the 24-frame search, finally measured on a correct split
+
+The rotation search had beaten the 4-sign version on the *broken* component
+split (0.222 vs 0.170) and was never re-measured after that split was fixed.
+Folded in, with one further change: **scored by occupancy overlap rather than
+extent agreement**, which is cheap now that the grid exists and which extent
+cannot do — extent cannot tell a part from its 180° flip.
+
+```
+                        pre-residual IoU   residual cells   mean silhouette IoU
+4-sign, extent-scored              0.075           11,659                 0.844
+24-frame, overlap-scored           0.208            8,818                 0.906
+```
+
+Per model: 0.970/0.983/0.988 · 0.929/0.954/0.924 · 0.878/**1.000**/0.888 ·
+0.736/0.926/0.877. `soldlmb` was **0.10** three rounds ago and now reaches 1.000
+on one view.
+
+Why 24 and not 4: the old version fixed axis ORDER from the eigenvalue sort and
+tried only sign flips. Machine parts routinely have near-degenerate eigenvalues
+— a wheel's two in-plane axes, a plate's two long ones — so the sort order is
+arbitrary between two copies of the same shape, and **the correct rotation was
+often not among the four tried**.
+
+## Usefulness: slots, variants and a practical latent space
+
+`tools/web_slots.py`. The web reconstructs well, which makes it an archive; it
+did not answer the question a builder asks — *what else could go here?*
+
+A **slot is a category plus a size band**, not a category alone. `roadwheel` has
+33 members spanning an order of magnitude; offering them in one list gives a
+vehicle one absurd wheel. Bands are geometric because parts scale
+multiplicatively.
+
+```
+slots : 22   (18 with a real choice)
+block/band2       169 variants   0.202 - 0.594
+block/band1        81 variants   0.071 - 0.198
+disc/band2         46 variants   0.202 - 0.632
+```
+
+**Swapping works because the frame belongs to the slot.** Every placement now
+carries `rot` and `scale`, so a swap keeps the placement's orientation and
+refits the variant's extent — the part fills a pose it did not define.
+`swap_plan` drops the occupancy residual deliberately: it was measured against
+the part that used to be there, and carrying it over would apply one part's
+corrections to another's geometry.
+
+**The latent space is built from harvest evidence, not a learned embedding.**
+Each part already has `sig`, `tris`, `size`, `instances` and `residual_mean`;
+the feature vector is `(log size, tri density, log instances, residual)` and
+neighbours are restricted to the same category — distance alone will report that
+a small disc resembles a small block, which is numerically true and useless.
