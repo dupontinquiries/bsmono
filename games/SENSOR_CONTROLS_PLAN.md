@@ -11,7 +11,7 @@
 
 ## Decisions needed before I proceed
 1. **Game duplicates (the "move to games/").** apps/ and games/ hold *diverged* versions:
-   `apps/unendlich` (29M) vs `games/unendlich` (40M); `apps/cybertron` (5.7M) vs `games/blackstar`
+   `apps/unendlich` (29M) vs `games/unendlich` (40M); `apps/cybertron` (5.7M) vs `games/blackstar` — RESOLVED: both `apps/` copies purged, `games/` is source of truth
    (94M, the archive rename). These are NOT the same tree — a blind move would lose work. Which is
    canonical per game (keep apps/, keep games/, or merge)? Then I consolidate under games/.
 2. **macOS "fixup" — need the specifics.** What's failing (build? window/surface? sensors? Metal
