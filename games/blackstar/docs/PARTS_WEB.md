@@ -314,3 +314,66 @@ the error was surface thickness rather than lost detail. Combine them:
 
 The parts library and the voxel work were being treated as alternatives. The
 measurement says they are the two halves of the same representation.
+
+---
+
+# Round four — occupancy residual built, and a 2× scale bug found
+
+## What was built
+
+`occupancy_residual()` replaces the displacement field with two sparse sets —
+cells the component fills that the exemplar does not (`add`), and the reverse
+(`rem`) — packed one `u16` index per changed cell. Cheaper than the three signed
+bytes it replaces, and acting on the cells that were actually wrong.
+
+The renderer reconstructs **volume**: pose the exemplar, voxelise, apply the
+sets, emit a box per occupied cell. That is the point — a displaced surface
+cannot express "there is material here the exemplar lacks", and a box grid can.
+
+## Two bugs found by measuring, not by reading
+
+**The residual carried no frame.** The solver sized its grid over posed exemplar
+*and* component; the renderer derived one from the exemplar alone. Different
+boxes, so every cell index referred to somewhere else and the correction was
+noise. `lo`/`span` now travel with the residual. Fixing it moved IoU 0.337 →
+0.391.
+
+**`size` is not an extent.** Measured on real placements: `size` 0.554 where the
+component's max-axis extent is 0.346 — roughly a diagonal against a per-axis
+measure, about 2× apart. Scaling by `size / extent` inflated every exemplar to
+double, which is why nothing overlapped its component. Scaling exemplar extent
+onto component extent instead cut the changed cells by a third, 28,385 →
+19,087.
+
+## Where it stands, honestly
+
+```
+pre-residual IoU (posed exemplar vs component) : 0.045
+occupancy cells                                : 19,087  (~37 KB, 138 placements)
+render IoU, occupancy path                     : 0.349
+render IoU, mesh path (no residual)            : 0.535
+```
+
+**The occupancy path is still worse than just placing the exemplar meshes.** And
+the number that explains it is `pre-residual IoU 0.045`: the posed exemplar
+overlaps its component almost not at all, so the residual is not correcting a
+near-match — it is storing the component nearly outright, and doing it through a
+16³ grid that is coarser than the mesh it replaced.
+
+**So the blocker is not the residual. It is the pose.** Until a posed exemplar
+lands on its component, the parts library is not being reused at reconstruction
+time at all, and every mechanism built on top of it measures the wrong thing.
+The remaining suspects, in order of how much they would explain:
+
+1. **Rotation.** PCA alignment scored by extent agreement is weak for parts
+   whose principal axes are near-degenerate, which machine parts often are.
+   Scoring by occupancy overlap directly — now cheap, since the voxel grid is
+   already there — would pick the sign combination that actually fits.
+2. **Placement-to-component matching.** Nearest-centroid lets several placements
+   claim one component, and this model has 484 components against 61
+   placements.
+3. **Exemplar choice.** The first part with a matching signature wins; the
+   cluster may contain a closer member.
+
+Each is testable against `pre-residual IoU` without rendering anything, which
+makes the next round cheap.
