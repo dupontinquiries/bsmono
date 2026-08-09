@@ -412,3 +412,63 @@ mod attention_path_tests {
         assert!(src.contains("understate prefill by roughly `n_heads`"));
     }
 }
+
+/// IQ1_S row slicing: the arithmetic, checkable without a GPU.
+///
+/// `lin_row_view` now slices IQ1_S, which is what `MOE_MATVEC_IQ1_S` needed to ever be dispatched.
+/// The slice is pure byte arithmetic over 50-byte/256-weight blocks, and **a wrong offset here
+/// produces plausible garbage rather than an error** — every length check still passes, the model
+/// loads, and it generates confidently wrong text. So the arithmetic is tested separately from the
+/// dispatch.
+pub fn iq1_row_slice(k: usize, row0: usize, rows: usize) -> Option<(u64, u64)> {
+    // Refused rather than rounded: a mid-block cut is the silent-corruption case.
+    if k % 256 != 0 { return None }
+    let row_bytes = (k / 256 * 50) as u64;
+    Some((row0 as u64 * row_bytes, rows as u64 * row_bytes))
+}
+
+#[cfg(test)]
+mod iq1_slice_tests {
+    use super::*;
+
+    #[test]
+    fn SCOUTS_expert_width_slices_cleanly() {
+        // ff=16384 from the engine's own load line: 64 blocks of 256, 3200 bytes per row.
+        let (off, len) = iq1_row_slice(16384, 0, 1).unwrap();
+        assert_eq!(len, 3200);
+        assert_eq!(off, 0);
+        let (off2, _) = iq1_row_slice(16384, 5, 1).unwrap();
+        assert_eq!(off2, 5 * 3200);
+    }
+
+    #[test]
+    fn a_NON_ALIGNED_width_is_REFUSED_rather_than_rounded() {
+        // A mid-block cut passes every length check and decodes to plausible floats. Refusing is the
+        // only safe answer, and it is why this returns Option rather than a best effort.
+        assert!(iq1_row_slice(100, 0, 1).is_none());
+        assert!(iq1_row_slice(16384 + 1, 0, 1).is_none());
+    }
+
+    #[test]
+    fn consecutive_slices_ABUT_exactly() {
+        // Off-by-one-block is the failure that would corrupt one expert's first row with another's
+        // last, which reads as a routing bug rather than a slicing one.
+        let (o0, l0) = iq1_row_slice(4096, 0, 3).unwrap();
+        let (o1, _) = iq1_row_slice(4096, 3, 3).unwrap();
+        assert_eq!(o0 + l0, o1, "slice 0 must end exactly where slice 1 begins");
+    }
+
+    #[test]
+    fn the_byte_rate_matches_the_format() {
+        // 50 bytes per 256 weights is 1.5625 bpw — the number the whole residency plan rests on.
+        let (_, len) = iq1_row_slice(256, 0, 1).unwrap();
+        assert_eq!(len, 50);
+        assert!((len as f64 * 8.0 / 256.0 - 1.5625).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_ZERO_row_slice_is_empty_rather_than_the_whole_tensor() {
+        // A length of 0 read as "unbounded" is how a view becomes the entire buffer.
+        assert_eq!(iq1_row_slice(4096, 7, 0).unwrap().1, 0);
+    }
+}
