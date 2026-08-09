@@ -1,0 +1,11 @@
+[package]
+name = "dht-kit"
+version = "0.1.0"
+edition = "2021"
+description = "OpenDHT-compatible messaging in Rust: the wire format only — msgpack query/reply/error maps, InfoHash, values with ids. No transport, no routing table, no engine. The layer every DHT implementation in the fleet can share regardless of which engine it drives."
+
+[lib]
+name = "dht_kit"
+path = "src/lib.rs"
+
+[dependencies]
