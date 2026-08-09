@@ -224,6 +224,10 @@ pub fn act_block_sums(act: &[f32]) -> Vec<f32> {
 
 /// Weight formats the CPU path can consume directly from the mapped file.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Named with ggml's spellings rather than Rust's casing convention, deliberately: renaming these to
+/// `Q8Zero` and `Q4K` would make a grep for the format name miss the enum representing it, and this
+/// codebase cross-references ggml type names constantly.
+#[allow(non_camel_case_types)]
 pub enum Quant { Q8_0, Q4_K }
 
 impl Quant {

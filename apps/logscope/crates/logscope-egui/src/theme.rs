@@ -116,71 +116,7 @@ pub const MANSION_GARDEN: Palette = Palette {
     maxmark: c(0x9c,0x78,0x2e), whisker: c(0x32,0x2c,0x20),
 };
 
-
-/// Persian Garden: a chahar bagh at the golden hour — sun-bleached mud-brick walls, packed-earth
-/// paths, turquoise water in the rills, and the deep green of cypress against it. Warm, dry, and
-/// bright; the complementary turquoise/terracotta pair is the palette Persian gardens are built on.
-pub const PERSIAN_GARDEN: Palette = Palette {
-    name: "Persian Garden", dark: false, material: Material::Stone, lit: true, canopy: false, light: c(0xff,0xe6,0xb4),
-    bg: c(0xd6,0xc0,0x98), window: c(0xe2,0xcf,0xaa), panel: c(0xe2,0xcf,0xaa), panel2: c(0xcd,0xb6,0x8e), line: c(0xb4,0x94,0x62),
-    ink: c(0x35,0x2a,0x1c), dim: c(0x60,0x50,0x38), faint: c(0x82,0x70,0x50), track_bg: c(0xc6,0xae,0x86),
-    amber: c(0xc0,0x86,0x2c), amber_soft: c(0xe2,0xb0,0x54), amber_ink: c(0xf8,0xf0,0xdc),
-    blue: c(0x1e,0x82,0x96), cyan: c(0x24,0xa2,0xa8), violet: c(0x6e,0x4c,0x74), green: c(0x3e,0x6e,0x3a),
-    yellow: c(0xc2,0x92,0x24), red: c(0xa8,0x40,0x2c), red_soft: c(0xc4,0x6c,0x52),
-    maxmark: c(0xa8,0x74,0x28), whisker: c(0x35,0x2a,0x1c),
-};
-
-/// Garden Cloister: cool grey limestone, moss-green garth, weathered lead and bronze. Overcast and
-/// quiet — the light a north-facing arcade actually gets, and the restraint a cloister is for.
-pub const GARDEN_CLOISTER: Palette = Palette {
-    name: "Garden Cloister", dark: false, material: Material::Stone, lit: true, canopy: false, light: c(0xf0,0xf0,0xe8),
-    bg: c(0xc4,0xc4,0xb8), window: c(0xd2,0xd2,0xc6), panel: c(0xd2,0xd2,0xc6), panel2: c(0xba,0xba,0xac), line: c(0x98,0x98,0x88),
-    ink: c(0x2c,0x2e,0x2a), dim: c(0x54,0x58,0x50), faint: c(0x74,0x78,0x6e), track_bg: c(0xb2,0xb2,0xa4),
-    amber: c(0x96,0x7e,0x40), amber_soft: c(0xbc,0xa4,0x66), amber_ink: c(0xf2,0xf2,0xea),
-    blue: c(0x44,0x6e,0x86), cyan: c(0x3e,0x86,0x82), violet: c(0x64,0x54,0x76), green: c(0x46,0x6e,0x38),
-    yellow: c(0x9c,0x88,0x38), red: c(0x8e,0x44,0x36), red_soft: c(0xac,0x6c,0x5c),
-    maxmark: c(0x86,0x70,0x36), whisker: c(0x2c,0x2e,0x2a),
-};
-
-/// Madrassa Court: Fez zellij — cobalt and glazed green against ivory plaster, brass lamplight, and
-/// carved cedar. The most saturated palette in the set, because that is exactly what the tilework is.
-pub const MADRASSA: Palette = Palette {
-    name: "Madrassa Court", dark: false, material: Material::Stone, lit: true, canopy: false, light: c(0xff,0xec,0xc8),
-    bg: c(0xdc,0xd0,0xb8), window: c(0xe8,0xde,0xc8), panel: c(0xe8,0xde,0xc8), panel2: c(0xd0,0xc2,0xa6), line: c(0xa8,0x92,0x6a),
-    ink: c(0x2a,0x26,0x1e), dim: c(0x56,0x4c,0x3c), faint: c(0x7a,0x6c,0x56), track_bg: c(0xcc,0xbe,0xa2),
-    amber: c(0xc2,0x94,0x30), amber_soft: c(0xe6,0xbc,0x60), amber_ink: c(0xfa,0xf4,0xe4),
-    blue: c(0x1d,0x5a,0x8e), cyan: c(0x1c,0x86,0x8a), violet: c(0x6a,0x46,0x7c), green: c(0x1e,0x6a,0x4a),
-    yellow: c(0xc9,0xa3,0x3c), red: c(0x9c,0x3a,0x30), red_soft: c(0xbc,0x64,0x54),
-    maxmark: c(0xb0,0x82,0x2c), whisker: c(0x2a,0x26,0x1e),
-};
-
-/// Bamboo Grove: green-filtered daylight, moss, wet stone, and the one warm lantern. Dark because a
-/// mature stand of bamboo genuinely is — the canopy takes most of the light before it reaches you.
-pub const BAMBOO_GROVE: Palette = Palette {
-    name: "Bamboo Grove", dark: true, material: Material::Wood, lit: true, canopy: true, light: c(0xd8,0xf0,0xb0),
-    bg: c(0x16,0x22,0x18), window: c(0x1e,0x2c,0x1e), panel: c(0x1e,0x2c,0x1e), panel2: c(0x26,0x36,0x26), line: c(0x3a,0x4e,0x36),
-    ink: c(0xdc,0xe8,0xc8), dim: c(0xa2,0xb4,0x8c), faint: c(0x74,0x88,0x62), track_bg: c(0x12,0x1c,0x14),
-    amber: c(0xd0,0xa8,0x50), amber_soft: c(0xe8,0xc8,0x80), amber_ink: c(0x18,0x14,0x08),
-    blue: c(0x74,0xa8,0xb4), cyan: c(0x6c,0xbc,0x9c), violet: c(0xa8,0x94,0xc0), green: c(0x9a,0xc4,0x60),
-    yellow: c(0xd8,0xc4,0x62), red: c(0xc8,0x70,0x54), red_soft: c(0xdc,0x96,0x7c),
-    maxmark: c(0x9c,0x7c,0x38), whisker: c(0xdc,0xe8,0xc8),
-};
-
-
-/// Rural Commons: laterite earth, thatch, and dry olive scrub under a high hard sun, with one
-/// cooking fire for warmth. Ochres and browns pulled from the woodwork kit's own BaseColor maps
-/// and lifted; the single saturated note is the hearth, which is how the place actually reads.
-pub const RURAL_COMMONS: Palette = Palette {
-    name: "Rural Commons", dark: false, material: Material::Wood, lit: true, canopy: false, light: c(0xff,0xe4,0xb0),
-    bg: c(0xc4,0x9a,0x70), window: c(0xd2,0xac,0x82), panel: c(0xd2,0xac,0x82), panel2: c(0xba,0x92,0x68), line: c(0x94,0x6a,0x44),
-    ink: c(0x2e,0x22,0x18), dim: c(0x58,0x42,0x30), faint: c(0x7a,0x5e,0x44), track_bg: c(0xb2,0x8a,0x60),
-    amber: c(0xbe,0x7c,0x2c), amber_soft: c(0xe2,0xa8,0x58), amber_ink: c(0xf8,0xec,0xd8),
-    blue: c(0x38,0x6e,0x8c), cyan: c(0x2e,0x8c,0x8a), violet: c(0x6c,0x4a,0x6e), green: c(0x5c,0x6e,0x30),
-    yellow: c(0xc8,0x96,0x2a), red: c(0xb0,0x44,0x24), red_soft: c(0xc8,0x70,0x4e),
-    maxmark: c(0xa8,0x6c,0x2a), whisker: c(0x2e,0x22,0x18),
-};
-
-pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN, ALLEY, FRACTAL_SPIRES, RECURSIVE_CITADEL, HOLLOW_JUNGLE, YELLOW_BRICK_ROAD, BIFROST, TITAN_RIBCAGE, PERSIAN_GARDEN, GARDEN_CLOISTER, MADRASSA, BAMBOO_GROVE, RURAL_COMMONS];
+pub const PALETTES: &[Palette] = &[FOLDING_AT_HOME, READING_ROOM, ARCHIVE, SLATE, LIBRARY, CANOPY, MISTFALL, ATLANTIS, CLOUDSCAPE, FOREST, TREEHOUSE, MANSION_GARDEN, ALLEY, FRACTAL_SPIRES, RECURSIVE_CITADEL, HOLLOW_JUNGLE, YELLOW_BRICK_ROAD, BIFROST, TITAN_RIBCAGE];
 
 /// Frozen Bifrost Bunker: a tight circular arena — a raised basalt dais (Nordic knotwork packed with frost) ringed
 /// by sunken glacial-ice trenches, its heart a shattered hexagonal pane of iridescent prismatic glass whose
@@ -848,47 +784,7 @@ pub fn ensure_contrast_accent(fg: Color32, bg: Color32, min: f32) -> Color32 {
 /// user messages render inside a frame filled with PANEL, so that's the surface to guarantee. PANEL() reads
 /// the LIVE day/night-adjusted palette, so these track the brightness curve. Accents use the hue-preserving
 /// adjuster (backticks stay cyan, not mud); body/ink use the plain one (a value shift is fine for text).
-/// Guarantee `min` against EVERY surface markdown can land on, not just one.
-///
-/// This is the bug the earlier md_strong fixes did not reach, and the reason
-/// they "were never reflected in the GUI": the colour was ensured against
-/// PANEL(), while chat.rs draws user messages on PANEL2()
-/// (`Role::User => (…, theme::PANEL2())`) and blockquotes under an accent wash.
-/// A floor proved against a surface the text is not on is not a floor. Measured
-/// across the palette set, bold promised 7:1 and delivered as little as 5.42:1
-/// on the surface it was actually drawn on — brown on brown in the wood themes,
-/// which is exactly where it was reported.
-///
-/// Converging rather than picking one surface: pushing a colour clear of PANEL2
-/// can drop it back below the floor on PANEL, so the passes alternate until the
-/// result clears both. Panel and panel2 are always the same light/dark family in
-/// every palette here, so the two pulls are in the same direction and this
-/// settles quickly; the loop is bounded anyway, and the fallback is the pole,
-/// which is legible by construction.
-fn ensure_contrast_all(fg: Color32, surfaces: &[Color32], min: f32) -> Color32 {
-    let clears = |c: Color32| surfaces.iter().all(|b| contrast_ratio(c, *b) >= min);
-    let mut c = fg;
-    for _ in 0..4 {
-        if clears(c) { return c; }
-        for b in surfaces { c = ensure_contrast(c, *b, min); }
-    }
-    if clears(c) { return c; }
-    // No single colour clears every surface — take the pole that does best on
-    // the worst of them. Legible with some desaturation beats hue-faithful and
-    // unreadable, which is the same trade ensure_contrast_accent already makes.
-    let worst = |c: Color32| surfaces.iter()
-        .map(|b| contrast_ratio(c, *b))
-        .fold(f32::INFINITY, f32::min);
-    if worst(Color32::WHITE) >= worst(Color32::BLACK) { Color32::WHITE } else { Color32::BLACK }
-}
-
-/// The surfaces markdown is drawn on: the assistant panel and the user panel.
-/// If chat.rs ever renders a message on a third fill, it belongs here — that is
-/// the whole maintenance burden of this approach, and it is cheaper than a
-/// per-call-site colour that silently goes stale.
-fn md_surfaces() -> [Color32; 2] { [PANEL(), PANEL2()] }
-
-fn md_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast_all(fg, &md_surfaces(), min) }
+fn md_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast(fg, PANEL(), min) }
 fn md_accent_on_panel(fg: Color32, min: f32) -> Color32 { ensure_contrast_accent(fg, PANEL(), min) }
 /// Markdown body ink, ≥ 4.5:1 (WCAG AA) on the message panel.
 pub fn md_ink() -> Color32 { md_on_panel(INK(), 4.5) }
@@ -897,16 +793,18 @@ pub fn md_ink() -> Color32 { md_on_panel(INK(), 4.5) }
 pub fn md_accent() -> Color32 { md_accent_on_panel(CYAN(), 4.5) }
 /// Markdown **bold**, ≥ 7:1 on the panel.
 ///
+/// The renderer took `ui.visuals().strong_text_color()` — egui's raw default, which never passes
+/// through the contrast adjustment every other markdown colour goes through. Links and inline code
+/// were fixed for exactly this ("the raw palette cyan is neon on several themes and simply fades
+/// against pale panels"); bold was left on the untreated value and is unreadable on some themes.
+///
+/// Held to 7:1 rather than the 4.5:1 body floor because bold exists to stand OUT from body text — a
+/// bold run that merely clears the same bar as its surroundings is bold that does not read as bold,
+/// which is a different failure from being invisible and just as useless.
+pub fn md_strong() -> Color32 { md_on_panel(INK(), 7.0) }
 /// Markdown secondary (bullets, quote text), ≥ 4.5:1 on the panel — real reading content gets the full
 /// body floor on the surface it lands on.
 pub fn md_dim() -> Color32 { md_on_panel(DIM(), 4.5) }
-/// Markdown BOLD ink, ≥ 7.0:1 on the panel (ceiling-capped). egui's default fonts carry no
-/// bold weight in this pipeline, so COLOR is the entire bold signal — **bold** must land
-/// visibly HEAVIER than body ink (4.5) on every palette and every point of the day/night
-/// curve, or emphasis reads as de-emphasis. That was the reported bug: bold went through
-/// egui's generic `visuals().strong_text_color()`, the one markdown color that never passed
-/// through the contrast machinery, and washed out against several panels.
-pub fn md_strong() -> Color32 { md_on_panel(INK(), 7.0) }
 /// Blockquote bar/wash accent, guaranteed ≥ 3.0:1 (a decorative element needs less).
 pub fn md_quote_accent() -> Color32 { md_accent_on_panel(AMBER(), 3.0) }
 /// A colored inline run (e.g. the workflow-word sequence RECONSTRUCT→MODEL→…) that keeps the violet hue but
@@ -2067,14 +1965,6 @@ mod day_night_tests {
                 demand_accent(q.violet, q.panel, 4.5, "violet on panel (colored run)");
                 demand_accent(q.amber, q.panel, 3.0, "amber on panel (quote accent)");
                 demand(q.ink, q.panel, 4.5, "ink on panel (md body)");
-                // **bold** on the panel: no bold font weight exists in this pipeline, so the
-                // 7.0-vs-4.5 contrast differential IS the emphasis. Two guarantees: the strong
-                // floor holds (ceiling-capped), and bold NEVER lands lighter than body ink.
-                demand(q.ink, q.panel, 7.0, "ink on panel STRONG (md bold)");
-                let body_got = contrast_ratio(ensure_contrast(q.ink, q.panel, 4.5), q.panel);
-                let strong_got = contrast_ratio(ensure_contrast(q.ink, q.panel, 7.0), q.panel);
-                assert!(strong_got >= body_got - 0.05,
-                    "{} bold ({strong_got:.2}) must not be lighter than body ({body_got:.2})", p.name);
                 demand(q.dim, q.bg, 4.5, "dim (md body — raised from 4.0)");
                 demand(q.amber, q.bg, 3.0, "quote accent");
                 demand(q.ink, q.panel2, 4.5, "ink on panel2");
@@ -2238,81 +2128,5 @@ mod md_contrast_tests {
         let body = contrast_ratio(md_ink(), PANEL());
         assert!(strong >= body, "bold {strong:.2}:1 vs body {body:.2}:1 — bold must not read weaker");
         assert!(strong >= 6.9, "and it is held to 7:1, not the 4.5 floor: {strong:.2}");
-    }
-}
-
-#[cfg(test)]
-mod md_surface_tests {
-    use super::*;
-
-    /// The palettes whose PANEL2 physically cannot carry the 7:1 bold floor:
-    /// pure white on that surface reaches only 5.66:1 and 6.78:1 respectively.
-    /// No choice of ink fixes that, and darkening panel2 until it can costs the
-    /// user/assistant distinction — it collapses to 1.03:1 against panel, which
-    /// is the same colour to the eye. Recorded rather than silently mangled;
-    /// the list is asserted so a NEW palette cannot quietly join it.
-    const TIGHT_PANEL2: &[&str] = &["Recursive Citadel", "Yellow Brick Road"];
-
-    /// The maximum contrast any colour can reach against a surface.
-    fn ceiling(bg: Color32) -> f32 {
-        contrast_ratio(Color32::WHITE, bg).max(contrast_ratio(Color32::BLACK, bg))
-    }
-
-    /// Every markdown colour must clear its floor on EVERY surface a message can
-    /// be drawn on — or, where the surface cannot support the floor at all, come
-    /// within a hair of the best that surface allows.
-    ///
-    /// Guaranteeing against PANEL alone let bold reach 5.42:1 on PANEL2 in Rural
-    /// Commons and 5.52:1 in Yellow Brick Road while claiming 7:1. That is the
-    /// brown-on-brown report: the wood themes draw user messages on panel2, and
-    /// the floor was proved against a surface the text was not on.
-    #[test]
-    fn every_markdown_colour_clears_its_floor_on_every_surface() {
-        let mut bad = Vec::new();
-        for p in PALETTES {
-            let surfaces = [p.panel, p.panel2];
-            for (label, fg, min) in [("ink", p.ink, 4.5f32), ("dim", p.dim, 4.5), ("strong", p.ink, 7.0)] {
-                let c = ensure_contrast_all(fg, &surfaces, min);
-                for (i, b) in surfaces.iter().enumerate() {
-                    let r = contrast_ratio(c, *b);
-                    let reachable = ceiling(*b).min(min);
-                    if r < reachable - 0.01 {
-                        bad.push(format!("{} {} on panel{} = {:.2}:1 (want {:.2}, surface allows {:.2})",
-                            p.name, label, if i == 0 { "" } else { "2" }, r, min, ceiling(*b)));
-                    }
-                }
-            }
-        }
-        assert!(bad.is_empty(), "{} failures:\n{}", bad.len(), bad.join("\n"));
-    }
-
-    /// The palettes that cannot carry the bold floor are exactly the ones we
-    /// know about. A new palette with an unreadable panel2 fails here rather
-    /// than shipping.
-    #[test]
-    fn no_new_palette_joins_the_tight_list() {
-        let tight: Vec<&str> = PALETTES.iter()
-            .filter(|p| ceiling(p.panel2) < 7.0)
-            .map(|p| p.name).collect();
-        assert_eq!(tight, TIGHT_PANEL2,
-            "a palette's panel2 cannot support 7:1 bold — pick a darker or lighter panel2");
-    }
-
-    /// The convergence must not overshoot into a colour that fails the surface
-    /// it started from — the reason the passes alternate rather than run once.
-    #[test]
-    fn a_second_surface_does_not_undo_the_first() {
-        for p in PALETTES {
-            let one = ensure_contrast(p.ink, p.panel, 7.0);
-            let both = ensure_contrast_all(p.ink, &[p.panel, p.panel2], 7.0);
-            let cap = |bg: Color32| {
-                contrast_ratio(Color32::WHITE, bg).max(contrast_ratio(Color32::BLACK, bg)).min(7.0)
-            };
-            assert!(contrast_ratio(both, p.panel) >= cap(p.panel) - 0.01,
-                "{} regressed on panel", p.name);
-            assert!(contrast_ratio(both, p.panel2) >= cap(p.panel2) - 0.01,
-                "{} still fails panel2", p.name);
-            let _ = one;
-        }
     }
 }

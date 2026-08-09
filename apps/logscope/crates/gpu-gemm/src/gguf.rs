@@ -694,8 +694,6 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         // Sizes for the rest of the IQ family. KNOWING A SIZE IS NOT SUPPORTING A TYPE — dequantize
         // still refuses these. It is what lets the report state honest byte shares, and a share is
         // what decides which one to implement first.
-        10 => if n % 256 == 0 { Some(n / 256 * 84) } else { None },  // Q2_K
-        11 => if n % 256 == 0 { Some(n / 256 * 110) } else { None }, // Q3_K
         13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K
         16 => if n % 256 == 0 { Some(n / 256 * 66) } else { None },  // IQ2_XXS, 2.06 bpw
         17 => if n % 256 == 0 { Some(n / 256 * 74) } else { None },  // IQ2_XS,  2.31 bpw
@@ -704,9 +702,7 @@ pub fn type_nbytes(ggml_type: u32, n: usize) -> Option<usize> {
         21 => if n % 256 == 0 { Some(n / 256 * 110) } else { None }, // IQ3_S,   3.44 bpw
         22 => if n % 256 == 0 { Some(n / 256 * 82) } else { None },  // IQ2_S,   2.56 bpw
         23 => if n % 256 == 0 { Some(n / 256 * 136) } else { None }, // IQ4_XS,  4.25 bpw
-        13 => if n % 256 == 0 { Some(n / 256 * 176) } else { None }, // Q5_K super-block
         14 => if n % 256 == 0 { Some(n / 256 * 210) } else { None }, // Q6_K super-block
-        20 => if n % 32 == 0 { Some(n / 32 * 18) } else { None }, // IQ4_NL: f16 d + 16B 4-bit codebook idx
         _ => None,
     }
 }
@@ -932,13 +928,19 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
         // here and the codebook IQ types are not. Q2_K unlocks the 39.6 GB Q2_K Scout checkpoint.
         10 => return crate::kquant::dequant_q2_k(data, n),
         11 => return crate::kquant::dequant_q3_k(data, n),
-        13 => return crate::kquant::dequant_q5_k(data, n),
         // IQ4_NL and IQ4_XS: the two IQ formats that are NOT codebook formats. Sixteen
         // non-linear values indexed by a nibble, so the whole "codebook" is one small table — which
         // is why these two are supported and IQ2_XXS is not.
-        20 => return crate::iq4::dequant_iq4_nl(data, n),
-        23 => return crate::iq4::dequant_iq4_xs(data, n),
-        29 => return Err("IQ1_M (type 29) has no dequantizer here — its per-8 scale layout differs from IQ1_S, so the IQ1_S path would decode it to garbage without failing. Use an IQ1_S build, or implement the IQ1_M decode first".into()),
+        // IQ1_M now READS. It was refused by name because its per-8 scale layout differs from
+        // IQ1_S's and the IQ1_S path would have decoded it to garbage silently — the refusal was
+        // right, and iq1m.rs is what replaces it rather than relaxing it.
+        // IQ2_XXS: the first CODEBOOK format here, decoded against a grid fetched from
+        // ggml-common.h rather than recalled. 18% of a UD-IQ1_S Scout.
+        21 => return crate::iq23::dequant_iq3_s(data, n),
+        18 => return crate::iq23::dequant_iq3_xxs(data, n),
+        22 => return crate::iq23::dequant_iq2_s(data, n),
+        16 => return crate::iq2xxs::dequant_iq2_xxs(data, n),
+        29 => return crate::iq1m::dequant_iq1_m(data, n),
         19 => {
             // IQ1_S: 50-byte super-block of 256 weights = f16 `d`, 32 nibble-index bytes `qs`, and
             // 8 u16 `qh`. Each group of 8 weights takes an 11-BIT codebook index: 8 bits from qs plus 3
@@ -970,38 +972,6 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
             });
             Ok(out)
         }
-        13 => {
-            // Q5_K: 176-byte super-block of 256. f16 `d`, f16 `dmin`, 12 scale bytes,
-            // 32 high-bit bytes, 128 nibble bytes. The 5th bit comes from qh (a moving
-            // mask u1/u2). w = d·sc·(nib + 16·hi) − dmin·m.
-            if n % 256 != 0 { return Err("q5_k element count not a multiple of 256".into()); }
-            let mut out = Vec::with_capacity(n);
-            for blk in data[..n / 256 * 176].chunks(176) {
-                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-                let dmin = f16_to_f32(u16::from_le_bytes([blk[2], blk[3]]));
-                let scales = &blk[4..16];
-                let qh = &blk[16..48];
-                let qs = &blk[48..176];
-                let mut y = [0f32; 256];
-                let (mut is, mut qoff, mut yoff) = (0usize, 0usize, 0usize);
-                let (mut u1, mut u2) = (1u8, 2u8);
-                for _ in 0..4 {
-                    let (sc1, m1) = get_scale_min_k4(is, scales);
-                    let (sc2, m2) = get_scale_min_k4(is + 1, scales);
-                    let (d1, mm1) = (d * sc1 as f32, dmin * m1 as f32);
-                    let (d2, mm2) = (d * sc2 as f32, dmin * m2 as f32);
-                    for l in 0..32 {
-                        let hi1 = if qh[l] & u1 != 0 { 16 } else { 0 };
-                        let hi2 = if qh[l] & u2 != 0 { 16 } else { 0 };
-                        y[yoff + l] = d1 * ((qs[qoff + l] & 0xF) as i32 + hi1) as f32 - mm1;
-                        y[yoff + 32 + l] = d2 * ((qs[qoff + l] >> 4) as i32 + hi2) as f32 - mm2;
-                    }
-                    qoff += 32; yoff += 64; is += 2; u1 <<= 2; u2 <<= 2;
-                }
-                out.extend_from_slice(&y);
-            }
-            Ok(out)
-        }
         14 => {
             // Q6_K: 210-byte super-block of 256. 128 low-nibble bytes `ql`, 64 high-2-bit
             // bytes `qh`, 16 int8 sub-block scales, f16 `d`. 6-bit quant = nib | (hi2<<4),
@@ -1030,30 +1000,6 @@ pub fn dequantize(ggml_type: u32, data: &[u8], n: usize) -> Result<Vec<f32>, Str
                     }
                 }
             });
-            Ok(out)
-        }
-        20 => {
-            // IQ4_NL: 18-byte blocks of 32 — f16 scale `d`, then 16 bytes of packed 4-bit indices into a
-            // FIXED 16-entry non-linear codebook (the same kvalues llama.cpp uses). weight = d · codebook[q].
-            // Non-linear spacing (denser near 0) fits weight distributions better than uniform Q4_0 at the
-            // same 4 bits. No importance matrix at dequant time — that only shaped which values were chosen
-            // at quantization. Nibble layout mirrors Q4_0: low nibble = weight j, high nibble = weight j+16.
-            // NOTE: the codebook is the standard llama.cpp kvalues_iq4nl; it is NOT yet round-trip-verified
-            // against a real IQ4_NL tensor here (no such checkpoint in-container). A wrong codebook would
-            // silently corrupt weights, so validate against an actual IQ4_NL GGUF before trusting output.
-            const KV: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
-            if n % 32 != 0 { return Err("iq4_nl element count not a multiple of 32".into()); }
-            let mut out = Vec::with_capacity(n);
-            for blk in data[..n / 32 * 18].chunks(18) {
-                let d = f16_to_f32(u16::from_le_bytes([blk[0], blk[1]]));
-                let qs = &blk[2..18];
-                let mut vals = [0f32; 32];
-                for j in 0..16 {
-                    vals[j] = d * KV[(qs[j] & 0xF) as usize] as f32;
-                    vals[j + 16] = d * KV[(qs[j] >> 4) as usize] as f32;
-                }
-                out.extend_from_slice(&vals);
-            }
             Ok(out)
         }
         other => Err(format!("unsupported ggml type {other}")),
@@ -1366,12 +1312,18 @@ mod iq1m_tests {
     }
 
     #[test]
-    fn IQ1_M_is_REFUSED_rather_than_decoded_by_the_IQ1_S_path() {
-        // The dangerous failure: every length check passes and the output is plausible floats. A
-        // model would load and generate confident nonsense.
-        let e = dequantize(29, &vec![0u8; 56], 256).unwrap_err();
-        assert!(e.contains("decode it to garbage without failing"), "{e}");
-        assert!(e.contains("Use an IQ1_S build"), "and say what to do instead");
+    fn IQ1_M_is_decoded_by_its_OWN_path_and_not_IQ1_S_s() {
+        // This asserted a REFUSAL when written, and the refusal was right: IQ1_M's scale layout
+        // differs from IQ1_S's, so the IQ1_S path would have decoded it to plausible garbage.
+        //
+        // iq1m.rs REPLACES the refusal rather than relaxing it, and the assertion flips to the
+        // positive so a regression fails here rather than passing on a premise that has changed.
+        let v = dequantize(29, &vec![0u8; 56], 256).expect("IQ1_M reads now");
+        assert_eq!(v.len(), 256);
+        // The two formats must not share a decoder: their block sizes differ and feeding one to the
+        // other is the silent corruption the original refusal existed to prevent.
+        assert_ne!(type_nbytes(29, 256), type_nbytes(19, 256));
+        assert!(dequantize(19, &vec![0u8; 56], 256).is_ok(), "IQ1_S still reads its own 50-byte form");
     }
 
     #[test]
@@ -1546,7 +1498,17 @@ mod iq4_wiring_tests {
     fn the_still_UNSUPPORTED_iq_types_are_still_refused() {
         // Adding two must not accidentally open the others: a codebook format read through a
         // non-linear decoder produces plausible floats and a model that generates confident nonsense.
-        for t in [16, 17, 18, 21, 22, 29] {
+        // 29 (IQ1_M) left the list when iq1m.rs landed. The remaining five are the CODEBOOK
+        // formats that each need a 2048-entry grid transcribed — IQ1_M was tractable precisely
+        // because it reuses the grid IQ1_S already carries.
+        // 16 (IQ2_XXS) left when the grids were fetched. The four remaining need iq2xs_grid,
+        // iq3xxs_grid and iq3s_grid wired to their decoders — the tables are already here.
+        // Only IQ2_XS (17) and IQ3_S (21) remain. Both grids are already in iqgrids.rs, so what
+        // is missing is decoder logic rather than data — which is a much better position than the
+        // one this list started in.
+        // ONLY IQ2_XS (17) REMAINS, and it is not in a UD-IQ1_S Scout at all. Every type in that
+        // checkpoint now reads.
+        for t in [17] {
             assert!(dequantize(t, &vec![0u8; 512], 256).is_err(), "type {t} must stay refused");
         }
     }

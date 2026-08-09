@@ -34,7 +34,31 @@ for no reason.
 
 | machine | OS | adapter | RAM | single alloc | concurrent | notes |
 |---|---|---|---|---|---|---|
-| M2 Ultra | Asahi | `Apple M2 Ultra (G14D B1) [Vulkan]` | 177 GiB | 63 GiB (`--gate-vram`) | **31 GiB — MEASURED, `--gate-residency` 2026-08** | held 31 GiB in 124 slabs; the 125th failed with "Failed to allocate BO VMA". The constant was right. |
+| `ultra-fed` | Fedora 43 Asahi | `7.1.6-400.asahi.fc43.aarch64+16k` | `Apple M2 Ultra (G14D B1) [Vulkan]` | 128 GB | 63 GiB | **31 GiB** (arena) |
+
+### The `+16k` matters more than it looks
+
+That kernel runs **16 KiB pages**, not 4 KiB, and none of the consequences are cosmetic:
+
+* **mmap granularity is 16 KiB.** A GGUF tensor offset that is 4K-aligned is not page-aligned here,
+  so a zero-copy path written assuming 4K either falls back to a copy silently or is wrong.
+* **Allocations round up to 16 KiB**, so thousands of small tensors waste four times the slack —
+  an argument for the arena independent of the BO-VMA one.
+* **The concurrent-buffer ceiling may be page-COUNT bound rather than byte-bound.** If so, 31 GiB
+  is specific to this page size and would be wrong on a 4K Asahi kernel.
+* **A cached `--gate-residency` result must record it**, or two machines sharing an adapter string
+  and differing in page size get each other's answer.
+
+`getconf PAGESIZE` is the check and belongs beside `uname -a` in the required facts.
+
+### Confirmed on hardware, 2026-08
+
+`--gate-quantref` passes on `ultra-fed` — the first time the driver profile has been VERIFIED rather
+than inferred. Ties away from zero and reciprocal-product scaling both hold for q2, q3, q4 and q8.
+
+The tie densities it reports (0.040 / 0.124 / 0.270 / 4.976 per unit range) are why a gate must span
+a wide enough range to contain one: **a narrow gate passes by never generating the case it exists to
+test.**
 | M2 Max | Asahi | — | 64 GB | not measured | not measured | laptop; used for the Delegate role |
 
 **The gap between 63 and 31 is not an error.** `--gate-vram` allocates and releases; the arena must
