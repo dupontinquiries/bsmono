@@ -374,14 +374,18 @@ pub fn login_ui(ui: &mut egui::Ui, l: &mut Login,
 
         let user = ui.add(egui::TextEdit::singleline(&mut l.username)
             .hint_text("Username").desired_width(240.0));
-        if l.focus == Field::Username { user.request_focus(); }
+        // The guard matters: `l.focus` stays Username for as long as the user is
+        // typing there, so an unguarded call re-requests focus every frame and
+        // re-initialises the cursor — the caret jumps back and each keystroke
+        // overwrites the last. Same bug logscope's vim fields had.
+        if l.focus == Field::Username && !user.has_focus() { user.request_focus(); }
         if user.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             l.username_return();
         }
 
         let pass = ui.add(egui::TextEdit::singleline(&mut l.password)
             .hint_text("Password (optional)").password(true).desired_width(240.0));
-        if l.focus == Field::Password { pass.request_focus(); }
+        if l.focus == Field::Password && !pass.has_focus() { pass.request_focus(); }
         let pass_enter = pass.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
         if let Some(e) = &l.error {
