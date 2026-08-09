@@ -564,3 +564,35 @@ flatpak = false
 runtime = "none"
 targets = ["desktop"]
 notes = "deterministic 1v1 RTS in Rust: the M0 simulation core, a headless match runner with scripted macro bots for all three races, and the transport-agnostic lockstep session layer (M2), proven by running two clients in-process with zero desyncs. NO ENGINE DEPENDENCIES — serde + ron only — and pinned to rustc 1.75 so it builds on distro toolchains, the same convention as bot-arena. `client/` is workspace-EXCLUDED because it pulls Bevy; the sim workspace builds without it. Imported as a source snapshot: the tarball carried no .git, and the incremental bundle for the same drop could not be applied (see maintenance/ECHELON_M0_02_BLOCKED.md)."
+
+# --- games registered after an audit found them buildable but unlisted --------
+# Found by checking every directory with a Cargo.toml against every section of
+# this file. The four apps the same check flagged were FALSE POSITIVES — they
+# are registered against their `egui-frontend/` subdirectory rather than their
+# root, which is correct and which my check did not understand. These four are
+# real: two of them arrived through imports I made and I never registered them,
+# so check-features.sh and any build-everything sweep have been skipping them.
+
+[games.blackstar-rs]
+path = "games/blackstar-rs"
+kind = "cargo"
+role = "game"
+notes = "The Rust blackstar on the skydribble engine — raid, loot, damage, patrol, procgen, dispatch, ballistics. Self-contained: references nothing in games/blackstar and carries its own assets. Needs libasound2-dev to link, so it does not build in the CI container."
+
+[games.skydribble]
+path = "games/skydribble"
+kind = "cargo"
+role = "game"
+notes = "Air-dribble playground, Rust + wgpu. Shares an engine with blackstar-rs and NO git history with it, so engine improvements move between them by port rather than merge — see games/ENGINE_SHARING.md. Also needs libasound2-dev."
+
+[games.bsgames]
+path = "games/bsgames"
+kind = "cargo"
+role = "game"
+notes = "The game centre: profiles, presence, launch kinds, and the cross-game tournament host built on shared/netcode (brackets, lobbies, attested results)."
+
+[games.soldier]
+path = "games/soldier"
+kind = "cargo"
+role = "game"
+
