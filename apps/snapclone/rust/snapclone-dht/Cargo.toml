@@ -17,3 +17,10 @@ chrono  = { version = "0.4", features = ["serde"] }
 serde   = { version = "1", features = ["derive"] }
 tokio   = { version = "1", features = ["net", "time", "rt"] }
 tracing = "0.1"
+
+[dev-dependencies]
+# Parity harness only. The two engines are compared on OBSERVABLE behaviour, so
+# the shared one has to be linkable from here — it is not a runtime dependency
+# and nothing in src/ references it.
+snapcore = { path = "../../../../shared/snapcore" }
+

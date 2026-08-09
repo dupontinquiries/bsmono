@@ -2671,6 +2671,7 @@ dependencies = [
  "serde",
  "snapclone-identity",
  "snapclone-nat",
+ "snapcore",
  "tokio",
  "tracing",
 ]
