@@ -499,3 +499,59 @@ as the estimate to test, not the answer.
 4. **Components from the harvester's own splitter, never a second one.**
 5. `render_parity.py` — the only check that catches the mistakes the geometric
    metrics missed, three times running.
+
+---
+
+# The full corpus run — measured, not projected
+
+Ran the settled recipe over every model.
+
+```
+converted     : 1,011 of 1,012 (one stem collision)
+harvest       : 40,701 part types, 85,659 placements, 993 models placed
+repeated      : 11,999,929 triangles across placements
+                 7,927,868 stored once each   ->  34% repeated
+web           : 54,660,477 bytes (40,701 parts, all annotated)
+residual      : ~8 KB per 40 placements at grid 16
+render parity : 0.826 mean silhouette IoU across 4 models x 3 views
+```
+
+Per model: 0.735/0.918/0.869, 0.783/0.878/0.802, 0.721/0.918/0.863,
+0.716/0.854/0.860. **The recipe holds at 200× the sample it was tuned on** —
+0.844 on five models, 0.826 on the full library.
+
+## Against the projection
+
+I projected ~22,000 types and ~24MB. Measured: **40,701 types and 54.7MB.**
+Off by 1.8× and 2.3× — the corpus has more distinct geometry than the five-model
+sample implied, which is the same direction the earlier 8MB projection missed in.
+
+**Two projections, both optimistic, both from small samples.** The lesson is
+specific rather than general: part-count extrapolation from a handful of models
+understates, because the models sampled first are the ones that decompose
+cleanly, and each new model adds more novel geometry than the average of those
+before it.
+
+## What it means for the 500MB budget
+
+```
+web + residuals   :  ~55 MB
+baked .iqm        :  512 MB
+ratio             :  10.7%   (9.4x smaller)
+```
+
+Not the 4.7% projected, but replacing 512MB with 55MB takes the bundle from
+635MB to roughly **180MB** — comfortably inside 500MB, with room that the
+projection did not depend on.
+
+## What is still true and unfinished
+
+* **0.826 is not 1.0.** It is good enough to browse, stream, overlay and animate
+  from; it is not yet a pixel-identical replacement, and the remaining gap is
+  mostly parts the harvest still misses at `min_tris 20`.
+* **Only 993 of 1,011 models got placements.** The other 18 produced no
+  clusterable components at all and would need their geometry kept.
+* **Textures and materials are untouched.** Every number here is geometry.
+* The 24-frame rotation search measured better than the 4-sign one (0.222 vs
+  0.170) on the old component split and has never been re-measured on the
+  correct one. It is the cheapest remaining improvement.
