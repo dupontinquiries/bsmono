@@ -5726,7 +5726,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let q = b.wq.apply(self, &h1m, t);
         let k = b.wk.apply(self, &h1m, t);
         let v = b.wv.apply(self, &h1m, t);
-        let attn = self.attention_mh_full_t(&q, &k, &v, t, d, n_heads, n_heads);
+        let attn = self.bidir_attn(&q, &k, &v, t, d, n_heads, n_heads);
         let o = b.wo.apply(self, &attn, t);
         let x2 = self.dit_gated_add(x, &o, &gate1);
 
@@ -5746,7 +5746,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
         let q = b.wq.apply(self, &h1, t);
         let k = b.wk.apply(self, &h1, t);
         let v = b.wv.apply(self, &h1, t);
-        let attn = self.attention_mh_full_t(&q, &k, &v, t, d, n_heads, n_heads);
+        let attn = self.bidir_attn(&q, &k, &v, t, d, n_heads, n_heads);
         let o = b.wo.apply(self, &attn, t);
         let x2 = self.add_t(x, &o);
         let h2 = self.layernorm_t(&x2, &b.g2, &b.b2, t, d, eps);
@@ -15511,6 +15511,28 @@ impl Gpu {
     /// current target exceeds 128). Grid is one workgroup per (row, head), so
     /// `t * n_heads` must stay under the 65,535 workgroup-x limit — same bound
     /// the causal ext path already lives with.
+    /// Bidirectional attention for the vision path, tiled by default.
+    ///
+    /// `attention_mh_full_t` is one thread per (row, head), each streaming the whole K and V with
+    /// no shared memory and no rescale. **On Honeykrisp that is measurably inaccurate above ~64
+    /// rows** — gate-bidir-attn's column 1 shows it diverging from the tiled kernel at t=64
+    /// (3.30e-4) where lavapipe holds until t=2100, and columns 2 and 3 identify the naive side as
+    /// the one that moved.
+    ///
+    /// ViT and DiT blocks ran on it. They now route here, which falls back to the naive kernel above
+    /// hd 192 — the one shape the tiled path does not cover, and no current target hits it.
+    ///
+    /// LOGSCOPE_NAIVE_BIDIR=1 restores the old routing, because a vision path that regresses should
+    /// be revertible without a rebuild.
+    pub fn bidir_attn(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: usize, dm: usize,
+        n_heads: usize, n_kv_heads: usize) -> Tensor
+    {
+        if std::env::var_os("LOGSCOPE_NAIVE_BIDIR").is_some() {
+            return self.attention_mh_full_t(q, k, v, t, dm, n_heads, n_kv_heads);
+        }
+        self.attention_mh_bidir_tiled(q, k, v, t, dm, n_heads, n_kv_heads)
+    }
+
     pub fn attention_mh_bidir_tiled(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
         let hd = dm / n_heads;
         if hd > 192 {
