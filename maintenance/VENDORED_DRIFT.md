@@ -89,3 +89,44 @@ that depends on it still compiles.
 `tournament`. Those are additive, so syncing them looks equally safe — but
 `netcode` is the crate the games *do* call directly, and the last check that
 matters (does the game still build) cannot run here without `libasound2-dev`.
+
+---
+
+# netcode — synced, and the drift explained itself
+
+The last outstanding copy. Once `reannounce` was ported upstream, the shared
+crate became a **true superset**: no file exists only in the vendored copies, and
+the only remaining textual differences were a reformatted line and the
+`pub(crate)` visibility the `lobby` module needed. So the sync is additive by
+inspection.
+
+Both games' vendored `netcode` now carries `attest`, `lobby` and `tournament` —
+the bracket, discovery and result-attestation work — and both copies pass the
+same **86 tests** as the shared crate.
+
+## Why the drift existed at all
+
+`games/skydribble/src/net.rs:318` calls `mp.reannounce()`.
+
+That is the whole story in one line. The game needed a keepalive, the fix was
+written where the game could see it — the vendored copy — and there was no
+mechanism to carry it back. Every other consumer of `netcode` kept dropping off
+friend lists, and nothing connected the two facts because the two crates are
+different files.
+
+## Safety, checked rather than assumed
+
+* The games call exactly two things: `Multiplayer` and `handoff::from_env`.
+  `handoff.rs` is byte-identical between shared and vendored; `multiplayer.rs`
+  only gains `reannounce`, which the game already calls.
+* All three added modules are new files — nothing existing changes shape.
+* Verified after: 86 tests in each vendored copy, and `snapcore` beneath them
+  still compiles.
+
+## The remaining step, and why it is still not taken
+
+The vendor directories can now be deleted and the dependencies repointed at
+`games/shared/netcode` and `shared/snapcore`, which is what removes the drift
+permanently rather than resetting it. That is a **build-graph** change, and the
+only check that matters — do the games still build — needs `libasound2-dev`,
+which this container lacks. Syncing is verifiable here; repointing is not.
