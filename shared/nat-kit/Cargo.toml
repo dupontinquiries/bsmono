@@ -1,0 +1,11 @@
+[package]
+name = "nat-kit"
+version = "0.1.0"
+edition = "2021"
+description = "STUN (RFC 5389) messaging in Rust: binding requests, responses, XOR-MAPPED-ADDRESS. The codec only — no sockets, no async, no dependencies. The NAT-discovery counterpart to dht-kit, so any transport in the fleet can learn its public address without linking tokio."
+
+[lib]
+name = "nat_kit"
+path = "src/lib.rs"
+
+[dependencies]

@@ -137,3 +137,44 @@ already used would make "compatible" mean "compatible with what we had".
 **Still not compliance.** Round-tripping our own encoder proves self-consistency.
 Until bytes from a real OpenDHT node decode and re-encode identically, this is
 "shaped like the reference". That test needs one packet capture and nothing else.
+
+---
+
+## `shared/nat-kit` — the other half of the stack
+
+A DHT that cannot learn its own public address cannot be reached by peers behind
+NAT, so STUN is not an optional extra here: it is the step before a routing
+table means anything. The stack now has one kit per protocol layer:
+
+| layer | kit | deps |
+|---|---|---|
+| DHT messaging | `dht-kit` | none |
+| NAT discovery | `nat-kit` | none |
+| leaf transport primitives | `net-kit` | — |
+| engine | `snapcore` | — |
+
+STUN already existed in `snapclone-nat`, ported from `NatTraversal.cpp` — but it
+pulls **tokio, anyhow, bytes, rand and tracing**, which is right for an app and
+wrong for a layer two engines with different toolchains must share.
+
+**No randomness in the kit.** The caller supplies the transaction id. A crate
+that generated one would either drag in `rand` or ship a weak PRNG, and the id
+is security-relevant: it is the only thing matching a response to its request.
+
+12 tests. Three worth naming:
+
+* **the raw address must not appear on the wire** — that is the entire purpose
+  of XOR-MAPPED-ADDRESS, since NATs rewrite addresses they recognise inside
+  packet bodies, and a plain address gets mangled in transit by the very device
+  describing it
+* **v6 xors with cookie ++ tx where v4 uses the cookie alone** — getting that
+  wrong decodes to a plausible but wrong address rather than failing, so the
+  test asserts the same address under a different tx encodes differently
+* **a packet with its top bits set is not STUN** — this is what lets STUN share
+  a socket, and it is how a DHT packet arriving on the STUN port is rejected
+  rather than misparsed into a routing decision
+
+**Unknown attributes are skipped here and refused in `dht-kit`** — opposite
+choices, deliberately. We control both ends of the DHT and neither end of a
+public STUN server; refusing unknown comprehension-optional attributes would
+reject valid responses from most of the internet.
