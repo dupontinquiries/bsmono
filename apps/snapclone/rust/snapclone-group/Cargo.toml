@@ -29,11 +29,6 @@ hex           = "0.4"
 subtle        = "2"
 
 [dev-dependencies]
-# Integration test: a full group message round-trip through the local
-# micro-DHT (seal+sign → PUT to feed bucket → GET → verify+open). Dev-only, so
-# it never affects what the app links.
-snapclone-microdht = { path = "../snapclone-microdht" }
-# The fleet's shared DHT. Added alongside rather than replacing: this test asks
-# whether snapcore can carry the value layer snapclone-microdht carries today,
-# and the answer is only credible if both run.
+# The fleet's shared DHT. It now carries the value layer alone: the
+# snapclone-microdht round trip was retired once its snapcore twin proved out.
 snapcore = { path = "../../../../shared/snapcore" }

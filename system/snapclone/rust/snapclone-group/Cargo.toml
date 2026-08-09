@@ -29,7 +29,3 @@ hex           = "0.4"
 subtle        = "2"
 
 [dev-dependencies]
-# Integration test: a full group message round-trip through the local
-# micro-DHT (seal+sign → PUT to feed bucket → GET → verify+open). Dev-only, so
-# it never affects what the app links.
-snapclone-microdht = { path = "../snapclone-microdht" }

@@ -2729,7 +2729,6 @@ dependencies = [
  "hkdf",
  "rand_core 0.6.4",
  "sha2",
- "snapclone-microdht",
  "snapcore",
  "subtle",
  "x25519-dalek",
@@ -2813,10 +2812,6 @@ dependencies = [
 
 [[package]]
 name = "snapclone-menu"
-version = "0.1.0"
-
-[[package]]
-name = "snapclone-microdht"
 version = "0.1.0"
 
 [[package]]
