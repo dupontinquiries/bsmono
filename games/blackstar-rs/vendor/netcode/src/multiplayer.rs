@@ -93,14 +93,25 @@ impl Multiplayer {
     /// End hosting: tear down the control-plane record (presence flips back to `Online`, so
     /// `join_via_friend` stops offering it — see `SessionExt::end_session`'s doc for the TTL
     /// caveat on the raw record itself).
-    /// Keep a live session discoverable: re-publish the record + presence.
-    /// Records and presence carry TTLs on the store — a host that announces
-    /// once and then plays for ten minutes silently falls off the friend
-    /// list. Call every ~20 s while hosting.
+    /// Keep a live session discoverable: re-publish the record and presence.
+    ///
+    /// Ported back from the copy vendored into skydribble and blackstar-rs,
+    /// where it was written and where it stayed. Records and presence carry
+    /// TTLs on the store, so **a host that announces once and then plays for
+    /// ten minutes silently falls off the friend list** — the session is alive
+    /// and undiscoverable, which looks to everyone else like the host left.
+    ///
+    /// Call roughly every 20 seconds while hosting. It is deliberately cheap
+    /// and idempotent: re-announcing an already-live session is a store write
+    /// that costs nothing, and a host that skips one tick is not penalised.
+    ///
+    /// Does nothing when not hosting, rather than erroring — a caller ticking
+    /// this on a timer should not have to know whether hosting has ended.
     pub fn reannounce(&mut self) {
         if let (Some(tok), Some(sock)) = (self.token.clone(), self.socket.as_ref()) {
             if let Ok(local) = sock.local_addr() {
-                let rec = SessionRecord::new(&self.game, &self.me.id, "udp", &local.to_string());
+                let rec = SessionRecord::new(&self.game, &self.me.id, "udp",
+                                             &local.to_string());
                 self.svc.announce_session(&mut self.me, &tok, &rec);
             }
         }
@@ -259,5 +270,57 @@ mod tests {
         let plain = for_startup("clawbound", "LocalCat", None);
         assert_eq!(plain.me.id, "LocalCat");
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod reannounce_tests {
+    use super::*;
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("netcode-re-{name}-{}.jsonl", std::process::id()))
+    }
+
+    #[test]
+    fn reannouncing_keeps_a_host_resolvable() {
+        // The bug it exists for: records carry a TTL, so a host that announces
+        // once and plays for ten minutes falls off the friend list while still
+        // hosting. Alive and undiscoverable looks exactly like "they left".
+        let path = tmp_path("keeps");
+        let mut host = Multiplayer::at_store("soldier", "kesslerd", "Kessler", path.clone());
+        host.host("127.0.0.1:0").expect("bind");
+        host.reannounce();
+
+        let friend = Multiplayer::at_store("soldier", "f", "F", path);
+        assert!(friend.svc().join_via_friend("kesslerd").is_some(),
+                "still resolvable after a re-announce");
+    }
+
+    #[test]
+    fn reannouncing_while_not_hosting_does_nothing_rather_than_failing() {
+        // A caller ticking this on a timer should not have to know whether
+        // hosting has ended — and a panic or an error there would make the
+        // timer the thing that has to carry the state machine.
+        let path = tmp_path("idle");
+        let mut idle = Multiplayer::at_store("soldier", "nobody", "Nobody", path.clone());
+        idle.reannounce();
+        let friend = Multiplayer::at_store("soldier", "f", "F", path);
+        assert!(friend.svc().join_via_friend("nobody").is_none(),
+                "and it did not announce a session that was never started");
+    }
+
+    #[test]
+    fn reannouncing_after_stopping_does_not_resurrect_the_session() {
+        // The ordering that matters: stop_hosting clears the token, so a timer
+        // firing one last time after the host quit must not put the session
+        // back on the store for others to dial into.
+        let path = tmp_path("stopped");
+        let mut host = Multiplayer::at_store("soldier", "quitter", "Q", path.clone());
+        host.host("127.0.0.1:0").expect("bind");
+        host.stop_hosting();
+        host.reannounce();
+
+        let friend = Multiplayer::at_store("soldier", "f", "F", path);
+        assert!(friend.svc().join_via_friend("quitter").is_none());
     }
 }
