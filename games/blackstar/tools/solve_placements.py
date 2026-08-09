@@ -34,6 +34,28 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "game-model-tools", "python"))
 
 
+from transform_collage import weld, components as split_components
+
+
+def real_components(verts, tris, eps_frac=0.002):
+    """The model's actual connected pieces, not a sphere of nearby vertices.
+
+    The first version took "vertices within 0.75 x size of the centroid", which
+    is a ball that scoops in whatever else is nearby — a wheel arrives with a
+    slice of the fender welded to it, and no rotation fits that. This is the
+    same connected-component split the harvester uses, so the thing being posed
+    is the thing that was clustered.
+    """
+    if not verts:
+        return []
+    lo = [min(v[i] for v in verts) for i in range(3)]
+    hi = [max(v[i] for v in verts) for i in range(3)]
+    span = max(hi[i] - lo[i] for i in range(3)) or 1.0
+    flat = [i for t in tris for i in t]
+    remap = weld(verts, span * eps_frac)
+    return [[verts[i] for i in g] for g in split_components(len(verts), flat, remap)]
+
+
 def load_obj(path):
     verts, tris = [], []
     with open(path) as f:
@@ -195,6 +217,64 @@ def align_pca(ex, comp):
     return bestR, best
 
 
+def shape_modifier(ex, comp, R, size, bins=8):
+    """A residual stored as a VECTOR FIELD over the part's volume, not a flat
+    scalar.
+
+    `residual_max` says only "this exemplar fits badly". That is enough to
+    decide whether to keep the original geometry and nothing else. A modifier
+    says WHERE and IN WHICH DIRECTION it differs, which is the difference
+    between discarding a part and correcting it.
+
+    The field is volumetric on purpose: the part is divided into an 8x8x8 grid
+    of its own bounding box, and each occupied cell stores the mean
+    displacement from the exemplar's surface to the component's. A per-vertex
+    delta would be flat in the sense that matters — it would be tied to one
+    tessellation, so it could not be applied to an exemplar with a different
+    vertex count, which is exactly the case here. A field over the volume is
+    tied to SPACE, so it transfers to any mesh occupying that space.
+
+    Cost: at most 8^3 cells x 3 int8 = 1.5KB before compression, and in practice
+    far less because only occupied cells are stored. Against a part that costs
+    several KB of geometry, correcting is cheaper than storing a second copy.
+    """
+    ce, cc = centroid(ex), centroid(comp)
+    ext = max(max(p[i] for p in ex) - min(p[i] for p in ex) for i in range(3)) or 1.0
+    s = (size or ext) / ext
+    posed = [[sum(R[i][j] * (p[j] - ce[j]) for j in range(3)) * s + cc[i]
+              for i in range(3)] for p in ex]
+
+    lo = [min(p[i] for p in posed + comp) for i in range(3)]
+    hi = [max(p[i] for p in posed + comp) for i in range(3)]
+    span = [max(hi[i] - lo[i], 1e-9) for i in range(3)]
+
+    def cell_of(p):
+        return tuple(min(bins - 1, max(0, int((p[i] - lo[i]) / span[i] * bins)))
+                     for i in range(3))
+
+    # Where the component's surface sits in each cell, against where the posed
+    # exemplar's does. Mean-to-mean rather than nearest-point, because nearest
+    # -point needs a correspondence and that is the trap this whole exercise
+    # already fell into once.
+    ca, cb = {}, {}
+    for p in posed:
+        ca.setdefault(cell_of(p), []).append(p)
+    for p in comp:
+        cb.setdefault(cell_of(p), []).append(p)
+
+    mod, scale = {}, max(span)
+    for k in cb:
+        if k not in ca:
+            continue
+        ma = centroid(ca[k])
+        mb = centroid(cb[k])
+        d = [(mb[i] - ma[i]) / scale for i in range(3)]
+        if max(abs(x) for x in d) < 0.01:
+            continue    # below a hundredth of the part: not worth a byte
+        mod["%d,%d,%d" % k] = [max(-127, min(127, int(round(x * 127)))) for x in d]
+    return mod, len(cb), len(ca)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lib", required=True)
@@ -203,6 +283,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--samples", type=int, default=64)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--modifiers", action="store_true",
+                    help="store a volumetric residual field per placement")
     a = ap.parse_args()
 
     lib = json.load(open(a.lib))
@@ -215,7 +297,7 @@ def main():
             if os.path.exists(mp):
                 by_sig[p["sig"]] = load_obj(mp)[0]
 
-    solved = unsolved = 0
+    solved = unsolved = modcells = 0
     residuals = []
     items = list(lib.get("placements", {}).items())
     if a.limit:
@@ -224,20 +306,27 @@ def main():
         src = os.path.join(a.originals, name, name + ".obj")
         if not os.path.exists(src):
             continue
-        mv, _ = load_obj(src)
+        mv, mt = load_obj(src)
         if not mv:
+            continue
+        comps = real_components(mv, mt)
+        if not comps:
             continue
         for pl in pls:
             ex = by_sig.get(pl["sig"])
             if not ex:
                 unsolved += 1
                 continue
-            # The component this placement refers to: the model's vertices near
-            # the recorded centroid, within the recorded size. Approximate, and
-            # the residual reports how approximate.
-            r = (pl.get("size") or 0.0) * 0.75
-            comp = [v for v in mv if math.dist(v, pl["centroid"]) <= r] if r else []
-            if len(comp) < 8:
+            # The real component nearest this placement's centroid. Matching by
+            # centroid rather than by index because the placement records where
+            # the piece IS, and the split does not preserve harvest order.
+            comp = None
+            best = None
+            for g in comps:
+                d = math.dist(centroid(g), pl["centroid"])
+                if best is None or d < best:
+                    best, comp = d, g
+            if comp is None or len(comp) < 8:
                 unsolved += 1
                 continue
             R, err = align_pca(ex, comp)
@@ -247,6 +336,11 @@ def main():
             pl["rot"] = [[round(R[i][j], 6) for j in range(3)] for i in range(3)]
             pl["rot_residual"] = round(err, 5)
             residuals.append(err)
+            if a.modifiers:
+                mod, nb, na = shape_modifier(ex, comp, R, pl.get("size"))
+                if mod:
+                    pl["mod"] = mod
+                    modcells += len(mod)
             solved += 1
 
     json.dump(lib, open(a.out, "w"), separators=(",", ":"))
@@ -257,6 +351,8 @@ def main():
         mid = residuals[len(residuals) // 2]
         p90 = residuals[int(len(residuals) * 0.9)]
         print("residual / size   : median %.3f   p90 %.3f" % (mid, p90))
+    if a.modifiers:
+        print("modifier cells    : %d  (~%.1f KB raw)" % (modcells, modcells * 3 / 1024))
     print("wrote %s" % a.out)
     return 0
 

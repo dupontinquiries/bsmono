@@ -86,6 +86,21 @@ def reconstruct(model, placements, idx, pay, off):
         s = (pl["size"] or ext) / ext
         base = len(verts)
         R = pl.get("rot")
+        mod = pl.get("mod")
+        # Placement bounds for the modifier lookup, computed on the POSED
+        # exemplar so the cell a vertex lands in matches the cell the solver
+        # measured it in.
+        if mod:
+            posed = []
+            for v in pv:
+                q = [(v[d] - c[d]) * s for d in range(3)]
+                if R:
+                    q = [sum(R[i][j] * q[j] for j in range(3)) for i in range(3)]
+                posed.append([q[d] + pl["centroid"][d] for d in range(3)])
+            mlo = [min(p[i] for p in posed) for i in range(3)]
+            mhi = [max(p[i] for p in posed) for i in range(3)]
+            mspan = [max(mhi[i] - mlo[i], 1e-9) for i in range(3)]
+            mscale = max(mspan)
         for v in pv:
             q = [(v[d] - c[d]) * s for d in range(3)]
             if R:
@@ -93,7 +108,14 @@ def reconstruct(model, placements, idx, pay, off):
                 # rotation would swing the part around the model origin and
                 # move it somewhere else entirely.
                 q = [sum(R[i][j] * q[j] for j in range(3)) for i in range(3)]
-            verts.append([q[d] + pl["centroid"][d] for d in range(3)])
+            p3 = [q[d] + pl["centroid"][d] for d in range(3)]
+            if mod:
+                k = ",".join(str(min(7, max(0, int((p3[i] - mlo[i]) / mspan[i] * 8))))
+                             for i in range(3))
+                dv = mod.get(k)
+                if dv:
+                    p3 = [p3[i] + dv[i] / 127.0 * mscale for i in range(3)]
+            verts.append(p3)
         for a, b, cc in pt:
             tris.append((a + base, b + base, cc + base))
     return verts, tris, missing
