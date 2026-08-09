@@ -8605,6 +8605,25 @@ through is the evidence that the concurrent one is lower than this.",
 — no expert streaming, no host copy, no staging ring. Set LOGSCOPE_MOE_STREAM=1 to force streaming.",
                             gib(full_resident), gib(gpu_budget));
                         auto_q4 = true;
+                        // SUSPECTED FALL-THROUGH — the comment below may be wrong, and the compiler
+                        // is the witness.
+                        //
+                        // "value assigned to `auto_q4` is never read ... this value is reassigned
+                        // later and never read" means control flow DOES reach the streaming branch's
+                        // `auto_q4 = true; moe_stream_pin = Some(pin);` from here. The compiler does
+                        // not guess about reachability.
+                        //
+                        // If that is right, a model that FITS FULLY RESIDENT still gets
+                        // moe_stream_pin set, so it streams experts it did not need to stream — the
+                        // exact per-token cost this whole line of work is trying to remove, paid by
+                        // the models that had already escaped it.
+                        //
+                        // Not fixed here: the branch structure needs reading whole, and a wrong
+                        // early-return would turn a model that streams into one that refuses to
+                        // load. The check is one line of evidence away — load anything whose experts
+                        // fit under the budget and see whether "EXPERT STREAMING" prints after
+                        // "MoE fits FULLY RESIDENT".
+                        //
                         // moe_stream_pin stays None, which is what selects the resident path below.
                     } else if dense + ring_cost > gpu_budget {
                                     return Err(format!("MoE won't fit even with expert streaming: dense ~{:.1} GiB + a {}-slot ring ~{:.1} GiB exceeds ~{:.1} GiB.{} Use llama.cpp or Metal.", gib(dense), ring, gib(ring_cost), gib(gpu_budget),
@@ -8739,6 +8758,15 @@ either",
                                         }));
                                 }
                                 auto_q4 = true;
+                                // LOUD IF THE FALL-THROUGH IS REAL. If a model already printed "MoE fits FULLY
+                                // RESIDENT" and reaches here, it is about to stream experts it did not need to —
+                                // and the only reason nobody noticed is that the two messages are 130 lines apart
+                                // in the source and adjacent in the log.
+                                if full_resident <= gpu_budget {
+                                    eprintln!("wgpu-engine: BUG — this model FITS FULLY RESIDENT and expert \
+                                streaming is being enabled anyway. The resident branch fell through. Every expert fetch \
+                                from here is a per-token cost this model had already escaped; please report this line.");
+                                }
                                 moe_stream_pin = Some(pin);
                                 let resident = dense + ring_cost + (pin as u64) * per_expert_all_layers;
                                 eprintln!("loader: MoE won't fit fully resident → EXPERT STREAMING (q4, auto — LOGSCOPE_MOE_STREAM=0 opts out): pin {pin}/{n_expert} experts + {ring}-slot ring per layer, ~{:.1} GiB resident (dense ~{:.1} GiB); {} cold experts stream from host RAM per layer",
