@@ -178,3 +178,41 @@ is security-relevant: it is the only thing matching a response to its request.
 choices, deliberately. We control both ends of the DHT and neither end of a
 public STUN server; refusing unknown comprehension-optional attributes would
 reject valid responses from most of the internet.
+
+---
+
+## Step 1 done: snapcore can speak the wire
+
+`shared/snapcore/src/wire.rs`, behind a `wire` feature that is **off by
+default**. snapcore has had zero dependencies and five crates rely on that —
+`cargo tree` still shows it dependency-free in the default build, and
+share-kit, net-kit, netcode and bsgames were each built to confirm.
+
+The bridge translates and nothing more: a decoded `Msg` becomes the right
+`Node::handle_*` call and the answer becomes a `Msg` back. It does not own a
+socket, retransmit, or decide when to query — those belong to a transport and to
+the lookup driver, and putting them here would make this a third engine rather
+than the seam between the two that exist.
+
+Decisions worth keeping:
+
+* **A reply is never answered.** Answering an answer is an amplification loop,
+  not a protocol.
+* **The sender's socket address is used, never one it claims.** A node that
+  could name its own address would insert peers wherever it liked — that is how
+  a routing table fills with one attacker's endpoints.
+* **A v6 contact is omitted from a reply rather than mapped to 0.0.0.0**, which
+  would advertise a peer nobody can reach.
+* **A put with no value is an error, not a silent success**, or the sender
+  believes its data landed.
+* **`refresh` answers 501.** Nothing beneath implements value keep-alive, and a
+  reply saying "fine" while the value expires is worse than a refusal.
+
+A failing test taught something on the way: two queries from one node id at
+different addresses correctly **replace** rather than duplicate. That is right —
+a phone leaving wifi keeps its id and arrives from a new socket, and two entries
+for one id send half the traffic to an address that stopped answering — so the
+behaviour is now pinned by its own test.
+
+**Remaining: steps 2–4.** `listen`/`refresh` in the engine, a real capture to
+turn "shaped like" into "compatible with", then retire the older crates.
