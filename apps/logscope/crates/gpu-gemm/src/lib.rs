@@ -11041,6 +11041,16 @@ impl Gpu {
     /// Causal multi-head attention (prefill). `q` is [t, n_heads*hd]; `k`/`v` are
     /// [t, n_kv_heads*hd]. With n_kv_heads < n_heads this is grouped-query attention.
     pub fn attention_mh_t(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        // PREFILL CAN TAKE THE TILED KERNEL. ATTENTION_MH runs one thread per (row, head), each
+        // streaming the whole K and V with no shared memory and no cross-row reuse — quadratic in t.
+        // ATTENTION_MH_EXT_PAR tiles the KV loop with an online softmax and already exists here.
+        //
+        // The mapping is exact rather than approximate: for prefill the "cache" IS k/v, so base is 0
+        // and s is t. Behind a flag because that is a NUMERICAL claim and not a reasoning one —
+        // --gate-prefill-attn compares the two element-wise and is what settles it.
+        if std::env::var_os("LOGSCOPE_TILED_PREFILL").is_some() && dm / n_heads <= 192 {
+            return self.attention_mh_ext_swa(q, k, v, 0, t, dm, n_heads, n_kv_heads, None);
+        }
         let out = self.alloc(t, dm); let hd = dm / n_heads;
         let dims = [t as u32, hd as u32, n_heads as u32, n_kv_heads as u32];
         self.dispatch(ATTENTION_MH, &[q, k, v], &out, bytemuck::cast_slice(&dims), (((t * n_heads) as u32).div_ceil(64), 1, 1)); out

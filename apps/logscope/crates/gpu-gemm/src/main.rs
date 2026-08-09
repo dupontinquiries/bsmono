@@ -3904,6 +3904,62 @@ a disagreement here would have proved one wrong.");
         return;
     }
 
+    if args.iter().any(|a| a == "--gate-prefill-attn") {
+        // Does routing prefill to the tiled kernel change the numbers?
+        //
+        // ATTENTION_MH (naive) against ATTENTION_MH_EXT_PAR (tiled, online softmax) on the same
+        // inputs. Bit-exactness is NOT expected — an online softmax sums in a different order, so
+        // the question is whether the difference is at rounding scale or at wrong-answer scale.
+        let gpu = Gpu::new();
+        println!("gate-prefill-attn: adapter = {}", gpu.adapter_name);
+        let mut worst_rel = 0.0f32;
+        let mut worst_case = String::new();
+        for &(t, n_heads, n_kv_heads, hd) in &[
+            (8usize, 4usize, 4usize, 32usize),      // square, no GQA
+            (32, 8, 2, 64),                          // GQA 4:1
+            (64, 8, 8, 128),                         // head_dim at the common size
+            (129, 4, 1, 96),                         // odd length, MQA
+        ] {
+            let dm = n_heads * hd;
+            let kvd = n_kv_heads * hd;
+            // Deterministic inputs: a wrong kernel must fail on structure, not on luck with random
+            // values that happen to be small.
+            let q: Vec<f32> = (0..t * dm).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
+            let k: Vec<f32> = (0..t * kvd).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
+            let v: Vec<f32> = (0..t * kvd).map(|i| ((i % 11) as f32 - 5.0) / 5.0).collect();
+            let (qt, kt, vt) = (gpu.upload(&q, t, dm), gpu.upload(&k, t, kvd), gpu.upload(&v, t, kvd));
+
+            std::env::remove_var("LOGSCOPE_TILED_PREFILL");
+            let naive = gpu.download(&gpu.attention_mh_t(&qt, &kt, &vt, t, dm, n_heads, n_kv_heads));
+            std::env::set_var("LOGSCOPE_TILED_PREFILL", "1");
+            let tiled = gpu.download(&gpu.attention_mh_t(&qt, &kt, &vt, t, dm, n_heads, n_kv_heads));
+            std::env::remove_var("LOGSCOPE_TILED_PREFILL");
+
+            if naive.len() != tiled.len() {
+                println!("  t={t} h={n_heads}/{n_kv_heads} hd={hd}: SHAPE MISMATCH {} vs {}",
+                    naive.len(), tiled.len());
+                worst_rel = f32::INFINITY;
+                continue;
+            }
+            // Relative to the magnitude present, so a large output does not hide a real error and a
+            // near-zero one does not manufacture a huge ratio.
+            let scale = naive.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+            let d = naive.iter().zip(&tiled).fold(0.0f32, |m, (a, b)| m.max((a - b).abs())) / scale;
+            println!("  t={t:>4} heads={n_heads}/{n_kv_heads} hd={hd:>3}: max rel diff {d:.2e}");
+            if d > worst_rel { worst_rel = d; worst_case = format!("t={t} hd={hd}"); }
+        }
+        println!();
+        // f32 accumulation over a few thousand terms in a different order lands here; anything
+        // larger is a different answer rather than a different rounding.
+        const TOL: f32 = 1e-4;
+        if worst_rel <= TOL {
+            println!("gate-prefill-attn: PASS — worst {worst_rel:.2e} <= {TOL:.0e}. The tiled kernel agrees with the naive one to rounding, so LOGSCOPE_TILED_PREFILL=1 is safe to run.");
+        } else {
+            println!("gate-prefill-attn: FAIL — worst {worst_rel:.2e} at {worst_case}, over {TOL:.0e}. That is a different answer rather than different rounding: the base/s mapping or the causal mask differs between the two kernels. Do NOT set LOGSCOPE_TILED_PREFILL.");
+        }
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-loadpath") {
         // What to measure before hand-tuning file -> CPU -> GPU. Answers what it can here and prints
         // the rest as a checklist, because a fact that needs a real model file cannot be faked and
@@ -5021,7 +5077,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-q4k  --gate-q4resident  --gate-q6k\n  --gate-q8direct  --gate-qkv  --gate-quant-survey  --gate-quantref\n  --gate-quanttables  --gate-qwen2  --gate-qwen3  --gate-residency\n  --gate-rubric  --gate-store  --gate-stream-slots  --gate-submit\n  --gate-swa  --gate-vae-conv  --gate-vae-resblock  --gate-vit-block\n  --gate-vram  --gate-worker  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-store  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }
