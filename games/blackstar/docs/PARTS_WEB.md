@@ -125,3 +125,69 @@ answer; 8MB was the guess.**
 * **The baked `.iqm` are still in place.** They should not be removed until a
   render comparison passes, and `residual_max` is the field that decides which
   parts need their own geometry rather than a cluster representative.
+
+---
+
+# Render parity — measured, and it does not pass yet
+
+`tools/render_parity.py` rasterises the original and the web reconstruction from
+three viewpoints and compares silhouette IoU and depth RMSE. Software
+rasteriser, no GPU needed: a depth buffer answers both questions. Reported per
+view as well as averaged, because a reconstruction can be convincing head-on and
+wrong from above.
+
+## First run: 0.183 mean IoU
+
+```
+model                                    place  miss   front   side    top
+imported_soldierrib_part0                    6     4   0.019  0.013  0.046
+imported_donors_bot_yukon_brawler           62    59   0.192  0.139  0.061
+imported_raidboss_tremor                    61    50   0.233  0.166  0.228
+mean silhouette IoU: 0.183
+```
+
+The `miss` column is the finding: **59 of 62 placements had no part in the web**.
+Measured directly — placements reference 4,950 distinct signatures and the web
+carries 790. **16% coverage.** The `--emit-per-category 80` cap, not
+quantisation, was doing the damage.
+
+## Second run: coverage fixed, 0.509 mean IoU
+
+Re-harvested the same five models emitting every part type (112 of 112), rebuilt
+the web, re-measured:
+
+```
+imported_raidboss_tremor                    61     0   0.720  0.700  0.708
+imported_donors_bot_yukon_brawler           62     0   0.448  0.602  0.532
+mean silhouette IoU: 0.509
+```
+
+Zero misses, and IoU nearly tripled. **So the cap was the dominant term** — but
+0.509 is still not "indistinguishable", and the remaining gap has a known cause.
+
+## The remaining gap is orientation
+
+A placement records `sig`, `centroid` and `size`. **It records no rotation.** So
+the reconstruction can put the right part in the right place at the right scale
+and still have it turned the wrong way, which is exactly what a half-matching
+silhouette looks like.
+
+That is not a defect in the harness or the web format — it is what
+`partlib.json` currently carries. And the fix already exists in the repo:
+`derive_web.py` recovers rigid transforms with Kabsch, described in its own
+header as *"the motion it undergoes is not something to invent — it is the rigid
+transform that carries one onto the other"*. The same solve applies here; it
+just has not been run for placements.
+
+## Where that leaves the 53×
+
+The 5.9MB figure is real but it is 5.9MB of a representation that **cannot yet
+rebuild its models faithfully**. Two things must land before the baked `.iqm`
+can go:
+
+1. **Per-placement rotation**, via the existing Kabsch solve.
+2. **Full part coverage** in the web, or a measured cap that keeps IoU high —
+   the 80-per-category cap costs far more than it saves.
+
+Both are known work with existing tools rather than open questions, and the
+harness now measures whether they worked.
