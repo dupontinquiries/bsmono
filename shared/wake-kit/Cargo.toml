@@ -1,0 +1,11 @@
+[package]
+name = "wake-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Spend less radio: coalesce periodic network work into shared wake windows, and decide when a payload is worth compressing. Policy only — no sockets, no timers, no compressor, no dependencies."
+
+[lib]
+name = "wake_kit"
+path = "src/lib.rs"
+
+[dependencies]
