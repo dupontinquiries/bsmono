@@ -596,3 +596,9 @@ path = "games/soldier"
 kind = "cargo"
 role = "game"
 
+[shared.bsweb]
+path = "games/shared/bsweb"
+kind = "cargo"
+role = "library"
+notes = "Reader for the BSWEB parts-web format — geometry stored once, referenced by placements, annotated with harvest categories and inferred material properties. Dependency-free like netcode so both the C-adjacent Rust tools and blackstar-rs can link it without pulling serde or a zlib crate into their graphs. Callers pass already-decompressed bytes; an engine has a decompressor already."
+

@@ -1,0 +1,10 @@
+[package]
+name = "bsweb"
+version = "0.1.0"
+edition = "2021"
+description = "Reader for the BSWEB parts-web format: geometry stored once, referenced by placements, annotated with material properties. Dependency-free like netcode, so both engines can link it without pulling serde or a zlib crate into their graphs."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
