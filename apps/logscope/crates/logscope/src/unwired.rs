@@ -237,7 +237,15 @@ mod live_tests {
         // Raising a ceiling for genuinely unwired code is the right move ONLY with the reason
         // attached, which is the difference between a ratchet and a rubber stamp. When
         // reachability starts consuming validate_record, this should come back down.
-        const CEILING: usize = 602;
+        // 605: exactly my three additions in fleet — ModelPresence, time_to_ready_s and
+        // worth_the_wait. Attributable, unlike the dupscan bump beside it, and the same true
+        // positive as peerrecord at 602: real work with no caller, because nothing in the app
+        // asks the fleet anything yet.
+        //
+        // This comes back down when the app calls fleet::choose. If it has not by the time
+        // another three land, the honest reading is that the multi-device stack is being
+        // designed and not built, and the ceiling is the thing that will say so.
+        const CEILING: usize = 605;
         assert!(n <= CEILING,
             "{n} unwired public items, ceiling {CEILING}. Something was built and not connected — \
 which looks finished from every angle a check can see, and is why this ceiling exists rather than a \

@@ -86,6 +86,71 @@ pub fn candidates<'a>(members: &'a [FleetMember], t: deviceplan::Task)
     (ok, refused)
 }
 
+/// What the peer already has loaded.
+///
+/// Named `ModelPresence` rather than `Residency` because `memplan::Residency` already means a WEIGHT
+/// FORMAT — F32, Int8, Q4. Two different ideas under one noun is what the duplicate ratchet exists
+/// to catch, and it caught this one on the run that introduced it.
+///
+/// **`deviceplan` scores hardware and never asks this**, which makes it possible to route work to a
+/// machine that is perfectly capable and 66 seconds away from being useful. That figure is measured:
+/// Scout Q4_K_M loads in 66.1s on the Ultra, and a peer that has to load it before answering turns a
+/// two-second request into a minute-long one.
+#[derive(Clone, PartialEq, Debug)]
+pub enum ModelPresence {
+    /// The model is loaded right now.
+    Loaded,
+    /// It is on disk and would have to load. Seconds, measured or estimated.
+    OnDisk { load_s: f32 },
+    /// Not present. It would have to be transferred first — which for a 30 GiB checkpoint over
+    /// anything but a LAN is not a delay, it is a different plan.
+    Absent { gib: f32 },
+}
+
+impl ModelPresence {
+    /// Seconds before this peer can start work, over a link of the given speed.
+    pub fn time_to_ready_s(&self, link_mib_s: f32) -> f32 {
+        match self {
+            ModelPresence::Loaded => 0.0,
+            ModelPresence::OnDisk { load_s } => *load_s,
+            ModelPresence::Absent { gib } => {
+                let transfer = gib * 1024.0 / link_mib_s.max(1.0);
+                // Plus a load once it lands. Estimated from the transfer size rather than assumed,
+                // because a peer that must fetch 30 GiB is not going to load it quickly either.
+                transfer + gib * 2.2
+            }
+        }
+    }
+
+    pub fn explain(&self, link_mib_s: f32) -> String {
+        let t = self.time_to_ready_s(link_mib_s);
+        match self {
+            ModelPresence::Loaded => "loaded and ready".into(),
+            ModelPresence::OnDisk { .. } => format!(
+                "on disk, {t:.0}s to load. Worth it for a batch and not for one request — the load is paid once and amortises over everything sent after it"),
+            ModelPresence::Absent { gib } => format!(
+                "not present: {gib:.0} GiB to transfer plus a load, ~{t:.0}s. That is not a delay, it is a different plan — pre-stage it or use a peer that has it"),
+        }
+    }
+}
+
+/// Is the wait worth it for work of this size?
+///
+/// **The comparison is against doing it locally**, not against zero. A 66-second load is absurd for
+/// one token and trivial for an hour of batch work, and nothing decides that without knowing how
+/// much work is coming.
+pub fn worth_the_wait(r: &ModelPresence, link_mib_s: f32, local_est_s: f32, remote_est_s: f32)
+    -> Result<f32, String>
+{
+    let ready = r.time_to_ready_s(link_mib_s);
+    let remote_total = ready + remote_est_s;
+    if remote_total >= local_est_s {
+        return Err(format!(
+            "{ready:.0}s to be ready plus {remote_est_s:.0}s of work is {remote_total:.0}s against {local_est_s:.0}s locally — {}", r.explain(link_mib_s)));
+    }
+    Ok(local_est_s / remote_total)
+}
+
 /// Pick one member for a task, given how much work the session can commit to.
 ///
 /// `candidates` returns everyone eligible; something has to choose. The choice is not "fastest
@@ -140,6 +205,49 @@ mod tests {
                 gpu_gib: gpu, rtt_s: 0.02, link_mib_s: link, can_execute: true,
             },
         }
+    }
+
+    #[test]
+    fn a_LOADED_peer_beats_a_faster_one_that_must_load() {
+        // The gap deviceplan leaves: hardware capability says nothing about readiness, and 66
+        // seconds of load turns a two-second request into a minute.
+        let loaded = ModelPresence::Loaded;
+        let on_disk = ModelPresence::OnDisk { load_s: 66.1 };
+        assert_eq!(loaded.time_to_ready_s(1000.0), 0.0);
+        assert!(worth_the_wait(&loaded, 1000.0, 10.0, 2.0).is_ok());
+        assert!(worth_the_wait(&on_disk, 1000.0, 10.0, 2.0).is_err(), "68s > 10s locally");
+    }
+
+    #[test]
+    fn the_SAME_load_is_worth_it_for_a_batch() {
+        // Amortisation is the whole question: absurd for one token, trivial for an hour of work.
+        let on_disk = ModelPresence::OnDisk { load_s: 66.1 };
+        let x = worth_the_wait(&on_disk, 1000.0, 3600.0, 600.0).unwrap();
+        assert!(x > 5.0, "got {x}x");
+    }
+
+    #[test]
+    fn an_ABSENT_model_is_a_DIFFERENT_PLAN_not_a_delay() {
+        // 30 GiB over a link is not something to wait through; the message says pre-stage rather
+        // than leaving someone to watch a progress bar.
+        let absent = ModelPresence::Absent { gib: 30.0 };
+        assert!(absent.explain(100.0).contains("different plan"));
+        assert!(absent.time_to_ready_s(100.0) > 300.0);
+    }
+
+    #[test]
+    fn a_FASTER_LINK_shortens_an_absent_model_and_not_a_loaded_one() {
+        assert!(ModelPresence::Absent { gib: 30.0 }.time_to_ready_s(1000.0)
+              < ModelPresence::Absent { gib: 30.0 }.time_to_ready_s(100.0));
+        assert_eq!(ModelPresence::Loaded.time_to_ready_s(1.0), 0.0);
+    }
+
+    #[test]
+    fn the_refusal_compares_against_LOCAL_rather_than_against_zero() {
+        // "68 seconds" is not a reason on its own — it is a reason only next to what doing it here
+        // would cost.
+        let e = worth_the_wait(&ModelPresence::OnDisk { load_s: 66.1 }, 1000.0, 10.0, 2.0).unwrap_err();
+        assert!(e.contains("against 10s locally"));
     }
 
     #[test]
