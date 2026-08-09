@@ -97,3 +97,47 @@ them from what is in the tree.
 So the 500MB target still runs through the web, and the web still needs its
 0.826 to become "indistinguishable" before that swap is a cleanup rather than a
 loss. **Lossless cleanup is now exhausted at single-digit megabytes per pass.**
+
+---
+
+# Third pass — the pack is already optimal
+
+The one canonical lossless lever left was a full delta-search repack, skipped
+earlier because it timed out:
+
+```
+git repack -a -d -f --window=250 --depth=250
+```
+
+Default git packs with `--window=10 --depth=50`. Twenty-five times the search
+window, run to completion over the whole repository:
+
+```
+before : 629.85 MiB
+after  : 629.85 MiB
+```
+
+**No change.** Which is itself the answer: the pack is dominated by `.iqm`,
+`.png` and `.bin`, all already-compressed or high-entropy binary. Delta
+compression has nothing left to find between them, so no packing parameter
+helps.
+
+Also fixed here: `refs/remotes/origin/HEAD` pointed at a null sha1 after the
+history rewrites, and would have been inherited by every clone from these
+bundles. `git fsck --no-dangling` is now clean.
+
+## The lossless question is settled
+
+Four passes, measured each time:
+
+| pass | action | saved |
+|---|---|---:|
+| 1 | untracked `target/` dirs (disk only, not in bundle) | 0 MB |
+| 1 | audit: SDL2 `.a`, `.spv`, duplicate blobs — all rejected | 0 MB |
+| 2 | catalog `.iqm`, `apps/unendlich`, `apps/cybertron`, `_build` | 6 MB |
+| 3 | maximum-effort repack | 0 MB |
+
+**629MB, and every remaining megabyte is unique content that nothing in the tree
+can regenerate.** There is no lossless path to 500MB. The 129MB gap is exactly
+the size of the model corpora, and the only thing that removes them without loss
+is a reconstruction good enough to replace them.
