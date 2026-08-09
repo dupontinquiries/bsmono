@@ -614,3 +614,9 @@ kind = "cargo"
 role = "library"
 notes = "STUN (RFC 5389) messaging: binding request/success/error, XOR-MAPPED-ADDRESS for v4 and v6, MAPPED-ADDRESS for older servers. Codec only — no sockets, no async, no randomness (the caller supplies the transaction id), no dependencies. The NAT-discovery counterpart to dht-kit; snapclone-nat has the same protocol but drags in tokio, anyhow, bytes, rand and tracing."
 
+[shared.wake-kit]
+path = "shared/wake-kit"
+kind = "cargo"
+role = "library"
+notes = "Spend less radio: coalesce Background periodic work into device-offset wake windows so a 20s and a 60s job share one modem wake-up, and decide when a payload is worth compressing. Policy only — no timers, no sockets, no compressor, no dependencies. Generalises snapcore::schedule, which does the same for DHT maintenance alone."
+
