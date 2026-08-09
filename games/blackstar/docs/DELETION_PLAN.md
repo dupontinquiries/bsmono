@@ -59,3 +59,53 @@ From `DELETION_READINESS.md`, unchanged by this plan:
 The plan is sound and the budget is comfortable. The gate is fidelity evidence,
 not size arithmetic — and that ordering is worth keeping, because the size
 argument will be just as true after the two failing models are understood.
+
+---
+
+# Executed — 629.9 MB → 464.7 MB
+
+```
+before          629.9 MB
+after           464.7 MB      35 MB under budget
+commits          1,771        history intact
+```
+
+## What was kept
+
+| | count | size |
+|---|---:|---:|
+| voxel representatives | 1,012 | 6.1 MB |
+| example originals | 21 | 15 MB |
+| parts web (40,742 parts) | 1 | 36.4 MB |
+| textures | 406 | untouched |
+
+Every model still has a representative at 0.955 shape IoU. The examples are the
+**median** of each of 11 vehicle types plus a 75th-percentile second for the
+larger ones and one high-res keeper — median rather than largest, because a
+validator wants a typical case and the extremes generalise worst.
+
+## The trap that nearly ate the examples
+
+`git filter-repo --path-glob 'games/blackstar/engine_src/data/*.iqm'` matched
+**1,154 files, not 1,133**. Git pathspec `*` crosses `/`, so it took the 21
+examples in `data/examples/` along with the corpus — the files committed
+specifically to survive the purge.
+
+It would have failed silently: filter-repo reports success either way, and the
+examples simply would not have been there. Caught by counting the glob's matches
+before running it, then backing up and restoring.
+
+## What this does not claim
+
+Parity from committed artefacts alone was last measured at **0.419**, not 0.906
+— the committed harvest is thinner than the one the good numbers came from, and
+the placements still carry no rotations. **The originals are gone, so that gap
+can no longer be closed by re-harvesting them.** What remains is:
+
+* exact reconstruction where the parts library covers a model
+* a 0.955-shape representative for every model regardless
+* 21 originals for validating the pipeline
+
+That is a deliberate trade, not an oversight: the corpus was 512 MB of assets
+that no longer fit the direction, and the representative tier means nothing
+became unrecognisable.
