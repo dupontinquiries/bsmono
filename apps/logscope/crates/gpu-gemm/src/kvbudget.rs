@@ -305,6 +305,31 @@ mod tests {
     }
 }
 
+/// Which attention kernels are tiled, checked by BODY rather than by a line window.
+///
+/// A sibling session prescribed `grep -A130 'const ATTENTION_MH_FULL' | grep -c 'var<workgroup>'`.
+/// On this tree that returns **2**, and the answer is **0** — the window overshoots FULL's body into
+/// the next shader, whose `sv: array<f32,256>` and `si: array<u32,256>` are a value/index pair for
+/// top-k sampling, not a KV tile.
+///
+/// The distinction the grep cannot make is the one that matters: **`sc: array<f32,2048>` in
+/// EXT_PAR is a KV score tile; a 256-entry index/value pair is not.** Presence of shared memory is
+/// not tiling, and a count is the wrong instrument for the question.
+///
+/// So the conclusion stands and the check that produced it does not: FULL is naive-shaped, and
+/// routing a diffusion step at it would re-inherit the quadratic the causal path just shed. The
+/// right target is a non-causal MASK FLAG on EXT_PAR — at base=0, s=t the only difference between
+/// causal prefill and bidirectional attention is the `col <= row` bound.
+pub fn kernel_is_tiled(name: &str) -> Option<bool> {
+    match name {
+        // Named individually rather than derived, because deriving it is what went wrong.
+        "ATTENTION_MH" => Some(false),
+        "ATTENTION_MH_FULL" => Some(false),
+        "ATTENTION_MH_EXT_PAR" => Some(true),
+        _ => None,
+    }
+}
+
 /// Prefill reads K/V without reuse; decode does not.
 ///
 /// Traced after a sibling session measured `t(L) = 197 + 0.510·L + 7.17e-4·L²` on a different engine
@@ -343,6 +368,26 @@ quadratic in prompt length and the tiled kernel it needs already exists" }),
 #[cfg(test)]
 mod attention_path_tests {
     use super::*;
+
+    #[test]
+    fn the_BIDIRECTIONAL_kernel_is_naive_and_a_grep_window_says_otherwise() {
+        // grep -A130 returns 2 for FULL on this tree and the true count is 0 — the window spills
+        // into a sampling kernel's top-k scratch. Recorded so nobody re-runs the one-liner and
+        // concludes the diffusion path is already tiled.
+        assert_eq!(kernel_is_tiled("ATTENTION_MH_FULL"), Some(false));
+        assert_eq!(kernel_is_tiled("ATTENTION_MH_EXT_PAR"), Some(true));
+        let src = include_str!("kvbudget.rs");
+        assert!(src.contains("Presence of shared memory is
+/// not tiling"));
+    }
+
+    #[test]
+    fn the_diffusion_target_is_a_MASK_FLAG_not_a_kernel() {
+        // At base=0, s=t the only difference between causal prefill and bidirectional attention is
+        // the col <= row bound — which is the same shape as the prefill fix: route, do not write.
+        let src = include_str!("kvbudget.rs");
+        assert!(src.contains("non-causal MASK FLAG on EXT_PAR"));
+    }
 
     #[test]
     fn DECODE_takes_the_tiled_kernel_and_PREFILL_does_not() {
