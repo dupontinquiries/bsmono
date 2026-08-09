@@ -3551,6 +3551,32 @@ everywhere: it looks like a hardware problem"
                 .expect("the CPU reference reads this fixture");
         }
         let got = gpu.matvec_iq1_s(&act, &raw, n, k);
+
+        // AND THE RESIDENT PATH, which nothing tested until now.
+        //
+        // linear_iq1_s_t is what a loaded model actually calls — matvec_iq1_s is a standalone
+        // helper. They dispatch the same shader and bound DIFFERENT numbers of buffers: the
+        // resident one omitted the codebook grid entirely, so this gate passed while the path the
+        // 30.3 GiB residency argument rests on dispatched a shader without its codebook.
+        let resident = {
+            let words: Vec<u32> = raw.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let w = gpu_kernels::Iq1Weight {
+                blocks: gpu.upload_u32(&words), n, k,
+            };
+            let at = gpu.upload(&act, 1, k);
+            gpu.download(&gpu.linear_iq1_s_t(&at, &w, 1))
+        };
+        let mut worst_res = 0f32;
+        for r in 0..n {
+            let e = (resident[r] - want[r]).abs() / want[r].abs().max(1.0);
+            if e > worst_res { worst_res = e; }
+        }
+        println!("  resident path (linear_iq1_s_t): worst rel {worst_res:.2e}");
+        if worst_res > 1e-3 {
+            println!("  gate-iq1s-kernel: the RESIDENT path disagrees with the CPU reference. matvec_iq1_s may still agree — they are different functions dispatching the same shader, and only this one is what a loaded model calls.");
+        }
+
         let mut worst = 0f32;
         for r in 0..n {
             let e = (got[r] - want[r]).abs() / want[r].abs().max(1.0);
@@ -3560,8 +3586,17 @@ everywhere: it looks like a hardware problem"
         println!("  rows {n}, k {k}, worst relative error {worst:.2e}");
         println!("  cpu[0..4] = {:?}", &want[..4.min(n)]);
         println!("  gpu[0..4] = {:?}", &got[..4.min(n)]);
+        // THE VERDICT MUST COVER BOTH PATHS. It reported MATCHES while linear_iq1_s_t returned
+        // garbage — the standalone helper correct and the resident path a loaded model takes not,
+        // which is the combination every previous gate read as green.
+        if worst_res > 1e-3 {
+            println!("gate-iq1s-kernel: FAIL — matvec_iq1_s agrees ({worst:.2e}) and \
+        linear_iq1_s_t does NOT ({worst_res:.2e}). The RESIDENT path is the one a loaded model \
+        calls.");
+        } else {
         println!("gate-iq1s-kernel: native IQ1_S matvec {} the CPU reference {}",
             if ok { "MATCHES" } else { "DIVERGES from" }, if ok { "✓" } else { "" });
+        }
         if !ok {
             println!("  => the format reading is already proven by dot_iq1_s matching the \
 dequantizer, so a divergence here is the kernel's arithmetic or its indexing, not the layout");
