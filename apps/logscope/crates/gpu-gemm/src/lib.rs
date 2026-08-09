@@ -2346,7 +2346,25 @@ fn lin_row_view(l: &Lin, row0: usize, rows: usize) -> Option<Lin> {
         // block boundary only when the row length is a multiple of 256. That is the same
         // alignment rule qkvsplit enforces for Q4_K and it needs the same explicit check rather
         // than a silent mid-block cut. Nothing slices an IQ1_S tensor today.
-        LinKind::Iq1(_) => None,
+        // SLICEABLE WHEN THE ROW LENGTH IS BLOCK-ALIGNED, refused loudly when it is not.
+        //
+        // IQ1_S packs 256 weights into 50 bytes, so a row slice lands on a block boundary only when
+        // `k` is a multiple of 256. That holds for every MoE model this targets — Scout's expert ff
+        // is 16384 — and where it does not hold a silent mid-block cut would produce plausible
+        // garbage rather than an error, which is why the check is explicit and the failure is None.
+        //
+        // This is what MOE_MATVEC_IQ1_S has been waiting for: the kernel exists and has never been
+        // dispatched, because nothing could hand it a per-expert slice.
+        LinKind::Iq1(q) => {
+            if q.k % 256 != 0 { return None }
+            let row_bytes = (q.k / 256 * 50) as u64;
+            let (off, len) = (row0 as u64 * row_bytes, rows as u64 * row_bytes);
+            // The blocks tensor is uploaded as opaque words, so its cols are byte_len/4.
+            Some(Lin::iq1(Iq1Weight {
+                blocks: tview(&q.blocks, off, len, 1, (len / 4) as usize),
+                n: rows, k: q.k,
+            }))
+        }
         LinKind::Q8(w) => {
             let kb = w.k / 32;
             Some(Lin { kind: LinKind::Q8(QWeight {
