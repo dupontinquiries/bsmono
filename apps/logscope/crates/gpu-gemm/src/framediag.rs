@@ -296,7 +296,18 @@ mod flush_reopen_tests {
     fn flush_and_wait_REOPENS_the_frame_it_took() {
         let src = include_str!("lib.rs");
         let i = src.find("fn flush_and_wait(&self)").expect("flush_and_wait moved");
-        let body = &src[i..(i + 1800).min(src.len())];
+        // THE FUNCTION'S REAL BODY, not a byte window. The first version scanned 1800 chars, and
+        // an edit inside flush_and_wait that added five lines pushed begin_frame past the end — the
+        // test failed on code that was correct, which is the same fixed-window failure this project
+        // criticised in a `grep -A130` two days earlier.
+        //
+        // Scan to the next top-level `    fn ` or `    pub fn `, which is where the body actually
+        // ends.
+        let rest = &src[i..];
+        let end = rest[1..].find("\n    fn ").map(|x| x + 1)
+            .min(rest[1..].find("\n    pub fn ").map(|x| x + 1).unwrap_or(usize::MAX).into())
+            .unwrap_or(rest.len());
+        let body = &rest[..end.min(rest.len())];
         assert!(body.contains("self.begin_frame();"),
             "flush_and_wait must restore the frame it took, or every dispatch after an expert \
 stream runs frameless");
