@@ -5338,8 +5338,19 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             // and passing the same tensor twice would produce plausible wrong numbers, which is the
             // failure mode this codebase has spent a week on.
             //
-            // The MoE stacks are therefore never built as Iq1 today; the loader converts them. A
-            // native MoE path needs MOE_MATVEC_IQ1_S with a one-buffer binding, which does not exist.
+            // CORRECTION: MOE_MATVEC_IQ1_S DOES exist — 3 refs, 0 dispatch sites. And the shape
+            // objection above is wrong too: that kernel takes THREE inputs like Q4 does (a, w,
+            // grid), so the obstacle was never "one buffer against a pair".
+            //
+            // The real obstacles, found by tracing rather than by re-reading this comment:
+            //   1. lin_row_view could not slice IQ1_S per expert. FIXED — block-aligned slicing.
+            //   2. the third input is a shared 2048-entry CODEBOOK GRID, not a per-weight scale,
+            //      so it is a model-level constant this tuple has no slot for.
+            //   3. linear_iq1_s_t binds two buffers to a shader declaring three, so the resident
+            //      path is itself mismatched and must be settled before a MoE path copies it.
+            //
+            // A stale comment that names the wrong blocker costs more than no comment: it was read
+            // three times as though it were current.
             LinKind::Iq1(_) => unreachable!(
                 "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
 binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
@@ -5355,8 +5366,19 @@ binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
             // and passing the same tensor twice would produce plausible wrong numbers, which is the
             // failure mode this codebase has spent a week on.
             //
-            // The MoE stacks are therefore never built as Iq1 today; the loader converts them. A
-            // native MoE path needs MOE_MATVEC_IQ1_S with a one-buffer binding, which does not exist.
+            // CORRECTION: MOE_MATVEC_IQ1_S DOES exist — 3 refs, 0 dispatch sites. And the shape
+            // objection above is wrong too: that kernel takes THREE inputs like Q4 does (a, w,
+            // grid), so the obstacle was never "one buffer against a pair".
+            //
+            // The real obstacles, found by tracing rather than by re-reading this comment:
+            //   1. lin_row_view could not slice IQ1_S per expert. FIXED — block-aligned slicing.
+            //   2. the third input is a shared 2048-entry CODEBOOK GRID, not a per-weight scale,
+            //      so it is a model-level constant this tuple has no slot for.
+            //   3. linear_iq1_s_t binds two buffers to a shader declaring three, so the resident
+            //      path is itself mismatched and must be settled before a MoE path copies it.
+            //
+            // A stale comment that names the wrong blocker costs more than no comment: it was read
+            // three times as though it were current.
             LinKind::Iq1(_) => unreachable!(
                 "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
 binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),

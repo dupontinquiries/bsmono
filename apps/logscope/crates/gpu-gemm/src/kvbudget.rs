@@ -413,6 +413,33 @@ mod attention_path_tests {
     }
 }
 
+/// # BINDING MISMATCH on the resident IQ1_S path
+///
+/// Found while tracing why `MOE_MATVEC_IQ1_S` has never been dispatched. It is not the reason, and
+/// it is worse than the reason:
+///
+/// ```text
+///   MATVEC_IQ1_S declares    binding 0 a, 1 w, 2 grid, 3 c, 4 dims
+///   linear_iq1_s_t binds     &[a, &w.blocks]              <- two buffers, no grid
+///
+///   matvec_iq1_s   binds     a, w, grid                   <- correct, and it is what --gate-iq1s
+///                                                            exercises
+/// ```
+///
+/// **So the gate passes on a path the model does not take.** `linear_iq1_s_t` is the resident decode
+/// entry — the one the whole 30.3 GiB residency argument rests on — and it dispatches a shader whose
+/// third storage binding it never provides.
+///
+/// The comment beside it jokes about "a gate testing a path nothing calls". This is the inverse and
+/// costlier version: a path nothing tests, called by everything that would matter.
+///
+/// Not fixed here. The fix is a process-lifetime grid tensor — `matvec_iq1_s` rebuilds and re-uploads
+/// 16 KiB of it PER CALL, which its own comment argues against — and threading that through wants
+/// the resident path's ownership decided rather than a tensor conjured at the call site.
+pub fn iq1_binding_mismatch() -> &'static str {
+    "linear_iq1_s_t binds 2 storage buffers; MATVEC_IQ1_S declares 3 (a, w, grid). The grid is never provided on the resident path, and --gate-iq1s exercises matvec_iq1_s instead, which binds it correctly"
+}
+
 /// IQ1_S row slicing: the arithmetic, checkable without a GPU.
 ///
 /// `lin_row_view` now slices IQ1_S, which is what `MOE_MATVEC_IQ1_S` needed to ever be dispatched.
@@ -430,6 +457,17 @@ pub fn iq1_row_slice(k: usize, row0: usize, rows: usize) -> Option<(u64, u64)> {
 #[cfg(test)]
 mod iq1_slice_tests {
     use super::*;
+
+    #[test]
+    fn the_resident_path_BINDING_MISMATCH_is_recorded() {
+        // A path nothing tests, called by everything that would matter. Recorded rather than fixed,
+        // because the fix is a process-lifetime grid tensor and conjuring one at the call site is
+        // how a wrong buffer gets bound silently.
+        let m = iq1_binding_mismatch();
+        assert!(m.contains("binds 2 storage buffers"));
+        assert!(m.contains("MATVEC_IQ1_S declares 3"));
+        assert!(m.contains("gate-iq1s exercises matvec_iq1_s instead"));
+    }
 
     #[test]
     fn SCOUTS_expert_width_slices_cleanly() {
