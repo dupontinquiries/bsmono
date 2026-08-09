@@ -438,3 +438,64 @@ function was the bug. The rule has been "grep before writing"; the sharper
 version is **share the function, do not re-derive its behaviour** — two
 implementations of "split a mesh into pieces" cannot disagree if there is only
 one.
+
+---
+
+# Round six — the recipe works. min_tris was throwing away most of the model.
+
+## The measurement that found it
+
+Coverage tracked render IoU almost exactly, so I measured what the harvester's
+default threshold discards:
+
+| model | components | tris | ≥120 tris | covered | render IoU |
+|---|---:|---:|---:|---:|---:|
+| yukon_brawler | 300 | 32,000 | 62 | **73.4%** | 0.96–0.98 |
+| raidboss_tremor | 563 | 32,000 | 61 | 43.0% | 0.65–0.68 |
+| soldierrib | 118 | 4,527 | 6 | **29.7%** | 0.28–0.42 |
+
+`--min-tris 120` was dropping **70% of some models' geometry** before clustering
+ever saw it. Not a reconstruction failure — those parts were never in the
+library.
+
+## The result
+
+| min_tris | part types | placements | web | residual | **mean IoU** |
+|---:|---:|---:|---:|---:|---:|
+| 120 | 112 | 138 | 226 KB | 8 KB | 0.500 |
+| **20** | **502** | **747** | **371 KB** | **23 KB** | **0.844** |
+| 6 | 629 | 1,076 | 386 KB | — | 0.852 |
+
+**0.500 → 0.844 for 63% more bytes.** And 6 buys almost nothing over 20, so
+**20 is the knee**.
+
+Per model at min_tris 20:
+
+```
+yukon_brawler   0.973  0.988  0.987
+raidboss_tremor 0.933  0.954  0.929
+soldierrib      0.735  0.918  0.869
+```
+
+## Projected to the corpus
+
+The 748-model harvest at 120 produced 4,950 part types and a 5.35MB web. Scaling
+by the measured 112 → 502 factor: **~22,000 types, ~24MB**, against **512MB** of
+baked `.iqm` — **4.7%**, at a fidelity that is 0.93–0.99 on models the harvest
+covers well.
+
+That is a projection, not a measurement, and the earlier 8MB projection from the
+head of the corpus turned out optimistic when the tail was measured. Treat 24MB
+as the estimate to test, not the answer.
+
+## The working recipe
+
+1. `iqm_to_obj.py` — the corpus is only readable at all through this.
+2. `part_harvest.py --min-tris 20 --emit-per-category <large>` — the default
+   threshold and the exemplar cap were each costing more than they saved.
+3. `solve_placements.py --modifiers --grid 16` — poses by principal axes,
+   scales exemplar extent onto component extent, and stores an occupancy delta
+   with its own grid frame.
+4. **Components from the harvester's own splitter, never a second one.**
+5. `render_parity.py` — the only check that catches the mistakes the geometric
+   metrics missed, three times running.
