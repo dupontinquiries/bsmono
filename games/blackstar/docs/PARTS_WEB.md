@@ -191,3 +191,63 @@ can go:
 
 Both are known work with existing tools rather than open questions, and the
 harness now measures whether they worked.
+
+---
+
+# Solving the rotation — two attempts, one negative result
+
+`tools/solve_placements.py` fills in the orientation a placement never carried.
+Measured on the same five models with full part coverage:
+
+| placement rotation | mean silhouette IoU |
+|---|---:|
+| none (baseline) | 0.509 |
+| **Kabsch on radius-ordered points** | **0.495 — worse** |
+| principal-axis alignment | **0.535** |
+
+## Why the first attempt made it worse
+
+Kabsch needs point *pairs*, and two meshes of the same part share no vertex
+order. I paired them by sorting each set by distance from its own centroid —
+rotation-invariant, and not a correspondence. Two copies of a part interleave
+differently under that sort, so Kabsch fitted noise and returned a confident
+wrong rotation. The residuals said so before the render did: median 0.508 of
+part size, which is not a fit.
+
+This is worth keeping in the record because the fix looked obvious. `derive_web.py`
+already solves rigid transforms with Kabsch, so "run the same solve for
+placements" seemed like plumbing. It is not: derive_web has a correspondence
+(the same component identified in both of a character's forms) and placements do
+not.
+
+**And the harvester cannot supply one.** Its `residual()` uses "the same
+rotation/mirror-invariant radial profile the clustering uses" — it matches
+shapes *without* ever recovering pose, by design. So no transform exists to be
+copied; it has to be derived.
+
+## Why the second worked
+
+Principal axes avoid correspondence rather than solving it. The covariance's
+eigenvectors are a property of the shape, not of any vertex pairing, so two
+copies of a part yield the same frame however they are tessellated. Four
+sign combinations are tried and scored by extent agreement, keeping `det = +1`
+so a mirror never passes as a rotation.
+
+## Where this leaves it
+
+0.535 is progress and is not parity. What the numbers now say about the
+remaining gap:
+
+* **Symmetric parts are unfixable this way.** A wheel's principal axes are
+  degenerate about its spin axis, so its orientation is genuinely
+  underdetermined by shape alone — and for a wheel it also does not matter.
+  Which parts those are is knowable from the eigenvalue spread, and worth
+  recording so effort goes where it counts.
+* **Component extraction is crude.** A placement's component is currently "the
+  model's vertices within 0.75 × size of the centroid", which mixes in
+  neighbouring parts. A real component split — the harvester already does one —
+  would sharpen both the alignment and the score.
+* **Per-instance residuals are the escape hatch.** `rot_residual` is written per
+  placement, so a part the solve could not pose can keep its own geometry
+  instead of being rebuilt wrong. That is the mechanism that makes an imperfect
+  solve safe to ship.

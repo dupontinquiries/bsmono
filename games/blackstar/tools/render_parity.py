@@ -63,11 +63,10 @@ def part_mesh(part, pay, off):
 def reconstruct(model, placements, idx, pay, off):
     """Assemble a model from its placement list.
 
-    NOTE the limitation this exposes: a placement records `sig`, `centroid` and
-    `size` and NOT an orientation. So a part can be put in the right place at
-    the right scale and still be turned the wrong way. That is not a flaw in
-    this harness — it is what the manifest currently carries, and measuring it
-    is how the gap becomes visible.
+    Applies `rot` when the placement carries one (see solve_placements.py) and
+    falls back to unrotated when it does not — so the same harness measures both
+    states and the difference between them is the answer to "did the solve
+    help".
     """
     by_sig = {}
     for p in idx["parts"]:
@@ -86,8 +85,15 @@ def reconstruct(model, placements, idx, pay, off):
         ext = max(max(v[d] for v in pv) - min(v[d] for v in pv) for d in range(3)) or 1.0
         s = (pl["size"] or ext) / ext
         base = len(verts)
+        R = pl.get("rot")
         for v in pv:
-            verts.append([(v[d] - c[d]) * s + pl["centroid"][d] for d in range(3)])
+            q = [(v[d] - c[d]) * s for d in range(3)]
+            if R:
+                # Rotate about the part's own centre BEFORE translating, or the
+                # rotation would swing the part around the model origin and
+                # move it somewhere else entirely.
+                q = [sum(R[i][j] * q[j] for j in range(3)) for i in range(3)]
+            verts.append([q[d] + pl["centroid"][d] for d in range(3)])
         for a, b, cc in pt:
             tris.append((a + base, b + base, cc + base))
     return verts, tris, missing
