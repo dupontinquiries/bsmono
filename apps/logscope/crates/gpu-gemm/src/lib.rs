@@ -9080,6 +9080,21 @@ LOADER gap, not a bad checkpoint — see the MLA line earlier in this log for wh
                             found.push(format!("{suffix} {:?}", t.dims));
                         }
                     }
+                    // A fused checkpoint is NOT an error: the fused branch below reads
+                    // attn_qkv directly and shape-checks it. This guard used to return
+                    // before that branch could run, which made the working path dead
+                    // code — the loader announced "does not recognise its attention
+                    // layout" about a layout it does in fact implement. Reported from a
+                    // real load of Qwen3.5-4B, whose attn_qkv is [2560, 8192] and whose
+                    // 8192 rows are exactly attn_dim 4096 + 2 x kv 2048.
+                    //
+                    // Only attn_qkv is let through. wqkv and query_key_value are listed
+                    // by the diagnostic because naming them helps a reader, but nothing
+                    // below reads them, so passing them on would swap a clear error for
+                    // a confusing one further in.
+                    if g.tensor(&format!("blk.{i}.attn_qkv.weight")).is_some() {
+                        // fall through to the fused branch, which validates the rows
+                    } else {
                     let hint = if found.iter().any(|f| f.starts_with("attn_qkv") || f.starts_with("wqkv")
                                                    || f.starts_with("query_key_value")) {
                         // Says what the shapes WOULD have to be, so a reader can tell in one glance
@@ -9096,6 +9111,7 @@ that is interleaved instead would slice plausibly and be wrong"
                     return Err(format!("blk.{i} has no `attn_q.weight`. What it DOES have: [{}]{hint}. \
 The file is not corrupt; this loader does not recognise its attention layout",
                         if found.is_empty() { "nothing recognisable".into() } else { found.join(", ") }));
+                    }
                 }
                 // The loader's internal layout IS q ++ k ++ v, so a checkpoint that ships them already
                 // fused needs no rearrangement — only a shape check. Guarded rather than assumed: some

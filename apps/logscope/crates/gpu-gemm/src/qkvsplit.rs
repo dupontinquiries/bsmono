@@ -598,3 +598,45 @@ mod equivalence_tests {
         assert_ne!(a.len(), b.len(), "and a different amount of the tensor — silently, if unchecked");
     }
 }
+
+#[cfg(test)]
+mod qwen35_regression {
+    use super::*;
+
+    /// The real numbers from the failed load, kept as a test because the bug was
+    /// not in this module — it was that the LOADER refused before reaching the
+    /// fused branch. This pins the arithmetic that branch relies on, so if the
+    /// shapes ever stop lining up the failure says which number moved.
+    ///
+    /// `Qwen3.5-4B-Q4_K_M.gguf`, blk.0: `attn_qkv [2560, 8192]`, `attn_norm [2560]`.
+    /// Hidden is 2560; the fused rows are attn_dim 4096 + 2 x kv 2048 = 8192.
+    #[test]
+    fn qwen35_4b_fused_qkv_rows_add_up() {
+        let n_head = 32;
+        let n_kv = 16;
+        let head_dim = 128;
+        let rows = 8192;
+        let sp = split(rows, n_head, n_kv, head_dim).expect("the layout is the blocked q|k|v form");
+        assert_eq!(sp.q_rows(), 4096);
+        assert_eq!(sp.k_rows(), 2048);
+        assert_eq!(sp.v_rows(), 2048);
+        assert_eq!(sp.q_rows() + sp.k_rows() + sp.v_rows(), rows);
+    }
+
+    #[test]
+    fn a_row_count_that_does_not_add_up_is_refused() {
+        // The guard that matters: a per-head interleaved tensor can have a
+        // plausible total, and slicing it as three blocks produces attention over
+        // the wrong projections — fluent nonsense rather than an error.
+        assert!(split(8191, 32, 16, 128).is_err());
+        assert!(split(6144, 32, 16, 128).is_err(), "Qwen3-style rows against Qwen3.5 heads");
+    }
+
+    #[test]
+    fn equal_thirds_is_the_wrong_assumption_under_gqa() {
+        // n_head 32 against n_kv 16 means q is twice k and v, not one third each.
+        let sp = split(8192, 32, 16, 128).unwrap();
+        assert_ne!(sp.q_rows(), 8192 / 3);
+        assert_eq!(sp.q_rows(), sp.k_rows() * 2);
+    }
+}
