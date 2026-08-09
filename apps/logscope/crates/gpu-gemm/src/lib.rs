@@ -1489,12 +1489,22 @@ impl Gpu {
         e.push(wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, count: None,
             ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None } });
         let bgl = dev.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor { label: None, entries: &e });
-        let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(LINEAR_Q8_0_TILED.into()) });
+        // SOURCE-TEMPLATED specialization, replacing the override-constant path. gate-gemm-spec
+        // proved on Honeykrisp (M2 Ultra, 2026-08-09 log) that pipelines built from one module with
+        // different `override TILE` values come back BIT-EXACT across tiles — the spec constant is
+        // collapsed somewhere below wgpu, so every "tile" ran the same kernel and every tile sweep
+        // on this driver measured one pipeline three times. Distinct module bytes cannot be
+        // collapsed by any driver cache. Cost: one extra module per tile, compiled once.
+        // NOTE: per-shape tile winners persisted BEFORE this fix were probed under the collapse and
+        // are noise — bump the gemm-tile store namespace (or clear the cache) before trusting them.
+        let src = LINEAR_Q8_0_TILED.replace("override TILE: u32 = 16u;", &format!("const TILE: u32 = {tile}u;"));
+        assert!(src.len() != LINEAR_Q8_0_TILED.len() || !src.contains("override TILE"),
+            "tile templating anchor missing — LINEAR_Q8_0_TILED's override line changed; update gemm_pipeline");
+        let module = dev.create_shader_module(wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Wgsl(src.into()) });
         let layout = dev.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: None, bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
-        let consts = [("TILE", tile as f64)];
         let pipeline = dev.create_compute_pipeline(&wgpu::ComputePipelineDescriptor { label: None, layout: Some(&layout),
             module: &module, entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions { constants: &consts, zero_initialize_workgroup_memory: false },
+            compilation_options: wgpu::PipelineCompilationOptions { constants: &[], zero_initialize_workgroup_memory: false },
             cache: None });
         let p: Pipe = Arc::new((bgl, pipeline));
         self.pipelines.lock().unwrap().insert(key, p.clone());
