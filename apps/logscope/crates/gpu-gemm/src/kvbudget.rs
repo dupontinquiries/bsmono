@@ -510,3 +510,67 @@ mod iq1_slice_tests {
         assert_eq!(iq1_row_slice(4096, 7, 0).unwrap().1, 0);
     }
 }
+
+/// Uniform layouts, compared before the code that would get them wrong is written.
+///
+/// `linear_iq1_s_t` passed `[n, k, kb, 0]` to a shader declaring `{m, n, k, kb, gx, ...}`. Every
+/// field shifted by one, `kb` landed on zero, the loop never ran, and the path returned zeros for
+/// as long as it has existed — green on every gate, because the gates exercised a different
+/// function with the correct layout.
+///
+/// **The stack builder is one copy-paste away from repeating it**, because the two MoE kernels do
+/// not agree either:
+///
+/// ```text
+///   MOE_MATVEC_Q4      { n, k, kb, gx, _slot, rstride, xper, _p }
+///   MOE_MATVEC_IQ1_S   { m, n, k, kb, gx, slots,   xper, pad }
+/// ```
+///
+/// The IQ1_S kernel carries a leading `m` inherited from the dense variant, so **taking the Q4
+/// dims and swapping the shader constant shifts every field by one** — the identical failure, in a
+/// path with no gate yet.
+///
+/// Recorded here rather than as a comment at the call site, because the call site does not exist:
+/// this is the thing to read before writing it.
+pub fn moe_uniform_layout(kernel: &str) -> Option<&'static [&'static str]> {
+    match kernel {
+        "MOE_MATVEC_Q4" => Some(&["n", "k", "kb", "gx", "_slot", "rstride", "xper", "_p"]),
+        "MOE_MATVEC_IQ1_S" => Some(&["m", "n", "k", "kb", "gx", "slots", "xper", "pad"]),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod uniform_layout_tests {
+    use super::*;
+
+    #[test]
+    fn the_two_MoE_kernels_do_NOT_share_a_uniform_layout() {
+        // The check that would have caught the dense bug before it shipped, applied to the path
+        // that has not been written yet.
+        let q4 = moe_uniform_layout("MOE_MATVEC_Q4").unwrap();
+        let iq1 = moe_uniform_layout("MOE_MATVEC_IQ1_S").unwrap();
+        assert_ne!(q4, iq1, "copying Q4's dims into the Iq1 stack path would shift every field");
+        assert_eq!(q4.len(), iq1.len(), "same LENGTH, which is what makes it silent");
+    }
+
+    #[test]
+    fn the_IQ1_kernel_carries_a_LEADING_m_that_Q4_does_not() {
+        // The specific offset. m is inherited from the dense variant, and it is the whole reason a
+        // copy-paste shifts rather than mismatches — a mismatch would fail loudly.
+        assert_eq!(moe_uniform_layout("MOE_MATVEC_IQ1_S").unwrap()[0], "m");
+        assert_eq!(moe_uniform_layout("MOE_MATVEC_Q4").unwrap()[0], "n");
+    }
+
+    #[test]
+    fn kb_is_the_field_whose_ZERO_makes_the_failure_silent() {
+        // With kb == 0 there are no blocks to accumulate, so the shader returns zeros rather than
+        // wrong numbers — and zeros are what a downstream norm turns into plausible output.
+        let iq1 = moe_uniform_layout("MOE_MATVEC_IQ1_S").unwrap();
+        assert_eq!(iq1[3], "kb");
+        // Shifting Q4's layout into it puts gx where kb belongs, which is nonzero and therefore
+        // WORSE: wrong numbers instead of obvious zeros.
+        let q4 = moe_uniform_layout("MOE_MATVEC_Q4").unwrap();
+        assert_eq!(q4[3], "gx", "a shifted copy writes gx into kb — nonzero, so no obvious zeros");
+    }
+}
