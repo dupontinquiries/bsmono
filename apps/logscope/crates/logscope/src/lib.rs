@@ -75,6 +75,7 @@ pub mod longrun;
 pub mod opsched;
 pub mod deviceplan;
 pub mod fleet;
+pub mod delegateledger;
 pub mod dispatchpick;
 pub mod reachability;
 pub mod peerrecord;
