@@ -394,6 +394,18 @@ impl SubmitCauseSnapshot {
     /// Exposed so the profile can check itself: every download maps a buffer and every map polls, so
     /// a poll count below the download count means one of the two counters is not measuring what its
     /// name says.
+    /// The three shares the verdict needs, as deltas.
+    ///
+    /// **Added because the verdict was reading the counters cumulatively** while the attribution
+    /// line beside it subtracted a baseline — so one line said "no-frame 0 (0%)" and the other said
+    /// "55% of dispatches ran with NO FRAME OPEN" about the same run. The verdict was describing a
+    /// previously-loaded model.
+    pub fn shares_since(&self, since: &SubmitCauseSnapshot) -> (u64, u64, u64) {
+        (self.no_frame.saturating_sub(since.no_frame),
+         self.download.saturating_sub(since.download),
+         self.passes.saturating_sub(since.passes))
+    }
+
     pub fn downloads_since(&self, since: &SubmitCauseSnapshot) -> u64 {
         self.download.saturating_sub(since.download)
     }
@@ -418,6 +430,26 @@ impl SubmitCauseSnapshot {
 /// Returns the headline and, only when something is anomalous, a caveat. **Silence is the normal
 /// case**: a run that always prints two extra lines teaches the reader to skip both, which is how
 /// five GPU resets sat unread in journalctl.
+/// Takes the counters as DELTAS rather than reading them cumulatively.
+///
+/// The old signature read the process-global counters directly, and the submit-causes line beside it
+/// subtracts a per-generation baseline. So one line said `no-frame 0 (0%)` and the other said "55%
+/// of dispatches ran with NO FRAME OPEN" **in the same output, about the same run** — the verdict
+/// was reporting a previous model's frameless dispatches inside this model's headline.
+///
+/// Self-contradicting output is worse than no output: it sent me looking for a third frame leak
+/// that the fixes had already closed.
+pub fn run_verdict_delta_shares(
+    no_frame: u64, download: u64, passes: u64, tokens: u64, wall_s: f64, sync_s: f64,
+) -> (String, Option<String>) {
+    let shape = crate::perfverdict::RunShape {
+        submits: no_frame + download + passes,
+        no_frame, download, passes,
+        tokens, wall_s, sync_s,
+    };
+    (shape.headline(), shape.caveat())
+}
+
 pub fn run_verdict(tokens: u64, wall_s: f64, sync_s: f64) -> (String, Option<String>) {
     use std::sync::atomic::Ordering::Relaxed;
     let shape = crate::perfverdict::RunShape {
