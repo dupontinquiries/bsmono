@@ -608,3 +608,9 @@ kind = "cargo"
 role = "library"
 notes = "OpenDHT-compatible messaging in Rust: the wire format alone — msgpack query/reply/push/error maps, 160-bit InfoHash, values with per-value ids, IPv4 node entries. No transport, no routing table, no engine, no dependencies. The protocol layer snapcore lacks and snapclone-dht had buried in an app crate; the seam that lets any engine in the fleet speak the reference's format."
 
+[shared.nat-kit]
+path = "shared/nat-kit"
+kind = "cargo"
+role = "library"
+notes = "STUN (RFC 5389) messaging: binding request/success/error, XOR-MAPPED-ADDRESS for v4 and v6, MAPPED-ADDRESS for older servers. Codec only — no sockets, no async, no randomness (the caller supplies the transaction id), no dependencies. The NAT-discovery counterpart to dht-kit; snapclone-nat has the same protocol but drags in tokio, anyhow, bytes, rand and tracing."
+
