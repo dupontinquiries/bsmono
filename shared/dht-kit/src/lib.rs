@@ -44,6 +44,12 @@
 
 pub const HASH_LEN: usize = 20;
 
+/// How deeply an unknown value may nest before it is refused.
+///
+/// A bound rather than a guideline: recursion without one is a remote abort,
+/// which no caller can catch. See `Rd::skip_depth`.
+pub const MAX_NESTING: usize = 64;
+
 /// A 160-bit id — OpenDHT's `InfoHash` width, used for both node ids and keys.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub struct InfoHash(pub [u8; HASH_LEN]);
@@ -284,6 +290,23 @@ impl<'a> Rd<'a> {
     /// well enough to know its length and then discarded, so a malformed one
     /// still fails rather than desynchronising the reader.
     fn skip(&mut self) -> Option<()> {
+        self.skip_depth(0)
+    }
+
+    /// Depth-bounded skip.
+    ///
+    /// Found by a hostile-input probe rather than by reading: a 100KB packet
+    /// containing nothing but 100,000 nested `fixarray(1)` headers **aborted
+    /// the process with a stack overflow**. One unauthenticated datagram, and
+    /// `Option` cannot express it — a caller cannot catch an abort, so this is
+    /// a remote denial of service, not a parse failure.
+    ///
+    /// 64 is far above anything the reference sends. OpenDHT's argument maps
+    /// nest one level (a value inside `a`), so a legitimate message never
+    /// exceeds three or four; a limit that generous costs nothing real and
+    /// leaves room for the format to grow.
+    fn skip_depth(&mut self, depth: usize) -> Option<()> {
+        if depth > MAX_NESTING { return None; }
         let t = *self.b.get(self.i)?;
         match t {
             0x00..=0x7F | 0xC0 | 0xC2 | 0xC3 => { self.i += 1; }
@@ -295,8 +318,14 @@ impl<'a> Rd<'a> {
             0xD9 => { self.i += 1; let n = self.byte()? as usize; self.take(n)?; }
             0xDA => { self.i += 1; let n = u16::from_be_bytes(self.take(2)?.try_into().ok()?) as usize; self.take(n)?; }
             0xC4 | 0xC5 | 0xC6 => { let _ = self.bin()?; }
-            0x90..=0x9F | 0xDC => { let n = self.arr_len()?; for _ in 0..n { self.skip()?; } }
-            0x80..=0x8F | 0xDE => { let n = self.map_len()?; for _ in 0..n { self.skip()?; self.skip()?; } }
+            0x90..=0x9F | 0xDC => {
+                let n = self.arr_len()?;
+                for _ in 0..n { self.skip_depth(depth + 1)?; }
+            }
+            0x80..=0x8F | 0xDE => {
+                let n = self.map_len()?;
+                for _ in 0..n { self.skip_depth(depth + 1)?; self.skip_depth(depth + 1)?; }
+            }
             _ => return None,
         }
         if self.i > self.b.len() { return None; }
