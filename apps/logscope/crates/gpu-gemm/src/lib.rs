@@ -11401,14 +11401,25 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         // a gate testing a path nothing calls.
         assert_eq!(m, 1, "IQ1_S matvec is decode-only; batched prefill converts instead");
         let out = self.alloc(1, w.n);
-        let dims = [w.n as u32, w.k as u32, (w.k / 256) as u32, 0u32];
-        let gx = (w.n as u32).div_ceil(64).max(1);
+        // THE DIMS WERE SHIFTED BY ONE FIELD. The shader declares
+        //     struct D { m, n, k, kb, gx, ... }
+        // and this passed [n, k, kb, 0] — so m got n, n got k, k got kb, kb got 0, and gx was never
+        // written. Every field wrong by one position, which is why the path returned zeros rather
+        // than something subtly off: with kb == 0 there are no blocks to accumulate.
+        //
+        // matvec_iq1_s had the correct layout all along. Two functions dispatching one shader with
+        // different uniform layouts, and only the helper was gated.
+        let gx = (w.n as u32).min(32768).max(1);
+        let dims = [1u32, w.n as u32, w.k as u32, (w.k / 256) as u32, gx, 0, 0, 0];
         // THE GRID WAS MISSING. MATVEC_IQ1_S declares three storage bindings and this bound two,
         // so the resident decode path — the one the whole 30.3 GiB residency argument rests on —
         // dispatched a shader without its codebook. --gate-iq1s did not catch it because that gate
         // exercises matvec_iq1_s, which uploads the grid itself.
         self.dispatch(MATVEC_IQ1_S, &[a, &w.blocks, self.iq1s_grid_tensor()], &out,
-            bytemuck::cast_slice(&dims), (gx, 1, 1));
+            // (gx, gy) like the helper, not (gx, 1). With gx now meaning "columns of the
+            // dispatch grid" rather than "workgroups of 64", a single row would launch a fraction
+            // of the work — the second half of the same shifted-layout mistake.
+            bytemuck::cast_slice(&dims), (gx, (w.n as u32).div_ceil(gx), 1));
         out
     }
 
