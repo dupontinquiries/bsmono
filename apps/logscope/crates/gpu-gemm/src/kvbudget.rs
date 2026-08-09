@@ -96,9 +96,87 @@ and needs roughly a third of this)".into());
     lines.join("\n")
 }
 
+/// What share of a decoded token's memory traffic is the cache rather than the weights.
+///
+/// **Cache precision is a capacity lever at every context length and a SPEED lever only at long
+/// ones**, and the crossover is sharp enough to matter:
+///
+/// ```text
+///   GLM-4.7-Flash Q4_K_S, 15.3 GiB resident, f16 MLA cache
+///     ctx   8,000    cache is  2.6% of bytes read per token
+///     ctx  32,000    cache is  9.7%
+///     ctx 128,000    cache is 30.1%
+///     ctx 512,000    cache is 63.3%
+/// ```
+///
+/// Decode is bandwidth-bound, so this share is roughly the share of decode time. At 512k, moving
+/// f16 to q8 takes bytes-per-token from 41.7 GiB to 28.5 — **a 1.46x speedup from a change that
+/// does nothing measurable at 8k.**
+///
+/// It also explains part of something already measured: a real conversation went 74%, 91%, 112%
+/// sync across three turns, and the cache growing under it is one of the reasons decode gets slower
+/// as a session continues. Not the whole reason, and not one that had a name.
+pub fn cache_read_share(shape: &KvShape, dtype: &str, ctx: u64, weights_gib: f64) -> Option<f64> {
+    let b = kv_elem_bytes(dtype)?;
+    let cache_gib = shape.bytes_per_token(b) * ctx as f64 / 1024f64.powi(3);
+    let total = cache_gib + weights_gib;
+    if total <= 0.0 { return None }
+    Some(cache_gib / total)
+}
+
+/// Is halving the cache precision worth it for SPEED at this context?
+///
+/// Returns the estimated speedup, or a reason it is not worth doing. Separated from capacity because
+/// the same change is always a capacity win and only sometimes a speed one — and conflating them
+/// leads to spending accuracy at 8k for nothing.
+pub fn precision_speed_case(
+    shape: &KvShape, from: &str, to: &str, ctx: u64, weights_gib: f64,
+) -> Result<f64, String> {
+    let (bf, bt) = (kv_elem_bytes(from).ok_or("unknown from-dtype")?,
+                    kv_elem_bytes(to).ok_or("unknown to-dtype")?);
+    if bt >= bf { return Err(format!("{to} is not coarser than {from}")) }
+    let g = |b: f32| shape.bytes_per_token(b) * ctx as f64 / 1024f64.powi(3) + weights_gib;
+    let speedup = g(bf) / g(bt);
+    // Below a few percent the accuracy cost buys nothing measurable, and saying so prevents a
+    // quality regression traded for noise.
+    if speedup < 1.05 {
+        return Err(format!(
+            "{speedup:.3}x at {ctx} tokens — the cache is only {:.1}% of bytes read per token here, so {to} costs accuracy and buys nothing measurable. It remains a CAPACITY win; this is the speed question", 100.0 * cache_read_share(shape, from, ctx, weights_gib).unwrap_or(0.0)));
+    }
+    Ok(speedup)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cache_share_CROSSES_OVER_between_short_and_long_context() {
+        // 2.6% at 8k and 63% at 512k: the same knob is noise at one end and the dominant cost at the
+        // other, which is why one recommendation cannot serve both.
+        let s = KvShape::glm_flash(48);
+        assert!(cache_read_share(&s, "f16", 8_000, 15.3).unwrap() < 0.05);
+        assert!(cache_read_share(&s, "f16", 512_000, 15.3).unwrap() > 0.60);
+    }
+
+    #[test]
+    fn coarsening_the_cache_is_REFUSED_as_a_speed_change_at_short_context() {
+        // Spending accuracy at 8k for a 1.01x gain is a quality regression traded for noise.
+        let e = precision_speed_case(&KvShape::glm_flash(48), "f16", "q8", 8_000, 15.3).unwrap_err();
+        assert!(e.contains("buys nothing measurable"));
+        assert!(e.contains("remains a CAPACITY win"), "the two questions must stay separate");
+    }
+
+    #[test]
+    fn at_LONG_context_the_same_change_is_a_real_speedup() {
+        let x = precision_speed_case(&KvShape::glm_flash(48), "f16", "q8", 512_000, 15.3).unwrap();
+        assert!(x > 1.4, "got {x}");
+    }
+
+    #[test]
+    fn a_FINER_target_precision_is_refused_rather_than_reported_as_a_slowdown() {
+        assert!(precision_speed_case(&KvShape::glm_flash(48), "q8", "f16", 512_000, 15.3).is_err());
+    }
 
     #[test]
     fn MLA_is_roughly_a_third_of_GQA_for_the_same_model_size() {
