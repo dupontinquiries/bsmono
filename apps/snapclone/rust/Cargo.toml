@@ -31,7 +31,6 @@ members = [
     "snapclone-audio",
     "snapclone-proximity",
     "snapclone-face",
-    "snapclone-microdht",
     "snapclone-group",
     "snapclone-videosrc",
     "snapclone-av1policy",
