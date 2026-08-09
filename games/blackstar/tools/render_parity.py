@@ -59,6 +59,26 @@ def part_mesh(part, pay, off, bits=16):
     for i in range(part["nv"]):
         q = struct.unpack_from(fmt, vb, i * step)
         verts.append([lo[d] + q[d] / maxq * span[d] for d in range(3)])
+    if part["isize"] == 0:
+        # Zigzag varint deltas — see build_web.pack_indices. Read as a stream
+        # rather than by offset, which is the whole point: the encoding is
+        # variable width, so there is no index arithmetic to get wrong.
+        tris, cur, pos = [], 0, 0
+        for _ in range(part["nt"]):
+            t = []
+            for _k in range(3):
+                shift, z = 0, 0
+                while True:
+                    b = ib[pos]; pos += 1
+                    z |= (b & 0x7F) << shift
+                    if b < 0x80:
+                        break
+                    shift += 7
+                d = (z >> 1) ^ -(z & 1)
+                cur += d
+                t.append(cur)
+            tris.append(tuple(t))
+        return verts, tris
     fmt, sz = ("<3H", 6) if part["isize"] == 2 else ("<3I", 12)
     tris = [struct.unpack_from(fmt, ib, i * sz) for i in range(part["nt"])]
     return verts, tris
