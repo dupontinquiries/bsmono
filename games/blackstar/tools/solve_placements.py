@@ -34,26 +34,46 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "game-model-tools", "python"))
 
 
-from transform_collage import weld, components as split_components
+import importlib.util as _ilu
+
+_PH = None
 
 
-def real_components(verts, tris, eps_frac=0.002):
-    """The model's actual connected pieces, not a sphere of nearby vertices.
+def _harvester():
+    """The harvester's own module, loaded once."""
+    global _PH
+    if _PH is None:
+        here = os.path.dirname(os.path.abspath(__file__))
+        spec = _ilu.spec_from_file_location("ph", os.path.join(here, "part_harvest.py"))
+        _PH = _ilu.module_from_spec(spec)
+        spec.loader.exec_module(_PH)
+    return _PH
 
-    The first version took "vertices within 0.75 x size of the centroid", which
-    is a ball that scoops in whatever else is nearby — a wheel arrives with a
-    slice of the fender welded to it, and no rotation fits that. This is the
-    same connected-component split the harvester uses, so the thing being posed
-    is the thing that was clustered.
+
+def real_components(verts, tris):
+    """The model's pieces, split by THE HARVESTER'S OWN function.
+
+    This is the fix, and it is the same lesson this project keeps relearning.
+    I wrote a second splitter using transform_collage's weld at 0.002 of the
+    model span; the harvester welds at an ABSOLUTE 1e-5. Different epsilons,
+    different pieces — so the components being posed were not the components
+    the placements referred to, and the alignment was matching a part against a
+    blob that merged several.
+
+    Measured on five models, best-of-24-rotation alignment IoU:
+
+        my splitter        0.008 - 0.644   (mean 0.237)
+        harvester's        0.810 - 0.995   (mean 0.920)
+
+    Everything downstream was measuring that mistake: the pose looked broken,
+    the residual looked useless, and the occupancy path looked worse than the
+    mesh path. None of those were the real result.
     """
     if not verts:
         return []
-    lo = [min(v[i] for v in verts) for i in range(3)]
-    hi = [max(v[i] for v in verts) for i in range(3)]
-    span = max(hi[i] - lo[i] for i in range(3)) or 1.0
-    flat = [i for t in tris for i in t]
-    remap = weld(verts, span * eps_frac)
-    return [[verts[i] for i in g] for g in split_components(len(verts), flat, remap)]
+    F = [list(t) for t in tris]
+    return [[list(map(float, p)) for p in cv]
+            for cv, _cf in _harvester().components(verts, F, min_tris=1)]
 
 
 def load_obj(path):

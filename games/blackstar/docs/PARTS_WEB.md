@@ -377,3 +377,64 @@ The remaining suspects, in order of how much they would explain:
 
 Each is testable against `pre-residual IoU` without rendering anything, which
 makes the next round cheap.
+
+---
+
+# Round five — solved. The component splitter was the bug.
+
+```
+model                          placements  front   side    top
+imported_donors_bot_yukon_brawler      62  0.962  0.981  0.973
+imported_raidboss_tremor               61  0.656  0.646  0.684
+imported_soldierrib_part0               6  0.282  0.419  0.424
+imported_warforcybertronautobotsoldlmb  2  0.105  0.096  0.117
+```
+
+**A model whose parts the harvest actually covered reconstructs at 0.96–0.98
+silhouette IoU** — from a 232KB web plus 7.5KB of occupancy residual, against a
+mesh it replaces. `yukon_brawler` was **0.014** two rounds ago.
+
+## What was wrong
+
+I wrote a second component splitter. `transform_collage`'s weld at 0.002 of the
+model span; the harvester welds at an **absolute 1e-5**. Different epsilons,
+different pieces — so the components being posed were not the components the
+placements referred to, and every alignment was matching a part against a blob
+that had merged several of them.
+
+Measured across five models, best-of-24-rotation alignment:
+
+| splitter | grid IoU |
+|---|---|
+| mine (relative eps) | 0.008 – 0.644, mean 0.237 |
+| **the harvester's own** | **0.810 – 0.995, mean 0.920** |
+
+Everything downstream had been measuring that mistake. The pose looked broken,
+the residual looked useless, the occupancy path looked worse than the mesh path.
+None of those were real results — and each one sent a round of work at the wrong
+target.
+
+Knock-on effects once fixed: alignment residual **median 0.344 → 0.000**, and
+occupancy cells **19,087 → 3,842**, an 80% cut, because a correct pose has far
+less to correct.
+
+## What still limits the mean
+
+The remaining low scorers have **6, 7 and 2 placements**. The harvest found only
+a handful of parts in them, so most of those models are not represented at any
+pose — that is harvest coverage, not reconstruction. `min_tris` and the
+clustering tolerance are the knobs, and they are a different investigation from
+this one.
+
+The 24-frame rotation search (all proper axis permutations and signs, scored by
+occupancy overlap rather than extent) is worth folding into the solver: it beat
+the 4-sign version 0.222 vs 0.170 on the old split, and has not been re-measured
+on the correct one.
+
+## Standing lesson
+
+This is the seventh time in this project that a second copy of an existing
+function was the bug. The rule has been "grep before writing"; the sharper
+version is **share the function, do not re-derive its behaviour** — two
+implementations of "split a mesh into pieces" cannot disagree if there is only
+one.
