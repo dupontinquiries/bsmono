@@ -14,6 +14,13 @@ use std::collections::HashMap;
 
 pub struct Out { pub to: Addr, pub bytes: Vec<u8> }
 
+/// How often a stored value is re-published. Ten minutes, comfortably inside
+/// the TTLs the group feed uses.
+pub const REANNOUNCE_MS: u64 = 600_000;
+/// How often quiet buckets are touched. Fifteen minutes: staleness costs a
+/// slower lookup, never a failure.
+pub const REFRESH_MS: u64 = 900_000;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Op { Find, Get, Put, Listen }
 
@@ -42,6 +49,11 @@ pub struct Engine {
     pending: HashMap<u32, (usize, Addr)>,
     searches: Vec<Search>,
     token_secret: u32,
+    /// When maintenance last ran, in the caller's clock. Zero means "never",
+    /// which makes both jobs due on the first tick — correct for a node that
+    /// has just joined and should publish before waiting a window.
+    last_reannounce_ms: u64,
+    last_refresh_ms: u64,
     /// completed search results the host can poll: target -> values
     pub results: HashMap<InfoHash, Vec<Value>>,
     /// values delivered by listener pushes (target -> values), for the app layer
@@ -53,6 +65,7 @@ impl Engine {
         Engine {
             id, table: RoutingTable::new(id), store: Storage::default(),
             next_tid: 1, pending: HashMap::new(), searches: Vec::new(),
+            last_reannounce_ms: 0, last_refresh_ms: 0,
             token_secret: 0x5EED ^ (id.0[0] as u32) << 8 | id.0[1] as u32,
             results: HashMap::new(), pushed: Vec::new(),
         }
@@ -251,10 +264,90 @@ impl Engine {
         self.pump(si, now)
     }
 
-    pub fn tick(&mut self, now: u64) -> Vec<Out> {
+    /// Periodic upkeep. Expiry always runs; network maintenance runs only when
+    /// `wake_kit` says this is a wake-up worth spending.
+    ///
+    /// The comment that used to sit here said reannounce and bucket refresh
+    /// "would live" in this function. They now do, and they are gated rather
+    /// than unconditional — which is the whole point. A DHT node that
+    /// reannounced on its own timer would wake the modem on a schedule nothing
+    /// else on the device shares, and after a transmission a cellular radio
+    /// holds a high-power state for seconds. Ten scattered wake-ups cost far
+    /// more than ten batched ones carrying identical bytes.
+    ///
+    /// `radio_up` is the caller's: it knows whether a call, a transfer or a
+    /// user-initiated fetch already has the modem hot, and this engine does
+    /// not. Passing `false` is always safe — it means "do not wake on my
+    /// account", which is the conservative direction.
+    pub fn tick_with_radio(&mut self, now: u64, radio_up: bool) -> Vec<Out> {
+        // Expiry is local bookkeeping — no packets, no radio — so it is never
+        // gated. Deferring it would grow memory for no power saving at all.
         self.store.expire(now);
-        // (reannounce / bucket refresh would live here; the sim drives puts explicitly)
-        vec![]
+
+        let jobs = vec![
+            // Re-announce is Background: the presence record has a TTL measured
+            // in minutes, so a delay of one window is invisible while the
+            // saving is not.
+            wake_kit::Job {
+                name: "reannounce".into(),
+                period_ms: REANNOUNCE_MS,
+                urgency: wake_kit::Urgency::Background,
+                last_ms: self.last_reannounce_ms,
+            },
+            // Bucket refresh is Opportunistic: a stale bucket costs a slower
+            // lookup later, never a failure, so it must never be the reason a
+            // modem powers up.
+            wake_kit::Job {
+                name: "refresh".into(),
+                period_ms: REFRESH_MS,
+                urgency: wake_kit::Urgency::Opportunistic,
+                last_ms: self.last_refresh_ms,
+            },
+        ];
+        let plan = wake_kit::plan(&jobs, &self.id.0, now, radio_up);
+
+        let mut out = Vec::new();
+        for job in &plan.run {
+            match job.as_str() {
+                "reannounce" => {
+                    self.last_reannounce_ms = now;
+                    out.extend(self.reannounce_all(now));
+                }
+                "refresh" => {
+                    self.last_refresh_ms = now;
+                    out.extend(self.refresh_buckets(now));
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Backwards-compatible tick: never wakes the radio on its own account.
+    ///
+    /// Kept so the sim and existing callers are unchanged — `sim.rs` drives
+    /// puts explicitly and has no radio to model.
+    pub fn tick(&mut self, now: u64) -> Vec<Out> {
+        self.tick_with_radio(now, false)
+    }
+
+    /// Re-publish what this node stores locally, so values survive their TTL.
+    fn reannounce_all(&mut self, now: u64) -> Vec<Out> {
+        let keys = self.store.local_keys();
+        let mut out = Vec::new();
+        for k in keys {
+            out.extend(self.start(k, Op::Get, None, now));
+        }
+        out
+    }
+
+    /// Touch buckets that have gone quiet by looking up a random id in each.
+    fn refresh_buckets(&mut self, now: u64) -> Vec<Out> {
+        // One self-lookup is the cheap approximation: it walks the table and
+        // re-contacts the nodes nearest us, which is where staleness hurts
+        // most. A per-bucket sweep is the thorough version and is a lot more
+        // packets for a benefit nobody has measured here.
+        self.start(self.id, Op::Find, None, now)
     }
 
     /// Poll-and-clear resolved get results for a key.
