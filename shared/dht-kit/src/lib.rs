@@ -44,6 +44,18 @@
 
 pub const HASH_LEN: usize = 20;
 
+/// The largest message that reliably crosses a path without fragmenting.
+///
+/// 1200 bytes is the conservative figure QUIC uses for its own initial packets
+/// (RFC 9000 §14) and is safe on any IPv6 path, whose minimum MTU is 1280 with
+/// 40 bytes of header and 8 of UDP on top. A DHT reply that exceeds it is not
+/// an error — it will usually arrive — but it is the point where delivery
+/// starts depending on the path rather than on us.
+///
+/// Measured at this size: a 20-node v6 reply is 868 bytes and a reply carrying
+/// one 1024-byte value is 1100.
+pub const SAFE_DATAGRAM: usize = 1200;
+
 /// How deeply an unknown value may nest before it is refused.
 ///
 /// A bound rather than a guideline: recursion without one is a remote abort,
@@ -822,6 +834,41 @@ mod tests {
         assert_eq!(HASH_LEN, 20);
         assert_eq!(InfoHash::zero().0.len(), 20);
         assert_ne!(InfoHash::from_seed(1), InfoHash::from_seed(2));
+    }
+
+    #[test]
+    fn a_full_reply_fits_in_one_safe_datagram() {
+        // The property every datagram transport depends on — plain UDP today,
+        // QUIC's unreliable datagrams (RFC 9221) tomorrow. A reply that exceeds
+        // SAFE_DATAGRAM does not fail; it starts depending on the path's MTU,
+        // and a lookup whose replies are silently dropped on some paths is far
+        // harder to diagnose than one that never worked.
+        //
+        // k = 20 is Kademlia's usual bucket size, so this is the realistic
+        // worst case rather than a convenient one.
+        let v6 = Addr::V6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1], 4222);
+        let nodes: Vec<_> = (0..20u64).map(|i| (InfoHash::from_seed(i), v6)).collect();
+        let m = Msg::Reply { tid: 1, from: h(1), nodes, values: vec![], token: 0 };
+        let n = m.encode().len();
+        assert!(n <= SAFE_DATAGRAM, "a k=20 v6 reply is {n} bytes");
+    }
+
+    #[test]
+    fn a_value_near_a_kilobyte_still_fits() {
+        // Values are the part a caller controls, so this is where the budget
+        // gets spent. One kilobyte of payload leaves room for the envelope.
+        let m = Msg::Reply { tid: 1, from: h(1), nodes: vec![],
+                             values: vec![Value { id: 1, data: vec![0u8; 1024] }], token: 0 };
+        assert!(m.encode().len() <= SAFE_DATAGRAM);
+    }
+
+    #[test]
+    fn the_envelope_overhead_is_small_enough_to_reason_about() {
+        // If the framing ever grows, callers sizing values against
+        // SAFE_DATAGRAM would start overflowing without touching their own
+        // code. This pins the overhead so that change is visible here first.
+        let empty = Msg::Reply { tid: 1, from: h(1), nodes: vec![], values: vec![], token: 0 };
+        assert!(empty.encode().len() < 100, "envelope is {} bytes", empty.encode().len());
     }
 
     #[test]
