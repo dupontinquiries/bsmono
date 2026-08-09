@@ -121,6 +121,27 @@ and needs roughly a third of this)".into());
     lines.join("\n")
 }
 
+/// # The q8 cache EXISTS and the app cannot reach it
+///
+/// Checked rather than assumed, after the last commit ended by saying this was unknown:
+///
+/// ```text
+///   QKvCache { kq, ks, .. }        a quantized KV cache, with separate quant and scale tensors
+///   forward_kv_q8                  prefill against it
+///   decode_step_q8                 decode against it, used by kernel-validate
+///
+///   Session { cache: KvCache }     what the APP holds — .k and .v, f16
+///   stream_session_window          the app's decode path, reads s.cache.k
+/// ```
+///
+/// **So the 1.46x at 512k is implemented, tested, and unreachable from the interface.** The engine
+/// carries both caches and the application selects the larger one, permanently, because the type it
+/// stores in `Session` decides which decode path is even callable.
+///
+/// That makes this the `unwired` pattern at engine scale: not a module nobody calls, but a
+/// capability nobody can ask for. Wiring it is a `Session` change rather than a flag, which is why
+/// it is recorded here rather than done in passing.
+///
 /// What share of a decoded token's memory traffic is the cache rather than the weights.
 ///
 /// **Cache precision is a capacity lever at every context length and a SPEED lever only at long
@@ -187,6 +208,16 @@ mod tests {
         let f16_share = cache_read_share(&s, "f16", 128_000, 15.3).unwrap();
         assert!(f32_share > f16_share * 1.4, "f32 {f32_share:.3} vs f16 {f16_share:.3}");
         assert!(f32_share > 0.45, "at 128k the f32 cache is nearly half the read");
+    }
+
+    #[test]
+    fn the_speedup_this_module_computes_is_currently_UNREACHABLE() {
+        // Documented so the number is never quoted as available. QKvCache and decode_step_q8 exist;
+        // Session holds KvCache; the app's stream_session_window reads s.cache.k. A capability
+        // nobody can ask for is not a capability.
+        let src = include_str!("kvbudget.rs");
+        assert!(src.contains("implemented, tested, and unreachable from the interface"));
+        assert!(src.contains("a `Session` change rather than a flag"));
     }
 
     #[test]
