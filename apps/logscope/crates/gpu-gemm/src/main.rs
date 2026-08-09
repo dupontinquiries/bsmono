@@ -1080,35 +1080,43 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--gate-autotune") {
-        // Validate the autotune MECHANISM (not the choice — perf isn't measurable on lavapipe): it
-        // returns a valid tile, the disk cache round-trips, and the chosen tile is bit-exact vs tile 1.
-        use gpu_kernels::{Gpu, store};
+        // Validate the autotune MECHANISM (not the choice — perf isn't measurable on lavapipe).
+        // CONTRACT (kernel × tile era): autotune_matvec returns a PACKED DecodeConfig (marker bit |
+        // kernel.id()<<16 | tile), installed via set_matvec_cfg — NOT a bare tile. The previous
+        // checks here asserted the pre-wg128 bare-tile contract and fed the packed value where bare
+        // tiles belong; on the M2 Ultra that printed as "chosen tile 2147614728" (0x8002_0008 =
+        // v2-wg128 @ tile 8) and the bit-exact check silently exercised a clamped fallback.
+        use gpu_kernels::{DecodeConfig, Gpu, store};
         let gpu = Gpu::new();
         eprintln!("gate-autotune: adapter = {}", gpu.adapter_name);
         let (k, n) = (2048usize, 16384usize); // a 1B-class FFN up shape
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
-        let best = gpu.autotune_matvec(k, n);
-        ck("autotune returns a tile in {1,2,4,8}", [1u32, 2, 4, 8].contains(&best));
-        // cache round-trip under a throwaway adapter key
+        let packed = gpu.autotune_matvec(k, n);
+        ck("returns a PACKED config (marker bit set)", packed & 0x8000_0000 != 0);
+        let cfg = DecodeConfig::unpack(packed);
+        ck("unpacked tile in {1,2,4,8}", [1u32, 2, 4, 8].contains(&cfg.tile));
+        ck("pack∘unpack round-trips", cfg.pack() == packed);
+        // cache round-trip under a throwaway adapter key (the store carries the packed u32 opaquely)
         let key = "test-adapter-xyz";
-        store::autotune_put(key, k, n, best);
-        ck("cache get == put", store::autotune_get(key, k, n) == Some(best));
+        store::autotune_put(key, k, n, packed);
+        ck("cache get == put", store::autotune_get(key, k, n) == Some(packed));
         ck("cache miss for unknown shape is None", store::autotune_get(key, k + 1, n).is_none());
-        store::autotune_put(key, k, n, if best == 1 { 4 } else { 1 }); // overwrite
-        ck("cache overwrite replaces (no dup rows)", store::autotune_get(key, k, n).is_some() && store::autotune_get(key, k, n) != Some(best));
-        // set + read back, and confirm the installed tile is bit-exact vs tile 1
-        gpu.set_matvec_tile(best);
-        ck("set_matvec_tile installs the value", gpu.matvec_tile() == best);
+        let other = DecodeConfig { tile: if cfg.tile == 1 { 4 } else { 1 }, ..cfg }.pack();
+        store::autotune_put(key, k, n, other); // overwrite
+        ck("cache overwrite replaces (no dup rows)", store::autotune_get(key, k, n) == Some(other));
+        // install the PACKED config through the real entry point, read it back as the system profile
+        gpu.set_matvec_cfg(packed);
+        ck("set_matvec_cfg installs kernel+tile", gpu.decode_profile() == cfg);
         let mut rng = 0xabcd_1234u64; let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
         let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
         let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
         let qw = gpu.quantize_q8_resident(&w, n, k);
         let a = gpu.upload(&act, 1, k);
         let r1 = gpu.download(&gpu.matvec_decode(&a, &qw, 1));
-        let rb = gpu.download(&gpu.matvec_decode(&a, &qw, best));
+        let rb = gpu.download(&gpu.matvec_decode(&a, &qw, cfg.tile));
         let d = r1.iter().zip(&rb).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
         ck("chosen tile is bit-exact vs tile 1", d == 0.0);
-        println!("gate-autotune: chosen tile {best} | {}", if ok { "mechanism checks \u{2713}" } else { "FAIL \u{2717}" });
+        println!("gate-autotune: chosen {} @ tile {} | {}", cfg.kernel.label(), cfg.tile, if ok { "mechanism checks \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-matvec") {
