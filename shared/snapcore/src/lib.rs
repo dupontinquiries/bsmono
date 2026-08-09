@@ -50,6 +50,7 @@ pub mod node;
 pub mod proximity;
 pub mod routing;
 pub mod sim;
+pub mod guard;
 pub mod store;
 
 #[cfg(feature = "wire")]

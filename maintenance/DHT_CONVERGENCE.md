@@ -216,3 +216,58 @@ behaviour is now pinned by its own test.
 
 **Remaining: steps 2–4.** `listen`/`refresh` in the engine, a real capture to
 turn "shaped like" into "compatible with", then retire the older crates.
+
+---
+
+## Hardening audit — what the reference does that we did not
+
+Audited both engines against what a public Kademlia needs operationally.
+Present in one or both: token binding, search termination when the closest set
+stops improving, node liveness with a replacement cache, ID-derived maintenance
+windows. **Absent from both: rate limiting, subnet diversity, token rotation.**
+
+`shared/snapcore/src/guard.rs` adds all three. No dependencies, no clock, no
+sockets — the caller supplies `now_ms`, so the same policy runs under a real
+transport and under `sim`.
+
+### Token rotation — a real bug, not a hardening nicety
+
+`snapclone-dht` derives its token secret **once at construction and never
+changes it**, so a token is valid for the lifetime of the process. Tokens exist
+to prove a writer actually received a packet at the address it claims, and
+**proof that never expires is not proof of anything current** — anyone who
+observes one can keep announcing to that node forever.
+
+`TokenRing` rotates on a five-minute cadence and keeps **two secrets live**.
+With one, every rotation would reject tokens issued moments earlier: a peer that
+did `get` at 4:59 and `put` at 5:01 would fail for no reason it could see or
+fix.
+
+The port is deliberately **not** part of the binding — a NAT rewrites it between
+the get and the put, and binding to it would fail exactly the peers that need
+hole-punching most.
+
+### Rate limiting, keyed by IP
+
+A single peer can saturate a node with `find` queries, each a routing-table
+scan. That is not theoretical: it is what a buggy peer in a retry loop does by
+accident, and the effect on everyone else is identical to an attack.
+
+Keyed by **IP rather than node id**, because a node id is self-asserted and an
+attacker rolls a new one per packet — and by IP rather than socket, or a source
+rolls an ephemeral port instead. `gc()` exists so the limiter cannot become the
+memory exhaustion it prevents.
+
+### Subnet diversity
+
+A bucket filled from one /24 is a bucket an attacker owns: they answer every
+lookup landing there and eclipse the node from the rest of the network. Capped
+at two per /24, or per **/64** on v6 — /128 would treat one machine's many
+addresses as many operators, which is precisely the confusion being exploited.
+
+The cost is stated rather than hidden: on a genuine single-subnet LAN this caps
+contacts. Two is still enough to route, which is why the number is two.
+
+**Not yet wired into the engines' packet paths** — this commit adds the policy
+and its tests. Wiring is a change to `Node::handle_*` and belongs behind its own
+verification, the same way the wire feature did.
