@@ -5361,9 +5361,16 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
             //
             // A stale comment that names the wrong blocker costs more than no comment: it was read
             // three times as though it were current.
-            LinKind::Iq1(_) => unreachable!(
-                "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
-binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
+            // IQ1_S NOW FITS, and what changed is that the second tensor is the CODEBOOK GRID.
+            //
+            // The obstacle was never "one buffer against a pair": MOE_MATVEC_IQ1_S takes three
+            // inputs like Q4 does, and its third is a shared 2048-entry codebook — a DEVICE
+            // CONSTANT rather than a per-weight scale. iq1s_grid_tensor() caches it for the
+            // device's life, so the slot this tuple wanted has had an occupant all along.
+            //
+            // Untested against a real IQ1_S MoE checkpoint: nothing builds an Iq1 stack yet, so
+            // this arm is reachable only once the loader stops converting them.
+            LinKind::Iq1(q) => (&q.blocks, self.iq1s_grid_tensor(), q.k, MOE_MATVEC_IQ1_S),
             LinKind::F32(_) => return None,
         };
         let (dn_qw, dn_qs, dn_k, sh_dn) = match &m.stacked_down.kind {
@@ -5389,9 +5396,16 @@ binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
             //
             // A stale comment that names the wrong blocker costs more than no comment: it was read
             // three times as though it were current.
-            LinKind::Iq1(_) => unreachable!(
-                "IQ1_S MoE stacks are not built — the loader converts them, because the stacked path \
-binds a (qw, qs) pair and IQ1_S has one interleaved buffer"),
+            // IQ1_S NOW FITS, and what changed is that the second tensor is the CODEBOOK GRID.
+            //
+            // The obstacle was never "one buffer against a pair": MOE_MATVEC_IQ1_S takes three
+            // inputs like Q4 does, and its third is a shared 2048-entry codebook — a DEVICE
+            // CONSTANT rather than a per-weight scale. iq1s_grid_tensor() caches it for the
+            // device's life, so the slot this tuple wanted has had an occupant all along.
+            //
+            // Untested against a real IQ1_S MoE checkpoint: nothing builds an Iq1 stack yet, so
+            // this arm is reachable only once the loader stops converting them.
+            LinKind::Iq1(q) => (&q.blocks, self.iq1s_grid_tensor(), q.k, MOE_MATVEC_IQ1_S),
             LinKind::F32(_) => return None,
         };
         let slots = m.cfg.n_used.clamp(1, 16) as usize;
