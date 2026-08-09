@@ -81,6 +81,22 @@ pub enum StunError {
     /// returned as a half-answer.
     NoAddress,
     BadAttribute,
+    /// A **comprehension-required** attribute (type < 0x8000) we do not
+    /// implement. RFC 5389 §7.3.1 is explicit that these must not be ignored:
+    /// the sender is saying "you must understand this to understand me", and
+    /// processing the message anyway means acting on a meaning we did not read.
+    UnknownRequired(u16),
+}
+
+/// Is this attribute one a receiver may skip?
+///
+/// RFC 5389 §15 splits the space at 0x8000: **0x0000–0x7FFF are
+/// comprehension-required**, 0x8000–0xFFFF are comprehension-optional. That
+/// single bit is the difference between an extension point and a security hole,
+/// and a parser that skips both treats every future mandatory attribute as
+/// decoration.
+pub fn is_comprehension_optional(attr: u16) -> bool {
+    attr >= 0x8000
 }
 
 fn put_header(out: &mut Vec<u8>, kind: u16, tx: &TxId, body_len: u16) {
@@ -209,12 +225,21 @@ impl Msg {
                     code = Some(v[2] as u16 * 100 + v[3] as u16);
                     reason = String::from_utf8_lossy(&v[4..]).trim_end_matches('\0').to_string();
                 }
-                // Unknown comprehension-optional attributes are skipped, which
-                // RFC 5389 requires — unlike dht-kit, where we control both
-                // ends. A STUN server we do not own will send attributes we
+                // The split RFC 5389 §7.3.1 requires, and which the first
+                // version of this kit got wrong by skipping everything.
+                //
+                // Comprehension-OPTIONAL (>= 0x8000) is skipped: a STUN server
+                // we do not own will send SOFTWARE, FINGERPRINT and others we
                 // have never heard of, and refusing them would reject valid
                 // responses from most of the internet.
-                _ => {}
+                //
+                // Comprehension-REQUIRED (< 0x8000) is refused. The sender is
+                // saying "you must understand this to understand me" —
+                // MESSAGE-INTEGRITY and USERNAME live in this range, so
+                // silently skipping would mean accepting an authenticated
+                // message while ignoring its authentication.
+                other if is_comprehension_optional(other) => {}
+                other => return Err(StunError::UnknownRequired(other)),
             }
             i += al + (4 - al % 4) % 4;
         }
@@ -375,6 +400,70 @@ mod tests {
             let m = Msg::BindingError { tx: TX, code: 400, reason: reason.into() };
             assert_eq!(Msg::decode(&m.encode()), Ok(m), "reason {reason:?}");
         }
+    }
+
+
+    fn success_with_attr(attr: u16, value: &[u8]) -> Vec<u8> {
+        let (fam, xip, xport) = xor_addr(&Addr::V4([198, 51, 100, 9], 4433), &TX);
+        let pad = (4 - value.len() % 4) % 4;
+        let body = 4 + value.len() + pad + 12;
+        let mut b = Vec::new();
+        put_header(&mut b, BINDING_SUCCESS, &TX, body as u16);
+        b.extend_from_slice(&attr.to_be_bytes());
+        b.extend_from_slice(&(value.len() as u16).to_be_bytes());
+        b.extend_from_slice(value);
+        b.extend(std::iter::repeat(0).take(pad));
+        b.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        b.extend_from_slice(&8u16.to_be_bytes());
+        b.push(0);
+        b.push(fam);
+        b.extend_from_slice(&xport.to_be_bytes());
+        b.extend_from_slice(&xip);
+        b
+    }
+
+    #[test]
+    fn the_split_is_at_0x8000_exactly() {
+        // One bit separates an extension point from a security hole.
+        assert!(!is_comprehension_optional(0x0000));
+        assert!(!is_comprehension_optional(0x7FFF));
+        assert!(is_comprehension_optional(0x8000));
+        assert!(is_comprehension_optional(0xFFFF));
+        // The real attributes either side of the line.
+        assert!(!is_comprehension_optional(0x0008), "MESSAGE-INTEGRITY is required");
+        assert!(!is_comprehension_optional(0x0006), "USERNAME is required");
+        assert!(is_comprehension_optional(0x8022), "SOFTWARE is optional");
+        assert!(is_comprehension_optional(0x8028), "FINGERPRINT is optional");
+    }
+
+    #[test]
+    fn an_unknown_optional_attribute_is_skipped() {
+        // SOFTWARE from a server we do not own. Refusing these would reject
+        // valid responses from most of the internet.
+        let b = success_with_attr(0x8022, b"coturn");
+        assert_eq!(Msg::decode(&b), Ok(Msg::BindingSuccess {
+            tx: TX, addr: Addr::V4([198, 51, 100, 9], 4433) }));
+    }
+
+    #[test]
+    fn an_unknown_required_attribute_is_refused() {
+        // The bug this kit shipped with: skipping everything. An attribute
+        // below 0x8000 means "you must understand this to understand me", and
+        // processing the message anyway acts on a meaning we did not read.
+        let b = success_with_attr(0x0025, b"\x00\x00\x00\x00");
+        assert_eq!(Msg::decode(&b), Err(StunError::UnknownRequired(0x0025)));
+    }
+
+    #[test]
+    fn message_integrity_is_never_silently_ignored() {
+        // The case that makes this a security matter rather than a spec
+        // detail. MESSAGE-INTEGRITY is 0x0008 — comprehension-required — so a
+        // parser that skips unknown attributes accepts an AUTHENTICATED message
+        // while ignoring its authentication, which is strictly worse than not
+        // supporting authentication at all.
+        let b = success_with_attr(0x0008, &[0u8; 20]);
+        assert_eq!(Msg::decode(&b), Err(StunError::UnknownRequired(0x0008)),
+                   "an unimplemented MESSAGE-INTEGRITY must stop the parse");
     }
 
     #[test]
