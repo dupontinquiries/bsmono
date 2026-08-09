@@ -1117,7 +1117,11 @@ was evicted)", prompt_ids.len())
             //
             // The caveat prints only when something is anomalous. A run that always adds two lines
             // teaches the reader to skip both, which is how five GPU resets sat unread in journalctl.
-            let (headline, caveat) = gpu_kernels::run_verdict(
+            // DELTAS, not cumulative counters. Reading them cumulatively made this line contradict
+            // the attribution line directly above it — 0% against 55% for the same run, because the
+            // verdict was describing the previously-loaded model's dispatches.
+            let (v_nf, v_dl, v_ps) = gpu_kernels::SubmitCauseSnapshot::now().shares_since(&cause0);
+            let (headline, caveat) = gpu_kernels::run_verdict_delta_shares(v_nf, v_dl, v_ps, 
                 per as u64, secs as f64, sync_ms / 1000.0);
             eprintln!("wgpu-engine: [{}] {headline}", self.name);
             if let Some(c) = caveat { eprintln!("wgpu-engine: [{}] {c}", self.name); }
