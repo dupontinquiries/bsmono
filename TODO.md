@@ -98,9 +98,11 @@ All build & test `--offline` (crypto-kit/share-kit need the cached crates.io dep
 
 ## Source-of-truth hygiene
 
-- [ ] Monorepo's `apps/unendlich` + `apps/logscope` are STALE snapshots (real
-      fixes live in the standalone repos). Make the monorepo source of truth; pull
-      standalone fixes ONCE via `git subtree`.
+- [x] Monorepo's `apps/unendlich` was a STALE snapshot beside `games/unendlich`.
+      Resolved: `games/unendlich` is the source of truth (verified ahead of the
+      r746 drop — it carries the netcode wiring the drop predates), and the
+      `apps/` copy has been purged from history. `apps/logscope` remains the
+      live tree and is not a duplicate.
 
 ## Parked backlog (no execute without greenlight)
 

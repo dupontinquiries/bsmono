@@ -10,7 +10,7 @@ retired; all games now under `games/`).
 | game | canonical | content verdict | sensor-kit | touchkit | gpu-kit | shared-net | notes |
 |---|---|---|---|---|---|---|---|
 | unendlich | `games/unendlich` (2096f, 40M) | superset of apps/; **r637 drop is +22f newer** | ✗ | ✗ | ✗ (dynamic present-mode) | own `sim/net` + DHT; handoff pending | rebase r637 "sway-water" delta |
-| blackstar | `games/blackstar` (736f, 94M) | **ahead** of apps/cybertron *and* cmake drop | n/a (C engine) | n/a | n/a | own C `netcode.c`/`net_transport` | Rust kits don't apply |
+| blackstar | `games/blackstar` (736f, 94M) | **ahead** of the since-purged apps/cybertron *and* cmake drop | n/a (C engine) | n/a | n/a | own C `netcode.c`/`net_transport` | Rust kits don't apply |
 | paperbound | `games/paperbound` (40f) | **stub→full**: drop (40f) replaced 2-file stub | n/a (Python) | n/a | n/a | own `netplay.py` (LAN lockstep) | needs python build lane |
 | clawbound | `games/clawbound` (23f) | single copy, canonical | ✗ | ✗ | **already Fifo** (not a stutter source) | `net.rs` present | gpu-kit = robustness only |
 | soldier | `games/soldier` (107f) | single copy, canonical | ✗ | ✗ | ✗ (dynamic present-mode) | minimal net | needs inspection |
@@ -25,7 +25,7 @@ integration backlog.
 
 ## unendlich — voxel GPU engine (Rust, wgpu)
 **Content.** `games/unendlich` (2096 files, 40M) is the canonical copy and a strict **superset** of the
-now-removed `apps/unendlich` — it carries 5 extra net modules (`chunk_pool`, `client_reconcile`,
+now-removed `apps/unendlich` (purged from history; see maintenance/LOSSLESS_CLEANUP_AUDIT.md) — it carries 5 extra net modules (`chunk_pool`, `client_reconcile`,
 `lag_compensation`, `player_roster`, `snapshot_interp`) and nothing lived only on the apps side.
 **Open item:** the `unendlich-r637-sway-water` drop is **slightly newer** than the tree — 2118 vs 2096
 files, 26 vs 25 net modules. The delta is the "sway-water" revision (rev 637) plus one extra net
@@ -44,7 +44,7 @@ should *announce/discover* via the shared control plane — call `host_game_sess
 
 ## blackstar — space RTS on the exengine C engine (C)
 **Content.** `games/blackstar` (736 files, 94M) is canonical and **ahead of everything**: its
-`netcode.c`/`.h` are byte-identical to `apps/cybertron`'s and it *adds* `net_transport.{c,h}`; and it's
+`netcode.c`/`.h` are byte-identical to the since-purged `apps/cybertron`'s and it *adds* `net_transport.{c,h}`; and it's
 larger than the `cybertron-cmake` drop (524 files) too, which also has `net_transport`. Confirmed: the
 24f blackstar is the later, better version.
 

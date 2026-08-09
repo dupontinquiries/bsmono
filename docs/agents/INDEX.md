@@ -7,7 +7,7 @@ general-LLM split with the logscope-tree mapping — now lives at
 
 ## Catalog (≈40 docs)
 
-**apps/unendlich** — by far the largest cluster.
+**games/unendlich** — by far the largest cluster. (Moved from `apps/`; the old path was purged, so references to `apps/unendlich` in older notes are historical.)
 - `HANDOFF_I1_viewmodel.md`, `HAIKU_WORKER_BRIEF.md`, `docs/KNOWN-TEST-FAILURES.md`
 - `handoff/` — ~25 task handoffs: `HANDOFF_{fog,weather,water_physics,plants,
   textures,textures_foliage,world_surface,worldmgmt,mesh_budget,mesh_partition,
