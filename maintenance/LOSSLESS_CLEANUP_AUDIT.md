@@ -52,3 +52,48 @@ replacing the baked models is not a loss.
 
 That makes the remaining work clear: **improving reconstruction accuracy IS the
 repo-size work.** They stopped being separate tasks at 0.826.
+
+---
+
+# Second pass — three more removals, 6MB, and why so little
+
+Pushed harder rather than accepting the first pass's conclusion. Three things
+came out, all genuinely lossless:
+
+**1,000 catalog `.iqm` (16MB).** The earlier attempt at this deletion was wrong
+because the engine loads `data/*.iqm`. The catalog is different, checked three
+ways: `engine_src` never mentions `catalog` at all; `bot_generate.py` and
+`detail_apply.py` only ever *write* .iqm into `data/`, never read the catalog's;
+and `obj_to_iqm.py` regenerates them exactly, proven on all 1,000 with the real
+`INTERQUAKEMODEL\0` header. The rebuild command is in `catalog/README.md`.
+
+**`apps/unendlich` (49MB packed) and `apps/cybertron`.** Both moved to `games/`
+in July. The tree has not carried them since; history still did.
+
+**`gyroball/.../libiio/_build`.** A tracked build directory.
+
+## The result, and the lesson repeated
+
+Bundle **635MB → 629MB**. Six megabytes for 65MB of "packed size" removed.
+
+This is the third time in this work that `filter-repo --analyze`'s packed column
+has overpromised, and the reason is the same each time: **it reports per-blob
+compression, and git's pack already delta-compresses near-identical blobs across
+the repository.** `apps/unendlich` was nearly free because `games/unendlich`
+holds the same content; the duplicate catalog `.iqm` were cheap for the same
+reason.
+
+The corollary is worth stating once: **in a repo where content has been moved
+rather than changed, deleting the old copy saves almost nothing.** Only removing
+content that exists *nowhere else* moves the number.
+
+## Which leaves exactly one lever
+
+The three corpora are unique content — `blackstar/engine_src/data` 302MB,
+`blackstar-rs/assets/bots` 172MB, `cybertron/engine_src/data` 82MB. Nothing
+duplicates them, so removing them would move the number, and nothing regenerates
+them from what is in the tree.
+
+So the 500MB target still runs through the web, and the web still needs its
+0.826 to become "indistinguishable" before that swap is a cleanup rather than a
+loss. **Lossless cleanup is now exhausted at single-digit megabytes per pass.**
