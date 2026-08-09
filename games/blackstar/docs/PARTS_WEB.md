@@ -251,3 +251,66 @@ remaining gap:
   placement, so a part the solve could not pose can keep its own geometry
   instead of being rebuilt wrong. That is the mechanism that makes an imperfect
   solve safe to ship.
+
+---
+
+# Third round — the residual has to be occupancy, not displacement
+
+Two changes measured, and the second one is the finding.
+
+## Real components instead of a sphere
+
+Extraction now uses the same connected-component split the harvester uses
+(`transform_collage.weld` + `components`) rather than "vertices within 0.75 ×
+size of the centroid". The alignment residual improved sharply — **median 1.528
+→ 0.344 of part size** — so the pieces being posed really are cleaner.
+
+Silhouette IoU: **0.535 → 0.501.** Slightly worse. The residual and the render
+disagree, which means the remaining error is not in the *fit*; matching a
+placement to a component by nearest centroid is now the weak link, since several
+placements can claim the same piece.
+
+## The shape modifier, and why it did nothing
+
+`--modifiers` stores a volumetric residual: the part's bounding box divided
+8×8×8, each occupied cell carrying the mean displacement from the posed exemplar
+to the component. Volumetric rather than per-vertex on purpose — a per-vertex
+delta is tied to one tessellation and cannot be applied to an exemplar with a
+different vertex count, which is exactly the case here. A field over space
+transfers to any mesh occupying that space.
+
+It cost 1,180 cells (~3.5KB) and moved IoU by **0.000**.
+
+Measured why, on one model's first twenty placements:
+
+```
+cells occupied by exemplar only : 1,092
+cells occupied by component only:   755
+cells occupied by both          :   236
+```
+
+**A displacement field only acts where both shapes are present** — 236 cells out
+of 2,083. The other 1,847 are pure occupancy disagreement: volume the exemplar
+has and the component does not, or the reverse. No displacement can fix that,
+because there is nothing in the cell to displace. Silhouette error *is*
+occupancy error, so a displacement modifier is structurally the wrong tool for
+the thing being measured.
+
+## What the residual should be
+
+An **occupancy delta**, not a displacement — per cell, add volume / remove
+volume / leave alone. Two bits per cell against three signed bytes, so it is
+*cheaper* than what was just tried, and it acts on exactly the 1,847 cells that
+matter rather than the 236 that do not.
+
+That lands on the voxel probe from the other direction. The probe found run-length
+voxels at 1.1% of OBJ with IoU flat at 0.953 across resolutions, and concluded
+the error was surface thickness rather than lost detail. Combine them:
+
+* the **exemplar** carries the shape, cheaply, shared across every instance
+* the **occupancy delta** carries what this instance does differently
+* both are volumetric, which is what a part is — a shape that fills space, not a
+  surface that approximates one
+
+The parts library and the voxel work were being treated as alternatives. The
+measurement says they are the two halves of the same representation.
