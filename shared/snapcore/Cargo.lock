@@ -3,5 +3,12 @@
 version = 4
 
 [[package]]
+name = "dht-kit"
+version = "0.1.0"
+
+[[package]]
 name = "snapcore"
 version = "0.1.0"
+dependencies = [
+ "dht-kit",
+]

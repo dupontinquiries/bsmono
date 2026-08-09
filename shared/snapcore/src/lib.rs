@@ -51,3 +51,6 @@ pub mod proximity;
 pub mod routing;
 pub mod sim;
 pub mod store;
+
+#[cfg(feature = "wire")]
+pub mod wire;

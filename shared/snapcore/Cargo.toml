@@ -7,3 +7,15 @@ description = "Pure-Rust Kademlia DHT node for the unified monorepo. Routing cor
 
 [lib]
 path = "src/lib.rs"
+
+[dependencies]
+# The OpenDHT-compatible wire, OPTIONAL. snapcore has had zero dependencies and
+# five crates rely on that; making the codec a feature keeps it true for anyone
+# who only wants the engine, while letting a real transport turn packets into
+# handler calls without a second implementation.
+dht-kit = { path = "../dht-kit", optional = true }
+
+[features]
+default = []
+wire = ["dep:dht-kit"]
+
