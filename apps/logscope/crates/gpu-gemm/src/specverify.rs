@@ -161,3 +161,94 @@ mod tests {
         assert!(!worth_speculating(0.0, 180.0, 0.5), "and a zero cost is a missing measurement");
     }
 }
+
+/// Whether speculation helps, given what a run is actually bound by.
+///
+/// # The non-obvious part
+///
+/// Speculation is usually described as free when it works: the target verifies k drafted tokens in
+/// ONE batched pass, so the weights are read once for k tokens instead of k times. `verify_forward`
+/// does exactly that — `block_prefill_ext` over all rows — so on a **bandwidth-bound** decode the
+/// verification is nearly free and the win is close to the acceptance rate.
+///
+/// **On a submit-bound decode it is the opposite.** Each draft step is a full decode on the draft
+/// model, with its own dispatches and its own pass boundaries. Drafting k tokens adds k draft
+/// decodes' worth of submits to buy one batched verify. If submits are what costs, speculation
+/// makes the run SLOWER while every acceptance-rate number looks healthy.
+///
+/// Scout's measured shape — 71% no-frame, 913 submits per token — is the second case. That is worth
+/// knowing before loading a draft model and concluding the feature does not work.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Bound { Bandwidth, Submits, Unknown }
+
+/// Classify from a run's own numbers.
+pub fn what_binds(submits_per_token: f64, sync_share: f64) -> Bound {
+    // THRESHOLD FROM THE MEASUREMENTS, not from a round number. The dense 1B runs about 4 submits
+    // per token; Scout runs 913 and, on a longer conversation, 13321. That is two orders of
+    // magnitude of separation, so anything above 100 is unambiguous — my first guess was 1000, which
+    // put Scout's own 913 in the "unclear" bucket and made the classifier useless for the exact case
+    // it was written for.
+    if submits_per_token > 100.0 { return Bound::Submits }
+    // High sync with few submits is waiting on memory rather than on submission.
+    if sync_share > 0.5 && submits_per_token <= 100.0 { return Bound::Bandwidth }
+    Bound::Unknown
+}
+
+/// What speculation is worth here.
+pub fn speculation_outlook(bound: Bound, accept_rate: f64, k: usize) -> String {
+    match bound {
+        Bound::Bandwidth => format!(
+            "bandwidth-bound: verification reads the weights ONCE for {k} tokens, so at a {:.0}% \
+acceptance rate the win is close to {:.1}x. This is the case speculation was designed for",
+            accept_rate * 100.0, 1.0 + accept_rate * k as f64),
+        Bound::Submits => format!(
+            "submit-bound: each of the {k} draft steps is a full decode on the draft model with its \
+own dispatches, and they buy ONE batched verify. Speculation adds submits to a run that is already \
+losing to them — expect it to be SLOWER while the acceptance rate looks healthy. Fix the submit \
+path first"),
+        Bound::Unknown =>
+            "neither submits nor sync dominates clearly, so speculation's effect is not predictable \
+from these numbers — measure it rather than reasoning about it".into(),
+    }
+}
+
+#[cfg(test)]
+mod outlook_tests {
+    use super::*;
+
+    #[test]
+    fn SCOUT_s_measured_shape_is_submit_bound_and_speculation_would_HURT() {
+        // 913 submits per token, 71% no-frame. Loading a draft model here and concluding the feature
+        // does not work would be the wrong lesson from a real slowdown.
+        assert_eq!(what_binds(913.0, 1.12), Bound::Submits);
+        let s = speculation_outlook(Bound::Submits, 0.7, 4);
+        assert!(s.contains("SLOWER while the acceptance rate looks healthy"));
+        assert!(s.contains("Fix the submit path first"));
+    }
+
+    #[test]
+    fn a_BANDWIDTH_bound_run_gets_the_win_speculation_is_designed_for() {
+        // Weights read once for k tokens, so the verify is nearly free and the win tracks acceptance.
+        assert_eq!(what_binds(4.0, 0.74), Bound::Bandwidth);
+        // 1 + 0.75*4 = 4.0. My first assertion said 3.0x, computed in my head rather than from the
+        // formula in the function — the same error as the 97%-versus-98% one two commits ago.
+        assert!(speculation_outlook(Bound::Bandwidth, 0.75, 4).contains("4.0x"));
+    }
+
+    #[test]
+    fn an_UNCLEAR_run_is_told_to_MEASURE_rather_than_given_a_number() {
+        // A prediction from numbers that do not support one is worse than no prediction, because it
+        // gets acted on.
+        assert_eq!(what_binds(50.0, 0.3), Bound::Unknown);
+        assert!(speculation_outlook(Bound::Unknown, 0.7, 4).contains("measure it rather than"));
+    }
+
+    #[test]
+    fn the_submit_verdict_does_not_depend_on_the_ACCEPTANCE_RATE() {
+        // The trap this exists to name: acceptance can be excellent and the run still slower,
+        // because the cost is in the draft's submits rather than in wasted tokens.
+        for r in [0.3, 0.9] {
+            assert!(speculation_outlook(Bound::Submits, r, 4).contains("SLOWER"));
+        }
+    }
+}

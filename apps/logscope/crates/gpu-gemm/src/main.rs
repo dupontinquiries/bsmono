@@ -1080,35 +1080,43 @@ fn main() {
         return;
     }
     if args.iter().any(|a| a == "--gate-autotune") {
-        // Validate the autotune MECHANISM (not the choice — perf isn't measurable on lavapipe): it
-        // returns a valid tile, the disk cache round-trips, and the chosen tile is bit-exact vs tile 1.
-        use gpu_kernels::{Gpu, store};
+        // Validate the autotune MECHANISM (not the choice — perf isn't measurable on lavapipe).
+        // CONTRACT (kernel × tile era): autotune_matvec returns a PACKED DecodeConfig (marker bit |
+        // kernel.id()<<16 | tile), installed via set_matvec_cfg — NOT a bare tile. The previous
+        // checks here asserted the pre-wg128 bare-tile contract and fed the packed value where bare
+        // tiles belong; on the M2 Ultra that printed as "chosen tile 2147614728" (0x8002_0008 =
+        // v2-wg128 @ tile 8) and the bit-exact check silently exercised a clamped fallback.
+        use gpu_kernels::{DecodeConfig, Gpu, store};
         let gpu = Gpu::new();
         eprintln!("gate-autotune: adapter = {}", gpu.adapter_name);
         let (k, n) = (2048usize, 16384usize); // a 1B-class FFN up shape
         let mut ok = true; let mut ck = |l: &str, v: bool| { ok &= v; println!("  [{}] {l}", if v { "\u{2713}" } else { "\u{2717} FAIL" }); };
-        let best = gpu.autotune_matvec(k, n);
-        ck("autotune returns a tile in {1,2,4,8}", [1u32, 2, 4, 8].contains(&best));
-        // cache round-trip under a throwaway adapter key
+        let packed = gpu.autotune_matvec(k, n);
+        ck("returns a PACKED config (marker bit set)", packed & 0x8000_0000 != 0);
+        let cfg = DecodeConfig::unpack(packed);
+        ck("unpacked tile in {1,2,4,8}", [1u32, 2, 4, 8].contains(&cfg.tile));
+        ck("pack∘unpack round-trips", cfg.pack() == packed);
+        // cache round-trip under a throwaway adapter key (the store carries the packed u32 opaquely)
         let key = "test-adapter-xyz";
-        store::autotune_put(key, k, n, best);
-        ck("cache get == put", store::autotune_get(key, k, n) == Some(best));
+        store::autotune_put(key, k, n, packed);
+        ck("cache get == put", store::autotune_get(key, k, n) == Some(packed));
         ck("cache miss for unknown shape is None", store::autotune_get(key, k + 1, n).is_none());
-        store::autotune_put(key, k, n, if best == 1 { 4 } else { 1 }); // overwrite
-        ck("cache overwrite replaces (no dup rows)", store::autotune_get(key, k, n).is_some() && store::autotune_get(key, k, n) != Some(best));
-        // set + read back, and confirm the installed tile is bit-exact vs tile 1
-        gpu.set_matvec_tile(best);
-        ck("set_matvec_tile installs the value", gpu.matvec_tile() == best);
+        let other = DecodeConfig { tile: if cfg.tile == 1 { 4 } else { 1 }, ..cfg }.pack();
+        store::autotune_put(key, k, n, other); // overwrite
+        ck("cache overwrite replaces (no dup rows)", store::autotune_get(key, k, n) == Some(other));
+        // install the PACKED config through the real entry point, read it back as the system profile
+        gpu.set_matvec_cfg(packed);
+        ck("set_matvec_cfg installs kernel+tile", gpu.decode_profile() == cfg);
         let mut rng = 0xabcd_1234u64; let mut rnd = || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; (rng >> 40) as f32 / (1u64 << 24) as f32 - 0.5 };
         let w: Vec<f32> = (0..n * k).map(|_| rnd()).collect();
         let act: Vec<f32> = (0..k).map(|_| rnd()).collect();
         let qw = gpu.quantize_q8_resident(&w, n, k);
         let a = gpu.upload(&act, 1, k);
         let r1 = gpu.download(&gpu.matvec_decode(&a, &qw, 1));
-        let rb = gpu.download(&gpu.matvec_decode(&a, &qw, best));
+        let rb = gpu.download(&gpu.matvec_decode(&a, &qw, cfg.tile));
         let d = r1.iter().zip(&rb).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
         ck("chosen tile is bit-exact vs tile 1", d == 0.0);
-        println!("gate-autotune: chosen tile {best} | {}", if ok { "mechanism checks \u{2713}" } else { "FAIL \u{2717}" });
+        println!("gate-autotune: chosen {} @ tile {} | {}", cfg.kernel.label(), cfg.tile, if ok { "mechanism checks \u{2713}" } else { "FAIL \u{2717}" });
         return;
     }
     if args.iter().any(|a| a == "--gate-matvec") {
@@ -2898,7 +2906,7 @@ fn main() {
         let gus: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(100 + l as u32 * 50 + e as u32, 2 * ff * d)).collect()).collect();
         let dns: Vec<Vec<Vec<f32>>> = (0..2).map(|l| (0..ne).map(|e| mk(900 + l as u32 * 50 + e as u32, d * ff)).collect()).collect();
         // 4 distinct inputs, cycled 3× = 12 "tokens"
-        let inputs: Vec<Vec<f32>> = (0..4).map(|i| mk(7000 + i as u32, d)).collect();
+        let _inputs: Vec<Vec<f32>> = (0..4).map(|i| mk(7000 + i as u32, d)).collect();
 
         // Routing must actually VARY for prefetch to matter. With random weights every input routes to the
         // same experts (nothing evicts, nothing to prefetch), so drive routing explicitly: an input built as
@@ -3551,6 +3559,32 @@ everywhere: it looks like a hardware problem"
                 .expect("the CPU reference reads this fixture");
         }
         let got = gpu.matvec_iq1_s(&act, &raw, n, k);
+
+        // AND THE RESIDENT PATH, which nothing tested until now.
+        //
+        // linear_iq1_s_t is what a loaded model actually calls — matvec_iq1_s is a standalone
+        // helper. They dispatch the same shader and bound DIFFERENT numbers of buffers: the
+        // resident one omitted the codebook grid entirely, so this gate passed while the path the
+        // 30.3 GiB residency argument rests on dispatched a shader without its codebook.
+        let resident = {
+            let words: Vec<u32> = raw.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+            let w = gpu_kernels::Iq1Weight {
+                blocks: gpu.upload_u32(&words), n, k,
+            };
+            let at = gpu.upload(&act, 1, k);
+            gpu.download(&gpu.linear_iq1_s_t(&at, &w, 1))
+        };
+        let mut worst_res = 0f32;
+        for r in 0..n {
+            let e = (resident[r] - want[r]).abs() / want[r].abs().max(1.0);
+            if e > worst_res { worst_res = e; }
+        }
+        println!("  resident path (linear_iq1_s_t): worst rel {worst_res:.2e}");
+        if worst_res > 1e-3 {
+            println!("  gate-iq1s-kernel: the RESIDENT path disagrees with the CPU reference. matvec_iq1_s may still agree — they are different functions dispatching the same shader, and only this one is what a loaded model calls.");
+        }
+
         let mut worst = 0f32;
         for r in 0..n {
             let e = (got[r] - want[r]).abs() / want[r].abs().max(1.0);
@@ -3560,8 +3594,17 @@ everywhere: it looks like a hardware problem"
         println!("  rows {n}, k {k}, worst relative error {worst:.2e}");
         println!("  cpu[0..4] = {:?}", &want[..4.min(n)]);
         println!("  gpu[0..4] = {:?}", &got[..4.min(n)]);
+        // THE VERDICT MUST COVER BOTH PATHS. It reported MATCHES while linear_iq1_s_t returned
+        // garbage — the standalone helper correct and the resident path a loaded model takes not,
+        // which is the combination every previous gate read as green.
+        if worst_res > 1e-3 {
+            println!("gate-iq1s-kernel: FAIL — matvec_iq1_s agrees ({worst:.2e}) and \
+        linear_iq1_s_t does NOT ({worst_res:.2e}). The RESIDENT path is the one a loaded model \
+        calls.");
+        } else {
         println!("gate-iq1s-kernel: native IQ1_S matvec {} the CPU reference {}",
             if ok { "MATCHES" } else { "DIVERGES from" }, if ok { "✓" } else { "" });
+        }
         if !ok {
             println!("  => the format reading is already proven by dot_iq1_s matching the \
 dequantizer, so a divergence here is the kernel's arithmetic or its indexing, not the layout");
@@ -3860,6 +3903,30 @@ See Gpu::q6k_dequant: two faults found and fixed, two remaining."
         });
         return;
     }
+    if args.iter().any(|a| a == "--gate-passfuse") {
+        // Does THIS driver honour barriers between dispatches inside one compute pass?
+        //
+        // Pass boundaries are 97% of submits on a dense model after the frame leaks were fixed, and
+        // collapsing them is a substantial restructure. This is the one cheap experiment that says
+        // whether it is possible at all — run before the work, not after.
+        use gpu_kernels::passfuse::*;
+        let gpu = Gpu::new();
+        println!("gate-passfuse: adapter = {}", gpu.adapter_name);
+        println!("  {STEPS} dependent steps of x = 2x + 1 from x = 1; correct answer {}",
+            expected(STEPS));
+        let src = r#"
+@group(0) @binding(0) var<storage, read_write> b: array<u32>;
+@compute @workgroup_size(64) fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  if (g.x < arrayLength(&b)) { b[g.x] = b[g.x] * 2u + 1u; }
+}"#;
+        let (unfused, fused) = gpu.passfuse_probe(src, STEPS);
+        let v = judge(unfused, fused);
+        println!("  unfused {unfused}, fused {fused}");
+        println!("{}", v.explain());
+        if !v.safe_to_fuse() { println!("gate-passfuse: FAIL"); }
+        return;
+    }
+
     if args.iter().any(|a| a == "--gate-quanttables") {
         // Five decoders were added in one sitting and every test for them constructs a block from
         // the same understanding of the layout the decoder uses — which is circular. This does not
@@ -3877,6 +3944,116 @@ a disagreement here would have proved one wrong.");
         } else {
             println!("gate-quanttables: {} FAIL", a.len() + b.len());
         }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--gate-prefill-attn") {
+        // Does routing prefill to the tiled kernel change the numbers?
+        //
+        // ATTENTION_MH (naive) against ATTENTION_MH_EXT_PAR (tiled, online softmax) on the same
+        // inputs. Bit-exactness is NOT expected — an online softmax sums in a different order, so
+        // the question is whether the difference is at rounding scale or at wrong-answer scale.
+        let gpu = Gpu::new();
+        println!("gate-prefill-attn: adapter = {}", gpu.adapter_name);
+        let mut worst_rel = 0.0f32;
+        let mut worst_case = String::new();
+        for &(t, n_heads, n_kv_heads, hd) in &[
+            (8usize, 4usize, 4usize, 32usize),      // square, no GQA
+            (32, 8, 2, 64),                          // GQA 4:1
+            (64, 8, 8, 128),                         // head_dim at the common size
+            (129, 4, 1, 96),                         // odd length, MQA
+        ] {
+            let dm = n_heads * hd;
+            let kvd = n_kv_heads * hd;
+            // Deterministic inputs: a wrong kernel must fail on structure, not on luck with random
+            // values that happen to be small.
+            let q: Vec<f32> = (0..t * dm).map(|i| ((i % 17) as f32 - 8.0) / 8.0).collect();
+            let k: Vec<f32> = (0..t * kvd).map(|i| ((i % 13) as f32 - 6.0) / 6.0).collect();
+            let v: Vec<f32> = (0..t * kvd).map(|i| ((i % 11) as f32 - 5.0) / 5.0).collect();
+            let (qt, kt, vt) = (gpu.upload(&q, t, dm), gpu.upload(&k, t, kvd), gpu.upload(&v, t, kvd));
+
+            std::env::remove_var("LOGSCOPE_TILED_PREFILL");
+            let naive = gpu.download(&gpu.attention_mh_t(&qt, &kt, &vt, t, dm, n_heads, n_kv_heads));
+            std::env::set_var("LOGSCOPE_TILED_PREFILL", "1");
+            let tiled = gpu.download(&gpu.attention_mh_t(&qt, &kt, &vt, t, dm, n_heads, n_kv_heads));
+            std::env::remove_var("LOGSCOPE_TILED_PREFILL");
+
+            if naive.len() != tiled.len() {
+                println!("  t={t} h={n_heads}/{n_kv_heads} hd={hd}: SHAPE MISMATCH {} vs {}",
+                    naive.len(), tiled.len());
+                worst_rel = f32::INFINITY;
+                continue;
+            }
+            // Relative to the magnitude present, so a large output does not hide a real error and a
+            // near-zero one does not manufacture a huge ratio.
+            let scale = naive.iter().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-6);
+            let d = naive.iter().zip(&tiled).fold(0.0f32, |m, (a, b)| m.max((a - b).abs())) / scale;
+            println!("  t={t:>4} heads={n_heads}/{n_kv_heads} hd={hd:>3}: max rel diff {d:.2e}");
+            if d > worst_rel { worst_rel = d; worst_case = format!("t={t} hd={hd}"); }
+        }
+        println!();
+        // f32 accumulation over a few thousand terms in a different order lands here; anything
+        // larger is a different answer rather than a different rounding.
+        const TOL: f32 = 1e-4;
+        if worst_rel <= TOL {
+            println!("gate-prefill-attn: PASS — worst {worst_rel:.2e} <= {TOL:.0e}. The tiled kernel agrees with the naive one to rounding, so LOGSCOPE_TILED_PREFILL=1 is safe to run.");
+        } else {
+            println!("gate-prefill-attn: FAIL — worst {worst_rel:.2e} at {worst_case}, over {TOL:.0e}. That is a different answer rather than different rounding: the base/s mapping or the causal mask differs between the two kernels. Do NOT set LOGSCOPE_TILED_PREFILL.");
+        }
+        return;
+    }
+
+    if args.iter().any(|a| a == "--gate-loadpath") {
+        // What to measure before hand-tuning file -> CPU -> GPU. Answers what it can here and prints
+        // the rest as a checklist, because a fact that needs a real model file cannot be faked and
+        // pretending otherwise would produce a number nobody should trust.
+        use gpu_kernels::loadprofile::*;
+        let gpu = Gpu::new();
+        println!("gate-loadpath: adapter = {}", gpu.adapter_name);
+        println!();
+
+        // MEASURED HERE: upload bandwidth against transfer size. This is the one that decides the
+        // arena's slab size, and 1024 MiB is currently a guess.
+        println!("upload bandwidth by transfer size:");
+        let mut prev_gib_s = 0.0f64;
+        for mib in [16usize, 64, 256] {
+            let words = mib * 1024 * 1024 / 4;
+            let src = vec![0u32; words];
+            let _warm = gpu.upload_u32(&src);      // first transfer pays allocation, not bandwidth
+            let t = std::time::Instant::now();
+            let _b = gpu.upload_u32(&src);
+            let s = t.elapsed().as_secs_f64();
+            let gib_s = (mib as f64 / 1024.0) / s.max(1e-9);
+            let trend = if prev_gib_s > 0.0 && gib_s < prev_gib_s * 0.9 { "  DEGRADING — smaller slabs may be faster" }
+                        else if prev_gib_s > 0.0 && gib_s > prev_gib_s * 1.1 { "  still climbing — larger slabs may be faster" }
+                        else { "" };
+            println!("  {mib:>5} MiB  {s:>7.3}s  {gib_s:>6.2} GiB/s{trend}");
+            prev_gib_s = gib_s;
+        }
+        println!();
+
+        // NOT MEASURABLE HERE, and said so rather than guessed.
+        // MEASURED HERE TOO: what the running kernel's page size means for the view path. Synthetic
+        // offsets at GGUF's 32-byte alignment, because the real answer needs a checkpoint and the
+        // SHAPE of the answer does not.
+        {
+            use gpu_kernels::pagesize::*;
+            let p = running_page_size();
+            let synthetic: Vec<u64> = (0..1000u64).map(|i| 4096 + i * 32).collect();
+            println!("page size: {} KiB", p / 1024);
+            println!("  {}", MapAudit::of(synthetic, p).report());
+            println!();
+        }
+
+        println!("still needed from the machine, in the order they constrain each other:");
+        for (n, r) in requirements().iter().enumerate() {
+            println!("  {}. [{:?}] {}", n + 1, r.stage, r.fact);
+            println!("       how:     {}", r.how);
+            println!("       unlocks: {}", r.unlocks);
+        }
+        println!();
+        println!("and the two Scout quants need SEPARATE profiles:");
+        for q in ["Q4_K_M", "IQ1_S"] { println!("  {q}: {}", per_quant_note(q)); }
         return;
     }
 
@@ -3985,6 +4162,12 @@ pushing until it fails hard");
         // honoured at all and the decode-path question is moot — a much bigger finding than a
         // mis-placed end_frame, and one this comparison gets for free.
         println!("--- with a frame held ---\n{}", gpu_kernels::framediag::report());
+        // DOWNLOADS BY CALLER. `download` is 20-29% of submits on real runs and nobody knows which
+        // calls they are: sampling is one per token, and a dense model showed ~137. Counting them
+        // where they happen is the same move that found the frame leak.
+        let _ = gpu.download(&a);
+        let _ = gpu.download(&a);
+        println!("--- downloads by call site ---\n{}", gpu_kernels::framediag::download_report(2));
         return;
     }
 
@@ -4937,7 +5120,7 @@ still pass, which is why this one exists."
     // A help text that disagrees with the code is worse than none: it does not merely omit, it
     // asserts absence. Someone reading it concludes the gate was never written and goes looking for
     // the wrong thing.
-    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-matvec\n  --gate-memplan  --gate-mla-block  --gate-mmap  --gate-moe-cpu\n  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw  --gate-moe-repin\n  --gate-moe-stream  --gate-perf  --gate-prefill  --gate-q4k\n  --gate-q4resident  --gate-q6k  --gate-q8direct  --gate-qkv\n  --gate-quant-survey  --gate-quantref  --gate-quanttables  --gate-qwen2\n  --gate-qwen3  --gate-residency  --gate-rubric  --gate-store\n  --gate-stream-slots  --gate-submit  --gate-swa  --gate-vae-conv\n  --gate-vae-resblock  --gate-vit-block  --gate-vram  --gate-worker\n  --gate-zerocopy");
+    println!("unknown gate '{g}'. available:\n  --gate-arch  --gate-autotune  --gate-autotune-cache  --gate-branch\n  --gate-bytes  --gate-cpuops  --gate-dit-block  --gate-dit-conditioning\n  --gate-dit-primitives  --gate-gemm-spec  --gate-gemma  --gate-iq1s\n  --gate-iq1s-kernel  --gate-kvtree  --gate-llama4-kqnorm  --gate-loadpath\n  --gate-matvec  --gate-memplan  --gate-mla-block  --gate-mmap\n  --gate-moe-cpu  --gate-moe-fusion  --gate-moe-prefetch  --gate-moe-raw\n  --gate-moe-repin  --gate-moe-stream  --gate-passfuse  --gate-perf\n  --gate-prefill  --gate-prefill-attn  --gate-q4k  --gate-q4resident\n  --gate-q6k  --gate-q8direct  --gate-qkv  --gate-quant-survey\n  --gate-quantref  --gate-quanttables  --gate-qwen2  --gate-qwen3\n  --gate-residency  --gate-rubric  --gate-store  --gate-stream-slots\n  --gate-submit  --gate-swa  --gate-vae-conv  --gate-vae-resblock\n  --gate-vit-block  --gate-vram  --gate-worker  --gate-zerocopy");
         eprintln!("(run with no flags for the full kernel-validation suite, or --models to list models)");
         return;
     }

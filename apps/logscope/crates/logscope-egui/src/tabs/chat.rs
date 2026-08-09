@@ -61,33 +61,6 @@ pub fn mic_shape(scene: &str, material: theme::Material) -> MicShape {
 /// ACCESSIBLE: the 3D slab is the visual, and an egui widget placed over this rect is the hit-test +
 /// AccessKit overlay, so pointer clicks and screen-reader focus both target the physical object in the
 /// scene. Returns None if any corner is behind the camera (don't interact with an off-screen slab).
-/// Resolve a screen-anchored HUD slab against everything already placed this frame.
-/// Projects the desired (world-centre, w×h world) rect, packs it via hud_pack::place
-/// (never overlapping an earlier slab, clamped to the stage), then UN-projects the
-/// resolved centre so the 3D meshes and the egui overlay move together. Returns the
-/// possibly-moved world centre plus a size scale (<1 only on the packed-stage
-/// fallback, where the slab shrinks into the largest free band instead of stacking
-/// on a neighbour). Sites multiply their primary world size by the scale once, and
-/// every derived offset follows.
-#[allow(clippy::too_many_arguments)]
-fn hud_resolve(placed: &mut Vec<crate::hud_pack::Placed>, stage: egui::Rect,
-               cam: &crate::spatial::OrbitCam, cen: crate::spatial::Vec3,
-               right: crate::spatial::Vec3, up: crate::spatial::Vec3,
-               cx: f32, cy: f32, scale: f32,
-               want: crate::spatial::Vec3, w: f32, h: f32) -> (crate::spatial::Vec3, f32) {
-    let Some(desired) = project_slab_rect(cam, want, right, up, w, h, cx, cy, scale) else {
-        return (want, 1.0);
-    };
-    let resolved = crate::hud_pack::place(placed, stage, desired, 6.0);
-    let sz = if desired.width() > 0.5 && desired.height() > 0.5 {
-        (resolved.width() / desired.width()).min(resolved.height() / desired.height()).min(1.0)
-    } else { 1.0 };
-    if (resolved.center() - desired.center()).length() < 0.5 && sz >= 0.999 {
-        return (want, 1.0);
-    }
-    (screen_to_world(cam, cen, right, up, cx, cy, scale, resolved.center().x, resolved.center().y), sz)
-}
-
 pub fn project_slab_rect(cam: &crate::spatial::OrbitCam, center: crate::spatial::Vec3,
                          right: crate::spatial::Vec3, up: crate::spatial::Vec3, w: f32, h: f32,
                          cx: f32, cy: f32, scale: f32) -> Option<egui::Rect> {
@@ -390,11 +363,6 @@ impl Msg {
     fn all_variants(&self) -> &[String] { &self.variants }
     fn cur_mut(&mut self) -> &mut String { &mut self.variants[self.cur] }
 }
-/// A message as the CONTEXT WINDOW sees it: role + cleaned text (see chosen_msgs). Drop-in for
-/// the builders' `m.role` / `m.text()` usage.
-struct CtxMsg { role: Role, text: String }
-impl CtxMsg { fn text(&self) -> &str { &self.text } }
-
 impl logscope::branchtree::Node for Msg {
     fn parent(&self) -> Option<usize> { self.parent }
 }
@@ -641,10 +609,9 @@ fn md_line_job(ui: &egui::Ui, line: &str, size: f32, base: egui::Color32) -> egu
     use egui::text::{LayoutJob, TextFormat};
     use egui::{FontFamily, FontId};
     // CONTRAST-ENSURED, like the accent two lines down. This was
-    // `ui.visuals().strong_text_color()` — egui's untreated default, never checked against these
-    // panels — so bold runs in a message could fail to read on themes where every other markdown
-    // colour had been adjusted. md_strong guarantees a heavier floor than body ink; the fix that
-    // was applied to links and inline code was simply never applied here.
+    // `ui.visuals().strong_text_color()` — egui's untreated default — so bold runs in a message could
+    // fail to read on themes where every other markdown colour had been adjusted. The fix that was
+    // applied to links and inline code was never applied here.
     let strong = theme::md_strong();
     let mut job = LayoutJob::default();
     job.wrap.max_width = ui.available_width();
@@ -911,13 +878,7 @@ pub struct Chat {
     branch_from: Option<usize>,    // if set, the next user message forks off this node instead of the tip
     gen_samples: Vec<crate::estimate::GenSample>, // completed generations → progress estimates
     last_prompt_tokens: usize,     // prompt size of the in-flight generation (for the live estimate)
-    queue: std::collections::VecDeque<(String, Option<usize>, Option<logscope_fan::styles::Style>)>, // (text, parent, work style) fired while busy → run when free
-    /// Reflexes: automatic bounded reactions to a finished fan branch (compile error → one fix
-    /// follow-up; test failure → one; empty reply → one retry; near-duplicate → annotation only).
-    /// The coordinator's spinal cord — the brain (user / next turn) stays in charge of what they queue.
-    reflexes_on: bool,
-    /// Branch indices already reflex-scanned: at most one reaction per branch, ever.
-    reflexed: std::collections::HashSet<usize>,
+    queue: std::collections::VecDeque<(String, Option<usize>)>, // (text, parent) fired while busy → run when free
     fold_pos: Vec<crate::spatial::Vec3>, // cached protein-fold layout (recomputed when the tree changes)
     flex_pos: Vec<crate::spatial::Vec3>, // cached obstacle-AVOIDED render positions (strand weaved around scenery)
     flex_key: Option<(usize, crate::scene3d::EnvParams)>, // (node count, env) the flex was computed for
@@ -971,13 +932,6 @@ pub struct Chat {
     lanes_ready: bool, // the pool's async model load completed (LaneEvt::Ready seen)
     local_model_path: Option<String>, // the picker's selected LOCAL .gguf, captured each frame for :lanes
     rep_monitor: crate::repetition::RepeatMonitor, // cuts a runaway repetition loop in the live reply (all backends)
-    /// Deduplicated CODE COMPONENTS harvested from the transcript (see components.rs): the UI
-    /// lists them, the context builder references them instead of repeating their code, and the
-    /// descriptor model names them when the worker is idle.
-    components: crate::components::ComponentRegistry,
-    naming_q: std::collections::VecDeque<usize>,   // components awaiting a model-written name
-    naming_live: Option<usize>,                    // a naming request currently streaming back
-    naming_buf: String,
     stream: Option<Stream>,
     last: Option<(usize, f32)>,
     ctx: Ctx,
@@ -1096,7 +1050,6 @@ impl Default for Chat {
             active_leaf: None, branch_from: None,
             gen_samples: Vec::new(), last_prompt_tokens: 0,
             queue: std::collections::VecDeque::new(),
-            reflexes_on: true, reflexed: std::collections::HashSet::new(),
             fold_pos: Vec::new(),
             flex_pos: Vec::new(),
             flex_key: None,
@@ -1133,8 +1086,6 @@ impl Default for Chat {
             lanes: None, lane_jobs: std::collections::HashMap::new(), lanes_ready: false,
             local_model_path: None,
             rep_monitor: crate::repetition::RepeatMonitor::default(),
-            components: crate::components::ComponentRegistry::default(),
-            naming_q: std::collections::VecDeque::new(), naming_live: None, naming_buf: String::new(),
             stream: None, last: None, ctx: Ctx::default(),
             backend: BackendKind::preferred(), sent_params: None, sent_backend: None, pending_cancel: false,
             ws_note: None, save_picker: Default::default(),
@@ -1163,24 +1114,6 @@ impl Default for Chat {
     }
 }
 impl Chat {
-    /// Seed the sampling sliders from the model's recommended defaults (`GenParams::for_model`) on a
-    /// successful load. Only the sampling trio moves (temperature / repeat penalty / min-p); the memory
-    /// knobs (n_ctx, max_tokens) stay the user's. Slider tweaks made AFTER a load are respected until
-    /// the next load — the preset is a starting point per model, not a lock. Concretely this exists
-    /// because GLM-4.7's card says repetition penalty must be OFF, and our 1.15 default would quietly
-    /// degrade it for anyone who didn't read that card.
-    pub fn apply_model_sampling_preset(&mut self, model_name: &str) {
-        let p = logscope::llm_backend::GenParams::for_model(model_name);
-        let d = logscope::llm_backend::GenParams::default();
-        // Only act when the model actually has a preset (differs from the global default): a load of a
-        // no-preset model must NOT stomp sliders back to defaults.
-        if (p.temperature, p.repeat_penalty, p.min_p) != (d.temperature, d.repeat_penalty, d.min_p) {
-            self.ctx.temperature = p.temperature;
-            self.ctx.repeat_penalty = p.repeat_penalty;
-            self.ctx.min_p = p.min_p;
-        }
-    }
-
     /// Prefill the composer (used when another tab routes a prompt to Chat).
     pub fn set_input(&mut self, s: String) { self.input = s; }
 
@@ -1329,19 +1262,6 @@ impl Chat {
                 }
                 Evt::Loaded(Ok(info)) => { self.template = info.template; return; }
                 Evt::Loaded(Err(_)) => { return; }
-            }
-        }
-        // A descriptor-model naming request in flight: its tokens belong to the component,
-        // not the transcript. Consumed here so the normal stream machinery never sees them.
-        if let Some(cid) = self.naming_live {
-            match e {
-                Evt::Token(t) => { self.naming_buf.push_str(&t); return; }
-                Evt::Done { .. } => {
-                    self.components.set_name(cid, std::mem::take(&mut self.naming_buf));
-                    self.naming_live = None;
-                    return;
-                }
-                _ => { self.naming_live = None; self.naming_buf.clear(); }
             }
         }
         match e {
@@ -1506,14 +1426,6 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 if let Some(i) = idx {
                     if let Some(m) = self.msgs.get_mut(i) {
                         if m.text().is_empty() { *m.cur_mut() = "[stopped]".into(); }
-                    }
-                }
-                // Post-hoc repetition read on the finished reply: a HUD-visible note now, and
-                // condensation of exactly this pattern when the context is next rebuilt.
-                if let Some(i) = idx {
-                    if let Some(rep) = self.msgs.get(i).and_then(|m| crate::repetition::analyze(m.text())) {
-                        self.hud.observe(format!("repetition in reply: {} ×{} (\"{}\") — will be condensed in context",
-                            rep.kind, rep.reps.max(2), rep.sample), "repetition");
                     }
                 }
                 self.last = Some((tokens, secs));
@@ -1715,7 +1627,7 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
             match &fan.kind {
                 FanKind::Continue => {
                     if self.queue.len() >= MAX_FAN_QUEUE { break 'outer; }
-                    self.queue.push_back((CONTINUE_ALL_TOK.to_string(), Some(l), None));
+                    self.queue.push_back((CONTINUE_ALL_TOK.to_string(), Some(l)));
                     added += 1;
                 }
                 FanKind::Fuzzy { width, template } => {
@@ -1724,7 +1636,7 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                     if task.trim().is_empty() { continue; }
                     for v in crate::consensus::fuzz(&task, *width, now_unix().wrapping_add(l as u64)) {
                         if self.queue.len() >= MAX_FAN_QUEUE { break 'outer; }
-                        self.queue.push_back((v, Some(l), None));
+                        self.queue.push_back((v, Some(l)));
                         added += 1;
                     }
                 }
@@ -1733,11 +1645,6 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         fan.rounds_left -= 1;
         let rounds = fan.rounds_left;
         if rounds > 0 && added > 0 { self.fan = Some(fan); } // more rounds → keep fanning as the queue drains
-        if added == 0 {
-            self.hud.observe(logscope_fan::liaison_fan::narrate(
-                &logscope_fan::liaison_fan::FanEvent::FanFinished {
-                    branches: self.msgs.iter().filter(|m| m.role == Role::Assistant).count() }), "liaison");
-        }
         self.note = if added == 0 { "fan finished — no more leaves to expand".into() }
                     else { format!("fan: +{added} queued · {rounds} rounds left · {} pending (:stop to cancel)", self.queue.len()) };
     }
@@ -1921,12 +1828,10 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 // rewrites them to <|header_start|>/<|eot|> authoritatively at generate time.
                 TemplateKind::Llama4 => self.build_prompt_llama3(&sys, upto),
                 TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
-                TemplateKind::Gemma3 => self.build_prompt_gemma3(&sys, upto),
                 TemplateKind::Plain => self.build_prompt_plain(&sys, upto),
             },
             // llama.cpp path is otherwise Plain, but Gemma needs its own turn markers to stop correctly.
             _ if self.template == TemplateKind::Gemma => self.build_prompt_gemma(&sys, upto),
-            _ if self.template == TemplateKind::Gemma3 => self.build_prompt_gemma3(&sys, upto),
             _ => self.build_prompt_plain(&sys, upto),
         }
     }
@@ -2185,45 +2090,17 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     /// Most-recent turns that fit the budget — the in-context slice of the conversation graph, i.e. the
     /// SAME selection the Graph sidebar paints. convograph is the single authority; this is what the
     /// model is actually fed. When threading is off, only the latest message is kept (context leads).
-    /// The context window's messages, CLEANED for the model: every historical message runs
-    /// through repetition::condense (fence-aware — code is never edited) and the component
-    /// registry's block dedup (an identical code block already in this context collapses to a
-    /// one-line reference). The NEWEST message stays verbatim — that's the live turn. The
-    /// user-visible transcript is untouched; only what the model re-reads changes.
-    fn chosen_msgs(&self, per_msg_overhead: usize, sys: &str, upto: usize) -> Vec<CtxMsg> {
+    fn chosen_msgs(&self, per_msg_overhead: usize, sys: &str, upto: usize) -> Vec<&Msg> {
         let budget = self.ctx.n_ctx.saturating_sub(self.ctx.max_tokens) as usize;
         let max_msgs = if self.threading { self.ctx.history_turns * 2 + 1 } else { 1 };
         let mut g = self.convo_graph(upto);
         g.mark_window_ex(budget, est(sys) + 8, per_msg_overhead, max_msgs);
-        let ids = g.context_ids();
-        let n = ids.len();
-        let mut seen = std::collections::HashSet::new();
-        ids.into_iter().enumerate().map(|(i, id)| {
-            let m = &self.msgs[id];
-            let text = if i + 1 == n { m.text().to_string() } else {
-                let (condensed, _) = crate::repetition::condense(m.text());
-                self.components.dedup_for_context(&condensed, &mut seen)
-            };
-            CtxMsg { role: m.role, text }
-        }).collect()
+        g.context_ids().into_iter().map(|id| &self.msgs[id]).collect()
     }
 
     fn sys(&self) -> &str {
         let s = self.context.trim();
         if s.is_empty() { LONG_HORIZON } else { s }
-    }
-
-    /// A one-off single-turn prompt in the LIVE template — the descriptor-model side channel
-    /// (component naming) uses this so its request stops correctly on every model family.
-    fn wrap_single_turn(&self, user: &str) -> String {
-        let sysline = "You are a terse code librarian.";
-        match self.live_template() {
-            TemplateKind::ChatML => format!("<|im_start|>system\n{sysline}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"),
-            TemplateKind::Llama3 | TemplateKind::Llama4 => format!("<|start_header_id|>system<|end_header_id|>\n{sysline}<|eot_id|><|start_header_id|>user<|end_header_id|>\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n"),
-            TemplateKind::Gemma3 => format!("<start_of_turn>user\n{sysline}\n{user}<end_of_turn>\n<start_of_turn>model\n"),
-            TemplateKind::Gemma => format!("<|turn>system\n{sysline}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n"),
-            TemplateKind::Plain => format!("System: {sysline}\nUser: {user}\nAssistant:"),
-        }
     }
 
     /// Plain transcript format (llama.cpp path; the model adds BOS).
@@ -2278,29 +2155,6 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         s
     }
 
-    /// Gemma 2/3 chat template: <start_of_turn>ROLE\n ... <end_of_turn>\n, roles user/model.
-    /// There is NO system role in this family — the system text folds into the FIRST user turn
-    /// (llama.cpp's convention), which matters doubly here: emitting a fake system turn makes the
-    /// model imitate turn markers, and gemma3 previously fell through to Plain entirely (the
-    /// uploaded log's `template=Plain`), so it never saw this format at all.
-    fn build_prompt_gemma3(&self, sys: &str, upto: usize) -> String {
-        let mut s = String::new();
-        let mut sys_pending = if sys.trim().is_empty() { None } else { Some(sys.to_string()) };
-        for m in self.chosen_msgs(8, sys, upto) {
-            let role = if m.role == Role::User { "user" } else { "model" };
-            let text = neutralize_markers(m.text());
-            let body = if m.role == Role::User {
-                match sys_pending.take() {
-                    Some(sy) => format!("{sy}\n\n{text}"),
-                    None => text,
-                }
-            } else { text };
-            s.push_str(&format!("<start_of_turn>{role}\n{body}<end_of_turn>\n"));
-        }
-        s.push_str("<start_of_turn>model\n");
-        s
-    }
-
     fn send(&mut self, infer: &Inference, doc: &crate::analysis::Doc, ui: &egui::Ui) {
         // Composer command routing: a line the user submits that begins with ':' is executed as a
         // command HERE, not sent to the model. '::text' escapes a literal message that starts with a
@@ -2338,42 +2192,8 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
                 // Fire-and-queue: if the model is busy, don't stop it — enqueue this (branch) turn to run as
                 // soon as the current reply finishes. This is what makes branching non-blocking. An active
                 // agent run owns the model too, so queue behind it rather than colliding.
-                if self.stream.is_some() || self.agent_run.is_some() || self.agent_fan.is_some() { self.queue.push_back((qt, parent, None)); return; }
-                self.start_generation(qt, parent, None, infer, doc);
-            }
-        }
-    }
-
-    /// Reflex pass at queue-drain time: the previous queued branch just finished streaming, so scan
-    /// it against its earlier siblings and react — bounded to ONE reaction per branch and gated on
-    /// the toggle. Runs only while fan work is pending/active (a lone chat turn is not fanned work).
-    fn maybe_reflex(&mut self, _infer: &Inference, _doc: &crate::analysis::Doc) {
-        if !self.reflexes_on { return; }
-        if self.queue.is_empty() && self.fan.is_none() { return; }
-        let Some(idx) = self.msgs.len().checked_sub(1) else { return };
-        if self.msgs[idx].role != Role::Assistant || self.reflexed.contains(&idx) { return; }
-        let reply = self.msgs[idx].text().to_string();
-        if reply.is_empty() && self.stream.is_some() { return; } // still streaming, not finished
-        self.reflexed.insert(idx);
-        let parent = self.msgs[idx].parent;
-        let siblings: Vec<String> = self.msgs.iter().enumerate()
-            .filter(|(i, m)| *i != idx && m.role == Role::Assistant && m.parent == parent)
-            .map(|(_, m)| m.text().to_string()).collect();
-        let sib_refs: Vec<&str> = siblings.iter().map(|s| s.as_str()).collect();
-        for r in logscope_fan::reflex::scan(&reply, &sib_refs, logscope_fan::reflex::Config::default()) {
-            match logscope_fan::reflex::reaction(&r) {
-                logscope_fan::reflex::Reaction::FollowUp { prompt, why } => {
-                    if self.queue.len() < MAX_FAN_QUEUE {
-                        self.queue.push_back((prompt, parent, None));
-                        self.hud.observe(logscope_fan::liaison_fan::narrate(
-                            &logscope_fan::liaison_fan::FanEvent::ReflexFollowUp { why }), "liaison");
-                    }
-                    break; // one follow-up per branch
-                }
-                logscope_fan::reflex::Reaction::Annotate { note } => {
-                    self.hud.observe(format!("reflex: {note}"), "liaison");
-                    self.note = note;
-                }
+                if self.stream.is_some() || self.agent_run.is_some() || self.agent_fan.is_some() { self.queue.push_back((qt, parent)); return; }
+                self.start_generation(qt, parent, infer, doc);
             }
         }
     }
@@ -2417,22 +2237,7 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
         self.last_prompt_tokens = 0;
     }
 
-    fn start_generation(&mut self, qt: String, parent: Option<usize>, style: Option<logscope_fan::styles::Style>, infer: &Inference, doc: &crate::analysis::Doc) {
-        // A fan work style varies HOW this thread decodes, not just what it is told: apply the
-        // sampling half for this one generation and restore afterwards (the ctx is the user's).
-        let saved = (self.ctx.temperature, self.ctx.min_p);
-        if let Some(st) = &style {
-            self.ctx.temperature = (self.ctx.temperature + st.temp_delta).clamp(0.05, 1.5);
-            if let Some(mp) = st.min_p { self.ctx.min_p = mp; }
-        }
-        let restore = style.is_some();
-        let r = self.start_generation_inner(qt, parent, style, infer, doc);
-        if restore { self.ctx.temperature = saved.0; self.ctx.min_p = saved.1; }
-        r
-    }
-    fn start_generation_inner(&mut self, qt: String, parent: Option<usize>, style: Option<logscope_fan::styles::Style>, infer: &Inference, doc: &crate::analysis::Doc) {
-        // The instruction half of a work style rides the prompt itself.
-        let qt = match &style { Some(st) => format!("{}\n\n[work style: {}]", qt, st.system), None => qt };
+    fn start_generation(&mut self, qt: String, parent: Option<usize>, infer: &Inference, doc: &crate::analysis::Doc) {
         // fresh reply → fresh stepwise accounting
         self.step_last_paused = 0; self.step_continues = 0; self.step_pending_continue = false; self.step_arm_continue = false;
         if !self.msgs.is_empty() {
@@ -2549,32 +2354,6 @@ survived being reported, so more turns will not fix them", mark.k, mark.n, repea
     }
 
     fn sync_worker(&mut self, infer: &Inference) {
-        // COMPONENT REGISTRY: incrementally harvest fenced code blocks from the transcript.
-        // New components queue for a descriptor-model name; the request fires only when the
-        // worker is idle, and its reply is intercepted in apply_evt (never enters the chat).
-        {
-            let texts: Vec<String> = self.msgs.iter().map(|m| m.text().to_string()).collect();
-            for id in self.components.sync(texts.iter().map(|t| t.as_str())) {
-                self.naming_q.push_back(id);
-                let c = &self.components.items[id];
-                self.note = format!("component #{}: {} ({} lines, {})", c.id + 1, c.name, c.lines, c.lang);
-            }
-        }
-        if self.stream.is_none() && self.naming_live.is_none() {
-            if let Some(cid) = self.naming_q.pop_front() {
-                if let Some(c) = self.components.items.get(cid) {
-                    let head: String = c.text.lines().take(24).collect::<Vec<_>>().join("\n");
-                    let ask = format!("Describe what this {} code does in 3 to 6 lowercase words. Answer with ONLY those words.\n\n{}\n",
-                                      if c.lang.is_empty() { "code" } else { &c.lang }, head);
-                    let prompt = self.wrap_single_turn(&ask);
-                    self.naming_live = Some(cid);
-                    self.naming_buf.clear();
-                    infer.generate(prompt);
-                }
-            }
-        } else if self.naming_live.is_some() && self.naming_buf.len() >= 64 {
-            infer.cancel();   // the descriptor answered; don't let it ramble the budget away
-        }
         if self.sent_backend != Some(self.backend) { infer.set_backend(self.backend); self.sent_backend = Some(self.backend); }
         // Template: trust the worker's LIVE detected template over per-tab cached state. A tab created
         // after the model loaded (or whose Evt::Loaded another drain consumed) otherwise keeps a stale
@@ -4005,11 +3784,6 @@ them to", patches.len());
                     "Archive"      => ([0xe6, 0xd8, 0xbc], crate::texgen::mat::PAPER, 0.04, 188, [0x4a, 0x32, 0x1c], 0.45), // ink on parchment
                     "Reading Room" => ([0xf0, 0xe8, 0xd6], crate::texgen::mat::PAPER, 0.04, 190, [0x2e, 0x24, 0x18], 0.42), // typewriter ink
                     "Mansion Garden" => ([0xf0, 0xe6, 0xcc], crate::texgen::mat::STONE, 0.14, 150, [0xd8, 0xb4, 0x5c], 0.9), // cream marble + gold veins
-                    "Persian Garden"  => ([0xe4, 0xd2, 0xac], crate::texgen::mat::STONE, 0.12, 168, [0x1e, 0x82, 0x96], 0.8), // sun-warmed plaster, turquoise inlay
-                    "Garden Cloister" => ([0xd6, 0xd6, 0xc8], crate::texgen::mat::STONE, 0.10, 176, [0x46, 0x6e, 0x38], 0.7), // limestone plaque, moss-green cut
-                    "Madrassa Court"  => ([0xe8, 0xde, 0xc8], crate::texgen::mat::STONE, 0.16, 160, [0x1d, 0x5a, 0x8e], 0.95), // ivory plaster, cobalt zellij
-                    "Bamboo Grove"    => ([0x24, 0x32, 0x22], crate::texgen::mat::WOOD,  0.20, 140, [0x9a, 0xc4, 0x60], 1.0),  // dark board, lantern-lit green
-                    "Rural Commons"   => ([0xc8, 0xa0, 0x72], crate::texgen::mat::WOOD,  0.18, 158, [0xb0, 0x44, 0x24], 0.9),  // sun-bleached plank, hearth-red cut
                     // Every OTHER world derives a coherent idiom from its active palette (material + warm
                     // light + cool accent) instead of the old flat-grey quad, so the message panel and the
                     // mic pearl read as belonging to the scene. Dark worlds glow their accent on a dim tinted
@@ -4047,10 +3821,6 @@ them to", patches.len());
                 let (ppw_x, ppw_y) = px_per_world(&view_cam, cen, right, up, cx, cy, scale);
                 let ppw = ppw_x.min(ppw_y).max(1.0);
                 let anchor = |ax: f32, ay: f32| screen_to_world(&view_cam, cen, right, up, cx, cy, scale, rect.left() + ax * win_w, rect.top() + ay * win_h);
-                // Screen-space registry of this frame's HUD slabs: every screen-anchored
-                // component resolves through it, so the bottom dock/composer/action-row
-                // family (and the corner panels) can NEVER overlap — they restack instead.
-                let mut hud_placed: Vec<crate::hud_pack::Placed> = Vec::new();
                 // IN-SCENE PANEL BOX removed by default: the app is moving to a separate message box + text-entry
                 // box, so this third boxy plaque is redundant (and some of its layers weren't rendering cleanly).
                 // LOGSCOPE_PANEL=1 restores it. The MIC pearl (voice state) + node/voice highlights stay — they're
@@ -4243,9 +4013,6 @@ them to", patches.len());
                     // bottom of the canvas (the panel origin already sits low-centre).
                     let dock_c = anchor(0.5, 0.87); // bottom-centre, adapts to window size
                     let dock_radius = (0.42 * win_w / ppw / 1.36).clamp(0.55, 1.7); // arc spans ~42% of width
-                    let (dock_c, dock_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
-                                                        dock_c, dock_radius * 2.9, dock_radius * 1.2);
-                    let dock_radius = dock_radius * dock_hs;
                     let ds = dock_radius / 0.95; // scale buttons with the arc
                     let pos = crate::physui::dock_arc(
                         DOCK_IDS.len(),
@@ -4403,9 +4170,6 @@ them to", patches.len());
                     if std::env::var("LOGSCOPE_PHYS_PARAMS").map(|v| v != "0").unwrap_or(true) {
                         let panel_c = anchor(0.15, 0.60); // lower-left corner, adapts to window size
                         let plaque_w = (0.24 * win_w / ppw).clamp(0.9, 2.6);
-                        let (panel_c, panel_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
-                                                              panel_c, plaque_w, plaque_w * 1.60 / 1.42);
-                        let plaque_w = plaque_w * panel_hs;
                         let ps = plaque_w / 1.42; // scale the tuned layout by the window-derived plaque width
                         let back = |o: f32| V3::new(panel_c.x - toward.x * o, panel_c.y - toward.y * o, panel_c.z - toward.z * o);
                         // backing plaque (set back so the sliders sit proud of it)
@@ -4539,9 +4303,6 @@ them to", patches.len());
                     let comp_c = anchor(0.5, 0.90); // bottom-centre, adapts to window size
                     let comp_w = (0.62 * win_w / ppw).clamp(2.2, 6.5);
                     let comp_h = (0.20 * win_h / ppw).clamp(0.55, 1.3);
-                    let (comp_c, comp_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
-                                                        comp_c, comp_w, comp_h);
-                    let (comp_w, comp_h) = (comp_w * comp_hs, comp_h * comp_hs);
                     if let Some(rect) = project_slab_rect(&view_cam, comp_c, right, up, comp_w, comp_h, cx, cy, scale) {
                         let pearl_t = ui.input(|i| i.time) as f32;
                         let vpartial = self.voice.as_ref().map(|v| v.partial().to_string()).unwrap_or_default();
@@ -4580,9 +4341,6 @@ them to", patches.len());
                         ];
                         let arow_c = anchor(0.5, 0.985); // just below the composer
                         let btn_w = (0.08 * win_w / ppw).clamp(0.35, 0.9);
-                        let (arow_c, arow_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
-                                                            arow_c, btn_w * 3.7, btn_w * 0.9);
-                        let btn_w = btn_w * arow_hs;
                         let gap = btn_w * 1.35;
                         for (i, (glyph, hint)) in acts.iter().enumerate() {
                             let dx = (i as f32 - 1.0) * gap; // centre the middle button
@@ -4628,13 +4386,6 @@ them to", patches.len());
                 if !self.backdrop && !self.agent_plan.is_empty() {
                     let pc0 = anchor(0.86, 0.13);
                     let pw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
-                    let (pc0, pw) = {
-                        let ph = 0.15 * (pw / 1.3) * 9.5;   // title + up to 8 rows
-                        let cc0 = crate::spatial::Vec3::new(pc0.x - up.x * ph * 0.45, pc0.y - up.y * ph * 0.45, pc0.z - up.z * ph * 0.45);
-                        let (cc1, hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale, cc0, pw, ph);
-                        let ph2 = ph * hs;
-                        (crate::spatial::Vec3::new(cc1.x + up.x * ph2 * 0.45, cc1.y + up.y * ph2 * 0.45, cc1.z + up.z * ph2 * 0.45), pw * hs)
-                    };
                     let pscale = pw / 1.3;
                     let title_c = V3::new(pc0.x - toward.x * 0.30, pc0.y - toward.y * 0.30, pc0.z - toward.z * 0.30);
                     for cell in m3::label_cells(title_c, right, up, toward, "PLAN", 0.010 * pscale, t, egui::Color32::from_rgb(232, 238, 252), 0.7, 0.0, tanim, m3::SceneLight::Uniform, 0) { graph.push(cell); }
@@ -4654,9 +4405,6 @@ them to", patches.len());
                 if !self.backdrop && !self.agent_files.is_empty() {
                     let fc = anchor(0.86, 0.42);
                     let fw = (0.22 * win_w / ppw).clamp(0.8, 2.4);
-                    let (fc, fc_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
-                                                  fc, fw, fw * 1.7 / 1.3);
-                    let fw = fw * fc_hs;
                     let fs = fw / 1.3;
                     let back = |o: f32| V3::new(fc.x - toward.x * o, fc.y - toward.y * o, fc.z - toward.z * o);
                     let mut plaque = m3::panel(back(-0.06 * fs), right, up, 1.3 * fs, 1.7 * fs, egui::Color32::from_rgb(pc[0], pc[1], pc[2]));
@@ -4688,13 +4436,6 @@ them to", patches.len());
                 if !self.backdrop && !self.agent_candidates.is_empty() {
                     let cc = anchor(0.17, 0.22);
                     let cw = (0.30 * win_w / ppw).clamp(1.4, 3.6);
-                    let (cc, cw) = {
-                        let ch = 0.30 * (cw / 2.0) * 6.0 + 0.6 * (cw / 2.0);  // title + rows
-                        let cc0 = crate::spatial::Vec3::new(cc.x - up.x * ch * 0.4, cc.y - up.y * ch * 0.4, cc.z - up.z * ch * 0.4);
-                        let (cc1, hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale, cc0, cw, ch);
-                        let ch2 = ch * hs;
-                        (crate::spatial::Vec3::new(cc1.x + up.x * ch2 * 0.4, cc1.y + up.y * ch2 * 0.4, cc1.z + up.z * ch2 * 0.4), cw * hs)
-                    };
                     let cs = cw / 2.0;
                     let best = self.agent_candidates.iter().max_by_key(|b| (b.approved == Some(true), b.verified, b.files)).map(|b| b.index);
                     let title_c = V3::new(cc.x - toward.x * 0.30 + up.x * 0.5 * cs, cc.y - toward.y * 0.30 + up.y * 0.5 * cs, cc.z - toward.z * 0.30 + up.z * 0.5 * cs);
@@ -4769,9 +4510,6 @@ them to", patches.len());
                     let rc = anchor(0.5, 0.17); // top-centre, adapts to window size
                     let pw = (0.44 * win_w / ppw).clamp(1.6, 5.2);
                     let ph = (pw * 0.42).min(0.30 * win_h / ppw); // cap by height so it fits short windows
-                    let (rc, rc_hs) = hud_resolve(&mut hud_placed, rect, &view_cam, cen, right, up, cx, cy, scale,
-                                                  rc, pw, ph);
-                    let (pw, ph) = (pw * rc_hs, ph * rc_hs);
                     let bscale = (pw / (24.0 * 6.0) * 0.90).clamp(0.006, 0.03); // body fits ~24 cols
                     let hscale = bscale * 0.82;
                     // drop shadow (offset down-right, set back) for real depth
@@ -4918,7 +4656,7 @@ them to", patches.len());
                     saturation: std::env::var("LOGSCOPE_SAT").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.18),
                     shoulder: std::env::var("LOGSCOPE_SHOULDER").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.0),
                     // per-scene BLOOM trim — Old Library + Cloudscape were over-blooming (detail washed out)
-                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, "Persian Garden" => 0.34, "Madrassa Court" => 0.32, "Garden Cloister" => 0.45, "Bamboo Grove" => 0.70, "Rural Commons" => 0.40, _ => 1.0 }, texscale: dtexscale, bump: dbump,
+                    threshold: gthr * 1.0, bloom_amt: gbloom * 0.85 * match name { "Old Library" => 0.5, "Cloudscape" => 0.42, "Reading Room" => 0.4, "Recursive Citadel" => 0.5, "Folding@home" => 0.4, "Mansion Garden" => 0.26, _ => 1.0 }, texscale: dtexscale, bump: dbump,
                     caustic, godray_amt: gr_amt, godray_weight: gr_w, godray_decay: gr_dec,
                     pearl, pearl_variant, pearl_pos, pearl_r, aspect: rect.width() / rect.height().max(1.0),
                     nacre: std::env::var("LOGSCOPE_NACRE").ok().and_then(|v| v.trim().parse::<f32>().ok()).unwrap_or(1.4),
@@ -5416,7 +5154,7 @@ them to", patches.len());
                 let base = self.base_for_fan();
                 if !base.is_empty() {
                     let parent = self.walk_focus.or(self.active_leaf);
-                    for v in crate::consensus::fuzz(&base, n, now_unix()) { self.queue.push_back((v, parent, None)); }
+                    for v in crate::consensus::fuzz(&base, n, now_unix()) { self.queue.push_back((v, parent)); }
                     self.input.clear();
                     self.note = format!("fuzz: fanned {n} retries (:stop to cancel)");
                 } else { self.note = ":fuzz — nothing to fan (type a prompt, or send one first)".into(); }
@@ -5428,35 +5166,10 @@ them to", patches.len());
                 let base = self.base_for_fan();
                 if !base.is_empty() {
                     let parent = self.walk_focus.or(self.active_leaf);
-                    let styles = logscope_fan::styles::assign(n, now_unix());
-                    for ((v, _name), st) in crate::directives::fanout_user(&base, n, now_unix()).into_iter().zip(styles) {
-                        self.queue.push_back((v, parent, Some(st)));
-                    }
+                    for (v, _name) in crate::directives::fanout_user(&base, n, now_unix()) { self.queue.push_back((v, parent)); }
                     self.input.clear();
-                    self.hud.observe(logscope_fan::liaison_fan::narrate(
-                        &logscope_fan::liaison_fan::FanEvent::RoundStarted { round: 1, width: n, styled: true }), "liaison");
-                    self.note = format!("fuzzd: fanned {n} branches — distinct directive + work style each (:stop to cancel)");
+                    self.note = format!("fuzzd: fanned {n} directive-varied branches (:stop to cancel)");
                 } else { self.note = ":fuzzd — nothing to fan (type a prompt, or send one first)".into(); }
-            }
-            // :paths N — fan N feature-CREATION paths for the composer's feature idea: each branch is
-            // anchored to a distinct build-path archetype (mvp/api/data/test/ux/risk) and ends in the
-            // same "## Path summary" block, so the branches compare side by side and :pick /
-            // :merge-docs apply unchanged. The planning sibling of :fuzzd.
-            Command::Paths(n) => {
-                let base = self.base_for_fan();
-                if !base.is_empty() {
-                    let parent = self.walk_focus.or(self.active_leaf);
-                    for (_name, p) in logscope_fan::pathfan::prompts(&base, n, now_unix()) {
-                        if self.queue.len() >= MAX_FAN_QUEUE { break; }
-                        self.queue.push_back((p, parent, None));
-                    }
-                    self.input.clear();
-                    self.fan_is_docs = true; // path plans are documents — suggest union over pick
-                    let preview: String = base.chars().take(40).collect();
-                    self.hud.observe(logscope_fan::liaison_fan::narrate(
-                        &logscope_fan::liaison_fan::FanEvent::PathsFanned { feature_preview: preview, n }), "liaison");
-                    self.note = format!("paths: exploring {n} feature-creation paths (:stop to cancel)");
-                } else { self.note = ":paths — describe the feature first (type it, or send it as a message)".into(); }
             }
             // :o / :open <path> — import a chat (markdown ## You / ## Assistant) and load it as the convo.
             Command::Open(p) => {
@@ -5558,7 +5271,7 @@ them to", patches.len());
                             let parent = self.walk_focus.or(self.active_leaf);
                             let tasks = crate::vimmode::map_tasks(&files, &template);
                             let n = tasks.len();
-                            for t in tasks { self.queue.push_back((t, parent, None)); }
+                            for t in tasks { self.queue.push_back((t, parent)); }
                             self.note = format!(":map — fanned {n} worker task(s), one per changed file (:stop to cancel)");
                         }
                     }
@@ -5589,7 +5302,7 @@ them to", patches.len());
                     if holes.is_empty() { self.note = ":fill — found no todo!()/unimplemented!() holes in the skeleton".into(); }
                     else {
                         let parent = self.walk_focus.or(self.active_leaf);
-                        for h in &holes { self.queue.push_back((crate::decompose::subtask_prompt(&skeleton, h), parent, None)); }
+                        for h in &holes { self.queue.push_back((crate::decompose::subtask_prompt(&skeleton, h), parent)); }
                         let n = holes.len();
                         self.fill_session = Some(FillSession { skeleton, holes });
                         if from_composer { self.input.clear(); }
@@ -5623,7 +5336,7 @@ them to", patches.len());
                 else {
                     let context: Vec<String> = self.msgs.iter().filter(|m| m.role == Role::Assistant).map(|m| m.text().to_string()).collect();
                     let parent = self.walk_focus.or(self.active_leaf);
-                    self.queue.push_back((crate::quest::quest_prompt(&task, n, &context), parent, None));
+                    self.queue.push_back((crate::quest::quest_prompt(&task, n, &context), parent));
                     self.note = format!("asking {n} clarifying questions — answer the A: lines, then :ans");
                 }
             }
@@ -6615,19 +6328,7 @@ if let Some(msg) = self.error_banner.clone() {
                                 ui.add_space(6.0);
                             }
                             ui.separator();
-                            ui.checkbox(&mut self.reflexes_on, "⚡ reflexes")
-                                .on_hover_text("Automatic bounded reactions to finished fan branches: a compile error or test failure queues ONE fix follow-up, an empty reply ONE retry; near-duplicates are annotated (consider :pick). The brain stays in charge — reflexes only add follow-ups, never cancel work.");
-                            ui.add_space(4.0);
-                            ui.horizontal(|ui| {
-                                if ui.button("🎐 fuzz ×6").on_hover_text("Fan 6 branches off the focus — each with a distinct behavioral directive AND its own work style (instruction + sampling). Same as :fuzzd 6.").clicked() {
-                                    self.run_command(crate::vimmode::Command::FuzzDirective(6), ui);
-                                }
-                                if ui.button("🛣 paths ×6").on_hover_text("Explore 6 feature-creation paths for the composer text (mvp/api/data/test/ux/risk archetypes), each ending in a comparable summary. Same as :paths 6.").clicked() {
-                                    self.run_command(crate::vimmode::Command::Paths(6), ui);
-                                }
-                            });
-                            ui.add_space(4.0);
-                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. Aggressive best-of-K runs are now styled: K distinct work styles per unit. Reflexes + the liaison narrate under the newest message.").color(theme::FAINT()).small());
+                            ui.label(RichText::new("Coordinator modes fan one task out to parallel workers over the same loaded model — no extra models needed. Task decomposition + execution wiring is in progress; selecting a mode here records the intent.").color(theme::FAINT()).small());
                         }
                         RightPage::Graph => {
                             ui.label(RichText::new("CONVERSATION GRAPH").color(theme::DIM()).small().strong());
@@ -6892,29 +6593,7 @@ if let Some(msg) = self.error_banner.clone() {
                             if ui.button("📂 Open folder").on_hover_text(format!("Reveal {}", dir.display())).clicked() { Self::reveal(&dir); }
                         }
                     });
-                    });
-                    // ── CODE COMPONENTS: the deduplicated blocks this conversation has produced.
-                    // Named by the descriptor model when it has spoken (•), by their own
-                    // declarations until then. Click a row to copy the component's code.
-                    if !self.components.items.is_empty() {
-                        egui::CollapsingHeader::new(RichText::new(format!("CODE COMPONENTS ({})", self.components.items.len()))
-                                .color(theme::CYAN()).strong().small())
-                            .default_open(false)
-                            .show(ui, |ui| {
-                                for c in &self.components.items {
-                                    let tag = if c.named_by_model { "•" } else { "·" };
-                                    let line = format!("#{} {} {}  — {} · {} lines · ×{}",
-                                        c.id + 1, tag, c.name,
-                                        if c.lang.is_empty() { "code" } else { &c.lang }, c.lines, c.uses);
-                                    if ui.add(egui::Label::new(RichText::new(line).small()).sense(egui::Sense::click()))
-                                        .on_hover_text("click to copy this component's code")
-                                        .clicked() {
-                                        ui.ctx().copy_text(c.text.clone());
-                                    }
-                                }
-                            });
-                    }
- // close gen_files_drawer
+                    }); // close gen_files_drawer
                 });
             }
             if let Some((msg, at)) = &self.ws_note {
@@ -7602,12 +7281,11 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
             // Between rounds of a depth fan: once this round's generations have all finished and drained,
             // fire the next round on the NEW frontier (this is what makes :Nca / :Nfa go N deep).
             if self.queue.is_empty() && self.fan.is_some() { self.fan_step(); }
-            self.maybe_reflex(infer, doc);
-            if let Some((qt, parent, style)) = self.queue.pop_front() {
+            if let Some((qt, parent)) = self.queue.pop_front() {
                 if qt == CONTINUE_ALL_TOK {
                     if let Some(l) = parent { self.expand_leaf(l, infer, doc); }
                 } else {
-                    self.start_generation(qt, parent, style, infer, doc);
+                    self.start_generation(qt, parent, infer, doc);
                 }
                 ui.ctx().request_repaint();
             }
@@ -7914,8 +7592,8 @@ mod tests {
     fn activity_status_summarizes_inflight_work() {
         let mut c = Chat::default();
         assert_eq!(c.activity_status(), None, "idle → nothing to show");
-        c.queue.push_back(("x".into(), None, None));
-        c.queue.push_back(("y".into(), None, None));
+        c.queue.push_back(("x".into(), None));
+        c.queue.push_back(("y".into(), None));
         assert_eq!(c.activity_status().as_deref(), Some("2 queued"));
         // a running depth fan reads alongside the queued count
         c.fan = Some(Fan { kind: FanKind::Continue, rounds_left: 3, only: None });
@@ -8127,11 +7805,6 @@ fn scene_light(name: &str) -> (egui::Color32, egui::Color32, f32, f32) {
         "Forest"       => (c(0xd0, 0xe2, 0x8a), c(0x2e, 0x3c, 0x1e), 0.86, 1.06), // sunlit woodland green
         "Treehouse"    => (c(0xe2, 0xb0, 0x6e), c(0x1c, 0x26, 0x12), 0.58, 1.0),  // warm dusk canopy (fireflies pop)
         "Mansion Garden" => (c(0xd2, 0xc8, 0xb0), c(0x76, 0x6e, 0x58), 0.54, 0.70), // cream marble — toned further (still too bloomy)
-        "Persian Garden"  => (c(0xf0, 0xd8, 0x9a), c(0x8e, 0x74, 0x4e), 0.80, 0.95), // low golden-hour sun over dust
-        "Garden Cloister" => (c(0xdc, 0xdc, 0xd0), c(0x6e, 0x72, 0x68), 0.62, 0.78), // flat overcast; a north arcade is never bright
-        "Madrassa Court"  => (c(0xf6, 0xe2, 0xb0), c(0x86, 0x74, 0x54), 0.84, 0.92), // high sun into a white court, brass bounce
-        "Bamboo Grove"    => (c(0xbc, 0xdc, 0x86), c(0x24, 0x34, 0x20), 0.50, 0.66), // green-filtered light under a full canopy
-        "Rural Commons"   => (c(0xff, 0xdc, 0x9e), c(0x8c, 0x66, 0x42), 0.88, 1.02), // high hard sun on dust — the brightest world in the set
         _              => (c(140, 168, 205),    c(96, 82, 66),       0.74, 1.00),
     }
 }

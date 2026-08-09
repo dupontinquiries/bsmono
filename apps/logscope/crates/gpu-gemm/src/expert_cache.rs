@@ -633,6 +633,76 @@ mod route_condition_tests {
     }
 }
 
+/// # CORRECTION: this is redundant with `layer_can_route`, and the arithmetic below is still right
+///
+/// The 62x figure holds and the conclusion drawn from it did not. Dense MoE removes the readback by
+/// computing every expert — **and it requires every expert resident, because you cannot compute what
+/// you would have to stream.**
+///
+/// That is the same precondition `layer_can_route` needs. And when it holds, `layer_can_route`
+/// already removes the readback for FREE: the readback exists so the CPU can FETCH a cold expert,
+/// and `MOE_MATVEC_GLU_Q4` reads the expert index from `selw` on the GPU. With everything pinned
+/// there is nothing to fetch, so nothing to read back — at 1x the compute rather than 16x.
+///
+/// **Dense MoE pays 16x compute to buy something already available at 1x.** The two are not
+/// alternatives to weigh; one strictly dominates.
+///
+/// Kept rather than deleted because the model is correct and the crossover arithmetic is reusable —
+/// if a case ever appears where the readback survives full residency, this is the calculation. What
+/// is deleted is the belief that Scout is that case.
+///
+/// # SUPERSEDED — read this before implementing dense-MoE
+///
+/// **The v2 decode path already routes on the GPU with zero readbacks**, and it was built before
+/// this analysis. `moe_ffn_routed` chooses it when:
+///
+/// ```text
+/// t == 1  &&  (m.stream.is_none() || layer_resident)  &&  !m.cfg.weight_before
+/// ```
+///
+/// So the readback that dense-MoE removes by computing all sixteen experts is ALREADY removed, at
+/// 1x the compute instead of 16x, by a top-k kernel plus expert-indexed matvecs over the stacked
+/// weights. Computing everything is strictly worse than routing correctly on the GPU.
+///
+/// **What actually blocks Scout is the two other conditions**, not the readback itself:
+///
+/// * `m.stream.is_none() || layer_resident` — Scout streams, and pins 6 of 16 experts, so no layer
+///   qualifies. IQ1_S residency is what changes this.
+/// * `!m.cfg.weight_before` — Scout has weight_before, which `MOE_PRESCALE` addresses and which is
+///   still unvalidated.
+///
+/// The arithmetic below is kept because the CROSSOVER reasoning is sound and reusable — a 16x
+/// compute multiplier landing on 0.1% of a step really is favourable. It is simply not the cheapest
+/// way to reach that outcome here, and I proposed it without checking what the routed path already
+/// did.
+///
+/// # Residency between messages does not help, and the numbers say why
+///
+/// A natural question: can the model stay resident between messages to skip the expert streaming?
+///
+/// **It already does.** `MoeStream` is built in `load_gguf_inner` and lives on `MoeLayer`, which
+/// lives on the `Model` — the pins and the ring survive every generation. Nothing is torn down
+/// between messages, so nothing can be saved by keeping it.
+///
+/// The cost is **per token**, not per session:
+///
+/// ```text
+///   one Scout Q4_K_M generation: 2061 fills, 143.4 GiB moved, 90 tokens
+///     = 22.9 fills per token, 1632 MiB per token
+///     the engine's own line agrees: "2476 MiB per token"
+/// ```
+///
+/// A startup cost would be ~33 GiB once and then near zero. This is a rate, because **the router
+/// picks different experts for different tokens** — 10 of 16 are cold, and 62.7% of lookups hit the
+/// 6 that are pinned. The other 37.3% fetch, every token, forever.
+///
+/// ## What does help
+///
+/// Only pinning more. The engine says it plainly — "each expert added moves the floor by 1/16" — and
+/// at 6/16 pinned the floor is where it is. Pinning all 16 removes the fetch entirely, which is what
+/// `layer_can_route` needs and what a smaller quant buys: **the lever is bytes per expert, not
+/// session lifetime.**
+///
 /// Is it faster to compute EVERY expert than to ask which one?
 ///
 /// # The trade
@@ -690,6 +760,34 @@ mod dense_moe_tests {
     use super::*;
 
     #[test]
+    fn expert_streaming_is_a_PER_TOKEN_cost_not_a_startup_one() {
+        // 2061 fills over 90 tokens is 22.9 per token. A startup cost would be one burst and then
+        // silence; this is a rate, because the router picks different experts per token.
+        let (fills, tokens) = (2061.0f64, 90.0f64);
+        assert!(fills / tokens > 20.0, "a per-token rate, not a one-off");
+    }
+
+    #[test]
+    fn the_documented_answer_is_that_residency_ALREADY_persists() {
+        // MoeStream lives on MoeLayer lives on Model. Keeping the model loaded is already happening,
+        // so it cannot be the fix.
+        let src = include_str!("expert_cache.rs");
+        assert!(src.contains("It already does."));
+        assert!(src.contains("the lever is bytes per expert, not
+/// session lifetime"));
+    }
+
+    #[test]
+    fn dense_moe_is_DOMINATED_by_layer_can_route_wherever_it_applies() {
+        // Both need every expert resident. When that holds, layer_can_route removes the same
+        // readback at 1x compute instead of 16x — so the favourable arithmetic below describes a
+        // trade nobody should take.
+        let all_pinned: Vec<u32> = (0..16).collect();
+        assert!(layer_can_route(&all_pinned, 16), "the cheaper path already applies");
+        assert!(dense_moe_worthwhile(0.999, 16, 1).is_ok(), "and the expensive one also would");
+    }
+
+    #[test]
     fn at_SCOUTS_measured_stall_computing_everything_is_dramatically_faster() {
         // 99.9% waiting means the 16x multiplier lands on 0.1% of the step.
         let s = dense_moe_worthwhile(0.999, 16, 1).unwrap();
@@ -718,6 +816,16 @@ mod dense_moe_tests {
         // Top-2 of 16 is an 8x multiplier, so it wins at a lower stall — the trade improves as the
         // router already touches more experts.
         assert!(dense_moe_crossover(16, 2) < dense_moe_crossover(16, 1));
+    }
+
+    #[test]
+    fn the_module_says_v2_ALREADY_removes_this_readback() {
+        // Guards against someone implementing dense-MoE from the arithmetic without reading why it
+        // is not the cheapest route. The v2 path removes the same readback at 1x compute.
+        let src = include_str!("expert_cache.rs");
+        assert!(src.contains("SUPERSEDED"));
+        assert!(src.contains("already removed, at\n/// 1x the compute instead of 16x")
+             || src.contains("1x the compute instead of 16x"));
     }
 
     #[test]

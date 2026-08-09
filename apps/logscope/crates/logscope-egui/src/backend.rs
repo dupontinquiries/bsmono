@@ -325,11 +325,7 @@ window submits bounded (watchdog-safe), governor uses the tight Apple-Vulkan bud
             } else if tok.special_id("<|eot_id|>").is_some() || tok.special_id("<|start_header_id|>").is_some() {
                 TemplateKind::Llama3
             } else if tok.special_id("<|turn>").is_some() || tok.special_id("<turn|>").is_some() {
-                TemplateKind::Gemma // Gemma 4 turn markers
-            } else if tok.special_id("<end_of_turn>").is_some() {
-                TemplateKind::Gemma3 // Gemma 2/3 <start_of_turn>/<end_of_turn> — previously fell through to
-                                     // Plain (the log's "template=Plain"), so the model never saw its own
-                                     // chat format AND its turn markers were never emitted or stopped on
+                TemplateKind::Gemma // Gemma 4 turn markers (changed from Gemma 3's <start_of_turn>/<end_of_turn>)
             } else {
                 TemplateKind::Plain
             };
@@ -423,29 +419,18 @@ precision, and cost {:.1} GiB of disk for nothing",
             // output is bit-identical for any tile (--gate-matvec), so this can never change results.
             if !gpu.profile_forced() && std::env::var_os("LOGSCOPE_NO_AUTOTUNE").is_none() {
                 let (k, n) = (model.d, 2 * model.h); // wgate_up: the largest decode mat-vec
-                // TWO GUARDS ON THE SAME PATH, from two lines that each found half of it.
-                //
-                // First: is the cached value even a config? Values like 2147549188 look like
-                // poison but are 0x8001_0004 — PACKED DecodeConfigs (high bit set, kernel id in
-                // the high half, tile in the low). A naive range check would discard every tuned
-                // config on every machine that had one and retune on every load.
-                //
-                // Second: is the cached KERNEL still allowed here? The autotune SEARCH skips
-                // subgroup kernels when sg_ok is false, but a restored choice skipped that check,
-                // so a cache written under a different build, driver, or LOGSCOPE_MATVEC_SG=1
-                // selects V2WgSg on a machine where the guard has since disabled it — visible in
-                // the wild as "subgroup decode kernel DISABLED" three lines above "kernel V2WgSg,
-                // cached autotune".
-                //
-                // A cache is just a path that skips the code that would have said no, and it needs
-                // every check the live path has.
-                let cached_raw = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n);
-                let cached = cached_raw.filter(|&t| t & 0x8000_0000 != 0 || (1..=64).contains(&t));
-                if let (Some(raw), None) = (cached_raw, cached) {
-                    eprintln!("wgpu-engine: cached decode tile {raw} is neither a packed config nor a sane bare tile — discarding, retuning");
-                }
-                if let Some(t) = cached {
-                    let t = if t & 0x8000_0000 != 0 {
+                if let Some(t) = gpu_kernels::store::autotune_get(&gpu.adapter_name, k, n) {
+                    // RE-APPLY THE GUARD ON CACHE LOAD. The autotune SEARCH skips subgroup kernels
+                    // when sg_ok is false, but a cached choice was restored without that check — so a
+                    // cache written when the subgroup kernel was allowed (a different build, driver,
+                    // or LOGSCOPE_MATVEC_SG=1 run) selects V2WgSg on a machine where the guard has
+                    // since disabled it. Your Qwen log shows exactly that: "subgroup decode kernel
+                    // DISABLED" three lines above "decode tile = 8 (kernel V2WgSg, cached autotune)".
+                    //
+                    // A guard enforced on one path and not the other is the same class as every other
+                    // stale-check bug this session; a cache is just a path that skips the code that
+                    // would have said no.
+                    let t = {
                         let dc = gpu_kernels::DecodeConfig::unpack(t);
                         if dc.kernel.needs_subgroups() && !gpu.subgroup_kernel_ok() {
                             eprintln!("wgpu-engine: cached decode kernel {:?} needs subgroups, which \
@@ -453,18 +438,17 @@ are disabled on this device — falling back to the autotuned non-subgroup defau
                             gpu_kernels::DecodeConfig { kernel: gpu_kernels::MatvecKernel::V2Wg128,
                                                         tile: dc.tile }.pack()
                         } else { t }
-                    } else { t };
+                    };
                     gpu.set_matvec_tile(t);
-                    // UNPACK BEFORE PRINTING, or the line reads "decode tile = 2147549192" — a
-                    // value that cannot be a tile, on every load. Harmless to the engine and
-                    // corrosive to the log: a number nobody can read is a line nobody checks, and
-                    // this is the line you consult when a shape is slow.
-                    if t & 0x8000_0000 != 0 {
-                        let c = gpu_kernels::DecodeConfig::unpack(t);
-                        eprintln!("wgpu-engine: decode cfg = {:?} tile {} (cached autotune for this GPU)", c.kernel, c.tile);
-                    } else {
-                        eprintln!("wgpu-engine: decode tile = {t} (cached autotune for this GPU)");
-                    }
+                    // UNPACK BEFORE PRINTING. The cache stores a packed (kernel, tile) u32 and this
+                    // printed it raw, so the line read "decode tile = 2147549192" — a value that
+                    // cannot be a tile, on every load, on both machines. Tiles are 1/2/4/8.
+                    //
+                    // Harmless to the engine and corrosive to the log: a number nobody can read is a
+                    // line nobody checks, and this is the line you would consult when a shape is slow.
+                    let dc = gpu_kernels::DecodeConfig::unpack(t);
+                    eprintln!("wgpu-engine: decode tile = {} (kernel {:?}, cached autotune for this GPU)",
+                        dc.tile, dc.kernel);
                 } else {
                     let t0 = std::time::Instant::now();
                     let best = gpu.autotune_matvec(k, n);
@@ -773,22 +757,12 @@ using {} for this run but NOT caching it; a difference this small is run-to-run 
 would mislead every later load",
                     v.margin() * 100.0, v.on_ms, v.off_ms, if decision { "ON" } else { "off" });
             }
-            // (The conclusive branch above already logs its caching; a second unconditional
-            // "cached for <adapter>" here printed even on the INCONCLUSIVE path — a lying log line.)
+            eprintln!("wgpu-engine: fast-decode A/B — off {off:.1} ms/tok, on {on:.1} ms/tok → levers {} (cached for {})",
+                if decision { "ON" } else { "OFF" }, self.gpu.adapter_name);
         }
         pub fn generate(&mut self, prompt: &str, p: &GenParams, cancel: &dyn Fn() -> bool, on: &mut dyn FnMut(&str) -> bool) -> Result<usize, String> {
             let toks = self.tok.encode(prompt);
             let mut prompt_ids = if toks.is_empty() { vec![0] } else { toks };
-            // BOS: llama.cpp prepends it whenever the GGUF says add_bos_token, and DeepSeek-
-            // LLM/Coder DEPEND on it — their chat template has no in-body special tokens, so
-            // without this the model never sees its start token (one visible symptom of the
-            // gibberish bug, alongside the unscaled linear rope). Guarded: a template that
-            // already begins with BOS (encoded via the specials scan) is left alone.
-            if self.tok.add_bos {
-                if let Some(b) = self.tok.bos_id {
-                    if prompt_ids.first() != Some(&b) { prompt_ids.insert(0, b); }
-                }
-            }
             // Diagnostic: scan the ENCODED prompt for special tokens + show its tail. A correct ChatML
             // prompt has exactly 2 specials per turn + 1 (the trailing <|im_start|>), and the tail must
             // end on the assistant primer. EXTRA specials = stray markers from injected content (a log
@@ -798,8 +772,8 @@ would mislead every later load",
                 let sp: Vec<(usize, u32)> = prompt_ids.iter().enumerate()
                     .filter(|(_, &t)| self.tok.is_special(t)).map(|(i, &t)| (i, t)).collect();
                 let tail: Vec<u32> = prompt_ids.iter().rev().take(12).rev().copied().collect();
-                eprintln!("wgpu-engine: [{}] prompt diag — {} special tokens (showing ≤12): {:?}; tail ids = {:?}; bos={:?} add_bos={}",
-                    self.name, sp.len(), &sp[..sp.len().min(12)], tail, self.tok.bos_id, self.tok.add_bos);
+                eprintln!("wgpu-engine: [{}] prompt diag — {} special tokens (showing ≤12): {:?}; tail ids = {:?}",
+                    self.name, sp.len(), &sp[..sp.len().min(12)], tail);
             }
             let sp = SamplerParams { temperature: p.temperature, top_k: 40, top_p: 0.95, repeat_penalty: p.repeat_penalty, repeat_last_n: 64, min_p: p.min_p };
             // Decode budget for this reply. With auto-continue on, `reply_ceiling` is the per-reply
@@ -974,7 +948,6 @@ was evicted)", prompt_ids.len())
             let (s0, p0, su0, sy0) = (
                 gpu_kernels::GPU_SUBMITS.load(AOrd::Relaxed), gpu_kernels::GPU_POLLS.load(AOrd::Relaxed),
                 gpu_kernels::GPU_SETUP_NS.load(AOrd::Relaxed), gpu_kernels::GPU_SYNC_NS.load(AOrd::Relaxed));
-            let c0 = gpu_kernels::gpu_submit_causes();
             let (bgh0, bgm0) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed), gpu_kernels::BG_MISSES.load(AOrd::Relaxed));
             // Windowed SAMPLED decode: the whole sample→embed→decode cycle stays on-device for k
             // tokens per readback — no per-token full-vocab logits sync and no per-token O(v·log v)
@@ -1069,32 +1042,27 @@ was evicted)", prompt_ids.len())
             // mislabel sends optimisation effort at command setup when the kernels are the cost.
             let total_ms = (secs as f64) * 1000.0;
             let accounted = setup_ms + sync_ms;
-            // "GPU-execution-bound" WAS AN OVERSTATEMENT. The condition is that setup and sync
-            // together are under 15% of wall time — which says where the time ISN'T, not where it
-            // is. At the 0.1% seen in real runs, 99.9% is UNACCOUNTED, and unaccounted is not a
-            // bound: the GPU may be executing, or the timers may simply not cover the slow path.
-            // The "-bound" suffix is appended by the caller, so the label stays short and
-            // adjectival — a phrase that already reads as a sentence produced "neither setup nor
-            // sync sees it-bound" in a real log.
+            // "GPU-execution-bound" WAS AN OVERSTATEMENT. The condition is that setup and sync together
+            // are under 15% of wall time — which says where the time ISN'T, not where it is. At the 0.1%
+            // seen in real runs, 99.9% is UNACCOUNTED, and unaccounted is not a bound: the GPU may be
+            // executing, or the timers may simply not cover the path that is slow.
+            //
+            // Same class as gate-q4k claiming "the loader can stop requantizing" while testing only
+            // dequantization — a label asserting more than its evidence, which is worse than no label
+            // because nobody re-derives it.
+            // The suffix "-bound" is appended by the caller, so a phrase that already reads as a
+            // sentence produced "neither setup nor sync sees it-bound" in a real log. Kept short and
+            // adjectival for that reason: the label must survive the template it is dropped into.
             let bound = if accounted < total_ms * 0.02 { "UNACCOUNTED" }
                 else if accounted < total_ms * 0.15 { "likely GPU-execution" }
                 else if setup_ms >= sync_ms { "dispatch" } else { "GPU-sync" };
-            {
-                // WHY the submits happened — one run names the mechanism instead of three guesses
-                // (the Scout/Metal hunt). Printed only when a cause was recorded.
-                let c1 = gpu_kernels::gpu_submit_causes();
-                let d: Vec<u64> = c1.iter().zip(c0.iter()).map(|(a, b)| a.saturating_sub(*b)).collect();
-                let tot: u64 = d.iter().sum();
-                if tot > 0 {
-                    let pc = |v: u64| (v as f64 / tot as f64 * 100.0).round() as u64;
-                    eprintln!("wgpu-engine: [{}] submit causes — passes {} ({}%), download {} ({}%), end_frame {} ({}%), dims-wrap {} ({}%), frameless {} ({}%), other {} ({}%)",
-                        self.name, d[0], pc(d[0]), d[1], pc(d[1]), d[2], pc(d[2]), d[3], pc(d[3]), d[4], pc(d[4]), d[5], pc(d[5]));
-                }
-            }
             // NAME THE BOTTLENECK, not just the split. "GPU-execution-bound, 0.1% accounted" says
-            // where the time ISN'T and leaves an operator with nothing to act on. perfverdict
-            // resolves it into one verdict — or says the run is at the memory roofline and the
-            // split is irrelevant, which is the answer that stops work rather than misdirecting it.
+            // where the time ISN'T and leaves an operator with nothing to act on. perfverdict resolves
+            // it into one verdict — or says the run is at the memory roofline and the split is
+            // irrelevant, which is the answer that stops work rather than misdirecting it.
+            //
+            // active_bytes comes from the resident footprint; gib_per_s is 0 unless --gate-perf has
+            // run, and perfverdict reports efficiency 0 and says so rather than dividing by it.
             {
                 let sample = gpu_kernels::perfverdict::Sample {
                     tokens: per as u64,
@@ -1103,7 +1071,8 @@ was evicted)", prompt_ids.len())
                     sync_ms,
                     submits: ds as u64,
                     // ACTIVE BYTES, derived from the architecture rather than stored — so it cannot
-                    // drift from what the model is. Parameters times resident bytes-per-parameter.
+                    // drift from what the model is. Parameters times the resident bytes-per-parameter:
+                    // ~0.56 for q4 residency, which is the format the loader reports.
                     active_bytes: {
                         let experts = self.model.n_active_experts();
                         let params = gpu_kernels::active_params_per_token(
@@ -1112,9 +1081,9 @@ was evicted)", prompt_ids.len())
                         (params as f64 * 0.5625) as u64      // q4 + per-32 scales
                     },
                     // READ FROM THE MEASUREMENT, and None stays None. An adapter that has never run
-                    // --gate-perf yields 0 and perfverdict reports efficiency 0 and says the
-                    // roofline cannot be evaluated — rather than substituting a default, which
-                    // would produce a confident efficiency figure from no measurement.
+                    // --gate-perf yields 0 and perfverdict reports efficiency 0 and says the roofline
+                    // cannot be evaluated — rather than substituting a default, which would produce a
+                    // confident efficiency figure from no measurement.
                     gib_per_s: gpu_kernels::store::bandwidth_get(&self.gpu.adapter_name)
                         .unwrap_or(0.0) as f64,
                 };
@@ -1148,7 +1117,11 @@ was evicted)", prompt_ids.len())
             //
             // The caveat prints only when something is anomalous. A run that always adds two lines
             // teaches the reader to skip both, which is how five GPU resets sat unread in journalctl.
-            let (headline, caveat) = gpu_kernels::run_verdict(
+            // DELTAS, not cumulative counters. Reading them cumulatively made this line contradict
+            // the attribution line directly above it — 0% against 55% for the same run, because the
+            // verdict was describing the previously-loaded model's dispatches.
+            let (v_nf, v_dl, v_ps) = gpu_kernels::SubmitCauseSnapshot::now().shares_since(&cause0);
+            let (headline, caveat) = gpu_kernels::run_verdict_delta_shares(v_nf, v_dl, v_ps, 
                 per as u64, secs as f64, sync_ms / 1000.0);
             eprintln!("wgpu-engine: [{}] {headline}", self.name);
             if let Some(c) = caveat { eprintln!("wgpu-engine: [{}] {c}", self.name); }
@@ -1203,10 +1176,19 @@ was evicted)", prompt_ids.len())
             }
             eprintln!("[{}] {attr}", gpu_kernels::stamp());
             crate::diag::note(&attr);
-            let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
+            let vv0 = 0u64; // baseline is per-process; the subtraction keeps the shape of the others
+                    let (bgh, bgm) = (gpu_kernels::BG_HITS.load(AOrd::Relaxed) - bgh0, gpu_kernels::BG_MISSES.load(AOrd::Relaxed) - bgm0);
             if bgh + bgm > 0 {
-                eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} lookups ({:.0}% reused, {:.0}/tok saved) [LOGSCOPE_BG_CACHE]",
-                    self.name, bgh + bgm, 100.0 * bgh as f64 / (bgh + bgm).max(1) as f64, bgh as f64 / per);
+                // SPLIT OUT THE UNCACHEABLE LOOKUPS. A dispatch whose input carries a non-zero view is a
+                    // KV slice, and its key CAN NEVER REPEAT — counting those as misses makes a working
+                    // cache read as 13% and invites optimising what is not broken. lib.rs says so at the
+                    // increment site, and the counter it increments was never read by anything.
+                    let vv = gpu_kernels::BG_VIEW_VARYING.load(AOrd::Relaxed).saturating_sub(vv0);
+                    let cacheable = (bgh + bgm).saturating_sub(vv);
+                    eprintln!("wgpu-engine: [{}] bind-group cache — {bgh} hits / {} cacheable lookups \
+({:.0}% reused, {:.0}/tok saved); {vv} uncacheable (KV slices, keys that cannot repeat) [LOGSCOPE_BG_CACHE]",
+                        self.name, cacheable,
+                        100.0 * bgh as f64 / cacheable.max(1) as f64, bgh as f64 / per);
             }
             // Adapt passes-per-submit: feed this turn's per-token decode time to the tuner, which sweeps
             // SUBMIT_PROFILES across replies and settles on the fastest, then caches it. Bit-exact across
@@ -1480,18 +1462,10 @@ pub fn make(kind: BackendKind) -> Box<dyn Backend> {
 /// must match the model: a ChatML model (smollm2, `<|im_end|>`) fed Llama-3 markers drifts into
 /// byte-level marker text and never hits its real stop. Detected from the tokenizer at load.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TemplateKind {
-    Llama3, ChatML, Plain,
-    /// Gemma 4: <|turn>ROLE ... <turn|>, native system role.
-    Gemma,
-    Llama4,
-    /// Gemma 2/3: <start_of_turn>/<end_of_turn>, roles user/model, NO system role
-    /// (system text folds into the first user turn).
-    Gemma3,
-}
+pub enum TemplateKind { Llama3, ChatML, Plain, Gemma, Llama4 }
 impl TemplateKind {
-    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3, Self::Llama4 => 4, Self::Gemma3 => 5 } }
-    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, 4 => Self::Llama4, 5 => Self::Gemma3, _ => return None }) }
+    fn to_u8(self) -> u8 { match self { Self::Llama3 => 0, Self::ChatML => 1, Self::Plain => 2, Self::Gemma => 3, Self::Llama4 => 4 } }
+    fn from_u8(v: u8) -> Option<Self> { Some(match v { 0 => Self::Llama3, 1 => Self::ChatML, 2 => Self::Plain, 3 => Self::Gemma, 4 => Self::Llama4, _ => return None }) }
 }
 
 /// What a successful load reports back to the UI.

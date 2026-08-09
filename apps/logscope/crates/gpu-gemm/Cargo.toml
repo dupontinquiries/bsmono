@@ -37,6 +37,14 @@ required-features = ["zerocopy"]
 name = "caps-probe"
 path = "src/bin/caps-probe.rs"
 
+[[bin]]
+name = "diffstep-bench"
+path = "src/bin/diffstep-bench.rs"
+
+[[bin]]
+name = "gemmshape-bench"
+path = "src/bin/gemmshape-bench.rs"
+
 [features]
 # scoped experiment: does NOT wire into the live loader — a self-contained import path + probe you can
 # compile and run on the M2 to see whether Honeykrisp supports external-memory-host import at all.

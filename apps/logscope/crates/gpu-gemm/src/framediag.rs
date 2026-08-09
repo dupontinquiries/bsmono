@@ -37,6 +37,7 @@ pub fn arm() {
     ARMED.store(true, Relaxed);
     *FRAMELESS_BY_SITE.lock().unwrap() = Some(Default::default());
     *BY_PTR.lock().unwrap() = Some(Default::default());
+    *DOWNLOADS_BY_SITE.lock().unwrap() = Some(Default::default());
 }
 
 /// Record a frameless dispatch by pipeline pointer.
@@ -133,24 +134,94 @@ all, rather than dropped at one place", v.len())
     lines.join("\n")
 }
 
+/// Downloads by call site.
+///
+/// `download` is 20-29% of submits and nobody knows which calls they are. Sampling is one readback
+/// per token, so a dense model showing ~137 per token has ~136 coming from somewhere unaccounted —
+/// and the honest way to find out is the same one that found the frame leak: **count them where they
+/// happen rather than reason about where they might be.**
+///
+/// Keyed on `std::panic::Location`, so no call site needs editing to be counted.
+pub static DOWNLOADS_BY_SITE: std::sync::Mutex<Option<std::collections::BTreeMap<String, u64>>>
+    = std::sync::Mutex::new(None);
+
+/// Record a readback. `#[track_caller]` puts the CALLER's location in the map, which is the question
+/// being asked — `download` itself is one line and says nothing.
+#[track_caller]
+pub fn note_download() {
+    if !ARMED.load(Relaxed) { return }
+    let loc = std::panic::Location::caller();
+    let key = format!("{}:{}", loc.file().rsplit('/').next().unwrap_or(loc.file()), loc.line());
+    if let Ok(mut g) = DOWNLOADS_BY_SITE.lock() {
+        if let Some(m) = g.as_mut() { *m.entry(key).or_insert(0) += 1; }
+    }
+}
+
+/// The download report, ordered by count.
+pub fn download_report(tokens: u64) -> String {
+    let Ok(g) = DOWNLOADS_BY_SITE.lock() else { return "download tally unavailable".into() };
+    let Some(m) = g.as_ref() else { return "not armed; pass --frame-diag or set LOGSCOPE_FRAME_DIAG=1".into() };
+    if m.is_empty() { return "no downloads recorded".into() }
+    let mut v: Vec<_> = m.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1));
+    let total: u64 = v.iter().map(|(_, n)| **n).sum();
+    let mut out = vec![format!("{total} downloads across {} sites", v.len())];
+    if tokens > 0 {
+        // Per token is the number that matters: one is sampling and unavoidable, and everything
+        // above one is the question.
+        out.push(format!("  {:.1} per token — sampling accounts for 1.0, the rest is the question",
+            total as f64 / tokens as f64));
+    }
+    for (site, n) in v.iter().take(10) {
+        out.push(format!("  {n:>8}  {site}{}", if tokens > 0 {
+            format!("  ({:.1}/tok)", **n as f64 / tokens as f64) } else { String::new() }));
+    }
+    out.join("\n")
+}
+
+/// Serialises every test that touches the process-global tallies.
+///
+/// **One lock at module scope, not one per test module.** Two locks would not serialise against each
+/// other, which is exactly the race the first one was added to fix — and the download tests share
+/// the same statics as the frame tests.
+#[cfg(test)]
+pub(crate) static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn reset() {
     for c in [&FRAME_OPENED, &FRAME_CLOSED, &FRAME_CLOSED_WHILE_CLOSED, &REOPEN_DECLINED] {
         c.store(0, Relaxed);
     }
     if let Ok(mut g) = FRAMELESS_BY_SITE.lock() { if let Some(m) = g.as_mut() { m.clear(); } }
+    if let Ok(mut g) = BY_PTR.lock() { if let Some(m) = g.as_mut() { m.clear(); } }
+    if let Ok(mut g) = DOWNLOADS_BY_SITE.lock() { if let Some(m) = g.as_mut() { m.clear(); } }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fresh() { reset(); arm(); }
+    /// Serialises the tests in this module.
+    ///
+    /// **They share process-global state** — the counters and both tallies are statics — and cargo
+    /// runs tests in parallel by default, so one test's `reset()` can land inside another's
+    /// assertions. That produced exactly one failure in ten full-suite runs while writing this,
+    /// which is the worst frequency for a flake: often enough to be real, rare enough to be
+    /// dismissed as noise the next time it appears.
+
+    fn fresh() -> std::sync::MutexGuard<'static, ()> {
+        // Poisoning is ignored: a panicking test already failed, and refusing to run the others
+        // because of it turns one failure into eight.
+        let g = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        arm();
+        g
+    }
 
     #[test]
     fn a_DOMINANT_site_is_called_out() {
         // The shape of the answer decides the fix, and the report says which shape it is rather than
         // leaving a reader to eyeball a list.
-        fresh();
+        let _serial = fresh();
         for _ in 0..100 { note_frameless("moe_ffn_v1 readback"); }
         note_frameless("sample_at");
         assert!(report().contains("ONE SITE DOMINATES"));
@@ -160,7 +231,7 @@ mod tests {
     fn a_SPREAD_reads_as_the_frame_never_being_held() {
         // A different diagnosis from one bad site: if every site contributes, the frame is not being
         // held at all and fixing any one of them changes nothing.
-        fresh();
+        let _serial = fresh();
         for s in ["a", "b", "c", "d"] { for _ in 0..10 { note_frameless(s); } }
         let r = report();
         assert!(r.contains("not being held at all"), "{r}");
@@ -170,7 +241,7 @@ mod tests {
     fn CLOSED_WHILE_CLOSED_is_explained_rather_than_just_counted() {
         // The counter most likely to name the bug: a speculative end_frame makes everything after it
         // frameless, which is a different fault from a frame never opened.
-        fresh();
+        let _serial = fresh();
         FRAME_CLOSED_WHILE_CLOSED.store(3, Relaxed);
         assert!(report().contains("calls end_frame speculatively"));
     }
@@ -179,7 +250,7 @@ mod tests {
     fn a_DECLINED_REOPEN_points_at_download_as_the_SYMPTOM() {
         // If decode's frame was already closed by something earlier, download's `had_frame` guard
         // correctly refuses to reopen — which would make download look guilty and not be.
-        fresh();
+        let _serial = fresh();
         REOPEN_DECLINED.store(7, Relaxed);
         assert!(report().contains("SYMPTOM rather than the cause"));
     }
@@ -188,8 +259,10 @@ mod tests {
     fn UNARMED_says_how_to_arm_rather_than_reporting_zero() {
         // Reporting "0 frameless dispatches" when the tally was never enabled is the false-green
         // shape this project keeps hitting.
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         reset();
         *FRAMELESS_BY_SITE.lock().unwrap() = None;
+        *BY_PTR.lock().unwrap() = None;
         ARMED.store(false, Relaxed);
         assert!(report().contains("not armed"));
     }
@@ -198,7 +271,7 @@ mod tests {
     fn armed_with_NO_hits_is_distinct_from_unarmed() {
         // "The frame held for the whole run" is a real result and must not be confused with "nobody
         // measured".
-        fresh();
+        let _serial = fresh();
         assert!(report().contains("held for the whole run"));
     }
 }
@@ -223,7 +296,18 @@ mod flush_reopen_tests {
     fn flush_and_wait_REOPENS_the_frame_it_took() {
         let src = include_str!("lib.rs");
         let i = src.find("fn flush_and_wait(&self)").expect("flush_and_wait moved");
-        let body = &src[i..(i + 1800).min(src.len())];
+        // THE FUNCTION'S REAL BODY, not a byte window. The first version scanned 1800 chars, and
+        // an edit inside flush_and_wait that added five lines pushed begin_frame past the end — the
+        // test failed on code that was correct, which is the same fixed-window failure this project
+        // criticised in a `grep -A130` two days earlier.
+        //
+        // Scan to the next top-level `    fn ` or `    pub fn `, which is where the body actually
+        // ends.
+        let rest = &src[i..];
+        let end = rest[1..].find("\n    fn ").map(|x| x + 1)
+            .min(rest[1..].find("\n    pub fn ").map(|x| x + 1).unwrap_or(usize::MAX).into())
+            .unwrap_or(rest.len());
+        let body = &rest[..end.min(rest.len())];
         assert!(body.contains("self.begin_frame();"),
             "flush_and_wait must restore the frame it took, or every dispatch after an expert \
 stream runs frameless");
@@ -277,5 +361,85 @@ mod second_leak_tests {
             let end = i + src[i + 10..].find("\n    pub fn ").map(|n| n + 10).unwrap_or(4000);
             assert!(src[i..end.min(src.len())].contains("begin_frame"), "{f} does not reopen");
         }
+    }
+}
+
+#[cfg(test)]
+mod leak_guard {
+    /// Every `flush_and_wait` on a hot path must reopen the frame it closed.
+    ///
+    /// Two leaks were found by reading, a week apart in effect: the dims-ring wrap, and expert
+    /// streaming at 480 calls per token. Both were `flush_and_wait()` with no reopen, both cost
+    /// two thirds of all submits, and both were invisible because **the frame was correctly opened
+    /// at the top of the decode step** — so every obvious check passed.
+    ///
+    /// A grep is a crude test and it is the right shape here: the failure is a call site MISSING a
+    /// neighbouring line, which no type or trait can express.
+    #[test]
+    fn every_flush_and_wait_is_followed_by_a_conditional_reopen() {
+        let src = include_str!("lib.rs");
+        let mut missing = Vec::new();
+        for (n, line) in src.lines().enumerate() {
+            if !line.trim().starts_with("self.flush_and_wait();") { continue }
+            // The reopen must be within a few lines after, and guarded by had_frame.
+            let after: String = src.lines().skip(n + 1).take(4).collect::<Vec<_>>().join("\n");
+            if !(after.contains("had_frame") && after.contains("begin_frame")) {
+                missing.push(n + 1);
+            }
+        }
+        assert!(missing.is_empty(),
+            "flush_and_wait at line(s) {missing:?} ends the frame without reopening it. Everything \
+dispatched after runs on its own encoder until the next decode step — which is how 67% of submits \
+came to have no frame open");
+    }
+
+    /// The reopen must be CONDITIONAL, not unconditional.
+    ///
+    /// A caller that was not in a frame must not acquire one behind its back — `download`'s comment
+    /// establishes that and both new sites follow it. An unconditional `begin_frame` would leave a
+    /// frame open across a caller that never wanted one, and the symptom would be work batched into
+    /// a frame nobody flushes.
+    #[test]
+    fn the_reopens_are_guarded_by_had_frame() {
+        let src = include_str!("lib.rs");
+        let guarded = src.matches("if had_frame && std::env::var_os(\"LOGSCOPE_NO_FRAME_REOPEN\")").count();
+        assert!(guarded >= 2, "expected both reopen sites to be guarded, found {guarded}");
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    #[test]
+    fn downloads_are_attributed_to_the_CALLER_not_to_download_itself() {
+        // Without #[track_caller] the tally names lib.rs's one download line 53 times and answers
+        // nothing. Two calls from adjacent lines must appear as two sites.
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset(); arm();
+        note_download();
+        note_download();
+        let r = download_report(2);
+        assert!(r.contains("2 downloads across 2 sites"), "{r}");
+    }
+
+    #[test]
+    fn the_per_token_line_names_the_ONE_readback_that_is_unavoidable() {
+        // Sampling is one per token. Everything above one is the question, and saying so stops a
+        // reader treating the whole figure as waste.
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset(); arm();
+        note_download();
+        assert!(download_report(1).contains("sampling accounts for 1.0"));
+    }
+
+    #[test]
+    fn an_UNARMED_tally_says_how_to_arm_rather_than_reporting_zero() {
+        // The false-green shape again: "0 downloads" when nothing was counted.
+        let _serial = crate::framediag::SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+        *DOWNLOADS_BY_SITE.lock().unwrap() = None;
+        ARMED.store(false, Relaxed);
+        assert!(download_report(0).contains("not armed"));
     }
 }
