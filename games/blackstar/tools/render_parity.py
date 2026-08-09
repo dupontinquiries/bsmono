@@ -47,14 +47,18 @@ def load_web(path):
     return idx, pay, off
 
 
-def part_mesh(part, pay, off):
+def part_mesh(part, pay, off, bits=16):
     vs, ve, ie = off[part["geom"]]
     vb, ib = pay[vs:ve], pay[ve:ie]
     lo, span = part["lo"], part["span"]
     verts = []
+    # The web records its own bit depth; reading it rather than assuming 16 is
+    # what lets one decoder handle both, and a decoder that guessed would
+    # silently produce a part 256x too small.
+    fmt, step, maxq = ("<3H", 6, 65535.0) if bits > 8 else ("<3B", 3, 255.0)
     for i in range(part["nv"]):
-        q = struct.unpack_from("<3H", vb, i * 6)
-        verts.append([lo[d] + q[d] / 65535.0 * span[d] for d in range(3)])
+        q = struct.unpack_from(fmt, vb, i * step)
+        verts.append([lo[d] + q[d] / maxq * span[d] for d in range(3)])
     fmt, sz = ("<3H", 6) if part["isize"] == 2 else ("<3I", 12)
     tris = [struct.unpack_from(fmt, ib, i * sz) for i in range(part["nt"])]
     return verts, tris
@@ -78,7 +82,7 @@ def reconstruct(model, placements, idx, pay, off):
         if part is None:
             missing += 1
             continue
-        pv, pt = part_mesh(part, pay, off)
+        pv, pt = part_mesh(part, pay, off, idx.get("bits", 16))
         # Scale the exemplar to the placement's recorded size, about its own
         # centre, then move it to the placement centroid.
         c = [sum(v[d] for v in pv) / len(pv) for d in range(3)]
