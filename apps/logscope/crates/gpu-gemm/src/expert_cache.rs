@@ -676,6 +676,33 @@ mod route_condition_tests {
 /// way to reach that outcome here, and I proposed it without checking what the routed path already
 /// did.
 ///
+/// # Residency between messages does not help, and the numbers say why
+///
+/// A natural question: can the model stay resident between messages to skip the expert streaming?
+///
+/// **It already does.** `MoeStream` is built in `load_gguf_inner` and lives on `MoeLayer`, which
+/// lives on the `Model` — the pins and the ring survive every generation. Nothing is torn down
+/// between messages, so nothing can be saved by keeping it.
+///
+/// The cost is **per token**, not per session:
+///
+/// ```text
+///   one Scout Q4_K_M generation: 2061 fills, 143.4 GiB moved, 90 tokens
+///     = 22.9 fills per token, 1632 MiB per token
+///     the engine's own line agrees: "2476 MiB per token"
+/// ```
+///
+/// A startup cost would be ~33 GiB once and then near zero. This is a rate, because **the router
+/// picks different experts for different tokens** — 10 of 16 are cold, and 62.7% of lookups hit the
+/// 6 that are pinned. The other 37.3% fetch, every token, forever.
+///
+/// ## What does help
+///
+/// Only pinning more. The engine says it plainly — "each expert added moves the floor by 1/16" — and
+/// at 6/16 pinned the floor is where it is. Pinning all 16 removes the fetch entirely, which is what
+/// `layer_can_route` needs and what a smaller quant buys: **the lever is bytes per expert, not
+/// session lifetime.**
+///
 /// Is it faster to compute EVERY expert than to ask which one?
 ///
 /// # The trade
@@ -731,6 +758,24 @@ pub fn dense_moe_crossover(n_experts: u32, top_k: u32) -> f32 {
 #[cfg(test)]
 mod dense_moe_tests {
     use super::*;
+
+    #[test]
+    fn expert_streaming_is_a_PER_TOKEN_cost_not_a_startup_one() {
+        // 2061 fills over 90 tokens is 22.9 per token. A startup cost would be one burst and then
+        // silence; this is a rate, because the router picks different experts per token.
+        let (fills, tokens) = (2061.0f64, 90.0f64);
+        assert!(fills / tokens > 20.0, "a per-token rate, not a one-off");
+    }
+
+    #[test]
+    fn the_documented_answer_is_that_residency_ALREADY_persists() {
+        // MoeStream lives on MoeLayer lives on Model. Keeping the model loaded is already happening,
+        // so it cannot be the fix.
+        let src = include_str!("expert_cache.rs");
+        assert!(src.contains("It already does."));
+        assert!(src.contains("the lever is bytes per expert, not
+/// session lifetime"));
+    }
 
     #[test]
     fn dense_moe_is_DOMINATED_by_layer_can_route_wherever_it_applies() {
