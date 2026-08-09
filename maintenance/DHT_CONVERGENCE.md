@@ -69,3 +69,33 @@ hand-rolled msgpack subset actually has:
 
 Step 3 is the one that cannot be faked, and nothing in this repository currently
 does it.
+
+---
+
+## Parity harness — step 1's safety net, landed
+
+`snapclone-dht/tests/lan_parity.rs` runs the same LAN exchange through both
+engines and compares what an observer sees. Four tests, all green.
+
+**What parity means here, and what it cannot.** Not byte-identical packets —
+snapcore has no wire at all, so asserting that would assert something that
+cannot be true. Instead: given N nodes, a bootstrap, a put, and a get **from a
+node that never stored the value**, do both deliver the same bytes from a lookup
+that actually traversed other nodes?
+
+| test | why it is the one to write |
+|---|---|
+| delivery to a non-storing reader | the property every caller depends on, and the one that must survive swapping the engine underneath |
+| neither invents a value for an unstored key | the easier half to get wrong: returning something for an unknown key is worse than returning nothing, because the caller cannot tell |
+| convergence at n = 4, 8, 16 | parity of SHAPE — if one engine needed twice the network, the swap would change behaviour under real conditions while both still passed the delivery test |
+| payloads of 64, 300, 4096 bytes | a LAN transfer is not 30 bytes; this is where a subset wire starts writing the wrong length prefix and where a value-size cap diverges silently |
+
+Both run with no sockets and a fixed clock, so a disagreement is behavioural
+rather than a timing race.
+
+**This is what makes step 1 safe.** Giving snapcore the wire means callers move
+from one engine to the other, and until now nothing checked that the move
+preserved anything. The harness is also the regression net for steps 2 and 4:
+adding `listen`/`refresh` and retiring the older crates both have to keep these
+four green.
+
