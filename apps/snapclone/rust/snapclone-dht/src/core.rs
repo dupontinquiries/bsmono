@@ -172,6 +172,16 @@ impl Storage {
     pub fn listen(&mut self, key: InfoHash, who: Addr, tid: u32) {
         self.listeners.entry(key).or_default().push((who, tid));
     }
+    /// Keys this node currently holds, for re-announce.
+    ///
+    /// Returns keys rather than values because re-announcing is a lookup that
+    /// re-publishes to the nodes now closest to each key — the closest set
+    /// drifts as peers join and leave, so the point is to find who should hold
+    /// it today rather than to resend to whoever held it before.
+    pub fn local_keys(&self) -> Vec<InfoHash> {
+        self.map.keys().copied().collect()
+    }
+
     pub fn expire(&mut self, now: u64) {
         for l in self.map.values_mut() {
             l.retain(|s| now.saturating_sub(s.stored_at) <= VALUE_EXPIRE_MS);

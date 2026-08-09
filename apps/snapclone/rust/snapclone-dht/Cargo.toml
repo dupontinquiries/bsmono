@@ -18,6 +18,8 @@ serde   = { version = "1", features = ["derive"] }
 tokio   = { version = "1", features = ["net", "time", "rt"] }
 tracing = "0.1"
 
+wake-kit = { path = "../../../../shared/wake-kit" }
+
 [dev-dependencies]
 # Parity harness only. The two engines are compared on OBSERVABLE behaviour, so
 # the shared one has to be linkable from here — it is not a runtime dependency
