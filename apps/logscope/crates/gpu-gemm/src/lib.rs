@@ -709,6 +709,16 @@ pub struct Gpu {
     /// pool recycles a small set of activation buffers so those identities repeat across tokens. Key =
     /// (pipeline ptr, input+out buffer handles, dims buffer handle); wgpu::Buffer is Eq/Hash on its inner
     /// handle. Bit-identical by construction (same buffers, same bindings). Capped like the dims cache.
+    /// The IQ1_S codebook, uploaded once for the device's life.
+    ///
+    /// It is 2048 entries — 16 KiB — and CONSTANT for the process. `matvec_iq1_s` rebuilt and
+    /// re-uploaded it on every call, which its own comment argues against in the line above the
+    /// code doing it. And `linear_iq1_s_t` did not upload it at all, binding two buffers to a
+    /// shader that declares three.
+    ///
+    /// One owner fixes both: the re-upload becomes a clone of an Arc'd buffer, and the resident
+    /// path gets the binding it was missing.
+    iq1_grid: std::sync::OnceLock<Tensor>,
     bg_cache: Mutex<HashMap<BgKey, std::sync::Arc<wgpu::BindGroup>>>,
     /// Free-list recycling per-op output buffers across ops/tokens (see BufferPool).
     pool: std::sync::Arc<BufferPool>,
@@ -1286,7 +1296,7 @@ impl Gpu {
             };
             Mutex::new(crate::governor::Governor::new(crate::governor::Budget::for_backend(gb, unified, conservative_vma)))
         };
-        let gpu = Self { device, queue, adapter_name, dev_errors, pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
+        let gpu = Self { device, queue, adapter_name, dev_errors, iq1_grid: std::sync::OnceLock::new(), pipelines: Mutex::new(HashMap::new()), frame: Mutex::new(None), profile, profile_forced, shape_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), gemm_tiles: std::sync::RwLock::new(std::collections::HashMap::new()), flush_every, inflight_cap, pending_submits: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)), governor_dead: std::sync::atomic::AtomicBool::new(false), dims_cache: Mutex::new(HashMap::new()), bg_cache: Mutex::new(HashMap::new()), pool: std::sync::Arc::new(BufferPool::default()), arena: Mutex::new(None), pending_q4k: Mutex::new(Vec::new()), moe_stage: Mutex::new(None), stage_cursor: Mutex::new(0), subgroups, unified, sg_ok: std::sync::atomic::AtomicBool::new(false), gemm_ok: std::sync::atomic::AtomicBool::new(false), valid_gemm_tiles: std::sync::RwLock::new(Vec::new()), rope_neox: std::sync::atomic::AtomicBool::new(false), rope_mscale: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()), conservative_vma, trace_layer: std::sync::atomic::AtomicI32::new(-1), trace_tok: std::sync::atomic::AtomicI64::new(-1), pending_keep: Mutex::new(Vec::new()), dims_ring: Mutex::new((Vec::new(), 0, 0)), governor, dims_alloc_failed: std::sync::atomic::AtomicBool::new(false), degrade_level, oom_flag };
         // Tiled prefill GEMM uses `override TILE` in @workgroup_size — that needs SPIR-V/MSL specialization
         // constants, which the GL backend lacks (it fails to compile the entry point, and the error surfaces
         // asynchronously so an error scope can't catch it). Restrict the tiled path to non-GL backends, then
@@ -11366,6 +11376,25 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     ///
     /// The kernel and its bindings already existed for `--gate-iq1s-kernel`. This is the entry point
     /// that lets a RESIDENT weight reach them, which is the piece that was missing.
+    /// The IQ1_S codebook as a device tensor, built once.
+    ///
+    /// Entry i is (low 4 signed bytes, high 4). Packed here rather than in the shader because it is
+    /// constant for the process and unpacking it per dispatch would be 16 KiB of work per matvec —
+    /// the reasoning `matvec_iq1_s` already gave while re-uploading it per call anyway.
+    pub fn iq1s_grid_tensor(&self) -> &Tensor {
+        self.iq1_grid.get_or_init(|| {
+            let mut grid = Vec::with_capacity(4096);
+            for e in crate::iq1s_grid::IQ1S_GRID.iter() {
+                grid.push((*e & 0xFFFF_FFFF) as u32);
+                grid.push((*e >> 32) as u32);
+            }
+            Tensor {
+                buf: self.upload_bytes(bytemuck::cast_slice(&grid), "iq1s-grid"),
+                rows: 1, cols: grid.len(), pool: None, view: None,
+            }
+        })
+    }
+
     pub fn linear_iq1_s_t(&self, a: &Tensor, w: &Iq1Weight, m: usize) -> Tensor {
         // Decode only. This variant exists so a 30.3 GiB checkpoint can stay resident, and residency
         // matters at m == 1; claiming batch support it does not have would be the same kind of lie as
@@ -11374,7 +11403,12 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let out = self.alloc(1, w.n);
         let dims = [w.n as u32, w.k as u32, (w.k / 256) as u32, 0u32];
         let gx = (w.n as u32).div_ceil(64).max(1);
-        self.dispatch(MATVEC_IQ1_S, &[a, &w.blocks], &out, bytemuck::cast_slice(&dims), (gx, 1, 1));
+        // THE GRID WAS MISSING. MATVEC_IQ1_S declares three storage bindings and this bound two,
+        // so the resident decode path — the one the whole 30.3 GiB residency argument rests on —
+        // dispatched a shader without its codebook. --gate-iq1s did not catch it because that gate
+        // exercises matvec_iq1_s, which uploads the grid itself.
+        self.dispatch(MATVEC_IQ1_S, &[a, &w.blocks, self.iq1s_grid_tensor()], &out,
+            bytemuck::cast_slice(&dims), (gx, 1, 1));
         out
     }
 
@@ -11407,18 +11441,14 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         // The grid as u32 pairs: entry i is (low 4 signed bytes, high 4). Packed here rather than in
         // the shader because it is constant for the process and unpacking it per dispatch would be
         // 16 KiB of work per matvec.
-        let mut grid = Vec::with_capacity(4096);
-        for e in crate::iq1s_grid::IQ1S_GRID.iter() {
-            grid.push((*e & 0xFFFF_FFFF) as u32);
-            grid.push((*e >> 32) as u32);
-        }
-        let gt = self.upload_bytes(bytemuck::cast_slice(&grid), "iq1s-grid");
+        // Shared with the resident path rather than rebuilt: 16 KiB per call, and the comment
+        // above says so while the code did it anyway.
         let out = self.alloc(1, n);
         let gx = (n as u32).min(32768);
         let gy = (n as u32).div_ceil(gx);
         let dims = [1u32, n as u32, k as u32, (k / 256) as u32, gx, 0, 0, 0];
         let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, view: None };
-        let gten = Tensor { buf: gt, rows: 1, cols: grid.len(), pool: None, view: None };
+        let gten = self.iq1s_grid_tensor().clone();
         self.dispatch(MATVEC_IQ1_S, &[&at, &wten, &gten], &out,
                       bytemuck::cast_slice(&dims), (gx, gy, 1));
         self.download(&out)
