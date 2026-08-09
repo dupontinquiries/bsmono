@@ -467,13 +467,83 @@ def load_web_exemplars(path):
     return out
 
 
+def load_representative(path):
+    """Decode a .svxr representative into a point cloud.
+
+    This exists because the originals are gone. The solve aligns an exemplar to
+    the component it stands in for, and it used to read that component out of
+    the original mesh — 512MB of which was purged once the representative tier
+    made every model recoverable in shape.
+
+    A representative is occupancy at grid 32 with a palette, measured at 0.955
+    shape IoU against a 96^3 reference. As a point cloud it is exactly what
+    `align_frames` consumes, so the solve can still run — on a coarser target
+    than the original mesh, which is a real cost and is why the result is
+    reported separately rather than mixed in with mesh-solved numbers.
+    """
+    import gzip as _g, struct as _s
+    b = _g.decompress(open(path, "rb").read())
+    if b[:5] != b"SVXR\x01":
+        raise ValueError("not a representative")
+    n, npal, nvox = _s.unpack_from("<HHI", b, 5)
+    lo = _s.unpack_from("<3f", b, 13)
+    step = _s.unpack_from("<f", b, 25)[0]
+    off = 29 + npal * 3
+    cells = []
+    for i in range(nvox):
+        cells.append(_s.unpack_from("<3H", b, off + i * 4))
+    return cells, lo, step
+
+
+def representative_components(path, min_voxels=6):
+    """Split a representative into connected pieces.
+
+    The first attempt fed the whole cloud in as one component and scored 0.013
+    pre-residual IoU — of course it did: aligning a wheel against an entire
+    vehicle overlaps almost nowhere. A representative has no mesh connectivity,
+    but it has SPATIAL connectivity, and 6-connected labelling on the occupancy
+    grid recovers the same kind of split the mesh version gets from shared
+    vertices.
+
+    Pieces below `min_voxels` are dropped. At grid 32 a handful of voxels is a
+    speck the aligner cannot orient, and feeding it in produces a confident
+    rotation fitted to noise — the same failure the harvester's min_tris avoids
+    on the mesh side.
+    """
+    cells, lo, step = load_representative(path)
+    occ = set(cells)
+    seen = set()
+    out = []
+    for start in cells:
+        if start in seen:
+            continue
+        stack = [start]
+        seen.add(start)
+        group = []
+        while stack:
+            c = stack.pop()
+            group.append(c)
+            x, y, z = c
+            for d in ((1,0,0),(-1,0,0),(0,1,0),(0,-1,0),(0,0,1),(0,0,-1)):
+                nb = (x+d[0], y+d[1], z+d[2])
+                if nb in occ and nb not in seen:
+                    seen.add(nb)
+                    stack.append(nb)
+        if len(group) >= min_voxels:
+            out.append([[lo[i] + (c[i] + 0.5) * step for i in range(3)]
+                        for c in group])
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lib", required=True)
     ap.add_argument("--meshes", default=None, help="dir of exemplar .obj")
     ap.add_argument("--web", default=None,
                     help="read exemplars from a BSWEB file instead of loose .obj")
-    ap.add_argument("--originals", required=True, help="dir of <model>/<model>.obj")
+    ap.add_argument("--originals", default=None, help="dir of <model>/<model>.obj")
+    ap.add_argument("--representatives", default=None,
+                    help="dir of <model>.svxr, used when the originals are gone")
     ap.add_argument("--out", required=True)
     ap.add_argument("--samples", type=int, default=64)
     ap.add_argument("--limit", type=int, default=0)
@@ -506,13 +576,17 @@ def main():
     if a.limit:
         items = items[:a.limit]
     for name, pls in items:
-        src = os.path.join(a.originals, name, name + ".obj")
-        if not os.path.exists(src):
-            continue
-        mv, mt = load_obj(src)
-        if not mv:
-            continue
-        comps = real_components(mv, mt)
+        comps = None
+        if a.originals:
+            src = os.path.join(a.originals, name, name + ".obj")
+            if os.path.exists(src):
+                mv, mt = load_obj(src)
+                if mv:
+                    comps = real_components(mv, mt)
+        if comps is None and a.representatives:
+            rp = os.path.join(a.representatives, name + ".svxr")
+            if os.path.exists(rp):
+                comps = representative_components(rp)
         if not comps:
             continue
         for pl in pls:
