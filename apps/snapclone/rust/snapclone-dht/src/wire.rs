@@ -223,3 +223,130 @@ impl Msg {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The codec claimed OpenDHT compatibility with no test behind it. These
+    // pin the claim: the message shapes the reference (`src/net.h`) uses, and
+    // the failure modes a hand-rolled msgpack subset actually has.
+
+    fn hash(b: u8) -> InfoHash {
+        let mut h = [0u8; HASH_LEN];
+        h[0] = b;
+        h[HASH_LEN - 1] = b ^ 0xFF;
+        InfoHash(h)
+    }
+
+    // Addr is a packed u64 in this crate, not a SocketAddr — checked rather
+    // than assumed, after writing the test against the wrong type first.
+    fn addr(p: u16) -> Addr { 0x7F00_0001_0000_0000u64 | p as u64 }
+
+    #[test]
+    fn every_query_kind_round_trips() {
+        // ping, find, get, put, listen — the query names the reference sends.
+        for q in [Q::Ping, Q::Find, Q::Get, Q::Put, Q::Listen] {
+            let m = Msg::Query { tid: 7, from: hash(1), q: q.clone(), target: hash(2),
+                                 token: 0, value: None };
+            let back = Msg::decode(&m.encode()).expect("round trip");
+            assert_eq!(back, m, "{q:?} did not survive");
+        }
+    }
+
+    #[test]
+    fn a_put_carries_its_value() {
+        // The one query whose arguments include a value; dropping it would make
+        // a put that stores nothing and reports success.
+        let v = Value { id: 0xDEAD_BEEF, data: b"payload".to_vec() };
+        let m = Msg::Query { tid: 1, from: hash(3), q: Q::Put, target: hash(4),
+                             token: 99, value: Some(v.clone()) };
+        match Msg::decode(&m.encode()).expect("round trip") {
+            Msg::Query { value: Some(got), token, .. } => {
+                assert_eq!(got, v);
+                assert_eq!(token, 99);
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_reply_round_trips_nodes_and_values_together() {
+        // A find reply carries nodes; a get reply carries values; the reference
+        // permits both in one message and a codec that assumed either/or would
+        // silently truncate.
+        let m = Msg::Reply {
+            tid: 42,
+            from: hash(5),
+            nodes: vec![(hash(6), addr(4222)), (hash(7), addr(4223))],
+            values: vec![Value { id: 1, data: vec![0xAA; 40] }],
+            token: 1234,
+        };
+        assert_eq!(Msg::decode(&m.encode()).expect("round trip"), m);
+    }
+
+    #[test]
+    fn a_listener_push_round_trips() {
+        // MessageType::ValueData — unsolicited values for a key. Without it a
+        // listen is a subscription nothing can deliver to.
+        let m = Msg::Push { tid: 9, from: hash(8), target: hash(9),
+                            values: vec![Value { id: 2, data: b"pushed".to_vec() }] };
+        assert_eq!(Msg::decode(&m.encode()).expect("round trip"), m);
+    }
+
+    #[test]
+    fn an_error_round_trips() {
+        let m = Msg::Error { tid: 3, code: 401 };
+        assert_eq!(Msg::decode(&m.encode()).expect("round trip"), m);
+    }
+
+    #[test]
+    fn truncation_at_every_length_is_refused_rather_than_half_decoded() {
+        // The failure mode a hand-rolled msgpack subset actually has: a length
+        // prefix promising more bytes than arrived. A decoder that returned a
+        // partial message would put attacker-controlled short reads into the
+        // routing table.
+        let m = Msg::Reply { tid: 11, from: hash(10),
+                             nodes: vec![(hash(11), addr(5000))],
+                             values: vec![Value { id: 3, data: vec![1, 2, 3] }],
+                             token: 7 };
+        let full = m.encode();
+        for cut in 0..full.len() {
+            assert!(Msg::decode(&full[..cut]).is_none(),
+                    "a {cut}-byte prefix decoded to something");
+        }
+        assert!(Msg::decode(&full).is_some());
+    }
+
+    #[test]
+    fn trailing_garbage_does_not_change_the_message() {
+        // Datagrams get padded; the reference reads one map and stops.
+        let m = Msg::Query { tid: 5, from: hash(12), q: Q::Find, target: hash(13),
+                             token: 0, value: None };
+        let mut b = m.encode();
+        b.extend_from_slice(&[0xFF; 8]);
+        assert_eq!(Msg::decode(&b), Some(m));
+    }
+
+    #[test]
+    fn a_value_larger_than_a_fixstr_uses_the_wide_form() {
+        // fixstr caps at 31 bytes and bin8 at 255. A value crossing both is
+        // where a subset codec quietly writes the wrong header byte.
+        for n in [30usize, 32, 254, 256, 4000] {
+            let m = Msg::Push { tid: 1, from: hash(14), target: hash(15),
+                                values: vec![Value { id: 4, data: vec![0x5A; n] }] };
+            let back = Msg::decode(&m.encode()).unwrap_or_else(|| panic!("{n} bytes failed"));
+            assert_eq!(back, m, "{n} bytes round-tripped wrong");
+        }
+    }
+
+    #[test]
+    fn a_transaction_id_survives_the_full_u32_range() {
+        // tid is how a reply is matched to its query; a codec that narrowed it
+        // would mismatch replies under load rather than fail.
+        for tid in [0u32, 1, 255, 256, 65535, 65536, u32::MAX] {
+            let m = Msg::Error { tid, code: 0 };
+            assert_eq!(Msg::decode(&m.encode()), Some(m));
+        }
+    }
+}
