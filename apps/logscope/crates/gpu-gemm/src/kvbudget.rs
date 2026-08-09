@@ -22,6 +22,31 @@
 //! It fits under a 31 GiB ceiling with 5.3 GiB spare, and **no useful model fits in 5.3 GiB**. The
 //! honest figure is context AFTER weights, which is what this computes.
 
+/// # What the engine actually stores today, checked rather than assumed
+///
+/// I wrote the arithmetic above against an f16 baseline and then went to look. **The MLA latent
+/// cache is f32**: `mla_attention_step_t` takes `c_kv: &Tensor`, a plain f32 tensor, and the
+/// int8 `QKvCache` serves standard attention only. There is no quantized MLA variant.
+///
+/// So every f16 figure above understates the case by 2x, and the real picture is:
+///
+/// ```text
+///   GLM-4.7-Flash Q4_K_S, 15.3 GiB weights, f32 MLA latent
+///     ctx  32,000   cache 3.3 GiB  (17.7% of bytes read)   int8 would give 1.15x
+///     ctx 128,000   cache 13.2 GiB (46.3%)                  int8 would give 1.53x
+///     ctx 512,000   cache 52.7 GiB (77.5%)                  int8 would give 2.39x
+///
+///   max context on 31 GiB:   f32  152,431 tokens
+///                            int8 609,727 tokens
+/// ```
+///
+/// **Quantizing the MLA latent is the single largest unbuilt lever for long context**, and it is
+/// both a 4x capacity win and — past roughly 64k — a real speed win. The mechanism exists for the
+/// other cache type, which makes this a port rather than a design.
+///
+/// The staged cache (hot f32 window over a warm int8 tail) already exists too, and applies to the
+/// same problem from the other direction.
+///
 /// The shapes that decide cache size.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct KvShape {
@@ -149,6 +174,20 @@ pub fn precision_speed_case(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_f32_baseline_makes_the_case_TWICE_what_f16_suggested() {
+        // Checked rather than assumed: the MLA path takes c_kv as a plain f32 Tensor, so the f16
+        // numbers elsewhere in this module understate it by 2x.
+        let s = KvShape::glm_flash(48);
+        let f32_share = {
+            let cache = s.bytes_per_token(4.0) * 128_000.0 / 1024f64.powi(3);
+            cache / (cache + 15.3)
+        };
+        let f16_share = cache_read_share(&s, "f16", 128_000, 15.3).unwrap();
+        assert!(f32_share > f16_share * 1.4, "f32 {f32_share:.3} vs f16 {f16_share:.3}");
+        assert!(f32_share > 0.45, "at 128k the f32 cache is nearly half the read");
+    }
 
     #[test]
     fn the_cache_share_CROSSES_OVER_between_short_and_long_context() {
