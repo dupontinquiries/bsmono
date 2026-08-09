@@ -24,7 +24,7 @@
 //! "y"  message kind — "q" query, "r" reply, "e" error
 //! "q"  query name — ping, find, get, put, listen, refresh
 //! "a"  arguments map: "id", "target"/"h", "token", "values", "want"
-//! "r"  reply map:     "id", "token", "nodes", "values"
+//! "r"  reply map:     "id", "token", "nodes" (v4), "nodes6" (v6), "values"
 //! "e"  error array:   [code, message]
 //! ```
 //!
@@ -90,34 +90,63 @@ pub struct Value {
     pub data: Vec<u8>,
 }
 
-/// A peer address as the wire carries it: 4-byte IPv4 plus port.
+/// A peer address as the wire carries it — **both families**.
 ///
-/// IPv4-only, deliberately and visibly. The reference carries both, and a kit
-/// that silently truncated a v6 address would produce a routing table full of
-/// plausible wrong peers. `Addr::from_bytes` refuses a length it does not
-/// understand instead.
+/// The first version of this kit was v4-only, and that was wrong for the reason
+/// v6 exists: a dual-stack peer reachable over v6 usually needs no NAT
+/// traversal at all, so dropping v6 contacts discards exactly the peers that
+/// are easiest to reach. On a v6-only network it discards all of them.
+///
+/// The reference keeps the families in separate reply keys — `nodes` and
+/// `nodes6` — rather than tagging each entry, so a v4-only implementation reads
+/// the key it understands and ignores the other. That is why this enum encodes
+/// into two lists instead of one tagged list: a tag would make every old client
+/// fail on a mixed reply.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Addr {
-    pub ip: [u8; 4],
-    pub port: u16,
+pub enum Addr {
+    V4([u8; 4], u16),
+    V6([u8; 16], u16),
 }
 
-impl Addr {
-    pub fn new(ip: [u8; 4], port: u16) -> Addr { Addr { ip, port } }
+/// Bytes on the wire for one node entry: 20-byte id plus the address.
+pub const NODE_ENTRY_V4: usize = HASH_LEN + 6;
+pub const NODE_ENTRY_V6: usize = HASH_LEN + 18;
 
-    pub fn to_bytes(&self) -> [u8; 6] {
-        let mut b = [0u8; 6];
-        b[..4].copy_from_slice(&self.ip);
-        b[4..].copy_from_slice(&self.port.to_be_bytes());
+impl Addr {
+    /// Kept for callers written against the v4-only version.
+    pub fn new(ip: [u8; 4], port: u16) -> Addr { Addr::V4(ip, port) }
+
+    pub fn v6(ip: [u8; 16], port: u16) -> Addr { Addr::V6(ip, port) }
+
+    pub fn port(&self) -> u16 {
+        match self { Addr::V4(_, p) | Addr::V6(_, p) => *p }
+    }
+
+    pub fn is_v6(&self) -> bool { matches!(self, Addr::V6(..)) }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        match self {
+            Addr::V4(ip, p) => { b.extend_from_slice(ip); b.extend_from_slice(&p.to_be_bytes()); }
+            Addr::V6(ip, p) => { b.extend_from_slice(ip); b.extend_from_slice(&p.to_be_bytes()); }
+        }
         b
     }
 
+    /// Length decides the family — 6 bytes is v4, 18 is v6. No tag byte,
+    /// because the reference does not send one and inventing one here would
+    /// make our replies unreadable to it.
     pub fn from_bytes(b: &[u8]) -> Option<Addr> {
-        if b.len() != 6 { return None; }
-        Some(Addr {
-            ip: [b[0], b[1], b[2], b[3]],
-            port: u16::from_be_bytes([b[4], b[5]]),
-        })
+        match b.len() {
+            6 => Some(Addr::V4([b[0], b[1], b[2], b[3]],
+                               u16::from_be_bytes([b[4], b[5]]))),
+            18 => {
+                let mut ip = [0u8; 16];
+                ip.copy_from_slice(&b[..16]);
+                Some(Addr::V6(ip, u16::from_be_bytes([b[16], b[17]])))
+            }
+            _ => None,
+        }
     }
 }
 
@@ -385,13 +414,26 @@ impl Msg {
                 put_str(&mut o, "t"); put_uint(&mut o, *tid as u64);
                 put_str(&mut o, "y"); put_str(&mut o, "r");
                 put_str(&mut o, "r");
-                put_map(&mut o, 4);
+                put_map(&mut o, 5);
                 put_str(&mut o, "id"); put_bin(&mut o, &from.0);
                 put_str(&mut o, "token"); put_uint(&mut o, *token as u64);
+                // Split by family, as the reference does. A single tagged list
+                // would be simpler and would make every v4-only client fail on
+                // a mixed reply.
+                let v4: Vec<_> = nodes.iter().filter(|(_, a)| !a.is_v6()).collect();
+                let v6: Vec<_> = nodes.iter().filter(|(_, a)| a.is_v6()).collect();
                 put_str(&mut o, "nodes");
-                put_arr(&mut o, nodes.len());
-                for (h, a) in nodes {
-                    let mut packed = Vec::with_capacity(HASH_LEN + 6);
+                put_arr(&mut o, v4.len());
+                for (h, a) in &v4 {
+                    let mut packed = Vec::with_capacity(NODE_ENTRY_V4);
+                    packed.extend_from_slice(&h.0);
+                    packed.extend_from_slice(&a.to_bytes());
+                    put_bin(&mut o, &packed);
+                }
+                put_str(&mut o, "nodes6");
+                put_arr(&mut o, v6.len());
+                for (h, a) in &v6 {
+                    let mut packed = Vec::with_capacity(NODE_ENTRY_V6);
                     packed.extend_from_slice(&h.0);
                     packed.extend_from_slice(&a.to_bytes());
                     put_bin(&mut o, &packed);
@@ -456,11 +498,18 @@ impl Msg {
                                 let k = r.arr_len()?;
                                 for _ in 0..k { values.push(read_value(&mut r)?); }
                             }
-                            "nodes" => {
+                            "nodes" | "nodes6" => {
                                 let k = r.arr_len()?;
                                 for _ in 0..k {
                                     let b = r.bin()?;
-                                    if b.len() != HASH_LEN + 6 { return None; }
+                                    // The entry's own length says which family
+                                    // it is, so one branch reads both keys and
+                                    // a v6 entry arriving under "nodes" still
+                                    // parses rather than being rejected on a
+                                    // key name.
+                                    if b.len() != NODE_ENTRY_V4 && b.len() != NODE_ENTRY_V6 {
+                                        return None;
+                                    }
                                     let mut h = [0u8; HASH_LEN];
                                     h.copy_from_slice(&b[..HASH_LEN]);
                                     nodes.push((InfoHash(h), Addr::from_bytes(&b[HASH_LEN..])?));
@@ -609,12 +658,63 @@ mod tests {
     }
 
     #[test]
-    fn an_address_that_is_not_four_bytes_plus_a_port_is_refused() {
-        // IPv4-only is a stated limit, not a silent one: truncating a v6
-        // address would fill a routing table with plausible wrong peers.
-        assert!(Addr::from_bytes(&[1, 2, 3, 4, 0, 80]).is_some());
-        assert!(Addr::from_bytes(&[1, 2, 3, 4]).is_none());
-        assert!(Addr::from_bytes(&[0; 18]).is_none());
+    fn an_address_is_read_by_length_and_nothing_else_is_accepted() {
+        // 6 bytes is v4, 18 is v6, and there is no tag byte because the
+        // reference does not send one. Anything else is a different address
+        // family or a corrupt entry, and guessing would put an unreachable peer
+        // in the routing table.
+        assert_eq!(Addr::from_bytes(&[1, 2, 3, 4, 0, 80]), Some(Addr::V4([1, 2, 3, 4], 80)));
+        assert!(matches!(Addr::from_bytes(&[0; 18]), Some(Addr::V6(..))));
+        for bad in [0usize, 4, 5, 7, 16, 17, 19, 22] {
+            assert!(Addr::from_bytes(&vec![0u8; bad]).is_none(), "{bad} bytes accepted");
+        }
+    }
+
+    #[test]
+    fn v4_and_v6_nodes_travel_in_separate_reply_keys() {
+        // The reference splits them so a v4-only client reads `nodes` and
+        // ignores `nodes6`. A single tagged list would be simpler and would
+        // make every such client fail on a mixed reply.
+        let m = Msg::Reply {
+            tid: 1,
+            from: h(1),
+            nodes: vec![
+                (h(2), Addr::V4([192, 168, 0, 2], 4222)),
+                (h(3), Addr::V6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                 0, 0, 0, 0, 0, 0, 0, 1], 4223)),
+                (h(4), Addr::V4([10, 0, 0, 9], 5000)),
+            ],
+            values: vec![],
+            token: 7,
+        };
+        let bytes = m.encode();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("nodes6"), "the v6 key must be present");
+        let back = Msg::decode(&bytes).expect("round trip");
+        match back {
+            Msg::Reply { nodes, .. } => {
+                assert_eq!(nodes.len(), 3, "all three survive the split");
+                assert_eq!(nodes.iter().filter(|(_, a)| a.is_v6()).count(), 1);
+                // Order within a family is preserved; families are grouped.
+                assert_eq!(nodes[0].1, Addr::V4([192, 168, 0, 2], 4222));
+                assert_eq!(nodes[2].1, Addr::V6([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                                 0, 0, 0, 0, 0, 0, 0, 1], 4223));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_v6_only_reply_still_carries_its_peers() {
+        // On a v6-only network every contact is v6, and a kit that dropped them
+        // would report an empty DHT rather than a working one.
+        let m = Msg::Reply {
+            tid: 2, from: h(5),
+            nodes: vec![(h(6), Addr::V6([0xfe, 0x80, 0, 0, 0, 0, 0, 0,
+                                         0, 0, 0, 0, 0, 0, 0, 2], 9000))],
+            values: vec![], token: 0,
+        };
+        assert_eq!(Msg::decode(&m.encode()), Some(m));
     }
 
     #[test]

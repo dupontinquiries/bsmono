@@ -25,7 +25,7 @@ use crate::node::{FindValue, Node};
 use crate::routing::{Contact, NodeId, ID_LEN};
 use crate::store::Key;
 use dht_kit::{Addr as WireAddr, InfoHash, Msg, Query, Value};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 /// snapcore ids and dht-kit hashes are both 160-bit, so this is a rename rather
 /// than a conversion — asserted by the compiler through `ID_LEN`.
@@ -41,21 +41,28 @@ pub fn from_hash(h: &InfoHash) -> NodeId {
     NodeId(b)
 }
 
-/// IPv4 only, and it fails rather than truncating.
+/// Both families, since dht-kit gained `nodes6`.
 ///
-/// dht-kit's node entries are 4-byte addresses, so a v6 contact cannot be put
-/// on the wire. Returning `None` means such a contact is **omitted from a
-/// reply**, which is honest; mapping it to 0.0.0.0 would advertise a peer
-/// nobody can reach and quietly poison the requester's routing table.
-pub fn to_wire_addr(a: &SocketAddr) -> Option<WireAddr> {
+/// The first version returned `None` for v6 and dropped those contacts from
+/// replies. That was the wrong trade on any modern network: a peer reachable
+/// over v6 usually needs no NAT traversal at all, so dropping them discards
+/// precisely the easiest peers to reach — and on a v6-only network it reports
+/// an empty DHT.
+///
+/// Infallible now, which is why it returns `WireAddr` rather than an `Option`:
+/// there is no address a socket can hold that the wire cannot carry.
+pub fn to_wire_addr(a: &SocketAddr) -> WireAddr {
     match a.ip() {
-        IpAddr::V4(v4) => Some(WireAddr::new(v4.octets(), a.port())),
-        IpAddr::V6(_) => None,
+        IpAddr::V4(v4) => WireAddr::V4(v4.octets(), a.port()),
+        IpAddr::V6(v6) => WireAddr::V6(v6.octets(), a.port()),
     }
 }
 
 pub fn from_wire_addr(a: &WireAddr) -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::from(a.ip)), a.port)
+    match a {
+        WireAddr::V4(ip, p) => SocketAddr::new(IpAddr::V4(Ipv4Addr::from(*ip)), *p),
+        WireAddr::V6(ip, p) => SocketAddr::new(IpAddr::V6(Ipv6Addr::from(*ip)), *p),
+    }
 }
 
 /// Turn an inbound message into the handler call it names, and produce the
@@ -86,9 +93,10 @@ pub fn handle(node: &mut Node, from_addr: SocketAddr, msg: &Msg, now: u64) -> Op
     // it chose, which is how a routing table gets filled with a single
     // attacker's endpoints.
     let pack = |contacts: Vec<Contact>| -> Vec<(InfoHash, WireAddr)> {
-        contacts.iter()
-            .filter_map(|c| to_wire_addr(&c.addr).map(|a| (to_hash(&c.id), a)))
-            .collect()
+        // No filter_map any more: every contact can be carried, so a reply
+        // lists what the routing table actually knows rather than the v4 subset
+        // of it.
+        contacts.iter().map(|c| (to_hash(&c.id), to_wire_addr(&c.addr))).collect()
     };
 
     match query {
@@ -251,7 +259,7 @@ mod tests {
                &query_from(0x11, Query::Ping, InfoHash::zero(), None), 10);
         match handle(&mut n, peer(), &query_from(0x22, Query::Find, InfoHash::from_seed(2), None), 11) {
             Some(Msg::Reply { nodes, .. }) => {
-                assert!(nodes.iter().any(|(_, a)| a.ip == [203, 0, 113, 5] && a.port == 9999),
+                assert!(nodes.iter().any(|(_, a)| *a == WireAddr::V4([203, 0, 113, 5], 9999)),
                         "the contact came from the socket: {nodes:?}");
             }
             other => panic!("{other:?}"),
@@ -273,7 +281,7 @@ mod tests {
                 let same_id: Vec<_> = nodes.iter()
                     .filter(|(h, _)| *h == InfoHash::from_seed(0x33)).collect();
                 assert_eq!(same_id.len(), 1, "one entry per id: {nodes:?}");
-                assert_eq!(same_id[0].1.ip, [198, 51, 100, 7], "the newer address wins");
+                assert_eq!(same_id[0].1, WireAddr::V4([198, 51, 100, 7], 1234), "the newer address wins");
             }
             other => panic!("{other:?}"),
         }
@@ -286,10 +294,27 @@ mod tests {
     }
 
     #[test]
-    fn a_v6_contact_is_omitted_from_a_reply_rather_than_mapped_to_zero() {
-        // dht-kit node entries are v4. Advertising 0.0.0.0 would poison the
-        // requester's table with a peer nobody can reach.
-        assert!(to_wire_addr(&"[::1]:4222".parse().unwrap()).is_none());
-        assert!(to_wire_addr(&"10.0.0.1:4222".parse().unwrap()).is_some());
+    fn both_address_families_survive_the_round_trip() {
+        for s in ["10.0.0.1:4222", "[2001:db8::1]:4223", "[fe80::2]:9000"] {
+            let a: SocketAddr = s.parse().unwrap();
+            assert_eq!(from_wire_addr(&to_wire_addr(&a)), a, "{s}");
+        }
+    }
+
+    #[test]
+    fn a_v6_peer_is_advertised_rather_than_dropped() {
+        // The bug this replaced: v6 contacts were filtered out of replies, so a
+        // v6-only network reported an empty DHT and a dual-stack one hid the
+        // peers needing no NAT traversal at all.
+        let mut n = node(9);
+        handle(&mut n, "[2001:db8::5]:9999".parse().unwrap(),
+               &query_from(0x55, Query::Ping, InfoHash::zero(), None), 10);
+        match handle(&mut n, peer(), &query_from(0x66, Query::Find, InfoHash::from_seed(2), None), 11) {
+            Some(Msg::Reply { nodes, .. }) => {
+                assert!(nodes.iter().any(|(_, a)| a.is_v6()),
+                        "the v6 peer must come back: {nodes:?}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
