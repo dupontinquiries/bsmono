@@ -422,10 +422,57 @@ def occupancy_residual(ex, comp, R, size, n=16):
             "add": enc(add), "rem": enc(rem)}, iou
 
 
+def load_web_exemplars(path):
+    """Exemplar geometry straight out of the web, keyed by signature.
+
+    The solver used to read a directory of loose .obj files, which quietly made
+    the pipeline non-self-contained: `catalog/importedcat/meshes` holds 790
+    exemplars while `partlib_full.json` references 40,742 part types, so a solve
+    against the committed tree found an exemplar for one placement in fifty and
+    reported a pre-residual IoU of 0.012 — not a fidelity result, a missing-file
+    result.
+
+    The web has all 40,742. Reading from it means the solve runs on what is
+    actually committed, which is the difference between a reproducible pipeline
+    and one that only worked on the machine where /tmp still had the harvest.
+    """
+    import gzip, struct as _s
+    with gzip.open(path, "rb") as f:
+        if f.read(6) != b"BSWEB\x01":
+            raise ValueError("not a BSWEB file")
+        nidx, npay = _s.unpack("<II", f.read(8))
+        idx = json.loads(f.read(nidx))
+        pay = f.read(npay)
+    off, o = [], 0
+    for g in idx["geom"]:
+        off.append((o, o + g["v"]))
+        o += g["v"] + g["i"]
+    bits = idx.get("bits", 16)
+    wide = bits > 8
+    step = 6 if wide else 3
+    maxq = 65535.0 if wide else 255.0
+    out = {}
+    for part in idx["parts"]:
+        sig = part.get("sig")
+        if not sig or sig in out:
+            continue
+        vs, ve = off[part["geom"]]
+        vb = pay[vs:ve]
+        lo, span = part["lo"], part["span"]
+        verts = []
+        for i in range(part["nv"]):
+            q = _s.unpack_from("<3H" if wide else "<3B", vb, i * step)
+            verts.append([lo[d] + q[d] / maxq * span[d] for d in range(3)])
+        out[sig] = verts
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lib", required=True)
-    ap.add_argument("--meshes", required=True, help="dir of exemplar .obj")
+    ap.add_argument("--meshes", default=None, help="dir of exemplar .obj")
+    ap.add_argument("--web", default=None,
+                    help="read exemplars from a BSWEB file instead of loose .obj")
     ap.add_argument("--originals", required=True, help="dir of <model>/<model>.obj")
     ap.add_argument("--out", required=True)
     ap.add_argument("--samples", type=int, default=64)
@@ -439,12 +486,18 @@ def main():
     lib = json.load(open(a.lib))
     # Exemplar geometry by signature, so a placement can find what it stands in
     # for.
-    by_sig = {}
-    for p in lib.get("parts", []):
-        if p.get("mesh") and p.get("sig") and p["sig"] not in by_sig:
-            mp = os.path.join(a.meshes, p["mesh"] + ".obj")
-            if os.path.exists(mp):
-                by_sig[p["sig"]] = load_obj(mp)[0]
+    if a.web:
+        by_sig = load_web_exemplars(a.web)
+    elif a.meshes:
+        by_sig = {}
+        for p in lib.get("parts", []):
+            if p.get("mesh") and p.get("sig") and p["sig"] not in by_sig:
+                mp = os.path.join(a.meshes, p["mesh"] + ".obj")
+                if os.path.exists(mp):
+                    by_sig[p["sig"]] = load_obj(mp)[0]
+    else:
+        ap.error("need --web or --meshes")
+    print("exemplars available: %d" % len(by_sig))
 
     solved = unsolved = modcells = 0
     residuals = []
