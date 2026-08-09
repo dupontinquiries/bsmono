@@ -275,6 +275,69 @@ def shape_modifier(ex, comp, R, size, bins=8):
     return mod, len(cb), len(ca)
 
 
+def vox(points, lo, span, n):
+    """Occupancy of a point set on a shared grid."""
+    out = set()
+    for p in points:
+        out.add(tuple(min(n - 1, max(0, int((p[i] - lo[i]) / span[i] * n)))
+                      for i in range(3)))
+    return out
+
+
+def occupancy_residual(ex, comp, R, size, n=16):
+    """The residual as OCCUPANCY, which is what the last round's measurement
+    said it had to be.
+
+    A displacement field moved silhouette IoU by exactly 0.000, and the reason
+    was measurable: of 2,083 cells, only 236 were occupied by both the posed
+    exemplar and the component. The other 1,847 were volume one had and the
+    other did not — nothing to displace. Silhouette error IS occupancy error.
+
+    So this stores two sparse sets instead of a vector field:
+
+        add    -- cells the component fills and the exemplar does not
+        remove -- cells the exemplar fills and the component does not
+
+    Cheaper than the displacement it replaces (one packed index per changed
+    cell against three signed bytes) and it acts on exactly the cells that were
+    wrong. Both sets are volumetric — this is a shape correction over space,
+    not a surface tweak.
+    """
+    ce, cc = centroid(ex), centroid(comp)
+    # Scale exemplar extent onto the COMPONENT's extent, not onto the
+    # placement's `size`. Measured: size is ~2x the max-axis extent (0.554
+    # against 0.346), so using it inflated every exemplar to roughly double and
+    # nothing overlapped its component — pre-residual IoU 0.016. `size` is a
+    # diagonal-like measure and extent is a per-axis one; they are not
+    # interchangeable, and treating them as such was the whole failure.
+    ext = max(max(p[i] for p in ex) - min(p[i] for p in ex) for i in range(3)) or 1.0
+    cext = max(max(p[i] for p in comp) - min(p[i] for p in comp) for i in range(3)) or ext
+    sc = cext / ext
+    posed = [[sum(R[i][j] * (p[j] - ce[j]) for j in range(3)) * sc + cc[i]
+              for i in range(3)] for p in ex]
+
+    lo = [min(p[i] for p in posed + comp) for i in range(3)]
+    hi = [max(p[i] for p in posed + comp) for i in range(3)]
+    span = [max(hi[i] - lo[i], 1e-9) for i in range(3)]
+
+    A = vox(posed, lo, span, n)
+    B = vox(comp, lo, span, n)
+    add = sorted(B - A)
+    rem = sorted(A - B)
+    # Packed as a single index per cell: n<=16 fits three 4-bit fields in a
+    # u16, so a changed cell costs two bytes rather than six.
+    enc = lambda s: [(c[0] * n + c[1]) * n + c[2] for c in s]
+    iou = len(A & B) / max(1, len(A | B))
+    # The grid FRAME travels with the residual. The solver sizes the grid over
+    # the posed exemplar AND the component; a reader that only has the exemplar
+    # would derive a different box, and every cell index would then refer to
+    # the wrong place. That is not a detail — it silently turns a correction
+    # into noise, which is exactly what it did before this was stored.
+    return {"n": n, "lo": [round(x, 6) for x in lo],
+            "span": [round(x, 6) for x in span],
+            "add": enc(add), "rem": enc(rem)}, iou
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--lib", required=True)
@@ -283,6 +346,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--samples", type=int, default=64)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--grid", type=int, default=16,
+                    help="occupancy grid per part; 16 packs a cell into a u16")
     ap.add_argument("--modifiers", action="store_true",
                     help="store a volumetric residual field per placement")
     a = ap.parse_args()
@@ -299,6 +364,7 @@ def main():
 
     solved = unsolved = modcells = 0
     residuals = []
+    pre_iou = []
     items = list(lib.get("placements", {}).items())
     if a.limit:
         items = items[:a.limit]
@@ -334,13 +400,22 @@ def main():
                 unsolved += 1
                 continue
             pl["rot"] = [[round(R[i][j], 6) for j in range(3)] for i in range(3)]
+            exx = max(max(q[i] for q in ex) - min(q[i] for q in ex) for i in range(3)) or 1.0
+            cxx = max(max(q[i] for q in comp) - min(q[i] for q in comp) for i in range(3)) or exx
+            pl["scale"] = round(cxx / exx, 6)
+            # The centroid recorded by the harvester is the placement's, but the
+            # component's own centroid is where the geometry actually sits —
+            # and they differ once a component is matched by proximity.
+            cc0 = centroid(comp)
+            pl["centroid"] = [round(x, 6) for x in cc0]
             pl["rot_residual"] = round(err, 5)
             residuals.append(err)
             if a.modifiers:
-                mod, nb, na = shape_modifier(ex, comp, R, pl.get("size"))
-                if mod:
-                    pl["mod"] = mod
-                    modcells += len(mod)
+                occ, iou0 = occupancy_residual(ex, comp, R, pl.get("size"), a.grid)
+                if occ["add"] or occ["rem"]:
+                    pl["occ"] = occ
+                    modcells += len(occ["add"]) + len(occ["rem"])
+                    pre_iou.append(iou0)
             solved += 1
 
     json.dump(lib, open(a.out, "w"), separators=(",", ":"))
@@ -352,7 +427,11 @@ def main():
         p90 = residuals[int(len(residuals) * 0.9)]
         print("residual / size   : median %.3f   p90 %.3f" % (mid, p90))
     if a.modifiers:
-        print("modifier cells    : %d  (~%.1f KB raw)" % (modcells, modcells * 3 / 1024))
+        print("occupancy cells   : %d changed  (~%.1f KB at 2 bytes each)"
+              % (modcells, modcells * 2 / 1024))
+        if pre_iou:
+            print("pre-residual IoU  : %.3f mean (posed exemplar vs component)"
+                  % (sum(pre_iou) / len(pre_iou)))
     print("wrote %s" % a.out)
     return 0
 

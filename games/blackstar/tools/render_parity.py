@@ -83,10 +83,54 @@ def reconstruct(model, placements, idx, pay, off):
         # centre, then move it to the placement centroid.
         c = [sum(v[d] for v in pv) / len(pv) for d in range(3)]
         ext = max(max(v[d] for v in pv) - min(v[d] for v in pv) for d in range(3)) or 1.0
-        s = (pl["size"] or ext) / ext
+        # `size` is a diagonal-like measure, roughly 2x the max-axis extent —
+        # using it as a scale doubled every part. The solver records the scale
+        # it actually used; fall back to 1.0 rather than to `size`.
+        s = pl.get("scale") or 1.0
         base = len(verts)
         R = pl.get("rot")
+        occ = pl.get("occ")
         mod = pl.get("mod")
+
+        if occ:
+            # Occupancy path: pose the exemplar, voxelise it, apply the add /
+            # remove sets, and emit a box per occupied cell. The reconstruction
+            # becomes VOLUME rather than a surface copy — which is the point,
+            # since the residual corrects volume and a displaced surface cannot
+            # express "there is material here that the exemplar lacks".
+            posed = []
+            for v in pv:
+                q = [(v[d] - c[d]) * s for d in range(3)]
+                if R:
+                    q = [sum(R[i][j] * q[j] for j in range(3)) for i in range(3)]
+                posed.append([q[d] + pl["centroid"][d] for d in range(3)])
+            n = occ["n"]
+            # Use the frame the solver recorded, never a locally-derived one.
+            lo = occ["lo"]
+            span = occ["span"]
+            cells = set()
+            for p in posed:
+                cells.add(tuple(min(n - 1, max(0, int((p[i] - lo[i]) / span[i] * n)))
+                                for i in range(3)))
+            dec = lambda k: ((k // n) // n, (k // n) % n, k % n)
+            for k in occ.get("rem", []):
+                cells.discard(dec(k))
+            for k in occ.get("add", []):
+                cells.add(dec(k))
+            step = [span[i] / n for i in range(3)]
+            for (cx, cy, cz) in cells:
+                o = [lo[0] + cx * step[0], lo[1] + cy * step[1], lo[2] + cz * step[2]]
+                b0 = len(verts)
+                for dx in (0, 1):
+                    for dy in (0, 1):
+                        for dz in (0, 1):
+                            verts.append([o[0] + dx * step[0], o[1] + dy * step[1],
+                                          o[2] + dz * step[2]])
+                # 12 triangles per box, indices into the 8 corners just added.
+                for f in ((0,1,3),(0,3,2),(4,6,7),(4,7,5),(0,4,5),(0,5,1),
+                          (2,3,7),(2,7,6),(0,2,6),(0,6,4),(1,5,7),(1,7,3)):
+                    tris.append((b0+f[0], b0+f[1], b0+f[2]))
+            continue
         # Placement bounds for the modifier lookup, computed on the POSED
         # exemplar so the cell a vertex lands in matches the cell the solver
         # measured it in.
