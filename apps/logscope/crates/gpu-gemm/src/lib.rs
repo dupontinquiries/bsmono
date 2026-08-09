@@ -3369,11 +3369,16 @@ impl Gpu {
             // This site takes the frame through a `map` rather than an `if let`, so the blanket
             // drain did not reach it — and it is flush_and_wait, the path Scout uses PER LAYER.
             // Missing it would have dropped queued dispatches on the hottest route in the engine.
-            drop(g.take().map(|mut frame| {
+            // WAS drop(...map(...).map(...)), which the compiler flagged: that chain ends in
+            // Option<()> and dropping a Copy value does nothing. The side effects inside the
+            // maps had already run, so the code was correct and read as though the drop were
+            // load-bearing. An if-let says the same thing and cannot be misread.
+            if let Some(mut frame) = g.take() {
                 Self::drain_pending(&mut frame);
                 SUBMIT_BY_END_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                frame
-            }).map(|frame| { self.submit(frame.enc); self.retain_keep(frame.keep); }));
+                self.submit(frame.enc);
+                self.retain_keep(frame.keep);
+            }
         }
         let t_poll = std::time::Instant::now();
         crate::counted_poll(&self.device);
@@ -11483,8 +11488,12 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
         let gy = (n as u32).div_ceil(gx);
         let dims = [1u32, n as u32, k as u32, (k / 256) as u32, gx, 0, 0, 0];
         let wten = Tensor { buf: wt, rows: 1, cols: raw.len().div_ceil(4), pool: None, view: None };
-        let gten = self.iq1s_grid_tensor().clone();
-        self.dispatch(MATVEC_IQ1_S, &[&at, &wten, &gten], &out,
+        // No .clone(): Tensor does not implement Clone, so cloning a &Tensor copies the reference
+        // and does nothing. The cached grid is borrowed for the dispatch, which is all it needs —
+        // and had Tensor implemented Clone, that call would have duplicated a GPU buffer handle per
+        // matvec without anyone noticing, which is the version of this warning that costs something.
+        let gten = self.iq1s_grid_tensor();
+        self.dispatch(MATVEC_IQ1_S, &[&at, &wten, gten], &out,
                       bytemuck::cast_slice(&dims), (gx, gy, 1));
         self.download(&out)
     }
