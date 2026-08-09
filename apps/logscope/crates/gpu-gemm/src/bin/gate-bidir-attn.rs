@@ -8,9 +8,19 @@
 //! the cross-tile online-softmax rescale under the NON-causal bound, which no
 //! existing gate reaches.
 //!
-//! Tolerance: 1e-3 worst relative. f32 online accumulation against an f64 reference
-//! drifts with sqrt(t) — at t=2100 that is ~1e-5..1e-4 rounding scale; a mask bug or
-//! rescale bug shows up at 1e-1 scale and cannot hide under this bar.
+//! v2 metrics, after the v1 FAIL on lavapipe (worst-rel 9.24e-3): v1 compared f32-GPU
+//! against f64-CPU with a 1e-6 relative floor, so its worst-rel is dominated by
+//! whichever output element the random draw made tiny — it grows with sample count
+//! (t=8 passed, t=129 "failed") without any kernel defect, and it cannot be compared
+//! to the causal gate's 1e-7, which is f32-vs-f32. Three columns now discriminate:
+//!   1. tiled vs the NAIVE GPU bidirectional (f32 twin, the causal gate's own metric
+//!      class): <= 1e-4 — ulp-level agreement or the kernel is wrong, full stop.
+//!   2. worst ABSOLUTE error vs the f64 reference: <= 5e-5 — catches a defect that
+//!      the naive twin might share.
+//!   3. worst relative error restricted to well-conditioned elements (|ref| >= 1e-2):
+//!      <= 5e-4 — the v1 intent, minus the tiny-denominator artifact.
+//! If column 1 fails, the kernel is guilty. If 1 passes and 2 fails, BOTH bidir
+//! kernels share a defect. If all pass, v1 convicted its own oracle.
 //!
 //!   cargo run --release --bin gate-bidir-attn
 
@@ -49,9 +59,16 @@ fn main() {
         let k = gpu.upload(&kv, t, kvdm);
         let v = gpu.upload(&vv, t, kvdm);
         let got = gpu.download(&gpu.attention_mh_bidir_tiled(&q, &k, &v, t, dm, nh, nkv));
+        let naive = gpu.download(&gpu.attention_mh_full_t(&q, &k, &v, t, dm, nh, nkv));
+        let mut worst_twin = 0.0f32; // tiled vs naive GPU: the f32-vs-f32 metric class
+        for (g, nv) in got.iter().zip(&naive) {
+            let rel = (g - nv).abs() / nv.abs().max(1e-6);
+            worst_twin = worst_twin.max(rel);
+        }
 
         let scale = 1.0f64 / (hd as f64).sqrt();
-        let mut worst = 0.0f32;
+        let mut worst_abs = 0.0f64;
+        let mut worst = 0.0f32; // rel, well-conditioned elements only
         for i in 0..t {
             for h in 0..nh {
                 let kb = (h / (nh / nkv)) * hd;
@@ -72,12 +89,17 @@ fn main() {
                 for c in 0..hd {
                     let e: f64 = (0..t).map(|j| s[j] * vv[j * kvdm + kb + c] as f64).sum();
                     let g = got[i * dm + h * hd + c];
-                    let rel = (g as f64 - e).abs() / e.abs().max(1e-6);
-                    worst = worst.max(rel as f32);
+                    worst_abs = worst_abs.max((g as f64 - e).abs());
+                    if e.abs() >= 1e-2 {
+                        let rel = (g as f64 - e).abs() / e.abs();
+                        worst = worst.max(rel as f32);
+                    }
                 }
             }
         }
-        ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: worst rel {worst:.2e} <= 1e-3"), worst <= 1e-3);
+        ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: tiled==naive f32 twin, worst rel {worst_twin:.2e} <= 1e-4"), worst_twin <= 1e-4);
+        ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: worst ABS vs f64 ref {worst_abs:.2e} <= 5e-5"), worst_abs <= 5e-5);
+        ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: worst rel (|ref|>=1e-2) {worst:.2e} <= 5e-4"), worst <= 5e-4);
     }
 
     println!(
