@@ -271,6 +271,38 @@ impl<'a> Rd<'a> {
             _ => None,
         }
     }
+    /// Skip one value of any type this subset can encode.
+    ///
+    /// Needed because the reference's maps carry keys we do not implement —
+    /// `want` (which address families to return), `sid`, and whatever a later
+    /// version adds. The first version of this kit REFUSED unknown keys, which
+    /// sounded strict and meant a real OpenDHT message carrying `want` was
+    /// dropped whole. Strictness against a protocol you do not control is not
+    /// safety, it is a guarantee of eventual incompatibility.
+    ///
+    /// Skipping is only safe because it is *structural*: the value is parsed
+    /// well enough to know its length and then discarded, so a malformed one
+    /// still fails rather than desynchronising the reader.
+    fn skip(&mut self) -> Option<()> {
+        let t = *self.b.get(self.i)?;
+        match t {
+            0x00..=0x7F | 0xC0 | 0xC2 | 0xC3 => { self.i += 1; }
+            0xCC => { self.i += 2; }
+            0xCD => { self.i += 3; }
+            0xCE => { self.i += 5; }
+            0xCF => { self.i += 9; }
+            0xA0..=0xBF => { let n = (t & 0x1F) as usize; self.i += 1; self.take(n)?; }
+            0xD9 => { self.i += 1; let n = self.byte()? as usize; self.take(n)?; }
+            0xDA => { self.i += 1; let n = u16::from_be_bytes(self.take(2)?.try_into().ok()?) as usize; self.take(n)?; }
+            0xC4 | 0xC5 | 0xC6 => { let _ = self.bin()?; }
+            0x90..=0x9F | 0xDC => { let n = self.arr_len()?; for _ in 0..n { self.skip()?; } }
+            0x80..=0x8F | 0xDE => { let n = self.map_len()?; for _ in 0..n { self.skip()?; self.skip()?; } }
+            _ => return None,
+        }
+        if self.i > self.b.len() { return None; }
+        Some(())
+    }
+
     fn hash(&mut self) -> Option<InfoHash> {
         let b = self.bin()?;
         if b.len() != HASH_LEN { return None; }
@@ -405,7 +437,11 @@ impl Msg {
                                     nodes.push((InfoHash(h), Addr::from_bytes(&b[HASH_LEN..])?));
                                 }
                             }
-                            _ => return None,
+                            // Unknown argument keys are SKIPPED, not refused:
+                            // the reference sends `want` today and will send
+                            // more later, and rejecting the message loses the
+                            // parts we do understand.
+                            _ => r.skip()?,
                         }
                     }
                 }
@@ -566,11 +602,83 @@ mod tests {
         }
     }
 
+
     #[test]
-    fn an_unknown_map_key_is_refused_rather_than_ignored() {
-        // Skipping unknown keys sounds tolerant and is how two implementations
-        // silently disagree about what a message meant. Better to fail loudly
-        // while the format is still being pinned down.
+    fn an_unknown_argument_key_is_skipped_so_the_message_survives() {
+        // The reference sends `want` (which address families to return) and we
+        // do not implement it. Refusing the message would drop a valid query
+        // over a field we simply do not need — strictness against a protocol
+        // you do not control is a guarantee of eventual incompatibility.
+        let mut b = Vec::new();
+        put_map(&mut b, 4);
+        put_str(&mut b, "t"); put_uint(&mut b, 5);
+        put_str(&mut b, "y"); put_str(&mut b, "q");
+        put_str(&mut b, "q"); put_str(&mut b, "find");
+        put_str(&mut b, "a");
+        put_map(&mut b, 4);
+        put_str(&mut b, "id"); put_bin(&mut b, &h(1).0);
+        put_str(&mut b, "want"); put_arr(&mut b, 2);
+        put_str(&mut b, "n4"); put_str(&mut b, "n6");
+        put_str(&mut b, "h"); put_bin(&mut b, &h(2).0);
+        put_str(&mut b, "token"); put_uint(&mut b, 3);
+        assert_eq!(Msg::decode(&b), Some(Msg::Query {
+            tid: 5, from: h(1), query: Query::Find, target: h(2),
+            token: 3, value: None,
+        }));
+    }
+
+    #[test]
+    fn skipping_is_structural_so_a_malformed_unknown_still_fails() {
+        // The danger of skipping is desynchronising the reader — walking past a
+        // length that was a lie and reading the next key from the middle of a
+        // value. The skip parses enough to know the length, so a truncated
+        // unknown fails instead.
+        let mut b = Vec::new();
+        put_map(&mut b, 4);
+        put_str(&mut b, "t"); put_uint(&mut b, 5);
+        put_str(&mut b, "y"); put_str(&mut b, "q");
+        put_str(&mut b, "q"); put_str(&mut b, "find");
+        put_str(&mut b, "a");
+        put_map(&mut b, 2);
+        put_str(&mut b, "junk");
+        b.push(0xC5); b.extend_from_slice(&9999u16.to_be_bytes()); // promises 9999 bytes
+        b.extend_from_slice(b"short");
+        assert_eq!(Msg::decode(&b), None);
+    }
+
+    #[test]
+    fn a_nested_unknown_value_is_skipped_whole() {
+        // Maps and arrays nest; a skip that handled only scalars would read a
+        // nested map's first key as the next argument key.
+        let mut b = Vec::new();
+        put_map(&mut b, 4);
+        put_str(&mut b, "t"); put_uint(&mut b, 9);
+        put_str(&mut b, "y"); put_str(&mut b, "q");
+        put_str(&mut b, "q"); put_str(&mut b, "get");
+        put_str(&mut b, "a");
+        put_map(&mut b, 3);
+        put_str(&mut b, "future");
+        put_map(&mut b, 2);
+        put_str(&mut b, "id"); put_uint(&mut b, 7);      // same key names as ours
+        put_str(&mut b, "h"); put_bin(&mut b, &[0u8; 20]);
+        put_str(&mut b, "id"); put_bin(&mut b, &h(3).0);
+        put_str(&mut b, "h"); put_bin(&mut b, &h(4).0);
+        match Msg::decode(&b) {
+            Some(Msg::Query { from, target, .. }) => {
+                assert_eq!(from, h(3), "the nested id must not leak out");
+                assert_eq!(target, h(4));
+            }
+            other => panic!("decoded as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_unknown_top_level_key_is_still_refused() {
+        // The asymmetry is deliberate. Inside `a`/`r` the reference extends
+        // freely, so skipping is required for interop. At the TOP level the
+        // keys are the message's own frame — t, y, q, a, r, e — and something
+        // unrecognised there means we are not looking at the message we think
+        // we are.
         let mut b = Vec::new();
         put_map(&mut b, 2);
         put_str(&mut b, "t"); put_uint(&mut b, 1);
