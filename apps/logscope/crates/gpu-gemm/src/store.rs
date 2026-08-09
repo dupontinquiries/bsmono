@@ -87,6 +87,17 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 ///
 /// v2: the value became a packed (kernel, tile).
 ///
+/// **v5: every GEMM tile verdict was probed against ONE pipeline.** `override TILE` was a
+/// spec constant, and this driver collapsed all three tile variants into a single compiled
+/// module — so a sweep that reported an 8/16/32 comparison measured the same pipeline three
+/// times, and the winners it persisted are noise. The fix templates the tile into the module
+/// source as a `const`, which no cache can collapse, and this bump discards verdicts made
+/// before it.
+///
+/// The same lesson as v4, arriving by a different route: **a cached verdict outlives the code
+/// that produced it**, and a probe with a broken fixture is worse than no probe because its
+/// output looks like a measurement.
+///
 /// **v4: the probes that produce these verdicts were fed corrupt weights.** `QUANT_PACK` and
 /// `Q4K_TO_Q4` packed their bytes with a shift by a lane-varying amount, which returns zero on
 /// Honeykrisp for every lane whose shift is non-zero. Three probes depended on it — `self_check_sg`,
@@ -100,7 +111,7 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 ///
 /// The rule this encodes: **changing a kernel invalidates every measurement taken against it.** The
 /// epoch is in the name so that is one edit rather than a cache-clearing instruction nobody follows.
-fn autotune_file() -> PathBuf { cache_root().join("autotune-v4.tsv") }
+fn autotune_file() -> PathBuf { cache_root().join("autotune-v5.tsv") }
 pub fn autotune_get(adapter: &str, k: usize, n: usize) -> Option<u32> {
     let txt = std::fs::read_to_string(autotune_file()).ok()?;
     for line in txt.lines() {
