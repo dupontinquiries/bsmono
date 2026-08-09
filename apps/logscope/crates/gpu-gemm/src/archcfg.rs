@@ -126,6 +126,20 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: true, dense_supported: true,
             note: "Qwen3-MoE (Qwen3-Coder-30B-A3B confirmed: d=2048, 48 layers, n_heads=32, n_kv_heads=4, head_dim=128 [NOTE head_dim != d/n_heads=64], 128 experts × ff=768, top-8, NO shared expert; ffn_*_exps stacked with the expert dim OUTERMOST, each slice contiguous & 256-divisible; attn_v/ffn_down_exps are mixed Q6_K/Q4_K per layer). Needs: (1) head_dim decoupled from d/n_heads in the attention path [moe::layer_shape], (2) per-expert dequant→requant of the stacked ffn_*_exps in the loader, (3) MoE forward route→top-8→weighted expert sum [moe::route, ready]. Reuses the existing matvec/SwiGLU kernels per expert.",
         },
+        // RND1 (general.architecture = "rnd1"): Radical Numerics' masked-DIFFUSION conversion of
+        // Qwen3-30B-A3B — identical tensor/metadata shape to qwen3moe (128 experts, top-8, QK-Norm,
+        // NO shared expert, NEOX rope), trained to denoise rather than to continue. Loads through the
+        // Qwen3Moe machinery unchanged; what differs is the FORWARD the caller runs (denoise_stats:
+        // bidirectional attention over the whole block, no KV accumulation) and the mask token, read
+        // from tokenizer.ggml.mask_token_id (gguf_mask_token_id in lib). AR-decoding this checkpoint
+        // emits fluent-looking noise — it has no causal training; that is the model, not a bug.
+        "rnd1" => ArchConfig {
+            arch: Arch::Qwen3Moe, prefix: "rnd1", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: true, moe_shared_expert: false, interleaved_nope: false,
+            logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            supported: true, dense_supported: true,
+            note: "RND1-30B-A3B: qwen3moe-shaped diffusion model; run the denoise path (denoise-bench), not AR decode. Mask id from tokenizer.ggml.mask_token_id.",
+        },
         // Qwen4 (general.architecture = "qwen4"): continues Qwen3.5's per-head QK-Norm base and adds
         // mixture-of-experts — a router (blk.N.ffn_gate_inp.weight) selecting top-k of N expert FFNs
         // (ffn_{gate,up,down}_exps.weight). The DENSE forward (QK-Norm → RoPE → GQA → SwiGLU → RMSNorm) is

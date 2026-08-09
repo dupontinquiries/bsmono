@@ -15319,3 +15319,336 @@ mod shader_drift_tests {
         for b in &bodies[1..] { assert_eq!(b, &bodies[0], "byte_at has drifted"); }
     }
 }
+
+// ============================================================================
+// Row-stats unembedding (diffuser confidence path)
+// ----------------------------------------------------------------------------
+// One workgroup per row over the [m, n] logits: online softmax stats without any
+// host-side [m, vocab] readback. Output per row: (argmax id, p_top, logit margin,
+// entropy in nats) — the Learn2PD filter's feature vector and EoTP's inputs, and
+// the replacement for downloading full logits in a denoise step. v1 materializes
+// [m, n] logits on-GPU via the proven tiled GEMM, then reduces; fusing the GEMM
+// and killing that intermediate is the follow-up once a row-view helper exists.
+// Correctness oracle: `cargo run --release --bin gate-rowstats` (lavapipe-safe).
+const ROWSTATS_F32: &str = r#"
+struct D { m:u32, n:u32 };
+@group(0)@binding(0) var<storage,read> z: array<f32>;
+@group(0)@binding(1) var<storage,read_write> o: array<f32>;
+@group(0)@binding(2) var<uniform> d: D;
+var<workgroup> w1: array<f32,64>;
+var<workgroup> w2: array<f32,64>;
+var<workgroup> ws: array<f32,64>;
+var<workgroup> wt: array<f32,64>;
+var<workgroup> wi: array<u32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let r=wg.x; let tid=lid.x; let base=r*d.n;
+  var z1=-3.0e38; var z2=-3.0e38; var s=0.0; var t=0.0; var id=0u;
+  var j=tid;
+  loop{ if(j>=d.n){break;}
+    let v=z[base+j];
+    if(v>z1){ let e=exp(z1-v); s=s*e+1.0; t=t*e+v*1.0; z2=z1; z1=v; id=j; }
+    else { let e=exp(v-z1); s=s+e; t=t+v*e; if(v>z2){ z2=v; } }
+    j=j+64u; }
+  w1[tid]=z1; w2[tid]=z2; ws[tid]=s; wt[tid]=t; wi[tid]=id;
+  workgroupBarrier();
+  for(var st=32u;st>0u;st=st>>1u){
+    if(tid<st){
+      let za=w1[tid]; let zb=w1[tid+st];
+      if(zb>za){
+        let e=exp(za-zb);
+        ws[tid]=ws[tid]*e+ws[tid+st];
+        wt[tid]=wt[tid]*e+wt[tid+st];
+        w2[tid]=max(w2[tid+st], za);
+        w1[tid]=zb; wi[tid]=wi[tid+st];
+      } else {
+        let e=exp(zb-za);
+        ws[tid]=ws[tid]+ws[tid+st]*e;
+        wt[tid]=wt[tid]+wt[tid+st]*e;
+        w2[tid]=max(w2[tid], zb);
+      }
+    }
+    workgroupBarrier();
+  }
+  if(tid==0u){
+    o[r*4u+0u]=f32(wi[0]);
+    o[r*4u+1u]=1.0/ws[0];
+    o[r*4u+2u]=w1[0]-w2[0];
+    o[r*4u+3u]=(w1[0]+log(ws[0]))-(wt[0]/ws[0]);
+  }
+}"#;
+
+impl Gpu {
+    /// Per-row unembedding stats: `hidden` is the final-norm'd `[m, k]` activations,
+    /// `w` the (tied) lm_head as q8-resident. Returns a `[m, 4]` tensor of
+    /// (argmax_id, p_top, logit_margin, entropy_nats); download is 16 bytes/row.
+    /// The `[m, n]` logits exist only as a GPU-side intermediate for the reduce.
+    pub fn unembed_stats(&self, hidden: &Tensor, w: &QWeight, m: usize) -> Tensor {
+        let z = self.linear_q8_0_t(hidden, w, m);
+        let out = self.alloc(m, 4);
+        let dims = [m as u32, w.n as u32, 0u32, 0u32];
+        self.dispatch(ROWSTATS_F32, &[&z], &out, bytemuck::cast_slice(&dims), (m as u32, 1, 1));
+        out
+    }
+}
+
+// ============================================================================
+// Non-causal tiled attention (the diffuser's attention)
+// ----------------------------------------------------------------------------
+// ATTENTION_MH_EXT_PAR with the causal bound and sliding window removed — the
+// ONLY semantic delta. Every query row attends [0, s): a denoise step sees the
+// whole block. Same 2048-row shared-memory tiles, online softmax with cross-tile
+// rescale, GQA head mapping, register accumulators (hd <= 192), one workgroup
+// per (row, head). Without this, a bidirectional step regresses to the naive
+// ATTENTION_MH_FULL shape — one thread per (row, head) streaming all of K/V —
+// which is the 120 GFLOPS quadratic term the tiled-prefill flag just evicted
+// from the causal path. Oracle: `cargo run --release --bin gate-bidir-attn`
+// (f64 CPU reference, includes a t=2100 case crossing the 2048-row tile).
+const ATTENTION_MH_BIDIR_PAR: &str = r#"
+struct D { s:u32,hd:u32,nh:u32,nkv:u32,base:u32,nswa:u32,swaty:u32,_c:u32 };
+@group(0)@binding(0) var<storage,read> q: array<f32>;
+@group(0)@binding(1) var<storage,read> kc: array<f32>;
+@group(0)@binding(2) var<storage,read> vc: array<f32>;
+@group(0)@binding(3) var<storage,read_write> o: array<f32>;
+@group(0)@binding(4) var<uniform> dd: D;
+var<workgroup> sc: array<f32,2048>;
+var<workgroup> red: array<f32,64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let row=wg.x;
+  let i=row/dd.nh; let hh=row%dd.nh; let tid=lid.x;
+  let dm=dd.nh*dd.hd; let kvdm=dd.nkv*dd.hd;
+  let b=hh*dd.hd; let kb=(hh/(dd.nh/dd.nkv))*dd.hd;
+  let scale=1.0/sqrt(f32(dd.hd));
+  let l=dd.base+dd.s;                                 // NON-CAUSAL: every row attends [0, base+s)
+  let TILE=2048u;
+  var m=-3.4e38; var den=0.0;
+  var acc0=0.0; var acc1=0.0; var acc2=0.0;
+  var t0=0u;                                          // no sliding window in a denoise step
+  loop {
+    if(t0>=l){break;}
+    let t1=min(l, t0+TILE);
+    var lmax=-3.4e38; var j=t0+tid;
+    loop { if(j>=t1){break;} var dot=0.0; for(var c=0u;c<dd.hd;c=c+1u){dot=dot+q[i*dm+b+c]*kc[j*kvdm+kb+c];} let sv=dot*scale; sc[j-t0]=sv; lmax=max(lmax,sv); j=j+64u; }
+    red[tid]=lmax; workgroupBarrier();
+    for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=max(red[tid],red[tid+st]); } workgroupBarrier(); }
+    let tilemax=red[0]; workgroupBarrier();
+    let newm=max(m, tilemax);
+    let resc=exp(m-newm);
+    var tden=0.0; j=t0+tid;
+    loop { if(j>=t1){break;} let p=exp(sc[j-t0]-newm); sc[j-t0]=p; tden=tden+p; j=j+64u; }
+    red[tid]=tden; workgroupBarrier();
+    for(var st=32u; st>0u; st=st>>1u){ if(tid<st){ red[tid]=red[tid]+red[tid+st]; } workgroupBarrier(); }
+    let tilesum=red[0]; workgroupBarrier();
+    den=den*resc+tilesum;
+    acc0=acc0*resc; acc1=acc1*resc; acc2=acc2*resc;
+    var c=tid; var slot=0u;
+    loop { if(c>=dd.hd){break;}
+      var a=0.0; for(var jj=t0;jj<t1;jj=jj+1u){ a=a+sc[jj-t0]*vc[jj*kvdm+kb+c]; }
+      if(slot==0u){acc0=acc0+a;} else if(slot==1u){acc1=acc1+a;} else {acc2=acc2+a;}
+      c=c+64u; slot=slot+1u;
+    }
+    m=newm; t0=t0+TILE;
+    workgroupBarrier();
+  }
+  var c=tid; var slot=0u;
+  loop { if(c>=dd.hd){break;}
+    var a=acc0; if(slot==1u){a=acc1;} else if(slot==2u){a=acc2;}
+    o[i*dm+b+c]=a/den; c=c+64u; slot=slot+1u;
+  }
+}"#;
+
+impl Gpu {
+    /// Tiled non-causal attention over raw `[t, kv_dim]` K/V — the denoise step's
+    /// attention. Falls back to the naive `attention_mh_full_t` above hd 192 (no
+    /// current target exceeds 128). Grid is one workgroup per (row, head), so
+    /// `t * n_heads` must stay under the 65,535 workgroup-x limit — same bound
+    /// the causal ext path already lives with.
+    pub fn attention_mh_bidir_tiled(&self, q: &Tensor, k: &Tensor, v: &Tensor, t: usize, dm: usize, n_heads: usize, n_kv_heads: usize) -> Tensor {
+        let hd = dm / n_heads;
+        if hd > 192 {
+            return self.attention_mh_full_t(q, k, v, t, dm, n_heads, n_kv_heads);
+        }
+        let out = self.alloc(t, dm);
+        let dims = [t as u32, hd as u32, n_heads as u32, n_kv_heads as u32, 0u32, 0u32, 0u32, 0u32];
+        self.dispatch(ATTENTION_MH_BIDIR_PAR, &[q, k, v], &out, bytemuck::cast_slice(&dims), ((t * n_heads) as u32, 1, 1));
+        out
+    }
+}
+
+// ============================================================================
+// Denoise step (the diffuser's forward) + policy seam
+// ----------------------------------------------------------------------------
+// Composes the gated parts into the real workload: bidirectional tiled attention
+// (gate-bidir-attn) over a full block, then per-position confidence stats
+// (gate-rowstats). Framed from birth — prefill_batched predates the frame fix
+// and pays per-dispatch submits; this path must not inherit that.
+// `block_bidir` is `block_prefill` with the attention call swapped and the
+// cache writes dropped; every other line is a transcription, on purpose.
+const _DENOISE_DOC: () = ();
+
+/// Which positions to reveal this step, given per-position stats. Pure — no GPU,
+/// no engine types beyond the stats layout — so implementations are testable on
+/// recorded traces and swappable (threshold heuristic, oracle recorder, learned
+/// Learn2PD filter) without touching the loop.
+pub trait DenoisePolicy {
+    /// `stats` is `[t][4]`: (argmax_id, p_top, logit_margin, entropy_nats).
+    /// `masked[i]` says whether position i is still hidden. Return the indices
+    /// to reveal this step (must be currently masked).
+    fn select(&mut self, step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize>;
+}
+
+/// Baseline policy: reveal the K most confident (highest p_top) masked positions
+/// per step — the fixed-budget schedule every dLLM paper's heuristic baseline uses.
+pub struct ConfidenceTopK { pub k: usize }
+impl DenoisePolicy for ConfidenceTopK {
+    fn select(&mut self, _step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..stats.len()).filter(|&i| masked[i]).collect();
+        idx.sort_by(|&a, &b| stats[b][1].partial_cmp(&stats[a][1]).unwrap_or(std::cmp::Ordering::Equal));
+        idx.truncate(self.k);
+        idx
+    }
+}
+
+impl Gpu {
+    /// Stats-only reduce over an existing `[rows, cols]` logits tensor (see
+    /// ROWSTATS_F32). Split out of `unembed_stats` so callers that already hold
+    /// logits from a `Weight::apply` route (any weight format) can reuse it.
+    pub fn rowstats_t(&self, z: &Tensor, rows: usize, cols: usize) -> Tensor {
+        let out = self.alloc(rows, 4);
+        let dims = [rows as u32, cols as u32, 0u32, 0u32];
+        self.dispatch(ROWSTATS_F32, &[z], &out, bytemuck::cast_slice(&dims), (rows as u32, 1, 1));
+        out
+    }
+
+    /// One transformer block, bidirectional, cacheless: `block_prefill` with
+    /// `attention_mh_bidir_tiled` in place of the causal kernel and the
+    /// `write_rows` cache appends removed. RoPE stays — masked-diffusion models
+    /// keep real positions; only the attention mask differs.
+    fn block_bidir(&self, w: &BlockWeights, x: &Tensor, ff: &Tensor, t: usize, d: usize, head_dim: usize, n_heads: usize, n_kv_heads: usize, base: f32, eps: f32) -> Tensor {
+        let base = w.rope_base.unwrap_or(base);
+        let base = if w.nope { 0.0 } else { base };
+        let hd = head_dim; let kv = n_kv_heads * hd; let ad = n_heads * hd;
+        let n1 = self.rmsnorm_t(x, &w.g1, t, d, eps);
+        let q = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wq.apply(self, &n1, t), &w.q_norm, t, ad, hd, eps), ff, t, ad, base, 0, hd), w, t, ad, hd, eps);
+        let q = match w.attn_temp {
+            Some(at) if w.nope && at.active_at(t.saturating_sub(1)) => self.scale_query_temp_rows(&q, at, 0, t, ad),
+            _ => q,
+        };
+        let k = self.kq_post(self.rope_mh_t(&self.qk_norm(w.wk.apply(self, &n1, t), &w.k_norm, t, kv, hd, eps), ff, t, kv, base, 0, hd), w, t, kv, hd, eps);
+        let v = w.wv.apply(self, &n1, t);
+        let attn = self.attention_mh_bidir_tiled(&q, &k, &v, t, ad, n_heads, n_kv_heads);
+        let o = w.wo.apply(self, &attn, t);
+        let x2 = self.add_t(x, &o);
+        self.ffn_apply(w, &x2, t, d, eps)
+    }
+
+    /// One denoise step's readout: bidirectional forward over `tokens`, final
+    /// norm, output projection, per-position stats. Returns `t * 4` f32s laid
+    /// out as ROWSTATS_F32 rows. Framed: one submit batch per step.
+    pub fn denoise_stats(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
+        let t = tokens.len();
+        if t == 0 { return Vec::new(); }
+        self.begin_frame();
+        let mut xh = Vec::with_capacity(t * m.d);
+        for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
+        let mut x = self.upload(&xh, t, m.d);
+        for li in 0..m.n_layers {
+            x = self.block_bidir(&m.layers[li], &x, &m.rope_factors, t, m.d, m.head_dim, m.n_heads, m.n_kv_heads, m.base, m.eps);
+        }
+        let xn = self.rmsnorm_t(&x, &m.out_norm, t, m.d, m.eps);
+        let z = m.output.apply(self, &xn, t);
+        let stats = self.rowstats_t(&z, t, z.cols);
+        let out = self.download(&stats);
+        self.end_frame();
+        out
+    }
+}
+
+/// Mask token id for a diffusion checkpoint: `tokenizer.ggml.mask_token_id` first
+/// (the standard GGUF key llama.cpp's converters emit), else any `*.mask_token_id`
+/// (arch-namespaced variants). None means the file does not say — callers should
+/// refuse loudly rather than guess, because denoising around the wrong mask id
+/// produces plausible-looking nonsense instead of an error.
+pub fn gguf_mask_token_id(g: &gguf::Gguf) -> Option<u32> {
+    if let Some(v) = g.get_u32("tokenizer.ggml.mask_token_id") {
+        return Some(v);
+    }
+    for (k, v) in g.metadata.iter() {
+        if k.ends_with(".mask_token_id") {
+            if let gguf::Value::U32(x) = v { return Some(*x); }
+            if let gguf::Value::I32(x) = v { return Some(*x as u32); }
+            if let gguf::Value::U64(x) = v { return Some(*x as u32); }
+        }
+    }
+    None
+}
+
+/// Adaptive reveal: everything the model is confident about (p_top >= tau) unmasks
+/// this step — the variable-k schedule that makes parallel decoding actually
+/// parallel. When nothing clears the bar, the single most confident position is
+/// revealed anyway (progress floor: the loop must terminate). This is the
+/// heuristic Learn2PD's learned filter replaces; same contract, so they swap.
+pub struct ThresholdPolicy { pub tau: f32 }
+impl DenoisePolicy for ThresholdPolicy {
+    fn select(&mut self, _step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize> {
+        let mut picks: Vec<usize> = (0..stats.len())
+            .filter(|&i| masked[i] && stats[i][1] >= self.tau)
+            .collect();
+        if picks.is_empty() {
+            if let Some(best) = (0..stats.len())
+                .filter(|&i| masked[i])
+                .max_by(|&a, &b| stats[a][1].partial_cmp(&stats[b][1]).unwrap_or(std::cmp::Ordering::Equal))
+            {
+                picks.push(best);
+            }
+        }
+        picks
+    }
+}
+
+/// Wraps any policy and records, for every masked position at every step, the
+/// stats it saw and whether it was revealed — then labels each record with the
+/// Learn2PD oracle bit at finalize: did this step's argmax survive to the final
+/// output? One JSONL line per (step, position); std-only, no serde.
+pub struct TraceRecorder<P: DenoisePolicy> {
+    pub inner: P,
+    records: Vec<(usize, usize, [f32; 4], bool)>,
+}
+impl<P: DenoisePolicy> TraceRecorder<P> {
+    pub fn new(inner: P) -> Self { Self { inner, records: Vec::new() } }
+    /// Label every record against the final tokens and write JSONL. The label is
+    /// the oracle the filter trains toward: `argmax_at_step == final_token`.
+    pub fn finalize(&self, final_tokens: &[u32], path: &str) -> std::io::Result<usize> {
+        use std::io::Write;
+        let f = std::fs::File::create(path)?;
+        let mut w = std::io::BufWriter::new(f);
+        for &(step, pos, s, revealed) in &self.records {
+            let label = (s[0] as u32) == final_tokens[pos];
+            writeln!(
+                w,
+                "{{\"step\":{step},\"pos\":{pos},\"argmax\":{},\"p\":{:.6},\"margin\":{:.4},\"entropy\":{:.4},\"revealed\":{},\"label\":{}}}",
+                s[0] as u32, s[1], s[2], s[3], revealed as u8, label as u8
+            )?;
+        }
+        w.flush()?;
+        Ok(self.records.len())
+    }
+}
+impl<P: DenoisePolicy> DenoisePolicy for TraceRecorder<P> {
+    fn select(&mut self, step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize> {
+        let picks = self.inner.select(step, stats, masked);
+        for i in 0..stats.len() {
+            if masked[i] {
+                self.records.push((step, i, stats[i], picks.contains(&i)));
+            }
+        }
+        picks
+    }
+}
+
+impl DenoisePolicy for Box<dyn DenoisePolicy> {
+    fn select(&mut self, step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize> {
+        (**self).select(step, stats, masked)
+    }
+}
