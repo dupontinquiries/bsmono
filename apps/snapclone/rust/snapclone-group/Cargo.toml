@@ -33,3 +33,7 @@ subtle        = "2"
 # micro-DHT (seal+sign → PUT to feed bucket → GET → verify+open). Dev-only, so
 # it never affects what the app links.
 snapclone-microdht = { path = "../snapclone-microdht" }
+# The fleet's shared DHT. Added alongside rather than replacing: this test asks
+# whether snapcore can carry the value layer snapclone-microdht carries today,
+# and the answer is only credible if both run.
+snapcore = { path = "../../../../shared/snapcore" }
