@@ -99,3 +99,41 @@ preserved anything. The harness is also the regression net for steps 2 and 4:
 adding `listen`/`refresh` and retiring the older crates both have to keep these
 four green.
 
+
+---
+
+## `shared/dht-kit` — the messaging layer, extracted
+
+The fleet's kits are per-layer, and the DHT lacked one. `shared/dht-kit` is
+**OpenDHT-compatible messaging and nothing else**:
+
+* **no transport** — bytes in, message out; no sockets, no async, no runtime
+* **no routing table, no engine, no storage** — those differ between
+  implementations and are not what interoperability is made of
+* **no dependencies** — a protocol crate that drags in serde forces a version
+  choice on every consumer, and two engines with different toolchains is exactly
+  the situation this serves
+
+It carries the six query names the reference sends — including **`refresh`**,
+which neither existing engine implements. A kit that shipped only the five we
+already used would make "compatible" mean "compatible with what we had".
+
+13 tests, chosen for what a hand-rolled msgpack subset actually gets wrong:
+
+* truncation at **every** byte length is refused — a decoder returning a partial
+  message puts attacker-controlled short reads into a routing table
+* values at 0/1/254/255/256/65535/65536 bytes, straddling both bin8 and bin16
+  boundaries, where a subset codec writes the wrong header and the payload
+  shifts by one
+* a node entry that is not 20-byte hash + 6-byte address is refused, because a
+  different width means a different address family and guessing is worse than
+  failing
+* an **unknown map key is refused rather than ignored** — skipping unknown keys
+  sounds tolerant and is how two implementations silently disagree about what a
+  message meant
+* transaction ids across the full u32 range, since a narrowed tid mismatches
+  replies under load rather than failing
+
+**Still not compliance.** Round-tripping our own encoder proves self-consistency.
+Until bytes from a real OpenDHT node decode and re-encode identically, this is
+"shaped like the reference". That test needs one packet capture and nothing else.

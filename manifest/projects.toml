@@ -602,3 +602,9 @@ kind = "cargo"
 role = "library"
 notes = "Reader for the BSWEB parts-web format — geometry stored once, referenced by placements, annotated with harvest categories and inferred material properties. Dependency-free like netcode so both the C-adjacent Rust tools and blackstar-rs can link it without pulling serde or a zlib crate into their graphs. Callers pass already-decompressed bytes; an engine has a decompressor already."
 
+[shared.dht-kit]
+path = "shared/dht-kit"
+kind = "cargo"
+role = "library"
+notes = "OpenDHT-compatible messaging in Rust: the wire format alone — msgpack query/reply/push/error maps, 160-bit InfoHash, values with per-value ids, IPv4 node entries. No transport, no routing table, no engine, no dependencies. The protocol layer snapcore lacks and snapclone-dht had buried in an app crate; the seam that lets any engine in the fleet speak the reference's format."
+
