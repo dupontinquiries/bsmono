@@ -207,6 +207,70 @@ def pca_axes(pts):
     return [[V[r][i] for r in range(3)] for i in order]
 
 
+_FRAMES = None
+
+
+def _frames():
+    """All 24 proper rotations of an orthonormal frame: axis permutation and
+    sign, keeping det = +1 so a mirror never passes as a rotation."""
+    global _FRAMES
+    if _FRAMES is None:
+        import itertools
+        out = []
+        for perm in itertools.permutations(range(3)):
+            par = 1
+            pl = list(perm)
+            for i in range(3):
+                for j in range(i + 1, 3):
+                    if pl[i] > pl[j]:
+                        par = -par
+            for sx in (1, -1):
+                for sy in (1, -1):
+                    for sz in (1, -1):
+                        if par * sx * sy * sz == 1:
+                            out.append((perm, (sx, sy, sz)))
+        _FRAMES = out
+    return _FRAMES
+
+
+def align_frames(ex, comp, n=16):
+    """Best of all 24 frames, scored by OCCUPANCY OVERLAP.
+
+    Two changes from `align_pca`, and both matter:
+
+    * **24 frames, not 4 signs.** The old version fixed the axis ORDER from the
+      eigenvalue sort and tried only sign flips. Machine parts routinely have
+      near-degenerate eigenvalues — a wheel's two in-plane axes, a plate's two
+      long ones — so the sort order is arbitrary between two copies of the same
+      shape and the correct rotation was often not among the four tried.
+    * **Scored by overlap, not extent.** Extent agreement is a proxy that
+      cannot tell a part from its 180-degree flip. Voxel overlap is the thing
+      actually being optimised, and it is cheap now that the grid exists.
+    """
+    Ea, Ca = pca_axes(ex), pca_axes(comp)
+    ce, cc = centroid(ex), centroid(comp)
+    exx = max(max(p[i] for p in ex) - min(p[i] for p in ex) for i in range(3)) or 1.0
+    cxx = max(max(p[i] for p in comp) - min(p[i] for p in comp) for i in range(3)) or exx
+    sc = cxx / exx
+    lo = [min(p[i] for p in comp) for i in range(3)]
+    hi = [max(p[i] for p in comp) for i in range(3)]
+    span = [max(hi[i] - lo[i], 1e-9) for i in range(3)]
+    target = vox(comp, lo, span, n)
+
+    best, bestR = -1.0, None
+    for perm, sgn in _frames():
+        E = [[Ea[perm[r]][i] * sgn[r] for i in range(3)] for r in range(3)]
+        R = [[sum(Ca[k][i] * E[k][j] for k in range(3)) for j in range(3)]
+             for i in range(3)]
+        posed = [[sum(R[i][j] * (p[j] - ce[j]) for j in range(3)) * sc + cc[i]
+                  for i in range(3)] for p in ex]
+        A = vox(posed, lo, span, n)
+        iou = len(A & target) / max(1, len(A | target))
+        if iou > best:
+            best, bestR = iou, R
+    return bestR, 1.0 - best
+
+
 def align_pca(ex, comp):
     """Rotation carrying the exemplar's principal frame onto the component's.
 
@@ -415,7 +479,7 @@ def main():
             if comp is None or len(comp) < 8:
                 unsolved += 1
                 continue
-            R, err = align_pca(ex, comp)
+            R, err = align_frames(ex, comp)
             if R is None:
                 unsolved += 1
                 continue
