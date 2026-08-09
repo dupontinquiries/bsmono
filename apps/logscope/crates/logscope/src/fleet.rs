@@ -172,6 +172,34 @@ pub fn choose<'a>(
     Ok(ok.remove(0))
 }
 
+/// Choose, but skip devices the ledger has found unreliable.
+///
+/// `choose` picks the cheapest machine that clears the bar and knows nothing about what happened
+/// last time. **A device that fails 60% of its work still looks perfect to it** — reachable,
+/// capable, correct path — because every signal it consults is about capacity rather than history.
+///
+/// The ledger is the missing input, and it is deliberately narrow: an OPTIMISTIC device is still
+/// used, because a machine that reliably takes twice its budget is useful and the budget is what is
+/// wrong. Only UNRELIABLE removes it, since a fast failure costs the round trip and the retry.
+pub fn choose_with_history<'a>(
+    members: &'a [FleetMember],
+    t: deviceplan::Task,
+    history: &dyn Fn(&str) -> Vec<crate::delegateledger::Record>,
+) -> Result<(&'a FleetMember, reachability::Path), Vec<String>> {
+    let (ok, mut refused) = candidates(members, t);
+    let mut usable: Vec<_> = ok.into_iter().filter(|(m, _)| {
+        let v = crate::delegateledger::verdict(&history(&m.device.name));
+        if v.keep_using() { true } else {
+            refused.push(format!("{}: {}", m.device.name, v.explain()));
+            false
+        }
+    }).collect();
+    if usable.is_empty() { return Err(refused) }
+    usable.sort_by(|a, b| a.0.device.gpu_gib.partial_cmp(&b.0.device.gpu_gib)
+        .unwrap_or(std::cmp::Ordering::Equal));
+    Ok(usable.remove(0))
+}
+
 /// Everything the fleet can do right now, as one line per task kind.
 ///
 /// **Reports the empty cases too.** "No machine can verify aarch64 natively" is the fact an operator
@@ -248,6 +276,39 @@ mod tests {
         // would cost.
         let e = worth_the_wait(&ModelPresence::OnDisk { load_s: 66.1 }, 1000.0, 10.0, 2.0).unwrap_err();
         assert!(e.contains("against 10s locally"));
+    }
+
+    #[test]
+    fn an_UNRELIABLE_device_is_skipped_even_when_it_is_the_cheapest_fit() {
+        // choose() would take it: reachable, capable, cheapest. Only history says otherwise, and
+        // history is the input it never had.
+        use crate::delegateledger::Record;
+        let ms = vec![
+            member("flaky", 4.0, 1000.0, Some(Path::Direct)),
+            member("solid", 24.0, 1000.0, Some(Path::Direct)),
+        ];
+        let hist = |name: &str| -> Vec<Record> {
+            if name == "flaky" {
+                (0..6).map(|i| Record { device: name.into(), task: Task::BuildCheck,
+                    budget_s: 10.0, actual_s: 1.0, succeeded: i == 0 }).collect()
+            } else { Vec::new() }
+        };
+        let (picked, _) = choose_with_history(&ms, Task::BuildCheck, &hist).unwrap();
+        assert_eq!(picked.device.name, "solid", "the cheapest fit was skipped on its record");
+        assert_eq!(choose(&ms, Task::BuildCheck).unwrap().0.device.name, "flaky",
+            "and plain choose still takes it, which is the gap this closes");
+    }
+
+    #[test]
+    fn a_merely_SLOW_device_is_still_used() {
+        // Optimistic is not disqualifying: the budget is wrong, not the machine.
+        use crate::delegateledger::Record;
+        let ms = vec![member("slow", 4.0, 1000.0, Some(Path::Direct))];
+        let hist = |n: &str| -> Vec<Record> {
+            (0..6).map(|_| Record { device: n.into(), task: Task::BuildCheck,
+                budget_s: 10.0, actual_s: 25.0, succeeded: true }).collect()
+        };
+        assert!(choose_with_history(&ms, Task::BuildCheck, &hist).is_ok());
     }
 
     #[test]
