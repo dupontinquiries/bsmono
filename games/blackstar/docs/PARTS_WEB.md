@@ -670,3 +670,63 @@ another band posed into it is the absurd-wheel failure the bands exist to
 prevent. And unlisted slots **keep their original part and its residual**, so
 changing one wheel type leaves the rest of the vehicle untouched: 49 residuals
 survived the swap above.
+
+---
+
+# Round nine — indices were the payload, and the pose is now solved
+
+## Compression: 295KB → 249KB, reconstruction bit-identical
+
+Measured where the bytes actually were, rather than guessing again:
+
+```
+index    raw 168,153   gz  31,351     (11% of the web)
+payload  raw 399,273   gz 262,166     (89%)
+   of which vertices        80,689
+   of which indices        168,633    <- the majority
+```
+
+**Indices cost twice what vertices do**, because a `u16` triple is 6 bytes per
+triangle against 3 per vertex at 8-bit. Delta-encoded as zigzag varints against
+the running index — an OBJ's triangles reference nearby vertices, so successive
+indices differ by small numbers and a varint spends one byte on most of them:
+
+```
+absolute u16   317,268 raw   168,633 gz
+delta varint   171,192 raw   124,314 gz    -26%
+```
+
+Web **294,645 → 249,466 bytes, parity unchanged at 0.904**. The index records
+which encoding was used; a decoder that guessed would read garbage rather than
+fail, which is the worse of the two.
+
+## Accuracy: exemplar choice and rotation are both done
+
+Tested whether a better exemplar exists than the one the signature points at,
+searching 60 candidates per placement:
+
+```
+by signature      mean aligned IoU 0.995
+best in library   mean aligned IoU 0.995
+```
+
+**Identical.** The signature already selects the optimal part, and after the
+24-frame search the pose is optimal too. Neither is worth further work.
+
+## So the remaining gap is coverage, and it is now small
+
+At `min_tris 20` the harvest covers 89–100% of each model's triangles:
+
+| model | components | coverage | placements |
+|---|---:|---:|---:|
+| yukon_brawler | 300 | 97% | 220 |
+| raidboss_tremor | 563 | 93% | 378 |
+| soldierrib | 118 | 89% | 70 |
+
+Per-part alignment is 0.995 and whole-model parity is 0.904, so **the residue is
+the 3–11% of small components still dropped** — not pose, not exemplar choice,
+not encoding. Lowering `min_tris` further was measured earlier and buys almost
+nothing (0.852 at 6 versus 0.844 at 20 on the old aligner), which suggests the
+last few percent are slivers that a triangle threshold cannot separate from
+noise. That is a different problem — one for the harvester's clustering
+tolerance rather than for this pipeline.
