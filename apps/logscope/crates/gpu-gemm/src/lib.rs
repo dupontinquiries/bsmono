@@ -34,6 +34,7 @@ pub mod shaderdev;
 pub mod framediag;
 pub mod loadprofile;
 pub mod pagesize;
+pub mod kvbudget;
 pub mod sensitivity;
 pub mod lookupdraft;
 pub mod specloop;
