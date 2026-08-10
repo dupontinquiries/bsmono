@@ -1,0 +1,18 @@
+[package]
+name = "snapclone-presence"
+version = "0.1.0"
+edition = "2021"
+description = "snapclone's own DHT layer: sc-ID identity, presence records, gossip peer discovery, and the announce record. The 297 lines that were genuinely snapclone's inside snapclone-dht, over the shared engine instead of a second copy of one."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# The protocol types only — InfoHash, Value, HASH_LEN. Not an engine: this crate
+# builds records and keys, and something else puts them on a socket.
+dht-kit = { path = "../../../../shared/dht-kit" }
+snapclone-identity = { path = "../snapclone-identity" }
+anyhow  = "1"
+rand    = "0.8"
+chrono  = { version = "0.4", features = ["serde"] }
+serde   = { version = "1", features = ["derive"] }

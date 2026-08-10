@@ -620,3 +620,9 @@ kind = "cargo"
 role = "library"
 notes = "Spend less radio: coalesce Background periodic work into device-offset wake windows so a 20s and a 60s job share one modem wake-up, and decide when a payload is worth compressing. Policy only — no timers, no sockets, no compressor, no dependencies. Generalises snapcore::schedule, which does the same for DHT maintenance alone."
 
+[apps.snapclone-presence]
+path = "apps/snapclone/rust/snapclone-presence"
+kind = "cargo"
+role = "library"
+notes = "What snapclone puts IN a DHT rather than a DHT: sc-ID identity, presence records and their keys, gossip peer discovery, and the announce record. Extracted from snapclone-dht, whose other 1,062 lines duplicated snapcore and dht-kit. Depends on dht-kit for types only — it builds records, something else puts them on a socket."
+
