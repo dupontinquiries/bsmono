@@ -51,6 +51,7 @@ pub mod help_manual;
 pub mod keyboard_inset;
 pub mod press_gesture;
 pub mod punch_addrs;
+pub mod qr_render;
 pub mod tab_bar;
 pub mod touch_feedback;
 pub mod requests;
