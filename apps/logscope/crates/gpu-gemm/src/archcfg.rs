@@ -179,6 +179,22 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: true, dense_supported: true,
             note: "gemma3: (1+w) rms norm, geglu, post-norms and sliding-window attention",
         },
+        // Gemma 4, including the E2B/E4B "effective parameter" variants aimed at phones and 8GB
+        // machines. Architecturally Gemma 3's successor — (1+w) RMS norm, GeGLU, per-head QK-Norm
+        // before RoPE, NEOX pairing, no soft-caps — so it reuses that path rather than getting a
+        // speculative one of its own.
+        //
+        // supported = false DELIBERATELY, and this is the honest part: nothing here has run a Gemma 4
+        // checkpoint. The entry exists so the loader reports "recognised, unverified" instead of
+        // "unknown architecture", which are different problems for whoever hits it — one means send a
+        // file, the other means write a kernel. It flips to true when a real checkpoint passes the
+        // gate, not before.
+        "gemma4" | "gemma4e" => ArchConfig {
+            arch: Arch::Gemma3, prefix: "gemma4", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::RmsGemma, act: Act::GeGlu,
+            rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: true,
+            supported: false, dense_supported: false,
+            note: "gemma4/E-series: assumed Gemma 3 shape (1+w rms, geglu, qk-norm, NEOX). UNVERIFIED against a real checkpoint — recognised so the failure names the gap rather than the family",
+        },
         "phi3" => ArchConfig {
             arch: Arch::Phi3, prefix: "phi3", attn_qkv_bias: false, attn_qk_norm: false, norm: Norm::Rms, act: Act::SwiGlu,
             rope_interleaved: false, moe: false, moe_shared_expert: false, interleaved_nope: false, logit_softcap: None, attn_softcap: None, tied_embed_default: false,
