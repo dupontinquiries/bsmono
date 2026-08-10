@@ -43,6 +43,7 @@ pub mod swipe_physics;
 pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
+pub mod ambient_blobs;
 pub mod help_manual;
 pub mod punch_addrs;
 pub mod tab_bar;
