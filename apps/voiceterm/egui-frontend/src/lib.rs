@@ -12,6 +12,7 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
+pub mod password_prompt;
 pub mod audit_chain;
 pub mod context_redact;
 pub mod phonetic_store;
