@@ -641,3 +641,9 @@ kind = "cargo"
 role = "library"
 notes = "Clean up with AI, shared by voiceterm, logscope and tadpole. Finds a small local GGUF in ~/models, describes the job, and returns a PROPOSAL the user accepts or rejects — never a silent rewrite. Ranks Gemma 4 E-series first for structured output on phone-class hardware, then Qwen3.5, Phi-4-mini, Llama 3.2. Backends plug in behind a trait: llama.cpp preferred, logscope's wgpu engine as the fallback that works where the C toolchain does not build."
 
+[tools.astfind]
+path = "tools/astfind"
+kind = "cargo"
+role = "library"
+notes = "fzf-like search over the monorepo's Rust items: find a function, read its doc comment, list its call sites. fzf's scoring model ported with its tuning relationships intact. Line-wise rather than syn, so a file that does not compile still indexes — which is when you most want to search. Ratatui shell and the optional wgpu/ollama analysis pass are separate layers over this core."
+
