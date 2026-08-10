@@ -2568,6 +2568,9 @@ pub static STALL_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 #[inline]
 pub fn mark_dispatch(pipe_id: usize, wg: (u32, u32, u32), dim0: u32) {
     use std::sync::atomic::Ordering::Relaxed;
+    // COUNT unconditionally: the c689 report's disp/step column read 0 because this counter rode
+    // the stall gate and never moved outside stall-armed runs. One relaxed add on a priced-hot path.
+    DISPATCH_SEQ.fetch_add(1, Relaxed);
     if STALL_MS.load(Relaxed) == 0 { return; }
     // The PIPELINE identity, not a name: pipelines are cached for the process lifetime so the value is
     // stable and comparable across a run, and storing it is one atomic write on a path taken tens of
@@ -2576,7 +2579,6 @@ pub fn mark_dispatch(pipe_id: usize, wg: (u32, u32, u32), dim0: u32) {
     LAST_SHADER.store(pipe_id, Relaxed);
     LAST_WG.store(((wg.0 as u64) << 32) | (wg.1 as u64) << 16 | wg.2 as u64, Relaxed);
     LAST_DIM0.store(dim0, Relaxed);
-    DISPATCH_SEQ.fetch_add(1, Relaxed);
 }
 
 /// Check whether a poll stalled, and if so report exactly what was in flight.
@@ -15634,6 +15636,13 @@ impl Gpu {
     pub fn denoise_stats(&self, m: &Model, tokens: &[u32]) -> Vec<f32> {
         let t = tokens.len();
         if t == 0 { return Vec::new(); }
+        // Refuse loudly at the door: the c689 run passed Qwen's mask id (151643) into a Llama embed
+        // and died 15k lines deep as a slice-range panic. Wrong-vocab ids are a one-line diagnosis.
+        // (Pick a reserved special for the model family — not eot; EoTP treats eot specially.)
+        let vocab = m.embed.len() / m.d;
+        if let Some(&bad) = tokens.iter().find(|&&id| id as usize >= vocab) {
+            panic!("denoise_stats: token id {bad} >= vocab {vocab} — wrong mask id for this model family?");
+        }
         self.begin_frame();
         let mut xh = Vec::with_capacity(t * m.d);
         for &id in tokens { let s = id as usize * m.d; xh.extend_from_slice(&m.embed[s..s + m.d]); }
@@ -15735,5 +15744,61 @@ impl<P: DenoisePolicy> DenoisePolicy for TraceRecorder<P> {
 impl DenoisePolicy for Box<dyn DenoisePolicy> {
     fn select(&mut self, step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize> {
         (**self).select(step, stats, masked)
+    }
+}
+
+/// Learn2PD filter, inference side: a logistic model over per-position features
+/// (p_top, logit margin, entropy, step), standardized with the training-time
+/// mean/sd stored alongside the weights. Reveals every masked position the
+/// filter scores >= tau, with the same progress floor as ThresholdPolicy.
+/// Weights come from `filter-train` (plain text, one line, no deps); the trait
+/// contract is identical to the heuristics, so this drops in where they were.
+pub struct LearnedPolicy {
+    pub w: [f32; 4],
+    pub b: f32,
+    pub mu: [f32; 4],
+    pub sd: [f32; 4],
+    pub tau: f32,
+}
+impl LearnedPolicy {
+    pub fn score(&self, s: &[f32; 4], step: usize) -> f32 {
+        let x = [s[1], s[2], s[3], step as f32];
+        let mut z = self.b;
+        for j in 0..4 {
+            z += self.w[j] * (x[j] - self.mu[j]) / self.sd[j].max(1e-6);
+        }
+        1.0 / (1.0 + (-z).exp())
+    }
+    /// Parse the `filter-train` export: `l2pd-v1 mu=a,b,c,d sd=a,b,c,d w=a,b,c,d b=x tau=y`.
+    pub fn from_text(t: &str) -> Result<Self, String> {
+        let mut mu = [0.0; 4]; let mut sd = [1.0; 4]; let mut w = [0.0; 4];
+        let (mut b, mut tau) = (0.0f32, 0.5f32);
+        if !t.trim_start().starts_with("l2pd-v1") { return Err("not an l2pd-v1 file".into()); }
+        let vec4 = |v: &str, out: &mut [f32; 4]| -> Result<(), String> {
+            let parts: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+            if parts.len() != 4 { return Err(format!("expected 4 values, got {} in '{v}'", parts.len())); }
+            out.copy_from_slice(&parts); Ok(())
+        };
+        for tok in t.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("mu=") { vec4(v, &mut mu)?; }
+            else if let Some(v) = tok.strip_prefix("sd=") { vec4(v, &mut sd)?; }
+            else if let Some(v) = tok.strip_prefix("w=") { vec4(v, &mut w)?; }
+            else if let Some(v) = tok.strip_prefix("b=") { b = v.parse().map_err(|_| "bad b")?; }
+            else if let Some(v) = tok.strip_prefix("tau=") { tau = v.parse().map_err(|_| "bad tau")?; }
+        }
+        Ok(Self { w, b, mu, sd, tau })
+    }
+}
+impl DenoisePolicy for LearnedPolicy {
+    fn select(&mut self, step: usize, stats: &[[f32; 4]], masked: &[bool]) -> Vec<usize> {
+        let mut picks: Vec<usize> = (0..stats.len())
+            .filter(|&i| masked[i] && self.score(&stats[i], step) >= self.tau)
+            .collect();
+        if picks.is_empty() {
+            if let Some(best) = (0..stats.len()).filter(|&i| masked[i]).max_by(|&a, &b| {
+                self.score(&stats[a], step).partial_cmp(&self.score(&stats[b], step)).unwrap_or(std::cmp::Ordering::Equal)
+            }) { picks.push(best); }
+        }
+        picks
     }
 }
