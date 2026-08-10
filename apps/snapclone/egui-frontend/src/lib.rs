@@ -44,6 +44,7 @@ pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
 pub mod ambient_blobs;
+pub mod ambient_camera;
 pub mod ambient_inbox;
 pub mod ambient_palette;
 pub mod camera_select;
