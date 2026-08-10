@@ -51,9 +51,14 @@ fn main() {
 
     let gpu = Gpu::new();
     eprintln!("denoise: adapter = {}", gpu.adapter_name);
-    let bytes = std::fs::read(path).expect("read gguf");
+    // Split-GGUF aware: expand siblings from the filename, mmap each shard for the process
+    // lifetime (retain_map — no host-RAM copy of a 60 GB Q4 split; LOGSCOPE_NO_MMAP honored),
+    // and hand the set to load_gguf_parts. Single files take the same path with one shard.
+    let shards = gguf_shard_paths(path).expect("resolve gguf shards");
+    let parts: Vec<&'static [u8]> = shards.iter().map(|q| retain_map(q).expect("map gguf shard")).collect();
+    let mapped_gb = parts.iter().map(|b| b.len()).sum::<usize>() as f64 / 1e9;
     // Metadata pass first: mask token id + tokenizer, so real checkpoints print real text.
-    let g = gguf::parse(&bytes).expect("parse gguf header");
+    let g = gguf::parse(parts[0]).expect("parse gguf header (shard 1 carries metadata)");
     let arch = g.declared_arch().unwrap_or_else(|| "?".into());
     let mask_id: u32 = match mask_cli.or_else(|| gguf_mask_token_id(&g)) {
         Some(v) => v,
@@ -67,9 +72,10 @@ Pass it as the 5th argument (e.g. 151643 for a Qwen mechanism run)."
         }
     };
     let tok = tokenizer::Tokenizer::from_gguf(&g).ok();
-    let model = gpu.load_gguf_opt(&bytes, true).expect("load gguf");
+    let model = gpu.load_gguf_parts(&parts, true).expect("load gguf");
     eprintln!(
-        "denoise: loaded '{arch}' ({} layers) | L={l} fill={fill} steps={steps} mask_id={mask_id} ({})",
+        "denoise: loaded '{arch}' — {} shard(s), {:.1} GB mapped ({} layers) | L={l} fill={fill} steps={steps} mask_id={mask_id} ({})",
+        shards.len(), mapped_gb,
         model.n_layers,
         if mask_cli.is_some() { "CLI" } else { "from gguf metadata" }
     );
