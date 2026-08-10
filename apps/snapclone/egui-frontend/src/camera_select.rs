@@ -26,11 +26,24 @@
 pub enum Facing { Front, Rear, Unknown }
 
 /// A capture device as enumerated by the platform.
+///
+/// `id` is the **PipeWire node name**, which is what the backend targets with
+/// `pipewiresrc target-object=<node>` — not a `/dev/videoN` path. Those still
+/// appear in a settings file written by an older build, and `select` falls back
+/// rather than failing when one no longer resolves.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Device {
     pub id: String,
     pub label: String,
     pub facing: Facing,
+    /// Sources sharing a group cannot be live at the same time. `None` means
+    /// freely concurrent — an independent USB webcam.
+    ///
+    /// This is `snapclone_videosrc::CaptureGroup`, and it is the reason PIP has
+    /// to be checked rather than assumed: on the FP5 the front and rear cameras
+    /// share one ISP, so `pipewiresrc` on the second one fails to negotiate. The
+    /// Qt build offered PIP anyway and it silently did not work on device.
+    pub capture_group: Option<u32>,
 }
 
 /// Frame rotation applied before display.
@@ -97,8 +110,13 @@ pub fn select(devices: &[Device], preferred: &str, mirror_front: bool) -> Select
 
     if preferred == PIP_ID {
         if let (Some(f), Some(r)) = (front, rear) {
-            return Selection::Pip { main: r.id.clone(), inset: f.id.clone(),
-                                    inset_mirrored: mirror_front };
+            if concurrent(f, r) {
+                return Selection::Pip { main: r.id.clone(), inset: f.id.clone(),
+                                        inset_mirrored: mirror_front };
+            }
+            // Two cameras that cannot run together. Falling through to the rear
+            // sensor shows something rather than a black inset over a working
+            // main view, which is what the Qt build did.
         }
         // Asked for PIP on a device with one camera. Falling back to that
         // camera is better than showing nothing, and better than an error: the
@@ -120,11 +138,29 @@ pub fn select(devices: &[Device], preferred: &str, mirror_front: bool) -> Select
 
 /// Is PIP offerable?
 ///
-/// Asked before showing the option rather than after choosing it — an entry that
-/// fails when tapped teaches nothing.
+/// Two sensors is necessary and NOT sufficient. They must also be able to run
+/// at once: on a phone whose front and rear cameras share an ISP they cannot,
+/// and the second `pipewiresrc` fails to negotiate. The Qt build checked only
+/// for two cameras, offered PIP, and it silently did nothing on the FP5.
+///
+/// Asked before showing the option rather than after choosing it — an entry
+/// that fails when tapped teaches nothing.
 pub fn pip_available(devices: &[Device]) -> bool {
-    devices.iter().any(|d| d.facing == Facing::Front)
-        && devices.iter().any(|d| d.facing == Facing::Rear)
+    let (Some(f), Some(r)) = (devices.iter().find(|d| d.facing == Facing::Front),
+                              devices.iter().find(|d| d.facing == Facing::Rear))
+    else { return false };
+    concurrent(f, r)
+}
+
+/// Can these two run at the same time?
+///
+/// Mirrors `snapclone_videosrc::can_run_simultaneously` for the two-source case.
+/// `None` is freely concurrent; equal `Some` ids share exclusive hardware.
+pub fn concurrent(a: &Device, b: &Device) -> bool {
+    match (a.capture_group, b.capture_group) {
+        (Some(x), Some(y)) => x != y,
+        _ => true,
+    }
 }
 
 /// Guess a facing from a device label, when the platform does not say.
@@ -140,17 +176,72 @@ pub fn facing_from_label(label: &str) -> Facing {
     else { Facing::Unknown }
 }
 
+/// Build a [`Device`] from a PipeWire node's properties.
+///
+/// The backend enumerates nodes and hands over their property dictionary; this
+/// turns one into a device or rejects it. Written against the property NAMES
+/// rather than a binding type, so it is testable with no PipeWire running and
+/// so a portal-provided node (which arrives with the same properties through a
+/// different route) needs no second code path.
+///
+/// ## Which nodes are cameras
+///
+/// `media.class` must contain `Video/Source`. A sink is not a camera, and
+/// neither is `Stream/Output/Video` — that is another application's output,
+/// and offering it as a camera is how a video call ends up showing itself.
+pub fn device_from_node(props: &[(&str, &str)]) -> Option<Device> {
+    let get = |k: &str| props.iter().find(|(n, _)| *n == k).map(|(_, v)| *v);
+
+    let class = get("media.class")?;
+    if !class.contains("Video/Source") { return None; }
+
+    // node.name is the handle `pipewiresrc target-object` takes. Without it the
+    // device cannot be opened, so a node lacking one is not offerable however
+    // well it is described.
+    let id = get("node.name")?;
+    if id.is_empty() { return None; }
+
+    let label = get("node.description").or_else(|| get("node.nick")).unwrap_or(id);
+
+    // PipeWire may state the facing outright; otherwise fall back to the label,
+    // which is a guess and returns Unknown when it cannot tell.
+    let facing = match get("api.libcamera.location").or_else(|| get("device.location")) {
+        Some("front") => Facing::Front,
+        Some("back") | Some("rear") => Facing::Rear,
+        _ => facing_from_label(label),
+    };
+
+    // Sensors behind one ISP are grouped by their DEVICE id: libcamera exposes
+    // both phone cameras under one device, which is exactly the exclusivity
+    // that breaks PIP. A USB webcam is its own device and so its own group,
+    // which is the behaviour we want without special-casing it.
+    let capture_group = get("device.id").and_then(|d| d.parse::<u32>().ok());
+
+    Some(Device { id: id.to_string(), label: label.to_string(), facing, capture_group })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn dev(id: &str, label: &str, facing: Facing) -> Device {
-        Device { id: id.into(), label: label.into(), facing }
+        Device { id: id.into(), label: label.into(), facing, capture_group: None }
     }
 
+    fn shared(id: &str, label: &str, facing: Facing, group: u32) -> Device {
+        Device { id: id.into(), label: label.into(), facing, capture_group: Some(group) }
+    }
+
+    /// A laptop-ish pair: two independent nodes, freely concurrent.
     fn phone() -> Vec<Device> {
         vec![dev("/dev/video0", "rear camera", Facing::Rear),
              dev("/dev/video2", "front camera", Facing::Front)]
+    }
+
+    /// An FP5: both sensors behind one ISP.
+    fn fp5() -> Vec<Device> {
+        vec![shared("camera-rear", "rear camera", Facing::Rear, 1),
+             shared("camera-front", "front camera", Facing::Front, 1)]
     }
 
     #[test]
@@ -222,6 +313,48 @@ mod tests {
     }
 
     #[test]
+    fn pip_is_refused_when_the_two_sensors_share_an_isp() {
+        // The FP5 case the Qt build got wrong: it checked for two cameras,
+        // offered PIP, and the second pipewiresrc failed to negotiate — so the
+        // feature silently did nothing on device.
+        assert!(pip_available(&phone()), "independent nodes can pair");
+        assert!(!pip_available(&fp5()), "one ISP cannot serve both");
+    }
+
+    #[test]
+    fn pip_requested_on_an_isp_shared_phone_shows_the_rear_camera() {
+        // Something rather than a black inset over a working main view.
+        match select(&fp5(), PIP_ID, true) {
+            Selection::Single { id, mirrored } => {
+                assert_eq!(id, "camera-rear");
+                assert!(!mirrored);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn two_independent_webcams_are_concurrent_even_in_the_same_group_position() {
+        // None means freely concurrent, and must not be confused with group 0 —
+        // which is why the type is Option<u32> rather than a bare id.
+        let a = dev("usb-a", "cam", Facing::Unknown);
+        let b = dev("usb-b", "cam", Facing::Unknown);
+        assert!(concurrent(&a, &b));
+        let g0a = shared("a", "cam", Facing::Unknown, 0);
+        let g0b = shared("b", "cam", Facing::Unknown, 0);
+        assert!(!concurrent(&g0a, &g0b), "group 0 is a real group");
+    }
+
+    #[test]
+    fn a_grouped_and_an_ungrouped_source_can_run_together() {
+        // A phone camera plus a screenshare stream, which is the common case
+        // for "share my screen and my face".
+        let cam = shared("camera-front", "front", Facing::Front, 1);
+        let usb = dev("usb-webcam", "webcam", Facing::Unknown);
+        assert!(concurrent(&cam, &usb));
+    }
+
+    #[test]
     fn no_cameras_is_a_state_rather_than_a_panic() {
         // Desktops without a webcam are the common development case.
         assert_eq!(select(&[], "", true), Selection::None);
@@ -256,6 +389,87 @@ mod tests {
         assert_eq!(Rotation::from_degrees(450), Rotation::Cw90, "wraps");
         assert_eq!(Rotation::from_degrees(37), Rotation::None, "nonsense reads as none");
         assert_eq!(Rotation::from_degrees(0), Rotation::None);
+    }
+
+    #[test]
+    fn a_pipewire_camera_node_becomes_a_device() {
+        let d = device_from_node(&[
+            ("media.class", "Video/Source"),
+            ("node.name", "camera-rear"),
+            ("node.description", "Rear Camera"),
+            ("api.libcamera.location", "back"),
+            ("device.id", "42"),
+        ]).expect("a camera");
+        assert_eq!(d.id, "camera-rear");
+        assert_eq!(d.label, "Rear Camera");
+        assert_eq!(d.facing, Facing::Rear);
+        assert_eq!(d.capture_group, Some(42));
+    }
+
+    #[test]
+    fn another_applications_video_output_is_not_a_camera() {
+        // Stream/Output/Video is somebody else's output, and offering it as a
+        // camera is how a video call ends up showing itself.
+        assert!(device_from_node(&[
+            ("media.class", "Stream/Output/Video"),
+            ("node.name", "some-app"),
+        ]).is_none());
+        assert!(device_from_node(&[
+            ("media.class", "Audio/Source"),
+            ("node.name", "mic"),
+        ]).is_none());
+    }
+
+    #[test]
+    fn a_node_without_a_name_cannot_be_opened_so_it_is_not_offered() {
+        // node.name is the handle pipewiresrc target-object takes.
+        assert!(device_from_node(&[
+            ("media.class", "Video/Source"),
+            ("node.description", "Nameless Camera"),
+        ]).is_none());
+    }
+
+    #[test]
+    fn the_facing_pipewire_states_beats_the_label_guess() {
+        // A node described "Main Camera" while libcamera says front is a front
+        // camera; trusting the label would un-mirror a selfie.
+        let d = device_from_node(&[
+            ("media.class", "Video/Source"),
+            ("node.name", "cam"),
+            ("node.description", "Main Camera"),
+            ("api.libcamera.location", "front"),
+        ]).unwrap();
+        assert_eq!(d.facing, Facing::Front, "label says rear, libcamera says front");
+    }
+
+    #[test]
+    fn two_sensors_on_one_libcamera_device_share_a_capture_group() {
+        // This is where the FP5 constraint comes from — no special case, just
+        // the device id both sensors report.
+        let front = device_from_node(&[("media.class", "Video/Source"),
+            ("node.name", "f"), ("api.libcamera.location", "front"), ("device.id", "7")]).unwrap();
+        let rear = device_from_node(&[("media.class", "Video/Source"),
+            ("node.name", "r"), ("api.libcamera.location", "back"), ("device.id", "7")]).unwrap();
+        assert!(!concurrent(&front, &rear));
+        assert!(!pip_available(&[front, rear]));
+    }
+
+    #[test]
+    fn a_usb_webcam_gets_its_own_group_without_a_special_case() {
+        let a = device_from_node(&[("media.class", "Video/Source"),
+            ("node.name", "usb0"), ("device.id", "11")]).unwrap();
+        let b = device_from_node(&[("media.class", "Video/Source"),
+            ("node.name", "usb1"), ("device.id", "12")]).unwrap();
+        assert!(concurrent(&a, &b));
+    }
+
+    #[test]
+    fn a_node_falls_back_through_description_then_nick_then_name() {
+        let n = device_from_node(&[("media.class", "Video/Source"), ("node.name", "cam0")]).unwrap();
+        assert_eq!(n.label, "cam0", "the name is the last resort, not an empty label");
+        let k = device_from_node(&[("media.class", "Video/Source"),
+            ("node.name", "cam0"), ("node.nick", "Webcam")]).unwrap();
+        assert_eq!(k.label, "Webcam");
     }
 
     #[test]
