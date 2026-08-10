@@ -7,6 +7,7 @@ use wgpu::util::DeviceExt;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
+pub mod flash_qblock;
 pub mod gguf;
 pub mod cpumatvec;
 pub mod cpupool;
