@@ -97,7 +97,18 @@ fn main() {
                 }
             }
         }
-        ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: tiled==naive f32 twin, worst rel {worst_twin:.2e} <= 1e-4"), worst_twin <= 1e-4);
+        // Three-way verdict (lavapipe + Honeykrisp, 2026-08-09): when the twins diverge but the
+        // tiled kernel matches the f64 reference, the NAIVE twin is the inaccurate side — it sums
+        // t f32 terms with no online rescale and stops being a reference above a few thousand rows
+        // (a few dozen under Honeykrisp fast-math). Divergence with a clean f64 column is
+        // information about the twin, not a failure of the kernel under test.
+        if worst_twin <= 1e-4 {
+            ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: tiled==naive f32 twin, worst rel {worst_twin:.2e} <= 1e-4"), true);
+        } else if worst_abs <= 5e-5 && worst <= 5e-4 {
+            println!("  [i] t={t:>4}: twins diverge ({worst_twin:.2e}) but tiled matches f64 — naive twin is the inaccurate side at this length; not a kernel failure");
+        } else {
+            ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: twins diverge ({worst_twin:.2e}) AND tiled misses f64 — kernel guilty"), false);
+        }
         ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: worst ABS vs f64 ref {worst_abs:.2e} <= 5e-5"), worst_abs <= 5e-5);
         ck(&format!("t={t:>4} heads={nh}/{nkv} hd={hd:>3}: worst rel (|ref|>=1e-2) {worst:.2e} <= 5e-4"), worst <= 5e-4);
     }

@@ -37,6 +37,8 @@ fn main() {
     let threshold: Option<f32> = args.iter().find_map(|a| a.strip_prefix("--threshold=").and_then(|v| v.parse().ok()));
     let eotp = args.iter().any(|a| a == "--eotp");
     let trace_path: Option<String> = args.iter().find_map(|a| a.strip_prefix("--trace=").map(str::to_string));
+    // --filter=FILE     use a trained Learn2PD filter (filter-train output) as the reveal policy.
+    let filter_path: Option<String> = args.iter().find_map(|a| a.strip_prefix("--filter=").map(str::to_string));
     args.retain(|a| !a.starts_with("--"));
     let path = args.get(1).unwrap_or_else(|| {
         eprintln!("usage: denoise-bench <model.gguf> [L] [fill] [steps] [mask_id]");
@@ -87,9 +89,15 @@ Pass it as the 5th argument (e.g. 151643 for a Qwen mechanism run)."
 
     let eos_id = g.get_u32("tokenizer.ggml.eos_token_id");
     let k_fixed = n_fill.div_ceil(steps.max(1));
-    let base_policy: Box<dyn DenoisePolicy> = match threshold {
-        Some(tau) => Box::new(ThresholdPolicy { tau }),
-        None => Box::new(ConfidenceTopK { k: k_fixed }),
+    let base_policy: Box<dyn DenoisePolicy> = match (&filter_path, threshold) {
+        (Some(fp), _) => {
+            let txt = std::fs::read_to_string(fp).expect("read filter file");
+            let lp = LearnedPolicy::from_text(&txt).expect("parse l2pd file");
+            eprintln!("denoise: learned filter from {fp} (tau={:.2})", lp.tau);
+            Box::new(lp)
+        }
+        (None, Some(tau)) => Box::new(ThresholdPolicy { tau }),
+        (None, None) => Box::new(ConfidenceTopK { k: k_fixed }),
     };
     let mut policy = TraceRecorder::new(base_policy);
     let _ = gpu.denoise_stats(&model, &tokens); // warm: pipelines + first-use compiles
