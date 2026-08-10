@@ -13,7 +13,7 @@
 //! identity is derived from**, so a forged record is detectable without asking anyone. The DHT then
 //! carries data whose authenticity does not depend on the DHT.
 //!
-//! ## This overlaps `snapclone-dht::gossip::PeerRecord`, and the difference is the point
+//! ## This overlaps `snapclone-presence::gossip::PeerRecord`, and the difference is the point
 //!
 //! That one exists and is a scaffold: `sc_id`, `address`, `seen_at`. No signature, no TTL, no
 //! capability. **Checked before writing this**, because six duplicate implementations have already
@@ -28,7 +28,11 @@
 //!
 //! Neither replaces the other. A gossip view that only ever hears directly from peers is safer with
 //! `seen_at`; a DHT record fetched from strangers needs `published_at` and a signature. **The merge
-//! should keep both**, and this module should move into snapclone-dht rather than persist beside it.
+//! should keep both**, and this module should move into snapclone-presence rather than persist beside it.
+//!
+//! (That crate was `snapclone-dht` until the network triage: its gossip, presence and identity
+//! modules were the only part not duplicating snapcore, and they were extracted so the rest could
+//! go. The overlap is unchanged — only the address is.)
 //!
 //! ## Staleness is not the same as absence
 //!
@@ -211,8 +215,8 @@ mod tests {
         // Seventh duplicate found in this tree, and the first one checked for BEFORE writing rather
         // than after. The doc has to survive, or the next reader re-derives the same module again.
         let src = include_str!("peerrecord.rs");
-        assert!(src.contains("snapclone-dht::gossip::PeerRecord"));
-        assert!(src.contains("should move into snapclone-dht rather than persist beside it"));
+        assert!(src.contains("snapclone-presence::gossip::PeerRecord"));
+        assert!(src.contains("should move into snapclone-presence rather than persist beside it"));
     }
 
     #[test]

@@ -2666,22 +2666,6 @@ name = "snapclone-debounce"
 version = "0.1.0"
 
 [[package]]
-name = "snapclone-dht"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "rand 0.8.6",
- "serde",
- "snapclone-identity",
- "snapclone-nat",
- "snapcore",
- "tokio",
- "tracing",
- "wake-kit",
-]
-
-[[package]]
 name = "snapclone-face"
 version = "0.1.0"
 dependencies = [
@@ -3729,10 +3713,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "wake-kit"
-version = "0.1.0"
 
 [[package]]
 name = "walkdir"

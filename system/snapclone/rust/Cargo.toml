@@ -8,7 +8,6 @@ members = [
     "snapclone-proto",
     "snapclone-storage",
     "snapclone-core",
-    "snapclone-dht",
     "snapclone-ui-traits",
     "snapclone-vcard",
     "snapclone-wire",
