@@ -626,3 +626,12 @@ kind = "cargo"
 role = "library"
 notes = "What snapclone puts IN a DHT rather than a DHT: sc-ID identity, presence records and their keys, gossip peer discovery, and the announce record. Extracted from snapclone-dht, whose other 1,062 lines duplicated snapcore and dht-kit. Depends on dht-kit for types only — it builds records, something else puts them on a socket."
 
+[apps.tadpole]
+path = "apps/tadpole/egui-frontend"
+kind = "cargo"
+role = "app"
+daemon = false
+runtime = "egui"
+targets = ["desktop", "mobile"]
+notes = "Image to text, all Rust — a Frog-shaped OCR app on egui with touch support. Built around REGIONS rather than a text blob, because PP-OCRv5-style backends return per-box confidence and rendering that as one text area throws away what the newer model is better at. The engine is a trait: rusto-rs today, a stub in tests, something else later."
+
