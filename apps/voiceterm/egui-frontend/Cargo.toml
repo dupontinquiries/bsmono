@@ -22,7 +22,24 @@ required-features = ["app"]
 default = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs, no extra flags — see
 # manifest/projects.toml) produces the deploy binary directly, same convention as rusty-board-egui.
-app = ["dep:eframe"]
+app = ["dep:eframe", "x11", "wayland"]
+
+# Display backends, split so a build can pick one.
+#
+# Measured: eframe pulls BOTH by default here, and on a clean build
+# x11rb-protocol is 10.5s and wayland-protocols 4.9s — 15.4s of a 122s build for
+# two backends when a machine runs one. Twenty-four crates in this repo carry
+# the same pair.
+#
+# `app` still enables both, so nothing changes for anyone building the default
+# and a deploy binary still runs on either session type. What this adds is the
+# ability to say `--no-default-features --features app-wayland` on a machine
+# where the other backend is dead weight — which is every phone target this
+# repo builds for.
+x11 = ["eframe?/x11"]
+wayland = ["eframe?/wayland"]
+app-x11 = ["dep:eframe", "x11"]
+app-wayland = ["dep:eframe", "wayland"]
 
 [dependencies]
 # XDG resolution. prefs_path() hand-rolled the same logic, with a comment
@@ -35,7 +52,7 @@ uikit-web = { path = "../../../shared/uikit/crates/uikit-web" }
 snapclone-theme = { path = "../../../shared/uikit/crates/snapclone-theme" }
 settings-kit = { path = "../../../shared/settings-kit" }
 nifty-core = { path = "../../../shared/nifty-core" }
-eframe = { version = "0.34", default-features = false, features = ["glow", "wayland", "x11"], optional = true }
+eframe = { version = "0.34", default-features = false, features = ["glow"], optional = true }
 
 [workspace]
 

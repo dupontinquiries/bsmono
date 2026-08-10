@@ -116,4 +116,18 @@ strip = true
 panic = "abort"
 
 [profile.dev]
-opt-level = 1
+# Own code unoptimised: this crate is 133k lines in ONE crate, so every touch
+# pays a full single-threaded frontend pass over all of it. opt-level = 1 here
+# applied to that pass and to every dependency, on every clean build.
+opt-level = 0
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
+# Dependencies optimised and compiled ONCE, then cached. Measured on the egui
+# frontend: the app's own code is 4.3s of a 122s clean build — 96% is
+# dependencies, and they only rebuild when versions change. Paying opt-level 2
+# there costs nothing on a rebuild and buys back the runtime opt-level = 1 was
+# there for.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
