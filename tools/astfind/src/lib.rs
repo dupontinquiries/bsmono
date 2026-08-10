@@ -19,6 +19,7 @@
 //! why a bonus cancels at 8 characters. Finding a function without its doc
 //! finds half of it, so docs are indexed as a first-class field and searchable.
 
+pub mod purity;
 pub mod score;
 
 /// What kind of item was found.
