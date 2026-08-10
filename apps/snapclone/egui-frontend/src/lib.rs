@@ -58,6 +58,7 @@ pub mod scroll_passthrough;
 pub mod snap_export;
 pub mod tab_bar;
 pub mod thumbnails;
+pub mod trace_channels;
 pub mod voice_bridge;
 pub mod touch_feedback;
 pub mod requests;
