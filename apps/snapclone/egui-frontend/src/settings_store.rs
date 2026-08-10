@@ -186,3 +186,71 @@ mod tests {
         assert_eq!(parse("# only a comment\n"), Settings::default());
     }
 }
+
+#[cfg(test)]
+mod roundtrip_tests {
+    use super::*;
+    use crate::settings_page::Settings;
+
+    /// Every field set to something distinguishable from its default.
+    ///
+    /// The point is that a field ADDED to `Settings` and forgotten in `render`
+    /// silently stops persisting — the user changes it, saves, restarts, and it
+    /// is back to the default with no error anywhere. This catches that by
+    /// comparing the whole struct rather than field by field, so a new field is
+    /// covered the moment it exists.
+    fn populated() -> Settings {
+        let mut s = Settings::default();
+        s.display_name = "Ada Lovelace".into();
+        s.palette = "graphite".into();
+        s.read_receipts = !s.read_receipts;
+        s.camera_device = "/dev/video2".into();
+        s.mirror_front = !s.mirror_front;
+        s.shutter_sound = !s.shutter_sound;
+        s.face_library = !s.face_library;
+        s.listen_port = 44_444;
+        s.upnp = !s.upnp;
+        s.stun_host = "stun.example.org:3478".into();
+        s.dht_host = "bootstrap.example.org:4222".into();
+        s.require_encryption = !s.require_encryption;
+        s.keep_days = 45;
+        s.export_dir = "/home/kd/exports".into();
+        s.ambient_enabled = !s.ambient_enabled;
+        s.debug_trace = !s.debug_trace;
+        s
+    }
+
+    #[test]
+    fn every_setting_survives_a_save_and_load() {
+        let want = populated();
+        let got = parse(&render(&want));
+        assert_eq!(got, want, "a field is missing from render() or parse()");
+    }
+
+    #[test]
+    fn the_camera_device_specifically_survives() {
+        // Called out because it is the one a user notices: a camera that opens
+        // the wrong device after every restart looks like the camera is broken
+        // rather than like a settings bug.
+        let mut s = Settings::default();
+        s.camera_device = "/dev/video4".into();
+        assert_eq!(parse(&render(&s)).camera_device, "/dev/video4");
+    }
+
+    #[test]
+    fn defaults_round_trip_to_defaults() {
+        // A freshly-written file must read back as what was written, or the
+        // first save after a fresh install changes settings nobody touched.
+        let d = Settings::default();
+        assert_eq!(parse(&render(&d)), d);
+    }
+
+    #[test]
+    fn a_value_containing_spaces_is_not_truncated() {
+        // Display names have spaces. Splitting a line on whitespace rather than
+        // on the first `=` loses everything after the first word.
+        let mut s = Settings::default();
+        s.display_name = "Ada  Lovelace  the First".into();
+        assert_eq!(parse(&render(&s)).display_name, "Ada  Lovelace  the First");
+    }
+}
