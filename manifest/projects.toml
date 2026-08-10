@@ -635,3 +635,9 @@ runtime = "egui"
 targets = ["desktop", "mobile"]
 notes = "Image to text, all Rust — a Frog-shaped OCR app on egui with touch support. Built around REGIONS rather than a text blob, because PP-OCRv5-style backends return per-box confidence and rendering that as one text area throws away what the newer model is better at. The engine is a trait: rusto-rs today, a stub in tests, something else later."
 
+[shared.cleanup-kit]
+path = "shared/cleanup-kit"
+kind = "cargo"
+role = "library"
+notes = "Clean up with AI, shared by voiceterm, logscope and tadpole. Finds a small local GGUF in ~/models, describes the job, and returns a PROPOSAL the user accepts or rejects — never a silent rewrite. Ranks Gemma 4 E-series first for structured output on phone-class hardware, then Qwen3.5, Phi-4-mini, Llama 3.2. Backends plug in behind a trait: llama.cpp preferred, logscope's wgpu engine as the fallback that works where the C toolchain does not build."
+

@@ -1,0 +1,11 @@
+[package]
+name = "cleanup-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Clean up with AI, shared: find a small local model, describe the job, and return a PROPOSAL the user accepts or rejects. Policy and discovery only — no inference, no runtime, no dependencies. Backends (llama.cpp, logscope's wgpu engine) plug in behind a trait."
+
+[lib]
+name = "cleanup_kit"
+path = "src/lib.rs"
+
+[dependencies]
