@@ -70,3 +70,36 @@ transport  snapclone-nat ... the async socket layer
 
 Seven crates instead of nine, one engine instead of three, and every protocol
 layer dependency-free.
+
+---
+
+## Correction: I wired the weaker scheduler
+
+`snapcore::schedule` had **eleven tests and no caller** — a policy nothing
+consulted. Meanwhile I wired `wake-kit`'s gating into `snapclone-dht`'s engine,
+which is the *worse* of the two for that job:
+
+| | knows about |
+|---|---|
+| `wake-kit` | Interactive / Background / Opportunistic across arbitrary app work |
+| `snapcore::schedule` | **which bucket** went stale, **which values** are durable, and whether the device is on battery |
+
+Both are right for their scope. Using the general one for the DHT-specific job
+was not, and it happened because I did not look for an existing scheduler before
+reaching for the kit I had just built.
+
+Now wired: `Node::next_maintenance` drives `schedule::plan`, and the routing
+table gained the one input the scheduler asked for and the table never kept —
+**per-bucket last-query times**. That absence is why `plan` could not have had a
+caller: it wanted a number nobody was recording.
+
+`note_query` is called from `handle_find_node` and `handle_find_value`, so
+**ordinary traffic keeps buckets fresh and maintenance only covers what traffic
+missed**. That is the whole advantage of measuring staleness over refreshing on
+a timer, and it is now tested: a just-queried bucket plans nothing.
+
+snapcore 71 tests, 82 with the wire feature; netcode's 86 still pass.
+
+`wake-kit` keeps its place — cross-app periodic work is a real problem and the
+apps' 1s/2s/5s/20s/60s/360s timers are still unbatched. What changes is that the
+DHT does not use it, because something better was already there.
