@@ -44,6 +44,7 @@ pub mod video_viewer;
 pub mod posture;
 pub mod camera_policy;
 pub mod punch_addrs;
+pub mod tab_bar;
 pub mod requests;
 pub mod reticle;
 pub mod roster;
