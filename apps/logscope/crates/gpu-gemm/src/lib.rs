@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 
 pub mod flash_qblock;
+pub mod llada2;
 pub mod pool_class;
 pub mod quant_mix;
 pub mod gguf;

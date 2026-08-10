@@ -140,6 +140,32 @@ pub fn for_arch(arch: &str) -> ArchConfig {
             supported: true, dense_supported: true,
             note: "RND1-30B-A3B: qwen3moe-shaped diffusion model; run the denoise path (denoise-bench), not AR decode. Mask id from tokenizer.ggml.mask_token_id.",
         },
+        // LLaDA2 (general.architecture = "llada2"): ByteDance's masked-DIFFUSION MoE. Like rnd1 it
+        // runs the DENOISE forward rather than AR decode — non-causal attention over the whole
+        // block, no KV cache — but it is NOT simply "qwen3moe with a different forward", and the
+        // four differences all fail silently if assumed away (see the llada2 module, which carries
+        // them as testable data):
+        //
+        //   1. The LAST layers are NextN multi-token-prediction blocks and the transformer loop does
+        //      NOT run them: n_transformer_layers = n_layer - nextn_predict_layers. Iterating
+        //      0..n_layer walks into plausibly-shaped non-attention tensors — wrong numbers, not a
+        //      missing-tensor error.
+        //   2. The FIRST n_layer_dense_lead layers are dense; the rest are MoE.
+        //   3. FUSED attn_qkv with a GQA-asymmetric split: V starts at n_embd + n_embd_gqa, NOT at
+        //      2*n_embd. Thirding the row reads V from inside K and still produces fluent text.
+        //   4. A shared expert is ADDED to the routed sum, and the router carries an expert bias
+        //      (ffn_exp_probs_b) this loader has no representation for yet.
+        //
+        // supported: false until a forward pass runs on the real checkpoint — (2) and (3) are wired
+        // as data but the dense-lead split, the expert bias and the NextN skip are not yet in the
+        // loader. LOGSCOPE_TRY_UNSUPPORTED_ARCH=1 attempts it; wrong output is the EXPECTED failure.
+        "llada2" => ArchConfig {
+            arch: Arch::Qwen3Moe, prefix: "llada2", attn_qkv_bias: false, attn_qk_norm: true, norm: Norm::Rms, act: Act::SwiGlu,
+            rope_interleaved: false, moe: true, moe_shared_expert: true, interleaved_nope: false,
+            logit_softcap: None, attn_softcap: None, tied_embed_default: false,
+            supported: false, dense_supported: false,
+            note: "LLaDA2.0-mini-preview (Q4_0, ~9.3 GB): masked-diffusion MoE. Run the DENOISE path (denoise-bench), not AR decode — AR-decoding a diffusion checkpoint emits fluent noise; that is the model, not a bug. Needs, in order: (1) skip the trailing nextn_predict_layers rather than iterating 0..n_layer, (2) dense-lead split at n_layer_dense_lead, (3) FUSED attn_qkv sliced at 0 / n_embd / n_embd+n_embd_gqa — the V offset is NOT 2*n_embd under GQA, (4) ffn_exp_probs_b expert bias in the router, (5) shared expert added to the routed sum. llada2::Llada2Shape carries 1-3 as validated data. Mask id from tokenizer.ggml.mask_token_id.",
+        },
         // Qwen4 (general.architecture = "qwen4"): continues Qwen3.5's per-head QK-Norm base and adds
         // mixture-of-experts — a router (blk.N.ffn_gate_inp.weight) selecting top-k of N expert FFNs
         // (ffn_{gate,up,down}_exps.weight). The DENSE forward (QK-Norm → RoPE → GQA → SwiGLU → RMSNorm) is
