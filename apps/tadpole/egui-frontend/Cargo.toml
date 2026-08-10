@@ -11,6 +11,9 @@ path = "src/lib.rs"
 [dependencies]
 uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
 egui = "0.34"
+# Diagram rendering for OCR output that is a chart rather than prose. Pure
+# parser, no UI, already shared by voiceterm.
+nifty-core = { path = "../../../shared/nifty-core" }
 
 [features]
 default = []
