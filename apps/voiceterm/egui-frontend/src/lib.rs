@@ -12,6 +12,7 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
+pub mod mail_selector;
 pub mod token_log;
 pub mod connections_graph;
 pub mod summary_queue;
