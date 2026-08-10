@@ -64,7 +64,21 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("no apps installed yet — build some from the Fleet tab").weak());
     }
 
+    // The list scrolls; the confirmation below it does not.
+    //
+    // Without this the page simply grew past the window and the later apps were
+    // unreachable — no scrollbar, no clipping, just gone. `auto_shrink` off on
+    // the vertical axis so a short list does not collapse the area and make the
+    // separator jump around as apps are installed.
+    //
+    // The confirmation deliberately stays OUTSIDE: it appears at the bottom in
+    // response to a button that may be scrolled anywhere, and a confirmation
+    // that can itself scroll out of view is one a user answers by guessing.
     let rows = app.apps.versions.clone();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .max_height(ui.available_height() - 96.0)
+        .show(ui, |ui| {
     let mut last_app = String::new();
     for (name, label, is_current) in rows {
         // Group by app: three pins of one app under one heading reads as one
@@ -123,6 +137,8 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
             }
         });
     }
+
+        });
 
     // Confirmation. Asked because removing a pin is not undoable: the bytes are
     // content-addressed, but the pin is the only record that this app ever had

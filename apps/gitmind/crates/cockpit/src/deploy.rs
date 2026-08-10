@@ -653,7 +653,12 @@ fn fingerprint_of(keys: &str) -> Option<String> {
 /// Doing this in one place (the GUI, one known_hosts) is what avoids the lock /
 /// split you get from accepting keys in the terminal *and* the GUI separately.
 pub fn trust_host(host: &str) -> Result<String, String> {
-    let h = host.trim();
+    // Normalised for the same reason untrust_host is: host_trusted() below
+    // compares against known_hosts, and checking `pi@fairphone` there always
+    // reports "not trusted" — so every call re-fetched and re-appended, growing
+    // a duplicate entry per invocation.
+    let owned = known_hosts_key(host).ok_or_else(|| "no host given".to_string())?;
+    let h = owned.as_str();
     if h.is_empty() {
         return Err("no host given".into());
     }
@@ -777,11 +782,58 @@ pub fn local_identity_pubkey() -> Option<String> {
 
 /// Remove every `~/.ssh/known_hosts` entry for `host` (`ssh-keygen -R`). Used by
 /// re-trust to clear a stale / conflicting key before re-adding the current one.
-pub fn untrust_host(host: &str) -> Result<(), String> {
+/// The exact string `known_hosts` stores for a host, which is not the string a
+/// user types.
+///
+/// This is the bug that breaks ordinary ssh. `ssh-keygen -R` matches the
+/// key literally, so passing `pi@fairphone` or `fairphone:2222` removes
+/// NOTHING — and `-R` exits 0 either way, because "nothing to remove" is not an
+/// error. Re-trust then appends a second key for the same host, and a
+/// known_hosts with two different keys for one host is precisely the state that
+/// produces REMOTE HOST IDENTIFICATION HAS CHANGED in every other ssh client on
+/// the machine. The GUI reports success while breaking the terminal.
+///
+/// Three normalisations, all of them things a user types:
+///   * `user@host` → the user part is ssh's, not known_hosts'.
+///   * `host:2222` → stored as `[host]:2222`, the bracketed form.
+///   * `[host]:22` and bare `host` on port 22 are the same entry: ssh omits
+///     the default port, so bracketing it creates an entry nothing matches.
+pub fn known_hosts_key(host: &str) -> Option<String> {
     let h = host.trim();
-    if h.is_empty() {
-        return Err("no host".into());
+    let h = h.rsplit_once('@').map(|(_, r)| r).unwrap_or(h);
+    if h.is_empty() { return None; }
+    // Already bracketed. Two forms: `[host]:port` and a bare `[ipv6]` with no
+    // port, which is what THIS FUNCTION emits for an IPv6 literal — so failing
+    // to parse it made normalisation non-idempotent, and any path that
+    // normalised twice lost the host entirely. Caught by the idempotence test,
+    // which is the one that looks redundant until it isn't.
+    if let Some(rest) = h.strip_prefix('[') {
+        if let Some((inner, port)) = rest.split_once("]:") {
+            if inner.is_empty() { return None; }
+            return Some(if port == "22" { inner.to_string() }
+                        else { format!("[{inner}]:{port}") });
+        }
+        let inner = rest.strip_suffix(']')?;
+        if inner.is_empty() { return None; }
+        return Some(format!("[{inner}]"));
     }
+    // A single colon is host:port. An IPv6 literal has several, and must be
+    // bracketed rather than split — `::1` is a host, not a port.
+    let colons = h.matches(':').count();
+    if colons == 1 {
+        let (name, port) = h.split_once(':')?;
+        if name.is_empty() || port.is_empty() || !port.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        return Some(if port == "22" { name.to_string() } else { format!("[{name}]:{port}") });
+    }
+    if colons > 1 { return Some(format!("[{h}]")); }
+    Some(h.to_string())
+}
+
+pub fn untrust_host(host: &str) -> Result<(), String> {
+    let h = known_hosts_key(host).ok_or_else(|| "no host".to_string())?;
+    let h = h.as_str();
     // `-R` exits 0 even when there was nothing to remove; only a real error fails.
     let out = Command::new("ssh-keygen")
         .args(["-R", h])
@@ -1431,5 +1483,65 @@ mod tests {
         assert!(clean.contains("# comment"), "comments preserved");
         assert!(clean.contains("20260706000000") && !clean.contains("20260701000000"), "kept newest dup only");
         assert!(!clean.contains("20260101000000"), "expired gone");
+    }
+
+    #[test]
+    fn a_user_prefix_is_stripped_because_known_hosts_does_not_store_it() {
+        // The bug: `ssh-keygen -R pi@fairphone` matches nothing, exits 0, and
+        // re-trust then appends a SECOND key. Two keys for one host is exactly
+        // what makes every other ssh client on the machine refuse to connect.
+        assert_eq!(known_hosts_key("pi@fairphone").as_deref(), Some("fairphone"));
+        assert_eq!(known_hosts_key("fairphone").as_deref(), Some("fairphone"));
+        assert_eq!(known_hosts_key("me@10.0.0.5").as_deref(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn a_non_default_port_takes_the_bracketed_form_known_hosts_uses() {
+        assert_eq!(known_hosts_key("fairphone:2222").as_deref(), Some("[fairphone]:2222"));
+        assert_eq!(known_hosts_key("pi@box:2222").as_deref(), Some("[box]:2222"));
+    }
+
+    #[test]
+    fn the_default_port_is_omitted_rather_than_bracketed() {
+        // ssh writes a bare host for port 22, so bracketing it creates an entry
+        // nothing will ever match — a silent no-op removal all over again.
+        assert_eq!(known_hosts_key("fairphone:22").as_deref(), Some("fairphone"));
+        assert_eq!(known_hosts_key("[fairphone]:22").as_deref(), Some("fairphone"));
+    }
+
+    #[test]
+    fn an_already_bracketed_host_is_kept_rather_than_double_wrapped() {
+        assert_eq!(known_hosts_key("[fairphone]:2222").as_deref(), Some("[fairphone]:2222"));
+    }
+
+    #[test]
+    fn an_ipv6_literal_is_bracketed_not_split_on_its_colons() {
+        // `::1` is a host, not a host and a port. Splitting on the last colon
+        // would produce a nonsense entry and remove nothing.
+        assert_eq!(known_hosts_key("fe80::1").as_deref(), Some("[fe80::1]"));
+        assert_eq!(known_hosts_key("::1").as_deref(), Some("[::1]"));
+    }
+
+    #[test]
+    fn a_malformed_host_is_refused_rather_than_normalised_into_something_wrong() {
+        // Refusing is safe; guessing edits the user's known_hosts on a
+        // misparse, which is the file this whole fix exists to protect.
+        assert_eq!(known_hosts_key(""), None);
+        assert_eq!(known_hosts_key("   "), None);
+        assert_eq!(known_hosts_key("pi@"), None);
+        assert_eq!(known_hosts_key("host:"), None);
+        assert_eq!(known_hosts_key("host:notaport"), None);
+        assert_eq!(known_hosts_key(":22"), None);
+    }
+
+    #[test]
+    fn normalisation_is_idempotent() {
+        // trust_host normalises then hands the result to host_trusted and
+        // write_known_host; a second pass must not change it again or the
+        // written entry and the checked entry drift apart.
+        for h in ["pi@fairphone:2222", "fairphone", "fe80::1", "box:22"] {
+            let once = known_hosts_key(h).unwrap();
+            assert_eq!(known_hosts_key(&once).as_deref(), Some(once.as_str()), "{h}");
+        }
     }
 }
