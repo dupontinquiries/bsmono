@@ -57,6 +57,7 @@ pub mod qr_render;
 pub mod snap_export;
 pub mod tab_bar;
 pub mod thumbnails;
+pub mod voice_bridge;
 pub mod touch_feedback;
 pub mod requests;
 pub mod reticle;
