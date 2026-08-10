@@ -53,6 +53,7 @@ pub mod press_gesture;
 pub mod punch_addrs;
 pub mod qr_render;
 pub mod tab_bar;
+pub mod thumbnails;
 pub mod touch_feedback;
 pub mod requests;
 pub mod reticle;
