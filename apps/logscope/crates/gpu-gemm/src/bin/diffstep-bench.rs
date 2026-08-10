@@ -46,11 +46,16 @@ fn main() {
         if chunked { "TILED (prefill_chunked, ext/online-softmax)" } else { "naive (prefill_batched, ATTENTION_MH)" });
 
     let t0 = Instant::now();
-    let bytes = std::fs::read(path).expect("read gguf");
-    let model = gpu.load_gguf_opt(&bytes, true).expect("load gguf");
+    // Split-GGUF aware: expand siblings from the filename, mmap each shard for the process
+    // lifetime (retain_map — no host-RAM copy of a 60 GB Q4 split; LOGSCOPE_NO_MMAP honored),
+    // and hand the set to load_gguf_parts. Single files take the same path with one shard.
+    let shards = gguf_shard_paths(path).expect("resolve gguf shards");
+    let parts: Vec<&'static [u8]> = shards.iter().map(|q| retain_map(q).expect("map gguf shard")).collect();
+    let mapped_gb = parts.iter().map(|b| b.len()).sum::<usize>() as f64 / 1e9;
+    let model = gpu.load_gguf_parts(&parts, true).expect("load gguf");
     eprintln!(
-        "diffstep: loaded {} ({} layers, kv_dim {}) in {:.1}s",
-        path, model.n_layers, model.kv_dim(), t0.elapsed().as_secs_f32()
+        "diffstep: loaded {} — {} shard(s), {:.1} GB mapped ({} layers, kv_dim {}) in {:.1}s",
+        path, shards.len(), mapped_gb, model.n_layers, model.kv_dim(), t0.elapsed().as_secs_f32()
     );
     let pipes = gpu.warm(&model);
     eprintln!("diffstep: warmed {pipes} pipelines");

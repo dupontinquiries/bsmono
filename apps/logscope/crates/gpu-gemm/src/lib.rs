@@ -15818,3 +15818,91 @@ impl DenoisePolicy for LearnedPolicy {
         picks
     }
 }
+
+/// Expand a split-GGUF path (`…-00001-of-00002.gguf`) into all shard paths, in order.
+/// Any shard of the set may be given; non-split paths return themselves. A missing
+/// sibling is an error that names the exact absent file — the loader's own
+/// "split.count says N but M were supplied" fires later and less helpfully.
+pub fn gguf_shard_paths(path: &str) -> Result<Vec<String>, String> {
+    let stem = match path.strip_suffix(".gguf") { Some(s) => s, None => return Ok(vec![path.to_string()]) };
+    let is5 = |s: &str| s.len() == 5 && s.bytes().all(|b| b.is_ascii_digit());
+    let parsed = (|| {
+        let of_pos = stem.rfind("-of-")?;
+        let total = &stem[of_pos + 4..];
+        let idx_start = stem[..of_pos].rfind('-')? + 1;
+        let idx = &stem[idx_start..of_pos];
+        if !is5(total) || !is5(idx) { return None; }
+        Some((stem[..idx_start].to_string(), total.parse::<u32>().ok()?))
+    })();
+    let Some((base, total)) = parsed else { return Ok(vec![path.to_string()]) };
+    // A total of zero parses as five digits and is a real filename a truncated
+    // download leaves behind. `1..=0` is empty, so the helper would return an
+    // empty Vec and both benches index parts[0] — a panic instead of a message.
+    // Caught while casting the vote on this patch.
+    if total == 0 {
+        return Err(format!("split gguf: {path} declares 00000 shards — the name is malformed"));
+    }
+    let mut out = Vec::with_capacity(total as usize);
+    for i in 1..=total {
+        let p = format!("{base}{i:05}-of-{total:05}.gguf");
+        if !std::path::Path::new(&p).exists() {
+            return Err(format!("split gguf: shard {i}/{total} missing at {p}"));
+        }
+        out.push(p);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod shard_path_tests {
+    use super::gguf_shard_paths;
+
+    #[test]
+    fn non_split_passes_through() {
+        assert_eq!(gguf_shard_paths("/m/x-UD-IQ1_S.gguf").unwrap(),
+                   vec!["/m/x-UD-IQ1_S.gguf".to_string()]);
+    }
+
+    #[test]
+    fn second_shard_normalizes_and_names_missing_sibling() {
+        let e = gguf_shard_paths("/nonexistent/m-00002-of-00002.gguf").unwrap_err();
+        assert!(e.contains("shard 1/2"), "{e}");
+        assert!(e.contains("m-00001-of-00002.gguf"), "{e}");
+    }
+
+    // --- cases the patch did not cover, added while casting the vote ---
+
+    #[test]
+    fn a_total_of_zero_yields_no_shards_rather_than_looping() {
+        // `-00000-of-00000` parses as five digits and is a real filename a
+        // truncated download can leave behind. 1..=0 is empty, so this returns
+        // an empty Vec — and parts[0] in both benches would then panic on an
+        // index rather than reporting a bad file.
+        let e = gguf_shard_paths("/tmp/m-00000-of-00000.gguf").unwrap_err();
+        assert!(e.contains("00000 shards"), "{e}");
+    }
+
+    #[test]
+    fn a_path_without_the_gguf_suffix_passes_through() {
+        // Hardlinks and symlinks without the extension are ordinary.
+        assert_eq!(gguf_shard_paths("/m/model").unwrap(), vec!["/m/model".to_string()]);
+    }
+
+    #[test]
+    fn a_non_numeric_shard_marker_is_not_treated_as_a_split() {
+        // "…-part-of-two.gguf" contains "-of-" and must not be expanded.
+        assert_eq!(gguf_shard_paths("/m/part-of-two.gguf").unwrap(),
+                   vec!["/m/part-of-two.gguf".to_string()]);
+        assert_eq!(gguf_shard_paths("/m/x-0001-of-0002.gguf").unwrap().len(), 1,
+                   "four digits is not the llama.cpp convention");
+    }
+
+    #[test]
+    fn a_filename_containing_of_earlier_still_resolves() {
+        // rfind rather than find: "Mixture-of-Experts-00001-of-00002.gguf" has
+        // two "-of-" markers and the shard one is the last.
+        let r = gguf_shard_paths("/nonexistent/Mixture-of-Experts-00002-of-00002.gguf");
+        let e = r.unwrap_err();
+        assert!(e.contains("Mixture-of-Experts-00001-of-00002.gguf"), "{e}");
+    }
+}
