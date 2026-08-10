@@ -12,6 +12,7 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
+pub mod workspaces_view;
 pub mod pty_input;
 pub mod table_view;
 pub mod row_render;
