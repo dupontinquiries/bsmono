@@ -490,8 +490,41 @@ fn autosave_path() -> Option<std::path::PathBuf> {
 const MAX_CHECKPOINTS: usize = 30;
 
 struct Ctx { n_ctx: u32, max_tokens: u32, temperature: f32, repeat_penalty: f32, min_p: f32, history_turns: usize }
+impl Ctx {
+    /// Settings for a generation profile.
+    ///
+    /// A thinking model emits thousands of `<think>` tokens, so the old
+    /// max_tokens of 512 truncated mid-think every time — which presents as
+    /// "never finishes" and is indistinguishable from the loop the stop-token
+    /// and ChatML fixes already cured. See `gen_profile`.
+    pub fn for_profile(p: crate::gen_profile::Profile) -> Self {
+        let d = p.defaults();
+        Self { n_ctx: d.n_ctx, max_tokens: d.max_tokens, temperature: d.temperature,
+               repeat_penalty: d.repeat_penalty, min_p: d.min_p, history_turns: 8 }
+    }
+
+    /// Re-apply defaults for a newly loaded model, unless the user has changed them.
+    ///
+    /// Only when untouched: silently overwriting settings somebody typed is
+    /// worse than a bad default, because it happens after they have already
+    /// decided the app is wrong.
+    pub fn adopt_for_model(&mut self, name: &str, declared_ctx: Option<u32>) -> bool {
+        let current_profile_defaults = crate::gen_profile::Profile::Direct.defaults();
+        let untouched = self.n_ctx == current_profile_defaults.n_ctx
+            && self.max_tokens == current_profile_defaults.max_tokens
+            && self.temperature == current_profile_defaults.temperature;
+        if !untouched { return false; }
+        let p = crate::gen_profile::detect(name, declared_ctx);
+        if p == crate::gen_profile::Profile::Direct { return false; }
+        let turns = self.history_turns;
+        *self = Ctx::for_profile(p);
+        self.history_turns = turns;
+        true
+    }
+}
+
 impl Default for Ctx {
-    fn default() -> Self { Self { n_ctx: 4096, max_tokens: 512, temperature: 0.35, repeat_penalty: 1.15, min_p: 0.05, history_turns: 8 } }
+    fn default() -> Self { Ctx::for_profile(crate::gen_profile::Profile::Direct) }
 }
 
 fn est(s: &str) -> usize { s.len() / 4 + 1 } // rough tokens; the backend tokenizes exactly
