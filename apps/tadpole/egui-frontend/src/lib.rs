@@ -29,6 +29,7 @@
 //! rusto-rs today, something else later, a stub in tests. Everything here is
 //! written against `Ocr`, and the app logic is testable with no model at all.
 
+pub mod models;
 pub mod table;
 
 use std::collections::BTreeSet;
@@ -131,6 +132,10 @@ pub struct Tadpole {
     pub regions: Vec<Region>,
     /// Which regions the user has selected, by index.
     selected: BTreeSet<usize>,
+    /// Where the weights are, or what is missing. Re-checked on demand rather
+    /// than cached at startup: a user who drops the files in while the app is
+    /// open should not have to restart to be believed.
+    pub models: models::ModelState,
     /// How to present the page. Defaults to Lines: a page is prose until the
     /// geometry says otherwise, and guessing "table" on a paragraph produces a
     /// two-column mess that looks like a bug.
@@ -144,12 +149,27 @@ impl Default for Tadpole {
             regions: Vec::new(),
             selected: BTreeSet::new(),
             render: table::Render::Lines,
+            models: models::ModelState::Missing,
             last_error: None,
         }
     }
 }
 
 impl Tadpole {
+    /// Re-scan for weights. Cheap — a handful of `exists` checks — so a caller
+    /// can run it whenever the setup page is shown.
+    pub fn rescan_models<F>(&mut self, home: &std::path::Path, exists: F)
+    where F: Fn(&std::path::Path) -> bool {
+        self.models = models::discover(home, exists);
+    }
+
+    /// Can a scan actually run?
+    ///
+    /// Asked before offering the button rather than after pressing it: an OCR
+    /// app whose Scan fails with "no model" taught the user nothing they could
+    /// not have been told first.
+    pub fn can_scan(&self) -> bool { self.models.is_ready() }
+
     /// The table this page makes, if it makes one.
     pub fn table(&self) -> Option<table::Table> {
         let t = table::detect(&self.regions, 0.6);
@@ -487,6 +507,30 @@ mod tests {
         assert_eq!(app.rendered(), "just prose here");
         app.render = table::Render::Raw;
         assert_eq!(app.rendered(), "just prose here");
+    }
+
+    #[test]
+    fn a_rescan_notices_weights_that_arrived_while_the_app_was_open() {
+        // The whole reason discovery is re-run rather than cached: a user who
+        // drops the files in should not have to restart to be believed.
+        let home = std::path::PathBuf::from("/home/kd");
+        let mut app = Tadpole::default();
+        app.rescan_models(&home, |_| false);
+        assert!(!app.can_scan());
+
+        app.rescan_models(&home, |p| {
+            let s = p.display().to_string();
+            s.starts_with("/home/kd/models/") && !s.contains("PPOCR")
+        });
+        assert!(app.can_scan(), "the same app instance now sees them");
+    }
+
+    #[test]
+    fn scanning_is_offered_only_when_it_would_work() {
+        // A Scan button that fails with "no model" taught the user nothing they
+        // could not have been told first.
+        let app = Tadpole::default();
+        assert!(!app.can_scan(), "a fresh app has not found weights yet");
     }
 
     #[test]
