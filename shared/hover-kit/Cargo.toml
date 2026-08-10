@@ -1,0 +1,7 @@
+[package]
+name = "hover-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Hover gating and pointer synthesis for phone-class sensors: a proximity sensor decides WHEN vision runs, vision decides WHERE. Pure policy, no I/O, no camera."
+
+[dependencies]

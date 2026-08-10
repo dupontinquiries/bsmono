@@ -12,6 +12,7 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
+pub mod summary_scope;
 pub mod command_search;
 pub mod corpus_tape;
 pub mod acoustic_cache;
