@@ -1481,9 +1481,30 @@ pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
 /// which is the opposite of what I expected when I wrote the probe.
 pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
 
+/// The largest SINGLE allocation this driver accepts, as `--gate-vram` measures it.
+///
+/// Recorded beside the concurrent ceiling because the two were conflated in every
+/// user-facing message: the refusal text quoted this number as evidence the
+/// concurrent one was wrong. They answer different questions, and a plan is
+/// bound by the SMALLER — one 40 GiB buffer being accepted says nothing about
+/// whether forty 1 GiB buffers can be live at once.
+pub const ASAHI_SINGLE_ALLOC_GIB: f64 = 63.0;
+
 /// Does a resident plan fit within what this device will hold at once?
 pub fn resident_fits_concurrent(resident_gib: f64, conservative_vma: bool) -> bool {
     !conservative_vma || resident_gib <= ASAHI_CONCURRENT_BUFFER_GIB
+}
+
+/// The binding ceiling for a resident plan.
+///
+/// Always the concurrent figure when it is lower. Named so no future message can
+/// quote the single-allocation number as a budget again.
+pub fn binding_ceiling_gib(conservative_vma: bool) -> f64 {
+    if conservative_vma {
+        ASAHI_CONCURRENT_BUFFER_GIB.min(ASAHI_SINGLE_ALLOC_GIB)
+    } else {
+        f64::INFINITY
+    }
 }
 
 #[cfg(test)]
@@ -1616,12 +1637,18 @@ mod provenance_tests {
         let src = include_str!("lib.rs");
         let i = src.find("GPU budget {:.1} GiB clamped to").expect("clamp message moved");
         let window = &src[i..(i + 1400).min(src.len())];
-        assert!(window.contains("COMPILED-IN CONSTANT"),
-            "the clamp must say the figure is a constant, or it reads as a measurement of the \
+        // UPDATED: the figure has since been MEASURED — --gate-residency held 124 GiB-slabs on an
+        // M2 Ultra and the 125th was refused. So "COMPILED-IN CONSTANT" is no longer the honest
+        // wording; it understates now, where it used to overstate. The invariant the test was
+        // protecting is unchanged and is what it now checks: the message must not imply it measured
+        // the machine in front of the operator. It carries the one-machine caveat instead.
+        assert!(window.contains("ONE machine's"),
+            "the clamp must keep the one-machine caveat, or it reads as a measurement of the \
 machine in front of the operator");
-        assert!(window.contains("measured once on an"),
-            "and it must say WHERE the number came from, since 'a constant' alone invites someone \
-to treat it as arbitrary and raise it");
+        assert!(window.contains("--gate-residency"),
+            "and it must name the probe the number came from, since a bare figure invites someone \
+to treat it as arbitrary and raise it — which now fails mid-quantization rather than at planning \
+time, forty seconds in");
     }
 
     #[test]
@@ -1926,5 +1953,52 @@ mod file_view_refusal_tests {
         // A tensor the table does not have is a different layout, and the real load attempt reports
         // it better than a guess here would.
         assert!(file_view_refusal(None, Some(12), Some(12)).is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn the_concurrent_ceiling_binds_not_the_single_allocation_one() {
+        // The conflation behind the misleading refusal: --gate-vram's 63 GiB was
+        // quoted as evidence the 31 GiB budget was wrong. One 40 GiB buffer
+        // being accepted says nothing about forty 1 GiB buffers being live at
+        // once, and the plan is bound by the smaller.
+        assert!(ASAHI_SINGLE_ALLOC_GIB > ASAHI_CONCURRENT_BUFFER_GIB);
+        assert_eq!(binding_ceiling_gib(true), ASAHI_CONCURRENT_BUFFER_GIB);
+    }
+
+    #[test]
+    fn a_seventy_b_q4km_is_correctly_refused() {
+        // 40.5 GiB resident against a measured 31 GiB concurrent ceiling. The
+        // refusal was RIGHT — --gate-residency held 124 GiB-slabs and the 125th
+        // failed on a 177 GiB machine — and the old message told the user to
+        // override it, which fails forty seconds into quantization instead.
+        assert!(!resident_fits_concurrent(40.5, true));
+    }
+
+    #[test]
+    fn the_same_model_is_allowed_where_the_clamp_does_not_apply() {
+        // Non-Asahi devices are not bound by this figure at all, so the refusal
+        // must not leak to them.
+        assert!(resident_fits_concurrent(40.5, false));
+        assert!(binding_ceiling_gib(false).is_infinite());
+    }
+
+    #[test]
+    fn a_model_under_the_ceiling_fits() {
+        // GLM-4.7-Flash at 16.5 GiB, the load that did work in the same session.
+        assert!(resident_fits_concurrent(16.5, true));
+    }
+
+    #[test]
+    fn the_boundary_is_inclusive() {
+        // A plan exactly at the measured ceiling held in the probe, so refusing
+        // it would be a wrong refusal by one byte.
+        assert!(resident_fits_concurrent(ASAHI_CONCURRENT_BUFFER_GIB, true));
+        assert!(!resident_fits_concurrent(ASAHI_CONCURRENT_BUFFER_GIB + 0.1, true));
     }
 }

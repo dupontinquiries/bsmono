@@ -8550,11 +8550,11 @@ feed_forward_length/{n_used_meta} (llama.cpp's fallback)");
                     eprintln!("loader: GPU budget {:.1} GiB clamped to {:.1} GiB — this driver \
 accepts a large single allocation but will not hold more than that in buffers at once. A plan above \
 it fails mid-load rather than at planning time. \
-THIS FIGURE IS A COMPILED-IN CONSTANT, not a measurement of this device: it was measured once on an \
-M2 Ultra at 1 and 2 GiB slabs, mapped and unmapped, and every Asahi machine now receives that \
-number. On different hardware it may be wrong in either direction \u{2014} `kernel-validate \
---gate-vram` measures the single-allocation ceiling on THIS device, and a load that fails part-way \
-through is the evidence that the concurrent one is lower than this.",
+This ceiling is MEASURED, not guessed: --gate-residency held 124 GiB-slabs on an M2 Ultra and the \
+125th was refused, on a machine with 177 GiB of RAM. Note it is the CONCURRENT ceiling \u{2014} \
+--gate-vram's larger single-allocation figure answers a different question and does not raise this \
+one. It is still ONE machine's number: on other Asahi hardware run `kernel-validate \
+--gate-residency` to measure THIS device.",
                         gpu_budget as f64 / (1u64 << 30) as f64,
                         crate::memplan::ASAHI_CONCURRENT_BUFFER_GIB);
                     gpu_budget = cap;
@@ -8778,15 +8778,28 @@ either",
                                     gib(resident), gib(dense), n_expert.saturating_sub(pin));
                             } else {
                             // report what streaming WOULD do so it's actionable, even though execution isn't wired
+                            // The old text here told the user this ceiling was a stale guess and that
+                            // --gate-vram had measured 63 GiB — advice that sends them to raise
+                            // LOGSCOPE_MAX_GPU_GB and fail forty seconds into quantization instead of
+                            // at planning time. `--gate-residency` has since MEASURED it: 124 one-GiB
+                            // slabs held, the 125th refused with "Failed to allocate BO VMA", on a
+                            // machine with 177 GiB of RAM and the probe allowed to reach 88. The
+                            // hardware genuinely stops at 31.
+                            //
+                            // --gate-vram's 63 GiB is not a contradiction, it is a different question:
+                            // the largest SINGLE allocation the device accepts. Concurrent residency
+                            // is the binding limit, and quoting the single-allocation number here was
+                            // what made the refusal look wrong.
                             let ceiling_note = if self.conservative_vma {
-                                " (a CONSTANT for Asahi/Honeykrisp, not a measurement — it was taken from the staging upload path before the arena removed the staging, and `--gate-vram` measured this same device honouring 63 GiB)"
+                                " (MEASURED on an M2 Ultra by --gate-residency: 124 GiB-slabs held, the 125th refused — this is the concurrent-buffer ceiling, not the single-allocation one)"
                             } else { "" };
                             let msg = match crate::memplan::plan_streaming(&shape, gpu_budget, Residency::Q4, 4096, 2, 256 * (1 << 20)) {
                                 Some(p) => format!("won't fit resident in ~{:.1} GiB{} — a layer-streaming plan EXISTS ON PAPER ONLY (StreamPlan is computed here and has no \
 executor; nothing streams blocks today) and it would pin {}/{} blocks and stream {} per token \
 (~{:.0} ms/tok at 21 GiB/s, the MEASURED upload rate). \
-FIRST CHECK WHETHER THIS BUDGET IS REAL: it is a compiled-in constant, and on an M2 Ultra `kernel-validate --gate-vram` measured the device honouring 63 GiB against this figure's 24 — a model this size may simply fit. \
-Then: raise LOGSCOPE_MAX_GPU_GB to what the probe found, or use the llama.cpp backend.",
+This ceiling is measured, so raising LOGSCOPE_MAX_GPU_GB will not help — it fails mid-quantization instead of here. \
+If this is NOT an M2 Ultra the figure is one machine's, and `kernel-validate --gate-residency` measures THIS device; \
+otherwise use the llama.cpp backend for a model this size.",
                                     gib(gpu_budget), ceiling_note, p.pinned_layers, p.total_layers, p.streamed_layers(), p.decode_ms_per_token(100.0)),
                                 None => format!("won't fit even a streaming ring in ~{:.1} GiB{}; use the llama.cpp backend.", gib(gpu_budget), ceiling_note),
                             };
