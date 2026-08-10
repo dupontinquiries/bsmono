@@ -37,9 +37,12 @@
 
 /// Below this, allocations are keyed exactly.
 ///
-/// 4 KB — a page. Under it, rounding blurs distinct hot sizes into one bucket
-/// and the buffers are cheap enough that a miss costs little.
-pub const EXACT_BELOW: u64 = 4096;
+/// **One page, queried rather than assumed.** I wrote 4096 here with the
+/// comment "a page", which is wrong on this fleet: Asahi Fedora runs a 16 KiB
+/// page kernel and Apple silicon is 16 KiB natively. The reasoning for classing
+/// — bigger than a page, so rounding is cheap relative to the mapping — did not
+/// apply to the 4-16 KiB band it was being applied to.
+pub fn exact_below() -> u64 { crate::pagesize::page_size() as u64 }
 
 /// Worst-case waste, as a fraction of the request. **Measured, not reasoned.**
 ///
@@ -63,7 +66,7 @@ pub const MAX_WASTE: f64 = 0.25;
 /// about 14%.
 pub fn size_class(size: u64) -> u64 {
     if size == 0 { return 0; }
-    if size < EXACT_BELOW { return size; }
+    if size < exact_below() { return size; }
     let po2 = size.next_power_of_two();
     if po2 == size { return size; }
     let floor = po2 / 2;
@@ -144,9 +147,10 @@ mod tests {
         // The whole point: exact keying makes a 5,200-byte buffer useless to a
         // 5,000-byte request, and a wider model produces more such near-misses.
         //
-        // Sizes above EXACT_BELOW deliberately — my first version used 4,000,
+        // Sizes above exact_below() deliberately — my first version used 4,000,
         // which is exempt from classing, so the test contradicted the policy it
         // was checking.
+        assert!(exact_below() <= 16_384, "the test sizes below assume at most a 16 KiB page");
         assert!(can_serve(size_class(5_000), 5_000));
         assert_eq!(size_class(5_000), size_class(5_100),
                    "both land in the same class; 5_200 crosses into the next");
@@ -162,7 +166,7 @@ mod tests {
         }
         // And across a dense sweep, not just chosen points — a bound that only
         // holds where somebody looked is not a bound.
-        for size in (EXACT_BELOW..200_000).step_by(37) {
+        for size in (exact_below()..200_000).step_by(37) {
             assert!(waste_fraction(size) <= MAX_WASTE + 1e-9,
                     "{size} wastes {:.1}%", waste_fraction(size) * 100.0);
         }
@@ -181,8 +185,8 @@ mod tests {
         // Below a page, rounding blurs distinct hot sizes into one oversized
         // bucket and buys nothing — those buffers are cheap and numerous.
         assert_eq!(size_class(64), 64);
-        assert_eq!(size_class(EXACT_BELOW - 1), EXACT_BELOW - 1);
-        assert_ne!(size_class(EXACT_BELOW), EXACT_BELOW - 1);
+        assert_eq!(size_class(exact_below() - 1), exact_below() - 1);
+        assert_ne!(size_class(exact_below()), exact_below() - 1);
     }
 
     #[test]

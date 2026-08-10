@@ -224,9 +224,14 @@ pub fn prefetch_mapped(path: &str, offset: usize, len: usize) -> bool {
     let g = reg.lock().unwrap();
     let Some(fb) = g.get(path) else { return false };
     if let FileBytes::Mapped(m) = *fb {
-        if offset >= m.len() || len == 0 { return false; }
-        let n = len.min(m.len() - offset);
-        return m.advise_range(memmap2::Advice::WillNeed, offset, n).is_ok();
+        // PAGE-ALIGNED, because madvise wants an aligned ADDRESS and memmap2
+        // passes ptr+offset straight through. An unaligned offset returns
+        // EINVAL, which .is_ok() turns into a false nobody checks — so on a
+        // 16 KiB-page kernel (Asahi Fedora ships one; Apple silicon is 16 KiB
+        // natively) this silently did nothing for three offsets in four, and
+        // the symptom was a load that pages in on demand ON ONE KERNEL ONLY.
+        let Some((off, n)) = crate::pagesize::align_advice(offset, len, m.len()) else { return false };
+        return m.advise_range(memmap2::Advice::WillNeed, off, n).is_ok();
     }
     false
 }
