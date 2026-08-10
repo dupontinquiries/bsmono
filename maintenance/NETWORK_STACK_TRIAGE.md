@@ -103,3 +103,45 @@ snapcore 71 tests, 82 with the wire feature; netcode's 86 still pass.
 `wake-kit` keeps its place — cross-app periodic work is a real problem and the
 apps' 1s/2s/5s/20s/60s/360s timers are still unbatched. What changes is that the
 DHT does not use it, because something better was already there.
+
+---
+
+## Done: `snapclone-dht` retired
+
+The three crates are one. What it took, in order, and none of the steps were
+skippable:
+
+1. **Extract the 297 unique lines** → `snapclone-presence` over `dht-kit` types.
+2. **Wire `snapcore::schedule`** — the crate carried the only live maintenance
+   gating, and retiring it before snapcore had its own would have traded a
+   duplicate for a regression.
+3. **Fix the stale cross-reference.** `logscope`'s `peerrecord.rs` has a test
+   asserting its own doc comment names `snapclone-dht::gossip::PeerRecord`. That
+   test caught the rename — a doc pointing at a crate that no longer exists —
+   which is exactly what it was written for. Now points at
+   `snapclone-presence`.
+4. **Remove**, from both the `apps/` and `system/` trees.
+
+Superseded rather than lost: `dht-kit` has 21 wire tests against the removed
+crate's 9, and `snapcore`'s maintenance tests cover what `maintenance_wakeups`
+covered, on the better scheduler.
+
+**The LAN parity harness went with it**, and that is the right call rather than a
+loss: it existed to answer "do the two engines agree", the answer was yes for
+several commits running, and there is now one engine. Keeping a harness that
+compares a thing to itself would be keeping the question open after it was
+answered.
+
+### Final shape
+
+| layer | crate | deps |
+|---|---|---|
+| protocol | `dht-kit`, `nat-kit` | none |
+| engine | `snapcore` (routing, store, lookup, punch, guard, schedule, wire) | dht-kit, optional |
+| policy | `wake-kit`, `net-kit` | none |
+| app | `netcode`, `snapclone-presence` | dht-kit / snapcore |
+| transport | `snapclone-nat` | tokio |
+
+**Seven crates, one engine, every protocol layer dependency-free** — which is
+what the triage set out to reach.
+
