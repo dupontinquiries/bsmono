@@ -30,12 +30,32 @@
 //! idempotent and order-independent, needs no coordination at all: the joiner
 //! can be receiving live edits while the catch-up is still arriving.
 
-use crate::{Presence, SiteId, Stamp, StampedOp};
-use studio_core::{Clip, ClipId, Effect, Op, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+use crate::{Presence, RackSync, SiteId, Stamp, StampedOp};
+use studio_core::{Bus, BusId, Clip, ClipId, Effect, Op, Send, Source, SourceId, Ticks, Track, TrackId, TrackKind};
+use studio_live::{Channel, Pattern, Rack, StepMod, SynthKind};
 
 /// Bumped whenever the encoding changes shape. A peer that sees a version it
 /// does not know refuses the packet rather than guessing.
-pub const WIRE_VERSION: u8 = 1;
+///
+/// v2: `Track` gained `route: Option<BusId>`, and `Op` gained the bus-graph
+/// variants (`AddBus`/`RemoveBus`/`SetBusGain`/`SetBusChain`/`SetBusSends`/
+/// `SetRoute`).
+///
+/// v3: `Bus` gained `muted: bool`, and `Op` gained `SetBusFlags`. A separate
+/// bump from v2 rather than folding it in, because v2 had already landed and
+/// been tested as its own shape before mute was designed — the "one bump per
+/// shape change" rule is about not bundling *unrelated* future changes into
+/// one guess, not about never bumping twice in the same session.
+///
+/// v4: `Op` gained `RemoveSource` — closing a real undo-correctness bug
+/// where `AddSource`'s own "inverse" used to be itself, meaning a source
+/// could never actually be undone or removed. `Packet::Rack` (whole-value
+/// rack sync) was added in the same working session but deliberately does
+/// NOT bump this constant: it isn't an `Op`/`Track`/`Bus` shape at all, and
+/// `Packet::decode`'s kind-byte dispatch already refuses an unrecognised
+/// packet kind on its own — see the version-refusal tests below for both
+/// mechanisms exercised separately.
+pub const WIRE_VERSION: u8 = 4;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Packet {
@@ -47,6 +67,8 @@ pub enum Packet {
     Hello { site: SiteId, since: u64 },
     /// The answer to a Hello.
     Catchup { ops: Vec<StampedOp> },
+    /// A rack sync — whole-value LWW, not an op. See [`RackSync`]'s docs.
+    Rack(RackSync),
 }
 
 // ── primitives ──────────────────────────────────────────────────────────────
@@ -122,18 +144,87 @@ fn get_clip(r: &mut R) -> Option<Clip> {
     Some(c)
 }
 
+fn put_opt_bus_id(o: &mut Vec<u8>, id: Option<BusId>) {
+    match id {
+        Some(b) => { put_u8(o, 1); put_u64(o, b.0); }
+        None => put_u8(o, 0),
+    }
+}
+fn get_opt_bus_id(r: &mut R) -> Option<Option<BusId>> {
+    Some(match r.u8()? {
+        0 => None,
+        _ => Some(BusId(r.u64()?)),
+    })
+}
+
+fn put_effects(o: &mut Vec<u8>, effects: &[Effect]) {
+    put_u16(o, effects.len().min(u16::MAX as usize) as u16);
+    for e in effects {
+        put_str(o, &e.kind); put_u8(o, e.enabled as u8);
+        put_u16(o, e.params.len().min(u16::MAX as usize) as u16);
+        for (k, v) in &e.params { put_str(o, k); put_f32(o, *v); }
+    }
+}
+fn get_effects(r: &mut R) -> Option<Vec<Effect>> {
+    let n = r.u16()? as usize;
+    let mut v = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        let kind = r.str()?;
+        let enabled = r.u8()? != 0;
+        let pn = r.u16()? as usize;
+        let mut params = std::collections::BTreeMap::new();
+        for _ in 0..pn { params.insert(r.str()?, r.f32()?); }
+        v.push(Effect { kind, params, enabled });
+    }
+    Some(v)
+}
+
+fn put_sends(o: &mut Vec<u8>, sends: &[Send]) {
+    put_u16(o, sends.len().min(u16::MAX as usize) as u16);
+    for s in sends {
+        put_u64(o, s.to.0); put_f32(o, s.level); put_u8(o, s.pre_fader as u8);
+    }
+}
+fn get_sends(r: &mut R) -> Option<Vec<Send>> {
+    let n = r.u16()? as usize;
+    let mut v = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        v.push(Send { to: BusId(r.u64()?), level: r.f32()?, pre_fader: r.u8()? != 0 });
+    }
+    Some(v)
+}
+
+fn put_bus(o: &mut Vec<u8>, b: &Bus) {
+    put_u64(o, b.id.0);
+    put_str(o, &b.name);
+    put_opt_bus_id(o, b.parent);
+    put_f32(o, b.gain);
+    put_effects(o, &b.chain);
+    put_sends(o, &b.sends);
+    put_u8(o, b.muted as u8);
+}
+fn get_bus(r: &mut R) -> Option<Bus> {
+    Some(Bus {
+        id: BusId(r.u64()?), name: r.str()?, parent: get_opt_bus_id(r)?,
+        gain: r.f32()?, chain: get_effects(r)?, sends: get_sends(r)?,
+        muted: r.u8()? != 0,
+    })
+}
+
 fn put_track(o: &mut Vec<u8>, t: &Track) {
     put_u64(o, t.id.0);
     put_u8(o, matches!(t.kind, TrackKind::Audio) as u8);
     put_str(o, &t.name);
     put_u8(o, t.muted as u8);
     put_u8(o, t.locked as u8);
+    put_opt_bus_id(o, t.route);
 }
 fn get_track(r: &mut R) -> Option<Track> {
     Some(Track {
         id: TrackId(r.u64()?),
         kind: if r.u8()? != 0 { TrackKind::Audio } else { TrackKind::Video },
         name: r.str()?, muted: r.u8()? != 0, locked: r.u8()? != 0,
+        route: get_opt_bus_id(r)?,
     })
 }
 
@@ -174,6 +265,14 @@ fn put_op(o: &mut Vec<u8>, op: &Op) {
             }
         }
         Op::AddSource { source } => { put_u8(o, 10); put_source(o, source); }
+        Op::AddBus { bus } => { put_u8(o, 11); put_bus(o, bus); }
+        Op::RemoveBus { id } => { put_u8(o, 12); put_u64(o, id.0); }
+        Op::SetBusGain { id, gain } => { put_u8(o, 13); put_u64(o, id.0); put_f32(o, *gain); }
+        Op::SetBusFlags { id, muted } => { put_u8(o, 17); put_u64(o, id.0); put_u8(o, *muted as u8); }
+        Op::SetBusChain { id, chain } => { put_u8(o, 14); put_u64(o, id.0); put_effects(o, chain); }
+        Op::SetBusSends { id, sends } => { put_u8(o, 15); put_u64(o, id.0); put_sends(o, sends); }
+        Op::SetRoute { track, bus } => { put_u8(o, 16); put_u64(o, track.0); put_opt_bus_id(o, *bus); }
+        Op::RemoveSource { id } => { put_u8(o, 18); put_u64(o, id.0); }
     }
 }
 
@@ -204,6 +303,14 @@ fn get_op(r: &mut R) -> Option<Op> {
             },
         },
         10 => Op::AddSource { source: get_source(r)? },
+        11 => Op::AddBus { bus: get_bus(r)? },
+        12 => Op::RemoveBus { id: BusId(r.u64()?) },
+        13 => Op::SetBusGain { id: BusId(r.u64()?), gain: r.f32()? },
+        17 => Op::SetBusFlags { id: BusId(r.u64()?), muted: r.u8()? != 0 },
+        14 => Op::SetBusChain { id: BusId(r.u64()?), chain: get_effects(r)? },
+        15 => Op::SetBusSends { id: BusId(r.u64()?), sends: get_sends(r)? },
+        16 => Op::SetRoute { track: TrackId(r.u64()?), bus: get_opt_bus_id(r)? },
+        18 => Op::RemoveSource { id: SourceId(r.u64()?) },
         _ => return None, // an op kind from a newer build: refuse, don't guess
     })
 }
@@ -218,6 +325,128 @@ fn get_stamped(r: &mut R) -> Option<StampedOp> {
         stamp: Stamp { lamport: r.u64()?, site: SiteId(r.u64()?) },
         op: get_op(r)?,
     })
+}
+
+fn put_synthkind(o: &mut Vec<u8>, k: &SynthKind) {
+    match k {
+        SynthKind::Sine { hz } => { put_u8(o, 0); put_f32(o, *hz); }
+        SynthKind::Sampler { source } => { put_u8(o, 1); put_u64(o, source.0); }
+        SynthKind::Beatspace { z, crossfade } => {
+            put_u8(o, 2);
+            for v in z { put_f32(o, *v); }
+            put_f32(o, *crossfade);
+        }
+        SynthKind::Sub { note, glide_from, glide_ms, drive, decay_ms } => {
+            put_u8(o, 3);
+            put_u8(o, *note as u8);
+            put_u8(o, glide_from.is_some() as u8);
+            put_u8(o, glide_from.unwrap_or(0) as u8);
+            put_f32(o, *glide_ms);
+            put_f32(o, *drive);
+            put_f32(o, *decay_ms);
+        }
+    }
+}
+fn get_synthkind(r: &mut R) -> Option<SynthKind> {
+    Some(match r.u8()? {
+        0 => SynthKind::Sine { hz: r.f32()? },
+        1 => SynthKind::Sampler { source: SourceId(r.u64()?) },
+        2 => {
+            let z = [r.f32()?, r.f32()?, r.f32()?];
+            SynthKind::Beatspace { z, crossfade: r.f32()? }
+        }
+        3 => {
+            let note = r.u8()? as i8;
+            let has_glide = r.u8()? != 0;
+            let glide_val = r.u8()? as i8;
+            let glide_ms = r.f32()?;
+            let drive = r.f32()?;
+            let decay_ms = r.f32()?;
+            SynthKind::Sub { note, glide_from: has_glide.then_some(glide_val), glide_ms, drive, decay_ms }
+        }
+        _ => return None, // a synth kind from a newer build: refuse, don't guess
+    })
+}
+
+fn put_channel(o: &mut Vec<u8>, c: &Channel) {
+    put_str(o, &c.name);
+    put_synthkind(o, &c.kind);
+    put_f32(o, c.gain);
+    put_f32(o, c.pan);
+    put_u8(o, c.muted as u8);
+}
+fn get_channel(r: &mut R) -> Option<Channel> {
+    Some(Channel { name: r.str()?, kind: get_synthkind(r)?, gain: r.f32()?, pan: r.f32()?, muted: r.u8()? != 0 })
+}
+
+fn put_stepmod(o: &mut Vec<u8>, m: &StepMod) {
+    put_f32(o, m.vel);
+    put_u8(o, m.ratchet);
+    put_u8(o, m.tune as u8);
+    put_u8(o, m.slide as u8);
+    put_f32(o, m.prob);
+    put_u8(o, m.every.is_some() as u8);
+    let (n, k) = m.every.unwrap_or((0, 0));
+    put_u8(o, n);
+    put_u8(o, k);
+}
+fn get_stepmod(r: &mut R) -> Option<StepMod> {
+    let vel = r.f32()?;
+    let ratchet = r.u8()?;
+    let tune = r.u8()? as i8;
+    let slide = r.u8()? != 0;
+    let prob = r.f32()?;
+    let has_every = r.u8()? != 0;
+    let n = r.u8()?;
+    let k = r.u8()?;
+    Some(StepMod { vel, ratchet, tune, slide, prob, every: has_every.then_some((n, k)) })
+}
+
+fn put_pattern(o: &mut Vec<u8>, pat: &Pattern) {
+    put_str(o, &pat.name);
+    put_u32(o, pat.steps);
+    put_u16(o, pat.rows.len().min(u16::MAX as usize) as u16);
+    for row in &pat.rows { put_u64(o, *row); }
+    put_u16(o, pat.mods.len().min(u16::MAX as usize) as u16);
+    for ((ch, step), m) in &pat.mods {
+        put_u16(o, *ch as u16);
+        put_u32(o, *step);
+        put_stepmod(o, m);
+    }
+}
+fn get_pattern(r: &mut R) -> Option<Pattern> {
+    let name = r.str()?;
+    let steps = r.u32()?;
+    let rn = r.u16()? as usize;
+    let mut rows = Vec::with_capacity(rn.min(4096));
+    for _ in 0..rn { rows.push(r.u64()?); }
+    let mn = r.u16()? as usize;
+    let mut mods = std::collections::BTreeMap::new();
+    for _ in 0..mn {
+        let ch = r.u16()? as usize;
+        let step = r.u32()?;
+        let m = get_stepmod(r)?;
+        mods.insert((ch, step), m);
+    }
+    Some(Pattern { name, steps, rows, mods })
+}
+
+fn put_rack(o: &mut Vec<u8>, rack: &Rack) {
+    put_u16(o, rack.channels.len().min(u16::MAX as usize) as u16);
+    for c in &rack.channels { put_channel(o, c); }
+    put_u16(o, rack.patterns.len().min(u16::MAX as usize) as u16);
+    for p in &rack.patterns { put_pattern(o, p); }
+    put_f32(o, rack.tempo_bpm);
+}
+fn get_rack(r: &mut R) -> Option<Rack> {
+    let cn = r.u16()? as usize;
+    let mut channels = Vec::with_capacity(cn.min(4096));
+    for _ in 0..cn { channels.push(get_channel(r)?); }
+    let pn = r.u16()? as usize;
+    let mut patterns = Vec::with_capacity(pn.min(4096));
+    for _ in 0..pn { patterns.push(get_pattern(r)?); }
+    let tempo_bpm = r.f32()?;
+    Some(Rack { channels, patterns, tempo_bpm })
 }
 
 impl Packet {
@@ -244,6 +473,12 @@ impl Packet {
                 put_u8(&mut o, 4);
                 put_u32(&mut o, ops.len() as u32);
                 for s in ops { put_stamped(&mut o, s); }
+            }
+            Packet::Rack(rs) => {
+                put_u8(&mut o, 5);
+                put_u64(&mut o, rs.seq);
+                put_u64(&mut o, rs.site.0);
+                put_rack(&mut o, &rs.rack);
             }
         }
         o
@@ -280,6 +515,12 @@ impl Packet {
                 let mut ops = Vec::with_capacity(n.min(4096));
                 for _ in 0..n { ops.push(get_stamped(&mut r)?); }
                 Packet::Catchup { ops }
+            }
+            5 => {
+                let seq = r.u64()?;
+                let site = SiteId(r.u64()?);
+                let rack = get_rack(&mut r)?;
+                Packet::Rack(RackSync { rack, seq, site })
             }
             _ => return None,
         };
@@ -343,6 +584,7 @@ impl super::Doc {
                 None
             }
             Packet::Presence(pr) => { self.presence(pr); None }
+            Packet::Rack(rs) => { self.integrate_rack(rs); None }
             Packet::Hello { since, .. } => Some(self.catchup_for(since)),
         }
     }
@@ -369,7 +611,7 @@ mod tests {
         };
         vec![
             Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-                name: "A1 — vocals".into(), muted: true, locked: false }, at: 3 },
+                name: "A1 — vocals".into(), muted: true, locked: false, route: None }, at: 3 },
             Op::RemoveTrack { id: TrackId(2) },
             Op::SetTrackFlags { id: TrackId(2), muted: false, locked: true },
             Op::AddClip { clip: clip.clone() },
@@ -380,6 +622,24 @@ mod tests {
             Op::SetEffects { id: ClipId(9), effects: effects() },
             Op::AddSource { source: Source { id: SourceId(3), path: "/takes/vox 03.wav".into(),
                 len: Ticks::from_seconds(90.0), sample_rate: 44_100, channels: 1, has_video: false } },
+            Op::AddBus { bus: Bus {
+                id: BusId(5), name: "808 — sub".into(), parent: Some(BusId(1)), gain: 0.9,
+                chain: effects(),
+                sends: vec![Send { to: BusId(2), level: 0.35, pre_fader: false }],
+                muted: false,
+            } },
+            Op::AddBus { bus: Bus { id: BusId(1), name: "Master-ish".into(), parent: None, gain: 1.0, chain: vec![], sends: vec![], muted: false } },
+            Op::RemoveBus { id: BusId(5) },
+            Op::SetBusGain { id: BusId(1), gain: 0.6 },
+            Op::SetBusFlags { id: BusId(1), muted: true },
+            Op::SetBusChain { id: BusId(1), chain: effects() },
+            Op::SetBusSends { id: BusId(1), sends: vec![
+                Send { to: BusId(2), level: 0.2, pre_fader: true },
+                Send { to: BusId(3), level: 0.0, pre_fader: false },
+            ] },
+            Op::SetRoute { track: TrackId(2), bus: Some(BusId(1)) },
+            Op::SetRoute { track: TrackId(2), bus: None },
+            Op::RemoveSource { id: SourceId(3) },
         ]
     }
 
@@ -415,6 +675,102 @@ mod tests {
         assert_eq!(Packet::decode(&h.encode()).unwrap(), h);
     }
 
+    fn sample_rack() -> Rack {
+        let mut pattern = Pattern::new("beat", 16, 3);
+        pattern.toggle(0, 0);
+        pattern.toggle(1, 4);
+        pattern.set_mod(1, 4, StepMod { vel: 0.7, ratchet: 4, tune: -5, slide: true, prob: 0.8, every: Some((1, 2)) });
+        Rack {
+            channels: vec![
+                Channel { name: "kick".into(), kind: SynthKind::Sine { hz: 60.0 }, gain: 1.0, pan: 0.0, muted: false },
+                Channel { name: "808".into(), kind: SynthKind::Sub { note: -5, glide_from: Some(0), glide_ms: 40.0, drive: 0.3, decay_ms: 300.0 }, gain: 0.9, pan: -0.1, muted: false },
+                Channel { name: "hat".into(), kind: SynthKind::Sampler { source: SourceId(3) }, gain: 0.6, pan: 0.2, muted: true },
+            ],
+            patterns: vec![pattern],
+            tempo_bpm: 140.0,
+        }
+    }
+
+    #[test]
+    fn a_rack_survives_the_wire_round_trip_exactly() {
+        // Including the awkward parts: a Sub channel's Option<i8> glide_from,
+        // a sparse StepMod with every field non-default, and a Beatspace
+        // channel's fixed-size z array.
+        let mut rack = sample_rack();
+        rack.channels.push(Channel {
+            name: "gan".into(),
+            kind: SynthKind::Beatspace { z: [0.25, -0.5, 0.9], crossfade: 0.4 },
+            gain: 1.0, pan: 0.0, muted: false,
+        });
+        let p = Packet::Rack(RackSync { rack, seq: 12, site: SiteId(3) });
+        let bytes = p.encode();
+        let back = Packet::decode(&bytes).expect("decodes");
+        assert_eq!(p, back, "round-trip changed the rack");
+    }
+
+    #[test]
+    fn an_empty_rack_round_trips_too() {
+        let p = Packet::Rack(RackSync { rack: Rack::default(), seq: 1, site: SiteId(1) });
+        assert_eq!(Packet::decode(&p.encode()).unwrap(), p);
+    }
+
+    #[test]
+    fn doc_receive_dispatches_a_rack_packet_into_integrate_rack() {
+        // The exhaustiveness-checked dispatch point: this is what the
+        // compiler's "non-exhaustive patterns" error caught while adding the
+        // Rack variant — a packet that encodes/decodes fine but is silently
+        // dropped by `receive` would be a real, quiet bug, not a hypothetical.
+        let mut doc = Doc::new(SiteId(1), Project::default());
+        assert!(doc.rack.is_none());
+        let sync = RackSync { rack: sample_rack(), seq: 1, site: SiteId(2) };
+        let reply = doc.receive(Packet::Rack(sync.clone()));
+        assert!(reply.is_none(), "a rack packet needs no reply, unlike a Hello");
+        assert_eq!(doc.rack, Some(sync));
+    }
+
+    #[test]
+    fn concurrent_rack_edits_converge_via_the_wire_packet_path() {
+        // The full path: two sites each publish a rack via set_rack, encode
+        // it to a real Packet, decode it back, and feed it to the other's
+        // receive() — not just calling integrate_rack directly in memory.
+        let mut a = Doc::new(SiteId(1), Project::default());
+        let mut b = Doc::new(SiteId(2), Project::default());
+
+        let sync_a = a.set_rack(sample_rack());
+        let mut rack_b = sample_rack();
+        rack_b.tempo_bpm = 174.0; // a different, conflicting edit
+        let sync_b = b.set_rack(rack_b);
+
+        // Deliver each other's packet through the real wire encode/decode.
+        let pkt_a = Packet::Rack(sync_a).encode();
+        let pkt_b = Packet::Rack(sync_b).encode();
+        b.receive(Packet::decode(&pkt_a).unwrap());
+        a.receive(Packet::decode(&pkt_b).unwrap());
+
+        assert_eq!(a.rack, b.rack, "both sites must converge on the identical rack");
+        // Both started from seq 1 (fresh docs) — the tie breaks on site, and
+        // SiteId(2) > SiteId(1), so b's edit (174 bpm) should win.
+        assert_eq!(a.rack.as_ref().unwrap().rack.tempo_bpm, 174.0);
+    }
+
+    #[test]
+    fn a_later_local_edit_always_outranks_a_previously_seen_remote_one() {
+        let mut a = Doc::new(SiteId(1), Project::default());
+        let remote = RackSync { rack: sample_rack(), seq: 5, site: SiteId(9) };
+        a.integrate_rack(remote);
+        assert_eq!(a.rack.as_ref().unwrap().seq, 5);
+
+        // A's own fresh edit must win even though A's site id (1) is lower
+        // than the remote's (9) — set_rack bases its seq on the highest seq
+        // seen so far specifically so a genuinely NEW edit is never
+        // out-ranked by an old one just because of site-id tie-breaking.
+        let mut new_rack = sample_rack();
+        new_rack.tempo_bpm = 90.0;
+        let local = a.set_rack(new_rack);
+        assert!(local.seq > 5, "a fresh local edit must get a higher seq than whatever was already known");
+        assert_eq!(a.rack.as_ref().unwrap().rack.tempo_bpm, 90.0);
+    }
+
     #[test]
     fn truncated_and_unknown_packets_are_refused_not_half_decoded() {
         // An edit applied from a corrupt packet would diverge one replica
@@ -437,6 +793,29 @@ mod tests {
         let mut future_op = full.clone();
         future_op[18] = 200;
         assert!(Packet::decode(&future_op).is_none());
+        // and the specific case this bump exists for: a peer still running
+        // the pre-bus-routing build (v1) sends a packet stamped with its own
+        // version. The new build must refuse it loudly rather than trying to
+        // read a Track that is missing the `route` byte it now expects.
+        let mut stale = full.clone();
+        stale[0] = 1;
+        assert!(Packet::decode(&stale).is_none(), "a v1 peer's packet must be refused, not misread");
+        // v2 existed too (bus routing without bus mute) — also refused now.
+        let mut stale_v2 = full.clone();
+        stale_v2[0] = 2;
+        assert!(Packet::decode(&stale_v2).is_none(), "a v2 peer's packet must be refused, not misread");
+        // v3 existed too (bus mute, no RemoveSource) — also refused now.
+        let mut stale_v3 = full.clone();
+        stale_v3[0] = 3;
+        assert!(Packet::decode(&stale_v3).is_none(), "a v3 peer's packet must be refused, not misread");
+    }
+
+    #[test]
+    fn a_v1_peer_sending_the_current_wire_version_would_still_be_misread_if_we_forgot_to_bump() {
+        // This is the inverse check: it pins that WIRE_VERSION really did
+        // move, so a future edit to the encoding can't silently forget the
+        // bump and let two incompatible builds both claim version N.
+        assert_eq!(WIRE_VERSION, 4, "bump this alongside the next encoding change, not instead of it");
     }
 
     #[test]
@@ -480,7 +859,7 @@ mod tests {
         // on another that started cold.
         let mut host = Doc::new(SiteId(1), Project { name: "cut".into(), ..Default::default() });
         host.local(Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         host.local(Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         for i in 0..6u64 {

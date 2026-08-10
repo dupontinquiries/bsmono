@@ -17,6 +17,10 @@ pub mod multiband;
 pub mod imager;
 pub mod chain;
 pub mod assistant;
+pub mod retune;
+pub mod psola;
+pub mod autotune;
+pub mod loudness;
 
 use std::collections::BTreeMap;
 use studio_core::Ticks;
@@ -425,14 +429,58 @@ pub enum Instance {
     Eq(Eq),
     Compressor(Compressor),
     Limiter(Limiter),
+    Multiband(Box<multiband::Multiband>),
+    Saturator(saturation::Saturator),
+    /// Plain gain, in dB — a trim stage positioned WHEREVER it sits in the
+    /// chain, unlike `Bus.gain`/`Clip.gain`, which are each a single scalar
+    /// always applied at one fixed point (the fader, after the whole insert
+    /// chain — see `mixdown`'s bus-fold docs). Without this, "boost 6dB
+    /// going into the limiter" (the clip-into-limiter mastering trick this
+    /// codebase's own README describes) had no way to land anywhere in
+    /// `Bus.chain` at all — mirrors `chain::Module::Gain`, the same concept
+    /// `Chain`'s own strip already has.
+    Gain(f32),
     Transform(Transform),
     Color(Color),
     Retime(Retime),
 }
 
+impl Instance {
+    /// Run one audio sample through this instance, for the variants that are
+    /// audio effects at all. `Transform`/`Color`/`Retime` are video-only —
+    /// passed through unchanged rather than refused, so a caller iterating a
+    /// mixed audio/video effect chain doesn't need to filter kinds itself
+    /// before calling this; it can just call it and trust silence for the
+    /// kinds that don't apply.
+    pub fn process_audio(&mut self, x: f32) -> f32 {
+        match self {
+            Instance::Eq(e) => e.process(x),
+            Instance::Compressor(c) => c.process(x),
+            Instance::Limiter(l) => l.process(x),
+            Instance::Multiband(m) => m.process(x),
+            Instance::Saturator(s) => s.process(x),
+            Instance::Gain(db) => x * from_db_pub(*db),
+            Instance::Transform(_) | Instance::Color(_) | Instance::Retime(_) => x,
+        }
+    }
+}
+
 /// Build a running effect from a project's stored description, or `None` when
 /// this build does not know the kind — which is how a project made with a
 /// plugin you lack still opens.
+///
+/// `"imager"` is deliberately NOT one of the kinds this builds, even though
+/// `imager::Imager` is fully implemented and tested: `Instance::process_audio`
+/// takes one sample and returns one, but an imager needs L and R
+/// SIMULTANEOUSLY (mid/side processing is inherently a relationship between
+/// the two channels, not a per-channel function) — the same reason
+/// `studio_fx::chain::Module::is_stereo()` exists to flag imager specially in
+/// the `Chain` strip. Fitting it into this mono per-sample interface would
+/// mean feeding it L and R sequentially through one instance, which is not
+/// stereo imaging at all, just a wrong answer that happens to compile. A bus
+/// or clip effect chain wanting stereo imaging needs a genuinely stereo-aware
+/// processing path here, which is real, separate work — not a missing match
+/// arm to fill in.
 pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> {
     let q = &effect.params;
     Some(match effect.kind.as_str() {
@@ -463,6 +511,43 @@ pub fn instantiate(effect: &studio_core::Effect, rate: f32) -> Option<Instance> 
         }
         "limiter" => Instance::Limiter(Limiter::new(rate, p(q, "ceiling", -0.3),
                                                     p(q, "lookahead", 5.0), p(q, "release", 50.0))),
+        "multiband" => {
+            // Crossover points, not output-band count — an N-crossover
+            // description yields N+1 bands, the same convention
+            // `multiband::Multiband::new` itself uses.
+            let n = p(q, "bands", 2.0).clamp(1.0, 6.0) as usize;
+            let freqs: Vec<f32> = (0..n)
+                .map(|i| p(q, &format!("freq{i}"), 200.0 * 2f32.powi(i as i32 + 1)))
+                .collect();
+            let mut mb = multiband::Multiband::new(rate, &freqs);
+            // Per-band gain and bypass are exposed now; per-band compressor
+            // threshold/ratio/attack/release are left at Multiband::new's own
+            // defaults — a reasonable first cut of control, not a cut corner:
+            // the essential structural parameter (crossover points, which
+            // bands exist at all) is here, finer per-band dynamics tuning is
+            // a natural follow-on rather than something this pass needed to
+            // finish to be useful.
+            for (i, band) in mb.bands.iter_mut().enumerate() {
+                band.gain_db = p(q, &format!("band{i}_gain"), 0.0);
+                band.bypass = p(q, &format!("band{i}_bypass"), 1.0) > 0.5;
+            }
+            Instance::Multiband(Box::new(mb))
+        }
+        "saturation" => {
+            let profile = match p(q, "profile", 0.0) as i32 {
+                1 => saturation::Profile::Tape,
+                2 => saturation::Profile::Console,
+                3 => saturation::Profile::Diode,
+                _ => saturation::Profile::Tube,
+            };
+            let mut sat = saturation::Saturator::new(profile);
+            sat.drive = p(q, "drive", 0.0).clamp(0.0, 1.0);
+            sat.bias = p(q, "bias", 0.0);
+            sat.mix = p(q, "mix", 1.0).clamp(0.0, 1.0);
+            sat.auto_gain = p(q, "auto_gain", 1.0) > 0.5;
+            Instance::Saturator(sat)
+        }
+        "gain" => Instance::Gain(p(q, "db", 0.0)),
         "transform" => Instance::Transform(Transform {
             x: p(q, "x", 0.0), y: p(q, "y", 0.0),
             scale_x: p(q, "scale_x", 1.0), scale_y: p(q, "scale_y", 1.0),
@@ -698,5 +783,123 @@ mod tests {
             Some(Instance::Transform(t)) => assert!(t.is_identity()),
             _ => panic!("transform should default to identity"),
         }
+    }
+
+    #[test]
+    fn process_audio_dispatches_to_the_right_audio_effect_and_passes_video_kinds_through() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 1000.0);
+        params.insert("gain0".to_string(), 6.0);
+        let eq_effect = studio_core::Effect { kind: "eq".into(), params, enabled: true };
+        let mut eq_instance = instantiate(&eq_effect, RATE).unwrap();
+        // A +6dB peaking EQ must actually change a signal at that frequency —
+        // this is the dispatch working, not a no-op passthrough.
+        let mut changed = false;
+        for i in 0..200 {
+            let t = i as f32 / RATE;
+            let x = (std::f32::consts::TAU * 1000.0 * t).sin();
+            let y = eq_instance.process_audio(x);
+            if (y - x).abs() > 1e-3 {
+                changed = true;
+            }
+        }
+        assert!(changed, "an EQ instance's process_audio should actually filter, not pass through");
+
+        // Video-only kinds pass audio through unchanged rather than silencing
+        // it or panicking — a mixed chain iterating kinds blindly must not
+        // need to filter video effects out first.
+        let transform_effect = studio_core::Effect { kind: "transform".into(), params: Default::default(), enabled: true };
+        let mut transform_instance = instantiate(&transform_effect, RATE).unwrap();
+        assert_eq!(transform_instance.process_audio(0.42), 0.42);
+    }
+
+    #[test]
+    fn multiband_instantiates_from_a_project_effect_and_actually_processes() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0); // one crossover -> two bands
+        params.insert("freq0".to_string(), 1000.0);
+        params.insert("band0_bypass".to_string(), 0.0); // enable the compressor on band 0
+        params.insert("band1_gain".to_string(), -12.0); // and cut band 1's gain hard
+        let effect = studio_core::Effect { kind: "multiband".into(), params, enabled: true };
+        let inst = instantiate(&effect, RATE).expect("multiband should now instantiate");
+        match &inst {
+            Instance::Multiband(m) => assert_eq!(m.bands.len(), 2, "one crossover point should yield two bands"),
+            _ => panic!("expected a Multiband instance"),
+        }
+        // A signal well above the crossover should read quieter than the
+        // same signal well below it, since band1 (the upper band) has a
+        // -12dB gain cut and band0 does not. Two FRESH instances — reusing
+        // one across both sweeps would let the crossover filter's residual
+        // low-frequency energy bleed into the high-frequency measurement.
+        let mut low_inst = instantiate(&effect, RATE).unwrap();
+        let mut high_inst = instantiate(&effect, RATE).unwrap();
+        let mut low_peak = 0.0f32;
+        let mut high_peak = 0.0f32;
+        for i in 0..4000 {
+            let t = i as f32 / RATE;
+            low_peak = low_peak.max(low_inst.process_audio((std::f32::consts::TAU * 200.0 * t).sin()).abs());
+        }
+        for i in 0..4000 {
+            let t = i as f32 / RATE;
+            high_peak = high_peak.max(high_inst.process_audio((std::f32::consts::TAU * 4000.0 * t).sin()).abs());
+        }
+        assert!(high_peak < low_peak * 0.6, "the upper band's -12dB cut should read measurably quieter: low {low_peak}, high {high_peak}");
+    }
+
+    #[test]
+    fn saturation_instantiates_from_a_project_effect_and_actually_drives() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("profile".to_string(), 0.0); // Tube
+        params.insert("drive".to_string(), 0.9);
+        let effect = studio_core::Effect { kind: "saturation".into(), params, enabled: true };
+        let mut inst = instantiate(&effect, RATE).expect("saturation should now instantiate");
+        let mut clean = instantiate(&studio_core::Effect {
+            kind: "saturation".into(),
+            params: { let mut p = std::collections::BTreeMap::new(); p.insert("drive".to_string(), 0.0); p },
+            enabled: true,
+        }, RATE).unwrap();
+
+        let mut differs = false;
+        for i in 0..500 {
+            let t = i as f32 / RATE;
+            let x = (std::f32::consts::TAU * 200.0 * t).sin();
+            let driven = inst.process_audio(x);
+            let dry = clean.process_audio(x);
+            if (driven - dry).abs() > 1e-3 { differs = true; }
+            assert!(driven.is_finite());
+        }
+        assert!(differs, "drive=0.9 should audibly differ from drive=0.0 through the same dispatch path");
+    }
+
+    #[test]
+    fn imager_is_deliberately_not_an_instantiable_kind() {
+        // Pinning the documented reason, not just the absence: Instance's
+        // process_audio is mono (one sample in, one out), and imaging is
+        // inherently a two-channel-at-once operation — see instantiate's
+        // own doc comment for why this is a scope boundary, not an oversight.
+        let effect = studio_core::Effect { kind: "imager".into(), params: Default::default(), enabled: true };
+        assert!(instantiate(&effect, RATE).is_none());
+    }
+
+    #[test]
+    fn gain_instantiates_and_applies_exactly_the_requested_db() {
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("db".to_string(), -6.0206); // -6.0206dB = exactly half amplitude
+        let effect = studio_core::Effect { kind: "gain".into(), params, enabled: true };
+        let mut inst = instantiate(&effect, RATE).expect("gain should instantiate");
+        let out = inst.process_audio(1.0);
+        assert!((out - 0.5).abs() < 1e-3, "-6.0206dB should read as almost exactly half amplitude, got {out}");
+    }
+
+    #[test]
+    fn a_default_gain_effect_is_unity_not_silence() {
+        // A bare Effect{kind:"gain"} with no "db" param must default to 0dB
+        // (unchanged), the same "sane default for an omitted parameter"
+        // convention every other kind here already follows — not to 0.0
+        // linear gain, which would silently mute anything using the default.
+        let effect = studio_core::Effect { kind: "gain".into(), params: Default::default(), enabled: true };
+        let mut inst = instantiate(&effect, RATE).unwrap();
+        assert_eq!(inst.process_audio(0.37), 0.37);
     }
 }

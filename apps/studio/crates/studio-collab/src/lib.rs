@@ -85,6 +85,39 @@ pub struct Presence {
     pub seq: u64,
 }
 
+/// The rack (patterns, channels, tempo), synced as a **last-writer-wins
+/// whole-value register** rather than through the op log's per-field
+/// convergence — deliberately, and worth explaining why.
+///
+/// A clip's fields (position, gain, effects) are edited independently and
+/// concurrently by design — two people nudging different clips must not
+/// collide. A rack is different: its channels and patterns are tightly
+/// coupled (a step references a channel by index; a `StepMod` references a
+/// channel's own note range), so a field-by-field merge of two peers'
+/// concurrent rack edits could easily produce a rack that never existed on
+/// either machine — a step pointing at a channel someone just deleted, or a
+/// `StepMod` from one edit paired with a channel list from another. Treating
+/// the whole rack as one LWW register — same mechanism as [`Presence`], just
+/// for something that DOES belong in the project rather than being throwaway
+/// — means a concurrent edit picks one peer's *complete, internally
+/// consistent* rack over the other's, never a blend of the two.
+///
+/// This is a real, deliberate trade: a producer's simultaneous edit can lose
+/// entirely rather than merge. For a rack — usually one person's instrument
+/// at a time, unlike a shared timeline of clips — that trade is the right
+/// one; a torn-apart pattern is a worse outcome than an occasionally-clobbered
+/// edit that Ctrl-Z or a re-do brings back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RackSync {
+    pub rack: studio_live::Rack,
+    /// Monotonically increasing from whichever rack this was derived from —
+    /// see [`Doc::set_rack`]. Paired with `site` for a deterministic total
+    /// order every replica computes identically, the same (seq, site)
+    /// tie-break `Stamp` already uses for ops.
+    pub seq: u64,
+    pub site: SiteId,
+}
+
 /// One replica of a shared project.
 pub struct Doc {
     pub site: SiteId,
@@ -105,6 +138,9 @@ pub struct Doc {
     /// Last writer per (clip, field), for the LWW rule.
     field_stamp: BTreeMap<(ClipId, Field), Stamp>,
     pub peers: BTreeMap<SiteId, Presence>,
+    /// The rack, synced as a whole-value LWW register — see [`RackSync`]'s
+    /// docs for why this is not just another op-log field.
+    pub rack: Option<RackSync>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -128,6 +164,7 @@ impl Doc {
             site, base: project.clone(), project, lamport: 0,
             seen: BTreeSet::new(), log: Vec::new(),
             field_stamp: BTreeMap::new(), peers: BTreeMap::new(),
+            rack: None,
         }
     }
 
@@ -212,6 +249,33 @@ impl Doc {
         }
     }
 
+    /// Publish a locally-edited rack. Bases the new sequence on whatever
+    /// rack is currently known (whether it originated here or arrived from a
+    /// peer), so a fresh local edit always outranks anything already seen —
+    /// the same reasoning `lamport` already uses for ops (`self.lamport =
+    /// self.lamport.max(...)`) applied to the rack's own single counter.
+    pub fn set_rack(&mut self, rack: studio_live::Rack) -> RackSync {
+        let next_seq = self.rack.as_ref().map(|r| r.seq).unwrap_or(0) + 1;
+        let sync = RackSync { rack, seq: next_seq, site: self.site };
+        self.rack = Some(sync.clone());
+        sync
+    }
+
+    /// Merge an incoming rack sync: keep whichever of the current and
+    /// incoming rack is greater by `(seq, site)` — a deterministic total
+    /// order every replica computes identically regardless of delivery
+    /// order, which is what makes this converge. See [`RackSync`]'s docs for
+    /// why this is whole-value LWW rather than a field-level merge.
+    pub fn integrate_rack(&mut self, incoming: RackSync) {
+        let keep_incoming = match &self.rack {
+            None => true,
+            Some(cur) => (incoming.seq, incoming.site) > (cur.seq, cur.site),
+        };
+        if keep_incoming {
+            self.rack = Some(incoming);
+        }
+    }
+
     /// Peers who are working in `clip`, for the "two people on the same clip"
     /// warning that prevents most conflicts before they happen.
     ///
@@ -240,9 +304,9 @@ mod tests {
     fn seed() -> Project {
         let mut p = Project { name: "session".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddTrack { track: Track { id: TrackId(2), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false }, at: 1 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, route: None }, at: 1 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "take1.mov".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         p
@@ -293,6 +357,39 @@ mod tests {
         let pos = a.project.clips[&ClipId(11)].pos;
         assert!(pos == Ticks::from_seconds(30.0) || pos == Ticks::from_seconds(40.0),
                 "LWW must pick an intended position, not invent one: {pos:?}");
+    }
+
+    #[test]
+    fn concurrent_bus_edits_still_converge_despite_field_of_not_covering_busses() {
+        // `field_of` only tracks (ClipId, Field) keys — AddBus/SetBusGain/etc
+        // return None from it, so they get none of the fast-path "a losing
+        // op is logged but skipped without a rebuild" optimization clip
+        // fields get. The question this test actually answers: does that
+        // make concurrent bus edits diverge or lose data, or is `rebuild`'s
+        // full deterministic replay still a sufficient safety net on its
+        // own? If this test passes, the field_of gap is a missed
+        // optimization, not a correctness bug — that distinction shouldn't
+        // be assumed, it should be checked.
+        let mut a = Doc::new(SiteId(1), seed());
+        let mut b = Doc::new(SiteId(2), seed());
+
+        let add = a.local(Op::AddBus { bus: studio_core::Bus {
+            id: studio_core::BusId(1), name: "Vocals".into(), parent: None, gain: 1.0,
+            chain: Vec::new(), sends: Vec::new(), muted: false,
+        } }).unwrap();
+        b.integrate(&add).unwrap();
+        assert_eq!(a.project, b.project, "both sites should agree right after the bus is added");
+
+        // Concurrent, conflicting gain edits to the SAME bus from both sites.
+        let g1 = a.local(Op::SetBusGain { id: studio_core::BusId(1), gain: 0.3 }).unwrap();
+        let g2 = b.local(Op::SetBusGain { id: studio_core::BusId(1), gain: 0.9 }).unwrap();
+        // Delivered in OPPOSITE orders to each site, like the clip-move test above.
+        b.integrate(&g1).unwrap();
+        a.integrate(&g2).unwrap();
+
+        assert_eq!(a.project, b.project, "both sites must converge on the identical bus gain despite field_of not tracking busses");
+        let gain = a.project.busses[&studio_core::BusId(1)].gain;
+        assert!(gain == 0.3 || gain == 0.9, "the winner must be one of the two intended values, never a blend: {gain}");
     }
 
     #[test]

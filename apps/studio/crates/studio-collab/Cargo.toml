@@ -6,4 +6,5 @@ description = "Realtime collaborative editing for Studio projects: a convergent 
 
 [dependencies]
 studio-core = { path = "../studio-core" }
+studio-live = { path = "../studio-live" }
 serde = { version = "1", features = ["derive"] }

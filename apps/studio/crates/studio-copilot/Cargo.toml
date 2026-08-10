@@ -1,0 +1,13 @@
+[package]
+name = "studio-copilot"
+version = "0.1.0"
+edition = "2021"
+description = "The session copilot: turns the mastering assistant's findings, and a small set of hand-composed workflows, into Op/Command proposals the user previews and applies themselves — a client of the same seam touch/voice/collab go through, with no private powers of its own. Every proposal is a preview, never an auto-apply."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+studio-command = { path = "../studio-command" }
+studio-fx = { path = "../studio-fx" }
+studio-voice = { path = "../studio-voice" }
+studio-live = { path = "../studio-live" }
+core-kit = { path = "../../../../shared/core-kit" }

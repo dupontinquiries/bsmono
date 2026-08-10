@@ -213,6 +213,19 @@ impl Session {
         crate::wire::Packet::Catchup { ops }
     }
 
+    /// The rack half of what a newcomer needs — kept as a SEPARATE packet
+    /// from [`Session::broadcast`] rather than folded into it, because the
+    /// rack isn't part of the project's op log at all (see [`crate::RackSync`]'s
+    /// docs on why it's synced as a whole-value LWW register instead). A real
+    /// join flow calls both: `broadcast()` for the project, this for the
+    /// rack, same as a peer who already shares the base separately asks for
+    /// `Doc::catchup_for` and this. Returns `None` when no rack has been set
+    /// yet — a project with no drum programming has nothing to hand over,
+    /// and a newcomer's own `Doc::rack` already starts as `None`.
+    pub fn rack_broadcast(&self) -> Option<crate::wire::Packet> {
+        self.doc.rack.clone().map(crate::wire::Packet::Rack)
+    }
+
     /// Is anyone still here? The question that decides whether a project can be
     /// archived — and the reason membership exists at all.
     pub fn is_idle(&self) -> bool { self.members.is_empty() }
@@ -242,7 +255,7 @@ mod tests {
     fn seeded_session() -> Session {
         let mut p = Project { name: "cut".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
             len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         Session::open(team(), "cut", Doc::new(SiteId(1), p))
@@ -387,5 +400,41 @@ mod tests {
         let mut newcomer = Doc::new(SiteId(5), Project { name: "cut".into(), ..Default::default() });
         newcomer.receive(s.broadcast());
         assert_eq!(newcomer.project, s.doc.project, "the broadcast reconstructs the session");
+    }
+
+    #[test]
+    fn rack_broadcast_is_none_when_nothing_has_set_a_rack_yet() {
+        let s = seeded_session();
+        assert!(s.rack_broadcast().is_none(), "a session with no rack activity has nothing to hand a newcomer");
+    }
+
+    #[test]
+    fn a_newcomer_gets_the_current_rack_alongside_the_project() {
+        // Regression test for a real gap: `broadcast()` alone only ever
+        // handed a newcomer the PROJECT — the rack (drum patterns, channels,
+        // tempo) simply never reached a joining peer at all, since it isn't
+        // part of the op log `broadcast()` reads from. A real join flow must
+        // call both `broadcast()` and `rack_broadcast()`; this pins that as
+        // the actual contract, not just that each method works alone.
+        let mut s = seeded_session();
+        let mut pattern = studio_live::Pattern::new("beat", 16, 1);
+        pattern.toggle(0, 0);
+        let rack = studio_live::Rack {
+            channels: vec![studio_live::Channel {
+                name: "kick".into(), kind: studio_live::SynthKind::Sine { hz: 60.0 },
+                gain: 1.0, pan: 0.0, muted: false,
+            }],
+            patterns: vec![pattern],
+            tempo_bpm: 140.0,
+        };
+        s.doc.set_rack(rack.clone());
+
+        let mut newcomer = Doc::new(SiteId(5), Project { name: "cut".into(), ..Default::default() });
+        newcomer.receive(s.broadcast());
+        let rack_packet = s.rack_broadcast().expect("a rack was set, so this must be Some");
+        newcomer.receive(rack_packet);
+
+        assert_eq!(newcomer.project, s.doc.project, "project still reconstructs correctly");
+        assert_eq!(newcomer.rack.as_ref().map(|r| &r.rack), Some(&rack), "and the rack must reach the newcomer too, not just the project");
     }
 }

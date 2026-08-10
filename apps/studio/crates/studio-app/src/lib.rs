@@ -55,7 +55,7 @@ impl Studio {
         for (i, (kind, nm)) in [(TrackKind::Video, "V1"), (TrackKind::Audio, "A1"),
                                  (TrackKind::Audio, "A2")].iter().enumerate() {
             p.apply(&Op::AddTrack { track: Track { id: TrackId(i as u64 + 1), kind: *kind,
-                name: (*nm).into(), muted: false, locked: false }, at: i }).ok();
+                name: (*nm).into(), muted: false, locked: false, route: None }, at: i }).ok();
         }
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "takes/demo.wav".into(),
             len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).ok();
