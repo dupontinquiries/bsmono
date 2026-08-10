@@ -218,6 +218,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "nifty-core"
+version = "0.1.0"
+
+[[package]]
 name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -425,6 +429,7 @@ name = "tadpole-egui"
 version = "0.1.0"
 dependencies = [
  "egui",
+ "nifty-core",
  "uikit-egui",
 ]
 

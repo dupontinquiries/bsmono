@@ -29,6 +29,8 @@
 //! rusto-rs today, something else later, a stub in tests. Everything here is
 //! written against `Ocr`, and the app logic is testable with no model at all.
 
+pub mod table;
+
 use std::collections::BTreeSet;
 
 /// One recognised region.
@@ -125,15 +127,70 @@ pub fn reading_order(regions: &[Region]) -> Vec<usize> {
 }
 
 /// The app's state.
-#[derive(Default)]
 pub struct Tadpole {
     pub regions: Vec<Region>,
     /// Which regions the user has selected, by index.
     selected: BTreeSet<usize>,
+    /// How to present the page. Defaults to Lines: a page is prose until the
+    /// geometry says otherwise, and guessing "table" on a paragraph produces a
+    /// two-column mess that looks like a bug.
+    pub render: table::Render,
     pub last_error: Option<OcrError>,
 }
 
+impl Default for Tadpole {
+    fn default() -> Self {
+        Tadpole {
+            regions: Vec::new(),
+            selected: BTreeSet::new(),
+            render: table::Render::Lines,
+            last_error: None,
+        }
+    }
+}
+
 impl Tadpole {
+    /// The table this page makes, if it makes one.
+    pub fn table(&self) -> Option<table::Table> {
+        let t = table::detect(&self.regions, 0.6);
+        if t.looks_like_table() { Some(t) } else { None }
+    }
+
+    /// The page as text, in the current render mode.
+    ///
+    /// Falls back to lines when the mode asks for a table and the page is not
+    /// one — a toggle that produced an empty pane would read as the app
+    /// breaking rather than as the page not being tabular.
+    pub fn rendered(&self) -> String {
+        match self.render {
+            table::Render::Lines => self.text(),
+            table::Render::Markdown => match self.table() {
+                Some(t) => table::to_markdown(&t),
+                None => self.text(),
+            },
+            table::Render::Raw => match self.table() {
+                Some(t) => table::to_raw(&t, self.px_per_char()),
+                None => self.text(),
+            },
+        }
+    }
+
+    /// Pixels per character, estimated from the regions themselves.
+    ///
+    /// Measured rather than assumed: a phone photo and a 4K screenshot of the
+    /// same table have wildly different pixel scales, and a fixed constant
+    /// would make one of them collapse and the other sprawl.
+    fn px_per_char(&self) -> f32 {
+        let mut total_w = 0.0f32;
+        let mut total_c = 0usize;
+        for r in &self.regions {
+            let (x0, _, x1, _) = r.bounds();
+            let n = r.text.chars().count();
+            if n > 0 { total_w += x1 - x0; total_c += n; }
+        }
+        if total_c == 0 { 8.0 } else { (total_w / total_c as f32).max(1.0) }
+    }
+
     /// Run a backend over an image and take the result.
     pub fn scan(&mut self, ocr: &dyn Ocr, image: &ImageRef) {
         match ocr.recognise(image) {
@@ -393,6 +450,62 @@ mod tests {
         let mut app = Tadpole::default();
         app.toggle(7);
         assert_eq!(app.selection_count(), 0);
+    }
+
+    #[test]
+    fn the_render_toggle_switches_presentation_without_changing_the_data() {
+        // Raw exists because reflowing a receipt is corruption dressed as
+        // tidiness; markdown exists because a wall of cells is unreadable. Both
+        // read the same regions.
+        let mut app = Tadpole::default();
+        app.scan(&Fake(vec![
+            r("Item", 0.9, 10.0, 10.0, 40.0, 20.0), r("Price", 0.9, 300.0, 11.0, 45.0, 20.0),
+            r("Tea", 0.9, 10.0, 50.0, 30.0, 20.0), r("2.50", 0.9, 300.0, 49.0, 38.0, 20.0),
+        ]), &img());
+
+        app.render = table::Render::Markdown;
+        let md = app.rendered();
+        assert!(md.contains("| Item | Price |"), "markdown: {md}");
+        assert!(md.lines().nth(1).unwrap().contains("---"));
+
+        app.render = table::Render::Raw;
+        let raw = app.rendered();
+        assert!(!raw.contains('|'), "raw keeps spacing, not pipes: {raw}");
+        assert!(raw.lines().next().unwrap().contains("Item"));
+
+        app.render = table::Render::Lines;
+        assert_eq!(app.rendered(), "Item\nPrice\nTea\n2.50");
+    }
+
+    #[test]
+    fn a_table_mode_on_a_page_that_is_not_a_table_falls_back_to_lines() {
+        // A toggle that produced an empty pane would read as the app breaking
+        // rather than as the page not being tabular.
+        let mut app = Tadpole::default();
+        app.scan(&Fake(vec![r("just prose here", 0.9, 10.0, 10.0, 200.0, 20.0)]), &img());
+        app.render = table::Render::Markdown;
+        assert_eq!(app.rendered(), "just prose here");
+        app.render = table::Render::Raw;
+        assert_eq!(app.rendered(), "just prose here");
+    }
+
+    #[test]
+    fn the_default_is_lines_because_a_page_is_prose_until_proven_otherwise() {
+        // Guessing "table" on a paragraph produces a two-column mess that looks
+        // like a bug.
+        assert_eq!(Tadpole::default().render, table::Render::Lines);
+    }
+
+    #[test]
+    fn character_width_is_measured_from_the_page_not_assumed() {
+        // A phone photo and a 4K screenshot of the same table have wildly
+        // different pixel scales; a fixed constant collapses one and sprawls
+        // the other.
+        let mut small = Tadpole::default();
+        small.scan(&Fake(vec![r("abcd", 0.9, 0.0, 0.0, 40.0, 12.0)]), &img());
+        let mut large = Tadpole::default();
+        large.scan(&Fake(vec![r("abcd", 0.9, 0.0, 0.0, 400.0, 120.0)]), &img());
+        assert!(large.px_per_char() > small.px_per_char() * 5.0);
     }
 
     #[test]
