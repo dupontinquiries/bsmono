@@ -33,6 +33,7 @@ pub mod audio;
 pub mod models;
 pub mod overview;
 pub mod paste;
+pub mod speakers;
 pub mod table;
 
 use std::collections::BTreeSet;
