@@ -24,6 +24,8 @@
 //! (project, sources, window) so a render is reproducible and testable — no
 //! device, no callback, no clock.
 
+pub mod stems;
+
 use std::collections::BTreeMap;
 use studio_core::{Project, SourceId, Ticks, TrackKind};
 
