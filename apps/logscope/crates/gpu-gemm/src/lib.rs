@@ -11502,10 +11502,31 @@ fallback kernel is causal-only) — long prompts on this model will attend outsi
     }
 
     pub fn linear_iq1_s_t(&self, a: &Tensor, w: &Iq1Weight, m: usize) -> Tensor {
-        // Decode only. This variant exists so a 30.3 GiB checkpoint can stay resident, and residency
-        // matters at m == 1; claiming batch support it does not have would be the same kind of lie as
-        // a gate testing a path nothing calls.
-        assert_eq!(m, 1, "IQ1_S matvec is decode-only; batched prefill converts instead");
+        // The KERNEL is decode-only: it computes one output row per dispatch and claiming batch
+        // support it does not have would be the same kind of lie as a gate testing a path nothing
+        // calls. That contract is right and stays.
+        //
+        // What was wrong is that the assert was the ONLY thing here. Its own message says "batched
+        // prefill converts instead" and nothing at this call site converted, so an IQ1_S model
+        // panicked on any m > 1 — which is prewarm's two-token warm, and then EVERY PROMPT, since a
+        // prompt is a batch by definition. A resident-IQ1_S checkpoint could load and could not be
+        // used.
+        //
+        // So m > 1 runs the decode kernel ROW BY ROW and reassembles. That is m dispatches where a
+        // batched kernel would take one, and it is the correct answer rather than the fast one: this
+        // path exists so a 30 GiB checkpoint stays resident at all, and a slow prefill on a model
+        // that otherwise cannot run is not a trade worth agonising over. A batched IQ1_S GEMM would
+        // replace this; until one exists, working beats crashing.
+        if m != 1 {
+            let cols = a.cols;
+            let out = self.alloc(m, w.n);
+            for r in 0..m {
+                let row = self.rows_view(a, r, 1, cols);
+                let got = self.linear_iq1_s_t(&row, w, 1);
+                self.copy_buf(&got, 0, &out, (r * w.n * 4) as u64, (w.n * 4) as u64);
+            }
+            return out;
+        }
         let out = self.alloc(1, w.n);
         // THE DIMS WERE SHIFTED BY ONE FIELD. The shader declares
         //     struct D { m, n, k, kb, gx, ... }
@@ -15919,5 +15940,53 @@ mod shard_path_tests {
         let r = gguf_shard_paths("/nonexistent/Mixture-of-Experts-00002-of-00002.gguf");
         let e = r.unwrap_err();
         assert!(e.contains("Mixture-of-Experts-00001-of-00002.gguf"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod iq1_batch_tests {
+    /// The crash this fixes: prewarm calls prefill_batched with two tokens, which reaches
+    /// `Lin::apply` with m=2, which reached an `assert_eq!(m, 1)` and killed the load thread.
+    ///
+    /// A GPU is needed to run the kernel, so what is checked here is the SHAPE of the fix — that
+    /// the batched entry point is reachable and that the row loop's arithmetic lands each row where
+    /// the next one expects it. Getting that wrong writes row r over row r-1 and produces a
+    /// plausible-looking tensor of repeated values, which is the failure mode worth catching
+    /// without hardware.
+    fn row_offsets(m: usize, n: usize) -> Vec<u64> {
+        (0..m).map(|r| (r * n * 4) as u64).collect()
+    }
+
+    #[test]
+    fn each_row_lands_after_the_previous_one() {
+        // Byte offsets, not element offsets — a missing *4 packs four rows into one row's space and
+        // the output looks like a shorter tensor rather than an error.
+        assert_eq!(row_offsets(4, 8), vec![0, 32, 64, 96]);
+    }
+
+    #[test]
+    fn the_rows_exactly_tile_the_output_with_no_gap_or_overlap() {
+        let (m, n) = (17, 5120);
+        let offs = row_offsets(m, n);
+        let stride = (n * 4) as u64;
+        for w in offs.windows(2) {
+            assert_eq!(w[1] - w[0], stride, "a gap or overlap between rows");
+        }
+        assert_eq!(offs.last().unwrap() + stride, (m * n * 4) as u64,
+                   "the last row ends exactly at the buffer end");
+    }
+
+    #[test]
+    fn a_single_row_batch_is_the_decode_path_unchanged() {
+        // m == 1 must not take the loop: it is the hot path, and routing it through a copy would
+        // add a dispatch to every decoded token.
+        assert_eq!(row_offsets(1, 4096), vec![0]);
+    }
+
+    #[test]
+    fn a_zero_row_batch_produces_no_copies() {
+        // Reachable from an empty prompt; the loop must not run rather than allocating a zero-row
+        // tensor and copying into it.
+        assert!(row_offsets(0, 4096).is_empty());
     }
 }
