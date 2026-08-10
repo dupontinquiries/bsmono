@@ -1,0 +1,11 @@
+[package]
+name = "astfind"
+version = "0.1.0"
+edition = "2021"
+description = "fzf-like search over the monorepo's Rust items: find a function, see its doc comment and its callers. Pure matching and indexing here; the ratatui shell and the optional AI pass are separate layers."
+
+[lib]
+name = "astfind"
+path = "src/lib.rs"
+
+[dependencies]
