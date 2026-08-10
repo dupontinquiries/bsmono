@@ -47,6 +47,7 @@ pub mod ambient_blobs;
 pub mod camera_select;
 pub mod chevron_confirm;
 pub mod help_manual;
+pub mod keyboard_inset;
 pub mod punch_addrs;
 pub mod tab_bar;
 pub mod requests;
