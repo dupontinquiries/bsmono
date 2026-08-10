@@ -111,7 +111,26 @@ pub fn ensure_cache_dir() -> std::io::Result<()> { std::fs::create_dir_all(cache
 ///
 /// The rule this encodes: **changing a kernel invalidates every measurement taken against it.** The
 /// epoch is in the name so that is one edit rather than a cache-clearing instruction nobody follows.
-fn autotune_file() -> PathBuf { cache_root().join("autotune-v5.tsv") }
+/// **v6: the adapter string does not identify the host.** Two kernels on one
+/// GPU — Asahi Fedora ships both a 4 KiB and a 16 KiB page build — produce the
+/// same adapter name and different host-side behaviour, and `prefetch_mapped`
+/// was silently a no-op on the 16 KiB one because madvise wants a page-aligned
+/// address. A verdict probed with a broken prefetch is a verdict probed with a
+/// different resident set.
+///
+/// So the key now carries the page size and this bump discards verdicts that
+/// could not say which kernel produced them. Same lesson as v4 and v5 by a
+/// third route: a key that cannot distinguish two conditions will silently
+/// serve one's answer for the other.
+fn autotune_file() -> PathBuf { cache_root().join("autotune-v6.tsv") }
+
+/// The adapter key, qualified by host page size.
+///
+/// Appended rather than replacing the adapter name so the file stays readable
+/// and greppable by GPU, which is how anyone actually inspects it.
+pub fn adapter_key(adapter: &str) -> String {
+    format!("{adapter} [{}k]", crate::pagesize::page_size() / 1024)
+}
 pub fn autotune_get(adapter: &str, k: usize, n: usize) -> Option<u32> {
     let txt = std::fs::read_to_string(autotune_file()).ok()?;
     for line in txt.lines() {
@@ -809,5 +828,44 @@ mod epoch_tests {
         std::env::set_var("LOGSCOPE_CACHE_DIR", &dir);
         let _ = std::fs::write(flush_file(), format!("A\t128\t{}\n", SUBMIT_TUNE_EPOCH + 5));
         assert_eq!(flush_get("A"), None);
+    }
+}
+
+#[cfg(test)]
+mod page_key_tests {
+    use super::*;
+
+    #[test]
+    fn the_key_distinguishes_two_kernels_on_one_gpu() {
+        // The gap: Asahi Fedora ships both a 4 KiB and a 16 KiB page build, and
+        // the adapter string is identical on both. A cache that cannot tell
+        // them apart serves one kernel's verdicts to the other.
+        let k = adapter_key("Apple M2 Ultra (G14D B1) [Vulkan]");
+        assert!(k.starts_with("Apple M2 Ultra"), "still greppable by GPU: {k}");
+        assert!(k.ends_with("k]"), "carries the page size: {k}");
+    }
+
+    #[test]
+    fn the_key_is_stable_within_a_run() {
+        // A key that varied between a write and a read would miss every time
+        // and re-probe on every load — slower than no cache at all.
+        assert_eq!(adapter_key("gpu"), adapter_key("gpu"));
+    }
+
+    #[test]
+    fn the_epoch_advanced_so_unqualified_verdicts_are_discarded() {
+        // Verdicts written before the key carried a page size cannot say which
+        // kernel produced them, and the store's own doctrine is that a cached
+        // verdict outlives the code that produced it.
+        assert!(autotune_file().to_string_lossy().contains("autotune-v6"));
+    }
+
+    #[test]
+    fn a_tab_in_an_adapter_name_cannot_forge_a_field() {
+        // The file is TSV; an adapter string containing a tab would split into
+        // extra columns and silently match the wrong shape.
+        let k = adapter_key("weird\tname");
+        assert_eq!(k.matches('\t').count(), 1,
+                   "a tab in the name is preserved but the key adds none: {k:?}");
     }
 }
