@@ -23,9 +23,15 @@ The consequences are larger than the bug:
 
 The fix is source templating: `override TILE: u32 = 16u;` is replaced with a
 `const` literal per tile, so the module *bytes* differ. No driver cache can
-collapse distinct modules. An assert guards the anchor line — if
-`LINEAR_Q8_0_TILED`'s override line ever drifts, the build fails loudly rather
-than silently reverting to one kernel.
+collapse distinct modules. An assert guards the anchor line — but **it is a runtime assert inside
+`gemm_pipeline`, not a build-time check**. A drifted anchor compiles fine and
+dies on the first pipeline creation.
+
+In a gate-first workflow that is nearly equivalent, since every gate run
+constructs GEMM pipelines and drift cannot survive one kernel-validate pass. It
+is *not* equivalent for anyone relying on `cargo build` alone, which is why the
+distinction is stated rather than glossed: a green build does not mean the
+anchor still matches.
 
 **The cache was innocent.** It keys `(ptr, 0x4000|tile)` correctly; the
 collapse was below wgpu. Worth stating because the obvious suspect was the
@@ -52,3 +58,36 @@ That structure exists because **disagreement between twins does not say which
 side moved** — the f64 column does. Before opening a kernel on any failing
 gate, check that gate's own oracle class and denominators first: we have now
 watched a gate convict its own oracle once this week.
+
+
+## Ledger updates from the c689 report
+
+Both of these post-date the patch text above.
+
+### The two-sided gemmshape question has been run once, and resolved to the middle
+
+On the **M2 Max, post-fix**: real spread appeared — **45% on q/o** — but only
+**3–6% on the time-dominant shapes**, moving the floor **~2.5%**.
+
+So "kernel work parked" is **restored on evidence for that box** rather than
+merely reinstated. The Ultra rerun is still owed, and still needs the
+store-namespace bump first, since the persisted winners under the collapse would
+otherwise seed it.
+
+That is the honest shape of the answer: not the clean two-sided outcome the
+prediction imagined, but a mixed middle where the sweep matters for a couple of
+shapes and does not move the total much.
+
+### The `attention_mh_full_t` routing is an ACCURACY fix, not a speed one
+
+It must **not** inherit the earlier −160 ms expectation. The c689 A/B tied
+chunked against naive — **2698.9 vs 2630.7** — because EXT_PAR moves the same
+K/V volume, it just moves it coalesced.
+
+Stating this matters because "route the vision path to the tiled kernel" reads
+like a performance task, and a reader who acts on it expecting −160 ms will
+conclude the routing failed when it did exactly what it was for.
+
+**The perf lever for the quadratic is a different kernel**: a query-block flash
+variant that stages K/V tiles once per row-block. That now sits at the top of
+the kernel queue.
