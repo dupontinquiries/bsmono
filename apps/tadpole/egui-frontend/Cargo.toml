@@ -1,0 +1,16 @@
+[package]
+name = "tadpole-egui"
+version = "0.1.0"
+edition = "2021"
+description = "Image to text, all Rust. A Frog-shaped OCR app on egui with touch support: capture or drop an image, get selectable text, copy a region or the lot."
+
+[lib]
+name = "tadpole"
+path = "src/lib.rs"
+
+[dependencies]
+uikit-egui = { path = "../../../shared/uikit/crates/uikit-egui" }
+egui = "0.34"
+
+[features]
+default = []
