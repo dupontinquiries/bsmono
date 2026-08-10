@@ -647,3 +647,9 @@ kind = "cargo"
 role = "library"
 notes = "fzf-like search over the monorepo's Rust items: find a function, read its doc comment, list its call sites. fzf's scoring model ported with its tuning relationships intact. Line-wise rather than syn, so a file that does not compile still indexes — which is when you most want to search. Ratatui shell and the optional wgpu/ollama analysis pass are separate layers over this core."
 
+[shared.hover-kit]
+path = "shared/hover-kit"
+kind = "cargo"
+role = "library"
+notes = "Hover gating and pointer synthesis for phone-class sensors. A phone proximity sensor is one bit at 5cm, not a rangefinder — so it gates WHEN the camera runs and vision decides WHERE. Pure policy, no sysfs or camera, testable without the hardware."
+
