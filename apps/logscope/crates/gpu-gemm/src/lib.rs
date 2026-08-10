@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 pub mod flash_qblock;
 pub mod pool_class;
+pub mod quant_mix;
 pub mod gguf;
 pub mod cpumatvec;
 pub mod cpupool;
