@@ -29,7 +29,9 @@
 //! rusto-rs today, something else later, a stub in tests. Everything here is
 //! written against `Ocr`, and the app logic is testable with no model at all.
 
+pub mod audio;
 pub mod models;
+pub mod overview;
 pub mod table;
 
 use std::collections::BTreeSet;
