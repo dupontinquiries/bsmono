@@ -32,6 +32,7 @@
 pub mod audio;
 pub mod models;
 pub mod overview;
+pub mod paste;
 pub mod table;
 
 use std::collections::BTreeSet;
@@ -132,6 +133,8 @@ pub fn reading_order(regions: &[Region]) -> Vec<usize> {
 /// The app's state.
 pub struct Tadpole {
     pub regions: Vec<Region>,
+    /// Transcript segments, when the source was audio or pasted text.
+    pub segments: Vec<audio::Segment>,
     /// Which regions the user has selected, by index.
     selected: BTreeSet<usize>,
     /// Where the weights are, or what is missing. Re-checked on demand rather
@@ -149,6 +152,7 @@ impl Default for Tadpole {
     fn default() -> Self {
         Tadpole {
             regions: Vec::new(),
+            segments: Vec::new(),
             selected: BTreeSet::new(),
             render: table::Render::Lines,
             models: models::ModelState::Missing,
@@ -213,11 +217,82 @@ impl Tadpole {
         if total_c == 0 { 8.0 } else { (total_w / total_c as f32).max(1.0) }
     }
 
+    /// Accept whatever was dropped, pasted or screenshotted.
+    ///
+    /// One entry point for all three, because they deliver the same three
+    /// things in practice and three handlers would drift. Returns the
+    /// classification so the caller can show the message for a refusal without
+    /// this function needing to know how messages are drawn.
+    pub fn accept(
+        &mut self,
+        bytes: &[u8],
+        name: Option<&str>,
+        ocr: &dyn Ocr,
+        transcriber: &dyn audio::Transcriber,
+    ) -> paste::Incoming {
+        let what = paste::classify(bytes, name);
+        match &what {
+            paste::Incoming::Image(_) => {
+                // The decoder lives in the shell, not here — this crate has no
+                // image dependency on purpose. A caller that has pixels calls
+                // scan() directly; accept() is for routing.
+                self.last_error = None;
+            }
+            paste::Incoming::Audio(f) => {
+                match transcriber.transcribe(bytes, *f) {
+                    Ok(segs) => { self.take_segments(segs); }
+                    Err(e) => {
+                        self.segments.clear();
+                        self.last_error = Some(e);
+                    }
+                }
+            }
+            paste::Incoming::Text(t) => {
+                // Text has no positions, so each line becomes a segment at its
+                // line index. That is enough for the overview, which only cares
+                // about ordering — and it means pasted notes get a mindmap.
+                let segs: Vec<audio::Segment> = t.lines()
+                    .filter(|l| !l.trim().is_empty())
+                    .enumerate()
+                    .map(|(i, l)| audio::Segment {
+                        start_ms: i as u64, end_ms: i as u64, text: l.trim().into(), score: 1.0,
+                    })
+                    .collect();
+                self.take_segments(segs);
+            }
+            _ => {}
+        }
+        what
+    }
+
+    fn take_segments(&mut self, segs: Vec<audio::Segment>) {
+        self.segments = segs;
+        // Regions and segments are two views of one document, and a new source
+        // replaces the document. Leaving stale regions would put the previous
+        // image's text in this recording's overview.
+        self.regions.clear();
+        self.selected.clear();
+        self.last_error = None;
+    }
+
+    /// Topics for the overview pane, from whichever half has material.
+    pub fn overview(&self) -> Vec<overview::Topic> {
+        let items = if !self.segments.is_empty() {
+            overview::from_segments(&self.segments)
+        } else {
+            overview::from_regions(&self.regions)
+        };
+        overview::topics(&items, 4, 12)
+    }
+
     /// Run a backend over an image and take the result.
     pub fn scan(&mut self, ocr: &dyn Ocr, image: &ImageRef) {
         match ocr.recognise(image) {
             Ok(r) => {
                 self.regions = r;
+                // Same rule in the other direction: a scan replaces the
+                // document, so a previous transcript must not linger.
+                self.segments.clear();
                 // Selection is cleared, not remapped: indices from the previous
                 // image mean nothing here, and keeping them would copy text
                 // from wherever those indices happen to land.
@@ -533,6 +608,95 @@ mod tests {
         // could not have been told first.
         let app = Tadpole::default();
         assert!(!app.can_scan(), "a fresh app has not found weights yet");
+    }
+
+    struct FakeVoice(Vec<audio::Segment>);
+    impl audio::Transcriber for FakeVoice {
+        fn transcribe(&self, _b: &[u8], _f: audio::Format) -> Result<Vec<audio::Segment>, OcrError> {
+            Ok(self.0.clone())
+        }
+    }
+    struct NoVoice;
+    impl audio::Transcriber for NoVoice {
+        fn transcribe(&self, _b: &[u8], _f: audio::Format) -> Result<Vec<audio::Segment>, OcrError> {
+            Err(OcrError::NoModel)
+        }
+    }
+    fn wav_bytes() -> Vec<u8> {
+        let mut v = b"RIFF".to_vec();
+        v.extend_from_slice(&[0; 4]);
+        v.extend_from_slice(b"WAVE");
+        v.extend_from_slice(&[0; 8]);
+        v
+    }
+
+    #[test]
+    fn a_dropped_wav_transcribes_and_fills_the_overview() {
+        let mut app = Tadpole::default();
+        let voice = FakeVoice(vec![
+            audio::Segment { start_ms: 0, end_ms: 1, text: "routing table basics".into(), score: 0.9 },
+            audio::Segment { start_ms: 30_000, end_ms: 1, text: "more routing table talk".into(), score: 0.9 },
+        ]);
+        let what = app.accept(&wav_bytes(), Some("meeting.wav"), &Fake(vec![]), &voice);
+        assert_eq!(what, paste::Incoming::Audio(audio::Format::Wav));
+        assert_eq!(app.segments.len(), 2);
+        assert!(app.overview().iter().any(|t| t.term == "routing"));
+    }
+
+    #[test]
+    fn pasted_text_gets_an_overview_without_any_model() {
+        // The overview works on ordering alone, so notes off the clipboard earn
+        // a mindmap with nothing installed.
+        let mut app = Tadpole::default();
+        let what = app.accept(b"routing tables
+something else
+routing again", None,
+                              &Fake(vec![]), &NoVoice);
+        assert!(matches!(what, paste::Incoming::Text(_)));
+        assert_eq!(app.segments.len(), 3);
+        assert!(app.overview().iter().any(|t| t.term == "routing"));
+    }
+
+    #[test]
+    fn a_new_source_replaces_the_document_in_both_directions() {
+        // Regions and segments are two views of one document. Leaving stale
+        // ones puts the previous image's text in this recording's overview.
+        let mut app = Tadpole::default();
+        app.scan(&Fake(vec![r("from the page", 0.9, 0.0, 0.0, 10.0, 10.0)]), &img());
+        assert_eq!(app.regions.len(), 1);
+
+        app.accept(&wav_bytes(), None, &Fake(vec![]),
+                   &FakeVoice(vec![audio::Segment { start_ms: 0, end_ms: 1,
+                       text: "from the tape".into(), score: 0.9 }]));
+        assert!(app.regions.is_empty(), "the page went away");
+        assert_eq!(app.segments.len(), 1);
+
+        app.scan(&Fake(vec![r("a new page", 0.9, 0.0, 0.0, 10.0, 10.0)]), &img());
+        assert!(app.segments.is_empty(), "and the tape went away");
+    }
+
+    #[test]
+    fn a_failed_transcription_reports_the_missing_model() {
+        let mut app = Tadpole::default();
+        app.accept(&wav_bytes(), None, &Fake(vec![]), &NoVoice);
+        assert_eq!(app.last_error, Some(OcrError::NoModel));
+        assert!(app.segments.is_empty());
+    }
+
+    #[test]
+    fn an_unsupported_drop_leaves_the_current_work_alone() {
+        // Dropping a PDF by accident must not clear the transcript you were
+        // reading — a refusal is not a reset.
+        let mut app = Tadpole::default();
+        app.accept(b"notes about routing
+and more routing", None, &Fake(vec![]), &NoVoice);
+        assert_eq!(app.segments.len(), 2);
+
+        let mut pdf = b"%PDF-1.7".to_vec();
+        pdf.extend_from_slice(&[0; 16]);
+        let what = app.accept(&pdf, Some("paper.pdf"), &Fake(vec![]), &NoVoice);
+        assert!(what.message().unwrap().contains("PNG"));
+        assert_eq!(app.segments.len(), 2, "the transcript survived the refusal");
     }
 
     #[test]
