@@ -107,6 +107,15 @@ impl Default for Params {
 pub struct Bucket {
     contacts: Vec<Contact>,
     replacements: Vec<Contact>,
+    /// When this bucket last saw a query. `schedule::plan` needs it to decide
+    /// which buckets have gone quiet, and it was the one input the scheduler
+    /// asked for that the table did not keep — which is why `plan` had eleven
+    /// tests and no caller.
+    ///
+    /// Zero means "never", and the scheduler treats that as NOT stale on
+    /// purpose: a fresh node has 160 empty buckets, and refreshing all of them
+    /// on first boot is the worst possible opening move for a battery.
+    last_query: u64,
 }
 
 impl Bucket {
@@ -188,6 +197,20 @@ impl RoutingTable {
 
     pub fn with_params(local: NodeId, params: Params) -> Self {
         Self { local, buckets: vec![Bucket::default(); N_BUCKETS], params }
+    }
+
+    /// When bucket `i` last saw activity. Out-of-range reads as never, so a
+    /// caller iterating N_BUCKETS against a shorter table gets "not stale"
+    /// rather than a panic.
+    pub fn bucket_last_query(&self, i: usize) -> u64 {
+        self.buckets.get(i).map(|b| b.last_query).unwrap_or(0)
+    }
+
+    /// Record that a bucket was exercised.
+    pub fn note_query(&mut self, target: &NodeId, now: u64) {
+        if let Some(i) = self.local.bucket_index(target) {
+            if let Some(b) = self.buckets.get_mut(i) { b.last_query = now; }
+        }
     }
 
     pub fn local(&self) -> &NodeId {
