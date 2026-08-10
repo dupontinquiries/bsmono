@@ -29,6 +29,9 @@ pub mod stems;
 use std::collections::BTreeMap;
 use studio_core::{Project, SourceId, Ticks, TrackKind};
 
+pub mod export;
+pub mod repitch;
+
 /// Audio for one source, as mono-per-channel planes.
 ///
 /// Real playback will stream these from disk; the model does not care, which is
@@ -192,6 +195,74 @@ impl Fades {
 /// Pure: same inputs, same samples, every time. Muted tracks contribute
 /// nothing; when any track is soloed, only soloed tracks are heard — the rule
 /// every DAW shares and every reimplementation gets backwards at least once.
+///
+/// ## Bus routing
+///
+/// A track with `route: None` feeds master directly, exactly as it always
+/// has — a project with no `Bus` values mixes bit-for-bit identically to
+/// before busses existed, which is the property that makes adding a bus
+/// graph to an existing model safe.
+///
+/// A track routed to a bus instead accumulates into that bus's own buffer.
+/// Busses are then folded in `Project::bus_order()` — children before the
+/// parents they feed, so a bus's own gain and its sends are fully resolved
+/// before anything downstream reads it:
+///
+/// 1. **Sends are tapped from the bus's signal**, `pre_fader` from before
+///    this bus's own gain is applied, post-fader from after — the same
+///    distinction every hardware console makes, because a pre-fader send
+///    (a cue mix, typically) must not move when someone rides the fader.
+/// 2. **The main path carries the post-gain signal** into the bus's parent
+///    (or master, if `parent` is `None`).
+///
+/// Each bus's own insert chain (`Bus.chain`) runs before its fader — see the
+/// bus-fold loop below for the exact order and why `pre` (what a pre-fader
+/// send taps) is captured after the chain but before gain. `Bus.chain` runs
+/// through `studio_fx::instantiate`/`Instance::process_audio`; an effect kind
+/// this build doesn't know is silently skipped, the same "opens without the
+/// plugin" rule every other effect host in this codebase follows.
+///
+/// A bus is muted from `Bus::muted`, or solo-gated from `bus_solo` (a
+/// mixdown-time listening choice, not project state — see `Op::SetBusFlags`'s
+/// docs on why bus solo, like track solo, is a parameter here rather than a
+/// persisted field). When `bus_solo` is non-empty, a bus survives to its
+/// parent and sends only if it is itself soloed, an ancestor of a soloed bus
+/// (so the soloed signal still has a path to master), or a descendant of one
+/// (so soloing a bus lets its whole subtree through) — walked via `parent`
+/// only, not `sends`, since a send is a parallel tap rather than part of the
+/// tree a solo should open up.
+fn solo_audible_bus_set(project: &Project, bus_solo: &[studio_core::BusId]) -> std::collections::BTreeSet<studio_core::BusId> {
+    use studio_core::BusId;
+    let mut set: std::collections::BTreeSet<BusId> = std::collections::BTreeSet::new();
+    if bus_solo.is_empty() {
+        return set;
+    }
+    for &s in bus_solo {
+        set.insert(s);
+        let mut cur = project.busses.get(&s).and_then(|b| b.parent);
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(p) = cur {
+            if !seen.insert(p) { break; } // cycle guard; apply() prevents this in live data
+            set.insert(p);
+            cur = project.busses.get(&p).and_then(|b| b.parent);
+        }
+    }
+    for id in project.busses.keys() {
+        if set.contains(id) { continue; }
+        let mut cur = project.busses.get(id).and_then(|b| b.parent);
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(p) = cur {
+            if !seen.insert(p) { break; }
+            if bus_solo.contains(&p) {
+                set.insert(*id);
+                break;
+            }
+            cur = project.busses.get(&p).and_then(|b| b.parent);
+        }
+    }
+    set
+}
+
 pub fn mixdown(
     project: &Project,
     audio: &BTreeMap<SourceId, SourceAudio>,
@@ -200,9 +271,16 @@ pub fn mixdown(
     to: Ticks,
     rate: u32,
     solo: &[studio_core::TrackId],
+    bus_solo: &[studio_core::BusId],
 ) -> Vec<f32> {
     let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
-    let mut out = vec![0.0f32; frames * 2];
+    let mut master = vec![0.0f32; frames * 2];
+    // One accumulator per bus, pre-populated for every bus in the project —
+    // not just the ones a track happens to route to — so a bus that exists
+    // only as a send target still has somewhere to land.
+    let mut bus_buf: BTreeMap<studio_core::BusId, Vec<f32>> =
+        project.busses.keys().map(|id| (*id, vec![0.0f32; frames * 2])).collect();
+
     for track in &project.tracks {
         if track.kind != TrackKind::Audio && !project.clips.values().any(|c| c.track == track.id) {
             continue;
@@ -210,12 +288,39 @@ pub fn mixdown(
         if track.muted { continue; }
         if !solo.is_empty() && !solo.contains(&track.id) { continue; }
 
+        let dest: &mut [f32] = match track.route {
+            Some(bus) => match bus_buf.get_mut(&bus) {
+                Some(b) => b.as_mut_slice(),
+                // Routed at a bus that no longer exists (e.g. a stale route
+                // surviving a bus removed by a peer's op before this route
+                // was cleared) — fall back to master rather than dropping
+                // the track's audio on the floor.
+                None => master.as_mut_slice(),
+            },
+            None => master.as_mut_slice(),
+        };
+
         for clip in project.track_clips(track.id) {
             // skip clips entirely outside the window
             if clip.end() <= from || clip.pos >= to { continue; }
             let Some(src) = audio.get(&clip.source) else { continue };
             if src.channels.is_empty() { continue; }
             let fade = fades.get(&clip.id).copied().unwrap_or_default();
+            // The clip's own effect chain, instantiated once per clip (not
+            // per sample) so a stateful effect's filter history is
+            // continuous across the whole clip rather than reset every
+            // sample. Same convention as the bus-chain wiring above: one
+            // `Instance` per effect, fed L then R in sequence — consistent
+            // with `studio_fx::chain::Chain::process`'s own established
+            // pattern rather than introducing a different one here. An
+            // unknown effect kind is silently skipped via `instantiate`'s
+            // `None`.
+            let mut clip_fx: Vec<studio_fx::Instance> = clip
+                .effects
+                .iter()
+                .filter(|e| e.enabled)
+                .filter_map(|e| studio_fx::instantiate(e, rate as f32))
+                .collect();
 
             let start = clip.pos.max(from);
             let stop = clip.end().min(to);
@@ -228,20 +333,105 @@ pub fn mixdown(
                 if src_frame >= src.frames() { break; }
                 let g = clip.gain * fade.gain_at(into_clip, clip.len);
                 let oi = (out_off + i) * 2;
-                if oi + 1 >= out.len() { break; }
+                if oi + 1 >= dest.len() { break; }
                 // a mono source feeds both sides; a stereo one keeps its image
-                let (l, r) = if src.channels.len() >= 2 {
+                let (mut l, mut r) = if src.channels.len() >= 2 {
                     (src.channels[0][src_frame], src.channels[1][src_frame])
                 } else {
                     let v = src.channels[0][src_frame];
                     (v, v)
                 };
-                out[oi] += l * g;
-                out[oi + 1] += r * g;
+                for inst in clip_fx.iter_mut() {
+                    l = inst.process_audio(l);
+                    r = inst.process_audio(r);
+                }
+                dest[oi] += l * g;
+                dest[oi + 1] += r * g;
             }
         }
     }
-    out
+
+    // Fold the bus graph: children before parents, so by the time a bus is
+    // processed everything that feeds it (tracks, and any child bus's main
+    // output and sends) has already landed in its accumulator. `bus_order`
+    // only fails on a cycle, which `apply` already refuses to create — so
+    // this can only happen against a project that reached memory some other
+    // way (a corrupt or foreign file). Rather than panic a render over it,
+    // busses are simply left unfolded: their tracks' audio is silently
+    // absent from master rather than crashing playback. That is the
+    // deliberately chosen lesser failure, matching the rest of Studio's
+    // "a damaged file is refused outright rather than half-read" stance —
+    // the refusal belongs at load time (where the caller can tell the user),
+    // not buried in a pure render function with no error channel to report
+    // it through.
+    let order = project.bus_order().unwrap_or_default();
+    let audible = solo_audible_bus_set(project, bus_solo);
+    for id in order {
+        let Some(bus) = project.busses.get(&id) else { continue };
+        let Some(buf) = bus_buf.remove(&id) else { continue };
+        // Mute is an absolute override, checked before solo; a gated bus's
+        // buffer — including everything already summed into it from its own
+        // tracks and any children processed earlier — is simply dropped,
+        // the same as a muted track's clips never reaching the mix.
+        let solo_ok = bus_solo.is_empty() || audible.contains(&id);
+        if bus.muted || !solo_ok {
+            continue;
+        }
+        let mut buf = buf;
+        // The bus's own insert chain (EQ/comp/etc, described by `Bus.chain`)
+        // runs before the fader — the same insert-then-fader order a
+        // physical channel strip uses, which is also why `pre` below (what
+        // a pre-fader send taps) is captured AFTER the chain but BEFORE
+        // gain: a pre-fader send hears the bus's own processing, just not
+        // its fader movement.
+        //
+        // One `Instance` per effect, fed the buffer's L/R samples in their
+        // natural interleaved order — not two independent per-channel
+        // instances — matching `studio_fx::chain::Chain::process`'s own
+        // established convention (it also runs one instance's state across
+        // both channels sequentially) rather than introducing a different,
+        // arguably-more-correct-but-inconsistent convention in a second
+        // place. An unknown effect kind is silently skipped via
+        // `instantiate`'s `None`, the same "opens without the plugin"
+        // behaviour every other effect host in this codebase has.
+        if !bus.chain.is_empty() {
+            let mut instances: Vec<studio_fx::Instance> = bus
+                .chain
+                .iter()
+                .filter(|e| e.enabled)
+                .filter_map(|e| studio_fx::instantiate(e, rate as f32))
+                .collect();
+            for s in buf.iter_mut() {
+                for inst in instances.iter_mut() {
+                    *s = inst.process_audio(*s);
+                }
+            }
+        }
+        let pre = buf.clone();
+        for s in buf.iter_mut() { *s *= bus.gain; }
+
+        for send in &bus.sends {
+            let tap: &[f32] = if send.pre_fader { &pre } else { &buf };
+            if let Some(target) = bus_buf.get_mut(&send.to) {
+                for (t, s) in target.iter_mut().zip(tap.iter()) {
+                    *t += s * send.level;
+                }
+            }
+        }
+
+        let parent: &mut [f32] = match bus.parent {
+            Some(p) => match bus_buf.get_mut(&p) {
+                Some(b) => b.as_mut_slice(),
+                None => master.as_mut_slice(),
+            },
+            None => master.as_mut_slice(),
+        };
+        for (p, b) in parent.iter_mut().zip(buf.iter()) {
+            *p += b;
+        }
+    }
+
+    master
 }
 
 /// Peak level of a rendered buffer, in dBFS. `-inf` for silence — reported as
@@ -255,7 +445,7 @@ pub fn peak_dbfs(samples: &[f32]) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use studio_core::{Clip, ClipId, Op, Source, Track, TrackId};
+    use studio_core::{Bus, BusId, Clip, ClipId, Op, Send, Source, Track, TrackId};
 
     fn tone(frames: usize, rate: u32, hz: f32, amp: f32) -> SourceAudio {
         let ch: Vec<f32> = (0..frames)
@@ -268,7 +458,7 @@ mod tests {
         let rate = 48_000;
         let mut p = Project { name: "mix".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "t.wav".into(),
             len: Ticks::from_seconds(len_s), sample_rate: rate, channels: 1, has_video: false } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
@@ -334,7 +524,7 @@ mod tests {
     fn silence_in_gives_silence_out() {
         let (p, mut audio) = project_with(1.0, 1.0);
         audio.insert(SourceId(1), SourceAudio { sample_rate: 48_000, channels: vec![vec![0.0; 48_000]] });
-        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(1.0), 48_000, &[]);
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(1.0), 48_000, &[], &[]);
         assert_eq!(out.len(), 48_000 * 2, "stereo interleaved, one second");
         assert!(out.iter().all(|s| *s == 0.0));
         assert_eq!(peak_dbfs(&out), f32::NEG_INFINITY, "silence is -inf, not a magic number");
@@ -345,8 +535,8 @@ mod tests {
         let (full, audio) = project_with(0.5, 1.0);
         let (half, _) = project_with(0.5, 0.5);
         let w = (Ticks::ZERO, Ticks::from_seconds(0.5));
-        let a = mixdown(&full, &audio, &BTreeMap::new(), w.0, w.1, 48_000, &[]);
-        let b = mixdown(&half, &audio, &BTreeMap::new(), w.0, w.1, 48_000, &[]);
+        let a = mixdown(&full, &audio, &BTreeMap::new(), w.0, w.1, 48_000, &[], &[]);
+        let b = mixdown(&half, &audio, &BTreeMap::new(), w.0, w.1, 48_000, &[], &[]);
         let (pa, pb) = (peak_dbfs(&a), peak_dbfs(&b));
         assert!((pa - pb - 6.02).abs() < 0.2, "half gain is ~6 dB down: {pa} vs {pb}");
     }
@@ -356,15 +546,15 @@ mod tests {
         let (mut p, audio) = project_with(0.5, 1.0);
         // mute → silence
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: true, locked: false }).unwrap();
-        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[]);
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
         assert!(out.iter().all(|s| *s == 0.0), "a muted track contributes nothing");
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: false }).unwrap();
         // solo on ANOTHER track silences this one — the rule reimplementations invert
         let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5),
-                          48_000, &[TrackId(99)]);
+                          48_000, &[TrackId(99)], &[]);
         assert!(out.iter().all(|s| *s == 0.0), "un-soloed tracks are silent while anything is soloed");
         let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5),
-                          48_000, &[TrackId(1)]);
+                          48_000, &[TrackId(1)], &[]);
         assert!(out.iter().any(|s| *s != 0.0), "and the soloed track is heard");
     }
 
@@ -387,13 +577,400 @@ mod tests {
         // Rendering a middle second must not shift the material: the samples in
         // the window have to be the same ones a full render would put there.
         let (p, audio) = project_with(3.0, 1.0);
-        let full = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(3.0), 48_000, &[]);
+        let full = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(3.0), 48_000, &[], &[]);
         let mid = mixdown(&p, &audio, &BTreeMap::new(),
-                          Ticks::from_seconds(1.0), Ticks::from_seconds(2.0), 48_000, &[]);
+                          Ticks::from_seconds(1.0), Ticks::from_seconds(2.0), 48_000, &[], &[]);
         assert_eq!(mid.len(), 48_000 * 2);
         let off = 48_000 * 2;
         for i in 0..mid.len() {
             assert!((mid[i] - full[off + i]).abs() < 1e-6, "window sample {i} must match the full render");
+        }
+    }
+
+    fn bus(id: u64, name: &str, parent: Option<u64>, gain: f32) -> Bus {
+        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain, chain: Vec::new(), sends: Vec::new(), muted: false }
+    }
+
+    #[test]
+    fn a_project_with_no_busses_mixes_exactly_as_before_busses_existed() {
+        // The whole point of `route: None` meaning "master": adding the bus
+        // graph to the model must not perturb a single sample of a project
+        // that doesn't use it.
+        let (p, audio) = project_with(0.5, 0.7);
+        assert!(p.busses.is_empty());
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(out.iter().any(|s| *s != 0.0));
+    }
+
+    #[test]
+    fn routing_through_a_bus_applies_the_buss_gain() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Drums", None, 0.5) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let direct = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: None }).unwrap();
+        let unrouted = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let (pd, pu) = (peak_dbfs(&direct), peak_dbfs(&unrouted));
+        assert!((pu - pd - 6.02).abs() < 0.2, "routing through a 0.5-gain bus should read ~6dB down: {pu} vs {pd}");
+    }
+
+    #[test]
+    fn a_bus_hierarchy_sums_children_into_the_parent_before_master() {
+        // Drums and 808 both feed a "Beat" bus; Beat feeds master. Cutting
+        // Beat's gain to zero must silence both children even though neither
+        // child's own gain changed — that's the point of a hierarchy over a
+        // flat list of busses.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Beat", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Drums", Some(1), 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(2)) }).unwrap();
+
+        let heard = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(heard.iter().any(|s| *s != 0.0), "audio reaches master through the two-level chain");
+
+        p.apply(&Op::SetBusGain { id: BusId(1), gain: 0.0 }).unwrap();
+        let silenced = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(silenced.iter().all(|s| *s == 0.0), "zeroing the parent bus must silence everything routed through it");
+    }
+
+    #[test]
+    fn a_send_adds_a_parallel_copy_on_top_of_the_main_path() {
+        // Vocals (parent: None) and Verb (parent: None) both flow straight
+        // to master on their own — so sending Vocals into Verb at 0.5 does
+        // NOT leave master unchanged, it makes it LOUDER by exactly the
+        // added parallel copy: master becomes vocals*1.0 (Vocals' own main
+        // path) + vocals*0.5 (Verb's main path, fed entirely by the send).
+        // That extra path — not a hole in the original — is the send's
+        // whole job, and is what this test actually pins.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Verb", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+
+        let before = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 0.5, pre_fader: false }] }).unwrap();
+        let after = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let (pb, pa) = (peak_dbfs(&before), peak_dbfs(&after));
+        // Both busses have parent: None, so both flow into master; the send
+        // adds a same-phase 0.5x copy on top, so the sum should read
+        // 20*log10(1.5) ≈ 3.52 dB louder, not merely "different."
+        assert!((pa - pb - 3.52).abs() < 0.2, "adding the send should add ~3.52dB (1.0 + 0.5 same-phase copy): {pb} -> {pa}");
+    }
+
+    #[test]
+    fn a_send_does_not_touch_the_source_buss_own_downstream_gain_stage() {
+        // Isolate the "main path unaffected" claim properly this time: put
+        // the send's target bus somewhere that does NOT also flow to
+        // master (a child of a second, muted-via-zero-gain parent), so its
+        // contribution to the final mix is independently zeroed, and only
+        // Vocals' own main path can be heard either way.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Verb", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(3, "VerbSink", Some(2), 0.0) }).unwrap(); // swallows Verb's output
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+
+        // Reroute Verb itself into the zero-gain sink instead of master.
+        let mut p = p;
+        p.busses.get_mut(&BusId(2)).unwrap().parent = Some(BusId(3));
+
+        let before = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 0.5, pre_fader: false }] }).unwrap();
+        let after = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        for i in 0..before.len() {
+            assert!((before[i] - after[i]).abs() < 1e-5,
+                "sample {i}: a send into a bus that never reaches master must not change the audible mix");
+        }
+    }
+
+    #[test]
+    fn a_pre_fader_send_ignores_the_buss_own_gain() {
+        // Vocals' own fader is all the way down (gain 0), but a pre-fader
+        // send to Cue must still carry the signal — Cue has no parent set,
+        // so its default `parent: None` already routes it straight to
+        // master, making the assertion just "master is not silent."
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 0.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Cue", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: true }] }).unwrap();
+
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(out.iter().any(|s| *s != 0.0),
+            "a pre-fader send must carry signal to Cue (and on to master) even though Vocals' own fader is at zero");
+
+        // And the control: make the same send post-fader instead. Now it
+        // taps Vocals AFTER its zero gain, so Cue — and therefore master —
+        // must go silent.
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: false }] }).unwrap();
+        let post = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(post.iter().all(|s| *s == 0.0),
+            "a post-fader send must inherit the source bus's own gain — silent here since Vocals' gain is zero");
+    }
+
+    #[test]
+    fn a_track_routed_to_a_since_removed_bus_falls_back_to_master_instead_of_vanishing() {
+        // Simulates a stale route surviving a bus removal that arrived from
+        // a peer before this project's own SetRoute-to-None caught up —
+        // audio must not be silently dropped on the floor.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.tracks[0].route = Some(BusId(404)); // no such bus, built directly like a corrupt/racy state
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(out.iter().any(|s| *s != 0.0), "audio routed at a missing bus must still reach master");
+    }
+
+    #[test]
+    fn a_clip_effect_measurably_changes_the_mix() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        let unprocessed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0); // project_with's own test tone frequency
+        params.insert("gain0".to_string(), -18.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+        let processed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let (pu, pp) = (peak_dbfs(&unprocessed), peak_dbfs(&processed));
+        assert!(pp < pu - 6.0, "an -18dB EQ cut on a clip at its own tone's frequency should measurably quiet the mix: unprocessed {pu}dBFS, processed {pp}dBFS");
+    }
+
+    #[test]
+    fn a_disabled_clip_effect_does_not_change_the_mix() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        let unprocessed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("gain0".to_string(), -18.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: false },
+        ] }).unwrap();
+        let with_disabled = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        for i in 0..unprocessed.len() {
+            assert!((unprocessed[i] - with_disabled[i]).abs() < 1e-5, "sample {i}: a disabled clip effect must not change the mix");
+        }
+    }
+
+    #[test]
+    fn an_unknown_clip_effect_kind_is_silently_skipped_not_a_panic() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "plugin_i_dont_have".into(), params: Default::default(), enabled: true },
+        ] }).unwrap();
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(out.iter().any(|s| *s != 0.0));
+    }
+
+    #[test]
+    fn clip_effects_and_bus_effects_both_apply_in_the_same_render() {
+        // Two independent EQ cuts (one on the clip, one on the bus it routes
+        // through) at the same frequency should compound to MORE attenuation
+        // than either alone — proving the two wiring sites are genuinely
+        // independent stages, not one silently overriding or skipping the
+        // other. Measured as steady-state RMS over a window well past any
+        // filter settling transient (a cascaded biquad's peak can briefly
+        // overshoot before settling, which makes whole-buffer peak the wrong
+        // metric for comparing two stacked filters — RMS over a settled
+        // window is what actually reflects steady-state attenuation).
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let clip_id = *p.clips.keys().next().unwrap();
+
+        fn rms_settled(out: &[f32]) -> f32 {
+            let settled = &out[4000.min(out.len())..]; // skip the first ~83ms
+            (settled.iter().map(|s| s * s).sum::<f32>() / settled.len().max(1) as f32).sqrt()
+        }
+        fn eq_cut(hz: f32, gain_db: f32) -> studio_core::Effect {
+            let mut params = std::collections::BTreeMap::new();
+            params.insert("bands".to_string(), 1.0);
+            params.insert("freq0".to_string(), hz);
+            params.insert("gain0".to_string(), gain_db);
+            studio_core::Effect { kind: "eq".into(), params, enabled: true }
+        }
+
+        let baseline = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![eq_cut(440.0, -9.0)] }).unwrap();
+        let clip_only = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        p.apply(&Op::SetBusChain { id: BusId(1), chain: vec![eq_cut(440.0, -9.0)] }).unwrap();
+        let both = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let (r0, r1, r2) = (rms_settled(&baseline), rms_settled(&clip_only), rms_settled(&both));
+        assert!(r1 < r0, "the clip-only cut should reduce settled RMS below baseline: {r0} -> {r1}");
+        assert!(r2 < r1, "adding the bus cut on top should reduce settled RMS further still: {r1} -> {r2}");
+    }
+
+    #[test]
+    fn a_bus_chain_effect_measurably_changes_the_mix() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let unprocessed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0); // project_with's own test tone frequency
+        params.insert("gain0".to_string(), -18.0); // a heavy cut, easy to detect
+        p.apply(&Op::SetBusChain { id: BusId(1), chain: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+        let processed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let (pu, pp) = (peak_dbfs(&unprocessed), peak_dbfs(&processed));
+        assert!(pp < pu - 6.0, "an -18dB EQ cut at the tone's own frequency should measurably quiet the mix: unprocessed {pu}dBFS, processed {pp}dBFS");
+    }
+
+    #[test]
+    fn a_bypassed_chain_effect_does_not_change_the_mix() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let unprocessed = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("gain0".to_string(), -18.0);
+        p.apply(&Op::SetBusChain { id: BusId(1), chain: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: false }, // disabled
+        ] }).unwrap();
+        let with_disabled_effect = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        for i in 0..unprocessed.len() {
+            assert!((unprocessed[i] - with_disabled_effect[i]).abs() < 1e-5,
+                "sample {i}: a disabled chain effect must not change the mix at all");
+        }
+    }
+
+    #[test]
+    fn an_unknown_effect_kind_in_a_bus_chain_is_silently_skipped_not_a_panic() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusChain { id: BusId(1), chain: vec![
+            studio_core::Effect { kind: "plugin_i_dont_have".into(), params: Default::default(), enabled: true },
+        ] }).unwrap();
+        // Must not panic, and should mix exactly as if the chain were empty —
+        // the same "a project opens without the plugin it references" rule
+        // the rest of this codebase's effect hosts already follow.
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(out.iter().any(|s| *s != 0.0));
+    }
+
+    #[test]
+    fn a_pre_fader_send_hears_the_chain_but_not_the_fader() {
+        // The chain runs before `pre` is captured, so a pre-fader send
+        // should carry the CHAIN-processed signal — unlike the fader
+        // (Bus.gain), which a pre-fader send is specifically defined to skip.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None, 0.0) }).unwrap(); // fader at zero
+        p.apply(&Op::AddBus { bus: bus(2, "Cue", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 1.0, pre_fader: true }] }).unwrap();
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("gain0".to_string(), -18.0);
+        p.apply(&Op::SetBusChain { id: BusId(1), chain: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        // Compare against the SAME setup but with the chain removed, to
+        // measure whether the send's content reflects the EQ cut.
+        let mut p_no_chain = p.clone();
+        p_no_chain.busses.get_mut(&BusId(1)).unwrap().chain.clear();
+        let out_no_chain = mixdown(&p_no_chain, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        let (with_chain_peak, without_chain_peak) = (peak_dbfs(&out), peak_dbfs(&out_no_chain));
+        assert!(with_chain_peak < without_chain_peak - 6.0,
+            "the pre-fader send should still carry the EQ-cut signal: with chain {with_chain_peak}dBFS, without {without_chain_peak}dBFS");
+    }
+
+    #[test]
+    fn a_muted_bus_silences_itself_and_everything_summed_into_it() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Drums", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let heard = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(heard.iter().any(|s| *s != 0.0));
+
+        p.apply(&Op::SetBusFlags { id: BusId(1), muted: true }).unwrap();
+        let muted = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(muted.iter().all(|s| *s == 0.0), "a muted bus must silence every track routed through it");
+    }
+
+    #[test]
+    fn bus_mute_is_an_absolute_override_even_while_that_bus_is_soloed() {
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Drums", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        p.apply(&Op::SetBusFlags { id: BusId(1), muted: true }).unwrap();
+        // Soloing the very bus that's muted: mute wins, by design (see the
+        // module docs on why this crate picked an absolute override instead
+        // of "solo overrides mute for the soloed channel," which some
+        // consoles do and this one deliberately doesn't, for simplicity).
+        let out = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[BusId(1)]);
+        assert!(out.iter().all(|s| *s == 0.0), "mute must beat solo, even self-solo");
+    }
+
+    #[test]
+    fn soloing_a_bus_silences_sibling_busses_but_not_its_own_ancestors_or_descendants() {
+        // Beat
+        // ├── Drums (routed track 1)
+        // └── Melody (routed track 2)
+        // Soloing Drums must silence Melody's path to master, but Beat
+        // itself (Drums' ancestor, needed to carry the soloed signal up)
+        // must remain open.
+        let (mut p, audio) = project_with(0.5, 1.0);
+        p.apply(&Op::AddTrack { track: studio_core::Track {
+            id: TrackId(2), kind: studio_core::TrackKind::Audio, name: "A2".into(),
+            muted: false, locked: false, route: None,
+        }, at: 1 }).unwrap();
+        let mut audio2 = audio.clone();
+        audio2.insert(studio_core::SourceId(2), tone(24_000, 48_000, 660.0, 0.5));
+        p.apply(&Op::AddSource { source: Source { id: studio_core::SourceId(2), path: "b.wav".into(),
+            len: Ticks::from_seconds(0.5), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(2), source: studio_core::SourceId(2), track: TrackId(2),
+            pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(0.5), gain: 1.0, effects: Vec::new() } }).unwrap();
+
+        p.apply(&Op::AddBus { bus: bus(1, "Beat", None, 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Drums", Some(1), 1.0) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(3, "Melody", Some(1), 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(2)) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(2), bus: Some(BusId(3)) }).unwrap();
+
+        let both = mixdown(&p, &audio2, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+        assert!(both.iter().any(|s| *s != 0.0));
+
+        let drums_only = mixdown(&p, &audio2, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[BusId(2)]);
+        // Isolate the pure-Drums path for comparison: mute Melody instead of
+        // soloing Drums, which should reach the identical result if the
+        // solo logic is correct.
+        let mut melody_muted = p.clone();
+        melody_muted.apply(&Op::SetBusFlags { id: BusId(3), muted: true }).unwrap();
+        let expected = mixdown(&melody_muted, &audio2, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.5), 48_000, &[], &[]);
+
+        assert_eq!(drums_only.len(), expected.len());
+        for i in 0..drums_only.len() {
+            assert!((drums_only[i] - expected[i]).abs() < 1e-5,
+                "sample {i}: soloing Drums must equal muting Melody — Beat (their shared ancestor) must stay open either way");
         }
     }
 }

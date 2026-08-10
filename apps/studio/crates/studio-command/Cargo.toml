@@ -1,0 +1,10 @@
+[package]
+name = "studio-command"
+version = "0.1.0"
+edition = "2021"
+description = "The seam every producer of studio actions goes through: touch, Helix keys, voice, the copilot, and collab all lower to Command, and every Command (plus every terminal outcome) is mirrored onto a bounded tap channel. Persistent edits lower to studio-core::Op; everything ephemeral (transport, cue level, monitor fx) stays out of the doc and off the wire. The command table (name, spoken phrases, arg schema, destructive flag) is the single source the voice grammar and the copilot's tool schema both compile from, so coverage cannot drift from features."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+studio-live = { path = "../studio-live" }
+serde = { version = "1", features = ["derive"] }

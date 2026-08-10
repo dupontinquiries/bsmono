@@ -186,8 +186,16 @@ pub struct Routine {
     /// What it does, as a template. `Placeholder` marks what the caller fills
     /// in from context (the selection, the playhead).
     pub steps: Vec<Step>,
-    /// How often it has been used — the database buildup that makes the
-    /// palette's ranking get better the more you edit.
+    /// How often it has been used — the ties `Repertoire::resolve` breaks on
+    /// (see `mark_used`, which is what actually increments this). NOT
+    /// weighted into this module's own `rank`/`Entry` palette scoring below:
+    /// `Entry::Routine` here (a simpler, earlier design) has no field to
+    /// carry a use count at all. The usage-weighted, UI-facing palette is
+    /// `studio_egui::palette::Entry` — a deliberately more careful
+    /// reimplementation whose own module docs explain the "ties only, never
+    /// outranks a better textual match" nuance this crate's `rank` doesn't
+    /// attempt. Read this field's effect through `resolve`'s voice-matching
+    /// tie-break, not through anything in this module's palette code.
     pub uses: u32,
 }
 
@@ -244,11 +252,31 @@ impl Repertoire {
             steps, uses: 0,
         });
     }
+
+    /// Record that `name` was just successfully invoked, so it ranks higher
+    /// on future ties. `resolve`'s scoring already reads `Routine.uses` (see
+    /// its tie-break term), but until this method existed nothing in the
+    /// crate ever wrote to it — the "the palette gets better the more you
+    /// edit" promise had no mechanism behind it, since `resolve` takes `&self`
+    /// and can't update its own counter from inside a read. A caller invokes
+    /// this after a routine's steps actually ran, not on every resolve — a
+    /// routine that merely matched but whose steps then failed shouldn't
+    /// rank higher for it.
+    pub fn mark_used(&mut self, name: &str) {
+        if let Some(r) = self.routines.iter_mut().find(|r| r.name == name) {
+            r.uses = r.uses.saturating_add(1);
+        }
+    }
 }
 
 // ── the command palette ─────────────────────────────────────────────────────
 
 /// Anything the palette can offer.
+///
+/// A simpler, earlier design than `studio_egui::palette::Entry`: this
+/// `Entry::Routine` carries only a name, not a use count, so `rank` below
+/// can't weight by usage the way that crate's own palette does — see
+/// `Routine::uses`'s doc comment for where that distinction actually lives.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
     /// A built-in command.
@@ -329,7 +357,7 @@ mod tests {
     fn project() -> Project {
         let mut p = Project { name: "t".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Audio,
-            name: "A1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "A1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "take.wav".into(),
             len: Ticks::from_seconds(60.0), sample_rate: 48_000, channels: 1, has_video: false } }).unwrap();
         p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
@@ -430,12 +458,33 @@ mod tests {
 
     #[test]
     fn frequently_used_routines_win_ties() {
-        // the database buildup: the palette gets better the more you edit
+        // the database buildup: the palette gets better the more you edit —
+        // now exercised through the real API (`mark_used`), not by poking
+        // the `uses` field directly the way this test used to have to.
         let mut r = Repertoire::default();
         r.record("a", &["do the thing"], vec![]);
         r.record("b", &["do the thing"], vec![]);
-        r.routines[1].uses = 40;
+        for _ in 0..40 { r.mark_used("b"); }
         assert_eq!(r.resolve("do the thing").map(|x| x.name.as_str()), Some("b"));
+    }
+
+    #[test]
+    fn mark_used_increments_only_the_named_routine() {
+        let mut r = Repertoire::default();
+        r.record("a", &["split it"], vec![]);
+        r.record("b", &["tighten it"], vec![]);
+        r.mark_used("a");
+        r.mark_used("a");
+        assert_eq!(r.routines[0].uses, 2);
+        assert_eq!(r.routines[1].uses, 0, "marking one routine used must not touch another's count");
+    }
+
+    #[test]
+    fn mark_used_on_an_unknown_name_is_a_harmless_no_op() {
+        let mut r = Repertoire::default();
+        r.record("a", &["split it"], vec![]);
+        r.mark_used("this routine does not exist");
+        assert_eq!(r.routines[0].uses, 0, "an unknown name must not panic or affect anything else");
     }
 
     #[test]
@@ -458,6 +507,23 @@ mod tests {
         assert_eq!(rank(&entries, "", 10).len(), 4);
         // and the limit is honoured
         assert_eq!(rank(&entries, "", 2).len(), 2);
+    }
+
+    #[test]
+    fn this_modules_entry_routine_carries_no_use_count_and_rank_cannot_weight_by_it() {
+        // Documents, rather than just asserts in a comment, the distinction
+        // this module's docs draw: `Entry::Routine` here has no `uses`
+        // field, so two routines with identical labels score identically
+        // regardless of how often either has actually been invoked via
+        // `Repertoire::mark_used`. The usage-weighted palette is
+        // `studio_egui::palette::Entry` — a different type entirely, not
+        // reachable or testable from this crate.
+        let entries = vec![
+            Entry::Routine { name: "tighten".into() },
+            Entry::Routine { name: "tighten".into() },
+        ];
+        let scored = rank(&entries, "tighten", 10);
+        assert_eq!(scored.len(), 2, "both entries score identically — there is no per-routine usage data here to differentiate them");
     }
 
     #[test]

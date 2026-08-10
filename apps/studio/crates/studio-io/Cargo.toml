@@ -1,0 +1,18 @@
+[package]
+name = "studio-io"
+version = "0.1.0"
+edition = "2021"
+description = "The only crate allowed to touch a sound card. Defines the AudioIo seam (object-safe, so it can be boxed and swapped for a cpal backend or a future native PipeWire filter node without studio-engine knowing the difference), and the loopback round-trip latency measurement Transport::record_position() depends on being honest. The measurement itself is plain math over two buffers and is tested without any device."
+
+[dependencies]
+studio-core = { path = "../studio-core" }
+core-kit = { path = "../../../../shared/core-kit" }
+cpal = { version = "0.15", optional = true }
+
+[features]
+# Off by default: the measurement math, the trait shape, and a fake backend
+# for tests all compile and run with zero system audio dependencies. Turn
+# this on only on a build host that actually has a sound card (and, on
+# Linux, ALSA/PipeWire dev headers) — that is the hardware stage, not the
+# authoring sandbox.
+device = ["dep:cpal"]

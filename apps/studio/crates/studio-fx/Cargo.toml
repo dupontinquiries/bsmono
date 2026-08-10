@@ -6,3 +6,9 @@ description = "Studio's effect plugins: biquad EQ, compressor, brickwall limiter
 
 [dependencies]
 studio-core = { path = "../studio-core" }
+core-kit = { path = "../../../../shared/core-kit" }
+
+[dev-dependencies]
+ebur128 = "0.1"
+studio-audio = { path = "../studio-audio" }
+hound = "3.5"

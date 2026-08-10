@@ -75,6 +75,7 @@ macro_rules! id_type {
 id_type!(ClipId, "A clip's stable identity. Never reused, never an index — this is what lets a remote op survive concurrent edits elsewhere on the timeline.");
 id_type!(TrackId, "A track's stable identity.");
 id_type!(SourceId, "A media source (Audacity's sequence/blocks, kdenlive's bin clip). The timeline references samples; it never owns them.");
+id_type!(BusId, "A bus's stable identity. Busses form a routing graph (parent hierarchy plus sends), not a flat list, which is why they get ids rather than being addressed by position.");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TrackKind { Video, Audio }
@@ -123,9 +124,51 @@ pub struct Track {
     pub name: String,
     pub muted: bool,
     pub locked: bool,
+    /// Which bus this track's signal feeds. `None` means straight to master —
+    /// the implicit root every bus graph has whether or not any `Bus` value
+    /// exists for it, so a project with no busses at all still mixes exactly
+    /// as it always did.
+    pub route: Option<BusId>,
 }
 
-/// The project: tracks, clips, and the sources they reference.
+/// A send: a parallel, weighted copy of a bus's signal into another bus.
+/// Distinct from `parent` (the bus's single primary output) — a bus has at
+/// most one parent but any number of sends, which is what lets a vocal bus
+/// feed both master (via parent) and a shared reverb bus (via a send) at
+/// once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Send {
+    pub to: BusId,
+    /// Linear gain on the sent copy, 1.0 = unity.
+    pub level: f32,
+    /// Tapped before this bus's own fader/chain gain is applied, vs. after.
+    pub pre_fader: bool,
+}
+
+/// A mixer bus: something tracks or other busses route into, with its own
+/// gain and effect chain, that in turn routes into a parent (or master, if
+/// `parent` is `None`). The vocals/drums/808/melody separation the whole
+/// point of a trap mixer is just four `Bus` values with distinct `parent`s
+/// (or none) — nothing more structural than that.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Bus {
+    pub id: BusId,
+    pub name: String,
+    /// This bus's primary output. `None` means master.
+    pub parent: Option<BusId>,
+    /// Linear gain, 1.0 = unity.
+    pub gain: f32,
+    pub chain: Vec<Effect>,
+    pub sends: Vec<Send>,
+    /// A muted bus (and everything summed into it) is absent from both its
+    /// sends and its parent — mute is an absolute override, checked before
+    /// solo, which keeps the two rules independent rather than needing a
+    /// combined truth table.
+    pub muted: bool,
+}
+
+/// The project: tracks, clips, the sources they reference, and the bus graph
+/// they route into.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     pub tracks: Vec<Track>,
@@ -133,6 +176,10 @@ pub struct Project {
     /// to search, and so ids stay valid no matter what happens to ordering.
     pub clips: BTreeMap<ClipId, Clip>,
     pub sources: BTreeMap<SourceId, Source>,
+    /// Busses keyed by id. Empty is a valid, common project: every track
+    /// routes to the implicit master and mixes exactly as before busses
+    /// existed at all.
+    pub busses: BTreeMap<BusId, Bus>,
     pub name: String,
 }
 
@@ -164,6 +211,34 @@ pub enum Op {
     SetGain { id: ClipId, gain: f32 },
     SetEffects { id: ClipId, effects: Vec<Effect> },
     AddSource { source: Source },
+    /// Refused while any clip still references this source (see
+    /// `Op::RemoveTrack`/`Op::RemoveBus` for the same "in use" refusal
+    /// pattern) — before this variant existed, `Op::AddSource`'s own
+    /// "inverse" was itself (a workaround for idempotent duplicate catch-up
+    /// delivery, not a real undo), which meant recording a source and then
+    /// undoing left the source permanently in the project. This is the fix.
+    RemoveSource { id: SourceId },
+    /// Refused if `bus.parent` doesn't exist, or is the bus's own id (a
+    /// direct self-loop) — see `Project::apply`'s cycle check for why a
+    /// longer cycle can never arise from `AddBus` alone.
+    AddBus { bus: Bus },
+    /// Refused while anything still points at this bus — a track routed to
+    /// it, another bus's `parent`, or another bus's `sends` — so deletion
+    /// never silently reroutes audio; the caller re-routes first, same
+    /// principle as a locked track refusing edits.
+    RemoveBus { id: BusId },
+    SetBusGain { id: BusId, gain: f32 },
+    /// Bus-level mute, persisted like `SetTrackFlags` — unlike solo, which
+    /// (as for tracks) is a mixdown-time parameter, not project state: it's
+    /// a listening choice for right now, not an edit worth undoing or
+    /// shipping to a collaborator.
+    SetBusFlags { id: BusId, muted: bool },
+    SetBusChain { id: BusId, chain: Vec<Effect> },    /// Replaces the whole sends list, like `SetEffects` does for a clip's
+    /// effects — the inverse is then just "the old vector," no per-send
+    /// add/remove bookkeeping needed.
+    SetBusSends { id: BusId, sends: Vec<Send> },
+    /// `bus: None` routes the track straight to master.
+    SetRoute { track: TrackId, bus: Option<BusId> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -171,10 +246,24 @@ pub enum EditError {
     NoSuchClip(ClipId),
     NoSuchTrack(TrackId),
     TrackLocked(TrackId),
+    /// Refused because clips are still on this track — see `Op::RemoveTrack`.
+    /// Removing them (or moving them off first) is the caller's job; a
+    /// track's own removal must never be the thing that silently deletes
+    /// clips undo can't bring back.
+    TrackInUse(TrackId),
     /// Two clips would occupy the same span of the same track.
     Overlap { id: ClipId, with: ClipId },
     /// A trim that would read past the end of the source, or a negative length.
     OutOfSource { id: ClipId },
+    NoSuchBus(BusId),
+    /// Something still routes into this bus — see `Op::RemoveBus`.
+    BusInUse(BusId),
+    /// Adding this edge (a `parent` or a `send`) would close a loop back to
+    /// `id`, which would make mixdown never terminate.
+    BusCycle { id: BusId },
+    NoSuchSource(SourceId),
+    /// A clip still references this source — see `Op::RemoveSource`.
+    SourceInUse(SourceId),
 }
 
 impl Project {
@@ -193,10 +282,21 @@ impl Project {
             Op::RemoveTrack { id } => {
                 let idx = self.tracks.iter().position(|t| t.id == *id)
                     .ok_or(EditError::NoSuchTrack(*id))?;
+                // Removing a track that still has clips on it would need to
+                // return more than one inverse op (the track AND every clip)
+                // to be undoable — and `apply` only ever returns one. Rather
+                // than silently cascading and losing those clips on undo
+                // (which is what this arm used to do — a real bug, caught
+                // by noticing the comment describing "the clips' own
+                // inverse ops" promised something the return type can't
+                // deliver), this refuses outright, the same "in use" refusal
+                // `Op::RemoveBus` already applies for exactly this reason.
+                // The caller removes the clips first — each of THOSE has its
+                // own exact single-op inverse, so nothing is lost either way.
+                if self.clips.values().any(|c| c.track == *id) {
+                    return Err(EditError::TrackInUse(*id));
+                }
                 let track = self.tracks.remove(idx);
-                // clips on a removed track go with it; the inverse re-adds the
-                // track, and the clips are restored by their own inverse ops
-                self.clips.retain(|_, c| c.track != *id);
                 Ok(Op::AddTrack { track, at: idx })
             }
             Op::SetTrackFlags { id, muted, locked } => {
@@ -257,10 +357,209 @@ impl Project {
                 Ok(inv)
             }
             Op::AddSource { source } => {
+                if let Some(old) = self.sources.get(&source.id) {
+                    // idempotent by id — a duplicate catch-up delivery
+                    // re-affirms the same source, not a fresh insert, so
+                    // its inverse is "put back whatever was already there,"
+                    // not the new value (that was the bug: the old code
+                    // returned `source.clone()` here, which is only a
+                    // correct inverse if the two happen to be identical).
+                    let old = old.clone();
+                    self.sources.insert(source.id, source.clone());
+                    return Ok(Op::AddSource { source: old });
+                }
                 self.sources.insert(source.id, source.clone());
-                Ok(Op::AddSource { source: source.clone() }) // idempotent by id
+                Ok(Op::RemoveSource { id: source.id })
+            }
+            Op::RemoveSource { id } => {
+                if self.clips.values().any(|c| c.source == *id) {
+                    return Err(EditError::SourceInUse(*id));
+                }
+                let source = self.sources.remove(id).ok_or(EditError::NoSuchSource(*id))?;
+                Ok(Op::AddSource { source })
+            }
+            Op::AddBus { bus } => {
+                if self.busses.contains_key(&bus.id) {
+                    // idempotent by id, same as AddSource — a duplicate
+                    // catch-up delivery must not error the joiner.
+                    let old = self.busses.insert(bus.id, bus.clone());
+                    return Ok(Op::AddBus { bus: old.unwrap() });
+                }
+                if let Some(p) = bus.parent {
+                    if p == bus.id {
+                        return Err(EditError::BusCycle { id: bus.id });
+                    }
+                    self.check_bus(p)?;
+                }
+                // A brand-new id cannot already be reachable from anywhere
+                // else in the graph, so a direct self-loop (just handled
+                // above) is the only cycle `AddBus` can introduce on its
+                // own; the general check below is a backstop, not load-
+                // bearing, but kept for symmetry with the other bus ops.
+                if let Some(p) = bus.parent {
+                    if self.would_create_cycle(bus.id, p) {
+                        return Err(EditError::BusCycle { id: bus.id });
+                    }
+                }
+                self.busses.insert(bus.id, bus.clone());
+                Ok(Op::RemoveBus { id: bus.id })
+            }
+            Op::RemoveBus { id } => {
+                let bus = self.busses.get(id).cloned().ok_or(EditError::NoSuchBus(*id))?;
+                let in_use = self.tracks.iter().any(|t| t.route == Some(*id))
+                    || self.busses.values().any(|b| b.id != *id && (b.parent == Some(*id) || b.sends.iter().any(|s| s.to == *id)));
+                if in_use {
+                    return Err(EditError::BusInUse(*id));
+                }
+                self.busses.remove(id);
+                Ok(Op::AddBus { bus })
+            }
+            Op::SetBusGain { id, gain } => {
+                let b = self.busses.get_mut(id).ok_or(EditError::NoSuchBus(*id))?;
+                let inv = Op::SetBusGain { id: *id, gain: b.gain };
+                b.gain = *gain;
+                Ok(inv)
+            }
+            Op::SetBusFlags { id, muted } => {
+                let b = self.busses.get_mut(id).ok_or(EditError::NoSuchBus(*id))?;
+                let inv = Op::SetBusFlags { id: *id, muted: b.muted };
+                b.muted = *muted;
+                Ok(inv)
+            }
+            Op::SetBusChain { id, chain } => {
+                let b = self.busses.get_mut(id).ok_or(EditError::NoSuchBus(*id))?;
+                let inv = Op::SetBusChain { id: *id, chain: b.chain.clone() };
+                b.chain = chain.clone();
+                Ok(inv)
+            }
+            Op::SetBusSends { id, sends } => {
+                self.check_bus(*id)?;
+                for s in sends {
+                    self.check_bus(s.to)?;
+                    // Checked against this bus's OWN sends excluded (they're
+                    // what's being replaced) so re-setting an unchanged sends
+                    // list is never spuriously refused for "depending on
+                    // itself".
+                    if self.would_create_cycle_excluding(*id, s.to, *id) {
+                        return Err(EditError::BusCycle { id: *id });
+                    }
+                }
+                let b = self.busses.get_mut(id).unwrap();
+                let inv = Op::SetBusSends { id: *id, sends: b.sends.clone() };
+                b.sends = sends.clone();
+                Ok(inv)
+            }
+            Op::SetRoute { track, bus } => {
+                self.check_track(*track)?;
+                if let Some(b) = bus {
+                    self.check_bus(*b)?;
+                }
+                let t = self.tracks.iter_mut().find(|t| t.id == *track).unwrap();
+                let inv = Op::SetRoute { track: *track, bus: t.route };
+                t.route = *bus;
+                Ok(inv)
             }
         }
+    }
+
+    fn check_bus(&self, id: BusId) -> Result<(), EditError> {
+        if self.busses.contains_key(&id) { Ok(()) } else { Err(EditError::NoSuchBus(id)) }
+    }
+
+    /// Would adding an edge `from -> to` (a `parent` pointer or a `send`)
+    /// close a loop back to `from`? True exactly when `to` can already reach
+    /// `from` by following existing `parent`/`send` edges — including the
+    /// trivial case `from == to`, a direct self-loop.
+    fn would_create_cycle(&self, from: BusId, to: BusId) -> bool {
+        self.reachable(to, from, None)
+    }
+
+    /// Same check, but pretend `exclude`'s own `sends` don't exist while
+    /// searching — used by `SetBusSends`, which is replacing that bus's
+    /// sends and must not be blocked by the very edges it's about to
+    /// overwrite. Its `parent` edge (a different field, unaffected by this
+    /// op) still counts.
+    fn would_create_cycle_excluding(&self, from: BusId, to: BusId, exclude: BusId) -> bool {
+        self.reachable(to, from, Some(exclude))
+    }
+
+    fn reachable(&self, from: BusId, to: BusId, exclude_sends_of: Option<BusId>) -> bool {
+        let mut stack = vec![from];
+        let mut seen = std::collections::BTreeSet::new();
+        while let Some(cur) = stack.pop() {
+            if cur == to {
+                return true;
+            }
+            if !seen.insert(cur) {
+                continue;
+            }
+            if let Some(b) = self.busses.get(&cur) {
+                if let Some(p) = b.parent {
+                    stack.push(p);
+                }
+                if Some(cur) != exclude_sends_of {
+                    for s in &b.sends {
+                        stack.push(s.to);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// A processing order for the bus graph: every bus appears after
+    /// everything it depends on (its parent, its sends) has already been
+    /// resolved — children before parents, so a mixdown fold can sum a bus
+    /// only once every input that feeds it is already computed.
+    ///
+    /// `apply` refuses cycles as they're introduced, so this should never
+    /// see one from a project built through `Op`s — but a loaded or foreign
+    /// file did not necessarily come from that path, and a cycle here would
+    /// otherwise mean mixdown never terminates. So this is checked
+    /// independently rather than trusted, matching the "a damaged file is
+    /// refused outright" rule the rest of Studio's persistence follows.
+    pub fn bus_order(&self) -> Result<Vec<BusId>, EditError> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Mark { Temp, Perm }
+        fn visit(
+            id: BusId,
+            busses: &BTreeMap<BusId, Bus>,
+            marks: &mut BTreeMap<BusId, Mark>,
+            out: &mut Vec<BusId>,
+        ) -> Result<(), EditError> {
+            match marks.get(&id) {
+                Some(Mark::Perm) => return Ok(()),
+                Some(Mark::Temp) => return Err(EditError::BusCycle { id }),
+                None => {}
+            }
+            marks.insert(id, Mark::Temp);
+            if let Some(b) = busses.get(&id) {
+                let mut targets: Vec<BusId> = Vec::new();
+                if let Some(p) = b.parent {
+                    targets.push(p);
+                }
+                for s in &b.sends {
+                    targets.push(s.to);
+                }
+                for t in targets {
+                    visit(t, busses, marks, out)?;
+                }
+            }
+            marks.insert(id, Mark::Perm);
+            out.push(id);
+            Ok(())
+        }
+        let mut marks = BTreeMap::new();
+        let mut out = Vec::new();
+        for id in self.busses.keys().copied() {
+            visit(id, &self.busses, &mut marks, &mut out)?;
+        }
+        // `visit` finishes a node only after everything it points to is
+        // fully resolved, so the raw push order has parents before the
+        // children that feed them — the reverse of what a mixdown fold
+        // wants (children summed first, then rolled into the parent).
+        out.reverse();
+        Ok(out)
     }
 
     fn check_track(&self, id: TrackId) -> Result<(), EditError> {
@@ -324,6 +623,14 @@ impl Project {
 pub struct History {
     undo: Vec<Op>,
     redo: Vec<Op>,
+    /// Positions in `undo` where an `apply_group` call began — the marker
+    /// `undo_group` unwinds back to. A plain `apply` never pushes one of
+    /// these, so single-op undo/redo behave exactly as before; this is
+    /// purely additive.
+    undo_group_starts: Vec<usize>,
+    /// The `redo`-side mirror, recorded by `undo_group` so a full group can
+    /// be redone as a unit too.
+    redo_group_starts: Vec<usize>,
 }
 
 impl History {
@@ -347,6 +654,74 @@ impl History {
     }
     pub fn can_undo(&self) -> bool { !self.undo.is_empty() }
     pub fn can_redo(&self) -> bool { !self.redo.is_empty() }
+
+    /// Apply every op in `ops` as one undo group: a single later
+    /// `undo_group` call reverts all of them together. This is what makes
+    /// `studio-copilot`'s `Proposal.ops` — several ops from one findings-
+    /// backed suggestion — undo as the one action the user perceived
+    /// applying, rather than needing N separate presses of undo to get back
+    /// to where they started.
+    ///
+    /// If any op fails partway through, everything already applied in this
+    /// call is rolled back (via the ordinary single-op `undo` machinery) and
+    /// the project is left exactly as it was before the call — a group
+    /// either fully lands or leaves no trace, never half of one.
+    pub fn apply_group(&mut self, project: &mut Project, ops: &[Op]) -> Result<(), EditError> {
+        let start = self.undo.len();
+        for op in ops {
+            if let Err(e) = self.apply(project, op) {
+                while self.undo.len() > start {
+                    self.undo(project);
+                }
+                // A failed group never really succeeded, so there is
+                // nothing meaningful left to redo — clear the trail the
+                // rollback's own `undo()` calls just built.
+                self.redo.clear();
+                return Err(e);
+            }
+        }
+        self.undo_group_starts.push(start);
+        Ok(())
+    }
+
+    pub fn can_undo_group(&self) -> bool { !self.undo_group_starts.is_empty() }
+    pub fn can_redo_group(&self) -> bool { !self.redo_group_starts.is_empty() }
+
+    /// Undo back to the start of the most recent group boundary, however
+    /// many individual `undo` steps that takes from wherever the stack
+    /// currently is. Returns how many ops it actually undid.
+    ///
+    /// This is deliberately robust to interleaving with plain `undo`/`redo`
+    /// rather than assuming a fixed count: if some of the group's entries
+    /// were already undone one at a time before this is called, it simply
+    /// finishes what's left — the `while` condition naturally stops at the
+    /// group's start position regardless of how the stack got there. See
+    /// this module's tests for exactly that scenario pinned as a real case,
+    /// not a hypothetical.
+    pub fn undo_group(&mut self, project: &mut Project) -> usize {
+        let Some(start) = self.undo_group_starts.pop() else { return 0 };
+        let mut n = 0;
+        while self.undo.len() > start {
+            if self.undo(project).is_none() { break; }
+            n += 1;
+        }
+        if n > 0 {
+            self.redo_group_starts.push(self.redo.len() - n);
+        }
+        n
+    }
+
+    /// The `redo` counterpart: re-apply everything a preceding `undo_group`
+    /// call undid, as one action. Returns how many ops it redid.
+    pub fn redo_group(&mut self, project: &mut Project) -> usize {
+        let Some(start) = self.redo_group_starts.pop() else { return 0 };
+        let mut n = 0;
+        while self.redo.len() > start {
+            if self.redo(project).is_none() { break; }
+            n += 1;
+        }
+        n
+    }
 }
 
 #[cfg(test)]
@@ -356,7 +731,7 @@ mod tests {
     fn proj() -> Project {
         let mut p = Project { name: "t".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
             len: Ticks::from_seconds(30.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
         p
@@ -449,5 +824,370 @@ mod tests {
         p.apply(&Op::SetTrackFlags { id: TrackId(1), muted: false, locked: true }).unwrap();
         assert!(matches!(p.apply(&Op::AddClip { clip: clip(1, 0.0, 5.0) }),
                          Err(EditError::TrackLocked(_))));
+    }
+
+    #[test]
+    fn removing_a_track_with_clips_on_it_is_refused_not_silently_cascaded() {
+        // Regression test for a real bug: RemoveTrack used to silently
+        // delete every clip on the track as a side effect, but `apply`
+        // returns exactly one inverse Op — so undo only brought the TRACK
+        // back, not the clips. The fix is the same "in use" refusal
+        // Op::RemoveBus already uses: the caller removes the clips first.
+        let mut p = proj();
+        p.apply(&Op::AddClip { clip: clip(1, 0.0, 5.0) }).unwrap();
+        let err = p.apply(&Op::RemoveTrack { id: TrackId(1) });
+        assert!(matches!(err, Err(EditError::TrackInUse(TrackId(1)))), "{err:?}");
+        assert_eq!(p.tracks.len(), 1, "the refused removal must leave the track in place");
+        assert!(p.clips.contains_key(&ClipId(1)), "and the clip must still be there too");
+    }
+
+    #[test]
+    fn removing_an_empty_track_still_works_and_undoes_cleanly() {
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        h.apply(&mut p, &Op::RemoveTrack { id: TrackId(1) }).unwrap();
+        assert!(p.tracks.is_empty());
+        h.undo(&mut p);
+        assert_eq!(p, start, "removing and undoing an empty track must round-trip exactly, same as before this fix");
+    }
+
+    #[test]
+    fn removing_a_track_with_clips_via_a_group_first_removes_clips_then_the_track_and_undoes_as_one() {
+        // This is the actual right way to do "delete this track and
+        // everything on it" now: bundle RemoveClip for every clip plus the
+        // final RemoveTrack into one apply_group call, so the whole
+        // compound action undoes together as the single thing the user
+        // perceived doing — the payoff of the undo-group work pairing with
+        // this fix, not two unrelated changes.
+        let mut p = proj();
+        p.apply(&Op::AddClip { clip: clip(1, 0.0, 5.0) }).unwrap();
+        p.apply(&Op::AddClip { clip: clip(2, 6.0, 2.0) }).unwrap();
+        let before_group = p.clone();
+
+        let mut h = History::default();
+        // proj()'s own AddTrack/AddClip calls above weren't through `h`, so
+        // start a fresh group covering just the removal itself.
+        h.apply_group(&mut p, &[
+            Op::RemoveClip { id: ClipId(1) },
+            Op::RemoveClip { id: ClipId(2) },
+            Op::RemoveTrack { id: TrackId(1) },
+        ]).unwrap();
+        assert!(p.tracks.is_empty());
+        assert!(p.clips.is_empty());
+
+        let n = h.undo_group(&mut p);
+        assert_eq!(n, 3);
+        assert_eq!(p, before_group, "one undo_group call should restore both clips and the track together");
+    }
+
+    #[test]
+    fn removing_a_source_still_referenced_by_a_clip_is_refused() {
+        let mut p = proj();
+        p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+        p.apply(&Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
+            pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(2.0), gain: 1.0, effects: Vec::new() } }).unwrap();
+        let err = p.apply(&Op::RemoveSource { id: SourceId(1) });
+        assert!(matches!(err, Err(EditError::SourceInUse(SourceId(1)))), "{err:?}");
+        assert!(p.sources.contains_key(&SourceId(1)), "the refused removal must leave the source in place");
+    }
+
+    #[test]
+    fn removing_an_unreferenced_source_works_and_undoes_cleanly() {
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        h.apply(&mut p, &Op::AddSource { source: Source { id: SourceId(1), path: "a.wav".into(),
+            len: Ticks::from_seconds(10.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+        assert_eq!(p.sources.len(), 1);
+        h.undo(&mut p);
+        assert_eq!(p, start, "adding then undoing a source must fully round-trip — the bug this fixes is that it previously didn't");
+    }
+
+    #[test]
+    fn recording_a_take_now_fully_undoes_via_apply_group_source_included() {
+        // The exact regression this fix targets, expressed at the Op level
+        // (studio-live's own test covers the same thing through
+        // Recorder::commit_ops directly): AddSource followed by AddClip,
+        // applied as one group, must undo BOTH — not leave an orphaned
+        // source behind the way the old "AddSource's inverse is itself"
+        // workaround did.
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        h.apply_group(&mut p, &[
+            Op::AddSource { source: Source { id: SourceId(1), path: "take.wav".into(),
+                len: Ticks::from_seconds(4.0), sample_rate: 48_000, channels: 2, has_video: false } },
+            Op::AddClip { clip: Clip { id: ClipId(1), source: SourceId(1), track: TrackId(1),
+                pos: Ticks::ZERO, src_in: Ticks::ZERO, len: Ticks::from_seconds(4.0), gain: 1.0, effects: Vec::new() } },
+        ]).unwrap();
+        assert_eq!(p.sources.len(), 1);
+        assert_eq!(p.clips.len(), 1);
+
+        let n = h.undo_group(&mut p);
+        assert_eq!(n, 2, "both the source and the clip should undo together");
+        assert_eq!(p, start, "no orphaned source should remain — this is the bug, made concrete");
+    }
+
+    #[test]
+    fn a_duplicate_add_source_delivery_restores_the_original_on_undo_not_the_duplicate() {
+        // A subtler bug the same fix incidentally corrects: the OLD
+        // "idempotent" branch returned the NEW value as its own inverse,
+        // which is only a correct undo if the two values happen to be
+        // byte-identical. Here they deliberately aren't (different path),
+        // so undo must restore the ORIGINAL, not the duplicate.
+        let mut p = proj();
+        let mut h = History::default();
+        h.apply(&mut p, &Op::AddSource { source: Source { id: SourceId(1), path: "original.wav".into(),
+            len: Ticks::from_seconds(5.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+        h.apply(&mut p, &Op::AddSource { source: Source { id: SourceId(1), path: "duplicate-delivery.wav".into(),
+            len: Ticks::from_seconds(5.0), sample_rate: 48_000, channels: 2, has_video: false } }).unwrap();
+        assert_eq!(p.sources[&SourceId(1)].path, "duplicate-delivery.wav");
+
+        h.undo(&mut p);
+        assert_eq!(p.sources[&SourceId(1)].path, "original.wav", "undo of the duplicate delivery must restore the ORIGINAL value, not just re-apply the duplicate");
+    }
+
+    fn bus(id: u64, name: &str, parent: Option<u64>) -> Bus {
+        Bus { id: BusId(id), name: name.into(), parent: parent.map(BusId), gain: 1.0, chain: Vec::new(), sends: Vec::new(), muted: false }
+    }
+
+    #[test]
+    fn every_bus_op_has_an_exact_inverse() {
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        h.apply(&mut p, &Op::AddBus { bus: bus(1, "Vocals", None) }).unwrap();
+        h.apply(&mut p, &Op::AddBus { bus: bus(2, "Verb", None) }).unwrap();
+        h.apply(&mut p, &Op::SetBusGain { id: BusId(1), gain: 0.5 }).unwrap();
+        h.apply(&mut p, &Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 0.3, pre_fader: false }] }).unwrap();
+        h.apply(&mut p, &Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        h.apply(&mut p, &Op::SetBusFlags { id: BusId(1), muted: true }).unwrap();
+        assert!(h.can_undo());
+        while h.can_undo() { h.undo(&mut p); }
+        assert_eq!(p, start, "undoing every bus op must restore the opening project exactly");
+    }
+
+    #[test]
+    fn a_duplicate_add_bus_delivery_restores_the_original_on_undo_not_the_duplicate() {
+        // The same check just applied to AddSource's now-fixed bug, run
+        // against AddBus's own idempotent-duplicate branch — which reasoning
+        // says should already be correct (BTreeMap::insert returns the
+        // PREVIOUS value it displaced, which is what gets used as the
+        // inverse here, unlike AddSource's old code which independently
+        // re-derived the wrong value). Reasoning that a similar-looking
+        // branch is fine is exactly the kind of assumption that let the
+        // AddSource bug sit for this long — so this checks it directly
+        // rather than trusting the re-derivation on its own.
+        let mut p = proj();
+        let mut h = History::default();
+        h.apply(&mut p, &Op::AddBus { bus: bus(1, "Vocals", None) }).unwrap();
+        let mut duplicate = bus(1, "Vocals", None);
+        duplicate.gain = 0.42; // deliberately different, so a wrong inverse is detectable
+        h.apply(&mut p, &Op::AddBus { bus: duplicate }).unwrap();
+        assert_eq!(p.busses[&BusId(1)].gain, 0.42);
+
+        h.undo(&mut p);
+        assert_eq!(p.busses[&BusId(1)].gain, 1.0, "undo of the duplicate delivery must restore the ORIGINAL gain, not just re-apply the duplicate");
+    }
+
+    #[test]
+    fn undo_group_reverts_every_op_in_the_group_together() {
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        h.apply_group(&mut p, &[
+            Op::AddBus { bus: bus(1, "Vocals", None) },
+            Op::SetBusGain { id: BusId(1), gain: 0.5 },
+            Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) },
+        ]).unwrap();
+        assert_ne!(p, start, "the group should have visibly changed the project");
+        assert!(h.can_undo_group());
+        let n = h.undo_group(&mut p);
+        assert_eq!(n, 3, "should have undone exactly the three ops in the group");
+        assert_eq!(p, start, "one undo_group call should fully revert a three-op group");
+    }
+
+    #[test]
+    fn a_failing_op_partway_through_a_group_rolls_back_atomically() {
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        let err = h.apply_group(&mut p, &[
+            Op::AddBus { bus: bus(1, "Vocals", None) },
+            Op::SetBusGain { id: BusId(1), gain: 0.5 },
+            Op::SetBusGain { id: BusId(99), gain: 0.5 }, // no such bus — must fail
+        ]);
+        assert!(err.is_err());
+        assert_eq!(p, start, "a group that fails partway through must leave the project completely unchanged");
+        assert!(!h.can_undo_group(), "a failed group must not register as an undoable group");
+        assert!(!h.can_undo(), "a failed group must not leave any of its partial ops on the plain undo stack either");
+    }
+
+    #[test]
+    fn undo_group_is_lifo_across_multiple_groups() {
+        let mut p = proj();
+        let mut h = History::default();
+        h.apply_group(&mut p, &[Op::AddBus { bus: bus(1, "Vocals", None) }]).unwrap();
+        let after_group1 = p.clone();
+        h.apply_group(&mut p, &[Op::AddBus { bus: bus(2, "Drums", None) }]).unwrap();
+        assert_eq!(p.busses.len(), 2);
+
+        h.undo_group(&mut p);
+        assert_eq!(p, after_group1, "the SECOND group should undo first (LIFO), leaving the first group's bus intact");
+        assert_eq!(p.busses.len(), 1);
+
+        h.undo_group(&mut p);
+        assert_eq!(p.busses.len(), 0, "the first group should now undo too");
+    }
+
+    #[test]
+    fn undo_group_composes_correctly_with_a_partial_plain_undo_inside_it() {
+        // A real scenario, not a hypothetical: something calls plain
+        // single-op undo() a couple of times (e.g. the user pressing Ctrl-Z
+        // manually) partway through what was originally applied as a group.
+        // undo_group must then just finish whatever is left of that group,
+        // not double-undo or panic.
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        h.apply_group(&mut p, &[
+            Op::AddBus { bus: bus(1, "Vocals", None) },
+            Op::AddBus { bus: bus(2, "Drums", None) },
+            Op::AddBus { bus: bus(3, "808", None) },
+        ]).unwrap();
+
+        h.undo(&mut p); // manually undo just the last op (removes bus 3)
+        assert_eq!(p.busses.len(), 2);
+
+        let n = h.undo_group(&mut p); // should finish the remaining two
+        assert_eq!(n, 2, "undo_group should report only what IT undid, not the group's original size");
+        assert_eq!(p, start, "the group should still end up fully reverted in total");
+    }
+
+    #[test]
+    fn redo_group_reapplies_a_whole_undone_group() {
+        let mut p = proj();
+        let mut h = History::default();
+        h.apply_group(&mut p, &[
+            Op::AddBus { bus: bus(1, "Vocals", None) },
+            Op::AddBus { bus: bus(2, "Drums", None) },
+        ]).unwrap();
+        let after_apply = p.clone();
+        h.undo_group(&mut p);
+        assert_eq!(p.busses.len(), 0);
+        assert!(h.can_redo_group());
+
+        let n = h.redo_group(&mut p);
+        assert_eq!(n, 2);
+        assert_eq!(p, after_apply, "redo_group should restore the project exactly as the group left it");
+    }
+
+    #[test]
+    fn plain_undo_still_works_one_step_at_a_time_regardless_of_grouping() {
+        // Confirms apply_group is purely additive: ordinary single-op
+        // undo/redo behave exactly as before, unaware of and unaffected by
+        // group boundaries — a caller that never uses groups sees no
+        // change at all.
+        let mut p = proj();
+        let start = p.clone();
+        let mut h = History::default();
+        h.apply(&mut p, &Op::AddBus { bus: bus(1, "Vocals", None) }).unwrap();
+        h.apply_group(&mut p, &[
+            Op::AddBus { bus: bus(2, "Drums", None) },
+            Op::AddBus { bus: bus(3, "808", None) },
+        ]).unwrap();
+        assert_eq!(p.busses.len(), 3);
+
+        h.undo(&mut p);
+        assert_eq!(p.busses.len(), 2, "one plain undo should remove exactly one bus, group or not");
+        h.undo(&mut p);
+        assert_eq!(p.busses.len(), 1);
+        h.undo(&mut p);
+        assert_eq!(p, start, "three plain undos should fully revert, same total effect as grouping would have");
+    }
+
+    #[test]
+    fn default_route_is_master_and_costs_nothing() {
+        // A project with zero busses must still be exactly as valid as
+        // before busses existed — the whole point of `route: None` meaning
+        // "master" rather than requiring an explicit master Bus value.
+        let p = proj();
+        assert!(p.busses.is_empty());
+        assert_eq!(p.tracks[0].route, None);
+    }
+
+    #[test]
+    fn a_bus_parent_must_exist() {
+        let mut p = proj();
+        let err = p.apply(&Op::AddBus { bus: bus(1, "Vocals", Some(99)) });
+        assert!(matches!(err, Err(EditError::NoSuchBus(BusId(99)))), "{err:?}");
+    }
+
+    #[test]
+    fn a_bus_cannot_be_its_own_parent() {
+        let mut p = proj();
+        let err = p.apply(&Op::AddBus { bus: bus(1, "Loopy", Some(1)) });
+        assert!(matches!(err, Err(EditError::BusCycle { id: BusId(1) })), "{err:?}");
+    }
+
+    #[test]
+    fn a_send_that_would_close_a_loop_is_refused() {
+        let mut p = proj();
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Verb", Some(1)) }).unwrap(); // Verb -> Vocals (parent)
+        // Vocals sending into Verb would close Vocals -> Verb -> Vocals.
+        let err = p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![Send { to: BusId(2), level: 0.2, pre_fader: false }] });
+        assert!(matches!(err, Err(EditError::BusCycle { id: BusId(1) })), "{err:?}");
+    }
+
+    #[test]
+    fn resetting_a_buss_own_unchanged_sends_is_never_spuriously_refused() {
+        let mut p = proj();
+        p.apply(&Op::AddBus { bus: bus(1, "Vocals", None) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Verb", None) }).unwrap();
+        let sends = vec![Send { to: BusId(2), level: 0.4, pre_fader: false }];
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: sends.clone() }).unwrap();
+        // Re-applying the identical sends list must not trip the cycle
+        // check against itself.
+        p.apply(&Op::SetBusSends { id: BusId(1), sends }).unwrap();
+    }
+
+    #[test]
+    fn removing_a_bus_something_depends_on_is_refused() {
+        let mut p = proj();
+        p.apply(&Op::AddBus { bus: bus(1, "Drums", None) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let err = p.apply(&Op::RemoveBus { id: BusId(1) });
+        assert!(matches!(err, Err(EditError::BusInUse(BusId(1)))), "{err:?}");
+
+        // Reroute away, then removal succeeds.
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: None }).unwrap();
+        p.apply(&Op::RemoveBus { id: BusId(1) }).unwrap();
+        assert!(p.busses.is_empty());
+    }
+
+    #[test]
+    fn bus_order_processes_children_before_the_parents_they_feed() {
+        let mut p = proj();
+        p.apply(&Op::AddBus { bus: bus(1, "Master-ish", None) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Drums", Some(1)) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(3, "808", Some(1)) }).unwrap();
+        let order = p.bus_order().unwrap();
+        let pos = |id: u64| order.iter().position(|b| *b == BusId(id)).unwrap();
+        assert!(pos(2) < pos(1), "Drums must be processed before the bus it feeds");
+        assert!(pos(3) < pos(1), "808 must be processed before the bus it feeds");
+    }
+
+    #[test]
+    fn bus_order_detects_a_cycle_even_in_data_that_bypassed_apply() {
+        // A cycle can only reach live state via a corrupt/foreign file, since
+        // `apply` refuses to create one — simulate that by building the
+        // graph directly rather than through ops.
+        let mut p = proj();
+        p.busses.insert(BusId(1), Bus { id: BusId(1), name: "A".into(), parent: Some(BusId(2)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
+        p.busses.insert(BusId(2), Bus { id: BusId(2), name: "B".into(), parent: Some(BusId(1)), gain: 1.0, chain: vec![], sends: vec![], muted: false });
+        assert!(matches!(p.bus_order(), Err(EditError::BusCycle { .. })));
     }
 }

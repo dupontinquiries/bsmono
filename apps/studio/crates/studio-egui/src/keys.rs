@@ -404,7 +404,7 @@ mod tests {
     fn edit_points_are_the_words_of_a_timeline() {
         let mut p = Project { name: "t".into(), ..Default::default() };
         p.apply(&Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         p.apply(&Op::AddSource { source: Source { id: SourceId(1), path: "a".into(),
             len: Ticks::from_seconds(100.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         for (i, at) in [0.0f64, 5.0, 12.0].iter().enumerate() {

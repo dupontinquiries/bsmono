@@ -244,7 +244,7 @@ mod tests {
         // End to end over the awkward carrier: chunked, shuffled, duplicated.
         let mut host = Doc::new(SiteId(1), Project { name: "cut".into(), ..Default::default() });
         host.local(Op::AddTrack { track: Track { id: TrackId(1), kind: TrackKind::Video,
-            name: "V1".into(), muted: false, locked: false }, at: 0 }).unwrap();
+            name: "V1".into(), muted: false, locked: false, route: None }, at: 0 }).unwrap();
         host.local(Op::AddSource { source: Source { id: SourceId(1), path: "a.mov".into(),
             len: Ticks::from_seconds(600.0), sample_rate: 48_000, channels: 2, has_video: true } }).unwrap();
         for i in 0..150u64 {

@@ -35,6 +35,8 @@ pub mod transport;
 
 use studio_audio::SourceAudio;
 use studio_core::Ticks;
+use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
 
 /// Musical time. Tempo lives here rather than on the timeline because a project
 /// can hold several tempos and the timeline is in absolute ticks regardless.
@@ -64,7 +66,7 @@ impl Tempo {
 }
 
 /// What a channel is playing.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SynthKind {
     /// A plain sine — always available, so a rack is playable with no plugins.
     Sine { hz: f32 },
@@ -74,10 +76,44 @@ pub enum SynthKind {
     /// pattern step can move it, so latent drift becomes automation instead of
     /// a live-only gesture. Rendered by the host when beatspace is present.
     Beatspace { z: [f32; 3], crossfade: f32 },
+    /// The 808: a sine core with optional pitch glide and saturation drive,
+    /// built in (unlike Beatspace, it needs no external model). The trap rack
+    /// item this crate exists to support.
+    Sub {
+        /// Semitone offset from [`SUB_REFERENCE_HZ`] (55 Hz, A1 — a common
+        /// 808 fundamental).
+        note: i8,
+        /// `Some(prev)` glides from `prev`'s pitch to `note`'s over
+        /// `glide_ms`, instead of starting at `note` directly. Carrying the
+        /// source pitch explicitly here — rather than the synth remembering
+        /// "the last note played" as hidden mutable state — is the same
+        /// choice `studio-core::Op` makes everywhere else: an absolute value
+        /// the caller supplies, not a delta inferred from history, so
+        /// `render` stays a pure function of its inputs and a step-mod layer
+        /// built later can decide per-hit whether to slide without this
+        /// synth needing to track anything across calls.
+        glide_from: Option<i8>,
+        glide_ms: f32,
+        /// 0..=1, fed into a `studio_fx::saturation::Saturator` (`Profile::Tube`
+        /// — asymmetric, strong 2nd harmonic, the classic 808 warmth). 0
+        /// skips the saturator entirely.
+        drive: f32,
+        /// Amplitude decay time: roughly the time to fall to -60dB.
+        decay_ms: f32,
+    },
+}
+
+/// Reference fundamental for [`SynthKind::Sub`]'s semitone offsets: 55 Hz,
+/// standard A1 tuning and a common 808 fundamental in trap production.
+pub const SUB_REFERENCE_HZ: f32 = 55.0;
+
+/// Semitone offset to Hz, relative to [`SUB_REFERENCE_HZ`].
+pub fn sub_freq(note: i8) -> f32 {
+    SUB_REFERENCE_HZ * 2f32.powf(note as f32 / 12.0)
 }
 
 /// One rack channel.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Channel {
     pub name: String,
     pub kind: SynthKind,
@@ -91,17 +127,65 @@ pub struct Channel {
 /// Stored as a bitmask per channel rather than a Vec<bool> because a rack is
 /// edited by toggling single steps thousands of times a session, and because a
 /// pattern that fits in a word is trivially cheap to send to a collaborator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pattern {
     pub name: String,
     pub steps: u32,
     /// One mask per channel; bit `i` set means "fire on step i".
     pub rows: Vec<u64>,
+    /// Sparse per-(channel, step) modifiers. A step with no entry behaves
+    /// exactly like a plain hit — velocity 1, no ratchet, no retune, no
+    /// slide, fires every time — which is the property that keeps a
+    /// straightforward beat (most steps use none of this) cheap to store and
+    /// cheap to send, the same reasoning that made `rows` a bitmask.
+    pub mods: BTreeMap<(usize, u32), StepMod>,
+}
+
+/// Per-step trap-rack modifiers, layered on top of the plain on/off bitmask.
+///
+/// A default `StepMod` is defined to be indistinguishable from no entry at
+/// all — see [`Pattern::set_mod`], which relies on that to keep storage
+/// sparse automatically rather than accumulating a `StepMod::default()` for
+/// every step someone has ever touched.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct StepMod {
+    /// 0..=1, scales the channel's own gain for this hit only.
+    pub vel: f32,
+    /// 1..=4 retriggers inside the step, evenly subdivided — a hat roll.
+    /// Values outside the range are clamped when rendered, not refused; a
+    /// pattern is a value, and clamping keeps it always renderable rather
+    /// than making a bounce fail over one bad byte.
+    pub ratchet: u8,
+    /// Semitone offset from the channel's own note/pitch. Meaningful for
+    /// [`SynthKind::Sub`] (added to `note`) and [`SynthKind::Sine`] (scales
+    /// `hz`); a no-op for `Sampler` and `Beatspace`, which have no pitch
+    /// parameter to offset.
+    pub tune: i8,
+    /// Glide from whatever note this channel last played, instead of
+    /// starting at this hit's own pitch directly. If this is the channel's
+    /// first hit in the render (nothing to glide from), `slide` is silently
+    /// a no-op rather than an error — a pattern's first note can't legally
+    /// mean anything else.
+    pub slide: bool,
+    /// 0..=1. Below 1, the hit fires probabilistically rather than always —
+    /// see [`render_pattern`]'s docs on how this stays deterministic despite
+    /// being random-looking.
+    pub prob: f32,
+    /// `Some((n, k))` fires only on passes where `pass % k == n` — "every
+    /// other bar," "the 3rd of 4." `None` (the common case) fires on every
+    /// pass, subject to `prob`.
+    pub every: Option<(u8, u8)>,
+}
+
+impl Default for StepMod {
+    fn default() -> StepMod {
+        StepMod { vel: 1.0, ratchet: 1, tune: 0, slide: false, prob: 1.0, every: None }
+    }
 }
 
 impl Pattern {
     pub fn new(name: &str, steps: u32, channels: usize) -> Pattern {
-        Pattern { name: name.into(), steps: steps.min(64), rows: vec![0; channels] }
+        Pattern { name: name.into(), steps: steps.min(64), rows: vec![0; channels], mods: BTreeMap::new() }
     }
     pub fn is_set(&self, ch: usize, step: u32) -> bool {
         step < self.steps && self.rows.get(ch).map(|r| r >> step & 1 == 1).unwrap_or(false)
@@ -114,6 +198,22 @@ impl Pattern {
         if step >= self.steps { return; }
         if let Some(r) = self.rows.get_mut(ch) {
             if on { *r |= 1 << step } else { *r &= !(1 << step) }
+        }
+    }
+    /// The modifiers at (ch, step), or the all-defaults `StepMod` if none
+    /// were ever set — indistinguishable from "a plain hit" by design.
+    pub fn mod_at(&self, ch: usize, step: u32) -> StepMod {
+        self.mods.get(&(ch, step)).copied().unwrap_or_default()
+    }
+    /// Setting a step back to `StepMod::default()` removes its sparse entry
+    /// rather than storing an all-defaults value — this is what keeps
+    /// `mods` proportional to the steps someone actually customised, not to
+    /// every step anyone has ever touched a knob on.
+    pub fn set_mod(&mut self, ch: usize, step: u32, m: StepMod) {
+        if m == StepMod::default() {
+            self.mods.remove(&(ch, step));
+        } else {
+            self.mods.insert((ch, step), m);
         }
     }
     /// Every (channel, step) that fires, in step order — what a renderer walks.
@@ -132,7 +232,7 @@ impl Pattern {
 }
 
 /// The rack: channels plus the patterns over them.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Rack {
     pub channels: Vec<Channel>,
     pub patterns: Vec<Pattern>,
@@ -184,17 +284,100 @@ impl Synth for BuiltinSynth<'_> {
                 // works, which is the point of describing rather than linking.
                 out.fill(0.0);
             }
+            SynthKind::Sub { note, glide_from, glide_ms, drive, decay_ms } => {
+                let target_hz = sub_freq(*note);
+                let start_hz = glide_from.map(sub_freq).unwrap_or(target_hz);
+                let glide_samples = ((*glide_ms / 1000.0) * rate as f32).round().max(0.0) as usize;
+                let glide_samples = glide_samples.min(out.len());
+                // Decay time constant so amplitude reaches -60dB (1/1000) by
+                // decay_ms: exp(-decay_ms/1000/tau) = 1/1000 → tau =
+                // (decay_ms/1000) / ln(1000).
+                let tau = ((*decay_ms).max(1.0) / 1000.0) / 6.907_755;
+                // Phase is integrated every sample and NEVER reset, even
+                // while the frequency is sweeping — that is what makes the
+                // glide phase-continuous by construction rather than by
+                // careful tuning: a discontinuity only happens if something
+                // jumps the phase, and nothing here does.
+                let mut phase = 0.0f64;
+                for (i, s) in out.iter_mut().enumerate() {
+                    let hz = if glide_samples == 0 || i >= glide_samples {
+                        target_hz
+                    } else {
+                        // Exponential (log-frequency) interpolation — a
+                        // musical glide sweeps octaves at a constant rate,
+                        // not Hz at a constant rate.
+                        let t = i as f32 / glide_samples as f32;
+                        start_hz * (target_hz / start_hz).powf(t)
+                    };
+                    phase += std::f64::consts::TAU * hz as f64 / rate as f64;
+                    let t_s = i as f32 / rate as f32;
+                    let env = (-(t_s as f64 / tau.max(1e-6) as f64)).exp() as f32;
+                    *s = phase.sin() as f32 * env;
+                }
+                if *drive > 0.0 {
+                    let mut sat = studio_fx::saturation::Saturator::new(studio_fx::saturation::Profile::Tube);
+                    sat.drive = drive.clamp(0.0, 1.0);
+                    sat.process_block(out);
+                }
+            }
         }
     }
 }
 
+/// Turn a channel's base [`SynthKind`] plus a step's [`StepMod`] into the
+/// kind actually rendered for this hit. `prev_note` is the note this channel
+/// last played in this render (tracked by [`render_pattern`]'s own loop, not
+/// by the synth) — see `SynthKind::Sub::glide_from`'s docs on why glide
+/// state lives in the value passed to `render`, not in hidden state.
+fn apply_step_mod(kind: &SynthKind, m: &StepMod, prev_note: Option<i8>) -> SynthKind {
+    match kind {
+        SynthKind::Sub { note, glide_ms, drive, decay_ms, .. } => SynthKind::Sub {
+            note: note.saturating_add(m.tune),
+            glide_from: if m.slide { prev_note } else { None },
+            glide_ms: *glide_ms,
+            drive: *drive,
+            decay_ms: *decay_ms,
+        },
+        SynthKind::Sine { hz } => SynthKind::Sine { hz: hz * 2f32.powf(m.tune as f32 / 12.0) },
+        // Sampler and Beatspace have no pitch parameter `tune` or `slide`
+        // could act on — left untouched rather than pretending to apply
+        // something that has no defined meaning for them.
+        other => other.clone(),
+    }
+}
+
+/// The kind for a ratchet subdivision after the first: same pitch, no
+/// inherited glide. Sliding into your own retrigger has no obvious meaning,
+/// so it's deliberately not attempted — only the first subdivision of a
+/// ratchet carries whatever glide the step asked for.
+fn strip_glide(kind: &SynthKind) -> SynthKind {
+    match kind {
+        SynthKind::Sub { note, glide_ms, drive, decay_ms, .. } => {
+            SynthKind::Sub { note: *note, glide_from: None, glide_ms: *glide_ms, drive: *drive, decay_ms: *decay_ms }
+        }
+        other => other.clone(),
+    }
+}
+
 /// Render a pattern to mono samples — the bounce that turns a rack into a clip.
+///
+/// `pass` is which loop iteration this bounce represents (0 for a one-shot
+/// bounce), and is the only thing that makes [`StepMod::prob`] and
+/// [`StepMod::every`] meaningful: `render_pattern` is otherwise a pure
+/// function of (pattern, rack, tempo, rate), same as `studio_audio::mixdown`,
+/// and probability is made deterministic rather than actually random by
+/// seeding a PRNG from `(pass, channel, step)` — the same pass of the same
+/// pattern always renders identically, which is what keeps a render (and a
+/// test of one) reproducible. This is the same trade `unendlich`'s worldgen
+/// makes (`core_kit::rng::SplitMix64`, deterministic by seed rather than a
+/// system RNG), reused here rather than re-derived.
 pub fn render_pattern(
     pattern: &Pattern,
     rack: &Rack,
     synth: &mut dyn Synth,
     tempo: &Tempo,
     rate: u32,
+    pass: u32,
 ) -> Vec<f32> {
     let step = tempo.step_len().to_samples(rate).max(1) as usize;
     let total = step * pattern.steps as usize;
@@ -203,18 +386,89 @@ pub fn render_pattern(
     // they do on a real rack instead of being truncated at the grid.
     let voice_len = (step * 4).min(total.max(step));
     let mut scratch = vec![0.0f32; voice_len];
+    // The note each channel most recently played, in step order — local to
+    // this render, not the synth's business. See `apply_step_mod`'s docs.
+    let mut last_note: BTreeMap<usize, i8> = BTreeMap::new();
+
     for (ch_i, step_i) in pattern.hits() {
         let Some(ch) = rack.channels.get(ch_i) else { continue };
         if ch.muted { continue; }
-        scratch.fill(0.0);
-        synth.render(&ch.kind, rate, &mut scratch);
-        let at = step_i as usize * step;
-        for (i, v) in scratch.iter().enumerate() {
-            if at + i >= out.len() { break; }
-            out[at + i] += v * ch.gain;
+        let m = pattern.mod_at(ch_i, step_i);
+
+        if let Some((n, k)) = m.every {
+            if k > 0 && pass % k as u32 != n as u32 {
+                continue;
+            }
+        }
+        if m.prob < 1.0 {
+            let seed = ((pass as u64) << 32) ^ ((ch_i as u64) << 16) ^ (step_i as u64);
+            let mut rng = core_kit::rng::SplitMix64::new(seed);
+            if (rng.next_f64() as f32) >= m.prob {
+                continue; // this trial did not fire
+            }
+        }
+
+        let kind = apply_step_mod(&ch.kind, &m, last_note.get(&ch_i).copied());
+        if let SynthKind::Sub { note, .. } = &kind {
+            last_note.insert(ch_i, *note);
+        }
+
+        let ratchet = m.ratchet.clamp(1, 4) as usize;
+        let sub_step = (step / ratchet).max(1);
+        for r in 0..ratchet {
+            scratch.fill(0.0);
+            let this_kind = if r == 0 { kind.clone() } else { strip_glide(&kind) };
+            synth.render(&this_kind, rate, &mut scratch);
+            let at = step_i as usize * step + r * sub_step;
+            for (i, v) in scratch.iter().enumerate() {
+                if at + i >= out.len() { break; }
+                out[at + i] += v * ch.gain * m.vel;
+            }
         }
     }
     out
+}
+
+/// The ops that land a pattern's render onto the timeline as a clip —
+/// "bounce the beat" made real. Deliberately the same shape as
+/// [`Recorder::commit_ops`]: a pattern render and a vocal take are both
+/// "audio that needs to become a clip," and sharing the shape is what keeps
+/// a bounce going through the identical undo/collab path a punch-in take
+/// does, rather than needing its own special case in the sync layer.
+///
+/// The actual samples (`render_pattern`'s own return value, analogous to
+/// [`Recorder::to_audio`]) are the caller's responsibility to store keyed by
+/// `source` — this function only returns the two ops that describe where
+/// they live and how long they are, exactly like `commit_ops` does for a
+/// take.
+pub fn bounce_ops(
+    pattern: &Pattern,
+    tempo: &Tempo,
+    rate: u32,
+    source: studio_core::SourceId,
+    clip: studio_core::ClipId,
+    track: studio_core::TrackId,
+    at: Ticks,
+    path: &str,
+) -> Vec<studio_core::Op> {
+    let step = tempo.step_len().to_samples(rate).max(1) as usize;
+    let total_frames = step * pattern.steps as usize;
+    let len = Ticks::from_samples(total_frames as i64, rate);
+    vec![
+        studio_core::Op::AddSource {
+            source: studio_core::Source {
+                id: source, path: path.into(), len,
+                sample_rate: rate, channels: 1, has_video: false,
+            },
+        },
+        studio_core::Op::AddClip {
+            clip: studio_core::Clip {
+                id: clip, source, track,
+                pos: at, src_in: Ticks::ZERO, len,
+                gain: 1.0, effects: Vec::new(),
+            },
+        },
+    ]
 }
 
 // ── recording ───────────────────────────────────────────────────────────────
@@ -370,7 +624,7 @@ mod tests {
         let t = Tempo { bpm: 120.0, steps_per_beat: 4 };
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
-        let out = render_pattern(&p, &r, &mut synth, &t, 48_000);
+        let out = render_pattern(&p, &r, &mut synth, &t, 48_000, 0);
         let step = t.step_len().to_samples(48_000) as usize;
         assert_eq!(out.len(), step * 8);
         let energy = |from: usize, to: usize| out[from..to.min(out.len())]
@@ -392,7 +646,7 @@ mod tests {
         let t = Tempo::default();
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
-        let out = render_pattern(&p, &r, &mut synth, &t, 48_000);
+        let out = render_pattern(&p, &r, &mut synth, &t, 48_000, 0);
         assert!(!out.is_empty(), "the pattern still renders");
         assert!(out.iter().all(|s| *s == 0.0), "and is silent, not a crash or a click");
         // the channel description survives so a host WITH beatspace can play it
@@ -407,7 +661,7 @@ mod tests {
         p.set(0, 0, true);
         let sources = std::collections::BTreeMap::new();
         let mut synth = BuiltinSynth { sources: &sources };
-        let out = render_pattern(&p, &r, &mut synth, &Tempo::default(), 48_000);
+        let out = render_pattern(&p, &r, &mut synth, &Tempo::default(), 48_000, 0);
         assert!(out.iter().all(|s| *s == 0.0));
     }
 
@@ -455,5 +709,540 @@ mod tests {
         let audio = rec.to_audio();
         assert_eq!(audio.channels.len(), 2);
         assert_eq!(audio.frames(), 48_000);
+    }
+
+    #[test]
+    fn a_committed_take_undoes_as_one_action_via_apply_group() {
+        // commit_ops predates apply_group in this codebase's own history —
+        // this checks the two actually compose correctly, not just that
+        // each works in isolation. A real "record a verse" flow (see
+        // studio-copilot's set_up_a_verse) ends with exactly this: apply
+        // the take's ops as one group, so one undo removes both the source
+        // and the clip together, matching what the user perceived doing
+        // (one take, not two edits).
+        let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
+        project.apply(&Op::AddTrack { track: studio_core::Track {
+            id: TrackId(2), kind: studio_core::TrackKind::Audio, name: "Vox".into(),
+            muted: false, locked: false, route: None,
+        }, at: 0 }).unwrap();
+        let before = project.clone();
+
+        let mut rec = Recorder::new(48_000, 2, Ticks::from_seconds(8.0));
+        rec.arm(true);
+        rec.feed(&[0.25; 96_000]);
+        let ops = rec.commit_ops(SourceId(7), ClipId(70), TrackId(2), "takes/take-1.wav");
+
+        let mut history = studio_core::History::default();
+        history.apply_group(&mut project, &ops).expect("a fresh take's ops should apply cleanly as a group");
+        assert_eq!(project.sources.len(), 1);
+        assert_eq!(project.clips.len(), 1);
+
+        let n = history.undo_group(&mut project);
+        assert_eq!(n, 2, "the source and the clip together — one action, two ops, undone as one");
+        assert_eq!(project, before, "undo_group should restore the project to exactly its pre-take state");
+    }
+
+    fn sub_hz_of(samples: &[f32], rate: u32) -> f32 {
+        // Zero-crossing period estimate over the given window — good enough
+        // for a synthesized sine with no other partials in it.
+        let mut crossings = Vec::new();
+        for i in 1..samples.len() {
+            if samples[i - 1] <= 0.0 && samples[i] > 0.0 {
+                crossings.push(i);
+            }
+        }
+        if crossings.len() < 2 {
+            return 0.0;
+        }
+        let periods: Vec<f32> = crossings.windows(2).map(|w| (w[1] - w[0]) as f32).collect();
+        let mean_period = periods.iter().sum::<f32>() / periods.len() as f32;
+        rate as f32 / mean_period
+    }
+
+    /// Recompute the exact expected waveform independently of the
+    /// implementation's control flow, from the same documented formula
+    /// (phase integrated every sample, exponential/log-frequency
+    /// interpolation during the glide, exponential amplitude decay). This is
+    /// a stronger check than a statistical pitch estimate: it pins the
+    /// literal sample values, not just "roughly the right frequency."
+    fn expected_sub_samples(rate: u32, target_hz: f32, start_hz: f32, glide_samples: usize, tau: f32, n: usize) -> Vec<f32> {
+        let mut phase = 0.0f64;
+        let mut out = vec![0.0f32; n];
+        for (i, s) in out.iter_mut().enumerate() {
+            let hz = if glide_samples == 0 || i >= glide_samples {
+                target_hz
+            } else {
+                let t = i as f32 / glide_samples as f32;
+                start_hz * (target_hz / start_hz).powf(t)
+            };
+            phase += std::f64::consts::TAU * hz as f64 / rate as f64;
+            let t_s = i as f32 / rate as f32;
+            let env = (-(t_s as f64 / tau.max(1e-6) as f64)).exp() as f32;
+            *s = phase.sin() as f32 * env;
+        }
+        out
+    }
+
+    fn sub_tau(decay_ms: f32) -> f32 {
+        (decay_ms.max(1.0) / 1000.0) / 6.907_755
+    }
+
+    #[test]
+    fn sub_freq_matches_standard_octave_steps_from_a1() {
+        assert!((sub_freq(0) - SUB_REFERENCE_HZ).abs() < 1e-3, "note 0 is the reference itself");
+        assert!((sub_freq(12) - 110.0).abs() < 0.1, "an octave up from A1 is A2, 110Hz");
+        assert!((sub_freq(-12) - 27.5).abs() < 0.1, "an octave down is A0, 27.5Hz");
+    }
+
+    #[test]
+    fn a_sub_hit_with_no_glide_holds_its_target_pitch_throughout() {
+        let rate = 48_000;
+        let kind = SynthKind::Sub { note: 12, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 2000.0 };
+        let mut out = vec![0.0f32; 4800]; // 100ms
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        synth.render(&kind, rate, &mut out);
+        let hz = sub_hz_of(&out[..2400], rate); // first 50ms, well within a slow decay
+        assert!((hz - sub_freq(12)).abs() < 1.0, "no glide requested: pitch should be A2 (110Hz) throughout, measured {hz}");
+    }
+
+    #[test]
+    fn glide_matches_the_documented_closed_form_exactly() {
+        let rate = 48_000;
+        let target_hz = sub_freq(12);
+        let start_hz = sub_freq(0);
+        let glide_ms = 50.0;
+        let decay_ms = 2000.0;
+        let glide_samples = ((glide_ms / 1000.0) * rate as f32).round() as usize;
+        let n = 9600;
+        let kind = SynthKind::Sub { note: 12, glide_from: Some(0), glide_ms, drive: 0.0, decay_ms };
+        let mut out = vec![0.0f32; n];
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        synth.render(&kind, rate, &mut out);
+
+        let expected = expected_sub_samples(rate, target_hz, start_hz, glide_samples, sub_tau(decay_ms), n);
+        for i in 0..n {
+            assert!((out[i] - expected[i]).abs() < 1e-4,
+                "sample {i}: got {} expected {} — the implementation drifted from its documented formula", out[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn glide_produces_no_phase_discontinuity() {
+        // A model-independent check, unlike the closed-form test above: a
+        // phase RESET (the classic glide-click bug) would blow past the
+        // derivative bound of the fastest pure tone involved, regardless of
+        // what formula produced it. This is what would catch a regression
+        // that broke phase continuity while still matching some formula.
+        let rate = 48_000;
+        let kind = SynthKind::Sub { note: 12, glide_from: Some(0), glide_ms: 50.0, drive: 0.0, decay_ms: 2000.0 };
+        let mut out = vec![0.0f32; 9600];
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        synth.render(&kind, rate, &mut out);
+
+        let max_hz = sub_freq(12).max(SUB_REFERENCE_HZ);
+        let bound = 2.0 * std::f32::consts::PI * max_hz / rate as f32 * 1.5; // 1.5x slack for the envelope's own slope
+        for w in out.windows(2) {
+            let d = (w[1] - w[0]).abs();
+            assert!(d <= bound + 0.02, "sample-to-sample jump {d} exceeds the continuity bound {bound} — looks like a phase reset");
+        }
+    }
+
+    #[test]
+    fn a_sub_hit_with_glide_from_the_same_note_is_flat_not_degenerate() {
+        // glide_from == note (ratio 1.0 in the exponential interpolation) is
+        // a real input a caller could send (e.g. a step-mod layer that
+        // always fills glide_from and only sometimes actually changes pitch)
+        // and must not divide-by-zero or NaN out.
+        let rate = 48_000;
+        let kind = SynthKind::Sub { note: 3, glide_from: Some(3), glide_ms: 30.0, drive: 0.0, decay_ms: 500.0 };
+        let mut out = vec![0.0f32; 2400];
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        synth.render(&kind, rate, &mut out);
+        assert!(out.iter().all(|s| s.is_finite()), "must not NaN when start and target pitch are identical");
+
+        let no_glide = SynthKind::Sub { note: 3, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 500.0 };
+        let mut reference = vec![0.0f32; 2400];
+        synth.render(&no_glide, rate, &mut reference);
+        for i in 0..out.len() {
+            assert!((out[i] - reference[i]).abs() < 1e-4,
+                "glide_from == note should render identically to no glide at all (sample {i})");
+        }
+    }
+
+    #[test]
+    fn the_amplitude_envelope_decays_toward_silence_by_decay_ms() {
+        let rate = 48_000;
+        let decay_ms = 100.0;
+        let kind = SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms };
+        let mut out = vec![0.0f32; 24_000]; // 500ms, well past the decay
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        synth.render(&kind, rate, &mut out);
+
+        let peak = |s: &[f32]| s.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let early = peak(&out[0..480]); // first 10ms
+        let at_decay = peak(&out[4700..4800]); // right around t=decay_ms (4800 samples)
+        assert!(at_decay < early * 0.05, "amplitude at decay_ms ({at_decay}) should have fallen to roughly -60dB of the onset ({early})");
+    }
+
+    #[test]
+    fn drive_audibly_changes_the_output_and_never_produces_nan() {
+        let rate = 48_000;
+        let clean = SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.0, decay_ms: 1000.0 };
+        let driven = SynthKind::Sub { note: 0, glide_from: None, glide_ms: 0.0, drive: 0.9, decay_ms: 1000.0 };
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+
+        let mut a = vec![0.0f32; 4800];
+        let mut b = vec![0.0f32; 4800];
+        synth.render(&clean, rate, &mut a);
+        synth.render(&driven, rate, &mut b);
+
+        assert!(b.iter().all(|s| s.is_finite()), "a driven 808 must never produce NaN/Inf");
+        let differs = a.iter().zip(b.iter()).any(|(x, y)| (x - y).abs() > 1e-4);
+        assert!(differs, "drive > 0 should audibly change the waveform vs drive = 0");
+
+        // The saturator's own DC blocker should keep a driven signal centred
+        // near zero rather than drifting — a light integration check, since
+        // saturation.rs already tests the blocker itself exhaustively.
+        let mean: f32 = b[2400..].iter().sum::<f32>() / (b.len() - 2400) as f32;
+        assert!(mean.abs() < 0.05, "driven output has drifted off zero: mean {mean}");
+    }
+
+    #[test]
+    fn render_pattern_plays_a_sub_channel_end_to_end() {
+        let mut rack = rack();
+        rack.channels.push(Channel {
+            name: "808".into(),
+            kind: SynthKind::Sub { note: -5, glide_from: None, glide_ms: 0.0, drive: 0.3, decay_ms: 300.0 },
+            gain: 1.0, pan: 0.0, muted: false,
+        });
+        let mut pattern = Pattern::new("beat", 16, rack.channels.len());
+        pattern.toggle(3, 0); // the new 808 channel, on step 0
+        let tempo = Tempo { bpm: 140.0, steps_per_beat: 4 };
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let out = render_pattern(&pattern, &rack, &mut synth, &tempo, 48_000, 0);
+        assert!(out.iter().any(|s| *s != 0.0), "a pattern with a Sub hit must produce audible output");
+    }
+
+    #[test]
+    fn bounce_ops_declares_a_source_length_matching_render_patterns_actual_output() {
+        let rack = rack();
+        let mut pattern = Pattern::new("beat", 16, rack.channels.len());
+        pattern.toggle(0, 0);
+        pattern.toggle(1, 4);
+        let tempo = Tempo { bpm: 128.0, steps_per_beat: 4 };
+        let rate = 48_000;
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let rendered = render_pattern(&pattern, &rack, &mut synth, &tempo, rate, 0);
+
+        let ops = bounce_ops(&pattern, &tempo, rate, SourceId(9), ClipId(9), TrackId(1), Ticks::ZERO, "bounce.wav");
+        let Op::AddSource { source } = &ops[0] else { panic!("expected AddSource first") };
+        assert_eq!(source.len.to_samples(rate) as usize, rendered.len(),
+            "the declared source length must match render_pattern's actual sample count exactly, or a later mixdown could read out of bounds or truncate");
+        assert_eq!(source.channels, 1, "render_pattern is mono");
+    }
+
+    #[test]
+    fn bounce_ops_apply_cleanly_and_land_a_playable_clip() {
+        let rack = rack();
+        let mut pattern = Pattern::new("beat", 16, rack.channels.len());
+        pattern.toggle(0, 0);
+        let tempo = Tempo::default();
+
+        let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
+        project.apply(&Op::AddTrack { track: studio_core::Track {
+            id: TrackId(1), kind: studio_core::TrackKind::Audio, name: "Drums".into(),
+            muted: false, locked: false, route: None,
+        }, at: 0 }).unwrap();
+
+        let ops = bounce_ops(&pattern, &tempo, 48_000, SourceId(1), ClipId(1), TrackId(1), Ticks::from_seconds(2.0), "bounce.wav");
+        for op in ops {
+            project.apply(&op).expect("bounce ops should apply cleanly onto a project with the target track already present");
+        }
+        let clips = project.track_clips(TrackId(1));
+        assert_eq!(clips.len(), 1);
+        assert_eq!(clips[0].pos, Ticks::from_seconds(2.0), "the clip should land at the requested position, not always at the timeline start");
+    }
+
+    #[test]
+    fn a_bounced_pattern_is_audible_through_a_real_mixdown() {
+        // The full loop: render the pattern's actual samples, bounce its ops
+        // onto a project, register the rendered audio under the same
+        // SourceId the ops reference, and mix down — proving the bounce
+        // path produces something that is not just structurally valid but
+        // genuinely plays.
+        let rack = rack();
+        let mut pattern = Pattern::new("beat", 16, rack.channels.len());
+        pattern.toggle(0, 0);
+        pattern.toggle(0, 8);
+        let tempo = Tempo { bpm: 128.0, steps_per_beat: 4 };
+        let rate = 48_000;
+        let sources_for_render = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources_for_render };
+        let rendered = render_pattern(&pattern, &rack, &mut synth, &tempo, rate, 0);
+        assert!(rendered.iter().any(|s| *s != 0.0), "sanity: the pattern itself should be audible before bouncing it");
+
+        let mut project = studio_core::Project { name: "t".into(), ..Default::default() };
+        project.apply(&Op::AddTrack { track: studio_core::Track {
+            id: TrackId(1), kind: studio_core::TrackKind::Audio, name: "Drums".into(),
+            muted: false, locked: false, route: None,
+        }, at: 0 }).unwrap();
+        for op in bounce_ops(&pattern, &tempo, rate, SourceId(1), ClipId(1), TrackId(1), Ticks::ZERO, "bounce.wav") {
+            project.apply(&op).unwrap();
+        }
+
+        let mut audio_map = std::collections::BTreeMap::new();
+        audio_map.insert(SourceId(1), SourceAudio { sample_rate: rate, channels: vec![rendered.clone()] });
+
+        let clip_len = Ticks::from_samples(rendered.len() as i64, rate);
+        let mix = studio_audio::mixdown(&project, &audio_map, &std::collections::BTreeMap::new(),
+            Ticks::ZERO, clip_len, rate, &[], &[]);
+        assert!(mix.iter().any(|s| *s != 0.0), "a bounced pattern, mixed down through the normal timeline path, must be audible");
+    }
+
+    #[test]
+    fn a_default_step_mod_is_indistinguishable_from_no_entry_and_stays_sparse() {
+        let mut p = Pattern::new("beat", 16, 2);
+        assert_eq!(p.mod_at(0, 3), StepMod::default(), "an untouched step reads as all-defaults");
+        p.set_mod(0, 3, StepMod { vel: 0.5, ..StepMod::default() });
+        assert_eq!(p.mods.len(), 1);
+        p.set_mod(0, 3, StepMod::default());
+        assert!(p.mods.is_empty(), "setting a step back to all-defaults must remove its sparse entry");
+    }
+
+    #[test]
+    fn apply_step_mod_offsets_a_subs_note_and_leaves_others_untouched() {
+        let sub = SynthKind::Sub { note: 3, glide_from: None, glide_ms: 40.0, drive: 0.2, decay_ms: 300.0 };
+        let m = StepMod { tune: 5, ..StepMod::default() };
+        match apply_step_mod(&sub, &m, None) {
+            SynthKind::Sub { note, glide_from, glide_ms, drive, decay_ms } => {
+                assert_eq!(note, 8, "3 + 5 semitones");
+                assert_eq!(glide_from, None, "slide was false: no glide requested");
+                assert_eq!(glide_ms, 40.0);
+                assert_eq!(drive, 0.2);
+                assert_eq!(decay_ms, 300.0);
+            }
+            other => panic!("unexpected kind: {other:?}"),
+        }
+
+        // Sampler has no pitch parameter tune could act on — untouched.
+        let sampler = SynthKind::Sampler { source: SourceId(1) };
+        assert_eq!(apply_step_mod(&sampler, &m, None), sampler);
+    }
+
+    #[test]
+    fn apply_step_mod_scales_a_sines_hz_by_the_tune_offset() {
+        let sine = SynthKind::Sine { hz: 440.0 };
+        let up_an_octave = StepMod { tune: 12, ..StepMod::default() };
+        match apply_step_mod(&sine, &up_an_octave, None) {
+            SynthKind::Sine { hz } => assert!((hz - 880.0).abs() < 0.01, "up 12 semitones doubles the frequency, got {hz}"),
+            other => panic!("unexpected kind: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slide_glides_from_the_previous_hit_but_only_when_requested() {
+        let sub = SynthKind::Sub { note: 7, glide_from: None, glide_ms: 40.0, drive: 0.0, decay_ms: 300.0 };
+        let no_slide = StepMod::default();
+        let with_slide = StepMod { slide: true, ..StepMod::default() };
+
+        match apply_step_mod(&sub, &no_slide, Some(2)) {
+            SynthKind::Sub { glide_from, .. } => assert_eq!(glide_from, None, "slide=false must ignore a previous note even if one is known"),
+            _ => unreachable!(),
+        }
+        match apply_step_mod(&sub, &with_slide, Some(2)) {
+            SynthKind::Sub { glide_from, .. } => assert_eq!(glide_from, Some(2), "slide=true should carry the previous note forward"),
+            _ => unreachable!(),
+        }
+        match apply_step_mod(&sub, &with_slide, None) {
+            SynthKind::Sub { glide_from, .. } => assert_eq!(glide_from, None, "nothing to slide from on a channel's first hit — silently a no-op, not an error"),
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn render_pattern_carries_slide_across_consecutive_hits_on_the_same_channel() {
+        // Two hits on one Sub channel: step 0 at note 0, step 4 slides to
+        // note 12. The second hit's rendered pitch must glide FROM the first
+        // hit's ACTUAL note (0), not from the channel's base SynthKind note
+        // — proving render_pattern tracks last_note per channel correctly.
+        let rack = Rack {
+            channels: vec![Channel {
+                name: "808".into(),
+                kind: SynthKind::Sub { note: 0, glide_from: None, glide_ms: 30.0, drive: 0.0, decay_ms: 2000.0 },
+                gain: 1.0, pan: 0.0, muted: false,
+            }],
+            patterns: vec![], tempo_bpm: 120.0,
+        };
+        let mut pattern = Pattern::new("beat", 16, 1);
+        pattern.toggle(0, 0);
+        pattern.toggle(0, 4);
+        pattern.set_mod(0, 4, StepMod { tune: 12, slide: true, ..StepMod::default() });
+        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4 };
+        let rate = 48_000;
+        let step_samples = tempo.step_len().to_samples(rate) as usize;
+
+        // Render just the second hit's kind by re-deriving it exactly the
+        // way render_pattern does, and compare against a synthesized full
+        // pattern render at the sample level for the slid hit's onset.
+        let expected_kind = SynthKind::Sub { note: 12, glide_from: Some(0), glide_ms: 30.0, drive: 0.0, decay_ms: 2000.0 };
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let mut expected_scratch = vec![0.0f32; step_samples * 4];
+        synth.render(&expected_kind, rate, &mut expected_scratch);
+
+        let out = render_pattern(&pattern, &rack, &mut synth, &tempo, rate, 0);
+        let onset = 4 * step_samples;
+        for i in 0..2000.min(expected_scratch.len()).min(out.len() - onset) {
+            assert!((out[onset + i] - expected_scratch[i]).abs() < 1e-4,
+                "sample {i} after the slid hit's onset: render_pattern's slide did not glide from the first hit's actual note");
+        }
+    }
+
+    #[test]
+    fn ratchet_subdivides_a_step_into_evenly_spaced_sample_accurate_retriggers() {
+        let mut rack = rack();
+        rack.channels[0].kind = SynthKind::Sine { hz: 4000.0 };
+        let mut pattern = Pattern::new("beat", 4, rack.channels.len());
+        pattern.toggle(0, 0);
+        pattern.set_mod(0, 0, StepMod { ratchet: 4, ..StepMod::default() });
+        let tempo = Tempo { bpm: 120.0, steps_per_beat: 4 };
+        let rate = 48_000;
+        let step_samples = tempo.step_len().to_samples(rate) as usize;
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let out = render_pattern(&pattern, &rack, &mut synth, &tempo, rate, 0);
+
+        let sub_step = step_samples / 4;
+        let mut reference = vec![0.0f32; step_samples * 4]; // must match render_pattern's own voice_len exactly
+        synth.render(&SynthKind::Sine { hz: 4000.0 }, rate, &mut reference);
+
+        // First onset: no overlap from any earlier retrigger yet, so this
+        // segment must match a one-off render exactly — the strongest,
+        // least-derived check available.
+        for i in 0..sub_step {
+            assert!((out[i] - reference[i]).abs() < 1e-4,
+                "ratchet 0, offset {i}: expected a fresh onset matching a one-off render, got {} vs {}", out[i], reference[i]);
+        }
+
+        // Later onsets legitimately overlap with the ringing tail of earlier
+        // retriggers (a voice may ring past its own step, by design), so
+        // reconstruct the additive sum the same way render_pattern does and
+        // compare the WHOLE buffer, rather than assuming any later segment
+        // is isolated.
+        let mut expected = vec![0.0f32; out.len()];
+        for r in 0..4 {
+            let onset = r * sub_step;
+            for (i, v) in reference.iter().enumerate() {
+                if onset + i >= expected.len() { break; }
+                expected[onset + i] += v;
+            }
+        }
+        for i in 0..out.len() {
+            assert!((out[i] - expected[i]).abs() < 1e-4,
+                "sample {i}: ratchet output does not match 4 evenly-spaced (every {sub_step} samples), fully additive retriggers");
+        }
+    }
+
+    #[test]
+    fn ratchet_is_clamped_into_range_rather_than_refused() {
+        let mut rack = rack();
+        rack.channels[0].kind = SynthKind::Sine { hz: 2000.0 };
+        let mut pattern = Pattern::new("beat", 4, rack.channels.len());
+        pattern.toggle(0, 0);
+        pattern.set_mod(0, 0, StepMod { ratchet: 200, ..StepMod::default() }); // absurd, must clamp not panic
+        let tempo = Tempo::default();
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let out = render_pattern(&pattern, &rack, &mut synth, &tempo, 48_000, 0);
+        assert!(out.iter().all(|s| s.is_finite()));
+    }
+
+    #[test]
+    fn velocity_scales_the_hit_relative_to_the_channels_own_gain() {
+        let mut rack = rack();
+        rack.channels[0].kind = SynthKind::Sine { hz: 1000.0 };
+        rack.channels[0].gain = 1.0;
+        let mut full = Pattern::new("beat", 4, rack.channels.len());
+        full.toggle(0, 0);
+        let mut half = full.clone();
+        half.set_mod(0, 0, StepMod { vel: 0.5, ..StepMod::default() });
+
+        let tempo = Tempo::default();
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        let a = render_pattern(&full, &rack, &mut synth, &tempo, 48_000, 0);
+        let b = render_pattern(&half, &rack, &mut synth, &tempo, 48_000, 0);
+        let peak = |s: &[f32]| s.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+        assert!((peak(&b) - peak(&a) * 0.5).abs() < 1e-4, "vel=0.5 should exactly halve the hit's amplitude");
+    }
+
+    #[test]
+    fn probability_zero_never_fires_and_one_always_does() {
+        let mut rack = rack();
+        rack.channels[0].kind = SynthKind::Sine { hz: 1000.0 };
+        let mut never = Pattern::new("beat", 4, rack.channels.len());
+        never.toggle(0, 0);
+        never.set_mod(0, 0, StepMod { prob: 0.0, ..StepMod::default() });
+        let mut always = never.clone();
+        always.set_mod(0, 0, StepMod { prob: 1.0, ..StepMod::default() });
+
+        let tempo = Tempo::default();
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+        for pass in 0..10 {
+            let out = render_pattern(&never, &rack, &mut synth, &tempo, 48_000, pass);
+            assert!(out.iter().all(|s| *s == 0.0), "prob=0.0 must never fire (pass {pass})");
+        }
+        let out = render_pattern(&always, &rack, &mut synth, &tempo, 48_000, 0);
+        assert!(out.iter().any(|s| *s != 0.0), "prob=1.0 must always fire");
+    }
+
+    #[test]
+    fn probability_is_deterministic_per_pass_and_roughly_matches_its_rate_across_many() {
+        let mut rack = rack();
+        rack.channels[0].kind = SynthKind::Sine { hz: 1000.0 };
+        let mut pattern = Pattern::new("beat", 4, rack.channels.len());
+        pattern.toggle(0, 0);
+        pattern.set_mod(0, 0, StepMod { prob: 0.5, ..StepMod::default() });
+        let tempo = Tempo::default();
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+
+        // Same pass rendered twice must agree exactly — determinism, not
+        // "randomness" in the usual sense.
+        let a = render_pattern(&pattern, &rack, &mut synth, &tempo, 48_000, 7);
+        let b = render_pattern(&pattern, &rack, &mut synth, &tempo, 48_000, 7);
+        assert_eq!(a, b, "the same (pattern, pass) must render identically every time");
+
+        let fired = (0..200)
+            .filter(|&pass| render_pattern(&pattern, &rack, &mut synth, &tempo, 48_000, pass).iter().any(|s| *s != 0.0))
+            .count();
+        assert!((60..140).contains(&fired), "prob=0.5 across 200 passes should land near 100 fires, got {fired}");
+    }
+
+    #[test]
+    fn every_gates_a_hit_to_specific_passes() {
+        let mut rack = rack();
+        rack.channels[0].kind = SynthKind::Sine { hz: 1000.0 };
+        let mut even_only = Pattern::new("beat", 4, rack.channels.len());
+        even_only.toggle(0, 0);
+        even_only.set_mod(0, 0, StepMod { every: Some((0, 2)), ..StepMod::default() });
+        let tempo = Tempo::default();
+        let sources = std::collections::BTreeMap::new();
+        let mut synth = BuiltinSynth { sources: &sources };
+
+        for pass in 0..6u32 {
+            let out = render_pattern(&even_only, &rack, &mut synth, &tempo, 48_000, pass);
+            let fired = out.iter().any(|s| *s != 0.0);
+            assert_eq!(fired, pass % 2 == 0, "pass {pass}: every=(0,2) should fire only on even passes");
+        }
     }
 }
