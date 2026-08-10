@@ -3908,7 +3908,7 @@ back it. Reporting device OOM rather than mapping an invalid buffer",
                 view.copy_from_slice(bytes);
             }));
             if wrote.is_err() {
-                eprintln!("wgpu-engine: ARENA SLAB UNUSABLE — slab {} of {:.1} MiB could not be mapped at offset {off} ({} bytes). {:.1} GiB of slabs had already been placed, all still mapped. NEXT DIAGNOSTIC: rerun with LOGSCOPE_ARENA_SLAB_MB=1024 — failing again at the same TOTAL means the cap is on mapped bytes and a smaller slab cannot help; getting past it means the cap is per-buffer or per-count and the slab size IS the fix. Meanwhile lower LOGSCOPE_MAX_GPU_GB, or let the model stream instead of forcing residency.",
+                eprintln!("wgpu-engine: ARENA SLAB UNUSABLE — slab {} of {:.1} MiB could not be mapped at offset {off} ({} bytes). {:.1} GiB of slabs had already been placed, all still mapped. 1024 MiB slabs are now the DEFAULT on this driver — that is the size the 31 GiB concurrent ceiling was measured with, and a 2 GiB arena died at 6 GiB placed. If this failed at 1024, the cap is on MAPPED BYTES and a smaller slab cannot help: rerun `kernel-validate --gate-residency` to re-measure the ceiling for THIS slab size, then lower LOGSCOPE_MAX_GPU_GB to what it reports, or let the model stream instead of forcing residency.",
                     a.slabs.len(), a.slab_size as f64 / (1 << 20) as f64, len,
                     (a.slabs.len().saturating_sub(1) as f64 * a.slab_size as f64) / (1u64 << 30) as f64);
                 // Re-raised rather than swallowed: the buffer is unusable and there is no Tensor to
@@ -8953,8 +8953,22 @@ last block and k's first would decode to garbage")),
         };
         let _arena_guard = if arena_on {
             let max_buf = self.device.limits().max_buffer_size;
+            // DEFAULT 1 GiB, not 2, on a BO-VMA-constrained driver — and the reason is that the
+            // budget and the allocator must agree about what a byte costs.
+            //
+            // ASAHI_CONCURRENT_BUFFER_GIB (31.0) was MEASURED by --gate-residency using ONE-GiB
+            // slabs: 124 held, the 125th refused. The arena then asked for 2047 MiB slabs and a
+            // Scout load planned at ~29.5 GiB died with 6.0 GiB placed — at slab 4. The ceiling is
+            // therefore not a flat byte count; it depends on the slab size, and budgeting against a
+            // figure measured under different conditions is why a plan that "fits" fails a quarter
+            // of the way in.
+            //
+            // The failure message already asks the operator to rerun with LOGSCOPE_ARENA_SLAB_MB=1024
+            // as the next diagnostic. That is the measured configuration, so it is the default now;
+            // the env var still overrides in either direction.
+            let default_slab: u64 = if self.conservative_vma { 1 << 30 } else { 2 << 30 };
             let slab = std::env::var("LOGSCOPE_ARENA_SLAB_MB").ok().and_then(|m| m.trim().parse::<u64>().ok())
-                .map(|mb| mb << 20).unwrap_or(2 << 30).min(max_buf).max(256 << 20);
+                .map(|mb| mb << 20).unwrap_or(default_slab).min(max_buf).max(256 << 20);
             // Align the slab size DOWN to 256 (≥ COPY_BUFFER_ALIGNMENT=4). A UMA zero-copy slab is created
             // mapped_at_creation, which requires size % 4 == 0 — and some drivers report max_buffer_size as
             // an odd value (Honeykrisp/Asahi: ~2047 MiB = 2^31-1), so `.min(max_buf)` can land on an

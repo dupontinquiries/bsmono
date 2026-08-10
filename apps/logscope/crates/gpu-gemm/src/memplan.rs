@@ -1481,6 +1481,20 @@ pub const ASAHI_MAPPED_CEILING_GIB: f64 = 31.0;
 /// which is the opposite of what I expected when I wrote the probe.
 pub const ASAHI_CONCURRENT_BUFFER_GIB: f64 = 31.0;
 
+/// The slab size the ceiling above was measured with.
+///
+/// **The ceiling is not a flat byte count — it depends on this.** A Scout load
+/// planned at ~29.5 GiB against the 31 GiB figure died with only **6.0 GiB
+/// placed, at slab 4 of 2047 MiB**. The probe that produced 31 used ONE-GiB
+/// slabs; the arena was asking for 2 GiB ones. Budgeting against a number
+/// measured under different conditions is exactly why a plan that "fits" fails a
+/// quarter of the way in.
+///
+/// So the arena now defaults to this size on a conservative-VMA driver, and any
+/// future re-measurement must record the slab size beside the total or the
+/// number means nothing.
+pub const ASAHI_MEASURED_SLAB_MIB: u64 = 1024;
+
 /// The largest SINGLE allocation this driver accepts, as `--gate-vram` measures it.
 ///
 /// Recorded beside the concurrent ceiling because the two were conflated in every
@@ -1992,6 +2006,25 @@ mod ceiling_tests {
     fn a_model_under_the_ceiling_fits() {
         // GLM-4.7-Flash at 16.5 GiB, the load that did work in the same session.
         assert!(resident_fits_concurrent(16.5, true));
+    }
+
+    #[test]
+    fn the_ceiling_records_the_slab_size_it_was_measured_with() {
+        // The Scout failure proved the ceiling is slab-size-dependent: 31 GiB
+        // was measured at 1 GiB slabs, and at 2047 MiB the same device refused
+        // after 6 GiB. A total without its slab size is not a measurement, it
+        // is a number that happens to have been true once.
+        assert_eq!(ASAHI_MEASURED_SLAB_MIB, 1024);
+    }
+
+    #[test]
+    fn a_plan_that_fits_the_ceiling_can_still_fail_at_a_larger_slab_size() {
+        // Documents the trap rather than pretending residency is one number:
+        // 29.5 GiB "fits" 31 GiB, and it died anyway.
+        assert!(resident_fits_concurrent(29.5, true), "fits by the budget");
+        // ...which is only meaningful when the arena uses the measured slab size.
+        assert_eq!(ASAHI_MEASURED_SLAB_MIB, 1024,
+                   "if this changes, the 31 GiB figure needs re-measuring with it");
     }
 
     #[test]
