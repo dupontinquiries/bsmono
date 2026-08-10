@@ -6,6 +6,7 @@
 //! mixer/routing engine is already Qt-free, so on-device this drives it directly; here it
 //! carries a small view model so the crate builds and the logic is unit-tested.
 
+pub mod product_silhouette;
 pub mod transport;
 pub mod spaces;
 pub mod all_tracks;
