@@ -342,8 +342,22 @@ impl eframe::App for VoicetermApp {
                     }
                     CentralView::Browser => {
                         ui.horizontal(|ui| {
-                            let mut url = self.browser.url.clone();
-                            if ui.text_edit_singleline(&mut url).lost_focus() { self.browser.load(&url); }
+                            // THE ONE-CHARACTER BUG. This used to clone
+                            // `self.browser.url` into a local every frame, edit
+                            // the COPY, and write back only on lost_focus() —
+                            // so every keystroke was discarded on the next
+                            // repaint and the field could never hold more than
+                            // the character typed since the last frame.
+                            //
+                            // Edit the field itself; commit on Enter or on
+                            // focus loss.
+                            let r = ui.text_edit_singleline(&mut self.browser.url);
+                            let entered = r.lost_focus()
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                            if entered || r.lost_focus() {
+                                let u = self.browser.url.clone();
+                                self.browser.load(&u);
+                            }
                         });
                         if let Some(why) = self.browser.empty_reason() {
                             ui.colored_label(c.text_weak, why);
@@ -598,7 +612,16 @@ impl eframe::App for VoicetermApp {
             // the mic FAB docks at the terminal's bottom-right corner; press-hold opens the
             // action compass right there (matches the reference: the compass pops up ABOVE the FAB,
             // opening from the mic button itself, not a separate host button).
-            let fab = fab_rect(term_rect, 56.0);
+            // Docked against a SHRUNK rect, not the terminal's own. fab_dock
+            // deliberately overlaps the corner it docks to — there is a test
+            // pinning that, because overlapping the terminal BORDER is the
+            // intended look. What it must not overlap is the window edge, and
+            // when the terminal runs to the edge those are the same pixel.
+            //
+            // So the margin belongs here rather than in the shared helper: the
+            // shared behaviour is right, this call site just needs to hand it a
+            // rect that already has room.
+            let fab = fab_rect(term_rect.shrink(10.0), 56.0);
             let resp = mic_fab_ui(ui, fab, &self.colors);
             let _ = self.compass.ui_from_host(ui, &resp, &mut self.app);
         });

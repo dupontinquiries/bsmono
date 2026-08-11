@@ -971,8 +971,23 @@ impl App {
     /// Consume this frame's keyboard/paste events into the input line. Returns `Some(command)` on Enter
     /// (the submitted line, already taken out of the input); typing appends, Backspace deletes, and a
     /// paste inserts its text (control chars stripped). The host runs the returned command on its PTY.
+    /// Consume keyboard input for the terminal.
+    ///
+    /// **Returns immediately when another widget wants the keyboard.** This
+    /// reads `ui.input()`, which is the GLOBAL event stream — every keystroke
+    /// in the frame, whether or not a text field has focus. Without this guard
+    /// the terminal steals characters from any `TextEdit` on screen, and the
+    /// symptom is the one that gets reported: a URL bar that accepts one
+    /// character and then stops, because the terminal is eating the rest.
+    ///
+    /// `wants_keyboard_input()` is true exactly when a widget has focus and
+    /// takes text, which is the condition under which the terminal must not
+    /// look at the event stream at all.
     pub fn handle_input(&mut self, ui: &egui::Ui) -> Option<String> {
         self.pending_bytes.clear();
+        if ui.ctx().wants_keyboard_input() {
+            return None;
+        }
         let mut pending: Vec<u8> = Vec::new();
         let mut submitted = None;
         ui.input(|i| {
