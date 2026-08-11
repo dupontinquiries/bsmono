@@ -217,6 +217,25 @@ pub fn desktop_filename(name: &str, label: &str) -> String {
     format!("gitmind-{name}@{label}.desktop")
 }
 
+/// Arguments an app needs in order to open its GUI from a launcher.
+///
+/// Most binaries in this fleet open a window when run bare. A few are
+/// **subcommand-driven** and do not: `beatspace` requires `beatspace gui`,
+/// because its other subcommands (`train`, `gpu`) are the reason it exists as a
+/// CLI at all. Launching such a binary with no arguments does not open a
+/// smaller window — it prints usage and exits, so the desktop entry appears to
+/// do nothing at all.
+///
+/// A table rather than a guess: there is no way to tell from the outside
+/// whether a binary defaults to a GUI, and running it to find out is not
+/// something a launcher-writer can do.
+pub fn gui_launch_args(name: &str) -> &'static [&'static str] {
+    match name {
+        "beatspace" => &["gui"],
+        _ => &[],
+    }
+}
+
 /// Build a freedesktop `.desktop` entry for a pinned version.
 pub fn desktop_entry(v: &AppVersion, name: &str, terminal: bool, icon: Option<&str>) -> String {
     let short = &v.commit[..v.commit.len().min(8)];
@@ -224,7 +243,15 @@ pub fn desktop_entry(v: &AppVersion, name: &str, terminal: bool, icon: Option<&s
     s.push_str("Type=Application\n");
     s.push_str(&format!("Name={name} @ {}\n", v.label));
     s.push_str(&format!("Comment=gitmind-pinned {name} from commit {short} ({})\n", v.target));
-    s.push_str(&format!("Exec={} %U\n", v.path));
+    // Subcommand-driven apps need their GUI verb here or the launcher starts a
+    // CLI that immediately exits. `%U` stays last so a file argument still
+    // arrives after the verb rather than instead of it.
+    let args = gui_launch_args(name);
+    if args.is_empty() {
+        s.push_str(&format!("Exec={} %U\n", v.path));
+    } else {
+        s.push_str(&format!("Exec={} {} %U\n", v.path, args.join(" ")));
+    }
     s.push_str(&format!("Icon={}\n", icon.unwrap_or("application-x-executable")));
     s.push_str(&format!("Terminal={}\n", if terminal { "true" } else { "false" }));
     s.push_str("Categories=Development;\n");
@@ -300,6 +327,48 @@ pub fn build_from_commit(
     }
     let art = workdir.join(artifact);
     std::fs::read(&art).map_err(|e| format!("artifact not found at {}: {e}", art.display()))
+}
+
+#[cfg(test)]
+mod gui_launch_tests {
+    use super::*;
+
+    #[test]
+    fn beatspace_gets_its_gui_subcommand() {
+        // `beatspace` requires `beatspace gui`; launched bare it prints usage
+        // and exits, so the desktop entry looks like it does nothing.
+        assert_eq!(gui_launch_args("beatspace"), &["gui"]);
+    }
+
+    #[test]
+    fn an_ordinary_app_gets_no_extra_arguments() {
+        // Most binaries open a window when run bare, and adding a verb they do
+        // not have would break every one of them to fix one.
+        assert!(gui_launch_args("voiceterm").is_empty());
+        assert!(gui_launch_args("snapclone").is_empty());
+        assert!(gui_launch_args("").is_empty());
+    }
+
+    #[test]
+    fn the_file_placeholder_stays_after_the_verb() {
+        // `%U` must follow the subcommand: `beatspace %U gui` would pass the
+        // file as the verb, and the app would reject its own launcher.
+        // Every field listed: AppVersion does not derive Default, and a
+        // struct-update shorthand would not compile.
+        let v = AppVersion {
+            label: "v1".into(),
+            commit: "abcdef1234".into(),
+            oid: "0".into(),
+            target: "x86_64-unknown-linux-gnu".into(),
+            installed: 0,
+            path: "/home/u/.local/bin/beatspace".into(),
+        };
+        let e = desktop_entry(&v, "beatspace", false, None);
+        let exec = e.lines().find(|l| l.starts_with("Exec=")).expect("an Exec line");
+        assert!(exec.ends_with(" %U"), "{exec}");
+        assert!(exec.contains(" gui "), "the gui verb is missing: {exec}");
+        assert!(exec.find(" gui ").unwrap() < exec.find("%U").unwrap());
+    }
 }
 
 #[cfg(test)]
