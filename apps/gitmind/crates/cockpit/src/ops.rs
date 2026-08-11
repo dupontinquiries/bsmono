@@ -271,9 +271,30 @@ pub fn build_locally_logged(
     let status = child.wait().map_err(|e| format!("build wait failed: {e}"))?;
     if status.success() {
         let bin = resolve_binary(&cargo, app_dir, &cargo_target, &build_id, Some(&build_dir.display().to_string()));
-        let size = std::fs::metadata(&bin).map(|m| m.len()).unwrap_or(0);
-        on_line(&format!("✓ built {} ({} KB)", app, size / 1024));
-        Ok((bin, size))
+        // A MISSING ARTIFACT IS A FAILURE, not a zero-byte success. This used
+        // to `unwrap_or(0)` and print "✓ built bsettings (0 KB)" — a tick, a
+        // name, and no binary, which is the most misleading line this function
+        // can produce: the build genuinely succeeded, so the error is not in
+        // cargo's output either.
+        //
+        // It happens when the produced binary is not where resolve_binary
+        // looked — a package whose bin name differs from the crate name, a bin
+        // behind required-features, a workspace laying targets out elsewhere.
+        // All three exist in this fleet.
+        match std::fs::metadata(&bin) {
+            Ok(m) if m.len() > 0 => {
+                let size = m.len();
+                on_line(&format!("✓ built {} ({} KB)", app, size / 1024));
+                Ok((bin, size))
+            }
+            _ => {
+                on_line(&format!(
+                    "✗ {app}: cargo succeeded but no binary at {}", bin.display()));
+                on_line("   the bin name may differ from the crate name, or sit behind a feature");
+                Err(format!(
+                    "build produced no artifact for {app} (looked for {})", bin.display()))
+            }
+        }
     } else {
         Err(format!("build failed (exit {})", status.code().unwrap_or(-1)))
     }
