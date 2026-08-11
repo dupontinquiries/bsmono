@@ -20,21 +20,32 @@
 //! `Project` directly: a lock a UI stutter might be holding is precisely
 //! what a real-time callback must never wait on.
 //!
-//! ## What this proves, and what it doesn't yet
+//! ## What this proves, and what's still honestly open
 //!
 //! Wiring these three already-independently-tested pieces together and
 //! proving the composition works — via `studio_io::TestIo`, no hardware
-//! needed — is this module's job. What it does NOT yet do:
-//! [`StreamingRenderer::render`] allocates a fresh `Vec<f32>` per call
-//! (`mixdown`'s own original shape), which makes [`DeviceEngine::tick`]
-//! correct but not the allocation-free callback `studio_io::DuplexCallback`'s
-//! own docs ask a real implementation to be. That is a genuine, separately-
-//! scoped next step (pre-sized scratch buffers reused across calls), not a
-//! defect in what's built here — the same "prove the shape first, make it
-//! allocation-free second" ordering `studio-io`'s own `CpalIo` already
-//! followed (correct config negotiation landed before anyone had measured
-//! whether the negotiation itself needs to be realtime-safe, because it
-//! only runs once at stream start, not per callback).
+//! needed — is this module's job. [`DeviceEngine::tick`] calls
+//! `StreamingRenderer::render_into`, not the `Vec`-returning `render`, so
+//! the render path itself is allocation-free once `EffectCache` and
+//! `RenderScratch` have warmed up (see `studio_audio`'s own
+//! `render_into_reuses_scratch_allocations_across_contiguous_calls` test).
+//! `tick`'s own defensive fallback for a span whose length doesn't match
+//! the room left in `output` (shouldn't happen — `Advance::spans()` always
+//! sums to exactly the frames requested — but is exactly the kind of
+//! off-by-one a device buffer size calculation is prone to) does still
+//! allocate a scratch `Vec` on that rare path; the common path does not.
+//! `Recorder::feed` (already built, pre-session) only appends — no
+//! allocation there either once its capacity is warm. What's still real,
+//! separately-scoped work: `EffectCache`/`RenderScratch` growing on a
+//! structural project edit (a new bus, an effect added to a clip for the
+//! first time) does allocate, which is the right trade for something that
+//! happens on an edit, not every buffer — named here rather than left
+//! implicit. `Recorder::feed` (already built, pre-session) grows its
+//! buffer via `Vec::extend_from_slice` with an initial capacity of two
+//! seconds (`Recorder::new`) but WILL reallocate on a longer take — a real,
+//! separate allocation site this module doesn't attempt to fix, since
+//! `Recorder`'s own growth strategy is that crate's concern, not this
+//! wiring's.
 
 use std::collections::BTreeMap;
 
@@ -150,10 +161,31 @@ impl DeviceEngine {
 
         let mut offset = 0usize;
         for (from, to) in advance.spans() {
-            let rendered = self.renderer.render(&self.engine.project, &self.audio, &self.fades, from, to, self.rate, &[], &[]);
-            let end = (offset + rendered.len()).min(output.len());
-            let take = end.saturating_sub(offset);
-            output[offset..end].copy_from_slice(&rendered[..take]);
+            let n = (to.to_samples(self.rate) - from.to_samples(self.rate)).max(0) as usize;
+            let end = (offset + n * 2).min(output.len());
+            let room = end - offset;
+            // Writes directly into this span's slice of `output` — no
+            // intermediate `Vec`, and the renderer's own bus/master scratch
+            // is reused call after call (`StreamingRenderer::render_into`,
+            // not `render`). This is the allocation-free path the module
+            // doc above promises; `render` (the `Vec`-returning one) is
+            // deliberately not used here.
+            //
+            // `render_into` requires its output slice to be exactly `n * 2`
+            // long — `Advance::spans()` always sums to exactly the frames
+            // requested, so `room` should always equal `n * 2` in practice.
+            // The `else` is a deliberate defensive fallback rather than a
+            // bare assert-and-panic: exactly the kind of off-by-one a
+            // device buffer size calculation is prone to should degrade to
+            // a rare extra allocation, not a mid-callback crash.
+            if room == n * 2 {
+                self.renderer.render_into(&self.engine.project, &self.audio, &self.fades, from, to, self.rate, &[], &[], &mut output[offset..end]);
+            } else {
+                let mut scratch = vec![0.0f32; n * 2];
+                self.renderer.render_into(&self.engine.project, &self.audio, &self.fades, from, to, self.rate, &[], &[], &mut scratch);
+                let take = room.min(scratch.len());
+                output[offset..offset + take].copy_from_slice(&scratch[..take]);
+            }
             offset = end;
         }
         // A span that rendered fewer samples than the buffer expects (e.g.
