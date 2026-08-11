@@ -27,12 +27,39 @@ echo
 
 # 1. Binary present?
 echo "--- 1. Binary ---"
-for path in /usr/local/bin/rusty-board $HOME/.local/bin/rusty-board; do
+# Collect ALL of them, not just the last match. Two installs is the
+# interesting case: a user who once ran --system and later installed to
+# ~/.local has two binaries, and PATH order decides which one actually runs —
+# so reporting only one can name the copy that is NOT running while the stale
+# one is what KWin launches.
+FOUND=()
+for path in /usr/local/bin/rusty-board "$HOME/.local/bin/rusty-board"; do
     if [[ -x "$path" ]]; then
         ok "Binary at $path is executable"
+        FOUND+=("$path")
         BINARY_PATH="$path"
     fi
 done
+
+if [[ ${#FOUND[@]} -gt 1 ]]; then
+    warn "Two rusty-board binaries are installed:"
+    for f in "${FOUND[@]}"; do echo "      $f"; done
+    RESOLVED="$(command -v rusty-board 2>/dev/null || echo '(not on PATH)')"
+    echo "    PATH resolves to: $RESOLVED"
+    echo "    The other copy is dead weight and will confuse every later check."
+    echo "    Remove the one you do not want, or run ./scripts/uninstall.sh first."
+    BINARY_PATH="$RESOLVED"
+fi
+
+# Which frontend is this? Both install under the same name deliberately (the
+# .desktop file and KWin registration name that path), so the only way to tell
+# them apart afterwards is to ask the binary.
+if [[ -n "${BINARY_PATH:-}" && -x "$BINARY_PATH" ]]; then
+    FRONTEND_ID="$("$BINARY_PATH" --version 2>/dev/null | head -1 || true)"
+    if [[ -n "$FRONTEND_ID" ]]; then
+        echo "    Reports: $FRONTEND_ID"
+    fi
+fi
 if [[ -z "${BINARY_PATH:-}" ]]; then
     fail "No rusty-board binary found in /usr/local/bin or ~/.local/bin"
     echo "    Try: cargo b --release && sudo install -m755 target/release/rusty-board /usr/local/bin/"

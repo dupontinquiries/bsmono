@@ -11,6 +11,7 @@ use egui::{Align2, FontId, Rect, CornerRadius, Sense, Stroke, Ui, Vec2};
 use uikit_egui::{apply_palette, Adaptive, PaletteColors};
 
 pub mod cardinal_gesture;
+pub mod swipe_rerank;
 pub mod settings_model;
 pub mod animations;
 pub mod tap_hold;
