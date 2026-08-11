@@ -141,19 +141,29 @@ impl DeviceEngine {
         // Recording capture — checked AFTER advance, not before, so a
         // count-in that punches in mid-buffer (`Advance::punched_in`)
         // captures this same buffer's input rather than missing it by one
-        // callback. Simplification worth naming: the whole buffer is fed
-        // once `recording` is true for it, even though a punch that lands
-        // mid-buffer technically only "owns" the samples after the punch
-        // point. Splitting that precisely needs `Transport` to expose the
-        // punch's in-buffer sample offset, which it doesn't yet — real,
-        // separately-scoped follow-up, not attempted here.
+        // callback. `Advance::punch_offset` (added alongside this) gives
+        // the exact frame within this buffer the punch landed at, so only
+        // the samples actually after the punch are captured — an earlier
+        // version of this method fed the whole buffer once `recording` was
+        // true for it, which is simpler but wrong by up to one buffer's
+        // worth of pre-punch samples.
         if self.engine.transport.recording {
             let rate = self.rate;
-            let channels = self.input_channels;
+            let channels = self.input_channels as usize;
             let punch_in = self.engine.transport.record_position();
-            let recorder = self.recorder.get_or_insert_with(|| Recorder::new(rate, channels, punch_in));
+            let recorder = self.recorder.get_or_insert_with(|| Recorder::new(rate, channels as u16, punch_in));
             recorder.arm(true);
-            recorder.feed(input);
+            match advance.punch_offset {
+                // The punch landed inside THIS buffer: only the samples
+                // from the punch onward belong to the take. `punch_offset`
+                // is in frames, not interleaved samples — scale by the
+                // input's own channel count to index correctly.
+                Some(offset) if advance.punched_in => {
+                    let start = (offset as usize * channels).min(input.len());
+                    recorder.feed(&input[start..]);
+                }
+                _ => recorder.feed(input),
+            }
         } else if let Some(mut rec) = self.recorder.take() {
             rec.arm(false);
             self.pending_takes.push(rec);
@@ -305,6 +315,63 @@ mod tests {
         }
         assert_eq!(total_rendered, 20 * buffer_frames * 2);
         assert_eq!(dev.engine.transport.position(), Ticks::from_samples((20 * buffer_frames) as i64, rate));
+    }
+
+    #[test]
+    fn a_mid_buffer_punch_only_captures_samples_after_the_punch_not_the_whole_buffer() {
+        // The precision `Advance::punch_offset` exists for: a count-in that
+        // crosses the punch point partway through a buffer must capture
+        // only the samples from the punch onward, not the whole buffer
+        // (which would smuggle count-in silence into the take as if it had
+        // been recorded).
+        let rate = 48_000;
+        let (p, audio) = project_with_tone(rate, 1.0);
+        let mut engine = EngineState::new(p, rate, 16);
+        engine.transport.count_in = Ticks::from_samples(300, rate);
+        let (mut tx, rx) = crate::command_ring(16);
+        let mut dev = DeviceEngine::new(engine, rx, audio, rate, 1);
+
+        // Seek to a real punch target first, so the count-in has somewhere
+        // meaningful to roll back from (punching in at frame 0 would make
+        // "mid-buffer" trivially the very first sample of the very first tick).
+        tx.send(Command::Transport(TransportCmd::Seek(Ticks::from_samples(500, rate)))).unwrap();
+        tx.send(Command::Transport(TransportCmd::Play)).unwrap();
+        tx.send(Command::Transport(TransportCmd::Record(true))).unwrap();
+
+        // First tick: 128 frames, well short of the punch (rolled-back
+        // start is frame 200; punch is frame 500) — still counting in.
+        let mut out0 = vec![0.0f32; 128 * 2];
+        dev.tick(&vec![0.0f32; 128], &mut out0);
+        assert!(dev.engine.transport.is_counting_in(), "128 frames from 200 must not yet reach the punch at 500");
+
+        // Second tick: 256 frames from position 328 crosses 500 at offset
+        // 172 into this buffer. Fed silence before that offset, a
+        // distinctive nonzero signal after — only the latter should survive
+        // into the take.
+        let buf_frames = 256usize;
+        let punch_offset_in_this_buffer = 172usize;
+        let mut fed = vec![0.0f32; buf_frames];
+        for (i, s) in fed.iter_mut().enumerate().skip(punch_offset_in_this_buffer) {
+            *s = ((i as f32) * 0.3).sin() * 0.8;
+        }
+        let mut out1 = vec![0.0f32; buf_frames * 2];
+        dev.tick(&fed, &mut out1);
+        assert!(!dev.engine.transport.is_counting_in(), "this buffer must have crossed the punch");
+
+        tx.send(Command::Transport(TransportCmd::Record(false))).unwrap();
+        let mut out2 = vec![0.0f32; 64 * 2];
+        dev.tick(&vec![0.0f32; 64], &mut out2);
+
+        let takes = dev.take_pending_recordings();
+        assert_eq!(takes.len(), 1);
+        let captured = takes[0].to_audio().channels[0].clone();
+        let expected_from_second_tick = buf_frames - punch_offset_in_this_buffer;
+        assert_eq!(
+            captured.len(), expected_from_second_tick,
+            "must hold exactly the post-punch tail of the straddling buffer — the third tick's Record(false) is drained \
+            before that tick's capture check runs, so none of tick 3 is captured either, same as arming"
+        );
+        assert!(captured[0] != 0.0, "the very first captured sample must be from right after the punch, not the pre-punch silence this test fed");
     }
 
     #[test]
