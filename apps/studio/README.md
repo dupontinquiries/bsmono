@@ -53,6 +53,7 @@ edits exactly reversible, which floats are not.
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
+| `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 7 |
 
 `studio-egui` couldn't be re-verified in this pass — it needs `egui`/`eframe`,
 which needs a newer cargo than was available; the number above is carried
@@ -86,8 +87,18 @@ them.
 This is a **core**, not a shipping application. What exists is tested and real:
 the model, undo, and convergence. What does not exist yet, in rough order:
 
-1. **Media I/O** — decode/encode. The intended shape is `symphonia` for audio
-   decode, `ffmpeg` via CLI for video, keeping the core codec-free.
+1. **Media I/O** — the audio half exists now: a new `studio-media` crate
+   wraps Symphonia (WAV/FLAC/Vorbis/MP3/AAC, pure Rust, no system codec
+   libs) behind one function, `decode_file`, returning the same
+   `SourceAudio` a recorded take or a bounced pattern already produces — so
+   a decoded file is indistinguishable from either once it's in memory. 7
+   tests, including de-interleaving (a stereo file's channels must not
+   bleed into each other) and a 200,000-sample file (the packet-loop/EOF
+   handling, not just a single-packet fixture). Video decode — the
+   `ffmpeg`-via-CLI half — is still genuinely unbuilt: a different failure
+   mode (a missing binary, not an unsupported codec) and real, separate
+   work, deliberately not bolted onto the audio crate just because both are
+   nominally "Media I/O."
 2. **Audio render graph** — this was stale: `studio_audio::mixdown` already
    mixes tracks, applies clip and bus effect chains, handles sends/mute/solo,
    and is real and tested (49 tests) — `studio-live`'s own
