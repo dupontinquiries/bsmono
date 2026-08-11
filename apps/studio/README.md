@@ -47,7 +47,7 @@ edits exactly reversible, which floats are not.
 | crate | what it is | tests |
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
-| `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 71 |
+| `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) | 49 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
@@ -111,7 +111,7 @@ the model, undo, and convergence. What does not exist yet, in rough order:
 4. **Publishing to a live DHT** — `studio-collab::dht` now calls
    `snapcore::store::Store`'s put/get directly: `publish` chunks a `Packet`
    under the session key, `discover` reassembles whatever's complete.
-   Genuinely tested end-to-end (8 tests, including a full `Session::broadcast`
+   Genuinely tested end-to-end (9 tests, including a full `Session::broadcast`
    → publish → discover → joiner round trip) — what's still missing is the
    network half, iteratively storing to and reading from the nodes actually
    closest to a key, which is `share-kit`'s own still-pending "networked
