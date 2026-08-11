@@ -1,0 +1,12 @@
+[package]
+name = "studio-media"
+version = "0.1.0"
+edition = "2021"
+description = "Audio decode: turns a file on disk into a studio_audio::SourceAudio. Kept as its own crate, not folded into studio-audio or studio-core, for the same reason studio-io is the only crate allowed to touch a sound card — studio-core and studio-audio's own docs already promise to stay codec-free, and Symphonia is what backs that promise rather than a hand-rolled decoder. Video decode (the README's ffmpeg-via-CLI half of Media I/O) is not here; this crate is audio-only, matching Symphonia's own scope."
+
+[dependencies]
+studio-audio = { path = "../studio-audio" }
+symphonia = { version = "0.5", features = ["wav", "flac", "vorbis", "mp3", "aac", "isomp4", "pcm"] }
+
+[dev-dependencies]
+hound = "3.5"

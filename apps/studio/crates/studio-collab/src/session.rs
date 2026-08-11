@@ -194,22 +194,26 @@ impl Session {
     /// collaborator are literally the ones that rebuild it from disk. A peer who
     /// already shares the base should ask for `Doc::catchup_for` instead, which
     /// is far smaller.
+    ///
+    /// The snapshot alone is the whole answer — it is built from
+    /// `self.doc.project`, which already reflects every op `self.doc.history()`
+    /// holds, so appending the log after the snapshot would replay each of
+    /// this session's own edits a second time on top of a base that already
+    /// contains them. That was a real bug here until `dht`'s own end-to-end
+    /// test (`local()` an `AddTrack`, then `broadcast()`, then check what a
+    /// joiner ends up with) caught it: `AddTrack` pushes onto a `Vec`, so the
+    /// duplicate wasn't a silent no-op the way it is for a map-keyed op like
+    /// `AddClip` — a newcomer got the same track twice. Every existing test
+    /// up to that point either seeded its project directly (bypassing
+    /// `Doc::local`, so `history()` was empty) or only exercised `AddClip`,
+    /// whose idempotent re-apply happened to hide exactly this.
     pub fn broadcast(&self) -> crate::wire::Packet {
         let base = crate::file::snapshot(&self.doc.project);
-        let mut ops: Vec<crate::StampedOp> = base.into_iter().enumerate()
+        let ops: Vec<crate::StampedOp> = base.into_iter().enumerate()
             .map(|(i, op)| crate::StampedOp {
                 stamp: crate::Stamp { lamport: i as u64 + 1, site: SiteId(0) }, op,
             })
             .collect();
-        // then the session's own history, stamped after the snapshot so a
-        // replay applies them in the right order
-        let base_len = ops.len() as u64;
-        for e in self.doc.history() {
-            ops.push(crate::StampedOp {
-                stamp: crate::Stamp { lamport: base_len + e.stamp.lamport, site: e.stamp.site },
-                op: e.op.clone(),
-            });
-        }
         crate::wire::Packet::Catchup { ops }
     }
 
@@ -389,6 +393,27 @@ mod tests {
         assert!(s.stale(5_000, 10_000).is_empty());
         assert_eq!(s.stale(15_000, 10_000), vec![SiteId(2)]);
         assert!(s.is_present(SiteId(2)), "flagged, not removed");
+    }
+
+    #[test]
+    fn broadcast_does_not_double_apply_ops_made_via_local() {
+        // Regression test for a real bug: `broadcast()` used to send the full
+        // snapshot (which already reflects every op in `doc.history()`) AND
+        // then replay `doc.history()` again on top of it. Silent for a
+        // map-keyed op like `AddClip` (a duplicate upsert is a no-op) but not
+        // for `AddTrack`, which pushes onto a `Vec` — a newcomer got the same
+        // track twice.
+        let mut s = seeded_session(); // already has one track, added directly to the project, not via .local()
+        s.doc.local(Op::AddTrack {
+            track: Track { id: TrackId(2), kind: TrackKind::Audio, name: "A1".into(), muted: false, locked: false, route: None },
+            at: 1,
+        }).unwrap();
+        assert_eq!(s.doc.history().len(), 1, "exactly one op went through .local()");
+
+        let mut newcomer = Doc::new(SiteId(5), Project { name: "cut".into(), ..Default::default() });
+        newcomer.receive(s.broadcast());
+        assert_eq!(newcomer.project.tracks.len(), 2, "the seeded track plus the one added via .local() — not three");
+        assert_eq!(newcomer.project, s.doc.project, "and the whole project matches exactly, not just the count");
     }
 
     #[test]

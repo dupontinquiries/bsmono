@@ -1,0 +1,11 @@
+[package]
+name = "studio-video"
+version = "0.1.0"
+edition = "2021"
+description = "Video probing, thumbnailing, and audio-track extraction via ffmpeg/ffprobe subprocesses — the README's 'ffmpeg via CLI for video, keeping the core codec-free' half of Media I/O. Kept as its own crate, matching studio-media's own precedent: shelling out to an external binary is a genuinely different technology and failure mode (a missing binary vs. an unsupported codec feature) from studio-media's pure-Rust Symphonia decode, and belongs behind its own seam rather than folded in just because both are nominally 'media decode'. Does not decode video frames itself — extracts single-frame PNG thumbnails and the audio track (handed to studio-media's own decoder), which is what an editor's timeline actually needs first."
+
+[dependencies]
+studio-audio = { path = "../studio-audio" }
+studio-media = { path = "../studio-media" }
+studio-core = { path = "../studio-core" }
+serde_json = "1"

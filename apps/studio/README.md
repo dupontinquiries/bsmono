@@ -46,13 +46,19 @@ edits exactly reversible, which floats are not.
 
 | crate | what it is | tests |
 |---|---|---|
-| `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
-| `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, **sessions** | 41 |
+| `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
+| `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
-| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
-| `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
-| `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 54 |
+| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **streaming render** + **block-backed edit sequences** + **destructive editing** | 83 |
+| `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
+| `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
+| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
+| `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
+| `studio-video` | video probing, thumbnails, audio-track extraction (real `ffmpeg`/`ffprobe`) | 11 |
+
+`studio-egui` couldn't be re-verified in this pass — it needs `egui`/`eframe`,
+which needs a newer cargo than was available; the number above is carried
+over unchanged rather than guessed at. Every other row was re-run directly.
 
 ## Realtime collaboration, concretely
 
@@ -82,17 +88,112 @@ them.
 This is a **core**, not a shipping application. What exists is tested and real:
 the model, undo, and convergence. What does not exist yet, in rough order:
 
-1. **Media I/O** — decode/encode. The intended shape is `symphonia` for audio
-   decode, `ffmpeg` via CLI for video, keeping the core codec-free.
-2. **Audio render graph** — mix tracks, apply effects, produce samples. The
-   `Effect` type is already opaque-by-design so hosts can register kinds.
-3. **Device I/O** — the transport clock and mixdown are done; nothing yet
-   hands samples to a sound card or pulls them from a microphone.
-4. **Publishing to a live DHT** — session keys, chunking and reassembly are
-   done and tested against the awkward carrier shape; what remains is calling
-   `snapclone-dht`'s put/get from a running node.
-5. **Block-backed sources** — Audacity's insight that samples live in chunks so
-   an edit touches a few blocks, not a file.
+1. **Media I/O** — both halves exist now. `studio-media` wraps Symphonia
+   (WAV/FLAC/Vorbis/MP3/AAC, pure Rust, no system codec libs) behind
+   `decode_file`/`decode_bytes`, returning the same `SourceAudio` a
+   recorded take or a bounced pattern already produces. 9 tests, including
+   de-interleaving, a 200,000-sample file for the packet-loop/EOF handling,
+   and `decode_bytes` (audio already in memory, no file — the seam
+   `studio-video` needs) matching `decode_file` exactly. `studio-video`
+   shells to real `ffmpeg`/`ffprobe` (confirmed present in this sandbox
+   before writing a line of it — an assumption from earlier in this same
+   session, that video decode needed tooling this sandbox doesn't have,
+   turned out wrong the same way the egui assumption a few commits back
+   did): `probe` for duration/resolution/fps/audio-track metadata,
+   `thumbnail_png` for a single frame's raw PNG bytes, `extract_audio`
+   piping a video's audio track straight into `decode_bytes` with no temp
+   file. 8 tests, all against real subprocesses and ffmpeg-generated
+   fixtures, not fakes. Deliberately NOT built: decoding a video frame into
+   pixels — there is no `VideoFrame` type anywhere in this codebase yet,
+   and that's real, separate work past what an editor needs first
+   (knowing what a file is, showing something for it, treating its audio
+   like any other source).
+2. **Audio render graph** — `studio_audio::mixdown` mixes tracks, applies
+   clip and bus effect chains, handles sends/mute/solo, and is real and
+   tested (72 tests) — `studio-live`'s own
+   `a_bounced_pattern_is_audible_through_a_real_mixdown` proves a pattern
+   bounce survives the whole path. The gap this used to describe (a fresh
+   effect-instance set built on every call, correct offline, wrong once per
+   device buffer) is closed too: `StreamingRenderer` wraps the same mixing
+   logic — `mixdown` itself didn't change, it's now a two-line wrapper
+   around the shared `mixdown_with_cache` — around an `EffectCache` that
+   persists instances across contiguous calls and resets automatically on a
+   seek. Checked directly: consecutive buffer-sized calls match a one-shot
+   offline render sample-for-sample; a chain edited mid-playback (this is a
+   collaborative editor, so that's a real case, not a hypothetical) takes
+   effect on the very next contiguous call.
+3. **Device I/O** — `studio-io`'s `device` feature now builds a full-duplex
+   `CpalIo`: a dedicated thread owns the (`!Send`) cpal streams, an `rtrb`
+   ring buffer bridges input to output since the two have no shared clock,
+   and config negotiation picks a real device config instead of ignoring
+   the request. Compiled and unit-tested (17 tests, including the
+   negotiation fallback logic against hand-built device configs) — **not**
+   yet run against real hardware, since there is still no sound card in the
+   authoring sandbox. That verification is the next step, not a redesign.
+4. **Publishing to a live DHT** — `studio-collab::dht` now calls
+   `snapcore::store::Store`'s put/get directly: `publish` chunks a `Packet`
+   under the session key, `discover` reassembles whatever's complete.
+   Genuinely tested end-to-end (9 tests, including a full `Session::broadcast`
+   → publish → discover → joiner round trip) — what's still missing is the
+   network half, iteratively storing to and reading from the nodes actually
+   closest to a key, which is `share-kit`'s own still-pending "networked
+   Backend." This module is the local half of that seam, done; not a
+   placeholder for it.
+5. **Block-backed sources** — `studio_audio::block::BlockSequence` now
+   exists: one channel as a sequence of variable-length blocks behind
+   `Arc<[f32]>`, so `insert`/`delete` rebuild only the block(s) straddling
+   the edit and leave every other block the same allocation, not just the
+   same bytes — checked directly via pointer identity, not value equality,
+   across 18 tests. Kept separate from `SourceAudio` (mixdown/`Peaks`'s own
+   type) rather than rewriting it: block-backing pays for itself on the
+   *edit* path, not playback, so `to_flat_channels`/`from_flat_channels`
+   bridge the two rather than forking the representation everywhere else
+   that already works with flat audio. `BlockSequence` now has a real
+   caller too: `studio_audio::destructive` (`delete_range_ops`/
+   `insert_at_ops`) cuts a range out of a source or punches material into
+   one, and hands back the same `Op::AddSource`/`Op::AddClip` shape
+   `repitch`/`bounce_ops`/`Recorder::commit_ops` already use — a
+   destructive edit never mutates the source it started from, so it's
+   non-destructive at the model level and needs no new convergence rule.
+   Checked directly, not just argued: two concurrent destructive edits of
+   the same recording, applied in either order, converge to byte-identical
+   projects using nothing but the pre-existing op semantics.
+
+This closes every item that was on this list when this section was last
+written honestly. What's real and load-bearing now, named precisely rather
+than left as a vague "not built yet": real hardware verification for
+`studio-io` (item 3), the network half of DHT publishing (item 4), and a
+`VideoFrame` type plus everything a timeline needs to composite/render one
+(item 1's own remaining piece — `studio-video` gives an editor what it
+needs first, not full video playback). None of those are guesses — each is
+a concrete next step pinned by a test or a doc comment that says exactly
+what it's waiting on. Item 2's own remaining piece — a streaming render
+path — is no longer on this list; it's built.
+
+One more thing this list never named because items 2 and 3 were written
+before either existed: `studio-engine` now has `device::DeviceEngine`,
+wiring its own `EngineState`/`Command` ring to `StreamingRenderer` and
+`studio_io::AudioIo` into an actual callback — proven end-to-end against a
+real `AudioIo` implementor (`TestIo`, standing in for `CpalIo` since there's
+still no hardware in this sandbox), not just called directly. This crate
+needed no UI toolchain to build that: it has never depended on egui.
+The render path is allocation-free on its warm path too now:
+`StreamingRenderer::render_into` writes into a caller-provided buffer and
+reuses a `RenderScratch` (the master accumulator and every bus's buffer,
+resized in place rather than rebuilt) across calls, and `DeviceEngine::
+tick` calls it instead of the `Vec`-returning `render`. Checked directly —
+a bus scratch buffer's `.capacity()` is unchanged across two same-size
+contiguous calls, not just assumed stable. What's still real and named
+rather than glossed over: `EffectCache`/`RenderScratch` growing on a
+structural edit (a new bus, a clip's first effect) still allocates, which
+is the right trade for something that happens on an edit rather than every
+buffer, and `Recorder::feed`'s buffer (built before this session) still
+reallocates past its two-second initial capacity on a longer take.
+`Transport::advance` now also reports exactly where within a buffer a
+count-in's punch point lands (`Advance::punch_offset`), and `DeviceEngine`
+uses it to capture only the post-punch samples of a straddling buffer
+instead of the whole thing — the count-in's own silence no longer leaks
+into the start of a take.
 
 A test found the one real bug in this pass: `rebuild()` originally replayed the
 op log from an empty project and erased every track and source that pre-dated
