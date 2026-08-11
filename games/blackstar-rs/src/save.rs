@@ -35,6 +35,12 @@ pub struct Save {
     pub academy: String,
     /// garage loadout: skin, wheels, trail, explosion
     pub look: String,
+    /// raid wardens cleared, comma-separated boss ids (see raidlog.rs)
+    pub wardens: String,
+    /// campaign missions cleared, comma-separated ids (see campaign.rs)
+    pub missions: String,
+    /// nightfall weeks cleared, comma-separated week numbers (see nightfall.rs)
+    pub nightfalls: String,
 }
 
 impl Default for Save {
@@ -58,6 +64,9 @@ impl Default for Save {
             tuned_profile: 255,
             trials: String::new(),
             academy: String::new(),
+            wardens: String::new(),
+            missions: String::new(),
+            nightfalls: String::new(),
             look: String::new(),
         }
     }
@@ -85,6 +94,9 @@ pub fn load() -> (Save, Bindings, Config) {
             "tuned_profile" => s.tuned_profile = v.parse().unwrap_or(s.tuned_profile),
             "trials" => s.trials = v.to_string(),
             "academy" => s.academy = v.to_string(),
+            "wardens" => s.wardens = v.to_string(),
+            "missions" => s.missions = v.to_string(),
+            "nightfalls" => s.nightfalls = v.to_string(),
             "look" => s.look = v.to_string(),
             "total_rings" => s.total_rings = v.parse().unwrap_or(s.total_rings),
             "total_car_rings" => s.total_car_rings = v.parse().unwrap_or(s.total_car_rings),
@@ -132,6 +144,15 @@ pub fn store(s: &Save, b: &Bindings, cfg: &Config) {
     let _ = writeln!(out, "tuned_profile {}", s.tuned_profile);
     let _ = writeln!(out, "trials {}", s.trials);
     let _ = writeln!(out, "academy {}", s.academy);
+    if !s.wardens.is_empty() {
+        let _ = writeln!(out, "wardens {}", s.wardens);
+    }
+    if !s.missions.is_empty() {
+        let _ = writeln!(out, "missions {}", s.missions);
+    }
+    if !s.nightfalls.is_empty() {
+        let _ = writeln!(out, "nightfalls {}", s.nightfalls);
+    }
     let _ = writeln!(out, "look {}", s.look);
     let _ = writeln!(out, "total_rings {}", s.total_rings);
     let _ = writeln!(out, "total_car_rings {}", s.total_car_rings);

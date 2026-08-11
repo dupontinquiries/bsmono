@@ -49,7 +49,17 @@ mod platform;
 mod posture;
 mod procars;
 mod procgen;
+mod campaign;
+mod campsim;
+mod energon;
+mod nightfall;
+mod skirmish;
 mod raid;
+mod raidcon;
+mod raidgen;
+mod raidlog;
+mod raidrun;
+mod raidsim;
 mod relay;
 mod render;
 mod style;
@@ -904,6 +914,17 @@ fn main() {
     if argv.iter().any(|a| a == "--sim") {
         // headless AI sim: pure physics, no window, no GPU, no audio
         sim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--campaign") {
+        // headless campaign: slides, waves, objective machines, progression
+        campsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--raid") {
+        // headless raid loop: generator -> foothold -> encounters -> loot,
+        // narrated with its reasoning
+        raidsim::run(&argv);
         return;
     }
     env_logger::init();
