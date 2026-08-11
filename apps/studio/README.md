@@ -54,7 +54,7 @@ edits exactly reversible, which floats are not.
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
 | `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
-| `studio-video` | video probing, thumbnails, audio-track extraction (real `ffmpeg`/`ffprobe`) | 8 |
+| `studio-video` | video probing, thumbnails, audio-track extraction (real `ffmpeg`/`ffprobe`) | 11 |
 
 `studio-egui` couldn't be re-verified in this pass — it needs `egui`/`eframe`,
 which needs a newer cargo than was available; the number above is carried
