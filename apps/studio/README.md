@@ -49,7 +49,7 @@ edits exactly reversible, which floats are not.
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
 | `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
-| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) | 49 |
+| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **block-backed edit sequences** | 67 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
@@ -128,8 +128,25 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    closest to a key, which is `share-kit`'s own still-pending "networked
    Backend." This module is the local half of that seam, done; not a
    placeholder for it.
-5. **Block-backed sources** — Audacity's insight that samples live in chunks so
-   an edit touches a few blocks, not a file.
+5. **Block-backed sources** — `studio_audio::block::BlockSequence` now
+   exists: one channel as a sequence of variable-length blocks behind
+   `Arc<[f32]>`, so `insert`/`delete` rebuild only the block(s) straddling
+   the edit and leave every other block the same allocation, not just the
+   same bytes — checked directly via pointer identity, not value equality,
+   across 18 tests. Kept separate from `SourceAudio` (mixdown/`Peaks`'s own
+   type) rather than rewriting it: block-backing pays for itself on the
+   *edit* path, not playback, so `to_flat_channels`/`from_flat_channels`
+   bridge the two rather than forking the representation everywhere else
+   that already works with flat audio.
+
+This closes every item that was on this list when this section was last
+written honestly. What's real and load-bearing now, named precisely rather
+than left as a vague "not built yet": a streaming variant of `mixdown` that
+carries effect state across calls (item 2's own note above), real hardware
+verification for `studio-io` (item 3), the network half of DHT publishing
+(item 4), and video decode (item 1). None of those are guesses — each is a
+concrete next step pinned by a test or a doc comment that says exactly what
+it's waiting on.
 
 A test found the one real bug in this pass: `rebuild()` originally replayed the
 op log from an empty project and erased every track and source that pre-dated
