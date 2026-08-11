@@ -20,6 +20,7 @@
 //! checked by a test: content that names a weapon the engine cannot fire is
 //! a crash waiting for whoever adds the seventh chassis.
 
+use crate::patrol;
 use crate::weapons::{Element, Verb};
 
 // ------------------------------------------------------------- chassis ---
@@ -73,6 +74,11 @@ pub struct Troop {
     pub tint: [u8; 3],
     /// ability ids; resolved through `ability()`
     pub abilities: &'static [&'static str],
+    /// who it fights for — `patrol::Destination.hostiles` is the same
+    /// enum, and `waves_for` in `campaign.rs` matches them so a mission
+    /// sited on a Corrupted-faction world actually meets the Corrupted
+    /// rather than a generic grunt line with the right paint job
+    pub faction: patrol::Faction,
 }
 
 /// The `fire_mode` strings in the JSON, resolved. `suppress` and `beam` both
@@ -80,25 +86,66 @@ pub struct Troop {
 /// weapon-profile property rather than a different verb.
 pub const TROOPS: &[Troop] = &[
     // ---- player classes ----
-    Troop { id: "vanguard",    role: Role::PlayerClass, chassis: "standard",   fire: Verb::Push,   element: Element::Water,    tint: [150, 170, 200], abilities: &["dash", "overclock"] },
-    Troop { id: "interceptor", role: Role::PlayerClass, chassis: "angular",    fire: Verb::Cone,   element: Element::Air,      tint: [170, 200, 190], abilities: &["dash", "cloak"] },
-    Troop { id: "titan",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Chain,  element: Element::Electric, tint: [140, 150, 175], abilities: &["shield", "turret"] },
-    Troop { id: "specialist",  role: Role::PlayerClass, chassis: "strider",    fire: Verb::Beam,   element: Element::Ice,      tint: [160, 200, 220], abilities: &["cloak", "blink"] },
-    Troop { id: "reaver",      role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Bank,   element: Element::Rock,     tint: [180, 165, 140], abilities: &["dash", "pulse"] },
-    Troop { id: "warden",      role: Role::PlayerClass, chassis: "bruiser",    fire: Verb::Beam,   element: Element::Ice,      tint: [150, 185, 205], abilities: &["shield", "resonance"] },
-    Troop { id: "pyre",        role: Role::PlayerClass, chassis: "angular",    fire: Verb::Flak,   element: Element::Fire,     tint: [220, 130, 70], abilities: &["overclock", "pulse"] },
-    Troop { id: "prime",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210], abilities: &["shield", "resonance"] },
-    Troop { id: "scout",       role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Pool,   element: Element::Vine,     tint: [120, 180, 120], abilities: &["hover", "dash"] },
-    Troop { id: "siege",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Pool,   element: Element::Rock,     tint: [165, 150, 130], abilities: &["turret", "shield"] },
+    Troop { id: "vanguard",    role: Role::PlayerClass, chassis: "standard",   fire: Verb::Push,   element: Element::Water,    tint: [150, 170, 200], abilities: &["dash", "overclock"] , faction: patrol::Faction::Coalition },
+    Troop { id: "interceptor", role: Role::PlayerClass, chassis: "angular",    fire: Verb::Cone,   element: Element::Air,      tint: [170, 200, 190], abilities: &["dash", "cloak"] , faction: patrol::Faction::Coalition },
+    Troop { id: "titan",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Chain,  element: Element::Electric, tint: [140, 150, 175], abilities: &["shield", "turret"] , faction: patrol::Faction::Coalition },
+    Troop { id: "specialist",  role: Role::PlayerClass, chassis: "strider",    fire: Verb::Beam,   element: Element::Ice,      tint: [160, 200, 220], abilities: &["cloak", "blink"] , faction: patrol::Faction::Coalition },
+    Troop { id: "reaver",      role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Bank,   element: Element::Rock,     tint: [180, 165, 140], abilities: &["dash", "pulse"] , faction: patrol::Faction::Coalition },
+    Troop { id: "warden",      role: Role::PlayerClass, chassis: "bruiser",    fire: Verb::Beam,   element: Element::Ice,      tint: [150, 185, 205], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
+    Troop { id: "pyre",        role: Role::PlayerClass, chassis: "angular",    fire: Verb::Flak,   element: Element::Fire,     tint: [220, 130, 70], abilities: &["overclock", "pulse"] , faction: patrol::Faction::Coalition },
+    Troop { id: "prime",       role: Role::PlayerClass, chassis: "sentinel",   fire: Verb::Shove,  element: Element::Water,    tint: [90, 140, 210], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
+    Troop { id: "scout",       role: Role::PlayerClass, chassis: "raptor",     fire: Verb::Pool,   element: Element::Vine,     tint: [120, 180, 120], abilities: &["hover", "dash"] , faction: patrol::Faction::Coalition },
+    Troop { id: "siege",       role: Role::PlayerClass, chassis: "juggernaut", fire: Verb::Pool,   element: Element::Rock,     tint: [165, 150, 130], abilities: &["turret", "shield"] , faction: patrol::Faction::Coalition },
     // ---- hostiles: what patrol has been missing ----
-    Troop { id: "grunt",            role: Role::Enemy, chassis: "standard", fire: Verb::Push,   element: Element::None,     tint: [130, 130, 140], abilities: &[] },
-    Troop { id: "blackstar_raider", role: Role::Enemy, chassis: "angular",  fire: Verb::Pierce, element: Element::Electric, tint: [70, 70, 90], abilities: &["dash"] },
-    Troop { id: "ravager",          role: Role::Enemy, chassis: "bruiser",  fire: Verb::Flak,   element: Element::Fire,     tint: [180, 90, 60], abilities: &["shield"] },
-    Troop { id: "slipstream",       role: Role::Enemy, chassis: "raptor",   fire: Verb::Cone,   element: Element::Air,      tint: [160, 190, 200], abilities: &["hover", "dash"] },
+    Troop { id: "grunt",            role: Role::Enemy, chassis: "standard", fire: Verb::Push,   element: Element::None,     tint: [130, 130, 140], abilities: &[] , faction: patrol::Faction::Hijacks },
+    Troop { id: "blackstar_raider", role: Role::Enemy, chassis: "angular",  fire: Verb::Pierce, element: Element::Electric, tint: [70, 70, 90], abilities: &["dash"] , faction: patrol::Faction::BlackstarClans },
+    Troop { id: "ravager",          role: Role::Enemy, chassis: "bruiser",  fire: Verb::Flak,   element: Element::Fire,     tint: [180, 90, 60], abilities: &["shield"] , faction: patrol::Faction::Hijacks },
+    Troop { id: "slipstream",       role: Role::Enemy, chassis: "raptor",   fire: Verb::Cone,   element: Element::Air,      tint: [160, 190, 200], abilities: &["hover", "dash"] , faction: patrol::Faction::Hijacks },
     // ---- elemental variants ----
-    Troop { id: "ashfall_lancer",     role: Role::Variant, chassis: "raptor",   fire: Verb::Flak,     element: Element::Fire, tint: [210, 110, 60], abilities: &["overclock"] },
-    Troop { id: "hoarfrost_sentinel", role: Role::Variant, chassis: "sentinel", fire: Verb::Beam,     element: Element::Ice,  tint: [170, 215, 235], abilities: &["shield", "resonance"] },
-    Troop { id: "magma_breaker",      role: Role::Variant, chassis: "bruiser",  fire: Verb::Pool,     element: Element::Fire, tint: [200, 80, 40], abilities: &["pulse"] },
+    Troop { id: "ashfall_lancer",     role: Role::Variant, chassis: "raptor",   fire: Verb::Flak,     element: Element::Fire, tint: [210, 110, 60], abilities: &["overclock"] , faction: patrol::Faction::Coalition },
+    Troop { id: "hoarfrost_sentinel", role: Role::Variant, chassis: "sentinel", fire: Verb::Beam,     element: Element::Ice,  tint: [170, 215, 235], abilities: &["shield", "resonance"] , faction: patrol::Faction::Coalition },
+    Troop { id: "magma_breaker",      role: Role::Variant, chassis: "bruiser",  fire: Verb::Pool,     element: Element::Fire, tint: [200, 80, 40], abilities: &["pulse"] , faction: patrol::Faction::Coalition },
+    // ---- the Corrupted: Jhiaxus' experiment, in three stages ----
+    // (see corruption.rs; element is None because the treatment never
+    // gives them one, and Role::Enemy because they are not coalition
+    // elites — they are the thing the coalition and the Autobots both
+    // fear equally)
+    Troop { id: "corrupted_drifter", role: Role::Enemy, chassis: "standard", fire: Verb::Push,  element: Element::None, tint: [70, 90, 70],  abilities: &["dash"], faction: patrol::Faction::Corrupted },
+    Troop { id: "corrupted_bloom",   role: Role::Enemy, chassis: "bruiser",  fire: Verb::Pool,  element: Element::None, tint: [55, 75, 55],  abilities: &["shield", "pulse"], faction: patrol::Faction::Corrupted },
+    Troop { id: "corrupted_apex",    role: Role::Variant, chassis: "juggernaut", fire: Verb::Vortex, element: Element::None, tint: [30, 45, 35], abilities: &["shield", "resonance", "pulse"], faction: patrol::Faction::Corrupted },
+    // ---- the Dreadwake fleet: Blackstar's named ranks ----
+    // (TF_DOOMSDAY_FILMMAKER_CHARTS.md section 11 -- the boarding-battle
+    // roster that was, until now, three lines of mission flavor text
+    // ("corsairs in the cradles, raiders on the rails") with nothing
+    // behind them. Verb/element choices follow the doc's own job
+    // description for each rank rather than being invented from scratch)
+    Troop { id: "driftcutter",   role: Role::Enemy,   chassis: "raptor",     fire: Verb::Cone,   element: Element::Air,      tint: [90, 100, 120],  abilities: &["dash", "hover"], faction: patrol::Faction::BlackstarClans },
+    Troop { id: "hullbreaker",   role: Role::Enemy,   chassis: "juggernaut", fire: Verb::Pierce, element: Element::Rock,     tint: [60, 55, 65],    abilities: &["shield"], faction: patrol::Faction::BlackstarClans },
+    Troop { id: "corsair",       role: Role::Enemy,   chassis: "angular",    fire: Verb::Bank,   element: Element::Electric, tint: [75, 65, 40],   abilities: &["dash"], faction: patrol::Faction::BlackstarClans },
+    Troop { id: "pale_vector",   role: Role::Variant, chassis: "sentinel",   fire: Verb::Pool,   element: Element::Rock,     tint: [140, 130, 150], abilities: &["pulse"], faction: patrol::Faction::BlackstarClans },
+    Troop { id: "straxxus",      role: Role::Variant, chassis: "juggernaut", fire: Verb::Pierce, element: Element::Fire,     tint: [50, 45, 55],    abilities: &["shield", "overclock"], faction: patrol::Faction::BlackstarClans },
+    Troop { id: "glaciator",     role: Role::Variant, chassis: "sentinel",   fire: Verb::Beam,   element: Element::Ice,      tint: [110, 140, 170], abilities: &["shield", "resonance"], faction: patrol::Faction::BlackstarClans },
+    Troop { id: "magnetron",     role: Role::Variant, chassis: "strider",    fire: Verb::Chain,  element: Element::Electric, tint: [95, 90, 60],   abilities: &["overclock"], faction: patrol::Faction::BlackstarClans },
+    Troop { id: "plasma_wraith", role: Role::Variant, chassis: "raptor",     fire: Verb::Flak,   element: Element::Fire,     tint: [80, 40, 50],    abilities: &["cloak", "dash"], faction: patrol::Faction::BlackstarClans },
+    // ---- Earth's own named threats, Doomsday-era ----
+    // (TF_DOOMSDAY_FILMMAKER_CHARTS.md section 5's strategic map: "Krakon
+    // in Pacific" and "Pyroclast in mantle" — sited exactly where
+    // `the_drowned_approach` (the trench) and `the_mantle_dive` (the
+    // foundry) already happen. Role::Enemy rather than Variant on
+    // purpose: Variant is gated to film >= 4 ("trilogy two fields the
+    // elemental variants" — campaign.rs's own rule), and these two are
+    // Doomsday/Dominion-era, both film-2 missions — Variant would have
+    // compiled clean and never once appeared where the doc places them,
+    // caught only by actually running the missions rather than trusting
+    // the build. Left as roster entries rather than champions for
+    // either mission: both missions' text is already composed around
+    // Unicron's own avatar and the Corrupted converging, and forcing a
+    // named champion into an established wave count is how this
+    // session broke campaign balance twice already. Tagged
+    // Faction::Corrupted — Earth's own faction — so they surface
+    // naturally through the on-site preference without new plumbing.)
+    Troop { id: "krakon",    role: Role::Enemy, chassis: "bruiser",    fire: Verb::Vortex, element: Element::Water, tint: [30, 60, 70],  abilities: &["shield", "resonance"], faction: patrol::Faction::Corrupted },
+    Troop { id: "pyroclast", role: Role::Enemy, chassis: "juggernaut", fire: Verb::Pool,   element: Element::Fire,  tint: [90, 35, 20],  abilities: &["pulse"], faction: patrol::Faction::Corrupted },
 ];
 
 pub fn troop(id: &str) -> Option<&'static Troop> {
