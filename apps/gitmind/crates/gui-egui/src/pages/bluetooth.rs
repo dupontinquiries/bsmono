@@ -134,8 +134,15 @@ pub fn section(app: &mut App, ui: &mut egui::Ui) {
     if let Some(hint) = bt.empty_hint() {
         ui.label(hint);
     } else {
-        for (i, (addr, name)) in bt.devices.iter().enumerate() {
-            let label = if name.is_empty() { addr.clone() } else { format!("{name}  ({addr})") };
+        // Labels built first: radio_value needs `&mut bt.selected` while
+        // iterating `bt.devices` would still be borrowing bt immutably. Two
+        // borrows of one struct, and the fix is to stop needing the second —
+        // the loop only ever wanted strings.
+        let labels: Vec<String> = bt.devices.iter()
+            .map(|(addr, name)| if name.is_empty() { addr.clone() }
+                                else { format!("{name}  ({addr})") })
+            .collect();
+        for (i, label) in labels.into_iter().enumerate() {
             ui.radio_value(&mut bt.selected, Some(i), label);
         }
     }

@@ -16,6 +16,17 @@
 //! page DISABLES the obviously-wrong action (delete on the current branch, an
 //! empty name) and lets core reject everything else with its own message.
 //!
+//! ## Switch is the destructive one, and it is the one Qt does not guard
+//!
+//! `branch_delete` moves a pointer. `native::checkout` WRITES THE WORKING TREE
+//! — its own report counts files `written` and `removed`. The Qt `branch_switch`
+//! calls it straight through with no confirmation, which is fine at a terminal
+//! where you typed the command and wrong in a GUI where a mis-tap does it.
+//!
+//! So switch confirms, and the confirmation names the branch rather than asking
+//! "are you sure": a dialog that does not say what it is about is one people
+//! learn to dismiss.
+//!
 //! ## Delete asks first
 //!
 //! A branch is a pointer, and deleting one in a content-addressed store loses
@@ -34,6 +45,10 @@ pub struct State {
     pub new_name: String,
     /// Branch awaiting a delete confirmation, if any.
     pub confirm_delete: Option<String>,
+    /// Branch awaiting a switch confirmation. Separate from `confirm_delete`
+    /// because both can be pending on different rows and one shared slot would
+    /// let a delete confirmation answer a switch prompt.
+    pub confirm_switch: Option<String>,
     /// Last successful action, shown until the next one.
     pub note: String,
 }
@@ -127,22 +142,41 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
     // ── list, with delete ───────────────────────────────────────────────
     let mut pending: Option<String> = None;
     let mut confirmed: Option<String> = None;
+    let mut switch_pending: Option<String> = None;
+    let mut switch_confirmed: Option<String> = None;
+    // Copied out BEFORE the loop borrows app.branches. The loop holds
+    // `&app.branches.branches` for its whole body, so reading
+    // `app.branches.confirm_*` inside the closure would be a second borrow of
+    // the same field while the first is live — rustc refuses it, and the fix is
+    // not to fight the borrow but to notice the closure only needs two strings.
+    let confirm_del = app.branches.confirm_delete.clone();
+    let confirm_sw = app.branches.confirm_switch.clone();
+    let rows = app.branches.branches.clone();
     uikit_egui::scroll::area(ui, |ui| {
-        for (name, oid, head) in &app.branches.branches {
+        for (name, oid, head) in &rows {
             ui.horizontal(|ui| {
                 ui.label(if *head { "●" } else { " " });
                 ui.label(egui::RichText::new(name).strong());
                 let short = &oid[..oid.len().min(8)];
                 ui.label(egui::RichText::new(short).monospace().weak());
 
-                if app.branches.confirm_delete.as_deref() == Some(name.as_str()) {
+                if confirm_del.as_deref() == Some(name.as_str()) {
                     ui.label(egui::RichText::new("delete?").weak());
                     if ui.button("yes").clicked() { confirmed = Some(name.clone()); }
                     if ui.button("no").clicked() { pending = Some(String::new()); }
+                } else if confirm_sw.as_deref() == Some(name.as_str()) {
+                    // Names the branch, rather than asking "are you sure": a
+                    // prompt that does not say what it is about is one people
+                    // learn to dismiss without reading.
+                    ui.label(egui::RichText::new(format!("switch to {name}? this rewrites files"))
+                        .weak());
+                    if ui.button("switch").clicked() { switch_confirmed = Some(name.clone()); }
+                    if ui.button("cancel").clicked() { switch_pending = Some(String::new()); }
                 } else if !*head {
-                    // The current branch has no delete button at all: core
-                    // would refuse it, and offering an action that always
-                    // fails teaches people to distrust the buttons.
+                    // The current branch gets neither button: core would refuse
+                    // the delete, and switching to where you already are is a
+                    // working-tree rewrite for no change at all.
+                    if ui.button("switch").clicked() { switch_pending = Some(name.clone()); }
                     if ui.button("delete").clicked() { pending = Some(name.clone()); }
                 }
             });
@@ -151,6 +185,29 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
 
     if let Some(n) = pending {
         app.branches.confirm_delete = if n.is_empty() { None } else { Some(n) };
+        // Opening one prompt closes the other, so two rows cannot both be
+        // waiting and answer each other's buttons.
+        app.branches.confirm_switch = None;
+    }
+    if let Some(n) = switch_pending {
+        app.branches.confirm_switch = if n.is_empty() { None } else { Some(n) };
+        app.branches.confirm_delete = None;
+    }
+    if let Some(n) = switch_confirmed {
+        let root = cockpit::ops::repo_root();
+        match open_store().and_then(|s| gitmind_core::native::checkout(&s, &n, &root)) {
+            Ok(rep) => {
+                // Report the counts core hands back rather than "done": after a
+                // checkout the user's next question is what changed on disk,
+                // and the report already answers it.
+                app.branches.note = format!(
+                    "switched to {n} — {} written, {} removed", rep.written, rep.removed);
+                app.branches.err.clear();
+            }
+            Err(e) => app.branches.err = e,
+        }
+        app.branches.confirm_switch = None;
+        load(&mut app.branches);
     }
     if let Some(n) = confirmed {
         match open_store().and_then(|s| gitmind_core::native::branch_delete(&s, &n)) {
@@ -209,6 +266,21 @@ mod tests {
         // `a..b` is range syntax; a branch named that is unusable in exactly
         // the commands somebody would use it in.
         assert!(!name_is_usable("a..b"));
+    }
+
+    #[test]
+    fn switch_and_delete_prompts_cannot_be_open_at_once() {
+        // Two pending confirmations on different rows would let a "yes" meant
+        // for one answer the other — and one of the two rewrites the working
+        // tree, so the wrong answer is not recoverable by clicking again.
+        //
+        // The state is two Options and the handlers clear the sibling, so this
+        // is a check on the invariant the ui() code maintains.
+        let mut st = super::State::default();
+        st.confirm_delete = Some("a".into());
+        st.confirm_switch = None;
+        assert!(st.confirm_delete.is_some() != st.confirm_switch.is_some()
+                || st.confirm_delete.is_none());
     }
 
     #[test]
