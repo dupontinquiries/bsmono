@@ -47,7 +47,7 @@ edits exactly reversible, which floats are not.
 | crate | what it is | tests |
 |---|---|---|
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
-| `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, **sessions** | 41 |
+| `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 71 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
 | `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
@@ -94,9 +94,15 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    negotiation fallback logic against hand-built device configs) — **not**
    yet run against real hardware, since there is still no sound card in the
    authoring sandbox. That verification is the next step, not a redesign.
-4. **Publishing to a live DHT** — session keys, chunking and reassembly are
-   done and tested against the awkward carrier shape; what remains is calling
-   `snapclone-dht`'s put/get from a running node.
+4. **Publishing to a live DHT** — `studio-collab::dht` now calls
+   `snapcore::store::Store`'s put/get directly: `publish` chunks a `Packet`
+   under the session key, `discover` reassembles whatever's complete.
+   Genuinely tested end-to-end (8 tests, including a full `Session::broadcast`
+   → publish → discover → joiner round trip) — what's still missing is the
+   network half, iteratively storing to and reading from the nodes actually
+   closest to a key, which is `share-kit`'s own still-pending "networked
+   Backend." This module is the local half of that seam, done; not a
+   placeholder for it.
 5. **Block-backed sources** — Audacity's insight that samples live in chunks so
    an edit touches a few blocks, not a file.
 
