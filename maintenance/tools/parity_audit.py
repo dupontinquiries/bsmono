@@ -203,7 +203,27 @@ def covered_in_code(name, text):
     `named` and a low `code` is where to go looking — that gap is exactly where
     WayfinderPage was hiding."""
     code = '\n'.join(l for l in text.split('\n') if not l.lstrip().startswith(('//', '#', '*')))
-    return name in code or snake(name) in code
+    if name in code or snake(name) in code:
+        return True
+
+    # THE TRAILING-NOUN CASE, found on rusty-board's MicrotermView. The port is
+    # complete — StenoCandidate, the fuzzy flag, the exact-before-fuzzy sort,
+    # all of it — but the module is `microterm.rs`, because in Rust the `View`
+    # suffix is Qt's noise rather than part of the name.
+    #
+    # So a Qt class ending in View/Widget/Page/Dialog/Panel also matches its
+    # stem. That is a real loosening and it can produce a false POSITIVE: a
+    # `microterm` mentioned anywhere would now count. Accepted deliberately,
+    # because `named` is documented as the UPPER bound — its job is "somebody
+    # knew this existed", and `code` remains the honest lower one. A false
+    # negative here is worse: it sends somebody to port a surface that is
+    # already done, which is the most expensive possible wrong answer.
+    for suffix in ('View', 'Widget', 'Page', 'Dialog', 'Panel', 'Window'):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            stem = name[:-len(suffix)]
+            if stem in code or snake(stem) in code:
+                return True
+    return False
 
 def manifest_state(app_id):
     p = os.path.join(ROOT, 'manifest', 'projects.toml')
