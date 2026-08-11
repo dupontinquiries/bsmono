@@ -50,6 +50,7 @@ pub mod ambient_palette;
 pub mod camera_select;
 pub mod chevron_confirm;
 pub mod handshake;
+pub mod landmark_hash;
 pub mod peer_dial;
 pub mod peer_session;
 pub mod power_tier;
