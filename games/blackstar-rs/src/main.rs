@@ -22,6 +22,7 @@ mod fx;
 mod gamepad;
 mod gyro;
 mod content;
+mod corruption;
 mod cyber;
 mod custom;
 mod partcars;
