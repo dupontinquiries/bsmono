@@ -205,10 +205,22 @@ pub fn device_from_node(props: &[(&str, &str)]) -> Option<Device> {
 
     // PipeWire may state the facing outright; otherwise fall back to the label,
     // which is a guess and returns Unknown when it cannot tell.
+    // Location arrives in THREE spellings and GNOME Snapshot's `aperture` crate
+    // matches all of them: "Front"|"front"|"0" and "Back"|"back"|"1". My first
+    // version took lowercase only, so a capitalised or numeric location — which
+    // is what libcamera actually reports on some pipelines — fell through to
+    // guessing from the label. That is a silent downgrade from a stated fact to
+    // an inference, and it un-mirrors a selfie.
     let facing = match get("api.libcamera.location").or_else(|| get("device.location")) {
-        Some("front") => Facing::Front,
-        Some("back") | Some("rear") => Facing::Rear,
-        _ => facing_from_label(label),
+        Some(v) => match v.trim() {
+            "Front" | "front" | "0" => Facing::Front,
+            "Back" | "back" | "rear" | "Rear" | "1" => Facing::Rear,
+            // A location we do not recognise is NOT a reason to trust the
+            // label: the platform stated something and we failed to read it,
+            // which is worth being unknown about rather than guessing over.
+            _ => Facing::Unknown,
+        },
+        None => facing_from_label(label),
     };
 
     // Sensors behind one ISP are grouped by their DEVICE id: libcamera exposes
@@ -427,6 +439,30 @@ mod tests {
             ("media.class", "Video/Source"),
             ("node.description", "Nameless Camera"),
         ]).is_none());
+    }
+
+    #[test]
+    fn every_spelling_of_location_is_read() {
+        // GNOME Snapshot's aperture crate matches "Front"|"front"|"0" and
+        // "Back"|"back"|"1" — libcamera reports capitalised and numeric forms
+        // on some pipelines. Taking lowercase only silently downgrades a stated
+        // fact to a label guess, which un-mirrors a selfie.
+        for (v, want) in [("front", Facing::Front), ("Front", Facing::Front), ("0", Facing::Front),
+                          ("back", Facing::Rear), ("Back", Facing::Rear), ("1", Facing::Rear)] {
+            let d = device_from_node(&[("media.class", "Video/Source"),
+                ("node.name", "cam"), ("api.libcamera.location", v)]).unwrap();
+            assert_eq!(d.facing, want, "location {v:?}");
+        }
+    }
+
+    #[test]
+    fn an_unrecognised_location_is_unknown_rather_than_a_label_guess() {
+        // The platform stated something and we failed to read it. Falling back
+        // to the label would paper over a real gap in this match.
+        let d = device_from_node(&[("media.class", "Video/Source"),
+            ("node.name", "cam"), ("node.description", "Front Camera"),
+            ("api.libcamera.location", "external")]).unwrap();
+        assert_eq!(d.facing, Facing::Unknown, "guessed from the label instead");
     }
 
     #[test]
