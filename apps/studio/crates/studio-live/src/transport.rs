@@ -102,23 +102,33 @@ impl Transport {
     /// render the pieces in the right order.
     pub fn advance(&mut self, frames: i64) -> Advance {
         if !self.playing || frames <= 0 {
-            return Advance { from: self.position(), to: self.position(), wrapped: None, punched_in: false };
+            return Advance { from: self.position(), to: self.position(), wrapped: None, punched_in: false, punch_offset: None };
         }
         let from = self.position();
         let mut punched_in = false;
+        let mut punch_offset = None;
 
         // Count-in: the clock runs but the recorder stays disarmed until it
         // reaches the punch point. `punch_at` was stored by rolling the position
         // back, so the punch is simply "count_in past where we started".
         if self.counting_in {
             let punch = self.punch_frame;
+            let frame_start = self.frame;
             self.frame += frames;
             if self.frame >= punch {
                 self.counting_in = false;
                 self.recording = true;
                 punched_in = true;
+                // How many frames into THIS buffer the punch actually
+                // landed — `punch` can only be at or after `frame_start`
+                // here (that's what `self.frame >= punch` just confirmed
+                // becoming true this call), so the offset is never
+                // negative; clamped anyway rather than trusted, since a
+                // caller slicing its own buffer by this value must never
+                // receive something that would panic that slice.
+                punch_offset = Some((punch - frame_start).max(0));
             }
-            return Advance { from, to: self.position(), wrapped: None, punched_in };
+            return Advance { from, to: self.position(), wrapped: None, punched_in, punch_offset };
         }
 
         self.frame += frames;
@@ -132,7 +142,7 @@ impl Transport {
                 wrapped = Some((e, s));
             }
         }
-        Advance { from, to: self.position(), wrapped, punched_in }
+        Advance { from, to: self.position(), wrapped, punched_in, punch_offset }
     }
 }
 
@@ -145,6 +155,14 @@ pub struct Advance {
     pub wrapped: Option<(Ticks, Ticks)>,
     /// True on the buffer where a count-in ended and recording armed.
     pub punched_in: bool,
+    /// When `punched_in` is true, how many FRAMES into this buffer (not
+    /// samples across channels — a caller multiplies by its own channel
+    /// count to index an interleaved buffer) the punch actually landed.
+    /// `None` on every buffer where `punched_in` is false, including ones
+    /// entirely before or after a count-in — a punch that already happened
+    /// on a previous buffer has no meaningful offset into THIS one, and a
+    /// caller should not try to derive one from a stale value.
+    pub punch_offset: Option<i64>,
 }
 
 impl Advance {
@@ -298,6 +316,46 @@ mod tests {
         assert!(t.recording, "and recording is now armed");
         assert!(!t.is_counting_in());
         assert!(t.position() >= Ticks::from_seconds(30.0));
+        // Before this call the clock sat at 29.0s (28.0 rolled-back start +
+        // the 1.0s just advanced); the punch is at exactly 30.0s, which is
+        // RATE frames into this RATE+10-frame buffer.
+        assert_eq!(a.punch_offset, Some(RATE as i64), "the punch offset must be exactly where 30.0s falls inside this buffer");
+    }
+
+    #[test]
+    fn punch_offset_is_none_on_every_buffer_that_does_not_punch_in() {
+        let mut t = Transport::new(RATE);
+        // No count-in at all: recording starts immediately, no punch to report.
+        let a = t.advance(256);
+        assert_eq!(a.punch_offset, None, "a transport not counting in has nothing to report an offset for");
+
+        // A buffer well before the punch, during a count-in.
+        t.count_in = Ticks::from_seconds(2.0);
+        t.start_recording(Ticks::from_seconds(30.0));
+        let b = t.advance(256);
+        assert!(!b.punched_in);
+        assert_eq!(b.punch_offset, None, "a buffer that doesn't cross the punch must not report a stale or guessed offset");
+
+        // The buffer AFTER the one that punched in — recording is already
+        // armed, so this buffer's own punch_offset must not still claim one.
+        t.advance(2 * RATE as i64); // cross the punch
+        let d = t.advance(256);
+        assert!(!d.punched_in);
+        assert_eq!(d.punch_offset, None, "punch_offset must not linger past the buffer it actually happened in");
+    }
+
+    #[test]
+    fn punch_offset_lands_exactly_at_the_configured_punch_point_for_a_short_count_in() {
+        // A small, hand-checkable case: a one-frame count-in inside a
+        // 100-frame buffer should punch in at offset exactly 1.
+        let mut t = Transport::new(RATE);
+        t.count_in = Ticks::from_samples(1, RATE);
+        t.start_recording(Ticks::from_samples(1, RATE));
+        assert_eq!(t.position(), Ticks::ZERO, "rolled back by exactly the one-frame count-in");
+
+        let a = t.advance(100);
+        assert!(a.punched_in);
+        assert_eq!(a.punch_offset, Some(1), "the punch is 1 frame into a buffer that starts at the rolled-back position");
     }
 
     #[test]
