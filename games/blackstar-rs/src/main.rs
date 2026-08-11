@@ -51,6 +51,11 @@ mod procars;
 mod procgen;
 mod campaign;
 mod campsim;
+mod chi;
+mod clones;
+mod gear;
+mod gearsim;
+mod vault;
 mod energon;
 mod nightfall;
 mod skirmish;
@@ -914,6 +919,11 @@ fn main() {
     if argv.iter().any(|a| a == "--sim") {
         // headless AI sim: pure physics, no window, no GPU, no audio
         sim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--gear") {
+        // the bearer's sheet, the ship's vault, the clone gallery
+        gearsim::run(&argv);
         return;
     }
     if argv.iter().any(|a| a == "--campaign") {

@@ -1,0 +1,408 @@
+//! GEAR — the bearer's sheet, Destiny style.
+//!
+//! Three weapon slots and an armor rail, a small bag, swap on the go.
+//! The slots are not invented: they fall out of `ballistics::Delivery`,
+//! which every weapon verb already declares —
+//!
+//!   KINETIC  <- thrown mass (Flak, Pierce, Bank, Chain)
+//!   ENERGY   <- light       (Beam, Blink)
+//!   POWER    <- pressure and contact (Pool, Vortex, Cone, Shove,
+//!               Push, Thrust, Grapple)
+//!
+//! — the same trichotomy Destiny's kinetic/energy/power made muscle
+//! memory. A weapon is a (verb, element) pair because that is what a
+//! weapon IS in this engine, plus a provenance tag when a warden
+//! dropped it: nineteen bosses, nineteen collectible arms.
+//!
+//! Armor is `loadout.rs` mods, not a new type — the gear sheet adds the
+//! two gates the loadout module leaves to the caller: the slot budget
+//! of a suited human, and CHI WORTHINESS (`chi.rs`), with the refusal
+//! printed in full, because "unworthy" with a number is a goal and
+//! without one is a wall.
+//!
+//! Inventory ops persist to the save immediately: a bag is state, not a
+//! plan, and a dry-run knapsack helps nobody. The battle sims stay
+//! dry-run-by-default; the difference is deliberate.
+
+use std::fmt::Write as _;
+
+use crate::ballistics::Delivery;
+use crate::chi::{self, Chi};
+use crate::loadout::{slot_count, BodyFit, Loadout, Mod, MODS};
+use crate::survival::Body;
+use crate::weapons::{Element, Verb, ELEMENTS};
+
+/// The three rails.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Rail {
+    Kinetic,
+    Energy,
+    Power,
+}
+
+pub fn rail_of(v: Verb) -> Rail {
+    match v.delivery() {
+        Delivery::Kinetic => Rail::Kinetic,
+        Delivery::Beam => Rail::Energy,
+        Delivery::Blast | Delivery::Melee => Rail::Power,
+    }
+}
+
+impl Rail {
+    pub fn name(self) -> &'static str {
+        match self {
+            Rail::Kinetic => "kinetic",
+            Rail::Energy => "energy",
+            Rail::Power => "power",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Rail> {
+        match s {
+            "kinetic" => Some(Rail::Kinetic),
+            "energy" => Some(Rail::Energy),
+            "power" => Some(Rail::Power),
+            _ => None,
+        }
+    }
+}
+
+/// One thing that can sit in a bag, a vault, or on the body.
+#[derive(Clone, Debug)]
+pub enum Item {
+    Weapon { verb: Verb, element: Element, from: Option<String> },
+    Armor(&'static Mod),
+}
+
+/// Mods carry no PartialEq and two statics with one name are one mod,
+/// so item equality is code equality — the same rule the save uses.
+impl PartialEq for Item {
+    fn eq(&self, other: &Item) -> bool {
+        self.code() == other.code()
+    }
+}
+
+const VERBS: [Verb; 13] = [
+    Verb::Push, Verb::Shove, Verb::Blink, Verb::Flak, Verb::Pool, Verb::Cone, Verb::Bank,
+    Verb::Pierce, Verb::Chain, Verb::Thrust, Verb::Vortex, Verb::Beam, Verb::Grapple,
+];
+
+pub fn verb_name(v: Verb) -> &'static str {
+    match v {
+        Verb::Push => "push", Verb::Shove => "shove", Verb::Blink => "blink", Verb::Flak => "flak",
+        Verb::Pool => "pool", Verb::Cone => "cone", Verb::Bank => "bank", Verb::Pierce => "pierce",
+        Verb::Chain => "chain", Verb::Thrust => "thrust", Verb::Vortex => "vortex",
+        Verb::Beam => "beam", Verb::Grapple => "grapple",
+    }
+}
+
+impl Item {
+    /// The save code. Weapons: `w:verb:element[:from]`. Armor: `m:NAME`.
+    pub fn code(&self) -> String {
+        match self {
+            Item::Weapon { verb, element, from } => match from {
+                Some(f) => format!("w:{}:{}:{}", verb_name(*verb), element.name(), f),
+                None => format!("w:{}:{}", verb_name(*verb), element.name()),
+            },
+            Item::Armor(m) => format!("m:{}", m.name),
+        }
+    }
+    pub fn parse(code: &str) -> Option<Item> {
+        let code = code.trim();
+        if let Some(rest) = code.strip_prefix("w:") {
+            let mut it = rest.splitn(3, ':');
+            let v = it.next()?;
+            let e = it.next()?;
+            let verb = *VERBS.iter().find(|x| verb_name(**x) == v)?;
+            let element = *ELEMENTS.iter().find(|x| x.name() == e)?;
+            return Some(Item::Weapon { verb, element, from: it.next().map(str::to_string) });
+        }
+        if let Some(name) = code.strip_prefix("m:") {
+            return MODS.iter().find(|m| m.name == name).map(Item::Armor);
+        }
+        None
+    }
+    /// The line a sheet prints.
+    pub fn label(&self) -> String {
+        match self {
+            Item::Weapon { verb, element, from } => {
+                let base = format!("{} {}", element.name(), verb_name(*verb));
+                match from {
+                    Some(f) => format!("{base} (off {f})"),
+                    None => base,
+                }
+            }
+            Item::Armor(m) => format!("{} [{} slot{}]", m.name, m.slots, if m.slots == 1 { "" } else { "s" }),
+        }
+    }
+}
+
+/// What the bearer is wearing and carrying. The vault is elsewhere
+/// (`vault.rs`) — this is the body and the bag.
+#[derive(Clone, Default)]
+pub struct Gear {
+    pub kinetic: Option<Item>,
+    pub energy: Option<Item>,
+    pub power: Option<Item>,
+    pub worn: Vec<&'static Mod>,
+    pub bag: Vec<Item>,
+}
+
+/// Bag capacity: small on purpose — the ship's vault is where a hoard
+/// lives, and walking past it is a choice.
+pub const BAG_CAP: usize = 9;
+/// The bearer wears a suit; the suit's slot budget is the armor rail.
+pub const BODY: Body = Body::HumanSuited;
+
+impl Gear {
+    pub fn from_save(armed: &str, worn: &str, bag: &str) -> Gear {
+        let mut g = Gear::default();
+        let mut rails = armed.split(',');
+        for slot in [&mut g.kinetic, &mut g.energy, &mut g.power] {
+            *slot = rails.next().and_then(Item::parse);
+        }
+        for name in worn.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(m) = MODS.iter().find(|m| m.name == name) {
+                if !g.worn.iter().any(|w| w.name == m.name) {
+                    g.worn.push(m);
+                }
+            }
+        }
+        for code in bag.split(',') {
+            if let Some(it) = Item::parse(code) {
+                if g.bag.len() < BAG_CAP {
+                    g.bag.push(it);
+                }
+            }
+        }
+        g
+    }
+    pub fn save_lines(&self) -> (String, String, String) {
+        let armed = [&self.kinetic, &self.energy, &self.power]
+            .iter()
+            .map(|s| s.as_ref().map(|i| i.code()).unwrap_or_else(|| "-".into()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let worn = self.worn.iter().map(|m| m.name).collect::<Vec<_>>().join(",");
+        let bag = self.bag.iter().map(|i| i.code()).collect::<Vec<_>>().join(",");
+        (armed, worn, bag)
+    }
+
+    pub fn rail_slot(&mut self, r: Rail) -> &mut Option<Item> {
+        match r {
+            Rail::Kinetic => &mut self.kinetic,
+            Rail::Energy => &mut self.energy,
+            Rail::Power => &mut self.power,
+        }
+    }
+
+    fn loadout(&self) -> Loadout {
+        Loadout { mods: self.worn.iter().map(|m| (*m).clone()).collect() }
+    }
+
+    /// Pick something up. Full bag says so.
+    pub fn take(&mut self, it: Item) -> Result<(), String> {
+        if self.bag.len() >= BAG_CAP {
+            return Err(format!("the bag is full ({BAG_CAP}); the ship's vault is not"));
+        }
+        self.bag.push(it);
+        Ok(())
+    }
+
+    /// Equip bag item `i`. Weapons go to their delivery's rail, swapping
+    /// what was there back into the bag. Armor passes three gates —
+    /// body fit, slot budget, chi worthiness — and each refusal names
+    /// itself.
+    pub fn equip(&mut self, i: usize, chi: &Chi) -> Result<String, String> {
+        if i >= self.bag.len() {
+            return Err(format!("no bag item {i}"));
+        }
+        match self.bag[i].clone() {
+            Item::Weapon { verb, .. } => {
+                let it = self.bag.remove(i);
+                let r = rail_of(verb);
+                let old = self.rail_slot(r).replace(it);
+                if let Some(o) = old {
+                    self.bag.push(o);
+                }
+                Ok(format!("armed on the {} rail", r.name()))
+            }
+            Item::Armor(m) => {
+                if !m.fits.accepts(BODY) {
+                    return Err(format!("{} does not fit a suited human", m.name));
+                }
+                if self.worn.iter().any(|w| w.name == m.name) {
+                    return Err(format!("{} is already worn", m.name));
+                }
+                chi::worthy(chi, m)?;
+                let mut trial = self.loadout();
+                trial.mods.push(m.clone());
+                if !trial.legal(BODY) {
+                    return Err(format!(
+                        "no room: {} wants {} slot(s), {} of {} spent",
+                        m.name,
+                        m.slots,
+                        self.loadout().slots_used(),
+                        slot_count(BODY)
+                    ));
+                }
+                self.bag.remove(i);
+                self.worn.push(m);
+                Ok(format!("worn -- {} of {} armor slots spent", self.loadout().slots_used(), slot_count(BODY)))
+            }
+        }
+    }
+
+    /// Take something off, back into the bag: a rail by name, or a worn
+    /// mod by its name.
+    pub fn stow(&mut self, what: &str) -> Result<String, String> {
+        if self.bag.len() >= BAG_CAP {
+            return Err(format!("the bag is full ({BAG_CAP}); make room first"));
+        }
+        if let Some(r) = Rail::parse(what) {
+            return match self.rail_slot(r).take() {
+                Some(it) => {
+                    let l = it.label();
+                    self.bag.push(it);
+                    Ok(format!("{l} stowed"))
+                }
+                None => Err(format!("the {} rail is already empty", r.name())),
+            };
+        }
+        let up = what.to_uppercase();
+        if let Some(pos) = self.worn.iter().position(|m| m.name == up) {
+            let m = self.worn.remove(pos);
+            self.bag.push(Item::Armor(m));
+            return Ok(format!("{} unbolted", m.name));
+        }
+        Err(format!("nothing called '{what}' is equipped (rails: kinetic/energy/power, or a worn mod's name)"))
+    }
+
+    /// The Destiny sheet, as text.
+    pub fn sheet(&self, chi: &Chi) -> String {
+        let mut out = String::new();
+        let _ = writeln!(out, "THE BEARER'S SHEET");
+        for (r, s) in [(Rail::Kinetic, &self.kinetic), (Rail::Energy, &self.energy), (Rail::Power, &self.power)] {
+            let _ = writeln!(out, "  {:8} {}", r.name(), s.as_ref().map(|i| i.label()).unwrap_or_else(|| "--".into()));
+        }
+        let _ = writeln!(out, "  armor    {} of {} slots", self.loadout().slots_used(), slot_count(BODY));
+        for m in &self.worn {
+            let _ = writeln!(out, "           {}", Item::Armor(m).label());
+        }
+        let _ = writeln!(out, "  chi      {}", chi::sheet(chi));
+        let _ = writeln!(out, "  bag      {} of {BAG_CAP}", self.bag.len());
+        for (i, it) in self.bag.iter().enumerate() {
+            let note = match it {
+                Item::Armor(m) => match chi::worthy(chi, m) {
+                    Err(e) => format!("  <- {e}"),
+                    Ok(()) => String::new(),
+                },
+                _ => String::new(),
+            };
+            let _ = writeln!(out, "    [{i}] {}{note}", it.label());
+        }
+        out
+    }
+}
+
+/// What a warden drops: the mech decides the verb (the fight decides
+/// the weapon), the finale arena decides the element, the boss signs
+/// it. Nineteen distinct arms, deterministic.
+pub fn warden_drop(boss: &crate::raidcon::Boss) -> Item {
+    use crate::raidcon::Mech;
+    let verb = match boss.mech {
+        Mech::Purge => Verb::Flak,
+        Mech::Ground => Verb::Pierce,
+        Mech::Air => Verb::Cone,
+        Mech::Sync => Verb::Beam,
+    };
+    Item::Weapon { verb, element: chi::arena_element(boss.arena), from: Some(boss.id.to_string()) }
+}
+
+/// What a nightfall drops: the lightest human mod governed by the
+/// week's burn, if the burn governs any — a body that survived the
+/// element is offered its kit.
+pub fn nightfall_drop(burn: Element) -> Option<Item> {
+    MODS.iter()
+        .filter(|m| m.fits != BodyFit::Machine && chi::governor(m) == burn)
+        .min_by_key(|m| m.slots)
+        .map(Item::Armor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raidcon::BOSSES;
+
+    #[test]
+    fn items_roundtrip_their_codes() {
+        let w = Item::Weapon { verb: Verb::Pierce, element: Element::Ice, from: Some("hussar".into()) };
+        assert_eq!(Item::parse(&w.code()), Some(w.clone()));
+        let m = Item::Armor(MODS.iter().find(|m| m.name == "AEROGEL LINER").unwrap());
+        assert_eq!(Item::parse(&m.code()), Some(m));
+        assert_eq!(Item::parse("w:zorch:ice"), None);
+        assert_eq!(Item::parse("m:IMAGINARY HAT"), None);
+    }
+
+    #[test]
+    fn rails_follow_delivery_and_swaps_go_back_to_the_bag() {
+        let mut g = Gear::default();
+        let chi = Chi::default();
+        g.take(Item::Weapon { verb: Verb::Pierce, element: Element::Ice, from: None }).unwrap();
+        g.take(Item::Weapon { verb: Verb::Flak, element: Element::Fire, from: None }).unwrap();
+        g.equip(0, &chi).unwrap();
+        assert!(g.kinetic.is_some(), "pierce is thrown mass; it belongs on kinetic");
+        g.equip(0, &chi).unwrap(); // flak is kinetic too: swap
+        assert_eq!(g.bag.len(), 1, "the swapped-out weapon vanished");
+        match &g.kinetic {
+            Some(Item::Weapon { verb: Verb::Flak, .. }) => {}
+            other => panic!("the rail holds {other:?}"),
+        }
+    }
+
+    #[test]
+    fn armor_passes_worthiness_and_the_slot_budget() {
+        let mut g = Gear::default();
+        let shell = Item::Armor(MODS.iter().find(|m| m.name == "LEAD-WEAVE SHELL").unwrap());
+        g.take(shell).unwrap();
+        let unworthy = Chi::default();
+        let err = g.equip(0, &unworthy).unwrap_err();
+        assert!(err.contains("unworthy") && err.contains("rock"), "{err}");
+        let worthy = Chi::from_line("rock:15,vine:25,ice:3");
+        g.equip(0, &worthy).unwrap();
+        // budget: 3 of 4 spent; a 2-slot pack must be refused with a number
+        g.take(Item::Armor(MODS.iter().find(|m| m.name == "SCRUBBER PACK").unwrap())).unwrap();
+        let err = g.equip(0, &worthy).unwrap_err();
+        assert!(err.contains("no room"), "{err}");
+        // but a 1-slot liner fits
+        g.take(Item::Armor(MODS.iter().find(|m| m.name == "AEROGEL LINER").unwrap())).unwrap();
+        g.equip(1, &worthy).unwrap();
+    }
+
+    #[test]
+    fn nineteen_wardens_drop_nineteen_distinct_arms() {
+        let mut seen = std::collections::HashSet::new();
+        for b in BOSSES {
+            let d = warden_drop(b);
+            assert!(seen.insert(d.code()), "{} drops a duplicate", b.id);
+            match d {
+                Item::Weapon { from: Some(f), .. } => assert_eq!(f, b.id),
+                other => panic!("a warden dropped {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn gear_roundtrips_the_save_lines() {
+        let mut g = Gear::default();
+        let chi = Chi::from_line("fire:15");
+        g.take(Item::Weapon { verb: Verb::Beam, element: Element::Ice, from: None }).unwrap();
+        g.equip(0, &chi).unwrap();
+        g.take(Item::Armor(MODS.iter().find(|m| m.name == "RADIATOR VANES").unwrap())).unwrap();
+        g.equip(0, &chi).unwrap();
+        g.take(Item::Weapon { verb: Verb::Vortex, element: Element::Water, from: Some("trenchmaster".into()) }).unwrap();
+        let (a, w, b) = g.save_lines();
+        let back = Gear::from_save(&a, &w, &b);
+        assert_eq!(back.save_lines(), (a, w, b));
+        assert!(back.energy.is_some() && back.worn.len() == 1 && back.bag.len() == 1);
+    }
+}

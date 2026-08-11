@@ -113,6 +113,28 @@ pub fn run(argv: &[String]) {
                     nf.record(week);
                     let (mut sv, b, cfg) = save::load();
                     sv.nightfalls = nf.line();
+                    // the burn trains the bearer, and some weeks it pays kit
+                    let mut chi_log = crate::chi::Chi::from_line(&sv.chi);
+                    chi_log.bank(card.burn, crate::chi::PER_NIGHTFALL);
+                    sv.chi = chi_log.line();
+                    println!(
+                        "   chi: {} +{} (L{})",
+                        card.burn.name(),
+                        crate::chi::PER_NIGHTFALL,
+                        chi_log.level(card.burn)
+                    );
+                    if let Some(drop) = crate::gear::nightfall_drop(card.burn) {
+                        let mut gear = crate::gear::Gear::from_save(&sv.armed, &sv.worn, &sv.bag);
+                        let label = drop.label();
+                        match gear.take(drop) {
+                            Ok(()) => println!("   drop: {label} -> bag"),
+                            Err(e) => println!("   drop: {label} refused ({e})"),
+                        }
+                        let (armed, worn, bag_line) = gear.save_lines();
+                        sv.armed = armed;
+                        sv.worn = worn;
+                        sv.bag = bag_line;
+                    }
                     save::store(&sv, &b, &cfg);
                     let lit = energon::energon(&log, &raids, nf.count());
                     println!("   week {week} banked -- energon {lit} (+{})", energon::PER_NIGHTFALL);
