@@ -150,6 +150,18 @@ step pinned by a test or a doc comment that says exactly what it's waiting
 on. Item 2's own remaining piece — a streaming render path — is no longer
 on this list; it's built.
 
+One more thing this list never named because items 2 and 3 were written
+before either existed: `studio-engine` now has `device::DeviceEngine`,
+wiring its own `EngineState`/`Command` ring to `StreamingRenderer` and
+`studio_io::AudioIo` into an actual callback — proven end-to-end against a
+real `AudioIo` implementor (`TestIo`, standing in for `CpalIo` since there's
+still no hardware in this sandbox), not just called directly. This crate
+needed no UI toolchain to build that: it has never depended on egui.
+`StreamingRenderer::render` still allocates per call, so this callback is
+correct but not yet the allocation-free one `studio_io::DuplexCallback`'s
+own docs ask for — named directly in `device.rs`'s module doc, not
+discovered later.
+
 A test found the one real bug in this pass: `rebuild()` originally replayed the
 op log from an empty project and erased every track and source that pre-dated
 the session. A `Doc` now remembers the project it opened.
