@@ -12,6 +12,7 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
+pub mod term_grid;
 pub mod iio_light;
 pub mod editor_keys;
 pub mod date_phrase;
