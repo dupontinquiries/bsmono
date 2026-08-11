@@ -89,3 +89,35 @@ unknown about rather than papering over.
 The `pw-stream` binding that turns the fd into frames. Everything it would
 *decide* — which node, which way up, whether PIP is possible — is already
 decided and tested in `camera_select` without a device.
+
+## Frame delivery: the three-tier conversion ladder
+
+Read from `aperture/src/viewfinder.rs`. This is the decision that actually
+determines whether a preview lags, and Snapshot makes it **once at pipeline
+build time** — the answer cannot change after the sink exists.
+
+```
+   sink accepts YUY2?  --yes-->  paintablesink direct        no conversion
+          |no
+   gl-context is Some? --yes-->  glsinkbin + glcolorconvert  GPU pass
+          |no
+                                 videoconvert               CPU, ~110 MB/s @720p30
+```
+
+Two details worth copying exactly:
+
+* **The YUV check is a caps intersection, not an assumption.** Snapshot builds
+  YUY2 caps and intersects them with the sink pad template. If the sink takes
+  camera-native YUV, the most expensive step in the pipeline does not exist.
+* **GL is chosen only when `gl-context` is actually `Some`.** Guessing is caught
+  by the CPU fallback — but by then the pipeline is built and the preview is
+  already slow.
+
+`frame_pump::ConvertPath` models this ladder, and `should_downscale` fires only
+on the CPU tier: on the GPU paths resolution is nearly free, so dropping it
+there costs image quality for nothing.
+
+The `tee` is also worth noting — Snapshot branches the viewfinder sink so
+recording and preview share one capture rather than opening the camera twice. On
+the FP5's shared ISP that is not an optimisation, it is the difference between
+working and not.
