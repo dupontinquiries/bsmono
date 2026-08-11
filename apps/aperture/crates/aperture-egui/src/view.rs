@@ -36,6 +36,7 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
         state.show_loop_pane = !state.show_loop_pane;
     }
     state.poll_completions(now_ms);
+    state.poll_note();
     state.tick_completion(now_ms);
     if state.debounce.armed() || state.ghost.is_pending() {
         // A request may become due (or land) without any input event —
@@ -152,12 +153,29 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     let caret = state.editor.caret_pos();
     state.cam.caret_x.target = caret.col as f32 * m.char_w;
     state.cam.caret_y.target = caret.line as f32 * m.line_h;
-    if state.follow_caret {
+    let max_scroll = (total_h - rect.height()).max(0.0);
+    if state.follow_mode {
+        // Only when the caret LINE moved (impakt-cam's event model): wheel
+        // scrolling is free browsing until the next caret motion — and never
+        // mid-drag, so selecting by mouse doesn't yank the world.
+        let dragging = ui.ctx().input(|i| i.pointer.primary_down());
+        if caret.line != state.last_follow_line && !dragging {
+            state.last_follow_line = caret.line;
+            let follow = crate::camera::Follow::lines(2.0, 120.0, m.line_h);
+            let caret_y = caret.line as f32 * m.line_h;
+            match follow.target(caret_y, m.line_h, rect.height(), max_scroll, state.cam.scroll_y.target) {
+                crate::camera::FollowMove::Keep => {}
+                crate::camera::FollowMove::Glide(t) => state.cam.scroll_y.target = t,
+                crate::camera::FollowMove::Snap(t) => state.cam.scroll_y.snap(t),
+            }
+        }
+        state.follow_caret = false; // the mode supersedes the one-shot
+    } else if state.follow_caret {
         state.follow_caret = false;
         let y0 = caret.line as f32 * m.line_h;
         state.cam.ensure_visible(y0, y0 + m.line_h, rect.height(), m.line_h * 2.0);
     }
-    state.cam.clamp_scroll((total_h - rect.height()).max(0.0));
+    state.cam.clamp_scroll(max_scroll);
     if state.cam.step(dt) {
         ui.ctx().request_repaint();
     }
@@ -208,9 +226,32 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
 
     // Rows: gutter number + syntax-colored galley. Split the borrows so the
     // syntax cache can pull line text while we hold the rest of state.
-    let AppState { editor, syntax, .. } = &mut *state;
+    let AppState { editor, syntax, find, git_changed, .. } = &mut *state;
     for line in first..last {
         let y = rect.top() - scroll + line as f32 * m.line_h;
+        // Find-match slabs: every match a faint wash, the current one loud.
+        if let Some(f) = find.as_ref() {
+            for (c0, c1, current) in f.on_line(&editor.buffer, line) {
+                let x0 = rect.left() + m.gutter_w + c0 as f32 * m.char_w;
+                let x1 = rect.left() + m.gutter_w + c1 as f32 * m.char_w;
+                let r = Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + m.line_h));
+                let (fill, stroke) = if current {
+                    (colors.warning.gamma_multiply(0.35), Stroke::new(1.0, colors.warning))
+                } else {
+                    (colors.warning.gamma_multiply(0.16), Stroke::NONE)
+                };
+                painter.rect(r, 2.0, fill, stroke, egui::StrokeKind::Outside);
+            }
+        }
+        // Uncommitted lines wear a green bar in the gutter — diff as
+        // marginalia, the same mark the physical viewer uses on its page.
+        if git_changed.iter().any(|(a, b)| line >= *a && line < *b) {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(rect.left() + 1.0, y), Vec2::new(3.0, m.line_h)),
+                0.0,
+                Color32::from_rgb(94, 158, 76),
+            );
+        }
         let num = format!("{}", line + 1);
         let num_color = if line == caret.line { colors.accent } else { colors.text_weak };
         painter.text(
@@ -221,7 +262,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
             num_color,
         );
         let text = editor.buffer.line(line).into_owned();
-        let spans = syntax.spans_for(line, |j| editor.buffer.line(j).into_owned());
+        let spans = syntax.spans_for(line, &editor.buffer);
         let mut job = LayoutJob::default();
         let mut cursor = 0usize;
         for s in &spans {
@@ -234,6 +275,8 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
                 TokKind::Comment => colors.text_weak,
                 TokKind::Number => colors.warning,
                 TokKind::Attr => colors.accent_soft,
+                TokKind::Fn => colors.glow,
+                TokKind::Type => colors.accent_soft,
                 TokKind::Plain => colors.text,
             };
             let italics = s.kind == TokKind::Comment;
@@ -289,7 +332,57 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(530));
     }
 
+    // Symbol popup: a compact list pinned under the caret. The selection
+    // window shows at most eight rows; label bright, signature dim.
+    if let Some(p) = &state.popup {
+        let row_h = m.line_h + 4.0;
+        let shown = p.items.len().min(8);
+        let first = p.sel.saturating_sub(shown - 1).min(p.items.len() - shown);
+        let w = (m.char_w * 52.0).min(rect.width() - 24.0);
+        let px = cx.min(rect.right() - w - 8.0).max(rect.left() + 4.0);
+        let below = cy + m.line_h + 2.0;
+        let py = if below + shown as f32 * row_h + 8.0 > rect.bottom() {
+            cy - shown as f32 * row_h - 10.0 // flip above when the caret is low
+        } else {
+            below
+        };
+        let panel = Rect::from_min_size(Pos2::new(px, py), Vec2::new(w, shown as f32 * row_h + 8.0));
+        painter.rect_filled(panel, 6.0, colors.bg_raised);
+        painter.rect_stroke(panel, 6.0, Stroke::new(1.0, colors.border), egui::StrokeKind::Outside);
+        for (row, i) in (first..first + shown).enumerate() {
+            let item = &p.items[i];
+            let y = panel.top() + 4.0 + row as f32 * row_h;
+            let r = Rect::from_min_size(Pos2::new(panel.left() + 4.0, y), Vec2::new(w - 8.0, row_h));
+            if i == p.sel {
+                painter.rect_filled(r, 4.0, colors.accent.gamma_multiply(0.22));
+            }
+            let label_galley = painter.layout_no_wrap(
+                item.label.clone(),
+                m.font.clone(),
+                if i == p.sel { colors.text } else { colors.text_weak },
+            );
+            let label_w = label_galley.size().x;
+            painter.galley(Pos2::new(r.left() + 6.0, r.top() + 2.0), label_galley, colors.text);
+            let avail = w - label_w - 34.0;
+            if avail > m.char_w * 6.0 {
+                painter.text(
+                    Pos2::new(r.left() + label_w + 18.0, r.center().y),
+                    Align2::LEFT_CENTER,
+                    truncate(&item.detail, (avail / (m.char_w * 0.8)) as usize),
+                    FontId::monospace(m.font.size * 0.8),
+                    colors.text_weak.gamma_multiply(0.75),
+                );
+            }
+        }
+    }
+
     scrollbar(ui, state, &painter, rect, total_h, colors.accent);
+
+    // A read-only revision preview gets a border, not just a status chip —
+    // the cue should be visible without looking down at the chrome.
+    if state.rev_ix.is_some() {
+        painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, colors.warning), egui::StrokeKind::Inside);
+    }
 }
 
 fn fmt(font: &FontId, color: Color32, italics: bool) -> TextFormat {
@@ -346,6 +439,29 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
         );
         ui.separator();
         ui.label(egui::RichText::new(format!("{:?}", state.lang)).color(colors.text_weak));
+        if state.syntax.is_tree_sitter() {
+            ui.label(egui::RichText::new("ts").color(colors.text_weak).small());
+        }
+        if state.follow_mode {
+            ui.separator();
+            ui.label(egui::RichText::new("◉ follow").color(colors.accent));
+        }
+        if let Some(i) = state.rev_ix {
+            ui.separator();
+            let rev = &state.revs[i];
+            let mark = if matches!(rev.kind, aperture_core::gitspace::RevKind::Checkpoint(_)) { "◈" } else { "●" };
+            ui.label(
+                egui::RichText::new(format!("👁 read-only · rev {}/{} {mark} · Esc to return", i + 1, state.revs.len()))
+                    .color(colors.warning),
+            );
+        } else if !state.git_changed.is_empty() {
+            ui.separator();
+            let n: usize = state.git_changed.iter().map(|(a, b)| b - a).sum();
+            ui.label(
+                egui::RichText::new(format!("± {n} uncommitted"))
+                    .color(Color32::from_rgb(120, 176, 100)),
+            );
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if let Some((msg, until)) = &state.status {
@@ -369,6 +485,12 @@ fn status_bar(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, now_ms:
             ui.label(egui::RichText::new("Ctrl+P commands · F2 loop").color(colors.text_weak));
         });
     });
+    if state.rev_ix.is_some() && !state.rev_note.is_empty() {
+        ui.horizontal(|ui| {
+            ui.add_space(2.0);
+            ui.label(egui::RichText::new(format!("✎ {}", state.rev_note)).color(colors.text_weak).small());
+        });
+    }
 }
 
 fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, now_ms: u64) {
@@ -455,13 +577,57 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
                             }
                         }
                         Mode::OpenFile => {
-                            ui.label(
-                                egui::RichText::new("Enter to open · Esc to cancel")
-                                    .color(colors.text_weak)
-                                    .small(),
-                            );
-                            if enter && !p.input.trim().is_empty() {
-                                open_path = Some(p.input.trim().to_string());
+                            let ranked = crate::file_finder::rank(&p.root, &p.files, &p.input, 10);
+                            if !ranked.is_empty() {
+                                // Fuzzy matches against the walked file list:
+                                // the TODO.md-named behavior. Typed-path
+                                // entry (below) stays reachable for paths
+                                // outside the walk — never removed, only
+                                // no longer the ONLY way in.
+                                ui.label(
+                                    egui::RichText::new("↑↓ navigate · Enter open · Esc cancel")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if up {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                if down {
+                                    p.selected = (p.selected + 1).min(ranked.len() - 1);
+                                }
+                                for (i, (full, rel)) in ranked.iter().enumerate() {
+                                    let selected = i == p.selected;
+                                    let bg = if selected { colors.accent.gamma_multiply(0.25) } else { Color32::TRANSPARENT };
+                                    let text_color = if selected { colors.text } else { colors.text_weak };
+                                    let row = egui::Frame::new().fill(bg).corner_radius(CornerRadius::same(4)).inner_margin(4.0);
+                                    let resp = row
+                                        .show(ui, |ui| {
+                                            ui.set_width(ui.available_width());
+                                            ui.label(egui::RichText::new(rel).color(text_color));
+                                        })
+                                        .response
+                                        .interact(Sense::click());
+                                    if resp.clicked() {
+                                        open_path = Some(full.to_string_lossy().into_owned());
+                                    }
+                                }
+                                if enter {
+                                    let i = p.selected.min(ranked.len() - 1);
+                                    open_path = Some(ranked[i].0.to_string_lossy().into_owned());
+                                }
+                            } else {
+                                // No fuzzy hit at all (or nothing walked, e.g.
+                                // an unreadable root): fall back to the
+                                // original honest behavior — type the exact
+                                // path, Enter opens it verbatim.
+                                ui.label(
+                                    egui::RichText::new("no match — Enter opens the typed path exactly · Esc cancel")
+                                        .color(colors.text_weak)
+                                        .small(),
+                                );
+                                if enter && !p.input.trim().is_empty() {
+                                    open_path = Some(p.input.trim().to_string());
+                                }
                             }
                         }
                     }
@@ -504,7 +670,24 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::S => K::S,
         EK::Y => K::Y,
         EK::Z => K::Z,
+        EK::E => K::E,
+        EK::Comma => K::Comma,
+        EK::Period => K::Period,
+        EK::B => K::B,
+        EK::M => K::M,
+        EK::F => K::F,
+        EK::F3 => K::F3,
         EK::Space => K::Space,
         _ => return None,
     })
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    }
 }

@@ -12,8 +12,9 @@ use crate::camera::Cam;
 use crate::ghost::Ghost;
 use aperture_complete::engine::Engine;
 use aperture_complete::providers::{CommandProvider, OllamaConfig, OllamaProvider, StaticProvider};
-use aperture_complete::{make_request, CompletionOutcome, Debounce, Provider};
-use aperture_core::syntax::{Language, Lexer, SyntaxCache};
+use aperture_complete::{make_request, CompletionOutcome, CompletionRequest, Debounce, Provider};
+use aperture_core::gitspace::{self, GitRunner, Runner as _};
+use aperture_core::syntax::{Language, Syntax};
 use aperture_core::{Editor, Selection};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -44,7 +45,94 @@ pub enum K {
     S,
     Y,
     Z,
+    E,
+    F,
+    F3,
     Space,
+    Comma,
+    Period,
+    B,
+    M,
+}
+
+/// Incremental search. Matches are absolute char ranges, kept sorted; the
+/// query is case-smart in the ASCII sense (any uppercase letter → sensitive)
+/// so byte offsets survive the fold — Unicode case folding can change
+/// lengths, and a find bar that misdraws its own highlights is worse than
+/// one that is case-exact for non-ASCII.
+#[derive(Clone, Debug, Default)]
+pub struct FindState {
+    pub query: String,
+    pub matches: Vec<(usize, usize)>,
+    pub cur: usize,
+    last_version: u64,
+    last_query: String,
+}
+
+impl FindState {
+    pub fn recompute(&mut self, buffer: &aperture_core::Buffer, version: u64) {
+        if version == self.last_version && self.query == self.last_query {
+            return;
+        }
+        self.last_version = version;
+        self.last_query = self.query.clone();
+        self.matches.clear();
+        self.cur = 0;
+        if self.query.is_empty() {
+            return;
+        }
+        let sensitive = self.query.chars().any(|c| c.is_ascii_uppercase());
+        let needle = if sensitive { self.query.clone() } else { self.query.to_ascii_lowercase() };
+        let mut line_start_char = 0usize;
+        for li in 0..buffer.len_lines() {
+            let line = buffer.line(li);
+            let hay = if sensitive { line.to_string() } else { line.to_ascii_lowercase() };
+            for (b, _) in hay.match_indices(&needle) {
+                let c0 = hay[..b].chars().count();
+                let c1 = c0 + needle.chars().count();
+                self.matches.push((line_start_char + c0, line_start_char + c1));
+            }
+            line_start_char += line.chars().count();
+        }
+    }
+
+    /// Column ranges of matches on `line` (for the view's highlight slabs),
+    /// plus whether each is the current one.
+    pub fn on_line(&self, buffer: &aperture_core::Buffer, line: usize) -> Vec<(usize, usize, bool)> {
+        let start = buffer.pos_to_char(aperture_core::Pos::new(line, 0));
+        let end = start + buffer.line(line).chars().count();
+        self.matches
+            .iter()
+            .enumerate()
+            .filter(|(_, &(a, _))| a >= start && a < end)
+            .map(|(i, &(a, b))| (a - start, b.min(end) - start, i == self.cur))
+            .collect()
+    }
+}
+
+/// The symbol popup: instant, local, LSP-SHAPED. Items come from
+/// `AppState::gather_symbols` today (the outline, parsed in-process); a
+/// language server plugs in as another producer of the same `PopupItem`s —
+/// the popup itself never knows where names come from. That's the "via LSP
+/// standards" seam: label/insert/detail is deliberately the shape of an LSP
+/// CompletionItem's label/insertText/detail.
+#[derive(Clone, Debug)]
+pub struct PopupItem {
+    pub label: String,
+    pub insert: String,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Popup {
+    pub items: Vec<PopupItem>,
+    pub sel: usize,
+    /// Char offset where the word being completed starts.
+    pub prefix_start: usize,
+}
+
+pub(crate) fn sel_range(a: usize, b: usize) -> aperture_core::Selection {
+    aperture_core::Selection { anchor: a, head: b }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +173,48 @@ pub struct AppState {
     pub path: Option<PathBuf>,
     pub dirty: bool,
     pub lang: Language,
-    pub syntax: SyntaxCache,
+    pub syntax: Syntax,
+    pub find: Option<FindState>,
+    /// impakt-cam mode: the camera keeps the caret centered (dead zone +
+    /// snap horizon live in `camera::Follow`). The view applies it only when
+    /// the caret LINE changed, so wheel-browsing is free until you type.
+    pub follow_mode: bool,
+    pub last_follow_line: usize,
+    // ── gitspace ────────────────────────────────────────────────────────────
+    git: Option<(GitRunner, String)>,
+    /// Worktree lines changed vs. the newest commit, refreshed on load and
+    /// after every save (edits between saves don't move the gutter — it
+    /// answers "what's on disk that isn't committed", the same question the
+    /// physical viewer's worktree marks answer).
+    pub git_changed: Vec<(usize, usize)>,
+    /// The file's timeline: commits + gitmind checkpoints, newest first.
+    pub revs: Vec<gitspace::Rev>,
+    /// None = live and editable; Some(i) = READ-ONLY preview of revs[i].
+    /// Mirrors aperture-view's rev_ix exactly — same timeline, same index,
+    /// same "past-the-newest steps home" rule — so the two shells agree on
+    /// what "revision 3" means if you ever compare notes between them.
+    pub rev_ix: Option<usize>,
+    /// The live buffer's text, snapshotted on entering a revision preview.
+    /// Returning home restores it EXACTLY — unsaved edits survive browsing
+    /// history unchanged. Honest caveat: the undo STACK does not survive the
+    /// round trip (Editor's history isn't cloneable, and cloning it just for
+    /// this felt like the wrong invasiveness to add to aperture-core for a
+    /// read-only side trip); content is preserved, undo depth resets.
+    live_text: Option<String>,
+    /// The SAME margin-note idea as aperture-view: a dedicated engine (own
+    /// APERTURE_CMD provider, independent of the ghost-completion engine —
+    /// a "describe this diff" prompt and a fill-in-middle prompt are
+    /// different jobs) that describes whatever revision is on screen.
+    /// Newest-request-wins is exactly right here too: scrub through history
+    /// and only wherever you settle gets described.
+    describe: Option<Engine>,
+    pub rev_note: String,
+    note_generation: u64,
+    fim_ctx: String,
+    fim_ctx_version: u64,
+    pub popup: Option<Popup>,
+    symbols: Vec<(String, String)>,
+    symbols_version: u64,
 
     pub cam: Cam,
     /// View sets this after any caret-moving command so the camera follows.
@@ -121,7 +250,26 @@ impl AppState {
             path,
             dirty: false,
             lang,
-            syntax: SyntaxCache::new(Lexer::new(lang)),
+            syntax: Syntax::new(lang),
+            find: None,
+            follow_mode: false,
+            last_follow_line: usize::MAX,
+            git: None,
+            git_changed: Vec::new(),
+            revs: Vec::new(),
+            rev_ix: None,
+            live_text: None,
+            describe: std::env::var("APERTURE_CMD").ok().map(|cmd| {
+                let argv = cmd.split_whitespace().map(str::to_string).collect();
+                Engine::new(Box::new(CommandProvider::new(argv)))
+            }),
+            rev_note: String::new(),
+            note_generation: 0,
+            fim_ctx: String::new(),
+            fim_ctx_version: u64::MAX,
+            popup: None,
+            symbols: Vec::new(),
+            symbols_version: u64::MAX,
             cam: Cam::new(15.0),
             follow_caret: false,
             ai_enabled: true,
@@ -142,7 +290,174 @@ impl AppState {
             s.apply_env_provider();
             s.engine = Some(Engine::new(s.build_provider()));
         }
+        s.git = s.path.as_deref().and_then(gitspace::discover);
+        if let Some((r, rel)) = &s.git {
+            s.revs = gitspace::history(r, rel, 48);
+        }
+        s.refresh_git();
         s
+    }
+
+    /// Where Ctrl+O's file picker walks from: the git repo root when there
+    /// is one (the natural "workspace" — same root gitspace already
+    /// discovered), else the open file's directory, else cwd. Never fails
+    /// outright; worst case is "walk from wherever we happen to be."
+    pub fn workspace_root(&self) -> std::path::PathBuf {
+        if let Some((r, _)) = &self.git {
+            return r.root.clone();
+        }
+        if let Some(p) = &self.path {
+            if let Some(dir) = p.parent() {
+                return dir.to_path_buf();
+            }
+        }
+        std::env::current_dir().unwrap_or_default()
+    }
+
+    /// Recompute the gutter's diff marks: worktree vs. the newest commit.
+    /// Called on load and after every successful save — never mid-edit, so
+    /// typing doesn't churn a `git diff` on every keystroke. Only meaningful
+    /// while live; a shown revision computes its own diff in `rev_step`.
+    fn refresh_git(&mut self) {
+        if self.rev_ix.is_some() {
+            return;
+        }
+        self.git_changed = self
+            .git
+            .as_ref()
+            .and_then(|(r, rel)| {
+                self.revs
+                    .iter()
+                    .find(|v| v.kind == gitspace::RevKind::Commit)
+                    .map(|base| gitspace::worktree_changed(r, &base.oid, rel))
+            })
+            .unwrap_or_default();
+    }
+
+    /// Step through the file's timeline: `d = +1` older, `-1` newer; newer
+    /// past the newest comes home to the live worktree — exactly
+    /// aperture-view's `jump`/`rev_step` contract, so the two shells' idea of
+    /// "revision 3" is the same index into the same merged history. The view
+    /// is READ-ONLY while previewing (`type_text` and friends check
+    /// `rev_ix`); Escape or stepping home hands editing back.
+    pub fn rev_step(&mut self, d: isize, now_ms: u64) {
+        if self.revs.is_empty() || self.git.is_none() {
+            return;
+        }
+        let cur = self.rev_ix.map(|i| i as isize).unwrap_or(-1);
+        let next = (cur + d).clamp(-1, self.revs.len() as isize - 1);
+        if next == cur {
+            return;
+        }
+        if self.live_text.is_none() {
+            self.live_text = Some(self.editor.buffer.to_string());
+        }
+        let (r, rel) = self.git.as_ref().unwrap();
+        if next < 0 {
+            let text = self.live_text.take().unwrap_or_default();
+            self.rev_ix = None;
+            self.set_preview_text(&text);
+            self.refresh_git();
+            self.rev_note.clear();
+            self.set_status("back to the live file", now_ms);
+        } else {
+            let i = next as usize;
+            let Some(text) = gitspace::file_at(r, &self.revs[i].oid, rel) else {
+                // The file didn't exist at this revision: step past it in
+                // the same direction, same convention as aperture-view.
+                self.rev_ix = Some(i);
+                return self.rev_step(d.signum(), now_ms);
+            };
+            self.git_changed = gitspace::changed_ranges(r, &self.revs[i].oid, rel);
+            self.rev_ix = Some(i);
+            self.set_preview_text(&text);
+            let mark = if matches!(self.revs[i].kind, gitspace::RevKind::Checkpoint(_)) { "◈ " } else { "" };
+            self.set_status(
+                &format!("viewing {}rev {}/{} — read-only ({})", mark, i + 1, self.revs.len(), self.revs[i].subject),
+                now_ms,
+            );
+            self.request_describe();
+        }
+    }
+
+    /// Promote the revision currently on screen to a real branch (gitmind's
+    /// own pattern: "promoting any checkpoint to a real branch is one
+    /// `branch <n> <ckpt-oid>`" — this is that command, reachable from
+    /// wherever you're LOOKING). Only meaningful while previewing; a no-op
+    /// otherwise rather than branching HEAD, which `Ctrl+B` on the live file
+    /// would too easily fire by accident.
+    pub fn branch_from_here(&mut self, now_ms: u64) {
+        let (Some((r, _)), Some(i)) = (&self.git, self.rev_ix) else {
+            self.set_status("branch: preview a revision first", now_ms);
+            return;
+        };
+        let rev = &self.revs[i];
+        let name = gitspace::suggest_branch_name(rev);
+        match gitspace::branch_from(r, &rev.oid, &name) {
+            Ok(()) => self.set_status(&format!("branched '{name}' from {}", &rev.oid[..8]), now_ms),
+            Err(e) => self.set_status(&format!("branch failed: {}", e.trim().lines().next().unwrap_or(&e)), now_ms),
+        }
+    }
+
+    /// Check the previewed revision out into a fresh side-by-side worktree
+    /// (gitmind's `materialize`): "stand in this version, in a real
+    /// directory, without disturbing the one I'm in." Same guard as
+    /// `branch_from_here` — a no-op message while live, never checking out
+    /// HEAD into a stray directory by accident.
+    pub fn materialize_here(&mut self, now_ms: u64) {
+        let (Some((r, _)), Some(i)) = (&self.git, self.rev_ix) else {
+            self.set_status("materialize: preview a revision first", now_ms);
+            return;
+        };
+        let rev = &self.revs[i];
+        let dest = gitspace::suggest_worktree_path(&r.root, rev);
+        match gitspace::materialize(r, &rev.oid, &dest.to_string_lossy()) {
+            Ok(()) => self.set_status(&format!("materialized at {}", dest.display()), now_ms),
+            Err(e) => self.set_status(&format!("materialize failed: {}", e.trim().lines().next().unwrap_or(&e)), now_ms),
+        }
+    }
+
+    /// Ask the assistant for one sentence on the shown revision: what it
+    /// changed and when you'd want it. No `APERTURE_CMD`, no note, zero
+    /// cost — same contract as aperture-view's `request_describe`.
+    fn request_describe(&mut self) {
+        self.rev_note.clear();
+        let (Some(engine), Some(i), Some((r, rel))) = (&self.describe, self.rev_ix, &self.git) else {
+            return;
+        };
+        let rev = &self.revs[i];
+        self.note_generation += 1;
+        let stat = r.run(&["show", "--stat", "--format=%s", &rev.oid, "--", rel.as_str()]).unwrap_or_default();
+        let prompt = format!(
+            "One sentence, plain words: what did this change do to this file, and when would someone want this version?\nCommit: {}\n{}\nAnswer:",
+            rev.subject,
+            stat.chars().take(600).collect::<String>()
+        );
+        engine.request(CompletionRequest { generation: self.note_generation, prefix: prompt, suffix: String::new(), lang: "text".into() });
+    }
+
+    /// Drain the describe engine; call once per frame.
+    pub fn poll_note(&mut self) {
+        let Some(engine) = &self.describe else { return };
+        while let Some(out) = engine.poll() {
+            if out.generation == self.note_generation {
+                if let Ok(text) = out.result {
+                    self.rev_note = text.trim().lines().next().unwrap_or("").chars().take(160).collect();
+                }
+            }
+        }
+    }
+
+    /// Swap the buffer's content without touching `path`/`lang`/`git`;
+    /// fresh parse, caret home, undo stack reset (see `live_text`'s doc).
+    fn set_preview_text(&mut self, text: &str) {
+        self.editor = Editor::from_str(text);
+        self.syntax = Syntax::new(self.lang);
+        self.dirty = false;
+        self.popup = None;
+        self.ghost.dismiss();
+        self.fim_ctx_version = u64::MAX;
+        self.symbols_version = u64::MAX;
     }
 
     fn apply_env_provider(&mut self) {
@@ -188,10 +503,375 @@ impl AppState {
         self.status = Some((msg.to_string(), until));
     }
 
+    /// The context filler: the file's outline, as commented signatures, cached
+    /// by buffer version. This is what turns "complete this cursor" into
+    /// "complete this cursor IN THIS FILE" — the model sees every fn/type
+    /// name and signature for ~one screen of budget, assembled in
+    /// microseconds from the already-parsed tree (no LSP round trip; the
+    /// same seam serves an LSP source later, but a local parse beats a
+    /// server hop for latency at this job).
+    pub fn fim_context(&mut self) -> String {
+        if self.fim_ctx_version == self.editor.version {
+            return self.fim_ctx.clone();
+        }
+        let outline = self.syntax.outline(&self.editor.buffer);
+        let mut ctx = String::new();
+        if !outline.is_empty() {
+            ctx.push_str("// file outline:\n");
+            for it in outline.iter().take(60) {
+                ctx.push_str("//   ");
+                ctx.push_str(&it.sig);
+                ctx.push('\n');
+            }
+        }
+        self.fim_ctx_version = self.editor.version;
+        self.fim_ctx = ctx.clone();
+        ctx
+    }
+
+    pub fn toggle_follow(&mut self, now_ms: u64) {
+        self.follow_mode = !self.follow_mode;
+        self.last_follow_line = usize::MAX; // re-center immediately on the next frame
+        let msg = if self.follow_mode { "follow camera: on" } else { "follow camera: off" };
+        self.set_status(msg, now_ms);
+    }
+
+    // ── symbol popup ────────────────────────────────────────────────────────
+
+    fn gather_symbols(&mut self) -> &[(String, String)] {
+        if self.symbols_version != self.editor.version {
+            self.symbols = self
+                .syntax
+                .outline(&self.editor.buffer)
+                .into_iter()
+                .map(|it| (it.name, it.sig))
+                .collect();
+            self.symbols_version = self.editor.version;
+        }
+        &self.symbols
+    }
+
+    /// The word (ident chars, `::` included) ending at the caret.
+    fn word_before_caret(&self) -> (usize, String) {
+        let caret = self.editor.sel.head;
+        let mut start = caret;
+        let mut chars: Vec<char> = Vec::new();
+        while start > 0 {
+            let c = self.editor.buffer.char_at(start - 1);
+            match c {
+                Some(c) if c.is_alphanumeric() || c == '_' || c == ':' => {
+                    chars.push(c);
+                    start -= 1;
+                }
+                _ => break,
+            }
+        }
+        chars.reverse();
+        (start, chars.into_iter().collect())
+    }
+
+    /// (Re)build the popup for the word at the caret; closes it when the word
+    /// is too short or nothing matches. `min_len` lets Ctrl+Space open on
+    /// anything while auto-trigger waits for two chars.
+    fn refresh_popup(&mut self, min_len: usize) {
+        if !self.editor.sel.is_caret() {
+            self.popup = None;
+            return;
+        }
+        let (start, word) = self.word_before_caret();
+        if word.chars().count() < min_len {
+            self.popup = None;
+            return;
+        }
+        self.gather_symbols();
+        let mut scored: Vec<(i32, PopupItem)> = self
+            .symbols
+            .iter()
+            .filter(|(name, _)| name != &word)
+            .filter_map(|(name, sig)| {
+                uikit_egui::fuzzy::score(&word, name).map(|s| {
+                    (s, PopupItem { label: name.clone(), insert: name.clone(), detail: sig.clone() })
+                })
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.label.len().cmp(&b.1.label.len())));
+        let items: Vec<PopupItem> = scored.into_iter().map(|(_, i)| i).take(24).collect();
+        if items.is_empty() {
+            self.popup = None;
+        } else {
+            self.ghost.dismiss();
+            self.popup = Some(Popup { items, sel: 0, prefix_start: start });
+        }
+    }
+
+    fn popup_accept(&mut self, now_ms: u64) {
+        let Some(p) = self.popup.take() else { return };
+        let Some(item) = p.items.get(p.sel) else { return };
+        let caret = self.editor.sel.head;
+        self.editor.replace_range(p.prefix_start, caret, &item.insert);
+        self.after_edit(now_ms);
+        self.arm_completion(now_ms);
+    }
+
+    /// Popup key handling; true = consumed. Runs BEFORE the ghost so Tab
+    /// prefers the explicit list over the speculative ghost.
+    fn popup_key(&mut self, key: K, shift: bool, now_ms: u64) -> bool {
+        if self.popup.is_none() {
+            return false;
+        }
+        match key {
+            K::Down => {
+                if let Some(p) = &mut self.popup {
+                    p.sel = (p.sel + 1) % p.items.len();
+                }
+            }
+            K::Up => {
+                if let Some(p) = &mut self.popup {
+                    p.sel = (p.sel + p.items.len() - 1) % p.items.len();
+                }
+            }
+            K::Tab | K::Enter => {
+                let _ = shift;
+                self.popup_accept(now_ms);
+            }
+            K::Escape => self.popup = None,
+            K::Backspace => {
+                self.popup = None; // the backspace itself falls through to the editor
+                return false;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    // ── auto-pairs ──────────────────────────────────────────────────────────
+    //
+    // Three moves, all invertible through the ordinary op history:
+    //  wrap    — selection + opener types the pair AROUND it, selection kept;
+    //  pair    — opener at a caret inserts both, caret lands between;
+    //  skip    — typing a closer that's already under the caret steps over it
+    //            instead of doubling it (unconditional: predictable beats
+    //            clever bookkeeping about who inserted it).
+    // Quotes only pair when they don't touch a word (so `don't` and Rust
+    // lifetimes never fight the editor). Backspace inside an empty pair
+    // removes both (one gesture).
+
+    fn pair_of(open: char) -> Option<char> {
+        match open {
+            '(' => Some(')'),
+            '[' => Some(']'),
+            '{' => Some('}'),
+            '"' => Some('"'),
+            '\'' => Some('\''),
+            _ => None,
+        }
+    }
+
+    fn try_auto_pair(&mut self, t: &str, now_ms: u64) -> bool {
+        let mut chars = t.chars();
+        let (Some(ch), None) = (chars.next(), chars.next()) else { return false };
+        let caret = self.editor.sel.head;
+        let next = self.editor.buffer.char_at(caret);
+        let is_quote = ch == '"' || ch == '\'';
+
+        // skip-over: the closer is already there.
+        if matches!(ch, ')' | ']' | '}') || is_quote {
+            if next == Some(ch) && self.editor.sel.is_caret() {
+                self.ghost.dismiss();
+                self.debounce.cancel();
+                self.editor.move_right(false);
+                return true;
+            }
+            if !is_quote {
+                return false; // a bare closer with nothing under the caret: type it plainly
+            }
+        }
+
+        let Some(close) = Self::pair_of(ch) else { return false };
+
+        // wrap: opener with a selection surrounds it and keeps it selected.
+        if !self.editor.sel.is_caret() {
+            let (a, b) = (self.editor.sel.min(), self.editor.sel.max());
+            let inner = self.editor.buffer.slice_to_string(a, b);
+            self.ghost.dismiss();
+            self.editor.replace_range(a, b, &format!("{ch}{inner}{close}"));
+            self.editor.sel = sel_range(a + 1, b + 1);
+            self.after_edit(now_ms);
+            return true;
+        }
+
+        // quotes: never pair against a word (apostrophes, lifetimes).
+        if is_quote {
+            let prev = if caret > 0 { self.editor.buffer.char_at(caret - 1) } else { None };
+            let word = |c: Option<char>| c.map_or(false, |c| c.is_alphanumeric() || c == '_');
+            if word(prev) || word(next) {
+                return false;
+            }
+        }
+
+        // pair: both chars, caret between — ONE history gesture, so a single
+        // undo removes the pair the way a single keystroke created it.
+        self.ghost.dismiss();
+        self.debounce.cancel();
+        self.editor.insert_text(&format!("{ch}{close}"), now_ms);
+        self.editor.move_left(false);
+        self.after_edit(now_ms);
+        true
+    }
+
+    /// Backspace between an empty pair deletes both halves.
+    fn backspace_pair(&mut self, now_ms: u64) -> bool {
+        if !self.editor.sel.is_caret() {
+            return false;
+        }
+        let caret = self.editor.sel.head;
+        if caret == 0 {
+            return false;
+        }
+        let (prev, next) = (self.editor.buffer.char_at(caret - 1), self.editor.buffer.char_at(caret));
+        let paired = matches!((prev, next),
+            (Some('('), Some(')')) | (Some('['), Some(']')) | (Some('{'), Some('}'))
+            | (Some('"'), Some('"')) | (Some('\''), Some('\'')));
+        if paired {
+            self.editor.replace_range(caret - 1, caret + 1, "");
+            self.after_edit(now_ms);
+            return true;
+        }
+        false
+    }
+
+    // ── revision preview (read-only) ────────────────────────────────────────
+
+    /// While `rev_ix.is_some()`: cursor movement, scrolling, and Ctrl+,/.
+    /// pass through normally (browsing a fixed text is exactly what the
+    /// editor's motion code already does); anything that would MUTATE the
+    /// buffer is swallowed instead of silently no-oping — Escape (or
+    /// stepping past the newest revision) is the one documented way home.
+    fn handle_preview(&mut self, ev: &Ev, now_ms: u64) -> Option<Effects> {
+        match ev {
+            Ev::Key { key: K::Escape, .. } => {
+                while self.rev_ix.is_some() {
+                    self.rev_step(-1, now_ms);
+                }
+                Some(Effects::default())
+            }
+            Ev::Key { key: K::Comma, ctrl: true, .. } => {
+                self.rev_step(1, now_ms);
+                Some(Effects::default())
+            }
+            Ev::Key { key: K::Period, ctrl: true, .. } => {
+                self.rev_step(-1, now_ms);
+                Some(Effects::default())
+            }
+            Ev::Key { key: K::B, ctrl: true, .. } => {
+                self.branch_from_here(now_ms);
+                Some(Effects::default())
+            }
+            Ev::Key { key: K::M, ctrl: true, .. } => {
+                self.materialize_here(now_ms);
+                Some(Effects::default())
+            }
+            Ev::Text(_) | Ev::Paste(_) | Ev::Cut => Some(Effects::default()), // swallow mutation
+            Ev::Key { key: K::Backspace | K::Delete | K::Tab | K::Enter, .. } => Some(Effects::default()),
+            _ => None, // motion, copy, scroll, etc. — handle normally
+        }
+    }
+
+    // ── find (Ctrl+F) ───────────────────────────────────────────────────────
+
+    pub fn open_find(&mut self) {
+        let seed = if !self.editor.sel.is_caret() {
+            let t = self.editor.selected_text();
+            if t.contains('\n') { String::new() } else { t }
+        } else {
+            String::new()
+        };
+        let mut f = FindState { query: seed, matches: Vec::new(), cur: 0, last_version: u64::MAX, last_query: String::new() };
+        f.recompute(&self.editor.buffer, self.editor.version);
+        self.find = Some(f);
+        self.find_jump(1, true);
+    }
+
+    /// Returns Some(effects) when the event was consumed by find; None when
+    /// it closed find and should still be handled normally (never currently).
+    fn handle_find(&mut self, ev: &Ev, _now_ms: u64) -> Option<Effects> {
+        let fx = Effects::default();
+        match ev {
+            Ev::Text(t) => {
+                if let Some(f) = &mut self.find {
+                    f.query.push_str(t);
+                }
+                self.find_refresh_jump();
+            }
+            Ev::Paste(t) => {
+                if let Some(f) = &mut self.find {
+                    f.query.push_str(&t.replace('\n', " "));
+                }
+                self.find_refresh_jump();
+            }
+            Ev::Key { key: K::Backspace, .. } => {
+                if let Some(f) = &mut self.find {
+                    f.query.pop();
+                }
+                self.find_refresh_jump();
+            }
+            Ev::Key { key: K::Escape, .. } => self.find = None,
+            Ev::Key { key: K::Enter, shift, .. } | Ev::Key { key: K::F3, shift, .. } => {
+                self.find_jump(if *shift { -1 } else { 1 }, false);
+            }
+            Ev::Key { key: K::Down, .. } => self.find_jump(1, false),
+            Ev::Key { key: K::Up, .. } => self.find_jump(-1, false),
+            Ev::Key { key: K::F, ctrl: true, .. } => {} // already open; keep typing
+            _ => return Some(fx), // swallow everything else while the bar is up
+        }
+        Some(fx)
+    }
+
+    fn find_refresh_jump(&mut self) {
+        let version = self.editor.version;
+        if let Some(f) = &mut self.find {
+            f.recompute(&self.editor.buffer, version);
+        }
+        self.find_jump(1, true);
+    }
+
+    /// Move to the next/prev match. `from_caret` = seek the first match at or
+    /// after the caret instead of stepping from the current index.
+    fn find_jump(&mut self, dir: isize, from_caret: bool) {
+        let caret = self.editor.sel.min();
+        let version = self.editor.version;
+        let Some(f) = &mut self.find else { return };
+        f.recompute(&self.editor.buffer, version);
+        if f.matches.is_empty() {
+            return;
+        }
+        let n = f.matches.len();
+        f.cur = if from_caret {
+            f.matches.iter().position(|&(s, _)| s >= caret).unwrap_or(0)
+        } else if dir > 0 {
+            (f.cur + 1) % n
+        } else {
+            (f.cur + n - 1) % n
+        };
+        let (a, b) = f.matches[f.cur];
+        self.editor.sel = crate::state::sel_range(a, b);
+    }
+
     // ── the event loop ──────────────────────────────────────────────────────
 
     pub fn handle(&mut self, ev: Ev, now_ms: u64) -> Effects {
         let mut fx = Effects::default();
+        if self.find.is_some() {
+            if let Some(fx) = self.handle_find(&ev, now_ms) {
+                return fx;
+            }
+            // fall through: the event closed find and should also act normally
+        }
+        if self.rev_ix.is_some() {
+            if let Some(fx) = self.handle_preview(&ev, now_ms) {
+                return fx;
+            }
+        }
         match ev {
             Ev::Text(t) => self.type_text(&t, now_ms),
             Ev::Paste(t) => {
@@ -215,10 +895,14 @@ impl AppState {
     }
 
     fn type_text(&mut self, t: &str, now_ms: u64) {
+        if self.try_auto_pair(t, now_ms) {
+            self.popup = None;
+            return;
+        }
         let consumed = self.ghost.on_text_inserted(t);
         self.editor.insert_text(t, now_ms);
         self.dirty = true;
-        self.syntax.invalidate_from(self.editor.caret_pos().line.saturating_sub(0));
+        self.syntax.absorb(&mut self.editor.buffer);
         self.follow_caret = true;
         if consumed {
             // Ghost absorbed the keystroke: no re-request, no debounce churn.
@@ -226,12 +910,22 @@ impl AppState {
         } else {
             self.arm_completion(now_ms);
         }
+        // Popup auto-trigger — but never over a SHOWN ghost: the ghost is a
+        // concrete suggestion in hand, the popup is for fishing. Two ident
+        // chars open it; any non-ident char closes it.
+        if !self.ghost.is_shown() {
+            let ident = t.chars().all(|c| c.is_alphanumeric() || c == '_' || c == ':');
+            if ident {
+                self.refresh_popup(2);
+            } else {
+                self.popup = None;
+            }
+        }
     }
 
     fn after_edit(&mut self, now_ms: u64) {
         self.dirty = true;
-        let line = self.editor.caret_pos().line;
-        self.syntax.invalidate_from(line.saturating_sub(1));
+        self.syntax.absorb(&mut self.editor.buffer);
         self.follow_caret = true;
         let _ = now_ms;
     }
@@ -248,7 +942,11 @@ impl AppState {
     fn key(&mut self, key: K, ctrl: bool, shift: bool, alt: bool, now_ms: u64, fx: &mut Effects) {
         use K::*;
         let _ = alt;
-        // Ghost interception first: Tab / Ctrl+→ / Esc while shown.
+        // Popup first: an explicit list outranks the speculative ghost.
+        if self.popup_key(key, shift, now_ms) {
+            return;
+        }
+        // Ghost interception next: Tab / Ctrl+→ / Esc while shown.
         if self.ghost.is_shown() {
             match (key, ctrl) {
                 (Tab, false) => {
@@ -263,7 +961,7 @@ impl AppState {
                     if let Some(word) = self.ghost.accept_word() {
                         self.editor.insert_text(&word, now_ms);
                         self.dirty = true;
-                        self.syntax.invalidate_from(self.editor.caret_pos().line);
+                        self.syntax.absorb(&mut self.editor.buffer);
                         self.follow_caret = true;
                         self.debounce.cancel();
                     }
@@ -285,7 +983,20 @@ impl AppState {
             (S, true) => self.save(now_ms),
             (O, true) => self.open_palette_in_open_mode(),
             (P, true) => self.open_palette(),
-            (Space, true) => self.trigger_completion_now(now_ms),
+            (F, true) => self.open_find(),
+            (E, true) => self.toggle_follow(now_ms),
+            (Comma, true) => self.rev_step(1, now_ms),
+            (Period, true) => self.rev_step(-1, now_ms),
+            (B, true) => self.branch_from_here(now_ms),
+            (M, true) => self.materialize_here(now_ms),
+            (F3, false) => {
+                // F3 with the bar closed: reopen on the last query and step.
+                if self.find.is_none() {
+                    self.open_find();
+                } 
+            }
+            (Space, true) if shift => self.trigger_completion_now(now_ms),
+            (Space, true) => self.refresh_popup(1),
             (Left, true) => self.moved(|s, sh| s.editor.move_word(-1, sh), shift),
             (Right, true) => self.moved(|s, sh| s.editor.move_word(1, sh), shift),
             (Home, true) => self.moved(|s, sh| s.editor.move_doc(false, sh), shift),
@@ -300,8 +1011,10 @@ impl AppState {
             (End, false) => self.moved(|s, sh| s.editor.move_end(sh), shift),
             (Backspace, _) => {
                 self.ghost.dismiss();
-                self.editor.backspace(now_ms);
-                self.after_edit(now_ms);
+                if !self.backspace_pair(now_ms) {
+                    self.editor.backspace(now_ms);
+                    self.after_edit(now_ms);
+                }
                 self.arm_completion(now_ms);
             }
             (Delete, _) => {
@@ -311,7 +1024,7 @@ impl AppState {
             }
             (Enter, _) => {
                 self.ghost.dismiss();
-                self.editor.newline(now_ms);
+                self.editor.newline_smart(now_ms);
                 self.after_edit(now_ms);
                 self.arm_completion(now_ms);
             }
@@ -333,8 +1046,7 @@ impl AppState {
         self.debounce.cancel();
         f(self);
         self.dirty = true;
-        let line = self.editor.caret_pos().line;
-        self.syntax.invalidate_from(line.saturating_sub(1));
+        self.syntax.absorb(&mut self.editor.buffer);
         self.follow_caret = true;
     }
 
@@ -355,6 +1067,7 @@ impl AppState {
             Some(p) => match self.editor.buffer.save(p) {
                 Ok(()) => {
                     self.dirty = false;
+                    self.refresh_git();
                     self.set_status("saved", now_ms);
                 }
                 Err(e) => self.set_status(&format!("save failed: {e}"), now_ms),
@@ -392,6 +1105,7 @@ impl AppState {
 
     /// Ctrl+Space and the palette's "complete now" both land here.
     pub fn trigger_completion_now(&mut self, _now_ms: u64) {
+        let ctx = self.fim_context();
         let Some(engine) = &self.engine else { return };
         if !self.ai_enabled {
             return;
@@ -408,7 +1122,7 @@ impl AppState {
             Language::Rust => "rust",
             Language::Plain => "text",
         };
-        let req = make_request(&before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
+        let req = make_request(&ctx, &before, &after, lang, self.editor.version, PREFIX_BUDGET, SUFFIX_BUDGET);
         self.ghost.request_sent(req.generation);
         engine.request(req);
     }
@@ -453,7 +1167,9 @@ impl AppState {
     }
 
     fn open_palette_in_open_mode(&mut self) {
-        self.palette = Some(crate::palette_ui::PaletteState::open_file());
+        let root = self.workspace_root();
+        let files = crate::file_finder::walk_files(&root, 4000);
+        self.palette = Some(crate::palette_ui::PaletteState::open_file(root, files));
         self.ghost.dismiss();
         self.debounce.cancel();
     }
@@ -592,4 +1308,473 @@ mod tests {
         let ci = s.caret_from_click(3.0 * 8.0 + 3.0, 1.0 * 16.0 + 2.0, 16.0, 8.0);
         assert_eq!(s.editor.buffer.char_to_pos(ci), aperture_core::Pos::new(1, 3));
     }
+    #[test]
+    fn find_is_case_smart_and_cycles() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "Alpha beta\nALPHA gamma\nalpha", 0);
+        key(&mut s, K::F, true, 100);
+        for ch in "alpha".chars() {
+            s.handle(Ev::Text(ch.to_string()), 110);
+        }
+        let f = s.find.as_ref().unwrap();
+        assert_eq!(f.matches.len(), 3, "lowercase query matches all cases");
+        // Enter cycles forward and wraps; the selection tracks the match.
+        let first = s.editor.sel;
+        key(&mut s, K::Enter, false, 120);
+        key(&mut s, K::Enter, false, 130);
+        key(&mut s, K::Enter, false, 140);
+        assert_eq!(s.editor.sel, first, "three steps over three matches wraps home");
+        // An uppercase char flips to case-sensitive.
+        s.handle(Ev::Text("X".into()), 150);
+        for _ in 0..1 {} // (query is now "alphaX": no matches)
+        assert_eq!(s.find.as_ref().unwrap().matches.len(), 0);
+        key(&mut s, K::Backspace, false, 160);
+        key(&mut s, K::Escape, false, 170);
+        assert!(s.find.is_none(), "esc closes");
+        // Typing goes to the editor again — and since Esc leaves the match
+        // selected (jump-then-edit is the workflow), it REPLACES the match.
+        let before = s.editor.buffer.len_chars();
+        s.handle(Ev::Text("!".into()), 180);
+        assert_eq!(s.editor.buffer.len_chars(), before - 5 + 1);
+        assert!(s.editor.buffer.to_string().contains('!'));
+    }
+
+    #[test]
+    fn find_seeds_from_selection_and_swallows_while_open() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "needle hay needle", 0);
+        s.editor.sel = crate::state::sel_range(0, 6); // "needle"
+        key(&mut s, K::F, true, 100);
+        assert_eq!(s.find.as_ref().unwrap().query, "needle");
+        assert_eq!(s.find.as_ref().unwrap().matches.len(), 2);
+        // Ctrl+S while the bar is up is swallowed, not a save.
+        let dirty_before = s.dirty;
+        key(&mut s, K::S, true, 110);
+        assert_eq!(s.dirty, dirty_before);
+        assert!(s.find.is_some());
+    }
+
+    #[test]
+    fn auto_pairs_pair_skip_wrap_and_unpair() {
+        let mut s = AppState::new(None, false);
+        s.handle(Ev::Text("(".into()), 0);
+        assert_eq!(s.editor.buffer.to_string(), "()");
+        assert_eq!(s.editor.sel.head, 1, "caret between");
+        s.handle(Ev::Text(")".into()), 10);
+        assert_eq!(s.editor.buffer.to_string(), "()", "skip-over, not doubled");
+        assert_eq!(s.editor.sel.head, 2);
+        key(&mut s, K::Z, true, 20);
+        assert_eq!(s.editor.buffer.to_string(), "", "the pair was ONE undo gesture");
+        // wrap a selection, selection survives inside
+        typed(&mut s, "abc", 100);
+        s.editor.sel = crate::state::sel_range(0, 3);
+        s.handle(Ev::Text("[".into()), 200);
+        assert_eq!(s.editor.buffer.to_string(), "[abc]");
+        assert_eq!((s.editor.sel.min(), s.editor.sel.max()), (1, 4));
+        key(&mut s, K::Z, true, 300);
+        assert_eq!(s.editor.buffer.to_string(), "abc", "wrap undoes whole");
+    }
+
+    #[test]
+    fn quotes_respect_words_and_backspace_eats_pairs() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "don", 0);
+        s.handle(Ev::Text("'".into()), 50);
+        assert_eq!(s.editor.buffer.to_string(), "don'", "apostrophe after a word never pairs");
+        typed(&mut s, "t ", 60);
+        s.handle(Ev::Text("\"".into()), 100);
+        assert_eq!(s.editor.buffer.to_string(), "don't \"\"");
+        key(&mut s, K::Backspace, false, 200);
+        assert_eq!(s.editor.buffer.to_string(), "don't ", "backspace inside an empty pair eats both");
+    }
+
+    #[test]
+    fn follow_mode_toggles_and_rearms() {
+        let mut s = AppState::new(None, false);
+        assert!(!s.follow_mode);
+        key(&mut s, K::E, true, 0);
+        assert!(s.follow_mode);
+        assert_eq!(s.last_follow_line, usize::MAX, "toggle re-arms an immediate recenter");
+        s.last_follow_line = 5;
+        key(&mut s, K::E, true, 100);
+        assert!(!s.follow_mode);
+        key(&mut s, K::E, true, 200);
+        assert_eq!(s.last_follow_line, usize::MAX, "re-enable re-arms again");
+    }
+
+    #[test]
+    fn popup_suggests_outline_symbols_and_accepts() {
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        typed(&mut s, "fn compute_total() {}\nfn compute_tax() {}\nfn main() { ", 0);
+        for ch in "comp".chars() {
+            s.handle(Ev::Text(ch.to_string()), 100);
+        }
+        // typing "comp" keystroke-by-keystroke (2+ ident chars, no ghost) auto-opened it
+        let p = s.popup.as_ref().expect("auto-triggered");
+        assert!(p.items.iter().any(|i| i.label == "compute_total"), "{:?}",
+            p.items.iter().map(|i| &i.label).collect::<Vec<_>>());
+        assert!(p.items.iter().any(|i| i.label == "compute_tax"));
+        assert!(p.items.iter().all(|i| i.label != "main"), "non-matches filtered");
+        // Tab completes the word IN PLACE (replaces the typed prefix).
+        let want = p.items[0].label.clone();
+        key(&mut s, K::Tab, false, 500);
+        assert!(s.popup.is_none());
+        assert!(s.editor.buffer.to_string().ends_with(&format!("main() {{ {want}")),
+            "{}", s.editor.buffer.to_string());
+        // One undo removes the completion as a unit.
+        key(&mut s, K::Z, true, 600);
+        assert!(s.editor.buffer.to_string().ends_with("main() { comp"));
+    }
+
+    #[test]
+    fn popup_esc_closes_and_nonident_dismisses() {
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        typed(&mut s, "fn hello_world() {}\n", 0);
+        for ch in "hel".chars() {
+            s.handle(Ev::Text(ch.to_string()), 50);
+        }
+        assert!(s.popup.is_some());
+        key(&mut s, K::Escape, false, 100);
+        assert!(s.popup.is_none());
+        typed(&mut s, "l", 200);
+        assert!(s.popup.is_some(), "typing more ident chars reopens");
+        s.handle(Ev::Text(" ".into()), 300);
+        assert!(s.popup.is_none(), "a non-ident char closes it");
+    }
+
+    #[test]
+    fn fim_context_carries_the_outline_and_caches() {
+        let mut s = AppState::new(None, false);
+        s.lang = aperture_core::syntax::Language::Rust;
+        s.syntax.set_language(s.lang);
+        typed(&mut s, "fn alpha() {}\nstruct Beta { x: u32 }\n", 0);
+        let ctx = s.fim_context();
+        assert!(ctx.contains("fn alpha()"), "{ctx}");
+        assert!(ctx.contains("struct Beta"), "{ctx}");
+        let again = s.fim_context();
+        assert_eq!(ctx, again, "version-cached");
+    }
+
+
+    #[test]
+    fn git_gutter_tracks_uncommitted_lines_and_refreshes_on_save() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("g.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        // Uncommitted edit on disk before the editor even opens it.
+        std::fs::write(&f, "fn one() {}\nfn two() {}\n").unwrap();
+
+        let mut s = AppState::new(Some(f.clone()), false);
+        assert_eq!(s.git_changed, vec![(1, 2)], "picked up on open, before any keystroke");
+
+        // An in-editor edit does NOT move the gutter until save (refresh is
+        // save-triggered, not edit-triggered — no diff-per-keystroke).
+        typed(&mut s, "fn three() {}\n", 0);
+        assert_eq!(s.git_changed, vec![(1, 2)], "unchanged mid-edit");
+
+        // save() just writes the file — it doesn't commit — so the gutter
+        // still marks everything uncommitted, now including the typed line.
+        s.save(100);
+        assert_eq!(
+            s.editor.buffer.to_string(),
+            "fn three() {}\nfn one() {}\nfn two() {}\n",
+        );
+        assert_eq!(s.git_changed, vec![(0, 1), (2, 3)], "refreshed against the on-disk content");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_repo_no_git_status_zero_cost() {
+        let s = AppState::new(None, false);
+        assert!(s.git_changed.is_empty());
+    }
+
+    #[test]
+    fn rev_step_previews_read_only_and_home_restores_exact_live_text() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-revstep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("r.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        std::fs::write(&f, "fn one() {}\nfn two() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "two"]);
+        let head = String::from_utf8(Command::new("git").arg("-C").arg(&dir).args(["rev-parse", "HEAD"]).output().unwrap().stdout).unwrap();
+        git(&["update-ref", "refs/checkpoints/sess", head.trim()]);
+
+        let mut s = AppState::new(Some(f.clone()), false);
+        typed(&mut s, "fn three() {}\n", 0); // unsaved live edit, never committed
+        let live_now = s.editor.buffer.to_string();
+        assert_eq!(s.revs.len(), 3, "2 commits + 1 checkpoint");
+
+        key(&mut s, K::Comma, true, 100); // older
+        assert!(s.rev_ix.is_some());
+        let ix0 = s.rev_ix.unwrap();
+
+        // The view is READ-ONLY: typing is swallowed, not applied.
+        let before = s.editor.buffer.to_string();
+        typed(&mut s, "INTRUDER", 150);
+        assert_eq!(s.editor.buffer.to_string(), before, "preview text is untouched by typing");
+
+        // Ctrl+, / Ctrl+. still work while previewing (navigate the timeline).
+        key(&mut s, K::Comma, true, 200);
+        assert_ne!(s.rev_ix.unwrap(), ix0, "moved further back");
+        key(&mut s, K::Period, true, 250);
+        assert_eq!(s.rev_ix.unwrap(), ix0, "and back to the same spot");
+
+        // Escape jumps all the way home in one gesture, regardless of depth.
+        key(&mut s, K::Escape, false, 300);
+        assert!(s.rev_ix.is_none());
+        assert_eq!(s.editor.buffer.to_string(), live_now, "unsaved edit survived the round trip exactly");
+
+        // Stepping past the newest revision also comes home.
+        key(&mut s, K::Comma, true, 400);
+        key(&mut s, K::Period, true, 450);
+        assert!(s.rev_ix.is_none());
+        assert_eq!(s.editor.buffer.to_string(), live_now);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rev_step_is_a_noop_without_a_repo() {
+        let mut s = AppState::new(None, false);
+        key(&mut s, K::Comma, true, 0);
+        assert!(s.rev_ix.is_none());
+    }
+
+    #[test]
+    fn describe_engine_fires_on_landing_and_clears_on_home() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-note-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("n.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+
+        let mut s = AppState::new(Some(f), false);
+        assert!(s.describe.is_none(), "no APERTURE_CMD in the test process: zero cost");
+        // Inject a deterministic provider directly (avoids mutating process
+        // env, which is global and unsafe to touch from a parallel test run).
+        s.describe = Some(aperture_complete::engine::Engine::new(Box::new(
+            aperture_complete::providers::CommandProvider::new(vec!["echo".into(), "-n".into(), "a tidy note".into()]),
+        )));
+
+        s.rev_step(1, 0);
+        assert!(s.rev_ix.is_some());
+        let mut got = false;
+        for _ in 0..200 {
+            s.poll_note();
+            if s.rev_note == "a tidy note" {
+                got = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got, "note arrived within 1s: {:?}", s.rev_note);
+
+        s.rev_step(-1, 100); // home
+        assert!(s.rev_ix.is_none());
+        assert!(s.rev_note.is_empty(), "note clears on returning home");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn branch_from_here_only_acts_while_previewing() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-branch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("b.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "keep this idea"]);
+
+        let mut s = AppState::new(Some(f), false);
+        let branches_before = || {
+            String::from_utf8(Command::new("git").arg("-C").arg(&dir).args(["branch", "--list"]).output().unwrap().stdout).unwrap()
+        };
+        // Live, not previewing: Ctrl+B must NOT branch HEAD by accident, and
+        // must say so rather than silently doing nothing (a prior version of
+        // this binding existed ONLY inside the preview-mode gate, so the key
+        // was a true no-op while live — this assertion is what catches that).
+        key(&mut s, K::B, true, 0);
+        assert!(!branches_before().contains("keep-this"), "no branch created while live: {}", branches_before());
+        assert!(s.status.as_ref().unwrap().0.contains("preview a revision first"), "the guard must SAY something, not just silently do nothing: {:?}", s.status);
+
+        key(&mut s, K::Comma, true, 50); // enter preview
+        key(&mut s, K::B, true, 100);
+        let branches = branches_before();
+        assert!(branches.contains("from/keep-this-idea-"), "branch created from the previewed revision: {branches}");
+        assert!(s.status.as_ref().unwrap().0.starts_with("branched"));
+
+        // Re-running the same branch collides; the failure surfaces plainly.
+        key(&mut s, K::B, true, 150);
+        assert!(s.status.as_ref().unwrap().0.contains("failed"), "{:?}", s.status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materialize_here_guards_live_and_checks_out_while_previewing() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-mat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("m.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "snapshot me"]);
+
+        let mut s = AppState::new(Some(f), false);
+        key(&mut s, K::M, true, 0);
+        assert!(s.status.as_ref().unwrap().0.contains("preview a revision first"), "guarded while live");
+
+        key(&mut s, K::Comma, true, 50);
+        key(&mut s, K::M, true, 100);
+        let (msg, _) = s.status.clone().unwrap();
+        assert!(msg.starts_with("materialized at"), "{msg}");
+        let path = msg.strip_prefix("materialized at ").unwrap();
+        assert_eq!(std::fs::read_to_string(format!("{path}/m.rs")).unwrap(), "fn one() {}\n", "a real, separate checkout");
+        assert_eq!(std::fs::read_to_string(dir.join("m.rs")).unwrap(), "fn one() {}\n", "the original worktree is untouched");
+
+        let _ = Command::new("git").arg("-C").arg(&dir).args(["worktree", "remove", "--force", path]).output();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn ctrl_o_walks_the_git_root_and_populates_real_candidates() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-open-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("src/lib.rs"), "").unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+
+        // Open a file two directories below the git root — workspace_root()
+        // should still resolve to the REPO root, not the file's own parent,
+        // so the picker can find siblings elsewhere in the tree.
+        let f = dir.join("src/lib.rs");
+        let mut s = AppState::new(Some(f), false);
+        assert_eq!(s.workspace_root(), dir, "prefers the git root over the file's own directory");
+
+        key(&mut s, K::O, true, 0);
+        let p = s.palette.as_ref().expect("palette opened");
+        assert_eq!(p.mode, crate::palette_ui::Mode::OpenFile);
+        let rels: Vec<String> = p.files.iter().map(|f| f.strip_prefix(&p.root).unwrap().to_string_lossy().into_owned()).collect();
+        assert!(rels.contains(&"src/lib.rs".to_string()), "{rels:?}");
+        assert!(rels.contains(&"Cargo.toml".to_string()), "{rels:?}");
+        assert!(!rels.iter().any(|r| r.starts_with(".git")), "{rels:?}");
+
+        let ranked = crate::file_finder::rank(&p.root, &p.files, "lib", 10);
+        assert!(ranked.iter().any(|(_, rel)| rel == "src/lib.rs"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn workspace_root_falls_back_without_a_repo() {
+        let s = AppState::new(None, false);
+        // No path, no repo: falls back to cwd rather than panicking.
+        assert_eq!(s.workspace_root(), std::env::current_dir().unwrap_or_default());
+    }
+
+    #[test]
+    fn enter_between_auto_paired_braces_splits_through_the_real_key_path() {
+        let mut s = AppState::new(None, false);
+        typed(&mut s, "fn main() ", 0);
+        typed(&mut s, "{", 10); // auto-pairs to "{}"", caret between them
+        assert_eq!(s.editor.buffer.to_string(), "fn main() {}");
+        key(&mut s, K::Enter, false, 20);
+        assert_eq!(s.editor.buffer.to_string(), "fn main() {\n    \n}");
+        let pos = s.editor.caret_pos();
+        assert_eq!((pos.line, pos.col), (1, 4), "caret on the empty middle line");
+    }
+
+    #[test]
+    fn enter_is_swallowed_while_previewing_a_revision() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-egui-enter-preview-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("e.rs");
+        std::fs::write(&f, "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+
+        let mut s = AppState::new(Some(f), false);
+        key(&mut s, K::Comma, true, 0); // enter preview
+        assert!(s.rev_ix.is_some());
+        let before = s.editor.buffer.to_string();
+        key(&mut s, K::Enter, false, 50);
+        assert_eq!(
+            s.editor.buffer.to_string(), before,
+            "Enter must not mutate a 'read-only' preview buffer"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

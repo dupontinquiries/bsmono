@@ -93,6 +93,64 @@ impl Cam {
     }
 }
 
+/// impakt-cam, distilled: keep the caret CENTERED, not merely visible — but
+/// only move when it's worth moving. Three rules, ported knob-for-knob from
+/// the Atom plugin that named this feature, minus its elastic ease (our
+/// Smooth is deliberately overshoot-free — a viewport that springs past the
+/// line re-reads as jank; that property is unit-tested and stays):
+///  • a DEAD ZONE around the current top (impakt-cam `lineCenterThresh`):
+///    small drifts — typing along a line, nudging a row — don't move the
+///    world. Measured in TOP space, not caret space, so the file's edges
+///    (where centering clamps) go quiet for free instead of scrolling
+///    forever against the clamp.
+///  • GLIDE inside the horizon: the Smooth takes the new target; its
+///    rate×error physics already covers longer jumps at higher px/s, which
+///    is impakt-cam's `rowModifier` for free.
+///  • SNAP beyond it (`maxLinesToScroll`): a 5000-line jump animated is a
+///    sickening blur AND a frame-cost cliff; past the horizon, teleport.
+#[derive(Clone, Copy, Debug)]
+pub struct Follow {
+    /// px of top-drift tolerated before the camera bothers moving.
+    pub dead_zone: f32,
+    /// px beyond which a jump teleports instead of gliding.
+    pub snap_beyond: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FollowMove {
+    Keep,
+    Glide(f32),
+    Snap(f32),
+}
+
+impl Follow {
+    /// Line-denominated construction (the natural units for the knobs).
+    pub fn lines(dead: f32, snap: f32, line_h: f32) -> Follow {
+        Follow { dead_zone: dead * line_h, snap_beyond: snap * line_h }
+    }
+
+    /// Where should the viewport top go so `caret_y` (content px) is
+    /// vertically centered — and is the move worth making?
+    pub fn target(
+        &self,
+        caret_y: f32,
+        line_h: f32,
+        view_h: f32,
+        max_scroll: f32,
+        cur_target: f32,
+    ) -> FollowMove {
+        let desired = (caret_y - (view_h - line_h) * 0.5).clamp(0.0, max_scroll.max(0.0));
+        let d = (desired - cur_target).abs();
+        if d <= self.dead_zone {
+            FollowMove::Keep
+        } else if d > self.snap_beyond {
+            FollowMove::Snap(desired)
+        } else {
+            FollowMove::Glide(desired)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,4 +201,45 @@ mod tests {
         c.ensure_visible(100.0, 116.0, 400.0, 40.0);
         assert!((c.scroll_y.target - 60.0).abs() < 0.01);
     }
+    #[test]
+    fn follow_dead_zone_glide_and_snap() {
+        let line = 20.0;
+        let f = Follow::lines(2.0, 120.0, line);
+        let view = 800.0;
+        let max = 100_000.0;
+        // caret at line 100: an 80-line hop — inside the 120-line horizon → glide
+        let caret_y = 100.0 * line;
+        let desired = caret_y - (view - line) * 0.5;
+        assert_eq!(f.target(caret_y, line, view, max, 0.0), FollowMove::Glide(desired));
+        // caret at line 300: past the horizon → teleport
+        let far_y = 300.0 * line;
+        let far_desired = far_y - (view - line) * 0.5;
+        assert_eq!(f.target(far_y, line, view, max, 0.0), FollowMove::Snap(far_desired), "beyond the horizon teleports");
+        // one line of drift from a centered target: inside the dead zone
+        let m = f.target(caret_y + line, line, view, max, desired);
+        assert_eq!(m, FollowMove::Keep, "typing nearby doesn't move the world: {m:?}");
+        // five lines out: glides to the new center
+        match f.target(caret_y + 5.0 * line, line, view, max, desired) {
+            FollowMove::Glide(t) => assert!((t - (desired + 5.0 * line)).abs() < 1e-3),
+            other => panic!("expected glide, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn follow_goes_quiet_at_file_edges() {
+        let line = 20.0;
+        let f = Follow::lines(2.0, 120.0, line);
+        // caret on line 1 of the file: centering is impossible; desired clamps
+        // to 0, and once the target is 0 the dead zone holds — no perpetual
+        // scroll against the clamp.
+        assert_eq!(f.target(1.0 * line, line, 800.0, 5000.0, 0.0), FollowMove::Keep);
+        // bottom clamp likewise
+        let max = 300.0;
+        match f.target(10_000.0, line, 800.0, max, 0.0) {
+            FollowMove::Glide(t) | FollowMove::Snap(t) => assert_eq!(t, max),
+            m => panic!("{m:?}"),
+        }
+        assert_eq!(f.target(10_000.0, line, 800.0, max, max), FollowMove::Keep);
+    }
+
 }

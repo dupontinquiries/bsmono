@@ -120,6 +120,39 @@ impl Editor {
         self.insert_text(&s, now_ms);
     }
 
+    /// Enter's smart form: between an unseparated `{` and `}` (the pair
+    /// auto-pairs itself would have produced), split into three lines — the
+    /// opener, an empty deeper-indented line with the caret, the closer at
+    /// the OPENER's indent — instead of one plain newline that would leave
+    /// the closer hugging the opener. One `insert_text` call (one undo
+    /// step), then the caret is placed by hand: `insert_text` naturally
+    /// lands it at the END of the inserted text (after the closer's line),
+    /// so the middle line needs an explicit `Selection` afterward.
+    /// Anything else (caret not between an adjacent `{}`) falls through to
+    /// plain `newline`'s ordinary auto-indent.
+    pub fn newline_smart(&mut self, now_ms: u64) {
+        if !self.sel.is_caret() {
+            return self.newline(now_ms);
+        }
+        let at = self.sel.head;
+        let (prev, next) = (self.buffer.char_at(at.wrapping_sub(1)), self.buffer.char_at(at));
+        if at == 0 || prev != Some('{') || next != Some('}') {
+            return self.newline(now_ms);
+        }
+        let line = self.buffer.char_to_pos(at).line;
+        let text = self.buffer.line(line);
+        let indent: String = text.chars().take_while(|c| *c == ' ' || *c == '\t').collect();
+        let inner = format!("{indent}{}", " ".repeat(TAB_WIDTH));
+        let mut s = String::with_capacity(2 + indent.len() * 2 + inner.len());
+        s.push('\n');
+        s.push_str(&inner);
+        s.push('\n');
+        s.push_str(&indent);
+        let caret_at = at + 1 + inner.chars().count();
+        self.insert_text(&s, now_ms);
+        self.sel = Selection::caret(caret_at);
+    }
+
     pub fn insert_tab(&mut self, now_ms: u64) {
         let col = self.caret_pos().col;
         let n = TAB_WIDTH - (col % TAB_WIDTH);
@@ -407,4 +440,48 @@ mod tests {
         e.insert_tab(0);
         assert_eq!(e.buffer.line_len(0), 4, "col 2 → pad 2 to reach stop 4");
     }
+    #[test]
+    fn newline_smart_splits_an_adjacent_brace_pair() {
+        let mut e = Editor::from_str("fn main() {}\n");
+        // Caret between { and }.
+        e.sel = Selection::caret(11);
+        assert_eq!((e.buffer.char_at(10), e.buffer.char_at(11)), (Some('{'), Some('}')));
+        e.newline_smart(0);
+        assert_eq!(e.buffer.to_string(), "fn main() {\n    \n}\n");
+        // Caret lands on the empty deeper-indented middle line.
+        let pos = e.caret_pos();
+        assert_eq!((pos.line, pos.col), (1, 4));
+    }
+
+    #[test]
+    fn newline_smart_preserves_the_openers_indent_for_the_closer() {
+        let mut e = Editor::from_str("    if x {}\n");
+        e.sel = Selection::caret(10); // between { and } on an indented line
+        e.newline_smart(0);
+        assert_eq!(e.buffer.to_string(), "    if x {\n        \n    }\n");
+    }
+
+    #[test]
+    fn newline_smart_is_one_undo_step() {
+        let mut e = Editor::from_str("fn f() {}\n");
+        e.sel = Selection::caret(8);
+        e.newline_smart(0);
+        assert_eq!(e.buffer.to_string(), "fn f() {\n    \n}\n");
+        e.undo();
+        assert_eq!(e.buffer.to_string(), "fn f() {}\n", "one undo removes the whole split, not one line at a time");
+    }
+
+    #[test]
+    fn newline_smart_falls_through_when_not_between_braces() {
+        let mut e = Editor::from_str("let x = 1;\n");
+        e.sel = Selection::caret(5);
+        e.newline_smart(0);
+        assert_eq!(e.buffer.to_string(), "let x\n = 1;\n", "ordinary newline, no split");
+
+        let mut e2 = Editor::from_str("{}\n");
+        e2.sel = Selection { anchor: 0, head: 1 }; // a real selection, not a caret
+        e2.newline_smart(0);
+        assert_eq!(e2.buffer.to_string(), "\n}\n", "a selection falls through too, never brace-splits");
+    }
+
 }

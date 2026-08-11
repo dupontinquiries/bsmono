@@ -28,11 +28,29 @@ impl Pos {
 #[derive(Clone, Debug, Default)]
 pub struct Buffer {
     rope: Rope,
+    /// Every mutation, as byte offsets + (row, byte-col) points — exactly the
+    /// shape an incremental consumer wants (tree-sitter's InputEdit today,
+    /// LSP incremental sync tomorrow). Drained by [`Buffer::drain_edits`];
+    /// callers that never drain pay one Vec that gets truncated (see drain).
+    edits: Vec<TextEdit>,
+}
+
+/// One contiguous replace, recorded *before* the rope mutated (so `old_*`
+/// describe the pre-edit text). Points are (row, BYTE column) — tree-sitter's
+/// convention, not char columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TextEdit {
+    pub start_byte: usize,
+    pub old_end_byte: usize,
+    pub new_end_byte: usize,
+    pub start_point: (usize, usize),
+    pub old_end_point: (usize, usize),
+    pub new_end_point: (usize, usize),
 }
 
 impl Buffer {
     pub fn from_str(s: &str) -> Self {
-        Buffer { rope: Rope::from_str(s) }
+        Buffer { rope: Rope::from_str(s), edits: Vec::new() }
     }
 
     pub fn load(path: &Path) -> io::Result<Self> {
@@ -113,19 +131,103 @@ impl Buffer {
 
     pub fn insert(&mut self, at: usize, text: &str) {
         let at = self.clamp(at);
+        if text.is_empty() {
+            return;
+        }
+        let start_byte = self.rope.char_to_byte(at);
+        let start_point = self.point_of_byte(start_byte);
         self.rope.insert(at, text);
+        self.push_edit(TextEdit {
+            start_byte,
+            old_end_byte: start_byte,
+            new_end_byte: start_byte + text.len(),
+            start_point,
+            old_end_point: start_point,
+            new_end_point: advance_point(start_point, text),
+        });
     }
 
     pub fn remove(&mut self, start: usize, end: usize) {
         let (start, end) = (self.clamp(start), self.clamp(end));
         if start < end {
+            let start_byte = self.rope.char_to_byte(start);
+            let old_end_byte = self.rope.char_to_byte(end);
+            let start_point = self.point_of_byte(start_byte);
+            let old_end_point = self.point_of_byte(old_end_byte);
             self.rope.remove(start..end);
+            self.push_edit(TextEdit {
+                start_byte,
+                old_end_byte,
+                new_end_byte: start_byte,
+                start_point,
+                old_end_point,
+                new_end_point: start_point,
+            });
         }
+    }
+
+    fn push_edit(&mut self, e: TextEdit) {
+        // A consumer that never drains (plain lexer path, tests poking the
+        // buffer directly) must not leak: keep only a bounded tail — enough
+        // that "drain after each gesture" callers never lose anything.
+        if self.edits.len() >= 4096 {
+            self.edits.drain(..2048);
+        }
+        self.edits.push(e);
+    }
+
+    /// Take everything recorded since the last drain, oldest first.
+    pub fn drain_edits(&mut self) -> Vec<TextEdit> {
+        std::mem::take(&mut self.edits)
+    }
+
+    /// (row, byte-column) of an absolute byte offset — tree-sitter Point shape.
+    fn point_of_byte(&self, byte: usize) -> (usize, usize) {
+        let line = self.rope.byte_to_line(byte);
+        (line, byte - self.rope.line_to_byte(line))
+    }
+
+    /// Total length in BYTES (the rope's native `len_chars` is chars).
+    pub fn len_bytes(&self) -> usize {
+        self.rope.len_bytes()
+    }
+
+    /// The rope chunk containing `byte`: (chunk text, chunk's start byte).
+    /// The incremental-parse feed — O(log n), no materialization.
+    pub fn chunk_at_byte(&self, byte: usize) -> (&str, usize) {
+        let (chunk, b, _, _) = self.rope.chunk_at_byte(byte);
+        (chunk, b)
+    }
+
+    /// Chunks covering `range` (byte offsets), for query text predicates.
+    pub fn byte_slice_chunks(&self, range: std::ops::Range<usize>) -> impl Iterator<Item = &str> {
+        self.rope.byte_slice(range).chunks()
+    }
+
+    /// Byte offset where `line` starts (one past the end for line == len_lines).
+    pub fn line_to_byte(&self, line: usize) -> usize {
+        self.rope.line_to_byte(line.min(self.rope.len_lines()))
     }
 
     pub fn to_string(&self) -> String {
         self.rope.to_string()
     }
+}
+
+
+/// Walk `text` from `start` (row, byte-col), counting BYTES per char and
+/// resetting the column on newline — tree-sitter Point arithmetic.
+fn advance_point(start: (usize, usize), text: &str) -> (usize, usize) {
+    let (mut row, mut col) = start;
+    for ch in text.chars() {
+        if ch == '\n' {
+            row += 1;
+            col = 0;
+        } else {
+            col += ch.len_utf8();
+        }
+    }
+    (row, col)
 }
 
 #[cfg(test)]

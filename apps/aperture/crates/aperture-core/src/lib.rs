@@ -21,12 +21,23 @@
 //!
 //! No egui, no sockets, no threads. `cargo test -p aperture-core` runs the
 //! whole editing model headless in well under a second — that is the point.
+//!
+//! One additional I/O boundary, on the same terms as load/save: `gitspace`
+//! shells out to `git` (`std::process::Command`, no new dependency) to read
+//! history, diffs, and blame. It's a boundary the SAME shape as reading a
+//! file off disk — the editor still has zero opinions about threads or
+//! sockets — so it lives here rather than forcing every consumer (the flat
+//! shell AND the physical viewer) to duplicate the parsers or take on a
+//! heavier crate just to see what changed.
 
 pub mod buffer;
 pub mod editor;
+pub mod gitspace;
 pub mod history;
 pub mod op;
 pub mod syntax;
+#[cfg(feature = "tree-sitter")]
+pub mod ts;
 
 pub use buffer::{Buffer, Pos};
 pub use editor::{Editor, Selection};

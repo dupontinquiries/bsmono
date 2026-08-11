@@ -17,7 +17,13 @@ required-features = ["app"]
 # Default-on so `cargo build --release` (what the build orchestrator runs — see
 # manifest/projects.toml) produces the deploy binary directly, same convention
 # as bo-suite-egui / rusty-board-egui.
-default = ["app"]
+default = ["app", "tree-sitter"]
+# Grammar highlighting + outline (context filler, symbol popup). Explicitly
+# default HERE and not merely inherited via workspace feature unification —
+# `cargo test -p aperture-egui` builds without sibling crates' features, and
+# a feature that only unification turns on is a feature that's off exactly
+# when you test it.
+tree-sitter = ["aperture-core/tree-sitter"]
 app = ["dep:eframe"]
 
 [dependencies]
