@@ -64,6 +64,15 @@ struct Feel {
     /// SECOND way to write the file — the drift the settings module exists to
     /// avoid. The panel shows and cycles; the host persists.
     setting_values: std::collections::HashMap<String, String>,
+    /// Flash on the output line when text is committed. The port had four
+    /// animations and used none of them, so every commit looked identical to
+    /// no commit — on a keyboard whose output is a label rather than a focused
+    /// field, that is the only feedback there is.
+    commit_flash: crate::animations::OneShot,
+    /// Continuous pulse while recording. A static "listening" label cannot
+    /// distinguish a live mic from a hung one, which is the state a voice
+    /// keyboard most needs to make visible.
+    record_pulse: crate::animations::Pulse,
     /// Which gesture category the live trail is showing — only visible when trail debug
     /// styling is on (see the Diagnostics toggle). Recomputed as the gesture is classified.
     trail_style: TrailStyle,
@@ -101,6 +110,8 @@ impl Feel {
             clear_hold: Default::default(),
             settings_open: false,
             setting_values: Default::default(),
+            commit_flash: Default::default(),
+            record_pulse: Default::default(),
         }
     }
 }
@@ -123,8 +134,28 @@ impl eframe::App for Feel {
         // In a real embedding these become `TextCommitted` signals; here they
         // are counted, which is enough to prove the wiring end to end rather
         // than only up to the commit.
+        let dt_ms = ctx.input(|i| i.stable_dt) * 1000.0;
         for _ in self.service.take_pending() {
             self.committed += 1;
+            // Start on the DRAIN rather than at each commit site: one flash per
+            // frame however many words landed, and every commit path gets it
+            // without three separate calls to keep in step.
+            self.commit_flash.start();
+        }
+        self.commit_flash.tick(dt_ms, crate::animations::COMMIT_MS);
+        // The pulse follows the mic rather than being toggled alongside it —
+        // two booleans for one fact drift, and the one that drifts is the one
+        // the user is looking at.
+        let listening = !matches!(self.mic, crate::mic_source::MicState::Idle);
+        if listening != self.record_pulse.is_running() {
+            if listening { self.record_pulse.start(); } else { self.record_pulse.stop(); }
+        }
+        self.record_pulse.tick(dt_ms);
+        if self.commit_flash.is_running() || self.record_pulse.is_running() {
+            // Animations need frames. Without this they advance only when
+            // something else causes a repaint, which is exactly when nothing
+            // is happening.
+            ctx.request_repaint();
         }
 
         egui::Panel::top("out").show(ctx, |ui| {
@@ -188,7 +219,13 @@ impl eframe::App for Feel {
                 // refusals need different fixes and a single "failed" hides
                 // which.
                 if !matches!(self.mic, crate::mic_source::MicState::Idle) {
-                    ui.label(egui::RichText::new(self.mic.label()).small());
+                    // Pulsed, so a live mic is distinguishable from a hung one.
+                    // The floor is RECORD_FLOOR rather than zero: a label that
+                    // fades to invisible reads as a glitch rather than as
+                    // breathing.
+                    let o = self.record_pulse.opacity();
+                    ui.label(egui::RichText::new(self.mic.label()).small()
+                        .color(ui.visuals().text_color().gamma_multiply(o)));
                     if self.mic.retryable() && ui.small_button("retry").clicked() {
                         self.mic = crate::mic_source::MicState::Idle;
                     }
@@ -212,8 +249,15 @@ impl eframe::App for Feel {
                 // — which is exactly how this module sat unreached with 19
                 // passing tests.
                 if self.committed > 0 {
+                    // Flashed brighter for COMMIT_MS after each commit.
+                    // commit_opacity returns >1 while running, which
+                    // gamma_multiply reads as a brightening — so the line
+                    // lifts and settles rather than blinking out and back.
+                    let o = crate::animations::commit_opacity(&self.commit_flash);
                     ui.label(egui::RichText::new(format!(
-                        "Keyboard1.TextCommitted × {}", self.committed)).weak().size(11.0));
+                        "Keyboard1.TextCommitted × {}", self.committed))
+                        .size(11.0)
+                        .color(ui.visuals().weak_text_color().gamma_multiply(o)));
                 }
                 // CLEAR IS HOLD-TO-CONFIRM, because a tap wipes everything the
                 // user typed and there is no undo. tap_hold exists for exactly
