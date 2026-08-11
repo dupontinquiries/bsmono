@@ -64,6 +64,7 @@ pub mod touch_feedback;
 pub mod requests;
 pub mod reticle;
 pub mod roster;
+pub mod send_state;
 pub mod send_summary;
 pub mod shutter;
 pub mod tile_strip;
