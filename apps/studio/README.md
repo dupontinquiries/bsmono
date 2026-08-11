@@ -53,7 +53,8 @@ edits exactly reversible, which floats are not.
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
-| `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 7 |
+| `studio-media` | audio decode (Symphonia: WAV/FLAC/Vorbis/MP3/AAC) into `SourceAudio` | 9 |
+| `studio-video` | video probing, thumbnails, audio-track extraction (real `ffmpeg`/`ffprobe`) | 8 |
 
 `studio-egui` couldn't be re-verified in this pass — it needs `egui`/`eframe`,
 which needs a newer cargo than was available; the number above is carried
@@ -87,18 +88,26 @@ them.
 This is a **core**, not a shipping application. What exists is tested and real:
 the model, undo, and convergence. What does not exist yet, in rough order:
 
-1. **Media I/O** — the audio half exists now: a new `studio-media` crate
-   wraps Symphonia (WAV/FLAC/Vorbis/MP3/AAC, pure Rust, no system codec
-   libs) behind one function, `decode_file`, returning the same
-   `SourceAudio` a recorded take or a bounced pattern already produces — so
-   a decoded file is indistinguishable from either once it's in memory. 7
-   tests, including de-interleaving (a stereo file's channels must not
-   bleed into each other) and a 200,000-sample file (the packet-loop/EOF
-   handling, not just a single-packet fixture). Video decode — the
-   `ffmpeg`-via-CLI half — is still genuinely unbuilt: a different failure
-   mode (a missing binary, not an unsupported codec) and real, separate
-   work, deliberately not bolted onto the audio crate just because both are
-   nominally "Media I/O."
+1. **Media I/O** — both halves exist now. `studio-media` wraps Symphonia
+   (WAV/FLAC/Vorbis/MP3/AAC, pure Rust, no system codec libs) behind
+   `decode_file`/`decode_bytes`, returning the same `SourceAudio` a
+   recorded take or a bounced pattern already produces. 9 tests, including
+   de-interleaving, a 200,000-sample file for the packet-loop/EOF handling,
+   and `decode_bytes` (audio already in memory, no file — the seam
+   `studio-video` needs) matching `decode_file` exactly. `studio-video`
+   shells to real `ffmpeg`/`ffprobe` (confirmed present in this sandbox
+   before writing a line of it — an assumption from earlier in this same
+   session, that video decode needed tooling this sandbox doesn't have,
+   turned out wrong the same way the egui assumption a few commits back
+   did): `probe` for duration/resolution/fps/audio-track metadata,
+   `thumbnail_png` for a single frame's raw PNG bytes, `extract_audio`
+   piping a video's audio track straight into `decode_bytes` with no temp
+   file. 8 tests, all against real subprocesses and ffmpeg-generated
+   fixtures, not fakes. Deliberately NOT built: decoding a video frame into
+   pixels — there is no `VideoFrame` type anywhere in this codebase yet,
+   and that's real, separate work past what an editor needs first
+   (knowing what a file is, showing something for it, treating its audio
+   like any other source).
 2. **Audio render graph** — `studio_audio::mixdown` mixes tracks, applies
    clip and bus effect chains, handles sends/mute/solo, and is real and
    tested (72 tests) — `studio-live`'s own
@@ -144,11 +153,13 @@ the model, undo, and convergence. What does not exist yet, in rough order:
 This closes every item that was on this list when this section was last
 written honestly. What's real and load-bearing now, named precisely rather
 than left as a vague "not built yet": real hardware verification for
-`studio-io` (item 3), the network half of DHT publishing (item 4), and
-video decode (item 1). None of those are guesses — each is a concrete next
-step pinned by a test or a doc comment that says exactly what it's waiting
-on. Item 2's own remaining piece — a streaming render path — is no longer
-on this list; it's built.
+`studio-io` (item 3), the network half of DHT publishing (item 4), and a
+`VideoFrame` type plus everything a timeline needs to composite/render one
+(item 1's own remaining piece — `studio-video` gives an editor what it
+needs first, not full video playback). None of those are guesses — each is
+a concrete next step pinned by a test or a doc comment that says exactly
+what it's waiting on. Item 2's own remaining piece — a streaming render
+path — is no longer on this list; it's built.
 
 One more thing this list never named because items 2 and 3 were written
 before either existed: `studio-engine` now has `device::DeviceEngine`,
