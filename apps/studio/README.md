@@ -169,6 +169,11 @@ structural edit (a new bus, a clip's first effect) still allocates, which
 is the right trade for something that happens on an edit rather than every
 buffer, and `Recorder::feed`'s buffer (built before this session) still
 reallocates past its two-second initial capacity on a longer take.
+`Transport::advance` now also reports exactly where within a buffer a
+count-in's punch point lands (`Advance::punch_offset`), and `DeviceEngine`
+uses it to capture only the post-punch samples of a straddling buffer
+instead of the whole thing — the count-in's own silence no longer leaks
+into the start of a take.
 
 A test found the one real bug in this pass: `rebuild()` originally replayed the
 op log from an empty project and erased every track and source that pre-dated
