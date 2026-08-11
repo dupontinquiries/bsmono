@@ -50,6 +50,7 @@ pub mod ambient_palette;
 pub mod camera_select;
 pub mod chevron_confirm;
 pub mod handshake;
+pub mod peer_dial;
 pub mod help_manual;
 pub mod keyboard_inset;
 pub mod press_gesture;
