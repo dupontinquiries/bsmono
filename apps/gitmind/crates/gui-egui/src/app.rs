@@ -63,6 +63,7 @@ pub struct App {
     pub fleet: pages::fleet::State,
     pub push: pages::push::State,
     pub apps: pages::apps::State,
+    pub bluetooth: pages::bluetooth::BluetoothState,
     pub artifacts: pages::artifacts::State,
     pub share: pages::share::State,
     pub timeline: pages::timeline::State,

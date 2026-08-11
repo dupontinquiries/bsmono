@@ -190,4 +190,13 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
         ui.separator();
         ui.label(egui::RichText::new(&app.net.note).monospace().small());
     }
+
+    // Bluetooth OBEX push lives on the Network page, as it does in the Qt GUI:
+    // it is the answer to "these two machines share no LAN", which is the
+    // question this whole page is about.
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(8.0);
+    super::bluetooth::section(app, ui);
+
 }
