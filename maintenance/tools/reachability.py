@@ -133,7 +133,22 @@ def bin_reachable(src_dir):
         except OSError:
             pass
     mods = modules(src_dir)
-    seeds = [p for p in texts if "/bin/" in p or p.endswith("/main.rs")]
+    # lib.rs IS a seed, and leaving it out was a real false positive.
+    #
+    # In a lib+bin crate the binary is a few lines that call into the library,
+    # so almost everything is reached THROUGH lib.rs — and a module used only
+    # by a free function there looked unreachable. `cardinal_gesture` reported
+    # as unreached while the live path ran demo_app -> keyboard_ui -> paint_key
+    # -> dir8_from -> cardinal_gesture.
+    #
+    # This does loosen the check: a lib.rs item nothing calls now makes its
+    # dependencies look reached. That is the right trade here — the tool's job
+    # is finding whole subsystems nobody wired up, and a false NEGATIVE on one
+    # helper is cheaper than a false POSITIVE that sends somebody to re-wire
+    # code that already works. Reporting the second kind twice is how a tool
+    # stops being read.
+    seeds = [p for p in texts
+             if "/bin/" in p or p.endswith("/main.rs") or p.endswith("/lib.rs")]
     if not seeds:
         return None
 

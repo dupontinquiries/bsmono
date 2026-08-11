@@ -125,6 +125,89 @@ pub fn approx_bytes(bigrams: usize, trigrams: usize) -> usize {
     (bigrams + trigrams) * 16
 }
 
+/// The counts, held so the scoring policy above has something to score.
+///
+/// The port carried the POLICY — backoff, decay, the caps — and no store, so
+/// nothing could call it. This is the smallest thing that makes it usable: two
+/// maps and the prefix totals the policy needs, with the same decay curve.
+///
+/// Deliberately not persisted here. A keyboard writing to disk on every commit
+/// is a keyboard that stutters, and the host owns when to save — the same split
+/// `adaptive` uses.
+#[derive(Debug, Clone, Default)]
+pub struct NgramStore {
+    bigrams: std::collections::HashMap<String, Count>,
+    trigrams: std::collections::HashMap<String, Count>,
+    /// Totals per prefix, so scoring does not walk the whole map per candidate.
+    ///
+    /// Maintained alongside rather than recomputed: a candidate list is scored
+    /// on every swipe, and summing thousands of entries per candidate is the
+    /// difference between a suggestion bar and a stutter.
+    bi_prefix: std::collections::HashMap<String, f64>,
+    tri_prefix: std::collections::HashMap<String, f64>,
+}
+
+impl NgramStore {
+    pub fn len(&self) -> (usize, usize) { (self.bigrams.len(), self.trigrams.len()) }
+    pub fn is_empty(&self) -> bool { self.bigrams.is_empty() && self.trigrams.is_empty() }
+
+    /// Learn from a committed word given the two before it.
+    pub fn record(&mut self, pp: Option<&str>, prev: Option<&str>, word: &str, now_secs: u64) {
+        let w = norm(word);
+        if w.is_empty() { return; }
+        if let Some(p) = prev {
+            let p = norm(p);
+            bump(&mut self.bigrams, bigram_key(&p, &w), now_secs);
+            *self.bi_prefix.entry(p.clone()).or_insert(0.0) += 1.0;
+            if let Some(pp) = pp {
+                let pp = norm(pp);
+                bump(&mut self.trigrams, trigram_key(&pp, &p, &w), now_secs);
+                *self.tri_prefix.entry(format!("{pp}\u{1}{p}")).or_insert(0.0) += 1.0;
+            }
+        }
+        self.evict(now_secs);
+    }
+
+    /// The score for one candidate in this context.
+    pub fn score_for(&self, pp: Option<&str>, prev: Option<&str>, word: &str, now_secs: u64)
+        -> (f64, Order) {
+        let w = norm(word);
+        let bigram = prev.map(|p| norm(p)).and_then(|p| {
+            let c = self.bigrams.get(&bigram_key(&p, &w))?;
+            Some((effective(c, now_secs), *self.bi_prefix.get(&p).unwrap_or(&0.0)))
+        });
+        let trigram = match (pp, prev) {
+            (Some(pp), Some(p)) => {
+                let (pp, p) = (norm(pp), norm(p));
+                self.trigrams.get(&trigram_key(&pp, &p, &w)).map(|c| {
+                    (effective(c, now_secs),
+                     *self.tri_prefix.get(&format!("{pp}\u{1}{p}")).unwrap_or(&0.0))
+                })
+            }
+            _ => None,
+        };
+        score(&Context { trigram, bigram, _marker: std::marker::PhantomData })
+    }
+
+    /// Drop spent entries, and enforce the caps if still over.
+    fn evict(&mut self, now_secs: u64) {
+        if self.bigrams.len() > MAX_BIGRAMS {
+            self.bigrams.retain(|_, c| !is_spent(c, now_secs));
+        }
+        if self.trigrams.len() > MAX_TRIGRAMS {
+            self.trigrams.retain(|_, c| !is_spent(c, now_secs));
+        }
+    }
+}
+
+fn bump(m: &mut std::collections::HashMap<String, Count>, key: String, now: u64) {
+    let e = m.entry(key).or_insert(Count { count: 0.0, last_used_secs: now });
+    // Decay the existing count to NOW before adding, or an old entry re-used
+    // today would keep its undecayed weight and outrank everything.
+    e.count = effective(e, now) + 1.0;
+    e.last_used_secs = now;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +344,65 @@ mod tests {
         // floor, which would rank it above a candidate with no entry at all
         let (u, _) = score(&ctx(None, None));
         assert_eq!(u, 0.0);
+    }
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    #[test]
+    fn a_learned_continuation_scores_above_an_unseen_one() {
+        // The whole job: after "thank" you tend to write "you".
+        let mut st = NgramStore::default();
+        for _ in 0..5 { st.record(None, Some("thank"), "you", 0); }
+        let (seen, order) = st.score_for(None, Some("thank"), "you", 0);
+        let (unseen, _) = st.score_for(None, Some("thank"), "your", 0);
+        assert!(seen > unseen, "{seen} vs {unseen}");
+        assert_eq!(order, Order::Bigram);
+    }
+
+    #[test]
+    fn a_trigram_beats_the_bigram_once_it_has_data() {
+        let mut st = NgramStore::default();
+        for _ in 0..3 { st.record(Some("i"), Some("thank"), "you", 0); }
+        let (_, order) = st.score_for(Some("i"), Some("thank"), "you", 0);
+        assert_eq!(order, Order::Trigram);
+    }
+
+    #[test]
+    fn no_context_scores_nothing_rather_than_guessing() {
+        // At the start of a line there is no previous word, and inventing a
+        // score would rank candidates by nothing at all.
+        let mut st = NgramStore::default();
+        st.record(None, Some("a"), "b", 0);
+        assert_eq!(st.score_for(None, None, "b", 0), (0.0, Order::None));
+    }
+
+    #[test]
+    fn re_using_an_old_entry_decays_it_before_adding() {
+        // Without decaying first, an entry untouched for a year would keep its
+        // full weight the moment it is used again and outrank everything.
+        let mut st = NgramStore::default();
+        st.record(None, Some("a"), "b", 0);
+        let year = (DECAY_HALF_LIFE_SECS * 12.0) as u64;
+        st.record(None, Some("a"), "b", year);
+        let (s, _) = st.score_for(None, Some("a"), "b", year);
+        assert!(s <= MAX_BOOST);
+    }
+
+    #[test]
+    fn an_empty_word_is_not_learned() {
+        let mut st = NgramStore::default();
+        st.record(None, Some("a"), "", 0);
+        assert!(st.is_empty());
+    }
+
+    #[test]
+    fn case_does_not_split_a_continuation() {
+        let mut st = NgramStore::default();
+        for _ in 0..3 { st.record(None, Some("Thank"), "You", 0); }
+        let (s, _) = st.score_for(None, Some("thank"), "you", 0);
+        assert!(s > 0.0, "capitalisation split the history");
     }
 }
