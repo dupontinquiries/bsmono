@@ -86,8 +86,14 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    decode, `ffmpeg` via CLI for video, keeping the core codec-free.
 2. **Audio render graph** — mix tracks, apply effects, produce samples. The
    `Effect` type is already opaque-by-design so hosts can register kinds.
-3. **Device I/O** — the transport clock and mixdown are done; nothing yet
-   hands samples to a sound card or pulls them from a microphone.
+3. **Device I/O** — `studio-io`'s `device` feature now builds a full-duplex
+   `CpalIo`: a dedicated thread owns the (`!Send`) cpal streams, an `rtrb`
+   ring buffer bridges input to output since the two have no shared clock,
+   and config negotiation picks a real device config instead of ignoring
+   the request. Compiled and unit-tested (17 tests, including the
+   negotiation fallback logic against hand-built device configs) — **not**
+   yet run against real hardware, since there is still no sound card in the
+   authoring sandbox. That verification is the next step, not a redesign.
 4. **Publishing to a live DHT** — session keys, chunking and reassembly are
    done and tested against the awkward carrier shape; what remains is calling
    `snapclone-dht`'s put/get from a running node.
