@@ -557,9 +557,17 @@ fn worker_loop(
     // here — same behavior, no per-request env syscall during streaming. (Mirrors the
     // octree dispatcher, which already reads its copies once at thread start.)
     let mid_via_gpu = std::env::var("UNENDLICH_GPU_MESHER_MID")
-        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+        // r-radar-H/handoff-B: DEBUG.mesher_mid_gpu had zero consumers
+        // anywhere (tools/wiring_radar.py) despite handoff/WORKER_B_
+        // debug_toggles.md specifying exactly this OR, at exactly this
+        // site. Read once alongside the env var — matches the T6
+        // comment above's own stated design for this read (launch-time
+        // flag, not a per-frame check).
+        || crate::debug_settings::DEBUG.mesher_mid_gpu.load(std::sync::atomic::Ordering::Relaxed);
     let neutral_tint = std::env::var("UNENDLICH_NEUTRAL_TINT")
-        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+        || crate::debug_settings::DEBUG.neutral_tint.load(std::sync::atomic::Ordering::Relaxed);
     // r476: skip dispatching pure-air chunks to the GPU mesher (they always mesh
     // to nothing). Default ON — correctness-preserving, removes a large slice of
     // streaming dispatch load (flying / over-surface is mostly air). Set
@@ -1045,7 +1053,13 @@ fn octree_gpu_dispatcher_loop(
     // is regional, i.e. climate-driven), this removes it. Default off
     // (byte-identical). UNENDLICH_NEUTRAL_TINT=1 to enable.
     let neutral_tint = std::env::var("UNENDLICH_NEUTRAL_TINT")
-        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        .map(|v| v != "0" && !v.is_empty()).unwrap_or(false)
+        // r-radar-H/handoff-B: same DEBUG.neutral_tint OR as the sibling
+        // read above (this dispatcher thread keeps its own copy of the
+        // launch-time flag, per the T6 comment's "mirrors the octree
+        // dispatcher, which already reads its copies once at thread
+        // start" — keeping both copies consistent under the toggle).
+        || crate::debug_settings::DEBUG.neutral_tint.load(std::sync::atomic::Ordering::Relaxed);
     if neutral_tint {
         log::info!("octree-gpu-mesh-dispatcher: UNENDLICH_NEUTRAL_TINT=1 — \
                     feeding neutral climate (0.5,0.5) to the mesher (tint disabled)");

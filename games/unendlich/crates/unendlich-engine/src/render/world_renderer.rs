@@ -2105,7 +2105,18 @@ impl WorldRenderer {
         let is_debug_overlay = coord.x == i32::MIN
             && coord.y == i32::MIN
             && coord.z == i32::MIN;
-        let flag_bits = if is_debug_overlay {
+        // r-radar-H: DEBUG.no_cull was declared with zero consumers
+        // anywhere (tools/wiring_radar.py's dead-toggle sweep) — widen
+        // the EXISTING, already-tested FLAG_DEBUG_OVERLAY mechanism
+        // (chunk_cull.comp's `always_emit`) to apply globally when set,
+        // instead of only to the one sentinel chunk. Defaults false, so
+        // this is a no-op unless the operator opts in — same
+        // "contract-preserving off-switch" shape as r157's
+        // disable_fog/disable_shadows fix.
+        let no_cull_enabled = crate::debug_settings::DEBUG
+            .no_cull
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let flag_bits = if is_debug_overlay || no_cull_enabled {
             crate::render::chunk_indirect::FLAG_DEBUG_OVERLAY
         } else { 0 };
         // F3: pack the actual LOD into flags upper byte. The cull
@@ -2269,7 +2280,14 @@ impl WorldRenderer {
         let is_debug_overlay = coord.x == i32::MIN
             && coord.y == i32::MIN
             && coord.z == i32::MIN;
-        let flag_bits = if is_debug_overlay {
+        // r-radar-H: see the sibling call site above (fresh-upload path)
+        // for the full rationale — same DEBUG.no_cull widening of
+        // FLAG_DEBUG_OVERLAY, applied here for the mesh-cache-restore path
+        // so both upload paths agree on the toggle's effect.
+        let no_cull_enabled = crate::debug_settings::DEBUG
+            .no_cull
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let flag_bits = if is_debug_overlay || no_cull_enabled {
             crate::render::chunk_indirect::FLAG_DEBUG_OVERLAY
         } else { 0 };
         let flags = crate::world::lod::flags_with_lod(flag_bits, lod);

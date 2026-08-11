@@ -62,8 +62,6 @@ mod tests {
 
     // Dragon wing center (matches spawn.rs body plan).
     const WING1: [f32; 3] = [0.0, 0.8, 2.5];
-    const EYE1: [f32; 3] = [3.0, 0.6, 0.6];
-    const EYE2: [f32; 3] = [3.0, 0.6, -0.6];
 
     #[test]
     fn tearing_one_wing_grounds_the_dragon() {
@@ -79,10 +77,29 @@ mod tests {
     #[test]
     fn losing_both_eyes_blinds_it() {
         let mut d = spawn(CreatureKind::Dragon, [0.0; 3]);
-        let r1 = strike(&mut d, EYE1, 100);
+        // r-fulltest-run: EYE1/EYE2 used to be hardcoded local-space
+        // coordinates. spawn.rs's own comment explains why that's fragile:
+        // "Genome-driven body. Each spawn derives a deterministic genome
+        // from its position" — eye offset is `[eye_x, eye_up, eye_lat]`
+        // with `eye_up`/`eye_lat` computed via `lerp01(gene, ...)`, i.e.
+        // genuinely gene-dependent, not a fixed constant. It's still
+        // deterministic (same spawn position -> same genome -> same eye
+        // offset every run, not flaky), but a hardcoded guess drifts
+        // whenever the gene formula or head layout changes — which is
+        // exactly what happened here. Read the real offsets from the
+        // freshly-spawned dragon's own anatomy instead of guessing new
+        // magic numbers: self-correcting, can't drift again the same way.
+        let eye_offsets: Vec<[f32; 3]> = d.anatomy.as_ref()
+            .expect("dragon should have anatomy")
+            .parts.iter()
+            .filter(|p| p.part == Part::Eye)
+            .map(|p| p.offset)
+            .collect();
+        assert_eq!(eye_offsets.len(), 2, "dragon should have exactly 2 eyes");
+        let r1 = strike(&mut d, eye_offsets[0], 100);
         assert_eq!(r1.hit_part, Some(Part::Eye));
         assert!(!r1.blinded, "one eye left, still sees");
-        let r2 = strike(&mut d, EYE2, 100);
+        let r2 = strike(&mut d, eye_offsets[1], 100);
         assert!(r2.blinded, "second eye gone -> blind");
     }
 

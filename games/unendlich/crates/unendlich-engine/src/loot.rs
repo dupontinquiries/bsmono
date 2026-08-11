@@ -122,11 +122,138 @@ pub fn drops_with_legendary(
 }
 // ── end r330-swords ─────────────────────────────────────────────────────────
 
+// ── RLCraft-direction: danger-scaled loot ───────────────────────────────────
+/// Like [`drops_with_legendary`], but the drop site's danger (per
+/// `sim::spawn_danger` — deeper and farther from the origin is more
+/// dangerous) also scales the result: item stack counts scale with the same
+/// HP multiplier a creature spawned there would have gotten, and the
+/// legendary roll's effective chance goes up too.
+///
+/// Kept additive, same shape as [`drops_with_legendary`]'s own doc
+/// explains: existing callers of `drops`/`base_drops`/`drops_with_legendary`
+/// are untouched. The bin's death-loot path opts into this by calling it
+/// instead, passing the creature's death position.
+///
+/// Luck math: `drop_chance`'s `luck` parameter is a multiplier on the base
+/// rate (`chance = base * (1 + luck) * (1 - penalty)`), so
+/// `danger_multiplier() - 1.0` composes onto `ctx.luck` directly — 0 extra
+/// luck at baseline (at/near sea level, near the origin), up to +3.0 extra
+/// luck (quadrupling the base chance) at the same fully-saturated danger
+/// that gives the 4x HP ceiling. One number, one meaning, reused for both
+/// axes rather than inventing a second scale to tune.
+pub fn drops_with_danger(
+    kind: CreatureKind,
+    anatomy: Option<&crate::creature::Anatomy>,
+    death_position: [f32; 3],
+    roll_seed: u64,
+    ctx: crate::sim::legendary_loot::DropContext,
+) -> Vec<ItemDrop> {
+    let danger = crate::sim::spawn_danger::danger_multiplier(death_position);
+
+    let mut out = drops(kind, anatomy);
+    for d in out.iter_mut() {
+        d.count = crate::sim::spawn_danger::scale_hp(d.count, danger);
+    }
+
+    let boosted_ctx = crate::sim::legendary_loot::DropContext {
+        luck: ctx.luck + (danger - 1.0),
+        ..ctx
+    };
+    if let Some(spec) = crate::sim::legendary_loot::roll(roll_seed, boosted_ctx) {
+        out.push(ItemDrop { item: ItemKind::Legendary(spec), count: 1 });
+    }
+    out
+}
+// ── end RLCraft-direction ───────────────────────────────────────────────────
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::spawn::spawn;
     use crate::mob::strike;
+
+    #[test]
+    fn drops_with_danger_at_baseline_matches_drops_with_legendary_exactly() {
+        // At/near sea level, near the origin, danger_multiplier() == 1.0 —
+        // must be a byte-for-byte no-op vs the existing, untouched
+        // drops_with_legendary (same counts, same legendary roll outcome
+        // for the same seed/ctx, since luck bonus is exactly 0.0 there).
+        let ctx = crate::sim::legendary_loot::DropContext::ungated(0.3, 1.0, 0.0);
+        let plain = base_drops(CreatureKind::Dragon);
+        let via_legendary = drops_with_legendary(CreatureKind::Dragon, None, 42, ctx);
+        let via_danger = drops_with_danger(CreatureKind::Dragon, None, [0.0, 64.0, 0.0], 42, ctx);
+        // counts unaffected
+        for d in &plain {
+            assert_eq!(count_of(&via_danger, block_kind_of(d.item)), d.count);
+        }
+        // legendary roll outcome identical (luck bonus is exactly 0 here)
+        assert_eq!(via_legendary.len(), via_danger.len());
+    }
+
+    fn block_kind_of(item: ItemKind) -> BlockId {
+        match item {
+            ItemKind::Block(b) => b,
+            _ => BlockId::Air, // not used by count_of's block-only lookups in this test
+        }
+    }
+
+    #[test]
+    fn drops_with_danger_scales_item_counts_in_dangerous_territory() {
+        let ctx = crate::sim::legendary_loot::DropContext::ungated(0.0, 0.0, 0.0); // no legendary noise
+        let deep_far = [3500.0, -200.0, 3500.0]; // fully saturated on both axes -> 4.0x
+        let plain = base_drops(CreatureKind::Dragon);
+        let scaled = drops_with_danger(CreatureKind::Dragon, None, deep_far, 1, ctx);
+        // Every stack should be ~4x its baseline count (via scale_hp's
+        // round-and-floor-at-1 rule), never less than baseline.
+        for d in &plain {
+            let s = count_of(&scaled, block_kind_of(d.item));
+            assert!(s >= d.count, "{:?}: scaled {s} should be >= baseline {}", d.item, d.count);
+            if d.count > 0 {
+                assert!(s > d.count, "{:?}: a positive-count stack should visibly grow at max danger", d.item);
+            }
+        }
+    }
+
+    #[test]
+    fn drops_with_danger_never_shrinks_a_positive_stack_to_zero() {
+        // danger_multiplier is always >= 1.0 everywhere (verified in
+        // spawn_danger's own tests), so this should hold trivially — but
+        // assert it here too, since a broken composition between the two
+        // modules is exactly the kind of thing a per-module test suite
+        // alone wouldn't catch.
+        let ctx = crate::sim::legendary_loot::DropContext::ungated(0.0, 0.0, 0.0);
+        for pos in [[0.0, 64.0, 0.0], [500.0, 30.0, 500.0], [5000.0, -500.0, 5000.0]] {
+            let plain = base_drops(CreatureKind::Dragon);
+            let scaled = drops_with_danger(CreatureKind::Dragon, None, pos, 7, ctx);
+            for d in &plain {
+                if d.count > 0 {
+                    assert!(count_of(&scaled, block_kind_of(d.item)) > 0, "positive stack must not vanish at {pos:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn drops_with_danger_raises_legendary_odds_in_dangerous_territory() {
+        // Same base_rate/seed, only danger position differs. A moderate
+        // base rate + zero starting luck means baseline should usually
+        // miss and max-danger should usually hit, across many seeds.
+        let ctx = crate::sim::legendary_loot::DropContext::ungated(0.2, 0.0, 0.0);
+        let mut baseline_hits = 0;
+        let mut danger_hits = 0;
+        for seed in 0..200u64 {
+            if drops_with_danger(CreatureKind::Dragon, None, [0.0, 64.0, 0.0], seed, ctx)
+                .iter().any(|d| matches!(d.item, ItemKind::Legendary(_))) {
+                baseline_hits += 1;
+            }
+            if drops_with_danger(CreatureKind::Dragon, None, [3500.0, -200.0, 3500.0], seed, ctx)
+                .iter().any(|d| matches!(d.item, ItemKind::Legendary(_))) {
+                danger_hits += 1;
+            }
+        }
+        assert!(danger_hits > baseline_hits,
+            "max-danger legendary hits ({danger_hits}/200) should exceed baseline ({baseline_hits}/200)");
+    }
 
     fn count_of(drops: &[ItemDrop], b: BlockId) -> u16 {
         drops.iter().find(|d| d.item == ItemKind::Block(b)).map_or(0, |d| d.count)
@@ -155,7 +282,19 @@ mod tests {
     #[test]
     fn one_destroyed_eye_halves_the_amber() {
         let mut d = spawn(CreatureKind::Dragon, [0.0; 3]);
-        strike(&mut d, [3.0, 0.6, 0.6], 100); // eye 1
+        // r-fulltest-run: was a hardcoded [3.0, 0.6, 0.6] local-space
+        // coordinate — same fragility as mob.rs's losing_both_eyes_blinds_it
+        // (see that fix for the full explanation: eye offset is
+        // gene-derived in spawn.rs, deterministic per spawn position but
+        // not a fixed constant, and drifted from this hardcoded guess).
+        // Read the real offset from the spawned dragon's own anatomy.
+        let eye_offset = d.anatomy.as_ref()
+            .expect("dragon should have anatomy")
+            .parts.iter()
+            .find(|p| p.part == Part::Eye)
+            .expect("dragon should have an eye")
+            .offset;
+        strike(&mut d, eye_offset, 100); // eye 1
         let l = drops(CreatureKind::Dragon, d.anatomy.as_ref());
         assert_eq!(count_of(&l, BlockId::Amber), 1);
     }

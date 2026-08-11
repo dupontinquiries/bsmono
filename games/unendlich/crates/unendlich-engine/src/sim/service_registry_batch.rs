@@ -358,7 +358,20 @@ impl Service for MoistureService {
         "moisture_field"
     }
     fn tick(&mut self, ctx: &ServiceCtx) {
-        self.0.advect(ctx.dt.min(0.1), true, |_, _| [1.0, 0.0]);
+        // r-radar-H: was hardcoded `true`, ignoring DEBUG.advect_clamp
+        // entirely — despite moisture_field.rs's own doc comment saying
+        // this exact parameter is "wired to DEBUG.advect_clamp" and the
+        // toggle showing zero consumers anywhere (tools/wiring_radar.py).
+        // Honest scope note: this service is the r115 neutral-default
+        // smoke test (constant wind, constant climate, no real world
+        // data — proves the wiring compiles/runs, not gameplay behavior),
+        // so this fix makes the toggle's ONE real call site respect it,
+        // but has no visible in-game effect until moisture_field has a
+        // production consumer wired to real world state.
+        let advect_clamp = crate::debug_settings::DEBUG
+            .advect_clamp
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.0.advect(ctx.dt.min(0.1), advect_clamp, |_, _| [1.0, 0.0]);
         self.0.step_climate(
             &crate::moisture_field::ClimateParams::default(),
             |_, _| crate::moisture_field::ClimateSample { temperature: 0.5, is_water: 0.25 },

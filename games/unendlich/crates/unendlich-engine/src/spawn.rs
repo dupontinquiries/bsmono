@@ -258,7 +258,7 @@ pub fn spawn_seeded(kind: CreatureKind, seed: u64, position: [f32; 3]) -> Creatu
 
 /// Build a living creature of `kind` at `position`, with a breakable anatomy.
 pub fn spawn(kind: CreatureKind, position: [f32; 3]) -> Creature {
-    match kind {
+    let mut creature = match kind {
         CreatureKind::Dragon => {
             // Genome-driven body. Each spawn derives a deterministic genome from
             // its position, so dragons vary in build (neck/tail/wing/leg/bulk)
@@ -351,7 +351,27 @@ pub fn spawn(kind: CreatureKind, position: [f32; 3]) -> Creature {
                 .with_mass(55.0)
                 .with_anatomy(anatomy)
         }
+    };
+    // RLCraft-style danger scaling (sim::spawn_danger): deeper and farther
+    // from the origin, creatures are tougher. Single insertion point after
+    // the match rather than touching every PartState::new call site above
+    // — applies uniformly to every creature kind, present and future,
+    // without a per-kind blast radius. At/above sea level near the origin
+    // this is an exact no-op (multiplier == 1.0, scale_hp(x, 1.0) == x for
+    // any x — verified in spawn_danger's own tests), so existing spawns
+    // near world origin are unaffected.
+    let danger = crate::sim::spawn_danger::danger_multiplier(position);
+    if let Some(anat) = creature.anatomy.as_mut() {
+        for part in anat.parts.iter_mut() {
+            // Scale BOTH hp and max_hp identically — PartState::new sets
+            // hp == max_hp for a fresh spawn, and fraction()/is_destroyed()/
+            // graded() all read hp relative to max_hp. Scaling only hp
+            // would make a freshly-spawned creature look pre-damaged.
+            part.max_hp = crate::sim::spawn_danger::scale_hp(part.max_hp, danger);
+            part.hp = part.max_hp;
+        }
     }
+    creature
 }
 
 /// Bridge a designer [`CreatureBlueprint`](crate::creature_design::CreatureBlueprint)

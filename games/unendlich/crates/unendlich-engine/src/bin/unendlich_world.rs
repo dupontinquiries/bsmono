@@ -377,12 +377,21 @@ fn main() {
         unendlich_engine::world::plant_lifecycle::lifecycle_handler(),
     );
     // Leaf decay is intentionally NOT registered as an auto-firing
-    // handler. With age-based decay every leaf dies after ~50-100s
-    // real time regardless of context — empties forests. The handler
-    // is meant for "leaves whose supporting log is broken decay
-    // quickly" semantics, but the support relationship isn't wired
-    // yet. Until then, leaves are permanent. Re-enable when the
-    // log-removal trigger is in place:
+    // handler IN THIS BIN. With age-based decay every leaf dies after
+    // ~50-100s real time regardless of context — empties forests. The
+    // handler is meant for "leaves whose supporting log is broken decay
+    // quickly" semantics, gated on FLAG_DECAYING.
+    //
+    // STATUS UPDATE: that gate + the log-removal trigger that sets it
+    // DO exist now (r160) — but only in unendlich_fullgame.rs (see its
+    // tick_reg.register("leaf_decay", ...) plus the "[flora] N leaves
+    // orphaned" block-break handler). Neither has been ported to this
+    // bin. Registering the handler here alone would be a safe no-op
+    // (nothing in this bin ever sets FLAG_DECAYING, so the handler's
+    // gate always skips) — left commented rather than enabled-but-inert,
+    // so "registered" here continues to mean "actually does something."
+    // Porting both pieces from unendlich_fullgame.rs is the real fix if
+    // this bin needs leaf decay too:
     //
     //   tick_reg.register("leaf_decay",
     //       unendlich_engine::world::leaf_decay::decay_handler());
