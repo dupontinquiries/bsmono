@@ -22,7 +22,8 @@
 //!    PNG bytes by `ffmpeg` itself (not decoded further here — a caller
 //!    that wants pixels decodes the PNG with whatever image crate its own
 //!    UI layer already uses; this crate doesn't take that dependency just
-//!    to prove the bytes are real PNG).
+//!    to prove the bytes are real PNG). [`thumbnail_strip`] is several of
+//!    these at evenly-spaced positions, for a scrubber.
 //! 3. [`extract_audio`] — a video's audio track, piped through `ffmpeg` as
 //!    WAV and handed straight to [`studio_media::decode_bytes`] rather
 //!    than round-tripping through a temp file. This is the genuinely
@@ -180,6 +181,40 @@ pub fn thumbnail_png(path: &Path, at: Ticks) -> Result<Vec<u8>, VideoError> {
     ])
 }
 
+/// A strip of thumbnails at `count` evenly-spaced positions across the
+/// video's own duration, for a timeline scrubber — the natural next thing
+/// on top of [`thumbnail_png`] once a UI needs more than one frame.
+/// Returns `(position, PNG bytes)` pairs in time order.
+///
+/// Each slot is centred rather than left-aligned (`(i + 0.5) / count` of
+/// the duration, not `i / count`): the very first frame of a video is
+/// often black or mid-fade-in, and always landing the first thumbnail
+/// exactly there would make every scrubber built on this look broken in
+/// the same way on the same kind of source.
+///
+/// Honest about the cost: this is `count` separate `ffmpeg` invocations
+/// (`thumbnail_png` called in a loop), not the single-process batch
+/// extraction (one `-vf fps=...` decode pass producing every frame from
+/// one process) a genuinely optimized version would do. Simpler, correct,
+/// and honestly slower for a large `count` — the batch version is real,
+/// separate work this function doesn't attempt, the same "prove the shape
+/// first" trade this session's other new code already made more than once.
+pub fn thumbnail_strip(path: &Path, count: usize) -> Result<Vec<(Ticks, Vec<u8>)>, VideoError> {
+    if count == 0 {
+        return Ok(Vec::new());
+    }
+    let info = probe(path)?;
+    let total_s = info.duration.to_seconds().max(0.0);
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let frac = (i as f64 + 0.5) / count as f64;
+        let at = Ticks::from_seconds(total_s * frac);
+        let png = thumbnail_png(path, at)?;
+        out.push((at, png));
+    }
+    Ok(out)
+}
+
 /// Extract a video's audio track as a [`SourceAudio`], via `ffmpeg` piping
 /// WAV bytes straight to [`studio_media::decode_bytes`] — no temp file.
 /// `Ok(None)` when the file genuinely has no audio track (checked via
@@ -299,6 +334,46 @@ mod tests {
 
         assert!(png.len() > 100, "a real 64x48 PNG should be more than a header's worth of bytes");
         assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'], "must start with the real PNG magic bytes");
+    }
+
+    #[test]
+    fn thumbnail_strip_returns_evenly_spaced_valid_thumbnails_in_time_order() {
+        if !has_ffmpeg() { eprintln!("skipping: ffmpeg/ffprobe not available"); return; }
+        let path = make_test_video(true);
+        let strip = thumbnail_strip(&path, 4).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(strip.len(), 4);
+        for (_, png) in &strip {
+            assert_eq!(&png[..8], &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n'], "every entry must be a real PNG");
+        }
+        let positions: Vec<f64> = strip.iter().map(|(t, _)| t.to_seconds()).collect();
+        for w in positions.windows(2) {
+            assert!(w[1] > w[0], "positions must be strictly increasing: {positions:?}");
+        }
+        // Centred slots of a 1-second video split into 4: (0.5)/4, (1.5)/4,
+        // (2.5)/4, (3.5)/4 = 0.125, 0.375, 0.625, 0.875.
+        assert!((positions[0] - 0.125).abs() < 0.05, "first slot should be centred near 0.125s, got {}", positions[0]);
+        assert!((positions[3] - 0.875).abs() < 0.05, "last slot should be centred near 0.875s, got {}", positions[3]);
+    }
+
+    #[test]
+    fn thumbnail_strip_of_zero_is_an_empty_no_op_not_an_error() {
+        // No ffmpeg call at all needed to answer "give me zero thumbnails" —
+        // worth pinning as a real fast path, not just an edge case that
+        // happens to work.
+        let strip = thumbnail_strip(Path::new("/nonexistent/does-not-matter.mp4"), 0).unwrap();
+        assert!(strip.is_empty());
+    }
+
+    #[test]
+    fn thumbnail_strip_of_one_lands_near_the_midpoint() {
+        if !has_ffmpeg() { eprintln!("skipping: ffmpeg/ffprobe not available"); return; }
+        let path = make_test_video(true);
+        let strip = thumbnail_strip(&path, 1).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(strip.len(), 1);
+        assert!((strip[0].0.to_seconds() - 0.5).abs() < 0.1, "a single centred slot of a 1s video should land near 0.5s, got {}", strip[0].0.to_seconds());
     }
 
     #[test]
