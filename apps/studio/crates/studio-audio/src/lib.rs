@@ -775,6 +775,58 @@ mod tests {
     }
 
     #[test]
+    fn mixdown_reinstantiates_effect_state_on_every_call_not_a_realtime_render_yet() {
+        // `mixdown` is correct and fully tested as an OFFLINE bounce — call it
+        // once over the whole span you want and every effect chain runs
+        // continuously from the first sample to the last. What this test
+        // pins down is the boundary of that guarantee: `mixdown` builds a
+        // fresh `Vec<studio_fx::Instance>` on every call (see the clip_fx /
+        // bus-chain construction above), so a stateful effect's memory —
+        // here a high-Q peaking EQ's biquad z-1/z-2 history — does not
+        // survive between calls. Rendering one window in a single call and
+        // rendering the identical span as two back-to-back calls (exactly
+        // what a live device callback filling successive buffers would do)
+        // must therefore differ at the join, even though both start from the
+        // same source and the same effect params.
+        //
+        // This is not a bug — a one-shot bounce has no "between calls" to
+        // preserve state across — but it is real information for whoever
+        // wires this render graph into `studio-io`'s realtime callback next:
+        // a per-clip/per-bus `Instance` set needs to be built once and
+        // carried across calls (a streaming variant), not reconstructed from
+        // `mixdown`'s current one-shot shape.
+        let rate = 48_000;
+        let len_s = 0.1; // 4800 samples: long enough for a resonant filter's ring to matter
+        let (mut p, audio) = project_with(len_s, 1.0);
+
+        // A high-Q peaking boost right at the test tone's own frequency —
+        // exactly the shape that rings (carries state) rather than settling
+        // instantly, so a reset at the join is measurable.
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("q0".to_string(), 8.0);
+        params.insert("gain0".to_string(), 18.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+
+        let total = Ticks::from_seconds(len_s);
+        let one_shot = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, total, rate, &[], &[]);
+
+        let mid = Ticks::from_samples((total.to_samples(rate)) / 2, rate);
+        let mut two_calls = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, mid, rate, &[], &[]);
+        two_calls.extend(mixdown(&p, &audio, &BTreeMap::new(), mid, total, rate, &[], &[]));
+
+        assert_eq!(one_shot.len(), two_calls.len(), "splitting the window must not change the sample count");
+        let diverges = one_shot.iter().zip(two_calls.iter()).any(|(a, b)| (a - b).abs() > 1e-4);
+        assert!(diverges, "a resonant filter's state must NOT survive a mixdown call boundary today — \
+            if this assertion starts failing, mixdown has become state-continuous across calls and this \
+            test (and its doc comment) should be updated to say so, not deleted");
+    }
+
+    #[test]
     fn clip_effects_and_bus_effects_both_apply_in_the_same_render() {
         // Two independent EQ cuts (one on the clip, one on the bus it routes
         // through) at the same frequency should compound to MORE attenuation
