@@ -93,17 +93,35 @@ impl From<std::io::Error> for DecodeError {
 /// bounced pattern) already reaches the mix.
 pub fn decode_file(path: &Path) -> Result<SourceAudio, DecodeError> {
     let file = std::fs::File::open(path)?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let hint = extension_hint(path);
+    decode_source(Box::new(file), hint)
+}
 
+/// Decode audio already in memory — e.g. a subprocess's captured stdout
+/// (`studio_video::extract_audio` pipes ffmpeg's WAV output straight here
+/// rather than round-tripping through a temp file), or bytes fetched over
+/// the network. Same decode loop as `decode_file`, minus the filesystem.
+pub fn decode_bytes(bytes: Vec<u8>, extension_hint_str: Option<&str>) -> Result<SourceAudio, DecodeError> {
+    let mut hint = Hint::new();
+    if let Some(ext) = extension_hint_str {
+        hint.with_extension(ext);
+    }
+    decode_source(Box::new(std::io::Cursor::new(bytes)), hint)
+}
+
+fn extension_hint(path: &Path) -> Hint {
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
+    hint
+}
 
+fn decode_source(source: Box<dyn symphonia::core::io::MediaSource>, hint: Hint) -> Result<SourceAudio, DecodeError> {
+    let mss = MediaSourceStream::new(source, Default::default());
     let probed = symphonia::default::get_probe()
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
         .map_err(|_| DecodeError::UnsupportedFormat)?;
-
     decode_format(probed.format)
 }
 
@@ -291,6 +309,52 @@ mod tests {
         let audio = decode_format(format).unwrap();
         assert_eq!(audio.frames(), 1000);
         assert!(audio.channels[0].iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn decode_bytes_matches_decode_file_for_the_same_wav_content() {
+        // The seam studio_video::extract_audio actually needs: bytes that
+        // never touched a file (a subprocess's captured stdout, here stood
+        // in for by writing to a temp file only so decode_file has
+        // something to compare against — decode_bytes itself never reads
+        // one) must decode identically to the same bytes read from disk.
+        let samples: Vec<i16> = vec![0, 12_345, -12_345, 32_767, -32_768];
+        let spec = hound::WavSpec { channels: 1, sample_rate: 44_100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            for s in &samples { w.write_sample(*s).unwrap(); }
+            w.finalize().unwrap();
+        }
+
+        let from_bytes = decode_bytes(buf.clone(), Some("wav")).unwrap();
+
+        let tmp = std::env::temp_dir().join(format!("studio-media-test-{}.wav", std::process::id()));
+        std::fs::write(&tmp, &buf).unwrap();
+        let from_file = decode_file(&tmp).unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        assert_eq!(from_bytes.sample_rate, from_file.sample_rate);
+        assert_eq!(from_bytes.channels, from_file.channels);
+    }
+
+    #[test]
+    fn decode_bytes_without_an_extension_hint_still_probes_a_wav() {
+        // Symphonia's probe doesn't strictly need the hint for a well-formed
+        // WAV (it sniffs the RIFF/WAVE magic) — worth pinning, since
+        // studio_video won't always have a meaningful extension to pass
+        // (ffmpeg's stdout has none).
+        let samples: Vec<i16> = vec![100, -100, 200, -200];
+        let spec = hound::WavSpec { channels: 1, sample_rate: 22_050, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut w = hound::WavWriter::new(std::io::Cursor::new(&mut buf), spec).unwrap();
+            for s in &samples { w.write_sample(*s).unwrap(); }
+            w.finalize().unwrap();
+        }
+        let audio = decode_bytes(buf, None).unwrap();
+        assert_eq!(audio.sample_rate, 22_050);
+        assert_eq!(audio.frames(), 4);
     }
 
     #[test]
