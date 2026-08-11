@@ -572,8 +572,19 @@ pub fn load_raw_at(dir: &Path, target_len: f32, flip: bool) -> (Vec<RawPrim>, Ve
         let blob = d.blob.clone().unwrap_or_default();
         (d, blob)
     } else {
-        let d = gltf::Gltf::open(dir.join("scene.gltf"))
-            .unwrap_or_else(|e| panic!("open {:?}: {e}", dir));
+        // Panic with the path actually OPENED, not the directory. Printing
+        // `dir` made a doubled join — a caller passing `.../w00/scene.gltf`
+        // where a directory was expected — report as
+        // `open ".../w00/scene.gltf": Not a directory`, which reads like a
+        // missing asset and sent the reader looking for a file that was there
+        // all along.
+        let f = dir.join("scene.gltf");
+        let d = gltf::Gltf::open(&f).unwrap_or_else(|e| {
+            if !dir.is_dir() {
+                panic!("model dir {dir:?} is not a directory (caller passed a file?): {e}");
+            }
+            panic!("open {f:?}: {e}")
+        });
         let buffer_uri = d
             .buffers()
             .next()

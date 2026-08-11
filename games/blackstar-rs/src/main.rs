@@ -1328,11 +1328,18 @@ fn main() {
             let robot_target = dirs.last().map(|(_, t)| *t).unwrap_or(1.32);
             let mut walk: Vec<usize> = Vec::new();
             for k in 0..4usize {
-                let wp = bdir.join(format!("w{k:02}")).join("scene.gltf");
-                if !wp.exists() {
+                // model::load takes the pose DIRECTORY and joins scene.gltf
+                // itself. This used to join it here too, so load saw
+                // `w00/scene.gltf/scene.gltf` and every bot with walk poses
+                // crashed the game at startup with ENOTDIR — "Not a directory",
+                // which reads like a missing asset and is actually a doubled
+                // path. The existence check is on the FILE and the load is on
+                // the DIRECTORY, because those are two different questions.
+                let wdir = bdir.join(format!("w{k:02}"));
+                if !wdir.join("scene.gltf").is_file() {
                     break;
                 }
-                let m = model::load(&wp, &mut gpu, robot_target);
+                let m = model::load(&wdir, &mut gpu, robot_target);
                 let idx = cars.models.len();
                 walk.push(idx);
                 cars.models.push(m);
