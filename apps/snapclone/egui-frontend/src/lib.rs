@@ -49,6 +49,7 @@ pub mod ambient_inbox;
 pub mod ambient_palette;
 pub mod camera_select;
 pub mod chevron_confirm;
+pub mod dht_bootstrap;
 pub mod firewall_backend;
 pub mod gossip;
 pub mod handshake;
