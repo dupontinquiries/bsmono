@@ -63,6 +63,7 @@ pub mod qr_render;
 pub mod scroll_passthrough;
 pub mod sink_cushion;
 pub mod snap_expiry;
+pub mod store_privacy;
 pub mod snap_export;
 pub mod tab_bar;
 pub mod thumbnails;
