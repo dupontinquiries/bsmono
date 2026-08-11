@@ -173,7 +173,21 @@ mod tests {
                 sprint_ticks += 1;
             }
         }
-        assert!(sprint_ticks * 3 < 200, "winded: sprint is only intermittent, never sustained");
+        // r-fulltest-run: was `sprint_ticks * 3 < 200` (i.e. <33% duty
+        // cycle). DRAIN_PER_SEC's own doc comment explains why that's
+        // stale: "Lowered 5x from 0.5 so stamina lasts roughly 5x longer
+        // (operator: stamina felt low)" — an intentional tuning change.
+        // Reproduced the exact scenario standalone with the real Stamina
+        // constants/tick() logic (not guessed): starting fresh, 600 ticks
+        // of flat-out sprint leaves level=0.036, then the 200-tick
+        // "winded" phase gives sprint_ticks=120 — a 60% duty cycle, not
+        // <33%. The dragon still isn't PERMANENTLY sprinting (40% rest,
+        // real intermittency) — that's the property worth still checking
+        // — just not as aggressively throttled as the old drain rate
+        // produced. Bound with margin above the verified 120/200 so a
+        // real regression toward "basically always sprinting" still fails.
+        assert!(sprint_ticks < 200, "winded: sprint is never fully sustained");
+        assert!(sprint_ticks <= 150, "winded: sprint should still be meaningfully intermittent (measured 120/200 at current tuning)");
         assert!(s.speed <= p.max_speed * 1.15, "winded dragon settles near cruise, not sprint speed");
 
         // not asking to sprint regenerates stamina and matches plain step

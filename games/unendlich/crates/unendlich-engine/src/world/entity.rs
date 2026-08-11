@@ -936,6 +936,11 @@ impl EntityVertex {
     }
 }
 
+impl crate::world::entity_sanitize::HasPosition for EntityVertex {
+    #[inline]
+    fn position(&self) -> [f32; 3] { self.position }
+}
+
 /// Default per-kind color when no per-instance data overrides. The
 /// renderer is expected to call this for entities whose kind doesn't
 /// have its own color source (e.g., `DroppedItem` should sample the
@@ -1436,6 +1441,15 @@ mod tests {
         let (v0, _) = creature_to_vertices(&c);
         assert!((centroid(&v0, 1)[0] - 0.4).abs() < 1e-4, "foot at rest x");
         // Mid-stride, the two diagonal feet step in opposite directions.
+        // r-fulltest-run: also needs a nonzero forward velocity now. r484
+        // replaced the old "gait_phase alone drives swing" model with a
+        // speed-gated pose rig (pose::leg_swing's amplitude is
+        // `(speed/6.0).clamp(0,1) * leg_health * LEG_SWING_MAX` — verified
+        // directly by reading pose.rs) so a creature standing still with
+        // an arbitrary phase correctly shows no visible swing. This test
+        // predates that and only ever set gait_phase, never velocity, so
+        // amplitude was always exactly 0 regardless of phase.
+        c.body.velocity = [3.0, 0.0, 0.0];
         c.gait_phase = std::f32::consts::FRAC_PI_2;
         let (v1, _) = creature_to_vertices(&c);
         let fl = centroid(&v1, 1); // (+x,+z): diagonal -> phase 0 -> sin=+1 -> forward
@@ -2014,10 +2028,18 @@ mod tests {
 
     #[test]
     fn entity_vertex_size_matches_shader_layout() {
-        // EntityVertex must be exactly 6 floats = 24 bytes, repr(C),
-        // no padding. The vertex shader declares 2 vec3 inputs at
-        // tightly-packed offsets 0 and 12.
-        assert_eq!(std::mem::size_of::<EntityVertex>(), 24);
+        // r-fulltest-run: was asserting 24 (2 vec3, no alpha) — stale since
+        // before this session; `alpha: f32` was already a field on
+        // EntityVertex at the base commit this session started from (git
+        // history confirms it, not something added this session). The
+        // REAL pipeline binding already agrees with the struct, not with
+        // this test: entity_pipeline.rs's VertexInputBindingDescription
+        // has `stride: 28` with an explicit comment ("position[3] f32 @0,
+        // color[3] f32 @12, alpha f32 @24, stride 28") — so this was pure
+        // test rot, not a live CPU/GPU layout mismatch. Confirmed by
+        // running the full `unendlich-engine` test suite for real
+        // (8547 passed / 20 failed, this among them) rather than guessed.
+        assert_eq!(std::mem::size_of::<EntityVertex>(), 28);
         assert_eq!(std::mem::align_of::<EntityVertex>(), 4);
     }
 

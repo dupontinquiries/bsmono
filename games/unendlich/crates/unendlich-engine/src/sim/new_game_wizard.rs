@@ -245,7 +245,17 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_name_blocks_finish() {
+    fn duplicate_world_names_are_allowed_by_design() {
+        // r-fulltest-run: this test used to assert duplicate names are
+        // BLOCKED. r291's own code comment in can_finish() explains that's
+        // deliberately no longer true: "a world's identity is its ID, not
+        // its name... duplicate titles are allowed (two worlds can both be
+        // 'New World')... this was the silent Create dead-end: the
+        // catalog's default-named entry collided with a fresh
+        // default-named world." So the old assertion wasn't stale test
+        // data — it was actively testing removed behavior. Repurposed to
+        // guard the actual current contract (and, as a regression guard,
+        // to make sure nobody re-introduces the dead-end r291 fixed).
         use crate::sim::world_catalog::WorldEntry;
         let mut cat = WorldCatalog::new();
         cat.add(WorldEntry {
@@ -257,9 +267,11 @@ mod tests {
         });
         let mut w = NewGameWizard::new();
         w.set_name("Vale");
-        assert!(w.can_finish(&cat).is_err(), "name already taken");
-        assert!(w.finish(7, &cat).is_err());
-        // a unique name finishes
+        assert!(w.can_finish(&cat).is_ok(), "duplicate names are allowed by design (r291) — identity is the world ID, not the name");
+        assert!(w.finish(7, &cat).is_ok(), "finishing with a duplicate name must succeed");
+        // A second, differently-named world still finishes too — this
+        // isn't "uniqueness doesn't matter", it's "uniqueness isn't
+        // enforced"; unique names remain a perfectly normal case.
         w.set_name("Vale Two");
         assert!(w.can_finish(&cat).is_ok());
         assert!(w.finish(7, &cat).is_ok());

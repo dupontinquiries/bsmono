@@ -456,9 +456,21 @@ mod tests {
     #[test]
     fn oak_leaves_produces_subgrid() {
         let g = procedural_subgrid(BlockId::OakLeaves, 0, 0, 0).unwrap();
-        // Distinct leaf clumps (~6-9 clumps × 3-5 cells each).
+        // r-fulltest-run: bounds were (5, 80), sized for the OLD "6-9
+        // clumps x 3-5 cells" recipe. leaves()'s own comments explain two
+        // later, intentional rewrites that changed the density a lot:
+        // r496 replaced clumps with dense vertical strands ("Many more
+        // cells than the old clump recipe -> much denser canopy"), then
+        // r523 walked coverage back down from ~64% to ~45% of columns
+        // ("near-solid mass... real gaps let sky show through"). With
+        // res=8 (64 columns), ~45% coverage x ~3.5 avg strand height
+        // (len is 2..5) predicts ~101 cells — matching the observed 103
+        // almost exactly, confirming this is the intended density, not a
+        // regression. Bounds widened to fit both the old sparse-clump
+        // floor (still meaningfully "not empty") and the new stringy
+        // canopy's real range, with margin either side of 103.
         assert!(g.cell_count() > 5, "expected leaf cells; got {}", g.cell_count());
-        assert!(g.cell_count() < 80, "expected sparse fill; got {}", g.cell_count());
+        assert!(g.cell_count() < 160, "expected sparse-ish fill (real gaps for sky), got {}", g.cell_count());
         // All cells in valid sub-voxel range [0..RES).
         for c in &g.cells {
             assert!((c.sub_x as usize) < SUBVOXEL_RESOLUTION);
