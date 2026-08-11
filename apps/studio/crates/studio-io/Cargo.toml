@@ -8,6 +8,8 @@ description = "The only crate allowed to touch a sound card. Defines the AudioIo
 studio-core = { path = "../studio-core" }
 core-kit = { path = "../../../../shared/core-kit" }
 cpal = { version = "0.15", optional = true }
+rtrb = { version = "0.3.4", optional = true }
+dasp_sample = { version = "0.11.0", optional = true }
 
 [features]
 # Off by default: the measurement math, the trait shape, and a fake backend
@@ -15,4 +17,4 @@ cpal = { version = "0.15", optional = true }
 # this on only on a build host that actually has a sound card (and, on
 # Linux, ALSA/PipeWire dev headers) — that is the hardware stage, not the
 # authoring sandbox.
-device = ["dep:cpal"]
+device = ["dep:cpal", "dep:rtrb", "dep:dasp_sample"]
