@@ -1,0 +1,7 @@
+[package]
+name = "hand-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Hand-gesture taxonomy and evaluation harness, built around a labelled capture set from a real Fairphone. Parses the filename label convention into typed poses so any detector can be scored against device truth. No model, no image decoding."
+
+[dependencies]
