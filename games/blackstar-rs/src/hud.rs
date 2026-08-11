@@ -124,6 +124,73 @@ pub fn draw_cmds(ui: &mut Vec<UiVert>, a: f32, cmds: &[ui_layout::Cmd]) {
 /// nobody wrote a coordinate. Adding a row to the bridge is now adding a
 /// row, not editing a draw function and an input branch and hoping they
 /// still agree.
+/// DRAW THE DECK — a station console, posed by `menufx` and viewed
+/// through `deck::DeckView`.
+///
+/// The look, in order of intent:
+/// * the WORLD STAYS LIT. No full-screen sheet: a vignette of four edge
+///   quads dims the frame's border and leaves the middle alive, because
+///   a console on a ship has a ship behind it.
+/// * the station's ACCENT is the room's light: a chamfered header rail
+///   and the cursor bar carry it, so walking from armory to hold reads
+///   as a lighting change before a single row is read.
+/// * every row is drawn AT ITS POSE: slid along x by `offset`, faded by
+///   `alpha`, and squeezed toward its centreline by `unfold` — the
+///   cascade and the fold both fall out of the same three numbers.
+/// * the cursor is the SPRING, not the selection index: it draws where
+///   the motion says it is, stretched by its own speed, so it arrives a
+///   beat after the input the way a thing with mass does.
+pub fn draw_deck(ui: &mut Vec<UiVert>, a: f32, v: &crate::deck::DeckView) {
+    let [ar, ag, ab] = v.accent();
+    // vignette: edges only, centre untouched
+    quad(ui, -1.0, -1.0, 1.0, -0.72, [0.02, 0.02, 0.05, 0.72]);
+    quad(ui, -1.0, 0.72, 1.0, 1.0, [0.02, 0.02, 0.05, 0.72]);
+    quad(ui, -1.0, -0.72, -0.62, 0.72, [0.02, 0.02, 0.05, 0.55]);
+    quad(ui, 0.62, -0.72, 1.0, 0.72, [0.02, 0.02, 0.05, 0.55]);
+    // header rail: the room's light, with a chamfer step — a plate, not
+    // a line
+    quad(ui, -0.60, 0.80, 0.60, 0.812, [ar, ag, ab, 0.85]);
+    quad(ui, -0.58, 0.776, 0.40, 0.784, [ar, ag, ab, 0.35]);
+    label(ui, -0.58, 0.83, 0.011, a, PAPER, v.title());
+    label(ui, -0.58, 0.744, 0.0066, a, DIM, v.room());
+
+    let top = 0.66;
+    let row_h = 0.072;
+    let rows = v.rows();
+    // the cursor bar first, under the text: spring y in visible units
+    let (cy, squash) = v.cursor();
+    if cy >= -0.5 && (cy as usize) < rows.len().max(1) + 1 {
+        let y = top - cy * row_h;
+        let stretch = row_h * 0.5 * (1.0 + squash * 2.2);
+        quad(ui, -0.585, y - stretch + row_h * 0.28, 0.585, y + stretch - row_h * 0.22, [ar, ag, ab, 0.20]);
+        quad(ui, -0.585, y - stretch + row_h * 0.28, -0.575, y + stretch - row_h * 0.22, [ar, ag, ab, 0.9]);
+    }
+    for (vis_i, (_, row, pose, selected)) in rows.iter().enumerate() {
+        if pose.alpha <= 0.01 {
+            continue;
+        }
+        let y = top - vis_i as f32 * row_h;
+        let x = -0.56 + pose.offset * 0.12;
+        let fold = pose.unfold.clamp(0.05, 1.0);
+        let px = T_BODY * fold;
+        let base = if row.enabled { PAPER } else { DIM };
+        let col = [base[0], base[1], base[2], base[3] * pose.alpha];
+        let vcol = [ar, ag, ab, 0.9 * pose.alpha];
+        let heading = matches!(row.item, crate::menu::Item::Heading);
+        let hx = if heading { x - 0.02 } else { x };
+        row_pair(ui, hx, 0.58, y, &row.label, col, &row.item.value(), vcol, px, a);
+        let _ = selected;
+    }
+    // the selected row's hint, pinned low; feedback under it in accent
+    if let Some(h) = rows.iter().find(|(_, _, _, s)| *s).and_then(|(_, r, _, _)| r.hint) {
+        label(ui, -0.56, -0.80, 0.0066, a, DIM, h);
+    }
+    if let Some(f) = v.feedback() {
+        label(ui, -0.56, -0.86, 0.0072, a, [ar, ag, ab, 0.95], f);
+    }
+    label(ui, -0.56, -0.93, 0.0058, a, DIM, "TAB next station   ESC fold shut   ENTER press");
+}
+
 pub fn draw_menu(ui: &mut Vec<UiVert>, a: f32, m: &crate::menu::Menu) {
     quad(ui, -1.0, -1.0, 1.0, 1.0, [0.05, 0.04, 0.09, 0.55]);
     let scr = ui_layout::Screen::new(a);
