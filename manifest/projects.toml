@@ -659,3 +659,9 @@ kind = "cargo"
 role = "library"
 notes = "Hand-gesture taxonomy and evaluation harness over a labelled capture set from a real Fairphone. Parses the filename label convention into typed poses so a detector is scored against device truth rather than a benchmark shot on other hardware. No model, no image decoding."
 
+[shared.light-kit]
+path = "shared/light-kit"
+kind = "cargo"
+role = "library"
+notes = "Ambient-light policy: cover detection from differentials (pairs with hover-kit's proximity gate), a brightness PID in perceptual space with anti-windup, derivative-on-measurement, a deadband and asymmetric slew, plus adaptive white point and theme tinting capped at the fleet's 0.18 contrast ceiling. No sysfs, no rendering."
+

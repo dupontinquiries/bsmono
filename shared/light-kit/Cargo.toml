@@ -1,0 +1,7 @@
+[package]
+name = "light-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Ambient-light policy: cover detection from differentials, a brightness controller that does not hunt, adaptive white point, and theme tinting from room colour. Pure control law, no sysfs and no rendering."
+
+[dependencies]
