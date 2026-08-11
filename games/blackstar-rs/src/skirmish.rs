@@ -86,8 +86,19 @@ pub fn fighter(id: &str, start_at: f32) -> Option<Fighter> {
         hp *= 1.8;
         dps *= 1.6;
     }
-    // the coalition races fight behind elemental shields
-    let shield = if t.role == crate::content::Role::Variant { SHIELD_HP } else { 0.0 };
+    // the coalition races fight behind elemental shields — the word is
+    // load-bearing: a shield is elemental, so a Variant with no element
+    // (the Corrupted apex, `Element::None` — the treatment never gives
+    // them a ring position; see `corruption.rs`) does not get one. It
+    // already carries the evasion `Fighter::hit` applies below; stacking
+    // an elemental shield on top of that on a body the fiction never
+    // calls a coalition race broke the campaign's own winnability
+    // promise (caught by a test, not eyeballed).
+    let shield = if t.role == crate::content::Role::Variant && t.element != Element::None {
+        SHIELD_HP
+    } else {
+        0.0
+    };
     for a in t.abilities {
         let Some(ab) = ability(a) else { continue };
         match ab.kind {
@@ -129,6 +140,19 @@ fn shield_mult(ring: f32) -> f32 {
     }
 }
 
+/// Which corruption stage a troop id is, if it is one of the Corrupted
+/// (`corruption.rs`, `content.rs`'s `corrupted_*` roster) — the one
+/// place this module needs to know about that roster at all.
+fn corrupted_stage(id: &str) -> Option<crate::corruption::Stage> {
+    use crate::corruption::Stage;
+    match id {
+        "corrupted_drifter" => Some(Stage::One),
+        "corrupted_bloom" => Some(Stage::Two),
+        "corrupted_apex" => Some(Stage::Three),
+        _ => None,
+    }
+}
+
 impl Fighter {
     pub fn alive(&self) -> bool {
         self.hp > 0.0
@@ -139,7 +163,19 @@ impl Fighter {
     /// Route damage through the shield first. The ring decides how much
     /// of it the shield actually feels; once the shield is down, hp takes
     /// the ring-multiplied damage as usual.
+    ///
+    /// A CORRUPTED target routes through one more gate first: the doc's
+    /// continuous-transformation evasion (`corruption.rs`) — "weapons
+    /// that target a specific component miss because that component has
+    /// shifted." Applied before the shield/hp split so an apex Corrupted
+    /// (a Variant, so it also carries an elemental shield) genuinely
+    /// stacks both defenses, which is the fiction's own point about it
+    /// being the hardest thing either side has fought.
     fn hit(&mut self, dmg: f32, ring: f32) {
+        let dmg = match corrupted_stage(self.troop.id) {
+            Some(stage) => dmg * (1.0 - stage.evasion()),
+            None => dmg,
+        };
         if self.shield > 0.0 {
             self.shield -= dmg * shield_mult(ring);
         } else {
@@ -367,6 +403,42 @@ mod tests {
         let a = Squad::new(&[a_id, a_id, a_id], a_doc, OPEN_AT);
         let b = Squad::new(&[b_id, b_id, b_id], b_doc, OPEN_AT);
         Fight::new(a, b).resolve(600.0)
+    }
+
+    #[test]
+    fn an_elementless_variant_carries_no_elemental_shield() {
+        // the apex Corrupted is Role::Variant (for the wave density
+        // cap) but Element::None (the treatment gives it no ring
+        // position) — it must not double-dip into the coalition's
+        // elemental shield on top of its own evasion
+        let apex = fighter("corrupted_apex", OPEN_AT).unwrap();
+        assert_eq!(apex.shield, 0.0, "an elementless body carried an elemental shield");
+        // a real coalition variant still does
+        let sentinel = fighter("hoarfrost_sentinel", OPEN_AT).unwrap();
+        assert_eq!(sentinel.shield, SHIELD_HP);
+    }
+
+    #[test]
+    fn a_corrupted_target_actually_shrugs_off_some_incoming_damage() {
+        // hit() directly, rather than a full duel: dash/other abilities
+        // on the corrupted roster would otherwise confound a timing
+        // comparison, and the evasion is a property of ONE hit anyway
+        let mut drifter = fighter("corrupted_drifter", OPEN_AT).unwrap();
+        let mut plain = fighter("grunt", OPEN_AT).unwrap();
+        let (before_d, before_p) = (drifter.hp, plain.hp);
+        drifter.hit(50.0, 1.0);
+        plain.hit(50.0, 1.0);
+        let (lost_d, lost_p) = (before_d - drifter.hp, before_p - plain.hp);
+        assert!(lost_d < lost_p, "a stage-one target took the full hit: {lost_d} vs {lost_p}");
+        let expected = lost_p * (1.0 - crate::corruption::Stage::One.evasion());
+        assert!((lost_d - expected).abs() < 1e-3, "{lost_d} vs expected {expected}");
+
+        // and a heavier stage shrugs off more than a lighter one
+        let mut bloom = fighter("corrupted_bloom", OPEN_AT).unwrap();
+        let before_b = bloom.hp;
+        bloom.hit(50.0, 1.0);
+        let lost_b = before_b - bloom.hp;
+        assert!(lost_b < lost_d, "stage two took as much as stage one: {lost_b} vs {lost_d}");
     }
 
     #[test]

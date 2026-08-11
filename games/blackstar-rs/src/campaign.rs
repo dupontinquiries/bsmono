@@ -28,6 +28,7 @@
 
 use crate::content::{hostiles, missions_of, Mission, Objective, Role, MISSIONS};
 use crate::energon;
+use crate::patrol::{self, Faction};
 use crate::raidgen::{strhash, Rng};
 use crate::skirmish::{Casualty, Fight, Squad, OPEN_AT};
 use crate::weapons::Element;
@@ -38,10 +39,17 @@ use crate::weapons::Element;
 /// are grunt lines with a raider stiffener; the middle films bring the
 /// warband proper; trilogy two fields the elemental variants. The champion
 /// — when the mission names one — leads the final wave.
+///
+/// The destination's own faction (`patrol::Destination.hostiles`) is now
+/// load-bearing rather than flavor: a mission sited on a Corrupted world
+/// pulls from the Corrupted roster first, same as the treatment's own
+/// Film 2 logic — Jhiaxus' experiment does not politely wait for the
+/// Hijack war to make room for it (see `corruption.rs`).
 pub fn waves_for(m: &Mission) -> Vec<Vec<&'static str>> {
     let mut rng = Rng::new(strhash(m.id));
     let film = m.film as usize;
     let n_waves = 3 + film / 2; // 3,4,4,5,5,6 across the films
+    let site_faction = patrol::find(m.dest).map(|d| d.hostiles).unwrap_or(Faction::None);
     let pool: Vec<&'static str> = hostiles()
         .filter(|t| match t.role {
             Role::Variant => film >= 4,
@@ -52,10 +60,33 @@ pub fn waves_for(m: &Mission) -> Vec<Vec<&'static str>> {
         .filter(|t| Some(t.id) != m.champion)
         .map(|t| t.id)
         .collect();
+    // prefer the site's own faction, but never starve a wave over it —
+    // early films keep the grunt/raider-only gate above, and some
+    // faction rosters are thin or elite-only (Coalition sites, for
+    // instance, currently name nothing but Variant troops), so a
+    // strict filter would occasionally empty the line-troop pool below
+    let on_site: Vec<&'static str> = pool
+        .iter()
+        .copied()
+        .filter(|id| crate::content::troop(id).map(|t| t.faction == site_faction).unwrap_or(false))
+        .collect();
+    let preferred = if on_site.is_empty() { &pool } else { &on_site };
     let is_variant = |id: &str| {
         crate::content::troop(id).map(|t| t.role == Role::Variant).unwrap_or(false)
     };
-    let line_pool: Vec<&'static str> = pool.iter().copied().filter(|id| !is_variant(id)).collect();
+    // line troops for the shield-density substitution: prefer the
+    // on-site roster's own line troops, but an all-elite site (or an
+    // all-elite Corrupted apex encounter) falls back to the wider pool
+    // rather than leaving nothing to substitute in
+    let line_pool: Vec<&'static str> = {
+        let narrow: Vec<&'static str> = preferred.iter().copied().filter(|id| !is_variant(id)).collect();
+        if narrow.is_empty() {
+            pool.iter().copied().filter(|id| !is_variant(id)).collect()
+        } else {
+            narrow
+        }
+    };
+    let pool = preferred.clone();
     (0..n_waves)
         .map(|w| {
             let size = 2 + w.min(2) + usize::from(film >= 5);
@@ -420,6 +451,35 @@ impl CampaignLog {
     pub fn is_cleared(&self, id: &str) -> bool {
         self.cleared.contains(&id)
     }
+    /// Slipstream defects at Film 2's close — `TF_DOMINION_SCENE_MINDMAP.md`'s
+    /// Act 4 resolution: "Slipstream has defected — carries knowledge the
+    /// Autobots will need in Film 3." The troop entry (`content.rs`,
+    /// `Role::Enemy`, `Faction::Hijacks`) is left exactly as it is on
+    /// purpose — one named pilot defecting does not retire the airframe,
+    /// and `Squad::new` already builds from any id leniently, so a squad
+    /// naming "slipstream" post-defection just works. This predicate is
+    /// the fictional permission the mission text has already earned, not
+    /// a gate the code was missing: `the_drowned_approach` is Film 2's
+    /// actual final mission (`content.rs`'s own outro count confirms it —
+    /// every mission carries exactly two outro lines except the campaign
+    /// finale, so a defection beat was left for prose rather than forced
+    /// into an already-composed mission on this pass).
+    pub fn slipstream_defected(&self) -> bool {
+        self.is_cleared("the_drowned_approach")
+    }
+    /// The shield is fully mapped once Slipstream's Film 2 intel and
+    /// Film 3's own Cybertron archive reveal are both in — the exact
+    /// sequence `TF_ADDITIONAL_SCENE_AIDS.md` section 10 lays out:
+    /// "Cybertron archives — first written reference" comes first,
+    /// then "Slipstream provides missing coordinates — shield fully
+    /// mapped." Neither fact alone is the doc's ending; the archive
+    /// without the coordinates is a shape with no location, and the
+    /// coordinates without the archive are numbers with no context.
+    /// `beneath_the_pacific` (Film 3, sited on Cybertron) is where the
+    /// archive half of that sequence already happens in this campaign.
+    pub fn shield_mapped(&self) -> bool {
+        self.slipstream_defected() && self.is_cleared("beneath_the_pacific")
+    }
     pub fn done(&self) -> usize {
         self.cleared.len()
     }
@@ -473,6 +533,82 @@ mod tests {
             !MissionRun::new(m, &DEFAULT_SQUAD, DEFAULT_DOCTRINE, 0).resolve(1200.0)
         });
         assert!(flat_loses_somewhere, "trilogy two folded to a dry squad; re-tune the films");
+    }
+
+    #[test]
+    fn the_shield_needs_both_slipstreams_coordinates_and_the_cybertron_archive() {
+        // TF_ADDITIONAL_SCENE_AIDS.md's own sequence: neither fact
+        // alone maps the shield, in either order
+        let mut only_archive = CampaignLog::default();
+        only_archive.record("the_pluto_line");
+        only_archive.record("the_scavenger_king");
+        only_archive.record("the_red_extraction");
+        only_archive.record("the_beach_opens");
+        only_archive.record("what_jhiaxus_grew");
+        only_archive.record("the_mantle_dive");
+        // note: the_drowned_approach (Slipstream's own mission) is
+        // deliberately skipped here
+        only_archive.record("the_ashen_truce");
+        only_archive.record("beneath_the_pacific");
+        assert!(!only_archive.slipstream_defected());
+        assert!(!only_archive.shield_mapped(), "the shield mapped without Slipstream's coordinates");
+
+        let mut only_slipstream = CampaignLog::default();
+        only_slipstream.record("the_drowned_approach");
+        assert!(only_slipstream.slipstream_defected());
+        assert!(!only_slipstream.shield_mapped(), "the shield mapped without the Cybertron archive");
+
+        let mut both = only_archive.clone();
+        both.record("the_drowned_approach");
+        assert!(both.shield_mapped());
+    }
+
+    #[test]
+    fn slipstream_defects_at_film_twos_actual_close_and_a_squad_can_use_her_after() {
+        let mut log = CampaignLog::default();
+        assert!(!log.slipstream_defected());
+        // clearing an earlier film-2 mission is not the same as clearing
+        // the film's actual last one
+        log.record("what_jhiaxus_grew");
+        assert!(!log.slipstream_defected());
+        log.record("the_drowned_approach");
+        assert!(log.slipstream_defected());
+        // the fictional permission does not need a code gate: the roster
+        // was always lenient enough to field a defector
+        let squad = Squad::new(&["slipstream", "vanguard"], "skirmisher", OPEN_AT);
+        assert_eq!(squad.fighters.len(), 2, "slipstream did not compile into a fighter");
+    }
+
+    #[test]
+    fn a_corrupted_site_actually_fields_the_corrupted() {
+        // the gap this closes: `patrol::Destination.hostiles` existed
+        // and was read by nothing. earth is Faction::Corrupted; the
+        // beach mission (film 1, no champion) should now draw from the
+        // Corrupted roster rather than a generic grunt line, once the
+        // film-gate that reserves early films for grunts/raiders lifts.
+        let beach = MISSIONS.iter().find(|m| m.id == "the_beach_opens").unwrap();
+        assert_eq!(patrol::find(beach.dest).unwrap().hostiles, Faction::Corrupted);
+        // find a later mission actually sited on a Corrupted world with
+        // no name-collision on champion, to see the roster past the
+        // early-film grunt gate
+        let corrupted_site = MISSIONS
+            .iter()
+            .find(|m| m.film >= 4 && patrol::find(m.dest).map(|d| d.hostiles) == Some(Faction::Corrupted));
+        if let Some(m) = corrupted_site {
+            let seen: std::collections::HashSet<&str> = waves_for(m).into_iter().flatten().collect();
+            assert!(
+                seen.iter().any(|id| id.starts_with("corrupted_")),
+                "{} sits on a Corrupted world and never fielded one: {seen:?}",
+                m.id
+            );
+        }
+        // and an all-elite Coalition site (currently pluto's neighbours)
+        // must not panic by starving the shield-density substitution
+        let coalition_site =
+            MISSIONS.iter().find(|m| patrol::find(m.dest).map(|d| d.hostiles) == Some(Faction::Coalition));
+        if let Some(m) = coalition_site {
+            let _ = waves_for(m); // must not panic
+        }
     }
 
     #[test]
