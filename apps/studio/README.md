@@ -49,7 +49,7 @@ edits exactly reversible, which floats are not.
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
 | `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
-| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **streaming render** + **block-backed edit sequences** | 72 |
+| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **streaming render** + **block-backed edit sequences** + **destructive editing** | 83 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
@@ -148,7 +148,16 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    type) rather than rewriting it: block-backing pays for itself on the
    *edit* path, not playback, so `to_flat_channels`/`from_flat_channels`
    bridge the two rather than forking the representation everywhere else
-   that already works with flat audio.
+   that already works with flat audio. `BlockSequence` now has a real
+   caller too: `studio_audio::destructive` (`delete_range_ops`/
+   `insert_at_ops`) cuts a range out of a source or punches material into
+   one, and hands back the same `Op::AddSource`/`Op::AddClip` shape
+   `repitch`/`bounce_ops`/`Recorder::commit_ops` already use — a
+   destructive edit never mutates the source it started from, so it's
+   non-destructive at the model level and needs no new convergence rule.
+   Checked directly, not just argued: two concurrent destructive edits of
+   the same recording, applied in either order, converge to byte-identical
+   projects using nothing but the pre-existing op semantics.
 
 This closes every item that was on this list when this section was last
 written honestly. What's real and load-bearing now, named precisely rather
