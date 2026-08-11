@@ -332,6 +332,7 @@ impl EffectCache {
 #[derive(Default)]
 pub struct StreamingRenderer {
     cache: EffectCache,
+    scratch: RenderScratch,
     next_expected: Option<Ticks>,
 }
 
@@ -343,6 +344,12 @@ impl StreamingRenderer {
     /// Render `[from, to)`, reusing cached effect instances when this call
     /// picks up exactly where the previous one left off, and transparently
     /// resetting (same cost as a one-shot [`mixdown`] call) otherwise.
+    ///
+    /// Returns a freshly allocated `Vec` — kept for API compatibility with
+    /// existing callers and tests. [`StreamingRenderer::render_into`] is
+    /// the version that also reuses the bus/master scratch buffers across
+    /// calls and writes into a caller-provided buffer instead of
+    /// allocating one; a real device callback should prefer it.
     pub fn render(
         &mut self,
         project: &Project,
@@ -354,17 +361,43 @@ impl StreamingRenderer {
         solo: &[studio_core::TrackId],
         bus_solo: &[studio_core::BusId],
     ) -> Vec<f32> {
+        let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+        let mut out = vec![0.0f32; frames * 2];
+        self.render_into(project, audio, fades, from, to, rate, solo, bus_solo, &mut out);
+        out
+    }
+
+    /// The allocation-conscious version: writes into `out` (must be exactly
+    /// `(to - from)` frames of interleaved stereo — see [`mixdown_into`]),
+    /// and reuses this renderer's own [`RenderScratch`] across calls the
+    /// same way it already reuses [`EffectCache`]. This is what
+    /// `studio-engine`'s `DeviceEngine::tick` calls; `render` above exists
+    /// for callers (and tests) that want an owned `Vec` back and don't
+    /// need the per-call allocation avoided.
+    pub fn render_into(
+        &mut self,
+        project: &Project,
+        audio: &BTreeMap<SourceId, SourceAudio>,
+        fades: &BTreeMap<studio_core::ClipId, Fades>,
+        from: Ticks,
+        to: Ticks,
+        rate: u32,
+        solo: &[studio_core::TrackId],
+        bus_solo: &[studio_core::BusId],
+        out: &mut [f32],
+    ) {
         if self.next_expected != Some(from) {
             self.cache.reset();
         }
         self.next_expected = Some(to);
-        mixdown_with_cache(project, audio, fades, from, to, rate, solo, bus_solo, &mut self.cache)
+        mixdown_into(project, audio, fades, from, to, rate, solo, bus_solo, &mut self.cache, &mut self.scratch, out);
     }
 
-    /// Force a reset on the next `render`, regardless of continuity —
-    /// exposed for a caller that knows a discontinuity is coming (e.g. is
-    /// about to seek) and wants the reset to happen before the render call
-    /// that would otherwise detect it, not because detection needs help.
+    /// Force a reset on the next `render`/`render_into`, regardless of
+    /// continuity — exposed for a caller that knows a discontinuity is
+    /// coming (e.g. is about to seek) and wants the reset to happen before
+    /// the render call that would otherwise detect it, not because
+    /// detection needs help.
     pub fn reset(&mut self) {
         self.cache.reset();
         self.next_expected = None;
@@ -394,6 +427,48 @@ pub fn mixdown(
     mixdown_with_cache(project, audio, fades, from, to, rate, solo, bus_solo, &mut cache)
 }
 
+/// Reused across [`StreamingRenderer::render_into`] calls so a render
+/// doesn't allocate the master accumulator or per-bus buffers fresh every
+/// buffer, the same reasoning [`EffectCache`] already applies to effect
+/// instances. `mixdown`/`mixdown_with_cache`/`StreamingRenderer::render`
+/// still build a throwaway one internally — reuse only pays off when the
+/// same scratch survives across calls, which is exactly the streaming case.
+#[derive(Default)]
+pub struct RenderScratch {
+    /// One accumulator per bus, kept across calls and cleared in place
+    /// (`.clear(); .resize(...)` reuses the existing heap allocation when
+    /// capacity already covers the new length, rather than reallocating).
+    /// Entries for busses no longer in the project are dropped — a bus
+    /// being deleted is a structural edit, not a steady-state realtime
+    /// event, so paying an allocation on the NEXT call after a deletion is
+    /// the honest trade rather than something worth engineering around.
+    bus_buf: BTreeMap<studio_core::BusId, Vec<f32>>,
+    /// Busses already folded this call, holding their buffer until the
+    /// whole fold finishes — see `mixdown_into`'s own comment on why they
+    /// can't go straight back into `bus_buf` mid-call without changing
+    /// which sends land.
+    retired: Vec<(studio_core::BusId, Vec<f32>)>,
+    /// One reusable scratch for a bus's pre-fader tap, replacing what used
+    /// to be a fresh `buf.clone()` per bus per call. Only one bus needs
+    /// this at a time (the fold is sequential), so a single field suffices.
+    pre: Vec<f32>,
+}
+
+impl RenderScratch {
+    pub fn new() -> RenderScratch {
+        RenderScratch::default()
+    }
+}
+
+/// Resize `v` to exactly `len` zeros, reusing its existing allocation when
+/// `v.capacity() >= len` rather than always reallocating — the pattern
+/// every scratch buffer in this module uses to stay allocation-free once
+/// warmed up.
+fn zero_resize(v: &mut Vec<f32>, len: usize) {
+    v.clear();
+    v.resize(len, 0.0);
+}
+
 /// [`mixdown`]'s actual logic, parameterised over the [`EffectCache`] that
 /// backs every clip's and bus's effect instances — `mixdown` itself is a
 /// two-line wrapper handing this a cache nobody keeps, and
@@ -413,12 +488,58 @@ pub fn mixdown_with_cache(
     cache: &mut EffectCache,
 ) -> Vec<f32> {
     let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
-    let mut master = vec![0.0f32; frames * 2];
+    let mut out = vec![0.0f32; frames * 2];
+    let mut scratch = RenderScratch::new();
+    mixdown_into(project, audio, fades, from, to, rate, solo, bus_solo, cache, &mut scratch, &mut out);
+    out
+}
+
+/// The genuinely allocation-conscious entry point: writes into a
+/// caller-provided `out` (exactly `(to - from)` frames, interleaved
+/// stereo — matching `studio_io::DuplexCallback`'s own output shape)
+/// instead of returning a fresh `Vec`, and takes a [`RenderScratch`] the
+/// caller is expected to keep across calls. [`mixdown_with_cache`] and
+/// [`StreamingRenderer::render`] both delegate here with a throwaway
+/// scratch and output buffer; [`StreamingRenderer::render_into`] is the
+/// one that actually reuses both across calls.
+///
+/// `out.len()` must equal `((to - from) in frames) * 2`; a mismatched
+/// length is a caller bug, not a case this function tries to paper over —
+/// silently truncating or padding would hide exactly the kind of
+/// off-by-one a device buffer size calculation is prone to.
+pub fn mixdown_into(
+    project: &Project,
+    audio: &BTreeMap<SourceId, SourceAudio>,
+    fades: &BTreeMap<studio_core::ClipId, Fades>,
+    from: Ticks,
+    to: Ticks,
+    rate: u32,
+    solo: &[studio_core::TrackId],
+    bus_solo: &[studio_core::BusId],
+    cache: &mut EffectCache,
+    scratch: &mut RenderScratch,
+    out: &mut [f32],
+) {
+    let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
+    assert_eq!(out.len(), frames * 2, "mixdown_into: out.len() must equal frames * 2");
+    out.fill(0.0);
+    // `out` IS the master accumulator throughout — tracks routed directly
+    // to master write here, and folded busses add into it below, exactly
+    // the way the old separately-allocated `master` buffer worked. No
+    // extra buffer, no final copy.
+    let master = out;
+
     // One accumulator per bus, pre-populated for every bus in the project —
     // not just the ones a track happens to route to — so a bus that exists
-    // only as a send target still has somewhere to land.
-    let mut bus_buf: BTreeMap<studio_core::BusId, Vec<f32>> =
-        project.busses.keys().map(|id| (*id, vec![0.0f32; frames * 2])).collect();
+    // only as a send target still has somewhere to land. Busses no longer
+    // in the project are dropped from the scratch map (see RenderScratch's
+    // own docs on why that's the right trade); surviving ones are resized
+    // in place, reusing their allocation.
+    scratch.bus_buf.retain(|id, _| project.busses.contains_key(id));
+    for id in project.busses.keys() {
+        zero_resize(scratch.bus_buf.entry(*id).or_default(), frames * 2);
+    }
+    let bus_buf = &mut scratch.bus_buf;
 
     for track in &project.tracks {
         if track.kind != TrackKind::Audio && !project.clips.values().any(|c| c.track == track.id) {
@@ -434,9 +555,9 @@ pub fn mixdown_with_cache(
                 // surviving a bus removed by a peer's op before this route
                 // was cleared) — fall back to master rather than dropping
                 // the track's audio on the floor.
-                None => master.as_mut_slice(),
+                None => master.as_mut(),
             },
-            None => master.as_mut_slice(),
+            None => master.as_mut(),
         };
 
         for clip in project.track_clips(track.id) {
@@ -502,6 +623,15 @@ pub fn mixdown_with_cache(
     let audible = solo_audible_bus_set(project, bus_solo);
     for id in order {
         let Some(bus) = project.busses.get(&id) else { continue };
+        // Removed (not merely borrowed) from `bus_buf` for the rest of
+        // this bus's processing: a `send` targeting a bus later in this
+        // same loop is only supposed to land if that bus hasn't been
+        // folded yet (see `mixdown`'s existing contract — this refactor
+        // preserves it exactly). Retiring the buffer into `scratch.retired`
+        // rather than dropping it is what lets its allocation survive to
+        // the NEXT call without changing that contract within THIS call —
+        // reinserting into `bus_buf` immediately would make an
+        // already-processed bus look "not yet folded" to a later send.
         let Some(buf) = bus_buf.remove(&id) else { continue };
         // Mute is an absolute override, checked before solo; a gated bus's
         // buffer — including everything already summed into it from its own
@@ -509,6 +639,7 @@ pub fn mixdown_with_cache(
         // the same as a muted track's clips never reaching the mix.
         let solo_ok = bus_solo.is_empty() || audible.contains(&id);
         if bus.muted || !solo_ok {
+            scratch.retired.push((id, buf));
             continue;
         }
         let mut buf = buf;
@@ -536,11 +667,12 @@ pub fn mixdown_with_cache(
                 }
             }
         }
-        let pre = buf.clone();
+        zero_resize(&mut scratch.pre, buf.len());
+        scratch.pre.copy_from_slice(&buf);
         for s in buf.iter_mut() { *s *= bus.gain; }
 
         for send in &bus.sends {
-            let tap: &[f32] = if send.pre_fader { &pre } else { &buf };
+            let tap: &[f32] = if send.pre_fader { &scratch.pre } else { &buf };
             if let Some(target) = bus_buf.get_mut(&send.to) {
                 for (t, s) in target.iter_mut().zip(tap.iter()) {
                     *t += s * send.level;
@@ -551,16 +683,23 @@ pub fn mixdown_with_cache(
         let parent: &mut [f32] = match bus.parent {
             Some(p) => match bus_buf.get_mut(&p) {
                 Some(b) => b.as_mut_slice(),
-                None => master.as_mut_slice(),
+                None => master.as_mut(),
             },
-            None => master.as_mut_slice(),
+            None => master.as_mut(),
         };
         for (p, b) in parent.iter_mut().zip(buf.iter()) {
             *p += b;
         }
+        scratch.retired.push((id, buf));
     }
 
-    master
+    // Everything folded this call goes back into `bus_buf` now that no
+    // more sends can target it this call — ready, and already the right
+    // size, for the next call's `zero_resize` to reuse without a fresh
+    // allocation.
+    for (id, buf) in scratch.retired.drain(..) {
+        scratch.bus_buf.insert(id, buf);
+    }
 }
 
 /// Peak level of a rendered buffer, in dBFS. `-inf` for silence — reported as
@@ -1125,6 +1264,66 @@ mod tests {
         let mut cache = EffectCache::new();
         let b = mixdown_with_cache(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.3), 48_000, &[], &[], &mut cache);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn render_into_matches_render_including_a_project_with_busses_and_sends() {
+        // Not just the simple no-bus case: this exercises the exact code
+        // path `mixdown_into`'s bus fold rewrote (remove → retire →
+        // reinsert instead of the old remove-and-drop), with a real send
+        // and a real chain, so a mistake in the retire/reinsert bookkeeping
+        // would show up as a value mismatch here.
+        let (mut p, audio) = project_with(0.4, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Bus", None, 0.8) }).unwrap();
+        p.apply(&Op::AddBus { bus: bus(2, "Verb", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("gain0".to_string(), 6.0);
+        p.apply(&Op::SetBusChain { id: BusId(1), chain: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+        p.apply(&Op::SetBusSends { id: BusId(1), sends: vec![
+            studio_core::Send { to: BusId(2), level: 0.3, pre_fader: true },
+        ] }).unwrap();
+
+        let span = (Ticks::ZERO, Ticks::from_seconds(0.4));
+        let a = mixdown(&p, &audio, &BTreeMap::new(), span.0, span.1, 48_000, &[], &[]);
+        let mut renderer = StreamingRenderer::new();
+        let b = renderer.render(&p, &audio, &BTreeMap::new(), span.0, span.1, 48_000, &[], &[]);
+        renderer.reset();
+        let mut out = vec![0.0f32; a.len()];
+        renderer.render_into(&p, &audio, &BTreeMap::new(), span.0, span.1, 48_000, &[], &[], &mut out);
+
+        assert_eq!(a, b, "render() must match mixdown()");
+        assert_eq!(a, out, "render_into() must match mixdown() too, busses and sends included");
+    }
+
+    #[test]
+    fn render_into_reuses_scratch_allocations_across_contiguous_calls() {
+        // The actual point of this whole refactor, checked directly rather
+        // than trusted: after the first call has warmed up the scratch
+        // buffers, a second contiguous call must not grow any of the
+        // per-bus buffers — same technique `block.rs` uses for its own
+        // "did this edit touch this allocation" claim, applied here to
+        // "did this render call touch this allocation."
+        let (mut p, audio) = project_with(0.2, 1.0);
+        p.apply(&Op::AddBus { bus: bus(1, "Bus", None, 1.0) }).unwrap();
+        p.apply(&Op::SetRoute { track: TrackId(1), bus: Some(BusId(1)) }).unwrap();
+
+        let mut renderer = StreamingRenderer::new();
+        let total = Ticks::from_seconds(0.2);
+        let mid = Ticks::from_samples(total.to_samples(48_000) / 2, 48_000);
+        let mut out1 = vec![0.0f32; (mid.to_samples(48_000) as usize) * 2];
+        renderer.render_into(&p, &audio, &BTreeMap::new(), Ticks::ZERO, mid, 48_000, &[], &[], &mut out1);
+
+        let cap_before = renderer.scratch.bus_buf.get(&BusId(1)).unwrap().capacity();
+        let mut out2 = vec![0.0f32; ((total.to_samples(48_000) - mid.to_samples(48_000)) as usize) * 2];
+        renderer.render_into(&p, &audio, &BTreeMap::new(), mid, total, 48_000, &[], &[], &mut out2);
+        let cap_after = renderer.scratch.bus_buf.get(&BusId(1)).unwrap().capacity();
+
+        assert_eq!(cap_before, cap_after, "a same-size contiguous call must not reallocate the bus scratch buffer");
     }
 
     #[test]
