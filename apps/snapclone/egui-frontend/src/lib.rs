@@ -49,6 +49,7 @@ pub mod ambient_inbox;
 pub mod ambient_palette;
 pub mod camera_select;
 pub mod chevron_confirm;
+pub mod gossip;
 pub mod handshake;
 pub mod landmark_hash;
 pub mod nat_punch;
