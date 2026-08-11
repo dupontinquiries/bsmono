@@ -412,7 +412,16 @@ pub fn keyboard_ui_with_signal(
 /// border, instant colour-flip on press — no gradient/sheen, no blur. Otherwise keys use the standard
 /// carved-tile motion glide.
 fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool) -> Option<String> {
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    // CLICK AND DRAG. This was `Sense::click()`, which is why cardinal swipes
+    // did nothing: a key that only senses clicks never sees a drag, so the
+    // direction could not be measured however good the classifier was. `Key`
+    // has carried `cardinal` — the MessagEase direction→string table — the
+    // whole time, and nothing could reach it.
+    //
+    // The keys with the most cardinal entries are exactly the ones reported
+    // unreachable: on a compact layout a letter like L lives on a swipe, not a
+    // tile of its own.
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click_and_drag());
     let painter = ui.painter();
     if glass {
         let modifier = key.label.chars().count() > 1; // "shift"/"space"/"enter" etc. — sit subtly less present
