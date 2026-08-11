@@ -83,6 +83,18 @@ pub mod pbr_terms;
 pub mod viewport_layout;
 pub mod view_cull;
 pub mod moisture_field;
+// r-vk-harness-msrv: uses `ash::{vk, Device, Instance}` unconditionally
+// (moisture_texture.rs — a GPU texture-upload path with zero callers
+// anywhere in the crate, confirmed via grep) but had no feature gate,
+// unlike every other ash-dependent module here (see `local_player`
+// right below, gated on `render-core`). This broke `--no-default-
+// features --features mesh-ref` builds — exactly the build vk-harness's
+// own Cargo.toml requests for its GPU-vs-CPU parity tests (`mesh-ref`
+// is documented as "no glfw/ash"). `gpu` is the feature that actually
+// enables the `ash` optional dependency (`gpu = ["ash"]`), so that's
+// the correct, minimal gate — narrower than `render-core`, matching
+// what this module actually needs.
+#[cfg(feature = "gpu")]
 pub mod moisture_texture;
 #[cfg(feature = "render-core")]
 pub mod local_player;

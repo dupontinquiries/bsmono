@@ -40,11 +40,29 @@ pub fn clamp01(v: f32) -> f32 {
 
 /// Clamp to `[0, 1]`, mapping NaN to 0, via `v.max(0.0).min(1.0)`.
 /// **Byte-identical** to `sim::canopy_field_shift::clamp01` and
-/// `sim::particulate_field::c01`. Differs from [`clamp01`] for **exactly one
-/// input**: `-0.0` → `+0.0` here (vs `-0.0` for `clamp01`). They are otherwise
-/// bit-for-bit identical. Route max/min-form call sites here so the
-/// consolidation stays bit-parity-exact (the de-dup must NOT silently flip the
-/// sign of a zero in a field).
+/// `sim::particulate_field::c01`.
+///
+/// r-fulltest-run CORRECTION: this doc previously claimed `saturate(-0.0)`
+/// normalizes to `+0.0`, differing from [`clamp01`] (which preserves sign)
+/// at exactly that one input. Verified false on this platform (x86_64,
+/// rustc 1.75) with a direct, isolated reproduction:
+/// `(-0.0f32).max(0.0f32)` returns `-0.0`, not `+0.0` — so `clamp01` and
+/// `saturate` are actually bit-identical on EVERY input, including `-0.0`,
+/// not "every input but one." The real full test suite caught this: the
+/// test asserting the old (wrong) claim failed with
+/// `saturate(-0.0).to_bits() == 0x80000000`, not the expected `0x00000000`.
+///
+/// WORTH FLAGGING, not just fixing: IEEE 754's `minNum`/`maxNum` are
+/// implementation-defined for signed zeros — `max(-0.0, +0.0)` is NOT
+/// required to pick a consistent operand across platforms. This project
+/// targets both x86_64 (dev) and ARM/Apple Silicon (Asahi) and leans
+/// heavily on `f32` being bit-reproducible across machines for lockstep
+/// sim. If `saturate`'s sign-of-zero behavior ever DOES diverge between
+/// those targets — this fix doesn't prove it can't, only that x86_64
+/// currently agrees with `clamp01` — that's a genuine cross-platform
+/// determinism bug hiding in exactly this kind of "obviously equivalent"
+/// float rewrite. Worth an ARM-side check before trusting this is safe
+/// everywhere, not just here.
 #[inline]
 pub fn saturate(v: f32) -> f32 {
     if v.is_nan() {
@@ -248,23 +266,26 @@ mod tests {
     }
 
     #[test]
-    fn the_two_forms_diverge_only_at_negative_zero() {
-        // -0.0 is the single input where they differ (branch keeps the sign;
-        // max/min normalizes to +0.0). This guards the de-dup decision: branch
-        // sites → clamp01, max/min sites → saturate, never cross-routed.
+    fn the_two_forms_agree_everywhere_including_negative_zero() {
+        // r-fulltest-run CORRECTION: this test previously asserted
+        // saturate(-0.0) == +0.0 (diverging from clamp01's sign-preserving
+        // -0.0). Verified false on this platform via a direct, isolated
+        // repro: (-0.0f32).max(0.0f32) returns -0.0, not +0.0. So the two
+        // forms are actually bit-identical on EVERY f32 input, not every
+        // input but one. See saturate()'s doc comment for the full
+        // correction and a note on why this might not hold on every
+        // target platform (IEEE 754 leaves max(-0.0,+0.0) implementation-
+        // defined) even though it holds here.
         assert_eq!(clamp01(-0.0).to_bits(), (-0.0f32).to_bits());
-        assert_eq!(saturate(-0.0).to_bits(), (0.0f32).to_bits());
-        assert_ne!(clamp01(-0.0).to_bits(), saturate(-0.0).to_bits());
+        assert_eq!(saturate(-0.0).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(clamp01(-0.0).to_bits(), saturate(-0.0).to_bits());
         // Everywhere else (incl +0.0, 1.0, NaN→0, ±inf, in-range, out-of-range)
-        // they agree bit-for-bit.
+        // they also agree bit-for-bit.
         let mut h = 99u32;
         for _ in 0..20_000 {
             h = h.wrapping_mul(0x9E37_79B9).wrapping_add(3);
             let v = f32::from_bits(h ^ (h << 11));
-            if v.to_bits() == (-0.0f32).to_bits() {
-                continue;
-            }
-            assert_eq!(clamp01(v).to_bits(), saturate(v).to_bits(), "diverged off -0.0 at v={v}");
+            assert_eq!(clamp01(v).to_bits(), saturate(v).to_bits(), "diverged at v={v}");
         }
     }
 

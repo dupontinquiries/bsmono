@@ -4330,7 +4330,18 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
             fg_services.tick_all(&unendlich_engine::sim::service_registry::ServiceCtx { dt });
             fg_kernels.exercise();
         }
-        if !game_paused {
+        // r-radar-H: freeze_time is a debug-only, narrower cousin of the
+        // r161 game_paused freeze — stops just the world clock (and, below,
+        // sky/weather) without pausing input/sim/menus. Was declared in
+        // DebugSettings (F3 panel slot presumably reserved for it) but had
+        // zero consumers anywhere (confirmed via tools/wiring_radar.py's
+        // dead-toggle sweep) — same "aspirational flag" pattern r157's
+        // disable_fog/disable_shadows fix found and closed. Defaults false,
+        // so this is a strict no-op until someone actually flips it.
+        let freeze_time = unendlich_engine::debug_settings::DEBUG
+            .freeze_time
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !game_paused && !freeze_time {
             world_clock_elapsed += dt; // r121 world clock (r161: frozen while paused)
         }
         // r139: popdyn step — humidity-scaled grass regen vs herd grazing.
@@ -6873,7 +6884,14 @@ weather/wind={} flora=per-streamed-chunk spawn_egg=H(captured) load_fog=ON(defau
                 .store(!renderer.ui_shadows_on, std::sync::atomic::Ordering::Relaxed);
         }
         // r161: paused = the sun and the storm hold still too.
-        if !game_paused {
+        // r-radar-H: freeze_time (see the world_clock site above for the
+        // full rationale) also holds the sky/weather clocks — re-read the
+        // atomic here rather than relying on the earlier local's scope
+        // surviving this far through the frame loop.
+        let freeze_time_sky = unendlich_engine::debug_settings::DEBUG
+            .freeze_time
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if !game_paused && !freeze_time_sky {
             sky_state.tick(dt);
             weather_state.tick(dt);
         }

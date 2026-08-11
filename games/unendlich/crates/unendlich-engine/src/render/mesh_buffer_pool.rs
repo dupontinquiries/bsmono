@@ -28,6 +28,42 @@ pub const DEFAULT_VERT_BUFFER_SIZE: u64 = 3 * 1024 * 1024 * 1024;
 /// in the playtest distribution.
 pub const DEFAULT_INDEX_BUFFER_SIZE: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Resolve the live mesh-pool buffer sizes (vertex, index) in bytes.
+///
+/// r-vulkanmod-cf: this pool is a single fixed-capacity allocation for
+/// the whole resident chunk set — unlike VulkanMod's `AreaBuffer`
+/// (segmented per-`ChunkArea`, grows by adding segments), it was sized
+/// once for a render-distance-6 working set (see the constants above)
+/// and never revisited even though `UNENDLICH_RENDER_DISTANCE` now
+/// defaults to presets up to 20+ (see docs/PERF-LEVERS.md) and the
+/// sibling octree pool got exactly this env-var escape hatch
+/// (`UNENDLICH_OCTREE_POOL_MB`, see render/octree_buffer.rs). On
+/// exhaustion this pool doesn't grow or evict to make room — it logs a
+/// warning, increments `upload_fail_count`, and the chunk simply never
+/// gets a mesh (a permanent hole, not a transient pop-in). Full parity
+/// with VulkanMod's growable segmented allocator is a bigger change
+/// (this pool's allocator has no notion of "add another segment" yet);
+/// this is the same-shape stopgap the octree pool already uses —
+/// raise the ceiling instead of hitting it.
+///
+/// Same clamp shape as `octree_buffer::runtime_octree_pool_bytes`
+/// (64..=16384 MiB) so a fat-fingered value can't overcommit.
+pub fn runtime_mesh_pool_bytes() -> (u64, u64) {
+    const MIN_MB: u64 = 64;
+    const MAX_MB: u64 = 16 * 1024;
+    let vert = std::env::var("UNENDLICH_MESH_VERT_POOL_MB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|m| m.clamp(MIN_MB, MAX_MB) * 1024 * 1024)
+        .unwrap_or(DEFAULT_VERT_BUFFER_SIZE);
+    let idx = std::env::var("UNENDLICH_MESH_INDEX_POOL_MB")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(|m| m.clamp(MIN_MB, MAX_MB) * 1024 * 1024)
+        .unwrap_or(DEFAULT_INDEX_BUFFER_SIZE);
+    (vert, idx)
+}
+
 /// Errors from pool operations.
 #[derive(Debug)]
 pub enum MeshPoolError {
@@ -397,10 +433,15 @@ impl VulkanMeshPool {
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
     ) -> Result<Self, MeshPoolError> {
+        // r-vulkanmod-cf: honor UNENDLICH_MESH_VERT_POOL_MB /
+        // UNENDLICH_MESH_INDEX_POOL_MB instead of the hardcoded
+        // RD=6-era defaults — same escape hatch the octree pool
+        // already has via UNENDLICH_OCTREE_POOL_MB.
+        let (vert_buffer_size, idx_buffer_size) = runtime_mesh_pool_bytes();
         Self::with_buffer_sizes(
             device, instance, physical_device,
-            DEFAULT_VERT_BUFFER_SIZE,
-            DEFAULT_INDEX_BUFFER_SIZE,
+            vert_buffer_size,
+            idx_buffer_size,
         )
     }
 

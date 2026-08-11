@@ -120,8 +120,15 @@ mod tests {
         assert_eq!(deflect([5.0, 0.0, 0.0], &m, 0.0, 3.0), [0.0, 0.0, 0.0]);
         assert_eq!(deflect([5.0, 0.0, 0.0], &m, 1.0, 0.0), [0.0, 0.0, 0.0]);
         assert_eq!(deflect([0.0, 0.0, 0.0], &m, 1.0, 3.0), [0.0, 0.0, 0.0]);
-        let a = len3(deflect([2.0, 0.0, 0.0], &m, 1.0, 3.0));
-        let b = len3(deflect([4.0, 0.0, 0.0], &m, 1.0, 3.0));
+        // r-fulltest-run: was mag=2.0 vs mag=4.0. With this material
+        // (stiffness=2.0) and lever=3.0, `bend = (mag*l*w/stiffness).min(l)`
+        // gives raw_bend=3.0 and 6.0 respectively — BOTH already clamped to
+        // the lever ceiling (3.0), so a==b==3.0 and the monotonicity check
+        // this test exists for was never actually exercised (verified
+        // directly: deflect_bend(2.0,...)==deflect_bend(4.0,...)==3.0).
+        // Smaller magnitudes stay under the clamp so the comparison is real.
+        let a = len3(deflect([0.5, 0.0, 0.0], &m, 1.0, 3.0));
+        let b = len3(deflect([1.0, 0.0, 0.0], &m, 1.0, 3.0));
         assert!(b > a);
         let big = deflect([1000.0, 0.0, 0.0], &m, 1.0, 3.0);
         assert!(len3(big) <= 3.0 + 1e-4);

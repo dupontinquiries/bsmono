@@ -719,6 +719,19 @@ mod tests {
         for &c in &[chunk_a_coord, chunk_b_coord] {
             let mut chunk = Chunk::empty(c);
             chunk.set(5, 5, 5, BlockId::OakLeaves);
+            // r160 fix: only ORPHANED/flagged leaves decay (untouched
+            // canopy is permanent — see the handler's FLAG_DECAYING gate
+            // just above). This test is about the catch-up *tracker*,
+            // not about orphan detection, so simulate "a log was felled
+            // nearby" the same way the bin's break-a-log trigger does:
+            // mark the leaf FLAG_DECAYING up front. Before this fix the
+            // leaves here were never orphaned, so both chunks aged 0
+            // regardless of the tracker under test — this is what made
+            // the test fail after r160 (flagged in r205/r206 as a stale
+            // pre-r160 expectation, not touched at the time).
+            let mut state = crate::world::chunk::BlockInstanceState::default();
+            state.set_flag(crate::world::chunk::BlockInstanceState::FLAG_DECAYING, true);
+            chunk.set_instance_state(5, 5, 5, state);
             chunks.insert(c, std::sync::Arc::new(chunk));
         }
 
@@ -895,6 +908,15 @@ mod tests {
         for &c in &[render_chunk_coord, sim_chunk_coord] {
             let mut chunk = Chunk::empty(c);
             chunk.set(5, 5, 5, BlockId::OakLeaves);
+            // r160 fix: same reasoning as catchup_via_tracker_matches_continuous
+            // above — only orphaned/flagged leaves decay now, so this
+            // band-parity test needs its leaves pre-flagged as orphaned
+            // to exercise the property it's actually testing (band-equal
+            // aging), rather than testing "unflagged leaves don't age"
+            // by accident.
+            let mut state = crate::world::chunk::BlockInstanceState::default();
+            state.set_flag(crate::world::chunk::BlockInstanceState::FLAG_DECAYING, true);
+            chunk.set_instance_state(5, 5, 5, state);
             chunks.insert(c, std::sync::Arc::new(chunk));
         }
 

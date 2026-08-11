@@ -21,6 +21,7 @@ pub mod hot_shaders;
 pub mod light;
 pub mod mesher;
 pub mod mesh_buffer_alloc;
+pub mod segmented_alloc; // r-vulkanmod-cf: growable multi-segment allocator (VulkanMod AreaBuffer equivalent), staged — see mesh_pool_segmented_integration.md before wiring into mesh_buffer_pool
 pub mod copy_coalesce;
 pub mod mesh_buffer_pool;
 pub mod chunk_indirect;
