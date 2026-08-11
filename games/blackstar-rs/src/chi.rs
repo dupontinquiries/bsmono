@@ -8,6 +8,20 @@
 //! widening curve, spent nowhere — chi is not ammunition, it is what
 //! the body has become.
 //!
+//! The bearer is learning what an Ice Clone already knows without
+//! trying: per the treatment (`Clones.md`, and the worldbuilding
+//! addendum `TF_CLONE_CIVILIZATIONS_AND_CONVERGENCE.md`), Ice Clones
+//! and the elemental Clone races generally do not age the way anything
+//! else in this cast does — a native of one of these worlds who has
+//! stood watch for a thousand years is not old by their own reckoning.
+//! Each people mostly keeps to its own world or outpost; contact
+//! between them is occasional, not constant. `arena_element` below —
+//! frostline/kuiper/pluto to Ice, emberpit/unicron to Fire, trench to
+//! Water, and so on — is that geography: every arena a suited raid
+//! visits is somebody's home, not a neutral battlefield, and the chi
+//! banked there is the body being taught by the world itself rather
+//! than by a teacher who bothered to travel.
+//!
 //! Where chi comes from (both wired into the sims today):
 //! * a NIGHTFALL cleared banks chi in the burn element — the Watch
 //!   attunes to whatever ran hot that week;

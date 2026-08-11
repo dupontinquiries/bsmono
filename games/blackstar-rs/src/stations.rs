@@ -38,6 +38,7 @@ use crate::raidlog::RaidLog;
 use crate::save;
 use crate::ship::Phase;
 use crate::vault::Vault;
+use crate::watch::{self, Watch, NATIVE, PHOTON};
 
 /// The rooms with consoles in them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -134,6 +135,7 @@ pub struct Shipboard {
     pub chi: Chi,
     pub gear: Gear,
     pub vault: Vault,
+    pub watch: Watch,
 }
 
 impl Shipboard {
@@ -146,6 +148,7 @@ impl Shipboard {
             chi: Chi::from_line(&sv.chi),
             gear: Gear::from_save(&sv.armed, &sv.worn, &sv.bag),
             vault: Vault::from_line(&sv.vault),
+            watch: Watch::from_line(&sv.watch),
         }
     }
     pub fn store(&self) {
@@ -159,6 +162,7 @@ impl Shipboard {
         sv.worn = worn;
         sv.bag = bag;
         sv.vault = self.vault.line();
+        sv.watch = self.watch.line();
         save::store(&sv, &b, &cfg);
     }
     pub fn energon(&self) -> u32 {
@@ -279,12 +283,35 @@ pub fn build(st: Station, sb: &Shipboard, week: u64) -> Menu {
         }
         Station::Medbay => {
             rows.push(Row::heading(&format!("THE BEARER — chi: {}", crate::chi::sheet(&sb.chi))));
+            rows.push(Row::gap());
+            // THE WATCH — every native form is already the Morpher's
+            // (`watch.rs`, against Clones.md: "he has mapped them"), so
+            // every row below is pressable; a refusal comes back from
+            // apply() with the resolve numbers rather than a locked row.
+            rows.push(Row::heading(&format!(
+                "THE WATCH — {} form, {:.0}% resolve",
+                sb.watch.current_name(),
+                sb.watch.resolve() * 100.0
+            )));
+            for i in NATIVE {
+                let name = crate::weapons::TABLE[i].name;
+                let row = Row::action(watch_row_id(i), name);
+                rows.push(if Some(i) == sb.watch.current() {
+                    row.hint("held now").disabled()
+                } else if i == crate::watch::slot_named("ICE").unwrap() {
+                    row.hint("native state; the only form that opens the quantum leap")
+                } else {
+                    row.hint("press to shift")
+                });
+            }
+            let photon_label = if sb.watch.photon_reached() {
+                "PHOTON MAN — reached once, remembered dimly"
+            } else {
+                "PHOTON MAN — the Watch's ceiling"
+            };
             rows.push(
-                Row::action(
-                    "shift",
-                    if sb.chi.can_shift() { "HOLD THE ICE-CLONE FORM" } else { "THE ICE-CLONE FORM (ice level 3 required)" },
-                )
-                .hint("the vat remembers the shape even when the body cannot"),
+                Row::action("watch:photon", photon_label)
+                    .hint("no other form is sufficient; costs nearly everything the Watch has"),
             );
             rows.push(Row::gap());
             rows.push(Row::heading("THE SEVEN VATS"));
@@ -326,6 +353,13 @@ fn bag_row_id(i: usize) -> &'static str {
 fn deposit_row_id(i: usize) -> &'static str {
     const IDS: [&str; 9] = ["dep:0", "dep:1", "dep:2", "dep:3", "dep:4", "dep:5", "dep:6", "dep:7", "dep:8"];
     IDS[i.min(8)]
+}
+fn watch_row_id(i: usize) -> &'static str {
+    const IDS: [&str; 11] = [
+        "watch:0", "watch:1", "watch:2", "watch:3", "watch:4", "watch:5", "watch:6", "watch:7",
+        "watch:8", "watch:9", "watch:10",
+    ];
+    IDS[i.min(10)]
 }
 fn vault_row_id(i: usize) -> &'static str {
     // 27 stable ids, generated once — positional, because a chest slot IS
@@ -409,7 +443,31 @@ pub fn apply(st: Station, ev: &Event, sb: &mut Shipboard, week: u64) -> Option<O
                 Err(e) => Order::Refused(e),
             })
         }
-        Station::Medbay | Station::Wardeck => None,
+        Station::Medbay => {
+            // A console press is never the "no other form is enough"
+            // moment the treatment describes for Photon Man, so this
+            // path always declares desperate=false and PHOTON always
+            // refuses through it — matching watch.rs's own rule rather
+            // than special-casing the id. A true hold gesture is the
+            // seam: menufx already has `Motion::hold`, unbound from any
+            // shell key today; that binding is where "desperate" should
+            // come from once it exists.
+            let out = if id == "watch:photon" {
+                Some(sb.watch.shift(PHOTON, false))
+            } else {
+                id.strip_prefix("watch:")
+                    .and_then(|rest| rest.parse::<usize>().ok())
+                    .map(|i| sb.watch.shift(i, false))
+            }?;
+            Some(match out {
+                Ok(()) => {
+                    sb.store();
+                    Order::Did(format!("the Watch holds {} now", sb.watch.current_name()))
+                }
+                Err(e) => Order::Refused(e),
+            })
+        }
+        Station::Wardeck => None,
     }
 }
 
@@ -427,6 +485,7 @@ mod tests {
             chi: Chi::from_line("rock:15,fire:8"),
             gear: Gear::default(),
             vault: Vault::default(),
+            watch: Watch::default(),
         }
     }
 
@@ -504,6 +563,37 @@ mod tests {
         assert!(matches!(apply(Station::Hold, &ev, &mut sb, 0), Some(Order::Did(_))));
         assert_eq!(sb.gear.bag.len(), 1);
         assert_eq!(sb.vault.count(), 0);
+    }
+
+    #[test]
+    fn the_medbay_shifts_the_watch_through_the_console_and_photon_refuses_a_press() {
+        let mut sb = board();
+        let m = build(Station::Medbay, &sb, 0);
+        // METAL is a native form and must be pressable with no setup —
+        // watch.rs's whole point is that nothing needs to be "found" first
+        let metal = crate::watch::slot_named("METAL").unwrap();
+        let at = m.rows.iter().position(|r| r.id == watch_row_id(metal)).unwrap();
+        let mut host = Host::new();
+        host.open(m);
+        let ev = host.input(Input::Click(at)).unwrap();
+        match apply(Station::Medbay, &ev, &mut sb, 0) {
+            Some(Order::Did(msg)) => assert!(msg.contains("METAL"), "{msg}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(sb.watch.current_name(), "METAL");
+
+        // a console press is never a declared last resort, so Photon
+        // Man refuses through this path even with a full resolve pool
+        sb.watch = Watch::default();
+        let m = build(Station::Medbay, &sb, 0);
+        let at = m.rows.iter().position(|r| r.id == "watch:photon").unwrap();
+        host.open(m);
+        let ev = host.input(Input::Click(at)).unwrap();
+        match apply(Station::Medbay, &ev, &mut sb, 0) {
+            Some(Order::Refused(e)) => assert!(e.contains("nothing else is enough"), "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_ne!(sb.watch.current_name(), "PHOTON", "a tap opened the ceiling");
     }
 
     #[test]
