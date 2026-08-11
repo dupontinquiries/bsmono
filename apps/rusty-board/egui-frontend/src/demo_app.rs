@@ -32,6 +32,11 @@ struct Feel {
     real: RealBoard,
     real_active: bool,
     typed: String,
+    /// The learned dictionary. Ported, tested, and until now reached by
+    /// nothing — the reachability audit's top rusty-board finding. A swipe
+    /// keyboard that never learns which of two plausible words THIS person
+    /// uses is the feature working at its worst permanently.
+    dict: crate::adaptive::AdaptiveDictionary,
     /// Which gesture category the live trail is showing — only visible when trail debug
     /// styling is on (see the Diagnostics toggle). Recomputed as the gesture is classified.
     trail_style: TrailStyle,
@@ -161,12 +166,44 @@ impl eframe::App for Feel {
             // covers the top row would hide the letters you are about to swipe next.
             if !self.swipe.candidates.is_empty() {
                 let adaptive = Adaptive::detect(ctx);
+                // PERSONALISE BEFORE SHOWING. The recognizer scores SHAPE; it
+                // cannot know which of two shape-alike words this person
+                // actually writes. Reranking here rather than inside the
+                // recognizer keeps the shape score honest and auditable — the
+                // boost is applied where it can be seen and switched off.
+                //
+                // board_gestures::WordCandidate already uses the same
+                // convention swipe_rerank expects ("Lower is better. 0.0 ~=
+                // exact match"), so the recognizer's own scores are reranked
+                // directly rather than being re-derived from list position —
+                // position would throw away the margin between candidates,
+                // which is exactly what decides whether a boost should win.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64).unwrap_or(0);
+                let mut shown = self.swipe.candidates.clone();
+                for c in shown.iter_mut() {
+                    c.score -= self.dict.boost(&c.word, now);
+                }
+                shown.sort_by(|a, b| a.score.partial_cmp(&b.score)
+                    .unwrap_or(std::cmp::Ordering::Equal));
+                // `raw` copied out: the closure below takes `self` mutably
+                // (dict, typed, swipe), so reading `self.swipe.raw` inside it
+                // is an immutable borrow overlapping a mutable one. Same shape
+                // as the two borrow errors in gitmind's pages — the closure
+                // only ever wanted the string.
+                let raw = self.swipe.raw.clone();
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(format!("swiped “{}”", self.swipe.raw)).weak().size(12.0));
-                    if let Some(word) = candidate_bar(ui, &self.swipe.candidates, &adaptive) {
+                    ui.label(egui::RichText::new(format!("swiped “{raw}”")).weak().size(12.0));
+                    if let Some(word) = candidate_bar(ui, &shown, &adaptive) {
                         if !self.typed.is_empty() && !self.typed.ends_with(' ') && !self.typed.ends_with('\n') {
                             self.typed.push(' ');
                         }
+                        // LEARN FROM THE COMMIT, which is the only signal that
+                        // says anything: the user picked this word over the
+                        // ones beside it, so it is evidence in a way mere
+                        // typing frequency is not.
+                        self.dict.record_commit(&word, now);
                         self.typed.push_str(&word);
                         self.swipe.clear_candidates();
                     }
