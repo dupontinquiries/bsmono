@@ -59,6 +59,7 @@ pub mod press_gesture;
 pub mod punch_addrs;
 pub mod qr_render;
 pub mod scroll_passthrough;
+pub mod sink_cushion;
 pub mod snap_expiry;
 pub mod snap_export;
 pub mod tab_bar;
