@@ -47,6 +47,18 @@ pub enum IoError {
     BackendError(String),
 }
 
+impl std::fmt::Display for IoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IoError::NoDevice => write!(f, "no audio device available"),
+            IoError::UnsupportedConfig(msg) => write!(f, "unsupported audio config: {msg}"),
+            IoError::BackendError(msg) => write!(f, "audio backend error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for IoError {}
+
 /// A live stream. Dropping it (or calling `stop`) tears it down. The inner
 /// value is whatever the backend needs to keep alive — a `cpal::Stream`, a
 /// PipeWire filter handle, or nothing for a test fake — type-erased so the
@@ -110,39 +122,441 @@ impl TestIo {
 #[cfg(feature = "device")]
 mod cpal_backend {
     use super::*;
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{BufferSize, SampleFormat, SampleRate, StreamConfig, SupportedBufferSize};
+    use dasp_sample::{FromSample, Sample as DaspSample};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
-    /// The real backend. Not exercised by this crate's own test suite (there
-    /// is no sound card in the authoring sandbox) — it is verified on
-    /// developer hardware, same as every heavy crate in this tree's
-    /// "suspenders, not compilation" verification model.
+    /// Frames of slack in the input→output bridge. Comfortably above one
+    /// callback's worth (typical buffers are a few hundred to a couple
+    /// thousand frames) so ordinary scheduler jitter doesn't underrun, but
+    /// small enough that it doesn't add a second, invisible tier of latency
+    /// on top of the device's own — `Running::granted_buffer_frames` and the
+    /// loopback measurement above only account for the device, not this.
+    const BRIDGE_FRAMES: u32 = 4096;
+
+    /// The real backend.
+    ///
+    /// `cpal::Stream` is `!Send` on every backend (its platform handle is a
+    /// `PhantomData<*mut ()>`-tagged type) so it cannot be boxed into
+    /// `Running`'s `Box<dyn Any + Send>` the way the seam's first draft did —
+    /// confirmed by `cargo build --features device` failing with E0277
+    /// (`*mut () cannot be sent between threads safely`) before this patch.
+    /// There was no sound card in the authoring sandbox to have caught that
+    /// any other way; it needed the feature actually compiled, not just
+    /// read.
+    ///
+    /// The fix is the standard shape for a `!Send` resource: a dedicated OS
+    /// thread owns the streams for the life of the session, and only a stop
+    /// signal and a join handle — both plain `Send` types — cross back to
+    /// the caller inside `Running`.
+    ///
+    /// That thread also does the full-duplex bridging cpal itself doesn't
+    /// provide: `default_host()` hands out independent input and output
+    /// streams with no shared clock, so an input callback writes into an
+    /// [`rtrb`] ring buffer and the output callback drains it, padding with
+    /// silence on underrun (no input device, or the input side hasn't
+    /// caught up yet) rather than blocking — blocking an audio callback to
+    /// wait for data is how a buffer underrun becomes an audible glitch on
+    /// *every* stream instead of a dropped frame on one.
     #[derive(Default)]
     pub struct CpalIo;
 
     impl AudioIo for CpalIo {
-        fn start(&mut self, cfg: IoConfig, mut cb: DuplexCallback) -> Result<Running, IoError> {
-            use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        fn start(&mut self, cfg: IoConfig, cb: DuplexCallback) -> Result<Running, IoError> {
+            let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, IoError>>();
+            let (stop_tx, stop_rx) = mpsc::channel::<()>();
 
-            let host = cpal::default_host();
-            let out_dev = host.default_output_device().ok_or(IoError::NoDevice)?;
-            let out_cfg = out_dev
-                .default_output_config()
-                .map_err(|e| IoError::UnsupportedConfig(e.to_string()))?;
-            let _ = cfg; // full duplex + exact-config negotiation is the
-                         // hardware-stage follow-up; this proves the seam
-                         // compiles against real cpal types.
-            let scratch_in: Vec<f32> = Vec::new();
-            let stream = out_dev
-                .build_output_stream(
-                    &out_cfg.into(),
-                    move |data: &mut [f32], _info: &cpal::OutputCallbackInfo| {
-                        cb(&scratch_in, data);
-                    },
-                    move |err| eprintln!("studio-io: stream error: {err}"),
-                    None,
-                )
+            let handle = std::thread::Builder::new()
+                .name("studio-io-cpal".into())
+                .spawn(move || run_audio_thread(cfg, cb, ready_tx, stop_rx))
                 .map_err(|e| IoError::BackendError(e.to_string()))?;
-            stream.play().map_err(|e| IoError::BackendError(e.to_string()))?;
-            Ok(Running { granted_buffer_frames: cfg.buffer_frames, _keepalive: Box::new(stream) })
+
+            // The thread reports back once streams are actually playing (or
+            // have failed to start) so `start` returns a config that is
+            // really running rather than one merely requested — same
+            // reasoning as `Running::granted_buffer_frames` existing at all.
+            match ready_rx.recv_timeout(Duration::from_secs(3)) {
+                Ok(Ok(granted_buffer_frames)) => Ok(Running {
+                    granted_buffer_frames,
+                    _keepalive: Box::new(CpalHandle { stop_tx: Some(stop_tx), join: Some(handle) }),
+                }),
+                Ok(Err(e)) => {
+                    let _ = handle.join();
+                    Err(e)
+                }
+                Err(_) => {
+                    let _ = stop_tx.send(());
+                    let _ = handle.join();
+                    Err(IoError::BackendError("audio thread did not confirm startup in time".into()))
+                }
+            }
+        }
+    }
+
+    /// Owns the stop signal and the audio thread's join handle — both
+    /// `Send`, unlike the streams themselves, which is exactly why they
+    /// (not the streams) are what crosses back into `Running`. Dropping this
+    /// (via `Running` being dropped, or `Running::stop`) signals the thread
+    /// and waits for it, so the streams are guaranteed torn down before this
+    /// returns rather than left to an arbitrary future point.
+    struct CpalHandle {
+        stop_tx: Option<mpsc::Sender<()>>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Drop for CpalHandle {
+        fn drop(&mut self) {
+            if let Some(tx) = self.stop_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(j) = self.join.take() {
+                let _ = j.join();
+            }
+        }
+    }
+
+    /// Runs entirely on the dedicated audio thread: negotiates configs,
+    /// builds the streams, bridges them, and parks until told to stop.
+    /// Everything cpal hands back — `Device`, `Stream` — lives and dies on
+    /// this one thread; nothing of them crosses back to the caller.
+    fn run_audio_thread(
+        cfg: IoConfig,
+        mut cb: DuplexCallback,
+        ready_tx: mpsc::Sender<Result<u32, IoError>>,
+        stop_rx: mpsc::Receiver<()>,
+    ) {
+        let host = cpal::default_host();
+        let out_dev = match host.default_output_device() {
+            Some(d) => d,
+            None => {
+                let _ = ready_tx.send(Err(IoError::NoDevice));
+                return;
+            }
+        };
+
+        let (out_cfg, out_format) = match negotiate(&out_dev, &cfg, true) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+
+        // Input is best-effort: a machine with no microphone, or one whose
+        // input permission was declined, still gets output — the same
+        // "must still open" bargain the rest of Studio makes for a project
+        // that references a missing plugin or an unloaded model.
+        let in_dev = host.default_input_device();
+        let in_negotiated = in_dev.as_ref().and_then(|d| negotiate(d, &cfg, false).ok());
+
+        let bridge_capacity = (BRIDGE_FRAMES as usize) * (cfg.channels.max(1) as usize);
+        let (prod, mut cons) = rtrb::RingBuffer::<f32>::new(bridge_capacity.max(1));
+
+        let in_stream = match (&in_dev, &in_negotiated) {
+            (Some(dev), Some((in_stream_cfg, in_format))) => {
+                let built = match *in_format {
+                    SampleFormat::F32 => build_input_stream::<f32>(dev, in_stream_cfg, prod),
+                    SampleFormat::I16 => build_input_stream::<i16>(dev, in_stream_cfg, prod),
+                    other => Err(IoError::UnsupportedConfig(format!(
+                        "input sample format {other} not supported yet (only f32/i16)"
+                    ))),
+                };
+                match built {
+                    Ok(s) => match s.play() {
+                        Ok(()) => Some(s),
+                        Err(e) => {
+                            eprintln!("studio-io: input stream failed to start, continuing with silence: {e}");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("studio-io: input stream unavailable, continuing with silence: {e}");
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
+        let granted_buffer_frames = match out_cfg.buffer_size {
+            BufferSize::Fixed(n) => n,
+            BufferSize::Default => cfg.buffer_frames,
+        };
+
+        let mut in_scratch: Vec<f32> = Vec::new();
+        let fill = move |out: &mut [f32]| {
+            in_scratch.clear();
+            in_scratch.resize(out.len(), 0.0);
+            for slot in in_scratch.iter_mut() {
+                match cons.pop() {
+                    Ok(s) => *slot = s,
+                    // Underrun (no input device, or the producer hasn't
+                    // caught up yet): leave the rest of this callback's
+                    // input as silence rather than blocking for it.
+                    Err(_) => break,
+                }
+            }
+            cb(&in_scratch, out);
+        };
+
+        let out_stream = match out_format {
+            SampleFormat::F32 => build_output_stream::<f32>(&out_dev, &out_cfg, fill),
+            SampleFormat::I16 => build_output_stream::<i16>(&out_dev, &out_cfg, fill),
+            other => Err(IoError::UnsupportedConfig(format!(
+                "output sample format {other} not supported yet (only f32/i16)"
+            ))),
+        };
+        let out_stream = match out_stream {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(e));
+                return;
+            }
+        };
+        if let Err(e) = out_stream.play() {
+            let _ = ready_tx.send(Err(IoError::BackendError(e.to_string())));
+            return;
+        }
+
+        let _ = ready_tx.send(Ok(granted_buffer_frames));
+        let _ = stop_rx.recv(); // park until CpalHandle::drop signals stop
+        drop(out_stream);
+        drop(in_stream);
+    }
+
+    /// Picks a config close to `requested` from what the device actually
+    /// supports, preferring an exact channel-count and F32 match, then
+    /// falling back progressively (matching channels in any format, then
+    /// any config at all) rather than failing outright — a project should
+    /// open on whatever interface is plugged in, not only the one it was
+    /// authored against. `buffer_frames` is only honoured as `Fixed` when
+    /// the device's own reported range covers it; forcing a size outside
+    /// that range is a `BuildStreamError` waiting to happen, not a request
+    /// a device can simply be told to grant.
+    fn negotiate(
+        dev: &cpal::Device,
+        requested: &IoConfig,
+        output: bool,
+    ) -> Result<(StreamConfig, SampleFormat), IoError> {
+        let ranges: Vec<cpal::SupportedStreamConfigRange> = if output {
+            dev.supported_output_configs()
+                .map_err(|e| IoError::UnsupportedConfig(format!("{e:?}")))?
+                .collect()
+        } else {
+            dev.supported_input_configs()
+                .map_err(|e| IoError::UnsupportedConfig(format!("{e:?}")))?
+                .collect()
+        };
+        pick_config(&ranges, requested)
+    }
+
+    /// The selection logic proper, pulled out of [`negotiate`] so it can be
+    /// tested against hand-built [`cpal::SupportedStreamConfigRange`]s —
+    /// `SupportedStreamConfigRange::new` is a public constructor, so this
+    /// needs no device either, same reasoning `studio-egui`'s time↔pixel
+    /// arithmetic is kept `Ui`-free: the part most likely to be got subtly
+    /// wrong (fallback order, an off-by-one at a range boundary) is exactly
+    /// the part worth being able to test without hardware.
+    fn pick_config(
+        ranges: &[cpal::SupportedStreamConfigRange],
+        requested: &IoConfig,
+    ) -> Result<(StreamConfig, SampleFormat), IoError> {
+        if ranges.is_empty() {
+            return Err(IoError::UnsupportedConfig("device reports no supported configs".into()));
+        }
+
+        let rate_ok = |r: &cpal::SupportedStreamConfigRange| {
+            r.min_sample_rate().0 <= requested.sample_rate && requested.sample_rate <= r.max_sample_rate().0
+        };
+        let picked = ranges
+            .iter()
+            .find(|r| r.channels() == requested.channels && r.sample_format() == SampleFormat::F32 && rate_ok(r))
+            .or_else(|| ranges.iter().find(|r| r.channels() == requested.channels && rate_ok(r)))
+            .or_else(|| ranges.iter().find(|r| r.sample_format() == SampleFormat::F32))
+            .or_else(|| ranges.first())
+            .copied()
+            .expect("checked non-empty above");
+
+        let clamped_rate = requested.sample_rate.clamp(picked.min_sample_rate().0, picked.max_sample_rate().0);
+        let supported = picked.with_sample_rate(SampleRate(clamped_rate));
+        let format = supported.sample_format();
+        let mut stream_cfg = supported.config();
+        if let SupportedBufferSize::Range { min, max } = supported.buffer_size() {
+            if requested.buffer_frames >= *min && requested.buffer_frames <= *max {
+                stream_cfg.buffer_size = BufferSize::Fixed(requested.buffer_frames);
+            }
+        }
+        Ok((stream_cfg, format))
+    }
+
+    /// Builds an input stream of concrete sample type `T`, converting every
+    /// sample to `f32` (the ring buffer's — and [`DuplexCallback`]'s — only
+    /// currency) via `dasp_sample`'s conversion, and pushing it into the
+    /// bridge. A full ring buffer means the reader side hasn't kept up;
+    /// `push` failing is that overrun, and the sample is dropped rather than
+    /// the callback blocking to wait for room.
+    fn build_input_stream<T>(
+        dev: &cpal::Device,
+        cfg: &StreamConfig,
+        mut prod: rtrb::Producer<f32>,
+    ) -> Result<cpal::Stream, IoError>
+    where
+        T: cpal::SizedSample + DaspSample,
+        f32: FromSample<T>,
+    {
+        dev.build_input_stream(
+            cfg,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                for &s in data {
+                    let f: f32 = f32::from_sample(s);
+                    let _ = prod.push(f);
+                }
+            },
+            |err| eprintln!("studio-io: input stream error: {err}"),
+            None,
+        )
+        .map_err(|e| IoError::BackendError(e.to_string()))
+    }
+
+    /// Builds an output stream of concrete sample type `T`. `fill` produces
+    /// one callback's worth of `f32` (it is `run_audio_thread`'s closure
+    /// over the ring buffer and the user's [`DuplexCallback`]); this
+    /// function's only job is converting that into whatever format the
+    /// device actually wants.
+    fn build_output_stream<T>(
+        dev: &cpal::Device,
+        cfg: &StreamConfig,
+        mut fill: impl FnMut(&mut [f32]) + Send + 'static,
+    ) -> Result<cpal::Stream, IoError>
+    where
+        T: cpal::SizedSample + DaspSample,
+        T: FromSample<f32>,
+    {
+        let mut scratch: Vec<f32> = Vec::new();
+        dev.build_output_stream(
+            cfg,
+            move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                scratch.clear();
+                scratch.resize(data.len(), 0.0);
+                fill(&mut scratch);
+                for (o, &f) in data.iter_mut().zip(scratch.iter()) {
+                    *o = T::from_sample(f);
+                }
+            },
+            |err| eprintln!("studio-io: output stream error: {err}"),
+            None,
+        )
+        .map_err(|e| IoError::BackendError(e.to_string()))
+    }
+
+    #[cfg(test)]
+    mod pick_config_tests {
+        use super::*;
+
+        fn range(
+            channels: u16,
+            min_hz: u32,
+            max_hz: u32,
+            buf: Option<(u32, u32)>,
+            format: SampleFormat,
+        ) -> cpal::SupportedStreamConfigRange {
+            let buffer_size = match buf {
+                Some((min, max)) => SupportedBufferSize::Range { min, max },
+                None => SupportedBufferSize::Unknown,
+            };
+            cpal::SupportedStreamConfigRange::new(
+                channels,
+                SampleRate(min_hz),
+                SampleRate(max_hz),
+                buffer_size,
+                format,
+            )
+        }
+
+        fn wanted(channels: u16, sample_rate: u32, buffer_frames: u32) -> IoConfig {
+            IoConfig { sample_rate, channels, buffer_frames }
+        }
+
+        #[test]
+        fn no_ranges_is_a_clean_error_not_a_panic() {
+            let err = pick_config(&[], &wanted(2, 48_000, 512)).unwrap_err();
+            assert!(matches!(err, IoError::UnsupportedConfig(_)));
+        }
+
+        #[test]
+        fn prefers_exact_channels_and_f32_when_available() {
+            let ranges = vec![
+                range(2, 44_100, 48_000, None, SampleFormat::I16),
+                range(2, 44_100, 48_000, None, SampleFormat::F32),
+                range(1, 44_100, 48_000, None, SampleFormat::F32),
+            ];
+            let (cfg, format) = pick_config(&ranges, &wanted(2, 48_000, 512)).unwrap();
+            assert_eq!(format, SampleFormat::F32);
+            assert_eq!(cfg.channels, 2);
+            assert_eq!(cfg.sample_rate.0, 48_000);
+        }
+
+        #[test]
+        fn falls_back_to_matching_channels_in_any_format_over_wrong_channel_count() {
+            // Only I16 supports the requested channel count; a wrong-channel
+            // F32 range exists too. Getting the channel count right matters
+            // more than getting the sample format right — a stream opened
+            // on the wrong channel count is unusable, a converted format
+            // is merely extra work already handled by build_output_stream.
+            let ranges = vec![
+                range(1, 44_100, 48_000, None, SampleFormat::F32),
+                range(2, 44_100, 48_000, None, SampleFormat::I16),
+            ];
+            let (cfg, format) = pick_config(&ranges, &wanted(2, 48_000, 512)).unwrap();
+            assert_eq!(cfg.channels, 2);
+            assert_eq!(format, SampleFormat::I16);
+        }
+
+        #[test]
+        fn falls_back_to_any_config_when_nothing_matches_channels_or_rate() {
+            let ranges = vec![range(6, 8_000, 16_000, None, SampleFormat::I16)];
+            let (cfg, _format) = pick_config(&ranges, &wanted(2, 48_000, 512)).unwrap();
+            // Nothing requested is honoured, but a config comes back rather
+            // than an error — a project should open on whatever interface
+            // is plugged in.
+            assert_eq!(cfg.channels, 6);
+        }
+
+        #[test]
+        fn sample_rate_is_clamped_into_the_supported_range_not_rejected() {
+            let ranges = vec![range(2, 44_100, 96_000, None, SampleFormat::F32)];
+            let (cfg, _) = pick_config(&ranges, &wanted(2, 192_000, 512)).unwrap();
+            assert_eq!(cfg.sample_rate.0, 96_000);
+
+            let (cfg, _) = pick_config(&ranges, &wanted(2, 8_000, 512)).unwrap();
+            assert_eq!(cfg.sample_rate.0, 44_100);
+        }
+
+        #[test]
+        fn buffer_frames_fixed_when_device_range_covers_the_request() {
+            let ranges = vec![range(2, 44_100, 48_000, Some((64, 2048)), SampleFormat::F32)];
+            let (cfg, _) = pick_config(&ranges, &wanted(2, 48_000, 256)).unwrap();
+            assert_eq!(cfg.buffer_size, BufferSize::Fixed(256));
+        }
+
+        #[test]
+        fn buffer_frames_left_default_when_request_is_outside_the_device_range() {
+            // Forcing a size outside what the device reports it can grant is
+            // a `BuildStreamError` waiting to happen, not a request a device
+            // can simply be told to satisfy — falling back to `Default`
+            // here is what keeps `negotiate` honest about that.
+            let ranges = vec![range(2, 44_100, 48_000, Some((256, 512)), SampleFormat::F32)];
+            let (cfg, _) = pick_config(&ranges, &wanted(2, 48_000, 4096)).unwrap();
+            assert_eq!(cfg.buffer_size, BufferSize::Default);
+        }
+
+        #[test]
+        fn unknown_device_buffer_range_also_leaves_default() {
+            let ranges = vec![range(2, 44_100, 48_000, None, SampleFormat::F32)];
+            let (cfg, _) = pick_config(&ranges, &wanted(2, 48_000, 256)).unwrap();
+            assert_eq!(cfg.buffer_size, BufferSize::Default);
         }
     }
 }
