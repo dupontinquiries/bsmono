@@ -14,11 +14,13 @@ path = "src/bin/aperture-view.rs"
 required-features = ["app"]
 
 [features]
-default = ["app"]
+default = ["app", "tree-sitter"]
+tree-sitter = ["aperture-core/tree-sitter"]
 app = ["dep:eframe", "scene-kit/glow"]
 
 [dependencies]
 aperture-core = { workspace = true }
+aperture-complete = { workspace = true }
 aperture-egui = { path = "../aperture-egui", default-features = false }
 scene-kit = { path = "../../../../shared/scene-kit", default-features = false }
 egui = { workspace = true }

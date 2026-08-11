@@ -56,6 +56,9 @@ pub struct Uniforms {
     /// the GPU upload — the renderer re-uploads only when it changes, so passing the same page every
     /// frame costs one u64 compare. `None` keeps the 1×1 transparent fallback bound (no inscription).
     pub page: Option<PageTex>,
+    /// Static inscription atlas for `MAT_INSCRIPTION2` faces (same versioned
+    /// upload discipline; expected to change ~once per file/scene load).
+    pub page2: Option<PageTex>,
 }
 
 /// CPU-side page pixels headed for `u_page`. `rgba` is top-row-first (matching `panel_uv`'s V axis),
@@ -79,7 +82,7 @@ impl Default for Uniforms {
             nacre: 1.0, underwater: 0.0, defocus: 0.0, frost_a: 0.0, frost_b: 0.0, cam_warp: [0.0, 0.0], opaque: 0.0, bg: [0.04, 0.07, 0.10], dof: 0.0, focus: 18.0,
             saturation: 1.18,
             shoulder: 1.0,
-            light_viewproj: [0.0; 16], shadow_on: 0.0, page: None,
+            light_viewproj: [0.0; 16], shadow_on: 0.0, page: None, page2: None,
             fill_dir: [0.0, 1.0, 0.0], fill_col: [0.0, 0.0, 0.0],
         }
     }
@@ -217,6 +220,7 @@ struct Renderer {
     vbo: glow::Buffer, scene_vao: glow::VertexArray, empty_vao: glow::VertexArray,
     mat_tex: glow::Texture, nrm_tex: glow::Texture, baked_tex: usize, targets: Option<Targets>,
     page_tex: glow::Texture, page_version: Option<u64>,
+    page2_tex: glow::Texture, page2_version: Option<u64>,
 }
 impl Renderer {
     unsafe fn new(gl: &glow::Context) -> Self {
@@ -257,6 +261,18 @@ impl Renderer {
                 t
             },
             page_version: None,
+            page2_tex: {
+                let t = gl.create_texture().unwrap();
+                gl.bind_texture(glow::TEXTURE_2D, Some(t));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, 1, 1, 0, glow::RGBA,
+                    glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&[0, 0, 0, 0])));
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MIN_FILTER, glow::LINEAR as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_MAG_FILTER, glow::NEAREST as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_S, glow::CLAMP_TO_EDGE as i32);
+                gl.tex_parameter_i32(glow::TEXTURE_2D, glow::TEXTURE_WRAP_T, glow::CLAMP_TO_EDGE as i32);
+                t
+            },
+            page2_version: None,
             targets: None,
         }
     }
@@ -325,6 +341,14 @@ impl Renderer {
                 self.page_version = Some(p.version);
             }
         }
+        if let Some(p) = &u.page2 {
+            if self.page2_version != Some(p.version) {
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.page2_tex));
+                gl.tex_image_2d(glow::TEXTURE_2D, 0, glow::RGBA8 as i32, p.size[0], p.size[1], 0,
+                    glow::RGBA, glow::UNSIGNED_BYTE, glow::PixelUnpackData::Slice(Some(&p.rgba)));
+                self.page2_version = Some(p.version);
+            }
+        }
 
         // ---- 0) SHADOW MAP: depth-only pre-pass from the sun's ortho view (bright emitters skipped in the VS) ----
         if u.shadow_on > 0.5 {
@@ -361,6 +385,9 @@ impl Renderer {
         gl.active_texture(glow::TEXTURE0 + 2);
         gl.bind_texture(glow::TEXTURE_2D, Some(self.page_tex));
         gl.uniform_1_i32(loc("u_page").as_ref(), 2);
+        gl.active_texture(glow::TEXTURE0 + 3);
+        gl.bind_texture(glow::TEXTURE_2D, Some(self.page2_tex));
+        gl.uniform_1_i32(loc("u_page2").as_ref(), 3);
         gl.active_texture(glow::TEXTURE0);
         gl.uniform_1_f32(loc("u_texscale").as_ref(), u.texscale);
         gl.uniform_1_f32(loc("u_time").as_ref(), u.time);

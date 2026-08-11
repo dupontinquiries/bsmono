@@ -49,6 +49,7 @@ pub trait Provider: Send {
 
 /// Trim caret context to char-budgeted windows. Pure; boundary-safe.
 pub fn make_request(
+    context: &str,
     before: &str,
     after: &str,
     lang: &str,
@@ -56,7 +57,16 @@ pub fn make_request(
     prefix_budget: usize,
     suffix_budget: usize,
 ) -> CompletionRequest {
-    let prefix: String = tail_chars(before, prefix_budget);
+    // Context RIDES ABOVE the tail-trim: a long file prefix must never evict
+    // the outline (trimming after concatenation would cut exactly the part
+    // that tells the model what the file contains). Context gets at most
+    // half the budget; the live prefix keeps the rest.
+    let ctx: String = if context.is_empty() {
+        String::new()
+    } else {
+        context.chars().take(prefix_budget / 2).collect()
+    };
+    let prefix: String = format!("{ctx}{}", tail_chars(before, prefix_budget.saturating_sub(ctx.chars().count())));
     let suffix: String = after.chars().take(suffix_budget).collect();
     CompletionRequest { generation, prefix, suffix, lang: lang.to_string() }
 }
@@ -124,9 +134,23 @@ mod tests {
     #[test]
     fn make_request_trims_on_char_boundaries() {
         let before = "aé🙂xyz"; // multibyte on purpose
-        let req = make_request(before, "après", "rust", 7, 4, 3);
+        let req = make_request("", before, "après", "rust", 7, 4, 3);
         assert_eq!(req.prefix, "🙂xyz");
         assert_eq!(req.suffix, "apr");
         assert_eq!(req.generation, 7);
     }
+    #[test]
+    fn context_rides_above_the_tail_trim() {
+        // A long prefix would evict naive prepended context; ours can't be.
+        let long_prefix: String = "x".repeat(500);
+        let req = make_request("// ctx\n", &long_prefix, "", "rust", 1, 100, 10);
+        assert!(req.prefix.starts_with("// ctx\n"), "context survives any prefix length");
+        assert!(req.prefix.chars().count() <= 100, "total budget still holds");
+        // And it never hogs more than half the budget.
+        let big_ctx: String = "c".repeat(500);
+        let req = make_request(&big_ctx, &long_prefix, "", "rust", 1, 100, 10);
+        assert_eq!(req.prefix.chars().filter(|c| *c == 'c').count(), 50);
+        assert_eq!(req.prefix.chars().filter(|c| *c == 'x').count(), 50);
+    }
+
 }

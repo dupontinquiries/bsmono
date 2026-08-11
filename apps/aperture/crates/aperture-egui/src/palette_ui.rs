@@ -1,8 +1,10 @@
 //! palette_ui — Ctrl+P. Commands are data; ranking is uikit-egui's fuzzy
 //! scorer (the same one gitmind's pickers use), so palette feel is consistent
-//! across the suite. Two modes: command list, and free-text path entry for
-//! Ctrl+O (a real file picker is a follow-up — see TODO.md; typing a path is
-//! honest and works over ssh).
+//! across the suite. Two modes: command list, and Ctrl+O's file picker —
+//! `file_finder` walks the workspace root once per open and fuzzy-ranks
+//! against the typed query. Typed-path entry survives as the fallback when
+//! nothing fuzzy-matches (a path outside the walked root, or a huge repo
+//! past the walk cap): honest, and still works over ssh with zero UI.
 
 use crate::state::AppState;
 use snapclone_theme::PaletteId;
@@ -13,20 +15,26 @@ pub enum Mode {
     OpenFile,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct PaletteState {
     pub mode: Mode,
     pub input: String,
     pub selected: usize,
+    /// Ctrl+O's candidate pool: walked ONCE on entering the mode (not
+    /// per-keystroke — a repo walk is cheap once, wasteful sixty times a
+    /// second while typing), then fuzzy-ranked fresh every render against
+    /// whatever's currently typed.
+    pub root: std::path::PathBuf,
+    pub files: Vec<std::path::PathBuf>,
     pub focus_placed: bool,
 }
 
 impl PaletteState {
     pub fn commands() -> Self {
-        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, focus_placed: false }
+        PaletteState { mode: Mode::Commands, input: String::new(), selected: 0, focus_placed: false, root: std::path::PathBuf::new(), files: Vec::new() }
     }
-    pub fn open_file() -> Self {
-        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, focus_placed: false }
+    pub fn open_file(root: std::path::PathBuf, files: Vec<std::path::PathBuf>) -> Self {
+        PaletteState { mode: Mode::OpenFile, input: String::new(), selected: 0, focus_placed: false, root, files }
     }
 }
 
@@ -37,6 +45,11 @@ pub enum Cmd {
     ToggleAi,
     CompleteNow,
     ToggleLoopPane,
+    ToggleFollow,
+    OlderRevision,
+    NewerRevision,
+    BranchFromHere,
+    MaterializeHere,
     Theme(PaletteId),
     GotoLine(usize),
 }
@@ -48,6 +61,11 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("AI: Toggle ghost completions".to_string(), Cmd::ToggleAi),
         ("AI: Complete now".to_string(), Cmd::CompleteNow),
         ("View: Toggle loop pane".to_string(), Cmd::ToggleLoopPane),
+        ("View: Toggle follow camera (Ctrl+E)".to_string(), Cmd::ToggleFollow),
+        ("Git: Older revision (Ctrl+,)".to_string(), Cmd::OlderRevision),
+        ("Git: Newer revision (Ctrl+.)".to_string(), Cmd::NewerRevision),
+        ("Git: Branch from previewed revision (Ctrl+B)".to_string(), Cmd::BranchFromHere),
+        ("Git: Materialize previewed revision as a worktree (Ctrl+M)".to_string(), Cmd::MaterializeHere),
     ];
     for id in PaletteId::all() {
         v.push((format!("Theme: {id:?}"), Cmd::Theme(*id)));
@@ -75,7 +93,9 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
     match cmd {
         Cmd::Save => s.save(now_ms),
         Cmd::OpenFileMode => {
-            s.palette = Some(PaletteState::open_file());
+            let root = s.workspace_root();
+            let files = crate::file_finder::walk_files(&root, 4000);
+            s.palette = Some(PaletteState::open_file(root, files));
             return; // keep the palette open, in its new mode
         }
         Cmd::ToggleAi => {
@@ -88,6 +108,11 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
             s.set_status(msg, now_ms);
         }
         Cmd::CompleteNow => s.trigger_completion_now(now_ms),
+        Cmd::ToggleFollow => s.toggle_follow(now_ms),
+        Cmd::OlderRevision => s.rev_step(1, now_ms),
+        Cmd::NewerRevision => s.rev_step(-1, now_ms),
+        Cmd::BranchFromHere => s.branch_from_here(now_ms),
+        Cmd::MaterializeHere => s.materialize_here(now_ms),
         Cmd::ToggleLoopPane => s.show_loop_pane = !s.show_loop_pane,
         Cmd::Theme(id) => {
             s.theme_id = id;

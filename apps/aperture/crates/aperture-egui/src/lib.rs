@@ -4,6 +4,7 @@
 //! The `aperture` binary (feature `app`, default-on) is a thin eframe boot.
 
 pub mod camera;
+pub mod file_finder;
 pub mod ghost;
 pub mod loop_pane;
 pub mod palette_ui;

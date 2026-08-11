@@ -20,7 +20,12 @@ impl App {
     pub fn new(viewer: Viewer) -> Self {
         let cell = (GLYPH * SCALE) as f32;
         let aspect = (COLS as f32 * cell + cell * 2.0) / (ROWS as f32 * cell + cell * 2.0);
-        App { viewer, world: scene::build(aspect) }
+        let world = if let Some(atlas) = &viewer.atlas {
+            scene::build_rooms(&viewer.stations, viewer.focus, aspect, viewer.atlas_cell_px, atlas.size[1] as f32)
+        } else {
+            scene::build(aspect)
+        };
+        App { viewer, world }
     }
 }
 
@@ -83,12 +88,31 @@ pub fn frame(root: &mut Ui, app: &mut App) {
         if i.key_pressed(Key::Home) {
             app.viewer.goto_top();
         }
+        if i.key_pressed(Key::Comma) {
+            app.viewer.rev_step(1); // older
+        }
+        if i.key_pressed(Key::Period) {
+            app.viewer.rev_step(-1); // newer, and past newest = home to the worktree
+        }
+        if i.key_pressed(Key::B) {
+            app.viewer.branch_from_here(); // no-op with a message while live — same guard as the flat editor
+        }
+        if i.key_pressed(Key::M) {
+            app.viewer.materialize_here(); // gitmind's materialize, same guard
+        }
+        if i.key_pressed(Key::CloseBracket) {
+            app.viewer.jump_rel(1);
+        }
+        if i.key_pressed(Key::OpenBracket) {
+            app.viewer.jump_rel(-1);
+        }
         if i.key_pressed(Key::End) {
             app.viewer.goto_bottom();
         }
     });
 
     // ── animate, rasterize, window ──────────────────────────────────────────
+    app.viewer.poll_note();
     if app.viewer.step(dt) {
         ctx.request_repaint();
     } else {
@@ -111,9 +135,31 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     let v1 = ((off_px + win_px) / tex_h).clamp(0.0, 1.0);
     scene::set_page_window(&mut app.world, v0, v1);
 
+    // Jump landed: rebuild the corridor with the lectern at the new focus.
+    if app.viewer.world_dirty {
+        app.viewer.world_dirty = false;
+        if let Some(atlas) = &app.viewer.atlas {
+            let aspect = (COLS as f32 * 1.0) / (ROWS as f32 * 2.0);
+            app.world = scene::build_rooms(
+                &app.viewer.stations,
+                app.viewer.focus,
+                aspect,
+                app.viewer.atlas_cell_px,
+                atlas.size[1] as f32,
+            );
+        }
+    }
+
     // ── camera + uniforms ───────────────────────────────────────────────────
+    // The target FLIES between rooms (tx/ty/tz Smooths); in the classic
+    // single-room world those sit at the page center anyway.
+    let target = if app.viewer.stations.is_empty() {
+        app.world.page_center
+    } else {
+        scene_kit::spatial::Vec3::new(app.viewer.tx.pos, app.viewer.ty.pos, app.viewer.tz.pos)
+    };
     let cam = Camera::from_orbit(
-        &orbit(&app.viewer, app.world.page_center),
+        &orbit(&app.viewer, target),
         rect.width(),
         rect.height(),
         rect.height() * 0.78,
@@ -129,20 +175,29 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     let sd = [0.42f32, 0.78, 0.46];
     let sl = (sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]).sqrt();
     u.sun_dir = [sd[0] / sl, sd[1] / sl, sd[2] / sl];
-    u.sun_col = [1.0, 0.92, 0.78];
-    u.sky = [0.34, 0.40, 0.52];
+    // The ROOM sets the light: each station's deterministic RoomEnv, cross-
+    // faded during flight. (In the classic world this is BASE_ENV — the same
+    // golden-hour study as before.)
+    let env = app.viewer.current_env();
+    u.sun_col = env.sun_col;
+    u.sky = env.sky;
     u.ground = [0.23, 0.19, 0.14];
     u.ambient = 0.62;
-    u.fog = 0.0045;
-    u.fog_col = [0.09, 0.095, 0.115];
-    u.exposure = 1.32;
+    u.fog = env.fog;
+    u.fog_col = env.fog_col;
+    u.exposure = env.exposure;
     u.godray_amt = 0.22;
     u.sun_uv = [0.74, 0.16];
     u.opaque = 1.0;
     u.bg = [0.055, 0.06, 0.082];
-    u.saturation = 1.1;
+    u.saturation = env.saturation;
     u.touch = app.viewer.touch;
     u.page = Some(page_tex);
+    u.page2 = app
+        .viewer
+        .atlas
+        .as_ref()
+        .map(|p| PageTex { size: p.size, rgba: p.rgba.clone(), version: p.version });
 
     let verts = pack_sorted(&app.world.meshes, &cam, 0.004);
     root.painter().add(glow_scene::callback(rect, u, verts));
@@ -150,9 +205,23 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     // ── touch: click the page, the page answers ─────────────────────────────
     if response.clicked() {
         if let Some(click) = response.interact_pointer_pos() {
+            let mut jumped = None;
+            for (station_ix, mesh_ix) in &app.world.plaque_ix {
+                let pts: Vec<Pos2> = scene::plaque_corners(&app.world, *mesh_ix)
+                    .iter()
+                    .filter_map(|c| project(&cam, rect, *c))
+                    .collect();
+                if pts.len() == 4 && Rect::from_points(&pts).contains(click) {
+                    jumped = Some(*station_ix);
+                    break;
+                }
+            }
+            if let Some(to) = jumped {
+                app.viewer.jump(to);
+            }
             let corners = scene::page_corners(&app.world);
             let pts: Vec<Pos2> = corners.iter().filter_map(|c| project(&cam, rect, *c)).collect();
-            if pts.len() == 4 {
+            if jumped.is_none() && pts.len() == 4 {
                 let page_rect = Rect::from_points(&pts);
                 if page_rect.contains(click) {
                     app.viewer.touch_at([
@@ -174,10 +243,19 @@ pub fn frame(root: &mut Ui, app: &mut App) {
         egui::FontId::monospace(13.0),
         Color32::from_rgb(226, 220, 206),
     );
+    // Line 2: the assistant's margin note about the shown revision when one
+    // has arrived; the key hints otherwise.
+    let line2 = if let Some((msg, _)) = &app.viewer.branch_msg {
+        format!("⎇ {msg}")
+    } else if !app.viewer.rev_note.is_empty() {
+        format!("✎ {}", app.viewer.rev_note)
+    } else {
+        "wheel scroll · drag orbit · [ ] rooms · , . revisions · b branch · m worktree · click plaques".to_string()
+    };
     p.text(
         rect.left_bottom() + Vec2::new(12.0, -10.0),
         egui::Align2::LEFT_BOTTOM,
-        "wheel scroll · drag orbit · pinch/ctrl+wheel zoom · click the page",
+        line2,
         egui::FontId::proportional(11.0),
         Color32::from_rgba_unmultiplied(226, 220, 206, 140),
     );

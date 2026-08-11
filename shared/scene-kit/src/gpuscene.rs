@@ -21,6 +21,12 @@ use crate::spatial::{OrbitCam, Vec3};
 /// a page has parchment tooth, not moss.
 pub const MAT_INSCRIPTION: f32 = 5.0;
 
+/// Second inscription channel: `u_page2`, a STATIC atlas (station plaques,
+/// wayfinding) beside the dynamic `u_page` (the lectern's live text). Two
+/// channels because their upload cadences differ by orders of magnitude —
+/// the page re-uploads on every scroll step, the atlas once per file.
+pub const MAT_INSCRIPTION2: f32 = 6.0;
+
 // ── tiny column-major mat4 (what GLSL expects by default) ──────────────────────
 type M4 = [f32; 16];
 #[inline] fn idx(c: usize, r: usize) -> usize { c * 4 + r }
@@ -287,7 +293,8 @@ void main() {
 pub const SHADER_FS: &str = r#"
 in vec3 v_normal; in vec4 v_color; in vec3 v_world; flat in float v_mat; flat in float v_emissive; in vec2 v_uv;
 uniform sampler2DArray u_mat; uniform sampler2DArray u_nrm;
-uniform sampler2D u_page;      // the inscription raster; sampled by v_uv on MAT_INSCRIPTION faces only
+uniform sampler2D u_page;      // dynamic inscription (lectern page); mat 5
+uniform sampler2D u_page2;     // static inscription atlas (plaques); mat 6
 uniform float u_texscale; uniform float u_time; uniform float u_bump; uniform float u_exposure;
 // Last touch in world space; .w is its age in seconds, NEGATIVE when nothing has been touched — which
 // must read as "no response" rather than "touched at the origin", or every surface near 0,0,0 glows
@@ -390,7 +397,7 @@ void main() {
     if (v_mat > 4.5) {
         // Words sit ON the face: sampled in PAGE space by the mesh's own UVs — the whole point of the
         // 12→14 vertex upgrade. Ink alpha-composites over the tinted sheet; the sheet keeps its grain.
-        vec4 page = texture(u_page, v_uv);
+        vec4 page = v_mat > 5.5 ? texture(u_page2, v_uv) : texture(u_page, v_uv);
         albedo = mix(albedo, page.rgb, page.a);
         page_a = page.a;
     }

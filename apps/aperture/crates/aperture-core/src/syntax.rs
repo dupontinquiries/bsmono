@@ -31,6 +31,11 @@ pub enum TokKind {
     Str,
     Comment,
     Attr,
+    /// Function/method names — only the tree-sitter backend emits these
+    /// (a line lexer can't know a call from a variable).
+    Fn,
+    /// Type/struct/enum/trait names — likewise grammar-only.
+    Type,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -369,5 +374,109 @@ mod tests {
         let mut sorted = KEYWORDS.to_vec();
         sorted.sort_unstable();
         assert_eq!(sorted, KEYWORDS);
+    }
+}
+
+
+// ─── the seam, as a value: one façade over both backends ────────────────────
+
+use crate::buffer::Buffer;
+
+#[cfg(feature = "tree-sitter")]
+pub use crate::ts::{OutlineItem as OutlineItemAlias, OutlineItem, OutlineKind};
+#[cfg(not(feature = "tree-sitter"))]
+mod outline_stub {
+    /// Featureless stand-ins so `Syntax::outline`'s signature is stable.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum OutlineKind { Fn, Struct, Enum, Trait, Impl, Mod, Const }
+    #[derive(Clone, Debug)]
+    pub struct OutlineItem {
+        pub kind: OutlineKind,
+        pub name: String,
+        pub sig: String,
+        pub line: usize,
+        pub end_line: usize,
+    }
+}
+#[cfg(not(feature = "tree-sitter"))]
+pub use outline_stub::{OutlineItem as OutlineItemAlias, OutlineItem, OutlineKind};
+
+/// The syntax engine the shells actually hold. Picks tree-sitter when the
+/// feature is compiled AND the language has a grammar; otherwise the hand
+/// lexer — same `spans_for` out the other side, so the renderer cannot tell.
+pub struct Syntax {
+    lang: Language,
+    backend: Backend,
+}
+
+enum Backend {
+    Lexer(SyntaxCache),
+    #[cfg(feature = "tree-sitter")]
+    Ts(crate::ts::TsSyntax),
+}
+
+impl Syntax {
+    pub fn new(lang: Language) -> Syntax {
+        #[cfg(feature = "tree-sitter")]
+        if let Some(ts) = crate::ts::TsSyntax::new(lang) {
+            return Syntax { lang, backend: Backend::Ts(ts) };
+        }
+        Syntax { lang, backend: Backend::Lexer(SyntaxCache::new(Lexer::new(lang))) }
+    }
+
+    pub fn language(&self) -> Language {
+        self.lang
+    }
+
+    pub fn set_language(&mut self, lang: Language) {
+        *self = Syntax::new(lang);
+    }
+
+    /// True when the grammar backend is live (the loop pane shows it).
+    pub fn is_tree_sitter(&self) -> bool {
+        match &self.backend {
+            Backend::Lexer(_) => false,
+            #[cfg(feature = "tree-sitter")]
+            Backend::Ts(_) => true,
+        }
+    }
+
+    /// Drain the buffer's edit log into the backend: tree-sitter replays the
+    /// edits and reparses incrementally; the lexer invalidates from the
+    /// earliest touched line. Call after any mutating gesture (cheap no-op
+    /// when nothing changed).
+    pub fn absorb(&mut self, buf: &mut Buffer) {
+        let edits = buf.drain_edits();
+        if edits.is_empty() {
+            return;
+        }
+        match &mut self.backend {
+            Backend::Lexer(cache) => {
+                if let Some(line) = edits.iter().map(|e| e.start_point.0).min() {
+                    cache.invalidate_from(line);
+                }
+            }
+            #[cfg(feature = "tree-sitter")]
+            Backend::Ts(ts) => ts.apply_edits(buf, &edits),
+        }
+    }
+
+    /// The file's named places (fns, types, impl methods…). Empty on the
+    /// lexer backend on purpose: an outline built on guesses would put wrong
+    /// rooms in the world and wrong context in the prompt — worse than none.
+    pub fn outline(&mut self, buf: &Buffer) -> Vec<crate::syntax::OutlineItemAlias> {
+        match &mut self.backend {
+            Backend::Lexer(_) => Vec::new(),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Ts(ts) => ts.outline(buf),
+        }
+    }
+
+    pub fn spans_for(&mut self, line: usize, buf: &Buffer) -> Vec<Span> {
+        match &mut self.backend {
+            Backend::Lexer(cache) => cache.spans_for(line, |j| buf.line(j).into_owned()),
+            #[cfg(feature = "tree-sitter")]
+            Backend::Ts(ts) => ts.spans_for(line, buf),
+        }
     }
 }
