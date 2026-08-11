@@ -93,6 +93,7 @@ impl Default for App {
             fleet: pages::fleet::State::default(),
             push: pages::push::State::default(),
             apps: pages::apps::State::default(),
+            bluetooth: pages::bluetooth::BluetoothState::default(),
             timeline: pages::timeline::State::default(),
             import: pages::import::State::default(),
             branches: pages::branches::State::default(),
