@@ -264,6 +264,122 @@ fn solo_audible_bus_set(project: &Project, bus_solo: &[studio_core::BusId]) -> s
     set
 }
 
+/// Persists per-clip and per-bus effect-chain instances across successive
+/// [`mixdown_with_cache`] calls, so a stateful effect's memory — a
+/// resonant EQ's biquad history, a compressor's envelope, a limiter's
+/// lookahead buffer — survives a call boundary the way it already does
+/// *within* one offline [`mixdown`] call. See [`StreamingRenderer`] for the
+/// thing that actually wants this; `EffectCache` is the storage underneath
+/// it, kept as its own type so `mixdown_with_cache` can be tested against a
+/// cache directly without going through the renderer's call-boundary logic.
+///
+/// Re-instantiates a clip's or bus's chain only when the stored [`Effect`]
+/// list no longer matches what's live on the project — an effect chain
+/// edited mid-playback (this is a collaborative editor; another peer's edit
+/// can land between two calls) must take effect on the next render, not be
+/// silently ignored because a stale `Instance` was cached from before the
+/// edit.
+#[derive(Default)]
+pub struct EffectCache {
+    clip: BTreeMap<studio_core::ClipId, (Vec<studio_core::Effect>, Vec<studio_fx::Instance>)>,
+    bus: BTreeMap<studio_core::BusId, (Vec<studio_core::Effect>, Vec<studio_fx::Instance>)>,
+}
+
+impl EffectCache {
+    pub fn new() -> EffectCache {
+        EffectCache::default()
+    }
+
+    /// Drop every cached instance, forcing a fresh instantiate on the next
+    /// render. Call this after a transport seek/jump: a stateful effect's
+    /// memory from audio that is no longer temporally adjacent to what's
+    /// about to play isn't memory worth keeping — a DAW's reverb tail
+    /// cutting off on a seek is expected behaviour, not a bug this cache
+    /// should work around.
+    pub fn reset(&mut self) {
+        self.clip.clear();
+        self.bus.clear();
+    }
+
+    fn clip_instances(&mut self, id: studio_core::ClipId, chain: &[studio_core::Effect], rate: f32) -> &mut [studio_fx::Instance] {
+        let entry = self.clip.entry(id).or_default();
+        if entry.0 != chain {
+            entry.0 = chain.to_vec();
+            entry.1 = chain.iter().filter(|e| e.enabled).filter_map(|e| studio_fx::instantiate(e, rate)).collect();
+        }
+        &mut entry.1
+    }
+
+    fn bus_instances(&mut self, id: studio_core::BusId, chain: &[studio_core::Effect], rate: f32) -> &mut [studio_fx::Instance] {
+        let entry = self.bus.entry(id).or_default();
+        if entry.0 != chain {
+            entry.0 = chain.to_vec();
+            entry.1 = chain.iter().filter(|e| e.enabled).filter_map(|e| studio_fx::instantiate(e, rate)).collect();
+        }
+        &mut entry.1
+    }
+}
+
+/// A stateful wrapper around [`mixdown_with_cache`] for exactly the use
+/// [`mixdown`] itself is NOT safe for: calling once per device buffer.
+/// Tracks whether the last call's `to` matches this call's `from` — a
+/// genuinely contiguous stream of buffers, the only case a cached effect's
+/// memory is still meaningful — and resets the cache automatically on any
+/// gap (the first call, or a seek), so a caller doesn't have to reason
+/// about when reuse is valid; only about calling `reset()` isn't even
+/// necessary for a seek, `render` detects the discontinuity itself from the
+/// `from`/`to` it's given.
+#[derive(Default)]
+pub struct StreamingRenderer {
+    cache: EffectCache,
+    next_expected: Option<Ticks>,
+}
+
+impl StreamingRenderer {
+    pub fn new() -> StreamingRenderer {
+        StreamingRenderer::default()
+    }
+
+    /// Render `[from, to)`, reusing cached effect instances when this call
+    /// picks up exactly where the previous one left off, and transparently
+    /// resetting (same cost as a one-shot [`mixdown`] call) otherwise.
+    pub fn render(
+        &mut self,
+        project: &Project,
+        audio: &BTreeMap<SourceId, SourceAudio>,
+        fades: &BTreeMap<studio_core::ClipId, Fades>,
+        from: Ticks,
+        to: Ticks,
+        rate: u32,
+        solo: &[studio_core::TrackId],
+        bus_solo: &[studio_core::BusId],
+    ) -> Vec<f32> {
+        if self.next_expected != Some(from) {
+            self.cache.reset();
+        }
+        self.next_expected = Some(to);
+        mixdown_with_cache(project, audio, fades, from, to, rate, solo, bus_solo, &mut self.cache)
+    }
+
+    /// Force a reset on the next `render`, regardless of continuity —
+    /// exposed for a caller that knows a discontinuity is coming (e.g. is
+    /// about to seek) and wants the reset to happen before the render call
+    /// that would otherwise detect it, not because detection needs help.
+    pub fn reset(&mut self) {
+        self.cache.reset();
+        self.next_expected = None;
+    }
+}
+
+/// The offline entry point: renders `[from, to)` in one call with a fresh
+/// [`EffectCache`], so every effect chain runs continuously from the first
+/// sample to the last — correct for a one-shot bounce, and NOT safe to call
+/// repeatedly for consecutive windows (a stateful effect's memory resets
+/// every call — see `mixdown_reinstantiates_effect_state_on_every_call_not_a_realtime_render_yet`
+/// in this module's tests for that boundary proven directly). For
+/// consecutive windows — a real playback path — use [`StreamingRenderer`]
+/// instead, which is exactly this function's logic run against a cache that
+/// survives across calls rather than a throwaway one.
 pub fn mixdown(
     project: &Project,
     audio: &BTreeMap<SourceId, SourceAudio>,
@@ -273,6 +389,28 @@ pub fn mixdown(
     rate: u32,
     solo: &[studio_core::TrackId],
     bus_solo: &[studio_core::BusId],
+) -> Vec<f32> {
+    let mut cache = EffectCache::new();
+    mixdown_with_cache(project, audio, fades, from, to, rate, solo, bus_solo, &mut cache)
+}
+
+/// [`mixdown`]'s actual logic, parameterised over the [`EffectCache`] that
+/// backs every clip's and bus's effect instances — `mixdown` itself is a
+/// two-line wrapper handing this a cache nobody keeps, and
+/// [`StreamingRenderer::render`] is a wrapper handing this the SAME cache
+/// call after call. Everything about mixing tracks, bus routing, sends, and
+/// solo/mute is here exactly once; the only difference between an offline
+/// bounce and a live playback call is which cache they pass in.
+pub fn mixdown_with_cache(
+    project: &Project,
+    audio: &BTreeMap<SourceId, SourceAudio>,
+    fades: &BTreeMap<studio_core::ClipId, Fades>,
+    from: Ticks,
+    to: Ticks,
+    rate: u32,
+    solo: &[studio_core::TrackId],
+    bus_solo: &[studio_core::BusId],
+    cache: &mut EffectCache,
 ) -> Vec<f32> {
     let frames = (to.to_samples(rate) - from.to_samples(rate)).max(0) as usize;
     let mut master = vec![0.0f32; frames * 2];
@@ -316,12 +454,7 @@ pub fn mixdown(
             // pattern rather than introducing a different one here. An
             // unknown effect kind is silently skipped via `instantiate`'s
             // `None`.
-            let mut clip_fx: Vec<studio_fx::Instance> = clip
-                .effects
-                .iter()
-                .filter(|e| e.enabled)
-                .filter_map(|e| studio_fx::instantiate(e, rate as f32))
-                .collect();
+            let clip_fx: &mut [studio_fx::Instance] = cache.clip_instances(clip.id, &clip.effects, rate as f32);
 
             let start = clip.pos.max(from);
             let stop = clip.end().min(to);
@@ -396,12 +529,7 @@ pub fn mixdown(
         // `instantiate`'s `None`, the same "opens without the plugin"
         // behaviour every other effect host in this codebase has.
         if !bus.chain.is_empty() {
-            let mut instances: Vec<studio_fx::Instance> = bus
-                .chain
-                .iter()
-                .filter(|e| e.enabled)
-                .filter_map(|e| studio_fx::instantiate(e, rate as f32))
-                .collect();
+            let instances = cache.bus_instances(id, &bus.chain, rate as f32);
             for s in buf.iter_mut() {
                 for inst in instances.iter_mut() {
                     *s = inst.process_audio(*s);
@@ -825,6 +953,178 @@ mod tests {
         assert!(diverges, "a resonant filter's state must NOT survive a mixdown call boundary today — \
             if this assertion starts failing, mixdown has become state-continuous across calls and this \
             test (and its doc comment) should be updated to say so, not deleted");
+    }
+
+    #[test]
+    fn streaming_renderer_is_the_fix_the_previous_test_says_is_still_needed() {
+        // The mirror image of `mixdown_reinstantiates_effect_state_on_every_
+        // call_not_a_realtime_render_yet`, now asserting EQUALITY instead of
+        // divergence: the same resonant EQ, the same split into two calls,
+        // but through `StreamingRenderer` instead of bare `mixdown` — this
+        // must match the one-shot offline render exactly, because the
+        // effect instance carries its state across the call boundary
+        // instead of being rebuilt.
+        let rate = 48_000;
+        let len_s = 0.1;
+        let (mut p, audio) = project_with(len_s, 1.0);
+
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("q0".to_string(), 8.0);
+        params.insert("gain0".to_string(), 18.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+
+        let total = Ticks::from_seconds(len_s);
+        let one_shot = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, total, rate, &[], &[]);
+
+        let mid = Ticks::from_samples(total.to_samples(rate) / 2, rate);
+        let mut renderer = StreamingRenderer::new();
+        let mut streamed = renderer.render(&p, &audio, &BTreeMap::new(), Ticks::ZERO, mid, rate, &[], &[]);
+        streamed.extend(renderer.render(&p, &audio, &BTreeMap::new(), mid, total, rate, &[], &[]));
+
+        assert_eq!(one_shot.len(), streamed.len());
+        for (i, (a, b)) in one_shot.iter().zip(streamed.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "sample {i}: streamed {b} vs one-shot {a} — effect state should have carried across the call boundary");
+        }
+    }
+
+    #[test]
+    fn streaming_renderer_matches_offline_mixdown_split_into_many_small_buffers() {
+        // A more realistic shape than one split in the middle: many small,
+        // consecutive buffer-sized calls, the way a real device callback
+        // would actually drive this. Correctness must hold at every join,
+        // not just one.
+        let rate = 48_000;
+        let len_s = 0.2;
+        let (mut p, audio) = project_with(len_s, 1.0);
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("q0".to_string(), 6.0);
+        params.insert("gain0".to_string(), 12.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+
+        let total = Ticks::from_seconds(len_s);
+        let one_shot = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, total, rate, &[], &[]);
+
+        let buffer = Ticks::from_samples(512, rate); // a plausible real device buffer size
+        let mut renderer = StreamingRenderer::new();
+        let mut streamed = Vec::new();
+        let mut pos = Ticks::ZERO;
+        while pos < total {
+            let end = pos.saturating_add(buffer).min(total);
+            streamed.extend(renderer.render(&p, &audio, &BTreeMap::new(), pos, end, rate, &[], &[]));
+            pos = end;
+        }
+
+        assert_eq!(one_shot.len(), streamed.len());
+        for (i, (a, b)) in one_shot.iter().zip(streamed.iter()).enumerate() {
+            assert!((a - b).abs() < 1e-4, "sample {i}: streamed {b} vs one-shot {a}, across a {} buffer-sized calls", (total.to_samples(rate) as f64 / 512.0).ceil());
+        }
+    }
+
+    #[test]
+    fn a_seek_between_calls_resets_state_instead_of_carrying_stale_memory() {
+        // A non-contiguous call (this call's `from` doesn't match the
+        // previous call's `to`) is a seek. The cache must reset — carrying
+        // a filter's memory across a jump would mean the render at the new
+        // position depends on where the transport happened to be a moment
+        // ago, which is exactly the kind of state a seek is supposed to cut
+        // off. After a reset, rendering at a position is indistinguishable
+        // from a fresh `mixdown` call at that same position.
+        let rate = 48_000;
+        let len_s = 0.1;
+        let (mut p, audio) = project_with(len_s, 1.0);
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("q0".to_string(), 8.0);
+        params.insert("gain0".to_string(), 18.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+
+        let total = Ticks::from_seconds(len_s);
+        let mid = Ticks::from_samples(total.to_samples(rate) / 2, rate);
+        let quarter = Ticks::from_samples(total.to_samples(rate) / 4, rate);
+
+        let mut renderer = StreamingRenderer::new();
+        let _ = renderer.render(&p, &audio, &BTreeMap::new(), Ticks::ZERO, mid, rate, &[], &[]);
+        // A real seek: the next call's `from` (`quarter`) does NOT match the
+        // previous call's `to` (`mid`) — continuing exactly at `mid` would be
+        // the normal contiguous case (covered by the tests above), not a
+        // seek.
+        let after_seek = renderer.render(&p, &audio, &BTreeMap::new(), quarter, total, rate, &[], &[]);
+
+        let fresh = mixdown(&p, &audio, &BTreeMap::new(), quarter, total, rate, &[], &[]);
+        assert_eq!(after_seek, fresh, "a render after a seek must match a fresh one-shot render at that position, not carry over the pre-seek filter state");
+    }
+
+    #[test]
+    fn a_live_effect_edit_between_contiguous_calls_takes_effect_immediately() {
+        // This is a collaborative editor — another peer's edit (or the
+        // user's own) can land between two consecutive renders. A cached
+        // instance from before the edit must not silently keep playing the
+        // old chain.
+        let rate = 48_000;
+        let len_s = 0.1;
+        let (mut p, audio) = project_with(len_s, 1.0);
+        let clip_id = *p.clips.keys().next().unwrap();
+
+        let total = Ticks::from_seconds(len_s);
+        let mid = Ticks::from_samples(total.to_samples(rate) / 2, rate);
+
+        let mut renderer = StreamingRenderer::new();
+        let _ = renderer.render(&p, &audio, &BTreeMap::new(), Ticks::ZERO, mid, rate, &[], &[]);
+
+        // Edit lands between calls, contiguous position (no seek).
+        let mut params = std::collections::BTreeMap::new();
+        params.insert("bands".to_string(), 1.0);
+        params.insert("freq0".to_string(), 440.0);
+        params.insert("gain0".to_string(), -60.0); // effectively silences the tone
+        p.apply(&Op::SetEffects { id: clip_id, effects: vec![
+            studio_core::Effect { kind: "eq".into(), params, enabled: true },
+        ] }).unwrap();
+
+        let after_edit = renderer.render(&p, &audio, &BTreeMap::new(), mid, total, rate, &[], &[]);
+        let expected = mixdown(&p, &audio, &BTreeMap::new(), mid, total, rate, &[], &[]);
+        assert_eq!(after_edit, expected, "a chain change must be picked up on the very next render, not deferred until a discontinuity");
+
+        // Sanity, measured against the same span with no effect at all
+        // (rather than an arbitrary absolute dB guess) so the threshold is
+        // itself evidenced: a -60dB peaking cut centered on the tone's own
+        // frequency must measurably quiet it, the same standard
+        // `a_clip_effect_measurably_changes_the_mix` above already uses.
+        let mut p_plain = p.clone();
+        p_plain.apply(&Op::SetEffects { id: clip_id, effects: vec![] }).unwrap();
+        let unprocessed = mixdown(&p_plain, &audio, &BTreeMap::new(), mid, total, rate, &[], &[]);
+        assert!(
+            peak_dbfs(&after_edit) < peak_dbfs(&unprocessed) - 6.0,
+            "sanity: the -60dB EQ cut should have measurably quieted the tone: unprocessed {}dBFS, cut {}dBFS",
+            peak_dbfs(&unprocessed), peak_dbfs(&after_edit)
+        );
+    }
+
+    #[test]
+    fn mixdown_with_cache_and_a_fresh_cache_each_call_is_equivalent_to_plain_mixdown() {
+        // Regression check on the refactor itself: `mixdown` is now a thin
+        // wrapper over `mixdown_with_cache` with a throwaway cache. Calling
+        // `mixdown_with_cache` directly with a fresh cache every time must
+        // produce byte-identical output to `mixdown`, proving the refactor
+        // didn't change the offline path's behaviour.
+        let (p, audio) = project_with(0.3, 0.7);
+        let a = mixdown(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.3), 48_000, &[], &[]);
+        let mut cache = EffectCache::new();
+        let b = mixdown_with_cache(&p, &audio, &BTreeMap::new(), Ticks::ZERO, Ticks::from_seconds(0.3), 48_000, &[], &[], &mut cache);
+        assert_eq!(a, b);
     }
 
     #[test]
