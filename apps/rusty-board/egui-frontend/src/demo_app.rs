@@ -54,6 +54,16 @@ struct Feel {
     ngram: crate::ngram::NgramStore,
     /// Hold-to-confirm for the one destructive button in the app.
     clear_hold: crate::tap_hold::TapHold,
+    /// The in-keyboard settings panel. `settings_model` carries the groups and
+    /// their help text; `settings` reads rusty-board's REAL config rather than
+    /// a copy, so a field added on the GTK side cannot drift out of the port.
+    settings_open: bool,
+    /// Chosen values, keyed by config key. Held here rather than written
+    /// through on every tap: `settings` reads rusty-board's real Config and the
+    /// port has no writer for it, so persisting from the demo would mean a
+    /// SECOND way to write the file — the drift the settings module exists to
+    /// avoid. The panel shows and cycles; the host persists.
+    setting_values: std::collections::HashMap<String, String>,
     /// Which gesture category the live trail is showing — only visible when trail debug
     /// styling is on (see the Diagnostics toggle). Recomputed as the gesture is classified.
     trail_style: TrailStyle,
@@ -80,6 +90,17 @@ impl Feel {
             swipe: SwipeState::with_dictionary(
                 include_str!("../demo_words.txt").lines().map(|l| l.trim().to_string())
                     .filter(|l| !l.is_empty()).collect()),
+            // Feel has a HAND-WRITTEN constructor, so a new struct field does
+            // not appear here automatically — the same trap that produced
+            // gitmind's missing `bluetooth` initialiser. Every field added
+            // this session is listed explicitly.
+            dict: Default::default(),
+            service: Default::default(),
+            committed: 0,
+            ngram: Default::default(),
+            clear_hold: Default::default(),
+            settings_open: false,
+            setting_values: Default::default(),
         }
     }
 }
@@ -117,6 +138,9 @@ impl eframe::App for Feel {
                 // cannot find is the same as a control that does not exist.
                 if ui.selectable_label(self.tray_open, "▁ tray").clicked() {
                     self.tray_open = !self.tray_open;
+                }
+                if ui.selectable_label(self.settings_open, "⚙ settings").clicked() {
+                    self.settings_open = !self.settings_open;
                 }
                 if ui.selectable_label(self.microterm.is_visible(), "term").clicked() {
                     if self.microterm.is_visible() { self.microterm.hide(); }
@@ -323,6 +347,55 @@ impl eframe::App for Feel {
 
             });
 
+        }
+
+        if self.settings_open {
+            egui::TopBottomPanel::bottom("settings").show(ctx, |ui| {
+                ui.label(egui::RichText::new("Settings").strong());
+                // Which sections this port can actually honour. `settings::ready`
+                // exists precisely so the panel does not offer a switch that
+                // does nothing — a control that silently fails is worse than an
+                // absent one, because the user changes it and then trusts it.
+                let live: Vec<&str> = [
+                    (crate::settings::Section::Appearance, "appearance"),
+                    (crate::settings::Section::Behavior, "behaviour"),
+                    (crate::settings::Section::Gestures, "gestures"),
+                    (crate::settings::Section::Layout, "layout"),
+                    (crate::settings::Section::Voice, "voice"),
+                    (crate::settings::Section::Llm, "llm"),
+                ].iter().filter(|(s, _)| crate::settings::ready(*s)).map(|(_, n)| *n).collect();
+                ui.label(egui::RichText::new(format!("live sections: {}", live.join(", ")))
+                    .weak().size(11.0));
+
+                for g in crate::settings_model::Group::ALL {
+                    let items = crate::settings_model::group(g);
+                    if items.is_empty() { continue; }
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(g.title()).weak().size(11.0));
+                    for setting in items {
+                        let cur = self.setting_values.get(setting.key)
+                            .cloned()
+                            .unwrap_or_else(|| setting.values[0].to_string());
+                        let idx = setting.index_of(&cur);
+                        let shown = setting.options.get(idx).copied().unwrap_or("?");
+                        let r = ui.button(format!("{}: {}", setting.label, shown));
+                        if r.clicked() {
+                            // settings_model owns the cycling AND says whether
+                            // the change needs a relayout or a write — the
+                            // panel does not decide that, so a new setting
+                            // cannot arrive with the wrong side effects.
+                            let change = crate::settings_model::toggle(setting, &cur);
+                            self.setting_values.insert(setting.key.to_string(), change.value);
+                            if change.broadcast { ctx.request_repaint(); }
+                        }
+                        // The help line is where the options are EXPLAINED —
+                        // "staggered matches a physical keyboard; ortholinear is
+                        // a strict grid" is the sentence that makes the choice
+                        // meaningful, and two bare words leave the user guessing.
+                        r.on_hover_text(setting.help);
+                    }
+                }
+            });
         }
 
         if self.tray_open {
