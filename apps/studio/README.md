@@ -157,10 +157,18 @@ wiring its own `EngineState`/`Command` ring to `StreamingRenderer` and
 real `AudioIo` implementor (`TestIo`, standing in for `CpalIo` since there's
 still no hardware in this sandbox), not just called directly. This crate
 needed no UI toolchain to build that: it has never depended on egui.
-`StreamingRenderer::render` still allocates per call, so this callback is
-correct but not yet the allocation-free one `studio_io::DuplexCallback`'s
-own docs ask for — named directly in `device.rs`'s module doc, not
-discovered later.
+The render path is allocation-free on its warm path too now:
+`StreamingRenderer::render_into` writes into a caller-provided buffer and
+reuses a `RenderScratch` (the master accumulator and every bus's buffer,
+resized in place rather than rebuilt) across calls, and `DeviceEngine::
+tick` calls it instead of the `Vec`-returning `render`. Checked directly —
+a bus scratch buffer's `.capacity()` is unchanged across two same-size
+contiguous calls, not just assumed stable. What's still real and named
+rather than glossed over: `EffectCache`/`RenderScratch` growing on a
+structural edit (a new bus, a clip's first effect) still allocates, which
+is the right trade for something that happens on an edit rather than every
+buffer, and `Recorder::feed`'s buffer (built before this session) still
+reallocates past its two-second initial capacity on a longer take.
 
 A test found the one real bug in this pass: `rebuild()` originally replayed the
 op log from an empty project and erased every track and source that pre-dated
