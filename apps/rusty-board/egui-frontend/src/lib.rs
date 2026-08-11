@@ -411,6 +411,20 @@ pub fn keyboard_ui_with_signal(
 /// use the ported rusty-board-GTK glass recipe (`uikit_egui::glass`): high-alpha tinted fill, hairline
 /// border, instant colour-flip on press — no gradient/sheen, no blur. Otherwise keys use the standard
 /// carved-tile motion glide.
+/// Bridge the classifier's `Direction` to the widget's `Dir8`.
+///
+/// Two enums for one idea, in two crates that should not depend on each other:
+/// `cardinal_gesture` is rusty-board's ported classifier and `Dir8` belongs to
+/// the shared widget kit. A `From` impl would need one to know about the other.
+fn dir8_from(d: cardinal_gesture::Direction) -> uikit_egui::slide_menu::Dir8 {
+    use cardinal_gesture::Direction as D;
+    use uikit_egui::slide_menu::Dir8 as U;
+    match d {
+        D::N => U::N, D::NE => U::NE, D::E => U::E, D::SE => U::SE,
+        D::S => U::S, D::SW => U::SW, D::W => U::W, D::NW => U::NW,
+    }
+}
+
 fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors, glass: bool) -> Option<String> {
     // CLICK AND DRAG. This was `Sense::click()`, which is why cardinal swipes
     // did nothing: a key that only senses clicks never sees a drag, so the
@@ -466,6 +480,62 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
             .iter()
             .map(|(d, s)| (*d, uikit_egui::slide_menu::SlideOption::new(s.clone(), s.clone())))
             .collect();
+        // HAIRPIN TRACKING, alongside show_cardinal rather than replacing it.
+        //
+        // `show_cardinal` resolves tap-vs-direction and does it well, but it has
+        // no concept of a hairpin (out and BACK) or a rotation — grep it for
+        // either word and there is nothing. In the cardinal layout the hairpin
+        // is CAPITALISATION, so without this the layout cannot produce a
+        // capital letter at all. That is why the ported classifier is not
+        // redundant with the widget, and why the answer is not "delete one".
+        //
+        // The path is sampled here and classified on release; the widget keeps
+        // owning direction. Two jobs, one gesture, no second direction
+        // implementation to drift.
+        let path_id = id.with("hairpin");
+        if resp.drag_started() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                ui.ctx().data_mut(|d| d.insert_temp(path_id, vec![(p.x, p.y, 0u32)]));
+            }
+        }
+        if resp.dragged() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let t = (ui.input(|i| i.time) * 1000.0) as u32;
+                ui.ctx().data_mut(|d| {
+                    let mut v: Vec<(f32, f32, u32)> = d.get_temp(path_id).unwrap_or_default();
+                    // Bounded: a slow drag across one key would otherwise
+                    // accumulate a point per frame for as long as it is held.
+                    if v.len() < 256 { v.push((p.x, p.y, t)); }
+                    d.insert_temp(path_id, v);
+                });
+            }
+        }
+        if resp.drag_stopped() {
+            let pts: Vec<(f32, f32, u32)> =
+                ui.ctx().data_mut(|d| d.get_temp(path_id).unwrap_or_default());
+            ui.ctx().data_mut(|d| d.remove::<Vec<(f32, f32, u32)>>(path_id));
+            if pts.len() >= 3 {
+                let path: Vec<cardinal_gesture::SwipePoint> = pts.iter()
+                    .map(|(x, y, t)| cardinal_gesture::SwipePoint {
+                        x: *x as f64, y: *y as f64, t_ms: *t - pts[0].2,
+                    })
+                    .collect();
+                let th = cardinal_gesture::CardinalThresholds::default();
+                if let cardinal_gesture::CardinalGesture::Hairpin(d) =
+                    cardinal_gesture::classify(&path, &th)
+                {
+                    // The hairpin's DIRECTION selects which variant to
+                    // capitalise, so an out-and-back toward the north variant
+                    // capitalises that letter rather than the key's own.
+                    let want = dir8_from(d);
+                    let target = key.cardinal.iter().find(|(k, _)| *k == want)
+                        .map(|(_, s)| s.clone())
+                        .unwrap_or_else(|| key.emit.clone());
+                    return Some(target.to_uppercase());
+                }
+            }
+        }
+
         let menu = uikit_egui::slide_menu::SlideMenu::new(id).item_size((size.y * 0.9).clamp(36.0, 52.0));
         if let uikit_egui::slide_menu::SlideOutcome::Selected(v, _) = menu.show_cardinal(ui, id, &resp, &tap, &dirs) {
             return Some(v);
