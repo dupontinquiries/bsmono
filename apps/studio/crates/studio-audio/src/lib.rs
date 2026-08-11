@@ -25,6 +25,7 @@
 //! device, no callback, no clock.
 
 pub mod stems;
+pub mod block;
 
 use std::collections::BTreeMap;
 use studio_core::{Project, SourceId, Ticks, TrackKind};
