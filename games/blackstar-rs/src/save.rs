@@ -51,6 +51,9 @@ pub struct Save {
     pub bag: String,
     /// the ship's chest, positional item codes (see vault.rs)
     pub vault: String,
+    /// the Watch's current form, resolve, and whether Photon Man has
+    /// ever been reached deliberately (see watch.rs)
+    pub watch: String,
 }
 
 impl Default for Save {
@@ -82,6 +85,7 @@ impl Default for Save {
             worn: String::new(),
             bag: String::new(),
             vault: String::new(),
+            watch: String::new(),
             look: String::new(),
         }
     }
@@ -117,6 +121,7 @@ pub fn load() -> (Save, Bindings, Config) {
             "worn" => s.worn = v.to_string(),
             "bag" => s.bag = v.to_string(),
             "vault" => s.vault = v.to_string(),
+            "watch" => s.watch = v.to_string(),
             "look" => s.look = v.to_string(),
             "total_rings" => s.total_rings = v.parse().unwrap_or(s.total_rings),
             "total_car_rings" => s.total_car_rings = v.parse().unwrap_or(s.total_car_rings),
@@ -173,7 +178,7 @@ pub fn store(s: &Save, b: &Bindings, cfg: &Config) {
     if !s.nightfalls.is_empty() {
         let _ = writeln!(out, "nightfalls {}", s.nightfalls);
     }
-    for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("bag", &s.bag), ("vault", &s.vault)] {
+    for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("bag", &s.bag), ("vault", &s.vault), ("watch", &s.watch)] {
         if !v.is_empty() {
             let _ = writeln!(out, "{k} {v}");
         }
