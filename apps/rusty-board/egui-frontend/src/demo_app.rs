@@ -52,6 +52,8 @@ struct Feel {
     /// unigram exactly when two candidates are equally common on their own,
     /// which is the case the recognizer cannot break.
     ngram: crate::ngram::NgramStore,
+    /// Hold-to-confirm for the one destructive button in the app.
+    clear_hold: crate::tap_hold::TapHold,
     /// Which gesture category the live trail is showing — only visible when trail debug
     /// styling is on (see the Diagnostics toggle). Recomputed as the gesture is classified.
     trail_style: TrailStyle,
@@ -189,8 +191,38 @@ impl eframe::App for Feel {
                     ui.label(egui::RichText::new(format!(
                         "Keyboard1.TextCommitted × {}", self.committed)).weak().size(11.0));
                 }
-                if ui.button("clear").clicked() {
+                // CLEAR IS HOLD-TO-CONFIRM, because a tap wipes everything the
+                // user typed and there is no undo. tap_hold exists for exactly
+                // this and was reached by nothing — 270 lines, 12 tests, and
+                // the one destructive button in the app fired on a stray tap.
+                //
+                // A hold rather than a confirm dialog: the progress bar IS the
+                // confirmation, it cancels by letting go, and it does not
+                // interrupt what you were doing to ask.
+                let clear_resp = ui.add(egui::Button::new(
+                    if self.clear_hold.is_pressing() { "hold to clear…" } else { "clear" }));
+                if clear_resp.is_pointer_button_down_on() {
+                    if !self.clear_hold.is_pressing() { self.clear_hold.press(); }
+                } else if self.clear_hold.is_pressing() {
+                    // Released early: tap_hold returns Tapped, which for a
+                    // destructive action means "do nothing" rather than "do it".
+                    let _ = self.clear_hold.release();
+                }
+                let dt = ui.input(|i| i.stable_dt) * 1000.0;
+                if let Some(crate::tap_hold::Fired::HeldDown) = self.clear_hold.tick(dt) {
                     self.typed.clear();
+                }
+                if self.clear_hold.progress() > 0.0 {
+                    // Repaint while filling, or the bar advances only when
+                    // something else happens to cause a frame.
+                    ui.ctx().request_repaint();
+                    let p = self.clear_hold.progress();
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::vec2(48.0, 3.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(rect.min,
+                            egui::vec2(rect.width() * p, rect.height())),
+                        1.0, ui.visuals().selection.bg_fill);
                 }
             });
             ui.add_space(4.0);
