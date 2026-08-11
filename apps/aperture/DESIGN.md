@@ -559,7 +559,13 @@ some_file.rs` (add `--ignore-rust-version` on rustc <1.92).
 1. tree-sitter behind `LineLexer` (syntax.rs untouched elsewhere).
 2. Streaming ghosts (`stream:true`, Provider grows a cancel).
 3. File-fuzzy Ctrl+O over a workspace walk + `uikit_egui::fuzzy`.
-4. Multi-cursor (`Selection` → `Vec<Selection>`, edits fan out).
+4. ~~Multi-cursor~~ — **landed** (`aperture-core/src/multicursor.rs`). The seam was
+   right; what the doc could not know is that the hard part is not holding
+   several cursors but that **every edit invalidates every other cursor's
+   offsets**. Edits apply back-to-front so the not-yet-applied ones are always
+   before the edit point; overlaps merge BEFORE any edit is produced, so
+   double-deletion is unrepresentable rather than guarded against. Still to
+   wire: the shells' Ctrl+D / Alt+Click bindings.
 5. LSP crate on the same worker/inbox pattern as the completion Engine.
 6. Physical viewer: logscope migrates to scene-kit (re-export shims +
    `uvs: None` literal sweep); editing on the lectern (the ghost machine is

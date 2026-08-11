@@ -30,6 +30,7 @@
 //! shell AND the physical viewer) to duplicate the parsers or take on a
 //! heavier crate just to see what changed.
 
+pub mod multicursor;
 pub mod buffer;
 pub mod editor;
 pub mod gitspace;
