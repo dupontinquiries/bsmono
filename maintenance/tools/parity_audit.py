@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""parity_audit.py — one command, every egui port, no hand-maintained ledger.
+"""NOTE: this tool counts SURFACES, which is the wrong question on its own.
+A surface can be named, ported, tested and unreachable — see
+maintenance/tools/reachability.py, which asks whether the app's own binary
+arrives at a module. Every bug reported against these ports in August 2026 was
+of that second kind, and every one of them is invisible here.
+parity_audit.py — one command, every egui port, no hand-maintained ledger.
 
 The parity docs are written by hand per app, so they drift the moment anyone
 lands a widget without editing the table. This derives the state instead:
