@@ -343,33 +343,197 @@ pub struct Mission {
     /// the troop that leads the opposition, if one does
     pub champion: Option<&'static str>,
     pub beat: &'static str,
+    /// cutscene slides, the C engine's format: shown over a dim backdrop
+    /// before and after the mission, advanced or skipped. All ORIGINAL
+    /// terse prose — the story's beats and names, no script text.
+    pub intro: &'static [&'static str],
+    pub outro: &'static [&'static str],
 }
 
 pub const MISSIONS: &[Mission] = &[
+    // ============ TRILOGY ONE — disaster, war, sacrifice ============
     Mission { order: 1, id: "the_pluto_line", film: 1, dest: "pluto", site: "the outer containment line",
         objective: Objective::Eliminate, champion: Some("hoarfrost_sentinel"),
-        beat: "hold the outer containment line; Cryotek attacks" },
+        beat: "hold the outer containment line; Cryotek attacks",
+        intro: &[
+            "the system's edge. an old soldier in an older suit walks the wall he helped build.",
+            "witwicky doesn't talk about earth much. out here, quiet is what safe sounds like.",
+            "cryotek's line are mining the dead beyond the wire. end it before the quiet ends first.",
+        ],
+        outro: &[
+            "the ice line holds. witwicky exhales for the first time in an hour.",
+            "'you get used to the cold,' he says. 'you never get used to the waiting.'",
+        ] },
     Mission { order: 2, id: "the_scavenger_king", film: 1, dest: "outer_rim", site: "the Kuiper drift",
         objective: Objective::Eliminate, champion: Some("blackstar_raider"),
-        beat: "Blackstar, the Kuiper warlord" },
+        beat: "Blackstar, the Kuiper warlord",
+        intro: &[
+            "the frontier is full of cybertron's scattered children -- and their king.",
+            "blackstar doesn't serve the devourer. he collects what it leaves. he finds hope FUNNY.",
+            "his raiders pin the convoy where it drifts. so do not drift.",
+        ],
+        outro: &[
+            "you held. the warlord withdraws, unhurried. 'empires burn. i collect the ashes.'",
+            "on comms, quietly: 'he's not wrong about the burning. he's wrong about what's left.'",
+        ] },
     Mission { order: 3, id: "the_red_extraction", film: 1, dest: "mars", site: "the extraction rig",
         objective: Objective::Breach, champion: None,
-        beat: "tear the Mars extraction rig apart; the shard is already gone" },
+        beat: "tear the Mars extraction rig apart; the shard is already gone",
+        intro: &[
+            "a rig nobody registered has been coring the mantle for months. the crews are gone.",
+            "whatever it was cutting loose lifted out three days ago, burning sunward. to earth.",
+            "what is left is still digging. break the rig before it finds a second one.",
+        ],
+        outro: &[
+            "the rig folds into the crater it made. the dust settles wrong, and slowly.",
+            "the trajectory plot finishes. everyone looks at the blue dot at the end of it.",
+        ] },
     Mission { order: 4, id: "the_beach_opens", film: 1, dest: "earth", site: "the beach",
         objective: Objective::Protect, champion: None,
-        beat: "Earth's shore tears open; get the civilians clear" },
+        beat: "Earth's shore tears open; get the civilians clear",
+        intro: &[
+            "the mars shard came down hollow. los angeles felt it arrive before it landed.",
+            "aiden is nobody: a kid with a skateboard on a beach. then the ground takes a breath.",
+            "he doesn't run. he starts pulling people up the dunes. get the rest clear -- cover him.",
+        ],
+        outro: &[
+            "the civilians are out. aiden is still at the fissure edge, shaking, staying.",
+            "prime hears it through spark, not sound. far away, something old turns toward earth.",
+        ] },
     Mission { order: 5, id: "what_jhiaxus_grew", film: 2, dest: "earth", site: "the vault",
         objective: Objective::Eliminate, champion: None,
-        beat: "the architect of the Corrupted" },
+        beat: "the architect of the Corrupted",
+        intro: &[
+            "the architect meant to study the corruption. to catalogue it. to KEEP it.",
+            "each generation drifts further from his control -- and he cannot admit he is afraid.",
+            "there is no containment left. only the ones already loose. put them down gently, if you can.",
+        ],
+        outro: &[
+            "the vault goes quiet. that is not the same as safe.",
+            "in the wreckage, his notes: the devourer is no beast. it is a machine. it was BUILT.",
+        ] },
     Mission { order: 6, id: "the_mantle_dive", film: 2, dest: "earth", site: "the foundry",
         objective: Objective::Control, champion: None,
-        beat: "Hot Rod becomes Rodimus" },
+        beat: "Hot Rod becomes Rodimus",
+        intro: &[
+            "down the ruptured mantle: living-metal corridors, energon rivers, cathedral dark.",
+            "hot rod dives beside you -- reckless, loud, terrified of one thing: failing prime.",
+            "hold the descent. the avatar is forming out of the magma, and it is looking at optimus.",
+        ],
+        outro: &[
+            "unicron impales prime. hot rod doesn't cause the fall this time -- he catches it.",
+            "the matrix opens for the one who reached without wanting it. rodimus rises, burning.",
+        ] },
     Mission { order: 7, id: "the_drowned_approach", film: 2, dest: "earth", site: "the trench",
         objective: Objective::Survive, champion: None,
-        beat: "hold the descent as the Corrupted converge on the wound" },
-    Mission { order: 8, id: "beneath_the_pacific", film: 3, dest: "cybertron", site: "the gravity well",
+        beat: "hold the descent as the Corrupted converge on the wound",
+        intro: &[
+            "rodimus leads now, and hates how the word sounds. prime recovers in the fleet above.",
+            "below the pacific, the corrupted converge on a light that should not be down here.",
+            "survive the descent past the vent spires. every one that reaches the rift feeds it.",
+        ],
+        outro: &[
+            "the seabed splits. what was buried is not rock. it is a door, and it is open.",
+            "aiden, from the bunker: 'the old site under us -- it's humming the same note.'",
+        ] },
+    Mission { order: 8, id: "the_ashen_truce", film: 3, dest: "shield_edge", site: "the picket line",
+        objective: Objective::Control, champion: None,
+        beat: "Megatron comes back through the shield; the line has to decide",
+        intro: &[
+            "a decepticon signature crosses the shield, transponder open, weapons cold.",
+            "megatron. alone. half his frame is scar. 'the devourer eats decepticons too.'",
+            "hold the picket while the line decides whether an old enemy can surrender UP.",
+        ],
+        outro: &[
+            "prime meets him at the airlock. no speech. two old soldiers, one war left.",
+            "the truce is not forgiveness. it is arithmetic. everyone does it silently.",
+        ] },
+    Mission { order: 9, id: "beneath_the_pacific", film: 3, dest: "cybertron", site: "the gravity well",
         objective: Objective::Eliminate, champion: None,
-        beat: "Unicron; the truce; the gravity well" },
+        beat: "Unicron; the truce; the gravity well",
+        intro: &[
+            "megatron came back changed. harder. quieter. 'the devourer eats decepticons too.'",
+            "the plates begin to close over the only road to the core. someone has to hold them.",
+            "he plants himself under the collapsing world. 'go,' he says. nothing else.",
+        ],
+        outro: &[
+            "the avatar goes dark. the machine sleeps -- not dead, only denied. the plates settle.",
+            "they never find megatron. prime marks the spot anyway. the war's oldest debt, paid last.",
+        ] },
+    // ============ TRILOGY TWO — the inversion: wonder, scale, light ============
+    Mission { order: 10, id: "the_far_gate", film: 4, dest: "uncharted", site: "the dig",
+        objective: Objective::Eliminate, champion: None,
+        beat: "the bridge's first jump; the Corrupted were here first",
+        intro: &[
+            "the bridge did not ask where you wanted to go. it took you where the signal was.",
+            "a world off every chart -- and the corrupted were here FIRST, digging.",
+            "clear the dig. whatever they were reaching for, they do not get to finish.",
+        ],
+        outro: &[
+            "the site goes quiet. at its bottom: a door, older than the war, still sealed.",
+            "a voice from nowhere: 'now you have seen a far gate. there are more.'",
+        ] },
+    Mission { order: 11, id: "the_vault_of_ice", film: 4, dest: "glaciem", site: "the archive",
+        objective: Objective::Protect, champion: Some("hoarfrost_sentinel"),
+        beat: "defend the memory of the dead; Cryotek's line are mourners",
+        intro: &[
+            "glaciem keeps the first war in clear ice: every fallen name, every frame, preserved.",
+            "the ice-clones live slow and speak rarely. cryotek's line are not conquerors. MOURNERS.",
+            "the corrupted have come to eat the archive. defend the memory of the dead. all of it.",
+        ],
+        outro: &[
+            "the archive stands. cryotek prime bows -- glacier-deep, centuries slow -- and opens the vault.",
+            "inside: a build-record with a keyhole for a heart. the matrix is the key.",
+        ] },
+    Mission { order: 12, id: "the_tide_forges", film: 5, dest: "io", site: "the forge line",
+        objective: Objective::Survive, champion: None,
+        beat: "Billy routes the flare; hold the forge line while he drinks it",
+        intro: &[
+            "io's forges never cool; the magma-clone fires have burned since before the war.",
+            "billy holds the power of a star in his open hand, and asks if you are sure about this.",
+            "the flare arrives in minutes. hold the line while he ABSORBS it. do not stand in front.",
+        ],
+        outro: &[
+            "the sky goes white, then very dark. billy sits down in the slag, laughing, smoking.",
+            "'so that's my ceiling,' he says. nobody asks him to prove it twice.",
+        ] },
+    Mission { order: 13, id: "the_tithe_road", film: 5, dest: "titan", site: "the tithe-engine",
+        objective: Objective::Breach, champion: None,
+        beat: "break the tithe-engine over the only world where fuel falls as rain",
+        intro: &[
+            "titan: the only world where fuel falls as rain, and blackstar taxes every drop.",
+            "his clans are CLONES -- every body a patchwork of salvage; grief worn openly, as armour.",
+            "break the tithe-engine at the meet-ring. they will not thank you. they may respect you.",
+        ],
+        outro: &[
+            "the engine falls. an old clone watches it burn: 'he was the first of us to laugh.'",
+            "rodimus walks the wreck-streets a long time. 'they made a LIFE out here. out of nothing.'",
+        ] },
+    Mission { order: 14, id: "the_ashes_court", film: 6, dest: "outer_rim", site: "the dreadnought",
+        objective: Objective::Breach, champion: Some("blackstar_raider"),
+        beat: "board the king's own ship; take the court from the throne room",
+        intro: &[
+            "the second jump drops you ON HIS DECK. blackstar's flagship, under way.",
+            "corsairs in the cradles, raiders on the rails, and the bridge tower burning cold.",
+            "BREACH the command ward. take the court from the king in his own throne room.",
+        ],
+        outro: &[
+            "the ward shatters. blackstar, over the ship's bones: 'kept. every plate of you.'",
+            "he does not pursue. kings who survive know which battles buy nothing.",
+        ] },
+    Mission { order: 15, id: "the_heart_of_the_god_machine", film: 6, dest: "cybertron", site: "the spark chamber",
+        objective: Objective::Eliminate, champion: None,
+        beat: "everyone comes; Rodimus goes in alone",
+        intro: &[
+            "everyone comes: the fleet, the clans, the mourners, the perfected. even the ashes' king.",
+            "witwicky flies the breach run he's rehearsed for twenty years. aiden calls it from the bunker.",
+            "cut a road to the spark chamber. rodimus goes in alone -- the way prime once did for him.",
+        ],
+        outro: &[
+            "the matrix pours into the heart. not destruction -- QUIET. the god-machine lies down.",
+            "on pluto, the wall watches a calm sky. 'now THIS is what safe sounds like.'",
+            "and out past the bridge, nineteen old signals keep broadcasting. the wardens are waiting.",
+        ] },
 ];
 
 pub fn missions_of(film: u8) -> impl Iterator<Item = &'static Mission> {
@@ -469,13 +633,38 @@ mod content2_tests {
     }
 
     #[test]
-    fn the_first_trilogy_has_missions_and_the_second_does_not_yet() {
-        for n in 1..=3u8 {
-            assert!(missions_of(n).count() > 0, "film {n} has no missions");
+    fn both_trilogies_have_missions_now() {
+        // this test used to assert trilogy two was UNWRITTEN, so the gap
+        // was recorded rather than discovered. The gap is closed: fourteen
+        // missions, every film carrying at least two.
+        assert_eq!(MISSIONS.len(), 15);
+        for n in 1..=6u8 {
+            assert!(missions_of(n).count() >= 2, "film {n} is thin");
         }
-        // trilogy two is scripted but unwritten as missions; asserting it so
-        // the gap is recorded rather than discovered
-        assert_eq!(missions_of(4).count() + missions_of(5).count() + missions_of(6).count(), 0);
+        // and trilogy two sits in its own films' theatres, not recycled
+        // trilogy-one ground
+        for m in MISSIONS.iter().filter(|m| m.film >= 4) {
+            let f = film(m.film).unwrap();
+            assert!(f.theatres.contains(&m.dest), "{} strays outside film {}'s theatres", m.id, m.film);
+        }
+    }
+
+    #[test]
+    fn slides_fit_the_cutscene_card() {
+        // the C engine's constraints (six slides, 120 columns) kept the
+        // writing terse; keeping them keeps it terse here too
+        for m in MISSIONS {
+            assert!(!m.intro.is_empty(), "{} opens on nothing", m.id);
+            assert!(!m.outro.is_empty(), "{} ends on nothing", m.id);
+            for s in m.intro.iter().chain(m.outro) {
+                assert!(s.len() < 120, "{}: slide overruns the card: {s}", m.id);
+            }
+            assert!(m.intro.len() <= 6 && m.outro.len() <= 6, "{} has too many slides", m.id);
+        }
+        // the campaign's last word points at the endgame: the wardens
+        let last = MISSIONS.last().unwrap();
+        assert!(last.outro.iter().any(|s| s.contains("nineteen") || s.contains("wardens")),
+            "the finale should hand the player the raid roster");
     }
 
     #[test]

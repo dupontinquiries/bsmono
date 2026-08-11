@@ -49,7 +49,26 @@ mod platform;
 mod posture;
 mod procars;
 mod procgen;
+mod campaign;
+mod campsim;
+mod chi;
+mod clones;
+mod deck;
+mod gear;
+mod gearsim;
+mod menufx;
+mod menusim;
+mod stations;
+mod vault;
+mod energon;
+mod nightfall;
+mod skirmish;
 mod raid;
+mod raidcon;
+mod raidgen;
+mod raidlog;
+mod raidrun;
+mod raidsim;
 mod relay;
 mod render;
 mod style;
@@ -646,6 +665,11 @@ struct Game {
     toast_t: f32,
     mode: Mode,
     menu_from_pause: bool,
+    /// the ship's consoles, when the player is standing at one. The
+    /// shell has no live `ship::Ship` yet, so the deck opens under an
+    /// assumed Cruise phase — the phase gate is real and tested in
+    /// `deck.rs`; wiring a hull into the loop is its own seam.
+    deck: Option<deck::Deck>,
     held: HashSet<Key>,
     held_mouse: HashSet<MouseButton>,
     jump_edge: bool,
@@ -904,6 +928,27 @@ fn main() {
     if argv.iter().any(|a| a == "--sim") {
         // headless AI sim: pure physics, no window, no GPU, no audio
         sim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--menu") {
+        // the station consoles and their motion, previewed as text frames
+        menusim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--gear") {
+        // the bearer's sheet, the ship's vault, the clone gallery
+        gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--campaign") {
+        // headless campaign: slides, waves, objective machines, progression
+        campsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--raid") {
+        // headless raid loop: generator -> foothold -> encounters -> loot,
+        // narrated with its reasoning
+        raidsim::run(&argv);
         return;
     }
     env_logger::init();
@@ -1449,6 +1494,7 @@ fn main() {
         toast_t: 0.0,
         mode: Mode::Splash,
         menu_from_pause: false,
+        deck: None,
         held: HashSet::new(),
         held_mouse: HashSet::new(),
         jump_edge: false,
@@ -3149,6 +3195,46 @@ impl Game {
             Key::Character(s) => s.as_str(),
             _ => "",
         };
+        // THE DECK eats input while a console is on stage. Escape folds
+        // it shut (the fold finishes before it closes; that is the
+        // aesthetic), Tab walks to the next station, arrows and Enter go
+        // to the console. Everything else is swallowed: a player at a
+        // console is AT the console.
+        if self.mode == Mode::Play {
+            if let Some(d) = self.deck.as_mut() {
+                match &key {
+                    Key::Named(NamedKey::Escape) => {
+                        d.input(menu::Input::Back);
+                    }
+                    Key::Named(NamedKey::Tab) => {
+                        let all = stations::STATIONS;
+                        let at = all.iter().position(|s| *s == d.station).unwrap_or(0);
+                        d.walk_to(all[(at + 1) % all.len()]);
+                    }
+                    Key::Named(NamedKey::ArrowUp) => {
+                        d.input(menu::Input::Move(-1));
+                    }
+                    Key::Named(NamedKey::ArrowDown) => {
+                        d.input(menu::Input::Move(1));
+                    }
+                    Key::Named(NamedKey::Enter) => {
+                        if let Some(order) = d.input(menu::Input::Activate) {
+                            self.toastf(&format!("{order:?} — fly it from the terminal sims for now"));
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
+            if ch.eq_ignore_ascii_case("v") {
+                // walk below: the armory is the first console aft
+                match deck::Deck::open(stations::Station::Armory, ship::Phase::Cruise, nightfall::week_now()) {
+                    Ok(d) => self.deck = Some(d),
+                    Err(e) => self.toastf(e),
+                }
+                return;
+            }
+        }
         // arm the repeat for navigation keys, in menus only. Done here rather
         // than in the winit handler so it follows every path that reaches
         // key_down, including the repeat's own re-entry — which resets the
@@ -3777,6 +3863,14 @@ impl Game {
 
     fn frame(&mut self, dt: f32, win: &winit::window::Window) {
         self.time += dt;
+        // the deck's clocks: cascade, cursor spring, folds. When a fold
+        // finishes with nothing pending, the console leaves the stage.
+        if let Some(d) = self.deck.as_mut() {
+            d.tick(dt);
+            if d.is_shut() {
+                self.deck = None;
+            }
+        }
         // on-screen controls: recognizer + one-shot decay
         self.tpad.enabled |= self.cfg.touch.enabled;
         if self.tpad.enabled {
@@ -4747,6 +4841,12 @@ impl Game {
     }
 
     fn draw_hud(&self, ui: &mut Vec<UiVert>, aspect: f32) {
+        // a console on stage owns the screen the way a replay does — the
+        // world keeps rendering underneath; the deck is glass over it
+        if let Some(d) = self.deck.as_ref() {
+            hud::draw_deck(ui, aspect, &d.view());
+            return;
+        }
         // a replay owns the screen while it plays
         if let Some((mi, t)) = self.watching {
             if let Some(m) = self.moments.get(mi) {
