@@ -47,6 +47,11 @@ struct Feel {
     /// from one that is not wired at all, which is how this module came to be
     /// unreached in the first place.
     committed: usize,
+    /// Next-word counts. `adaptive` knows what this person types AT ALL;
+    /// this knows what they type AFTER what they just typed — a bigram beats a
+    /// unigram exactly when two candidates are equally common on their own,
+    /// which is the case the recognizer cannot break.
+    ngram: crate::ngram::NgramStore,
     /// Which gesture category the live trail is showing — only visible when trail debug
     /// styling is on (see the Diagnostics toggle). Recomputed as the gesture is classified.
     trail_style: TrailStyle,
@@ -210,9 +215,23 @@ impl eframe::App for Feel {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64).unwrap_or(0);
+                // The two previous words, for the n-gram context. Taken from
+                // the committed text rather than kept as separate state, so
+                // they cannot drift from what is actually on screen.
+                let mut prior = self.typed.split_whitespace().rev();
+                let prev = prior.next().map(|s| s.to_string());
+                let prev_prev = prior.next().map(|s| s.to_string());
+                let now_u = now.max(0) as u64;
                 let mut shown = self.swipe.candidates.clone();
                 for c in shown.iter_mut() {
+                    // Both signals, subtracted because score is a COST. The
+                    // dictionary boosts words this person uses; the n-gram
+                    // boosts words that follow what they just wrote. Either
+                    // alone misses half of it.
                     c.score -= self.dict.boost(&c.word, now);
+                    let (ng, _) = self.ngram.score_for(
+                        prev_prev.as_deref(), prev.as_deref(), &c.word, now_u);
+                    c.score -= ng;
                 }
                 shown.sort_by(|a, b| a.score.partial_cmp(&b.score)
                     .unwrap_or(std::cmp::Ordering::Equal));
@@ -233,6 +252,10 @@ impl eframe::App for Feel {
                         // ones beside it, so it is evidence in a way mere
                         // typing frequency is not.
                         self.dict.record_commit(&word, now);
+                        // Learn the SEQUENCE too, with the same two words that
+                        // scored it — recomputing them after the push would
+                        // include the word being learned as its own context.
+                        self.ngram.record(prev_prev.as_deref(), prev.as_deref(), &word, now_u);
                         self.service.commit_text(&word);
                         self.typed.push_str(&word);
                         self.swipe.clear_candidates();
