@@ -66,7 +66,7 @@ pub fn run(argv: &[String]) {
             // committed: the sweep lands on the save's log. Dry: the sweep
             // is its own hypothetical world, counted from zero.
             let log = if commit {
-                bank(&won)
+                bank(&won, body == Body::HumanSuited)
             } else {
                 let mut l = RaidLog::default();
                 for id in &won {
@@ -83,7 +83,7 @@ pub fn run(argv: &[String]) {
         Some(id) => {
             let victory = one(id, seed, body, speed, team_n, forced, false);
             if victory {
-                settle(id, commit);
+                settle(id, commit, body == Body::HumanSuited);
             }
         }
     }
@@ -95,27 +95,66 @@ fn load_log() -> RaidLog {
     RaidLog::from_line(&sv.wardens)
 }
 
-/// Bank a set of clears into the save. Returns the updated log.
-fn bank(ids: &[&str]) -> RaidLog {
+/// Bank a set of clears into the save — the shard, the DROP, and (for
+/// a suited team) the chi the arena trained. One load, one store. Every
+/// NEW clear drops its warden's arm into the bag, overflowing to the
+/// ship's vault; a full vault leaves it on the field and says so.
+fn bank(ids: &[&str], suited: bool) -> RaidLog {
+    use crate::chi::{self, Chi};
+    use crate::gear::{warden_drop, Gear};
+    use crate::vault::Vault;
     let (mut sv, b, cfg) = save::load();
     let mut log = RaidLog::from_line(&sv.wardens);
+    let mut gear = Gear::from_save(&sv.armed, &sv.worn, &sv.bag);
+    let mut vault = Vault::from_line(&sv.vault);
+    let mut chi_log = Chi::from_line(&sv.chi);
     for id in ids {
-        log.record(id);
+        if !log.record(id) {
+            continue; // a repeat clear banks nothing and drops nothing
+        }
+        let boss = crate::raidcon::boss(id).unwrap();
+        let drop = warden_drop(boss);
+        let label = drop.label();
+        let placed = match gear.take(drop.clone()) {
+            Ok(()) => format!("   drop: {label} -> bag"),
+            Err(_) => match vault.deposit(&mut { let mut g = Gear::default(); g.bag.push(drop); g }, 0) {
+                Ok(_) => format!("   drop: {label} -> the ship's vault (bag full)"),
+                Err(_) => format!("   drop: {label} left on the field (bag and vault full)"),
+            },
+        };
+        println!("{placed}");
+        if suited {
+            let e = chi::arena_element(boss.arena);
+            let before = chi_log.level(e);
+            chi_log.bank(e, chi::PER_SUITED_RAID);
+            let after = chi_log.level(e);
+            if after > before {
+                println!("   chi: {} +{} -- LEVEL {} (the suit walked {}; the body learned)", e.name(), chi::PER_SUITED_RAID, after, boss.arena);
+            } else {
+                println!("   chi: {} +{} ({})", e.name(), chi::PER_SUITED_RAID, chi_log.points(e));
+            }
+        }
     }
     sv.wardens = log.line();
+    let (armed, worn, bag_line) = gear.save_lines();
+    sv.armed = armed;
+    sv.worn = worn;
+    sv.bag = bag_line;
+    sv.vault = vault.line();
+    sv.chi = chi_log.line();
     save::store(&sv, &b, &cfg);
     log
 }
 
 /// After a single victory: bank it (or say how to), and narrate what the
 /// shard did to the seal — the reveal fires exactly when the state turns.
-fn settle(id: &str, commit: bool) {
+fn settle(id: &str, commit: bool, suited: bool) {
     if !commit {
         println!("   (dry run -- add --commit to bank the shard)");
         return;
     }
     let before = load_log().seal();
-    let log = bank(&[id]);
+    let log = bank(&[id], suited);
     println!("   shard banked: {}/19 -- {}", log.shards(), log.seal().label());
     if log.seal() != before {
         println!("   {}", log.seal().reveal());

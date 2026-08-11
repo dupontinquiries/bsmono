@@ -41,6 +41,16 @@ pub struct Save {
     pub missions: String,
     /// nightfall weeks cleared, comma-separated week numbers (see nightfall.rs)
     pub nightfalls: String,
+    /// the watch-bearer's elemental attunement, `elem:points` pairs (see chi.rs)
+    pub chi: String,
+    /// the three weapon rails, item codes or `-` (see gear.rs)
+    pub armed: String,
+    /// worn armor mods, comma-separated names
+    pub worn: String,
+    /// the bag, comma-separated item codes
+    pub bag: String,
+    /// the ship's chest, positional item codes (see vault.rs)
+    pub vault: String,
 }
 
 impl Default for Save {
@@ -67,6 +77,11 @@ impl Default for Save {
             wardens: String::new(),
             missions: String::new(),
             nightfalls: String::new(),
+            chi: String::new(),
+            armed: String::new(),
+            worn: String::new(),
+            bag: String::new(),
+            vault: String::new(),
             look: String::new(),
         }
     }
@@ -97,6 +112,11 @@ pub fn load() -> (Save, Bindings, Config) {
             "wardens" => s.wardens = v.to_string(),
             "missions" => s.missions = v.to_string(),
             "nightfalls" => s.nightfalls = v.to_string(),
+            "chi" => s.chi = v.to_string(),
+            "armed" => s.armed = v.to_string(),
+            "worn" => s.worn = v.to_string(),
+            "bag" => s.bag = v.to_string(),
+            "vault" => s.vault = v.to_string(),
             "look" => s.look = v.to_string(),
             "total_rings" => s.total_rings = v.parse().unwrap_or(s.total_rings),
             "total_car_rings" => s.total_car_rings = v.parse().unwrap_or(s.total_car_rings),
@@ -152,6 +172,11 @@ pub fn store(s: &Save, b: &Bindings, cfg: &Config) {
     }
     if !s.nightfalls.is_empty() {
         let _ = writeln!(out, "nightfalls {}", s.nightfalls);
+    }
+    for (k, v) in [("chi", &s.chi), ("armed", &s.armed), ("worn", &s.worn), ("bag", &s.bag), ("vault", &s.vault)] {
+        if !v.is_empty() {
+            let _ = writeln!(out, "{k} {v}");
+        }
     }
     let _ = writeln!(out, "look {}", s.look);
     let _ = writeln!(out, "total_rings {}", s.total_rings);
