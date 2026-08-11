@@ -333,7 +333,15 @@ mod tests {
         // bright: positive balance, no deficit
         let bal = energy_balance(0.9, 1.0);
         assert!(bal > 0.0);
-        assert_eq!(accumulate_starvation(0.5, bal), 0.5 - bal);
+        // r-fulltest-run: was `assert_eq!(..., 0.5 - bal)`, unclamped. With
+        // LIGHT_MAINTENANCE=0.18, bal=0.72, so 0.5-bal=-0.22 — negative,
+        // but accumulate_starvation's own doc comment says it's "clamped
+        // at 0 (surplus doesn't bank past healthy)", and its actual body
+        // is `(prev_deficit - energy_balance).max(0.0)`. The function was
+        // already correct; the test's expected-value formula just never
+        // applied the same clamp, so a large-enough surplus (this exact
+        // case) made it fail. Verified directly: (0.5f32 - bal).max(0.0).
+        assert_eq!(accumulate_starvation(0.5, bal), (0.5 - bal).max(0.0));
         // dark: negative balance, deficit climbs to death
         let mut def = 0.0;
         let mut t = 0;

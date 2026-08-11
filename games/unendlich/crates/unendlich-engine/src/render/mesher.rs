@@ -576,7 +576,16 @@ fn compute_tinted_color_for_top(
     // Heuristic: if the matrix has the default neutral [0.5, 0.5, 0.5]
     // base it's a "fallthrough" entry for this block — use the legacy
     // palette path so we don't regress non-matrix blocks to grey.
-    let is_neutral = response.base_rgb == [0.5; 3];
+    //
+    // r-radar-H: DEBUG.neutral_tint had zero consumers anywhere
+    // (tools/wiring_radar.py) despite its name implying exactly this
+    // legacy/flat branch. Widening the SAME existing condition (rather
+    // than adding a new bypass) so "neutral tint" means what the branch
+    // already means: skip climate-response tinting, keep the
+    // per-position palette variance. Defaults false (AtomicBool
+    // default), so this is a no-op unless explicitly enabled.
+    let is_neutral = response.base_rgb == [0.5; 3]
+        || crate::debug_settings::DEBUG.neutral_tint.load(std::sync::atomic::Ordering::Relaxed);
     if is_neutral {
         // Legacy path: block_color_per_face / block_color × per-position tint.
         let palette = match block_color_per_face(block) {
@@ -623,7 +632,10 @@ fn compute_tinted_color_for_face(
     world_model: Option<&std::sync::Arc<crate::world::world_model::WorldModel>>,
 ) -> [f32; 3] {
     let response = crate::world::material_response::for_block(block, wy);
-    let is_neutral = response.base_rgb == [0.5; 3];
+    // r-radar-H: same DEBUG.neutral_tint widening as compute_tinted_color_for_top
+    // above — keep both tint functions' behavior consistent under the toggle.
+    let is_neutral = response.base_rgb == [0.5; 3]
+        || crate::debug_settings::DEBUG.neutral_tint.load(std::sync::atomic::Ordering::Relaxed);
     if is_neutral {
         let palette = match block_color_per_face(block) {
             Some(faces) => faces[face],

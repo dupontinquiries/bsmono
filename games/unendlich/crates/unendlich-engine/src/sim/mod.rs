@@ -52,6 +52,7 @@ pub mod goals;
 pub mod gpu_bench;
 pub mod mob;
 pub mod spawn;
+pub mod spawn_danger; // RLCraft-style depth/distance danger scaling — see docs/design/rlcraft_direction.md
 pub mod salinity;
 pub mod sound;
 pub mod fluid;
@@ -72,6 +73,7 @@ pub mod net;
 pub mod personality;
 pub mod physics;
 pub mod rollback;
+pub mod netview; // r-radar-F: existed complete+tested (117 lines, own #[cfg(test)] module) but was never declared — orphaned, invisible to the compiler. Same bug class as r151b's water_waves.rs. Maps sim::rollback::Rollback -> a JSON snapshot for the shared netview/webhost-kit spectator; API checked against the real Rollback/SimState/Mob/Character field names, no drift found.
 /// EXPERIMENTAL (r238): batch-as-field grass LOD — front high-res per-blade,
 /// back fast-forwarded as a density/growth/sway field. Pure model always
 /// built + tested; live tick-path hookup is behind `grass-field-batch`.

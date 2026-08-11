@@ -1529,6 +1529,19 @@ impl ChunkManager {
         let rd_sq = rd * rd;
         let player = self.player_chunk;
 
+        // Drop any queued-but-not-yet-generated request for a chunk that's
+        // fallen outside the current render distance (player moved away
+        // since it was queued, or RD itself shrank via a live PERF-LEVERS
+        // toggle). Cheap — one lock, one `retain` over the loader's
+        // `wanted` map, bounded by queue depth (a few hundred entries at
+        // most), not by chunk count or render distance. In-flight work
+        // (already popped by a worker) is untouched, same as
+        // `ChunkLoader::cancel`. Without this, a chunk queued while
+        // approaching then abandoned on a turn would still generate and
+        // occupy a worker slot before anyone noticed it was unwanted —
+        // see the chunk_loader.rs r-cancel writeup.
+        self.loader.retain_wanted(|c| c.distance_sq(player) <= rd_sq);
+
         // Tier boundaries (Chebyshev distance). Clamped to rd so RD<32
         // degrades gracefully — outer bands become empty rather than
         // crossing the render distance.

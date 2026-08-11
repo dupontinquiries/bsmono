@@ -22,6 +22,7 @@ pub mod cpu_generator;
 pub mod terrain_batch; // r395: parallel chunk generation (terrain + water placement) over the rayon lane
 pub mod surface_run;
 pub mod entity;
+pub mod entity_sanitize; // r-exploding-tris: NaN/Inf guard for the entity render path (physics.rs/creature.rs/entity_pipeline.rs have zero such guards, unlike the packed chunk-mesh path) — staged, not yet wired, see docs/design/entity_sanitize_integration.md
 pub mod fields;
 pub mod flight;
 pub mod leaf_decay;

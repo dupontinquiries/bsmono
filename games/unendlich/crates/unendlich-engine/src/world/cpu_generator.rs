@@ -951,6 +951,75 @@ impl WorldGenerator {
         // mirrors terrain only — structures are a CPU post-pass in both paths).
         self.stamp_ruins(&mut blocks, coord);
 
+        // Phase 7: cave flora (r-flora-wiring step 1, per docs/FLORA-WIRING.md).
+        //
+        // STAGED, NOT DEFAULT — matches the doc's own caution: "designed,
+        // not wired... left for a session with the build-and-screenshot
+        // loop." This is that step-1 cut (gated, CPU-path-only, `Vine`
+        // stand-in block, clamp-to-box, no `flora_store`/lifecycle yet) so
+        // it's a one-env-var try when that session happens. It has NOT
+        // been visually confirmed in a cave — this sandbox has no GPU/
+        // display to build-and-screenshot with, which is exactly the
+        // check the doc says this needs before it's more than staged.
+        //
+        // Also note (see docs/CAVES_WIRED.md for the precedent): this
+        // only reaches the CPU-generated world. The fullgame path
+        // generates terrain on the GPU by default; on hardware where GPU
+        // worldgen actually runs, this will be silently invisible until
+        // the same placement is ported to `chunk_generation.comp`, same
+        // as cave_field was for months. It'll be visible today only on
+        // configs where GPU generation falls back to CPU (e.g. missing
+        // the required Vulkan feature).
+        if std::env::var("UNENDLICH_CAVE_FLORA").is_ok() {
+            let flora_max_y = (self.sea_level_at(origin_x, origin_z) as i32) - 4;
+            let occ = |cell: crate::world::stem::Cell| {
+                let (lx, ly, lz) = (cell.0 - origin_x, cell.1 - origin_y, cell.2 - origin_z);
+                if lx < 0 || ly < 0 || lz < 0
+                    || lx >= CHUNK_SIZE || ly >= CHUNK_SIZE || lz >= CHUNK_SIZE
+                {
+                    // Out-of-box: doc's v1 choice — treat as empty rather
+                    // than re-querying density/is_cave for a neighbor
+                    // chunk we don't have here. Truncates edge plants;
+                    // safe and deterministic (same tradeoff as the
+                    // tree-canopy `try_write` bounds check above).
+                    return false;
+                }
+                blocks[Chunk::block_index(lx, ly, lz)] != BlockId::Air
+            };
+            let moist = |cell: crate::world::stem::Cell| {
+                self.model.humidity(cell.0 as f64, cell.1 as f64, cell.2 as f64, 0.0) as f32
+            };
+            let temp = |cell: crate::world::stem::Cell| {
+                self.model.temperature(cell.0 as f64, cell.1 as f64, cell.2 as f64, 0.0) as f32
+            };
+
+            let flora = crate::world::chunk_flora::ChunkFlora::populate(
+                coord,
+                self.seed() as u64,
+                flora_max_y,
+                &occ,
+                &moist,
+                &temp,
+            );
+            for plant in &flora.plants {
+                for cell in plant.cells() {
+                    let (lx, ly, lz) = (cell.0 - origin_x, cell.1 - origin_y, cell.2 - origin_z);
+                    if lx < 0 || ly < 0 || lz < 0
+                        || lx >= CHUNK_SIZE || ly >= CHUNK_SIZE || lz >= CHUNK_SIZE
+                    {
+                        continue; // clamp: cross-chunk growth deferred (v2, per the doc)
+                    }
+                    let idx = Chunk::block_index(lx, ly, lz);
+                    if blocks[idx] == BlockId::Air {
+                        blocks[idx] = BlockId::Vine;
+                    }
+                }
+            }
+            // v1 deliberately does not populate `flora_store` / register
+            // the `plant_lifecycle` tick — placement only, per the doc's
+            // build-loop step 1. Lighting/animation is step 2.
+        }
+
         Chunk::from_blocks(coord, blocks)
     }
 
