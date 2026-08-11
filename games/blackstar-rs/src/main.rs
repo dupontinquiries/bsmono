@@ -36,6 +36,7 @@ mod hud;
 mod hydro;
 mod idle;
 mod input;
+mod intel;
 mod joints;
 mod lift;
 mod loadout;
@@ -62,6 +63,7 @@ mod menusim;
 mod stations;
 mod vault;
 mod energon;
+mod finale;
 mod nightfall;
 mod skirmish;
 mod raid;
@@ -940,6 +942,21 @@ fn main() {
     if argv.iter().any(|a| a == "--gear") {
         // the bearer's sheet, the ship's vault, the clone gallery
         gearsim::run(&argv);
+        return;
+    }
+    if argv.iter().any(|a| a == "--intel") {
+        // Blackstar's own Array logs, unlocked once his flagship falls
+        let (sv, _, _) = save::load();
+        let camp = campaign::CampaignLog::from_line(&sv.missions);
+        match intel::read(&camp) {
+            Some(frags) => {
+                println!("THE ARRAY LOGS -- recovered aboard Blackstar's own ship\n");
+                for f in frags {
+                    println!("[act {}] {}\n    {}\n", f.act, f.timestamp, f.text);
+                }
+            }
+            None => println!("nothing here yet -- these are Blackstar's own logs; board his ship first"),
+        }
         return;
     }
     if argv.iter().any(|a| a == "--campaign") {
