@@ -12,6 +12,7 @@
 //! enough to run a shell, `ls --color`, vim's basic drawing, etc. Rarer sequences are ignored
 //! rather than mis-rendered.
 
+pub mod date_phrase;
 pub mod cmd_risk;
 pub mod snapshot_policy;
 pub mod layered_graph;
