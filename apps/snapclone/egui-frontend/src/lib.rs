@@ -60,6 +60,7 @@ pub mod tab_bar;
 pub mod thumbnails;
 pub mod trace_channels;
 pub mod voice_bridge;
+pub mod wire_v3;
 pub mod touch_feedback;
 pub mod requests;
 pub mod reticle;
