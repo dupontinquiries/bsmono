@@ -37,6 +37,16 @@ struct Feel {
     /// keyboard that never learns which of two plausible words THIS person
     /// uses is the feature working at its worst permanently.
     dict: crate::adaptive::AdaptiveDictionary,
+    /// The `io.rustyboard.Keyboard1` request model. A keyboard's whole job is
+    /// to hand text to whatever asked for it, and every commit path here used
+    /// to end at a local String — so an embedder had nothing to read. Ported,
+    /// 19 tests, and reached by nothing until now.
+    service: crate::keyboard_service::KeyboardService,
+    /// How many commits the service has emitted. Shown in the demo so the
+    /// integration is VISIBLE — a silent pass-through is indistinguishable
+    /// from one that is not wired at all, which is how this module came to be
+    /// unreached in the first place.
+    committed: usize,
     /// Which gesture category the live trail is showing — only visible when trail debug
     /// styling is on (see the Diagnostics toggle). Recomputed as the gesture is classified.
     trail_style: TrailStyle,
@@ -78,6 +88,16 @@ impl eframe::App for Feel {
     #[allow(deprecated)]
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         apply_theme(ctx);
+        // Drain the service queue once per frame. Without this `pending` grows
+        // for the life of the process — a queue with no reader is a leak, and
+        // the model cannot know whether a host exists to read it.
+        //
+        // In a real embedding these become `TextCommitted` signals; here they
+        // are counted, which is enough to prove the wiring end to end rather
+        // than only up to the commit.
+        for _ in self.service.take_pending() {
+            self.committed += 1;
+        }
 
         egui::Panel::top("out").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -111,6 +131,7 @@ impl eframe::App for Feel {
                                 if !self.typed.is_empty() && !self.typed.ends_with(' ') {
                                     self.typed.push(' ');
                                 }
+                                self.service.commit_text(&text);
                                 self.typed.push_str(&text);
                             }
                         } else {
@@ -155,6 +176,14 @@ impl eframe::App for Feel {
                 ui.label(egui::RichText::new(format!("layout: {}", self.board.current().name)).strong());
                 ui.separator();
                 ui.label("hold a key for accents · drag across letters to swipe-type · tap a sidebar tab to switch layout");
+                // The service's commit count, shown because a silent
+                // pass-through is indistinguishable from one that is not wired
+                // — which is exactly how this module sat unreached with 19
+                // passing tests.
+                if self.committed > 0 {
+                    ui.label(egui::RichText::new(format!(
+                        "Keyboard1.TextCommitted × {}", self.committed)).weak().size(11.0));
+                }
                 if ui.button("clear").clicked() {
                     self.typed.clear();
                 }
@@ -204,6 +233,7 @@ impl eframe::App for Feel {
                         // ones beside it, so it is evidence in a way mere
                         // typing frequency is not.
                         self.dict.record_commit(&word, now);
+                        self.service.commit_text(&word);
                         self.typed.push_str(&word);
                         self.swipe.clear_candidates();
                     }
@@ -226,6 +256,12 @@ impl eframe::App for Feel {
 
                 if let Some(tapped) = crate::microterm::microterm_ui(ui, &mut self.microterm, &c) {
 
+                    // Every commit path goes through the service, not just the
+                    // interesting ones. A host that receives swiped words but
+                    // not typed ones is worse than a host that receives
+                    // nothing: the gap looks like dropped input rather than a
+                    // missing integration.
+                    self.service.commit_text(&tapped);
                     self.typed.push_str(&tapped);
 
                 }
