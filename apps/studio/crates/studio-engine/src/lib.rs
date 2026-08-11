@@ -3,13 +3,16 @@
 //! `studio-command` defines, and publishes a read-only snapshot for whatever
 //! renders or mixes against it.
 //!
-//! Two things this crate deliberately does NOT do, because they belong one
-//! layer down (`studio-io`, not built yet): touch a sound card, or run on a
-//! real-time thread. What it proves here is the *shape* of the realtime
-//! boundary — snapshot-swap instead of a shared mutable project, an SPSC ring
-//! instead of a mutex — so that boundary can be tested without a device and
-//! without `assert_no_alloc` lying about a callback that was never really
-//! called from one.
+//! This crate's model half — `EngineState`, `Command` lowering,
+//! snapshot-swap instead of a shared mutable project, an SPSC ring instead
+//! of a mutex — is proven without a device, and stays that way: nothing
+//! about `EngineState::apply` changed to add real-time support, because it
+//! never needed to. What DID need building, and now exists in [`device`],
+//! is the thing this comment used to say belonged "one layer down,
+//! `studio-io`, not built yet": [`device::DeviceEngine`] wires this crate's
+//! own `EngineState`/`CommandReceiver` to `studio_audio::StreamingRenderer`
+//! and `studio_io::AudioIo`, so a real device callback (or `studio_io::
+//! TestIo`, for testing without hardware) can actually drive this engine.
 //!
 //! ## Why snapshot-swap
 //!
@@ -39,6 +42,8 @@
 //! the crate's docs.
 
 use std::sync::Arc;
+
+pub mod device;
 
 use arc_swap::ArcSwap;
 use studio_command::{Command, CommandTap, EngineCmd, Outcome, TransportCmd};
@@ -199,9 +204,10 @@ impl TicksMulExt for studio_core::Ticks {
 /// The UI-thread producer side of the command ring.
 pub struct CommandSender(rtrb::Producer<Command>);
 
-/// The consumer side — today drained on the same thread as the producer by
-/// `EngineState::drain`, but see the crate docs: this is where a real audio
-/// thread attaches once `studio-io` exists, without this crate changing.
+/// The consumer side — `device::DeviceEngine` is the real audio-thread
+/// attachment point this doc used to describe as future work; its own
+/// `tick` calls `drain_into` once per callback, exactly the cadence this
+/// type's design always assumed.
 pub struct CommandReceiver(rtrb::Consumer<Command>);
 
 /// A fixed-capacity, non-allocating, single-producer/single-consumer ring for

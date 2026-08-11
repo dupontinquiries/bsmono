@@ -7,5 +7,7 @@ edition = "2021"
 studio-core = { path = "../studio-core" }
 studio-command = { path = "../studio-command" }
 studio-live = { path = "../studio-live" }
+studio-audio = { path = "../studio-audio" }
+studio-io = { path = "../studio-io" }
 arc-swap = "1"
 rtrb = "0.3"
