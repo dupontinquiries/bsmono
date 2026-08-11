@@ -738,6 +738,109 @@ pub fn install_suite_app(app: &crate::suite::SuiteApp) -> Result<Installed, Stri
 }
 
 /// Like [`install_suite_app`] but streams the build log to `on_line`.
+/// Run one app's test suite, with the same flags its build uses.
+///
+/// Cargo only. A CMake or Python app has no `cargo test` to run and saying so
+/// is more useful than inventing a runner for it — the alternative is a green
+/// tick from a command that did nothing, which is the failure mode the
+/// bsettings "0 KB" build taught.
+pub fn test_suite_app_logged(app: &crate::suite::SuiteApp, on_line: &mut dyn FnMut(&str)) -> Result<String, String> {
+    use std::io::{BufRead, BufReader};
+    let app_dir = crate::ops::resolve_app_dir(&app.path);
+    if !app_dir.join("Cargo.toml").exists() {
+        return Err(format!("{} is not a cargo crate — nothing to `cargo test`", app.name));
+    }
+    let argv = crate::buildflags::cargo_test_argv(
+        app.build_app_id(), &app.target, &app.features, app.no_default);
+    on_line(&format!("$ {}", argv.join(" ")));
+
+    let mut child = std::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .current_dir(&app_dir)
+        .env("PATH", crate::ops::tool_path_env())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("couldn't run the tests: {e}"))?;
+
+    // Cargo writes progress to stderr and test results to STDOUT, and the
+    // result lines are the ones that matter here — draining only stderr would
+    // show the compile and hide every "test result: ok".
+    let mut passed = 0usize;
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            if let Some(rest) = line.strip_prefix("test result: ok. ") {
+                if let Some(n) = rest.split(' ').next().and_then(|n| n.parse::<usize>().ok()) {
+                    passed += n;
+                }
+            }
+            on_line(&line);
+        }
+    }
+    if let Some(err) = child.stderr.take() {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            on_line(&line);
+        }
+    }
+    let status = child.wait().map_err(|e| format!("test wait failed: {e}"))?;
+    if status.success() {
+        Ok(format!("✓ {} — {passed} tests passed", app.name))
+    } else {
+        Err(format!("{} tests FAILED (exit {})", app.name, status.code().unwrap_or(-1)))
+    }
+}
+
+/// Build every app in the catalog. Returns (succeeded, failed names).
+///
+/// Keeps going past a failure rather than stopping at the first: the point of
+/// a whole-fleet run is to learn what is broken, and stopping tells you only
+/// about the first one. Both counts come back so a caller cannot report
+/// success while apps are failing.
+pub fn build_all_logged(on_line: &mut dyn FnMut(&str)) -> (usize, Vec<String>) {
+    let mut ok = 0usize;
+    let mut failed = Vec::new();
+    for app in catalog_apps() {
+        on_line(&format!("── {} ──", app.name));
+        match install_suite_app_logged(&app, on_line) {
+            Ok(i) => { ok += 1; on_line(&format!("✓ {} → {}", i.name, i.path)); }
+            Err(e) => { on_line(&format!("✗ {}: {e}", app.name)); failed.push(app.name.clone()); }
+        }
+    }
+    (ok, failed)
+}
+
+/// Test every app in the catalog. Returns (green, failed names).
+pub fn test_all_logged(on_line: &mut dyn FnMut(&str)) -> (usize, Vec<String>) {
+    let mut ok = 0usize;
+    let mut failed = Vec::new();
+    for app in catalog_apps() {
+        on_line(&format!("── {} ──", app.name));
+        match test_suite_app_logged(&app, on_line) {
+            Ok(msg) => { ok += 1; on_line(&msg); }
+            Err(e) => { on_line(&format!("✗ {e}")); failed.push(app.name.clone()); }
+        }
+    }
+    (ok, failed)
+}
+
+/// Every app the catalog shows, de-duplicated.
+///
+/// Drawn from `store_groups()` — the same list the Fleet page renders — so
+/// "all" cannot mean something different from what is on screen. An app in two
+/// groups is built once.
+pub fn catalog_apps() -> Vec<crate::suite::SuiteApp> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for g in store_groups() {
+        for a in g.apps {
+            if seen.insert(a.name.clone()) {
+                out.push(a);
+            }
+        }
+    }
+    out
+}
+
 pub fn install_suite_app_logged(app: &crate::suite::SuiteApp, on_line: &mut dyn FnMut(&str)) -> Result<Installed, String> {
     let target = if app.target.trim().is_empty() { native_triple_local() } else { app.target.clone() };
     let app_dir = crate::ops::resolve_app_dir(&app.path);

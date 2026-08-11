@@ -182,9 +182,65 @@ pub fn ui(app: &mut App, ui: &mut egui::Ui) {
                 }
             });
         }
+
+        // TEST, beside build rather than instead of it. The reachability audit
+        // makes the case: rusty-board's port has ten modules and 126 tests that
+        // the binary never reaches, and every one of those tests passes. A
+        // green suite and a working app are different claims, and the only way
+        // to notice the gap is to be able to run the suite from here.
+        //
+        // Same feature set as the build, deliberately — cargo_test_argv derives
+        // from the same SuiteApp, because a test run under different features
+        // tests different code.
+        if ui.add_enabled(can, egui::Button::new("test")).clicked() {
+            let mut a = sel.clone();
+            if !app.fleet.feature_toggles.is_empty() {
+                a.features = app.fleet.feature_toggles.iter().filter(|(_, on)| *on).map(|(n, _)| n.clone()).collect();
+                a.no_default = true;
+            }
+            app.task.run_logged(move |sink| {
+                let mut on_line = |l: &str| sink.push(l);
+                match cockpit::flow::test_suite_app_logged(&a, &mut on_line) {
+                    Ok(r) => r,
+                    Err(e) => format!("error: {e}"),
+                }
+            });
+        }
     } else {
         ui.label(egui::RichText::new("pick an app above").weak());
     }
+
+    // ── whole-catalog actions ────────────────────────────────────────────
+    //
+    // Reported missing from "all apps" and never added. Both walk
+    // `store_groups()`, which is the same list the catalog above renders — so
+    // "all" cannot drift from what the page shows.
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let idle = !app.task.is_running();
+        if ui.add_enabled(idle, egui::Button::new("build all")).clicked() {
+            app.task.run_logged(move |sink| {
+                let mut on_line = |l: &str| sink.push(l);
+                let (ok, failed) = cockpit::flow::build_all_logged(&mut on_line);
+                // Report BOTH counts. "built 23 apps" with three silent
+                // failures is the line that makes a broken fleet look healthy.
+                if failed.is_empty() { format!("✓ built {ok} apps") }
+                else { format!("built {ok}, FAILED {}: {}", failed.len(), failed.join(", ")) }
+            });
+        }
+        if ui.add_enabled(idle, egui::Button::new("test all")).clicked() {
+            app.task.run_logged(move |sink| {
+                let mut on_line = |l: &str| sink.push(l);
+                let (ok, failed) = cockpit::flow::test_all_logged(&mut on_line);
+                if failed.is_empty() { format!("✓ {ok} app suites green") }
+                else { format!("{ok} green, FAILED {}: {}", failed.len(), failed.join(", ")) }
+            });
+        }
+        ui.label(egui::RichText::new("runs every app in the catalog, one at a time")
+            .weak().small());
+    });
 
     if let Some(r) = app.task.take_result() {
         app.fleet.note = r;

@@ -219,6 +219,38 @@ pub fn declares_workspace(cargo_toml: &str) -> bool {
 /// Like [`cargo_build_argv`], but `as_bin` selects `--bin <app>` instead of `-p <app>` — used for a
 /// workspace-root app whose runnable binary is named after it (e.g. gitmind: package `gitmind-cli`,
 /// binary `gitmind`), where `-p gitmind` would fail with "did not match any packages".
+/// argv for TESTING a crate, built from the same flags as its build.
+///
+/// Deliberately shares `features` and `no_default` with the build argv: a test
+/// run under different features tests different code, and a green result there
+/// says nothing about the binary that ships. That is the whole reason this is
+/// derived from the app's SuiteApp rather than being a bare `cargo test`.
+///
+/// Two differences from the build, both intentional:
+///
+/// * `-p`, never `--bin`. `--bin` builds one target and runs NO tests — a lib's
+///   unit tests live in the lib target, so a bin-scoped test run reports
+///   success having executed nothing.
+/// * no `--release`. Debug assertions are most of what a test suite is for, and
+///   `--release` compiles them out.
+pub fn cargo_test_argv(app: &str, triple: &str, features: &[String], no_default: bool) -> Vec<String> {
+    let mut a: Vec<String> = vec!["cargo".into(), "test".into()];
+    if !triple.trim().is_empty() {
+        a.push("--target".into());
+        a.push(triple.to_string());
+    }
+    a.push("-p".into());
+    a.push(app.to_string());
+    if no_default {
+        a.push("--no-default-features".into());
+    }
+    if !features.is_empty() {
+        a.push("--features".into());
+        a.push(features.join(","));
+    }
+    a
+}
+
 pub fn cargo_build_argv_kind(app: &str, triple: &str, features: &[String], no_default: bool, as_bin: bool) -> Vec<String> {
     let mut a: Vec<String> = vec!["cargo".into(), "build".into(), "--release".into()];
     if !triple.trim().is_empty() {
@@ -606,5 +638,54 @@ logging = []
         let xarch = recommend_strategy("x86_64-unknown-linux-gnu", phone, true, true);
         assert_eq!(xarch.strategy, DeployStrategy::CrossCompile);
         assert!(xarch.reason.contains("x86_64") && xarch.reason.contains("aarch64"));
+    }
+
+}
+
+#[cfg(test)]
+mod test_argv_tests {
+    use super::*;
+
+    #[test]
+    fn tests_run_against_the_same_features_the_build_uses() {
+        // A test run under different features tests DIFFERENT CODE, and a green
+        // result there says nothing about the binary that ships. bsettings is
+        // the case that makes this concrete: its GUI only exists behind
+        // `--features gui`.
+        let feats = vec!["gui".to_string()];
+        let t = cargo_test_argv("bigsilicon-settings", "", &feats, false);
+        assert!(t.windows(2).any(|w| w == ["--features", "gui"]), "{t:?}");
+    }
+
+    #[test]
+    fn tests_use_p_and_never_bin() {
+        // `--bin` builds one target and runs NO tests — a lib's unit tests live
+        // in the lib target, so a bin-scoped run reports success having
+        // executed nothing. That is the worst possible green.
+        let t = cargo_test_argv("voiceterm", "", &[], false);
+        assert!(t.contains(&"-p".to_string()));
+        assert!(!t.contains(&"--bin".to_string()));
+    }
+
+    #[test]
+    fn tests_are_not_built_in_release() {
+        // Debug assertions are most of what a suite is for, and --release
+        // compiles them out.
+        let t = cargo_test_argv("voiceterm", "", &[], false);
+        assert!(!t.contains(&"--release".to_string()));
+    }
+
+    #[test]
+    fn no_default_features_carries_across() {
+        // rusty-board and blackstar both need it — their audio features want
+        // system libraries a build box may not have.
+        let t = cargo_test_argv("skydribble", "", &[], true);
+        assert!(t.contains(&"--no-default-features".to_string()));
+    }
+
+    #[test]
+    fn a_cross_target_is_passed_through() {
+        let t = cargo_test_argv("voiceterm", "aarch64-unknown-linux-gnu", &[], false);
+        assert!(t.windows(2).any(|w| w == ["--target", "aarch64-unknown-linux-gnu"]));
     }
 }
