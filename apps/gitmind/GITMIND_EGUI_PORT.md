@@ -66,6 +66,18 @@ original list has landed. The Qt `gui` crate remains the untouched fallback.
 ## Notes
 - Build headless: `cargo build -p gitmind-egui --lib` (RUSTFLAGS='' if the mold pin bites).
   Runnable: `--features app` (eframe; needs display libs).
-- Cleanup: panels currently use `.show(ctx, …)` which 0.34 deprecates in favour of `show_inside`
-  for nested cases — revisit for a warning-clean build.
+- ~~Cleanup: panels use `.show(ctx, …)` which 0.34 deprecates~~ — **investigated, nothing to do.**
+  The deprecation is real (`egui-0.34.3/src/containers/panel.rs:519` and `:1049`), but it has no
+  non-deprecated replacement for app code: `show_inside(ui)` needs a root `Ui`, and eframe hands
+  `update` only a `Context`. All four call sites are top-level panels in `app.rs`, which is the
+  case with no alternative.
+
+  `App::ui` already carries `#[allow(deprecated)]` with that reasoning written out, so the attribute
+  is **load-bearing rather than leftover** — removing it to "clean up warnings" would put four
+  unavoidable warnings back. Revisit only when eframe exposes a root `Ui`.
+
+  Checked while here: the crate uses none of 0.34's other panel deprecations (`default_width`,
+  `min_width`, `max_width`, `exact_width`, `size_range`, `SidePanel`, `TopBottomPanel`,
+  `show_animated`). The three `max_height` calls are `ScrollArea::max_height`, a different type that
+  is not deprecated.
 - The Qt `gui` crate is untouched and remains the fallback.
