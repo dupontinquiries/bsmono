@@ -84,6 +84,29 @@ for f in rusty-board rusty-board-config; do
     fi
 done
 
+# Uninstalling ONE prefix leaves the other installed, and that is the exact
+# situation sanity-check.sh warns about: two binaries, PATH deciding which one
+# KWin launches, and every later diagnostic about the wrong file. A user who
+# ran --system once and later installed to ~/.local will run uninstall once and
+# reasonably believe it is gone.
+#
+# So look in the other prefix too and SAY so — without removing it, because a
+# script invoked with an explicit --prefix should not delete outside it.
+OTHER_PREFIX="$HOME/.local"
+[[ "$SYSTEM_INSTALL" -eq 0 ]] && OTHER_PREFIX="/usr/local"
+for f in rusty-board rusty-board-config; do
+    if [[ -e "$OTHER_PREFIX/bin/$f" ]]; then
+        echo "==> NOTE: $OTHER_PREFIX/bin/$f is still installed." >&2
+        echo "    This uninstall only covered $PREFIX. That leftover is what" >&2
+        echo "    PATH may still resolve to — run:" >&2
+        if [[ "$OTHER_PREFIX" == "/usr/local" ]]; then
+            echo "      $0 --system" >&2
+        else
+            echo "      $0" >&2
+        fi
+    fi
+done
+
 # 5. Remove resources
 if [[ -d "$SHARE_DIR" ]]; then
     echo "    rm -r $SHARE_DIR"
