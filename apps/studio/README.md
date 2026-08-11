@@ -46,13 +46,17 @@ edits exactly reversible, which floats are not.
 
 | crate | what it is | tests |
 |---|---|---|
-| `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 6 |
+| `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
 | `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 71 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
-| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown | 8 |
-| `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 18 |
-| `studio-voice` | whisper transcript index, spoken repertoire, command palette | 9 |
-| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 54 |
+| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) | 49 |
+| `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
+| `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
+| `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
+
+`studio-egui` couldn't be re-verified in this pass — it needs `egui`/`eframe`,
+which needs a newer cargo than was available; the number above is carried
+over unchanged rather than guessed at. Every other row was re-run directly.
 
 ## Realtime collaboration, concretely
 
@@ -84,8 +88,18 @@ the model, undo, and convergence. What does not exist yet, in rough order:
 
 1. **Media I/O** — decode/encode. The intended shape is `symphonia` for audio
    decode, `ffmpeg` via CLI for video, keeping the core codec-free.
-2. **Audio render graph** — mix tracks, apply effects, produce samples. The
-   `Effect` type is already opaque-by-design so hosts can register kinds.
+2. **Audio render graph** — this was stale: `studio_audio::mixdown` already
+   mixes tracks, applies clip and bus effect chains, handles sends/mute/solo,
+   and is real and tested (49 tests) — `studio-live`'s own
+   `a_bounced_pattern_is_audible_through_a_real_mixdown` proves a pattern
+   bounce survives the whole path. What's genuinely still missing, and now
+   pinned by a test rather than left implicit: `mixdown` builds a fresh
+   effect-instance set on every call, so it's correct for a one-shot offline
+   bounce but NOT yet safe to call once per device buffer — a stateful
+   effect's memory (a resonant EQ's biquad history, tested directly) resets
+   at every call boundary. A streaming variant that carries instances across
+   calls is the real remaining piece, not "mix tracks, apply effects" from
+   scratch.
 3. **Device I/O** — `studio-io`'s `device` feature now builds a full-duplex
    `CpalIo`: a dedicated thread owns the (`!Send`) cpal streams, an `rtrb`
    ring buffer bridges input to output since the two have no shared clock,
