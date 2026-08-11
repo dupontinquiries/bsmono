@@ -17,6 +17,9 @@ PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PREFIX="${PREFIX:-$HOME/.local}"
 SYSTEM_INSTALL=0
 SKIP_BUILD=0
+# Which frontend to build and install. The GTK build is still the default
+# because it is the one KWin has been tested against; --egui selects the port.
+FRONTEND="gtk"
 WITH_MODEL=0
 MODEL="ggml-base.en.bin"
 
@@ -30,6 +33,8 @@ Options:
   --prefix DIR     Install prefix (default: \$HOME/.local)
   --system         Install to /usr/local (requires sudo)
   --skip-build     Skip cargo build (use existing target/release/)
+  --gtk            Build and install the GTK frontend (default)
+  --egui           Build and install the egui frontend instead
   --with-model     Download a Whisper model after install
   --model NAME     Whisper model to download (default: ggml-base.en.bin)
                      options: tiny.en, base.en, small.en, medium.en, large
@@ -42,6 +47,8 @@ while [[ $# -gt 0 ]]; do
         --prefix)       PREFIX="$2"; shift 2 ;;
         --system)       SYSTEM_INSTALL=1; PREFIX="/usr/local"; shift ;;
         --skip-build)   SKIP_BUILD=1; shift ;;
+        --egui)         FRONTEND="egui"; shift ;;
+        --gtk)          FRONTEND="gtk"; shift ;;
         --with-model)   WITH_MODEL=1; shift ;;
         --model)        MODEL="$2"; shift 2 ;;
         -h|--help)      usage; exit 0 ;;
@@ -115,15 +122,50 @@ fi
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
     echo "==> Building (release)..."
     cd "$PROJECT_ROOT"
-    cargo build --release
+    if [[ "$FRONTEND" == "egui" ]]; then
+        cargo build --release -p rusty-board-egui
+    else
+        cargo build --release
+    fi
 fi
 
-BIN_SRC="$PROJECT_ROOT/target/release/rusty-board"
+# The egui port ships a DIFFERENT binary name, so installing it as
+# "rusty-board" is deliberate rather than incidental: the .desktop file, the
+# systemd unit and KWin's virtual-keyboard registration all name that path,
+# and renaming any one of them without the others produces a keyboard that
+# installs cleanly and never appears.
+if [[ "$FRONTEND" == "egui" ]]; then
+    BIN_SRC="$PROJECT_ROOT/target/release/rusty-board-egui"
+else
+    BIN_SRC="$PROJECT_ROOT/target/release/rusty-board"
+fi
 BIN_CFG="$PROJECT_ROOT/target/release/rusty-board-config"
 
 if [[ ! -x "$BIN_SRC" ]]; then
-    echo "ERROR: $BIN_SRC not found. Did the build fail?" >&2
+    if [[ "$SKIP_BUILD" -eq 1 ]]; then
+        echo "ERROR: $BIN_SRC not found, and --skip-build was given." >&2
+        echo "       Run without --skip-build, or build first with:" >&2
+        echo "         cargo build --release" >&2
+    else
+        echo "ERROR: $BIN_SRC not found. Did the build fail?" >&2
+    fi
     exit 1
+fi
+
+# --skip-build installs whatever is already in target/release. That is the
+# point of the flag, but it silently installs a binary from a PREVIOUS
+# checkout if the tree has moved on since — and the symptom is a keyboard
+# that behaves like a version you no longer have, which is close to
+# undebuggable from the outside.
+#
+# So say how old it is. Not an error: installing a deliberately-kept build
+# is legitimate, and refusing would break the flag's actual use.
+if [[ "$SKIP_BUILD" -eq 1 ]]; then
+    bin_age_s=$(( $(date +%s) - $(stat -c %Y "$BIN_SRC" 2>/dev/null || echo 0) ))
+    if [[ "$bin_age_s" -gt 3600 ]]; then
+        printf '==> NOTE: installing a binary built %dh %dm ago (--skip-build).\n' \
+            $(( bin_age_s / 3600 )) $(( (bin_age_s % 3600) / 60 )) >&2
+    fi
 fi
 
 # 4. Install binaries and resources
