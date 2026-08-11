@@ -26,6 +26,7 @@
 
 pub mod stems;
 pub mod block;
+pub mod destructive;
 
 use std::collections::BTreeMap;
 use studio_core::{Project, SourceId, Ticks, TrackKind};
