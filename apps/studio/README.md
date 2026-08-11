@@ -49,7 +49,7 @@ edits exactly reversible, which floats are not.
 | `studio-core` | timebase, tracks, clips, sources, effects, `Op`, `History` | 29 |
 | `studio-collab` | convergent op log, presence, wire, carrier, project files, assets, sessions, **DHT publish/discover** | 63 |
 | `studio-egui` | timeline, touch, theater/split, Helix keys, **spectrum canvas** | 28 |
-| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **block-backed edit sequences** | 67 |
+| `studio-audio` | peak pyramids (Audacity's summary blocks) + mixdown (tracks, clip/bus effects, sends) + **streaming render** + **block-backed edit sequences** | 72 |
 | `studio-live` | pattern rack, synths (incl. beatspace), recording, transport | 41 |
 | `studio-voice` | whisper transcript index, spoken repertoire, command palette | 12 |
 | `studio-fx` | EQ, dynamics, transform, colour, retiming, analysis, saturation, multiband, imager, chain, **assistant** | 105 |
@@ -99,18 +99,20 @@ the model, undo, and convergence. What does not exist yet, in rough order:
    mode (a missing binary, not an unsupported codec) and real, separate
    work, deliberately not bolted onto the audio crate just because both are
    nominally "Media I/O."
-2. **Audio render graph** — this was stale: `studio_audio::mixdown` already
-   mixes tracks, applies clip and bus effect chains, handles sends/mute/solo,
-   and is real and tested (49 tests) — `studio-live`'s own
+2. **Audio render graph** — `studio_audio::mixdown` mixes tracks, applies
+   clip and bus effect chains, handles sends/mute/solo, and is real and
+   tested (72 tests) — `studio-live`'s own
    `a_bounced_pattern_is_audible_through_a_real_mixdown` proves a pattern
-   bounce survives the whole path. What's genuinely still missing, and now
-   pinned by a test rather than left implicit: `mixdown` builds a fresh
-   effect-instance set on every call, so it's correct for a one-shot offline
-   bounce but NOT yet safe to call once per device buffer — a stateful
-   effect's memory (a resonant EQ's biquad history, tested directly) resets
-   at every call boundary. A streaming variant that carries instances across
-   calls is the real remaining piece, not "mix tracks, apply effects" from
-   scratch.
+   bounce survives the whole path. The gap this used to describe (a fresh
+   effect-instance set built on every call, correct offline, wrong once per
+   device buffer) is closed too: `StreamingRenderer` wraps the same mixing
+   logic — `mixdown` itself didn't change, it's now a two-line wrapper
+   around the shared `mixdown_with_cache` — around an `EffectCache` that
+   persists instances across contiguous calls and resets automatically on a
+   seek. Checked directly: consecutive buffer-sized calls match a one-shot
+   offline render sample-for-sample; a chain edited mid-playback (this is a
+   collaborative editor, so that's a real case, not a hypothetical) takes
+   effect on the very next contiguous call.
 3. **Device I/O** — `studio-io`'s `device` feature now builds a full-duplex
    `CpalIo`: a dedicated thread owns the (`!Send`) cpal streams, an `rtrb`
    ring buffer bridges input to output since the two have no shared clock,
@@ -141,12 +143,12 @@ the model, undo, and convergence. What does not exist yet, in rough order:
 
 This closes every item that was on this list when this section was last
 written honestly. What's real and load-bearing now, named precisely rather
-than left as a vague "not built yet": a streaming variant of `mixdown` that
-carries effect state across calls (item 2's own note above), real hardware
-verification for `studio-io` (item 3), the network half of DHT publishing
-(item 4), and video decode (item 1). None of those are guesses — each is a
-concrete next step pinned by a test or a doc comment that says exactly what
-it's waiting on.
+than left as a vague "not built yet": real hardware verification for
+`studio-io` (item 3), the network half of DHT publishing (item 4), and
+video decode (item 1). None of those are guesses — each is a concrete next
+step pinned by a test or a doc comment that says exactly what it's waiting
+on. Item 2's own remaining piece — a streaming render path — is no longer
+on this list; it's built.
 
 A test found the one real bug in this pass: `rebuild()` originally replayed the
 op log from an empty project and erased every track and source that pre-dated
