@@ -151,15 +151,58 @@ impl Grid {
         v
     }
 
+    /// Columns a character occupies: 2 for the wide ranges, **0 for combining
+    /// marks**, 1 otherwise.
+    ///
+    /// The zero case is the one that bites. A combining accent that advanced
+    /// the cursor pushes the rest of the line right by one column PER ACCENT —
+    /// which is how a terminal turns an accented word into a staircase. And a
+    /// CJK glyph advancing by one leaves the next character painted over its
+    /// right half.
+    ///
+    /// Ported from voiceterm's `term_grid`, which had this table and no caller.
+    pub fn char_width(c: char) -> usize {
+        let u = c as u32;
+        if matches!(u, 0x0300..=0x036F | 0x1AB0..=0x1AFF | 0x20D0..=0x20FF | 0xFE20..=0xFE2F) {
+            return 0;
+        }
+        let wide = matches!(u,
+            0x1100..=0x115F | 0x2E80..=0x303E | 0x3041..=0x33FF |
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA000..=0xA4CF |
+            0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE6F |
+            0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 |
+            0x1F300..=0x1F64F | 0x1F900..=0x1F9FF);
+        if wide { 2 } else { 1 }
+    }
+
     /// Write a printable char at the cursor and advance (wrapping + scrolling as needed).
     pub fn put(&mut self, ch: char) {
-        if self.cur_col >= self.cols {
+        let w = Self::char_width(ch);
+
+        // A combining mark belongs to the character BEFORE it and must not
+        // occupy a cell of its own. Dropping it would lose the accent; taking a
+        // cell would shift the line. Neither is right, so it is skipped here —
+        // the cell keeps its base character, which is what a renderer without
+        // grapheme clustering can actually draw.
+        if w == 0 { return; }
+
+        // A wide glyph needs two columns, so it must not START in the last one:
+        // half of it would land on the next row. Wrapping first keeps it whole.
+        if self.cur_col + w > self.cols {
             self.cur_col = 0;
             self.line_feed();
         }
         let i = self.idx(self.cur_row, self.cur_col);
         self.cells[i] = Cell { ch, style: self.pen };
-        self.cur_col += 1;
+        if w == 2 {
+            // The second column is a PHANTOM: it holds no character of its own
+            // but must be occupied, or the next put lands on top of the wide
+            // glyph's right half. A space is the honest filler — row_text then
+            // reads back the same visual width the screen shows.
+            let j = self.idx(self.cur_row, self.cur_col + 1);
+            self.cells[j] = Cell { ch: ' ', style: self.pen };
+        }
+        self.cur_col += w;
     }
 
     /// Move down one line, scrolling if at the bottom.
@@ -1992,5 +2035,66 @@ mod input_wiring_tests {
         // why control keys appear to do nothing.
         let mut a = App::new(80, 24);
         assert!(a.take_pending_bytes().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod wide_char_tests {
+    use super::*;
+
+    #[test]
+    fn a_cjk_glyph_takes_two_columns() {
+        // Advancing by one leaves the next character painted over its right
+        // half, which is the classic garbled-CJK terminal.
+        let mut g = Grid::new(10, 2);
+        g.put('\u{4E2D}');
+        assert_eq!(g.cur_col, 2);
+    }
+
+    #[test]
+    fn a_combining_mark_takes_none() {
+        // One column per accent turns an accented word into a staircase.
+        let mut g = Grid::new(10, 2);
+        g.put('e');
+        let after_base = g.cur_col;
+        g.put('\u{0301}');   // combining acute
+        assert_eq!(g.cur_col, after_base, "the accent consumed a column");
+    }
+
+    #[test]
+    fn an_ascii_char_still_takes_one() {
+        // The common path must not change.
+        let mut g = Grid::new(10, 2);
+        g.put('a');
+        assert_eq!(g.cur_col, 1);
+        assert_eq!(Grid::char_width('a'), 1);
+    }
+
+    #[test]
+    fn a_wide_glyph_does_not_start_in_the_last_column() {
+        // Half of it would land on the next row.
+        let mut g = Grid::new(4, 3);
+        g.put('a'); g.put('b'); g.put('c');   // cols 0,1,2 — one left
+        let row_before = g.cur_row;
+        g.put('\u{4E2D}');
+        assert_eq!(g.cur_row, row_before + 1, "the wide glyph was split across rows");
+        assert_eq!(g.cur_col, 2);
+    }
+
+    #[test]
+    fn the_phantom_column_is_occupied() {
+        // Without it the next put lands on top of the wide glyph's right half.
+        let mut g = Grid::new(10, 2);
+        g.put('\u{4E2D}');
+        g.put('x');
+        let text = g.row_text(0);
+        assert!(text.starts_with('\u{4E2D}'), "{text:?}");
+        assert!(text.contains('x'));
+    }
+
+    #[test]
+    fn emoji_are_wide() {
+        assert_eq!(Grid::char_width('\u{1F600}'), 2);
+        assert_eq!(Grid::char_width('\u{1F9F0}'), 2);
     }
 }
