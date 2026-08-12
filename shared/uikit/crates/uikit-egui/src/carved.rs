@@ -72,8 +72,8 @@ pub fn paint_carved(
     painter.rect_filled(rect, rounding, fill);
 
     // 2) relief bevels: lit top edge, shadowed bottom edge
-    let top = Stroke::new(1.0, Color32::from_white_alpha(skin.bevel_lit));
-    let bot = Stroke::new(1.5, Color32::from_black_alpha(skin.bevel_shadow));
+    let top = Stroke::new(1.0_f32, Color32::from_white_alpha(skin.bevel_lit));
+    let bot = Stroke::new(1.5_f32, Color32::from_black_alpha(skin.bevel_shadow));
     painter.line_segment(
         [rect.left_top() + Vec2::new(2.0, 1.0), rect.right_top() + Vec2::new(-2.0, 1.0)],
         top,
@@ -100,7 +100,7 @@ pub fn paint_carved(
     }
 
     // 4) outer hairline so adjacent carved tiles read as separate
-    painter.rect_stroke(rect, rounding, Stroke::new(1.0, Color32::from_black_alpha(40)), egui::StrokeKind::Inside);
+    painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, Color32::from_black_alpha(40)), egui::StrokeKind::Inside);
 }
 
 /// L2: carved (engraved) text — a dark shadow below the ink and a lit lip above
@@ -160,7 +160,7 @@ pub fn pill(ui: &mut Ui, text: &str, base: Color32, accent: Color32, ink: Color3
         ui.painter().rect_stroke(
             rect,
             CornerRadius::same((rect.height() / 2.0) as u8),
-            Stroke::new(1.0, accent),
+            Stroke::new(1.0_f32, accent),
             egui::StrokeKind::Inside,
         );
     }
@@ -181,7 +181,7 @@ pub fn chip(ui: &mut Ui, text: &str, fg: Color32, bg: Color32, border: Color32) 
     let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
     let r = CornerRadius::same((rect.height() / 2.0) as u8);
     ui.painter().rect_filled(rect, r, bg);
-    ui.painter().rect_stroke(rect, r, Stroke::new(1.0, border), egui::StrokeKind::Inside);
+    ui.painter().rect_stroke(rect, r, Stroke::new(1.0_f32, border), egui::StrokeKind::Inside);
     ui.painter()
         .galley(rect.center() - galley.size() / 2.0, galley, fg);
 }

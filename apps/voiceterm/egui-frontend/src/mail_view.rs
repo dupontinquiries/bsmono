@@ -298,7 +298,7 @@ pub fn list_ui(ui: &mut egui::Ui, view: &mut MailView,
                 if t.has_attachments { ui.label(egui::RichText::new("📎").small()); }
             }).response;
             if open { ui.painter().rect_stroke(resp.rect, 2.0,
-                egui::Stroke::new(1.0, colors.accent), egui::StrokeKind::Inside); }
+                egui::Stroke::new(1.0_f32, colors.accent), egui::StrokeKind::Inside); }
             if resp.interact(egui::Sense::click()).clicked() {
                 clicked = Some(t.conversation_id.clone());
             }

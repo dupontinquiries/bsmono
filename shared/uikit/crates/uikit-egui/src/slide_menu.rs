@@ -505,7 +505,7 @@ impl SlideMenu {
                 let target = if hot_i { HOT_CELL_BLUE } else { vis.extreme_bg_color };
                 let fill = crate::motion::animate_color(&ctx, id.with(("cell", i)), target, 0.12);
                 painter.rect_filled(rect, radius, fill);
-                painter.rect_stroke(rect, radius, Stroke::new(1.0, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
+                painter.rect_stroke(rect, radius, Stroke::new(1.0_f32, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
                 let text_col = if hot_i { Color32::WHITE } else { vis.text_color() };
                 painter.text(rect.center(), Align2::CENTER_CENTER, &opt.label, FontId::proportional(18.0), text_col);
                 // Directional/deadband hint glyph at the cell's bottom edge (QML variant indicator).
@@ -695,7 +695,7 @@ impl SlideMenu {
                 let target = if on { vis.selection.bg_fill } else { vis.extreme_bg_color };
                 let fill = crate::motion::animate_color(&ctx, id.with(("card", key)), target, 0.12);
                 painter.rect_filled(rect, cr, fill);
-                painter.rect_stroke(rect, cr, Stroke::new(1.0, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
+                painter.rect_stroke(rect, cr, Stroke::new(1.0_f32, vis.widgets.noninteractive.bg_stroke.color), StrokeKind::Inside);
                 let tc = if on { Color32::WHITE } else { vis.text_color() };
                 painter.text(c, Align2::CENTER_CENTER, label, FontId::proportional(18.0), tc);
             };

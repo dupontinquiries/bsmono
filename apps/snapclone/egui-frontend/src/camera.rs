@@ -207,11 +207,11 @@ pub fn viewfinder(ui: &mut Ui, vf: &mut Viewfinder, frame: Option<&egui::Texture
             let c = vf.to_screen(s, rect);
             let col = colors.accent.gamma_multiply(a);
             let r = 26.0 - 6.0 * (1.0 - a);       // settles inward as it fades
-            p.circle_stroke(c, r, Stroke::new(2.0, col));
+            p.circle_stroke(c, r, Stroke::new(2.0_f32, col));
             for (dx, dy) in [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)] {
                 p.line_segment([Pos2::new(c.x + dx * r, c.y + dy * r),
                                 Pos2::new(c.x + dx * (r + 6.0), c.y + dy * (r + 6.0))],
-                               Stroke::new(2.0, col));
+                               Stroke::new(2.0_f32, col));
             }
         }
     }

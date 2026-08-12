@@ -236,7 +236,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
                 let x1 = rect.left() + m.gutter_w + c1 as f32 * m.char_w;
                 let r = Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + m.line_h));
                 let (fill, stroke) = if current {
-                    (colors.warning.gamma_multiply(0.35), Stroke::new(1.0, colors.warning))
+                    (colors.warning.gamma_multiply(0.35), Stroke::new(1.0_f32, colors.warning))
                 } else {
                     (colors.warning.gamma_multiply(0.16), Stroke::NONE)
                 };
@@ -348,7 +348,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         };
         let panel = Rect::from_min_size(Pos2::new(px, py), Vec2::new(w, shown as f32 * row_h + 8.0));
         painter.rect_filled(panel, 6.0, colors.bg_raised);
-        painter.rect_stroke(panel, 6.0, Stroke::new(1.0, colors.border), egui::StrokeKind::Outside);
+        painter.rect_stroke(panel, 6.0, Stroke::new(1.0_f32, colors.border), egui::StrokeKind::Outside);
         for (row, i) in (first..first + shown).enumerate() {
             let item = &p.items[i];
             let y = panel.top() + 4.0 + row as f32 * row_h;
@@ -381,7 +381,7 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     // A read-only revision preview gets a border, not just a status chip —
     // the cue should be visible without looking down at the chrome.
     if state.rev_ix.is_some() {
-        painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0, colors.warning), egui::StrokeKind::Inside);
+        painter.rect_stroke(rect.shrink(1.0), 0.0, Stroke::new(2.0_f32, colors.warning), egui::StrokeKind::Inside);
     }
 }
 
@@ -522,7 +522,7 @@ fn palette_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors, 
             let Some(p) = state.palette.as_mut() else { return };
             egui::Frame::new()
                 .fill(colors.bg_raised)
-                .stroke(Stroke::new(1.0, colors.border))
+                .stroke(Stroke::new(1.0_f32, colors.border))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(10.0)
                 .show(ui, |ui| {

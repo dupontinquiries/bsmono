@@ -56,7 +56,7 @@ pub fn show(ui: &mut Ui, tabs: &[Tab], selected: usize, min_touch: f32, colors: 
 
 fn painter_tab(ui: &Ui, rect: Rect, fill: Color32, border: Color32, active: bool) {
     let rounding = CornerRadius::same(4);
-    ui.painter().rect(rect.shrink(1.5), rounding, fill, Stroke::new(1.0, border), StrokeKind::Inside);
+    ui.painter().rect(rect.shrink(1.5), rounding, fill, Stroke::new(1.0_f32, border), StrokeKind::Inside);
     if active {
         // a left accent bar, the common "which tab is active" cue in a vertical rail
         let bar = Rect::from_min_max(rect.min, egui::pos2(rect.min.x + 3.0, rect.max.y));

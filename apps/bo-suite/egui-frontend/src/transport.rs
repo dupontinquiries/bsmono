@@ -188,10 +188,10 @@ pub fn transport_ui(ui: &mut egui::Ui, t: &mut Transport,
         let p = ui.painter_at(rect);
         let mid = rect.center().y;
         p.line_segment([egui::Pos2::new(rect.min.x, mid), egui::Pos2::new(rect.max.x, mid)],
-                       egui::Stroke::new(3.0, colors.bg_card));
+                       egui::Stroke::new(3.0_f32, colors.bg_card));
         let x = rect.min.x + rect.width() * t.fraction();
         p.line_segment([egui::Pos2::new(rect.min.x, mid), egui::Pos2::new(x, mid)],
-                       egui::Stroke::new(3.0, colors.accent));
+                       egui::Stroke::new(3.0_f32, colors.accent));
         p.circle_filled(egui::Pos2::new(x, mid), if t.is_scrubbing() { 7.0 } else { 5.0 }, colors.accent);
         if resp.drag_started() { t.begin_scrub(); }
         if let Some(pos) = resp.interact_pointer_pos() {

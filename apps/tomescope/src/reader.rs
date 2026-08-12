@@ -412,7 +412,7 @@ pub fn draw_raster_page(
         ui.painter().rect_stroke(
             rect.shrink(20.0),
             egui::CornerRadius::same(0),
-            Stroke::new(1.0, Color32::GRAY),
+            Stroke::new(1.0_f32, Color32::GRAY),
             egui::StrokeKind::Inside,
         );
         ui.painter().text(

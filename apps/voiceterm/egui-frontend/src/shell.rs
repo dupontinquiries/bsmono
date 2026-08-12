@@ -813,7 +813,7 @@ pub fn tab_row(ui: &mut Ui, tab: &WsTab, active: bool, c: &PaletteColors) -> Res
         // the fence: a 2px accent rule spanning the row's width, just under it (QML bottomMargin -3)
         let r = resp.rect;
         let y = r.bottom() + 2.0;
-        ui.painter().line_segment([egui::pos2(r.left(), y), egui::pos2(r.right(), y)], egui::Stroke::new(2.0, c.accent));
+        ui.painter().line_segment([egui::pos2(r.left(), y), egui::pos2(r.right(), y)], egui::Stroke::new(2.0_f32, c.accent));
         ui.add_space(3.0);
     }
     resp

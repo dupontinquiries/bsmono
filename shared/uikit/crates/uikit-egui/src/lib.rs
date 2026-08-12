@@ -173,7 +173,7 @@ pub fn paint_barrier(ui: &Ui, surface: Rect, fraction: f32, edge: Direction, acc
     let painter = ui.painter_at(surface);
 
     // faint track
-    painter.circle_stroke(center, r, Stroke::new(3.0, accent.gamma_multiply(0.25)));
+    painter.circle_stroke(center, r, Stroke::new(3.0_f32, accent.gamma_multiply(0.25)));
     // filled arc proxied by an alpha-scaled ring (egui has no arc primitive;
     // the app's real impl draws a true arc — this keeps the kit dependency-free)
     painter.circle_stroke(center, r, Stroke::new(3.0 * fraction, accent));
@@ -186,8 +186,8 @@ pub fn paint_barrier(ui: &Ui, surface: Rect, fraction: f32, edge: Direction, acc
     let col = accent.gamma_multiply(0.4 + 0.6 * fraction);
     let s = 5.0;
     let tip = center + Vec2::new(dir * s, 0.0);
-    painter.line_segment([center + Vec2::new(-dir * s, -s), tip], Stroke::new(2.0, col));
-    painter.line_segment([center + Vec2::new(-dir * s, s), tip], Stroke::new(2.0, col));
+    painter.line_segment([center + Vec2::new(-dir * s, -s), tip], Stroke::new(2.0_f32, col));
+    painter.line_segment([center + Vec2::new(-dir * s, s), tip], Stroke::new(2.0_f32, col));
 }
 
 #[cfg(test)]

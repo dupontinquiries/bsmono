@@ -75,7 +75,7 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
     v.faint_bg_color = c.bg_raised;
     v.hyperlink_color = c.accent;
     v.selection.bg_fill = c.accent.linear_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, c.accent);
+    v.selection.stroke = Stroke::new(1.0_f32, c.accent);
 
     let r = CornerRadius::same(tokens::RADIUS_SM as u8);
     let widgets = &mut v.widgets;
@@ -88,12 +88,12 @@ pub fn apply_palette(ctx: &Context, p: &Palette) -> PaletteColors {
     ] {
         state.bg_fill = fill;
         state.weak_bg_fill = fill;
-        state.bg_stroke = Stroke::new(1.0, c.border);
-        state.fg_stroke = Stroke::new(1.0, c.text);
+        state.bg_stroke = Stroke::new(1.0_f32, c.border);
+        state.fg_stroke = Stroke::new(1.0_f32, c.text);
         state.corner_radius = r;
     }
-    widgets.hovered.fg_stroke = Stroke::new(1.0, c.text);
-    widgets.active.bg_stroke = Stroke::new(1.0, c.accent);
+    widgets.hovered.fg_stroke = Stroke::new(1.0_f32, c.text);
+    widgets.active.bg_stroke = Stroke::new(1.0_f32, c.accent);
 
     // token-driven spacing so the egui app matches the FP5-tuned C++ metrics
     ctx.set_visuals(v);

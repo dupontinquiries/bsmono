@@ -140,7 +140,7 @@ pub fn history_ui(ui: &mut egui::Ui, h: &History, colors: &uikit_egui::PaletteCo
             let p = egui::pos2(rect.left() + nx * rect.width(),
                                rect.bottom() - ny * rect.height());
             if let Some(q) = prev {
-                painter.line_segment([q, p], egui::Stroke::new(2.0, colors.accent));
+                painter.line_segment([q, p], egui::Stroke::new(2.0_f32, colors.accent));
             }
             prev = Some(p);
         }

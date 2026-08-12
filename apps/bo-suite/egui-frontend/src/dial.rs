@@ -227,14 +227,14 @@ pub fn dial_ui(ui: &mut egui::Ui, d: &mut VolumeDial, size: f32,
     d.tick();
 
     let p = ui.painter();
-    p.circle_stroke(centre, radius, egui::Stroke::new(2.0, c.border));
+    p.circle_stroke(centre, radius, egui::Stroke::new(2.0_f32, c.border));
     // Tick marks every 10%, which is where the detents are — the marks and the
     // feedback have to agree or the clicks land between the lines.
     for i in 0..=10 {
         let a = (START_ANGLE + SWEEP_ANGLE * i as f32 / 10.0).to_radians();
         let dir = egui::vec2(a.cos(), a.sin());
         p.line_segment([centre + dir * (radius - 4.0), centre + dir * radius],
-                       egui::Stroke::new(1.0, c.text_weak));
+                       egui::Stroke::new(1.0_f32, c.text_weak));
     }
     // The filled arc, drawn as a run of short segments.
     let steps = ((d.value / 100.0) * 48.0) as usize;
@@ -243,7 +243,7 @@ pub fn dial_ui(ui: &mut egui::Ui, d: &mut VolumeDial, size: f32,
         let a1 = (START_ANGLE + SWEEP_ANGLE * (i + 1) as f32 / 48.0).to_radians();
         p.line_segment([centre + egui::vec2(a0.cos(), a0.sin()) * radius,
                         centre + egui::vec2(a1.cos(), a1.sin()) * radius],
-                       egui::Stroke::new(3.0, c.accent));
+                       egui::Stroke::new(3.0_f32, c.accent));
     }
     p.text(centre, egui::Align2::CENTER_CENTER, format!("{:.0}", d.value),
            egui::FontId::proportional(size * 0.22), c.text);

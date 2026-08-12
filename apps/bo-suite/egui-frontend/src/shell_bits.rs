@@ -219,12 +219,12 @@ pub fn card_frame(ui: &mut egui::Ui, card: &mut ControlCard, height: f32,
         col.r(), col.g(), col.b(), (col.a() as f32 * a) as u8);
     ui.painter().rect_filled(r, 8.0, fade(c.bg_card));
     let border = if card.active { c.accent } else { c.border };
-    ui.painter().rect_stroke(r, 8.0, egui::Stroke::new(1.0, fade(border)),
+    ui.painter().rect_stroke(r, 8.0, egui::Stroke::new(1.0_f32, fade(border)),
                              egui::StrokeKind::Inside);
     if card.glow() > 0.0 {
         let g = (card.glow() * a * 255.0) as u8;
         ui.painter().rect_stroke(r.expand(2.0), 10.0,
-            egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(
+            egui::Stroke::new(2.0_f32, egui::Color32::from_rgba_unmultiplied(
                 c.accent.r(), c.accent.g(), c.accent.b(), g)),
             egui::StrokeKind::Outside);
     }

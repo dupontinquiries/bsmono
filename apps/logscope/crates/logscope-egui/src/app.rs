@@ -551,7 +551,7 @@ impl eframe::App for LogscopeApp {
                         let y = rc.bottom() - 1.0;
                         ui.painter().line_segment(
                             [egui::pos2(x0, y), egui::pos2(x0 + w, y)],
-                            egui::Stroke::new(2.0, theme::AMBER()));
+                            egui::Stroke::new(2.0_f32, theme::AMBER()));
                     }
                 }
             });

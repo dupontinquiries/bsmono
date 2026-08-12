@@ -132,7 +132,7 @@ pub fn grid(ui: &mut egui::Ui, pattern: &Pattern, channels: &[studio_live::Chann
                 // The playhead is a column outline, not a fill: filling would
                 // hide whether the step under it is set, which is the one thing
                 // you are watching for.
-                painter.rect_stroke(cr, 3.0, egui::Stroke::new(1.5, c.warning),
+                painter.rect_stroke(cr, 3.0, egui::Stroke::new(1.5_f32, c.warning),
                                     egui::StrokeKind::Outside);
             }
         }

@@ -347,7 +347,7 @@ fn glass_frame() -> egui::Frame {
         fill: egui::Color32::from_rgba_unmultiplied(10, 13, 20, 190),
         corner_radius: theme::r(10),
         inner_margin: egui::Margin::symmetric(10, 6),
-        stroke: egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
+        stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24)),
         ..Default::default()
     }
 }
@@ -657,7 +657,7 @@ fn md_line_job(ui: &egui::Ui, line: &str, size: f32, base: egui::Color32) -> egu
         let color = if r.code || r.link { accent } else if r.bold { strong } else { base };
         let mut fmt = TextFormat { font_id: font, color, ..Default::default() };
         fmt.italics = r.italic;
-        if r.link { fmt.underline = egui::Stroke::new(1.0, accent); }
+        if r.link { fmt.underline = egui::Stroke::new(1.0_f32, accent); }
         job.append(&r.text, 0.0, fmt);
     }
     job
@@ -697,7 +697,7 @@ fn render_markdown(ui: &mut egui::Ui, text: &str, tail: &str) {
             );
             ui.painter().line_segment(
                 [egui::pos2(r.left() + 3.0, r.top() + 1.0), egui::pos2(r.left() + 3.0, r.bottom() - 1.0)],
-                egui::Stroke::new(2.5, bar),
+                egui::Stroke::new(2.5_f32, bar),
             );
             continue;
         }
@@ -4731,7 +4731,7 @@ them to", patches.len());
                 if let (Some(pid), Some((sx, sy)), Some((px, py))) = (nd.parent, screen(nd.id), nd.parent.and_then(screen)) {
                     let dim = self.pruned.contains(&nd.id) || self.pruned.contains(&pid);
                     let col = if dim { theme::LINE().linear_multiply(0.4) } else { theme::LINE() };
-                    p.line_segment([egui::pos2(px, py), egui::pos2(sx, sy)], egui::Stroke::new(1.0, col));
+                    p.line_segment([egui::pos2(px, py), egui::pos2(sx, sy)], egui::Stroke::new(1.0_f32, col));
                 }
             }
         }
@@ -4755,22 +4755,22 @@ them to", patches.len());
             //  radius*7. For a near node those became huge room-sized skinny rings overlaying the floor across every
             //  scene. Significance is already carried by node size/glow; the rings read as stray geometry.)
             let _ = (hot, prn);
-            if self.region.as_ref().map_or(false, |r| r.contains(&id)) { p.circle_stroke(pt, radius + 5.0, egui::Stroke::new(1.6, egui::Color32::from_rgb(0xc9, 0x8f, 0xff))); } // :best region
+            if self.region.as_ref().map_or(false, |r| r.contains(&id)) { p.circle_stroke(pt, radius + 5.0, egui::Stroke::new(1.6_f32, egui::Color32::from_rgb(0xc9, 0x8f, 0xff))); } // :best region
             if self.walk_focus == Some(id) {
                 // pulsing double halo so a voice/keyboard-focused node reads at a glance even mid-scene: an
                 // outer ring that breathes in radius + a steady inner ring. (Was a single static ring.)
                 let pulse = 0.5 + 0.5 * (time * 3.0 + id as f32).sin();
-                p.circle_stroke(pt, radius + 3.0, egui::Stroke::new(2.2, theme::AMBER()));
-                p.circle_stroke(pt, radius + 5.5 + 3.5 * pulse, egui::Stroke::new(1.6, theme::AMBER().linear_multiply(0.35 + 0.4 * (1.0 - pulse))));
+                p.circle_stroke(pt, radius + 3.0, egui::Stroke::new(2.2_f32, theme::AMBER()));
+                p.circle_stroke(pt, radius + 5.5 + 3.5 * pulse, egui::Stroke::new(1.6_f32, theme::AMBER().linear_multiply(0.35 + 0.4 * (1.0 - pulse))));
             }
-            if self.branch_from == Some(id) { p.circle_stroke(pt, radius + 6.5, egui::Stroke::new(2.0, egui::Color32::from_rgb(0xc9, 0x8f, 0xff))); }
-            if self.active_leaf == Some(id) { p.circle_stroke(pt, radius + 2.0, egui::Stroke::new(1.5, theme::CYAN())); } // live tip
+            if self.branch_from == Some(id) { p.circle_stroke(pt, radius + 6.5, egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0xc9, 0x8f, 0xff))); }
+            if self.active_leaf == Some(id) { p.circle_stroke(pt, radius + 2.0, egui::Stroke::new(1.5_f32, theme::CYAN())); } // live tip
             if prn {
-                p.circle_stroke(pt, radius, egui::Stroke::new(1.0, col.linear_multiply(0.5)));
+                p.circle_stroke(pt, radius, egui::Stroke::new(1.0_f32, col.linear_multiply(0.5)));
             } else if pearl_scene {
                 // outline only — let the 3D glossy pearl behind it show through
-                p.circle_stroke(pt, radius, egui::Stroke::new(1.0, col.linear_multiply(0.7)));
-                if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.5, egui::Stroke::new(1.0, theme::CYAN().linear_multiply(0.6))); }
+                p.circle_stroke(pt, radius, egui::Stroke::new(1.0_f32, col.linear_multiply(0.7)));
+                if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.5, egui::Stroke::new(1.0_f32, theme::CYAN().linear_multiply(0.6))); }
             } else if nd.kind.is_structural() {
                 // FAN-OUT / MERGE: a wide, flat bar rather than a blob. It reads as a junction — the
                 // point where the timeline splits or rejoins — instead of as one more thing that
@@ -4786,7 +4786,7 @@ them to", patches.len());
                 // LIAISON: a hollow ring. Nobody said it and nothing was produced, so it should not
                 // carry the visual weight of a turn — but it must remain findable, hence a ring rather
                 // than a fainter dot, which would read as a quiet message.
-                p.circle_stroke(pt, radius * 0.85, egui::Stroke::new(1.5, theme::CYAN()));
+                p.circle_stroke(pt, radius * 0.85, egui::Stroke::new(1.5_f32, theme::CYAN()));
             } else if nd.kind.is_artifact() {
                 // ARTIFACTS ARE SQUARES; conversation turns are circles. Shape is the fastest visual
                 // channel for "the conversation PRODUCED this" vs "someone SAID this", and unlike a hue
@@ -4795,7 +4795,7 @@ them to", patches.len());
                 let h = radius * 0.9;
                 let r = egui::Rect::from_center_size(pt, egui::vec2(h * 2.0, h * 2.0));
                 p.rect_filled(r, theme::r(2), col);
-                p.rect_stroke(r, theme::r(2), egui::Stroke::new(1.0, theme::INK().linear_multiply(0.6)),
+                p.rect_stroke(r, theme::r(2), egui::Stroke::new(1.0_f32, theme::INK().linear_multiply(0.6)),
                     egui::StrokeKind::Middle);
                 let gl = nd.kind.glyph();
                 if !gl.is_empty() && radius > 5.0 {
@@ -4804,7 +4804,7 @@ them to", patches.len());
                 }
             } else {
                 p.circle_filled(pt, radius, col);
-                if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.0, egui::Stroke::new(1.0, theme::INK().linear_multiply(0.5))); }
+                if nd.turn == crate::convograph::Turn::User { p.circle_stroke(pt, radius + 1.0, egui::Stroke::new(1.0_f32, theme::INK().linear_multiply(0.5))); }
             }
             if t < 0.42 && !prn {
                 // hand off to the 3D resonance text up close: the 2D caption lives in a mid band, fading in
@@ -4869,7 +4869,7 @@ them to", patches.len());
             labels.truncate(10);
             for (i, px, py, _d, md) in labels {
                 let pt = egui::pos2(px, py);
-                p.circle_stroke(pt, 5.0, egui::Stroke::new(1.5, egui::Color32::from_rgb(0xff, 0x4d, 0x6d)));
+                p.circle_stroke(pt, 5.0, egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0xff, 0x4d, 0x6d)));
                 let lab = format!("#{} {:.0}u", i, md);
                 let fid = egui::FontId::monospace(12.0);
                 p.text(pt + egui::vec2(8.0, -5.0), egui::Align2::LEFT_CENTER, &lab, fid.clone(), egui::Color32::BLACK);
@@ -6269,7 +6269,7 @@ if let Some(msg) = self.error_banner.clone() {
                     let has_file = !doc.name.is_empty();
                     if code.is_some() || has_file || !kws.is_empty() {
                         egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                         .show(ui, |ui| {
                             ui.label(RichText::new("CONTEXT CARDS").color(theme::DIM()).small().strong());
                             if has_file {
@@ -6416,13 +6416,13 @@ if let Some(msg) = self.error_banner.clone() {
                                             if let Some(pid) = nd.parent {
                                                 let py = top + pid as f32 * row_h;
                                                 let edge = if nd.in_context && g.nodes[pid].in_context { theme::CYAN().linear_multiply(0.5) } else { theme::LINE() };
-                                                p.line_segment([egui::pos2(cx, py), egui::pos2(cx, y)], egui::Stroke::new(1.5, edge));
+                                                p.line_segment([egui::pos2(cx, py), egui::pos2(cx, y)], egui::Stroke::new(1.5_f32, edge));
                                             }
                                             let base = if nd.turn == crate::convograph::Turn::User { theme::CYAN() } else { theme::GREEN() };
                                             let dot = if nd.in_context { base } else { base.linear_multiply(0.30) };
                                             let focused = self.walk_focus == Some(nd.id);
-                                            if focused { p.circle_stroke(egui::pos2(cx, y), 8.0, egui::Stroke::new(2.0, theme::AMBER())); }
-                                            if nd.pruned { p.circle_stroke(egui::pos2(cx, y), 5.0, egui::Stroke::new(1.0, theme::DIM())); }
+                                            if focused { p.circle_stroke(egui::pos2(cx, y), 8.0, egui::Stroke::new(2.0_f32, theme::AMBER())); }
+                                            if nd.pruned { p.circle_stroke(egui::pos2(cx, y), 5.0, egui::Stroke::new(1.0_f32, theme::DIM())); }
                                             else { p.circle_filled(egui::pos2(cx, y), 5.0, dot); }
                                             let tcol = if nd.pruned { theme::FAINT() } else if focused { theme::AMBER() } else if nd.in_context { theme::INK() } else { theme::DIM() };
                                             let who = if nd.turn == crate::convograph::Turn::User { "you" } else { "asst" };
@@ -6528,7 +6528,7 @@ if let Some(msg) = self.error_banner.clone() {
             ui.add_space(theme::PAD_XS as f32);
             if !arts.is_empty() && self.show_files {
                 egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
-                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                    outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                 .show(ui, |ui| {
                     let stitched = arts.iter().filter(|a| a.fragments > 1).count();
                     let hdr = if stitched > 0 {
@@ -6580,7 +6580,7 @@ if let Some(msg) = self.error_banner.clone() {
                             });
                             if self.file_hist == Some(i) {
                                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6), inner_margin: egui::Margin::same(theme::PAD_SM),
-                                    stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                                    stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                                 .show(ui, |ui| {
                                     if file_hist_view.is_empty() {
                                         ui.label(RichText::new("no recorded history for this file yet").color(theme::FAINT()).small());
@@ -6643,7 +6643,7 @@ if let Some(msg) = self.error_banner.clone() {
             // context-overflow suggestion: the next prompt won't fit the window, so it'd be trimmed
             if let Some(want) = self.ctx_suggestion(doc) {
                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::AMBER()), ..Default::default() }
+                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::AMBER()), ..Default::default() }
                 .show(ui, |ui| {
                     ui.horizontal_wrapped(|ui| {
                         ui.label(RichText::new("⚠").color(theme::AMBER()).small());
@@ -6654,7 +6654,7 @@ if let Some(msg) = self.error_banner.clone() {
             }
             if self.show_metrics {
                 egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                 .show(ui, |ui| {
                     ui.label(RichText::new("GPU phase breakdown — last generation").color(theme::CYAN()).strong().small());
                     let now = crate::metricspanel::snapshot(self.metrics_tokens);
@@ -6676,7 +6676,7 @@ if let Some(msg) = self.error_banner.clone() {
             }
             if self.show_checkpoints && !self.checkpoints.is_empty() {
                 egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                    outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                 .show(ui, |ui| {
                     egui::ScrollArea::vertical().id_salt("ckpts").max_height(140.0).show(ui, |ui| {
                         for (i, cp) in self.checkpoints.iter().enumerate().rev() {
@@ -6700,7 +6700,7 @@ if let Some(msg) = self.error_banner.clone() {
                     ui.label(RichText::new("no history yet — finish a turn to create the first node").color(theme::FAINT()).small());
                 } else {
                     egui::Frame { fill: theme::PANEL(), corner_radius: theme::r(8), inner_margin: egui::Margin::same(theme::PAD_SM),
-                        outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                        outer_margin: egui::Margin { bottom: theme::PAD_XS, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                     .show(ui, |ui| {
                         egui::ScrollArea::vertical().id_salt("tree").max_height(170.0).show(ui, |ui| {
                             for (id, parent, label, nfiles, msgs) in &rows {
@@ -6768,7 +6768,7 @@ if let Some(msg) = self.error_banner.clone() {
                 }
             }
             let composer_frame = egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
-                outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
             .show(ui, |ui| {
                 if let Some(bf) = self.branch_from {
                     ui.horizontal(|ui| {
@@ -6994,7 +6994,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                 .show(ui, |ui| {
                     if let Some(n) = self.recover {
                         egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(10), inner_margin: egui::Margin::same(theme::PAD_MD),
-                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0, theme::CYAN()), ..Default::default() }
+                            outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() }, stroke: egui::Stroke::new(1.0_f32, theme::CYAN()), ..Default::default() }
                         .show(ui, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("⟲").color(theme::CYAN()).strong());
@@ -7062,7 +7062,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                             egui::Frame { fill, corner_radius: theme::r(10),
                                 inner_margin: egui::Margin::symmetric(theme::PAD_MD, theme::PAD_SM + 2),
                                 outer_margin: egui::Margin { bottom: theme::PAD_SM, ..Default::default() },
-                                stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                                stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                             .show(ui, |ui| {
                                 // header: role · branch pager · controls
                                 ui.horizontal(|ui| {
@@ -7179,7 +7179,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                                 if open > 0.0 {
                                                     theme::fade(ui, open, |ui| {
                                                         egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6), inner_margin: egui::Margin::same(theme::PAD_SM),
-                                                            stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                                                            stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                                                         .show(ui, |ui| { ui.label(RichText::new(format!("{t}{tail}")).color(theme::DIM()).italics()); });
                                                     });
                                                 }
@@ -7200,7 +7200,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                                                 let mut show_summary = fpath.is_some()
                                                     && ui.ctx().data_mut(|d| *d.get_temp_mut_or(sum_id, in_session));
                                                 egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6),
-                                                    inner_margin: egui::Margin::same(theme::PAD_SM), stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                                                    inner_margin: egui::Margin::same(theme::PAD_SM), stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                                                 .show(ui, |ui| {
                                                     ui.horizontal(|ui| {
                                                         let l = lang.split_whitespace().next().unwrap_or("");
@@ -7270,7 +7270,7 @@ text's structure — an unclosed fence, an open brace — not predicted by a mod
                             ui.add_space(theme::PAD_XS as f32);
                             egui::Frame { fill: theme::PANEL2(), corner_radius: theme::r(6),
                                 inner_margin: egui::Margin::symmetric(theme::PAD_SM, theme::PAD_XS),
-                                stroke: egui::Stroke::new(1.0, theme::LINE()), ..Default::default() }
+                                stroke: egui::Stroke::new(1.0_f32, theme::LINE()), ..Default::default() }
                             .show(ui, |ui| {
                                 ui.horizontal_wrapped(|ui| {
                                     // the dot distinguishes a liaison SENTENCE from a raw engine line, so

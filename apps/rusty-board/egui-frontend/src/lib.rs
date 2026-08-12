@@ -460,7 +460,7 @@ fn paint_key(ui: &mut Ui, key: &Key, size: Vec2, gutter: f32, c: &PaletteColors,
     let fill = uikit_egui::motion::interactive_fill(ui.ctx(), &resp, c.bg_raised, c.bg_hover, c.accent);
     let rounding = CornerRadius::same((size.y * 0.18) as u8);
     painter.rect_filled(rect, rounding, fill);
-    painter.rect_stroke(rect, rounding, Stroke::new(1.0, c.bg_base), egui::StrokeKind::Inside);
+    painter.rect_stroke(rect, rounding, Stroke::new(1.0_f32, c.bg_base), egui::StrokeKind::Inside);
     let text_color = if resp.is_pointer_button_down_on() { c.bg_base } else { c.text };
     painter.text(
         rect.center(),

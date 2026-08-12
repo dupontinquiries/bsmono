@@ -972,7 +972,7 @@ pub fn glove_ui(ui: &mut egui::Ui, g: &GloveCursor, targets: &[Target],
             let at = escape_dot_at(f.at);
             let at = egui::pos2(at.0, at.1);
             p.circle_filled(at, 9.0, c.danger);
-            p.circle_stroke(at, 13.0, egui::Stroke::new(1.0, c.danger));
+            p.circle_stroke(at, 13.0, egui::Stroke::new(1.0_f32, c.danger));
             // Labelled, because a bare dot is a mystery. One flick up is the
             // whole instruction and it fits.
             p.text(at + egui::vec2(0.0, 20.0), egui::Align2::CENTER_TOP,
@@ -985,11 +985,11 @@ pub fn glove_ui(ui: &mut egui::Ui, g: &GloveCursor, targets: &[Target],
     // watching.
     if let Some(t) = targets.iter().find(|t| Some(t.id.as_str()) == g.snapped()) {
         p.circle_stroke(egui::pos2(t.at.0, t.at.1), 26.0,
-                        egui::Stroke::new(2.0, c.accent));
+                        egui::Stroke::new(2.0_f32, c.accent));
     }
     let at = egui::pos2(g.pos().0, g.pos().1);
     p.circle_filled(at, 14.0, c.accent);
-    p.circle_stroke(at, 14.0, egui::Stroke::new(2.0, c.bg_base));
+    p.circle_stroke(at, 14.0, egui::Stroke::new(2.0_f32, c.bg_base));
 }
 
 #[cfg(test)]

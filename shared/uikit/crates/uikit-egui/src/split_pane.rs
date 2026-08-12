@@ -107,7 +107,7 @@ impl SplitPane {
 /// Paint just a divider's visual (no interaction) — for callers that already have their own
 /// drag handling and only want the shared look.
 pub fn paint_divider(ui: &Ui, rect: Rect, color: Color32) {
-    ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0, color), StrokeKind::Inside);
+    ui.painter().rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0_f32, color), StrokeKind::Inside);
 }
 
 #[cfg(test)]

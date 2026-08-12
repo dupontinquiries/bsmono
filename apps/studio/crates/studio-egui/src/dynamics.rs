@@ -154,7 +154,7 @@ pub fn dynamics_ui(ui: &mut egui::Ui, comp: &Compressor, meter: &ReductionMeter,
     // Unity reference first, underneath: the curve is read as a DEPARTURE from
     // it, and without the reference a gentle ratio looks like no ratio.
     painter.line_segment([to_pos(MIN_DB, MIN_DB), to_pos(MAX_DB, MAX_DB)],
-                         egui::Stroke::new(1.0, c.border));
+                         egui::Stroke::new(1.0_f32, c.border));
 
     if is_transparent(comp) {
         painter.text(rect.center(), egui::Align2::CENTER_CENTER, "bypassed (1:1)",
@@ -162,11 +162,11 @@ pub fn dynamics_ui(ui: &mut egui::Ui, comp: &Compressor, meter: &ReductionMeter,
     } else {
         let pts: Vec<egui::Pos2> = curve(comp, 96).into_iter()
             .map(|(x, y)| to_pos(x, y)).collect();
-        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0, c.accent)));
+        painter.add(egui::Shape::line(pts, egui::Stroke::new(2.0_f32, c.accent)));
         // The bend, not the threshold — see knee_start_db.
         let k = knee_start_db(comp);
         painter.line_segment([to_pos(k, MIN_DB), to_pos(k, MAX_DB)],
-                             egui::Stroke::new(1.0, c.text_weak));
+                             egui::Stroke::new(1.0_f32, c.text_weak));
     }
 
     ui.add_space(4.0);
@@ -180,7 +180,7 @@ pub fn dynamics_ui(ui: &mut egui::Ui, comp: &Compressor, meter: &ReductionMeter,
     painter.rect_filled(bar, 2.0, col);
     let px = mrect.left() + mrect.width() * (meter.peak_db() / METER_FLOOR_DB).clamp(0.0, 1.0);
     painter.line_segment([egui::pos2(px, mrect.top()), egui::pos2(px, mrect.bottom())],
-                         egui::Stroke::new(1.5, c.text));
+                         egui::Stroke::new(1.5_f32, c.text));
 }
 
 #[cfg(test)]

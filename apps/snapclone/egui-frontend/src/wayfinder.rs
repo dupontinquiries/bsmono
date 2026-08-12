@@ -233,7 +233,7 @@ pub fn wayfinder_ui(ui: &mut egui::Ui, nodes: &[Node], photos: &[FloatingPhoto],
         // Rings sit at the projected fraction of each decade, so they line up
         // with the nodes rather than being cosmetic circles.
         let frac = 0.25 + 0.25 * i as f64;
-        p.circle_stroke(centre, radius * frac as f32, egui::Stroke::new(1.0, c.border));
+        p.circle_stroke(centre, radius * frac as f32, egui::Stroke::new(1.0_f32, c.border));
     }
     for (label, ang) in [("N", -90.0f32), ("E", 0.0), ("S", 90.0), ("W", 180.0)] {
         let a = ang.to_radians();

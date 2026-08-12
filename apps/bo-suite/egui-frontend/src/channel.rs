@@ -225,12 +225,12 @@ pub fn curve_ui(ui: &mut egui::Ui, speaker: &ChannelColumn, instrumental: &Chann
     for hz in GRID_HZ {
         let x = rect.left() + rect.width() * x_for_hz(hz) as f32;
         p.line_segment([egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                       egui::Stroke::new(1.0, c.border));
+                       egui::Stroke::new(1.0_f32, c.border));
     }
     // The 0 dB line, centred — the curve reads as deviation from flat.
     let mid_y = rect.center().y;
     p.line_segment([egui::pos2(rect.left(), mid_y), egui::pos2(rect.right(), mid_y)],
-                   egui::Stroke::new(1.0, c.text_weak));
+                   egui::Stroke::new(1.0_f32, c.text_weak));
 
     let plot = |col: &ChannelColumn, colour: egui::Color32| {
         let mut prev: Option<egui::Pos2> = None;
@@ -241,7 +241,7 @@ pub fn curve_ui(ui: &mut egui::Ui, speaker: &ChannelColumn, instrumental: &Chann
             let x = rect.left() + rect.width() * x_for_hz(hz) as f32;
             let y = mid_y - (db / 24.0) as f32 * rect.height() * 0.5;
             let pt = egui::pos2(x, y.clamp(rect.top(), rect.bottom()));
-            if let Some(q) = prev { p.line_segment([q, pt], egui::Stroke::new(2.0, colour)); }
+            if let Some(q) = prev { p.line_segment([q, pt], egui::Stroke::new(2.0_f32, colour)); }
             prev = Some(pt);
         }
     };

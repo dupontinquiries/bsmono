@@ -230,7 +230,7 @@ pub fn sources_ui(ui: &mut egui::Ui, s: &Sources,
                     let r = egui::Rect::from_center_size(rect.center(), rect.size() * scale);
                     ui.painter().rect_filled(r, 8.0, if active { c.accent } else { c.bg_card });
                     ui.painter().rect_stroke(r, 8.0,
-                        egui::Stroke::new(1.0, if active { c.accent } else { c.border }),
+                        egui::Stroke::new(1.0_f32, if active { c.accent } else { c.border }),
                         egui::StrokeKind::Inside);
                     let ink = if active { c.bg_base } else { c.accent };
                     ui.painter().text(r.left_center() + egui::vec2(12.0, 0.0),

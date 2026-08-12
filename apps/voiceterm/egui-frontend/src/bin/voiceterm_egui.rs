@@ -906,7 +906,7 @@ impl eframe::App for VoicetermApp {
                 ui.painter().rect_stroke(
                     r,
                     egui::CornerRadius::same(4),
-                    egui::Stroke::new(1.0, if resp.hovered() { colors.accent } else { colors.border }),
+                    egui::Stroke::new(1.0_f32, if resp.hovered() { colors.accent } else { colors.border }),
                     egui::StrokeKind::Inside,
                 );
                 // its own terminal, dimmed by the unfocused frame around it; web panes have no
