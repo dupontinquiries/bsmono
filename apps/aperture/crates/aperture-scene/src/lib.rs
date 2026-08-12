@@ -3,6 +3,7 @@
 //! tested), `scene` the world geometry (tested through `pack_sorted`), `app`
 //! the one egui/GL-touching layer, and the bin a thin eframe boot.
 
+pub mod graph;
 pub mod rooms;
 pub mod scene;
 pub mod viewer;

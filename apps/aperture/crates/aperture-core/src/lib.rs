@@ -30,13 +30,13 @@
 //! shell AND the physical viewer) to duplicate the parsers or take on a
 //! heavier crate just to see what changed.
 
-pub mod multicursor;
 pub mod buffer;
 pub mod editor;
 pub mod gitspace;
 pub mod history;
 pub mod op;
 pub mod syntax;
+pub mod width;
 #[cfg(feature = "tree-sitter")]
 pub mod ts;
 

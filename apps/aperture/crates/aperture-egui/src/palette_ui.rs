@@ -50,6 +50,7 @@ pub enum Cmd {
     NewerRevision,
     BranchFromHere,
     MaterializeHere,
+    OpenFindReplace,
     Theme(PaletteId),
     GotoLine(usize),
 }
@@ -66,6 +67,7 @@ pub fn command_list() -> Vec<(String, Cmd)> {
         ("Git: Newer revision (Ctrl+.)".to_string(), Cmd::NewerRevision),
         ("Git: Branch from previewed revision (Ctrl+B)".to_string(), Cmd::BranchFromHere),
         ("Git: Materialize previewed revision as a worktree (Ctrl+M)".to_string(), Cmd::MaterializeHere),
+        ("Find & Replace (Ctrl+H)".to_string(), Cmd::OpenFindReplace),
     ];
     for id in PaletteId::all() {
         v.push((format!("Theme: {id:?}"), Cmd::Theme(*id)));
@@ -113,6 +115,7 @@ pub fn apply(cmd: Cmd, s: &mut AppState, now_ms: u64) {
         Cmd::NewerRevision => s.rev_step(-1, now_ms),
         Cmd::BranchFromHere => s.branch_from_here(now_ms),
         Cmd::MaterializeHere => s.materialize_here(now_ms),
+        Cmd::OpenFindReplace => s.open_find_with_replace(),
         Cmd::ToggleLoopPane => s.show_loop_pane = !s.show_loop_pane,
         Cmd::Theme(id) => {
             s.theme_id = id;

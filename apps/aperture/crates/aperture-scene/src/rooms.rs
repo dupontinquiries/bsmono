@@ -131,10 +131,34 @@ pub struct Station {
     /// right now — a revision preview, or the live worktree's uncommitted
     /// lines).
     pub touched: bool,
+    /// Ancient by blame — heat below `DORMANT_HEAT`. `gitspace::heat` is
+    /// asymptotic (half-life a week; it approaches zero but never quite
+    /// reaches it for a line that's ever been committed at all), so this is
+    /// a threshold, not an exact-zero check — "hasn't moved in months," not
+    /// "was never written." A room reading that way feels different from
+    /// one that's just quiet this week; logscope's `region_plan` has a
+    /// `SealedCave` region type for exactly this shape of thing (dead
+    /// branches), gated behind a comment admitting the real per-branch
+    /// signal wasn't wired through yet and a seeded stand-in filled in for
+    /// it instead. Aperture has the real signal (blame, not a guess) — this
+    /// is that signal, not a placeholder.
+    pub dormant: bool,
+    /// The item's line span exceeds `LARGE_LINES` — logscope's `Chamber`
+    /// (its "token-heavy" region, sized up because there's more of it).
+    /// Independent of `dormant`: a room can be both large AND untouched.
+    pub large: bool,
 }
 
 pub const STATION_SPACING: f32 = 15.0;
 pub const CORRIDOR_HALF_W: f32 = 11.0;
+/// Line-span threshold for `large`: long enough that "this is a big one"
+/// is a fair read, short enough that ordinary multi-line functions don't
+/// all qualify — roughly a screenful at the editor's default zoom.
+pub const LARGE_LINES: usize = 15;
+/// Heat threshold for `dormant`: below this reads as "hasn't moved in
+/// months" (`gitspace::heat`'s half-life is a week, so ~0.05 corresponds to
+/// roughly 19 half-lives — comfortably "ancient," not merely "quiet lately").
+pub const DORMANT_HEAT: f32 = 0.05;
 
 /// Lay the outline down a corridor along −z: stations alternate sides,
 /// `mod` items sit centered (they read as gates, not rooms).
@@ -175,7 +199,14 @@ pub fn layout_full(outline: Vec<OutlineItem>, ages: &[i64], now: i64, changed: &
                 .map(|t| aperture_core::gitspace::heat(now, *t))
                 .fold(0.0f32, f32::max);
             let touched = changed.iter().any(|(a, b)| item.line < *b && *a <= item.end_line);
-            Station { pos: Vec3::new(x, 0.0, z), env, atlas_row: i, heat, touched, item }
+            // "Never touched" is only a real claim when there was blame data
+            // to have observed it in — no repo (or previewing a revision,
+            // where ages isn't fetched) must read as UNKNOWN, not dormant.
+            // heat==0 with no `ages` at all would otherwise mark every
+            // station dormant, which is a claim the data can't support.
+            let dormant = !ages.is_empty() && heat < DORMANT_HEAT;
+            let large = item.end_line.saturating_sub(item.line) > LARGE_LINES;
+            Station { pos: Vec3::new(x, 0.0, z), env, atlas_row: i, heat, touched, dormant, large, item }
         })
         .collect()
 }
@@ -264,6 +295,39 @@ mod tests {
         assert!(!st[0].touched);
         let st2 = layout_with_ages(vec![item(OutlineKind::Fn, "a", 0)], &[], 0);
         assert!(!st2[0].touched);
+    }
+
+    #[test]
+    fn dormant_requires_real_blame_data_unknown_is_never_dormant() {
+        let items = vec![item(OutlineKind::Fn, "a", 0)]; // lines 0..3
+        // No ages at all (no repo / previewing a revision): UNKNOWN, not dormant.
+        let unknown = layout_full(items.clone(), &[], 0, &[]);
+        assert!(!unknown[0].dormant, "no blame data means we don't know, not that it's dead");
+
+        // Real ages, all ~3 years old: heat is asymptotically near zero
+        // (never exactly zero for a line that was ever committed at all —
+        // that's WHY dormant is a threshold, not an exact-zero check).
+        let now = 1_000_000_000i64;
+        let ages = vec![now - 1000 * 86_400; 4];
+        let ancient = layout_full(items.clone(), &ages, now, &[]);
+        assert!(ancient[0].dormant, "genuinely observed, genuinely below the dormant threshold");
+
+        // Real ages, recently touched: definitely not dormant.
+        let ages_hot = vec![now; 4];
+        let hot = layout_full(items, &ages_hot, now, &[]);
+        assert!(!hot[0].dormant);
+    }
+
+    #[test]
+    fn large_is_a_pure_line_span_check_independent_of_dormant() {
+        let small = item(OutlineKind::Fn, "small", 0); // end_line = line+3 per the test helper
+        let mut big = item(OutlineKind::Fn, "big", 100);
+        big.end_line = big.line + 40;
+        let st = layout_full(vec![small, big], &[], 0, &[]);
+        assert!(!st[0].large, "3-line span: ordinary");
+        assert!(st[1].large, "40-line span: large");
+        // Both are "unknown" dormant-wise (no ages), independent of size.
+        assert!(!st[0].dormant && !st[1].dormant);
     }
 
 }

@@ -70,20 +70,27 @@ pub struct Rev {
     pub time: i64,
     pub subject: String,
     pub kind: RevKind,
+    /// Parent commit oids — empty for a root commit, 2+ for a merge.
+    /// Checkpoints (from `refs/checkpoints/*`, no ancestry query run for
+    /// them) carry an empty list too: they're a NAME pointing at a commit,
+    /// not a distinct node in the ancestry graph — the commit they point at
+    /// is the real graph node, already present via the ordinary log walk.
+    pub parents: Vec<String>,
 }
 
-/// Parse `git log --format=%H%x1f%ct%x1f%s` output (unit separator fields —
-/// subjects may contain anything printable except control chars).
+/// Parse `git log --format=%H%x1f%ct%x1f%P%x1f%s` output (unit separator
+/// fields; `%P` is parent oids space-separated, empty for a root commit —
+/// note %P sits BEFORE %s: a subject can itself contain spaces, so it must
+/// be the last field or splitting would misparse it).
 pub fn parse_log(s: &str) -> Vec<Rev> {
     s.lines()
         .filter_map(|l| {
             let mut f = l.split('\u{1f}');
-            Some(Rev {
-                oid: f.next()?.to_string(),
-                time: f.next()?.parse().ok()?,
-                subject: f.next().unwrap_or("").to_string(),
-                kind: RevKind::Commit,
-            })
+            let oid = f.next()?.to_string();
+            let time = f.next()?.parse().ok()?;
+            let parents = f.next().unwrap_or("").split_whitespace().map(str::to_string).collect();
+            let subject = f.next().unwrap_or("").to_string();
+            Some(Rev { oid, time, subject, kind: RevKind::Commit, parents })
         })
         .collect()
 }
@@ -99,7 +106,7 @@ pub fn parse_checkpoints(s: &str) -> Vec<Rev> {
             let time = f.next()?.parse().ok()?;
             let refname = f.next().unwrap_or("");
             let session = refname.strip_prefix("refs/checkpoints/").unwrap_or(refname).to_string();
-            Some(Rev { oid, time, subject: format!("checkpoint ◈ {session}"), kind: RevKind::Checkpoint(session) })
+            Some(Rev { oid, time, subject: format!("checkpoint ◈ {session}"), kind: RevKind::Checkpoint(session), parents: Vec::new() })
         })
         .collect()
 }
@@ -109,7 +116,7 @@ pub fn parse_checkpoints(s: &str) -> Vec<Rev> {
 /// appear regardless of which file changed — they're moments, not patches.
 pub fn history(r: &dyn Runner, rel: &str, limit: usize) -> Vec<Rev> {
     let mut revs = r
-        .run(&["log", &format!("--max-count={limit}"), "--format=%H\u{1f}%ct\u{1f}%s", "--", rel])
+        .run(&["log", &format!("--max-count={limit}"), "--format=%H\u{1f}%ct\u{1f}%P\u{1f}%s", "--", rel])
         .map(|s| parse_log(&s))
         .unwrap_or_default();
     if let Ok(s) = r.run(&[
@@ -264,6 +271,64 @@ pub fn suggest_worktree_path(repo_root: &Path, rev: &Rev) -> PathBuf {
         .join(format!("{name}@{slug}"))
 }
 
+/// The current HEAD, if there is one (a fresh repo before the first commit
+/// has none — callers treat that as "nowhere to mark yet," not an error).
+pub fn head_oid(r: &dyn Runner) -> Option<String> {
+    r.run(&["rev-parse", "HEAD"]).ok().map(|s| s.trim().to_string())
+}
+
+/// Aperture's own personal-bookmark namespace, `refs/aperture/visited/*` —
+/// deliberately parallel to gitmind's `refs/checkpoints/*`: a ref is the
+/// right primitive for "a name pointing at a commit that isn't a branch,"
+/// and reusing the mechanism means no new file format, nothing to gitignore,
+/// nothing that needs its own backup story. One ref per file, git-native.
+///
+/// This is PERSONAL wayfinding, not project history: it says "where YOU
+/// were," not "what happened." A ref name can contain `/` as path
+/// separators (that's how `refs/heads/feature/x` already works), so a
+/// repo-relative path becomes the ref's tail directly — sanitized only for
+/// the rare character git itself would reject in a ref component.
+fn visited_ref(rel: &str) -> String {
+    let safe: String = rel
+        .chars()
+        .map(|c| if c.is_alphanumeric() || matches!(c, '/' | '_' | '.' | '-') { c } else { '_' })
+        .collect();
+    format!("refs/aperture/visited/{safe}")
+}
+
+/// Mark "I was here" — write `refs/aperture/visited/<file>` at `oid`
+/// (typically the current HEAD). Overwrites any previous mark for this
+/// file; there is only ever one "last visited" point, not a history of
+/// them — that's what commit history is already for.
+pub fn mark_visited(r: &dyn Runner, rel: &str, oid: &str) -> Result<(), String> {
+    r.run(&["update-ref", &visited_ref(rel), oid]).map(|_| ())
+}
+
+/// Where you left off, if you ever marked it.
+pub fn last_visited(r: &dyn Runner, rel: &str) -> Option<String> {
+    r.run(&["rev-parse", "--verify", &visited_ref(rel)]).ok().map(|s| s.trim().to_string())
+}
+
+/// Group time-sorted (newest-first, `history()`'s own order) revisions into
+/// consecutive same-UTC-day runs — a session's worth of checkpoints and
+/// commits collapses into one batch instead of forty individual stops. No
+/// timezone handling (day = `unix_seconds.div_euclid(86400)`): deterministic
+/// and good enough for "roughly a day's work," which is the actual question
+/// wind-forward batching is answering, not a calendar-accurate boundary.
+pub fn batch_by_day(revs: &[Rev]) -> Vec<Vec<Rev>> {
+    let mut out: Vec<Vec<Rev>> = Vec::new();
+    for r in revs {
+        let day = r.time.div_euclid(86_400);
+        match out.last_mut() {
+            Some(batch) if batch.last().map(|b: &Rev| b.time.div_euclid(86_400)) == Some(day) => {
+                batch.push(r.clone());
+            }
+            _ => out.push(vec![r.clone()]),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,12 +427,12 @@ mod tests {
     }
     #[test]
     fn suggests_deterministic_readable_names() {
-        let rev = Rev { oid: "abc123deadbeef".into(), time: 0, subject: "Fix the Auth Bug!! (final)".into(), kind: RevKind::Commit };
+        let rev = Rev { oid: "abc123deadbeef".into(), time: 0, subject: "Fix the Auth Bug!! (final)".into(), kind: RevKind::Commit, parents: vec![] };
         let n1 = suggest_branch_name(&rev);
         let n2 = suggest_branch_name(&rev);
         assert_eq!(n1, n2, "same revision, same suggestion, every time");
         assert_eq!(n1, "from/fix-the-auth-bug-abc123de");
-        let empty = Rev { oid: "ffffffffffff".into(), time: 0, subject: "".into(), kind: RevKind::Commit };
+        let empty = Rev { oid: "ffffffffffff".into(), time: 0, subject: "".into(), kind: RevKind::Commit, parents: vec![] };
         assert_eq!(suggest_branch_name(&empty), "from/ffffffff", "empty subject still yields a usable name");
     }
 
@@ -402,7 +467,7 @@ mod tests {
     #[test]
     fn suggests_a_sibling_path_never_nested_inside_the_repo() {
         let root = Path::new("/home/dev/myproj");
-        let rev = Rev { oid: "cafef00dbeef".into(), time: 0, subject: "Add the thing".into(), kind: RevKind::Commit };
+        let rev = Rev { oid: "cafef00dbeef".into(), time: 0, subject: "Add the thing".into(), kind: RevKind::Commit, parents: vec![] };
         let p = suggest_worktree_path(root, &rev);
         assert_eq!(p, Path::new("/home/dev/myproj@add-the-thing-cafef00d"));
         assert!(!p.starts_with(root), "never nested inside the tree it snapshots");
@@ -438,6 +503,123 @@ mod tests {
         let _ = Command::new("git").arg("-C").arg(&dir).args(["worktree", "remove", "--force", dest.to_str().unwrap()]).output();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
+    fn batch_by_day_groups_consecutive_same_day_revs() {
+        let day = 86_400i64;
+        let mk = |t: i64, s: &str| Rev { oid: s.into(), time: t, subject: s.into(), kind: RevKind::Commit, parents: vec![] };
+        let revs = vec![
+            mk(day * 3 + 100, "c"), // day 3
+            mk(day * 3 + 10, "b"),  // day 3
+            mk(day * 1 + 50, "a"),  // day 1 (a gap at day 2 — no revs that day)
+        ];
+        let batches = batch_by_day(&revs);
+        assert_eq!(batches.len(), 2, "{batches:#?}");
+        assert_eq!(batches[0].len(), 2, "c and b share a day");
+        assert_eq!(batches[1].len(), 1, "a is alone, a day apart");
+    }
+
+    #[test]
+    fn batch_by_day_handles_empty_and_singleton() {
+        assert!(batch_by_day(&[]).is_empty());
+        let one = vec![Rev { oid: "x".into(), time: 0, subject: "x".into(), kind: RevKind::Commit, parents: vec![] }];
+        let batches = batch_by_day(&one);
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].len(), 1);
+    }
+
+    #[test]
+    fn homecoming_marks_and_recalls_a_real_repo() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-gitspace-visited-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("a.rs"), "fn one() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        let r = GitRunner { root: dir.clone() };
+
+        assert!(last_visited(&r, "a.rs").is_none(), "never marked yet");
+        let head1 = head_oid(&r).unwrap();
+        mark_visited(&r, "a.rs", &head1).expect("marks cleanly");
+        assert_eq!(last_visited(&r, "a.rs"), Some(head1.clone()));
+
+        // A second commit lands; the mark stays at the OLD point until
+        // explicitly re-marked — "where I left off," not "what's current."
+        std::fs::write(dir.join("a.rs"), "fn one() {}\nfn two() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "two"]);
+        assert_eq!(last_visited(&r, "a.rs"), Some(head1.clone()), "unmoved by new commits");
+
+        // Re-marking overwrites, doesn't accumulate a history of its own.
+        let head2 = head_oid(&r).unwrap();
+        assert_ne!(head1, head2);
+        mark_visited(&r, "a.rs", &head2).unwrap();
+        assert_eq!(last_visited(&r, "a.rs"), Some(head2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn visited_ref_sanitizes_but_stays_readable() {
+        assert_eq!(visited_ref("src/lib.rs"), "refs/aperture/visited/src/lib.rs");
+        assert_eq!(visited_ref("weird name!.rs"), "refs/aperture/visited/weird_name_.rs");
+    }
+
+    #[test]
+    fn parse_log_reads_parents_root_linear_and_merge() {
+        let s = "ccc\u{1f}300\u{1f}aaa bbb\u{1f}merge\nbbb\u{1f}200\u{1f}aaa\u{1f}second\naaa\u{1f}100\u{1f}\u{1f}root\n";
+        let revs = parse_log(s);
+        assert_eq!(revs.len(), 3);
+        assert_eq!(revs[0].parents, vec!["aaa".to_string(), "bbb".to_string()], "merge: two parents");
+        assert_eq!(revs[1].parents, vec!["aaa".to_string()], "linear: one parent");
+        assert!(revs[2].parents.is_empty(), "root commit: no parents");
+        // Subjects survived even though %P sits right before them.
+        assert_eq!(revs[0].subject, "merge");
+        assert_eq!(revs[2].subject, "root");
+    }
+
+    #[test]
+    fn history_reads_real_parent_oids_along_a_linear_chain() {
+        // Path-scoped log (`history()`'s whole point) applies git's default
+        // history simplification, which drops merge commits that don't
+        // UNIQUELY touch the given path — so the realistic, common case a
+        // per-file revision list actually sees is a linear chain, and
+        // that's what this proves end to end. Merge-oid PARSING itself is
+        // covered directly above (`parse_log_reads_parents_...`), against
+        // real git merge output, without the path filter getting in the way.
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-gitspace-parents-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("f.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "one"]);
+        std::fs::write(dir.join("f.txt"), "one\ntwo\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "two"]);
+        let r = GitRunner { root: dir.clone() };
+
+        let revs = history(&r, "f.txt", 10);
+        let two = revs.iter().find(|v| v.subject == "two").unwrap();
+        let one = revs.iter().find(|v| v.subject == "one").unwrap();
+        assert_eq!(two.parents, vec![one.oid.clone()], "two's parent IS one's real oid");
+        assert!(one.parents.is_empty(), "the root commit has none");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

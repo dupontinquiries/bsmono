@@ -115,6 +115,18 @@ pub struct Viewer {
     /// decays by `step`'s dt instead. Takes priority over `rev_note` in the
     /// chrome while it's alive; they're never both about the same thing.
     pub branch_msg: Option<(String, f32)>,
+
+    // ── homecoming: personal re-entry, not project history ─────────────────
+    /// Where you left off, if you ever marked it (`refs/aperture/visited/*`).
+    pub visited_oid: Option<String>,
+    /// Lines changed between `visited_oid` and NOW (worktree included) —
+    /// the touched-signal a homecoming uses instead of "what the newest
+    /// commit changed": a returning person cares about the whole gap, not
+    /// the single most recent step of it.
+    since_visited_changed: Vec<(usize, usize)>,
+    /// `visited_oid`'s position in `self.revs` (newest-first), if it's
+    /// within the fetched window — the doorway into winding forward.
+    pub homecoming_start_ix: Option<usize>,
 }
 
 /// Plaque text width — chosen WITH the plaque's world aspect: 14 columns over
@@ -159,6 +171,9 @@ impl Viewer {
             rev_note: String::new(),
             note_generation: 0,
             branch_msg: None,
+            visited_oid: None,
+            since_visited_changed: Vec::new(),
+            homecoming_start_ix: None,
         };
         out.git = out.path.as_deref().and_then(gitspace::discover);
         if let Some((r, rel)) = &out.git {
@@ -167,9 +182,70 @@ impl Viewer {
             if let Some(base) = out.revs.iter().find(|v| v.kind == gitspace::RevKind::Commit) {
                 out.changed = gitspace::worktree_changed(r, &base.oid, rel);
             }
+            out.visited_oid = gitspace::last_visited(r, rel);
+            if let Some(visited) = &out.visited_oid {
+                out.since_visited_changed = gitspace::worktree_changed(r, visited, rel);
+                out.homecoming_start_ix = out.revs.iter().position(|v| &v.oid == visited);
+                // A marker exists and points at something DIFFERENT from
+                // where the file stands now: touched should mean "changed
+                // since I was last here," a strictly more useful signal on
+                // return than "what the single newest commit did."
+                if !out.since_visited_changed.is_empty() {
+                    out.changed = out.since_visited_changed.clone();
+                }
+            }
         }
         out.build_rooms();
         out
+    }
+
+    /// "I'm caught up" — mark the current HEAD as where you're leaving off.
+    /// Overwrites any previous mark; there's only ever one "last visited"
+    /// point for a file, the same way there's only one bookmark position in
+    /// a book, not a history of every page you've ever opened it to.
+    pub fn mark_visited(&mut self) {
+        let msg = match &self.git {
+            Some((r, rel)) => match gitspace::head_oid(r) {
+                Some(head) => match gitspace::mark_visited(r, rel, &head) {
+                    Ok(()) => {
+                        self.visited_oid = Some(head);
+                        self.since_visited_changed.clear();
+                        "marked — see you next time".to_string()
+                    }
+                    Err(e) => format!("mark failed: {}", e.trim().lines().next().unwrap_or(&e)),
+                },
+                None => "mark: no commits yet".to_string(),
+            },
+            None => "mark: not a git repo".to_string(),
+        };
+        self.branch_msg = Some((msg, 3.0));
+    }
+
+    /// Step into the gap: jump the revision preview to right where you left
+    /// off. From there, `rev_step(-1)` (the existing "newer" direction) IS
+    /// winding forward — every room that changed while you were away lights
+    /// up as you walk it, one step of history at a time, until stepping
+    /// forward from the newest fetched revision comes home to the live
+    /// worktree, the same "arrived at now" convention `rev_step` already has.
+    pub fn enter_homecoming(&mut self) {
+        let Some(ix) = self.homecoming_start_ix else { return };
+        self.jump_to_rev(ix);
+    }
+
+    /// Jump the revision preview directly to `self.revs[ix]` — the piece
+    /// `rev_step` doesn't expose on its own (it only steps by ±1 from
+    /// wherever it currently is).
+    fn jump_to_rev(&mut self, ix: usize) {
+        let cur = self.rev_ix.map(|i| i as isize).unwrap_or(-1);
+        let target = ix as isize;
+        let mut guard = 0;
+        while self.rev_ix.map(|i| i as isize).unwrap_or(-1) != target && guard < self.revs.len() + 2 {
+            // Index 0 is newest; a HIGHER index is OLDER. rev_step's d=+1
+            // means older (walks to a higher index), d=-1 means newer.
+            let d = if target > cur { 1 } else { -1 };
+            self.rev_step(d);
+            guard += 1;
+        }
     }
 
     pub fn open(path: PathBuf) -> std::io::Result<Self> {
@@ -532,6 +608,24 @@ impl Viewer {
         self.dist.target = (self.dist.target * factor).clamp(16.0, 60.0);
     }
 
+    /// The hour (0..24) this scene's sun should reflect — logscope's
+    /// day-cycle theme, pulled in a second time but for a different axis
+    /// than `RoomEnv`: kind-of-room (fn/struct/mod...) is orthogonal to
+    /// time-of-day, so this drives ONLY the sun's angle, never fighting
+    /// RoomEnv's already-tuned mood colors. Previewing a revision: the
+    /// REAL hour that commit happened, so winding forward through history
+    /// means walking through actual days and nights, dawn to dusk, in the
+    /// order they really occurred — not a metaphor, the literal timestamp.
+    /// Live: the wall clock (`scene_kit`'s own override contract, so
+    /// `SCENE_KIT_HOUR`/`LOGSCOPE_HOUR` still works for anyone testing or
+    /// deliberately pinning it).
+    pub fn current_hour(&self) -> f32 {
+        match self.rev_ix.and_then(|i| self.revs.get(i)) {
+            Some(rev) => (rev.time.rem_euclid(86_400) as f32) / 3600.0,
+            None => scene_kit::mesh3d::local_hour(),
+        }
+    }
+
     pub fn status_line(&self) -> String {
         let name = self
             .path
@@ -561,7 +655,25 @@ impl Viewer {
             .get(self.focus)
             .map(|s| format!(" · room {}/{} {}", self.focus + 1, self.stations.len(), s.item.name))
             .unwrap_or_default();
-        format!("{name} · lines {top}–{bot} of {}{room}{rev} · {:?}", self.buffer.len_lines(), self.lang)
+        // Welcome back: only while live (rev_ix is None) and a gap exists —
+        // once H has been pressed and winding forward has begun, the rev
+        // segment above already says where you are; this would be noise.
+        let welcome = if self.rev_ix.is_none() {
+            match self.homecoming_start_ix {
+                Some(gap) if gap > 0 => {
+                    let n = self.stations.iter().filter(|s| s.touched).count();
+                    format!(
+                        " · ⌂ {gap} rev{} since you were last here, {n} room{} changed — press H",
+                        if gap == 1 { "" } else { "s" },
+                        if n == 1 { "" } else { "s" }
+                    )
+                }
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        format!("{name} · lines {top}–{bot} of {}{room}{rev}{welcome} · {:?}", self.buffer.len_lines(), self.lang)
     }
 }
 
@@ -848,6 +960,148 @@ mod tests {
         let beta = v.stations.iter().find(|s| s.item.name == "beta").unwrap();
         assert!(!alpha.touched, "alpha wasn't touched by the uncommitted edit");
         assert!(beta.touched, "beta was");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn homecoming_marks_recalls_and_winds_forward_through_the_gap() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-scene-homecoming-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("h.rs");
+        std::fs::write(&f, "fn alpha() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "alpha only"]);
+
+        // Mark visited HERE, at the very first commit.
+        let mut v = Viewer::from_text("fn alpha() {}\n", Language::Rust, Some(f.clone()));
+        v.mark_visited();
+        assert!(v.branch_msg.as_ref().unwrap().0.starts_with("marked"));
+        assert!(v.visited_oid.is_some());
+
+        // Time passes: two more commits land while "away."
+        std::fs::write(&f, "fn alpha() {}\nfn beta() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "beta arrives"]);
+        std::fs::write(&f, "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "gamma arrives"]);
+
+        // Reopen fresh, as if returning to the file after time away.
+        let live = std::fs::read_to_string(&f).unwrap();
+        let mut v2 = Viewer::from_text(&live, Language::Rust, Some(f.clone()));
+        assert!(v2.visited_oid.is_some(), "the mark persisted (it's a git ref)");
+        assert_eq!(v2.stations.len(), 3, "alpha, beta, gamma");
+        let beta = v2.stations.iter().find(|s| s.item.name == "beta").unwrap();
+        let gamma = v2.stations.iter().find(|s| s.item.name == "gamma").unwrap();
+        let alpha = v2.stations.iter().find(|s| s.item.name == "alpha").unwrap();
+        assert!(beta.touched, "beta arrived while away");
+        assert!(gamma.touched, "so did gamma");
+        assert!(!alpha.touched, "alpha existed before the mark — untouched");
+
+        // Wind forward from the mark: first step lands on "beta arrives".
+        assert!(v2.homecoming_start_ix.is_some());
+        v2.enter_homecoming();
+        assert!(v2.rev_ix.is_some(), "landed inside the gap, not live");
+        let landed_subject = v2.revs[v2.rev_ix.unwrap()].subject.clone();
+        assert_eq!(landed_subject, "alpha only", "starts AT the mark itself");
+
+        v2.rev_step(-1); // wind forward one step: newer
+        assert_eq!(v2.revs[v2.rev_ix.unwrap()].subject, "beta arrives");
+        v2.rev_step(-1);
+        assert_eq!(v2.revs[v2.rev_ix.unwrap()].subject, "gamma arrives");
+        v2.rev_step(-1); // one more step forward: arrived at now
+        assert!(v2.rev_ix.is_none(), "wound all the way forward to live");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn homecoming_is_inert_with_no_mark_and_no_repo() {
+        let mut v = Viewer::from_text("fn a() {}\n", Language::Rust, None);
+        assert!(v.visited_oid.is_none());
+        assert!(v.homecoming_start_ix.is_none());
+        v.enter_homecoming(); // must not panic
+        assert!(v.rev_ix.is_none());
+        v.mark_visited();
+        assert!(v.branch_msg.as_ref().unwrap().0.contains("not a git repo"));
+    }
+
+    #[test]
+    fn welcome_back_status_shows_the_gap_and_clears_once_homecoming_starts() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-scene-welcome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        let f = dir.join("w.rs");
+        std::fs::write(&f, "fn a() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "base"]);
+        let mut v = Viewer::from_text("fn a() {}\n", Language::Rust, Some(f.clone()));
+        v.mark_visited();
+        std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "grew"]);
+
+        let live = std::fs::read_to_string(&f).unwrap();
+        let mut v2 = Viewer::from_text(&live, Language::Rust, Some(f));
+        assert!(v2.status_line().contains("1 rev since"), "{}", v2.status_line());
+        assert!(v2.status_line().contains("1 room changed"), "{}", v2.status_line());
+        v2.enter_homecoming();
+        assert!(!v2.status_line().contains("since you were last here"), "no longer 'live', no welcome banner: {}", v2.status_line());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_hour_follows_the_real_commit_timestamp_while_previewing() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("aperture-scene-hour-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str], date: Option<&str>| {
+            let mut cmd = Command::new("git");
+            cmd.arg("-C").arg(&dir).args(args);
+            if let Some(d) = date {
+                cmd.env("GIT_AUTHOR_DATE", d).env("GIT_COMMITTER_DATE", d);
+            }
+            let out = cmd.output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        git(&["init", "-q"], None);
+        git(&["config", "user.email", "t@t"], None);
+        git(&["config", "user.name", "t"], None);
+        let f = dir.join("t.rs");
+        std::fs::write(&f, "fn a() {}\n").unwrap();
+        git(&["add", "."], None);
+        // A fixed, known timestamp: 1970-01-02 03:15:00 UTC = 27 hours in =
+        // hour-of-day 3.25 (3:15am), chosen off any DST/local-time ambiguity
+        // since gitspace parses %ct (unix seconds) directly.
+        git(&["commit", "-q", "-m", "night owl commit"], Some("1970-01-02T03:15:00+00:00"));
+
+        let mut v = Viewer::from_text("fn a() {}\n", Language::Rust, Some(f));
+        assert_eq!(v.rev_ix, None);
+        // Live: current_hour should be a plausible wall-clock value, NOT
+        // locked to the commit — sanity range check only (real time varies).
+        assert!((0.0..24.0).contains(&v.current_hour()));
+
+        v.rev_step(1); // preview the only commit
+        assert!(v.rev_ix.is_some());
+        let h = v.current_hour();
+        assert!((h - 3.25).abs() < 0.02, "expected ~3.25 (03:15 UTC), got {h}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

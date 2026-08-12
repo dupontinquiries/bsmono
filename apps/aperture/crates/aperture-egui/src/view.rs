@@ -60,9 +60,66 @@ pub fn frame(root: &mut Ui, state: &mut AppState) {
             editor_view(ui, state, &colors, dt, now_ms);
         });
 
+    if state.find.is_some() {
+        find_overlay(ctx, state, &colors);
+    }
     if state.palette.is_some() {
         palette_overlay(ctx, state, &colors, now_ms);
     }
+}
+
+/// Ctrl+F / Ctrl+H's floating bar: the query, match position, and — in
+/// replace mode — a second row for the replacement text with the focused
+/// field visually distinct (`handle_find`'s Tab toggles which one Text
+/// events reach). Without this, replace mode would be editing a string with
+/// zero on-screen feedback about what's typed or which field has focus —
+/// the highlight wash alone was already a thin signal for find-only; it
+/// would be actively confusing for two hidden fields.
+fn find_overlay(ctx: &Context, state: &mut AppState, colors: &PaletteColors) {
+    let Some(f) = &state.find else { return };
+    let match_label = if f.matches.is_empty() {
+        "no matches".to_string()
+    } else {
+        format!("{}/{}", f.cur + 1, f.matches.len())
+    };
+    let query_color = if f.focus == crate::state::FindFocus::Query || f.replace.is_none() {
+        colors.text
+    } else {
+        colors.text_weak
+    };
+    let query_line = format!("find: {}  ·  {match_label}", f.query);
+    let replace_line = f.replace.as_ref().map(|r| {
+        let color = if f.focus == crate::state::FindFocus::Replace { colors.text } else { colors.text_weak };
+        (format!("replace: {r}"), color)
+    });
+
+    egui::Area::new(Id::new("aperture_find"))
+        .anchor(Align2::RIGHT_TOP, Vec2::new(-12.0, 12.0))
+        .order(egui::Order::Foreground)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(colors.bg_raised)
+                .stroke(Stroke::new(1.0_f32, colors.border))
+                .corner_radius(CornerRadius::same(6))
+                .inner_margin(8.0)
+                .show(ui, |ui| {
+                    ui.label(egui::RichText::new(query_line).monospace().color(query_color));
+                    if let Some((line, color)) = replace_line {
+                        ui.label(egui::RichText::new(line).monospace().color(color));
+                        ui.label(
+                            egui::RichText::new("Tab switch field · Enter replace · Ctrl+Enter replace all · Esc close")
+                                .color(colors.text_weak)
+                                .small(),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new("Enter/F3 next · Shift+Enter prev · Ctrl+↑↓ history · Ctrl+H replace · Esc close")
+                                .color(colors.text_weak)
+                                .small(),
+                        );
+                    }
+                });
+        });
 }
 
 fn metrics(ui: &Ui, state: &AppState) -> Metrics {
@@ -151,7 +208,9 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
     let n_lines = state.editor.buffer.len_lines();
     let total_h = n_lines as f32 * m.line_h;
     let caret = state.editor.caret_pos();
-    state.cam.caret_x.target = caret.col as f32 * m.char_w;
+    let caret_line_text = state.editor.buffer.line(caret.line);
+    let caret_visual_col = aperture_core::width::char_col_to_visual(&caret_line_text, caret.col);
+    state.cam.caret_x.target = caret_visual_col as f32 * m.char_w;
     state.cam.caret_y.target = caret.line as f32 * m.line_h;
     let max_scroll = (total_h - rect.height()).max(0.0);
     if state.follow_mode {
@@ -213,10 +272,17 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
             let c0 = if line == pa.line { pa.col } else { 0 };
             let c1 = if line == pb.line { pb.col } else { state.editor.buffer.line_len(line) + 1 };
             let y = rect.top() - scroll + line as f32 * m.line_h;
+            // Width-aware: a selection spanning a wide CJK glyph highlights
+            // the full 2-cell glyph, not a narrow sliver. `_clamped` keeps
+            // the existing "reaches one cell past EOL" convention for
+            // full-line selections (c1 = line_len + 1, by construction above).
+            let text = state.editor.buffer.line(line);
+            let v0 = aperture_core::width::char_col_to_visual_clamped(&text, c0) as f32;
+            let v1 = aperture_core::width::char_col_to_visual_clamped(&text, c1) as f32;
             painter.rect_filled(
                 Rect::from_min_size(
-                    Pos2::new(content_left + c0 as f32 * m.char_w, y),
-                    Vec2::new(((c1 - c0) as f32 * m.char_w).max(m.char_w * 0.4), m.line_h),
+                    Pos2::new(content_left + v0 * m.char_w, y),
+                    Vec2::new(((v1 - v0) * m.char_w).max(m.char_w * 0.4), m.line_h),
                 ),
                 2.0,
                 sel_fill,
@@ -231,9 +297,14 @@ fn editor_view(ui: &mut Ui, state: &mut AppState, colors: &PaletteColors, dt: f3
         let y = rect.top() - scroll + line as f32 * m.line_h;
         // Find-match slabs: every match a faint wash, the current one loud.
         if let Some(f) = find.as_ref() {
+            let find_line_text = editor.buffer.line(line);
             for (c0, c1, current) in f.on_line(&editor.buffer, line) {
-                let x0 = rect.left() + m.gutter_w + c0 as f32 * m.char_w;
-                let x1 = rect.left() + m.gutter_w + c1 as f32 * m.char_w;
+                // Match spans are real substrings within the line (never
+                // past EOL), so the plain (non-clamped) conversion is exact.
+                let v0 = aperture_core::width::char_col_to_visual(&find_line_text, c0) as f32;
+                let v1 = aperture_core::width::char_col_to_visual(&find_line_text, c1) as f32;
+                let x0 = rect.left() + m.gutter_w + v0 * m.char_w;
+                let x1 = rect.left() + m.gutter_w + v1 * m.char_w;
                 let r = Rect::from_min_max(Pos2::new(x0, y), Pos2::new(x1, y + m.line_h));
                 let (fill, stroke) = if current {
                     (colors.warning.gamma_multiply(0.35), Stroke::new(1.0_f32, colors.warning))
@@ -675,6 +746,7 @@ fn map_key(key: egui::Key) -> Option<K> {
         EK::Period => K::Period,
         EK::B => K::B,
         EK::M => K::M,
+        EK::H => K::H,
         EK::F => K::F,
         EK::F3 => K::F3,
         EK::Space => K::Space,

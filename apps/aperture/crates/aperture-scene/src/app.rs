@@ -21,7 +21,7 @@ impl App {
         let cell = (GLYPH * SCALE) as f32;
         let aspect = (COLS as f32 * cell + cell * 2.0) / (ROWS as f32 * cell + cell * 2.0);
         let world = if let Some(atlas) = &viewer.atlas {
-            scene::build_rooms(&viewer.stations, viewer.focus, aspect, viewer.atlas_cell_px, atlas.size[1] as f32)
+            scene::build_rooms(&viewer.stations, viewer.focus, aspect, viewer.atlas_cell_px, atlas.size[1] as f32, &viewer.revs, viewer.rev_ix)
         } else {
             scene::build(aspect)
         };
@@ -100,6 +100,12 @@ pub fn frame(root: &mut Ui, app: &mut App) {
         if i.key_pressed(Key::M) {
             app.viewer.materialize_here(); // gitmind's materialize, same guard
         }
+        if i.key_pressed(Key::V) {
+            app.viewer.mark_visited(); // "I'm caught up" — refs/aperture/visited/*
+        }
+        if i.key_pressed(Key::H) {
+            app.viewer.enter_homecoming(); // step into the gap; then , / . wind forward/back
+        }
         if i.key_pressed(Key::CloseBracket) {
             app.viewer.jump_rel(1);
         }
@@ -146,6 +152,8 @@ pub fn frame(root: &mut Ui, app: &mut App) {
                 aspect,
                 app.viewer.atlas_cell_px,
                 atlas.size[1] as f32,
+                &app.viewer.revs,
+                app.viewer.rev_ix,
             );
         }
     }
@@ -171,10 +179,16 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     u.eye = cam.eye();
     u.time = time;
     u.aspect = rect.width() / rect.height().max(1.0);
-    // A study at golden hour: warm key from high right, cool sky fill.
-    let sd = [0.42f32, 0.78, 0.46];
-    let sl = (sd[0] * sd[0] + sd[1] * sd[1] + sd[2] * sd[2]).sqrt();
-    u.sun_dir = [sd[0] / sl, sd[1] / sl, sd[2] / sl];
+    // The sun follows the CLOCK, not a fixed study-light constant: live, the
+    // real wall-clock hour; previewing a revision, that commit's own real
+    // timestamp — winding forward through history means walking through
+    // the actual days and nights those changes happened in, literally, not
+    // as a metaphor. Orthogonal to RoomEnv (kind-of-room): time-of-day and
+    // room-character are independent axes in life, so they stay independent
+    // here — this touches sun_dir only, never RoomEnv's tuned mood colors.
+    let hour = app.viewer.current_hour();
+    let sd = scene_kit::mesh3d::sun_dir_3d_at(hour);
+    u.sun_dir = [sd.x, sd.y, sd.z];
     // The ROOM sets the light: each station's deterministic RoomEnv, cross-
     // faded during flight. (In the classic world this is BASE_ENV — the same
     // golden-hour study as before.)
@@ -182,7 +196,8 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     u.sun_col = env.sun_col;
     u.sky = env.sky;
     u.ground = [0.23, 0.19, 0.14];
-    u.ambient = 0.62;
+    let (_, _, hour_ambient) = scene_kit::mesh3d::sun_clock_at(hour);
+    u.ambient = 0.62 * (hour_ambient / 1.18).clamp(0.55, 1.0); // gentle day/night breathing, never fully dark
     u.fog = env.fog;
     u.fog_col = env.fog_col;
     u.exposure = env.exposure;
@@ -250,7 +265,7 @@ pub fn frame(root: &mut Ui, app: &mut App) {
     } else if !app.viewer.rev_note.is_empty() {
         format!("✎ {}", app.viewer.rev_note)
     } else {
-        "wheel scroll · drag orbit · [ ] rooms · , . revisions · b branch · m worktree · click plaques".to_string()
+        "wheel scroll · drag orbit · [ ] rooms · , . revisions · b branch · m worktree · v mark · h homecoming · click plaques".to_string()
     };
     p.text(
         rect.left_bottom() + Vec2::new(12.0, -10.0),
