@@ -407,7 +407,61 @@ impl eframe::App for VoicetermApp {
             // pending_bytes, and until now NOTHING DRAINED THEM. They were
             // computed correctly every frame and discarded, which is exactly
             // why typing worked and Ctrl-C appeared dead.
-            let submitted = self.app.handle_input(ui);
+            // TERMINAL CHORDS, from the ported pty_input. uikit-term's
+            // handle_input encodes bytes and knows nothing about tabs or
+            // splits, so Ctrl-Shift-T and Ctrl-Shift-[/] reached the SHELL as
+            // literal control bytes — the terminal received an escape sequence
+            // for a keystroke the user meant for the window.
+            //
+            // Intercepted before handle_input for that reason: a chord that is
+            // also encodable must not do both.
+            let mut chorded = false;
+            for out in voiceterm_egui::pty_input::drain_egui(
+                ui, voiceterm_egui::pty_input::TermMode::default(),
+                self.workspace.tabs.len() > 1)
+            {
+                if let Some(c) = out.chord {
+                    chorded = true;
+                    use voiceterm_egui::pty_input::Chord;
+                    match c {
+                        // Through apply(), never by writing `tabs`/`active`
+                        // directly: those are a PROJECTION of `model` that
+                        // `sync` rebuilds, so a direct write is undone the next
+                        // time anything else changes. WsCall::Command("new
+                        // tab") is the path tab_dispatch already uses, so the
+                        // chord and the menu item cannot diverge.
+                        Chord::NewTab => {
+                            self.workspace.apply(
+                                &voiceterm_egui::gesture_menus::WsCall::Command("new tab".into()));
+                        }
+                        Chord::NextTab => {
+                            let n = self.workspace.tabs.len();
+                            if n > 0 {
+                                let next = (self.workspace.active + 1) % n;
+                                self.workspace.apply(
+                                    &voiceterm_egui::gesture_menus::WsCall::Command(
+                                        format!("go to tab {}", next + 1)));
+                            }
+                        }
+                        Chord::PrevTab => {
+                            let n = self.workspace.tabs.len();
+                            if n > 0 {
+                                let prev = (self.workspace.active + n - 1) % n;
+                                self.workspace.apply(
+                                    &voiceterm_egui::gesture_menus::WsCall::Command(
+                                        format!("go to tab {}", prev + 1)));
+                            }
+                        }
+                        Chord::FocusRight => self.workspace.focus_dir(
+                            voiceterm_egui::terminal_workspace::Dir::Right),
+                        Chord::FocusLeft => self.workspace.focus_dir(
+                            voiceterm_egui::terminal_workspace::Dir::Left),
+                    }
+                }
+            }
+            // A chord consumed the frame's keys; letting handle_input run too
+            // would encode the same keystroke into the PTY behind the action.
+            let submitted = if chorded { None } else { self.app.handle_input(ui) };
             let key_bytes = self.app.take_pending_bytes();
             self.pty_out.extend_from_slice(&key_bytes);
             if let Some(line) = submitted {
