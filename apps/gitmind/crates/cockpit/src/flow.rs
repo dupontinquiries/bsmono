@@ -1014,6 +1014,25 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
         run_flags: String::new(),
         bin_name: None,
     };
+    // studio: the video NLE + Audacity-informed audio editor. Package
+    // `studio-app` at apps/studio/crates/studio-app, bin `studio` — the same
+    // package-is-not-the-binary shape as bsettings, and the shape that produced
+    // the "✓ built (0 KB)" report when resolve_binary looked for the wrong
+    // name.
+    //
+    // bin_name is set EXPLICITLY rather than left to default: the default is
+    // the entry's `name`, which is "studio" and happens to be right — but only
+    // by coincidence, since the crate is studio-app. Writing it down means a
+    // later rename of either does not silently break the lookup.
+    let studio = || crate::suite::SuiteApp {
+        name: "studio".into(),
+        path: "apps/studio/crates/studio-app".into(),
+        features: vec![],
+        no_default: false,
+        target: String::new(),
+        run_flags: String::new(),
+        bin_name: Some("studio".into()),
+    };
     // unendlich is a workspace root with no [package] of its own — several benchmark/probe bins
     // (perf-probe, gpu-mesh-bench, octree-bench, …) live alongside the real game, which is its own
     // differently-named bin (`unendlich-fullgame`) gated behind render/window/ui-overlay. Without
@@ -1031,9 +1050,13 @@ pub fn store_groups() -> Vec<crate::suite::Suite> {
     let mut work_group = group("work", "Productivity, comms & input", &work);
     work_group.apps.push(bsettings());
     let mut media_group = group("media", "Video, camera, imaging & games", &media);
+    // Media rather than music: it is a video NLE first, with the audio editor
+    // sharing its core — the README's own framing.
+    media_group.apps.push(studio());
     media_group.apps.push(unendlich());
     let mut all_group = group("bigsilicons-apps", "Every BigSilicon app — build all in one go", &all);
     all_group.apps.push(bsettings());
+    all_group.apps.push(studio());
     all_group.apps.push(unendlich());
     vec![
         group("coding", "Development & analysis tools", &coding),
