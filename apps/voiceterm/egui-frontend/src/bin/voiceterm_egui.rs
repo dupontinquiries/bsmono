@@ -395,6 +395,30 @@ impl eframe::App for VoicetermApp {
                                 self.browser.load(&u);
                             }
                         });
+                        // THE SITEMAP, under the URL bar. `explore` holds the
+                        // views over voiceterm's browsing cores and had no
+                        // surface at all — the app could group a site's pages
+                        // by what it knew about each one and never showed it.
+                        //
+                        // Built from the browser's OWN pages rather than a
+                        // fixture: a sitemap of invented paths would look like
+                        // a feature and be a decoration.
+                        let pages: Vec<voiceterm_egui::explore::SitePage> = self.browser
+                            .bookmarks.all().iter()
+                            .map(|b| voiceterm_egui::explore::SitePage {
+                                path: b.url.clone(),
+                                title: b.title.clone(),
+                                source: "bookmark",
+                                // Saved pages are ones the user reached, so
+                                // Visited is the honest status — claiming
+                                // Probed would assert a check we never ran.
+                                status: voiceterm_egui::explore::PageStatus::Visited,
+                            })
+                            .collect();
+                        let groups = voiceterm_egui::explore::group_rows(&pages);
+                        if let Some(path) = voiceterm_egui::explore::sitemap_ui(ui, &groups, &c) {
+                            self.browser.load(&path);
+                        }
                         if let Some(why) = self.browser.empty_reason() {
                             ui.colored_label(c.text_weak, why);
                         }
